@@ -795,6 +795,11 @@ pub(super) fn parse_machine_tag_style(raw: &str) -> Option<TypingInlineTagStyle>
 /// Mirror the renderer's faux-bold payload grammar (`inline_styles.rs`) for panel
 /// tag editing. `None` = unreadable payload; an empty or `default` payload yields
 /// [`FauxBoldParams::default`].
+///
+/// The leading thicken token is SIGNED and clamped to
+/// [`FAUX_THICKEN_PERCENT_MIN`]`..=`[`FAUX_THICKEN_PERCENT_MAX`] (a negative value
+/// THINS the glyphs); every token this payload omits keeps its
+/// [`FauxBoldParams::default`] value, exactly as the renderer's parser does.
 pub(super) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
     let value = value
         .trim()
@@ -807,11 +812,13 @@ pub(super) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
     if !thicken.is_finite() {
         return None;
     }
+    // Spread the crate `Default` instead of restating its fields: the renderer's own
+    // parser (`ms_text_render::inline_styles::parse_faux_bold_value`) does exactly this,
+    // so a payload that names no join/counter/expand token can never decode differently
+    // here than it does in the renderer.
     let mut result = FauxBoldParams {
-        thicken_percent: thicken.clamp(0.0, 25.0),
-        expand_percent: 0.0,
-        sharp_corners: true,
-        outward_only: true,
+        thicken_percent: thicken.clamp(FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX),
+        ..FauxBoldParams::default()
     };
     let mut expand_seen = false;
     for token in value.split(',').skip(1).map(str::trim) {

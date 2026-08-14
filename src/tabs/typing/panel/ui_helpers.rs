@@ -68,11 +68,13 @@ pub(super) fn draw_faux_style_controls(
     });
     if *bold && *faux_bold {
         ui.indent(Id::new(id_salt).with("faux_bold"), |ui| {
-            let response = ui.add(WheelSlider::new(faux_bold_thicken_percent, 0.0..=25.0).suffix("%").text(t!("typing.params.thicken")));
+            // SIGNED range: a negative thicken THINS the glyphs. Both the drag range and
+            // the wheel step take the renderer's own bounds, so the two cannot disagree.
+            let response = ui.add(WheelSlider::new(faux_bold_thicken_percent, FAUX_THICKEN_PERCENT_MIN..=FAUX_THICKEN_PERCENT_MAX).suffix("%").text(t!("typing.params.thicken")));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
             *changed |= response.changed();
             if let Some(steps) = wheel_steps_if_hovered(ui, &response) {
-                *changed |= apply_wheel_step_f32(faux_bold_thicken_percent, steps, 1.0, 0.0, 25.0);
+                *changed |= apply_wheel_step_f32(faux_bold_thicken_percent, steps, 1.0, FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX);
             }
             let response = ui.add(WheelSlider::new(faux_bold_expand_percent, 0.0..=50.0).suffix("%").text(t!("typing.params.extra_spacing")));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);

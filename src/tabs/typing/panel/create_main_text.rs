@@ -1267,8 +1267,9 @@ impl TypingCreatePanelState {
     /// Text-processing section (default collapsed, gated on `!font_missing` then
     /// `!selection_mode`): the six processing checkboxes (hanging punctuation,
     /// strip extra spaces, replace ellipsis with three dots, newline after
-    /// sentence, all-uppercase, enable inline tags). Moved verbatim from the
-    /// former right column.
+    /// sentence, all-uppercase, enable inline tags), plus the indented
+    /// force-remove-ellipsis-glyph sub-checkbox shown only while the ellipsis
+    /// substitution is on. Moved verbatim from the former right column.
     pub(super) fn draw_text_processing_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1301,6 +1302,30 @@ impl TypingCreatePanelState {
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &replace_ellipsis_resp);
                 *changed |= replace_ellipsis_resp.changed();
+                // Sub-parameter of the substitution above: only reachable while the
+                // parent is on, so it is indented under it and hidden otherwise (same
+                // grouping as the faux-bold strip). Its stored value survives the parent
+                // being toggled off — the renderer, not the panel, gates on both flags.
+                if self.replace_ellipsis_with_dots {
+                    // Salted by PANEL like the neighbouring faux-style indents
+                    // (`ui_helpers::faux_style_controls`, salt `typing_main_faux`):
+                    // the create and edit panels draw the same control, so their
+                    // indent ids must not collide.
+                    ui.indent(
+                        Id::new("typing_main_params").with("force_remove_ellipsis_glyph"),
+                        |ui| {
+                            let force_remove_glyph_resp = ui.checkbox(
+                                &mut self.force_remove_ellipsis_glyph,
+                                t!("typing.params.force_remove_ellipsis_glyph"),
+                            );
+                            mark_hscroll_block_on_hover(
+                                block_hscroll_by_hovered_param,
+                                &force_remove_glyph_resp,
+                            );
+                            *changed |= force_remove_glyph_resp.changed();
+                        },
+                    );
+                }
                 let sentence_nl_resp = ui.checkbox(
                     &mut self.new_line_after_sentence,
                     t!("typing.params.newline_after_sentence"),

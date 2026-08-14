@@ -60,7 +60,8 @@ Source:
 
 use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::glyph_blit::{
-    glyph_outline_transform, glyph_subpixel_offset, hash_font_id, resolve_outline_for_glyph,
+    glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset, hash_font_id,
+    resolve_outline_for_glyph,
 };
 use crate::glyph_contour::PlacedContour;
 use crate::inline_styles::InlineStyleSpan;
@@ -71,7 +72,7 @@ use crate::optical::{
 use crate::pipeline::{
     FauxGlyphStyle, GlyphScaleSettings, KerningSettings, faux_bounds_pads, faux_style_for_glyph,
     inline_glyph_offset_for_glyph, inline_glyph_scale_for_glyph, inline_kerning_for_glyph,
-    inline_text_color_for_glyph,
+    inline_text_color_for_glyph, resolve_faux_counter_flag,
 };
 use crate::raster::{
     GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
@@ -162,11 +163,17 @@ pub(crate) fn render_vertical_text(
     } = request;
     let width_px = layout_text.lines().count().max(1);
     let mut cache = SwashCache::new();
+    // Per-render outline cache. It feeds the draw-pass vector rasterizer, the
+    // optical ink measurement AND the faux counter-flag lookup during column
+    // collection, so it is created before the collector runs and reused by every
+    // later pass. Unused (and empty) for non-Optical, non-faux renders.
+    let mut outline_cache = OutlineCache::new();
     let columns = collect_vertical_render_columns(
         params,
         buffer,
         font_system,
         &mut cache,
+        &mut outline_cache,
         layout_text,
         inline_style_spans,
         layout_line_offsets,
@@ -186,12 +193,10 @@ pub(crate) fn render_vertical_text(
         line_extra_spacing_table.first().copied().unwrap_or(0.0),
         direction,
     );
-    // Per-render outline + ink-contour caches. The outline cache feeds both the
-    // draw-pass vector rasterizer and the optical ink measurement; the contour
-    // cache derives each glyph's ink contour once. Created before the bounds pass
-    // so the baselines (which the optical path may re-space) are computed with the
-    // same caches on both passes. Unused for non-Optical kerning modes.
-    let mut outline_cache = OutlineCache::new();
+    // Per-render ink-contour cache: derives each glyph's ink contour once.
+    // Created before the bounds pass so the baselines (which the optical path may
+    // re-space) are computed with the same caches on both passes. Unused for
+    // non-Optical kerning modes.
     let mut contour_cache = OpticalContourCache::new();
     // Reused per-glyph rasterizer buffers for the draw pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
@@ -447,13 +452,21 @@ pub(crate) fn render_vertical_text(
             // fallback, matching the draw branch below.
             let glyph_outline =
                 resolve_outline_for_glyph(font_system, &mut outline_cache, glyph, faux.bold);
+            // Whether this cell puts ink on the canvas at all: it either has an
+            // outline, or it is an outline-less glyph that still gets its bitmap
+            // blitted. `false` only for a glyph a faux THINNING offset consumed
+            // entirely, which draws nothing (the `continue` below) and therefore
+            // must not vote on the extra-info ink centers either. Short-circuits,
+            // so an outline glyph pays no extra lookup.
+            let draws_ink = glyph_outline.is_some()
+                || glyph_needs_bitmap_fallback(font_system, &mut outline_cache, glyph, faux.bold);
 
             // Extra-info sample: the SAME scaled placement box the draw pass
             // rasterizes, its center carried through the block rotation. BOTH cell
             // kinds contribute, but only the outline sample is warpable: the
             // bitmap-fallback box is drawn unwarped, so `map_points` must leave its
             // sample in place to match the unwarped pixels.
-            if extra_active {
+            if extra_active && draws_ink {
                 let (scaled_w, scaled_h) =
                     glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
                 let (corners, center) = rotated_box_samples(
@@ -501,6 +514,12 @@ pub(crate) fn render_vertical_text(
                     &aa_lut,
                     warp_ctx.as_ref(),
                 );
+                continue;
+            }
+
+            // A glyph whose outline was CONSUMED by a faux thinning offset draws
+            // nothing: blitting its bitmap would restore it at FULL weight.
+            if !draws_ink {
                 continue;
             }
 
@@ -693,6 +712,7 @@ fn collect_vertical_render_columns(
     buffer: &mut Buffer,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
     layout_text: &str,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     layout_line_offsets: &[usize],
@@ -730,11 +750,16 @@ fn collect_vertical_render_columns(
                 run.line_i,
                 glyph,
             );
-            let faux = faux_style_for_glyph(
-                params,
-                inline_style_spans,
-                layout_line_offsets,
-                run.line_i,
+            let faux = resolve_faux_counter_flag(
+                faux_style_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                font_system,
+                outline_cache,
                 glyph,
             );
             visual_width_px = visual_width_px.max(measure_vertical_glyph_visual_width(
@@ -779,11 +804,16 @@ fn collect_vertical_render_columns(
                 run.line_i,
                 glyph,
             );
-            let faux = faux_style_for_glyph(
-                params,
-                inline_style_spans,
-                layout_line_offsets,
-                run.line_i,
+            let faux = resolve_faux_counter_flag(
+                faux_style_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                font_system,
+                outline_cache,
                 glyph,
             );
             visual_width_px = visual_width_px.max(measure_vertical_glyph_visual_width(
@@ -957,10 +987,19 @@ fn compute_vertical_cell_baselines(
             VerticalRenderCell::Glyph { glyph, faux, .. } => {
                 let mut profile = glyph_ink_profile(font_system, cache, glyph, font_size_px);
                 // The ink profile is measured from the PLAIN swash bitmap; faux
-                // bold moves the ink boundary outward by `d`, so grow the
+                // bold moves the outer ink boundary away from the ink by the
+                // OUTER delta (counter compensation included), so grow the
                 // profile symmetrically to keep the ink-height stacking from
-                // overlapping thickened glyphs. `d == 0.0` is a no-op.
-                let faux_d = faux.d_px();
+                // overlapping thickened glyphs. `0.0` is a no-op.
+                //
+                // A NEGATIVE (thinning) delta deliberately does NOT shrink the
+                // profile: the measured bitmap extent is still the true plain
+                // ink, and pulling the stacking tighter by an unmeasured
+                // estimate would move every glyph in the column for a change
+                // whose real extent depends on which stems survived. Staying at
+                // the plain profile is the conservative choice — thinned glyphs
+                // stack exactly like un-thinned ones.
+                let faux_d = faux.outer_delta_px();
                 if faux_d > 0.0 {
                     profile.top_px -= faux_d;
                     profile.bottom_px += faux_d;
@@ -1370,6 +1409,7 @@ mod tests {
             uppercase_text: false,
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
+            force_remove_ellipsis_glyph: false,
             hanging_punctuation: false,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,

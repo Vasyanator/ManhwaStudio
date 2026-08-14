@@ -13,6 +13,10 @@ Key functions:
   public numeric accessor) to key the `OutlineCache`.
 - resolve_outline_for_glyph: per-render cached outline lookup for a laid-out
   glyph at its shaped em size, per faux-bold variant (`FauxOutlineParams`).
+- glyph_outline_has_counter: whether the glyph's PLAIN outline bounds a hole
+  (drives the faux-bold counter compensation of advance and bounds padding).
+- glyph_needs_bitmap_fallback: distinguishes "no outline at all" (blit the
+  bitmap) from "faux thinning consumed the outline" (draw nothing).
 - nominal_glyph_advance_px: font `hmtx` (un-kerned) advance of a glyph, the base
   step for `KerningMode::Fixed` (cosmic-text bakes pair kerning into
   `LayoutGlyph.w`, so the shaped advance cannot express "no pair kerning").
@@ -69,7 +73,10 @@ pub(crate) fn hash_font_id(font_id: impl std::hash::Hash) -> u64 {
 /// to the pre-faux behavior); variants are cached separately per quantized
 /// parameters. Returns `None` when the font is missing or the glyph has no
 /// fillable monochrome outline (space or COLR/bitmap color glyph); callers then
-/// fall back to the bitmap blit (faux bold never applies there). Never panics.
+/// fall back to the bitmap blit (faux bold never applies there) — but ONLY
+/// after [`glyph_needs_bitmap_fallback`] confirms that is the reason, because a
+/// faux THINNING offset can also consume every contour of a glyph that does
+/// have an outline, and that glyph must draw nothing. Never panics.
 #[must_use]
 pub(crate) fn resolve_outline_for_glyph(
     font_system: &mut FontSystem,
@@ -83,6 +90,54 @@ pub(crate) fn resolve_outline_for_glyph(
     let font = font_system.get_font(font_id)?;
     let key = OutlineKey::new(hash_font_id(font_id), glyph_id, em_px);
     outline_cache.get_or_extract_with_faux(key, &font.as_swash(), glyph_id, em_px, faux)
+}
+
+/// Whether the glyph's PLAIN outline contains a counter (hole), through the
+/// per-render outline cache.
+///
+/// Faux bold's counter-preserving mode compensates a counter-bearing glyph by
+/// doubling the outer offset (`FauxOutlineParams::outer_delta_px`), so the pen
+/// advance and the bounds padding — neither of which can see the outline — must
+/// know this flag to stay consistent with the drawn ink. `false` for a glyph
+/// with no fillable outline (space / color glyph), which never takes the faux
+/// geometry path anyway. Costs one winding classification per distinct
+/// glyph/em and nothing on a repeat lookup. Never panics.
+#[must_use]
+pub(crate) fn glyph_outline_has_counter(
+    font_system: &mut FontSystem,
+    outline_cache: &mut OutlineCache,
+    glyph: &LayoutGlyph,
+) -> bool {
+    let Some(font) = font_system.get_font(glyph.font_id) else {
+        return false;
+    };
+    let key = OutlineKey::new(hash_font_id(glyph.font_id), glyph.glyph_id, glyph.font_size);
+    outline_cache.glyph_has_counter(key, &font.as_swash(), glyph.glyph_id, glyph.font_size)
+}
+
+/// Whether a `None` from [`resolve_outline_for_glyph`] means "blit the swash
+/// BITMAP instead" rather than "draw nothing".
+///
+/// `None` has two distinct causes and they need opposite handling:
+/// - the glyph has no fillable monochrome outline at all (space, COLR/CBDT
+///   color glyph, embedded bitmap) — the caller must fall back to the bitmap;
+/// - a faux THINNING offset consumed every contour of a glyph that does have an
+///   outline — the caller must draw nothing, because blitting the bitmap would
+///   render that glyph at FULL weight in the middle of thinned text.
+///
+/// Returns `true` only in the first case. Resolving the plain outline is a
+/// cache hit whenever the faux variant was already attempted. Never panics.
+#[must_use]
+pub(crate) fn glyph_needs_bitmap_fallback(
+    font_system: &mut FontSystem,
+    outline_cache: &mut OutlineCache,
+    glyph: &LayoutGlyph,
+    faux: Option<FauxOutlineParams>,
+) -> bool {
+    if faux.is_none() {
+        return true;
+    }
+    resolve_outline_for_glyph(font_system, outline_cache, glyph, None).is_none()
 }
 
 /// Nominal (un-kerned) horizontal advance of a laid-out glyph in layout px.

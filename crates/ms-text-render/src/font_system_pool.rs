@@ -19,7 +19,8 @@ across threads, so a `FontSystem` built once is leased by whichever thread
 renders next.
 
 Main responsibilities:
-- own a bounded, mutex-guarded free list of `PooledFontSystem` items;
+- own a bounded, mutex-guarded free list of `PooledFontSystem` items, PARTITIONED
+  by `EllipsisLigatureMode`;
 - lease a `FontSystem` + its per-system `FontFaceCache` for the duration of one
   render and return it afterward (`with_leased_font_system`);
 - bound growth by dropping systems whose face cache or the pool itself has grown
@@ -50,6 +51,21 @@ even on a reused pooled system):
   `return_to_pool` DROPS a tainted system so it can never serve a future render.
   Documented residual: the single render that first triggers the collision may
   still mis-match before the system is dropped (rare, self-healing).
+- ELLIPSIS-PATCH PARTITION: `TextRenderParams.force_remove_ellipsis_glyph` makes
+  the loader register a PATCHED copy of the caller's font (see
+  `font_ligature_patch.rs`), and the flag is per render — so one process renders
+  the same font both ways. `FontFaceCache` is keyed by content id ALONE, so a
+  single system could serve only one of the two variants, and widening the key to
+  `(content id, mode)` would instead put two faces with the same
+  `(family, weight, style, stretch)` into one database — the very collision
+  `collides_with_other_file` taints and drops the system for. The pool is
+  therefore split by mode: a `FontSystem` is created in one mode, only ever loads
+  faces of that mode, and is only ever leased to a render of that mode. The cache
+  carries the mode (`FontFaceCache::ellipsis_mode`) so the loader reads it off the
+  system it is loading into instead of taking it as an argument, which makes the
+  wrong combination unrepresentable. Growth: the modes SHARE the
+  `MAX_POOLED_SYSTEMS` ceiling (the feature must not double resident font
+  memory), with `MAX_POOLED_SYSTEMS_PER_MODE` reserving room for the other mode.
 - Displacement-and-drop: when the caller's font declares a family the BUNDLED base
   also declares, the loader removes the bundled faces from that system's database so
   the user's own file wins the match (`font_registry::displace_bundled_faces`). The
@@ -71,6 +87,7 @@ use std::sync::{Mutex, OnceLock};
 use cosmic_text::{FontSystem, fontdb};
 
 use super::font_base;
+use super::font_ligature_patch::EllipsisLigatureMode;
 use super::font_registry::RegisteredFontFace;
 
 /// Maximum number of distinct CALLER font contents a pooled `FontSystem` may
@@ -88,9 +105,21 @@ use super::font_registry::RegisteredFontFace;
 /// system, so they do not scale with the pool size the way resident buffers do.
 const MAX_CACHED_FILES: usize = 64;
 
-/// Maximum number of `FontSystem` instances kept warm in the free list. Extra
-/// systems returned beyond this are dropped.
+/// Maximum number of `FontSystem` instances kept warm in the free list, across
+/// ALL ellipsis-patch modes. Extra systems returned beyond this are dropped.
 const MAX_POOLED_SYSTEMS: usize = 12;
+
+/// Maximum number of warm systems ONE `EllipsisLigatureMode` may occupy.
+///
+/// The pool is partitioned by mode (see the file header), and the total ceiling
+/// above is deliberately NOT doubled: patched and unpatched systems compete for
+/// the same 12 slots, so enabling the feature cannot double the renderer's
+/// resident font memory. This per-mode cap only stops one mode from taking every
+/// slot, which on a project that mixes both settings would leave the other mode
+/// rebuilding a `FontSystem` on every render. With 8 of 12, whichever mode runs
+/// first keeps at most 8 and the other still finds 4 warm systems — more than the
+/// number of renders the app runs concurrently.
+const MAX_POOLED_SYSTEMS_PER_MODE: usize = 8;
 
 /// Snapshot of a `FontSystem`'s generic default-family names, captured once at
 /// system creation so a later render can restore the pristine matching state.
@@ -182,6 +211,10 @@ pub struct FontFaceCache {
     /// Set when a family-name collision between two distinct files is detected.
     /// A tainted system is dropped by `return_to_pool`, never reused.
     tainted: bool,
+    /// Whether faces loaded through this cache have their ellipsis-producing
+    /// ligatures removed. Fixed for the life of the owning `FontSystem`; see the
+    /// ELLIPSIS-PATCH PARTITION contract in the file header.
+    ellipsis_mode: EllipsisLigatureMode,
 }
 
 impl FontFaceCache {
@@ -203,6 +236,23 @@ impl FontFaceCache {
             pristine: PristineDefaultFamilies::capture(font_system.db()),
             ..Self::default()
         }
+    }
+
+    /// Returns this cache with `mode` fixed as its ellipsis-patch mode.
+    ///
+    /// Consuming builder on purpose: the mode must be decided when the owning
+    /// `FontSystem` is created and never change afterwards, because the faces
+    /// already registered in that system were loaded under it.
+    #[must_use]
+    pub(crate) fn with_ellipsis_mode(mut self, mode: EllipsisLigatureMode) -> Self {
+        self.ellipsis_mode = mode;
+        self
+    }
+
+    /// The ellipsis-patch mode every load through this cache must use.
+    #[must_use]
+    pub(crate) fn ellipsis_mode(&self) -> EllipsisLigatureMode {
+        self.ellipsis_mode
     }
 
     /// Restores the captured pristine default families into `font_system`'s db.
@@ -331,20 +381,24 @@ struct PooledFontSystem {
 }
 
 impl PooledFontSystem {
-    /// Builds a fresh pooled system over the deterministic bundled font base
-    /// (`font_base::new_render_font_system`), never over the OS font database.
+    /// Builds a fresh pooled system for `mode` over the deterministic bundled font
+    /// base (`font_base::new_render_font_system`), never over the OS font database.
     ///
     /// The first call in a process resolves the `fonts/ui` manifest and reads the
     /// resident tiers (blocking I/O — see `prewarm_font_system_pool`); later calls
     /// only clone the shared `fontdb::Database`, which copies `Arc`s and name
     /// strings but no font bytes (`fontdb-0.16.2/src/lib.rs:151-159`).
+    ///
+    /// `mode` is fixed for the life of the system: it decides how every face
+    /// loaded into it is preprocessed, so it can never be changed on a system that
+    /// already holds faces (see the ELLIPSIS-PATCH PARTITION contract).
     #[must_use]
-    fn new() -> Self {
+    fn new(mode: EllipsisLigatureMode) -> Self {
         // Build the system first, then capture its pristine default families so a
         // no-family render can restore fresh-system matching regardless of pool
         // history (see file header, determinism guards).
         let system = font_base::new_render_font_system();
-        let cache = FontFaceCache::for_system(&system);
+        let cache = FontFaceCache::for_system(&system).with_ellipsis_mode(mode);
         Self {
             system,
             cache,
@@ -362,18 +416,29 @@ fn pool() -> &'static Mutex<Vec<PooledFontSystem>> {
     POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Leases a warm system from the pool, creating a new one if the pool is empty.
+/// Leases a warm system OF `mode` from the pool, creating a new one when the pool
+/// holds none.
+///
+/// A system of another mode is never handed out: its database already holds faces
+/// preprocessed for that other mode (see the ELLIPSIS-PATCH PARTITION contract in
+/// the file header). The scan is over at most `MAX_POOLED_SYSTEMS` entries.
 ///
 /// Recovers from a poisoned mutex (a panic in another lease) instead of
 /// propagating it: the pooled `Vec` is never left structurally invalid, so the
 /// data behind the poison is safe to reuse.
 #[must_use]
-fn checkout() -> PooledFontSystem {
+fn checkout(mode: EllipsisLigatureMode) -> PooledFontSystem {
     let mut guard = match pool().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.pop().unwrap_or_else(PooledFontSystem::new)
+    // Take the most recently parked matching system (warmest caches).
+    let found = guard
+        .iter()
+        .rposition(|pooled| pooled.cache.ellipsis_mode() == mode)
+        .map(|index| guard.remove(index));
+    drop(guard);
+    found.unwrap_or_else(|| PooledFontSystem::new(mode))
 }
 
 /// Returns a leased system to the pool, or drops it to bound growth or preserve
@@ -381,9 +446,10 @@ fn checkout() -> PooledFontSystem {
 ///
 /// Drops (does not requeue) the system when its matching has been tainted by a
 /// cross-file family-name collision (so a contaminated system can never serve a
-/// future render), when its face cache has grown past `MAX_CACHED_FILES`, or
-/// when the pool already holds `MAX_POOLED_SYSTEMS`. Dropping also resets
-/// cosmic-text shaping/db growth accumulated on a long-lived system.
+/// future render), when its face cache has grown past `MAX_CACHED_FILES`, when
+/// the pool already holds `MAX_POOLED_SYSTEMS`, or when this system's ellipsis
+/// mode already occupies `MAX_POOLED_SYSTEMS_PER_MODE` slots. Dropping also
+/// resets cosmic-text shaping/db growth accumulated on a long-lived system.
 fn return_to_pool(pooled: PooledFontSystem) {
     if !should_requeue(&pooled.cache) {
         // Dropped for determinism (tainted) or growth (too many cached files);
@@ -391,14 +457,19 @@ fn return_to_pool(pooled: PooledFontSystem) {
         // shaping/db growth accumulated on this long-lived system.
         return;
     }
+    let mode = pooled.cache.ellipsis_mode();
     let mut guard = match pool().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard.len() < MAX_POOLED_SYSTEMS {
+    let same_mode = guard
+        .iter()
+        .filter(|parked| parked.cache.ellipsis_mode() == mode)
+        .count();
+    if guard.len() < MAX_POOLED_SYSTEMS && same_mode < MAX_POOLED_SYSTEMS_PER_MODE {
         guard.push(pooled);
     }
-    // Otherwise drop: the pool is already at capacity.
+    // Otherwise drop: the pool, or this mode's share of it, is already full.
 }
 
 /// Whether a returned system is healthy enough to requeue for reuse.
@@ -413,16 +484,24 @@ fn should_requeue(cache: &FontFaceCache) -> bool {
     !cache.is_tainted() && cache.distinct_file_count() <= MAX_CACHED_FILES
 }
 
-/// Runs `f` with a leased `FontSystem` and its `FontFaceCache`, returning the
-/// system to the global pool afterward.
+/// Runs `f` with a leased `FontSystem` of `mode` and its `FontFaceCache`,
+/// returning the system to the global pool afterward.
+///
+/// `mode` selects the pool PARTITION: the leased system has only ever loaded
+/// faces preprocessed for that mode, and its cache reports the mode back to
+/// `font_registry::load_font_content`, which is how the per-render
+/// `force_remove_ellipsis_glyph` decision reaches the loader without widening the
+/// content-id cache key. See the ELLIPSIS-PATCH PARTITION contract in the file
+/// header.
 ///
 /// `f`'s result is returned as-is (including `Err`), and the system is returned
 /// to the pool on every non-panicking path. A panic inside `f` leaks that one
 /// system (the pool simply recreates it); the renderer must not panic.
 pub(crate) fn with_leased_font_system<R>(
+    mode: EllipsisLigatureMode,
     f: impl FnOnce(&mut FontSystem, &mut FontFaceCache) -> R,
 ) -> R {
-    let mut pooled = checkout();
+    let mut pooled = checkout(mode);
     let result = f(&mut pooled.system, &mut pooled.cache);
     pooled.render_count = pooled.render_count.saturating_add(1);
     return_to_pool(pooled);
@@ -436,15 +515,21 @@ pub(crate) fn with_leased_font_system<R>(
 /// (~19 MB of blocking I/O), which is exactly why this must run off the GUI thread.
 /// Intended to be called once from a background thread at startup. Cheap to call
 /// again (it just leases and returns a system).
+///
+/// Only the DEFAULT (`Keep`) partition is warmed. The expensive part — resolving
+/// the manifest and reading the resident tiers into the process-wide base — is
+/// shared by every partition, so a first render with
+/// `force_remove_ellipsis_glyph` still only pays for cloning the already-built
+/// database.
 pub fn prewarm_font_system_pool() {
-    let pooled = checkout();
+    let pooled = checkout(EllipsisLigatureMode::default());
     return_to_pool(pooled);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FontFaceCache, checkout, font_base, return_to_pool, should_requeue,
+        EllipsisLigatureMode, FontFaceCache, checkout, font_base, return_to_pool, should_requeue,
         with_leased_font_system,
     };
     use crate::font_provider::{FontContent, font_content_id};
@@ -540,7 +625,7 @@ mod tests {
     fn leased_system_exposes_the_bundled_base_and_returns_to_pool() {
         // Lease a system, touch it, and confirm a subsequent checkout can reuse a
         // pooled system (the pool is non-empty after the lease returns).
-        let face_count = with_leased_font_system(|system, _cache| {
+        let face_count = with_leased_font_system(EllipsisLigatureMode::Keep, |system, _cache| {
             // Touch the system so the closure genuinely uses the lease.
             system.db().len()
         });
@@ -558,7 +643,7 @@ mod tests {
         );
         // After the lease, at least one system should be parked. Check out and
         // return it to confirm reuse works without panicking.
-        let pooled = checkout();
+        let pooled = checkout(EllipsisLigatureMode::Keep);
         return_to_pool(pooled);
 
         // The assert above is only a proof of the NEGATIVE (nothing scanned the OS),
@@ -673,5 +758,75 @@ mod tests {
             !should_requeue(&cache),
             "a tainted cache must be dropped by return_to_pool, not requeued"
         );
+    }
+
+    /// A lease must never hand out a system of the OTHER ellipsis partition: its
+    /// database already holds faces preprocessed for that other mode.
+    #[test]
+    fn a_lease_always_matches_the_requested_ellipsis_mode() {
+        // Alternate so both a fresh build and a reuse of each partition are hit.
+        for mode in [
+            EllipsisLigatureMode::Keep,
+            EllipsisLigatureMode::Remove,
+            EllipsisLigatureMode::Remove,
+            EllipsisLigatureMode::Keep,
+            EllipsisLigatureMode::Keep,
+            EllipsisLigatureMode::Remove,
+        ] {
+            with_leased_font_system(mode, |_system, cache| {
+                assert_eq!(
+                    cache.ellipsis_mode(),
+                    mode,
+                    "a lease must come from the requested pool partition"
+                );
+            });
+        }
+    }
+
+    /// End-to-end guard for the partition: the SAME font rendered through the pool
+    /// in both modes must shape `...` differently every time, in any order.
+    ///
+    /// Without the partition the first variant to enter a system would win for
+    /// every later render on it — `FontFaceCache` is keyed by content id alone —
+    /// and the feature would silently render the wrong thing.
+    #[test]
+    fn both_ellipsis_modes_keep_shaping_the_same_font_their_own_way() {
+        use cosmic_text::{Attrs, Metrics};
+
+        let bytes = crate::font_ligature_patch::test_fixture::bytes();
+        let content = FontContent {
+            name: "ellipsis-fixture".to_string(),
+            original_name: "ellipsis-fixture".to_string(),
+            data: Arc::new(bytes.clone()),
+            face_index: 0,
+            content_id: font_content_id(&bytes),
+        };
+
+        let shaped_dots = |mode| {
+            with_leased_font_system(mode, |system, cache| {
+                let face = load_font_content(system, cache, &content, 0)
+                    .expect("the fixture must load into a leased system");
+                let attrs = face.apply_to_attrs(Attrs::new().metrics(Metrics::new(32.0, 32.0)));
+                let glyphs = font_base::test_bundle::shaped_glyphs(system, "...", &attrs);
+                // The pool is process-global and shared with every other test in
+                // this binary; taint the system so the fixture face is dropped
+                // with it instead of lingering in a requeued database.
+                cache.mark_tainted();
+                glyphs.len()
+            })
+        };
+
+        for _ in 0..2 {
+            assert_eq!(
+                shaped_dots(EllipsisLigatureMode::Remove),
+                3,
+                "with the patch the three periods must stay three glyphs"
+            );
+            assert_eq!(
+                shaped_dots(EllipsisLigatureMode::Keep),
+                1,
+                "without the patch the fixture's liga rule must fuse them into one"
+            );
+        }
     }
 }

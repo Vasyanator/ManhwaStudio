@@ -126,7 +126,8 @@ use crate::tabs::typing::render_next::{FontContent, FontFaceCache, load_font_con
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
-    AntiAliasingMode, FauxBoldParams, FontFallbackReport, HorizontalAlign, KerningMode,
+    AntiAliasingMode, FAUX_THICKEN_PERCENT_MAX, FAUX_THICKEN_PERCENT_MIN, FauxBoldParams,
+    FontFallbackReport, HorizontalAlign, KerningMode,
     LinePlacementReference, PxOrPercent, RenderExtraInfoRequest, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
@@ -1748,6 +1749,11 @@ struct TypingCreatePanelState {
     uppercase_text: bool,
     trim_extra_spaces: bool,
     replace_ellipsis_with_dots: bool,
+    /// Sub-parameter of `replace_ellipsis_with_dots`: after the substitution, also strip
+    /// the font's `. . . -> …` GSUB ligature so the three dots cannot be shaped back into
+    /// a single ellipsis glyph. Meaningful (and shown in the panel) ONLY while the parent
+    /// flag is on; the renderer applies the effect only when BOTH are set.
+    force_remove_ellipsis_glyph: bool,
     hanging_punctuation: bool,
     new_line_after_sentence: bool,
     enable_inline_style_tags: bool,

@@ -12,6 +12,9 @@ Three unrelated concerns live here:
 - **font-bundle audit** (`check_font_bundle.py`) — checking `fonts/` against the app's
   font-IDENTITY rules before the identity code ever sees the files. Run by hand when
   the bundle changes.
+- **fixture generation** (`make_ellipsis_ligature_fixture.py`) — building the one
+  committed test font of `ms-text-render`. Run by hand only when that fixture's
+  contract changes.
 - **`run-dev/`** — the source-run entry point (update from git, provision Rust,
   `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
   and is invoked through the launchers in the project root. It has its own
@@ -95,6 +98,19 @@ detection cannot be fooled by punctuation inside strings or comments.
   `src/tabs/typing/panel/fonts.rs` changes an identity rule — the tool is only useful
   while it predicts what the loader does, and the constants it mirrors are named in its
   docstring.
+- `make_ellipsis_ligature_fixture.py`: builds
+  `crates/ms-text-render/tests/fixtures/ellipsis_ligature.ttf` — a ~3 KB subset of
+  `fonts/ui/core/00-NotoSans-Regular.ttf`, renamed to a private family, carrying a
+  hand-written `liga` feature with `period period period -> ellipsis` plus two
+  ligatures that must SURVIVE the patch. It is the only reproducible source of the
+  negative case for `ms-text-render`'s ellipsis patcher (`font_ligature_patch.rs`):
+  no bundled or Git-tracked font carries such a rule. Needs `fontTools`
+  (`venv/bin/python tools/make_ellipsis_ligature_fixture.py`). The OUTPUT is
+  committed; regenerate and commit it together whenever the fixture contract
+  changes. The output is BYTE-REPRODUCIBLE — `head.created`/`head.modified` are
+  pinned to `FIXED_TIMESTAMP` and `recalcTimestamp` is off, so two runs produce
+  the same sha256 and a rerun shows up in `git status` only when something real
+  changed. Keep it that way when editing the script.
 - `test_i18n_extract.py`: stdlib `unittest` suite. Covers lexing (raw strings,
   comments, char literals, escapes), classification precedence, `concat!` refusal,
   `format!`->`tf!` placeholder conversion, suggested-key stability/collisions, the

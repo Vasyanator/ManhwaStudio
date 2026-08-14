@@ -159,7 +159,7 @@ pub(in crate::tabs::typing) fn frozen_v2_defaults() -> &'static Map<String, Valu
     DEFAULTS.get_or_init(|| {
         // Assembled entry by entry rather than as one `json!` literal: the whole set in
         // a single literal blows serde_json's macro recursion limit.
-        let entries: [(&str, Value); 44] = [
+        let entries: [(&str, Value); 45] = [
             ("text", json!("")),
             ("text_color", json!([0, 0, 0, 255])),
             ("font_size_px", json!(24.0)),
@@ -194,6 +194,7 @@ pub(in crate::tabs::typing) fn frozen_v2_defaults() -> &'static Map<String, Valu
             ("uppercase_text", json!(false)),
             ("trim_extra_spaces", json!(true)),
             ("replace_ellipsis_with_dots", json!(true)),
+            ("force_remove_ellipsis_glyph", json!(false)),
             ("hanging_punctuation", json!(true)),
             ("new_line_after_sentence", json!(false)),
             ("enable_inline_style_tags", json!(false)),
@@ -359,7 +360,7 @@ mod tests {
     #[test]
     fn defaults_are_frozen() {
         let defaults = frozen_v2_defaults();
-        let expected: [(&str, Value); 44] = [
+        let expected: [(&str, Value); 45] = [
             ("text", json!("")),
             ("text_color", json!([0, 0, 0, 255])),
             ("font_size_px", json!(24.0)),
@@ -447,6 +448,7 @@ mod tests {
             ("uppercase_text", json!(false)),
             ("trim_extra_spaces", json!(true)),
             ("replace_ellipsis_with_dots", json!(true)),
+            ("force_remove_ellipsis_glyph", json!(false)),
             ("hanging_punctuation", json!(true)),
             ("new_line_after_sentence", json!(false)),
             ("enable_inline_style_tags", json!(false)),

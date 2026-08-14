@@ -59,8 +59,18 @@ pub struct FontContent {
     pub data: FontBytes,
     /// Face index within `data`.
     pub face_index: usize,
-    /// Stable identity of `data` (content hash). Used as the load-cache key so the
-    /// same bytes register into a reused FontSystem only once.
+    /// Stable identity of the ORIGINAL `data` (content hash). Used as the
+    /// load-cache key so the same bytes register into a reused FontSystem only
+    /// once.
+    ///
+    /// It identifies the bytes the PROVIDER supplied, not necessarily the bytes
+    /// fontdb ends up holding: with `TextRenderParams.force_remove_ellipsis_glyph`
+    /// the loader registers a patched copy (`font_ligature_patch`). That stays
+    /// unambiguous because the registered face is a deterministic function of
+    /// these bytes plus the `EllipsisLigatureMode` of the `FontSystem`, and a
+    /// system belongs to exactly one mode for its whole life (the pool is
+    /// partitioned by mode — see `font_system_pool.rs`). So one content id can
+    /// never mean two different faces inside one system.
     pub content_id: u64,
 }
 

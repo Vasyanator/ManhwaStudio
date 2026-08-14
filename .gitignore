@@ -61,6 +61,13 @@
 !crates/**/*.toml
 !crates/**/*.md
 
+# The ellipsis-ligature test fixture of ms-text-render: a ~3 KB font that really
+# carries a `period period period -> ellipsis` rule. No bundled or published font
+# does, so without this the crate's tests would have nothing to test the patcher
+# against in a clean clone. Regenerate with
+# tools/make_ellipsis_ligature_fixture.py (whitelisted below).
+!crates/ms-text-render/tests/fixtures/*.ttf
+
 # Animated hint assets embedded by ms-gifs via include_bytes!. Without this the
 # crate does not build from a Git clone: the .webp files would be absent while
 # `include_bytes!` still references them.
@@ -95,6 +102,11 @@ tools/egui_docs/*.py[cod]
 # the script, but the script is the only way to regenerate that table, so it is
 # published deliberately (one file, per the per-script decision noted above).
 !tools/gen_char_table.py
+
+# The generator of the committed ms-text-render ellipsis-ligature fixture
+# (whitelisted above). The fixture must stay reproducible instead of being a
+# magic binary, so the one script that builds it is published with it.
+!tools/make_ellipsis_ligature_fixture.py
 
 # The run-dev source-run scripts. Unlike the rest of tools/, these are user-facing
 # and are useless unless published: run-dev.* in the root only hands off to them.

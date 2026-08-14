@@ -1262,6 +1262,7 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         uppercase_text: false,
         trim_extra_spaces: false,
         replace_ellipsis_with_dots: false,
+        force_remove_ellipsis_glyph: false,
         hanging_punctuation: false,
         new_line_after_sentence: false,
         enable_inline_style_tags: false,
@@ -2142,6 +2143,17 @@ fn normalize_and_render_params_handle_faux_keys() {
         Some(-45.0) // -90 clamps to -45
     );
 
+    // `thicken` is SIGNED: the legacy normalizer must keep a negative (THINNING)
+    // value and clamp only its magnitude, to the renderer's own lower bound.
+    let normalized_thicken = |percent: f64| {
+        let obj = serde_json::json!({ "text": "hi", "faux_bold_thicken_percent": percent });
+        normalize_text_params_object(obj.as_object().unwrap(), 512)
+            .get("faux_bold_thicken_percent")
+            .and_then(value_as_f32)
+    };
+    assert_eq!(normalized_thicken(-99.0), Some(-5.0), "-99 clamps to the minimum");
+    assert_eq!(normalized_thicken(-3.0), Some(-3.0), "a legitimate thinning survives");
+
     // force_* off -> faux gated to None even with faux_* on.
     let gated = serde_json::json!({
         "text_params": {
@@ -2177,6 +2189,26 @@ fn normalize_and_render_params_handle_faux_keys() {
     let params = text_render_params_from_render_data(&enabled).expect("params should parse");
     assert_eq!(params.faux_bold.map(|f| f.thicken_percent), Some(7.5));
     assert_eq!(params.faux_italic_slant_deg, Some(-30.0));
+
+    // The DECODE leg carries the sign too, and clamps only the magnitude.
+    let decoded_thicken = |percent: f64| {
+        let render_data = serde_json::json!({
+            "text_params": {
+                "text": "hi",
+                "font_path": "/tmp/font.ttf",
+                "force_bold": true,
+                "faux_bold": true,
+                "faux_bold_thicken_percent": percent,
+            },
+            "effects": [],
+        });
+        text_render_params_from_render_data(&render_data)
+            .expect("params should parse")
+            .faux_bold
+            .map(|faux| faux.thicken_percent)
+    };
+    assert_eq!(decoded_thicken(-99.0), Some(-5.0), "-99 clamps to the minimum");
+    assert_eq!(decoded_thicken(-3.0), Some(-3.0), "a legitimate thinning survives");
 }
 
 /// The canvas Shift+wheel font handler must defer ONLY when a real floating panel/popup

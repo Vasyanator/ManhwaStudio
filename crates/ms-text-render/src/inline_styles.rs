@@ -22,7 +22,10 @@ Notes:
 */
 
 use super::font_registry::{InlineFontRegistry, RegisteredFontFace, normalize_inline_font_label};
-use super::types::{FauxBoldParams, HorizontalAlign, PxOrPercent, parse_machine_tag};
+use super::types::{
+    FAUX_THICKEN_PERCENT_MAX, FAUX_THICKEN_PERCENT_MIN, FauxBoldParams, HorizontalAlign,
+    PxOrPercent, parse_machine_tag,
+};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
 const VERTICAL_HALF_SPACE: char = '\u{200A}';
@@ -701,15 +704,32 @@ fn parse_faux_italic_tag(raw_tag: &str) -> Option<f32> {
 
 /// Faux-bold value grammar: `thicken[,sharp|round][,out|both][,expand]`.
 ///
-/// - the first token is the `thicken_percent` number (0..25, % of font size);
+/// - the first token is the `thicken_percent` number, clamped to `-5..25`
+///   (% of font size); a NEGATIVE value THINS the glyphs instead of thickening
+///   them, `0` leaves them unchanged;
 /// - the remaining tokens come in any order: `sharp`/`round` (join style),
 ///   `out`/`both` (counters), and at most ONE extra number — `expand_percent`
 ///   (0..50, extra letter-spacing);
 /// - `default` (or an empty value) = the default parameters
-///   (thicken 3, expand 0, sharp, out — see `FauxBoldParams::default`).
+///   (thicken 3, expand 0, sharp, both — see `FauxBoldParams::default`).
 ///
 /// Returns `None` for an unreadable value (unknown token, a second stray
 /// number, or a non-numeric thicken).
+///
+/// Note that a negative EXPAND token is still clamped to `0`: only the leading
+/// thicken number carries a sign.
+///
+/// COMPATIBILITY EXCEPTION — an inline tag carries NO persistence key, so an
+/// omitted `out`/`both` token means today's `FauxBoldParams::default()`, and
+/// that default flipped from `out` (counters preserved) to `both` (uniform
+/// weight). Saved DOCUMENTS are unaffected: `text_params` stores
+/// `faux_bold_outward_only` explicitly and its frozen schema-2 default stays
+/// `true`. A saved TEXT is not: a hand-typed `<b=8>` or `<b=default>` written
+/// before the flip now renders uniform instead of counter-preserving. The
+/// exposure is limited to hand-typed tags — the typing panel always emits the
+/// token explicitly (`src/tabs/typing/panel/inline_tags.rs`). No compatibility
+/// shim exists, deliberately: a tag has no version to key one off, and guessing
+/// per tag would make two identical tags in one document mean different things.
 pub(crate) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
     let trimmed = value
         .trim()
@@ -724,7 +744,7 @@ pub(crate) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
         return None;
     }
     let mut params = FauxBoldParams {
-        thicken_percent: thicken.clamp(0.0, 25.0),
+        thicken_percent: thicken.clamp(FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX),
         ..FauxBoldParams::default()
     };
     let mut has_expand = false;
@@ -1466,10 +1486,36 @@ mod tests {
                 thicken_percent: 3.0,
                 expand_percent: 0.0,
                 sharp_corners: true,
-                outward_only: true,
+                // Unspecified tokens come from `FauxBoldParams::default`, whose
+                // counter mode is the uniform-weight `both`.
+                outward_only: false,
             })
         );
         assert_eq!(parsed.spans[2].faux_bold, None);
+
+        // A NEGATIVE thicken is a first-class value (glyph thinning), not a
+        // clamp-to-zero typo, and it survives the whole grammar.
+        let thinned = parse_inline_style_tags("a<b=-4,out,round>bc</b>d", 24.0);
+        assert_eq!(
+            thinned.spans[1].faux_bold,
+            Some(FauxBoldParams {
+                thicken_percent: -4.0,
+                expand_percent: 0.0,
+                sharp_corners: false,
+                outward_only: true,
+            })
+        );
+        // Out-of-range values clamp to the documented -5..=25 bounds.
+        let clamped_low = parse_inline_style_tags("a<b=-50>bc</b>d", 24.0);
+        assert_eq!(
+            clamped_low.spans[1].faux_bold.map(|faux| faux.thicken_percent),
+            Some(-5.0)
+        );
+        let clamped_high = parse_inline_style_tags("a<b=500>bc</b>d", 24.0);
+        assert_eq!(
+            clamped_high.spans[1].faux_bold.map(|faux| faux.thicken_percent),
+            Some(25.0)
+        );
     }
 
     #[test]

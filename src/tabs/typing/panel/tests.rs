@@ -118,6 +118,42 @@ paths change.
         assert!(matches!(parse_opening_inline_tag("i=-10"), Some(TypingInlineTagKind::FauxItalic(-10.0))));
     }
 
+    /// The panel's mirror of the renderer's `<b=...>` payload grammar must decode a
+    /// bare-magnitude payload EXACTLY as the renderer does.
+    ///
+    /// The renderer's own parser (`ms_text_render::inline_styles::parse_faux_bold_value`)
+    /// lives in a private module and cannot be called from here, so the pin is on the
+    /// shared contract both sides implement: every token the payload omits keeps its
+    /// `FauxBoldParams::default()` value, and the leading number is SIGNED and clamped to
+    /// the renderer's exported bounds. Restating any default here (as the mirror once
+    /// did) is what made the two drift apart when the crate default changed.
+    #[test]
+    fn panel_faux_bold_mirror_matches_the_renderer_defaults() {
+        assert_eq!(
+            parse_faux_bold_value("8"),
+            Some(FauxBoldParams { thicken_percent: 8.0, ..FauxBoldParams::default() }),
+            "an omitted token must mean the renderer's default, not a restated literal"
+        );
+        assert_eq!(parse_faux_bold_value("default"), Some(FauxBoldParams::default()));
+        assert_eq!(parse_faux_bold_value(""), Some(FauxBoldParams::default()));
+        // Signed magnitude, clamped to the renderer's own bounds on both ends.
+        assert_eq!(
+            parse_faux_bold_value("-3").map(|faux| faux.thicken_percent),
+            Some(-3.0)
+        );
+        assert_eq!(
+            parse_faux_bold_value("-99").map(|faux| faux.thicken_percent),
+            Some(FAUX_THICKEN_PERCENT_MIN)
+        );
+        assert_eq!(
+            parse_faux_bold_value("99").map(|faux| faux.thicken_percent),
+            Some(FAUX_THICKEN_PERCENT_MAX)
+        );
+        // Unreadable payloads stay unreadable (the tag then survives as literal text).
+        assert_eq!(parse_faux_bold_value("8,zzz"), None);
+        assert_eq!(parse_faux_bold_value("8,1,2"), None);
+    }
+
     #[test]
     fn inline_tag_editor_colors_dim_tags_and_whiten_content() {
         let colors = build_inline_tag_editor_text_colors("<b>Пример</b>");
@@ -2210,6 +2246,26 @@ paths change.
         assert!(!state.faux_bold_outward_only);
         assert!(state.faux_italic);
         assert_eq!(state.faux_italic_slant_deg, -45.0); // -90 clamps to -45
+
+        // `thicken` is SIGNED: a negative value is a THINNING request, so it must
+        // survive the read path instead of being clamped away at zero, and only an
+        // out-of-range magnitude is clamped — to the renderer's own lower bound.
+        let thinning = |percent: f64| {
+            let render_data = serde_json::json!({
+                "text_params": {
+                    "text": "Hi",
+                    "force_bold": true,
+                    "faux_bold": true,
+                    "faux_bold_thicken_percent": percent,
+                },
+                "effects": [],
+            });
+            let mut state = TypingCreatePanelState::new(false);
+            state.apply_render_data_json_with_options(&render_data, false);
+            state.faux_bold_thicken_percent
+        };
+        assert_eq!(thinning(-99.0), -5.0, "-99 clamps to the renderer's minimum");
+        assert_eq!(thinning(-3.0), -3.0, "a legitimate thinning survives verbatim");
     }
 
     // Finding 10 (c): the built TextRenderParams gate faux on the force_* flags.
@@ -2287,7 +2343,9 @@ paths change.
         );
         assert_eq!(
             build_inline_machine_tag(&normalized),
-            "<m b=8.00,sharp,out,0.00>"
+            // `both` — the counter token follows `FauxBoldParams::default()`, whose
+            // `outward_only` is the uniform-weight `false`.
+            "<m b=8.00,sharp,both,0.00>"
         );
     }
 

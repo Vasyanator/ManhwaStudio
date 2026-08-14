@@ -1018,6 +1018,34 @@ impl TypingCreatePanelState {
                                             &replace_ellipsis_resp,
                                         );
                                         changed |= replace_ellipsis_resp.changed();
+                                        // Sub-parameter of the substitution above: shown
+                                        // indented under it and only while the parent is
+                                        // on. Mirrors the create-mode block in
+                                        // `create_main_text::draw_text_processing_section`.
+                                        if self.replace_ellipsis_with_dots {
+                                            // Salted by PANEL like the neighbouring
+                                            // faux-style indents (salt
+                                            // `typing_edit_faux`), so the create and
+                                            // edit copies of this control cannot share
+                                            // an indent id.
+                                            ui.indent(
+                                                Id::new("typing_edit_params")
+                                                    .with("force_remove_ellipsis_glyph"),
+                                                |ui| {
+                                                    let force_remove_glyph_resp = ui.checkbox(
+                                                        &mut self.force_remove_ellipsis_glyph,
+                                                        t!(
+                                                            "typing.params.force_remove_ellipsis_glyph"
+                                                        ),
+                                                    );
+                                                    mark_hscroll_block_on_hover(
+                                                        &mut block_hscroll_by_hovered_param,
+                                                        &force_remove_glyph_resp,
+                                                    );
+                                                    changed |= force_remove_glyph_resp.changed();
+                                                },
+                                            );
+                                        }
                                         let sentence_nl_resp = ui.checkbox(
                                             &mut self.new_line_after_sentence,
                                             t!("typing.params.newline_after_sentence"),

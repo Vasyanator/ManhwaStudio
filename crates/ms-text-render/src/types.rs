@@ -26,7 +26,7 @@ Source compatibility:
 - `TextVectorLineTextDirection`
 - `TextVectorLineDistanceMode`
 - `AntiAliasingMode`
-- `FauxBoldParams`
+- `FauxBoldParams` (+ `FAUX_THICKEN_PERCENT_MIN` / `FAUX_THICKEN_PERCENT_MAX`)
 - `RenderExtraInfoRequest`
 - `RenderedTextExtraInfo`
 - `TEXT_FORMULA_USER_VAR_COUNT`
@@ -43,8 +43,10 @@ pub const TEXT_FORMULA_USER_VAR_COUNT: usize = 8;
 /// Ключи (общий контракт панели и рендера):
 /// - `b` — bold: valueless = the real Bold face; with a value
 ///   `b=thicken[,sharp|round][,out|both][,expand]` (or `b=default`) = faux bold
-///   on the SELECTED face (see [`FauxBoldParams`]); an unreadable value falls
-///   back to plain (real-face) bold
+///   on the SELECTED face (see [`FauxBoldParams`]); `thicken` is clamped to
+///   `-5..=25` % of the font size, where a NEGATIVE value thins the glyphs
+///   instead of thickening them; an unreadable value falls back to plain
+///   (real-face) bold
 /// - `i` — italic: valueless = the real Italic face; with a value
 ///   `i=slant_deg` (degrees, −45..45) = faux italic (baseline shear); an
 ///   unreadable value falls back to plain italic
@@ -243,18 +245,34 @@ impl PxOrPercent {
     }
 }
 
-/// Faux (synthetic) bold parameters: geometric thickening of the Regular-face
-/// glyph outlines instead of switching to the family's real Bold face.
+/// Lower bound of [`FauxBoldParams::thicken_percent`]: the strongest THINNING
+/// the renderer accepts, as a percentage of the font size.
+pub const FAUX_THICKEN_PERCENT_MIN: f32 = -5.0;
+
+/// Upper bound of [`FauxBoldParams::thicken_percent`]: the strongest
+/// thickening the renderer accepts, as a percentage of the font size.
+pub const FAUX_THICKEN_PERCENT_MAX: f32 = 25.0;
+
+/// Faux (synthetic) bold parameters: geometric re-weighting of the
+/// Regular-face glyph outlines instead of switching to the family's real Bold
+/// face. A negative `thicken_percent` THINS the glyphs instead.
 ///
 /// Takes effect only when the corresponding bold flag is also set
 /// (`TextRenderParams.force_bold` for the whole overlay, or an inline
-/// `<b=...>` span). The ink boundary of every affected glyph moves outward by
-/// `d = thicken_percent / 100 * font_size_px` (the glyph's own effective font
-/// size), and the horizontal pen advance automatically grows by `2*d` plus the
-/// extra `expand_percent` letter-spacing.
+/// `<b=...>` span). The ink boundary of every affected glyph moves AWAY from
+/// the ink by `d = thicken_percent / 100 * font_size_px` (the glyph's own
+/// effective font size) — into the ink when `d` is negative — so every stem
+/// grows (or shrinks) by `2*d`, and the horizontal pen advance follows with
+/// `2*d` plus the extra `expand_percent` letter-spacing. In the
+/// counter-preserving mode (`outward_only`) a glyph that bounds a counter
+/// instead moves its outer boundary by `2*d`, and its advance by `4*d`, so it
+/// keeps the same stem weight as an open glyph (see the field doc).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FauxBoldParams {
-    /// Outline offset distance as % of font size, `0..=25`. `0` = no thickening.
+    /// Outline offset distance as % of font size,
+    /// [`FAUX_THICKEN_PERCENT_MIN`]`..=`[`FAUX_THICKEN_PERCENT_MAX`]
+    /// (`-5..=25`). `0` = no change; negative = glyph thinning. Values outside
+    /// the range are clamped by the renderer.
     pub thicken_percent: f32,
     /// EXTRA letter-spacing as % of font size (`0..=50`), added on top of the
     /// automatic `2*d` advance growth.
@@ -262,20 +280,32 @@ pub struct FauxBoldParams {
     /// `true` = miter joins (limit ~4, sharp corners preserved); `false` =
     /// round (circular-arc) joins at offset vertices.
     pub sharp_corners: bool,
-    /// `true` = only outer contours offset outward (counters/holes keep their
-    /// size); `false` = holes also shrink by `d` (denser classic embolden).
+    /// `true` = counters/holes keep their size and only outer contours move;
+    /// `false` = holes move by `d` too (the uniform, denser classic embolden).
+    ///
+    /// `false` is the only mode with a UNIFORM stroke weight: every boundary
+    /// moves away from the ink by `d`, so every stem changes by exactly `2*d`.
+    /// Preserving counters would otherwise thicken a counter-bearing letter (О,
+    /// Б, В) only half as much as an open one (Н, Т, Ч), because one side of
+    /// its stroke does not move. The renderer compensates for that by moving
+    /// the outer contour of a counter-bearing glyph by `2*d`
+    /// (`vector::offset_outline`), which fixes О versus Н but necessarily
+    /// overshoots on a hybrid letter (Б, Я, Р), whose single outer contour
+    /// bounds both kinds of stroke, and cannot reach a crossbar with a counter
+    /// on both sides (В, Ф).
     pub outward_only: bool,
 }
 
 impl Default for FauxBoldParams {
     /// Defaults match the `<b=default>` inline tag: thicken 3 %, no extra
-    /// expansion, sharp (miter) corners, counters preserved.
+    /// expansion, sharp (miter) corners, counters shrunk (`outward_only ==
+    /// false` — the uniform-weight mode, see the field doc).
     fn default() -> Self {
         Self {
             thicken_percent: 3.0,
             expand_percent: 0.0,
             sharp_corners: true,
-            outward_only: true,
+            outward_only: false,
         }
     }
 }
@@ -362,6 +392,23 @@ pub struct TextRenderParams {
     /// (`new_line_after_sentence`), hanging punctuation and wrapping exactly as
     /// if the author had typed three periods.
     pub replace_ellipsis_with_dots: bool,
+    /// SUB-PARAMETER of [`TextRenderParams::replace_ellipsis_with_dots`]: takes
+    /// effect ONLY when that flag is also `true` (the panel shows it only under
+    /// the enabled parent, and the renderer applies the same `&&`).
+    ///
+    /// Rewriting `…` into `...` is not enough on a font whose `liga` feature maps
+    /// three periods back to the ellipsis glyph — the substitution is undone at
+    /// shaping time. With this flag the renderer registers a PATCHED copy of the
+    /// font in which every GSUB ligature rule producing `cmap(U+2026)` has been
+    /// removed (`font_ligature_patch`), so the three periods stay three glyphs. A
+    /// literal `…` still renders: it reaches its glyph through `cmap`, which the
+    /// patch never touches, as it never touches outlines, metrics or any other
+    /// ligature (`fi`, `ffl`, …).
+    ///
+    /// Cost: a font that actually carries such a rule is copied once per process
+    /// and the render is served from a separate `FontSystem` pool partition (see
+    /// `font_system_pool.rs`). A font without the rule costs one GSUB scan, once.
+    pub force_remove_ellipsis_glyph: bool,
     pub hanging_punctuation: bool,
     pub new_line_after_sentence: bool,
     pub enable_inline_style_tags: bool,

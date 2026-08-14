@@ -126,6 +126,7 @@ impl TypingCreatePanelState {
                 "uppercase_text": self.uppercase_text,
                 "trim_extra_spaces": self.trim_extra_spaces,
                 "replace_ellipsis_with_dots": self.replace_ellipsis_with_dots,
+                "force_remove_ellipsis_glyph": self.force_remove_ellipsis_glyph,
                 "hanging_punctuation": self.hanging_punctuation,
                 "new_line_after_sentence": self.new_line_after_sentence,
                 "enable_inline_style_tags": self.enable_inline_style_tags,

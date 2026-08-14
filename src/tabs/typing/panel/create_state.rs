@@ -191,12 +191,18 @@ impl TypingCreatePanelState {
             faux_bold_thicken_percent: 3.0,
             faux_bold_expand_percent: 0.0,
             faux_bold_sharp_corners: true,
-            faux_bold_outward_only: true,
+            // NEW overlays get the uniform-weight mode (every boundary moves by `d`, every
+            // stem by `2*d`). Deliberately NOT the frozen schema-2 default, which stays
+            // `true` for already-saved documents — see `text_params_schema.rs`.
+            faux_bold_outward_only: false,
             faux_italic: false,
             faux_italic_slant_deg: 14.0,
             uppercase_text: false,
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
+            // Off by default: patching the font's GSUB table is a deliberate opt-in for
+            // fonts that re-ligate the three dots back into an ellipsis glyph.
+            force_remove_ellipsis_glyph: false,
             hanging_punctuation: true,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,

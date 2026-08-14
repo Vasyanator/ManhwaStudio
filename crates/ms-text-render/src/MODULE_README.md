@@ -80,6 +80,14 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (style/stretch) and `family_has_face_of_requested_weight` (weight), see the
   UNSERVICEABLE-ATTRS GUARD contract below; both are `pub` so out-of-crate render
   harnesses can apply the same rules.
+- `font_ligature_patch.rs`: the byte-level GSUB patcher behind
+  `TextRenderParams.force_remove_ellipsis_glyph`. Finds the glyph `cmap` maps
+  U+2026 to and removes every `LigatureSubst` rule that OUTPUTS it, so a font
+  cannot fuse the `...` the pipeline substituted back into an ellipsis glyph.
+  Owns the process-global patch cache (keyed by content id) and
+  `EllipsisLigatureMode`, the pool's partition key. Edit it to change WHICH
+  lookups are patched or how the result is memoized; see the ELLIPSIS PATCH
+  contract below.
 - `font_base.rs`: the renderer's OWN font database and fallback chain, built once
   per process from the bundled `fonts/ui` stack (`ms-fonts`). Owns
   `new_render_font_system` (the single `FontSystem` constructor, re-exported from
@@ -312,7 +320,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
       EVERY bundled fallback font (all `Weight::NORMAL`) drops out of the run and a
       rare glyph in the same text renders as tofu. The request is therefore rewritten
       into FAUX bold at `FauxBoldParams::default()` (the `<b=default>` strength, 3 % of
-      the em) — the whole-overlay case in `pipeline::synthesized_bold_params`, the
+      the em, uniform `outward_only == false` counters) — the whole-overlay case in
+      `pipeline::synthesized_bold_params`, the
       inline case in `pipeline::degrade_unavailable_inline_bold` — with one
       `runtime_log::log_warn` and one user-visible `RenderedTextImage.warnings` entry.
       Loading the family's own Bold FILE, or setting explicit faux bold parameters,
@@ -326,6 +335,73 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
       `font_base::the_rare_han_chain_is_reachable_at_the_shaped_weight`. Removing it
       would need bold companions of the fallback fonts in `fonts/ui`; it cannot be
       fixed in matching code.
+- ELLIPSIS PATCH (`font_ligature_patch.rs`, `TextRenderParams.force_remove_ellipsis_glyph`)
+  — a SUB-PARAMETER of `replace_ellipsis_with_dots`: the patch is applied only
+  when BOTH flags are set, evaluated once in `pipeline::ellipsis_ligature_mode`.
+  Substituting `…` -> `...` is undone at shaping time by any font whose `liga`
+  feature maps three periods back to the ellipsis glyph, so the renderer instead
+  registers a PATCHED COPY of the font in which every ligature rule producing
+  `cmap(U+2026)` is gone.
+  - The edit is in place and size-preserving: inside a `LigatureSet` the offending
+    entry is removed from `ligatureOffsets` (survivors shift left,
+    `ligatureCount--`). Those offsets are relative to the `LigatureSet`, which does
+    not move, so the survivors stay valid. Blanking a record instead
+    (`componentCount = 0xFFFF`, a zero offset) makes ttf-parser's lazy offset array
+    stop at the broken entry and silently LOSE every later ligature of the same
+    set — verified on a synthetic font; do not "simplify" the patch that way.
+  - ONLY `LigatureSubst` (type 4, also inside Extension type 7) is touched.
+    `SingleSubst`/`AlternateSubst` rules that emit the ellipsis are legitimate
+    (`01-SourceHanSansK-Regular.otf` maps it to its full-width form via
+    `aalt`/`fwid`); contextual lookups (5/6) emit nothing themselves and dispatch
+    into the type 1-4 lookups the same walk already covers. `cmap`, outlines,
+    metrics, glyph count and every other ligature are byte-identical, so a literal
+    `…` still renders and `fi`/`ffl` still apply. Collections (`ttcf`) are refused
+    (their faces share tables) and any malformed structure means "register the
+    original", never a panic.
+  - THE WALK IS BOUNDED AND TABLE-SCOPED, which is what makes the paragraph above
+    true for a CORRUPTED font and not only for a well-formed one. Every offset is
+    validated against the GSUB's own `[offset, offset + length)` range from the
+    sfnt directory (`TableRange`), never merely against the file, and the single
+    write seam (`TableRange::write_field_u16`) refuses anything outside it — an
+    offset corrupted into `cmap`/`glyf`/`name` is neither followed nor written.
+    The traversal is charged against `MAX_GSUB_WALK_STEPS` and the reachable
+    `LigatureSet`s are DEDUPLICATED under `MAX_DISTINCT_LIGATURE_SETS` (both sized
+    with ~30x headroom over the worst of 2 267 real faces measured). Several
+    lookups may legally share a subtable and several subtables a set, so without
+    the dedup the collected list grows as `lookups x subtables x sets`: a 5.5 KB
+    crafted file reached 64 000 000 entries / 502 MB, and a slightly larger one
+    aborted the process on a 4 GB allocation. Exceeding a ceiling is a normal
+    `EllipsisPatchSkip` (logged, font registered unchanged), never a panic or a
+    partial patch. The dedup is also what keeps `EllipsisPatch.removed_rules`
+    honest — a shared set is one rule, not one per path reaching it.
+  - The patch is a pure, deterministic, idempotent function of the bytes, which is
+    what lets it coexist with the pool's byte-identical-output requirement. A font
+    with no such rule is returned as THE SAME BUFFER (no copy) — the fast path, and
+    also what keeps `font_base::resident_face_ids`' address-based identity intact.
+  - WHERE it runs is load-bearing: `font_registry::load_font_content` patches
+    strictly BETWEEN the resident short-circuit and the fontdb registration.
+    Patching earlier would give the bundled buffers a new address, register a
+    second copy of the built-in font, trigger `displace_bundled_faces` and taint
+    the system on every such render. The bundled `fonts/ui` stack is therefore
+    never patched — and needs no patch, pinned by
+    `the_shipped_bundle_survives_the_patch_unchanged`.
+  - POOL PARTITION (see `font_system_pool.rs`): the flag is per render, so both
+    variants of one font live in the same process. `FontFaceCache` is keyed by
+    content id ALONE — one system can hold only one variant, and widening the key
+    would put two faces of the same `(family, weight, style, stretch)` into one
+    database (the collision that taints and drops a system). The pool is therefore
+    split by `EllipsisLigatureMode`; a system is created in one mode, loads only
+    faces of that mode and is only leased to renders of that mode. The mode travels
+    on the cache, so the loader reads it off the system it is loading into rather
+    than taking a parameter — the wrong combination is unrepresentable. The two
+    modes SHARE the `MAX_POOLED_SYSTEMS` ceiling (the feature must not double
+    resident font memory); `MAX_POOLED_SYSTEMS_PER_MODE` only keeps one mode from
+    starving the other.
+  - Patched buffers are memoized process-wide by content id, bounded by BOTH
+    `MAX_CACHED_PATCHED_FONTS` (entries) and `MAX_CACHED_PATCHED_BYTES` (resident
+    patched bytes — the entry count alone is not a memory bound, since one entry
+    can be a 16 MB CJK face), so one font is patched once and every pooled
+    system in `Remove` mode shares one `Arc` instead of holding its own copy.
 - FALLBACK DIAGNOSTIC (`fallback_diag.rs` -> `RenderedTextImage.font_fallbacks`) —
   every render reports, as TYPED data and not as a `warnings` string, which
   characters of THIS text were drawn by a font other than the caller's own and by
@@ -384,8 +460,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     IS resolved by removal (see SELECTED FONT WINS above) — the caller's font must
     win — and taints the system for the same reason: its database no longer equals the
     base.
+  The pool is also PARTITIONED by `EllipsisLigatureMode` (see the ELLIPSIS PATCH
+  contract above): `with_leased_font_system` takes the mode and never hands a
+  render a system of the other partition.
   Growth is bounded — a leased system is dropped instead of requeued once its
-  cache exceeds `MAX_CACHED_FILES` or the pool holds `MAX_POOLED_SYSTEMS`. The
+  cache exceeds `MAX_CACHED_FILES`, the pool holds `MAX_POOLED_SYSTEMS`, or this
+  mode already holds `MAX_POOLED_SYSTEMS_PER_MODE` of them. The
   renderer must not panic while a system is leased (a panic leaks that one system;
   the pool recreates it). `prewarm_font_system_pool` (re-exported) lets the app
   pay the first scan on a background thread. The pool is NOT used by the throwaway
@@ -491,28 +571,70 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   SELECTED face (no Bold/Italic font matching — `pipeline.rs`
   `base_attrs_real_bold_italic`), `force_*` without faux keeps the legacy
   real-face behavior byte-identically. Faux bold offsets the flattened outline
-  by `d = thicken_percent/100 * glyph em` (`vector::offset_outline`:
-  outer-vs-hole decided by the actual NonZero winding at a point just inside
-  each ring — convention-free across TrueType/CFF; outer contours move
-  outward, holes shrink only when `outward_only == false`, and a counter
-  narrower than `2*d` collapses — the inverted/degenerate ring is dropped, not
-  emitted; miter limit ~4 or round joins; offset self-intersections are
-  absorbed by the NonZero fill) and grows each horizontal pen step by
-  `2*d + expand_px` (`Fixed`/`Auto`; the trailing glyph's extra is folded into
-  the logical `line_width_px` so alignment never overshoots; `Optical` instead
-  measures the offset outlines and normalizes the true ink gaps — no pen
-  growth, and `expand` does not apply). Faux italic is a baseline shear
-  `x' = x - tan(slant) * y` between scale and rotation in `GlyphTransform`
-  (advances unchanged), wired once through
+  by the SIGNED `d = thicken_percent/100 * glyph em`, `thicken_percent`
+  clamped to `-5..=25` so a NEGATIVE strength THINS the glyph
+  (`vector::offset_outline`: outer-vs-hole decided by the actual NonZero
+  winding at a point just inside each ring — convention-free across
+  TrueType/CFF; outer contours move AWAY from the ink (into it when `d < 0`),
+  holes follow only when `outward_only == false`; a ring narrower than `2*|d|`
+  inverts and is dropped, not emitted — a counter fills in when thickening, an
+  ink stem vanishes when thinning; miter limit ~4 or round joins; offset
+  self-intersections are absorbed by the NonZero fill). COUNTER COMPENSATION,
+  `outward_only == true` only: an outer ring CONTAINING a retained counter
+  moves by `2*d`, so О is as heavy as Н; the accepted cost is that a hybrid
+  letter (Б, Я, Р) overshoots to `4*d` on its open-space stroke and a crossbar
+  with counters on both sides (В, Ф) is not reached — the default
+  `outward_only == false` has neither problem and is uniform by construction.
+  PER-RING GEOMETRY vs PER-GLYPH FLAG: the compensation is decided PER RING
+  (only an outer ring that actually contains a retained counter takes `2*d`),
+  but the flag threaded into the advance and the bounds pads is PER GLYPH
+  (`FauxGlyphStyle::bold_has_counter` = "some ring of this glyph bounds a
+  counter") — the callers cannot see rings. They disagree in exactly one
+  direction: flag `true` while one of that glyph's outer rings is uncompensated
+  (`Ы`, `Ю` when drawn as two rings — the ink grows `3*d`, the pen `4*d`). The
+  over-report is deliberate: it only loosens spacing and enlarges the pre-trim
+  canvas (which the alpha trim gives back), while an under-report would crop
+  drawn ink and collide the next letter with it. Only reachable in this
+  non-default mode.
+  A glyph whose EVERY ring collapsed yields `None` from `offset_outline`; the
+  draw paths then draw nothing rather than falling back to the full-weight
+  swash bitmap (`glyph_blit::glyph_needs_bitmap_fallback` separates that case
+  from a genuinely outline-less color/space glyph). The horizontal pen step
+  grows by `2*outer_delta + expand_px`, where `outer_delta` carries the same
+  compensation and sign (`FauxGlyphStyle::outer_delta_px`; legitimately
+  negative under thinning) — `Fixed`/`Auto`; the trailing glyph's extra is
+  folded into the logical `line_width_px` so alignment never overshoots. BOTH
+  the pen and that width combine the shaped advance with the faux delta through
+  `pipeline::faux_floored_advance`, which floors the pair at zero IN THE
+  DIRECTION THE RUN ADVANCES (negative for an RTL run, where cosmic-text walks
+  the pen leftwards): a thinning delta is up to `-0.20 * em` and would otherwise
+  step a zero-advance combining mark — or narrow punctuation — BACKWARDS and
+  place the next glyph before it. Explicit tracking stays outside the floor
+  (negative letter-spacing is a request for overlap), and a zero delta returns
+  the advance untouched, so non-faux runs stay bit-identical;
+  `Optical` instead measures the offset outlines and normalizes the true ink
+  gaps — no pen growth, and `expand` does not apply. Faux italic is a baseline
+  shear `x' = x - tan(slant) * y` between scale and rotation in
+  `GlyphTransform` (advances unchanged), wired once through
   `glyph_blit::glyph_outline_transform` so all three draw paths get it.
   Per-variant caching: `OutlineKey`, `OpticalContourCache`, and the formula ink
   cache all carry the quantized faux bits (`vector::FauxOutlineParams`,
-  1/64 px fixed point; `0` = plain, so plain geometry keys are untouched).
-  Bounds are widened by the faux pads (`pipeline::faux_bounds_pads`; miter
-  overhang up to `4*d`, shear overhang `|shear| * dy`), the vertical
-  ink-height stacking grows via the padded ink profile and the column visual
-  width includes the same bold+shear overhangs, and per-glyph resolution
-  follows the inline-span-over-global rule (`pipeline::faux_style_for_glyph`).
+  1/64 px SIGNED fixed point: bits 0..=28 magnitude, bit 29 sign, bit 30 sharp,
+  bit 31 out; `0` = plain, so plain geometry keys are untouched). The per-glyph
+  "outline has a counter" flag is NOT part of the key (it is a function of the
+  glyph) — it is memoized in `OutlineCache::glyph_has_counter` and stamped onto
+  `FauxGlyphStyle` by `pipeline::resolve_faux_counter_flag`, which does nothing
+  and looks nothing up outside the `outward_only` mode. Bounds are widened by
+  the faux pads (`pipeline::faux_bounds_pads`; miter overhang up to
+  `4*|outer_delta|`, shear overhang `|shear| * dy`, keyed to the MAGNITUDE
+  because a thinning offset strays outside the plain ink too — the miter apex
+  at a reflex vertex of an outer ring is pushed up to `4*|d|` along the inward
+  bisector and pierces any thinner material, and the NonZero fill inks that
+  spike), the vertical ink-height stacking grows via
+  the padded ink profile (a thinning delta deliberately does NOT shrink it —
+  conservative) and the column visual width includes the same bold+shear
+  overhangs, and per-glyph resolution follows the inline-span-over-global rule
+  (`pipeline::faux_style_for_glyph`).
   Inline grammar: `<b=thicken[,sharp|round][,out|both][,expand]>` /
   `<b=default>` / `<i=slant_deg>` (machine keys `b=`/`i=` take the same value
   payload); bare `<b>`/`<i>`/valueless machine keys keep the real faces. Faux
@@ -586,7 +708,16 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   unwarped, aligned with its unwarped pixels. Each call site resolves the flag the
   same way the draw code does (`placement.outline.is_some()` on the horizontal
   Normal/rotated paths; the resolved outline `Option` on the vertical and
-  formula/on-path + `Shape` + custom-line paths). The rotated draw paths build
+  formula/on-path + `Shape` + custom-line paths). A glyph that draws NO INK is
+  excluded from the sampling on every path — the one case is a glyph whose every
+  contour a faux THINNING offset consumed, which has neither an outline nor a
+  bitmap fallback yet keeps a non-zero box; the centers report where the ink IS,
+  so a glyph drawing nothing must not move them (horizontal/rotated:
+  `HorizontalGlyphPlacement::draws_ink` / `RotatedGlyphPlacement::draws_ink`;
+  vertical and formula/custom-line: the local `draws_ink`, which is also what
+  their draw branch skips on). Pinned by
+  `a_fully_consumed_glyph_does_not_vote_on_the_extra_info_centers`. The rotated
+  draw paths build
   their per-glyph box via the shared `extra_info::rotated_box_samples` (scaled box
   half-extents rotated by the glyph's total rotation). Hanging-punctuation exclusion
   applies to every mode whose WRAP actually hangs punctuation: the horizontal paths
@@ -665,12 +796,19 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `font_registry::family_has_face_of_requested_weight` (weight). To change how an
   illegal one degrades (today: real italic -> faux italic at
   `SYNTHESIZED_ITALIC_SLANT_DEG`, real bold -> faux bold at
-  `FauxBoldParams::default()`), edit `pipeline::synthesized_italic_slant_deg` /
+  `FauxBoldParams::default()` — 3 %, sharp, uniform counters), edit `pipeline::synthesized_italic_slant_deg` /
   `pipeline::synthesized_bold_params` (whole overlay) and
   `pipeline::degrade_unavailable_inline_italic` /
   `pipeline::degrade_unavailable_inline_bold` (inline spans). Any NEW code that
   writes `attrs.style(..)`/`attrs.stretch(..)`/`attrs.weight(..)` with a value it did
   not read off a registered face must go through the matching predicate first.
+- To change WHICH GSUB lookups the ellipsis patch rewrites, how the patched bytes
+  are memoized, or the skip reasons, edit `font_ligature_patch.rs`. To change
+  WHERE the patch is applied in a load, edit the single seam in
+  `font_registry::load_font_content` (between the resident short-circuit and
+  `fontdb::Source::Binary`) — nowhere else. To change how the flag maps to a pool
+  partition, edit `pipeline::ellipsis_ligature_mode` and
+  `font_system_pool::checkout`/`return_to_pool`.
 - To change caller-visible render parameters or result shape, start in `types.rs`, then
   update `mod.rs` smoke anchors and parent typing serialization/parsing.
 - To change the mean/median extra-info math (hull centroid, median, degenerate
@@ -739,12 +877,17 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   the same axis the gap is measured on, the "final gap >= 0.5px" / "gaps converge to
   the median" contracts hold on the measured layout and are only sub-pixel-approximate
   on screen.
-- To change faux bold/italic, the geometry (polyline offset, joins, shear) lives
-  in `vector.rs` (`offset_outline`, `GlyphTransform.shear_x`,
-  `FauxOutlineParams`); per-glyph resolution, advances, and bounds pads live in
-  `pipeline.rs` (`FauxGlyphStyle`, `faux_style_for_glyph`,
-  `faux_advance_extra_px_for_glyph`, `faux_bounds_pads`); the inline
-  `<b=...>`/`<i=...>` grammar lives in `inline_styles.rs`.
+- To change faux bold/italic, the geometry (signed polyline offset, counter
+  compensation, joins, shear) lives in `vector.rs` (`offset_outline`,
+  `outline_has_counter`, `GlyphTransform.shear_x`, `FauxOutlineParams`);
+  per-glyph resolution, advances, and bounds pads live in `pipeline.rs`
+  (`FauxGlyphStyle`, `faux_style_for_glyph`, `resolve_faux_counter_flag`,
+  `faux_advance_extra_px_for_glyph`, `faux_bounds_pads`); the strength range is
+  one pair of constants (`types::FAUX_THICKEN_PERCENT_MIN`/`_MAX`) honoured by
+  BOTH the pipeline clamps and the `<b=...>` parser; the inline
+  `<b=...>`/`<i=...>` grammar lives in `inline_styles.rs`. Anything that derives
+  a distance from `FauxGlyphStyle` must use `outer_delta_px()`, never the raw
+  `FauxOutlineParams::d_px()` — the raw value ignores the counter compensation.
 - To change wrapping behavior, edit `wrap/`; keep measurement/scoring in
   `horizontal.rs`, dictionary/safety rules in `hyphenation.rs`, shape profiles in
   `shape.rs`, and vertical pre-layout in `vertical.rs`.
@@ -776,6 +919,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   glyph so a reachability test can tell "drawn by font X" from `.notdef` tofu. Keep
   the production-constructor assertion next to it where it still proves something
   (an empty database proves nothing scanned the OS fonts).
+- A test that needs a font which actually carries a `... -> ellipsis` ligature uses
+  `font_ligature_patch::test_fixture` (`tests/fixtures/ellipsis_ligature.ttf`, a
+  ~3 KB committed subset built by `tools/make_ellipsis_ligature_fixture.py`). No
+  bundled or Git-tracked font has such a rule, so the fixture — not a display font
+  from `fonts/` — is the only reproducible source of the negative case. Change the
+  fixture only through the script, and commit the regenerated file with it.
 - Add golden or property-style tests for new layout contracts where exact pixels are
   fragile. Use explicit tolerances for floating-point geometry and alpha math.
 - After Rust changes, run `cargo check-all` and

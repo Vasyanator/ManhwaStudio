@@ -191,7 +191,8 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
         faux_bold: (text_params.get("force_bold").and_then(Value::as_bool).unwrap_or(false)
             && text_params.get("faux_bold").and_then(Value::as_bool).unwrap_or(false))
             .then(|| crate::tabs::typing::render_next::types::FauxBoldParams {
-                thicken_percent: text_params.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0),
+                // SIGNED: a negative stored value is a legitimate THINNING request.
+                thicken_percent: text_params.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX),
                 expand_percent: text_params.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0),
                 sharp_corners: text_params.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true),
                 outward_only: text_params.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true),
@@ -215,6 +216,18 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("replace_ellipsis_with_dots")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Sub-parameter of the flag above, and the AND is what the renderer's contract
+        // asks for: the GSUB patch only makes sense on text the substitution already
+        // rewrote. Absent = off, which matches its frozen schema-2 default, so no card
+        // written before this option existed changes.
+        force_remove_ellipsis_glyph: text_params
+            .get("replace_ellipsis_with_dots")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && text_params
+                .get("force_remove_ellipsis_glyph")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         hanging_punctuation: text_params
             .get("hanging_punctuation")
             .and_then(Value::as_bool)
@@ -1283,7 +1296,8 @@ pub(super) fn normalize_text_params_object(
         "force_bold": obj.get("force_bold").and_then(Value::as_bool).unwrap_or(false),
         "force_italic": obj.get("force_italic").and_then(Value::as_bool).unwrap_or(false),
         "faux_bold": obj.get("faux_bold").and_then(Value::as_bool).unwrap_or(false),
-        "faux_bold_thicken_percent": obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0),
+        // SIGNED: a negative stored value is a legitimate THINNING request.
+        "faux_bold_thicken_percent": obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX),
         "faux_bold_expand_percent": obj.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0),
         "faux_bold_sharp_corners": obj.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true),
         "faux_bold_outward_only": obj.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true),
@@ -1329,6 +1343,7 @@ pub(super) fn normalize_text_params_object(
             "new_line_after_sentence",
             "trim_extra_spaces",
             "replace_ellipsis_with_dots",
+            "force_remove_ellipsis_glyph",
             "vertical_line_direction",
             // Vector rotation of the whole block, perpendicular line placement and its
             // reference band, and the anti-aliasing mode: panel-read parameters

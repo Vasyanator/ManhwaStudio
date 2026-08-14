@@ -24,6 +24,7 @@ mod effects;
 mod extra_info;
 mod fallback_diag;
 mod font_base;
+mod font_ligature_patch;
 mod font_provider;
 mod font_registry;
 mod font_system_pool;
@@ -202,6 +203,7 @@ pub fn touch_runtime_smoke_contract() {
         uppercase_text: false,
         trim_extra_spaces: true,
         replace_ellipsis_with_dots: true,
+        force_remove_ellipsis_glyph: false,
         hanging_punctuation: false,
         new_line_after_sentence: false,
         enable_inline_style_tags: true,
@@ -255,6 +257,7 @@ pub fn touch_runtime_smoke_contract() {
         params.uppercase_text,
         params.trim_extra_spaces,
         params.replace_ellipsis_with_dots,
+        params.force_remove_ellipsis_glyph,
         params.hanging_punctuation,
         params.new_line_after_sentence,
         params.enable_inline_style_tags,
@@ -414,6 +417,7 @@ mod tests {
             uppercase_text: false,
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
+            force_remove_ellipsis_glyph: false,
             hanging_punctuation: false,
             new_line_after_sentence: false,
             enable_inline_style_tags: true,

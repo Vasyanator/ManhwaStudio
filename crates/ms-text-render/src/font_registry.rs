@@ -12,6 +12,9 @@ Main responsibilities:
   `FontSystem` из пула не накапливала дублирующиеся faces;
 - следить, чтобы выбранный пользователем шрифт выигрывал сопоставление по имени
   семейства у бандлового фейса с тем же именем (`displace_bundled_faces`);
+- применять патч удаления «эллипсисных» лигатур (`font_ligature_patch`) ровно
+  между резидентным short-circuit и регистрацией в fontdb, если система пула
+  относится к режиму `EllipsisLigatureMode::Remove`;
 - отвечать на вопрос «может ли эта база обслужить такие attrs» —
   `family_has_matching_face` (style/stretch) и `family_has_face_of_requested_weight`
   (weight), guard для любой МОДИФИКАЦИИ attrs (см. UNSERVICEABLE-ATTRS GUARD в
@@ -32,6 +35,7 @@ font IS, and a second loader would key the face cache by something other than th
 content id.
 */
 
+use super::font_ligature_patch::{self, EllipsisLigatureMode};
 use super::font_provider::{FontContent, FontProvider};
 use super::font_system_pool::FontFaceCache;
 use cosmic_text::{Attrs, Family, FontSystem, Stretch, Style, Weight, fontdb};
@@ -95,6 +99,16 @@ pub struct InlineFontRegistryBuild {
 /// bundled font would put a second `(family, weight, style)` face into every pooled
 /// system. See `font_base::resident_face_ids`.
 ///
+/// ELLIPSIS PATCH: when `font_cache` is in `EllipsisLigatureMode::Remove` — the
+/// mode of the pool partition this system belongs to, i.e. the render's
+/// `replace_ellipsis_with_dots && force_remove_ellipsis_glyph` — the bytes handed
+/// to fontdb are a patched copy with every ligature rule producing the ellipsis
+/// glyph removed (`font_ligature_patch`). The `content_id` still identifies the
+/// ORIGINAL bytes; the registered face is a deterministic function of them plus
+/// the system's mode, and a system never mixes modes, so the key stays
+/// unambiguous. A font the bundled base already holds resident short-circuits
+/// ABOVE this and is therefore never patched.
+///
 /// # Errors
 /// Returns an error string if fontdb cannot parse the bytes.
 pub fn load_font_content(
@@ -141,9 +155,22 @@ pub fn load_font_content(
         return Ok(selected);
     }
 
+    // FORCE-REMOVE ELLIPSIS. Strictly AFTER the resident short-circuit above and
+    // BEFORE registration: patching earlier would hand `resident_ids_in` a
+    // different buffer ADDRESS, the bundled font would be registered a second
+    // time, `displace_bundled_faces` would strip the base and the system would be
+    // tainted and dropped after every render with the built-in font. The bundled
+    // stack needs no patch anyway (no `fonts/ui` file carries such a rule, pinned
+    // by `font_ligature_patch::the_shipped_bundle_survives_the_patch_unchanged`).
+    // The mode comes from the leased cache, not from a parameter, because it is a
+    // property of the whole `FontSystem` (see the pool's partition contract).
+    let data = match font_cache.ellipsis_mode() {
+        EllipsisLigatureMode::Keep => content.data.clone(),
+        EllipsisLigatureMode::Remove => font_ligature_patch::ellipsis_free_bytes(content),
+    };
     // Register the bytes into this system's db. fontdb takes the same erased
     // `Arc<dyn AsRef<[u8]>>` the content holds, so the buffer is shared, not copied.
-    let source = fontdb::Source::Binary(content.data.clone());
+    let source = fontdb::Source::Binary(data);
     let loaded_ids = font_system.db_mut().load_font_source(source);
     if loaded_ids.is_empty() {
         return Err("fontdb не смог распарсить данные шрифта".to_string());
@@ -485,10 +512,11 @@ pub fn build_inline_font_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        RegisteredFontFace, apply_default_families, family_has_face_of_requested_weight,
-        family_has_matching_face, load_font_content,
+        EllipsisLigatureMode, RegisteredFontFace, apply_default_families,
+        family_has_face_of_requested_weight, family_has_matching_face, load_font_content,
     };
     use crate::font_base;
+    use crate::font_ligature_patch::test_fixture;
     use crate::font_provider::{FontContent, font_content_id};
     use crate::font_system_pool::FontFaceCache;
     use cosmic_text::{Attrs, Family, FontSystem, Metrics, Stretch, Style, Weight, fontdb};
@@ -903,6 +931,145 @@ mod tests {
         assert!(
             !family_has_matching_face(&system, &italic),
             "the family condition must still reject the request the selected font cannot serve"
+        );
+    }
+
+    /// Builds the `FontContent` a provider would hand the loader for `bytes`.
+    fn content_over(name: &str, bytes: Vec<u8>) -> FontContent {
+        let content_id = font_content_id(&bytes);
+        FontContent {
+            name: name.to_string(),
+            original_name: name.to_string(),
+            data: Arc::new(bytes),
+            face_index: 0,
+            content_id,
+        }
+    }
+
+    /// Loads `content` into a fresh render system of `mode` and returns the
+    /// system together with the attrs of the registered face.
+    fn system_with(
+        mode: EllipsisLigatureMode,
+        content: &FontContent,
+    ) -> (FontSystem, RegisteredFontFace) {
+        let mut system = font_base::new_render_font_system();
+        let mut cache = FontFaceCache::for_system(&system).with_ellipsis_mode(mode);
+        let face = load_font_content(&mut system, &mut cache, content, 0)
+            .expect("the test content must load");
+        (system, face)
+    }
+
+    /// Number of glyphs `text` shapes to with the caller's own face.
+    fn shaped_len(system: &mut FontSystem, face: &RegisteredFontFace, text: &str) -> usize {
+        let attrs = face.apply_to_attrs(Attrs::new().metrics(Metrics::new(32.0, 32.0)));
+        font_base::test_bundle::shaped_glyphs(system, text, &attrs).len()
+    }
+
+    /// The whole point of `force_remove_ellipsis_glyph`: with the patch on, the
+    /// three periods the pipeline substituted for `…` must SURVIVE as three
+    /// glyphs — and nothing else about the font may change.
+    #[test]
+    fn the_ellipsis_patch_removes_only_the_ellipsis_ligature() {
+        let content = content_over("ellipsis-fixture", test_fixture::bytes());
+
+        let (mut patched, patched_face) = system_with(EllipsisLigatureMode::Remove, &content);
+        assert_eq!(
+            shaped_len(&mut patched, &patched_face, "..."),
+            3,
+            "the patched font must not fuse three periods back into the ellipsis glyph"
+        );
+        assert_eq!(
+            shaped_len(&mut patched, &patched_face, ".a"),
+            1,
+            "the sibling rule in the SAME LigatureSet must survive the offset-array shift"
+        );
+        assert_eq!(
+            shaped_len(&mut patched, &patched_face, "fi"),
+            1,
+            "a ligature of another LigatureSet must be untouched"
+        );
+        assert_eq!(
+            shaped_len(&mut patched, &patched_face, "\u{2026}"),
+            1,
+            "a literal ellipsis reaches its glyph through cmap and must still render"
+        );
+
+        // Same font, unpatched: the rule the feature exists for is really there.
+        let (mut kept, kept_face) = system_with(EllipsisLigatureMode::Keep, &content);
+        assert_eq!(
+            shaped_len(&mut kept, &kept_face, "..."),
+            1,
+            "without the patch the fixture's liga rule must fuse the periods"
+        );
+    }
+
+    /// The patch must not disturb a REAL shipped font: `00-NotoSans-Regular.ttf`
+    /// carries 691 ligatures (including `fi` in `liga`) and none of them outputs
+    /// the ellipsis, so shaping must be identical in both modes.
+    #[test]
+    fn the_bundled_noto_sans_keeps_its_ligatures_under_the_patch() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fonts/ui/core/00-NotoSans-Regular.ttf");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!(
+                "skipping the_bundled_noto_sans_keeps_its_ligatures_under_the_patch: {} is not \
+                 present next to this checkout",
+                path.display()
+            );
+            return;
+        };
+        // A caller's OWN copy of the file (read fresh), so the resident
+        // short-circuit cannot fire and the loader really registers bytes.
+        let content = content_over("noto-sans-copy", bytes);
+
+        for text in ["fi", "...", "\u{2026}"] {
+            let (mut kept, kept_face) = system_with(EllipsisLigatureMode::Keep, &content);
+            let (mut patched, patched_face) = system_with(EllipsisLigatureMode::Remove, &content);
+            assert_eq!(
+                shaped_len(&mut patched, &patched_face, text),
+                shaped_len(&mut kept, &kept_face, text),
+                "'{text}' must shape identically in both modes on a font with no ellipsis ligature"
+            );
+        }
+        let (mut patched, patched_face) = system_with(EllipsisLigatureMode::Remove, &content);
+        assert_eq!(
+            shaped_len(&mut patched, &patched_face, "fi"),
+            1,
+            "the `fi` ligature of the bundled Noto Sans must still apply after the patch"
+        );
+    }
+
+    /// The dedup contract must hold in the patched partition too: the patch runs
+    /// on the first load only, and a second load of the same content reuses the
+    /// face already in the database.
+    #[test]
+    fn reloading_a_patched_content_adds_no_second_face() {
+        let content = content_over("ellipsis-fixture", test_fixture::bytes());
+        let mut system = font_base::new_render_font_system();
+        let mut cache =
+            FontFaceCache::for_system(&system).with_ellipsis_mode(EllipsisLigatureMode::Remove);
+
+        let first = load_font_content(&mut system, &mut cache, &content, 0)
+            .expect("the fixture must load into a patched system");
+        let faces_after_first = system.db().len();
+        assert_eq!(cache.distinct_file_count(), 1);
+
+        let second = load_font_content(&mut system, &mut cache, &content, 0)
+            .expect("the second load must hit the cache");
+        assert_eq!(
+            system.db().len(),
+            faces_after_first,
+            "a cached patched content must not be registered a second time"
+        );
+        assert_eq!(
+            cache.distinct_file_count(),
+            1,
+            "the patched face is still keyed by the ORIGINAL content id"
+        );
+        assert_eq!(first.family_name, second.family_name);
+        assert!(
+            !cache.is_tainted(),
+            "loading one font twice must leave the system reusable"
         );
     }
 }

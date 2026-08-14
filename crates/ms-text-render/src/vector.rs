@@ -21,18 +21,24 @@ Key structures:
   rotation, translation), same convention as `PlacedContour`.
 - OutlineKey / OutlineCache: resolution-independent outline cache keyed per
   faux-bold variant (`faux_bits`, 0 = plain); `OutlineCache` also owns the
-  reusable swash `ScaleContext` used on a cache miss.
-- FauxOutlineParams: quantized (1/64 px) faux-bold offset parameters shared by
-  the outline cache key and the offset geometry itself.
+  reusable swash `ScaleContext` used on a cache miss and memoizes the per-glyph
+  "plain outline has a counter" flag.
+- FauxOutlineParams: quantized (1/64 px) SIGNED faux-bold offset parameters
+  shared by the outline cache key and the offset geometry itself (negative =
+  glyph thinning).
 - RasterScratch: reusable per-render rasterizer buffers (subpaths, zeno commands,
   coverage mask) so `rasterize_outline_into` allocates nothing per glyph.
 
 Key functions:
 - extract_glyph_outline: swash outline -> flattened `Outline` (via a reused
   `ScaleContext` passed by the caller).
-- offset_outline: polyline offset (faux bold embolden) on the flattened
-  outline — outward for outer contours, optional hole shrink, miter/round
-  joins; self-intersections are resolved by the NonZero fill.
+- offset_outline: signed polyline offset (faux bold embolden, or thinning for a
+  negative distance) on the flattened outline — outer contours move away from
+  the ink, holes move with them unless `outward_only`, miter/round joins;
+  self-intersections are resolved by the NonZero fill. `None` when the offset
+  consumed every contour.
+- outline_has_counter: whether the outline bounds a hole; drives the counter
+  compensation in the advance/bounds estimates that cannot see the outline.
 - flatten_quad / flatten_cubic: adaptive bezier flattening.
 - rasterize_outline_into: the single vector rasterizer (zeno + tint + over-blend);
   takes a `&mut RasterScratch` and resets it per glyph for byte-identical reuse.
@@ -231,70 +237,155 @@ impl GlyphTransform {
     }
 }
 
-/// Offset distances below this are treated as "no faux bold" (return the plain
-/// outline unchanged). Half of the 1/64 px quantization step.
+/// Offset MAGNITUDES below this are treated as "no faux bold" (return the plain
+/// outline unchanged). Half of the 1/64 px quantization step. The test is on
+/// `|d|`, so a sub-quantum THINNING distance is rejected exactly like a
+/// sub-quantum thickening one.
 const FAUX_MIN_OFFSET_PX: f32 = 1.0 / 128.0;
+
+/// Cap on the stored offset magnitude in 1/64 px units, so the sign bit and the
+/// two flag bits of [`FauxOutlineParams::key_bits`] stay free.
+///
+/// It is `2^29 - 64` and NOT the full 29-bit maximum `2^29 - 1`: the saturation
+/// in [`FauxOutlineParams::new`] happens in `f32`, and `2^29 - 1` has no `f32`
+/// representation — it rounds UP to `2^29`, which sets bit 29, the SIGN bit of
+/// the key, so a saturating thickening and a saturating thinning would collapse
+/// onto one cache key and one of the two signs would receive the other's
+/// geometry. `2^29 - 64` is a multiple of the `f32` ulp at that magnitude (32),
+/// so the cap survives its own round trip exactly. The cap is unreachable in
+/// practice (it needs `|d| >= 8_388_607 px`); it exists precisely to make the
+/// bit layout unconditional.
+const FAUX_MAX_ABS_Q64: i32 = (1 << 29) - 64;
 
 /// Quantized faux-bold parameters for outline offsetting and cache keying.
 ///
 /// The offset distance is stored in 1/64 px fixed point so two near-identical
 /// `f32` distances share one cache entry AND one geometry (the offset itself is
 /// computed from the quantized value — key and geometry can never disagree).
-/// The step is far below visual resolution.
+/// The step is far below visual resolution. The distance is SIGNED: a positive
+/// value thickens the glyph (outer boundaries move away from the ink), a
+/// negative one thins it (outer boundaries move INTO the ink).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FauxOutlineParams {
-    /// Offset distance in 1/64 px units, `> 0` (zero-distance params are
-    /// rejected by [`FauxOutlineParams::new`]). Capped at `2^30 - 1` so the two
-    /// flag bits of [`FauxOutlineParams::key_bits`] never collide.
-    d_q64: u32,
+    /// Signed offset distance in 1/64 px units, never `0` (zero-magnitude
+    /// params are rejected by [`FauxOutlineParams::new`]). The magnitude is
+    /// capped at [`FAUX_MAX_ABS_Q64`] so the sign + flag bits of
+    /// [`FauxOutlineParams::key_bits`] never collide with it.
+    d_q64: i32,
     /// Miter (`true`) vs round (`false`) joins at offset vertices.
     sharp_corners: bool,
-    /// Preserve counters/holes (`true`) vs shrink them by `d` (`false`).
+    /// Preserve counters/holes (`true`) vs move them by `d` too (`false`).
     outward_only: bool,
 }
 
 impl FauxOutlineParams {
-    /// Quantize `d_px` (outline offset distance in glyph-local px) to 1/64 px.
+    /// Quantize `d_px` (SIGNED outline offset distance in glyph-local px) to
+    /// 1/64 px.
     ///
-    /// Returns `None` for a non-finite, non-positive, or sub-quantum distance —
-    /// callers then take the plain (non-faux) outline path, which keeps a
-    /// zero-strength faux bold byte-identical to no faux bold.
+    /// A positive `d_px` thickens, a negative one thins. Returns `None` for a
+    /// non-finite distance or one whose MAGNITUDE is sub-quantum — callers then
+    /// take the plain (non-faux) outline path, which keeps a zero-strength faux
+    /// bold byte-identical to no faux bold.
     #[must_use]
     pub(crate) fn new(d_px: f32, sharp_corners: bool, outward_only: bool) -> Option<Self> {
-        if !d_px.is_finite() || d_px < FAUX_MIN_OFFSET_PX {
+        if !d_px.is_finite() || d_px.abs() < FAUX_MIN_OFFSET_PX {
             return None;
         }
-        // Round to the fixed-point grid; cap so the flag bits stay free.
-        let d_q64 = (d_px * 64.0).round().min(((1u32 << 30) - 1) as f32) as u32;
-        if d_q64 == 0 {
+        // Round to the fixed-point grid and cap the magnitude so the sign/flag
+        // bits stay free. `FAUX_MAX_ABS_Q64` is chosen to be exactly
+        // representable in `f32` (see its doc), so the saturating value survives
+        // the round trip and the result is always <= the 29-bit mask; the cast
+        // is bounded by the `min` (and the value is non-negative and finite,
+        // `min` also absorbing an `inf` product), so it cannot truncate or wrap.
+        let magnitude = (d_px.abs() * 64.0).round().min(FAUX_MAX_ABS_Q64 as f32) as i32;
+        if magnitude == 0 {
             return None;
         }
         Some(Self {
-            d_q64,
+            d_q64: if d_px < 0.0 { -magnitude } else { magnitude },
             sharp_corners,
             outward_only,
         })
     }
 
-    /// The quantized offset distance in px (always `> 0`).
+    /// The quantized SIGNED offset distance in px (never `0`; negative = thinning).
     #[must_use]
     pub(crate) fn d_px(self) -> f32 {
         self.d_q64 as f32 / 64.0
     }
 
-    /// Worst-case distance the offset boundary can stray from the source ink:
-    /// `d` for round joins (and bevel fallbacks), up to the miter limit `4*d`
-    /// at acute sharp corners. Bounds/canvas padding must use this, not `d`.
+    /// Whether counters/holes are preserved verbatim (the mode whose outer
+    /// delta depends on the per-glyph counter flag).
     #[must_use]
-    pub(crate) fn max_overhang_px(self) -> f32 {
-        self.d_px() * if self.sharp_corners { 4.0 } else { 1.0 }
+    pub(crate) fn outward_only(self) -> bool {
+        self.outward_only
+    }
+
+    /// The signed distance the OUTER (ink) boundary actually moves for a glyph
+    /// whose outline does (`has_counter`) or does not contain a counter.
+    ///
+    /// `outward_only` keeps counters verbatim, so a stroke bounded by an outer
+    /// ring on one side and a counter on the other would only grow by `d` while
+    /// a stroke bounded by the outer ring on BOTH sides grows by `2*d`. The
+    /// outer ring of a counter-bearing glyph is therefore moved by `2*d`, which
+    /// makes О as heavy as Н (see [`offset_outline`] for the accepted
+    /// limitations). In the uniform (`outward_only == false`) mode the outer
+    /// delta is always plain `d`.
+    ///
+    /// PER-GLYPH FLAG vs PER-RING GEOMETRY — [`offset_outline`] decides the
+    /// `2*d` compensation PER RING (only an outer ring that actually contains a
+    /// retained counter takes it), while `has_counter` is a property of the
+    /// WHOLE glyph ("some ring of it bounds a counter"), because the advance and
+    /// bounds callers cannot see the rings. The two disagree in exactly one
+    /// direction: `has_counter == true` while some outer ring of that glyph is
+    /// uncompensated — a glyph mixing a counter-bearing ring with a wider
+    /// counter-less one (`Ы`, `Ю` when drawn as two rings; its ink then grows by
+    /// `3*d` and this reports `4*d` of pen growth). That direction is the safe
+    /// one and is chosen deliberately: an over-report only over-reserves padding
+    /// and loosens spacing, whereas an under-report would crop drawn ink and let
+    /// the next letter collide with it. `outward_only == false` (the default) has
+    /// no compensation and therefore no asymmetry at all.
+    #[must_use]
+    pub(crate) fn outer_delta_px(self, has_counter: bool) -> f32 {
+        let d = self.d_px();
+        if self.outward_only && has_counter { 2.0 * d } else { d }
+    }
+
+    /// Worst-case distance the offset boundary can stray OUTSIDE the source
+    /// ink: the outer delta MAGNITUDE for round joins (and bevel fallbacks), up
+    /// to the miter limit `4x` that at acute sharp corners. Bounds/canvas
+    /// padding must use this, not `d`.
+    ///
+    /// The magnitude, not the signed value: a NEGATIVE (thinning) delta strays
+    /// outside the source ink too. At a REFLEX vertex of an outer ring the
+    /// inward offset lines DIVERGE, so that vertex is the "opening" side of the
+    /// join and its miter apex is pushed along the inward bisector by up to
+    /// `4*|delta|` (a round join by up to `|delta|`) — through the far side of
+    /// any material thinner than that. Measured on the fixture font
+    /// (`LiberationSans-Regular`, em 100, sharp corners): `v` strays 3.7 px
+    /// outside its plain outline at `-3 %` and `A` 9.2 px at `-5 %`. The
+    /// self-intersecting spike is inked by the NonZero fill (the documented
+    /// contract of [`offset_outline`]), so a zero pad would CROP it at the
+    /// canvas edge. Padding only ever grows the pre-trim canvas, which
+    /// `raster::trim_rendered_image_to_alpha_bounds` gives back.
+    #[must_use]
+    pub(crate) fn max_overhang_px(self, has_counter: bool) -> f32 {
+        self.outer_delta_px(has_counter).abs() * if self.sharp_corners { 4.0 } else { 1.0 }
     }
 
     /// Pack into the non-zero `u32` used by [`OutlineKey`] and the optical
-    /// contour-cache keys: bits 0..=29 = `d_q64`, bit 30 = sharp, bit 31 = out.
+    /// contour-cache keys: bits 0..=28 = `|d_q64|`, bit 29 = sign (set when
+    /// thinning), bit 30 = sharp, bit 31 = out.
+    ///
+    /// Non-zero for every accepted parameter set because the magnitude is
+    /// non-zero by construction, so `0` keeps meaning "plain (non-faux)".
+    /// Deliberately does NOT carry the per-glyph counter flag: that flag is a
+    /// function of the glyph outline, which the rest of the cache key
+    /// (font/glyph/em) already pins down.
     #[must_use]
     pub(crate) fn key_bits(self) -> u32 {
-        self.d_q64
+        self.d_q64.unsigned_abs()
+            | (u32::from(self.d_q64 < 0) << 29)
             | (u32::from(self.sharp_corners) << 30)
             | (u32::from(self.outward_only) << 31)
     }
@@ -360,6 +451,11 @@ impl OutlineKey {
 /// implemented manually and only reports the entry count.
 pub(crate) struct OutlineCache {
     map: HashMap<OutlineKey, Option<Arc<Outline>>>,
+    /// Memoized per-glyph "the PLAIN outline contains a counter" flag, keyed by
+    /// the PLAIN outline key. Populated lazily and only by
+    /// [`OutlineCache::glyph_has_counter`], so a render without faux bold never
+    /// pays for the winding classification.
+    counters: HashMap<OutlineKey, bool>,
     /// Reused swash scaler context; passed by `&mut` into `extract_glyph_outline`
     /// on every cache miss so extraction does not allocate a new context.
     context: swash::scale::ScaleContext,
@@ -386,6 +482,7 @@ impl OutlineCache {
     pub(crate) fn new() -> Self {
         Self {
             map: HashMap::new(),
+            counters: HashMap::new(),
             context: swash::scale::ScaleContext::new(),
         }
     }
@@ -411,14 +508,17 @@ impl OutlineCache {
     }
 
     /// Faux-bold-aware outline lookup: the plain outline for `faux == None`,
-    /// or the offset (emboldened) variant cached under the faux key otherwise.
+    /// or the offset (thickened / thinned) variant cached under the faux key
+    /// otherwise.
     ///
     /// `key` must be the PLAIN key for `font`/`glyph_id`/`em_px`. On a faux
     /// miss the plain outline is resolved first (through this same cache, so it
     /// is extracted at most once and stays byte-identical to the non-faux
     /// path), then offset via [`offset_outline`] with the QUANTIZED distance
     /// and cached under the faux variant key. A glyph with no fillable outline
-    /// is `None` for every variant. Never panics.
+    /// is `None` for every variant, and so is a glyph whose every contour
+    /// COLLAPSED under a thinning offset — that negative result is cached under
+    /// the faux key too, so it is computed once. Never panics.
     pub(crate) fn get_or_extract_with_faux(
         &mut self,
         key: OutlineKey,
@@ -436,19 +536,42 @@ impl OutlineCache {
         }
         let offset = self
             .get_or_extract(key, font, glyph_id, em_px)
-            .map(|plain| {
-                Arc::new(offset_outline(
-                    &plain,
-                    faux.d_px(),
-                    faux.sharp_corners,
-                    faux.outward_only,
-                ))
+            .and_then(|plain| {
+                offset_outline(&plain, faux.d_px(), faux.sharp_corners, faux.outward_only)
+                    .map(Arc::new)
             });
         self.map.insert(faux_key, offset.clone());
         offset
     }
 
-    /// Number of cached entries (including negative results).
+    /// Whether the glyph's PLAIN outline contains at least one counter (hole).
+    ///
+    /// `key` must be the PLAIN key for `font`/`glyph_id`/`em_px`. The flag
+    /// drives the counter compensation of the `outward_only` faux-bold mode
+    /// (see [`FauxOutlineParams::outer_delta_px`]) and therefore the pen
+    /// advance and the bounds padding, which have no access to the outline of
+    /// their own. Computed once per glyph from the cached plain outline (so it
+    /// costs one winding classification per distinct glyph/em and nothing on a
+    /// repeat lookup) and `false` for a glyph with no fillable outline.
+    /// Never panics.
+    pub(crate) fn glyph_has_counter(
+        &mut self,
+        key: OutlineKey,
+        font: &swash::FontRef,
+        glyph_id: u16,
+        em_px: f32,
+    ) -> bool {
+        if let Some(&cached) = self.counters.get(&key) {
+            return cached;
+        }
+        let has_counter = self
+            .get_or_extract(key, font, glyph_id, em_px)
+            .is_some_and(|plain| outline_has_counter(&plain));
+        self.counters.insert(key, has_counter);
+        has_counter
+    }
+
+    /// Number of cached outline entries (including negative results).
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
@@ -689,30 +812,53 @@ fn wrap_angle(mut angle: f32) -> f32 {
     angle
 }
 
-/// Offset (embolden) a flattened glyph outline by `d_px` on the crate's own
-/// polyline representation, preserving vertex order (and therefore winding).
+/// Offset a flattened glyph outline by the SIGNED distance `d_px` on the
+/// crate's own polyline representation, preserving vertex order (and therefore
+/// winding).
 ///
-/// Semantics (faux bold):
+/// A positive `d_px` THICKENS (faux bold), a negative one THINS the glyph.
+///
+/// Semantics:
 /// - Outer-vs-hole is decided by the actual NonZero fill semantics, not by a
 ///   winding convention: for each ring the total winding of ALL
 ///   (non-degenerate) rings is evaluated at a point strictly inside it
 ///   (`ring_interior_is_inked`). Ink inside (`winding != 0`) = an OUTER/ink
-///   boundary, moved outward by `d_px`; empty inside (`winding == 0`) = a
-///   counter (HOLE), moved INTO the hole by `d_px` (shrinking it) when
+///   boundary, moved AWAY from the ink by `d_px` (so inward for a negative
+///   `d_px`); empty inside (`winding == 0`) = a counter (HOLE), moved INTO the
+///   hole by `d_px` (shrinking it; growing it for a negative `d_px`) when
 ///   `outward_only == false` and copied unchanged when `outward_only == true`.
 ///   This matches what the NonZero rasterizer will fill for both TrueType and
 ///   CFF conventions and for same-wound nested rings (which are ink, not
 ///   holes). Assumes simple (non-self-intersecting) source contours — the norm
 ///   for font outlines.
+/// - COUNTER COMPENSATION (`outward_only == true` only): an outer ring that
+///   CONTAINS at least one retained counter is offset by `2 * d_px` instead of
+///   `d_px`. Without it a stroke bounded by the outer ring on one side and by a
+///   preserved counter on the other (О, Б, В) would grow by only `d` while a
+///   stroke bounded by the outer ring on BOTH sides (Н, Т, Ч) grows by `2*d`,
+///   i.e. counter-bearing letters would come out half as bold. ACCEPTED
+///   LIMITATIONS of this per-RING (not per-stroke) rule, deliberately not
+///   fixed: a hybrid letter (Б, Я, Р) has ONE outer ring bounding both a
+///   counter-adjacent stroke and an open-space stroke, so the open one
+///   overshoots to `4*d`; and a crossbar with a counter on BOTH sides (В, Ф) is
+///   not reached at all and keeps growing by `0`. The uniform
+///   `outward_only == false` mode has neither problem and is the default.
 /// - Joins at vertices: `sharp_corners == true` uses miter joins with limit ~4
 ///   (falling back to bevel beyond the limit); `false` approximates a circular
-///   arc with a segment count proportional to `d_px`.
+///   arc with a segment count proportional to `|d_px|`.
 /// - Degenerate contours (fewer than 3 distinct points or near-zero area) are
 ///   dropped. An offset ring whose orientation FLIPPED or whose area collapsed
-///   below the epsilon (a counter narrower than `2*d`) is dropped entirely —
-///   an inverted ring would contribute filled ink under NonZero instead of a
-///   collapsed counter.
-/// - `d_px <= 0` (or below the quantization epsilon) returns a clone.
+///   below the epsilon is dropped entirely: a counter narrower than `2*d`
+///   collapses when thickening, and under THINNING an ink stem narrower than
+///   `2*|d|` collapses the same way. An inverted ring must never be emitted —
+///   under NonZero it would contribute the exact opposite of what it bounds.
+/// - `|d_px|` below the quantization epsilon (or a non-finite `d_px`) returns a
+///   clone, so a zero-strength faux style is byte-identical to no faux style.
+///
+/// Returns `None` when NO contour survived (every ring collapsed under a
+/// thinning offset). Callers must treat that as "this glyph draws nothing" —
+/// falling back to the plain outline would render the glyph at FULL weight,
+/// which is the opposite of what was asked.
 ///
 /// Self-intersections in the offset polygons are ACCEPTABLE by contract: the
 /// rasterizer fills with the NonZero rule (`rasterize_outline_into`), which
@@ -725,9 +871,9 @@ pub(crate) fn offset_outline(
     d_px: f32,
     sharp_corners: bool,
     outward_only: bool,
-) -> Outline {
-    if !d_px.is_finite() || d_px < FAUX_MIN_OFFSET_PX {
-        return outline.clone();
+) -> Option<Outline> {
+    if !d_px.is_finite() || d_px.abs() < FAUX_MIN_OFFSET_PX {
+        return Some(outline.clone());
     }
 
     // Per-ring signed areas; `retained` marks the non-degenerate rings that
@@ -737,42 +883,47 @@ pub(crate) fn offset_outline(
         .iter()
         .map(|ring| ring_signed_area(ring))
         .collect();
-    let retained: Vec<bool> = outline
-        .subpaths
-        .iter()
-        .zip(areas.iter())
-        .map(|(ring, &area)| ring.len() >= 3 && area.abs() >= FAUX_MIN_CONTOUR_AREA_PX2)
-        .collect();
+    let retained = retained_ring_mask(&outline.subpaths, &areas);
     if !retained.iter().any(|&keep| keep) {
         // No non-degenerate contour: nothing to offset.
-        return outline.clone();
+        return Some(outline.clone());
     }
+    let is_outer = outer_ring_mask(&outline.subpaths, &retained);
 
     let mut out_subpaths: Vec<Vec<[f32; 2]>> = Vec::with_capacity(outline.subpaths.len());
     for (i, (ring, &area)) in outline.subpaths.iter().zip(areas.iter()).enumerate() {
         if !retained[i] {
             continue;
         }
-        let is_outer = ring_interior_is_inked(&outline.subpaths, &retained, i);
-        if !is_outer && outward_only {
+        if !is_outer[i] && outward_only {
             // Counters preserved: hole geometry copied verbatim.
             out_subpaths.push(ring.clone());
             continue;
         }
-        // Outer rings expand (offset outward relative to the ring); holes
-        // shrink, i.e. their boundary moves AGAINST the ring's outward normal
-        // (into the hole interior), which is a negative signed offset.
-        let delta = if is_outer { d_px } else { -d_px };
+        // Outer rings move along the ring's outward normal (away from the ink
+        // for a positive `d_px`, into it for a negative one); holes move
+        // AGAINST it (into the hole interior), which is the negated signed
+        // offset. The counter compensation doubles the outer step in the
+        // counter-preserving mode — see the doc block above.
+        let delta = if is_outer[i] {
+            let compensated = outward_only
+                && ring_contains_retained_counter(&outline.subpaths, &retained, &is_outer, i);
+            if compensated { 2.0 * d_px } else { d_px }
+        } else {
+            -d_px
+        };
         let offset_ring = offset_closed_ring(ring, area.signum(), delta, sharp_corners);
         if offset_ring.len() < 3 {
             continue;
         }
-        // Inversion/collapse guard: shrinking a counter narrower than `2*d`
-        // turns the ring inside out (flipped signed area) — under NonZero an
-        // inverted "hole" would ADD ink instead of vanishing. A collapsed
-        // counter is simply removed (solid ink), which is the correct
-        // embolden limit. Outward offsets cannot flip; the check is uniform
-        // for robustness.
+        // Inversion/collapse guard: a ring narrower than twice the offset it
+        // moves inward turns inside out (flipped signed area). Under NonZero an
+        // inverted ring contributes the OPPOSITE of what it bounds — an
+        // inverted counter would ADD ink, an inverted ink stem would SUBTRACT
+        // it — so the ring is dropped instead. Both directions reach this:
+        // thickening collapses a counter narrower than `2*d` (correct embolden
+        // limit: the counter fills in), thinning collapses an ink stem narrower
+        // than `2*|d|` (correct thinning limit: the stem disappears).
         let offset_area = ring_signed_area(&offset_ring);
         if offset_area.abs() < FAUX_MIN_CONTOUR_AREA_PX2 || (offset_area > 0.0) != (area > 0.0) {
             continue;
@@ -780,17 +931,99 @@ pub(crate) fn offset_outline(
         out_subpaths.push(offset_ring);
     }
 
-    // `from_subpaths` recomputes the AABB. An outline that lost every contour
-    // (e.g. a lone counter that collapsed) falls back to a clone — safe.
-    Outline::from_subpaths(out_subpaths, outline.winding).unwrap_or_else(|| outline.clone())
+    // `from_subpaths` recomputes the AABB and yields `None` when every contour
+    // was dropped — the glyph is fully consumed and draws nothing.
+    Outline::from_subpaths(out_subpaths, outline.winding)
+}
+
+/// Per-ring "non-degenerate enough to participate" mask: at least 3 points and
+/// an absolute area at or above [`FAUX_MIN_CONTOUR_AREA_PX2`].
+///
+/// `areas` must be the shoelace areas of `subpaths`, in the same order.
+#[must_use]
+fn retained_ring_mask(subpaths: &[Vec<[f32; 2]>], areas: &[f32]) -> Vec<bool> {
+    subpaths
+        .iter()
+        .zip(areas.iter())
+        .map(|(ring, &area)| ring.len() >= 3 && area.abs() >= FAUX_MIN_CONTOUR_AREA_PX2)
+        .collect()
+}
+
+/// Per-ring "this ring bounds INK" mask (see [`ring_interior_is_inked`]);
+/// dropped rings are reported as `false` and must never be consulted.
+#[must_use]
+fn outer_ring_mask(subpaths: &[Vec<[f32; 2]>], retained: &[bool]) -> Vec<bool> {
+    (0..subpaths.len())
+        .map(|i| retained[i] && ring_interior_is_inked(subpaths, retained, i))
+        .collect()
+}
+
+/// Whether the outer ring `outer_index` CONTAINS at least one retained counter.
+///
+/// Containment is decided the convention-free way the rest of this module
+/// works: a counter's own vertices are tested against the candidate outer ring
+/// with the NonZero winding number ([`ring_winding_at`]). Several vertices are
+/// sampled so a counter that happens to touch the outer boundary at one point
+/// is still recognized; a counter that lies outside the ring has every vertex
+/// at winding `0`. Cost is `O(outer_vertices * counters)` — glyph ring counts
+/// are single digits.
+#[must_use]
+fn ring_contains_retained_counter(
+    subpaths: &[Vec<[f32; 2]>],
+    retained: &[bool],
+    is_outer: &[bool],
+    outer_index: usize,
+) -> bool {
+    let outer = &subpaths[outer_index];
+    subpaths.iter().enumerate().any(|(j, hole)| {
+        if j == outer_index || !retained[j] || is_outer[j] {
+            return false;
+        }
+        // Three spread-out vertices: enough to survive one degenerate sample
+        // without walking the whole counter.
+        [0usize, hole.len() / 3, 2 * hole.len() / 3]
+            .into_iter()
+            .filter_map(|idx| hole.get(idx).copied())
+            .any(|vertex| ring_winding_at(outer, vertex) != 0)
+    })
+}
+
+/// Whether `outline` contains at least one retained COUNTER (hole) ring.
+///
+/// Uses the same classification [`offset_outline`] uses, so the answer always
+/// agrees with the geometry that will be produced: degenerate rings are ignored
+/// and a same-wound NESTED ring counts as INK, not as a counter. Callers use it
+/// to reproduce the counter compensation in the pen advance and the bounds
+/// padding, neither of which can see the outline.
+///
+/// It is a WHOLE-GLYPH answer, and the compensation it stands in for is decided
+/// PER RING: `true` means "at least one ring bounds a counter", not "every outer
+/// ring of this glyph is compensated". For a glyph mixing a counter-bearing ring
+/// with a counter-less one (`Ы`, `Ю` drawn as two rings) the callers therefore
+/// reserve `4*d` where the ink only grows by `3*d`. Over-reserving is the chosen
+/// error direction — it can only loosen spacing and enlarge the pre-trim canvas,
+/// while under-reserving would crop ink and collide glyphs — and it is reachable
+/// only in the non-default `outward_only` mode, the only mode that compensates
+/// at all. See [`FauxOutlineParams::outer_delta_px`].
+#[must_use]
+pub(crate) fn outline_has_counter(outline: &Outline) -> bool {
+    let areas: Vec<f32> = outline
+        .subpaths
+        .iter()
+        .map(|ring| ring_signed_area(ring))
+        .collect();
+    let retained = retained_ring_mask(&outline.subpaths, &areas);
+    (0..outline.subpaths.len())
+        .any(|i| retained[i] && !ring_interior_is_inked(&outline.subpaths, &retained, i))
 }
 
 /// Whether the region JUST INSIDE ring `index` (immediately right of its
 /// leftmost boundary on a scanline) is INK under the NonZero rule: the total
 /// winding of all `retained` rings there is non-zero.
 ///
-/// Ink inside means the ring is an outer/ink boundary (faux bold offsets it
-/// outward); an empty interior means it bounds a counter (hole). Evaluating
+/// Ink inside means the ring is an outer/ink boundary (faux bold moves it AWAY
+/// from the ink, or into it when thinning); an empty interior means it bounds a
+/// counter (hole). Evaluating
 /// the real winding — instead of comparing orientations — is convention-free
 /// (TrueType and CFF wind oppositely) and treats same-wound nested rings as
 /// the ink they render as. The sample interval runs from the ring's leftmost
@@ -2580,6 +2813,17 @@ mod tests {
         Outline::from_subpaths(rings, FillRule::NonZero).expect("non-empty outline")
     }
 
+    /// [`offset_outline`] for the cases that must keep at least one contour.
+    fn offset_kept(
+        outline: &Outline,
+        d_px: f32,
+        sharp_corners: bool,
+        outward_only: bool,
+    ) -> Outline {
+        offset_outline(outline, d_px, sharp_corners, outward_only)
+            .expect("offset must keep at least one contour")
+    }
+
     /// Screen-clockwise (positive shoelace area in the y-down frame) square.
     fn cw_square(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<[f32; 2]> {
         vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
@@ -2602,7 +2846,7 @@ mod tests {
     fn offset_square_miter_corners_are_exact() {
         let outline = outline_from_rings(vec![cw_square(0.0, 0.0, 10.0, 10.0)]);
         let d = 2.0;
-        let offset = offset_outline(&outline, d, true, true);
+        let offset = offset_kept(&outline, d, true, true);
         assert_eq!(offset.subpaths().len(), 1);
         let ring = &offset.subpaths()[0];
         // Right-angle miter apexes sit exactly d beyond each corner diagonal.
@@ -2621,16 +2865,26 @@ mod tests {
         let outline = outline_from_rings(vec![outer, hole.clone()]);
         let d = 2.0;
 
-        // outward_only = true: the hole ring is copied VERBATIM (counters kept).
-        let kept = offset_outline(&outline, d, true, true);
+        // outward_only = true: the hole ring is copied VERBATIM (counters kept)
+        // and the outer ring takes the COMPENSATED 2*d step, so the stroke
+        // between the outer edge and the preserved counter grows by 2*d — the
+        // same weight a counter-less glyph gets from its two moving edges.
+        let kept = offset_kept(&outline, d, true, true);
         assert_eq!(kept.subpaths().len(), 2);
         assert_eq!(kept.subpaths()[1], hole, "hole must be untouched");
-        // The outer ring still expanded.
-        assert_has_vertex_near(&kept.subpaths()[0], [-2.0, -2.0], 1e-3);
+        assert_has_vertex_near(&kept.subpaths()[0], [-4.0, -4.0], 1e-3);
+        let (kept_min, kept_max) = kept.local_bbox();
+        assert!(
+            (kept_min[0] + 2.0 * d).abs() < 1e-3 && (kept_max[0] - (20.0 + 2.0 * d)).abs() < 1e-3,
+            "compensated outer ring must move by 2*d, got {kept_min:?}..{kept_max:?}"
+        );
 
-        // outward_only = false: the hole shrinks by d on each side.
-        let shrunk = offset_outline(&outline, d, true, false);
+        // outward_only = false: the hole shrinks by d on each side and the
+        // outer ring moves by a plain d (the mode is uniform by construction,
+        // so it never compensates).
+        let shrunk = offset_kept(&outline, d, true, false);
         assert_eq!(shrunk.subpaths().len(), 2);
+        assert_has_vertex_near(&shrunk.subpaths()[0], [-2.0, -2.0], 1e-3);
         let hole_ring = &shrunk.subpaths()[1];
         for corner in [[7.0, 7.0], [7.0, 13.0], [13.0, 13.0], [13.0, 7.0]] {
             assert_has_vertex_near(hole_ring, corner, 1e-3);
@@ -2643,10 +2897,105 @@ mod tests {
     }
 
     #[test]
+    fn outward_only_does_not_compensate_a_counter_less_ring() {
+        // Non-regression half of the counter compensation: a solid ring with no
+        // counter inside it keeps the plain `d` step, so Н does not double up
+        // while О is being fixed. A DISJOINT second ink blob must not be
+        // mistaken for a counter of the first either.
+        let solo = outline_from_rings(vec![cw_square(0.0, 0.0, 20.0, 20.0)]);
+        let offset = offset_kept(&solo, 2.0, true, true);
+        assert_has_vertex_near(&offset.subpaths()[0], [-2.0, -2.0], 1e-3);
+        assert!(!outline_has_counter(&solo), "a solid ring has no counter");
+
+        let two_blobs = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 5.0, 5.0),
+            ccw_square(10.0, 0.0, 30.0, 20.0),
+        ]);
+        assert!(
+            !outline_has_counter(&two_blobs),
+            "two disjoint ink blobs contain no counter"
+        );
+        let offset = offset_kept(&two_blobs, 1.0, true, true);
+        assert_has_vertex_near(&offset.subpaths()[0], [-1.0, -1.0], 1e-3);
+        assert_has_vertex_near(&offset.subpaths()[1], [9.0, -1.0], 1e-3);
+    }
+
+    #[test]
+    fn thinning_pulls_outer_rings_in_and_grows_counters() {
+        // A negative distance is the mirror of a positive one: the outer ring
+        // moves INTO the ink, and in the uniform mode the counter grows by the
+        // same |d| (its boundary also moves into the ink).
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 20.0, 20.0),
+            ccw_square(5.0, 5.0, 15.0, 15.0),
+        ]);
+        let thinned = offset_kept(&outline, -2.0, true, false);
+        assert_eq!(thinned.subpaths().len(), 2);
+        assert_has_vertex_near(&thinned.subpaths()[0], [2.0, 2.0], 1e-3);
+        assert_has_vertex_near(&thinned.subpaths()[0], [18.0, 18.0], 1e-3);
+        let hole_ring = &thinned.subpaths()[1];
+        for corner in [[3.0, 3.0], [3.0, 17.0], [17.0, 17.0], [17.0, 3.0]] {
+            assert_has_vertex_near(hole_ring, corner, 1e-3);
+        }
+        assert!(
+            ring_signed_area(hole_ring) < 0.0,
+            "grown hole keeps its (negative) orientation"
+        );
+
+        // Counter-preserving mode: the hole stays verbatim and the outer ring
+        // takes the compensated 2*d step INWARD, so thinning stays consistent
+        // between О and Н exactly as thickening does.
+        let kept = offset_kept(&outline, -2.0, true, true);
+        assert_eq!(kept.subpaths()[1], ccw_square(5.0, 5.0, 15.0, 15.0));
+        assert_has_vertex_near(&kept.subpaths()[0], [4.0, 4.0], 1e-3);
+    }
+
+    #[test]
+    fn thinning_drops_a_stem_narrower_than_two_d() {
+        // A 3px-wide ink stem next to a solid block, thinned by |d| = 2 per
+        // side: the stem ring inverts and must be DROPPED, never emitted
+        // inside-out (an inverted ink ring would SUBTRACT under NonZero).
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 20.0, 20.0),
+            cw_square(30.0, 4.0, 33.0, 16.0),
+        ]);
+        for sharp in [true, false] {
+            let thinned = offset_kept(&outline, -2.0, sharp, true);
+            assert_eq!(
+                thinned.subpaths().len(),
+                1,
+                "the collapsed stem must be dropped entirely (sharp={sharp})"
+            );
+            let (min, max) = thinned.local_bbox();
+            assert!(
+                max[0] < 20.0 && min[0] > 0.0,
+                "only the shrunk block survives, got {min:?}..{max:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinning_that_consumes_every_ring_returns_none() {
+        // Every contour of this glyph is narrower than 2*|d|: nothing survives,
+        // and the caller must be told so instead of receiving the plain outline
+        // (which would render the glyph at FULL weight).
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 3.0, 12.0),
+            cw_square(6.0, 0.0, 9.0, 12.0),
+        ]);
+        assert!(
+            offset_outline(&outline, -2.0, true, true).is_none(),
+            "a fully consumed glyph must report None"
+        );
+        // The same glyph survives a gentler thinning.
+        assert!(offset_outline(&outline, -0.5, true, true).is_some());
+    }
+
+    #[test]
     fn offset_round_joins_add_arc_vertices_at_convex_corners() {
         let outline = outline_from_rings(vec![cw_square(0.0, 0.0, 10.0, 10.0)]);
-        let sharp = offset_outline(&outline, 2.0, true, true);
-        let round = offset_outline(&outline, 2.0, false, true);
+        let sharp = offset_kept(&outline, 2.0, true, true);
+        let round = offset_kept(&outline, 2.0, false, true);
         assert!(
             round.subpaths()[0].len() > sharp.subpaths()[0].len(),
             "round joins must add arc vertices over miter joins ({} vs {})",
@@ -2654,8 +3003,8 @@ mod tests {
             sharp.subpaths()[0].len()
         );
         // Segment count grows with d (arc step is proportional to the radius).
-        let round_small = offset_outline(&outline, 0.1, false, true);
-        let round_big = offset_outline(&outline, 8.0, false, true);
+        let round_small = offset_kept(&outline, 0.1, false, true);
+        let round_big = offset_kept(&outline, 8.0, false, true);
         assert!(
             round_big.subpaths()[0].len() > round_small.subpaths()[0].len(),
             "arc segment count must grow with d ({} vs {})",
@@ -2687,7 +3036,7 @@ mod tests {
             ccw_square(9.0, 4.0, 11.0, 16.0),
         ]);
         for sharp in [true, false] {
-            let offset = offset_outline(&outline, 2.0, sharp, false);
+            let offset = offset_kept(&outline, 2.0, sharp, false);
             assert_eq!(
                 offset.subpaths().len(),
                 1,
@@ -2704,7 +3053,7 @@ mod tests {
             cw_square(0.0, 0.0, 20.0, 20.0),
             ccw_square(5.0, 5.0, 15.0, 15.0),
         ]);
-        let offset = offset_outline(&survivable, 2.0, false, false);
+        let offset = offset_kept(&survivable, 2.0, false, false);
         assert_eq!(offset.subpaths().len(), 2);
         assert!(
             ring_signed_area(&offset.subpaths()[1]) < 0.0,
@@ -2727,8 +3076,8 @@ mod tests {
         ];
         let outline =
             outline_from_rings(vec![cw_square(0.0, 0.0, 20.0, 20.0), l_hole]);
-        let sharp = offset_outline(&outline, 1.5, true, false);
-        let round = offset_outline(&outline, 1.5, false, false);
+        let sharp = offset_kept(&outline, 1.5, true, false);
+        let round = offset_kept(&outline, 1.5, false, false);
         assert_eq!(sharp.subpaths().len(), 2);
         assert_eq!(round.subpaths().len(), 2);
         assert!(
@@ -2752,7 +3101,7 @@ mod tests {
             cw_square(0.0, 0.0, 5.0, 5.0),
             ccw_square(10.0, 0.0, 30.0, 20.0),
         ]);
-        let offset = offset_outline(&outline, 1.0, true, true);
+        let offset = offset_kept(&outline, 1.0, true, true);
         assert_eq!(offset.subpaths().len(), 2);
         assert_has_vertex_near(&offset.subpaths()[0], [-1.0, -1.0], 1e-3);
         assert_has_vertex_near(&offset.subpaths()[0], [6.0, 6.0], 1e-3);
@@ -2769,10 +3118,22 @@ mod tests {
             cw_square(0.0, 0.0, 20.0, 20.0),
             cw_square(5.0, 5.0, 15.0, 15.0),
         ]);
-        let offset = offset_outline(&outline, 1.0, true, false);
+        let offset = offset_kept(&outline, 1.0, true, false);
         assert_eq!(offset.subpaths().len(), 2);
         assert_has_vertex_near(&offset.subpaths()[1], [4.0, 4.0], 1e-3);
         assert_has_vertex_near(&offset.subpaths()[1], [16.0, 16.0], 1e-3);
+
+        // The trap of the counter compensation: a same-wound nested ring is INK,
+        // so it must NOT make the enclosing ring look counter-bearing. Both
+        // rings therefore keep the plain `d` step under `outward_only` too.
+        assert!(
+            !outline_has_counter(&outline),
+            "a same-wound nested ring is ink, not a counter"
+        );
+        let kept = offset_kept(&outline, 1.0, true, true);
+        assert_eq!(kept.subpaths().len(), 2);
+        assert_has_vertex_near(&kept.subpaths()[0], [-1.0, -1.0], 1e-3);
+        assert_has_vertex_near(&kept.subpaths()[1], [4.0, 4.0], 1e-3);
     }
 
     #[test]
@@ -2794,7 +3155,7 @@ mod tests {
             [0.0, 10.0],
             [0.0, 5.0],
         ];
-        let offset = offset_outline(&outline_from_rings(vec![noisy]), 2.0, true, true);
+        let offset = offset_kept(&outline_from_rings(vec![noisy]), 2.0, true, true);
         assert_eq!(offset.subpaths().len(), 1);
         for v in &offset.subpaths()[0] {
             assert!(v[0].is_finite() && v[1].is_finite(), "no NaN vertices");
@@ -2816,7 +3177,7 @@ mod tests {
             vec![[30.0, 30.0], [30.001, 30.0], [30.001, 30.001]],
             vec![[40.0, 40.0], [41.0, 40.0]],
         ]);
-        let offset = offset_outline(&outline, 2.0, true, true);
+        let offset = offset_kept(&outline, 2.0, true, true);
         assert_eq!(
             offset.subpaths().len(),
             1,
@@ -2828,10 +3189,104 @@ mod tests {
     fn offset_zero_distance_returns_identical_outline() {
         let rings = vec![cw_square(0.0, 0.0, 10.0, 10.0), ccw_square(2.0, 2.0, 8.0, 8.0)];
         let outline = outline_from_rings(rings.clone());
-        for d in [0.0, -1.0, 1.0 / 256.0, f32::NAN] {
-            let offset = offset_outline(&outline, d, true, false);
+        // Exact zero, both SUB-QUANTUM signs (|d| below FAUX_MIN_OFFSET_PX =
+        // 1/128 px, so a barely-negative strength stays a plain outline instead
+        // of thinning), and a non-finite distance.
+        for d in [0.0, -0.0, 1.0 / 256.0, -1.0 / 256.0, f32::NAN] {
+            let offset = offset_kept(&outline, d, true, false);
             assert_eq!(offset.subpaths(), outline.subpaths(), "d={d} must be a clone");
             assert_eq!(offset.local_bbox(), outline.local_bbox());
+        }
+        // The quantization threshold itself is INSIDE the accepted range in
+        // both directions, so it must actually move the geometry.
+        for d in [1.0 / 128.0, -1.0 / 128.0] {
+            let offset = offset_kept(&outline, d, true, false);
+            assert_ne!(
+                offset.local_bbox(),
+                outline.local_bbox(),
+                "d={d} is at the quantization threshold and must offset"
+            );
+        }
+    }
+
+    #[test]
+    fn faux_params_round_trip_a_signed_distance() {
+        let thick = FauxOutlineParams::new(2.0, true, false).expect("valid thickening");
+        let thin = FauxOutlineParams::new(-2.0, true, false).expect("valid thinning");
+        assert!((thick.d_px() - 2.0).abs() < 1e-6);
+        assert!((thin.d_px() + 2.0).abs() < 1e-6);
+        // Sign is part of the cache key, so the two variants can never alias,
+        // and both keys stay non-zero (`0` means "plain").
+        assert_ne!(thick.key_bits(), thin.key_bits());
+        assert_ne!(thick.key_bits(), 0);
+        assert_ne!(thin.key_bits(), 0);
+        // Sub-quantum magnitudes are rejected in both directions.
+        assert!(FauxOutlineParams::new(0.0, true, false).is_none());
+        assert!(FauxOutlineParams::new(-1.0 / 256.0, true, false).is_none());
+        assert!(FauxOutlineParams::new(f32::NAN, true, false).is_none());
+
+        // Counter compensation and the overhang magnitude.
+        let out = FauxOutlineParams::new(2.0, false, true).expect("valid");
+        assert!((out.outer_delta_px(false) - 2.0).abs() < 1e-6);
+        assert!((out.outer_delta_px(true) - 4.0).abs() < 1e-6);
+        let both = FauxOutlineParams::new(2.0, false, false).expect("valid");
+        assert!((both.outer_delta_px(true) - 2.0).abs() < 1e-6);
+        // Thinning pads by the MAGNITUDE, never by zero and never negatively: an
+        // inward offset also strays outside the plain ink (the miter apex at a
+        // reflex vertex is pushed up to 4*|d| along the inward bisector), and the
+        // NonZero fill inks that spike, so a zero pad would crop it.
+        let sharp_thin = FauxOutlineParams::new(-2.0, true, true).expect("valid");
+        assert!(sharp_thin.outer_delta_px(true) < 0.0, "the delta stays signed");
+        assert!(
+            (sharp_thin.max_overhang_px(true) - 16.0).abs() < 1e-6,
+            "thinning pads by |2*d| * 4, got {}",
+            sharp_thin.max_overhang_px(true)
+        );
+        let sharp_thick = FauxOutlineParams::new(2.0, true, true).expect("valid");
+        assert!((sharp_thick.max_overhang_px(true) - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn saturating_faux_magnitude_stays_inside_its_29_bit_field() {
+        // The cap must survive the `f32` saturation in `new`. `2^29 - 1` does
+        // not: it rounds UP to `2^29`, whose bit 29 IS the sign bit of the key,
+        // so a saturating thickening and a saturating thinning would produce one
+        // and the same key and one sign would be served the other's geometry.
+        const MAGNITUDE_MASK: u32 = (1 << 29) - 1;
+        assert_eq!(
+            FAUX_MAX_ABS_Q64 as f32 as i32,
+            FAUX_MAX_ABS_Q64,
+            "the cap must be exactly representable in f32"
+        );
+
+        // Well past the cap in both directions, plus the largest finite input
+        // (whose `* 64.0` product overflows f32 to +inf and must still saturate).
+        for &d_px in &[1.0e9_f32, 1.0e30, f32::MAX] {
+            let thick = FauxOutlineParams::new(d_px, true, false).expect("valid thickening");
+            let thin = FauxOutlineParams::new(-d_px, true, false).expect("valid thinning");
+            for (label, params) in [("thickening", thick), ("thinning", thin)] {
+                let bits = params.key_bits();
+                assert!(
+                    bits & MAGNITUDE_MASK <= u32::try_from(FAUX_MAX_ABS_Q64).expect("cap fits u32"),
+                    "{label} magnitude {} exceeds the cap at d_px {d_px}",
+                    bits & MAGNITUDE_MASK
+                );
+            }
+            // Bit 29 is the sign and nothing else, so the two saturating signs
+            // stay distinct cache keys.
+            assert_ne!(
+                thick.key_bits(),
+                thin.key_bits(),
+                "saturating +/- keys aliased at d_px {d_px}"
+            );
+            assert_eq!(thick.key_bits() & (1 << 29), 0);
+            assert_eq!(thin.key_bits() & (1 << 29), 1 << 29);
+            // Bits 30/31 stay exclusively the two flags, never magnitude spill.
+            assert_eq!(thick.key_bits() & (1 << 30), 1 << 30, "sharp flag");
+            assert_eq!(thick.key_bits() & (1 << 31), 0, "outward_only flag");
+            let flagged = FauxOutlineParams::new(d_px, false, true).expect("valid");
+            assert_eq!(flagged.key_bits() & (1 << 30), 0, "round join");
+            assert_eq!(flagged.key_bits() & (1 << 31), 1 << 31, "outward_only");
         }
     }
 

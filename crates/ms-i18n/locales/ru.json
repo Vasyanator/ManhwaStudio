@@ -4036,6 +4036,7 @@
   "typing.params.font_placeholder": "<шрифт>",
   "typing.params.font_unknown_placeholder": "<неизвестный шрифт>",
   "typing.params.force": "Принудительно",
+  "typing.params.force_remove_ellipsis_glyph": "Принудительно убрать глиф троеточия",
   "typing.params.global_rotation_label": "Глобальный поворот",
   "typing.params.global_rotation_tooltip": "Даёт более чёткий поворот, чем поворот после создания",
   "typing.params.hanging_punctuation": "Висящая пунктуация",

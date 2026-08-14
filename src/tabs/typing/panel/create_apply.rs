@@ -322,7 +322,8 @@ impl TypingCreatePanelState {
             .and_then(Value::as_bool)
             .unwrap_or(self.force_italic);
         self.faux_bold = text_params_obj.get("faux_bold").and_then(Value::as_bool).unwrap_or(false);
-        self.faux_bold_thicken_percent = text_params_obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0);
+        // SIGNED: a negative stored value is a legitimate THINNING request.
+        self.faux_bold_thicken_percent = text_params_obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(FAUX_THICKEN_PERCENT_MIN, FAUX_THICKEN_PERCENT_MAX);
         self.faux_bold_expand_percent = text_params_obj.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0);
         self.faux_bold_sharp_corners = text_params_obj.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true);
         self.faux_bold_outward_only = text_params_obj.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true);
@@ -340,6 +341,10 @@ impl TypingCreatePanelState {
             .get("replace_ellipsis_with_dots")
             .and_then(Value::as_bool)
             .unwrap_or(self.replace_ellipsis_with_dots);
+        self.force_remove_ellipsis_glyph = text_params_obj
+            .get("force_remove_ellipsis_glyph")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.force_remove_ellipsis_glyph);
         self.new_line_after_sentence = text_params_obj
             .get("new_line_after_sentence")
             .and_then(Value::as_bool)
@@ -731,6 +736,12 @@ impl TypingCreatePanelState {
             uppercase_text: self.uppercase_text,
             trim_extra_spaces: self.trim_extra_spaces,
             replace_ellipsis_with_dots: self.replace_ellipsis_with_dots,
+            // Sub-parameter: the GSUB patch is a no-op without the substitution that
+            // produces the three dots, so it is handed to the renderer only when BOTH
+            // flags are on. Keeping the AND here means a stored `true` under a disabled
+            // parent never leaks into a render.
+            force_remove_ellipsis_glyph: self.replace_ellipsis_with_dots
+                && self.force_remove_ellipsis_glyph,
             hanging_punctuation: self.hanging_punctuation,
             new_line_after_sentence: self.new_line_after_sentence,
             enable_inline_style_tags: self.enable_inline_style_tags,

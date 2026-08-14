@@ -3865,6 +3865,7 @@
   "typing.params.font_not_found_option": "{name} (não encontrada)",
   "typing.params.font_placeholder": "<fonte>",
   "typing.params.font_unknown_placeholder": "<fonte desconhecida>",
+  "typing.params.force_remove_ellipsis_glyph": "Forçar a remoção do glifo de reticências",
   "typing.params.global_rotation_label": "Rotação global",
   "typing.params.global_rotation_tooltip": "Oferece uma rotação mais nítida que girar após a criação",
   "typing.params.hanging_punctuation": "Pontuação suspensa",

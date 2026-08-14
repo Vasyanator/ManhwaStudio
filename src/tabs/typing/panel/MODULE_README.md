@@ -648,6 +648,15 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   panel default is fine (that key simply starts being written); changing a FROZEN value
   reinterprets every already-written document and requires bumping the version and adding a read
   branch. `defaults_are_frozen` pins every value so this cannot happen by accident.
+- SUB-PARAMETER `force_remove_ellipsis_glyph` (text-processing section) is a modifier of
+  `replace_ellipsis_with_dots`, not an independent step. It is stored on its own (frozen
+  default `false`, so no existing document changes meaning) but ANDed with its parent at every
+  site that builds a `TextRenderParams` — `create_apply::build_render_params_for` and
+  `tab/codec.rs` — so a stored `true` under a disabled parent can never reach the renderer. The
+  panel draws it indented under its parent and only while the parent is on
+  (`create_main_text::draw_text_processing_section`, mirrored in `create_edit.rs`), and it is
+  deliberately EXCLUDED from that section's «включено N» summary, which counts independent
+  processing steps.
 - CONVERSION of schema-1 documents lives on the TAB side (`tab/codec.rs`), not here; the panel
   only supplies `create_render_data::resolve_legacy_font_identity` (the legacy door) and
   `font_post_script_names` (the `identity → PostScript name per face` snapshot the PSD export
@@ -786,7 +795,32 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `stacked_columns = true`) kept only so the file compiles.
 - Bold/italic controls preserve legacy real-face behavior by default. Faux controls
   serialize their seven `text_params` keys on every render-data rebuild; parameterized
-  inline tags use the renderer's `<b=...>` / `<i=...>` grammar.
+  inline tags use the renderer's `<b=...>` / `<i=...>` grammar. The geometry those
+  parameters describe belongs to `crates/ms-text-render/src/MODULE_README.md` (faux
+  bold/italic contract) — do not restate it here.
+  - «Утолщение» (`faux_bold_thicken_percent`) is SIGNED: its range is the renderer's own
+    `FAUX_THICKEN_PERCENT_MIN..=FAUX_THICKEN_PERCENT_MAX` (`-5..=25`), where a negative
+    value THINS the glyphs. Both the `WheelSlider` range and the wheel step in
+    `ui_helpers::draw_faux_style_controls` take those constants, and every app-side clamp
+    (`create_apply`, `codec` decode + legacy normalizer, `inline_tags`) uses the same pair.
+    Widening or narrowing one of them alone makes a value ping-pong between paths.
+  - NEW overlays default `faux_bold_outward_only` to `false` (`create_state.rs`), the
+    uniform-weight mode. The FROZEN schema-2 default in `text_params_schema.rs` stays
+    `true` and must not follow it: it is what an already-saved document that omits the key
+    decodes to, and flipping it would silently re-render every existing overlay. The
+    per-field fallbacks in `create_apply`/`codec` are the same contract and stay `true`.
+    The only consequence is that new overlays now write the key explicitly.
+    ONE EXCEPTION to "saved documents are unaffected": an inline `<b=...>` tag lives in
+    the TEXT and carries no key, so an omitted counter token means whatever
+    `FauxBoldParams::default()` means TODAY — a hand-typed `<b=8>` / `<b=default>` saved
+    before the flip now renders `both` instead of `out`. `inline_tags.rs` always emits the
+    token explicitly, so only hand-typed tags are exposed. Documented, not shimmed: a tag
+    has no version to key a shim off.
+  - `inline_tags::parse_faux_bold_value` MIRRORS the renderer's `<b=...>` payload parser
+    (`ms_text_render::inline_styles::parse_faux_bold_value`, a private module — the app
+    cannot call it). It must build `FauxBoldParams` by spreading `..FauxBoldParams::default()`
+    so an omitted token can never mean a different value here than in the renderer; pinned
+    by `panel_faux_bold_mirror_matches_the_renderer_defaults`.
 - The advanced-form width metric (`create_advanced::build_advanced_form_glyph_widths`)
   must measure the SAME face the renderer draws, so its real-Bold/Italic face request
   (`apply_metric_real_bold_italic`) MIRRORS `ms_text_render::pipeline::

@@ -4036,6 +4036,7 @@
   "typing.params.font_placeholder": "<font>",
   "typing.params.font_unknown_placeholder": "<unknown font>",
   "typing.params.force": "Force",
+  "typing.params.force_remove_ellipsis_glyph": "Force-remove the ellipsis glyph",
   "typing.params.global_rotation_label": "Global rotation",
   "typing.params.global_rotation_tooltip": "Gives a sharper rotation than rotating after creation",
   "typing.params.hanging_punctuation": "Hanging punctuation",

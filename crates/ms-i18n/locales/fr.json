@@ -3865,6 +3865,7 @@
   "typing.params.font_not_found_option": "{name} (introuvable)",
   "typing.params.font_placeholder": "<police>",
   "typing.params.font_unknown_placeholder": "<police inconnue>",
+  "typing.params.force_remove_ellipsis_glyph": "Forcer la suppression du glyphe de points de suspension",
   "typing.params.global_rotation_label": "Rotation globale",
   "typing.params.global_rotation_tooltip": "Donne une rotation plus nette que la rotation après création",
   "typing.params.hanging_punctuation": "Ponctuation suspendue",

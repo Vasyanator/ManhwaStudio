@@ -63,8 +63,8 @@ use crate::drawn_lines::{
 use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::font_registry::InlineFontRegistry;
 use crate::glyph_blit::{
-    glyph_outline_transform, glyph_subpixel_offset, nominal_glyph_advance_px,
-    resolve_outline_for_glyph,
+    glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset,
+    nominal_glyph_advance_px, resolve_outline_for_glyph,
 };
 use crate::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance,
@@ -81,6 +81,7 @@ use crate::pipeline::{
     FauxGlyphStyle, GlyphScaleSettings, KerningSettings, effective_spacing_percent,
     hanging_edge_run_bounds, is_edge_run_hanging,
     faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
+    resolve_faux_counter_flag,
 };
 use crate::raster::{
     PixelBounds, RigidPlacement, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
@@ -535,9 +536,15 @@ fn render_text_with_drawn_lines_layout_once(
         line_extra_spacing_table.as_slice(),
         has_inline_size_overrides,
     );
+    // Resolution-independent glyph outlines: shared by the faux counter-flag
+    // lookup during seed collection, the ink-distance search (via the transforms
+    // below) and the composite pass, so each glyph is extracted at most once per
+    // render.
+    let mut outline_cache = OutlineCache::new();
     let mut seeds = collect_formula_glyph_seeds(
         params,
         font_system,
+        &mut outline_cache,
         buffer,
         attrs,
         faux_face_baseline,
@@ -560,10 +567,6 @@ fn render_text_with_drawn_lines_layout_once(
     // per distinct glyph, and are reused by the bounds and composite passes.
     let mut cache = SwashCache::new();
     let mut contour_cache: HashMap<(CacheKey, u32), CachedGlyphInk> = HashMap::new();
-    // Resolution-independent glyph outlines: shared by the ink-distance search
-    // (via the transforms below) and the composite pass so each glyph is
-    // extracted at most once per render.
-    let mut outline_cache = OutlineCache::new();
     // Reused per-glyph rasterizer buffers for the composite pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
@@ -878,12 +881,25 @@ fn render_text_with_drawn_lines_layout_once(
         // Resolve the outline up front so the extra-info sample knows whether this
         // glyph draws warped (outline) or as an UNWARPED color-glyph bitmap fallback.
         let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut outline_cache);
+        // Whether this glyph puts ink on the canvas at all: it either has an
+        // outline, or it is an outline-less glyph whose bitmap still gets blitted.
+        // `false` only for a glyph a faux THINNING offset consumed entirely, which
+        // draws nothing (the `continue` below) and therefore must not vote on the
+        // extra-info ink centers either. Short-circuits, so an outline glyph pays
+        // no extra lookup.
+        let draws_ink = glyph_outline.is_some()
+            || glyph_needs_bitmap_fallback(
+                font_system,
+                &mut outline_cache,
+                &seed.glyph,
+                seed.faux.bold,
+            );
 
         // Extra-info sample: the final line-placed, rotated glyph box the composite
         // pass draws. Both kinds contribute, but only the outline sample is warpable;
         // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
         // Leading/trailing hanging punctuation is skipped so it cannot drag the center.
-        if extra_active && !seed.hanging_excluded {
+        if extra_active && draws_ink && !seed.hanging_excluded {
             let (scaled_w, scaled_h) =
                 seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
             let (corners, center) = rotated_box_samples(
@@ -926,6 +942,12 @@ fn render_text_with_drawn_lines_layout_once(
                 &aa_lut,
                 warp_ctx.as_ref(),
             );
+            continue;
+        }
+
+        // A glyph whose outline was CONSUMED by a faux thinning offset draws
+        // nothing: blitting its bitmap would restore it at FULL weight.
+        if !draws_ink {
             continue;
         }
 
@@ -1295,10 +1317,15 @@ fn seed_ink_geometry(
             [gw, gh],
             [seed.glyph.w.max(1.0), 1.0],
         );
-        // Faux bold moves the ink boundary outward by `d` on each side; the
-        // bitmap-measured extent must grow with it so the min-distance base
-        // gap matches the drawn (offset) ink. `d == 0.0` adds exact zeros.
-        ink_width_px = (ink.right_px - ink.left_px).max(0.0) + 2.0 * seed.faux.d_px();
+        // Faux bold moves the outer ink boundary by the OUTER delta on each
+        // side (counter compensation included); the bitmap-measured extent must
+        // follow so the min-distance base gap matches the drawn (offset) ink.
+        // `0.0` adds exact zeros; a thinning delta shrinks the extent, which is
+        // floored at zero so a fully consumed glyph never reports a negative
+        // width.
+        ink_width_px = ((ink.right_px - ink.left_px).max(0.0)
+            + 2.0 * seed.faux.outer_delta_px())
+        .max(0.0);
     }
 
     // Trace the ink contour from the true outline once per distinct glyph key
@@ -1895,6 +1922,7 @@ fn render_text_with_formula_layout_once(
     let mut seeds = collect_formula_glyph_seeds(
         params,
         font_system,
+        &mut outline_cache,
         buffer,
         attrs,
         faux_face_baseline,
@@ -2217,12 +2245,25 @@ fn render_text_with_formula_layout_once(
         // Resolve the outline up front so the extra-info sample knows whether this
         // glyph draws warped (outline) or as an UNWARPED color-glyph bitmap fallback.
         let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut outline_cache);
+        // Whether this glyph puts ink on the canvas at all: it either has an
+        // outline, or it is an outline-less glyph whose bitmap still gets blitted.
+        // `false` only for a glyph a faux THINNING offset consumed entirely, which
+        // draws nothing (the `continue` below) and therefore must not vote on the
+        // extra-info ink centers either. Short-circuits, so an outline glyph pays
+        // no extra lookup.
+        let draws_ink = glyph_outline.is_some()
+            || glyph_needs_bitmap_fallback(
+                font_system,
+                &mut outline_cache,
+                &seed.glyph,
+                seed.faux.bold,
+            );
 
         // Extra-info sample: the final line-placed, rotated glyph box the composite
         // pass draws. Both kinds contribute, but only the outline sample is warpable;
         // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
         // Leading/trailing hanging punctuation is skipped so it cannot drag the center.
-        if extra_active && !seed.hanging_excluded {
+        if extra_active && draws_ink && !seed.hanging_excluded {
             let (scaled_w, scaled_h) =
                 seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
             let (corners, center) = rotated_box_samples(
@@ -2265,6 +2306,12 @@ fn render_text_with_formula_layout_once(
                 &aa_lut,
                 warp_ctx.as_ref(),
             );
+            continue;
+        }
+
+        // A glyph whose outline was CONSUMED by a faux thinning offset draws
+        // nothing: blitting its bitmap would restore it at FULL weight.
+        if !draws_ink {
             continue;
         }
 
@@ -2368,9 +2415,15 @@ fn detect_shape_layout_fallback_reason(
         line_extra_spacing_table,
         has_inline_size_overrides,
     );
+    // This probe only measures shaped advances, but the seeds it builds carry a
+    // resolved faux style, so it needs an outline cache of its own. It stays EMPTY
+    // unless faux bold in the counter-preserving mode is active (the only case
+    // that looks a glyph up), so the no-faux probe costs exactly nothing.
+    let mut outline_cache = OutlineCache::new();
     let seeds = collect_formula_glyph_seeds(
         params,
         font_system,
+        &mut outline_cache,
         buffer,
         attrs,
         faux_face_baseline,
@@ -2444,6 +2497,7 @@ fn detect_shape_layout_fallback_reason(
 fn collect_formula_glyph_seeds(
     params: &TextRenderParams,
     font_system: &mut FontSystem,
+    outline_cache: &mut OutlineCache,
     buffer: &mut Buffer,
     attrs: &Attrs<'_>,
     faux_face_baseline: FauxFaceBaseline,
@@ -2559,11 +2613,16 @@ fn collect_formula_glyph_seeds(
                 glyph_idx_in_line,
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
                 advance_px: 0.0,
-                faux: faux_style_for_glyph(
-                    params,
-                    inline_style_spans,
-                    layout_line_offsets,
-                    run.line_i,
+                faux: resolve_faux_counter_flag(
+                    faux_style_for_glyph(
+                        params,
+                        inline_style_spans,
+                        layout_line_offsets,
+                        run.line_i,
+                        glyph,
+                    ),
+                    font_system,
+                    outline_cache,
                     glyph,
                 ),
                 hanging_excluded: mark_hanging
@@ -2596,16 +2655,21 @@ fn collect_formula_glyph_seeds(
                 .unwrap_or(0);
             let style_offset = soft_hyphen_style_offset(&run, runs.peek(), layout_line_offsets);
             // Resolved before the struct literal below moves `hyphen_glyph`.
-            let hyphen_faux = style_offset
-                .map(|offset| {
-                    faux_style_at_offset(
-                        params,
-                        inline_style_spans,
-                        offset,
-                        hyphen_glyph.font_size,
-                    )
-                })
-                .unwrap_or(FauxGlyphStyle::NONE);
+            let hyphen_faux = resolve_faux_counter_flag(
+                style_offset
+                    .map(|offset| {
+                        faux_style_at_offset(
+                            params,
+                            inline_style_spans,
+                            offset,
+                            hyphen_glyph.font_size,
+                        )
+                    })
+                    .unwrap_or(FauxGlyphStyle::NONE),
+                font_system,
+                outline_cache,
+                &hyphen_glyph,
+            );
             out.push(FormulaGlyphSeed {
                 glyph: hyphen_glyph,
                 text_color: style_offset
