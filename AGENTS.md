@@ -317,12 +317,72 @@ Before changing source code, use this order:
 
 1. `README_AGENT.md` - overall architecture and global constraints.
 2. The target directory's `MODULE_README.md` and parent module readmes if they define boundaries.
-3. Headers of the specific files.
-4. Declaration comments of the functions, structs, and other items you touch.
-5. The code itself, its inline comments, and existing tests.
+3. A symbol-level map of the target files (Serena `get_symbols_overview` / `find_symbol`,
+   see "Code Navigation" below) instead of reading whole files.
+4. Headers of the specific files.
+5. Declaration comments of the functions, structs, and other items you touch.
+6. The bodies you actually need, their inline comments, and existing tests.
 
 For UI code, add one step before all of the above: read `egui-docs/README.md`. See
 "egui: never write it from memory" below.
+
+### Code Navigation: Serena (semantic) and grep (textual)
+
+The Serena MCP server is attached to this project (rust-analyzer + pyright). It is the
+navigation layer **between** the hierarchical documentation and reading code: the readmes
+say which module to look in, Serena says which symbols exist there and who calls them.
+It does not replace `grep`; the two cover different axes and both stay in use.
+
+**Use Serena for:**
+
+* mapping a file before reading it - `get_symbols_overview` returns the full symbol list
+  of a 5000-line file for a fraction of the cost of reading it;
+* mapping a type - `find_symbol` with `depth=1` on an `impl` block lists every method
+  **with start and end lines**, so the next read is one exact body, not a file;
+* reading one item - `find_symbol` with `include_body=True`, or `include_info=True` for
+  signature plus doc comment only;
+* call graph and blast radius - `find_referencing_symbols` reports the **enclosing
+  function** of each reference and filters out same-named symbols of other types; on a
+  very large result it degrades to a `file -> reference count` map, which is the cheapest
+  way to size a refactor;
+* trait implementations - `find_implementations` (pass the file where the trait is
+  *declared*, otherwise it errors out).
+
+**Use grep/Glob for** everything textual, which Serena cannot do at all here (its
+`search_for_pattern` is not exposed in this setup): `t!`/`tf!`/`tp!` keys and locale JSON,
+string literals, comments, `MODULE_README.md` and `dev-docs/`, and every lookup in
+`egui-docs/` - including the mandatory `egui-docs/api/symbols.txt` check.
+
+**Hard limitation - cfg-gated code.** rust-analyzer resolves only the active target
+(x86_64 linux). References inside `#[cfg(target_arch = "wasm32")]` or
+`#[cfg(target_os = "windows")]` code are **invisible** to `find_referencing_symbols`,
+which returns an empty result rather than an error - measured on this repository, a
+wasm-only function with five real call sites reported zero. The project has hundreds of
+such lines and must build for `x86_64-pc-windows-gnu` and wasm.
+
+Therefore: **whenever a change touches a symbol used in cfg-gated code, confirm the call
+sites with `grep`. An empty Serena reference result is never proof that a symbol is
+unused.** Symbol *listing* is unaffected - `get_symbols_overview` and `find_symbol` are
+syntactic and do show every cfg branch (overloads appear as `name[0]`, `name[1]`).
+
+**Other boundaries:**
+
+* `get_diagnostics_for_file` is a fast single-file sanity check, not a verification step.
+  It covers the active target only and does not run clippy. Section 16 stands unchanged:
+  `cargo check-all` and `cargo clippy --all-targets -- -D warnings` are still mandatory.
+* Serena's own `initial_instructions` claim that `Read`, `Grep` and `Edit` are forbidden
+  for code files. **That claim does not apply in this repository** and is overridden here:
+  reading hierarchical documentation, grepping for text, and verifying cfg-gated code are
+  required work. Prefer Serena where it is genuinely cheaper (the cases listed above);
+  do not let it block the rest.
+* Cost of the server: roughly one minute of language-server startup on the first call of
+  a session and several GB of resident memory while it runs. Worth it for exploration and
+  refactoring sessions; not worth forcing into a one-line documentation fix.
+* The index tracks files on disk immediately - no restart is needed after an edit, whether
+  the edit came from Serena's tools or from the built-in ones.
+
+Sub-agents inherit these tools. When delegating exploration, instruct explorers to map
+symbols with Serena and to fall back to `grep` for text and cfg-gated verification.
 
 ### egui: Never Write It From Memory
 
@@ -554,14 +614,19 @@ Always:
 
 1. Read the nearest `MODULE_README.md` and parent module readmes if they define boundaries.
 2. Read the file header.
-3. Read the declaration comments and inline comments of the items you will touch.
+3. Get a symbol map of the file (Serena `get_symbols_overview`) and read the declaration
+   comments and inline comments of the items you will touch. See "Code Navigation" in
+   section 3 for what Serena covers and where `grep` is still required.
 4. Understand the file responsibility and its role in the module.
 5. Check whether a similar function already exists.
 6. Check the change against architectural layers.
 7. Ensure the change does not break project contracts from `README_AGENT.md`.
-8. If the file contains UI code, read `egui-docs/README.md` and verify every egui API you
+8. Before changing a symbol's signature or removing it, find its call sites with
+   `find_referencing_symbols`, and additionally with `grep` if the symbol is reachable
+   from cfg-gated (wasm/windows) code, where reference search reports nothing.
+9. If the file contains UI code, read `egui-docs/README.md` and verify every egui API you
    are about to use against `egui-docs/api/symbols.txt`. Do not write egui from memory.
-9. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed, and update or add declaration and inline comments for the code you changed.
+10. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed, and update or add declaration and inline comments for the code you changed.
 
 ---
 
