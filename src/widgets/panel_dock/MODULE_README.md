@@ -13,7 +13,7 @@ gestures, the persistence layer (`persist.rs`) and the detached OS windows (`win
 production consumers are the three CANVAS program tabs: «Текст», whose eight tabs plus the canvas'
 own «Лента» live in seven default panels, «Клининг», whose «Клин» / «Инструменты клина» /
 «Выбранный инструмент» / «Быстрый клин найденного текста» join «Лента» in five default panels, and
-«Перевод», which declares «Лента» alone.
+«Перевод», whose «Последние персонажи» joins «Лента» in two default panels.
 The dedicated canvas-controls anchor those panels used to hang off is gone with the panel it named;
 only its STORED tag survives, decode-only, so an arrangement written by an older build still loads
 (see «A retired stored tag must keep DECODING» below).
@@ -168,6 +168,78 @@ the `id_salt`-revision hack in the old typing panels. Sizes live in `PanelNode::
   (`tab_landing`, `TabLanding`, `PanelDropTarget`) or a whole panel (`panel_landing`) lands on
   inside the receiving window. Entirely pure; the live geometry is fed in by
   `mod.rs::window_geometries`.
+
+### Transparent until hover
+A tab may declare `PanelTab::transparent_until_hover(true)`. The panel drawing that tab then keeps
+its CHROME invisible while the pointer is elsewhere. Chrome is everything drawn AROUND the content:
+
+* the `Frame` — background, border and shadow (`Frame::multiply_with_opacity`);
+* the collapse arrow, the drag grip and the resize grip (painter opacity, `faded`);
+* the BODY'S SCROLL BARS. They float over the content rather than belonging to it, and a bar the
+  user is DRAGGING keeps `interact_handle_opacity` however far the pointer leaves the panel — an
+  invisible panel would otherwise leave a bright bar on the bare canvas. They fade through the six
+  opacity fields of `ScrollStyle` (`faded_scroll_style`), set on the `Ui` the `ScrollArea` is shown
+  in and restored INSIDE the body, so a scroll area belonging to the tab's own content is content
+  and never fades;
+* the scroll area's edge-fade gradients need nothing: they are painted from `ui.stack().bg_color()`
+  (`scroll_area.rs:1564-1575`), which is the frame fill we already multiplied.
+
+The active tab's BODY is drawn exactly as always, so what is left on screen is the content floating
+on the canvas. Captions follow a rule of their own — a panel showing SEVERAL of them keeps them
+fully opaque even while invisible, because they are then the only thing that says the panel is there
+and the only way to switch tabs; a panel showing exactly one caption fades it with the rest. The two
+states are crossfaded with `Context::animate_bool_responsive`, keyed off the panel's own `Ui` id.
+
+The insertion marker, the dragged-caption preview and the docking/tear-out previews are deliberately
+NOT faded: every one of them is painted only while a gesture is in flight, and a gesture forces the
+panel visible anyway.
+
+Three properties are contractual:
+
+* **It is a per-frame declaration, not stored state.** It lives in `TabMeta` next to `visible`,
+  `persist.rs` knows nothing about it, and hovering never raises `dirty`. The routing decision —
+  "is this panel transparent this frame" — is taken by `plan_frame` (`PanelPlan::transparent`) and
+  is asked of the tab the panel actually DRAWS, so a transparent tab that is hidden, or merely not
+  the active one, leaves its panel opaque.
+* **It changes painting and NOTHING about geometry.** The header row is laid out identically in
+  both states, `Frame::multiply_with_opacity` scales colours only (never the inner margin, never
+  `stroke.width`), `faded_scroll_style` scales the six scroll-bar opacities and no size-bearing
+  field of `ScrollStyle` — so `allocated_width()` stays `0.0` and the no-oscillation rule below
+  holds unchanged — `HEADER_BODY_SPACING` is always applied, and every `Ui::interact` still runs. It
+  could not be otherwise: `PanelChrome` is ONE value for the whole `PanelDockState`, taken from the
+  last panel drawn, so a header that measured differently in one mode would move every panel of
+  every program tab and repaint forever — and `measured_size` is derived from the drawn frame minus
+  the body budget, so a changed header composition would land in the tab's stored measurement.
+* **An invisible panel still intercepts pointer input over its rect.** The `Area` keeps
+  `Order::Foreground` and `interactable(true)`, which canvas input gating
+  (`crate::input_util::pointer_over_floating_area`) and `Ui::rect_contains_pointer` both depend on.
+  Making the layer non-interactive would blind the panel to its own hover. This is an accepted
+  consequence of the mode, not a defect.
+
+**What forces a transparent panel visible** even with the pointer nowhere near it, so it cannot
+blink in the middle of a gesture aimed at it (`ChromeGate::shows_chrome`, pure and unit-tested):
+
+* `forced` — a tab payload in flight anywhere in the dock (every transparent panel must be visible
+  or there is nothing to aim the drop at) or a move of THIS panel (`DragPhase::Moving`). Both are
+  the driver's knowledge and arrive through `CollapsiblePanel::force_visible`;
+* `pressed_inside` — **a pointer button is held and the press STARTED inside the panel's rect**.
+  This is the general rule and the only one that covers a widget of the BODY: a scroll-bar handle, a
+  slider, a drag-adjusted value. None of them has an id the panel knows, and every one of them
+  routinely takes the cursor off the panel while the button is down. Built on
+  `PointerState::press_origin` + `any_down`, which egui writes on press and clears on release and
+  which a `PointerGone` deliberately leaves alone — so the latch covers a drag pulled out of the
+  window and drops the instant the gesture ends. A press that began on the canvas never lights the
+  panel, however far the cursor then travels over it;
+* `gesture` — a drag of one of the panel's own CHROME zones, asked of the `Context` by id
+  (`ms_panel_dock_move`, `…_move_spare`, `…_resize`). Kept ALONGSIDE `pressed_inside` rather than
+  folded into it: those gestures move the rect out from under the press origin, which is a fixed
+  screen point. A resize that shrinks the panel past the corner it was grabbed at is the standing
+  example;
+* `menu_open` — any popup is open (`Popup::is_any_open`; a tab caption's context-menu id is not
+  derivable, so the question is asked of the whole context and errs towards showing).
+
+`Response::hovered()` is not usable for any of this: while a button is held egui reports only the
+dragged widget as hovered.
 
 ### Gestures (plan §4.8)
 Two gestures, both decided in `drag.rs` and applied by the driver through the model:
@@ -646,6 +718,9 @@ plain `fn` and not a closure.
   - `visible(false)` keeps the tab's slot: its header is not shown, and a panel whose tabs are all
     hidden is not drawn — but neither is deleted. Deletion is a user action, never a visibility
     consequence.
+  - `transparent_until_hover(true)` asks the panel to hide its chrome until the pointer is over it
+    (see «Transparent until hover» above). Like `visible`, it is re-declared every frame, is never
+    stored, and applies only while the declaring tab is the one being DRAWN.
   - A tab present in the layout but NOT declared this frame (another program tab's, or one the
     caller skipped) is treated exactly like a hidden one.
   - A panel with nothing to draw is dropped from the layout the SOLVER sees for that frame, and its
@@ -717,6 +792,13 @@ plain `fn` and not a closure.
   contributes, which minimum applies), edit `plan_frame` / `tab_request` in `mod.rs`.
 - To change how a panel LOOKS (header, collapse arrow, scroll behaviour, resize grip), edit
   `panel.rs`.
+- To change WHEN a transparent-until-hover panel shows its chrome, edit `ChromeGate::shows_chrome`
+  in `panel.rs`; to change WHAT fades with it, edit `CollapsiblePanel::chrome_opacity` /
+  `caption_opacity` / `faded_scroll_style` / the `faded` call sites there. To change which panel is transparent at all,
+  edit `plan_frame` in `mod.rs` (`PanelPlan::transparent`) and `TabMeta`; to change what forces
+  visibility from outside the widget, edit `force_visible` at the `CollapsiblePanel` call site in
+  `draw_host`. Both rules are pure and unit-tested — keep them that way rather than growing a
+  condition inside the drawing loop.
 - To change what a caller may declare about a tab, edit `tab.rs` and the `TabMeta` it fills in
   `mod.rs`.
 - To change the frame model (which sizes are fed to the solver, which panels are solved, which tab

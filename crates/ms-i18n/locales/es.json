@@ -3424,6 +3424,7 @@
   "translation.tab.quick_ocr_no_text_status": "OCR rápido: no se encontró texto",
   "translation.tab.quick_ocr_result_status": "OCR rápido: {manual_text}",
   "translation.tab.ready_status": "Listo para trabajar",
+  "translation.tab.recent_characters_tab": "Personajes recientes",
   "translation.tab.recognition_done_blocks_status": "Reconocimiento completado. Bloques reconocidos: {recognized}/{total}",
   "translation.tab.recognition_done_no_text_status": "Reconocimiento completado, no se encontró texto",
   "translation.tab.recognition_error": "error de reconocimiento: {error}",

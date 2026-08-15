@@ -129,8 +129,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   for the MAIN window alone.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
-  adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — it can
-  no longer share `canvas::ribbon_only_dock_layout` with «Перевод», which names «Лента» alone — and
+  adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — every
+  canvas program tab has one, there is no shared ribbon-only builder to fall back on — and
   it is registered under `AppTab::Cleaning.key()` in `app.rs::restore_panel_dock` as well; a builder
   wired in only one of the two places silently resets the stored arrangement.
 - A dock tab body runs INSIDE `CanvasView::draw`. It edits the state its own widgets own — the

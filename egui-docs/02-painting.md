@@ -183,6 +183,51 @@ Where premultiplication bites:
 Scalar helpers: `linear_f32_from_gamma_u8` (`ecolor-0.35.0/src/lib.rs:97`),
 `gamma_u8_from_linear_f32` (:114), `hsv_from_rgb`/`rgb_from_hsv` (`ecolor-0.35.0/src/hsva.rs:191/:215`).
 
+## Fading things out without touching layout
+
+Three different tools; picking the wrong one changes geometry or interactivity.
+
+```rust
+Frame::multiply_with_opacity(t)  // egui-0.35.0/src/containers/frame.rs:313-318
+Ui::set_opacity(t) / Ui::multiply_opacity(t) / Ui::opacity()   // ui.rs:560 / :567 / :575
+Ui::set_invisible()              // ui.rs:537-540
+```
+
+- **`Frame::multiply_with_opacity(t)` scales `fill`, `stroke.color` and `shadow.color` — and
+  nothing else.** `inner_margin`, `outer_margin` and `stroke.WIDTH` survive untouched, so a frame
+  faded this way allocates exactly what it allocated before. At `t == 0.0` the shadow disappears
+  with the rest; no separate `Shadow::NONE` is needed.
+- **`Ui::set_opacity(t)` is a property of the `Ui`'s `Painter`, not of its layout.** Everything
+  painted after it — including child `Ui`s, which copy the painter — is multiplied by `t`
+  (`egui-0.35.0/src/painter.rs:201-221`); at `t == 0.0` `Painter::add` emits `Shape::Noop`, so a fully faded
+  element costs nothing. Nothing about allocation or the cursor changes, which makes
+  `let saved = ui.opacity(); ui.set_opacity(saved * t); …; ui.set_opacity(saved);` the way to fade
+  ONE widget of a row without moving anything. `Ui::scope` would also work visually but allocates a
+  child `Ui` and advances the parent's cursor by it — a layout change.
+- **`Ui::set_invisible()` is not "opacity 0".** It also calls `Ui::disable()`, so the widgets stop
+  responding. Use it only when invisible AND dead is what you mean.
+
+A `ScrollArea`'s bars are the exception that neither tool reaches: they are painted by the
+container itself, from the `ScrollStyle` of the `Ui` the area is shown in, one frame-level
+`ui.painter()` call each (`egui-0.35.0/src/containers/scroll_area.rs:1268`, `:1469-1519`). Fading
+them means scaling the six floating-bar opacities — `dormant`/`active`/`interact` × handle/background
+(`style.rs:491-579`) — **before** creating the `ScrollArea`, and touching nothing that decides a
+size, or `ScrollStyle::allocated_width()` (`style.rs:652-658`) changes and the bar starts stealing
+room from the content. Note that egui hard-codes both opacities to `1.0` for a SOLID style
+(`scroll_area.rs:1483-1484`, `:1495-1496`), so this only works on a floating one — which is egui's
+default (`style.rs:639-650`). The area's edge-fade gradients need nothing: they are painted from
+`ui.stack().bg_color()` (`scroll_area.rs:1564-1575`), i.e. from the enclosing `Frame`'s fill, which
+`multiply_with_opacity` has already faded.
+
+Repo example: `src/widgets/panel_dock/panel.rs` (`chrome_opacity`, `faded`, `faded_scroll_style`)
+hides a dock panel's frame, grips and body scroll bars until the pointer is over it while keeping
+its geometry and every gesture bit-identical to the opaque state.
+
+Crossfading between the two states is `Context::animate_bool_responsive(id, value)`
+(`context.rs:3099`): it requests the repaints the animation needs by itself (`:3145-3148`) and
+returns the TARGET value on the first call for a given id
+(`egui-0.35.0/src/animation_manager.rs:38-46`), so nothing flashes on the frame it first appears.
+
 ## ColorImage in 0.35 — the shape changed
 
 ```rust
@@ -282,3 +327,5 @@ points × `pixels_per_point`.
   (`upload_textures_incremental`, :1718).
 - Mask textures (`NEAREST`): `src/tabs/cleaning/tools/base.rs`, `src/tabs/translation/tab.rs`.
 - Anything that must also be exported: keep the `Arc<image::RgbaImage>` side alive (README_AGENT.md:711).
+- Fading a widget or a frame in/out without moving anything: `src/widgets/panel_dock/panel.rs`
+  (`faded`, `chrome_opacity`); see "Fading things out without touching layout" above.

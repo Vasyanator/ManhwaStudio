@@ -266,9 +266,11 @@ X range before the old overflow point.
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
 - `CANVAS_RIBBON_TAB` (`mod.rs`) is the ONE definition of the controls tab's identity, and the
   canvas does NOT own the panel it is drawn in. The canvas also owns the tab's DECLARATION
-  (`declare_ribbon_tab`) and the default one-panel arrangement of a program tab that declares
-  «Лента» and nothing else (`ribbon_only_dock_layout`, «Перевод»), so the three call sites cannot
-  drift. A tab that wants to
+  (`declare_ribbon_tab`), so the three call sites cannot drift. It owns no DEFAULT ARRANGEMENT:
+  every canvas program tab declares tabs of its own, and a default layout is the dictionary its
+  stored tab keys are resolved against, so each builds its own
+  (`translation_default_dock_layout`, `cleaning_default_dock_layout`, `typing_default_dock_layout`)
+  and all three give the ribbon panel the same id and left-edge anchor. A tab that wants to
   place other floating UI under that panel asks the DOCK for the rect
   (`PanelDockOutput::tab_rect(CANVAS_RIBBON_TAB)`), which answers for the MAIN window alone: it is
   `None` while the tab is hidden AND while the user keeps it in a detached sub-window, whose rect
@@ -386,11 +388,11 @@ X range before the old overflow point.
 - To change page layout, scrolling, zooming, or context menus, edit `scene.rs`.
 - To change what the «Лента» tab SHOWS, edit `scene.rs::draw_ribbon_tab_body`; to change how big it
   starts or how small it may get, edit the two `CANVAS_RIBBON_TAB_*_SIZE_PX` constants in `mod.rs`.
-  Where the panel holding it sits by default is a per-program-tab decision: «Текст» and «Клининг»
-  have their own builders (`typing_default_dock_layout`, `cleaning_default_dock_layout`), because a
-  default layout must name every tab its program tab declares; «Перевод» declares «Лента» alone and
-  uses `mod.rs::ribbon_only_dock_layout`. To change how the tab is DECLARED (title, size
-  bounds, body), edit `mod.rs::declare_ribbon_tab`, which all three tabs call.
+  Where the panel holding it sits by default is a per-program-tab decision, and all three tabs have
+  their own builder (`translation_default_dock_layout`, `cleaning_default_dock_layout`,
+  `typing_default_dock_layout`), because a default layout must name every tab its program tab
+  declares. To change how the tab is DECLARED (title, size bounds, body), edit
+  `mod.rs::declare_ribbon_tab`, which all three tabs call.
 - To change source page GPU residency or NEAREST inspection behavior, edit `scene.rs`,
   `mod.rs`, and the source-page texture owner in `app.rs`.
 - To change bubble editing behavior, start in `bubble_runtime.rs` and the relevant

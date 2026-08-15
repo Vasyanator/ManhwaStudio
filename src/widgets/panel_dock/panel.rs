@@ -18,6 +18,7 @@ Key structures:
 - `CollapsiblePanel`: the builder.
 - `CollapsiblePanelOutput`: everything the frame driver has to apply afterwards.
 - `TabDrop`: a tab released over this panel's header strip.
+- `ChromeGate`: the pure rule deciding whether a transparent panel is visible.
 
 Key functions:
 - `CollapsiblePanel::show`: draws the panel and runs the active tab's body.
@@ -66,6 +67,19 @@ Notes:
 - `egui::Resize` is deliberately not used: its size lives in egui memory, which
   is exactly what forced the `id_salt`-revision hack in the old typing panels.
   The size lives in our model instead.
+- A panel may be declared TRANSPARENT UNTIL HOVER, which fades its frame, its
+  collapse arrow, its two grips and the BODY'S SCROLL BARS out while the pointer
+  is elsewhere (and its captions too, but only when it shows exactly one of
+  them). Everything drawn AROUND the content is chrome; the content itself, and
+  any scroll area of its own, never fades. The mode is
+  PAINTING ONLY: same header row, same `Frame` margins and stroke WIDTH, same
+  `Ui::interact` calls, same `Order::Foreground` `Area`. Nothing else is
+  possible — the dock's `PanelChrome` is one global value taken from the last
+  panel drawn, so a header that measured differently in one mode would move
+  every panel of every program tab and repaint forever. The corollary is that an
+  invisible panel still intercepts pointer input over its rect; that is the
+  accepted cost of leaving the `Area` interactive, which the canvas' own input
+  gating depends on.
 - The body FILLS its budget on both axes and scrolls whatever does not fit, and
   what it reports back is the CONTENT's size, not the drawn one. Those two rules
   are one design: the panel is as tall as its largest tab, so a smaller tab must
@@ -238,6 +252,8 @@ pub struct CollapsiblePanel<'a> {
     active_tab: Option<TabId>,
     min_size: Vec2,
     accepts_drop: bool,
+    transparent_until_hover: bool,
+    force_visible: bool,
     move_targets: &'a [MoveTargetEntry<'a>],
 }
 
@@ -258,8 +274,54 @@ impl<'a> CollapsiblePanel<'a> {
             active_tab: None,
             min_size: Vec2::new(PANEL_MIN_WIDTH, COLLAPSED_PANEL_HEIGHT),
             accepts_drop: true,
+            transparent_until_hover: false,
+            force_visible: false,
             move_targets: &[],
         }
+    }
+
+    /// Whether this panel hides its own CHROME while the pointer is elsewhere.
+    ///
+    /// Chrome is everything drawn AROUND the content: the panel's frame
+    /// (background, border, shadow), the collapse arrow, the drag grip, the
+    /// resize grip and the body's SCROLL BARS (see [`faded_scroll_style`]). The
+    /// active tab's body never fades — nor does a scroll area of its own — and
+    /// the tab captions fade only when the panel shows exactly one of them (see
+    /// [`caption_opacity`]).
+    ///
+    /// **The mode changes painting and nothing else.** The header strip is laid
+    /// out identically, [`egui::Frame`] keeps its inner margin and its stroke
+    /// WIDTH, every `Ui::interact` still runs and the panel keeps its
+    /// `Order::Foreground` `Area`, so an invisible panel occupies the same rect,
+    /// reports the same [`PanelChrome`] and the same measurement, and still
+    /// intercepts pointer input over its rect. That is a hard requirement, not a
+    /// simplification: `PanelChrome` is global to the whole dock state and taken
+    /// from the last panel drawn, so a panel whose header measured differently
+    /// would move every other panel of every program tab and repaint forever.
+    ///
+    /// The driver passes what the tab being DRAWN declared
+    /// ([`super::PanelTab::transparent_until_hover`]).
+    #[must_use]
+    pub fn transparent_until_hover(mut self, transparent: bool) -> Self {
+        self.transparent_until_hover = transparent;
+        self
+    }
+
+    /// Forces a transparent panel to show its chrome this frame wherever the
+    /// pointer is. Ignored by a panel that is not transparent.
+    ///
+    /// The driver raises it for the gestures the widget cannot see the whole of:
+    /// a tab is in flight ANYWHERE in the dock (every transparent panel has to
+    /// be visible, or there is nothing to aim the drop at) and THIS panel is
+    /// being moved (the panel is pinned to the dock area's border while the
+    /// cursor is pulled past it, so the cursor is regularly not over the panel
+    /// it drags). Gestures the widget CAN see — a press held anywhere in its own
+    /// rect, a drag of one of its chrome zones — need no help from the driver;
+    /// see [`ChromeGate`].
+    #[must_use]
+    pub fn force_visible(mut self, force: bool) -> Self {
+        self.force_visible = force;
+        self
     }
 
     /// Destinations the «Переместить в окно →» submenu offers, in menu order.
@@ -371,7 +433,19 @@ impl<'a> CollapsiblePanel<'a> {
         outer_width: f32,
         body: impl FnOnce(&mut egui::Ui),
     ) -> CollapsiblePanelOutput {
-        let frame = egui::Frame::popup(ui.style());
+        // Decided BEFORE anything is painted: `egui::Frame` takes its colours as
+        // builder arguments, so how faded the chrome is has to be known before
+        // `Frame::show` runs.
+        let chrome_opacity = self.chrome_opacity(ui);
+        // `multiply_with_opacity` scales `fill`, `stroke.color` and
+        // `shadow.color` and NOTHING else
+        // (`egui-0.35.0/src/containers/frame.rs:313-318`). The inner margin and
+        // the stroke WIDTH survive it untouched, which is exactly what keeps the
+        // transparent mode geometry-neutral: `margin`, `border`, the body budget
+        // and the reported `PanelChrome` below are the same numbers in both
+        // states. At `0.0` the shadow disappears with the rest, so no separate
+        // `Shadow::NONE` is needed.
+        let frame = egui::Frame::popup(ui.style()).multiply_with_opacity(chrome_opacity);
         let margin = frame.inner_margin.sum();
         // `Frame` draws its stroke OUTSIDE the inner margin and allocates
         // `content + inner_margin + stroke` in the parent
@@ -433,7 +507,13 @@ impl<'a> CollapsiblePanel<'a> {
                 } else {
                     ("▼", t!("widgets.panel_dock.collapse_panel_tooltip"))
                 };
-                if ui.small_button(icon).on_hover_text(hint).clicked() {
+                // The collapse arrow is chrome and fades with the frame. Faded,
+                // never hidden: it keeps its slot in the row, so the strip's
+                // height — this panel's `PanelChrome` — cannot depend on the
+                // mode.
+                if faded(ui, chrome_opacity, |ui| {
+                    ui.small_button(icon).on_hover_text(hint).clicked()
+                }) {
                     toggle_collapsed = true;
                 }
                 // Reserve the drag handle's slot right of the collapse button and
@@ -452,14 +532,17 @@ impl<'a> CollapsiblePanel<'a> {
                 // against the handle and the two gestures would share a pixel.
                 ui.add_space(HEADER_HANDLE_GAP);
                 handle_span = Some((handle_left, handle_right));
-                for tab in self.tabs {
-                    header_rects.push(self.tab_header(
-                        ui,
-                        tab,
-                        &mut activated_tab,
-                        &mut move_tab,
-                    ));
-                }
+                let captions = caption_opacity(self.tabs.len(), chrome_opacity);
+                faded(ui, captions, |ui| {
+                    for tab in self.tabs {
+                        header_rects.push(self.tab_header(
+                            ui,
+                            tab,
+                            &mut activated_tab,
+                            &mut move_tab,
+                        ));
+                    }
+                });
             });
             header_height = header.response.rect.height();
             header_row = Some(header.response.rect);
@@ -482,6 +565,21 @@ impl<'a> CollapsiblePanel<'a> {
             let body_bottom =
                 self.rect.bottom() - frame.inner_margin.bottomf() - frame.stroke.width;
             let body_max_height = (body_bottom - body_top).max(PANEL_MIN_BODY_HEIGHT);
+            // THE SCROLL BARS ARE CHROME. They float OVER the body — an outline
+            // around the content, not part of it — and a bar the user is
+            // dragging stays fully lit (`interact_handle_opacity`) however far
+            // the pointer wanders off the panel, so a transparent panel would
+            // leave a bright bar floating on the bare canvas. `ScrollArea` reads
+            // this style from the `Ui` it is shown in, both for its sizes
+            // (`scroll_area.rs:756`) and for the two colours it paints
+            // (`:1268`, `:1469-1519`), so fading the style here is the whole
+            // fix. Restored INSIDE the body: a scroll area of the tab's own
+            // content is content, and content never fades.
+            let unfaded_scroll = ui.spacing().scroll;
+            let fade_bars = chrome_opacity < 1.0;
+            if fade_bars {
+                ui.spacing_mut().scroll = faded_scroll_style(unfaded_scroll, chrome_opacity);
+            }
             let scroll = egui::ScrollArea::both()
                 .id_salt(("ms_panel_dock_body", self.id_scope, active.as_str()))
                 .max_height(body_max_height)
@@ -506,7 +604,15 @@ impl<'a> CollapsiblePanel<'a> {
                 // into the panel's size, because the measurement below is taken
                 // from the content, never from what the body was given.
                 .auto_shrink([false, false])
-                .show(ui, body);
+                .show(ui, |ui| {
+                    if fade_bars {
+                        ui.spacing_mut().scroll = unfaded_scroll;
+                    }
+                    body(ui);
+                });
+            if fade_bars {
+                ui.spacing_mut().scroll = unfaded_scroll;
+            }
             // `ScrollAreaOutput::inner_rect` is the rect the body was given
             // BEFORE any auto-shrink adjustment (`scroll_area.rs:1040`), i.e.
             // exactly the budget above — which is what makes the subtraction
@@ -524,6 +630,7 @@ impl<'a> CollapsiblePanel<'a> {
                 ui,
                 handle_zone(row, span, content_right),
                 spare_move_zone(row, content_right),
+                chrome_opacity,
             ),
             None => HeaderMenuOutcome::default(),
         };
@@ -537,7 +644,7 @@ impl<'a> CollapsiblePanel<'a> {
         });
         let tab_drop = header_row
             .and_then(|row| self.tab_drop_zone(ui, row, content_right, &header_rects));
-        let size_override = self.resize_grip(ui, frame_rect);
+        let size_override = self.resize_grip(ui, frame_rect, chrome_opacity);
         // What the solver has to assume next frame. `collapsed_height` is the
         // outer height a collapsed panel occupies (border + margins + header);
         // the expanded panel additionally spends `HEADER_BODY_SPACING` before
@@ -731,11 +838,16 @@ impl<'a> CollapsiblePanel<'a> {
     /// Returns everything the two zones and their shared context menu asked for
     /// this frame ([`HeaderMenuOutcome`]). The zones deliberately exclude the
     /// collapse button and every tab caption: those are their own gestures.
+    ///
+    /// `chrome_opacity` fades the painted grip only. Both zones are SENSED in
+    /// every state: an invisible panel is still grabbed, docked and given a
+    /// context menu by exactly the same pixels.
     fn header_handle(
         &self,
         ui: &mut egui::Ui,
         handle: Rect,
         spare: Option<Rect>,
+        chrome_opacity: f32,
     ) -> HeaderMenuOutcome {
         let mut menu = HeaderMenuOutcome::default();
         let grip = self.move_zone(ui, handle, "ms_panel_dock_move", &mut menu);
@@ -748,16 +860,18 @@ impl<'a> CollapsiblePanel<'a> {
         let stroke = Stroke::new(1.0, color);
         let center = handle.center();
         let half = HEADER_GRIP_LINE_LENGTH * 0.5;
-        for step in [-1.0_f32, 1.0] {
-            let y = center.y + step * HEADER_GRIP_LINE_SPACING * 0.5;
-            ui.painter().line_segment(
-                [
-                    Pos2::new(center.x - half, y),
-                    Pos2::new(center.x + half, y),
-                ],
-                stroke,
-            );
-        }
+        faded(ui, chrome_opacity, |ui| {
+            for step in [-1.0_f32, 1.0] {
+                let y = center.y + step * HEADER_GRIP_LINE_SPACING * 0.5;
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(center.x - half, y),
+                        Pos2::new(center.x + half, y),
+                    ],
+                    stroke,
+                );
+            }
+        });
 
         menu.drag_started |= grip.drag_started();
         if let Some(rect) = spare {
@@ -874,7 +988,15 @@ impl<'a> CollapsiblePanel<'a> {
     /// grabbed, which are kept in egui's per-frame data store for the duration
     /// of the drag. Nothing about the panel's content or its currently drawn
     /// rect enters the answer — see [`resized_outer_size`] for why that matters.
-    fn resize_grip(&self, ui: &mut egui::Ui, frame_rect: Rect) -> Option<Vec2> {
+    ///
+    /// `chrome_opacity` fades the painted corner only: the grip is sensed in
+    /// every state, so an invisible panel is still resizable.
+    fn resize_grip(
+        &self,
+        ui: &mut egui::Ui,
+        frame_rect: Rect,
+        chrome_opacity: f32,
+    ) -> Option<Vec2> {
         if self.collapsed {
             return None;
         }
@@ -893,17 +1015,19 @@ impl<'a> CollapsiblePanel<'a> {
             ui.visuals().widgets.inactive.fg_stroke.color
         };
         let stroke = Stroke::new(1.0, color);
-        let painter = ui.painter();
-        for step in 1_u8..=3 {
-            let inset = RESIZE_GRIP_SIZE * (f32::from(step) / 4.0);
-            painter.line_segment(
-                [
-                    Pos2::new(grip_rect.right() - inset, grip_rect.bottom()),
-                    Pos2::new(grip_rect.right(), grip_rect.bottom() - inset),
-                ],
-                stroke,
-            );
-        }
+        faded(ui, chrome_opacity, |ui| {
+            let painter = ui.painter();
+            for step in 1_u8..=3 {
+                let inset = RESIZE_GRIP_SIZE * (f32::from(step) / 4.0);
+                painter.line_segment(
+                    [
+                        Pos2::new(grip_rect.right() - inset, grip_rect.bottom()),
+                        Pos2::new(grip_rect.right(), grip_rect.bottom() - inset),
+                    ],
+                    stroke,
+                );
+            }
+        });
 
         if response.drag_stopped() {
             // The gesture is over; its anchor must not survive into the next one.
@@ -931,6 +1055,249 @@ impl<'a> CollapsiblePanel<'a> {
         // rather than resizing from a stale one.
         let anchor = ui.ctx().data(|data| data.get_temp::<ResizeAnchor>(grip_id))?;
         resized_outer_size(anchor, pointer, self.min_size)
+    }
+
+    /// Opacity every chrome element of this panel is painted at this frame, in
+    /// `0.0..=1.0`. Always `1.0` unless
+    /// [`CollapsiblePanel::transparent_until_hover`] was set.
+    ///
+    /// The two states are crossfaded with
+    /// [`egui::Context::animate_bool_responsive`] (`egui-0.35.0/src/context.rs:3099`),
+    /// which requests the repaints the animation needs by itself
+    /// (`:3145-3148`) and returns the TARGET value on the first call for an id
+    /// (`egui-0.35.0/src/animation_manager.rs:38-46`), so a panel never flashes
+    /// on the frame it is first drawn. The animation id derives from the panel's
+    /// own `Ui` id — the layout key plus the `PanelId` — never from a caption.
+    ///
+    /// Everything it reads is available BEFORE the panel draws, which is the
+    /// point: the frame's colours are a builder argument, the ids of the three
+    /// chrome zones are deterministic and the pointer press is raw input, so no
+    /// widget has to exist yet for the answer to be exact.
+    fn chrome_opacity(&self, ui: &egui::Ui) -> f32 {
+        // This is the `!transparent` arm of [`ChromeGate::shows_chrome`], taken
+        // early so an ordinary panel touches nothing at all: no animation entry
+        // per panel, no popup or drag lookup on an idle frame.
+        if !self.transparent_until_hover {
+            return 1.0;
+        }
+        let ctx = ui.ctx();
+        let base = ui.id();
+        // A gesture on one of this panel's own CHROME zones. Asked of the
+        // CONTEXT by id rather than of a `Response`, because the answer is
+        // needed before the zones are sensed — and because `Response::hovered()`
+        // is useless here anyway: while a button is held egui reports only the
+        // dragged widget as hovered (`egui-0.35.0/src/interaction.rs:239-243`),
+        // so a panel would vanish from under its own resize grip. The header
+        // strip's drop zone is deliberately absent: it senses hover only, and a
+        // drop is already covered by the driver's `force_visible`.
+        let gesture = [
+            "ms_panel_dock_move",
+            "ms_panel_dock_move_spare",
+            "ms_panel_dock_resize",
+        ]
+        .into_iter()
+        .any(|key| ctx.is_being_dragged(base.with(key)));
+        // Everything the pointer press says, read once. `press_origin` is set on
+        // every press and cleared on every release
+        // (`egui-0.35.0/src/input_state/mod.rs:1146`, `:1194`), and a
+        // `PointerGone` clears NEITHER it nor `down` (`:1200-1206`) — which is
+        // exactly what makes it survive a drag pulled out of the window.
+        let (any_down, press_origin) =
+            ctx.input(|input| (input.pointer.any_down(), input.pointer.press_origin()));
+        let gate = ChromeGate {
+            transparent: self.transparent_until_hover,
+            forced: self.force_visible,
+            // Occlusion-aware, unlike a raw pointer read: a panel covered by
+            // another one does not light up through it
+            // (`egui-0.35.0/src/context.rs:3036-3057`).
+            pointer_inside: ui.rect_contains_pointer(self.rect),
+            // The generic form of "a gesture aimed at this panel is in flight",
+            // and the only one that reaches a widget of the BODY: a scroll
+            // handle, a slider, a drag-adjusted value. None of them has an id
+            // this widget knows, and all of them routinely take the cursor off
+            // the panel while the button is held.
+            pressed_inside: press_started_inside(self.rect, any_down, press_origin),
+            gesture,
+            // `Popup::is_any_open`, not the exact `Popup::is_id_open`. A context
+            // menu's id is `response.id.with("popup")`
+            // (`egui-0.35.0/src/containers/popup.rs:639`, `:653`), which IS
+            // derivable for the two move zones — but not for a tab caption,
+            // whose `Button::selectable` takes its id from the `Ui`'s auto-id
+            // counter. A caption's «Переместить в окно →» menu has to keep its
+            // panel visible just as much as the header's does, so the question
+            // is asked of the whole context. The over-approximation costs a
+            // transparent panel a moment of visibility while an unrelated popup
+            // is open somewhere, which errs towards SHOWING the panel — the only
+            // direction that cannot lose the user's UI.
+            menu_open: egui::Popup::is_any_open(ctx),
+        };
+        ctx.animate_bool_responsive(base.with("ms_panel_dock_transparency"), gate.shows_chrome())
+    }
+}
+
+/// The per-frame facts that decide whether a transparent-until-hover panel shows
+/// its chrome. Kept as a value so the rule stays a pure, testable function of
+/// them instead of a condition buried in the drawing code.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct ChromeGate {
+    /// The panel declared [`CollapsiblePanel::transparent_until_hover`].
+    transparent: bool,
+    /// The driver forced visibility ([`CollapsiblePanel::force_visible`]).
+    forced: bool,
+    /// The pointer is over the panel's rect, occlusion taken into account.
+    pointer_inside: bool,
+    /// A pointer button is held and the press that started it landed inside the
+    /// panel's rect (see [`press_started_inside`]).
+    ///
+    /// This is the general "the user is doing something to this panel" fact, and
+    /// the only one that covers a widget of the BODY — a scroll-bar handle, a
+    /// slider, a drag-adjusted value. Such a gesture has no id this widget knows
+    /// and routinely drags the cursor off the panel, so without it the whole
+    /// panel would fade out in the middle of the user's own drag.
+    pressed_inside: bool,
+    /// A drag of one of this panel's own CHROME zones (the two move zones or the
+    /// resize grip) is in flight.
+    ///
+    /// It is NOT subsumed by [`ChromeGate::pressed_inside`], although those
+    /// three zones are all inside the panel's rect: a gesture on them MOVES the
+    /// rect out from under the press origin, which is a fixed screen point. A
+    /// resize that shrinks the panel past the corner it was grabbed at is the
+    /// standing example — the press origin ends up outside the new rect while
+    /// the drag is still going. (The move gesture is additionally covered by
+    /// [`ChromeGate::forced`], but the resize is not reported to the driver at
+    /// all.) The converse does not hold either, so both are kept.
+    gesture: bool,
+    /// A context menu (or any other popup) is open.
+    menu_open: bool,
+}
+
+impl ChromeGate {
+    /// `true` when the panel paints its frame, its collapse arrow and its grips
+    /// at full opacity this frame.
+    ///
+    /// A panel that never asked for the mode always shows them; a transparent
+    /// one shows them while any single reason to be visible holds. The reasons
+    /// are ORed on purpose: each of them is "the user is doing something with
+    /// this panel", and the union is what keeps the panel from blinking when one
+    /// reason hands over to the next (pointer enters → button goes down → the
+    /// drag pulls the cursor outside → the panel itself moves away).
+    #[must_use]
+    fn shows_chrome(self) -> bool {
+        !self.transparent
+            || self.forced
+            || self.pointer_inside
+            || self.pressed_inside
+            || self.gesture
+            || self.menu_open
+    }
+}
+
+/// `true` while a pointer button is held AND the press that started the current
+/// gesture landed inside `rect`.
+///
+/// This is the widget-agnostic form of "the user is dragging something of this
+/// panel". It is what keeps a transparent panel lit while the user works a
+/// widget of its BODY — a scroll-bar handle, a slider, a drag-adjusted value —
+/// and takes the cursor off the panel doing so; none of those has an id the
+/// panel could ask about.
+///
+/// Both inputs come from [`egui::PointerState`], and their exact semantics are
+/// what make the rule a latch that cannot get stuck:
+/// * `press_origin` is written on every press and cleared on every release
+///   (`egui-0.35.0/src/input_state/mod.rs:1146`, `:1194`), and the release frame
+///   clears `down` too (`:1197`), so the latch drops exactly when the gesture
+///   ends and never one frame later;
+/// * a `PointerGone` clears NEITHER (`:1200-1206`, deliberately, so a drag
+///   survives leaving the window), which is precisely the case this rule exists
+///   for.
+///
+/// A press that started OUTSIDE `rect` never lights the panel, however far the
+/// cursor travels afterwards — `press_origin` is where the button went down, not
+/// where the pointer is now. Two accepted imprecisions: with several buttons the
+/// latest press wins (egui keeps one origin), and the test is geometric, so a
+/// press on a panel stacked ON TOP of this one at that point also counts. Both
+/// err towards showing a panel, which is the only direction that cannot lose the
+/// user's UI.
+#[must_use]
+fn press_started_inside(rect: Rect, any_down: bool, press_origin: Option<Pos2>) -> bool {
+    any_down && press_origin.is_some_and(|origin| rect.contains(origin))
+}
+
+/// Runs `draw` with the painter of `ui` faded by `opacity` and restores the
+/// previous opacity afterwards.
+///
+/// `opacity` MULTIPLIES what the `Ui` already has, so an `Area` that is itself
+/// fading in is not overridden.
+///
+/// Deliberately not [`egui::Ui::scope`]: a scope allocates a child `Ui` and
+/// advances the parent's cursor by what that child used, which is a layout
+/// change — and this widget's contract is that the transparent mode changes
+/// nothing about geometry. Opacity lives on the painter alone
+/// (`egui-0.35.0/src/ui.rs:560`), so setting and restoring it paints differently
+/// and lays out identically. It is also not [`egui::Ui::set_invisible`]
+/// (`egui-0.35.0/src/ui.rs:537-540`), which additionally DISABLES the `Ui`: a
+/// faded panel stays fully interactive.
+fn faded<R>(ui: &mut egui::Ui, opacity: f32, draw: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let restore = ui.opacity();
+    ui.set_opacity(restore * opacity);
+    let result = draw(ui);
+    ui.set_opacity(restore);
+    result
+}
+
+/// Opacity the tab captions of a panel are painted at, given how many captions
+/// its header strip shows and how faded its chrome is.
+///
+/// A panel showing SEVERAL captions keeps them fully opaque even when it is
+/// invisible: they are then the only thing on screen that says the panel is
+/// there and which of its tabs is showing, and captions the user cannot see are
+/// captions the user cannot click. A panel showing exactly one caption has
+/// nothing to choose between, so that caption fades with the rest of the chrome
+/// and the body is left alone on the canvas.
+#[must_use]
+fn caption_opacity(shown_captions: usize, chrome_opacity: f32) -> f32 {
+    if shown_captions > 1 {
+        1.0
+    } else {
+        chrome_opacity
+    }
+}
+
+/// `scroll` with the six opacities of a FLOATING scroll bar multiplied by
+/// `opacity`, and every other field returned untouched.
+///
+/// `ScrollArea` multiplies `*_handle_opacity` straight into the handle's colour
+/// and `*_background_opacity` into the bar's background
+/// (`egui-0.35.0/src/containers/scroll_area.rs:1469-1519`), so scaling the six
+/// of them is exactly "paint this bar `opacity` as strongly" and nothing else.
+///
+/// **Not one size-bearing field is touched** — `floating`, `bar_width`,
+/// `floating_width`, `floating_allocated_width`, `bar_inner_margin`,
+/// `bar_outer_margin`, `handle_min_length`, `content_margin`. That is a
+/// contract, not tidiness: `ScrollStyle::allocated_width()`
+/// (`egui-0.35.0/src/style.rs:652-658`) is `0.0` for a floating bar, which is
+/// what lets a bar appear without taking room from the content and therefore
+/// without being able to oscillate the measurement the panel's size is derived
+/// from (see this directory's `MODULE_README.md`, "The body FILLS its budget").
+/// A fade that moved any of them would reintroduce exactly that coupling.
+///
+/// **Limitation, stated rather than hidden:** egui hard-codes both opacities to
+/// `1.0` for a SOLID scroll style (`scroll_area.rs:1483-1484`, `:1495-1496`), so
+/// this function fades nothing there. It is not a problem today — no code in
+/// this repo assigns `Spacing::scroll`, so every scroll area runs on egui's
+/// default `ScrollStyle::floating()` (`egui-0.35.0/src/style.rs:639-650`) — but
+/// a project-wide switch to solid bars would have to fade them another way, and
+/// would break the no-oscillation contract above first.
+#[must_use]
+fn faded_scroll_style(scroll: egui::style::ScrollStyle, opacity: f32) -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        dormant_handle_opacity: scroll.dormant_handle_opacity * opacity,
+        active_handle_opacity: scroll.active_handle_opacity * opacity,
+        interact_handle_opacity: scroll.interact_handle_opacity * opacity,
+        dormant_background_opacity: scroll.dormant_background_opacity * opacity,
+        active_background_opacity: scroll.active_background_opacity * opacity,
+        interact_background_opacity: scroll.interact_background_opacity * opacity,
+        ..scroll
     }
 }
 
@@ -1280,6 +1647,240 @@ mod tests {
         let clamped = header_strip_rect(row, 4.0);
         assert!(clamped.width() <= 0.0);
         assert!(!clamped.contains(Pos2::new(100.0, 50.0)));
+    }
+
+    /// An ordinary panel is never touched by the rule, whatever the other flags
+    /// say — the mode is opt-in per drawn tab.
+    #[test]
+    fn a_panel_that_did_not_ask_for_the_mode_always_shows_its_chrome() {
+        assert!(ChromeGate::default().shows_chrome());
+        assert!(
+            ChromeGate {
+                transparent: false,
+                ..ChromeGate::default()
+            }
+            .shows_chrome()
+        );
+    }
+
+    /// The only state in which a transparent panel hides: nothing is happening
+    /// to it and the pointer is somewhere else.
+    #[test]
+    fn a_transparent_panel_hides_only_when_nothing_points_at_it() {
+        let idle = ChromeGate {
+            transparent: true,
+            ..ChromeGate::default()
+        };
+        assert!(!idle.shows_chrome());
+        assert!(
+            ChromeGate {
+                pointer_inside: true,
+                ..idle
+            }
+            .shows_chrome()
+        );
+    }
+
+    /// Every reason on its own is enough. They are ORed because the reasons hand
+    /// over to each other mid-gesture — the pointer enters, a drag starts, the
+    /// pointer is then pulled outside the panel it is dragging — and a panel that
+    /// required all of them at once would blink at each handover.
+    #[test]
+    fn each_reason_alone_keeps_a_transparent_panel_visible() {
+        let idle = ChromeGate {
+            transparent: true,
+            ..ChromeGate::default()
+        };
+        for gate in [
+            ChromeGate { forced: true, ..idle },
+            ChromeGate {
+                pointer_inside: true,
+                ..idle
+            },
+            ChromeGate {
+                pressed_inside: true,
+                ..idle
+            },
+            ChromeGate { gesture: true, ..idle },
+            ChromeGate {
+                menu_open: true,
+                ..idle
+            },
+        ] {
+            assert!(gate.shows_chrome(), "{gate:?} must show the chrome");
+        }
+    }
+
+    /// The case the press-origin rule exists for: the user grabs a widget of the
+    /// BODY — a scroll handle, a slider — and drags the cursor off the panel.
+    /// The pointer is no longer inside and no chrome zone is being dragged, so
+    /// the press is the only thing left that says the gesture is this panel's.
+    #[test]
+    fn a_drag_that_started_in_the_body_keeps_the_panel_visible_off_its_rect() {
+        let dragging_off_the_panel = ChromeGate {
+            transparent: true,
+            pointer_inside: false,
+            gesture: false,
+            pressed_inside: true,
+            ..ChromeGate::default()
+        };
+        assert!(dragging_off_the_panel.shows_chrome());
+    }
+
+    /// A press held inside the panel's rect latches the chrome on, whatever the
+    /// pointer does afterwards — including leaving the window, which egui
+    /// deliberately does not treat as a release.
+    #[test]
+    fn a_held_press_that_started_inside_latches_the_chrome_on() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(200.0, 150.0));
+        assert!(press_started_inside(
+            rect,
+            true,
+            Some(Pos2::new(150.0, 120.0))
+        ));
+        // The corners belong to the panel too.
+        assert!(press_started_inside(rect, true, Some(rect.min)));
+        assert!(press_started_inside(rect, true, Some(rect.max)));
+    }
+
+    /// No false positives. A press that began on the canvas must never light the
+    /// panel, however far the cursor travels over it afterwards — the rule reads
+    /// where the button went DOWN, not where the pointer is now.
+    #[test]
+    fn a_press_that_started_outside_never_lights_the_panel() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(200.0, 150.0));
+        assert!(!press_started_inside(
+            rect,
+            true,
+            Some(Pos2::new(99.0, 120.0))
+        ));
+        assert!(!press_started_inside(
+            rect,
+            true,
+            Some(Pos2::new(150.0, 231.0))
+        ));
+    }
+
+    /// The latch drops exactly when the gesture ends: egui clears `press_origin`
+    /// and `down` in the same release event, so neither an idle pointer nor a
+    /// stale origin can keep a panel lit.
+    #[test]
+    fn the_press_latch_drops_when_no_button_is_held() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(200.0, 150.0));
+        // Released this frame: egui reports no origin and nothing down.
+        assert!(!press_started_inside(rect, false, None));
+        // Neither half alone may latch: a hovering pointer with no button, and a
+        // held button egui could not give an origin for.
+        assert!(!press_started_inside(
+            rect,
+            false,
+            Some(Pos2::new(150.0, 120.0))
+        ));
+        assert!(!press_started_inside(rect, true, None));
+    }
+
+    /// A panel showing several captions keeps them readable while it is
+    /// invisible: they are the only thing left to say it is there and to switch
+    /// tabs with.
+    #[test]
+    fn several_captions_never_fade_with_the_chrome() {
+        assert_eq!(caption_opacity(2, 0.0), 1.0);
+        assert_eq!(caption_opacity(5, 0.35), 1.0);
+    }
+
+    /// A lone caption has nothing to choose between, so it fades with the rest
+    /// and leaves the body alone on the canvas. An empty strip follows the same
+    /// branch, which costs nothing: there is no caption to paint.
+    #[test]
+    fn a_lone_caption_fades_with_the_chrome() {
+        assert_eq!(caption_opacity(1, 0.0), 0.0);
+        assert_eq!(caption_opacity(1, 0.4), 0.4);
+        assert_eq!(caption_opacity(1, 1.0), 1.0);
+        assert_eq!(caption_opacity(0, 0.0), 0.0);
+    }
+
+    /// A visible panel paints its captions exactly as before the mode existed,
+    /// whatever the strip holds — the fade must not become a permanent tint.
+    #[test]
+    fn a_visible_panel_paints_every_caption_opaque() {
+        for count in 0..4_usize {
+            assert_eq!(caption_opacity(count, 1.0), 1.0);
+        }
+    }
+
+    /// The bars are chrome: every one of the six opacities scales with it, in
+    /// all three interaction states. `interact_*` matters most — a bar the user
+    /// is DRAGGING stays lit however far the pointer leaves the panel, which is
+    /// the one state in which an invisible panel could show a bright bar.
+    #[test]
+    fn the_scroll_bar_opacities_scale_with_the_chrome() {
+        let style = egui::style::ScrollStyle::floating();
+        let faded = faded_scroll_style(style, 0.0);
+        assert_eq!(faded.dormant_handle_opacity, 0.0);
+        assert_eq!(faded.active_handle_opacity, 0.0);
+        assert_eq!(faded.interact_handle_opacity, 0.0);
+        assert_eq!(faded.dormant_background_opacity, 0.0);
+        assert_eq!(faded.active_background_opacity, 0.0);
+        assert_eq!(faded.interact_background_opacity, 0.0);
+
+        let half = faded_scroll_style(style, 0.5);
+        assert_eq!(half.active_handle_opacity, style.active_handle_opacity * 0.5);
+        assert_eq!(
+            half.interact_handle_opacity,
+            style.interact_handle_opacity * 0.5
+        );
+        assert_eq!(
+            half.interact_background_opacity,
+            style.interact_background_opacity * 0.5
+        );
+    }
+
+    /// A visible panel must paint its bars exactly as an ordinary panel does,
+    /// or the mode would leave a permanent tint on a hovered panel.
+    #[test]
+    fn a_visible_panel_leaves_the_scroll_style_alone() {
+        let style = egui::style::ScrollStyle::floating();
+        assert_eq!(faded_scroll_style(style, 1.0), style);
+    }
+
+    /// THE contract of this fade: not one field that decides a SIZE may move.
+    /// `allocated_width() == 0` for a floating bar is what keeps a bar that
+    /// appears from taking room off the content — and therefore from oscillating
+    /// the measurement the panel's own size is derived from.
+    #[test]
+    fn fading_the_scroll_bars_moves_no_geometry() {
+        for style in [
+            egui::style::ScrollStyle::floating(),
+            egui::style::ScrollStyle::solid(),
+            egui::style::ScrollStyle::thin(),
+        ] {
+            for opacity in [0.0_f32, 0.37, 1.0] {
+                let faded = faded_scroll_style(style, opacity);
+                assert_eq!(faded.floating, style.floating);
+                assert_eq!(faded.bar_width, style.bar_width);
+                assert_eq!(faded.floating_width, style.floating_width);
+                assert_eq!(
+                    faded.floating_allocated_width,
+                    style.floating_allocated_width
+                );
+                assert_eq!(faded.bar_inner_margin, style.bar_inner_margin);
+                assert_eq!(faded.bar_outer_margin, style.bar_outer_margin);
+                assert_eq!(faded.handle_min_length, style.handle_min_length);
+                assert_eq!(faded.content_margin, style.content_margin);
+                assert_eq!(faded.allocated_width(), style.allocated_width());
+            }
+        }
+    }
+
+    /// The project runs on egui's default scroll style, and the fade only works
+    /// on a FLOATING bar (egui hard-codes both opacities to 1.0 for a solid
+    /// one). If a future egui default stopped being floating, the bars would
+    /// silently stop fading — this pins the assumption instead.
+    #[test]
+    fn the_default_scroll_style_is_the_floating_one_the_fade_needs() {
+        let default = egui::style::ScrollStyle::default();
+        assert!(default.floating);
+        assert_eq!(default.allocated_width(), 0.0);
     }
 
     #[test]

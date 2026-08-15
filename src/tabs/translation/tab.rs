@@ -68,15 +68,18 @@ Panel/UI flow:
 - `draw_canvas_overlay_top_left` (CanvasHooks): frame orchestrator, buttons, polling, flushes.
 
 Panel dock:
-- `draw_panel_dock`: runs this tab's `PanelDock` frame (the canvas' «Лента» tab is its only
-  declaration) at the end of `draw_canvas_overlay_top_left`. It must run on every frame the tab is
-  active — `PanelDock::end` is what keeps the dock's detached sub-window viewports alive.
+- `draw_panel_dock`: runs this tab's `PanelDock` frame — the canvas' «Лента» plus this tab's own
+  «Последние персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`) — at the end of
+  `draw_canvas_overlay_top_left`. It must run on every frame the tab is active —
+  `PanelDock::end` is what keeps the dock's detached sub-window viewports alive.
+- `TranslationDockCx`: the per-frame dock context; `draw_recent_characters_tab_body` is the one
+  tab body this tab owns.
 - `ribbon_panel_rect`: last frame's MAIN-WINDOW rect of the panel holding «Лента», `None` when the
   tab is hidden or detached; `text_detector_edit_panel_pos` places the two detector edit boxes
   under it and falls back to a fixed canvas offset.
-- The default arrangement is canvas-owned (`canvas::ribbon_only_dock_layout`). This is now its
-  only user: «Клининг» declares three tabs of its own and therefore builds its own default, since
-  a default layout is the dictionary stored tab keys are resolved against.
+- `translation_default_dock_layout`: this tab's OWN default arrangement, since a default layout is
+  the dictionary stored tab keys are resolved against. Registered under `AppTab::Translation.key()`
+  both in `app.rs::restore_panel_dock` and in `draw_panel_dock`'s `ensure_default_layout`.
 
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.
@@ -193,7 +196,7 @@ Key TranslationTabState field groups:
 use crate::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use crate::canvas::{
     BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
-    CanvasUiStatus, CanvasView, RibbonDockCx, TranslationStatusDisplay,
+    CanvasUiStatus, CanvasView, TranslationStatusDisplay,
 };
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
 use crate::memory_manager::{
@@ -245,12 +248,15 @@ use crate::tabs::translation::text_detector::{
     TranslationTextDetectorController,
 };
 use crate::tools::MaskBrush;
-use crate::widgets::panel_dock::{DockArea, PanelDock, PanelDockState};
+use crate::widgets::panel_dock::{
+    DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
+    PanelNode, TabId,
+};
 use crate::widgets::{
     AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider, WheelSpinBox,
 };
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, Stroke};
+use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -309,9 +315,126 @@ const OCR_ROUTE_INPUTS_CACHE_TTL: web_time::Duration = web_time::Duration::from_
 const FOOTER_CHARACTER_AUTOCOMPLETE_MAX: usize = 7;
 const CHARACTER_NAMES_WATCH_CHECK_SECS: f64 = 1.0;
 const RECENT_CHARACTER_HISTORY_LIMIT: usize = 6;
-const RECENT_CHARACTER_CARDS_LEFT_MARGIN: f32 = 340.0;
-const RECENT_CHARACTER_CARDS_TOP_MARGIN: f32 = 18.0;
-const RECENT_CHARACTER_CARDS_RIGHT_MARGIN: f32 = 24.0;
+
+// Dock tabs of the «Перевод» program tab. The id is a stable, non-localised
+// literal: it is the identity the persisted layout and every egui id of the
+// owning panel derive from (`dev-docs/i18n_exclusions.md` §A9).
+/// «Последние персонажи» — the row of cards naming the last
+/// [`RECENT_CHARACTER_HISTORY_LIMIT`] characters, one per digit hotkey.
+const TRANSLATION_RECENT_CHARACTERS_TAB: TabId = TabId::new("translation.recent_characters");
+
+/// Gap, in points, between two recent-character cards on both axes.
+const RECENT_CHARACTER_CARD_SPACING_PX: f32 = 8.0;
+/// Points between a recent-character card's border and its caption, horizontally.
+const RECENT_CHARACTER_CARD_MARGIN_X_PX: f32 = 10.0;
+/// Points between a recent-character card's border and its caption, vertically.
+const RECENT_CHARACTER_CARD_MARGIN_Y_PX: f32 = 6.0;
+/// Width, in points, of a recent-character card's border.
+const RECENT_CHARACTER_CARD_STROKE_WIDTH_PX: f32 = 1.0;
+/// Corner radius, in points, of a recent-character card.
+const RECENT_CHARACTER_CARD_CORNER_RADIUS_PX: u8 = 8;
+
+/// Smallest outer size, in points, the dock may shrink the «Последние персонажи»
+/// panel to.
+///
+/// A `min_size` is a shrink FLOOR, not a request (`panel_dock/MODULE_README.md`),
+/// so it only has to keep ONE card and the panel's grip reachable — the body
+/// scrolls below that, and the floor is deliberately far under
+/// [`TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX`] so a user who narrows the
+/// panel is not fought by the solver. Roughly one card (~120 pt of caption plus its
+/// margins) plus the panel's own ~16 pt of chrome, and a header strip plus
+/// `PANEL_MIN_BODY_HEIGHT`.
+const TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(150.0, 70.0);
+/// Outer size, in points, the «Последние персонажи» panel starts at.
+///
+/// The WIDTH is the number that matters and it is a COMPROMISE. The dock never
+/// re-measures a tab's width — it reports back the width it was GIVEN
+/// (`panel.rs::measured_size`) — so 560 pt stays the panel's width until the user
+/// drags the resize grip, whereas the height converges to the content on the second
+/// frame and only decides what the FIRST frame looks like. Before the migration the
+/// row of cards ran across almost the whole canvas in a single line; a narrow panel
+/// would change that look far more than the migration was meant to. 560 pt is the
+/// balance: ~544 pt of content once the panel's ~16 pt of chrome is taken off,
+/// against a card of ~110–160 pt plus [`RECENT_CHARACTER_CARD_SPACING_PX`], so the
+/// six-card history reads in 2–3 rows while the panel still leaves most of the
+/// canvas free. The height covers three such rows, the worst case at that width.
+const TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(560.0, 154.0);
+
+/// Builds the default dock arrangement of the «Перевод» program tab.
+///
+/// Two panels: the canvas' own «Лента» flush with the LEFT edge of the dock area —
+/// the same anchor, panel id and content sizing every canvas program tab gives it,
+/// so a user who already arranged the ribbon keeps it where they left it — and
+/// «Последние персонажи» docked to its RIGHT, top-aligned. That is exactly where
+/// the row of cards floated before it became a dock tab: it hung at a fixed
+/// 340 pt offset from the canvas' left edge, a constant picked to clear the width
+/// of the canvas controls panel the ribbon replaced.
+///
+/// The two panels carry different `target` + `edge` + `align` triples, which is
+/// what keeps the solver — a total function of whatever layout it is given — from
+/// laying one exactly on top of the other.
+///
+/// This tab needs a builder of ITS own because the default layout doubles as the
+/// DICTIONARY the persistence layer resolves stored tab keys against: a `TabId`
+/// missing from it is dropped from the user's arrangement on every load
+/// (`panel_dock/persist.rs::known_tabs`).
+///
+/// Used only when no layout exists yet for this program tab; a restored one always
+/// wins. Handed to the app-owned dock state as a plain `fn` pointer, both when the
+/// persisted layouts are restored before the first frame (`app.rs`) and by
+/// `ensure_default_layout` on every frame this tab draws — the two must name the
+/// same item, since the header's «сбросить раскладку» rebuilds from the one the
+/// state kept. A model refusal is logged and skipped, never panicked on: the dock
+/// then creates a panel for the orphaned tab on its own, which is a degraded
+/// arrangement rather than a lost tab.
+#[must_use]
+pub(crate) fn translation_default_dock_layout() -> DockLayout {
+    let mut layout = DockLayout::new();
+    let ribbon = PanelId::new(0);
+    let panels = [
+        // The ribbon is inserted FIRST because the cards anchor to it, and
+        // `insert_panel` rejects an anchor whose target does not exist yet.
+        (
+            ribbon,
+            vec![CANVAS_RIBBON_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            },
+        ),
+        (
+            PanelId::new(1),
+            vec![TRANSLATION_RECENT_CHARACTERS_TAB],
+            PanelAnchor::Panel {
+                target: ribbon,
+                edge: DockEdge::Right,
+                align: 0.0,
+            },
+        ),
+    ];
+    for (id, tabs, anchor) in panels {
+        let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
+            Ok(mut node) => {
+                node.anchor = anchor;
+                node
+            }
+            Err(error) => {
+                crate::runtime_log::log_warn(format!(
+                    "[translation] default dock layout: could not build panel {id} ({error}); \
+                     the dock will create one per orphaned tab on its own"
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = layout.insert_panel(node) {
+            crate::runtime_log::log_warn(format!(
+                "[translation] default dock layout: could not insert panel {id} ({error}); \
+                 the dock will create one per orphaned tab on its own"
+            ));
+        }
+    }
+    layout
+}
 
 pub const HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE: &str =
     "translation.ocr.quick.selection_mode";
@@ -1891,49 +2014,6 @@ impl TranslationTabState {
                 canvas.flush_pending_bubble_upserts_now(project);
             }
         }
-    }
-
-    fn draw_recent_character_cards(&self, ctx: &egui::Context, canvas_rect: Rect) {
-        if self.recent_characters.is_empty() {
-            return;
-        }
-        let left = (canvas_rect.left() + RECENT_CHARACTER_CARDS_LEFT_MARGIN)
-            .min(canvas_rect.right() - RECENT_CHARACTER_CARDS_RIGHT_MARGIN);
-        let available_width =
-            (canvas_rect.right() - left - RECENT_CHARACTER_CARDS_RIGHT_MARGIN).max(120.0);
-        egui::Area::new("translation_recent_character_cards".into())
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(egui::pos2(
-                left,
-                canvas_rect.top() + RECENT_CHARACTER_CARDS_TOP_MARGIN,
-            ))
-            .show(ctx, |ui| {
-                ui.set_max_width(available_width);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    for (idx, entry) in self.recent_characters.iter().enumerate() {
-                        egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(110, 110, 110, 170))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .stroke(Stroke::new(
-                                1.0,
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 44),
-                            ))
-                            .inner_margin(egui::Margin::symmetric(10, 6))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "[ {} ] {}",
-                                        idx + 1,
-                                        entry.character_name
-                                    ))
-                                    .color(Color32::from_rgb(235, 235, 235)),
-                                );
-                            });
-                    }
-                });
-            });
     }
 
     fn queue_footer_patch(&mut self, bubble_id: i64, field: &str, value: Value, now_s: f64) {
@@ -5125,6 +5205,160 @@ impl TranslationTabState {
     }
 }
 
+/// Per-frame context the panel dock hands to one «Перевод» tab body at a time.
+///
+/// The bodies capture nothing of their own: «Лента» needs the shared `CanvasView`
+/// (the hook's own parameter, borrow-independent of the tab state the hook was
+/// called on) while «Последние персонажи» needs the tab's own history. Closures
+/// capturing those borrows directly could not coexist in the dock's queue;
+/// exclusive, sequential access through this context lets every body reach exactly
+/// what it needs.
+///
+/// Every field is a borrow of a DISJOINT field of [`TranslationTabState`] or a
+/// plain copy, and none of them is the `PanelDockState` the dock itself borrows for
+/// the frame. There is no deferred-output field: this tab's own body only READS.
+struct TranslationDockCx<'a> {
+    /// Owner of the «Лента» body.
+    canvas: &'a mut CanvasView,
+    /// Project page count, shown by the «Лента» tab's page counter.
+    total_pages: usize,
+    /// Most recently used characters, newest first — one card per entry.
+    recent_characters: &'a VecDeque<RecentCharacterEntry>,
+}
+
+impl TranslationDockCx<'_> {
+    /// The accessor `canvas::declare_ribbon_tab` asks for, as a plain `fn` item the
+    /// caller can hand over instead of spelling the closure out.
+    fn ribbon_body(&mut self) -> (&mut CanvasView, usize) {
+        (&mut *self.canvas, self.total_pages)
+    }
+}
+
+/// Caption of the recent-character card at `rank` (0-based): the digit that
+/// activates the character, then the name.
+///
+/// The digit is `rank + 1` because the hotkeys are `1`..=`6`
+/// ([`RECENT_CHARACTER_HISTORY_LIMIT`]) while the history is indexed from zero —
+/// the same off-by-one [`TranslationTabState::recent_character_entry_for_rank`]
+/// resolves in the other direction.
+#[must_use]
+fn recent_character_card_caption(rank: usize, character_name: &str) -> String {
+    format!("[ {} ] {}", rank + 1, character_name)
+}
+
+/// Outer size, in points, of a recent-character card whose caption laid out to
+/// `caption_size`.
+///
+/// The caption plus the inner margin plus the border on all four sides, which is
+/// exactly what `egui::Frame` allocated for the same card before: its
+/// `outer_rect` is `content_rect + inner_margin + Margin::from(stroke.width) +
+/// outer_margin`, and the outer margin is zero here
+/// (`egui-0.35.0/src/containers/frame.rs:349-352`, `:456-462`).
+#[must_use]
+fn recent_character_card_size(caption_size: Vec2) -> Vec2 {
+    caption_size
+        + Vec2::new(
+            2.0 * (RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
+            2.0 * (RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
+        )
+}
+
+/// Top-left corner the caption is painted at inside a card laid out at `card_rect`.
+///
+/// The inverse of [`recent_character_card_size`]: `Frame` places the content rect
+/// one inner margin and one border in from the card's own corner.
+#[must_use]
+fn recent_character_card_caption_pos(card_rect: Rect) -> Pos2 {
+    card_rect.min
+        + Vec2::new(
+            RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
+            RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
+        )
+}
+
+/// Draws the «Последние персонажи» tab body: one card per remembered character,
+/// captioned with the digit that activates it, wrapping onto further rows at the
+/// panel's own width.
+///
+/// The cards are not interactive and this is deliberate — a character is picked by
+/// pressing its digit together with the bubble-create hotkey or the Shift+drag OCR
+/// gesture, never by clicking the card. The body only reads
+/// [`TranslationDockCx::recent_characters`]; the allocation senses `hover` and
+/// nothing else, exactly as `Frame::allocate_space` did
+/// (`egui-0.35.0/src/containers/frame.rs:466-468`), and nothing is painted from
+/// the response, so there is no hover highlight and no click target.
+///
+/// **A card may NOT be an `egui::Frame`, and that is the whole reason this function
+/// paints by hand.** `Frame::begin` takes its bounds from
+/// `Ui::available_rect_before_wrap` and reserves the space only afterwards, through
+/// `Prepared::allocate_space` → `Ui::allocate_rect` → `advance_cursor_after_rect`
+/// (`frame.rs:378-397`, `:466-468`, `egui-0.35.0/src/ui.rs:1256-1270`). That path
+/// calls `Placer::advance_after_rects` DIRECTLY and never reaches
+/// `Placer::next_space`, which is where `Layout::next_frame` starts a new row
+/// (`egui-0.35.0/src/placer.rs:113-125`, `src/layout.rs:506-528`). A framed card
+/// therefore cannot wrap: the whole history ran off the right edge of the panel
+/// and the body grew a horizontal scrollbar. `egui::Button` wraps in
+/// `cleaning::tab::draw_tool_button_rows` for the opposite reason — it measures
+/// itself first and allocates through `Ui::allocate_exact_size`.
+///
+/// So the caption is laid out FIRST (never wrapped, so a character name can never
+/// break across two lines), its card size is derived from the galley, that exact
+/// size goes through `allocate_exact_size` → `allocate_space` → `next_space`, and
+/// only then are the background, the border and the text painted into the rect the
+/// layout handed back. `Layout::next_frame` breaks a row only while
+/// `max_rect.left() < cursor.left()`, so a card wider than the whole panel still
+/// gets a row of its own rather than an empty one above it (`layout.rs:517`).
+///
+/// The look is unchanged: `StrokeKind::Inside` on the allocated rect reproduces
+/// `Frame::paint`, which draws its `RectShape` with the same `StrokeKind::Inside`
+/// on `widget_rect = content_rect + inner_margin + stroke.width`
+/// (`frame.rs:423-445`), and the galley comes from the same `FontSelection::Default`
+/// the removed `ui.label` resolved through (`egui-0.35.0/src/widgets/label.rs:173`).
+fn draw_recent_characters_tab_body(ui: &mut egui::Ui, cx: &mut TranslationDockCx<'_>) {
+    let fill = Color32::from_rgba_unmultiplied(110, 110, 110, 170);
+    let stroke = Stroke::new(
+        RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 44),
+    );
+    let caption_color = Color32::from_rgb(235, 235, 235);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(RECENT_CHARACTER_CARD_SPACING_PX);
+        for (rank, entry) in cx.recent_characters.iter().enumerate() {
+            // `Extend` with an infinite width: the card is sized from this galley, so
+            // the name must be measured as the single line it will be drawn as.
+            let caption = egui::WidgetText::from(
+                egui::RichText::new(recent_character_card_caption(rank, &entry.character_name))
+                    .color(caption_color),
+            )
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::FontSelection::Default,
+            );
+            let (card_rect, _) = ui.allocate_exact_size(
+                recent_character_card_size(caption.size()),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect(
+                card_rect,
+                egui::CornerRadius::same(RECENT_CHARACTER_CARD_CORNER_RADIUS_PX),
+                fill,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            // The colour is already baked into the galley by `RichText::color`, so the
+            // fallback only ever applies to a `Color32::PLACEHOLDER` section there is none of.
+            painter.galley(
+                recent_character_card_caption_pos(card_rect),
+                caption,
+                caption_color,
+            );
+        }
+    });
+}
+
 impl TranslationTabState {
     /// Top-left corner of the text-detector edit boxes: just under the dock panel
     /// holding the «Лента» tab, as they sat under the canvas controls panel before
@@ -5142,8 +5376,9 @@ impl TranslationTabState {
             .unwrap_or_else(|| canvas_rect.left_top() + egui::vec2(12.0, 112.0))
     }
 
-    /// Runs the «Перевод» tab's panel dock — its only dock surface is the canvas'
-    /// own «Лента» tab — and records the drawn panel's rect for the next frame.
+    /// Runs the «Перевод» tab's panel dock — the canvas' own «Лента» tab and this
+    /// tab's «Последние персонажи» — and records the ribbon panel's rect for the
+    /// next frame.
     ///
     /// Called at the very END of `draw_canvas_overlay_top_left`; see the call site
     /// for why that position is load-bearing.
@@ -5155,13 +5390,18 @@ impl TranslationTabState {
         total_pages: usize,
         panel_dock: &mut PanelDockState,
     ) {
+        // The SAME `fn` item `app.rs::restore_panel_dock` registers: the dock state
+        // keeps it to rebuild the arrangement for the header's reset item, so two
+        // different builders here would reset to something the user never saw.
         panel_dock.ensure_default_layout(
             AppTab::Translation.key(),
-            crate::canvas::ribbon_only_dock_layout,
+            translation_default_dock_layout,
         );
-        let mut cx = RibbonDockCx {
+        let recent_characters_visible = !self.recent_characters.is_empty();
+        let mut cx = TranslationDockCx {
             canvas,
             total_pages,
+            recent_characters: &self.recent_characters,
         };
         let mut dock = PanelDock::begin(
             ctx,
@@ -5171,7 +5411,24 @@ impl TranslationTabState {
                 layout_key: AppTab::Translation.key(),
             },
         );
-        crate::canvas::declare_ribbon_tab(&mut dock, RibbonDockCx::ribbon_body);
+        crate::canvas::declare_ribbon_tab(&mut dock, TranslationDockCx::ribbon_body);
+        // Declared on EVERY frame, visible only while the history has entries: a
+        // hidden tab keeps its slot in the layout and only its panel is skipped, so
+        // the first character of a fresh chapter brings the cards back to wherever
+        // the user put them. Skipping the declaration instead would make the dock
+        // treat the tab as another program tab's and seed it a fresh panel next time.
+        //
+        // Transparent until hovered: without the pointer on it the panel paints no
+        // frame, border, arrow or grip, so the cards float on the canvas exactly as
+        // they did as a bare `Area`. Hovering fades the chrome in and makes the panel
+        // draggable and resizable like any other.
+        dock.tab(TRANSLATION_RECENT_CHARACTERS_TAB)
+            .title(|| t!("translation.tab.recent_characters_tab"))
+            .visible(recent_characters_visible)
+            .transparent_until_hover(true)
+            .min_size(TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX)
+            .initial_size(TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX)
+            .show(draw_recent_characters_tab_body);
         // `tab_rect` answers for the MAIN window alone: it is `None` while the tab is
         // hidden AND while the user keeps it in a detached sub-window, whose rect lives
         // in that window's own coordinate frame. Both are "unknown" to the edit boxes.
@@ -5340,7 +5597,6 @@ impl CanvasHooks for TranslationTabState {
         self.flush_footer_patches(canvas, project, now_s);
         self.bubbles_panel.flush_text_updates(canvas, now_s);
         self.handle_text_detector_line_edit_hotkeys(ctx, canvas, project);
-        self.draw_recent_character_cards(ctx, canvas_rect);
 
         egui::Area::new("translation_canvas_open_buttons".into())
             .fixed_pos(canvas_rect.right_bottom() + egui::vec2(0.0, -40.0))
@@ -7940,8 +8196,265 @@ fn build_bubble_original_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        Pos2, Rect, TranslationTabState, egui, footer_tracking_should_recompute,
+        Pos2, RECENT_CHARACTER_CARD_MARGIN_X_PX, RECENT_CHARACTER_CARD_MARGIN_Y_PX,
+        RECENT_CHARACTER_CARD_SPACING_PX, RECENT_CHARACTER_CARD_STROKE_WIDTH_PX, Rect,
+        TRANSLATION_RECENT_CHARACTERS_TAB,
+        TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX,
+        TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX, TranslationTabState, Vec2, egui,
+        footer_tracking_should_recompute, recent_character_card_caption,
+        recent_character_card_caption_pos, recent_character_card_size,
+        translation_default_dock_layout,
     };
+    use crate::canvas::{
+        CANVAS_RIBBON_TAB, CANVAS_RIBBON_TAB_INITIAL_SIZE_PX, CANVAS_RIBBON_TAB_MIN_SIZE_PX,
+    };
+    use crate::widgets::panel_dock::{
+        DockEdge, HostId, PanelAnchor, PanelChrome, PanelId, PanelSizes, solve,
+    };
+
+    /// The digit shown on a card is the digit that activates it, and the history is
+    /// indexed from zero while the hotkeys start at one.
+    #[test]
+    fn a_recent_character_card_is_captioned_with_its_own_digit() {
+        assert_eq!(recent_character_card_caption(0, "Аня"), "[ 1 ] Аня");
+        assert_eq!(recent_character_card_caption(5, "Bob"), "[ 6 ] Bob");
+        // A missing name still leaves the digit legible — the card is the only
+        // place that says which digit is bound to what.
+        assert_eq!(recent_character_card_caption(2, ""), "[ 3 ] ");
+    }
+
+    /// The two card helpers are each other's inverse, and nothing but their
+    /// agreement keeps the caption centred: the size is what the layout allocates
+    /// and the position is where the text is painted inside it, so a margin changed
+    /// in one and not the other slides the text off the card.
+    ///
+    /// The inset reproduces `egui::Frame` exactly — one inner margin plus one border
+    /// on every side (`egui-0.35.0/src/containers/frame.rs:349-352`), which is what
+    /// makes the hand-painted card look identical to the framed one it replaced.
+    #[test]
+    fn a_recent_character_card_insets_its_caption_equally_on_every_side() {
+        let caption = Vec2::new(97.0, 18.0);
+        let size = recent_character_card_size(caption);
+        assert_eq!(
+            size,
+            caption
+                + Vec2::new(
+                    2.0 * (RECENT_CHARACTER_CARD_MARGIN_X_PX
+                        + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
+                    2.0 * (RECENT_CHARACTER_CARD_MARGIN_Y_PX
+                        + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
+                )
+        );
+
+        let card = Rect::from_min_size(Pos2::new(30.0, 40.0), size);
+        let drawn = Rect::from_min_size(recent_character_card_caption_pos(card), caption);
+        assert!(
+            card.contains_rect(drawn),
+            "the caption {drawn:?} sticks out of its card {card:?}"
+        );
+        assert_eq!(
+            drawn.left() - card.left(),
+            card.right() - drawn.right(),
+            "the caption is not horizontally centred in the card"
+        );
+        assert_eq!(
+            drawn.top() - card.top(),
+            card.bottom() - drawn.bottom(),
+            "the caption is not vertically centred in the card"
+        );
+        assert_eq!(
+            drawn.left() - card.left(),
+            RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX
+        );
+        assert_eq!(
+            drawn.top() - card.top(),
+            RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX
+        );
+    }
+
+    /// A card has to fit the panel the tab STARTS at, or the very first frame the
+    /// user sees is a single card with a horizontal scrollbar under it. The floor
+    /// must not fight it either: `min_size` only stops the shrink, so it has to stay
+    /// well under the start size, and it has to hold at least one card.
+    #[test]
+    fn the_start_size_fits_several_cards_and_the_floor_fits_one() {
+        // A caption of ~13 characters at the body font — «[ 1 ] Персонаж».
+        let card = recent_character_card_size(Vec2::new(100.0, 18.0));
+        // The panel spends this much on its own frame margins and border before the
+        // body gets any width (`Frame::popup`, 6 pt per side plus a 1 pt stroke).
+        const PANEL_CHROME_WIDTH_PX: f32 = 16.0;
+
+        let start_body = TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.x - PANEL_CHROME_WIDTH_PX;
+        let per_row = ((start_body + RECENT_CHARACTER_CARD_SPACING_PX)
+            / (card.x + RECENT_CHARACTER_CARD_SPACING_PX))
+            .floor();
+        // A band, not a number: the real card width is a font galley, so this only
+        // pins that the start width is neither one-card-narrow (which is what the
+        // pre-fix bug looked like) nor so wide the panel eats the canvas. Four fit at
+        // this caption length; a name half again as long still leaves three.
+        assert!(
+            (2.0..=5.0).contains(&per_row),
+            "the start width fits {per_row} cards per row, outside the 2-5 band the size targets"
+        );
+
+        let floor_body = TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.x - PANEL_CHROME_WIDTH_PX;
+        assert!(
+            floor_body >= card.x,
+            "the shrink floor cannot hold one card: {floor_body} pt of body for a {} pt card",
+            card.x
+        );
+        // Both operands are constants, so this is a compile-time check.
+        const {
+            assert!(
+                TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.x
+                    < TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.x
+                    && TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.y
+                        < TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.y,
+                "the floor must stay under the start size or the solver fights a user who narrows \
+                 the panel"
+            );
+        }
+    }
+
+    /// The default arrangement is what the dock is handed on a first run AND the
+    /// dictionary `panel_dock::persist` resolves stored tab keys against, so it has
+    /// to be well-formed and to name every tab this program tab can declare.
+    #[test]
+    fn the_default_dock_layout_places_the_two_translation_panels() {
+        let layout = translation_default_dock_layout();
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 2);
+
+        // «Лента» keeps the anchor and the id every canvas program tab gives it, so a
+        // user who already arranged the ribbon finds their panel where they left it.
+        let ribbon = layout
+            .panel(PanelId::new(0))
+            .expect("the ribbon panel exists");
+        assert_eq!(ribbon.tabs, vec![CANVAS_RIBBON_TAB]);
+        assert_eq!(
+            ribbon.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            }
+        );
+
+        // The cards reproduce where the floating row sat: to the RIGHT of the ribbon,
+        // aligned with its top edge.
+        let recent = layout
+            .panel(PanelId::new(1))
+            .expect("the recent-characters panel exists");
+        assert_eq!(recent.tabs, vec![TRANSLATION_RECENT_CHARACTERS_TAB]);
+        assert_eq!(
+            recent.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Right,
+                align: 0.0,
+            }
+        );
+        assert_ne!(
+            recent.anchor, ribbon.anchor,
+            "two panels sharing a target+edge+align would be laid out on the same rect"
+        );
+
+        // Both panels are content-sized: their size comes from their tabs' own
+        // declarations, and pinning one here would only make the first solve fight it.
+        for id in (0..2).map(PanelId::new) {
+            let panel = layout.panel(id).expect("a default panel exists");
+            assert_eq!(panel.size_override, None, "{id} must stay content-sized");
+        }
+
+        // A `TabId` missing here is dropped from the user's stored arrangement on
+        // every load (`panel_dock::persist::known_tabs`), so this list is the whole
+        // set this program tab can declare.
+        for tab in [CANVAS_RIBBON_TAB, TRANSLATION_RECENT_CHARACTERS_TAB] {
+            assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
+        }
+    }
+
+    /// Solving matters as much as being well-formed: the default arrangement is what
+    /// the user SEES on a first run, and a panel laid out on top of another one is
+    /// unreachable — the buried one cannot even be dragged out.
+    ///
+    /// Two frames are checked, because «Последние персонажи» is conditional: the one
+    /// where the history has entries (both panels) and the ordinary empty-history one
+    /// where `panel_dock::frame_layout` — built on `DockLayout::remove_panel` — drops
+    /// its panel for the frame.
+    #[test]
+    fn the_default_dock_layout_solves_into_disjoint_panels() {
+        // A maximised 1080p studio window: the canvas area of a 1920-wide window
+        // less the page-manager column and the scrollbar reserve. Deliberately not
+        // the largest possible area — the arrangement has to fit an ordinary window,
+        // not only a wide one.
+        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+        let with_cards = translation_default_dock_layout();
+        let mut without_cards = translation_default_dock_layout();
+        without_cards
+            .remove_panel(PanelId::new(1))
+            .expect("the recent-characters panel can be dropped for a frame");
+        for (frame, layout, expected_panels) in [
+            ("history non-empty", &with_cards, 2),
+            ("history empty", &without_cards, 1),
+        ] {
+            let solved = solve_default_layout(layout, area);
+            assert_eq!(solved.len(), expected_panels, "{frame}: every panel is placed");
+            for (id, rect) in &solved {
+                assert!(
+                    area.contains_rect(*rect),
+                    "{frame}: panel {id} is laid out outside the dock area: {rect:?}"
+                );
+            }
+            for (i, (id_a, rect_a)) in solved.iter().enumerate() {
+                for (id_b, rect_b) in &solved[i + 1..] {
+                    assert!(
+                        !rect_a.intersects(*rect_b),
+                        "{frame}: panels {id_a} and {id_b} overlap: {rect_a:?} vs {rect_b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Solves `layout` inside `area` with the sizes the two tabs declare, and returns
+    /// the drawn rects in panel order.
+    fn solve_default_layout(
+        layout: &crate::widgets::panel_dock::DockLayout,
+        area: Rect,
+    ) -> Vec<(PanelId, Rect)> {
+        // What the first frame feeds the solver: each panel's tab's `initial_size`,
+        // and its `min_size` as the floor.
+        let sizes: PanelSizes = [
+            (PanelId::new(0), CANVAS_RIBBON_TAB_INITIAL_SIZE_PX),
+            (
+                PanelId::new(1),
+                TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mins: PanelSizes = [
+            (PanelId::new(0), CANVAS_RIBBON_TAB_MIN_SIZE_PX),
+            (
+                PanelId::new(1),
+                TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let solved = solve(
+            layout,
+            HostId::MainWindow,
+            area,
+            &sizes,
+            &mins,
+            PanelChrome::default(),
+        );
+        let mut placed: Vec<(PanelId, Rect)> =
+            solved.iter().map(|(id, panel)| (id, panel.rect)).collect();
+        placed.sort_by_key(|(id, _)| *id);
+        placed
+    }
 
     /// The two text-detector edit boxes are drawn BEFORE the dock runs, so they position
     /// themselves from the previous frame's ribbon-panel rect and must degrade to a fixed

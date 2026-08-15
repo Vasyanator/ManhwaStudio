@@ -194,8 +194,8 @@ fn drawn_tool_indices() -> impl Iterator<Item = usize> {
 /// Builds the default dock arrangement of the «Клининг» program tab.
 ///
 /// Five panels reproducing where the migrated surfaces floated: the canvas' own
-/// «Лента» flush with the left edge (identical to
-/// [`canvas::ribbon_only_dock_layout`], so a user who already arranged the ribbon
+/// «Лента» flush with the left edge (the same panel id and anchor every canvas
+/// program tab's builder gives it, so a user who already arranged the ribbon
 /// keeps it), «Клин» to its right where the island sat, «Быстрый клин найденного
 /// текста» under «Клин» — the button that opens it lives there, and the left column
 /// is where the vertical room is, while hanging it off the right column would put an
@@ -210,11 +210,11 @@ fn drawn_tool_indices() -> impl Iterator<Item = usize> {
 /// solver — a total function of whatever layout it is given — from laying one panel
 /// exactly on top of another.
 ///
-/// This tab needs a builder of ITS own — it can no longer share
-/// [`canvas::ribbon_only_dock_layout`] with «Перевод» — because the default layout
-/// doubles as the DICTIONARY the persistence layer resolves stored tab keys
-/// against: a `TabId` missing from it is dropped from the user's arrangement on
-/// every load (`panel_dock/persist.rs::known_tabs`).
+/// Every canvas program tab needs a builder of ITS own — there is no shared
+/// ribbon-only one left — because the default layout doubles as the DICTIONARY the
+/// persistence layer resolves stored tab keys against: a `TabId` missing from it is
+/// dropped from the user's arrangement on every load
+/// (`panel_dock/persist.rs::known_tabs`).
 ///
 /// Used only when no layout exists yet for this program tab; a restored one always
 /// wins. Handed to the app-owned dock state as a plain `fn` pointer, both when the
@@ -3028,8 +3028,8 @@ mod tests {
         assert_eq!(layout.validate(), Ok(()));
         assert_eq!(layout.panels().len(), 5);
 
-        // «Лента» keeps the anchor and the id `canvas::ribbon_only_dock_layout` gave
-        // it, so a user who already arranged the ribbon under the shared builder
+        // «Лента» keeps the anchor and the id every canvas program tab's builder
+        // gives it, so a user who already arranged the ribbon under an earlier build
         // finds their panel where they left it.
         let ribbon = layout
             .panel(PanelId::new(0))

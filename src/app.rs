@@ -87,6 +87,7 @@ use crate::tabs::translation::{
     HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL, HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL,
     HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
     HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, TranslationHotkeyHints, TranslationTabState,
+    translation_default_dock_layout,
 };
 use crate::tabs::typing::{
     TypingDrawParams, TypingSaveFlushReason, TypingTabState, TypingTextFlushError,
@@ -3605,8 +3606,8 @@ impl PanelDockPass {
 #[must_use]
 fn tab_hosts_panel_dock(tab: AppTab) -> bool {
     match tab {
-        // The three canvas tabs: each declares the canvas' own «Лента» tab, and «Текст»
-        // additionally declares its own eight.
+        // The three canvas tabs: each declares the canvas' own «Лента» tab and further tabs
+        // of its own — one for «Перевод», four for «Клининг», eight for «Текст».
         AppTab::Translation | AppTab::Cleaning | AppTab::Typing => true,
         AppTab::PageManager
         | AppTab::PsEditor
@@ -3618,6 +3619,41 @@ fn tab_hosts_panel_dock(tab: AppTab) -> bool {
     }
 }
 
+/// The default-layout builder of every program tab that hosts the panel dock, keyed by
+/// `AppTab::key()`.
+///
+/// The dock migration's extension point: ONE entry per dock host, and the set of keys must match
+/// [`tab_hosts_panel_dock`] exactly. A builder must name every `TabId` its tab can declare —
+/// `persist` uses the default's tab set as the dictionary of known tabs, and a tab missing from it
+/// would be dropped from the user's arrangement on every load.
+///
+/// Each entry must be the SAME `fn` item the owning tab hands to
+/// `PanelDockState::ensure_default_layout` on every frame it draws: the state keeps that pointer to
+/// rebuild the arrangement for the header's «сбросить раскладку» item, so two different builders for
+/// one key would reset to something the user never saw. Pinned by
+/// `tests::the_dock_hosts_register_the_builders_their_tabs_declare`.
+///
+/// Every canvas program tab needs a builder of its own — «Перевод» adds «Последние персонажи» on top
+/// of the canvas' «Лента», «Клининг» adds four tabs and «Текст» eight — so there is no shared
+/// ribbon-only builder any of them could fall back to.
+#[must_use]
+fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'static>; 3] {
+    [
+        (
+            AppTab::Translation.key(),
+            translation_default_dock_layout as fn() -> DockLayout,
+        ),
+        (
+            AppTab::Cleaning.key(),
+            cleaning_default_dock_layout as fn() -> DockLayout,
+        ),
+        (
+            AppTab::Typing.key(),
+            typing_default_dock_layout as fn() -> DockLayout,
+        ),
+    ]
+}
+
 /// Builds this studio window's panel-dock state and restores the persisted arrangement from an
 /// already loaded `user_config.json` snapshot. Performs no I/O.
 ///
@@ -3626,33 +3662,13 @@ fn tab_hosts_panel_dock(tab: AppTab) -> bool {
 /// is logged by `panel_dock::persist`). Tabs the stored layout does not mention are re-created by
 /// the dock on the frame that declares them.
 ///
-/// The defaults slice is the dock migration's extension point: ONE entry per dock host, mapping
-/// `AppTab::key()` to that tab's default-layout builder. A builder must name every `TabId` its tab
-/// can declare — `persist` uses the default's tab set as the dictionary of known tabs, and a tab
-/// missing from it would be dropped from the user's arrangement on every load.
+/// The defaults come from [`panel_dock_default_layout_builders`], which is where a newly migrated
+/// program tab is registered.
 #[must_use]
 fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
     let restored = panel_dock_persist::layouts_from_user_settings(
         user_settings,
-        &[
-            // «Перевод» declares the canvas' «Лента» and nothing else, so it uses the
-            // canvas' own builder — see `canvas::ribbon_only_dock_layout`.
-            (
-                AppTab::Translation.key(),
-                crate::canvas::ribbon_only_dock_layout as fn() -> DockLayout,
-            ),
-            // «Клининг» adds three tabs of its own on top of «Лента», so it needs a
-            // builder that names them: the default doubles as the dictionary stored
-            // tab keys are resolved against.
-            (
-                AppTab::Cleaning.key(),
-                cleaning_default_dock_layout as fn() -> DockLayout,
-            ),
-            (
-                AppTab::Typing.key(),
-                typing_default_dock_layout as fn() -> DockLayout,
-            ),
-        ],
+        &panel_dock_default_layout_builders(),
     );
     let mut state = PanelDockState::new();
     // Layouts first: the sub-window install drops a window no restored layout puts a panel in, so
@@ -4651,11 +4667,15 @@ mod tests {
         TEXT_TAB_CONFIG_SECTION, TypingTextFlushError, ai_backend_version_warning_message,
         apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
         decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
-        page_op_text_quiesce, save_trigger_decision, should_seed_page_cache_on_initial_load,
-        PanelDockPass, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
+        page_op_text_quiesce, panel_dock_default_layout_builders, save_trigger_decision,
+        should_seed_page_cache_on_initial_load, DockLayout, PanelDockPass,
+        cleaning_default_dock_layout, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
+        translation_default_dock_layout, typing_default_dock_layout,
     };
+    use crate::canvas::CANVAS_RIBBON_TAB;
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
     use crate::tabs::AppTab;
+    use crate::widgets::panel_dock::TabId;
     use serde_json::{Value, json};
 
     /// The dock hosts are the tabs `PanelDock::end` runs for, and the idle sub-window keep-alive
@@ -4673,6 +4693,109 @@ mod tests {
             hosts,
             vec![AppTab::Translation, AppTab::Cleaning, AppTab::Typing]
         );
+    }
+
+    /// A dock host with no entry in `panel_dock_default_layout_builders` loads with NO stored
+    /// arrangement at all (`persist` only decodes the keys it is given), and an entry for a tab
+    /// that does not host the dock is a builder nothing ever runs. The two lists are therefore one
+    /// list, and this is the only place that says so.
+    #[test]
+    fn every_dock_host_has_exactly_one_default_layout_builder() {
+        let mut registered: Vec<&str> = panel_dock_default_layout_builders()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let before_dedup = registered.len();
+        registered.sort_unstable();
+        registered.dedup();
+        assert_eq!(
+            registered.len(),
+            before_dedup,
+            "a program-tab key is registered twice: {registered:?}"
+        );
+
+        let mut hosts: Vec<&str> = AppTab::ALL
+            .into_iter()
+            .filter(|tab| tab_hosts_panel_dock(*tab))
+            .map(AppTab::key)
+            .collect();
+        hosts.sort_unstable();
+        assert_eq!(
+            registered, hosts,
+            "the registered default layouts and the dock hosts must be the same set"
+        );
+    }
+
+    /// The contract the doc comments state as load-bearing: the builder registered here is the
+    /// SAME `fn` item the owning tab hands to `ensure_default_layout` every frame, because the dock
+    /// state keeps that pointer to serve the header's «сбросить раскладку» item.
+    ///
+    /// Checked twice on purpose. `fn_addr_eq` pins the identity itself, which is what the contract
+    /// is about; the `TabId` set is the semantic backstop, since function-pointer equality is
+    /// explicitly not guaranteed to survive codegen-unit merging and a builder swapped for one with
+    /// a different tab dictionary is the failure that actually costs the user their arrangement.
+    #[test]
+    fn the_dock_hosts_register_the_builders_their_tabs_declare() {
+        /// One row of the expectation table: the host tab, the builder it must be
+        /// registered with, and the `TabId`s that builder's layout has to name.
+        type ExpectedBuilder = (AppTab, fn() -> DockLayout, &'static [TabId]);
+
+        // `const` items, not inline slice literals: rvalue static promotion does not
+        // cover a `const fn` call, so an inline `&[TabId::new(..)]` would be a
+        // temporary the `'static` row type cannot borrow.
+        const TRANSLATION_TABS: &[TabId] = &[
+            CANVAS_RIBBON_TAB,
+            TabId::new("translation.recent_characters"),
+        ];
+        const CLEANING_TABS: &[TabId] = &[
+            CANVAS_RIBBON_TAB,
+            TabId::new("cleaning.clean"),
+            TabId::new("cleaning.tools"),
+            TabId::new("cleaning.active_tool"),
+            TabId::new("cleaning.quick_clean"),
+        ];
+        const TYPING_TABS: &[TabId] = &[
+            CANVAS_RIBBON_TAB,
+            TabId::new("typing.preview"),
+            TabId::new("typing.params"),
+            TabId::new("typing.effects"),
+            TabId::new("typing.actions"),
+            TabId::new("typing.layers"),
+            TabId::new("typing.mask"),
+            TabId::new("typing.deform"),
+            TabId::new("typing.layout_editor"),
+        ];
+
+        let expected: [ExpectedBuilder; 3] = [
+            (
+                AppTab::Translation,
+                translation_default_dock_layout,
+                TRANSLATION_TABS,
+            ),
+            (AppTab::Cleaning, cleaning_default_dock_layout, CLEANING_TABS),
+            (AppTab::Typing, typing_default_dock_layout, TYPING_TABS),
+        ];
+        let registered = panel_dock_default_layout_builders();
+        for (tab, builder, tabs) in expected {
+            let (_, found) = registered
+                .into_iter()
+                .find(|(key, _)| *key == tab.key())
+                .unwrap_or_else(|| panic!("{} has no default-layout builder", tab.key()));
+            assert!(
+                std::ptr::fn_addr_eq(found, builder),
+                "{} is registered with a builder other than the one its tab declares",
+                tab.key()
+            );
+            let layout = found();
+            for id in tabs {
+                assert!(
+                    layout.panel_of_tab(*id).is_some(),
+                    "{}'s default layout does not name {id}, so a stored {id} would be dropped on \
+                     every load",
+                    tab.key()
+                );
+            }
+        }
     }
 
     /// The idle sub-window pass must answer for the tab that DREW, and the two arms that

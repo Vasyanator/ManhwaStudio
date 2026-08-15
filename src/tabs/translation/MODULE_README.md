@@ -24,12 +24,38 @@ UI panels under `panels/` expose typed options/actions and avoid owning worker l
 converts panel actions into controller requests, canvas changes, persistent settings, or storage
 jobs.
 
-This tab also HOSTS the shared panel dock (`src/widgets/panel_dock`). It declares exactly one tab —
-the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`) —
-and its default arrangement is `canvas::ribbon_only_dock_layout` — one panel at the dock area's left
-edge, the same `fn` item «Клининг» registers, handed to the dock both by `app.rs::restore_panel_dock`
-and by `ensure_default_layout`. The tab itself is declared through `canvas::declare_ribbon_tab`, the
-canvas' one declaration of it. The dock state is app-owned (`MangaApp::panel_dock`, one per studio
+This tab also HOSTS the shared panel dock (`src/widgets/panel_dock`). It declares two tabs — the
+canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`, declared
+through `canvas::declare_ribbon_tab`, the canvas' one declaration of it) and its own «Последние
+персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`, body `draw_recent_characters_tab_body`) — through
+the per-frame context `TranslationDockCx`. Its default arrangement is its OWN
+`translation_default_dock_layout`: the ribbon panel at the dock area's left edge and the cards
+docked to its right, top-aligned, which is where the row of cards floated before the migration. The
+same `fn` item is handed to the dock both by `app.rs::restore_panel_dock` and by
+`ensure_default_layout`, since the dock state keeps it to rebuild the arrangement for the header's
+reset item.
+
+«Последние персонажи» is declared on EVERY frame with `visible(!recent_characters.is_empty())` and
+`transparent_until_hover(true)`. Visibility, not declaration, is what an empty history switches: a
+hidden tab keeps its slot in the layout, so the cards return to wherever the user put them, while a
+skipped declaration would make the dock treat the tab as another program tab's and seed it a fresh
+panel. Transparency is what keeps the cards looking exactly as they did as a bare `egui::Area` —
+the panel paints no frame, border, arrow or grip until the pointer is over it, and geometry is
+identical in both states. The cards are display-only in both states too: a character is activated by
+its digit together with the bubble-create hotkey or the Shift+drag OCR gesture, never by a click.
+
+A card is PAINTED, not built from an `egui::Frame`, and that is a contract of the body rather than a
+style choice. `Frame` reserves its space through `Ui::allocate_rect`, which advances the cursor past
+an explicit rect and never reaches `Placer::next_space` — the only place `Layout::next_frame` starts
+a new row — so a framed card cannot wrap and the whole history runs off the right edge of the panel
+into a horizontal scrollbar. `draw_recent_characters_tab_body` therefore lays the caption out first
+(unwrapped, so a name never breaks across two lines), derives the card size from that galley
+(`recent_character_card_size`), allocates that exact size through `Ui::allocate_exact_size`, and
+paints the background, the border and the text into the rect the layout returns
+(`recent_character_card_caption_pos`). The two size helpers are each other's inverse and are tested
+as such: they are what keeps the hand-painted card pixel-identical to the framed one it replaced.
+
+The dock state is app-owned (`MangaApp::panel_dock`, one per studio
 window) and reaches this tab through `CanvasDrawParams::panel_dock`, which the canvas passes into
 `draw_canvas_overlay_top_left`; the tab owns none of it. `draw_panel_dock` runs at the very END of
 that hook, and what that placement buys is ONE thing: running inside `CanvasView::draw` keeps a
@@ -157,9 +183,10 @@ is an author note addressed to the translator, not a replica.
   dock's detached OS windows are immediate viewports and exist only while `PanelDock::end` shows
   them, so an early return above it would close the user's windows for that frame.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
-  `canvas::ribbon_only_dock_layout` is dropped from the user's stored arrangement on every load. A
-  tab this program tab alone would declare therefore needs a default layout builder of its own,
-  since that one is shared with «Клининг».
+  `translation_default_dock_layout` is dropped from the user's stored arrangement on every load, so
+  adding a dock tab here means adding it to that builder too. It is registered under
+  `AppTab::Translation.key()` in `app.rs::restore_panel_dock` as well; a builder wired in only one
+  of the two places silently resets the stored arrangement.
 - Text detector page results carry source size, block rectangles in source pixels, mask size, and
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
 - Text-detector mask GPU eviction must drop only tiled `TextureHandle` pages and preserve detector
@@ -238,10 +265,14 @@ is an author note addressed to the translator, not a replica.
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
   detector storage, footer sync, or settings persistence, edit `tab.rs`.
 - To change which dock tabs this program tab declares, where its panels start, or what the
-  text-detector edit boxes anchor to, edit `draw_panel_dock` / `text_detector_edit_panel_pos` in
-  `tab.rs`; the «Лента» tab's own content, sizes, title, declaration
-  (`canvas::declare_ribbon_tab`) and shared default arrangement
-  (`canvas::ribbon_only_dock_layout`) live in `src/canvas/`.
+  text-detector edit boxes anchor to, edit `draw_panel_dock` / `text_detector_edit_panel_pos` /
+  `translation_default_dock_layout` in `tab.rs`; the «Лента» tab's own content, sizes, title and
+  declaration (`canvas::declare_ribbon_tab`) live in `src/canvas/`.
+- To change what the recent-character cards LOOK like or how they wrap, edit
+  `draw_recent_characters_tab_body` in `tab.rs`; to change how big their panel starts or how small
+  it may get, edit the two `TRANSLATION_RECENT_CHARACTERS_TAB_*_SIZE_PX` constants there. The
+  history itself is `collect_recent_character_history` and the digit lookup is
+  `recent_character_entry_for_rank`.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector

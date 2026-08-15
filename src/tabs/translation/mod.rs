@@ -11,7 +11,8 @@ Submodules:
 - `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
 - `panels`: UI subpanels for Translation tab.
-- `tab`: top-level Translation tab state implementing `CanvasHooks`.
+- `tab`: top-level Translation tab state implementing `CanvasHooks`, plus this program tab's
+  default panel-dock arrangement (`translation_default_dock_layout`).
 */
 
 mod adv_rec;
@@ -24,6 +25,9 @@ pub mod panels;
 mod tab;
 pub(crate) mod text_detector;
 
+/// The «Перевод» dock arrangement builder, handed to the app-owned dock state by
+/// `app.rs::restore_panel_dock` before the first frame.
+pub(crate) use tab::translation_default_dock_layout;
 pub use tab::{
     HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
     HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,

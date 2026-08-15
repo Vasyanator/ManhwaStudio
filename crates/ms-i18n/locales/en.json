@@ -3511,6 +3511,7 @@
   "translation.tab.quick_ocr_no_text_status": "Quick OCR: no text found",
   "translation.tab.quick_ocr_result_status": "Quick OCR: {manual_text}",
   "translation.tab.ready_status": "Ready to work",
+  "translation.tab.recent_characters_tab": "Recent characters",
   "translation.tab.recognition_done_blocks_status": "Recognition complete. Blocks recognized: {recognized}/{total}",
   "translation.tab.recognition_done_no_text_status": "Recognition complete, no text found",
   "translation.tab.recognition_error": "recognition error: {error}",

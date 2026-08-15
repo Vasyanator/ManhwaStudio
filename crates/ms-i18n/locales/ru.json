@@ -3511,6 +3511,7 @@
   "translation.tab.quick_ocr_no_text_status": "Быстрое OCR: текст не найден",
   "translation.tab.quick_ocr_result_status": "Быстрое OCR: {manual_text}",
   "translation.tab.ready_status": "Готов к работе",
+  "translation.tab.recent_characters_tab": "Последние персонажи",
   "translation.tab.recognition_done_blocks_status": "Распознавание готово. Распознано блоков: {recognized}/{total}",
   "translation.tab.recognition_done_no_text_status": "Распознавание завершено, текст не найден",
   "translation.tab.recognition_error": "ошибка распознавания: {error}",

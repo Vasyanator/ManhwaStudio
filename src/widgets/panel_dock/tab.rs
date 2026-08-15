@@ -8,14 +8,16 @@ one tab. A tab is not a container the caller nests into — it is a statement of
 The dock decides which panel draws it and when.
 
 Main responsibilities:
-- collect one tab's per-frame metadata (title, visibility, min/initial size);
+- collect one tab's per-frame metadata (title, visibility, transparency mode,
+  min/initial size);
 - hand the body closure to the dock's queue instead of drawing it immediately.
 
 Key structures:
 - `PanelTab`: the builder returned by `PanelDock::tab`.
 
 Key functions:
-- `PanelTab::title`, `visible`, `min_size`, `initial_size`, `show`.
+- `PanelTab::title`, `visible`, `transparent_until_hover`, `min_size`,
+  `initial_size`, `show`.
 
 Notes:
 `show` does NOT draw. It stores `Box<dyn FnOnce(&mut Ui, &mut C) + 'frame>` in
@@ -84,6 +86,31 @@ impl<'dock, 'ctx, 'frame, C> PanelTab<'dock, 'ctx, 'frame, C> {
     #[must_use]
     pub fn visible(mut self, visible: bool) -> Self {
         self.meta.visible = visible;
+        self
+    }
+
+    /// Declares that the panel drawing this tab keeps its CHROME invisible
+    /// while the pointer is elsewhere (default `false`).
+    ///
+    /// What disappears is everything drawn AROUND the content: the panel's own
+    /// frame (background, border, shadow), the collapse arrow, the drag grip,
+    /// the resize grip and the body's scroll bars. The tab's BODY is drawn
+    /// exactly as always — including any scroll area of its own — and a panel
+    /// showing more than one caption keeps its captions fully opaque, because
+    /// they are then the only thing that says which tab is on screen. Moving the
+    /// pointer over the panel fades the chrome back in, and the panel can be
+    /// dragged, docked and resized in both states.
+    ///
+    /// It is a per-frame declaration like [`PanelTab::visible`], not a stored
+    /// property: the panel is transparent on the frames the tab it actually
+    /// DRAWS asks for it, so a panel switched to another tab is opaque again.
+    ///
+    /// The mode changes painting only. The panel occupies the same rect, is laid
+    /// out identically and keeps intercepting pointer input over that rect —
+    /// an invisible panel still shields whatever is underneath it.
+    #[must_use]
+    pub fn transparent_until_hover(mut self, transparent: bool) -> Self {
+        self.meta.transparent_until_hover = transparent;
         self
     }
 

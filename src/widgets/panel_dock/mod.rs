@@ -111,6 +111,11 @@ const MEASUREMENT_EPSILON: f32 = 1.0;
 struct TabMeta {
     /// Whether the tab is drawn this frame. A hidden tab keeps its layout slot.
     visible: bool,
+    /// Whether the panel showing this tab hides its chrome until the pointer is
+    /// over it. A per-frame declaration like [`TabMeta::visible`] — nothing about
+    /// it is stored, because it describes what the CALLER wants this frame, not
+    /// how the user arranged the dock.
+    transparent_until_hover: bool,
     /// Lower bound on the owning panel's outer size while this tab is active.
     min_size: Option<Vec2>,
     /// Outer size used until the tab has been measured at least once.
@@ -121,6 +126,7 @@ impl Default for TabMeta {
     fn default() -> Self {
         Self {
             visible: true,
+            transparent_until_hover: false,
             min_size: None,
             initial_size: None,
         }
@@ -1222,6 +1228,15 @@ fn draw_host<'frame, C>(
             0.0,
             state.chrome.collapsed_height + PANEL_MIN_CONTENT_HEIGHT,
         ));
+        // What must keep a transparent panel visible even with the pointer
+        // nowhere near it. Both are gestures the panel is the TARGET of, and a
+        // panel that faded out in the middle of one would blink at the user:
+        // a tab in flight anywhere in the dock has to have every transparent
+        // panel to aim at, and a panel being MOVED is pinned to the dock area's
+        // border while the cursor is pulled outside it (the tension model), so
+        // the cursor is regularly not over the panel it is dragging.
+        let force_visible = carries_tab
+            || matches!(drag_phase, DragPhase::Moving { panel, .. } if panel == panel_plan.id);
         let body = entries.get_mut(&active).and_then(|entry| entry.body.take());
         let drawn = CollapsiblePanel::new(panel_plan.id, layout_key)
             .geometry(geometry)
@@ -1229,6 +1244,8 @@ fn draw_host<'frame, C>(
             .tabs(&headers, Some(active))
             .min_size(min_size)
             .move_targets(&move_entries)
+            .transparent_until_hover(panel_plan.transparent)
+            .force_visible(force_visible)
             // A window that merely still receives pointer events must not claim a
             // drop the user made over a window floating above it.
             .accepts_drop(owns_pointer)
@@ -3197,6 +3214,14 @@ struct PanelPlan {
     visible_tabs: Vec<TabId>,
     /// Tab whose body is drawn, or `None` when the panel has nothing to show.
     active_tab: Option<TabId>,
+    /// `true` when the tab this panel actually DRAWS asked for the
+    /// transparent-until-hover mode.
+    ///
+    /// The question is answered here rather than in the drawing loop so it stays
+    /// testable without a GPU, and it is asked of the ACTIVE tab alone: the mode
+    /// describes what is on screen, so a hidden — or merely inactive —
+    /// transparent tab must not make the panel showing another tab disappear.
+    transparent: bool,
 }
 
 /// The whole frame's decisions plus the size maps handed to the solver.
@@ -3231,7 +3256,10 @@ struct FramePlan {
 ///   applies [`DEFAULT_PANEL_SIZE`];
 /// * a panel with nothing to draw still reports the sizes of its stored
 ///   `active_tab`, which costs nothing because [`frame_layout`] takes that panel
-///   out of the solve altogether.
+///   out of the solve altogether;
+/// * the panel is drawn transparent-until-hover exactly when the tab it DRAWS
+///   declared that mode ([`PanelPlan::transparent`]) — a declaration of the
+///   caller's, so it is answered here rather than in the drawing loop.
 fn plan_frame(
     layout: &DockLayout,
     host: HostId,
@@ -3279,6 +3307,14 @@ fn plan_frame(
         }
 
         let size_source = active_tab.unwrap_or(node.active_tab);
+        // Only the DRAWN tab decides the mode: a transparent tab that is hidden,
+        // or merely not the active one, must not make the panel showing another
+        // tab disappear.
+        let transparent = active_tab.is_some_and(|tab| {
+            decls
+                .get(&tab)
+                .is_some_and(|meta| meta.transparent_until_hover)
+        });
         plan.panels.push(PanelPlan {
             id: node.id,
             collapsed: node.collapsed,
@@ -3289,6 +3325,7 @@ fn plan_frame(
             active_request: tab_request(size_source, decls, measured),
             visible_tabs,
             active_tab,
+            transparent,
         });
     }
     plan
@@ -3327,8 +3364,17 @@ mod tests {
     fn meta(visible: bool, min: Option<Vec2>, initial: Option<Vec2>) -> TabMeta {
         TabMeta {
             visible,
+            transparent_until_hover: false,
             min_size: min,
             initial_size: initial,
+        }
+    }
+
+    /// A declaration that asks for the transparent-until-hover mode.
+    fn transparent_meta(visible: bool) -> TabMeta {
+        TabMeta {
+            transparent_until_hover: true,
+            ..meta(visible, None, None)
         }
     }
 
@@ -3719,6 +3765,103 @@ mod tests {
         assert_eq!(plan.panels.len(), 1);
         assert_eq!(plan.panels[0].visible_tabs, vec![TAB_A]);
         assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
+    }
+
+    /// The mode belongs to what is ON SCREEN, so the ACTIVE tab answers for the
+    /// panel and its inactive siblings do not.
+    #[test]
+    fn only_the_drawn_tab_decides_whether_its_panel_is_transparent() {
+        let mut layout = DockLayout::new();
+        let mut node = panel_with(0, &[TAB_A, TAB_B]);
+        node.active_tab = TAB_A;
+        layout.insert_panel(node).expect("insert 0");
+
+        // The transparent tab is the drawn one.
+        let transparent_active = decls(&[
+            (TAB_A, transparent_meta(true)),
+            (TAB_B, meta(true, None, None)),
+        ]);
+        let plan = plan_frame(
+            &layout,
+            HostId::MainWindow,
+            &transparent_active,
+            &HashMap::new(),
+        );
+        assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
+        assert!(plan.panels[0].transparent);
+
+        // The same panel with an ORDINARY tab active: a transparent sibling
+        // sitting in the strip must not make the drawn one disappear.
+        let transparent_sibling = decls(&[
+            (TAB_A, meta(true, None, None)),
+            (TAB_B, transparent_meta(true)),
+        ]);
+        let plan = plan_frame(
+            &layout,
+            HostId::MainWindow,
+            &transparent_sibling,
+            &HashMap::new(),
+        );
+        assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
+        assert!(!plan.panels[0].transparent);
+    }
+
+    /// A hidden tab is not drawn, so it cannot make its panel transparent —
+    /// including when the panel falls back to another tab of its own.
+    #[test]
+    fn a_hidden_transparent_tab_leaves_its_panel_opaque() {
+        let mut layout = DockLayout::new();
+        let mut node = panel_with(0, &[TAB_A, TAB_B]);
+        node.active_tab = TAB_A;
+        layout.insert_panel(node).expect("insert 0");
+        let fallback = decls(&[
+            (TAB_A, transparent_meta(false)),
+            (TAB_B, meta(true, None, None)),
+        ]);
+        let plan = plan_frame(&layout, HostId::MainWindow, &fallback, &HashMap::new());
+        assert_eq!(plan.panels[0].active_tab, Some(TAB_B));
+        assert!(!plan.panels[0].transparent);
+
+        // And a panel with nothing showable at all is not transparent either:
+        // it is not drawn, so there is nothing to fade.
+        let nothing_shown = decls(&[
+            (TAB_A, transparent_meta(false)),
+            (TAB_B, meta(false, None, None)),
+        ]);
+        let plan = plan_frame(&layout, HostId::MainWindow, &nothing_shown, &HashMap::new());
+        assert_eq!(plan.panels[0].active_tab, None);
+        assert!(!plan.panels[0].transparent);
+    }
+
+    /// The hidden active tab's fallback keeps the mode of the tab that REPLACES
+    /// it: the panel shows a transparent tab, so the panel is transparent.
+    #[test]
+    fn a_transparent_fallback_tab_makes_its_panel_transparent() {
+        let mut layout = DockLayout::new();
+        let mut node = panel_with(0, &[TAB_A, TAB_B]);
+        node.active_tab = TAB_A;
+        layout.insert_panel(node).expect("insert 0");
+        let decls = decls(&[
+            (TAB_A, meta(false, None, None)),
+            (TAB_B, transparent_meta(true)),
+        ]);
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        assert_eq!(plan.panels[0].active_tab, Some(TAB_B));
+        assert!(plan.panels[0].transparent);
+    }
+
+    /// An undeclared tab carries no declaration at all, so nothing about it can
+    /// turn the mode on. This is the "another program tab's tab" case.
+    #[test]
+    fn an_undeclared_tab_never_turns_the_mode_on() {
+        let mut layout = DockLayout::new();
+        layout
+            .insert_panel(panel_with(0, &[TAB_A, TAB_C]))
+            .expect("insert 0");
+        let decls = decls(&[(TAB_A, meta(true, None, None))]);
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        assert_eq!(plan.panels[0].visible_tabs, vec![TAB_A]);
+        assert!(!plan.panels[0].transparent);
     }
 
     #[test]
