@@ -2,8 +2,9 @@
 
 ## Purpose
 This directory implements the Cleaning tab. It provides the canvas-facing UI for editing
-per-page clean overlays, quick text-mask cleanup, save/history controls, and a floating
-tool panel backed by reusable cleaning tools.
+per-page clean overlays, quick text-mask cleanup, save/history controls, and the tool picker
+backed by reusable cleaning tools. All of that UI lives in dock tabs; the tab owns no floating
+surface of its own.
 
 ## Architecture
 `CleaningTabState` owns a dedicated `CanvasView`, the active `CleaningTool`, cleaning UI state,
@@ -23,13 +24,20 @@ workers, and applies prepared `ColorImage` patches into `CleanOverlaysModel` as 
 Save operations collect overlay snapshots from the shared model and write `clean_layers/` in a
 worker thread.
 
-This tab HOSTS the shared panel dock (`src/widgets/panel_dock`). It declares exactly one tab —
-the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`) —
-and its default arrangement is `canvas::ribbon_only_dock_layout` — one panel at the dock area's left
-edge, the same `fn` item «Перевод» registers, handed to the dock both by `app.rs::restore_panel_dock`
-and by `ensure_default_layout`. The tab itself is declared through `canvas::declare_ribbon_tab`, the
-canvas' one declaration of it. The dock state is NOT owned here: it is app-owned
-(`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
+This tab HOSTS the shared panel dock (`src/widgets/panel_dock`), and every floating surface it has
+is a dock tab. It declares FIVE: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
+`CanvasView::draw_ribbon_tab_body`, declared through `canvas::declare_ribbon_tab` — the canvas' one
+declaration of it) plus four of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
+the quick-clean toggle and the save status), «Инструменты клина» (`cleaning.tools`: the tool picker,
+rows wrapping to the panel width), «Выбранный инструмент» (`cleaning.active_tool`:
+`CleaningTool::draw_ui`) and «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
+quick-clean parameters, its two run buttons and its progress). Its default arrangement is
+`cleaning_default_dock_layout` — five panels, handed to the dock both by
+`app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
+dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
+`CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
+three floating surfaces these tabs replaced performed theirs. The dock state is NOT owned here: it is
+app-owned (`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
 `CleaningDrawParams::panel_dock`, which `tab.rs` passes on to `CanvasDrawParams`. The dock runs in
 `CleaningHooks::draw_canvas_overlay_top_left` — inside `CanvasView::draw`, so a «Лента» edit still
 lands before `publish_canvas_settings` — and it must run on EVERY frame this tab is active,
@@ -47,8 +55,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 `src/ai_models.rs` before calling Python backend endpoints.
 
 ## Files and submodules
-- `tab.rs`: tab state, canvas orchestration, floating panels, mask loading, save jobs,
-  quick text-clean job orchestration, and history hotkeys.
+- `tab.rs`: tab state, canvas orchestration, the dock tabs and their default arrangement, mask
+  loading, save jobs, quick text-clean job orchestration, and history hotkeys.
 - `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
   clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
   (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->
@@ -115,20 +123,57 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   or committed clean-overlay edits.
 - Canvas zoom, drag-scroll, and context menus must respect active tool capture/blocking signals.
 - `panel_rects` is a SAME-FRAME list, cleared once per frame after `canvas.draw`. Every floating
-  surface that may swallow a tool click has to be in it — the dock's panels included, which is why
-  their rects are carried out of the hook rather than pushed straight into the field.
+  surface that may swallow a tool click has to be in it, and they are all dock panels now, which is
+  why their rects are carried out of the hook rather than pushed straight into the field. A rect is
+  never pushed into it directly: it arrives through `PanelDockOutput::drawn_panels`, which answers
+  for the MAIN window alone.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
-  `canvas::ribbon_only_dock_layout` is dropped from the user's stored arrangement on every load. A
-  tab this program tab alone would declare therefore needs a default layout builder of its own,
-  since that one is shared with «Перевод».
+  `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
+  adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — it can
+  no longer share `canvas::ribbon_only_dock_layout` with «Перевод», which names «Лента» alone — and
+  it is registered under `AppTab::Cleaning.key()` in `app.rs::restore_panel_dock` as well; a builder
+  wired in only one of the two places silently resets the stored arrangement.
+- A dock tab body runs INSIDE `CanvasView::draw`. It edits the state its own widgets own — the
+  active tool's UI mutates that tool, exactly as it did inside the tool window — but it may not
+  perform, or invalidate the inputs of, anything the tab defers: the canvas' overlay edits, the job
+  starters (`start_save_job`, `start_text_mask_load_job_if_needed`, `start_quick_text_clean_job`)
+  and the tool switch (`activate_tool`) all need `&mut CleaningTabState` and would land
+  mid-canvas-frame. Those are raised as flags on `CleaningDockOut` and run by `apply_dock_out`
+  after the canvas draw returns, in the order the surfaces they came from ran them. The worker/job
+  code itself never moves into a body.
+- Anything a tab body READS is polled BEFORE `canvas.draw`, not after it: `CleaningHooks` snapshots
+  the save state and the active tool index when it is built, so `poll_save_job` and
+  `ensure_active_tool_available` run at the top of `CleaningTabState::draw`. Polling after the draw
+  showed the previous frame's answer for one frame — a spinner outliving its save, a tool that had
+  just become unavailable still drawn selected — with nothing requesting the correcting repaint.
+- The tool buttons' captions are resolved at DRAW time from `CleaningTool::title()`, never cached in
+  the tab state: a cached caption keeps the language the app started in.
+- Every tab whose width is caption-driven («Инструменты клина», «Клин», «Быстрый клин найденного
+  текста») derives its `min_size` — and the last two their `initial_size` too — from the captions
+  they are about to draw, per frame and therefore per locale. The dock never re-measures a tab's
+  WIDTH (it stores the width the panel ASKED for), so a hardcoded width is permanent, and one sized
+  for Russian opens the French panel on a horizontal scrollbar.
+- `quick_text_mask_panel_open` is the ONE source of truth for the quick-clean tab: it is the tab's
+  `.visible(..)` and it gates the canvas' text-mask overlay, so it must never be forked into a
+  second flag. The tab is DECLARED on every frame regardless — a hidden tab keeps its slot in the
+  layout and only its panel is skipped, while an undeclared one would be re-seeded a fresh panel on
+  the next open. Its only affordance is the «Быстрый клин найденного текста» button in «Клин»,
+  which is drawn `selected` while the tab is open: the `egui::Window` it replaced had a title-bar
+  ✕, and a dock tab has no close affordance by design (a tab is only ever MOVED).
 
 ## Editing map
 - To change top-level cleaning UI, save behavior, history, or quick-clean orchestration,
   edit `tab.rs`.
-- To change which dock tabs this program tab declares or where its panels start, edit
-  `CleaningHooks::draw_canvas_overlay_top_left` in `tab.rs`; the «Лента» tab's own content, sizes,
-  title, declaration (`canvas::declare_ribbon_tab`) and shared default arrangement
-  (`canvas::ribbon_only_dock_layout`) live in `src/canvas/`.
+- To change which dock tabs this program tab declares or how big they start, edit
+  `CleaningHooks::draw_canvas_overlay_top_left` in `tab.rs`; where their panels sit by default is
+  `cleaning_default_dock_layout` in the same file, and both places have to agree. The «Лента» tab's
+  own content, sizes, title and declaration (`canvas::declare_ribbon_tab`) live in `src/canvas/`.
+- To change what a dock tab SHOWS, edit `draw_clean_tab_body` / `draw_tools_tab_body` /
+  `draw_active_tool_tab_body` / `draw_quick_clean_tab_body` in `tab.rs`; to change what a click
+  there DOES, add a field to `CleaningDockOut` and apply it in `apply_dock_out`.
+- To change how the tool buttons are laid out or how narrow the tool panel may get, edit
+  `draw_tool_button_rows` (rows wrap automatically; a caption never wraps) and the pair
+  `cleaning_tool_button_width` / `cleaning_tools_tab_min_width`.
 - To change quick text-clean pixel classification, mask evolution (grow/shrink), candidate
   selection, bubble-interior clipping, or conditional padding, edit `autoclean.rs`; keep
   worker/job coordination, mask resize, and detector-box source->page scaling

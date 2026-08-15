@@ -71,7 +71,7 @@ use crate::page_ops::{PageOpKind, PageOpOutcome, execute_page_op};
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
-use crate::tabs::cleaning::{CleaningDrawParams, CleaningTabState};
+use crate::tabs::cleaning::{CleaningDrawParams, CleaningTabState, cleaning_default_dock_layout};
 use crate::tabs::notes::NotesTabState;
 use crate::tabs::page_manager::{PageManagerAction, PageManagerTabState};
 use crate::tabs::ps_editor::PsEditorTabState;
@@ -3635,15 +3635,18 @@ fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
     let restored = panel_dock_persist::layouts_from_user_settings(
         user_settings,
         &[
-            // «Перевод» and «Клининг» declare the canvas' «Лента» and nothing else, so they
-            // share one builder — see `canvas::ribbon_only_dock_layout`.
+            // «Перевод» declares the canvas' «Лента» and nothing else, so it uses the
+            // canvas' own builder — see `canvas::ribbon_only_dock_layout`.
             (
                 AppTab::Translation.key(),
                 crate::canvas::ribbon_only_dock_layout as fn() -> DockLayout,
             ),
+            // «Клининг» adds three tabs of its own on top of «Лента», so it needs a
+            // builder that names them: the default doubles as the dictionary stored
+            // tab keys are resolved against.
             (
                 AppTab::Cleaning.key(),
-                crate::canvas::ribbon_only_dock_layout as fn() -> DockLayout,
+                cleaning_default_dock_layout as fn() -> DockLayout,
             ),
             (
                 AppTab::Typing.key(),

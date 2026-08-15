@@ -6,10 +6,11 @@ FILE HEADER (tabs/cleaning/tab.rs)
     `bottom_hint` stays `None`, so the overlay is not drawn) and does not persist a collapsed flag.
   - `tools` / `active_tool_idx`: набор инструментов и выбранный инструмент.
   - `stroke_active` / `last_stroke_point`: состояние текущего штриха.
-  - `panel_rects`: прямоугольники плавающих панелей (`остров` + `панель инструмента` + панели ДОКА,
-    добавляемые в список после `canvas.draw`) для фильтрации ввода.
+  - `panel_rects`: прямоугольники панелей ДОКА, нарисованных в этом кадре (добавляются в список
+    после `canvas.draw`), для фильтрации ввода. Своих плавающих окон у вкладки больше нет.
   - `text_mask_model`: shared-модель маски текста для mask-layer overlay в cleaning-canvas.
-  - `quick_text_mask_panel_open`: состояние плавающей панели "Быстрый клин найденного текста".
+  - `quick_text_mask_panel_open`: видимость вкладки дока «Быстрый клин найденного текста».
+    Единственный источник истины: он же гейтит оверлей текстовой маски на холсте.
   - `text_mask_textures`: tile-кэш текстовой маски для оверлея в cleaning-canvas with LRU metadata
     for memory-pressure eviction.
   - `text_mask_load_*`: асинхронная подзагрузка масок из `text_detection`, если в shared-модели ещё нет данных.
@@ -21,10 +22,16 @@ FILE HEADER (tabs/cleaning/tab.rs)
     все входы кадра приходят одним `CleaningDrawParams`, среди них `panel_dock` — состояние
     панельного дока, которым владеет приложение и которое одалживается на кадр.
   - `draw_canvas_overlay_top_left` (в `CleaningHooks`): единственное место, где эта вкладка
-    гоняет док; объявляет вкладку «Лента» через `canvas::declare_ribbon_tab`, раскладка по
-    умолчанию — общая с «Переводом» `canvas::ribbon_only_dock_layout`.
-  - `draw_tool_panel`: отдельное плавающее окно инструмента (выбор инструмента + его UI) со сворачиванием.
-  - `draw_quick_text_mask_panel`: плавающая сворачиваемая панель быстрого клина (параметры + запуск + прогресс).
+    гоняет док; объявляет «Ленту» через `canvas::declare_ribbon_tab` и четыре собственные вкладки —
+    «Клин» (`CLEANING_CLEAN_TAB`), «Инструменты клина» (`CLEANING_TOOLS_TAB`), «Выбранный
+    инструмент» (`CLEANING_ACTIVE_TOOL_TAB`) и «Быстрый клин найденного текста»
+    (`CLEANING_QUICK_CLEAN_TAB`, видима по `quick_text_mask_panel_open`). Раскладка по умолчанию —
+    собственная (`cleaning_default_dock_layout`).
+  - `draw_clean_tab_body` / `draw_tools_tab_body` / `draw_active_tool_tab_body` /
+    `draw_quick_clean_tab_body`: тела этих четырёх вкладок. Всё, что требует `&mut CleaningTabState`
+    (правки оверлея, запуск фоновых job-ов, смена инструмента), они не делают сами — идут внутри
+    `canvas.draw` — а выставляют флаги `CleaningDockOut`, которые `apply_dock_out` применяет уже
+    после `canvas.draw` в том же порядке, в каком это делали снесённые плавающие поверхности.
   - `active_cursor_occluder`: вычисляет scene-область активного курсора кисти для скрытия on_top/aside пузырей.
   - `start_text_mask_load_job_if_needed/poll_text_mask_load_job`: фоновые загрузка и применение масок.
   - `start_quick_text_clean_job/poll_quick_text_clean_job`: многопоточная обработка страниц по маске текста
@@ -49,7 +56,7 @@ use super::tools::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
     self, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot,
-    RibbonDockCx, SourceTextureUploadBudget,
+    SourceTextureUploadBudget,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -61,10 +68,13 @@ use crate::models::text_mask_model::TextMaskModel;
 use crate::project::ProjectData;
 use crate::tabs::AppTab;
 use crate::tabs::translation::backend_health::AiBackendHealthSnapshot;
-use crate::widgets::panel_dock::{DockArea, PanelDock, PanelDockState};
+use crate::widgets::panel_dock::{
+    DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
+    PanelNode, TabId,
+};
 use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
-use egui::{Align, Color32, Layout, Pos2, Rect};
+use egui::{Align, Color32, Layout, Pos2, Rect, Vec2};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -79,12 +89,85 @@ const TEXT_MASK_VISUAL_ALPHA_MAX: u8 = 96;
 fn save_hint_text() -> &'static str {
     t!("cleaning.tab.saving_status")
 }
-const FLOATING_PANEL_MARGIN: f32 = 12.0;
-/// Дополнительный отступ панели инструментов от правого края вьюпорта, чтобы
-/// плавающее окно не перекрывало вертикальный скроллбар холста.
-const CLEANING_TOOL_PANEL_SCROLLBAR_MARGIN: f32 = 15.0;
-const CLEANING_TOOL_PANEL_DEFAULT_WIDTH: f32 = 352.0;
-const CLEANING_TOOL_BUTTONS_PER_ROW: usize = 3;
+
+// Dock tabs of the «Клининг» program tab. Every id is a stable, non-localised
+// literal: it is the identity the persisted layout and every egui id of the
+// owning panel derive from (`dev-docs/i18n_exclusions.md` §A9).
+/// «Клин» — clean-layer visibility, the clear/save actions, the quick-clean entry
+/// point and the save status.
+const CLEANING_CLEAN_TAB: TabId = TabId::new("cleaning.clean");
+/// «Инструменты клина» — the tool picker alone.
+const CLEANING_TOOLS_TAB: TabId = TabId::new("cleaning.tools");
+/// «Выбранный инструмент» — the active tool's own UI (`CleaningTool::draw_ui`).
+const CLEANING_ACTIVE_TOOL_TAB: TabId = TabId::new("cleaning.active_tool");
+/// «Быстрый клин найденного текста» — the quick-clean parameters, its two run
+/// buttons and its progress. Shown only while `quick_text_mask_panel_open`.
+const CLEANING_QUICK_CLEAN_TAB: TabId = TabId::new("cleaning.quick_clean");
+
+/// Runtime marker painted on the badge of every Torch-backed tool button. A
+/// runtime NAME rather than prose, so it stays a literal
+/// (`dev-docs/i18n_exclusions.md` §A10).
+const CLEANING_AI_TOOL_MARKER: &str = "Torch";
+
+/// Smallest outer HEIGHT, in points, the dock may shrink the «Клин» panel to. Its
+/// body scrolls, so the floor only has to keep the two control rows on screen. The
+/// WIDTH half of the floor is measured per frame from the captions
+/// ([`cleaning_clean_tab_size_bounds`]).
+const CLEANING_CLEAN_TAB_MIN_HEIGHT_PX: f32 = 110.0;
+/// Outer HEIGHT, in points, the «Клин» panel starts at: two control rows, the two
+/// hint lines and the save status.
+const CLEANING_CLEAN_TAB_INITIAL_HEIGHT_PX: f32 = 150.0;
+
+/// Smallest outer HEIGHT, in points, the dock may shrink the «Инструменты клина»
+/// panel to. The width half of that floor is measured per frame from the widest
+/// tool button ([`cleaning_tab_outer_width`]); this is the height that keeps one
+/// button row plus its category label visible.
+const CLEANING_TOOLS_TAB_MIN_HEIGHT_PX: f32 = 96.0;
+/// Outer size, in points, the «Инструменты клина» panel starts at — the width the
+/// tool window used before the migration, which fits three buttons per row.
+const CLEANING_TOOLS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(352.0, 220.0);
+
+/// Smallest outer HEIGHT, in points, the dock may shrink the «Быстрый клин
+/// найденного текста» panel to: the two parameter rows and the run buttons. Its
+/// width floor is measured per frame ([`cleaning_quick_clean_tab_size_bounds`]).
+const CLEANING_QUICK_CLEAN_TAB_MIN_HEIGHT_PX: f32 = 120.0;
+/// Outer HEIGHT, in points, the «Быстрый клин найденного текста» panel starts at:
+/// the two parameter rows, the run buttons, the progress bar and two status lines,
+/// which is what it shows while a run is in flight.
+const CLEANING_QUICK_CLEAN_TAB_INITIAL_HEIGHT_PX: f32 = 230.0;
+
+/// Smallest outer size, in points, the dock may shrink the «Выбранный инструмент»
+/// panel to. The per-tool UIs differ wildly (the watermark tool's is by far the
+/// largest) and the body scrolls, so the floor is a usable strip, not a fit.
+const CLEANING_ACTIVE_TOOL_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 140.0);
+/// Outer size, in points, the «Выбранный инструмент» panel starts at: the tool
+/// window's own width, and enough height for the larger tool UIs to show their
+/// first controls without scrolling on the first frame.
+const CLEANING_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(352.0, 360.0);
+
+/// Extra width, in points, added to every measured tool-button caption before the
+/// «Инструменты клина» minimum is folded out of them.
+///
+/// [`cleaning_tool_button_width`] reconstructs egui's own sizing from the caption
+/// galley and `Spacing::button_padding`, but the real frame margin also carries
+/// the widget's expansion and its border stroke
+/// (`egui-0.35.0/src/widget_style.rs:161-165`), both of which vary with the
+/// interaction state. Erring HIGH costs a few points of panel width; erring low
+/// clips the caption the floor exists to protect. Same rationale and value as
+/// `settings::typesetting::font_groups::BUTTON_WIDTH_SLACK`.
+const CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX: f32 = 4.0;
+
+/// Width, in points, a dock panel spends on its own chrome before its body — the
+/// `Frame::popup` inner margin on both sides plus its border stroke on both sides.
+///
+/// A tab's `min_size` is an OUTER size (`panel_dock/MODULE_README.md`), so a floor
+/// derived from content width has to include it. Measured at 14 pt in the default
+/// style (`Margin::same(6)` per side, `egui-0.35.0/src/style.rs:1451`, plus a 1 pt
+/// `window_stroke` per side, `:1519`); rounded up because both are style-dependent
+/// and a floor that is a little too wide costs nothing while one that is too
+/// narrow clips a caption.
+const CLEANING_PANEL_CHROME_WIDTH_PX: f32 = 16.0;
+
 const BRUSH_TOOL_INDICES: [usize; 2] = [0, 1];
 const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
 // Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков) —
@@ -92,6 +175,395 @@ const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
 // рисуется ни в одной группе панели инструментов.
 const AREA_EDIT_TOOL_INDICES: [usize; 3] = [7, 8, 9];
 
+/// Every tool index the «Инструменты клина» tab draws a button for, in draw order.
+///
+/// The three groups are separate constants because they are drawn under separate
+/// category labels; this is the one place that needs them as a whole — the tab's
+/// width floor is the maximum over ALL of them, and a tool missing here would be
+/// a tool whose caption the floor does not protect.
+///
+/// No `#[must_use]`: `impl Iterator` already carries one, and repeating it is
+/// `clippy::double_must_use`.
+fn drawn_tool_indices() -> impl Iterator<Item = usize> {
+    BRUSH_TOOL_INDICES
+        .into_iter()
+        .chain(MASK_REMOVAL_TOOL_INDICES)
+        .chain(AREA_EDIT_TOOL_INDICES)
+}
+
+/// Builds the default dock arrangement of the «Клининг» program tab.
+///
+/// Five panels reproducing where the migrated surfaces floated: the canvas' own
+/// «Лента» flush with the left edge (identical to
+/// [`canvas::ribbon_only_dock_layout`], so a user who already arranged the ribbon
+/// keeps it), «Клин» to its right where the island sat, «Быстрый клин найденного
+/// текста» under «Клин» — the button that opens it lives there, and the left column
+/// is where the vertical room is, while hanging it off the right column would put an
+/// on-demand panel under a tool UI that is already the tallest thing on screen —,
+/// «Инструменты клина» flush with the right edge where the tool window sat, and
+/// «Выбранный инструмент» docked under it. All five are content-sized: their width
+/// is driven by their tabs' own `min_size`, and pinning a size here would only make
+/// the first solve fight it.
+///
+/// No two panels share a `target` + `edge` + `align`: the two `Bottom` anchors name
+/// different targets («Клин» and «Инструменты клина»), which is what keeps the
+/// solver — a total function of whatever layout it is given — from laying one panel
+/// exactly on top of another.
+///
+/// This tab needs a builder of ITS own — it can no longer share
+/// [`canvas::ribbon_only_dock_layout`] with «Перевод» — because the default layout
+/// doubles as the DICTIONARY the persistence layer resolves stored tab keys
+/// against: a `TabId` missing from it is dropped from the user's arrangement on
+/// every load (`panel_dock/persist.rs::known_tabs`).
+///
+/// Used only when no layout exists yet for this program tab; a restored one always
+/// wins. Handed to the app-owned dock state as a plain `fn` pointer, both when the
+/// persisted layouts are restored before the first frame and by
+/// `ensure_default_layout` on every frame this tab draws. A model refusal is
+/// logged and skipped, never panicked on: the dock then creates a panel for the
+/// orphaned tab on its own, which is a degraded arrangement rather than a lost tab.
+#[must_use]
+pub(crate) fn cleaning_default_dock_layout() -> DockLayout {
+    let mut layout = DockLayout::new();
+    let ribbon = PanelId::new(0);
+    let clean = PanelId::new(1);
+    let tools = PanelId::new(2);
+    let panels = [
+        // The ribbon is inserted FIRST because «Клин» anchors to it, and
+        // `insert_panel` rejects an anchor whose target does not exist yet.
+        (
+            ribbon,
+            vec![canvas::CANVAS_RIBBON_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            },
+        ),
+        (
+            clean,
+            vec![CLEANING_CLEAN_TAB],
+            PanelAnchor::Panel {
+                target: ribbon,
+                edge: DockEdge::Right,
+                align: 0.0,
+            },
+        ),
+        (
+            tools,
+            vec![CLEANING_TOOLS_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.0,
+            },
+        ),
+        (
+            PanelId::new(3),
+            vec![CLEANING_ACTIVE_TOOL_TAB],
+            PanelAnchor::Panel {
+                target: tools,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+        (
+            PanelId::new(4),
+            vec![CLEANING_QUICK_CLEAN_TAB],
+            PanelAnchor::Panel {
+                target: clean,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+    ];
+    for (id, tabs, anchor) in panels {
+        let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
+            Ok(mut node) => {
+                node.anchor = anchor;
+                node
+            }
+            Err(error) => {
+                crate::runtime_log::log_warn(format!(
+                    "[cleaning] default dock layout: could not build panel {id} ({error}); \
+                     the dock will create one per orphaned tab on its own"
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = layout.insert_panel(node) {
+            crate::runtime_log::log_warn(format!(
+                "[cleaning] default dock layout: could not insert panel {id} ({error}); \
+                 the dock will create one per orphaned tab on its own"
+            ));
+        }
+    }
+    layout
+}
+
+/// Width, in points, the caption `label` lays out to in the button text style.
+///
+/// Text LAYOUT only — no painting and no I/O — so it is safe on the GUI thread, and
+/// egui caches galleys, so re-measuring a fixed caption every frame costs a lookup.
+#[must_use]
+fn cleaning_caption_width(ctx: &egui::Context, style: &egui::Style, label: &str) -> f32 {
+    let font_id = egui::TextStyle::Button.resolve(style);
+    // The colour is irrelevant to the measurement; the galley is never painted.
+    ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_string(), font_id, Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// Width, in points, `label` needs as a cleaning tool button under `style`.
+///
+/// The caption's laid-out width plus the style's horizontal button padding on both
+/// sides plus [`CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX`]. For a `badged` (Torch-gated)
+/// button it also adds the marker badge's overhang, which is painted OUTSIDE the
+/// button's own rect (`widgets::marker_badge_overhang`).
+///
+/// What that badge term buys is narrow and worth stating exactly: it keeps the
+/// badge inside the panel for a button that starts a row at the tab's WIDTH FLOOR,
+/// which is the case the floor is computed for. It is not a general "the badge is
+/// never clipped" guarantee — at any wider width a wrapped row can still end with a
+/// badged button flush against the body's right edge, and there the badge is drawn
+/// over whatever is beside it exactly as it was before this migration.
+///
+/// The whole number is an ESTIMATE by construction: egui 0.35 derives the real
+/// button padding from `Style::button_style`, where it varies with the widget's
+/// interaction state, so this deliberately errs high.
+#[must_use]
+fn cleaning_tool_button_width(
+    ctx: &egui::Context,
+    style: &egui::Style,
+    label: &str,
+    badged: bool,
+) -> f32 {
+    let badge = if badged {
+        crate::widgets::marker_badge_overhang(ctx, style, CLEANING_AI_TOOL_MARKER)
+    } else {
+        0.0
+    };
+    cleaning_caption_width(ctx, style, label)
+        + style.spacing.button_padding.x * 2.0
+        + CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX
+        + badge
+}
+
+/// Width, in points, `label` needs as a `ui.checkbox` under `style`.
+///
+/// egui 0.35 lays a checkbox out as an `AtomLayout` of an icon square plus the
+/// caption, in a frame with NO padding of its own
+/// (`Style::checkbox_style`, `egui-0.35.0/src/widget_style.rs:174-189`;
+/// `egui-0.35.0/src/widgets/checkbox.rs:85-100`): `Spacing::icon_width` for the
+/// square, `Spacing::icon_spacing` for the gap
+/// (`egui-0.35.0/src/atomics/atom_layout.rs:302`), and a floor of
+/// `Spacing::interact_size.y`. The same slack as a button is added on top, for the
+/// same reason.
+#[must_use]
+fn cleaning_checkbox_width(ctx: &egui::Context, style: &egui::Style, label: &str) -> f32 {
+    let spacing = &style.spacing;
+    let content = spacing.icon_width
+        + spacing.icon_spacing
+        + cleaning_caption_width(ctx, style, label)
+        + CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX;
+    content.max(spacing.interact_size.y)
+}
+
+/// Natural width, in points, of `widths` laid out side by side in one row.
+///
+/// One `item_spacing.x` per gap, none after the last widget. An empty row is `0.0`.
+#[must_use]
+fn cleaning_row_width(widths: &[f32], item_spacing_x: f32) -> f32 {
+    let gaps = widths.len().saturating_sub(1);
+    // `usize -> f32` through `u16`: a row holds a handful of controls, so the
+    // saturating conversion is exact here and cannot lose precision even if it
+    // ever saturated.
+    let gap_total = item_spacing_x * f32::from(u16::try_from(gaps).unwrap_or(u16::MAX));
+    widths.iter().copied().filter(|w| w.is_finite()).sum::<f32>() + gap_total
+}
+
+/// Folds measured CONTENT widths into an OUTER panel width: the widest one plus the
+/// panel's own chrome and the body scrollbar's reserve.
+///
+/// Non-finite and non-positive measurements are ignored rather than propagated (a
+/// `min_size` reaching the solver as `NaN` would poison the whole layout); with no
+/// usable measurement at all the result is the chrome and the reserve alone, and the
+/// solver's own `PANEL_MIN_WIDTH` still applies underneath.
+#[must_use]
+fn cleaning_tab_outer_width(
+    content_widths: impl IntoIterator<Item = f32>,
+    scrollbar_reserve: f32,
+) -> f32 {
+    content_widths
+        .into_iter()
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .fold(0.0_f32, f32::max)
+        + CLEANING_PANEL_CHROME_WIDTH_PX
+        + scrollbar_reserve
+}
+
+/// Width, in points, a dock panel's body must keep clear on its right for the
+/// vertical scroll bar.
+///
+/// Verified against the LIVE style rather than taken from the dock's readme: nothing
+/// in this repo assigns `Spacing::scroll`, so it is egui's `ScrollStyle::default()`,
+/// which is `floating()` (`egui-0.35.0/src/style.rs:581-585`). A floating bar
+/// allocates NO width from the content (`floating_allocated_width: 0.0`, `:644`;
+/// `allocated_width()`, `:652-658`) — but it PAINTS over the rightmost `bar_width`
+/// points of the body when it is visible, and at the width floor that strip is
+/// exactly where a badged button's marker sits. So the reserve is the wider of what
+/// the bar TAKES and what it COVERS, which keeps this correct if the style is ever
+/// switched to a solid preset (where the two coincide).
+#[must_use]
+fn cleaning_scrollbar_reserve(style: &egui::Style) -> f32 {
+    let scroll = &style.spacing.scroll;
+    scroll
+        .allocated_width()
+        .max(scroll.bar_width + scroll.bar_outer_margin)
+}
+
+/// Width, in points, a `WheelSlider` with a value box needs under `style`.
+///
+/// It wraps `egui::Slider`, whose width is the rail (`Spacing::slider_width`) plus
+/// one item gap plus the value `DragValue`, and a `DragValue`'s minimum size is
+/// `Spacing::interact_size` (`egui-0.35.0/src/style.rs:406-411`). The caption is not
+/// part of it here: this tab draws the label as a separate widget beside the slider.
+#[must_use]
+fn cleaning_slider_width(style: &egui::Style) -> f32 {
+    let spacing = &style.spacing;
+    spacing.slider_width
+        + spacing.item_spacing.x
+        + spacing.interact_size.x
+        + CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX
+}
+
+/// Width, in points, a `WheelComboBox` showing `selected_text` needs under `style`.
+///
+/// It wraps `egui::ComboBox`, for which `Spacing::combo_width` is a MINIMUM rather
+/// than a fixed width (`egui-0.35.0/src/containers/combo_box.rs:345-347`): the box
+/// grows to fit its selected text plus the button padding and the drop-down arrow,
+/// which is an icon of `Spacing::icon_width` one `icon_spacing` away.
+#[must_use]
+fn cleaning_combo_width(ctx: &egui::Context, style: &egui::Style, selected_text: &str) -> f32 {
+    let spacing = &style.spacing;
+    let content = cleaning_caption_width(ctx, style, selected_text)
+        + spacing.button_padding.x * 2.0
+        + spacing.icon_spacing
+        + spacing.icon_width
+        + CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX;
+    content.max(spacing.combo_width)
+}
+
+/// Smallest and starting OUTER size of the «Клин» tab under `style`, measured from
+/// the captions it is about to draw.
+///
+/// Both bounds are per-locale by necessity. The dock never re-measures a tab's
+/// WIDTH — it stores the width the panel ASKED for (`panel_dock/mod.rs`,
+/// `PanelPlan::assumed_size`) — so `initial_size.x` is the panel's width until the
+/// user drags it, and a fixed number sized for Russian opens the French panel on a
+/// permanent horizontal scrollbar.
+///
+/// - the MINIMUM is the widest SINGLE control, because the three controls of the
+///   first row wrap ([`draw_clean_tab_body`]); the second row does not wrap, so its
+///   button counts as a single control here too;
+/// - the START is the widest natural ROW, so the first frame shows the first row
+///   unwrapped, exactly as the island did.
+#[must_use]
+fn cleaning_clean_tab_size_bounds(ctx: &egui::Context, style: &egui::Style) -> (Vec2, Vec2) {
+    let first_row = [
+        cleaning_checkbox_width(ctx, style, t!("cleaning.tab.show_layer_button")),
+        cleaning_tool_button_width(
+            ctx,
+            style,
+            t!("cleaning.tab.clear_current_layer_button"),
+            false,
+        ),
+        cleaning_tool_button_width(ctx, style, t!("cleaning.tab.save_clean_button"), false),
+    ];
+    let quick_clean = cleaning_tool_button_width(
+        ctx,
+        style,
+        t!("cleaning.tab.quick_clean_heading"),
+        false,
+    );
+    let reserve = cleaning_scrollbar_reserve(style);
+    let min_width = cleaning_tab_outer_width(
+        first_row.into_iter().chain(std::iter::once(quick_clean)),
+        reserve,
+    );
+    let initial_width = cleaning_tab_outer_width(
+        [
+            cleaning_row_width(&first_row, style.spacing.item_spacing.x),
+            quick_clean,
+        ],
+        reserve,
+    );
+    (
+        Vec2::new(min_width, CLEANING_CLEAN_TAB_MIN_HEIGHT_PX),
+        Vec2::new(
+            initial_width.max(min_width),
+            CLEANING_CLEAN_TAB_INITIAL_HEIGHT_PX,
+        ),
+    )
+}
+
+/// Smallest and starting OUTER size of the «Быстрый клин найденного текста» tab
+/// under `style`, measured from the controls it is about to draw.
+///
+/// Same rule and the same reasons as [`cleaning_clean_tab_size_bounds`]: all three
+/// of this body's rows wrap, so the MINIMUM is the widest single control, while the
+/// START is the widest natural row so nothing wraps on the first frame. Its width is
+/// caption-driven like the other tabs' — the two parameter labels and the two run
+/// buttons are the widest things in it, and they are the ones that grow in Spanish
+/// and French. The progress bar and the status lines below are not measured: a
+/// `ProgressBar` takes the width it is given and a `ui.small` wraps.
+#[must_use]
+fn cleaning_quick_clean_tab_size_bounds(ctx: &egui::Context, style: &egui::Style) -> (Vec2, Vec2) {
+    let spread_row = [
+        cleaning_caption_width(ctx, style, t!("cleaning.tab.mask_spread_radius_label")),
+        cleaning_slider_width(style),
+    ];
+    let background_row = [
+        cleaning_caption_width(ctx, style, t!("cleaning.tab.uneven_background_tool_label")),
+        // The widest option the combo can show, not the one selected right now: the
+        // floor must not move when the user picks another entry.
+        cleaning_combo_width(ctx, style, UnevenBackgroundTool::NoProcessing.title()),
+    ];
+    let run_row = [
+        cleaning_tool_button_width(
+            ctx,
+            style,
+            t!("cleaning.tab.clean_current_page_button"),
+            false,
+        ),
+        cleaning_tool_button_width(ctx, style, t!("cleaning.tab.clean_all_pages_button"), false),
+    ];
+    let reserve = cleaning_scrollbar_reserve(style);
+    let gap = style.spacing.item_spacing.x;
+    let min_width = cleaning_tab_outer_width(
+        spread_row
+            .into_iter()
+            .chain(background_row)
+            .chain(run_row),
+        reserve,
+    );
+    let initial_width = cleaning_tab_outer_width(
+        [
+            cleaning_row_width(&spread_row, gap),
+            cleaning_row_width(&background_row, gap),
+            cleaning_row_width(&run_row, gap),
+        ],
+        reserve,
+    );
+    (
+        Vec2::new(min_width, CLEANING_QUICK_CLEAN_TAB_MIN_HEIGHT_PX),
+        Vec2::new(
+            initial_width.max(min_width),
+            CLEANING_QUICK_CLEAN_TAB_INITIAL_HEIGHT_PX,
+        ),
+    )
+}
 
 #[derive(Clone)]
 struct TextMaskTextureTile {
@@ -195,7 +667,6 @@ pub struct CleaningDrawParams<'a> {
 pub struct CleaningTabState {
     canvas: CanvasView,
     tools: Vec<Box<dyn CleaningTool>>,
-    tool_labels: Vec<String>,
     active_tool_idx: usize,
     stroke_active: bool,
     last_stroke_point: Option<StrokePoint>,
@@ -238,17 +709,17 @@ impl Default for CleaningTabState {
             Box::<FluxFillInpaintTool>::default(),
             Box::<WatermarkRemovalTool>::default(),
         ];
-        let tool_labels = tools.iter().map(|tool| tool.title().to_string()).collect();
-
         let mut state = Self {
             canvas,
             tools,
-            tool_labels,
             active_tool_idx: 0,
             stroke_active: false,
             last_stroke_point: None,
             active_stroke_page_idx: None,
-            panel_rects: Vec::with_capacity(2),
+            // The five default dock panels, which is the most this tab puts on
+            // screen at once. Nothing else is added: every floating surface of this
+            // tab is a dock panel now.
+            panel_rects: Vec::with_capacity(5),
             text_mask_model: None,
             quick_text_mask_panel_open: false,
             text_mask_textures: HashMap::new(),
@@ -411,6 +882,20 @@ impl CleaningTabState {
         if ctx.input(|i| i.pointer.primary_released()) {
             self.finish_stroke();
         }
+        // Both of these ran between `canvas.draw` and the two floating surfaces that
+        // are dock tabs now, and both feed values those tabs READ. The dock runs
+        // inside `canvas.draw`, so they have to move ahead of it or the tabs would
+        // show last frame's answer: the «Клин» spinner would outlive the save by a
+        // frame (and only self-heal because `egui::Spinner` asks for a repaint,
+        // which it does not do while the panel is clipped out of view), and
+        // «Инструменты клина» would show a tool that is no longer available as
+        // selected. Both are safe here: `poll_save_job` touches only the save
+        // receiver and its two status fields, and `ensure_active_tool_available`
+        // does what the frame's own `primary_released` branch above already may do
+        // — commit the stroke in flight and swap the active tool — before anything
+        // has been drawn.
+        self.poll_save_job();
+        self.ensure_active_tool_available();
         let canvas_rect = ui.max_rect();
         let history_hotkeys_handled = self.handle_history_hotkeys(ctx);
         let hotkeys_handled = self.handle_active_tool_hotkeys(ctx, canvas_rect);
@@ -478,6 +963,18 @@ impl CleaningTabState {
             text_mask_synced_revision: &mut self.text_mask_synced_revision,
             cursor_occluder,
             dock_panel_rects: Vec::new(),
+            tools: &mut self.tools,
+            active_tool_idx: self.active_tool_idx,
+            save_job_in_progress: self.save_job_in_progress,
+            save_status_text: self.save_status_text.as_deref(),
+            quick_clean_spread_radius_px: &mut self.quick_clean_spread_radius_px,
+            quick_clean_uneven_background_tool: &mut self.quick_clean_uneven_background_tool,
+            quick_clean_job_in_progress: self.quick_clean_job_in_progress,
+            quick_clean_progress: &self.quick_clean_progress,
+            quick_clean_status_text: self.quick_clean_status_text.as_deref(),
+            text_mask_load_in_progress: self.text_mask_load_in_progress,
+            text_mask_load_status: self.text_mask_load_status.as_deref(),
+            dock_out: CleaningDockOut::default(),
         };
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
         self.canvas.draw(CanvasDrawParams {
@@ -494,11 +991,12 @@ impl CleaningTabState {
         // Taken while `hooks` is still alive and BEFORE the `&mut self` calls below, which would
         // otherwise conflict with the field borrows `hooks` holds.
         let dock_panel_rects = std::mem::take(&mut hooks.dock_panel_rects);
-        self.poll_save_job();
+        let dock_out = std::mem::take(&mut hooks.dock_out);
         self.panel_rects.clear();
         // The dock drew its panels DURING `canvas.draw`, i.e. before this frame's `clear`, so its
         // rects are re-added here: `canvas_pointer_occluded` gates the active tool on this
-        // same-frame list, exactly as it does for this tab's own island and tool panels.
+        // same-frame list. They are the WHOLE list now — every floating surface of this tab is a
+        // dock panel, so nothing else is ever pushed into it.
         //
         // Its z-order term (`ctx.layer_id_at` == `Order::Foreground`) does cover a dock panel on
         // its own, including the very first frame one appears — `Areas::set_state` records the
@@ -510,9 +1008,7 @@ impl CleaningTabState {
         // the user detached into a sub-window, whose rect would otherwise blank out this window's
         // top-left corner (`PanelDockOutput`).
         self.panel_rects.extend(dock_panel_rects);
-        self.draw_top_island_panel(ctx, canvas_rect, project);
-        self.draw_tool_panel(ctx, canvas_rect);
-        self.draw_quick_text_mask_panel(ctx, canvas_rect, project);
+        self.apply_dock_out(dock_out, project);
         self.handle_active_tool_input(ctx, canvas_rect, project);
         let ai_backend_available = self.ai_backend_available();
         let ai_backend_torch_available = self.ai_backend_torch_available();
@@ -615,285 +1111,59 @@ impl CleaningTabState {
         }
     }
 
-    fn draw_top_island_panel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: egui::Rect,
-        project: &ProjectData,
-    ) {
-        let mut overlays_visible = self.canvas.clean_overlays_visible();
-        let mut clear_page = false;
-        let mut request_save = false;
-        let mut toggle_quick_clean_panel = false;
-
-        let panel = egui::Area::new("cleaning_top_island_panel".into())
-            .fixed_pos(canvas_rect.left_top() + egui::vec2(360.0, 12.0))
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut overlays_visible, t!("cleaning.tab.show_layer_button"));
-                            if ui.button(t!("cleaning.tab.clear_current_layer_button")).clicked() {
-                                clear_page = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.save_job_in_progress,
-                                    egui::Button::new(t!("cleaning.tab.save_clean_button")),
-                                )
-                                .clicked()
-                            {
-                                request_save = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let quick_button = ui.button(t!("cleaning.tab.quick_clean_heading"));
-                            if quick_button.clicked() {
-                                toggle_quick_clean_panel = true;
-                            }
-                            let status_height = ui.spacing().interact_size.y;
-                            let status_width = ui.available_width().max(0.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(status_width, status_height),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    if self.save_job_in_progress {
-                                        ui.spinner();
-                                        ui.label(save_hint_text());
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.small(t!("cleaning.tab.paint_erase_hint"));
-                        ui.small(t!("cleaning.tab.scroll_brush_hint"));
-                        if !self.save_job_in_progress
-                            && let Some(status) = self.save_status_text.as_ref()
-                        {
-                            ui.small(status);
-                        }
-                    });
-                })
-            });
-
-        self.panel_rects.push(panel.response.rect);
-
-        if overlays_visible != self.canvas.clean_overlays_visible() {
-            self.canvas.set_clean_overlays_visible(overlays_visible);
+    /// Applies the deferred results of this frame's dock tab bodies, in the order
+    /// the two migrated floating surfaces applied theirs.
+    ///
+    /// The bodies run INSIDE `CanvasView::draw` — the dock is driven from
+    /// [`CleaningHooks::draw_canvas_overlay_top_left`] — where `&mut self` is not
+    /// reachable at all and where committing an overlay edit would land in the
+    /// middle of the canvas' own frame. A body therefore only RAISES a flag, and
+    /// every mutation happens here, at the point in the frame the island and the
+    /// tool window used to run: same calls, same order, same observable behaviour.
+    ///
+    /// `project` is needed by the two background-job starters and by nothing else.
+    fn apply_dock_out(&mut self, out: CleaningDockOut, project: &ProjectData) {
+        if let Some(visible) = out.set_overlays_visible
+            && visible != self.canvas.clean_overlays_visible()
+        {
+            self.canvas.set_clean_overlays_visible(visible);
         }
 
-        if clear_page {
+        if out.clear_current_layer {
             self.canvas
                 .clear_overlay_index(self.canvas.current_page_idx());
         }
 
-        if request_save {
+        if out.request_save {
             self.start_save_job(project);
         }
 
-        if toggle_quick_clean_panel {
+        if out.toggle_quick_clean_panel {
             let next_open = !self.quick_text_mask_panel_open;
             self.quick_text_mask_panel_open = next_open;
             if next_open {
                 self.start_text_mask_load_job_if_needed(project);
             }
         }
-    }
 
-    fn draw_tool_panel(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
-        self.ensure_active_tool_available();
-        let mut activate_tool_idx = self.active_tool_idx;
-        let tool_panel_default_pos = egui::pos2(
-            (canvas_rect.right()
-                - CLEANING_TOOL_PANEL_DEFAULT_WIDTH
-                - FLOATING_PANEL_MARGIN
-                - CLEANING_TOOL_PANEL_SCROLLBAR_MARGIN)
-                .max(canvas_rect.left() + FLOATING_PANEL_MARGIN),
-            canvas_rect.top() + FLOATING_PANEL_MARGIN,
-        );
-        let window = egui::Window::new(t!("cleaning.tab.tools_heading")).id(egui::Id::new("cleaning.tab.tools_heading"))
-            .id(egui::Id::new("cleaning_tool_floating_panel"))
-            .default_pos(tool_panel_default_pos)
-            .default_width(CLEANING_TOOL_PANEL_DEFAULT_WIDTH)
-            .collapsible(true)
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.draw_tool_button_group(
-                    ui,
-                    t!("cleaning.tab.brushes_label"),
-                    &BRUSH_TOOL_INDICES,
-                    &mut activate_tool_idx,
-                );
-                ui.add_space(6.0);
-                self.draw_tool_button_group(
-                    ui,
-                    t!("cleaning.tab.mask_removal_label"),
-                    &MASK_REMOVAL_TOOL_INDICES,
-                    &mut activate_tool_idx,
-                );
-                // SDXL и FLUX.1 Fill — на отдельной строке инструментов редактирования
-                // области, чтобы не растягивать панель в ширину.
-                self.draw_tool_button_rows(ui, &AREA_EDIT_TOOL_INDICES, &mut activate_tool_idx);
-                ui.separator();
-                if let Some(tool) = self.tools.get_mut(self.active_tool_idx) {
-                    tool.draw_ui(ui);
-                }
-            });
-
-        if let Some(window) = window {
-            self.panel_rects.push(window.response.rect);
+        // `ensure_active_tool_available` ran at the top of the tool window's own
+        // draw, i.e. AHEAD of this click; it now runs at the top of the frame
+        // instead (see [`CleaningTabState::draw`]), which keeps that order.
+        if let Some(idx) = out.activate_tool_idx
+            && idx != self.active_tool_idx
+            && self.tool_available(idx)
+        {
+            self.activate_tool(idx);
         }
 
-        if activate_tool_idx != self.active_tool_idx && self.tool_available(activate_tool_idx) {
-            self.activate_tool(activate_tool_idx);
-        }
-    }
-
-    fn draw_tool_button_group(
-        &self,
-        ui: &mut egui::Ui,
-        title: &str,
-        tool_indices: &[usize],
-        activate_tool_idx: &mut usize,
-    ) {
-        ui.label(egui::RichText::new(title).strong());
-        self.draw_tool_button_rows(ui, tool_indices, activate_tool_idx);
-    }
-
-    fn draw_tool_button_rows(
-        &self,
-        ui: &mut egui::Ui,
-        tool_indices: &[usize],
-        activate_tool_idx: &mut usize,
-    ) {
-        for row in tool_indices.chunks(CLEANING_TOOL_BUTTONS_PER_ROW) {
-            ui.horizontal(|ui| {
-                for &idx in row {
-                    let Some(label) = self.tool_labels.get(idx) else {
-                        continue;
-                    };
-                    let is_selected = *activate_tool_idx == idx;
-                    let requires_pytorch =
-                        self.tools.get(idx).is_some_and(|tool| tool.pytorch_required());
-                    // AI tools use a self-gating `AiButton` (Torch requirement, framed
-                    // to match the plain tool buttons) with a "Torch" runtime marker;
-                    // it disables itself and shows the reason when Torch is
-                    // unavailable. Non-AI tools stay plain always-enabled buttons.
-                    let clicked = if requires_pytorch {
-                        AiButton::new(label.as_str(), AiRequirement::Torch)
-                            .selected(is_selected)
-                            .marker("Torch")
-                            .draw(ui)
-                            .response
-                            .clicked()
-                    } else {
-                        ui.add(egui::Button::new(label.as_str()).selected(is_selected))
-                            .clicked()
-                    };
-                    if clicked {
-                        *activate_tool_idx = idx;
-                    }
-                }
-            });
-        }
-    }
-
-    fn draw_quick_text_mask_panel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: egui::Rect,
-        project: &ProjectData,
-    ) {
-        if !self.quick_text_mask_panel_open {
-            return;
-        }
-        let mut panel_open = self.quick_text_mask_panel_open;
-        let mut run_current_page = false;
-        let mut run_all_pages = false;
-        let window = egui::Window::new(t!("cleaning.tab.quick_clean_heading")).id(egui::Id::new("cleaning.tab.quick_clean_heading"))
-            .id(egui::Id::new("cleaning_quick_text_mask_panel"))
-            .default_pos(canvas_rect.left_top() + egui::vec2(1080.0, 12.0))
-            .collapsible(true)
-            .resizable(true)
-            .open(&mut panel_open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(t!("cleaning.tab.mask_spread_radius_label")).on_hover_text(
-                        t!("cleaning.tab.mask_spread_radius_hint"),
-                    );
-                    ui.add(
-                        WheelSlider::new(&mut self.quick_clean_spread_radius_px, 0..=128)
-                            .suffix(t!("cleaning.tab.pixels_suffix")),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label(t!("cleaning.tab.uneven_background_tool_label"));
-                    WheelComboBox::from_id_salt("quick-clean-uneven-bg-tool")
-                        .selected_text(self.quick_clean_uneven_background_tool.title())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.quick_clean_uneven_background_tool,
-                                UnevenBackgroundTool::NoProcessing,
-                                UnevenBackgroundTool::NoProcessing.title(),
-                            );
-                        });
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.quick_clean_job_in_progress,
-                            egui::Button::new(t!("cleaning.tab.clean_current_page_button")),
-                        )
-                        .clicked()
-                    {
-                        run_current_page = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.quick_clean_job_in_progress,
-                            egui::Button::new(t!("cleaning.tab.clean_all_pages_button")),
-                        )
-                        .clicked()
-                    {
-                        run_all_pages = true;
-                    }
-                });
-                if self.text_mask_load_in_progress {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.small(t!("cleaning.tab.mask_loading_status"));
-                    });
-                } else if let Some(status) = self.text_mask_load_status.as_ref() {
-                    ui.small(status);
-                }
-                if self.quick_clean_job_in_progress {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.small(t!("cleaning.tab.quick_clean_running_status"));
-                    });
-                }
-                if self.quick_clean_progress.total_pages > 0 {
-                    let progress = (self.quick_clean_progress.done_pages as f32
-                        / self.quick_clean_progress.total_pages as f32)
-                        .clamp(0.0, 1.0);
-                    ui.add(egui::ProgressBar::new(progress).text(tf!("cleaning.tab.pages_progress_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages)));
-                    ui.small(tf!("cleaning.tab.regions_progress_status", filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, partial = self.quick_clean_progress.regions_partial, page_errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
-                }
-                if let Some(status) = self.quick_clean_status_text.as_ref() {
-                    ui.small(status);
-                }
-            });
-        self.quick_text_mask_panel_open = panel_open;
-        if let Some(window) = window {
-            self.panel_rects.push(window.response.rect);
-        }
-        if run_current_page {
+        // Last, because the quick-clean window ran last among the migrated surfaces.
+        // Each run re-checks the mask load first, exactly as it did there; the job
+        // orchestration itself stays in `start_quick_text_clean_job`.
+        if out.run_quick_clean_current_page {
             self.start_text_mask_load_job_if_needed(project);
             self.start_quick_text_clean_job(project, vec![self.canvas.current_page_idx()]);
         }
-        if run_all_pages {
+        if out.run_quick_clean_all_pages {
             self.start_text_mask_load_job_if_needed(project);
             let page_indices: Vec<usize> = project.pages.iter().map(|page| page.idx).collect();
             self.start_quick_text_clean_job(project, page_indices);
@@ -1560,12 +1830,392 @@ impl CleaningTabState {
     }
 }
 
+/// What one frame of the «Клининг» dock tab bodies decided, drained by
+/// [`CleaningTabState::apply_dock_out`] once `CanvasView::draw` has returned.
+///
+/// The bodies cannot mutate the tab: they run inside the canvas draw, behind the
+/// dock's per-frame context, and the calls they stand for (`start_save_job`,
+/// `start_text_mask_load_job_if_needed`, `activate_tool`, the canvas' own overlay
+/// edits) all need `&mut CleaningTabState` and must not land mid-canvas-frame.
+/// Every field is therefore a REQUEST, applied later in the frame in the order the
+/// migrated floating surfaces applied theirs.
+#[derive(Debug, Default)]
+struct CleaningDockOut {
+    /// New clean-overlay visibility asked for by the «Клин» checkbox, if the user
+    /// touched it this frame.
+    set_overlays_visible: Option<bool>,
+    /// «Очистить текущий слой» was pressed.
+    clear_current_layer: bool,
+    /// «Сохранить клин» was pressed.
+    request_save: bool,
+    /// «Быстрый клин найденного текста» was pressed: flip the quick-clean window
+    /// and, when it opens, start the mask load.
+    toggle_quick_clean_panel: bool,
+    /// Tool index the «Инструменты клина» buttons ended the frame on. `None` while
+    /// the tab was not drawn at all, which must not be read as "activate tool 0".
+    activate_tool_idx: Option<usize>,
+    /// «Заклинить текущую страницу» was pressed.
+    run_quick_clean_current_page: bool,
+    /// «Заклинить все страницы» was pressed.
+    run_quick_clean_all_pages: bool,
+}
+
+/// Per-frame context the panel dock hands to one «Клининг» tab body at a time.
+///
+/// The bodies capture nothing of their own: «Лента» needs the shared `CanvasView`,
+/// «Инструменты клина» and «Выбранный инструмент» both need the tool list (the
+/// second one mutably), and «Клин» needs the save state. Closures capturing those
+/// borrows directly could not coexist in the dock's queue; exclusive, sequential
+/// access through this context lets every body reach exactly what it needs.
+///
+/// Every field is a borrow of a DISJOINT field of [`CleaningHooks`] or a plain
+/// copy, and none of them is the `PanelDockState` the dock itself borrows for the
+/// frame.
+struct CleaningDockCx<'a> {
+    /// Owner of the «Лента» body — the hook's own `canvas` parameter, which is
+    /// borrow-independent of the tab state the hook was called on.
+    canvas: &'a mut CanvasView,
+    /// Project page count, shown by the «Лента» tab's page counter.
+    total_pages: usize,
+    /// The registered cleaning tools: captions and Torch requirement for
+    /// «Инструменты клина», `draw_ui` for «Выбранный инструмент».
+    tools: &'a mut [Box<dyn CleaningTool>],
+    /// Index of the tool that is active as this frame's dock runs. The tools tab
+    /// starts its own optimistic selection from it (see [`CleaningDockOut`]).
+    active_tool_idx: usize,
+    /// Whether a clean save is in flight: disables «Сохранить клин» and drives the
+    /// spinner next to it.
+    save_job_in_progress: bool,
+    /// Last save status line, shown by «Клин» while no save is running.
+    save_status_text: Option<&'a str>,
+    /// Whether the quick-clean tab is open. Read by «Клин», whose button is the one
+    /// affordance that toggles it, so the button can show itself as pressed.
+    quick_clean_panel_open: bool,
+    /// Quick-clean spread radius, in page pixels — the tab's own `WheelSlider`.
+    quick_clean_spread_radius_px: &'a mut i32,
+    /// Quick-clean uneven-background tool — the tab's own `WheelComboBox`.
+    quick_clean_uneven_background_tool: &'a mut UnevenBackgroundTool,
+    /// Whether a quick-clean run is in flight: disables both run buttons and drives
+    /// the running spinner.
+    quick_clean_job_in_progress: bool,
+    /// Progress of the quick-clean run in flight, shown as a bar plus a line of
+    /// counters once it has a page total.
+    quick_clean_progress: &'a QuickTextCleanProgress,
+    /// Last quick-clean status line.
+    quick_clean_status_text: Option<&'a str>,
+    /// Whether a text-mask load is in flight, shown above the run buttons.
+    text_mask_load_in_progress: bool,
+    /// Last text-mask load status line.
+    text_mask_load_status: Option<&'a str>,
+    /// Everything the bodies decided this frame; drained after the canvas draw.
+    out: &'a mut CleaningDockOut,
+}
+
+/// Draws the «Клин» tab body: clean-layer visibility, the clear/save actions, the
+/// quick-clean entry point, the in-flight save spinner and the two hint lines.
+///
+/// Mutates nothing but [`CleaningDockOut`] — see there for why.
+///
+/// The first row WRAPS, on the same rule as the tool rows: three controls side by
+/// side are ~460 pt in Russian and ~490 in French, and a panel the user narrows
+/// below that must break the row rather than hide a button behind a horizontal
+/// scrollbar. The second row is one button plus a status strip that fills whatever
+/// is left, so it has nothing to wrap.
+fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    let mut overlays_visible = cx.canvas.clean_overlays_visible();
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Inside a wrapping layout egui defaults widget text to
+            // `TextWrapMode::Wrap` (`egui-0.35.0/src/ui.rs:588-600`), which breaks a
+            // caption over two lines instead of moving its control to the next row.
+            // Same fix, and same reason, as `draw_tool_button_rows`.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            if ui
+                .checkbox(&mut overlays_visible, t!("cleaning.tab.show_layer_button"))
+                .changed()
+            {
+                cx.out.set_overlays_visible = Some(overlays_visible);
+            }
+            if ui
+                .button(t!("cleaning.tab.clear_current_layer_button"))
+                .clicked()
+            {
+                cx.out.clear_current_layer = true;
+            }
+            if ui
+                .add_enabled(
+                    !cx.save_job_in_progress,
+                    egui::Button::new(t!("cleaning.tab.save_clean_button")),
+                )
+                .clicked()
+            {
+                cx.out.request_save = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            // Shown PRESSED while the quick-clean tab is open. That look is this
+            // button's whole close affordance: the panel used to be an
+            // `egui::Window` with a title-bar ✕, and a dock tab deliberately has
+            // none (a tab is only ever MOVED), so the one control that opens it has
+            // to read as the one that closes it again.
+            if ui
+                .add(
+                    egui::Button::new(t!("cleaning.tab.quick_clean_heading"))
+                        .selected(cx.quick_clean_panel_open),
+                )
+                .clicked()
+            {
+                cx.out.toggle_quick_clean_panel = true;
+            }
+            let status_height = ui.spacing().interact_size.y;
+            let status_width = ui.available_width().max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(status_width, status_height),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    if cx.save_job_in_progress {
+                        ui.spinner();
+                        ui.label(save_hint_text());
+                    }
+                },
+            );
+        });
+
+        ui.small(t!("cleaning.tab.paint_erase_hint"));
+        ui.small(t!("cleaning.tab.scroll_brush_hint"));
+        if !cx.save_job_in_progress
+            && let Some(status) = cx.save_status_text
+        {
+            ui.small(status);
+        }
+    });
+}
+
+/// Draws the «Инструменты клина» tab body: the three tool groups and nothing else.
+///
+/// Selection is OPTIMISTIC within the frame — a click marks its button selected
+/// straight away, and the actual `activate_tool` runs after the canvas draw — so
+/// the running selection is carried in [`CleaningDockOut::activate_tool_idx`]
+/// rather than read back from the tab state.
+fn draw_tools_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    let mut activate_tool_idx = cx.out.activate_tool_idx.unwrap_or(cx.active_tool_idx);
+    draw_tool_button_group(
+        ui,
+        t!("cleaning.tab.brushes_label"),
+        cx.tools,
+        &BRUSH_TOOL_INDICES,
+        &mut activate_tool_idx,
+    );
+    ui.add_space(6.0);
+    draw_tool_button_group(
+        ui,
+        t!("cleaning.tab.mask_removal_label"),
+        cx.tools,
+        &MASK_REMOVAL_TOOL_INDICES,
+        &mut activate_tool_idx,
+    );
+    // The area-edit tools (SDXL, FLUX.1 Fill, watermark removal) deliberately carry
+    // no category label of their own — they read as a continuation of the list.
+    draw_tool_button_rows(ui, cx.tools, &AREA_EDIT_TOOL_INDICES, &mut activate_tool_idx);
+    cx.out.activate_tool_idx = Some(activate_tool_idx);
+}
+
+/// Draws the «Быстрый клин найденного текста» tab body: the two parameters, the two
+/// run buttons, the mask-load and run status, and the progress of a run in flight.
+///
+/// Mutates the two parameter values it owns directly — they are plain settings the
+/// widgets edit in place — and defers the two RUNS, which start worker jobs through
+/// `&mut CleaningTabState` and would otherwise fire in the middle of the canvas'
+/// own frame ([`CleaningDockOut`]).
+///
+/// All three rows wrap on the same rule as the rest of this tab's bodies.
+fn draw_quick_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.label(t!("cleaning.tab.mask_spread_radius_label"))
+            .on_hover_text(t!("cleaning.tab.mask_spread_radius_hint"));
+        ui.add(
+            WheelSlider::new(cx.quick_clean_spread_radius_px, 0..=128)
+                .suffix(t!("cleaning.tab.pixels_suffix")),
+        );
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.label(t!("cleaning.tab.uneven_background_tool_label"));
+        WheelComboBox::from_id_salt("quick-clean-uneven-bg-tool")
+            .selected_text(cx.quick_clean_uneven_background_tool.title())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    cx.quick_clean_uneven_background_tool,
+                    UnevenBackgroundTool::NoProcessing,
+                    UnevenBackgroundTool::NoProcessing.title(),
+                );
+            });
+    });
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        if ui
+            .add_enabled(
+                !cx.quick_clean_job_in_progress,
+                egui::Button::new(t!("cleaning.tab.clean_current_page_button")),
+            )
+            .clicked()
+        {
+            cx.out.run_quick_clean_current_page = true;
+        }
+        if ui
+            .add_enabled(
+                !cx.quick_clean_job_in_progress,
+                egui::Button::new(t!("cleaning.tab.clean_all_pages_button")),
+            )
+            .clicked()
+        {
+            cx.out.run_quick_clean_all_pages = true;
+        }
+    });
+    if cx.text_mask_load_in_progress {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.small(t!("cleaning.tab.mask_loading_status"));
+        });
+    } else if let Some(status) = cx.text_mask_load_status {
+        ui.small(status);
+    }
+    if cx.quick_clean_job_in_progress {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.small(t!("cleaning.tab.quick_clean_running_status"));
+        });
+    }
+    let progress = cx.quick_clean_progress;
+    if progress.total_pages > 0 {
+        // Page counts through `u32` (total, so an absurd count saturates rather than
+        // wrapping) and then `f64`, which represents every `u32` exactly. `total` is
+        // non-zero inside this branch, and the quotient is clamped into `0..=1`, so
+        // the one narrowing step below cannot lose anything that matters.
+        let done = f64::from(u32::try_from(progress.done_pages).unwrap_or(u32::MAX));
+        let total = f64::from(u32::try_from(progress.total_pages).unwrap_or(u32::MAX));
+        let ratio = (done / total.max(1.0)).clamp(0.0, 1.0) as f32;
+        ui.add(egui::ProgressBar::new(ratio).text(tf!(
+            "cleaning.tab.pages_progress_status",
+            done = progress.done_pages,
+            total = progress.total_pages
+        )));
+        ui.small(tf!(
+            "cleaning.tab.regions_progress_status",
+            filled = progress.regions_filled,
+            skipped = progress.regions_skipped,
+            partial = progress.regions_partial,
+            page_errors = progress.failed_pages,
+            missing = progress.missing_masks
+        ));
+    }
+    if let Some(status) = cx.quick_clean_status_text {
+        ui.small(status);
+    }
+}
+
+/// Draws the «Выбранный инструмент» tab body: the active tool's own UI, with no
+/// heading of its own — the tab caption is the heading.
+fn draw_active_tool_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    if let Some(tool) = cx.tools.get_mut(cx.active_tool_idx) {
+        tool.draw_ui(ui);
+    }
+}
+
+/// Draws one labelled group of tool buttons.
+fn draw_tool_button_group(
+    ui: &mut egui::Ui,
+    title: &str,
+    tools: &[Box<dyn CleaningTool>],
+    tool_indices: &[usize],
+    activate_tool_idx: &mut usize,
+) {
+    ui.label(egui::RichText::new(title).strong());
+    draw_tool_button_rows(ui, tools, tool_indices, activate_tool_idx);
+}
+
+/// Lays the buttons of `tool_indices` out in rows that wrap to the available width.
+///
+/// A button never splits across rows and a row always holds at least one button,
+/// however narrow the panel: egui breaks a wrapping row only when the cursor has
+/// already left the row start (`egui-0.35.0/src/layout.rs:516-518`), so a button
+/// wider than the whole row still gets a row of its own instead of looping.
+fn draw_tool_button_rows(
+    ui: &mut egui::Ui,
+    tools: &[Box<dyn CleaningTool>],
+    tool_indices: &[usize],
+    activate_tool_idx: &mut usize,
+) {
+    ui.horizontal_wrapped(|ui| {
+        // Inside a wrapping horizontal layout egui defaults every widget's text to
+        // `TextWrapMode::Wrap` (`Ui::wrap_mode`, `egui-0.35.0/src/ui.rs:588-600`),
+        // which would break a long caption over two LINES instead of moving its
+        // button to the next ROW. `Extend` restores "the caption keeps its natural
+        // width, the row wraps", which is what the panel's own width floor is
+        // measured against (`cleaning_tab_outer_width`). Scoped to this child
+        // `Ui`, so the category labels above keep egui's own wrapping.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        for &idx in tool_indices {
+            let Some(tool) = tools.get(idx) else {
+                continue;
+            };
+            // Resolved at draw time, not cached: a caption cached once at
+            // construction would keep the language the app started in.
+            let label = tool.title();
+            let is_selected = *activate_tool_idx == idx;
+            // AI tools use a self-gating `AiButton` (Torch requirement, framed to
+            // match the plain tool buttons) with a "Torch" runtime marker; it
+            // disables itself and shows the reason when Torch is unavailable.
+            // Non-AI tools stay plain always-enabled buttons.
+            let clicked = if tool.pytorch_required() {
+                AiButton::new(label, AiRequirement::Torch)
+                    .selected(is_selected)
+                    .marker(CLEANING_AI_TOOL_MARKER)
+                    .draw(ui)
+                    .response
+                    .clicked()
+            } else {
+                ui.add(egui::Button::new(label).selected(is_selected))
+                    .clicked()
+            };
+            if clicked {
+                *activate_tool_idx = idx;
+            }
+        }
+    });
+}
+
 struct CleaningHooks<'a> {
     quick_text_mask_panel_open: bool,
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
     text_mask_textures: &'a mut HashMap<usize, TextMaskTexturePage>,
     text_mask_synced_revision: &'a mut u64,
     cursor_occluder: Option<CleaningCursorOccluder>,
+    /// The registered cleaning tools, lent to the two tool tab bodies.
+    tools: &'a mut [Box<dyn CleaningTool>],
+    /// Active tool index as of the start of this frame.
+    active_tool_idx: usize,
+    /// Whether a clean save is in flight, read by the «Клин» body.
+    save_job_in_progress: bool,
+    /// Last save status line, read by the «Клин» body.
+    save_status_text: Option<&'a str>,
+    /// Quick-clean parameters, lent to the «Быстрый клин найденного текста» body.
+    quick_clean_spread_radius_px: &'a mut i32,
+    quick_clean_uneven_background_tool: &'a mut UnevenBackgroundTool,
+    /// Quick-clean and mask-load progress, read by that body.
+    quick_clean_job_in_progress: bool,
+    quick_clean_progress: &'a QuickTextCleanProgress,
+    quick_clean_status_text: Option<&'a str>,
+    text_mask_load_in_progress: bool,
+    text_mask_load_status: Option<&'a str>,
+    /// What the dock tab bodies decided this frame. Collected here for the same
+    /// reason `dock_panel_rects` is: the hook runs inside `canvas.draw`, and every
+    /// mutation it stands for needs `&mut CleaningTabState` after that call
+    /// returns ([`CleaningTabState::apply_dock_out`]).
+    dock_out: CleaningDockOut,
     /// Outer rects of the dock panels drawn this frame in THIS window, collected
     /// by `draw_canvas_overlay_top_left` and drained by `CleaningTabState::draw`
     /// into `panel_rects`. It cannot be written straight into that field: the
@@ -1635,8 +2285,8 @@ impl CleaningHooks<'_> {
 }
 
 impl CanvasHooks for CleaningHooks<'_> {
-    /// Runs the «Клининг» tab's panel dock — its only floating dock surface is the
-    /// canvas' own «Лента» tab.
+    /// Runs the «Клининг» tab's panel dock: the canvas' own «Лента» plus this tab's
+    /// three — «Клин», «Инструменты клина» and «Выбранный инструмент».
     ///
     /// Implemented here, rather than after `canvas.draw` returns, for two reasons:
     /// the «Лента» body edits canvas settings and must land BEFORE
@@ -1654,10 +2304,49 @@ impl CanvasHooks for CleaningHooks<'_> {
         status: CanvasUiStatus,
         panel_dock: &mut PanelDockState,
     ) {
-        panel_dock.ensure_default_layout(AppTab::Cleaning.key(), canvas::ribbon_only_dock_layout);
-        let mut cx = RibbonDockCx {
+        panel_dock.ensure_default_layout(AppTab::Cleaning.key(), cleaning_default_dock_layout);
+        // Measured BEFORE the context takes the tool list: the tab's width floor is
+        // a property of the captions it is about to draw, and `min_size` is re-read
+        // fresh every frame, so a language switch moves it with no invalidation path
+        // of its own.
+        let style = ctx.style_of(ctx.theme());
+        let scrollbar_reserve = cleaning_scrollbar_reserve(&style);
+        let tools_min_size = egui::vec2(
+            cleaning_tab_outer_width(
+                drawn_tool_indices().filter_map(|idx| {
+                    self.tools.get(idx).map(|tool| {
+                        cleaning_tool_button_width(
+                            ctx,
+                            &style,
+                            tool.title(),
+                            tool.pytorch_required(),
+                        )
+                    })
+                }),
+                scrollbar_reserve,
+            ),
+            CLEANING_TOOLS_TAB_MIN_HEIGHT_PX,
+        );
+        let (clean_min_size, clean_initial_size) = cleaning_clean_tab_size_bounds(ctx, &style);
+        let (quick_clean_min_size, quick_clean_initial_size) =
+            cleaning_quick_clean_tab_size_bounds(ctx, &style);
+        let quick_clean_panel_open = self.quick_text_mask_panel_open;
+        let mut cx = CleaningDockCx {
             canvas,
             total_pages: status.total_pages,
+            tools: &mut *self.tools,
+            active_tool_idx: self.active_tool_idx,
+            save_job_in_progress: self.save_job_in_progress,
+            save_status_text: self.save_status_text,
+            quick_clean_panel_open,
+            quick_clean_spread_radius_px: &mut *self.quick_clean_spread_radius_px,
+            quick_clean_uneven_background_tool: &mut *self.quick_clean_uneven_background_tool,
+            quick_clean_job_in_progress: self.quick_clean_job_in_progress,
+            quick_clean_progress: self.quick_clean_progress,
+            quick_clean_status_text: self.quick_clean_status_text,
+            text_mask_load_in_progress: self.text_mask_load_in_progress,
+            text_mask_load_status: self.text_mask_load_status,
+            out: &mut self.dock_out,
         };
         let mut dock = PanelDock::begin(
             ctx,
@@ -1667,7 +2356,37 @@ impl CanvasHooks for CleaningHooks<'_> {
                 layout_key: AppTab::Cleaning.key(),
             },
         );
-        canvas::declare_ribbon_tab(&mut dock, RibbonDockCx::ribbon_body);
+        // The canvas owns this declaration; «Клининг» only says where its context
+        // keeps the canvas and the page count.
+        canvas::declare_ribbon_tab(&mut dock, |cx: &mut CleaningDockCx<'_>| {
+            (&mut *cx.canvas, cx.total_pages)
+        });
+        dock.tab(CLEANING_CLEAN_TAB)
+            .title(|| t!("cleaning.tab.clean_tab"))
+            .min_size(clean_min_size)
+            .initial_size(clean_initial_size)
+            .show(draw_clean_tab_body);
+        dock.tab(CLEANING_TOOLS_TAB)
+            .title(|| t!("cleaning.tab.tools_heading"))
+            .min_size(tools_min_size)
+            .initial_size(CLEANING_TOOLS_TAB_INITIAL_SIZE_PX)
+            .show(draw_tools_tab_body);
+        dock.tab(CLEANING_ACTIVE_TOOL_TAB)
+            .title(|| t!("cleaning.tab.active_tool_tab"))
+            .min_size(CLEANING_ACTIVE_TOOL_TAB_MIN_SIZE_PX)
+            .initial_size(CLEANING_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX)
+            .show(draw_active_tool_tab_body);
+        // Declared on EVERY frame, visible only while the toggle is on: a hidden tab
+        // keeps its slot in the layout and only its panel is skipped, so closing and
+        // reopening it returns it to wherever the user put it. Skipping the
+        // declaration instead would make the dock treat it as another program tab's
+        // and, on the next open, seed it a fresh panel.
+        dock.tab(CLEANING_QUICK_CLEAN_TAB)
+            .title(|| t!("cleaning.tab.quick_clean_heading"))
+            .visible(quick_clean_panel_open)
+            .min_size(quick_clean_min_size)
+            .initial_size(quick_clean_initial_size)
+            .show(draw_quick_clean_tab_body);
         // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a
         // panel the user detached into a sub-window, whose rect lives in that
         // window's own frame and would carve a dead zone out of this window's
@@ -2288,7 +3007,342 @@ fn build_text_mask_tile_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{scale_blocks_source_to_page, scale_edge_to_i32};
+    use super::{
+        AREA_EDIT_TOOL_INDICES, BRUSH_TOOL_INDICES, CLEANING_ACTIVE_TOOL_TAB, CLEANING_CLEAN_TAB,
+        CLEANING_PANEL_CHROME_WIDTH_PX, CLEANING_QUICK_CLEAN_TAB, CLEANING_TOOLS_TAB,
+        CleaningTabState, MASK_REMOVAL_TOOL_INDICES, cleaning_default_dock_layout,
+        cleaning_row_width, cleaning_tab_outer_width, drawn_tool_indices,
+        scale_blocks_source_to_page, scale_edge_to_i32,
+    };
+    use crate::canvas::CANVAS_RIBBON_TAB;
+    use crate::widgets::panel_dock::{DockEdge, PanelAnchor, PanelId};
+    use egui::{Pos2, Rect, Vec2};
+    use std::collections::BTreeSet;
+
+    /// The default arrangement is the one the dock is handed on a first run AND the
+    /// dictionary `panel_dock::persist` resolves stored tab keys against, so it has
+    /// to be well-formed and to name every tab this program tab can declare.
+    #[test]
+    fn the_default_dock_layout_places_the_five_cleaning_panels() {
+        let layout = cleaning_default_dock_layout();
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 5);
+
+        // «Лента» keeps the anchor and the id `canvas::ribbon_only_dock_layout` gave
+        // it, so a user who already arranged the ribbon under the shared builder
+        // finds their panel where they left it.
+        let ribbon = layout
+            .panel(PanelId::new(0))
+            .expect("the ribbon panel exists");
+        assert_eq!(ribbon.tabs, vec![CANVAS_RIBBON_TAB]);
+        assert_eq!(
+            ribbon.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            }
+        );
+
+        // «Клин» reproduces the island, which floated to the RIGHT of the canvas
+        // controls the ribbon replaced.
+        let clean = layout
+            .panel(PanelId::new(1))
+            .expect("the clean panel exists");
+        assert_eq!(clean.tabs, vec![CLEANING_CLEAN_TAB]);
+        assert_eq!(
+            clean.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Right,
+                align: 0.0,
+            }
+        );
+
+        // The two tool tabs reproduce the tool window at the right edge, one under
+        // the other — where the `ui.separator()` used to split it.
+        let tools = layout
+            .panel(PanelId::new(2))
+            .expect("the tools panel exists");
+        assert_eq!(tools.tabs, vec![CLEANING_TOOLS_TAB]);
+        assert_eq!(
+            tools.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.0,
+            }
+        );
+        let active_tool = layout
+            .panel(PanelId::new(3))
+            .expect("the active-tool panel exists");
+        assert_eq!(active_tool.tabs, vec![CLEANING_ACTIVE_TOOL_TAB]);
+        assert_eq!(
+            active_tool.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(2),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            }
+        );
+
+        // The quick-clean panel hangs off «Клин», where the button that opens it
+        // lives. It is the only conditional panel here, and it must not share an
+        // anchor with the other `Bottom` one: identical target+edge+align would lay
+        // the two on exactly the same rect.
+        let quick_clean = layout
+            .panel(PanelId::new(4))
+            .expect("the quick-clean panel exists");
+        assert_eq!(quick_clean.tabs, vec![CLEANING_QUICK_CLEAN_TAB]);
+        assert_eq!(
+            quick_clean.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(1),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            }
+        );
+        assert_ne!(
+            quick_clean.anchor, active_tool.anchor,
+            "the two Bottom anchors must name different targets"
+        );
+
+        // Every panel is content-sized: they take their width from their tabs' own
+        // `min_size`, which is measured per frame from the captions.
+        for id in (0..5).map(PanelId::new) {
+            let panel = layout.panel(id).expect("a default panel exists");
+            assert_eq!(panel.size_override, None, "{id} must stay content-sized");
+        }
+
+        // A `TabId` missing here is dropped from the user's stored arrangement on
+        // every load (`panel_dock::persist::known_tabs`), so this list is the whole
+        // set this program tab can declare.
+        for tab in [
+            CANVAS_RIBBON_TAB,
+            CLEANING_CLEAN_TAB,
+            CLEANING_TOOLS_TAB,
+            CLEANING_ACTIVE_TOOL_TAB,
+            CLEANING_QUICK_CLEAN_TAB,
+        ] {
+            assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
+        }
+    }
+
+    /// Solving matters as much as being well-formed: the default arrangement is what
+    /// the user SEES on a first run, and a panel laid out on top of another one is
+    /// unreachable — the buried one cannot even be dragged out.
+    ///
+    /// Two frames are checked, because «Быстрый клин найденного текста» is
+    /// conditional: the one where it is OPEN (the worst case, five panels) and the
+    /// ordinary one where it is closed and `panel_dock::frame_layout` — built on
+    /// `DockLayout::remove_panel` — drops its panel for the frame.
+    ///
+    /// The two tool panels hang off the RIGHT viewport edge while «Лента»/«Клин» and
+    /// the quick-clean panel hang off the LEFT one, so they form two independent
+    /// chains that the solver clamps independently and nothing stops from meeting in
+    /// the middle of a narrow area (see the threshold assertion below).
+    #[test]
+    fn the_default_dock_layout_solves_into_disjoint_panels() {
+        // A maximised 1080p studio window: the canvas area of a 1920-wide window
+        // less the page-manager column and the scrollbar reserve. Deliberately not
+        // the largest possible area — the arrangement has to fit an ordinary
+        // window, not only a wide one.
+        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+        let open = cleaning_default_dock_layout();
+        let mut closed = cleaning_default_dock_layout();
+        closed
+            .remove_panel(PanelId::new(4))
+            .expect("the quick-clean panel can be dropped for a frame");
+        for (frame, layout, expected_panels) in [
+            ("quick clean open", &open, 5),
+            ("quick clean closed", &closed, 4),
+        ] {
+            let solved = solve_default_layout(layout, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
+            assert_eq!(solved.len(), expected_panels, "{frame}: every panel is placed");
+            for (id, rect) in &solved {
+                assert!(
+                    area.contains_rect(*rect),
+                    "{frame}: panel {id} is laid out outside the dock area: {rect:?}"
+                );
+            }
+            for (i, (id_a, rect_a)) in solved.iter().enumerate() {
+                for (id_b, rect_b) in &solved[i + 1..] {
+                    assert!(
+                        !rect_a.intersects(*rect_b),
+                        "{frame}: panels {id_a} and {id_b} overlap: {rect_a:?} vs {rect_b:?}"
+                    );
+                }
+            }
+        }
+
+        // The two chains DO meet once the area is narrow enough — that is a property
+        // of two opposite viewport edges, not of this arrangement, and the surfaces
+        // this replaced overlapped in exactly the same way (the island and the
+        // quick-clean window sat at fixed offsets from the left edge, the tool window
+        // at a fixed offset from the right one). It is pinned here so the width it
+        // happens at cannot drift silently: measured at 1216 pt for the widest locale
+        // (French), i.e. the arrangement holds on any window at least ~1220 pt wide
+        // and the chains meet below that, where the solver has already shrunk both to
+        // their floors. The quick-clean panel does not move it — it is under «Клин»,
+        // not beside it.
+        let first_overlap = (400..=1600)
+            .rev()
+            .map(|width| f32::from(u16::try_from(width).unwrap_or(u16::MAX)))
+            .find(|width| {
+                let narrow = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(*width, 1000.0));
+                let panels = solve_default_layout(&open, narrow, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
+                panels.iter().enumerate().any(|(i, (_, rect_a))| {
+                    panels[i + 1..]
+                        .iter()
+                        .any(|(_, rect_b)| rect_a.intersects(*rect_b))
+                })
+            })
+            .expect("the two chains meet at some width");
+        assert!(
+            (1100.0..1300.0).contains(&first_overlap),
+            "the chains first overlap at {first_overlap} pt, outside the pinned band"
+        );
+    }
+
+    /// Width the «Клин» tab opens at in the widest of the five shipped locales.
+    ///
+    /// A fixed number here because the real one is measured from font galleys, which
+    /// need a live `Context`, and the arrangement has to hold for the WIDEST locale.
+    /// Measured with `cleaning_clean_tab_size_bounds` under egui's default font
+    /// stack: fr 464, ru 413, pt 408, es 389, en 335 — French is the widest, and the
+    /// value here clears it, since the app's own font stack is wider than egui's.
+    const CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX: f32 = 500.0;
+
+    /// Solves `layout` inside `area` with the sizes the tabs declare, and returns the
+    /// drawn rects in panel order.
+    fn solve_default_layout(
+        layout: &crate::widgets::panel_dock::DockLayout,
+        area: Rect,
+        clean_width: f32,
+    ) -> Vec<(PanelId, Rect)> {
+        use crate::canvas::{CANVAS_RIBBON_TAB_INITIAL_SIZE_PX, CANVAS_RIBBON_TAB_MIN_SIZE_PX};
+        use crate::widgets::panel_dock::{HostId, PanelChrome, PanelSizes, solve};
+
+        // What the first frame feeds the solver: each panel's largest tab's
+        // `initial_size`, and its `min_size` as the floor. The two measured widths
+        // stand in for what the captions produce at runtime.
+        let sizes: PanelSizes = [
+            (PanelId::new(0), CANVAS_RIBBON_TAB_INITIAL_SIZE_PX),
+            (
+                PanelId::new(1),
+                Vec2::new(clean_width, super::CLEANING_CLEAN_TAB_INITIAL_HEIGHT_PX),
+            ),
+            (PanelId::new(2), super::CLEANING_TOOLS_TAB_INITIAL_SIZE_PX),
+            (
+                PanelId::new(3),
+                super::CLEANING_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX,
+            ),
+            (
+                PanelId::new(4),
+                Vec2::new(
+                    clean_width,
+                    super::CLEANING_QUICK_CLEAN_TAB_INITIAL_HEIGHT_PX,
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mins: PanelSizes = [
+            (PanelId::new(0), CANVAS_RIBBON_TAB_MIN_SIZE_PX),
+            (
+                PanelId::new(1),
+                Vec2::new(clean_width, super::CLEANING_CLEAN_TAB_MIN_HEIGHT_PX),
+            ),
+            (
+                PanelId::new(2),
+                Vec2::new(200.0, super::CLEANING_TOOLS_TAB_MIN_HEIGHT_PX),
+            ),
+            (
+                PanelId::new(3),
+                super::CLEANING_ACTIVE_TOOL_TAB_MIN_SIZE_PX,
+            ),
+            (
+                PanelId::new(4),
+                Vec2::new(300.0, super::CLEANING_QUICK_CLEAN_TAB_MIN_HEIGHT_PX),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let solved = solve(
+            layout,
+            HostId::MainWindow,
+            area,
+            &sizes,
+            &mins,
+            PanelChrome::default(),
+        );
+        let mut placed: Vec<(PanelId, Rect)> =
+            solved.iter().map(|(id, panel)| (id, panel.rect)).collect();
+        placed.sort_by_key(|(id, _)| *id);
+        placed
+    }
+
+    /// Every registered tool must appear in exactly one button group, or it is
+    /// unreachable: the picker draws the three index groups and nothing else, so an
+    /// 11th tool pushed onto `CleaningTabState::default`'s list without touching a
+    /// group constant would simply never be shown.
+    #[test]
+    fn every_registered_tool_is_drawn_by_exactly_one_button_group() {
+        let state = CleaningTabState::default();
+        let drawn: Vec<usize> = drawn_tool_indices().collect();
+        let unique: BTreeSet<usize> = drawn.iter().copied().collect();
+        assert_eq!(
+            drawn.len(),
+            unique.len(),
+            "a tool index appears in more than one group: {drawn:?}"
+        );
+        let expected: BTreeSet<usize> = (0..state.tools.len()).collect();
+        assert_eq!(
+            unique, expected,
+            "the button groups {:?} do not cover the {} registered tools",
+            unique,
+            state.tools.len()
+        );
+        // Guards the three constants themselves against a silent re-partition.
+        let group_total = BRUSH_TOOL_INDICES.len()
+            + MASK_REMOVAL_TOOL_INDICES.len()
+            + AREA_EDIT_TOOL_INDICES.len();
+        assert_eq!(group_total, state.tools.len());
+    }
+
+    /// The width floor is the WIDEST single control plus the panel's chrome and the
+    /// scrollbar reserve: the rows wrap, so one control per row is still usable, and
+    /// anything narrower clips a caption no row break can rescue.
+    #[test]
+    fn cleaning_tab_outer_width_takes_the_widest_control_plus_chrome() {
+        assert_eq!(
+            cleaning_tab_outer_width([80.0, 137.5, 40.0], 10.0),
+            137.5 + CLEANING_PANEL_CHROME_WIDTH_PX + 10.0
+        );
+    }
+
+    /// A `NaN` minimum would poison the whole solve, and a non-positive one is not a
+    /// measurement — both are skipped rather than propagated. With nothing usable
+    /// left the floor is the chrome and the reserve alone; the solver's own
+    /// `PANEL_MIN_WIDTH` still applies underneath it.
+    #[test]
+    fn cleaning_tab_outer_width_skips_unusable_measurements() {
+        assert_eq!(
+            cleaning_tab_outer_width([f32::NAN, 60.0, -10.0, f32::INFINITY, 0.0], 0.0),
+            60.0 + CLEANING_PANEL_CHROME_WIDTH_PX
+        );
+        assert_eq!(
+            cleaning_tab_outer_width([], 0.0),
+            CLEANING_PANEL_CHROME_WIDTH_PX
+        );
+    }
+
+    /// A row is the sum of its controls plus one gap BETWEEN each pair — the number
+    /// the «Клин» tab opens at, so an off-by-one gap here is a permanent scrollbar.
+    #[test]
+    fn cleaning_row_width_counts_one_gap_between_each_pair() {
+        assert_eq!(cleaning_row_width(&[100.0, 50.0, 25.0], 8.0), 191.0);
+        assert_eq!(cleaning_row_width(&[100.0], 8.0), 100.0);
+        assert_eq!(cleaning_row_width(&[], 8.0), 0.0);
+    }
 
     #[test]
     fn scale_blocks_identity_passthrough_on_exact_size_match() {
@@ -2325,3 +3379,5 @@ mod tests {
         assert_eq!(scale_edge_to_i32(2.3, true), Some(3));
     }
 }
+
+

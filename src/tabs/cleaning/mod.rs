@@ -16,3 +16,6 @@ mod tools;
 mod watermark_chapter;
 
 pub use tab::{CleaningDrawParams, CleaningTabState};
+/// The «Клининг» dock arrangement builder, handed to the app-owned dock state by
+/// `app.rs::restore_panel_dock` before the first frame.
+pub(crate) use tab::cleaning_default_dock_layout;

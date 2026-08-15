@@ -19,7 +19,9 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities
   (`ai_backend_capabilities`: backend/torch/onnxruntime) via `AiCaps::current()`. The
   optional marker badge is painter-only and must never allocate a second interactive
-  rect (that would carve a hole in the button hitbox).
+  rect (that would carve a hole in the button hitbox). Because it is painted OUTSIDE
+  the button's rect, a caller budgeting a button's width asks `marker_badge_overhang`
+  rather than re-deriving the pill's geometry.
 - `text_edit_plus.rs`: multiline text editor with per-range text color and ordered rounded
   background highlights.
 - `spellchecked_line.rs`: text editor with asynchronous Hunspell-compatible

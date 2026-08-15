@@ -70,7 +70,7 @@ mod wheel_slider;
 mod wheel_spin_box;
 
 #[allow(unused_imports)]
-pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement};
+pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement, marker_badge_overhang};
 #[allow(unused_imports)]
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]

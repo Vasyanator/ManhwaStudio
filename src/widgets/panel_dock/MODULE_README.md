@@ -11,7 +11,9 @@ Current state: **phases 0–6**. The pure layer (`model.rs`, `solver.rs`, `drag.
 layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` including the reorganisation
 gestures, the persistence layer (`persist.rs`) and the detached OS windows (`window.rs`). The
 production consumers are the three CANVAS program tabs: «Текст», whose eight tabs plus the canvas'
-own «Лента» live in seven default panels, and «Перевод» / «Клининг», which declare «Лента» alone.
+own «Лента» live in seven default panels, «Клининг», whose «Клин» / «Инструменты клина» /
+«Выбранный инструмент» / «Быстрый клин найденного текста» join «Лента» in five default panels, and
+«Перевод», which declares «Лента» alone.
 The dedicated canvas-controls anchor those panels used to hang off is gone with the panel it named;
 only its STORED tag survives, decode-only, so an arrangement written by an older build still loads
 (see «A retired stored tag must keep DECODING» below).

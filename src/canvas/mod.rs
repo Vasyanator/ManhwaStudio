@@ -369,12 +369,12 @@ pub(crate) const CANVAS_RIBBON_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(340.0, 160.
 pub(crate) const CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX: f32 = 24.0;
 
 /// Per-frame dock context of a canvas program tab whose only dock tab is the
-/// canvas' own «Лента» — «Перевод» and «Клининг».
+/// canvas' own «Лента» — «Перевод».
 ///
-/// Both hooks receive the canvas as a PARAMETER, so this borrow is disjoint from
+/// The hook receives the canvas as a PARAMETER, so this borrow is disjoint from
 /// the tab state the hook was called on, which is what lets the dock frame hold
-/// it while the tab keeps using its own fields. «Текст» has its own context type:
-/// its eight further tabs need state this one knows nothing about.
+/// it while the tab keeps using its own fields. «Текст» and «Клининг» have context
+/// types of their own: their further tabs need state this one knows nothing about.
 pub(crate) struct RibbonDockCx<'a> {
     /// Owner of the «Лента» body.
     pub canvas: &'a mut CanvasView,
@@ -383,8 +383,8 @@ pub(crate) struct RibbonDockCx<'a> {
 }
 
 impl RibbonDockCx<'_> {
-    /// The accessor [`declare_ribbon_tab`] asks for, as a plain `fn` item both
-    /// callers can hand over instead of spelling a closure out twice.
+    /// The accessor [`declare_ribbon_tab`] asks for, as a plain `fn` item the
+    /// caller can hand over instead of spelling the closure out.
     pub(crate) fn ribbon_body(&mut self) -> (&mut CanvasView, usize) {
         (&mut *self.canvas, self.total_pages)
     }
@@ -417,10 +417,11 @@ pub(crate) fn declare_ribbon_tab<'frame, C>(
 /// edge of the dock area, where the canvas controls floated before the migration,
 /// and is content-sized — four rows have no reason to reserve a pinned height.
 ///
-/// Registered as the default builder of both «Перевод» and «Клининг» — one `fn`
-/// item for both, since the arrangement is identical and two one-line wrappers
-/// could only ever drift. «Текст» builds its own, because the ribbon is only the
-/// head of its left column there.
+/// Registered as the default builder of «Перевод», the one program tab that
+/// declares nothing else. «Текст» and «Клининг» build their own: a default layout
+/// is the DICTIONARY the persistence layer resolves stored tab keys against, so a
+/// program tab that declares further tabs of its own must name them there or lose
+/// them from the user's arrangement on every load.
 ///
 /// A model refusal is logged and yields an EMPTY layout, which leaves the dock to
 /// create a panel for the orphaned tab on its own — a degraded arrangement rather
@@ -3132,10 +3133,10 @@ fn image_bubble_crop_rect(bubble: &Bubble) -> [f32; 4] {
 mod tests {
     use super::*;
 
-    /// The default arrangement of the two canvas program tabs that declare the
-    /// «Лента» and nothing else — «Перевод» and «Клининг» share this one builder.
+    /// The default arrangement of a canvas program tab that declares «Лента» and
+    /// nothing else — «Перевод».
     ///
-    /// It is also the DICTIONARY of their dock tabs: a key it does not name is
+    /// It is also the DICTIONARY of its dock tabs: a key it does not name is
     /// dropped from the user's stored arrangement on every load
     /// (`src/widgets/panel_dock/persist.rs`). And it must PLACE its panel inside
     /// the dock area, not merely be well-formed.

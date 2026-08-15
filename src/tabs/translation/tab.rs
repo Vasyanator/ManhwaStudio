@@ -74,8 +74,9 @@ Panel dock:
 - `ribbon_panel_rect`: last frame's MAIN-WINDOW rect of the panel holding «Лента», `None` when the
   tab is hidden or detached; `text_detector_edit_panel_pos` places the two detector edit boxes
   under it and falls back to a fixed canvas offset.
-- The default arrangement is canvas-owned (`canvas::ribbon_only_dock_layout`), shared with
-  «Клининг».
+- The default arrangement is canvas-owned (`canvas::ribbon_only_dock_layout`). This is now its
+  only user: «Клининг» declares three tabs of its own and therefore builds its own default, since
+  a default layout is the dictionary stored tab keys are resolved against.
 
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.

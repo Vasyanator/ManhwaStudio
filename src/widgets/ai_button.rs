@@ -13,6 +13,8 @@ FILE HEADER (widgets/ai_button.rs)
   - `AiButton`: builder widget (text + requirement + optional selected/marker/
     min_size/extra enable condition/`enabled_on_unknown` optimistic gating).
   - `AiButtonResponse`: per-frame result (`response`, `enabled`).
+  - `marker_badge_overhang`: how far the marker badge sticks out past the
+    button's right edge, for callers that budget a button's width.
 - Drawing invariant: the marker badge is painted with the painter ONLY, over the
   button; it NEVER allocates a second interactive rect (which would carve a hole
   in the button hitbox). Clicks/hover come solely from the single `response`.
@@ -247,19 +249,97 @@ impl AiButton {
     }
 }
 
+/// Inner padding, in points, between the marker badge's caption and its pill
+/// outline.
+const MARKER_BADGE_PAD: Vec2 = Vec2::new(3.0, 1.0);
+
+/// The font the marker badge is laid out with under `style`: a third of the
+/// button text size ("3x smaller"), clamped so the badge stays legible.
+#[must_use]
+fn marker_badge_font(style: &egui::Style) -> egui::FontId {
+    let base = egui::TextStyle::Button.resolve(style).size;
+    egui::FontId::proportional((base / 3.0).max(6.0))
+}
+
+/// Outer size of the badge pill whose caption laid out to `caption_size`.
+///
+/// Pure, and the ONE definition of the pill's size: the painter and the width
+/// measurement below both go through it, so "how big is the badge" cannot be
+/// answered two ways.
+#[must_use]
+fn marker_badge_size(caption_size: Vec2) -> Vec2 {
+    caption_size + MARKER_BADGE_PAD * 2.0
+}
+
+/// Corner radius of a badge of `badge_size` — half its height, which is what makes
+/// each pill end a semicircle.
+///
+/// It is ALSO the badge's overhang past the button's right edge, because
+/// [`marker_badge_rect`] centres the right semicircle on the button's top-right
+/// corner. The two are one number by construction, which is the invariant
+/// `marker_badge_overhang_is_the_pills_right_radius` pins.
+#[must_use]
+fn marker_badge_radius(badge_size: Vec2) -> f32 {
+    badge_size.y / 2.0
+}
+
+/// Where a badge whose caption laid out to `caption_size` lands on `button_rect`.
+///
+/// Pure geometry: the right end's semicircle centre (at `max.x - radius`) sits on
+/// the button's top-right corner and the badge's vertical centre sits on the top
+/// edge, so the pill straddles the border and overhangs the right edge by exactly
+/// [`marker_badge_radius`].
+#[must_use]
+fn marker_badge_rect(button_rect: egui::Rect, caption_size: Vec2) -> egui::Rect {
+    let badge_size = marker_badge_size(caption_size);
+    let badge_max_x = button_rect.right() + marker_badge_radius(badge_size);
+    let badge_min = egui::pos2(
+        badge_max_x - badge_size.x,
+        button_rect.top() - badge_size.y / 2.0,
+    );
+    egui::Rect::from_min_size(badge_min, badge_size)
+}
+
+/// Lays `label` out in the badge font under `style` and returns the caption size.
+///
+/// Text LAYOUT only (no painting, no I/O), so it is safe on the GUI thread, and
+/// egui caches galleys, so re-measuring a fixed marker every frame is a lookup.
+/// The colour is irrelevant to the size, so the measurement path uses an arbitrary
+/// one and the painter lays the caption out again in the colour it needs.
+#[must_use]
+fn marker_badge_caption_size(ctx: &egui::Context, style: &egui::Style, label: &str) -> Vec2 {
+    let font = marker_badge_font(style);
+    ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_string(), font, egui::Color32::WHITE)
+            .size()
+    })
+}
+
+/// Points the marker badge painted for `label` overhangs the button's RIGHT edge
+/// by, under `style`.
+///
+/// A caller that budgets a button's width — a panel that must not clip the badge at
+/// its border — has to add this on top of the button's own width; the badge is
+/// painted outside the button's allocated rect and is not part of it.
+///
+/// Same layout-only cost and safety as [`marker_badge_caption_size`].
+#[must_use]
+pub fn marker_badge_overhang(ctx: &egui::Context, style: &egui::Style, label: &str) -> f32 {
+    let caption_size = marker_badge_caption_size(ctx, style, label);
+    marker_badge_radius(marker_badge_size(caption_size))
+}
+
 /// Paints the pill-shaped marker badge straddling the TOP-RIGHT corner of
 /// `button_rect`. Painter-only: it allocates no rect and never interacts, so it
-/// cannot affect the button hitbox. The badge is placed so its vertical center sits
-/// on the button's top edge (half above / half below the border) and the center of
-/// its right rounded end sits exactly on the top-right corner. `enabled` selects a
-/// muted foreground when the button is disabled so the badge reads as inactive too.
-/// Colours are derived from the current visuals so the badge stays legible in both
-/// light and dark themes.
+/// cannot affect the button hitbox. Placement and size come from
+/// [`marker_badge_rect`] / [`marker_badge_size`], the same pure geometry
+/// [`marker_badge_overhang`] answers from, so a caller's width budget and what is
+/// actually drawn cannot drift. `enabled` selects a muted foreground when the
+/// button is disabled so the badge reads as inactive too. Colours are derived from
+/// the current visuals so the badge stays legible in both light and dark themes.
 fn paint_marker_badge(ui: &egui::Ui, button_rect: egui::Rect, label: &str, enabled: bool) {
-    // Honor "3x smaller than the button text", clamped so the badge stays legible.
-    let base = egui::TextStyle::Button.resolve(ui.style()).size;
-    let font = egui::FontId::proportional((base / 3.0).max(6.0));
-
+    let style = ui.style();
     let badge_bg = ui.visuals().widgets.active.bg_fill;
     let badge_fg = if enabled {
         ui.visuals().strong_text_color()
@@ -267,34 +347,60 @@ fn paint_marker_badge(ui: &egui::Ui, button_rect: egui::Rect, label: &str, enabl
         ui.visuals().weak_text_color()
     };
 
+    // The measured caption size and the painted galley are laid out from the SAME
+    // style and font; only the colour differs, which does not affect the size.
+    let caption_size = marker_badge_caption_size(ui.ctx(), style, label);
+    let font = marker_badge_font(style);
     let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font, badge_fg));
 
-    // Small inner padding around the text; pill ends use a corner radius of half the
-    // badge height so each end is a semicircle.
-    let pad = egui::vec2(3.0, 1.0);
-    let badge_size = galley.size() + pad * 2.0;
-    let radius = badge_size.y / 2.0;
-
-    // Anchor: the right end's semicircle center (at max.x - radius) lands on the
-    // button's top-right corner, and the badge's vertical center lands on the top
-    // edge (so it straddles the border).
-    let badge_max_x = button_rect.right() + radius;
-    let badge_min = egui::pos2(
-        badge_max_x - badge_size.x,
-        button_rect.top() - badge_size.y / 2.0,
-    );
-    let badge_rect = egui::Rect::from_min_size(badge_min, badge_size);
+    let badge_rect = marker_badge_rect(button_rect, caption_size);
+    let radius = marker_badge_radius(badge_rect.size());
 
     // f32 -> u8 corner radius: `radius` is a small, non-negative half-height that
     // fits u8; clamp guards the conversion (no lossless integer alternative exists).
     let corner = egui::CornerRadius::same(radius.round().clamp(0.0, f32::from(u8::MAX)) as u8);
     ui.painter().rect_filled(badge_rect, corner, badge_bg);
-    ui.painter().galley(badge_rect.min + pad, galley, badge_fg);
+    ui.painter()
+        .galley(badge_rect.min + MARKER_BADGE_PAD, galley, badge_fg);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AiCaps, AiRequirement};
+    use super::{
+        AiCaps, AiRequirement, marker_badge_radius, marker_badge_rect, marker_badge_size,
+    };
+    use eframe::egui;
+    use egui::Vec2;
+
+    /// The number a caller budgets a button's width with (`marker_badge_overhang`)
+    /// and the number the painter actually draws with must be ONE number. Both are
+    /// `marker_badge_radius(marker_badge_size(caption))`, and the invariant that
+    /// makes that correct is geometric: the pill's right end is centred on the
+    /// button's top-right corner, so the drawn rect sticks out past that edge by
+    /// exactly the radius. Pure, so it needs no fonts and no window — only the
+    /// caption measurement does, and that one is colour-independent by
+    /// construction.
+    #[test]
+    fn marker_badge_overhang_is_the_pills_right_radius() {
+        let button = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(120.0, 24.0));
+        for caption in [
+            Vec2::new(18.0, 7.0),
+            Vec2::new(31.5, 9.0),
+            Vec2::new(0.0, 0.0),
+        ] {
+            let size = marker_badge_size(caption);
+            let radius = marker_badge_radius(size);
+            let rect = marker_badge_rect(button, caption);
+            assert_eq!(rect.size(), size, "the drawn pill is the measured pill");
+            assert!(
+                (rect.right() - button.right() - radius).abs() <= f32::EPSILON * 100.0,
+                "the drawn overhang {} must equal the budgeted radius {radius}",
+                rect.right() - button.right()
+            );
+            // Straddles the top border: half the pill above it, half below.
+            assert!((rect.center().y - button.top()).abs() <= f32::EPSILON * 100.0);
+        }
+    }
 
     /// Convenience constructor for a capability snapshot in tests.
     fn caps(backend: Option<bool>, torch: Option<bool>, ort: Option<bool>) -> AiCaps {
