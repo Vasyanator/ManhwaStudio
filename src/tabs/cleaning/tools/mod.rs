@@ -5,7 +5,15 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
   - `CleaningTool`, `StrokePoint`, `StrokeModifiers` из `base.rs`.
   - Конкретные инструменты вкладки cleaning:
     `ZamazkaTool`, `StampTool`, `GradientFillTool`, `TextureSynthesisInpaintTool`,
-    `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`.
+    `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`,
+    `FluxFillInpaintTool`, `WatermarkRemovalTool`.
+- Внутренние модули без экспорта:
+  - `watermark_library` — библиотека измеренных знаков на диске; используется
+    режимом «По главе» из `watermark_removal.rs`.
+  - `watermark_entry` — мост между движком разложения и библиотекой: приём
+    эталонных кадров, отображение вердиктов и подбор записей по подписи знака.
+  - `watermark_library_window` — окно управления библиотекой, открываемое из
+    инструмента.
 */
 mod base;
 
@@ -38,3 +46,12 @@ pub use zamazka::ZamazkaTool;
 
 mod stamp;
 pub use stamp::StampTool;
+
+mod watermark_library;
+
+mod watermark_entry;
+
+mod watermark_library_window;
+
+mod watermark_removal;
+pub use watermark_removal::WatermarkRemovalTool;

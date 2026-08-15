@@ -126,6 +126,15 @@ METHOD_INPAINT_FLUX_FILL = "inpaint.flux_fill"             # FLUX.1-Fill (stream
 METHOD_INPAINT_FLUX_FILL_UNLOAD = "inpaint.flux_fill.unload"
 METHOD_INPAINT_FLUX_FILL_STATUS = "inpaint.flux_fill.status"  # quant catalog + download state
 
+# --- Visible watermark removal ---
+# Primary flow is `watermark.detect` (mask only, fed to the existing inpainters);
+# `watermark.remove` is the experimental direct network pass. Both stream the
+# FLUX-style two-phase progress (`download` bytes / `generate` tiles).
+METHOD_WATERMARK_DETECT = "watermark.detect"  # predicted watermark mask PNG
+METHOD_WATERMARK_REMOVE = "watermark.remove"  # cleaned image ++ mask (experimental)
+METHOD_WATERMARK_STATUS = "watermark.status"  # model catalog + on-disk state
+METHOD_WATERMARK_UNLOAD = "watermark.unload"  # drop the resident network
+
 # --- Text detection ---
 METHOD_TEXTDETECTOR_CTD = "textdetector.ctd"        # POST /textdetector/ctd/detect
 METHOD_TEXTDETECTOR_PADDLE = "textdetector.paddle"  # POST /textdetector/paddle/detect
@@ -173,6 +182,10 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX_FILL,
         METHOD_INPAINT_FLUX_FILL_UNLOAD,
         METHOD_INPAINT_FLUX_FILL_STATUS,
+        METHOD_WATERMARK_DETECT,
+        METHOD_WATERMARK_REMOVE,
+        METHOD_WATERMARK_STATUS,
+        METHOD_WATERMARK_UNLOAD,
         METHOD_TEXTDETECTOR_CTD,
         METHOD_TEXTDETECTOR_PADDLE,
         METHOD_TEXTDETECTOR_SURYA,

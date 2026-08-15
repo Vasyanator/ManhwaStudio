@@ -220,12 +220,27 @@ class SdxlInpaintService:
 
         with self._lock:
             try:
-                pipe = self._ensure_pipeline_locked(
-                    model_path=normalized["model_path"],
-                    mode=normalized["mode"],
-                    device=device,
-                    model_key=model_key,
-                )
+                # Load scope: only a failure in here is a failed LOAD, and only
+                # then may the manager drop its entry for `model_key`.
+                try:
+                    pipe = self._ensure_pipeline_locked(
+                        model_path=normalized["model_path"],
+                        mode=normalized["mode"],
+                        device=device,
+                        model_key=model_key,
+                    )
+                except Exception:
+                    if lease.needs_load:
+                        lease.mark_load_failed()
+                    raise
+                # The pipeline is resident from here on, so it is registered
+                # before generation: a generation failure must leave it counted
+                # and evictable, not silently occupying VRAM off the books. In
+                # `four_channel` mode the generation below takes a SECOND lease
+                # (the shared LaMa prefill), which is exactly when the manager
+                # must see this pipeline as resident and in use.
+                if lease.needs_load:
+                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._inpaint_locked(
                     pipe,
                     image_rgb=image_rgb,
@@ -234,12 +249,8 @@ class SdxlInpaintService:
                     device=device,
                     progress_callback=progress_callback,
                 )
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
             except Exception as exc:
-                if lease.needs_load:
-                    lease.mark_load_failed()
                 self._last_error = str(exc)
                 raise
             finally:

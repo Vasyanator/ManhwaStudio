@@ -1,18 +1,21 @@
 # Module: modules/ai_backend/engines
 
 ## Purpose
-Model-family runtime that is shared by **more than one service domain**. A module belongs here only
-when at least two of `ocr/`, `detection/`, `inpaint/`, `reline/`, `translate/` depend on it; a model
-runtime used by a single domain belongs inside that domain's package instead.
+Model-family runtime and model-acquisition plumbing shared by **more than one service domain**. A
+module belongs here only when at least two of `ocr/`, `detection/`, `inpaint/`, `watermark/`,
+`reline/`, `translate/` depend on it; anything used by a single domain belongs inside that domain's
+package instead.
 
-Both current members earn their place:
+All three current members earn their place:
 - `paddle_onnx` is used by the PaddleOCR recognizer (`ocr/paddle.py`) **and** the PaddleOCR text
   detector (`detection/paddle.py`);
 - `surya_checkpoints` is used by the Surya OCR service (`ocr/surya.py`) **and** the Surya text
-  detector (`detection/surya.py`).
+  detector (`detection/surya.py`);
+- `model_download` is used by the FLUX.1-Fill service (`inpaint/flux_fill.py`) **and** the
+  watermark-removal service (`watermark/service.py`).
 
-That is why neither lives under `ocr/` or `detection/`: putting it in one of them would make the
-other domain import across a sibling boundary for a shared engine.
+That is why none of them lives under `ocr/`, `detection/` or `inpaint/`: putting one in a single
+domain would make the other domain import across a sibling boundary for shared machinery.
 
 ## Architecture
 Engines sit between `runtime/` (device selection, resident-model leases, program root) and the
@@ -36,8 +39,15 @@ for cv2/onnxruntime at startup.
 - `surya_checkpoints.py`: presence check and **eager** download of the `s3://` checkpoints the Surya
   services use — `checkpoint_local_dir()`, `checkpoint_ready()`, `ensure_checkpoint_downloaded()`.
   The Surya package is imported lazily inside each function.
-- `test_surya_checkpoints.py`: unit tests for the checkpoint contract; a fake `surya.common.s3` is
-  injected into `sys.modules`, so neither the Surya package nor network access is needed.
+- `model_download.py`: the staged-download envelope every self-downloading service shares —
+  `download_to_path()` (per-destination lock, re-check under it, process-private
+  `<name>.<pid>.part` staging, caller-supplied `verify` gate, atomic `os.replace`) and
+  `stream_response_to_file()` (response body → file with cumulative byte progress). It owns no
+  transport: callers pass a `fetch(staging)` callable, because the two of them authenticate
+  differently (HF bearer header vs. a `requests.Session` carrying Drive's confirm cookie).
+- `test_surya_checkpoints.py`, `test_model_download.py`: unit tests for the contracts above. A fake
+  `surya.common.s3` is injected into `sys.modules` for the former; the latter needs no network and
+  no `requests` at all.
 
 ## Contracts and invariants
 - `__init__.py` re-exports nothing and imports no submodule. `paddle_onnx` pulls cv2/numpy/
@@ -62,6 +72,12 @@ for cv2/onnxruntime at startup.
   helper's contract forbids holding its process-global `torch.nn.Module.to` patch around network I/O.
   A Surya service must call `ensure_checkpoint_downloaded()` first and keep only the weight transfer
   inside the patch.
+- `model_download`'s lock is a **download lock, not a service lock**: it is held across network I/O
+  and must never be nested inside a service-local lock, because a multi-GiB transfer must not block
+  `health()`, `unload()` or a `LoadedModelManager` eviction callback. Its per-destination locks are
+  created on demand and never removed. A destination only ever appears complete on disk: `verify`
+  runs on the staging file and a failed or rejected transfer removes it and leaves any previous
+  destination untouched.
 - `checkpoint_local_dir()` returns `""` and `checkpoint_ready()` returns `False` when the Surya
   package is not importable. Both mean "cannot tell" and callers must read them as "download it",
   never as an optimistic yes or a guessed path. Surya owns its own cache layout; do not relocate it.
@@ -74,5 +90,9 @@ for cv2/onnxruntime at startup.
   `paddle_onnx.py` (`provider_attempts`, `RuntimeFactory`, `resolve_compiled_cache_root`).
 - To change how Surya checkpoints are located or fetched, edit `surya_checkpoints.py`; both Surya
   services share it, so update `test_surya_checkpoints.py` in the same change.
+- To change the staging name, the serialization granularity or the publish step of an on-demand
+  weight download, edit `model_download.py`; FLUX and watermark removal both ride on it, so update
+  `test_model_download.py` in the same change. The transport and the integrity gate stay in the
+  calling service.
 - To add a new engine here, first confirm two or more service domains will use it — otherwise it
   belongs in the single domain package that needs it.

@@ -14,9 +14,15 @@ FILE HEADER (cleaning/tools/base.rs)
     custom-UI callback внутри окна редактора (для инструмент-специфичных параметров). Для отдельных
     инструментов есть расширенный режим второй маски (например, маска области примера).
     Вызов `run(image, mask[, sample_mask])` выполняется в фоне (worker-thread), результат поллится в UI.
-    Отдельная кнопка генерации маски отправляет текущий region image в выбранный backend-детектор текста
-    (ComicTextDetector, PaddleOCR или Surya) и заполняет mask-слой полученной бинарной маской без применения inpaint; параметры генерации маски
-    (например, расширение mask dilation) хранятся в базе инструмента и редактируются в общем collapsible UI.
+    Отдельная кнопка генерации маски отправляет текущий region image в выбранный backend-источник
+    (детекторы текста ComicTextDetector, PaddleOCR, Surya или детектор водяных знаков `watermark.detect`)
+    и заполняет mask-слой полученной бинарной маской без применения inpaint; параметры генерации маски
+    (расширение mask dilation, модель детектора водяных знаков) хранятся в базе инструмента
+    (`RegionMaskGenerationState`) и редактируются в общем collapsible UI.
+    Источник «Водяной знак» стримит `watermark.detect` (кадры `progress`: `phase="download"` байты /
+    `phase="generate"` шаги) и рисует прогресс-бар над секцией параметров; каталог моделей
+    (`slbr`/`wdnet`/`splitnet` — wire-идентификаторы, не локализуются) помечается ✓/«скачать»
+    по ответу `watermark.status`.
   - `RegionEditorSession`: состояние открытого окна region editor (target rect в overlay px,
     изображение, texture, статус, zoom-drag).
 - Потоки:
@@ -43,22 +49,27 @@ FILE HEADER (cleaning/tools/base.rs)
     пока открыто окно region editor.
   - `build_composited_region_image` режет базовую страницу и композитит overlay.
 */
+use crate::backend_ipc::{self, CallError};
 use crate::canvas::{CanvasView, OverlayRectPx};
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::ProjectData;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::tabs::translation::text_detector::{
     TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, detect_ai_ctd_mask_for_image,
-    detect_paddle_mask_for_image, detect_surya_mask_for_image,
+    detect_paddle_mask_for_image, detect_surya_mask_for_image, encode_color_image_png_rgba,
+    parse_mask_alpha_from_blob,
 };
 use crate::tools::MaskBrush;
-use crate::widgets::WheelSlider;
+use crate::widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use ms_thread::{self as thread, JoinHandle};
+use web_time::Duration;
 
 const CLEANING_PREVIEW_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const SCRATCH_PREVIEW_TILE_SIDE: usize = 1024;
@@ -1051,7 +1062,10 @@ impl RegionEditToolBase {
         });
     }
 
-    #[allow(dead_code)]
+    /// General region-editor frame for a tool that owns its window body but wants
+    /// the shared footer: `draw_editor` fills the body, then the status line and
+    /// the Отмена/Применить row are appended. Apply inserts `editor.image` back
+    /// into the page overlay through `CanvasView::replace_overlay_region_px`.
     pub fn draw_overlay_ui<OnOpen, DrawEditor>(
         &mut self,
         ctx: &egui::Context,
@@ -1313,7 +1327,13 @@ impl RegionEditToolBase {
         }
     }
 
-    fn ensure_region_editor_texture(editor: &mut RegionEditorSession, ctx: &egui::Context) {
+    /// Uploads (or re-uploads, when `texture_dirty`) the region image into the
+    /// editor's texture. Shared with tools that draw the region viewport
+    /// themselves instead of going through the mask editor.
+    pub(super) fn ensure_region_editor_texture(
+        editor: &mut RegionEditorSession,
+        ctx: &egui::Context,
+    ) {
         if editor.texture.is_none() {
             let texture = ctx.load_texture(
                 format!("cleaning-region-editor-{}", editor.scroll_id),
@@ -1558,10 +1578,99 @@ struct RegionInpaintJobResult {
     result: Result<egui::ColorImage, String>,
 }
 
+/// Per-message timeout of the streaming `watermark.detect` call. `wait_streaming`
+/// restarts it on every frame received, so this bounds the gap BETWEEN frames,
+/// not the total duration of a first run that downloads code and weights.
+const WATERMARK_DETECT_CALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Timeout of the one-shot `watermark.status` catalog query.
+const WATERMARK_STATUS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Long side the backend downscales the region to before running the detector.
+/// The mask branch has to see the whole watermark at once, so the pass is not
+/// tiled (`dev-docs/watermark_removal_plan.md` §3.3).
+pub(super) const WATERMARK_DETECT_DOWNSCALE_TO: u32 = 512;
+/// Binarization threshold the backend applies to the predicted soft mask.
+const WATERMARK_DETECT_THRESHOLD: f32 = 0.5;
+/// Default watermark model: best PSNR / mask F1 of the three (plan §7.2).
+pub(super) const DEFAULT_WATERMARK_MODEL: &str = "slbr";
+
+/// One entry of the watermark-detector catalog.
+///
+/// `id` is the WIRE value sent as `params.model` and the persisted selection
+/// identity, so it stays a literal; only `display_key` (an i18n catalog key
+/// resolved at render time) is localized — same split as `LamaModelSpec`,
+/// see `dev-docs/i18n_exclusions.md` §A5.
+///
+/// Shared with the standalone `watermark_removal.rs` tool, which selects from the
+/// same catalog — the catalog must never be duplicated per tool.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WatermarkModelSpec {
+    pub(super) id: &'static str,
+    display_key: &'static str,
+}
+
+impl WatermarkModelSpec {
+    /// Localized display name of the model; falls back to the catalog key when
+    /// the key is missing from the active locale.
+    pub(super) fn display_name(self) -> &'static str {
+        ms_i18n::lookup(self.display_key).unwrap_or(self.display_key)
+    }
+}
+
+/// Fixed watermark-detector catalog, mirroring the backend's supported models.
+pub(super) const WATERMARK_MODEL_SPECS: [WatermarkModelSpec; 3] = [
+    WatermarkModelSpec {
+        id: "slbr",
+        display_key: "cleaning.tools.watermark.model_slbr",
+    },
+    WatermarkModelSpec {
+        id: "wdnet",
+        display_key: "cleaning.tools.watermark.model_wdnet",
+    },
+    WatermarkModelSpec {
+        id: "splitnet",
+        display_key: "cleaning.tools.watermark.model_splitnet",
+    },
+];
+
+/// Snapshot of the backend `watermark.status` response: which catalog models
+/// already have their weights and their network code on disk.
+#[derive(Debug, Default, Clone)]
+pub(super) struct WatermarkStatus {
+    downloaded_models: Vec<String>,
+    code_ready_models: Vec<String>,
+}
+
+impl WatermarkStatus {
+    /// True when running `model_id` needs no download: both the weights and the
+    /// (runtime-fetched) network code are present on the backend side.
+    pub(super) fn is_ready(&self, model_id: &str) -> bool {
+        self.downloaded_models.iter().any(|id| id == model_id)
+            && self.code_ready_models.iter().any(|id| id == model_id)
+    }
+}
+
+/// Live progress of a streaming `watermark.*` call, shared between the worker
+/// that runs it and the editor UI that renders the progress bar.
+///
+/// Written by the mask-generation worker of this module and by the standalone
+/// `watermark_removal.rs` tool, which streams `watermark.remove` with the same
+/// two-phase (`download` bytes / `generate` steps) contract.
+#[derive(Debug, Default)]
+pub(super) struct WatermarkProgress {
+    pub(super) active: bool,
+    /// `"download"` (bytes) or `"generate"` (steps), from the `progress` frame.
+    pub(super) phase: String,
+    pub(super) step: u64,
+    pub(super) total: u64,
+    pub(super) label: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RegionMaskGenerationParams {
     method: RegionMaskGenerationMethod,
     dilate_size: i32,
+    /// Wire id of the selected watermark model; only used by the watermark source.
+    watermark_model: &'static str,
 }
 
 impl Default for RegionMaskGenerationParams {
@@ -1569,6 +1678,34 @@ impl Default for RegionMaskGenerationParams {
         Self {
             method: RegionMaskGenerationMethod::ComicTextDetector,
             dilate_size: 7,
+            watermark_model: DEFAULT_WATERMARK_MODEL,
+        }
+    }
+}
+
+/// Mask-generation state of a mask-inpaint tool: the shared parameters plus the
+/// watermark-source extras (catalog download state and streaming progress).
+#[derive(Debug)]
+struct RegionMaskGenerationState {
+    params: RegionMaskGenerationParams,
+    watermark_status: Option<WatermarkStatus>,
+    watermark_status_rx: Option<Receiver<Result<WatermarkStatus, String>>>,
+    /// Arms exactly ONE `watermark.status` query: set initially and re-armed
+    /// after a run that may have downloaded code or weights, cleared when the
+    /// query is spawned. Without it a failing query would be retried on every
+    /// frame, spawning a thread per frame.
+    watermark_status_wanted: bool,
+    watermark_progress: Arc<Mutex<WatermarkProgress>>,
+}
+
+impl Default for RegionMaskGenerationState {
+    fn default() -> Self {
+        Self {
+            params: RegionMaskGenerationParams::default(),
+            watermark_status: None,
+            watermark_status_rx: None,
+            watermark_status_wanted: true,
+            watermark_progress: Arc::new(Mutex::new(WatermarkProgress::default())),
         }
     }
 }
@@ -1578,14 +1715,28 @@ enum RegionMaskGenerationMethod {
     ComicTextDetector,
     PaddleOcr,
     Surya,
+    Watermark,
 }
 
 impl RegionMaskGenerationMethod {
+    /// UI label of the source. Detector names are brand names and stay literal
+    /// (`dev-docs/i18n_exclusions.md`); the watermark source is a description and
+    /// is localized.
     fn label(self) -> &'static str {
         match self {
             Self::ComicTextDetector => "ComicTextDetector",
             Self::PaddleOcr => "PaddleOCR",
             Self::Surya => "Surya",
+            Self::Watermark => t!("cleaning.mask_editor.source.watermark"),
+        }
+    }
+
+    /// True when the source runs a Torch model in the Python backend and must
+    /// therefore be disabled while the backend reports no Torch.
+    fn requires_torch(self) -> bool {
+        match self {
+            Self::PaddleOcr => false,
+            Self::ComicTextDetector | Self::Surya | Self::Watermark => true,
         }
     }
 }
@@ -1655,7 +1806,7 @@ pub struct RegionMaskInpaintToolBase {
     editor_state: Option<RegionInpaintEditorState>,
     ai_backend_available: bool,
     ai_backend_torch_available: bool,
-    mask_generation_params: RegionMaskGenerationParams,
+    mask_generation: RegionMaskGenerationState,
 }
 
 impl RegionMaskInpaintToolBase {
@@ -1666,7 +1817,7 @@ impl RegionMaskInpaintToolBase {
             editor_state: None,
             ai_backend_available: false,
             ai_backend_torch_available: false,
-            mask_generation_params: RegionMaskGenerationParams::default(),
+            mask_generation: RegionMaskGenerationState::default(),
         }
     }
 
@@ -1819,7 +1970,7 @@ impl RegionMaskInpaintToolBase {
             &mut self.brush_base,
             &mut self.editor_state,
         );
-        let mask_generation_params = &mut self.mask_generation_params;
+        let mask_generation = &mut self.mask_generation;
         region_base.draw_overlay_ui_custom(
             ctx,
             canvas,
@@ -1840,7 +1991,7 @@ impl RegionMaskInpaintToolBase {
                     sample_mask_enabled,
                     self.ai_backend_available,
                     self.ai_backend_torch_available,
-                    mask_generation_params,
+                    mask_generation,
                     &mut draw_custom_ui,
                     request_close,
                     apply_clicked,
@@ -1877,7 +2028,7 @@ impl RegionMaskInpaintToolBase {
         sample_mask_enabled: bool,
         ai_backend_available: bool,
         ai_backend_torch_available: bool,
-        mask_generation_params: &mut RegionMaskGenerationParams,
+        mask_generation: &mut RegionMaskGenerationState,
         draw_custom_ui: &mut DrawCustomUi,
         request_close: &mut bool,
         apply_clicked: &mut bool,
@@ -1899,6 +2050,29 @@ impl RegionMaskInpaintToolBase {
         let mut generating_mask = Self::poll_mask_generation_result(editor, editor_state);
         if brush_base.handle_size_shortcuts(ui.ctx()) {
             ui.ctx().request_repaint();
+        }
+
+        let RegionMaskGenerationState {
+            params: mask_generation_params,
+            watermark_status,
+            watermark_status_rx,
+            watermark_status_wanted,
+            watermark_progress,
+        } = mask_generation;
+
+        // The ✓/«скачать» marks come from the backend, so they are fetched lazily:
+        // once when the watermark source is first shown, and once more after a run
+        // that may have downloaded code or weights. A query is never issued while a
+        // detection is running, so the backend is not asked mid-download.
+        poll_watermark_status(watermark_status, watermark_status_rx);
+        if *watermark_status_wanted
+            && mask_generation_params.method == RegionMaskGenerationMethod::Watermark
+            && ai_backend_available
+            && editor_state.mask_generation_rx.is_none()
+            && watermark_status_rx.is_none()
+        {
+            *watermark_status_wanted = false;
+            *watermark_status_rx = Some(spawn_watermark_status_query());
         }
 
         // Scroll the editor body (brush controls, params, preview, status) so a
@@ -1966,55 +2140,21 @@ impl RegionMaskInpaintToolBase {
                     ui.horizontal(|ui| {
                         ui.label(t!("cleaning.mask_editor.mask_gen_params_heading"));
                         ui.add_space(8.0);
-                        egui::ComboBox::from_id_salt(("mask_generation_method", editor.scroll_id))
+                        WheelComboBox::from_id_salt(("mask_generation_method", editor.scroll_id))
                             .selected_text(mask_generation_params.method.label())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut mask_generation_params.method,
+                                for method in [
                                     RegionMaskGenerationMethod::PaddleOcr,
-                                    RegionMaskGenerationMethod::PaddleOcr.label(),
-                                );
-                                let response = ui.add_enabled(
-                                    ai_backend_torch_available,
-                                    egui::Button::new(RegionMaskGenerationMethod::Surya.label())
-                                        .selected(
-                                            mask_generation_params.method
-                                                == RegionMaskGenerationMethod::Surya,
-                                        ),
-                                );
-                                let response = if ai_backend_torch_available {
-                                    response
-                                } else {
-                                    response.on_disabled_hover_text(
-                                        egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
-                                            .color(Color32::from_rgb(240, 102, 102)),
-                                    )
-                                };
-                                if response.clicked() {
-                                    mask_generation_params.method =
-                                        RegionMaskGenerationMethod::Surya;
-                                }
-                                let response = ui.add_enabled(
-                                    ai_backend_torch_available,
-                                    egui::Button::new(
-                                        RegionMaskGenerationMethod::ComicTextDetector.label(),
-                                    )
-                                    .selected(
-                                        mask_generation_params.method
-                                            == RegionMaskGenerationMethod::ComicTextDetector,
-                                    ),
-                                );
-                                let response = if ai_backend_torch_available {
-                                    response
-                                } else {
-                                    response.on_disabled_hover_text(
-                                        egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
-                                            .color(Color32::from_rgb(240, 102, 102)),
-                                    )
-                                };
-                                if response.clicked() {
-                                    mask_generation_params.method =
-                                        RegionMaskGenerationMethod::ComicTextDetector;
+                                    RegionMaskGenerationMethod::Surya,
+                                    RegionMaskGenerationMethod::ComicTextDetector,
+                                    RegionMaskGenerationMethod::Watermark,
+                                ] {
+                                    draw_mask_source_entry(
+                                        ui,
+                                        &mut mask_generation_params.method,
+                                        method,
+                                        ai_backend_torch_available,
+                                    );
                                 }
                             });
                     });
@@ -2024,7 +2164,17 @@ impl RegionMaskInpaintToolBase {
                         WheelSlider::new(&mut mask_generation_params.dilate_size, 0..=30)
                             .text(t!("cleaning.common.mask_expand_label")),
                     );
+                    if mask_generation_params.method == RegionMaskGenerationMethod::Watermark {
+                        draw_watermark_model_picker_ui(
+                            ui,
+                            &mut mask_generation_params.watermark_model,
+                            watermark_status.as_ref(),
+                        );
+                    }
                 });
+                // Drawn outside the collapsible so a running detection stays visible
+                // while the parameter section is folded.
+                draw_watermark_progress_ui(ui, watermark_progress);
                 draw_custom_ui(ui);
                 Self::draw_mask_editor_image(ui, editor, brush_base, editor_state);
 
@@ -2039,11 +2189,7 @@ impl RegionMaskInpaintToolBase {
             editor_state.processing_rx.is_some() || editor_state.mask_generation_rx.is_some();
         let can_generate_mask = !background_busy
             && ai_backend_available
-            && match mask_generation_params.method {
-                RegionMaskGenerationMethod::ComicTextDetector => ai_backend_torch_available,
-                RegionMaskGenerationMethod::PaddleOcr => true,
-                RegionMaskGenerationMethod::Surya => ai_backend_torch_available,
-            };
+            && (ai_backend_torch_available || !mask_generation_params.method.requires_torch());
         let can_run = !background_busy;
         let can_rerun = can_run && editor_state.rerun_source.is_some();
         let can_undo = can_run && !editor_state.undo_stack.is_empty();
@@ -2054,23 +2200,29 @@ impl RegionMaskInpaintToolBase {
             generating_mask = true;
         }
         ui.horizontal(|ui| {
+            let generate_hint = mask_generation_hover_text(
+                mask_generation_params.method,
+                ai_backend_available,
+                ai_backend_torch_available,
+            );
             if ui
                 .add_enabled(can_generate_mask, egui::Button::new(t!("cleaning.mask_editor.generate_mask_button")))
-                .on_hover_text(match (ai_backend_available, mask_generation_params.method) {
-                    (false, _) => t!("cleaning.mask_editor.backend_unavailable_status").to_string(),
-                    (true, RegionMaskGenerationMethod::ComicTextDetector)
-                        if !ai_backend_torch_available =>
-                    {
-                        t!("cleaning.common.pytorch_not_installed_status").to_string()
-                    }
-                    (true, RegionMaskGenerationMethod::Surya) if !ai_backend_torch_available => {
-                        t!("cleaning.common.pytorch_not_installed_status").to_string()
-                    }
-                    _ => t!("cleaning.mask_editor.send_region_hint").to_string(),
-                })
+                .on_hover_text(generate_hint.clone())
+                // `on_hover_text` is enabled-only (`Tooltip::for_enabled`), so the
+                // reason the button is greyed out needs the disabled variant too.
+                .on_disabled_hover_text(generate_hint)
                 .clicked()
             {
-                Self::run_mask_generation(editor, editor_state, *mask_generation_params);
+                if mask_generation_params.method == RegionMaskGenerationMethod::Watermark {
+                    // The run may download code/weights; re-query the catalog once it ends.
+                    *watermark_status_wanted = true;
+                }
+                Self::run_mask_generation(
+                    editor,
+                    editor_state,
+                    *mask_generation_params,
+                    Arc::clone(watermark_progress),
+                );
             }
             if ui
                 .add_enabled(can_run, egui::Button::new(t!("cleaning.mask_editor.process_button")))
@@ -2378,10 +2530,14 @@ impl RegionMaskInpaintToolBase {
         editor.status = Some(t!("cleaning.mask_editor.processing_background_status").to_string());
     }
 
+    /// Starts mask generation for the selected source on a worker thread. The GUI
+    /// only polls `mask_generation_rx`; `watermark_progress` is written by the
+    /// worker while the streaming watermark call runs.
     fn run_mask_generation(
         editor: &mut RegionEditorSession,
         editor_state: &mut RegionInpaintEditorState,
         params: RegionMaskGenerationParams,
+        watermark_progress: Arc<Mutex<WatermarkProgress>>,
     ) {
         if editor_state.processing_rx.is_some() || editor_state.mask_generation_rx.is_some() {
             editor.status = Some(t!("cleaning.mask_editor.background_op_running_status").to_string());
@@ -2391,7 +2547,7 @@ impl RegionMaskInpaintToolBase {
         let image = editor.image.clone();
         let (tx, rx) = mpsc::channel::<RegionMaskGenerationJobResult>();
         thread::spawn(move || {
-            let result = Self::generate_text_mask_from_ai(&image, params);
+            let result = Self::generate_mask_from_ai(&image, params, &watermark_progress);
             let _ = tx.send(RegionMaskGenerationJobResult { result });
         });
         editor_state.mask_generation_rx = Some(rx);
@@ -2508,30 +2664,40 @@ impl RegionMaskInpaintToolBase {
         editor.status = Some(t!("cleaning.mask_editor.reverted_status").to_string());
     }
 
-    fn generate_text_mask_from_ai(
+    /// Runs the selected mask-generation source on the region image and returns a
+    /// binary mask in REGION coordinates (opaque white = masked, transparent = kept).
+    ///
+    /// `watermark_progress` is written only by the watermark source, whose first
+    /// call downloads network code and weights on the backend side.
+    ///
+    /// # Errors
+    /// Returns a user-facing message when the backend fails, when the returned
+    /// mask does not match the region size, or when its buffer length is wrong.
+    fn generate_mask_from_ai(
         image: &egui::ColorImage,
         params: RegionMaskGenerationParams,
+        watermark_progress: &Arc<Mutex<WatermarkProgress>>,
     ) -> Result<egui::ColorImage, String> {
-        let (mask_size, mask_alpha, method_label) = match params.method {
+        let method_label = params.method.label();
+        let (mask_size, mask_alpha) = match params.method {
             RegionMaskGenerationMethod::ComicTextDetector => {
                 let options = TextDetectorAiCtdOptions {
                     mask_dilate_size: params.dilate_size,
                     ..TextDetectorAiCtdOptions::default()
                 };
-                let (mask_size, mask_alpha) = detect_ai_ctd_mask_for_image(image, &options)?;
-                (mask_size, mask_alpha, "ComicTextDetector")
+                detect_ai_ctd_mask_for_image(image, &options)?
             }
             RegionMaskGenerationMethod::PaddleOcr => {
                 let options = TextDetectorPaddleOcrOptions {
                     mask_dilate_size: params.dilate_size,
                 };
-                let (mask_size, mask_alpha) = detect_paddle_mask_for_image(image, &options)?;
-                (mask_size, mask_alpha, "PaddleOCR")
+                detect_paddle_mask_for_image(image, &options)?
             }
             RegionMaskGenerationMethod::Surya => {
-                let (mask_size, mask_alpha) =
-                    detect_surya_mask_for_image(image, params.dilate_size)?;
-                (mask_size, mask_alpha, "Surya")
+                detect_surya_mask_for_image(image, params.dilate_size)?
+            }
+            RegionMaskGenerationMethod::Watermark => {
+                detect_watermark_mask(image, params, watermark_progress)?
             }
         };
         let mask_w = usize::try_from(mask_size[0])
@@ -2555,7 +2721,340 @@ impl RegionMaskInpaintToolBase {
     }
 }
 
-fn build_tinted_mask_preview(mask: &egui::ColorImage, rgb: [u8; 3]) -> egui::ColorImage {
+/// Draws one entry of the mask-source dropdown and applies a click to `selected`.
+///
+/// Torch-backed sources are disabled while the backend reports no Torch and
+/// explain that on hover, matching the tab-level AI gating.
+fn draw_mask_source_entry(
+    ui: &mut egui::Ui,
+    selected: &mut RegionMaskGenerationMethod,
+    method: RegionMaskGenerationMethod,
+    torch_available: bool,
+) {
+    let enabled = torch_available || !method.requires_torch();
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(method.label()).selected(*selected == method),
+    );
+    let response = if enabled {
+        response
+    } else {
+        response.on_disabled_hover_text(
+            egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
+                .color(Color32::from_rgb(240, 102, 102)),
+        )
+    };
+    if response.clicked() {
+        *selected = method;
+    }
+}
+
+/// Hover text of the «Сгенерировать маску» button: names the blocking condition
+/// (backend offline, Torch missing) or describes what the selected source does.
+fn mask_generation_hover_text(
+    method: RegionMaskGenerationMethod,
+    ai_backend_available: bool,
+    ai_backend_torch_available: bool,
+) -> String {
+    if !ai_backend_available {
+        return t!("cleaning.mask_editor.backend_unavailable_status").to_string();
+    }
+    if method.requires_torch() && !ai_backend_torch_available {
+        return t!("cleaning.common.pytorch_not_installed_status").to_string();
+    }
+    match method {
+        RegionMaskGenerationMethod::Watermark => {
+            t!("cleaning.tools.watermark.send_region_hint").to_string()
+        }
+        RegionMaskGenerationMethod::ComicTextDetector
+        | RegionMaskGenerationMethod::PaddleOcr
+        | RegionMaskGenerationMethod::Surya => {
+            t!("cleaning.mask_editor.send_region_hint").to_string()
+        }
+    }
+}
+
+/// Model row of the watermark source: a `WheelComboBox` over the fixed catalog
+/// with the ✓/«скачать» hint from `status`, plus the first-run download notice.
+pub(super) fn draw_watermark_model_picker_ui(
+    ui: &mut egui::Ui,
+    selected_model: &mut &'static str,
+    status: Option<&WatermarkStatus>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(t!("cleaning.tools.watermark.model_label"));
+        let selected_text = watermark_model_label(watermark_model_spec(selected_model), status);
+        WheelComboBox::from_id_salt("cleaning_watermark_model_picker")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for spec in WATERMARK_MODEL_SPECS {
+                    let label = watermark_model_label(spec, status);
+                    let _changed = ui.selectable_value(selected_model, spec.id, label).changed();
+                }
+            });
+    });
+    ui.small(t!("cleaning.tools.watermark.download_hint"));
+}
+
+/// Dropdown label of a watermark model: `✓` when the backend already has its code
+/// and weights, a «скачать» hint when it does not, and the plain (localized) name
+/// while no status snapshot has arrived yet.
+fn watermark_model_label(spec: WatermarkModelSpec, status: Option<&WatermarkStatus>) -> String {
+    let name = spec.display_name();
+    match status {
+        Some(status) if status.is_ready(spec.id) => format!("{name} ✓"),
+        Some(_) => tf!("cleaning.tools.watermark.model_download_label", model = name),
+        None => name.to_string(),
+    }
+}
+
+/// Catalog entry for a wire model id, falling back to the default model when the
+/// id is unknown (a stored selection from a newer catalog must not break the UI).
+pub(super) fn watermark_model_spec(model_id: &str) -> WatermarkModelSpec {
+    WATERMARK_MODEL_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.id == model_id)
+        .unwrap_or(WATERMARK_MODEL_SPECS[0])
+}
+
+/// Draws the progress bar of a running watermark detection; a no-op while idle.
+/// The download phase counts bytes, the generate phase counts steps.
+pub(super) fn draw_watermark_progress_ui(ui: &mut egui::Ui, progress: &Mutex<WatermarkProgress>) {
+    let (active, phase, step, total, label) = {
+        let guard = lock_watermark_progress(progress);
+        (
+            guard.active,
+            guard.phase.clone(),
+            guard.step,
+            guard.total,
+            guard.label.clone(),
+        )
+    };
+    if !active {
+        return;
+    }
+    // Byte and step counters are far below 2^53, so the f64 conversion used for
+    // the fraction and the MiB readout is exact.
+    let fraction = if total > 0 {
+        (step as f64 / total as f64).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let text = if phase == "download" {
+        let done_mib = step as f64 / (1024.0 * 1024.0);
+        let total_mib = total as f64 / (1024.0 * 1024.0);
+        tf!(
+            "cleaning.tools.watermark.download_progress_status",
+            label = label,
+            done = format!("{done_mib:.1}"),
+            total = format!("{total_mib:.1}")
+        )
+    } else if total > 0 {
+        tf!("cleaning.common.step_progress_status", step = step, total = total)
+    } else {
+        label
+    };
+    ui.add(egui::ProgressBar::new(fraction).text(text));
+    ui.ctx().request_repaint();
+}
+
+/// Locks the shared watermark progress, recovering from a poisoned mutex: the
+/// payload is display-only state, so a panicked writer must not kill the editor.
+pub(super) fn lock_watermark_progress(
+    progress: &Mutex<WatermarkProgress>,
+) -> MutexGuard<'_, WatermarkProgress> {
+    match progress.lock() {
+        Ok(guard) => guard,
+        Err(poison) => poison.into_inner(),
+    }
+}
+
+/// Polls the background `watermark.status` query. A failed query only clears the
+/// receiver: the catalog then shows plain model names instead of ✓/«скачать».
+pub(super) fn poll_watermark_status(
+    status: &mut Option<WatermarkStatus>,
+    status_rx: &mut Option<Receiver<Result<WatermarkStatus, String>>>,
+) {
+    let Some(rx) = status_rx.as_ref() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(Ok(value)) => {
+            *status = Some(value);
+            *status_rx = None;
+        }
+        Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+            *status_rx = None;
+        }
+        Err(TryRecvError::Empty) => {}
+    }
+}
+
+/// Spawns the `watermark.status` query on a worker thread (it is a blocking IPC
+/// call and must never run on the GUI thread) and returns its result channel.
+pub(super) fn spawn_watermark_status_query() -> Receiver<Result<WatermarkStatus, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(fetch_watermark_status());
+    });
+    rx
+}
+
+/// Queries `watermark.status` for the catalog download state.
+///
+/// # Errors
+/// Returns the backend error message, or the unified offline message when the
+/// backend cannot be reached.
+fn fetch_watermark_status() -> Result<WatermarkStatus, String> {
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
+    let (header, _blob) = client
+        .call(
+            backend_ipc::protocol::METHOD_WATERMARK_STATUS,
+            json!({}),
+            &[],
+            WATERMARK_STATUS_CALL_TIMEOUT,
+        )
+        .map_err(map_watermark_call_error)?;
+    Ok(WatermarkStatus {
+        downloaded_models: watermark_status_string_list(&header, "downloaded_models"),
+        code_ready_models: watermark_status_string_list(&header, "code_ready_models"),
+    })
+}
+
+/// Reads a string array field of a response header, tolerating a missing field
+/// (older backend) and skipping non-string entries.
+fn watermark_status_string_list(header: &Value, field: &str) -> Vec<String> {
+    header
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Request header of a `watermark.detect` call. `model` is the wire id of the
+/// catalog entry; `dilate_px` reuses the editor's shared mask-expansion control,
+/// while the detection scale and threshold stay at the backend defaults (their
+/// controls belong to the dedicated watermark tool).
+fn watermark_detect_header(params: RegionMaskGenerationParams) -> Value {
+    json!({
+        "params": {
+            "model": params.watermark_model,
+            "downscale_to": WATERMARK_DETECT_DOWNSCALE_TO,
+            "threshold": WATERMARK_DETECT_THRESHOLD,
+            "dilate_px": params.dilate_size.clamp(0, 30),
+        }
+    })
+}
+
+/// Streams a `watermark.detect` call for `image` and returns the predicted mask
+/// as `([w, h], alpha)` in region pixel coordinates (alpha is 0/255).
+///
+/// The response blob is an L8 PNG at the input resolution. `progress` is updated
+/// from the `progress` frames and is always cleared before returning, including
+/// on failure, so the editor never keeps a stuck progress bar.
+///
+/// # Errors
+/// Returns the backend error message, the abort notice for an interrupted call,
+/// or the unified offline message when the transport fails.
+fn detect_watermark_mask(
+    image: &egui::ColorImage,
+    params: RegionMaskGenerationParams,
+    progress: &Arc<Mutex<WatermarkProgress>>,
+) -> Result<([u32; 2], Vec<u8>), String> {
+    if image.size[0] == 0 || image.size[1] == 0 {
+        return Ok(([0, 0], Vec::new()));
+    }
+    let image_png = encode_color_image_png_rgba(image)?;
+    let header = watermark_detect_header(params);
+
+    {
+        let mut guard = lock_watermark_progress(progress);
+        guard.active = true;
+        guard.phase = "generate".to_string();
+        guard.step = 0;
+        guard.total = 0;
+        guard.label = t!("cleaning.tools.watermark.preparing_status").to_string();
+    }
+    let stream_result =
+        watermark_detect_stream_call(header, &image_png, |phase, step, total, label| {
+            let mut guard = lock_watermark_progress(progress);
+            guard.phase = phase;
+            guard.step = step;
+            guard.total = total;
+            guard.label = label;
+        });
+    {
+        let mut guard = lock_watermark_progress(progress);
+        guard.active = false;
+    }
+
+    let (_response_header, mask_blob) = stream_result?;
+    if mask_blob.is_empty() {
+        return Err(t!("cleaning.tools.watermark.no_mask_result_error").to_string());
+    }
+    parse_mask_alpha_from_blob(&mask_blob)
+}
+
+/// Issues the streaming `watermark.detect` request. Each `progress` frame carries
+/// `phase`/`step`/`total`/`label` in its header and no blob.
+fn watermark_detect_stream_call<F>(
+    header: Value,
+    blob: &[u8],
+    mut on_progress: F,
+) -> Result<(Value, Vec<u8>), String>
+where
+    F: FnMut(String, u64, u64, String),
+{
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
+    client
+        .call_streaming(
+            backend_ipc::protocol::METHOD_WATERMARK_DETECT,
+            header,
+            blob,
+            |progress_header, _preview_blob| {
+                let phase = progress_header
+                    .get("phase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("generate")
+                    .to_string();
+                let step = progress_header
+                    .get("step")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let total = progress_header
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let label = progress_header
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                on_progress(phase, step, total, label);
+            },
+            WATERMARK_DETECT_CALL_TIMEOUT,
+        )
+        .map_err(map_watermark_call_error)
+}
+
+/// `CallError` → user-facing message for watermark calls, mirroring the inpaint
+/// tools: backend errors verbatim, an abort notice for an interrupt, and the
+/// unified offline message for a transport failure.
+pub(super) fn map_watermark_call_error(err: CallError) -> String {
+    match err {
+        CallError::Error(msg) => msg,
+        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
+    }
+}
+
+pub(super) fn build_tinted_mask_preview(mask: &egui::ColorImage, rgb: [u8; 3]) -> egui::ColorImage {
     let mut out = egui::ColorImage::filled(mask.size, Color32::TRANSPARENT);
     for (idx, src) in mask.pixels.iter().enumerate() {
         let alpha = src.a();
@@ -3550,5 +4049,134 @@ mod tests {
         paint_line_mask_with_hardness(&mut mask, [3, 3], 1.0, 1.0, 1.0, 1.0, 2, 1.0, false);
 
         assert!((mask[4] - 1.0).abs() <= f32::EPSILON);
+    }
+
+    /// Watermark catalog ids are WIRE values sent as `params.model` and are the
+    /// persisted selection identity: they must stay these exact literals, and the
+    /// default selection must be one of them.
+    #[test]
+    fn watermark_catalog_ids_are_wire_literals() {
+        let ids: Vec<&str> = WATERMARK_MODEL_SPECS.iter().map(|spec| spec.id).collect();
+        assert_eq!(ids, vec!["slbr", "wdnet", "splitnet"]);
+        assert_eq!(DEFAULT_WATERMARK_MODEL, "slbr");
+        assert_eq!(
+            RegionMaskGenerationParams::default().watermark_model,
+            DEFAULT_WATERMARK_MODEL
+        );
+    }
+
+    /// An id that is not in the catalog (e.g. from a newer build) resolves to the
+    /// default entry instead of yielding an empty label.
+    #[test]
+    fn watermark_model_spec_falls_back_to_default() {
+        assert_eq!(watermark_model_spec("wdnet").id, "wdnet");
+        assert_eq!(watermark_model_spec("nope").id, DEFAULT_WATERMARK_MODEL);
+    }
+
+    /// The dropdown label marks a ready model with ✓, offers the download hint
+    /// when either the weights or the network code are still missing, and stays
+    /// plain while no status snapshot has arrived.
+    #[test]
+    fn watermark_model_label_marks_downloaded() {
+        let spec = watermark_model_spec("slbr");
+        let name = spec.display_name();
+        let ready = WatermarkStatus {
+            downloaded_models: vec!["slbr".to_string()],
+            code_ready_models: vec!["slbr".to_string()],
+        };
+        assert_eq!(
+            watermark_model_label(spec, Some(&ready)),
+            format!("{name} ✓")
+        );
+        // Weights present but code missing still means a download on the next run.
+        let code_missing = WatermarkStatus {
+            downloaded_models: vec!["slbr".to_string()],
+            code_ready_models: Vec::new(),
+        };
+        assert_eq!(
+            watermark_model_label(spec, Some(&code_missing)),
+            tf!("cleaning.tools.watermark.model_download_label", model = name)
+        );
+        assert_eq!(watermark_model_label(spec, None), name.to_string());
+    }
+
+    /// The detect header carries the wire model id plus the fixed detection
+    /// parameters, with the editor's shared dilation control clamped to the
+    /// slider range the backend expects.
+    #[test]
+    fn watermark_detect_header_shape() {
+        let params = RegionMaskGenerationParams {
+            method: RegionMaskGenerationMethod::Watermark,
+            dilate_size: 99,
+            watermark_model: "splitnet",
+        };
+        let header = watermark_detect_header(params);
+        assert!(header["params"].is_object(), "params must be an object");
+        assert_eq!(header["params"]["model"].as_str(), Some("splitnet"));
+        assert_eq!(header["params"]["downscale_to"].as_u64(), Some(512));
+        assert_eq!(header["params"]["dilate_px"].as_i64(), Some(30));
+        let threshold = header["params"]["threshold"].as_f64().unwrap_or(-1.0);
+        assert!((threshold - 0.5).abs() < 1e-6, "threshold was {threshold}");
+    }
+
+    /// `watermark.status` fields are optional and may hold non-string entries;
+    /// neither may break the catalog labels.
+    #[test]
+    fn watermark_status_list_tolerates_missing_and_garbage() {
+        let header = json!({ "downloaded_models": ["slbr", 7, null, "wdnet"] });
+        assert_eq!(
+            watermark_status_string_list(&header, "downloaded_models"),
+            vec!["slbr".to_string(), "wdnet".to_string()]
+        );
+        assert!(watermark_status_string_list(&header, "code_ready_models").is_empty());
+    }
+
+    /// Only PaddleOCR runs without Torch; every other mask source is gated on it.
+    #[test]
+    fn mask_source_torch_requirements() {
+        assert!(!RegionMaskGenerationMethod::PaddleOcr.requires_torch());
+        assert!(RegionMaskGenerationMethod::Surya.requires_torch());
+        assert!(RegionMaskGenerationMethod::ComicTextDetector.requires_torch());
+        assert!(RegionMaskGenerationMethod::Watermark.requires_torch());
+    }
+
+    /// The generate-button tooltip names the blocking condition first (backend,
+    /// then Torch) and otherwise describes the selected source.
+    #[test]
+    fn mask_generation_hover_text_names_blocker() {
+        assert_eq!(
+            mask_generation_hover_text(RegionMaskGenerationMethod::Watermark, false, true),
+            t!("cleaning.mask_editor.backend_unavailable_status")
+        );
+        assert_eq!(
+            mask_generation_hover_text(RegionMaskGenerationMethod::Watermark, true, false),
+            t!("cleaning.common.pytorch_not_installed_status")
+        );
+        assert_eq!(
+            mask_generation_hover_text(RegionMaskGenerationMethod::Watermark, true, true),
+            t!("cleaning.tools.watermark.send_region_hint")
+        );
+        assert_eq!(
+            mask_generation_hover_text(RegionMaskGenerationMethod::PaddleOcr, true, false),
+            t!("cleaning.mask_editor.send_region_hint")
+        );
+    }
+
+    /// Watermark call errors keep the backend message verbatim, label an
+    /// interrupt, and collapse a transport failure into the offline message.
+    #[test]
+    fn watermark_call_error_mapping_preserves_messages() {
+        assert_eq!(
+            map_watermark_call_error(CallError::Error("boom".to_string())),
+            "boom"
+        );
+        assert_eq!(
+            map_watermark_call_error(CallError::Interrupted("MARKER".to_string())),
+            tf!("cleaning.inpaint.request_aborted_error", msg = "MARKER")
+        );
+        assert_eq!(
+            map_watermark_call_error(CallError::Transport("dead".to_string())),
+            ai_backend_offline_error()
+        );
     }
 }

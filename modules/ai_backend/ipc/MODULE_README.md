@@ -33,6 +33,7 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── inpaint.py     — inpaint.lama_v2 / .lama_mpe / .aot (+ unloads)
                 ├── sdxl.py        — inpaint.sdxl (+ unload); streaming via ProgressEmitter
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
+                ├── watermark.py   — watermark.detect / .remove / .status / .unload; streaming
                 ├── reline.py      — reline.models / reline.process
                 ├── device.py      — device.get / .set / .cuda_diagnostics
                 ├── translate.py   — translate.deep
@@ -156,7 +157,8 @@ live in `handlers/MODULE_README.md`.
 - Image bytes are never base64-encoded on the wire. Request blobs carry raw PNG input; response
   blobs carry raw PNG output (masks, inpaint results, SDXL previews).
 - Inpaint methods that need two images (image + mask) use a concatenated blob: `blob = image_png ++
-  mask_png` with `image_len`/`mask_len` header fields splitting them.
+  mask_png` with `image_len`/`mask_len` header fields splitting them. `watermark.remove` applies the
+  same convention to its RESPONSE (`clean_png ++ mask_png`); it is the only method that does.
 - A `cancel{id}` sets that id's `threading.Event`; the handler observes it and raises `Interrupted`
   to emit `response{status:"interrupted"}`.
 - Event fan-out is best-effort. A broken or slow sink is dropped silently; the publisher never

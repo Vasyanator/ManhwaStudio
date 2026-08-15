@@ -31,6 +31,9 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `sdxl.py`: `inpaint.sdxl` (+ `.unload`) — streaming, with a latent-preview PNG blob per `progress`.
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
+- `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
+  (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
+  method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).
 - `reline.py`: `reline.models` / `reline.process` (on-disk paths only, no image bytes).
 - `device.py`: `device.get` / `.set` / `.cuda_diagnostics`.
 - `translate.py`: `translate.deep`.
@@ -55,7 +58,8 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - Long work must observe `cancel_event` and raise `Interrupted` so the dispatcher can answer
   `response{status:"interrupted"}`; a handler that ignores it makes the method uncancellable.
 - Raw bytes only: request/response blobs carry PNG bytes, never base64. Two-image inpaint requests
-  arrive as one concatenated blob split by the `image_len`/`mask_len` header fields.
+  arrive as one concatenated blob split by the `image_len`/`mask_len` header fields; the same
+  convention is used in the response direction by `watermark.remove`.
 
 ## Editing map
 - Change an existing method's wire shape: that group's module, and `../PROTOCOL.md §5` first.

@@ -990,7 +990,10 @@ fn parse_backend_line_rect(item: &Value) -> Option<TextDetectorRect> {
 
 /// Decodes the mask PNG from the response BLOB bytes (raw PNG, not base64).
 /// Returns `([w, h], alpha_pixels)` where each pixel is 0 or 255.
-fn parse_mask_alpha_from_blob(blob: &[u8]) -> Result<([u32; 2], Vec<u8>), String> {
+///
+/// Shared with the cleaning mask editor, whose watermark source consumes the same
+/// L8 mask contract (`src/tabs/cleaning/tools/base.rs`).
+pub(crate) fn parse_mask_alpha_from_blob(blob: &[u8]) -> Result<([u32; 2], Vec<u8>), String> {
     if blob.is_empty() {
         return Ok(([0, 0], Vec::new()));
     }
@@ -1050,7 +1053,15 @@ fn dilate_mask_alpha(mask_alpha: &mut Vec<u8>, mask_size: [u32; 2], dilate_size:
         .collect();
 }
 
-fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
+/// Encodes a region/page image as an RGBA8 PNG for a detector request blob.
+///
+/// Shared with the cleaning mask editor so every mask source sends the region in
+/// exactly the same encoding (`src/tabs/cleaning/tools/base.rs`).
+///
+/// # Errors
+/// Returns a user-facing message when the image is larger than `u32` or the PNG
+/// encoder fails.
+pub(crate) fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let width = image.size[0];
     let height = image.size[1];
     let raw = image

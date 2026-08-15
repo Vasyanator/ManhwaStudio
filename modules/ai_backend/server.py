@@ -6,8 +6,9 @@ Composition root of the Python AI backend: it builds every local AI service and
 serves them over the framed IPC protocol used by the Rust application.
 
 This is the ONLY module that knows the full set of domain sub-packages
-(`runtime/`, `engines/`, `ocr/`, `detection/`, `inpaint/`, `reline/`,
-`translate/`, `browser/`) and wires their services into the shared `AppState`.
+(`runtime/`, `engines/`, `ocr/`, `detection/`, `inpaint/`, `watermark/`,
+`reline/`, `translate/`, `browser/`) and wires their services into the shared
+`AppState`.
 Everything downstream (the IPC handlers in `ipc/handlers/`) reaches a service
 only through `HandlerContext.state.<attr>`, so the `AppState` field names are a
 cross-layer contract: renaming one silently breaks a handler and therefore an
@@ -63,6 +64,7 @@ from .inpaint.lama import LamaInpaintService
 from .inpaint.lama_mpe import LamaMpeInpaintService
 from .inpaint.sdxl import SdxlInpaintService
 from .inpaint.flux_fill import FluxFillInpaintService
+from .watermark.service import WatermarkRemovalService
 from .reline.service import RelineService
 from .translate.machine_translation import MachineTranslationService
 from .browser.service import BrowserService
@@ -109,6 +111,7 @@ class AppState:
     aot_inpaint: AotInpaintService
     sdxl_inpaint: SdxlInpaintService
     flux_fill_inpaint: FluxFillInpaintService
+    watermark: WatermarkRemovalService
     reline: RelineService
     machine_translation: MachineTranslationService
     ai_device: AiDeviceService
@@ -159,6 +162,9 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
             "aot": _safe_service_health(state.aot_inpaint),
             "flux_fill": _safe_service_health(state.flux_fill_inpaint),
         },
+        # Watermark removal is a domain of its own, not an inpaint engine: it
+        # predicts a mask instead of consuming one, so it gets a top-level key.
+        "watermark": _safe_service_health(state.watermark),
         "image_processing": {
             "reline": _safe_service_health(state.reline),
         },
@@ -237,6 +243,7 @@ def run_server(
         aot_inpaint=AotInpaintService(model_manager),
         sdxl_inpaint=SdxlInpaintService(model_manager, lama_inpaint_service),
         flux_fill_inpaint=FluxFillInpaintService(model_manager),
+        watermark=WatermarkRemovalService(model_manager),
         reline=RelineService(),
         machine_translation=MachineTranslationService(),
         ai_device=ai_device_service,

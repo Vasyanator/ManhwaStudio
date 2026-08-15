@@ -47,6 +47,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -57,6 +58,7 @@ try:
 except Exception:  # pragma: no cover - config is always importable in-app
     _config = None
 
+from ..engines.model_download import download_to_path, stream_response_to_file
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 from ..runtime.rocm_mmap_transfer import (
@@ -247,16 +249,24 @@ class FluxFillInpaintService:
         )
         with self._lock:
             try:
-                pipe = self._ensure_pipeline_locked(normalized, model_key)
+                # Load scope: only a failure in here is a failed LOAD, and only
+                # then may the manager drop its entry for `model_key`.
+                try:
+                    pipe = self._ensure_pipeline_locked(normalized, model_key)
+                except Exception:
+                    if lease.needs_load:
+                        lease.mark_load_failed()
+                    raise
+                # The pipeline is resident from here on, so it is registered
+                # before generation: a generation failure must leave it counted
+                # and evictable, not silently occupying VRAM off the books.
+                if lease.needs_load:
+                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._generate_locked(
                     pipe, image_rgb, mask_u8, normalized, progress_callback
                 )
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
             except Exception as exc:
-                if lease.needs_load:
-                    lease.mark_load_failed()
                 self._last_error = str(exc)
                 raise
             finally:
@@ -276,6 +286,12 @@ class FluxFillInpaintService:
 
         Files already present (non-empty) are skipped. Progress is reported in
         bytes via `progress_callback("download", done, total, label)`.
+
+        Runs OUTSIDE `self._lock` on purpose — a multi-GB download must never
+        block `health()`, `unload()` or an eviction callback — so two concurrent
+        first uses reach this method at once. Each individual file is serialized
+        and staged privately by `_download_file_streaming`; a file the other
+        thread already finished is skipped here rather than fetched twice.
         """
         quant = normalize_quant(quant)
         os.makedirs(_flux_dir(), exist_ok=True)
@@ -543,27 +559,32 @@ def _build_download_plan(quant: str) -> list[dict[str, Any]]:
     return plan
 
 
-def _download_file_streaming(url: str, dest: str, on_chunk: Callable[[int], None]) -> None:
-    """Stream `url` to `dest` (atomic via .part), reporting cumulative bytes."""
+def _download_file_streaming(url: str, dest: str, on_chunk: Callable[[int], None]) -> bool:
+    """Download `url` to `dest`, reporting cumulative bytes. Returns whether it ran.
+
+    Serialization, the process-private `.part` staging file and the atomic
+    publish belong to `engines.model_download.download_to_path`: IPC dispatches
+    onto a thread pool, so two first uses of the same quant can otherwise write
+    into one staging file at the same time — a ~22 GB corruption window here.
+    A file another thread already finished is skipped, not refetched.
+    """
     import requests
 
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".part"
     headers = {}
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    done = 0
-    with requests.get(url, stream=True, allow_redirects=True, headers=headers, timeout=60) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                done += len(chunk)
-                on_chunk(done)
-    os.replace(tmp, dest)
+
+    def fetch(staging: Path) -> None:
+        with requests.get(
+            url, stream=True, allow_redirects=True, headers=headers, timeout=60
+        ) as response:
+            response.raise_for_status()
+            stream_response_to_file(
+                response, staging, lambda done, _expected: on_chunk(done)
+            )
+
+    return download_to_path(dest, fetch)
 
 
 def _components_present() -> bool:

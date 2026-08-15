@@ -22,7 +22,7 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
         ├── ipc/                   — transport, dispatcher, event bus, handlers (torch-free)
         ├── browser/               — in-process Selenium / CloakBrowser scraping session
         │
-        ├── ocr/  detection/  inpaint/  reline/  translate/   — service domains
+        ├── ocr/  detection/  inpaint/  watermark/  reline/  translate/  — service domains
         │            │
         │            ▼
         ├── engines/               — model-family runtime shared by MORE THAN ONE domain
@@ -42,7 +42,8 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   onnxruntime just to tune MIOpen.
 - **A module belongs in `engines/` only if two or more domains use it** (`paddle_onnx` serves
   `ocr/paddle.py` and `detection/paddle.py`; `surya_checkpoints` serves `ocr/surya.py` and
-  `detection/surya.py`). A runtime used by exactly one domain belongs inside that domain.
+  `detection/surya.py`; `model_download` serves `inpaint/flux_fill.py` and `watermark/service.py`).
+  A runtime used by exactly one domain belongs inside that domain.
 
 ## Files and submodules
 - `server.py`: composition root — service construction, `AppState` wiring, framed IPC startup.
@@ -52,8 +53,8 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   does.
 - `runtime/`: program root (`paths.program_root()`), Torch availability, device/provider selection,
   `LoadedModelManager`, and the two ROCm workarounds. See `runtime/MODULE_README.md`.
-- `engines/`: cross-domain model-family runtime (`paddle_onnx`, `surya_checkpoints`). See
-  `engines/MODULE_README.md`.
+- `engines/`: cross-domain model-family runtime and model acquisition (`paddle_onnx`,
+  `surya_checkpoints`, `model_download`). See `engines/MODULE_README.md`.
 - `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya`) and the
   PaddleOCR-VL script constraint. See `ocr/MODULE_README.md`.
 - `detection/`: text detectors (`textdetector.ctd` / `.paddle` / `.surya`) plus the vendored
@@ -61,6 +62,10 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
   `.flux_fill`), the standalone LaMa V2 runtime module, and the vendored `lama_runtime_bundle/`.
   See `inpaint/MODULE_README.md`.
+- `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
+  A domain of its own, not a sixth inpainter: it PREDICTS a mask instead of consuming one, and its
+  weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`
+  (`config.WATERMARK_DIR`). See `watermark/MODULE_README.md`.
 - `reline/`: Reline pipeline adapter and catalog-backed downloader (`reline.models`,
   `reline.process`). See `reline/MODULE_README.md`.
 - `translate/`: machine translation (`translate.deep`). See `translate/MODULE_README.md`.

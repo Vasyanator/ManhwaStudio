@@ -15,7 +15,9 @@ Main responsibilities:
   or no longer file-backed (an fp16 run casts them into anonymous memory), and
   that it frees the allocator cache between components;
 - verify a failed move degrades to a warning instead of a failed load;
-- verify unloading and swapping quants drop the pipeline and report it.
+- verify unloading and swapping quants drop the pipeline and report it;
+- verify two concurrent first uses of the same quant stage the download once,
+  into a process-private file, instead of writing over each other.
 
 Notes:
 - Fake `torch` and `diffusers` modules are injected into `sys.modules`, so the
@@ -28,8 +30,12 @@ Notes:
 from __future__ import annotations
 
 import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import flux_fill as svc
@@ -454,6 +460,105 @@ class PipelinePlacementTests(unittest.TestCase):
         self.assertEqual(len(self.pipes), 2)
         self.assertIs(second, self.pipes[1])
         self.assertEqual(self.service._active_key, "flux_fill:Q4_0")
+
+
+class _SlowFluxResponse:
+    """Streaming stand-in whose body arrives slowly, one distinct payload per GET.
+
+    Distinct payloads are the point: if two callers stage into the same file
+    their bytes interleave, and the published result matches neither request.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.headers = {"Content-Length": str(len(payload))}
+
+    def __enter__(self) -> "_SlowFluxResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        return False
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int = 1 << 20):
+        for start in range(0, len(self._payload), 4096):
+            yield self._payload[start : start + 4096]
+            time.sleep(0.01)
+
+
+class WeightDownloadConcurrencyTests(unittest.TestCase):
+    """IPC dispatches onto a thread pool, so two first uses of a quant can race.
+
+    FLUX stages ~22 GB per quant, so a staging file shared between requests is a
+    very wide corruption window: both writers truncate and rewrite the same path,
+    one can hand a half-rewritten file to the reader, and the loser's
+    `os.replace` fails outright because the winner already moved it away.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.dest = self.root / "flux1-fill-dev-Q8_0.gguf"
+
+        self.payloads: list[bytes] = []
+        self.requests_seen: list[dict[str, str]] = []
+        self.lock = threading.Lock()
+
+        def get(url: str, **kwargs: object) -> _SlowFluxResponse:
+            with self.lock:
+                index = len(self.requests_seen)
+                headers = kwargs.get("headers")
+                self.requests_seen.append(dict(headers) if isinstance(headers, dict) else {})
+                payload = bytes([65 + index]) * 40960
+                self.payloads.append(payload)
+            return _SlowFluxResponse(payload)
+
+        module = types.ModuleType("requests")
+        module.get = get
+        modules_patch = patch.dict(sys.modules, {"requests": module})
+        modules_patch.start()
+        self.addCleanup(modules_patch.stop)
+
+    def _download(self, errors: list[BaseException]) -> None:
+        try:
+            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the assertion below
+            errors.append(exc)
+
+    def test_two_concurrent_downloads_fetch_once_and_do_not_corrupt(self) -> None:
+        errors: list[BaseException] = []
+        threads = [threading.Thread(target=self._download, args=(errors,)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        # The loser re-checks under the lock: a ~22 GB refetch is not free.
+        self.assertEqual(len(self.requests_seen), 1)
+        self.assertEqual(self.dest.read_bytes(), self.payloads[0])
+        self.assertEqual(list(self.root.glob("*.part")), [])
+
+    def test_a_present_file_is_not_downloaded_again(self) -> None:
+        self.dest.write_bytes(b"already here")
+
+        self.assertFalse(
+            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
+        )
+        self.assertEqual(self.requests_seen, [])
+
+    def test_the_hf_token_is_still_sent_as_a_bearer_header(self) -> None:
+        with patch.dict("os.environ", {"HF_TOKEN": "hf_secret"}):
+            self.assertTrue(
+                svc._download_file_streaming(
+                    "https://hf/flux.gguf", str(self.dest), lambda _n: None
+                )
+            )
+
+        self.assertEqual(self.requests_seen[0].get("Authorization"), "Bearer hf_secret")
 
 
 class UnloadTests(unittest.TestCase):

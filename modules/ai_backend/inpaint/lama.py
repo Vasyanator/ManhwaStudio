@@ -158,7 +158,19 @@ class LamaInpaintService:
 
         with self._lock:
             try:
-                inpainter = self._ensure_inpainter_locked(device, checkpoint_name)
+                # Load scope: only a failure in here is a failed LOAD, and only
+                # then may the manager drop its entry for `model_key`.
+                try:
+                    inpainter = self._ensure_inpainter_locked(device, checkpoint_name)
+                except Exception:
+                    if lease.needs_load:
+                        lease.mark_load_failed()
+                    raise
+                # The checkpoint is resident from here on, so it is registered
+                # before inference: an inference failure must leave it counted
+                # and evictable, not silently occupying VRAM off the books.
+                if lease.needs_load:
+                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 inpainter.set_refine(
                     normalized["refine"],
                     n_iters=normalized["n_iters"],
@@ -166,12 +178,8 @@ class LamaInpaintService:
                     px_budget=normalized["px_budget"],
                 )
                 out_rgb = inpainter(image_rgb, mask_u8)
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
             except Exception as exc:
-                if lease.needs_load:
-                    lease.mark_load_failed()
                 self._last_error = str(exc)
                 raise
             finally:

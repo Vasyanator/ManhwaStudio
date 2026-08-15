@@ -54,6 +54,7 @@ def _make_state(*, surya_raises: bool = False) -> SimpleNamespace:
         lama_mpe_inpaint=_OkService("lama_mpe"),
         aot_inpaint=_OkService("aot"),
         flux_fill_inpaint=_OkService("flux_fill"),
+        watermark=_OkService("watermark"),
         reline=_OkService("reline"),
         machine_translation=_OkService("mt"),
         model_manager=_OkService("mm"),
@@ -90,6 +91,7 @@ def test_one_raising_service_does_not_kill_snapshot() -> None:
     assert snap["text_detector"]["ctd"]["status"] == "ok"
     assert snap["inpaint"]["aot"]["status"] == "ok"
     assert snap["inpaint"]["flux_fill"]["status"] == "ok"
+    assert snap["watermark"]["status"] == "ok"
     assert snap["image_processing"]["reline"]["status"] == "ok"
     assert snap["machine_translation"]["status"] == "ok"
     assert snap["model_manager"]["status"] == "ok"
@@ -97,6 +99,6 @@ def test_one_raising_service_does_not_kill_snapshot() -> None:
     # Shape/keys unchanged.
     assert set(snap.keys()) == {
         "ok", "service", "backend_version", "snapshot_unix_s",
-        "is_torch_available", "ocr", "text_detector", "inpaint",
+        "is_torch_available", "ocr", "text_detector", "inpaint", "watermark",
         "image_processing", "machine_translation", "model_manager",
     }

@@ -15,7 +15,8 @@ Every service follows the same shape and is safe to copy from when adding a sixt
   (`lama_v2:<device>:<ckpt>`, `aot:<device>`, `sdxl:<mode>:<device>:<path>`, `flux_fill:<quant>`, …);
 - the key is leased from the shared `runtime.model_manager.LoadedModelManager`
   (`begin_model_use` → `mark_loaded` / `mark_load_failed` → `release`), which is what lets an idle
-  model be evicted by another service;
+  model be evicted by another service. **Load and inference are two separate `try` scopes**: see
+  the lease-protocol section below;
 - the target device comes from `General.ai_device` through the module-local
   `_resolve_selected_backend_device()` (`not-selected` resolves to a real runtime default). The one
   exception is `flux_fill.py`, which ignores the user's device choice and pins itself to the
@@ -42,10 +43,33 @@ Every service follows the same shape and is safe to copy from when adding a sixt
 - `sdxl.py`: `SdxlInpaintService` — SDXL (`inpaint.sdxl`, streaming). See the SDXL section.
 - `flux_fill.py`: `FluxFillInpaintService` — FLUX.1-Fill-dev (`inpaint.flux_fill`, `.unload`,
   `.status`, streaming). See the FLUX section.
-- `test_sdxl.py`, `test_flux_fill.py`: pure-Python unit tests (no torch, no diffusers, no weights, no
-  GPU — fake `torch`/`diffusers` modules are injected into `sys.modules`).
+- `test_sdxl.py`, `test_flux_fill.py`, `test_lease_protocol.py`: pure-Python unit tests (no torch, no
+  diffusers, no weights, no GPU — fake `torch`/`diffusers` modules are injected into `sys.modules`,
+  and `test_lease_protocol.py` stubs each service's load and inference step instead).
 
 ## Contracts and invariants
+
+### The lease protocol: a failed inference is not a failed load
+All five services take the lease BEFORE `self._lock` (`begin_model_use` can block while another
+thread's eviction callback waits for this service's lock; the reverse order deadlocks), and then run
+two distinct `try` scopes inside it:
+
+- **load scope** — `_ensure_*_locked(...)` only. A failure here, and only here, reports
+  `lease.mark_load_failed()`.
+- **run scope** — everything after `lease.mark_loaded(...)`, which is called as soon as the load
+  returned. A failure here records `_last_error` and re-raises without touching the lease.
+
+`mark_load_failed()` reaches `LoadedModelManager.abort_load`, which clears the entry's `resident`
+flag and drops its unload callback. Calling it after the load already succeeded — while the service
+still holds the model in `_net`/`_model`/`_pipe` with `_active_key` set and its weights still occupy
+VRAM — makes the manager under-count residency and makes that model permanently non-evictable until
+the same key is used again. Wrapping load and inference in one `try` is therefore a defect, not a
+style choice; `test_lease_protocol.py` pins it for all five services at once.
+
+`lease.release()` runs in `finally` in every path. One consequence to keep in mind: because a model
+that survived a failed inference now correctly counts toward `max_loaded_models`, a user cap of `1`
+makes SDXL's `four_channel` mode (which takes a SECOND lease for the shared LaMa prefill) fail with
+the manager's explicit "лимит загруженных моделей" error instead of silently exceeding the cap.
 
 ### The dynamic LaMa load chain (the most fragile thing here)
 `lama.py` → `lama_v2_runtime_inpainter.py` → `lama_runtime_bundle/` is wired by **file path, not by
@@ -92,7 +116,12 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 - All weights live under `ManhwaStudio_AI_Models/side_models/FLUX.1-Fill-dev-GGUF/`, **not** the
   Hugging Face cache: the chosen GGUF quant from `YarvixPA/FLUX.1-Fill-dev-GGUF`, plus the diffusers
   components (VAE / CLIP-L / T5-XXL / scheduler / tokenizers) from the open `ostris/Flex.1-alpha`
-  repo under `components/`. Downloads are streamed to `.part` files and renamed atomically.
+  repo under `components/`. Downloads go through `../engines/model_download.py` (shared with
+  `watermark/service.py`): serialized per destination file, staged into a process-private
+  `<name>.<pid>.part` and published with an atomic `os.replace`. `ensure_model()` deliberately runs
+  outside `self._lock` and the IPC layer dispatches onto a thread pool, so two first uses of the
+  same quant do reach it at once; the loser of each file's lock re-checks and skips instead of
+  refetching. `flux_fill.py` keeps only the transport (the HF bearer header).
 - `progress_callback(phase, step, total, label)` has two phases: `download` (byte-level) and
   `generate` (step-level). `ipc/handlers/flux_fill.py` streams both as `progress` frames with header
   `phase`/`step`/`total`/`label` and no preview blob.
@@ -129,7 +158,11 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   (`normalize_sdxl_params`, `SAMPLER_CONFIGS`, `_latent_preview_rgb`); keep `SAMPLER_CONFIGS` in sync
   with `SDXL_SAMPLERS` in `src/tabs/cleaning/tools/sdxl.rs`.
 - To change the FLUX quant catalog, download layout, or device pinning, see `flux_fill.py`
-  (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`).
+  (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
+  serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
+  shared with `watermark/`.
+- To change how a service reports load vs. inference failures to the model manager, change all five
+  at once and extend `test_lease_protocol.py` — the protocol is a cross-service contract.
 - To add a new inpaint backend, copy the service shape above, wire it in `server.py` + `AppState`,
   add an `ipc/handlers/` method and a `METHOD_INPAINT_*` constant in `ipc/protocol.py`, and route any
   GPU weight move through `runtime/rocm_mmap_transfer.py`.

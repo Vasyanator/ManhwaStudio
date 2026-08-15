@@ -81,6 +81,9 @@ SIDE_MODELS_DIR = os.path.join(MODELS_DIR, "side_models")
 # (VAE/CLIP/T5/scheduler) в подпапке components/.
 FLUX_FILL_DIR = os.path.join(SIDE_MODELS_DIR, "FLUX.1-Fill-dev-GGUF")
 FLUX_FILL_COMPONENTS_DIR = os.path.join(FLUX_FILL_DIR, "components")
+# Удаление видимых водяных знаков: веса и загружаемый в рантайме код сетей
+# (SLBR / WDNet / SplitNet) в подпапках <модель>/ и <модель>/src/.
+WATERMARK_DIR = os.path.join(SIDE_MODELS_DIR, "WatermarkRemoval")
 folders = [
     LAMA_DIR,
     os.path.join(LAMA_DIR, "models"),
@@ -94,6 +97,7 @@ folders = [
     SIDE_MODELS_DIR,
     FLUX_FILL_DIR,
     FLUX_FILL_COMPONENTS_DIR,
+    WATERMARK_DIR,
 ]
 for folder in folders:
     if not os.path.exists(folder):

@@ -98,6 +98,19 @@ pub const METHOD_INPAINT_FLUX_FILL: &str = "inpaint.flux_fill";
 pub const METHOD_INPAINT_FLUX_FILL_UNLOAD: &str = "inpaint.flux_fill.unload";
 pub const METHOD_INPAINT_FLUX_FILL_STATUS: &str = "inpaint.flux_fill.status";
 
+// --- Visible watermark removal ---
+/// Predicts a watermark mask for the request blob; responds with an L8 mask PNG
+/// at the input resolution.
+pub const METHOD_WATERMARK_DETECT: &str = "watermark.detect";
+/// Direct network pass (experimental): responds with the cleaned image PNG
+/// followed by the predicted mask PNG in one blob, delimited by `*_len` headers.
+pub const METHOD_WATERMARK_REMOVE: &str = "watermark.remove";
+/// Reports the model catalog: available models, the ones already downloaded, and
+/// the default choice.
+pub const METHOD_WATERMARK_STATUS: &str = "watermark.status";
+/// Releases the resident watermark model; responds with whether one was loaded.
+pub const METHOD_WATERMARK_UNLOAD: &str = "watermark.unload";
+
 // --- Text detection ---
 pub const METHOD_TEXTDETECTOR_CTD: &str = "textdetector.ctd";
 pub const METHOD_TEXTDETECTOR_PADDLE: &str = "textdetector.paddle";

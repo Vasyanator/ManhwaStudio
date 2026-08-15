@@ -36,3 +36,4 @@ from . import device       # noqa: F401  — device.get / .set / .cuda_diagnosti
 from . import translate    # noqa: F401  — translate.deep
 from . import browser      # noqa: F401  — browser.command (Selenium / CloakBrowser)
 from . import flux_fill     # noqa: F401  — inpaint.flux_fill (+ unload, + status)
+from . import watermark     # noqa: F401  — watermark.detect / .remove / .status / .unload

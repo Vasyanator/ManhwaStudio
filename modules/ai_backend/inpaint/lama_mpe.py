@@ -356,7 +356,20 @@ class LamaMpeInpaintService:
 
         with self._lock:
             try:
-                model = self._ensure_model_locked(device)
+                # Load scope: only a failure in here (including the checkpoint
+                # download it performs) is a failed LOAD, and only then may the
+                # manager drop its entry for `model_key`.
+                try:
+                    model = self._ensure_model_locked(device)
+                except Exception:
+                    if lease.needs_load:
+                        lease.mark_load_failed()
+                    raise
+                # The model is resident from here on, so it is registered before
+                # inference: an inference failure must leave it counted and
+                # evictable, not silently occupying VRAM off the books.
+                if lease.needs_load:
+                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._inpaint_locked(
                     model,
                     image_rgb=image_rgb,
@@ -364,12 +377,8 @@ class LamaMpeInpaintService:
                     inpaint_size=normalized["inpaint_size"],
                     device=device,
                 )
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
             except Exception as exc:
-                if lease.needs_load:
-                    lease.mark_load_failed()
                 self._last_error = str(exc)
                 raise
             finally:

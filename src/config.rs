@@ -573,6 +573,32 @@ pub fn flux_fill_inpaint_settings_path() -> PathBuf {
     data_dir().join("flux_fill_inpaint_settings.json")
 }
 
+/// Dedicated settings file for the «Удаление водяных знаков» cleaning tool
+/// (model, mode, tiling and mask parameters), kept out of `user_config.json`
+/// for the same reason as the SDXL and FLUX ones: its background saves must not
+/// race the canvas-settings saver.
+#[must_use]
+pub fn watermark_removal_settings_path() -> PathBuf {
+    data_dir().join("watermark_removal_settings.json")
+}
+
+/// Root of the reusable watermark LIBRARY: one self-contained directory per entry
+/// (metadata JSON, the `c`/`s` planes, the correlation template and the calibration
+/// crops that produced it).
+///
+/// The library belongs to the installation, not to a project: an entry measured on
+/// one chapter is what makes the next chapter of the same publisher instant, and an
+/// entry directory is meant to be copyable and shareable as a folder.
+///
+/// An entry's own directory is this root joined with its id. The id is persisted
+/// literal identity and must be validated as a single safe path segment first
+/// (`watermark_library::is_valid_entry_id`), or a hand-edited one could escape the
+/// root.
+#[must_use]
+pub fn watermark_library_dir() -> PathBuf {
+    data_dir().join("watermark_library")
+}
+
 pub fn program_dir() -> PathBuf {
     resolve_runtime_root()
 }
@@ -747,6 +773,13 @@ pub fn flux_fill_components_dir() -> PathBuf {
     flux_fill_dir().join("components")
 }
 
+/// Visible-watermark-removal models. Each network gets its own subdirectory
+/// (`slbr/`, `wdnet/`, `splitnet/`) holding its weights and its runtime-fetched
+/// source; mirrors `WATERMARK_DIR` in the Python backend's `config.py`.
+pub fn watermark_removal_dir() -> PathBuf {
+    side_models_dir().join("WatermarkRemoval")
+}
+
 pub fn model_folders() -> Vec<PathBuf> {
     vec![
         models_dir(),
@@ -763,6 +796,7 @@ pub fn model_folders() -> Vec<PathBuf> {
         side_models_dir(),
         flux_fill_dir(),
         flux_fill_components_dir(),
+        watermark_removal_dir(),
     ]
 }
 

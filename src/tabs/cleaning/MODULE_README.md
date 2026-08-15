@@ -57,8 +57,26 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `final_sanity_trim`. The thin `autoclean_page` wrapper is the only egui-touching part; it
   rasterizes the winning `RegionFill`s into the overlay patch. Includes synthetic pipeline and
   characterization tests. Detector boxes arrive from `tab.rs` already in page-pixel space.
-- `tools/`: cleaning tool trait, brush/region-edit bases, local fill tools, stamp tool, and
-  AI-backed inpaint tools. See `tools/MODULE_README.md`.
+- `watermark_chapter.rs`: GUI-free chapter-level watermark decomposition engine — the exact,
+  AI-free counterpart of the neural watermark path. A semi-transparent mark composites as
+  `I = c + s*B` (`c = alpha*W`, `s = 1 - alpha`), constant across every occurrence of one mark, so
+  observing it over different backgrounds determines `c`/`s` and removal is the division
+  `B = (I - c)/s`. Stages, all per `WatermarkKind` (a chapter may carry several distinct marks,
+  and two of them may share their artwork pixel for pixel): `validate_calibration_sample` (ring
+  flatness -> calibration target vs template-only) -> `estimate_model` (least squares over
+  separated flat samples; Theil-Sen against per-pixel background estimates; otherwise the graded
+  deposit-exact fit) -> `discover_anchors` (the anchor SET, coarse pyramid scan then full-res
+  refinement) -> `find_occurrences` / `scan_page` / `scan_chapter` (anchor-band NCC, then the
+  per-pixel-background gain test) -> `remove_occurrence` / `remove_occurrences_on_page`.
+  `refit_with_refined_backgrounds` is the estimated-background refinement loop, with a fixed,
+  named iteration count. Design and the measurements it rests on:
+  `dev-docs/watermark_chapter_decomposition_plan.md`. Consumed by the «По главе (точное
+  вычитание)» mode of `tools/watermark_removal.rs`; `mod.rs` keeps an `allow(dead_code)` for the
+  refinement surface the tool deliberately does not use (see the comment there).
+- `tools/`: cleaning tool trait, brush/region-edit bases, local fill tools, stamp tool, AI-backed
+  inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
+  watermark library, the library management window and the reference-crop intake that builds an
+  entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
 - `mod.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants
@@ -72,6 +90,27 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   shared state.
 - Shared model locks must be short-lived and released before image processing or file I/O.
 - Text-mask overlays are display state only until quick-clean applies explicit overlay patches.
+- Watermark decomposition never emits a model it cannot justify, and `ModelConditioning` is a
+  GRADED verdict rather than a binary one. With all calibration samples on one exactly known
+  background level the deposit `D = B - I` is still measured exactly, so a model IS produced and
+  removal at that level is exact; only the alpha scale is an assumption, and the verdict carries
+  the levels, their spread and an `AlphaUncertainty` (percent plus the LSB cost, including on dark
+  backgrounds) together with the sample that would collapse it. `estimate_model` refuses — no
+  model, and `WatermarkKind::refit` drops any previous one — only when not even the deposit was
+  measured. Its `c`/`s` are per pixel PER CHANNEL: per channel is mandatory for `c`, while alpha
+  measured channel-neutral on both chapters and the graded fit deliberately ties the channels
+  together. Removal is licensed only for occurrences the gain test verified: a correlation-only
+  accept is refused, because subtracting a mark that is not there injects an inverse mark.
+- Watermark KIND identity is `MarkSignature` (deposit chroma plus opacity gain), never the
+  template's shape: a colour mark and its greyscale twin can be pixel-identical in shape and
+  still need different `c`/`s`. A catalog must resolve a new sample with `find_matching_kind`,
+  and the same rule governs matching an open chapter against the on-disk library — with the
+  footprint required to agree on top of it, because `c`/`s` are per pixel.
+- A mark's anchor is a SET of columns discovered from the data (`discover_anchors` ->
+  `MarkTemplate::set_anchors`), not the one column the picked sample sat at, and anything that
+  keys or persists a model must include `MarkTemplate::anchor_key`. The accept rule additionally
+  requires the occurrence to sit within `ANCHOR_TOLERANCE_PX` of an anchor and to reach
+  `FALSE_ACCEPT_GAIN_FLOOR`; no `DetectionParams` value can widen past either.
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,
   or committed clean-overlay edits.
 - Canvas zoom, drag-scroll, and context menus must respect active tool capture/blocking signals.
@@ -95,6 +134,18 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   worker/job coordination, mask resize, and detector-box source->page scaling
   (`scale_blocks_source_to_page`) in `tab.rs`. The engine core must stay GUI-free; only the
   `autoclean_page` boundary and `paint_patch_from_mask` may touch egui.
+- To change watermark decomposition — sample validation, the `c`/`s` fit, the conditioning
+  verdict and its alpha uncertainty, mark identity, anchor discovery, detection thresholds or the
+  removal/residual maths — edit `watermark_chapter.rs`. Its named constants carry their own
+  rationale; change one only against the measurements in
+  `dev-docs/watermark_chapter_decomposition_plan.md`, and note that the two chapters measured
+  there disagree on several of them, so a constant is source-evidence, not a universal. The engine
+  must stay GUI-free: the mark catalog, the region editor, the jobs, `CanvasView` patches, i18n
+  and the watermark library belong to `tools/watermark_removal.rs`,
+  `tools/watermark_library.rs`, `tools/watermark_entry.rs` and
+  `tools/watermark_library_window.rs`. In particular, whether a set of samples separates the
+  model is answered by `estimate_model`'s own verdict; no caller may re-derive it from a copied
+  threshold.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
 - To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
   `TextMaskModel` contracts in `src/models/`.

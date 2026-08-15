@@ -44,7 +44,7 @@ use super::autoclean::{autoclean_page, UnevenBackgroundTool};
 use super::tools::{
     AotInpaintTool, CleaningCursorOccluder, CleaningTool, FluxFillInpaintTool, GradientFillTool,
     LamaInpaintTool, LamaMpeInpaintTool, SdxlInpaintTool, StampTool, StrokeModifiers, StrokePoint,
-    TextureSynthesisInpaintTool, ZamazkaTool,
+    TextureSynthesisInpaintTool, WatermarkRemovalTool, ZamazkaTool,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
@@ -87,8 +87,10 @@ const CLEANING_TOOL_PANEL_DEFAULT_WIDTH: f32 = 352.0;
 const CLEANING_TOOL_BUTTONS_PER_ROW: usize = 3;
 const BRUSH_TOOL_INDICES: [usize; 2] = [0, 1];
 const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
-// Инструменты редактирования области (SDXL, FLUX.1 Fill) — отдельной строкой.
-const AREA_EDIT_TOOL_INDICES: [usize; 2] = [7, 8];
+// Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков) —
+// отдельной строкой. Индекс, отсутствующий в этих массивах, зарегистрирован, но не
+// рисуется ни в одной группе панели инструментов.
+const AREA_EDIT_TOOL_INDICES: [usize; 3] = [7, 8, 9];
 
 
 #[derive(Clone)]
@@ -234,6 +236,7 @@ impl Default for CleaningTabState {
             Box::<AotInpaintTool>::default(),
             Box::<SdxlInpaintTool>::default(),
             Box::<FluxFillInpaintTool>::default(),
+            Box::<WatermarkRemovalTool>::default(),
         ];
         let tool_labels = tools.iter().map(|tool| tool.title().to_string()).collect();
 

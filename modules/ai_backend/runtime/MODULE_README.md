@@ -66,6 +66,15 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   device selection here is per-runtime for that reason and the two selections never alias.
 - `LoadedModelManager` eviction callbacks always run outside the manager lock, so a service-local
   lock can be taken inside them without deadlock.
+- **`ModelUsageLease.mark_load_failed()` means the LOAD failed, nothing else.** It reaches
+  `abort_load`, which clears the entry's `resident` flag and drops its unload callback, so calling
+  it for a failure that happened after the model was already loaded makes the manager under-count
+  residency and leaves a model that still occupies VRAM permanently non-evictable. A service must
+  therefore scope its load in its own `try` and call `mark_loaded()` as soon as that load returns —
+  before running inference — while `release()` runs in `finally` on every path. The inpaint and
+  watermark services are the reference shape (`inpaint/MODULE_README.md`, covered by
+  `inpaint/test_lease_protocol.py`); `ocr/` and `detection/` still wrap load and inference in one
+  `try` and are due the same treatment.
 - On a ROCm Torch build, `configure_rocm_runtime()` runs once at process startup before any
   inference: it defaults `MIOPEN_FIND_MODE=FAST` (immediate mode, no per-input-shape kernel
   auto-tuning), disables cudnn/MIOpen benchmark, and pins the MIOpen user/kernel cache under
