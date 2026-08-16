@@ -34,8 +34,9 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   files; includes byte-signature image detection, natural ordering, filtering, and progress events.
 - `project_io.rs`: projects-root catalog scan, target resolution, parallel PNG save pipeline, and
   save result mapping back to `OpenProjectSelection` where applicable.
-- `quick_download.rs`: direct chapter downloader for supported sites, URL extraction, parallel
-  image download/decode, and ribbon conversion.
+- `quick_download/`: direct chapter downloader for supported sites — controller/worker, host
+  dispatch, one module per site under `sites/`, and the shared HTTP/URL/HTML/base64 primitives.
+  Site knowledge is confined to `sites/`. See `quick_download/MODULE_README.md`.
 - `advanced_download.rs`: advanced browser bridge over the unified backend's `browser.command` IPC
   (Selenium or CloakBrowser, selected via `set_backend`), backend start-gate, helper version checks,
   backend selection, pattern link collection, cancellable auto link candidate grouping/review,
@@ -99,7 +100,9 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 
 ## Editing map
 - To change source picking or image import, edit `open_source.rs`.
-- To change direct supported-site downloading, edit `quick_download.rs`.
+- To change direct supported-site downloading, edit `quick_download/`: a site's URL/markup handling
+  lives in `quick_download/sites/<site>.rs` (a new site also needs one arm in
+  `quick_download/plan.rs`), threading/progress in `quick_download/controller.rs`.
 - To change Selenium/browser download, link collection, or canvas capture, edit
   `advanced_download.rs`.
 - To change save/export behavior or project catalog scanning, edit `project_io.rs`.
