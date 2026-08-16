@@ -216,6 +216,36 @@ is an author note addressed to the translator, not a replica.
   character, so the incomplete-replica rules would border every hint. `canvas_scrollbar_marks`
   carries the same exemption for the same reason — a hint's single line lives in `text`, so a
   translation-status stripe for it would always read "translated".
+- The character list (`character_names`) is ASSEMBLED, not loaded. It is
+  `build_translation_character_names(project_roster, chapter_names)` and its order IS the suggestion
+  priority: the "no character" sentinel, the `characters.json` roster
+  (`character_names_project`), the free-form names actually typed on this chapter's bubbles
+  (`character_names_chapter`), then the built-in service names — trimmed, deduplicated
+  case-insensitively, first spelling kept.
+- Its two consumers do NOT get the same slice, and that difference is a correctness contract, not
+  cosmetics. The bubbles panel takes the list whole: its character control is a combo box, the
+  sentinel is a selectable row and `character_names[0]` is the panel's fallback value. The footer
+  takes `footer_autocomplete_candidates(&character_names)` — the same slice with a LEADING
+  `footer_no_character()` removed (conditionally, never a blind `[1..]`) — because its control is a
+  free-text `AutocompleteLine` that splices the tail of a candidate from a word boundary: with
+  "(не указан)" among the candidates, typing "ук" writes the fragment `указан)` into the field with
+  `changed = true`, and one debounce later that fragment is a persisted character name no sentinel
+  filter can recognize. Anything added to the assembled list must be safe to splice tails from.
+  Both consumers borrow — the list stays ONE `Vec<String>` and is never cloned per frame.
+- `collect_chapter_character_names` reads the whole-chapter bubble snapshot with the same
+  `extra["character_name"]` reader the footer state uses, ignores `is_known_character`, and drops
+  blanks, the `footer_no_character()` / `footer_no_characters()` sentinels, and the `Image`/`Hint`
+  classes (neither owns a character field). The sentinel filter is REQUIRED: `panels/bubbles.rs`
+  persists `footer_no_character()` into `Bubble.extra` when the "И.П." checkbox is switched on for
+  a bubble whose name is not in the list.
+- The chapter scan is kept off the per-frame path by `sync_footer_tracking`'s
+  `hook_bubbles_revision` gate and reuses the snapshot already taken there; inside the gate the
+  scan always runs and only the reassembly is skipped when the collected set is unchanged. The
+  revision moves on every footer patch flush (~`FOOTER_PATCH_DEBOUNCE_SECS` while a name is being
+  typed), so that scan must stay linear and allocation-light. The same debounce is why a name
+  typed in the footer joins the list one flush later rather than on the keystroke. The chapter
+  scan reads the runtime-inclusive snapshot while `collect_recent_character_history` beside it
+  reads `project.bubbles`; the asymmetry is deliberate and documented at the call site.
 - Post-OCR processing is ONE helper, `ocr.rs::apply_post_ocr_processing`, and all three
   recognize routes (AI API, native ONNX, backend IPC) must call it — engine parity of the
   published text is a contract of this module. The caps-lock decision and the caps-lock
@@ -273,6 +303,12 @@ is an author note addressed to the translator, not a replica.
   it may get, edit the two `TRANSLATION_RECENT_CHARACTERS_TAB_*_SIZE_PX` constants there. The
   history itself is `collect_recent_character_history` and the digit lookup is
   `recent_character_entry_for_rank`.
+- To change what the character list holds or in what order, edit
+  `build_translation_character_names` (group order/dedup) and `collect_chapter_character_names`
+  (which bubbles contribute a name) in `tab.rs`; to change WHEN it is rebuilt, edit
+  `sync_chapter_character_names` and its call site inside `sync_footer_tracking`; to change what
+  the FOOTER field is allowed to suggest (as opposed to the panel combo box), edit
+  `footer_autocomplete_candidates`.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector

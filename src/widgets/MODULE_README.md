@@ -104,7 +104,39 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   `PanelDockState::take_dirty_layouts`; it is the only file of the subsystem that reaches the disk,
   and the debounce/retry policy behind it lives in `src/config_saver.rs`. Sub-windows are a later phase.
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
-  list.
+  list. Matching is SEGMENT-based, not whole-line: a query segment is any suffix of the text
+  before the caret that starts at a word/punctuation boundary (`-` and `'` are not boundaries —
+  they occur in names). NO SEGMENT WINS THE FRAME: variants are collected from every boundary and
+  merged into one ranked list, ordered from the segment NEAREST THE CARET outwards, because a
+  single winner let one stale candidate matching the whole line hide the completion of the two
+  letters being typed. Each `Suggestion` therefore carries its OWN `segment_start`; every consumer
+  splices at the start of the variant it picked. Inside one segment the order is whole-candidate
+  prefix matches before word-boundary matches; a word-boundary match inserts the candidate's TAIL
+  from the matched word on (typing `Су` offers `Су Лин`), except when that tail equals the query,
+  where the whole candidate is inserted so the entry still does something. Variants are
+  deduplicated by the LINE they would produce, not by candidate or by inserted text, so the same
+  offer reached from two segments is one entry. A variant that adds nothing is dropped outright
+  (`is_useless_variant`): its insertion equals the segment it replaces, or the text just before
+  the segment already spells the insertion's beginning so splicing would repeat it. A candidate of
+  more than `MAX_COMPLETION_CANDIDATE_WORDS` (4) whitespace-separated parts is a descriptive row
+  rather than a name: it is dropped from the word-boundary pass entirely and from the prefix pass
+  unless the segment starts at offset 0 — dropped INSIDE each per-segment scan, before anything is
+  collected, so it cannot crowd the ranked list. Writing into `value` is gated harder than the popup
+  is (`inline_insertion_allowed`): the segment needs at least `MIN_INLINE_SIGNIFICANT_CHARS` (2)
+  non-whitespace chars and exactly one surviving variant, because the candidate's spelling wins
+  over the user's and a one-letter match once capitalised a conjunction irreversibly. Neither
+  gate affects what the popup lists. A
+  tail entry shows the full candidate dimmed beside it via a two-section `LayoutJob`. Only the
+  segment range is ever replaced — the rest of the line survives, and the caret lands right after
+  the insertion. The widget mutates the caller's `value` SPECULATIVELY while drawing the inline
+  completion and remembers that exact string, so "is a completion standing?" is a comparison, not
+  a prefix heuristic. While one stands, `Escape` restores the typed text and caret REGARDLESS of
+  whether suggestions resolved this frame — the caller may rebuild its candidate list between
+  frames, and a speculative value must never become unreversible; losing focus commits it instead.
+  Case-insensitive matching streams `char::to_lowercase` instead of allocating lowercase copies,
+  because offsets found in a lowercased copy cannot be mapped back onto the original; for the same
+  reason the inline selection anchor is the number of CANDIDATE chars the query consumed, never
+  the query's own char count (folding can expand one char into several).
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
 - `viewport_color_selector.rs`: color selector with viewport eyedropper support.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume

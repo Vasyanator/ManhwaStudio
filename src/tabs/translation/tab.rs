@@ -84,6 +84,8 @@ Panel dock:
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.
 - `maybe_refresh_character_names_by_watch`: throttled mtime-watch `characters.json` with auto-refresh.
+- `sync_chapter_character_names`, `rebuild_character_names`: chapter-typed half of the footer
+  autocomplete base and the reassembly of the combined list.
 - `sync_footer_tracking`: tracks bubble lifecycle and prunes footer caches.
 - `init_last_footer_values`: bootstraps last-used footer defaults from latest bubble.
 - `apply_defaults_for_new_bubble`: applies footer defaults to newly detected bubbles.
@@ -91,7 +93,8 @@ Characters/footer sync:
 - `flush_footer_patches`: debounced flush of footer patches to `CanvasView::patch_bubble_extra_fields`.
 - `footer_state_for`: resolves runtime footer state with overrides.
 - `build_bubble_footer` (CanvasHooks): footer editor UI + patch scheduling; the replica-order spin
-  box is shared, then the bubble class selects the rest of the row.
+  box is shared, then the bubble class selects the rest of the row. Its character field is fed
+  `footer_autocomplete_candidates(&character_names)` — the sentinel-free slice.
 - `build_image_bubble_footer_controls`: image-class footer half (source type, paste/choose, crop).
 - `build_hint_bubble_footer_controls`: hint-class footer half (one visibility checkbox).
 - `build_bubble_header` (CanvasHooks): currently no-op hook.
@@ -145,7 +148,9 @@ Composition/settings handling:
 
 Module-level utility functions:
 - Character names / detector geometry:
-  `build_translation_character_names`, `detector_blocks_with_options`, `detector_expand_blocks`,
+  `build_translation_character_names`, `footer_autocomplete_candidates`,
+  `collect_chapter_character_names`,
+  `detector_blocks_with_options`, `detector_expand_blocks`,
   `detector_merge_blocks`, `detector_rects_touch_or_near`, `detector_rects_to_blocks_px`,
   `source_rect_to_scene_rect`.
 - Detector mask rendering:
@@ -182,7 +187,9 @@ Key TranslationTabState field groups:
   `textdetector_ocr_active_*`, `textdetector_ocr_retry_state`, `textdetector_ocr_* counters`.
 - MT runtime: `pending_translate_actions`, `pending_mt_start_all`, `pending_mt_start_page`,
   `mt_progress`, `mt_stop_notice`, `mt_request_preview_rx`, `mt_request_preview`.
-- Footer/characters runtime: `character_names`, `characters_loaded_for`,
+- Footer/characters runtime: `character_names` (assembled autocomplete base) and its two inputs
+  `character_names_project` (`characters.json` roster) + `character_names_chapter` (names typed on
+  this chapter's bubbles), `characters_loaded_for`,
   `characters_file_mtime`, `character_names_watch_last_check_s`,
   `pending_characters_refresh`, `footer_bootstrapped`,
   `footer_tracking_synced_revision`, `footer_known_ids`,
@@ -752,7 +759,19 @@ pub struct TranslationTabState {
     text_detector_settings_loaded_for: Option<PathBuf>,
     settings_save_tx: Sender<TranslationSettingsSaveRequest>,
     settings_save_thread: Option<JoinHandle<()>>,
+    /// Assembled character list, in suggestion priority order (see
+    /// `build_translation_character_names`). Rebuilt only when one of its two inputs below
+    /// changes. Two consumers with different needs read it as a SLICE, never a per-frame clone:
+    /// the bubbles panel takes it whole (its combo box needs the leading `footer_no_character()`
+    /// sentinel and uses `[0]` as a fallback value), the footer takes
+    /// `footer_autocomplete_candidates(..)` — the same slice minus that sentinel.
     character_names: Vec<String>,
+    /// Character roster loaded from the project's `characters.json`, in file order.
+    /// Refreshed by `reload_character_names` (project switch, mtime watch, explicit notify).
+    character_names_project: Vec<String>,
+    /// Free-form character names actually typed on this chapter's bubbles, ordered by bubble id.
+    /// Recomputed inside the bubble-revision gate of `sync_footer_tracking`.
+    character_names_chapter: Vec<String>,
     characters_loaded_for: Option<PathBuf>,
     characters_file_mtime: Option<SystemTime>,
     character_names_watch_last_check_s: f64,
@@ -997,6 +1016,8 @@ impl TranslationTabState {
             settings_save_tx,
             settings_save_thread: Some(settings_save_thread),
             character_names: Vec::new(),
+            character_names_project: Vec::new(),
+            character_names_chapter: Vec::new(),
             characters_loaded_for: None,
             characters_file_mtime: None,
             character_names_watch_last_check_s: -10_000.0,
@@ -1732,11 +1753,65 @@ impl TranslationTabState {
         }
     }
 
+    /// Re-reads the project character roster from `characters.json` and rebuilds the footer
+    /// autocomplete base around it. The chapter-collected names are kept as they are: they are
+    /// derived from bubbles, not from the roster file.
     fn reload_character_names(&mut self, project: &ProjectData) {
-        let loaded = load_character_names(project).unwrap_or_default();
-        self.character_names = build_translation_character_names(loaded);
+        // A read failure must be visible: the assembled list still looks populated (built-ins plus
+        // the names typed in this chapter), so a silently empty roster is easy to miss in the UI.
+        // Not per-frame spam — this runs only on a project/chapter switch, on an observed
+        // `characters.json` mtime change, or on an explicit `notify_characters_changed`.
+        self.character_names_project = match load_character_names(project) {
+            Ok(names) => names,
+            Err(error) => {
+                crate::runtime_log::log_warn(format!(
+                    "[translation] could not read the character roster; the footer autocomplete \
+                     falls back to built-in and chapter-collected names only. Dir: {} Error: {}",
+                    project.paths.characters_dir.display(),
+                    error
+                ));
+                Vec::new()
+            }
+        };
+        self.rebuild_character_names();
         self.characters_loaded_for = Some(project.paths.characters_dir.clone());
         self.characters_file_mtime = characters_file_mtime(project);
+    }
+
+    /// Reassembles `character_names` from its two inputs (`characters.json` roster and the names
+    /// typed in this chapter). Called only when one of them actually changed — both consumers
+    /// (the bubbles panel whole, the footer via `footer_autocomplete_candidates`) borrow the list
+    /// as a slice every frame, so rebuilding it per frame would be pure waste.
+    fn rebuild_character_names(&mut self) {
+        self.character_names = build_translation_character_names(
+            &self.character_names_project,
+            &self.character_names_chapter,
+        );
+    }
+
+    /// Refreshes the chapter-collected part of the footer autocomplete base from `bubbles`.
+    ///
+    /// `bubbles` must be the WHOLE chapter (all pages), not the current page: a name typed on any
+    /// page is offered on every other one.
+    ///
+    /// Cost, precisely: the full chapter scan ALWAYS runs when this is called — only the
+    /// reassembly of `character_names` is skipped, and only when the collected list is equal to
+    /// the stored one. The caller's revision gate is what keeps the scan off the per-frame path;
+    /// note that the revision moves on every footer patch flush, i.e. roughly every
+    /// `FOOTER_PATCH_DEBOUNCE_SECS` while a name is being typed, so the scan must stay linear and
+    /// allocation-light (see `collect_chapter_character_names`).
+    ///
+    /// A name just typed into the footer reaches the model through that same debounced
+    /// `pending_footer_patches` queue, so it enters the base one flush later, not on the
+    /// keystroke. That lag is accepted deliberately: the collection runs off the bubble revision,
+    /// and the flush is what moves it.
+    fn sync_chapter_character_names(&mut self, bubbles: &[Bubble]) {
+        let collected = collect_chapter_character_names(bubbles);
+        if collected == self.character_names_chapter {
+            return;
+        }
+        self.character_names_chapter = collected;
+        self.rebuild_character_names();
     }
 
     fn maybe_refresh_character_names_by_watch(&mut self, project: &ProjectData, now_s: f64) {
@@ -1753,8 +1828,11 @@ impl TranslationTabState {
     /// Tracks bubble lifecycle and prunes footer caches, applying footer defaults to newly
     /// detected bubbles.
     ///
+    /// Also refreshes the chapter-collected half of the footer character autocomplete base
+    /// (`sync_chapter_character_names`), which is derived from the same snapshot.
+    ///
     /// Runs every frame from `draw_canvas_overlay_top_left`, so the expensive recompute (full
-    /// bubble snapshot clone + id `HashSet` + recent-character history) is gated on
+    /// bubble snapshot clone + id `HashSet` + recent-character history + chapter names) is gated on
     /// `CanvasView::hook_bubbles_revision()`: when the revision is unchanged and footer tracking
     /// was already bootstrapped, the call returns early and reuses the cached footer state. A
     /// newly-created bubble (even one living only in `runtime_bubbles`) bumps the revision, so the
@@ -1771,6 +1849,17 @@ impl TranslationTabState {
         self.footer_tracking_synced_revision = Some(current_revision);
 
         let live_bubbles = canvas.hook_bubbles_snapshot(project);
+        // Reuse the snapshot that is already built here — it is the whole chapter plus the
+        // runtime-only bubbles, and `hook_bubbles_snapshot` clones the entire vector, so a second
+        // call for the character names would double the cost of every revision change.
+        //
+        // Deliberate asymmetry with `collect_recent_character_history` below, which reads
+        // `project.bubbles` (no runtime-only bubbles): a name on a just-created bubble that has
+        // not reached the model yet is offered by the autocomplete but is not yet a card in
+        // «Последние персонажи». Suggestions should be as eager as possible; the six ranked cards
+        // are a digit-addressed history and should not reshuffle around a bubble that may still
+        // vanish before it is ever flushed.
+        self.sync_chapter_character_names(&live_bubbles);
         let known_now = live_bubbles
             .iter()
             .map(|bubble| bubble.id)
@@ -5800,7 +5889,10 @@ impl CanvasHooks for TranslationTabState {
             // `footer_character_autocomplete` are disjoint fields, so the immutable
             // suggestions borrow coexists with the mutable autocomplete entry borrow;
             // it ends at the `draw` call, before the later `queue_footer_patch` writes.
-            let suggestions: &[String] = &self.character_names;
+            // That disjointness is also why the sentinel is trimmed by a FREE function over
+            // the field rather than a `&self` method — a method would borrow the whole
+            // `self` and collide with the `footer_character_autocomplete` entry below.
+            let suggestions: &[String] = footer_autocomplete_candidates(&self.character_names);
             let autocomplete = self
                 .footer_character_autocomplete
                 .entry(bubble_id)
@@ -6352,7 +6444,19 @@ impl TranslationTabState {
     }
 }
 
-fn build_translation_character_names(base: Vec<String>) -> Vec<String> {
+/// Assembles the footer character autocomplete base out of its four sources.
+///
+/// The returned order IS the suggestion priority the widget shows: the "no character" sentinel
+/// first, then the project roster from `characters.json` (`project_names`, in file order), then the
+/// free-form names typed on this chapter's bubbles (`chapter_names`, in bubble order), then the
+/// built-in service names. Entries are trimmed, empties dropped, and duplicates removed
+/// case-insensitively keeping the FIRST spelling — so a chapter name that already exists in the
+/// roster does not appear twice and keeps the roster's spelling.
+#[must_use]
+fn build_translation_character_names(
+    project_names: &[String],
+    chapter_names: &[String],
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut push_unique = |raw: &str| {
@@ -6366,11 +6470,85 @@ fn build_translation_character_names(base: Vec<String>) -> Vec<String> {
     };
 
     push_unique(footer_no_character());
-    for name in base {
-        push_unique(&name);
+    for name in project_names {
+        push_unique(name);
+    }
+    for name in chapter_names {
+        push_unique(name);
     }
     for name in footer_additional_character_names() {
         push_unique(name);
+    }
+    out
+}
+
+/// The suggestion slice the FOOTER's free-input field gets: `names` without a leading
+/// `footer_no_character()` sentinel.
+///
+/// The sentinel belongs to the bubbles panel alone, where the character field is a combo box and
+/// "(не указан)" is a selectable row (`panels/bubbles.rs` uses `character_names[0]` as its
+/// fallback value). In the footer the same list feeds a free-text field, and `AutocompleteLine`
+/// may splice the TAIL of a candidate from a word boundary: with the sentinel present, typing
+/// "ук" matches inside "(не указан)" and silently writes `указан)` into the field with
+/// `changed = true`. The debounced patch then stores that fragment as a real character name — it
+/// matches no sentinel, so nothing downstream (chapter names, recent-character cards, MT grouping,
+/// composition) would ever filter it out again. Keeping the sentinel out of the widget's input is
+/// the fix; the widget itself is right to offer tails.
+///
+/// The check is explicit, never a blind `[1..]`: a list that does not start with the sentinel (an
+/// empty one, or a future assembly order) is returned untouched. Returns a borrowed slice — the
+/// footer must not clone this per frame.
+#[must_use]
+fn footer_autocomplete_candidates(names: &[String]) -> &[String] {
+    match names.split_first() {
+        Some((first, rest)) if first == footer_no_character() => rest,
+        _ => names,
+    }
+}
+
+/// Collects every character name actually entered on `bubbles`, in bubble-id order.
+///
+/// `bubbles` is the whole chapter; the function does not care which page a bubble is on. The name
+/// is read from the same `extra` key, with the same reader, that
+/// `bubble_footer_state_from_record` uses for the footer field (`bubble_extra_string(..,
+/// "character_name")`), so what is collected is byte-for-byte what the user sees — but without
+/// building the whole `BubbleFooterState`, whose `clarification` `String` this function would
+/// allocate and immediately drop for every bubble in the chapter. The name is collected regardless
+/// of `is_known_character` — free-form input is the point of this list.
+///
+/// Dropped: bubbles of the `Image` and `Hint` classes (neither has a character field, so a stale
+/// `character_name` left in their `extra` by a class switch is not a name anyone typed there),
+/// blank names, and the two display sentinels `footer_no_character()` / `footer_no_characters()`.
+/// The sentinel filter is REQUIRED, not defensive: `panels/bubbles.rs` writes
+/// `footer_no_character()` into `Bubble.extra` through the footer patch queue when the "И.П."
+/// checkbox is switched on for a bubble whose name is not in the list, so the sentinel really does
+/// reach persisted data and would otherwise come back as a "character" named "(не указан)".
+/// Duplicates are removed case-insensitively, keeping the first spelling; names appear in
+/// ascending `Bubble.id` order of the bubble that introduced them, so the result is deterministic
+/// whatever order `bubbles` arrives in.
+#[must_use]
+fn collect_chapter_character_names(bubbles: &[Bubble]) -> Vec<String> {
+    let mut ordered = bubbles.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|bubble| bubble.id);
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for bubble in ordered {
+        match bubble.bubble_class.as_deref().map(BubbleClass::from_str) {
+            Some(BubbleClass::Image | BubbleClass::Hint) => continue,
+            Some(BubbleClass::Text) | None => {}
+        }
+        let name = bubble_extra_string(&bubble.extra, "character_name");
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed == footer_no_character()
+            || trimmed == footer_no_characters()
+        {
+            continue;
+        }
+        if seen.insert(trimmed.to_lowercase()) {
+            out.push(trimmed.to_string());
+        }
     }
     out
 }
@@ -8196,11 +8374,14 @@ fn build_bubble_original_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        Pos2, RECENT_CHARACTER_CARD_MARGIN_X_PX, RECENT_CHARACTER_CARD_MARGIN_Y_PX,
+        Bubble, Map, Pos2, RECENT_CHARACTER_CARD_MARGIN_X_PX, RECENT_CHARACTER_CARD_MARGIN_Y_PX,
         RECENT_CHARACTER_CARD_SPACING_PX, RECENT_CHARACTER_CARD_STROKE_WIDTH_PX, Rect,
         TRANSLATION_RECENT_CHARACTERS_TAB,
         TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX,
-        TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX, TranslationTabState, Vec2, egui,
+        TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX, TranslationTabState, Value, Vec2, egui,
+        build_translation_character_names, collect_chapter_character_names,
+        footer_additional_character_names, footer_autocomplete_candidates, footer_no_character,
+        footer_no_characters,
         footer_tracking_should_recompute, recent_character_card_caption,
         recent_character_card_caption_pos, recent_character_card_size,
         translation_default_dock_layout,
@@ -8496,5 +8677,199 @@ mod tests {
     fn footer_tracking_equal_revision_when_bootstrapped_skips() {
         // Unchanged bubble set on a bootstrapped tab: skip the per-frame recompute.
         assert!(!footer_tracking_should_recompute(Some(8), 8, true));
+    }
+
+    /// Builds a bubble carrying `character_name` in `extra`, the way the footer stores it.
+    /// `class` is the persisted `bubble_class` token (`None` = a legacy text bubble).
+    fn character_bubble(id: i64, class: Option<&str>, character_name: &str) -> Bubble {
+        let mut extra = Map::new();
+        extra.insert(
+            "character_name".to_string(),
+            Value::String(character_name.to_string()),
+        );
+        Bubble {
+            id,
+            img_idx: 0,
+            img_u: 0.5,
+            img_v: 0.5,
+            side: None,
+            bubble_class: class.map(str::to_string),
+            bubble_type: None,
+            text: String::new(),
+            original_text: String::new(),
+            extra,
+        }
+    }
+
+    /// Order is the suggestion priority the user sees, so it must follow the bubbles' own order
+    /// (ascending id) whatever order the snapshot arrives in, and a name re-used with different
+    /// capitalization must not produce a second entry.
+    #[test]
+    fn chapter_character_names_follow_bubble_id_order_and_dedupe_by_case() {
+        let bubbles = vec![
+            character_bubble(30, Some("text"), "Борис"),
+            character_bubble(10, None, "Аня"),
+            character_bubble(20, Some("text"), "аня"),
+            character_bubble(40, Some("text"), "  Борис  "),
+        ];
+        assert_eq!(
+            collect_chapter_character_names(&bubbles),
+            vec!["Аня".to_string(), "Борис".to_string()],
+            "first spelling wins and each name appears once"
+        );
+    }
+
+    /// `footer_no_character()` genuinely reaches `Bubble.extra` (the panel's "И.П." checkbox
+    /// writes it as a fallback value), so filtering it here is required rather than defensive; an
+    /// empty field is not a name; and neither an image nor a hint bubble has a character field at
+    /// all — a `character_name` left in their `extra` by a class switch must not leak into the
+    /// base.
+    #[test]
+    fn chapter_character_names_drop_sentinels_blanks_and_classes_without_a_character() {
+        let bubbles = vec![
+            character_bubble(1, Some("text"), ""),
+            character_bubble(2, Some("text"), "   "),
+            character_bubble(3, Some("text"), footer_no_character()),
+            character_bubble(4, Some("text"), footer_no_characters()),
+            character_bubble(5, Some("image"), "Обложка"),
+            character_bubble(6, Some("hint"), "Примечание"),
+            character_bubble(7, Some("text"), "Секретарша"),
+        ];
+        assert_eq!(
+            collect_chapter_character_names(&bubbles),
+            vec!["Секретарша".to_string()],
+        );
+    }
+
+    /// The assembled base is what the footer widget ranks its suggestions by, so the four groups
+    /// must stay in this exact order: sentinel, project roster, chapter-typed names, built-ins.
+    #[test]
+    fn the_autocomplete_base_orders_sentinel_roster_chapter_then_builtins() {
+        let project = vec!["Аня".to_string()];
+        let chapter = vec!["Секретарша".to_string()];
+        let out = build_translation_character_names(&project, &chapter);
+        assert_eq!(out[0], footer_no_character());
+        assert_eq!(out[1], "Аня");
+        assert_eq!(out[2], "Секретарша");
+        assert!(
+            out[3..]
+                .iter()
+                .map(String::as_str)
+                .eq(footer_additional_character_names()),
+            "the built-in service names close the list, in their declared order"
+        );
+    }
+
+    /// A name typed in the chapter that the roster already holds must not double the entry: the
+    /// roster spelling is the one shown, and the chapter copy is dropped case-insensitively.
+    #[test]
+    fn a_chapter_name_already_in_the_roster_is_not_repeated() {
+        let project = vec!["Аня".to_string()];
+        let chapter = vec!["аня".to_string(), "Секретарша".to_string()];
+        let out = build_translation_character_names(&project, &chapter);
+        // Cyrillic case folding is not ASCII case folding, so compare through `to_lowercase`,
+        // the same key the deduplication itself uses.
+        let anya_entries = out
+            .iter()
+            .filter(|name| name.to_lowercase() == "аня")
+            .count();
+        assert_eq!(anya_entries, 1);
+        assert_eq!(out[1], "Аня", "the roster spelling survives");
+        assert_eq!(out[2], "Секретарша");
+    }
+
+    /// The bubbles panel indexes `character_names[0]` as its "no character" fallback value and
+    /// shows the built-ins as combo-box rows, so an empty project must still produce exactly
+    /// sentinel + the 13 built-in service names.
+    #[test]
+    fn an_empty_project_still_yields_the_sentinel_and_every_builtin() {
+        let out = build_translation_character_names(&[], &[]);
+        assert_eq!(out.len(), 1 + footer_additional_character_names().len());
+        assert_eq!(out[0], footer_no_character());
+        assert!(
+            out[1..]
+                .iter()
+                .map(String::as_str)
+                .eq(footer_additional_character_names())
+        );
+    }
+
+    /// The sentinel is a combo-box row, never a free-input candidate: `AutocompleteLine` splices
+    /// the tail of a candidate from a word boundary, so leaving "(не указан)" in would let a query
+    /// like "ук" write the fragment `указан)` into the field and, one debounce later, into the
+    /// bubble as a real character name. The trim must be conditional, not a blind `[1..]`.
+    #[test]
+    fn the_footer_gets_the_candidates_without_the_leading_sentinel() {
+        let full = build_translation_character_names(&["Аня".to_string()], &[]);
+        let offered = footer_autocomplete_candidates(&full);
+        assert_eq!(offered.len(), full.len() - 1);
+        assert_eq!(offered[0], "Аня");
+        assert!(
+            !offered.iter().any(|name| name == footer_no_character()),
+            "no candidate may carry the sentinel's parentheses into a free-input field"
+        );
+
+        // A list that does not start with the sentinel is passed through untouched.
+        let no_sentinel = vec!["Аня".to_string(), "Борис".to_string()];
+        assert_eq!(footer_autocomplete_candidates(&no_sentinel), &no_sentinel[..]);
+        assert!(footer_autocomplete_candidates(&[]).is_empty());
+    }
+
+    /// The revision gate exists so an unrelated bubble edit does not reassemble the list. Nothing
+    /// else observes that, so assert it directly: a sync whose collected set is unchanged must
+    /// leave `character_names` byte-identical, and a sync that adds a name must rebuild it.
+    #[test]
+    fn an_unchanged_chapter_name_set_does_not_reassemble_the_list() {
+        let mut tab = TranslationTabState::default();
+        tab.character_names_project = vec!["Аня".to_string()];
+        tab.character_names_chapter = vec!["Секретарша".to_string()];
+        // A value the assembler could never produce: if it survives, no rebuild happened.
+        tab.character_names = vec!["<not reassembled>".to_string()];
+
+        let same = vec![character_bubble(1, Some("text"), "Секретарша")];
+        tab.sync_chapter_character_names(&same);
+        assert_eq!(
+            tab.character_names,
+            vec!["<not reassembled>".to_string()],
+            "an equal collected set must not touch the assembled list"
+        );
+
+        let grown = vec![
+            character_bubble(1, Some("text"), "Секретарша"),
+            character_bubble(2, Some("text"), "Босс"),
+        ];
+        tab.sync_chapter_character_names(&grown);
+        assert_eq!(
+            tab.character_names_chapter,
+            vec!["Секретарша".to_string(), "Босс".to_string()]
+        );
+        assert_eq!(tab.character_names[0], footer_no_character());
+        assert_eq!(tab.character_names[1], "Аня");
+        assert_eq!(tab.character_names[2], "Секретарша");
+        assert_eq!(tab.character_names[3], "Босс");
+    }
+
+    /// A roster reload replaces only the roster half. The chapter names are derived from bubbles,
+    /// not from `characters.json`, so they must survive it — otherwise every mtime tick of that
+    /// file would drop the free-form names until the next bubble revision change. This exercises
+    /// the assignment + `rebuild_character_names` pair that `reload_character_names` performs
+    /// around its disk read (the read itself needs a real `ProjectData` and is not covered here).
+    #[test]
+    fn a_roster_reload_keeps_the_chapter_collected_names() {
+        let mut tab = TranslationTabState::default();
+        tab.character_names_chapter = vec!["Секретарша".to_string()];
+        tab.character_names_project = vec!["Аня".to_string()];
+        tab.rebuild_character_names();
+
+        tab.character_names_project = vec!["Борис".to_string()];
+        tab.rebuild_character_names();
+
+        assert_eq!(tab.character_names_chapter, vec!["Секретарша".to_string()]);
+        assert_eq!(tab.character_names[0], footer_no_character());
+        assert_eq!(tab.character_names[1], "Борис", "the roster was replaced");
+        assert_eq!(
+            tab.character_names[2], "Секретарша",
+            "the chapter-collected names survived the reload"
+        );
     }
 }
