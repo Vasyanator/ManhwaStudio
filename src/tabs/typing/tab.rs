@@ -2952,15 +2952,26 @@ pub(super) struct TypingTextOverlayLayer {
     create_selection: Option<TypingCreateSelection>,
     create_editor: Option<TypingCreateTextEditor>,
     create_render_state: Option<TypingCreateRenderState>,
-    /// egui font-family name registered for the on-canvas text editor, keyed by
-    /// `(font identity, resolved content id, face index)`. Keyed on the IDENTITY, never the
-    /// file path: two panel entries can share a file (the bundled `fonts/ui` entry and a
-    /// user import of it) while being different fonts. The CONTENT ID is the one the
-    /// `FontProvider` reported for the bytes it actually served, so a font file replaced
-    /// under the same PostScript name registers afresh instead of being drawn forever from
-    /// the snapshot egui already holds (egui's `add_font` never re-reads).
-    editor_font_cache: HashMap<(String, u64, usize), String>,
-    editor_font_next_id: u64,
+    /// `(font identity, resolved content id, face index)` keys whose bytes this instance has
+    /// already handed to egui for the on-canvas text editor.
+    ///
+    /// An OPTIMIZATION, not the carrier of the font's identity: the egui family NAME is derived
+    /// from the same key by `create_upload::editor_font_family_name`, so an instance that starts
+    /// with an empty memo (a project reload rebuilds `MangaApp` inside the SAME `egui::Context`)
+    /// still names each font exactly as the previous one did. All the memo saves is copying the
+    /// bytes into an `egui::FontData` again; a repeat `add_font` under an existing name is a
+    /// no-op, and one key always stands for one set of bytes, so the repeat is harmless.
+    /// It records what was handed to THE context this layer is driven by — one layer never
+    /// outlives its `egui::Context`, it is the context that outlives the layer — so a memo hit
+    /// can never skip a registration the live context is missing.
+    ///
+    /// Keyed on the IDENTITY, never the file path: two panel entries can share a file (the
+    /// bundled `fonts/ui` entry and a user import of it) while being different fonts. The
+    /// CONTENT ID is the one the `FontProvider` reported for the bytes it actually served, so a
+    /// font file replaced under the same PostScript name gets a family of its own instead of
+    /// being drawn forever from the snapshot egui already holds (egui's `add_font` never
+    /// re-reads).
+    editor_font_cache: HashSet<(String, u64, usize)>,
     /// In-flight background resolve of the on-canvas editor's font, if any.
     ///
     /// Obtaining the bytes means a `fs::read` on a provider cache miss, which must never
@@ -3159,8 +3170,7 @@ impl Default for TypingTextOverlayLayer {
             create_selection: None,
             create_editor: None,
             create_render_state: None,
-            editor_font_cache: HashMap::new(),
-            editor_font_next_id: 0,
+            editor_font_cache: HashSet::new(),
             editor_font_request: None,
             create_status_error: None,
             create_status_warning: None,

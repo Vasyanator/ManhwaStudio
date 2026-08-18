@@ -21,6 +21,10 @@ The on-canvas editor's own-typeface font is obtained in TWO steps on purpose:
 driven once per frame from `draw_text_editor`, before its "no editor open" early
 return — registers the arrived bytes with egui, which does need the GUI thread. The
 field draws in the default UI font meanwhile.
+
+The egui family those bytes are registered under is DERIVED from the resolved
+content by `editor_font_family_name`; nothing here mints a name from a counter (see
+that function for why a counter is a defect in this position).
 */
 
 use super::*;
@@ -37,6 +41,40 @@ pub(super) fn shift_drag_capture_layer_id() -> egui::LayerId {
         egui::Order::Middle,
         egui::Id::new("typing_text_create_shift_capture"),
     )
+}
+
+/// Deterministic egui family name for the on-canvas create editor's own-typeface font of
+/// `(font_identity, content_id, face_index)`.
+///
+/// Depends ONLY on those three values — the very key the registration is memoized by — so the
+/// same font always names the same family, and fonts differing in any of them get different
+/// names up to a 64-bit hash collision (the bound `combo_font_family_name` accepts as well).
+///
+/// # Invariant
+/// The name may NOT depend on any counter or handle that lives shorter than the `egui::Context`.
+/// `Context::add_font` resolves a name collision in favour of the FIRST registrant and never
+/// compares bytes (egui-0.35.0/src/context.rs:2066-2074), while a project reload (a structural
+/// page-manager operation, «Перезагрузить проект») rebuilds the whole `MangaApp` — and with it
+/// this layer — INSIDE THE SAME context (`src/studio_bootstrap.rs`). A per-instance sequence
+/// number therefore re-issues a name the context already holds foreign bytes for, and the editor
+/// silently draws the previous session's typeface.
+///
+/// # Why this is not `widgets::font_preview::combo_font_family_name`
+/// The two namespaces must stay disjoint (hence the distinct prefix) because their CONTENT
+/// discriminants are different quantities for the same font: here it is `FontContent::content_id`
+/// (a `DefaultHasher` over the served bytes — `font_provider::font_content_id` in the
+/// `ms-text-render` crate), while the combo uses `FontEntry::content_hash` (the first 8 bytes
+/// of the file's SHA-256). Folding
+/// both into one name would either give one font two names or — worse — let two different fonts
+/// meet on one name.
+#[must_use]
+fn editor_font_family_name(font_identity: &str, content_id: u64, face_index: usize) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    font_identity.hash(&mut hasher);
+    content_id.hash(&mut hasher);
+    face_index.hash(&mut hasher);
+    format!("typing-editor-font-{:016x}", hasher.finish())
 }
 
 impl TypingTextOverlayLayer {
@@ -267,12 +305,18 @@ impl TypingTextOverlayLayer {
     /// Picks up a finished [`Self::request_editor_font`] without blocking and registers the
     /// bytes with egui (which must happen on the GUI thread, where the `Context` lives).
     ///
-    /// Registration is done at most once per `(identity, content id, face index)`: the
-    /// content id is what the provider reported for the bytes it actually served, so a font
-    /// file replaced under the same PostScript name is registered again instead of being
-    /// drawn forever from the snapshot egui already holds. An identity that did not resolve
-    /// leaves the editor on the default UI font. Call once per frame, including on frames
-    /// with no open editor, so a late result is not stranded in the channel.
+    /// The family the bytes go under is `editor_font_family_name(identity, content id, face
+    /// index)` — the SAME key the registration is memoized by, and a pure function of it, so a
+    /// layer rebuilt by a project reload inside the same `egui::Context` re-derives the name
+    /// instead of re-issuing a stale one (see that function's invariant). The content id is
+    /// what the provider reported for the bytes it actually served, so a font file replaced
+    /// under the same PostScript name gets its own family instead of being drawn forever from
+    /// the snapshot egui already holds.
+    ///
+    /// The bytes are handed to egui at most once per key and per app instance; a repeat under an
+    /// existing name is a no-op in egui anyway. An identity that did not resolve leaves the
+    /// editor on the default UI font. Call once per frame, including on frames with no open
+    /// editor, so a late result is not stranded in the channel.
     pub(super) fn poll_editor_font_request(&mut self, ctx: &egui::Context) {
         let Some(request) = self.editor_font_request.as_ref() else {
             return;
@@ -303,28 +347,27 @@ impl TypingTextOverlayLayer {
             content.content_id,
             request.face_index,
         );
-        let font_name = match self.editor_font_cache.get(&cache_key) {
-            Some(name) => name.clone(),
-            None => {
-                // egui owns the bytes it renders from, so the shared buffer is copied once
-                // per registration (never per frame).
-                let font_bytes = content.data.as_ref().as_ref().to_vec();
-                self.editor_font_next_id = self.editor_font_next_id.saturating_add(1);
-                let font_name = format!("typing-editor-font-{}", self.editor_font_next_id);
-                let mut font_data = egui::FontData::from_owned(font_bytes);
-                font_data.index = u32::try_from(request.face_index).unwrap_or(0);
-                ctx.add_font(egui::epaint::text::FontInsert::new(
-                    font_name.as_str(),
-                    font_data,
-                    vec![egui::epaint::text::InsertFontFamily {
-                        family: egui::FontFamily::Name(font_name.clone().into()),
-                        priority: egui::epaint::text::FontPriority::Highest,
-                    }],
-                ));
-                self.editor_font_cache.insert(cache_key, font_name.clone());
-                font_name
-            }
-        };
+        // Derived from the key, never minted: the name has to survive this layer's lifetime,
+        // which the egui `Context` outlives (`editor_font_family_name`).
+        let font_name = editor_font_family_name(&cache_key.0, cache_key.1, cache_key.2);
+        if self.editor_font_cache.insert(cache_key) {
+            // First time THIS instance hands these bytes over. egui owns the bytes it renders
+            // from, so the shared buffer is copied once per registration (never per frame).
+            // A repeat after a reload would be harmless — `add_font` keeps the existing
+            // registration and one key always stands for one set of bytes — the memo only
+            // spares the copy.
+            let font_bytes = content.data.as_ref().as_ref().to_vec();
+            let mut font_data = egui::FontData::from_owned(font_bytes);
+            font_data.index = u32::try_from(request.face_index).unwrap_or(0);
+            ctx.add_font(egui::epaint::text::FontInsert::new(
+                font_name.as_str(),
+                font_data,
+                vec![egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Name(font_name.clone().into()),
+                    priority: egui::epaint::text::FontPriority::Highest,
+                }],
+            ));
+        }
         if let Some(editor) = self.create_editor.as_mut() {
             editor.font_family = Some(egui::FontFamily::Name(font_name.into()));
         }
@@ -998,6 +1041,40 @@ mod tests {
         }
     }
 
+    /// Minimal OPEN create-editor, so a test can observe the family the poll installs on the
+    /// text field (the poll only writes it when an editor is open).
+    fn open_editor_stub() -> TypingCreateTextEditor {
+        TypingCreateTextEditor {
+            page_idx: 0,
+            scene_rect: Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0)),
+            center_page_px: [0.0, 0.0],
+            width_px: 100,
+            text: String::new(),
+            font_family: None,
+            font_size_px: 24.0,
+            needs_focus: false,
+            window_focused_last_frame: true,
+        }
+    }
+
+    /// A layer whose create editor is OPEN — the state in which `poll_editor_font_request`
+    /// installs the resolved family on the text field.
+    fn layer_with_open_editor() -> TypingTextOverlayLayer {
+        TypingTextOverlayLayer {
+            create_editor: Some(open_editor_stub()),
+            ..TypingTextOverlayLayer::default()
+        }
+    }
+
+    /// The family the OPEN create editor's text field is currently set to draw in.
+    fn editor_family_of(layer: &TypingTextOverlayLayer) -> egui::FontFamily {
+        layer
+            .create_editor
+            .as_ref()
+            .and_then(|editor| editor.font_family.clone())
+            .expect("the resolved font must reach the open editor's text field")
+    }
+
     /// Polls until the request has been consumed, without blocking forever if it never is.
     fn poll_until_settled(layer: &mut TypingTextOverlayLayer, ctx: &egui::Context) -> bool {
         for _ in 0..2000 {
@@ -1046,7 +1123,7 @@ mod tests {
         assert_eq!(
             layer.editor_font_cache.len(),
             1,
-            "the resolved font is registered once, on the GUI thread"
+            "the resolved font's bytes are handed to egui exactly once, on the GUI thread"
         );
     }
 
@@ -1057,21 +1134,28 @@ mod tests {
     #[test]
     fn the_editor_font_cache_is_keyed_by_the_resolved_content() {
         let ctx = egui::Context::default();
-        let mut layer = TypingTextOverlayLayer::default();
+        let mut layer = layer_with_open_editor();
 
         layer.request_editor_font(&spec("Alpha-Regular"), Arc::new(FixedFontProvider { content_id: 1 }));
         assert!(poll_until_settled(&mut layer, &ctx));
-        let after_first = layer.editor_font_next_id;
+        let first_key = ("Alpha-Regular".to_string(), 1_u64, 0_usize);
         assert_eq!(layer.editor_font_cache.len(), 1);
+        assert!(layer.editor_font_cache.contains(&first_key));
+        let after_first = editor_family_of(&layer);
 
         // Same identity, same bytes: the existing family is reused (egui `add_font` never
         // evicts, so a re-registration per open would leak atlases).
         layer.request_editor_font(&spec("Alpha-Regular"), Arc::new(FixedFontProvider { content_id: 1 }));
         assert!(poll_until_settled(&mut layer, &ctx));
-        assert_eq!(layer.editor_font_cache.len(), 1);
         assert_eq!(
-            layer.editor_font_next_id, after_first,
-            "unchanged bytes must not register a second family"
+            layer.editor_font_cache.len(),
+            1,
+            "unchanged bytes must not hand the bytes over a second time"
+        );
+        assert_eq!(
+            editor_family_of(&layer),
+            after_first,
+            "unchanged bytes must keep the editor on the same family"
         );
 
         // Same identity, DIFFERENT bytes: a fresh family, so the editor shows the new file.
@@ -1082,7 +1166,15 @@ mod tests {
             2,
             "replaced bytes behind one identity must register a new family"
         );
-        assert_ne!(layer.editor_font_next_id, after_first);
+        assert!(
+            layer.editor_font_cache.contains(&first_key),
+            "the previous registration is still live in this egui context"
+        );
+        assert_ne!(
+            editor_family_of(&layer),
+            after_first,
+            "replaced bytes must move the editor onto the new family"
+        );
     }
 
     /// An identity the provider cannot resolve leaves the editor on the default UI font and
@@ -1097,9 +1189,85 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let mut layer = TypingTextOverlayLayer::default();
+        let mut layer = layer_with_open_editor();
         layer.request_editor_font(&spec("Ghost-Regular"), Arc::new(EmptyProvider));
         assert!(poll_until_settled(&mut layer, &ctx));
         assert!(layer.editor_font_cache.is_empty());
+        assert!(
+            layer
+                .create_editor
+                .as_ref()
+                .is_some_and(|editor| editor.font_family.is_none()),
+            "an unresolvable identity must leave the field on the default UI font"
+        );
+    }
+
+    /// REGRESSION: a project reload (a structural page-manager operation, «Перезагрузить
+    /// проект») rebuilds the whole `MangaApp` — and with it this layer — inside the SAME
+    /// `egui::Context`. While the family name was a per-instance sequence number, the rebuilt
+    /// layer re-issued `typing-editor-font-1`, `Context::add_font` kept the bytes registered
+    /// under that name in the previous life of the app (it never compares bytes), and the editor
+    /// drew a FOREIGN typeface. Two layers over one context must therefore never name two
+    /// different fonts alike.
+    #[test]
+    fn two_layers_over_one_context_do_not_share_a_family_name() {
+        let ctx = egui::Context::default();
+
+        let mut before_reload = layer_with_open_editor();
+        before_reload.request_editor_font(
+            &spec("Alpha-Regular"),
+            Arc::new(FixedFontProvider { content_id: 1 }),
+        );
+        assert!(poll_until_settled(&mut before_reload, &ctx));
+        let first_family = editor_family_of(&before_reload);
+
+        // The reload: a brand-new layer (empty memo, no counter) over the SAME context.
+        let mut after_reload = layer_with_open_editor();
+        after_reload.request_editor_font(
+            &spec("Beta-Regular"),
+            Arc::new(FixedFontProvider { content_id: 2 }),
+        );
+        assert!(poll_until_settled(&mut after_reload, &ctx));
+        let second_family = editor_family_of(&after_reload);
+
+        assert_ne!(
+            first_family, second_family,
+            "a rebuilt layer must not name a different font the way the previous one named its own"
+        );
+
+        // …and the same font asked for again after the reload keeps its family, so the bytes
+        // already in the context are the right ones to reuse.
+        let mut same_font_again = layer_with_open_editor();
+        same_font_again.request_editor_font(
+            &spec("Alpha-Regular"),
+            Arc::new(FixedFontProvider { content_id: 1 }),
+        );
+        assert!(poll_until_settled(&mut same_font_again, &ctx));
+        assert_eq!(
+            editor_family_of(&same_font_again),
+            first_family,
+            "one font must keep one family name across instances of the layer"
+        );
+    }
+
+    /// The family name is a PURE function of `(identity, content id, face index)`: equal inputs
+    /// name one family, and any changed input names another. Its namespace is also disjoint from
+    /// the panel combo's, whose content discriminant is a different quantity for the same font.
+    #[test]
+    fn the_editor_font_family_name_is_a_pure_function_of_its_key() {
+        let base = editor_font_family_name("Alpha-Regular", 1, 0);
+        assert_eq!(base, editor_font_family_name("Alpha-Regular", 1, 0));
+        assert_ne!(base, editor_font_family_name("Beta-Regular", 1, 0));
+        assert_ne!(base, editor_font_family_name("Alpha-Regular", 2, 0));
+        assert_ne!(base, editor_font_family_name("Alpha-Regular", 1, 1));
+        assert!(
+            base.starts_with("typing-editor-font-"),
+            "the prefix is what keeps the editor's namespace apart: {base}"
+        );
+        assert_ne!(
+            base,
+            crate::widgets::combo_font_family_name("Alpha-Regular", 1, 0),
+            "the panel combo's names must not meet the editor's"
+        );
     }
 }

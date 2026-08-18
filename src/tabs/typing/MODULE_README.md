@@ -612,6 +612,14 @@ saving, and export.
   text preview). The create-preview panel needs no call: it shows a rendered IMAGE, not
   egui text. The call is idempotent, must run on the GUI thread inside a frame, and does its
   work on a worker thread — see `src/ui_fonts.rs`.
+- **An egui resource this tab registers is NAMED BY ITS CONTENT, never by an instance counter.**
+  A project reload (structural page-manager op, «Перезагрузить проект») rebuilds the whole
+  `MangaApp` — every tab state with it — inside the SAME `egui::Context`, and `Context::add_font`
+  keeps the FIRST registration of a name without comparing bytes. A sequence number therefore
+  re-issues a name the context already holds foreign bytes for. The create editor's own-typeface
+  family is `tab/create_upload.rs::editor_font_family_name(identity, content id, face)`, a pure
+  hash of its key; `widgets::font_preview::combo_font_family_name` is the same pattern for the
+  panel combos (a distinct prefix — the two content discriminants are different quantities).
 - **Layer move: ONE primitive, two input sources, two layer kinds** (`tab/move_layer.rs`). Translating
   a layer — text/image overlay or raster, by pointer drag or by arrow keys — is a single *move session*
   (`TypingLayerMoveSession`, at most one open). Nothing else may move a layer: rotation, deform-handle,
