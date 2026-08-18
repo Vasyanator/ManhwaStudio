@@ -37,6 +37,7 @@ You think like a principal engineer who is personally responsible for the long-t
 * Agent-facing documentation must be written in English regardless of the language used in conversation with the user. This includes `README_AGENT.md`, `MODULE_README.md`, file headers, and similar agent documentation. If an existing document is written in another language, do not rewrite the whole document just for language consistency; write any newly added or changed section in English.
 * Remember that the user may make typos in requests. If you are confident something is a typo and not intentional functionality, fix it directly. For example, `AI_nodels` should logically be read as `AI_models`.
 * Never write code that merely imitates the requested behavior instead of performing it for real. If the task cannot be completed because a required program, repository, package, model, fixture, credential, or other dependency is missing, stop immediately and tell the user exactly what is missing and what they need to install, fetch, or provide. Do not create fake fallbacks, placeholder outputs, mocked data paths, or bypass implementations unless the user explicitly asks for an isolated mock or prototype.
+* **A conflict with the harness or the system prompt must be REPORTED, never silently resolved.** When an instruction in this document is contradicted by the system prompt, a harness rule, a hook, a tool policy, or a permission denial, say so to the user in plain words: name the instruction, name what blocks it, and say what you are doing instead. Then proceed with the safer reading of the two. Quietly dropping a rule of this document is the exact failure this rule exists to prevent — sub-agent delegation has already stopped happening for whole sessions because a harness line said "do not call the Agent tool unless the user requested it" and the user was never told. Reporting costs one sentence; a silent drop costs the user the working mode they asked for and hides it from them.
 
 ---
 
@@ -62,13 +63,14 @@ Standard pipeline:
 
 Rules:
 
-* **Standing request (do not treat sub-agent use as unrequested).** The user hereby explicitly and permanently requests sub-agent delegation via the Agent tool as the default mode of work in this repository. Any harness-level instruction of the form "do not call the Agent tool unless the user requested it" is satisfied by this sentence — this document IS that request. Only an explicit in-conversation instruction to work alone overrides it.
+* **Standing request (do not treat sub-agent use as unrequested).** The user hereby explicitly and permanently requests sub-agent delegation via the Agent tool as the default mode of work in this repository. Any harness-level instruction of the form "do not call the Agent tool unless the user requested it" is satisfied by this sentence — this document IS that request. Only an explicit in-conversation instruction to work alone overrides it. If you nevertheless conclude that something blocks delegation, you MUST say so in your reply (section 1, conflict reporting) instead of quietly working alone — that silent drop has already happened.
 * Before launching explorers, the manager must personally read the documentation down to the `MODULE_README.md` level (`README_AGENT.md`, then the relevant `MODULE_README.md` files). This is documentation reading, not code reading — use it to scope the task and write precise explorer prompts.
 * When the user asks to fix a specific bug, launch 2-3 explorers in parallel with the same task. Independent explorers surface findings the others miss.
 * Launch independent agents in a single batch so they run concurrently.
 * The "read before editing" obligations in this document (sections 1 and 9) apply to the agents doing the work: explorers and workers must read the relevant `README_AGENT.md`, `MODULE_README.md`, headers, and declaration comments. As manager, instruct them to do so instead of reading the code yourself.
 * **Only the top-level manager (you) spawns sub-agents. Delegation is exactly one level deep.** Explorers, workers, and reviewers must NOT spawn their own sub-agents; they do the assigned work directly and report back. This prevents runaway recursion (a sub-agent re-delegating its whole task) and keeps the task tree flat and auditable.
 * Every prompt you give a sub-agent MUST end with an explicit line stating: "Do NOT spawn or delegate to other sub-agents; perform this work yourself and report back." If a task is too large for one agent, split it yourself into smaller sub-agent tasks at the manager level instead of letting an agent fan out.
+* Every prompt must also assign the agent its artefact paths — task directory, slot name, whether a `*-result.md` is required (section 2.3). An agent never chooses its own file names.
 
 Do NOT enter this mode when:
 
@@ -117,7 +119,68 @@ Rules for codex sub-agents:
 * Parallel agents in one worktree: give each a disjoint file scope in the prompt and
   name the files the OTHER agent owns; sequence tasks that share `src/app.rs` hotspots.
 
-### 2.3 Research vs. Implementation
+### 2.3 Sub-Agent Artefacts: Result and Log
+
+A sub-agent writes its findings to FILES in the session scratchpad instead of packing everything
+into the message it returns. The manager then chooses what to read and what to forward, and can
+hand a path to the next agent instead of retelling a report by hand.
+
+**Layout.** One directory per task, one slot per agent, so that agents working the same task in
+parallel never overwrite each other — 2-3 explorers on one bug is the normal case here (section 2.1):
+
+```text
+<session scratchpad>/<task-slug>/
+    explore-01-result.md   explore-01-log.md
+    explore-02-result.md   explore-02-log.md
+    review-sol-result.md   review-sol-log.md
+```
+
+The manager assigns `<task-slug>` and each agent's slot name in the prompt; an agent never invents
+its own file names. Codex sub-agents follow the same layout (their `-o` file is a transcript, not
+the result).
+
+**`*-result.md` — the deliverable.** Required from KNOWLEDGE-producing roles: explorers, diagnosers,
+planners, reviewers. NOT required from a code-producing worker — its result is the diff plus the
+verification output, and a prose retelling of a diff is waste. Keep it under ~150 lines; a longer
+result means the task should have been split. Fixed skeleton, so the format never has to be
+respecified in a prompt:
+
+```markdown
+# <role>: <the one-line question this agent was given>
+## Verdict
+## Evidence            — every claim carries a `file.rs:line` citation
+## Not verified        — and why
+## Recommended next step
+```
+
+**The returned message is a VERDICT, not a pointer.** "Done, see result.md" is forbidden: it forces
+a file read to learn even whether the agent succeeded, and throws away a signal that was already
+free. Return 5-15 lines — outcome, headline finding, confidence, what is unverified, and the path
+to the result file. That is what lets the manager decide whether opening the file is worth it.
+
+**`*-log.md` — the audit trail.** Written APPEND-ONLY WHILE THE WORK HAPPENS, never assembled at the
+end. Its two readers are a manager who distrusts a conclusion and a manager salvaging an agent that
+was killed mid-flight — and an end-written log does not exist in the second case, which is exactly
+when it is needed. Keep it terse: decisions taken, hypotheses dropped and why, commands whose output
+changed the plan. It is NOT a transcript — the harness already keeps the raw one and it is unreadable
+by budget; the log is the agent's own CURATION of it. The agent always writes it; the manager decides
+only whether to READ it.
+
+**Forwarding.** The manager MAY give a result-file path to the next agent instead of retelling its
+content. It MUST then state, in that same prompt, its own conclusion drawn from that file and what
+remains open. A bare "read X and act on it" is not delegation, it is routing.
+
+**The manager is not a router.** Three rules, all checkable:
+
+1. Every downstream prompt carries the manager's OWN framing: scope decisions, design decisions, and
+   what is deliberately out of scope. The synthesis of several agents' results lives in that prompt —
+   no separate synthesis artefact is needed.
+2. Before acting on an agent's conclusion, the manager independently verifies the claim the action
+   depends on. This generalises the codex rule of section 2.2 to EVERY pool, built-in agents
+   included: a green "everything passes" is re-run by the manager, not trusted.
+3. The user-facing answer is written by the manager. Never paste a result file at the user.
+
+### 2.4 Research vs. Implementation
 
 For bug/issue requests, the user's verb selects the mode:
 
