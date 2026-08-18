@@ -290,6 +290,13 @@ const TEXT_OVERLAY_MIN_SELECTION_SIDE_SCREEN_PX: f32 = 60.0;
 const TEXT_OVERLAY_MAX_OUT_OF_BOUNDS_UV: f32 = 0.90;
 const TEXT_OVERLAY_MIN_VISIBLE_FRACTION: f32 = 0.10;
 const TEXT_CREATE_SELECTION_MIN_SIDE_PX: f32 = 4.0;
+/// Floor for the on-canvas create editor's DISPLAYED font size
+/// ([`TypingCreateTextEditor::display_font_size_px`]).
+///
+/// Not a readability policy — the field is meant to show the render's true size, and at the
+/// canvas' minimum zoom a small font legitimately lands near 2 px. It only keeps degenerate
+/// geometry from handing egui a zero (or NaN) size to lay a text row out with.
+const MIN_EDITOR_DISPLAY_FONT_SIZE_PX: f32 = 1.0;
 const TEXT_EDITOR_MIN_WIDTH_PX: f32 = 120.0;
 const TEXT_EDITOR_MIN_HEIGHT_PX: f32 = 72.0;
 
@@ -2157,6 +2164,8 @@ struct TypingCreateTextEditor {
     width_px: u32,
     text: String,
     font_family: Option<egui::FontFamily>,
+    /// The panel's font size in SOURCE pixels, as the renderer will use it. The field draws it
+    /// scaled to screen pixels — see [`Self::display_font_size_px`]; never draw it raw.
     font_size_px: f32,
     needs_focus: bool,
     window_focused_last_frame: bool,

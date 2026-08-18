@@ -25,6 +25,11 @@ field draws in the default UI font meanwhile.
 The egui family those bytes are registered under is DERIVED from the resolved
 content by `editor_font_family_name`; nothing here mints a name from a counter (see
 that function for why a counter is a defect in this position).
+
+The SIZE the field draws at is not the panel's size either: the panel names a size in
+SOURCE pixels, the field lives in screen pixels, so the field scales it by its own
+screen-per-source factor (`TypingCreateTextEditor::display_font_size_px`). Display only —
+the render keeps taking the panel's unscaled size.
 */
 
 use super::*;
@@ -75,6 +80,34 @@ fn editor_font_family_name(font_identity: &str, content_id: u64, face_index: usi
     content_id.hash(&mut hasher);
     face_index.hash(&mut hasher);
     format!("typing-editor-font-{:016x}", hasher.finish())
+}
+
+impl TypingCreateTextEditor {
+    /// Font size the FIELD is drawn at: the panel's size scaled to this editor's view of the
+    /// page, so the glyphs being typed are already the size the render will put in this box.
+    ///
+    /// `font_size_px` is in SOURCE pixels — the unit the renderer works in — while the field is
+    /// laid out in screen pixels, so drawing it unscaled makes the text change size the moment
+    /// the render replaces it. `scene_rect.width() / width_px` is this editor's
+    /// screen-pixels-per-source-pixel: the canvas zoom, but taken from the very two numbers the
+    /// box and the render width were built from, so it cannot disagree with either — it stays
+    /// right even for a page whose clean overlay is not the size the page is drawn at, where the
+    /// raw canvas zoom would be off.
+    ///
+    /// The factor is FROZEN with the box. `scene_rect` is captured once when the editor opens and
+    /// does not follow a later pan or zoom, so a live factor would grow the text inside a box that
+    /// stayed put.
+    ///
+    /// Display only: nothing here reaches the renderer, which keeps taking the panel's unscaled
+    /// `font_size_px`.
+    fn display_font_size_px(&self) -> f32 {
+        // `width_px` is an image width and at least 1 (`selection_width_in_source_px`), so it is
+        // far inside f32's exactly-representable integer range and the division stays finite.
+        let screen_px_per_source_px = self.scene_rect.width() / self.width_px as f32;
+        // `f32::max` also returns the bound for a NaN input, so degenerate geometry can never
+        // hand egui a zero or NaN font size to lay a row out with.
+        (self.font_size_px * screen_px_per_source_px).max(MIN_EDITOR_DISPLAY_FONT_SIZE_PX)
+    }
 }
 
 impl TypingTextOverlayLayer {
@@ -421,6 +454,8 @@ impl TypingTextOverlayLayer {
                             .clone()
                             .filter(|family| is_font_family_bound(ctx, family))
                             .unwrap_or(egui::FontFamily::Proportional);
+                        // Read before the field takes `editor.text` mutably.
+                        let font_size_px = editor.display_font_size_px();
                         // The overlay-creation field is where a rare script normally
                         // enters the app, and when the selected font is not (yet) bound
                         // it is drawn with `Proportional`, which carries only the `core`
@@ -430,7 +465,7 @@ impl TypingTextOverlayLayer {
                         crate::ui_fonts::ensure_covers(ctx, &editor.text);
                         let edit = egui::TextEdit::multiline(&mut editor.text)
                             .id(text_edit_id)
-                            .font(egui::FontId::new(editor.font_size_px, family))
+                            .font(egui::FontId::new(font_size_px, family))
                             .desired_width(f32::INFINITY)
                             .desired_rows(1)
                             .lock_focus(true)
@@ -1269,5 +1304,74 @@ mod tests {
             crate::widgets::combo_font_family_name("Alpha-Regular", 1, 0),
             "the panel combo's names must not meet the editor's"
         );
+    }
+
+    /// An editor whose box is `scene_width_px` wide on screen for `width_px` rendered source
+    /// pixels, typed in a `font_size_px` (source) font.
+    fn editor_with_scale(
+        scene_width_px: f32,
+        width_px: u32,
+        font_size_px: f32,
+    ) -> TypingCreateTextEditor {
+        TypingCreateTextEditor {
+            scene_rect: Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(scene_width_px, 50.0),
+            ),
+            width_px,
+            font_size_px,
+            ..open_editor_stub()
+        }
+    }
+
+    /// The field must show the size the RENDER will produce in that same box: the panel names a
+    /// size in source pixels, the box is screen pixels, so the drawn size carries the editor's
+    /// screen-per-source factor. Without it the glyphs jump the moment the render lands.
+    #[test]
+    fn the_field_font_size_carries_the_editor_screen_to_source_scale() {
+        // 200 screen px showing 100 source px — the page is drawn at 2x.
+        let zoomed_in = editor_with_scale(200.0, 100, 24.0);
+        assert!(
+            (zoomed_in.display_font_size_px() - 48.0).abs() < 1e-4,
+            "at 2x the field must draw the panel's 24 source px as 48 screen px, got {}",
+            zoomed_in.display_font_size_px()
+        );
+
+        let zoomed_out = editor_with_scale(50.0, 100, 24.0);
+        assert!(
+            (zoomed_out.display_font_size_px() - 12.0).abs() < 1e-4,
+            "at 0.5x the same font must draw at 12 screen px, got {}",
+            zoomed_out.display_font_size_px()
+        );
+
+        // 1:1 is the case the field used to assume unconditionally.
+        let unzoomed = editor_with_scale(100.0, 100, 24.0);
+        assert!(
+            (unzoomed.display_font_size_px() - 24.0).abs() < 1e-4,
+            "at 1x the panel's size must reach the field untouched, got {}",
+            unzoomed.display_font_size_px()
+        );
+
+        // The scale is the BOX's, not a constant: a wider render behind the same box shrinks it.
+        let wide_render = editor_with_scale(100.0, 400, 24.0);
+        assert!(
+            (wide_render.display_font_size_px() - 6.0).abs() < 1e-4,
+            "the factor is scene width over rendered width, got {}",
+            wide_render.display_font_size_px()
+        );
+    }
+
+    /// The scaling may never hand egui a size it cannot lay a row out with, however degenerate the
+    /// selection geometry is. The floor is a guard, not a readability policy — see
+    /// `MIN_EDITOR_DISPLAY_FONT_SIZE_PX`.
+    #[test]
+    fn a_degenerate_editor_box_cannot_produce_a_zero_font_size() {
+        let degenerate = editor_with_scale(0.001, 100_000, 8.0);
+        let size = degenerate.display_font_size_px();
+        assert!(
+            size >= MIN_EDITOR_DISPLAY_FONT_SIZE_PX,
+            "a vanishing box must still yield a layout-able size, got {size}"
+        );
+        assert!(size.is_finite(), "the drawn size must never be NaN or infinite");
     }
 }
