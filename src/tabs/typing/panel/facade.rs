@@ -149,6 +149,9 @@ impl TypingTopPanelState {
             ui.label(egui::RichText::new(t!("typing.panel.image_params_heading")).strong());
         }
         let mut changed = false;
+        // ONE preset binding per pass: the pickers below report a confirmed cell
+        // edit into it, and the set is persisted once, after the pass.
+        let mut presets = ColorPresetsBinding::new(Some(self.color_presets.presets_mut()));
         ui.scope(|ui| {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal()
@@ -162,7 +165,8 @@ impl TypingTopPanelState {
                 .show(ui, |ui| match self.mode {
                     TypingTopPanelMode::CreateText => {
                         self.create_panel.clamp_face_index();
-                        self.create_panel.draw_params_section(ui, true, false);
+                        self.create_panel
+                            .draw_params_section(ui, true, false, &mut presets);
                     }
                     TypingTopPanelMode::EditText => {
                         if image_edit_only {
@@ -170,11 +174,21 @@ impl TypingTopPanelState {
                                 .edit_panel
                                 .draw_image_transform_only_section(ui, false);
                         } else {
-                            changed |= self.edit_panel.draw_edit_params_section(ui, true, false);
+                            changed |= self.edit_panel.draw_edit_params_section(
+                                ui,
+                                true,
+                                false,
+                                &mut presets,
+                            );
                         }
                     }
                 });
         });
+        // Reading the verdict is the binding's last use, so its borrow of the store
+        // ends here and the store can be asked to persist itself.
+        if presets.presets_changed() {
+            self.color_presets.save();
+        }
         if changed && self.mode == TypingTopPanelMode::EditText {
             self.emit_edit_request();
         }
@@ -187,16 +201,26 @@ impl TypingTopPanelState {
     /// re-render with a substituted font would silently change what is on the page.
     pub(in crate::tabs::typing) fn draw_effects_tab_body(&mut self, ui: &mut egui::Ui) {
         self.active_main_tab = TypingMainTab::Effects;
+        // ONE preset binding per pass; see `draw_params_tab_body`.
+        let mut presets = ColorPresetsBinding::new(Some(self.color_presets.presets_mut()));
         let changed = match self.mode {
-            TypingTopPanelMode::CreateText => self.create_panel.draw_effects_section(ui, true),
+            TypingTopPanelMode::CreateText => {
+                self.create_panel
+                    .draw_effects_section(ui, true, &mut presets)
+            }
             TypingTopPanelMode::EditText => {
                 let font_missing = self.edit_panel.missing_font.is_some();
                 ui.add_enabled_ui(!font_missing, |ui| {
-                    self.edit_panel.draw_effects_section(ui, true)
+                    self.edit_panel.draw_effects_section(ui, true, &mut presets)
                 })
                 .inner
             }
         };
+        // Reading the verdict is the binding's last use, so its borrow of the store
+        // ends here and the store can be asked to persist itself.
+        if presets.presets_changed() {
+            self.color_presets.save();
+        }
         if changed && self.mode == TypingTopPanelMode::EditText {
             self.emit_edit_request();
         }
@@ -563,6 +587,19 @@ impl TypingTopPanelState {
         self.edit_panel
             .char_table
             .set_project_favorites_path(Some(path));
+    }
+
+    /// Binds the tab's color presets to the open title's document
+    /// (`ProjectPaths::color_presets_file`, TITLE-scoped) and drives its loader.
+    ///
+    /// Mirrors [`Self::set_project_favorites_path`]: called every frame from
+    /// `TypingTabState::draw`. The store ignores a repeated identical path, so only
+    /// a real title change re-reads the file; the `poll` in the same call is what
+    /// delivers a finished background read, since the load is started from here and
+    /// nowhere else.
+    pub(in crate::tabs::typing) fn set_color_presets_path(&mut self, path: PathBuf) {
+        self.color_presets.set_path(Some(path));
+        self.color_presets.poll();
     }
 
     pub(in crate::tabs::typing) fn sync_export_status(&mut self, status: TypingExportUiStatus) {

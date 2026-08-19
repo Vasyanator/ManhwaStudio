@@ -666,6 +666,66 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `font_post_script_names` (the `identity → PostScript name per face` snapshot the PSD export
   carries in its job instead of re-opening font files).
 
+## Color presets (`color_presets_store.rs` + `ColorPresetsBinding`)
+- The 20 preset cells offered under the palette by EVERY color picker of the «Текст» tab —
+  the text color of both panels and every effect-card color — are ONE set per tab, owned by
+  `TypingTopPanelState::color_presets`. It sits above `create_panel`/`edit_panel` on purpose:
+  a per-panel set would let «Создание» and «Редактирование» drift apart and would read and
+  write one title document twice.
+- The set is TITLE-scoped: `{title_dir}/color_presets.json`
+  (`ProjectPaths::color_presets_file`, `config::COLOR_PRESETS_FILE`), version 1, shape
+  `{ "version": 1, "colors": [[r,g,b,a], …] }`. The bytes are PREMULTIPLIED sRGBA — the
+  representation `Color32`/`ColorPresets::to_stored` round-trips losslessly — NOT the
+  unmultiplied `[u8; 4]` of `settings.json`'s `bubble_status` rules.
+- Persistence discipline mirrors `char_table/favorites.rs` and is documented there: typed
+  `Missing`/`Loaded`/`NewerVersion`/`Invalid`/`Unreadable` load outcome, quarantine of a
+  MALFORMED document to the first free `color_presets.json.bad*` name, temp+rename,
+  everything through `crate::storage::storage()` (never `std::fs`), background load +
+  per-frame `poll`, and the SHARED `char_table::SnapshotWriter` for writes. Exactly one
+  document state — `Ready` — permits a write; `Loading`, `Quarantining`, `NewerVersion`,
+  `Unreadable` and `QuarantineFailed` REFUSE the save and log why: replacing a document this
+  process has not read (or has no right to rewrite) would overwrite the 19 cells it never saw
+  with in-memory defaults.
+- **A document of a NEWER version is read but NEVER written** — the same contract as the
+  self-versioned `"PanelLayout"` section of `user_config.json` (`README_AGENT.md`). Its known
+  cells are shown so the user still sees their colors, `ColorPresetsDocumentState::NewerVersion`
+  refuses every save with a WARN naming the path, and the refusal is permanent for that
+  document rather than transient. An OLDER (or absent) version is read best-effort and the
+  next change rewrites it as the current version — that is the migration path.
+- **No filesystem call may happen inside a frame** (CLAUDE.md §5). `save` only records
+  intent: on `Invalid` it stores a quarantine request and switches to `Quarantining`; the
+  free-`.bad`-name probe (up to 100 `exists`) and the `rename` run in the
+  `typing-quarantine-color-presets` worker started by `poll`, and the pending change is
+  handed to the writer only after the rename is CONFIRMED. Rebinding the store to another
+  title drops a request that has not started yet, and a verdict that arrives for an unbound
+  target is discarded. `favorites.rs` is NOT the reference here: its `toggle` still
+  quarantines synchronously on the GUI thread. The `*.bad` naming race the two quarantines
+  share is listed under "Contracts and invariants".
+- **Durability is temp+rename only, and is documented as such.** A reader never sees a
+  half-written document and a dying process leaves the previous set intact, but nothing is
+  fsynced (`Storage` exposes no such primitive), so a power loss can still cost the last
+  write — one preset edit, which the user redoes. The durable recipe of `doc_store.rs`
+  (`write_all` + `sync_all` + rename + directory fsync) is deliberately not used: it is built
+  on `std::fs` and would take this document off the wasm virtual store.
+- A missing document is not an error and is NOT written: the set starts from the built-in
+  palette (`PresetDefaults::Palette`), and the file appears only when the user confirms a
+  cell.
+- The path is pushed once per frame from `TypingTabState::draw` through
+  `facade::set_color_presets_path`, next to `set_project_favorites_path`; the same call
+  drives `poll`, which is the ONLY place the store starts or finishes disk work. A repeated
+  identical path is a no-op, so it costs one read per TITLE change.
+- The set reaches the drawing code as `ColorPresetsBinding` (`panel.rs`), a per-pass
+  `Option<&mut ColorPresets>` PLUS the collected "a cell was overwritten" verdict. Every
+  selector is drawn through `ColorPresetsBinding::draw_selector`, which is the single place
+  that records the verdict — a bare `Option<&mut ColorPresets>` would force ~15 call sites to
+  propagate a second return value each, and one forgotten site would silently lose a save.
+  The two dock-tab bodies (`facade::draw_params_tab_body` / `draw_effects_tab_body`) create
+  the binding and, after the pass, call `ColorPresetsStore::save` exactly once.
+- **`None` is a legitimate mode, not a gap.** `effect_defaults::EffectDefaultsEditorState::ui`
+  is drawn from the SETTINGS pane, where no title is open and there is therefore no document
+  to read or write; it passes `ColorPresetsBinding::none()` and gets the stock egui color
+  button, which is what `ViewportColorSelector::draw` has always shown.
+
 ## Character table (`char_table/`)
 - A panel-owned symbol picker ("Таблица символов"): a floating window of curated
   non-language symbols that INSERTS the picked character into the panel's active text
@@ -864,6 +924,11 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   wording
   is correct for any typesetting language, not hardcoded to Russian.
 - No catch-all `match` arms over `TextLanguage`/`ScriptGroup` in `font_coverage.rs`.
+- Accepted limitation of BOTH quarantines (`color_presets_store.rs`, `char_table/favorites.rs`):
+  the free `*.bad` name is chosen with an `exists` probe and a separate `rename`, so two app
+  instances quarantining one title's document in the same instant can pick one name twice and
+  the second replaces the first copy — closing it needs a rename-without-replace primitive
+  `Storage` does not expose, and the loss is one copy of an already-corrupt file.
 
 ## Advanced-form search: the knobs and the presentation order
 (`advanced_form_params.rs` + `text_forms::order_advanced_forms`; spec:
@@ -1054,6 +1119,10 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `schedule_advanced_form_search`; to change what it measures with, see
   `advanced_form_metric_spec` + `build_advanced_form_glyph_widths_from_spec`; to change the
   aspect-cap unit conversion, see `advanced_form_line_height_em`.
+- To change where the color presets live, their schema or their failure handling, see
+  `color_presets_store.rs`; to change WHICH pickers offer them, see `ColorPresetsBinding` in
+  `panel.rs` and its construction in `facade.rs`; to change the cells or the popup itself, see
+  `crate::widgets::color_preset_picker`.
 - To change what a language requires, see `font_coverage.rs`
   (`script_chars_for_group`, `extra_chars_for_language`, the `*_EXTRA_CHARS` sets).
 - To change when coverage is recomputed, see `facade.rs::begin_frame` (language-change

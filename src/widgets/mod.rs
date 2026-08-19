@@ -21,6 +21,12 @@ FILE HEADER (widgets/mod.rs)
     виджетов, когда открыт popup combobox.
   - `ViewportColorSelector`: селектор цвета с кнопкой `Пипетка`, который
     умеет брать цвет из пикселя текущего viewport через screenshot-события egui.
+  - `ColorPresetPicker` (+ `ColorPresets`, `PresetDefaults`,
+    `ColorPresetPickerOutput`): the stock egui palette popup extended with two
+    rows of color presets and an explicit update/cancel pair. The widget owns
+    only the UI state (which cell is targeted and the color it was last
+    synchronized with); the preset set itself is caller-owned data and the
+    caller persists it when `presets_changed` is reported.
   - `MarkedScrollArea`: вертикальный скролл с разметкой бара (типизированные/
     свободные пометки под ползунком) и жёлобом элементов слева от бара.
   - `AiButton`: an AI-tool launch button that gates its own availability on the
@@ -54,6 +60,7 @@ FILE HEADER (widgets/mod.rs)
 */
 mod ai_button;
 mod autocomplete_line;
+mod color_preset_picker;
 mod editable_combo_box;
 mod font_preview;
 mod hangul_keyboard;
@@ -73,6 +80,11 @@ mod wheel_spin_box;
 pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement, marker_badge_overhang};
 #[allow(unused_imports)]
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
+#[allow(unused_imports)]
+pub use color_preset_picker::{
+    ColorPresetPicker, ColorPresetPickerOutput, ColorPresets, PRESET_COLUMNS, PRESET_COUNT,
+    PRESET_ROWS, PresetDefaults,
+};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]

@@ -569,6 +569,12 @@ saving, and export.
     rendered by the settings pane. Per-card (de)serialization reuses the shared
     `effect_card_to_value` (`effect_cards.rs`) / `parse_effect_cards` codec; persistence
     reuses `presets_io::{load,save}_text_tab_effect_defaults` (off-GUI-thread saves).
+  - `color_presets_store.rs`: the SINGLE owner of the title-scoped color-preset document
+    (`{title_dir}/color_presets.json`, `ProjectPaths::color_presets_file`). Owns the 20 cells
+    every color picker of this tab offers, loads them in the background and persists a
+    confirmed cell edit through the shared `char_table::SnapshotWriter`. The set itself lives
+    in `TypingTopPanelState` — ONE per tab, so the create and the edit panel cannot drift
+    apart — and is handed to the drawing code as a `ColorPresetsBinding` (`panel.rs`).
   - `char_table/`: the «Таблица символов» symbol picker — `CharTableState` (tabs, cell
     size, expansion, the two favorite lists, the background glyph-coverage job) plus its
     `egui::Window` in `char_table/window.rs`. Opened from the "Изначальный текст"

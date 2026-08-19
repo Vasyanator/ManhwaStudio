@@ -138,7 +138,37 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   reason the inline selection anchor is the number of CANDIDATE chars the query consumed, never
   the query's own char count (folding can expand one char into several).
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
-- `viewport_color_selector.rs`: color selector with viewport eyedropper support.
+- `viewport_color_selector.rs`: color selector with viewport eyedropper support. Two entry
+  points share one frame: `draw` keeps the stock `ui.color_edit_button_srgba` swatch, and
+  `draw_with_presets` swaps it for `ColorPresetPicker` when the caller lends a `ColorPresets`
+  set. The eyedropper outranks both — while it is active the swatch is frozen and no preset
+  UI is drawn, so a sampled color can never be written into a cell by accident. Because those
+  are frames in which the picker is not drawn at all, every color the sampling writes — the
+  per-frame preview AND the rollback that ends a cancelled sampling — is announced to the picker
+  through `note_color_picked_by_user`, otherwise the picker would read a color the user
+  deliberately picked as a replacement made behind its back. The eyedropper contract (own
+  screenshot token, `eyedropper_active`, `primary_click_consumed_this_frame`) is unchanged by
+  the preset mode.
+- `color_preset_picker.rs`: the egui palette popup extended with two rows of color presets
+  (`PRESET_COLUMNS` x `PRESET_ROWS` = `PRESET_COUNT` cells) and an update/cancel action row.
+  `ColorPresets` is plain data: the widget reads cells and overwrites ONE of them on an
+  explicit confirmation, but ownership and persistence belong to the caller, which is told to
+  save by `ColorPresetPickerOutput::presets_changed`. `to_stored`/`from_stored` speak
+  PREMULTIPLIED sRGBA bytes because that is `Color32`'s own representation and therefore the
+  only lossless round-trip; a stored set of the wrong length is filled from `PresetDefaults`
+  instead of being rejected. The widget's own state is only the targeted cell plus the color
+  that cell was last synchronized with, and "has unsaved changes" is DERIVED from those two
+  rather than stored — which is what makes a color the user picked outside the popup (the
+  eyedropper) light the cell up without the widget observing that change. That derivation is
+  only sound while the selection still describes the world, so the widget also remembers the
+  color it itself last accounted for and the color the selected cell held when it was chosen,
+  and drops the selection at the start of a frame when either witness disagrees: a color
+  replaced by the OWNER (another text layer selected) must not mark a cell dirty, and an index
+  chosen in one title must not survive into another title's set. All of that logic lives in a private
+  `PresetSelection` that never touches `egui::Ui`, so the interaction is unit-tested without a
+  GUI. Two egui-0.35 facts the drawing depends on: the palette takes its width from
+  `Spacing::slider_width`, not from an argument, and the popup must be
+  `PopupCloseBehavior::CloseOnClickOutside` or the first click on a cell closes it.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume
   mouse-wheel changes without scrolling parent views.
 - `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets.
@@ -179,6 +209,16 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   scroll areas permanently blocked.
 - `ViewportColorSelector` samples only egui screenshot events for its own token; callers own the
   selected color and any durable persistence.
+- `ColorPresets` is caller-owned data. The widget never loads or saves it and must not grow a
+  disk path: it reports `presets_changed` and the owner decides where the set lives. Its public
+  API is total — an out-of-range cell index returns `None`/`false`, never a panic — because the
+  index can outlive the set it was chosen in (switching title replaces the whole set).
+- Because both the edited color and the preset set are replaced by their owner without telling
+  the widget, `ColorPresetPicker` treats its selection as a claim to be re-verified every frame,
+  never as durable state. Two obligations follow for anyone editing it: `draw` must run once per
+  frame while the widget is shown, and any code path that changes the color while `draw` is NOT
+  reached must report it with `note_color_picked_by_user` if the user picked that color, or stay
+  silent if the color was substituted for them.
 - Every floating panel of the studio must be built from `CollapsiblePanel` + `PanelTab` — no
   hand-rolled `Area + Frame::popup` panels and no bare `egui::Window` used as a panel. (Migration of
   the existing surfaces is phased; new panels have no exemption.) Its layout solver is a pure
@@ -199,6 +239,9 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - To change text styling/highlight layout, edit `text_edit_plus.rs` and verify wrapped lines and
   explicit newlines.
 - To change viewport eyedropper behavior, edit `viewport_color_selector.rs`.
+- To change the preset grid, its palette defaults, or the update/cancel semantics, edit
+  `color_preset_picker.rs`; to change WHERE a preset set comes from or goes, edit the caller,
+  not the widget.
 - To change jamo keyboard layout or latch semantics, edit `hangul_keyboard.rs`; the syllable
   arithmetic and the compatibility-jamo tables belong to `crates/ms-text-util/src/hangul.rs`.
 - To change panel docking (arrangement rules, gaps, shrinking, or later the panel widgets), edit

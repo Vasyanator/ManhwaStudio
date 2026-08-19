@@ -291,7 +291,16 @@ impl EffectDefaultsEditorState {
             egui::CollapsingHeader::new(header)
                 .id_salt(("typing_effect_default", effect_kind_key(kind)))
                 .show(ui, |ui| {
-                    let changed = draw_effect_card_controls(ui, &mut self.entries[idx].card);
+                    // No presets here, deliberately: this editor is drawn from the
+                    // SETTINGS pane, which has no open title — and the preset set is
+                    // title-scoped, so there is nothing to read or write. The stock
+                    // egui palette is the correct picker for a titleless caller, not
+                    // a degraded one.
+                    let changed = draw_effect_card_controls(
+                        ui,
+                        &mut self.entries[idx].card,
+                        &mut ColorPresetsBinding::none(),
+                    );
                     if changed {
                         let value = effect_card_to_value(&self.entries[idx].card);
                         set_effect_default_value(effect_kind_key(kind), value);

@@ -152,8 +152,8 @@ use crate::tabs::typing::render_next::types::{
     VerticalLineDirection,
 };
 use crate::widgets::{
-    SeedSpinBox, TextEditPlus, TextEditPlusTextColor, ViewportColorSelector, WheelComboBox,
-    WheelSlider, WheelSpinBox, random_seed,
+    ColorPresets, SeedSpinBox, TextEditPlus, TextEditPlusTextColor, ViewportColorSelector,
+    WheelComboBox, WheelSlider, WheelSpinBox, random_seed,
 };
 use cosmic_text::{Attrs, FontSystem, Metrics, fontdb};
 use eframe::egui;
@@ -257,6 +257,10 @@ pub(in crate::tabs::typing) mod fonts_data;
 mod font_coverage;
 use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
 mod char_table;
+/// The SINGLE owner of the title-scoped color-preset document
+/// (`{title_dir}/color_presets.json`) offered by the tab's color pickers.
+mod color_presets_store;
+use color_presets_store::ColorPresetsStore;
 use ms_text_util::language::{TextLanguage, text_language};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
@@ -526,6 +530,12 @@ pub struct TypingTopPanelState {
     active_main_tab: TypingMainTab,
     create_panel: TypingCreatePanelState,
     edit_panel: TypingCreatePanelState,
+    /// The ONE color-preset set of the tab, shared by both panels above.
+    ///
+    /// It lives here rather than in `TypingCreatePanelState` precisely because there
+    /// are two of those: a per-panel set would let «Создание» and «Редактирование»
+    /// drift apart, and would load and save the same title document twice.
+    color_presets: ColorPresetsStore,
     edit_overlay_idx: Option<usize>,
     /// What the edit panel currently targets (overlay or raster). Drives request routing.
     edit_target: Option<TypingEditTarget>,
@@ -709,6 +719,7 @@ impl Default for TypingTopPanelState {
             active_main_tab: TypingMainTab::Parameters,
             create_panel,
             edit_panel,
+            color_presets: ColorPresetsStore::default(),
             edit_overlay_idx: None,
             edit_target: None,
             edit_overlay_kind: None,
@@ -1201,6 +1212,69 @@ enum ReflectAxis {
     Y,
 }
 
+/// The color-preset set a draw pass may offer, plus the verdict "a cell was
+/// overwritten, persist it".
+///
+/// It exists because the presets have to reach ~15 color selectors nested deep
+/// inside the panel drawing code, and every one of them can report that the user
+/// confirmed a preset edit. Threading a bare `Option<&mut ColorPresets>` down would
+/// force each of those call sites to ALSO propagate a second return value; here the
+/// verdict is collected in one place ([`ColorPresetsBinding::draw_selector`]), so no
+/// call site can forget it, and the owner reads it once when the pass is over.
+///
+/// `None` is not a degraded mode: it selects the stock egui color button, which is
+/// what a caller without an open title (the settings-side effect-defaults editor)
+/// must show — there is no title to store presets in.
+#[derive(Debug)]
+struct ColorPresetsBinding<'a> {
+    /// The set to offer, or `None` for the stock egui color button.
+    presets: Option<&'a mut ColorPresets>,
+    /// Whether any selector of this pass overwrote a preset cell.
+    changed: bool,
+}
+
+impl<'a> ColorPresetsBinding<'a> {
+    /// Binds `presets` to one draw pass.
+    fn new(presets: Option<&'a mut ColorPresets>) -> Self {
+        Self {
+            presets,
+            changed: false,
+        }
+    }
+
+    /// A pass that offers no presets, for a caller with no open title.
+    fn none() -> Self {
+        Self::new(None)
+    }
+
+    /// Draws one color selector against this binding and records whether it
+    /// overwrote a preset cell.
+    ///
+    /// Returns whether the COLOR changed, which is the only part of the selector's
+    /// response the panel has ever used; the preset verdict is accumulated here
+    /// instead of being returned, so it cannot be dropped on the way up.
+    fn draw_selector(
+        &mut self,
+        ui: &mut egui::Ui,
+        selector: &mut ViewportColorSelector,
+        color: &mut Color32,
+    ) -> bool {
+        let response = selector.draw_with_presets(ui, color, self.presets.as_deref_mut());
+        self.changed |= response.presets_changed;
+        response.changed
+    }
+
+    /// Whether a preset cell was overwritten during this pass.
+    ///
+    /// `#[must_use]`: this verdict is the ONLY record that the user's edit still has
+    /// to be persisted — the binding is dropped at the end of the pass, so a caller
+    /// that reads it and ignores the answer silently loses the change.
+    #[must_use]
+    fn presets_changed(&self) -> bool {
+        self.changed
+    }
+}
+
 struct ColorField {
     value: Color32,
     picker: ViewportColorSelector,
@@ -1218,12 +1292,18 @@ impl ColorField {
         self.value.to_srgba_unmultiplied()
     }
 
-    fn draw(&mut self, ui: &mut egui::Ui, label: &str) -> bool {
+    /// Draws the labelled color row. `presets` decides whether the swatch opens the
+    /// preset picker or the stock egui palette; returns whether the COLOR changed.
+    fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        presets: &mut ColorPresetsBinding<'_>,
+    ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(label);
-            let resp = self.picker.draw(ui, &mut self.value);
-            changed |= resp.changed;
+            changed |= presets.draw_selector(ui, &mut self.picker, &mut self.value);
         });
         changed
     }

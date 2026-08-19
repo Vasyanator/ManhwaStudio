@@ -282,7 +282,18 @@ pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
     }
 }
 
-pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCard) -> bool {
+/// Draws the editable controls of ONE effect card and reports whether anything
+/// changed.
+///
+/// `presets` decides what every color swatch of the card opens: the tab's
+/// title-scoped preset picker, or — when it carries no set — the stock egui
+/// palette. The settings-side effect-defaults editor is the caller that has no
+/// title and therefore no presets to offer.
+pub(super) fn draw_effect_card_controls(
+    ui: &mut egui::Ui,
+    effect: &mut EffectCard,
+    presets: &mut ColorPresetsBinding<'_>,
+) -> bool {
     let mut changed = false;
     match effect {
         EffectCard::TextShake(shake) => {
@@ -301,7 +312,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             changed |= ui
                 .add(WheelSlider::new(&mut stroke.width_px, 0.0..=24.0).text(t!("typing.params.width_px_label")))
                 .changed();
-            changed |= stroke.color.draw(ui, t!("typing.effects.color_label"));
+            changed |= stroke.color.draw(ui, t!("typing.effects.color_label"), presets);
             changed |= ui.checkbox(&mut stroke.smoothing, t!("typing.effects.antialias_toggle")).changed();
             ui.add_enabled_ui(stroke.smoothing, |ui| {
                 changed |= ui
@@ -405,7 +416,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 ShadowColorMode::SourceColors
             };
             ui.add_enabled_ui(shadow.color_mode == ShadowColorMode::SingleColor, |ui| {
-                changed |= shadow.color.draw(ui, t!("typing.effects.color_label"));
+                changed |= shadow.color.draw(ui, t!("typing.effects.color_label"), presets);
             });
         }
         EffectCard::Blur(blur) => {
@@ -535,7 +546,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 .checkbox(&mut dry_media.use_source_color, t!("typing.effects.keep_source_color"))
                 .changed();
             ui.add_enabled_ui(!dry_media.use_source_color, |ui| {
-                changed |= dry_media.color.draw(ui, t!("typing.effects.color_label"));
+                changed |= dry_media.color.draw(ui, t!("typing.effects.color_label"), presets);
             });
         }
         EffectCard::Interference(interference) => {
@@ -720,9 +731,9 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                             .text(t!("typing.effects.blur_knee_label")),
                     )
                     .changed();
-                changed |= glow.color.draw(ui, t!("typing.effects.color_label"));
+                changed |= glow.color.draw(ui, t!("typing.effects.color_label"), presets);
             } else {
-                changed |= glow.color.draw(ui, t!("typing.effects.color_label"));
+                changed |= glow.color.draw(ui, t!("typing.effects.color_label"), presets);
                 let mut opacity_idx = if glow.opacity_mode == StrokeOpacityMode::Static {
                     0
                 } else {
@@ -780,8 +791,8 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             }
         }
         EffectCard::Gradient2(gradient) => {
-            changed |= gradient.color1.draw(ui, t!("typing.effects.gradient_color1_label"));
-            changed |= gradient.color2.draw(ui, t!("typing.effects.gradient_color2_label"));
+            changed |= gradient.color1.draw(ui, t!("typing.effects.gradient_color1_label"), presets);
+            changed |= gradient.color2.draw(ui, t!("typing.effects.gradient_color2_label"), presets);
             changed |= ui
                 .add(WheelSlider::new(&mut gradient.angle_deg, -360.0..=360.0).text(t!("typing.params.angle_label")))
                 .changed();
@@ -831,7 +842,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             ui.add_enabled_ui(
                 gradient.fill_mode == Gradient2FillMode::SpecificColor,
                 |ui| {
-                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
+                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"), presets);
                     changed |= ui
                         .add(
                             WheelSlider::new(&mut gradient.color_tolerance_percent, 0.0..=100.0)
@@ -848,10 +859,10 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             );
         }
         EffectCard::Gradient4(gradient) => {
-            changed |= gradient.color_top_left.draw(ui, t!("typing.effects.gradient_corner_top_left_label"));
-            changed |= gradient.color_top_right.draw(ui, t!("typing.effects.gradient_corner_top_right_label"));
-            changed |= gradient.color_bottom_left.draw(ui, t!("typing.effects.gradient_corner_bottom_left_label"));
-            changed |= gradient.color_bottom_right.draw(ui, t!("typing.effects.gradient_corner_bottom_right_label"));
+            changed |= gradient.color_top_left.draw(ui, t!("typing.effects.gradient_corner_top_left_label"), presets);
+            changed |= gradient.color_top_right.draw(ui, t!("typing.effects.gradient_corner_top_right_label"), presets);
+            changed |= gradient.color_bottom_left.draw(ui, t!("typing.effects.gradient_corner_bottom_left_label"), presets);
+            changed |= gradient.color_bottom_right.draw(ui, t!("typing.effects.gradient_corner_bottom_right_label"), presets);
             changed |= ui
                 .add(
                     WheelSlider::new(&mut gradient.width_percent, 1.0..=400.0)
@@ -898,7 +909,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             ui.add_enabled_ui(
                 gradient.fill_mode == Gradient4FillMode::SpecificColor,
                 |ui| {
-                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
+                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"), presets);
                     changed |= ui
                         .add(
                             WheelSlider::new(&mut gradient.color_tolerance_percent, 0.0..=100.0)

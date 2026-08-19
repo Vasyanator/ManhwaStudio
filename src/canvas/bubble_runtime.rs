@@ -2735,6 +2735,7 @@ mod tests {
                 title_dir: empty(),
                 notes_file: empty(),
                 char_favorites_file: empty(),
+                color_presets_file: empty(),
                 bubbles_file: empty(),
                 src_dir: empty(),
                 clean_layers_dir: empty(),

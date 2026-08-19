@@ -99,7 +99,9 @@ and the favorites stores), never on the GUI thread.
   through `config::JsonConfig` with an EMPTY default tree (so a read can never rewrite the
   file) and written through `config::update_user_config_file`.
 - **Every save goes through ONE coalescing writer per store, never a thread per change**
-  (`mod.rs::SnapshotWriter`). A change replaces the pending COMPLETE snapshot OF ITS TARGET
+  (`mod.rs::SnapshotWriter`, shared infrastructure of the whole `panel` module — the typing
+  tab's color presets use it too, which is why its log messages name the writer's thread
+  instead of this window). A change replaces the pending COMPLETE snapshot OF ITS TARGET
   and spawns a writer only if none is live; the writer drains one target's newest snapshot
   after each write and exits when nothing is pending. This is the contract, not an
   optimization — three defects follow directly from spawning a thread per change, and all

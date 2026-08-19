@@ -31,11 +31,15 @@ use super::*;
 
 impl TypingCreatePanelState {
 
+    /// Draws the edit panel's parameters for the selected layer and reports whether
+    /// anything changed. `presets` is the color-preset set its color swatches offer
+    /// (see [`ColorPresetsBinding`]).
     pub(super) fn draw_edit_params_section(
         &mut self,
         ui: &mut egui::Ui,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
+        presets: &mut ColorPresetsBinding<'_>,
     ) -> bool {
         let mut changed = self.draw_advanced_form_window(ui.ctx());
         changed |= self.drive_char_table_window(ui.ctx());
@@ -126,6 +130,7 @@ impl TypingCreatePanelState {
                     ui,
                     true,
                     remap_wheel_to_horizontal,
+                    presets,
                     false,
                     font_missing,
                 );
@@ -502,10 +507,11 @@ impl TypingCreatePanelState {
                                             Vec2::new(mid_col_w, 0.0),
                                             egui::Layout::top_down(Align::Min),
                                             |ui| {
-                                                let color_resp = self
-                                                    .text_color_selector
-                                                    .draw(ui, &mut self.text_color);
-                                                changed |= color_resp.changed;
+                                                changed |= presets.draw_selector(
+                                                    ui,
+                                                    &mut self.text_color_selector,
+                                                    &mut self.text_color,
+                                                );
                                                 if let Some(style) = inline_style.as_mut() {
                                                     let mut font_size_px = style
                                                         .font_size_px

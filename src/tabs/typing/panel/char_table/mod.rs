@@ -126,6 +126,10 @@ fn lock_slot<T>(slot: &Mutex<WriterSlot<T>>) -> MutexGuard<'_, WriterSlot<T>> {
 /// worker is live; it drains one target's newest snapshot after every write and
 /// exits when nothing is pending, clearing `running` under the same lock that
 /// found the slot empty (and from an RAII guard if a write unwinds).
+///
+/// Shared infrastructure of the whole `panel` module, not only of this window:
+/// the typing tab's color presets (`panel::color_presets_store`) use it too, which
+/// is why nothing here names a specific document.
 #[derive(Debug)]
 pub(super) struct SnapshotWriter<T: SnapshotTarget + Send + 'static> {
     slot: Arc<Mutex<WriterSlot<T>>>,
@@ -177,14 +181,15 @@ impl<T: SnapshotTarget + Send + 'static> SnapshotWriter<T> {
         }
         let slot = Arc::clone(&self.slot);
         let save = self.save;
+        let thread_name = self.thread_name;
         let spawn_result = thread::Builder::new()
             .name(self.thread_name.to_string())
-            .spawn(move || writer_loop(&slot, save));
+            .spawn(move || writer_loop(&slot, save, thread_name));
         if let Err(err) = spawn_result {
             let mut guard = lock_slot(&self.slot);
             guard.running = false;
             crate::runtime_log::log_error(format!(
-                "typing: char table: failed to spawn {} writer; change not persisted: {err}",
+                "typing: failed to spawn the {} writer; change not persisted: {err}",
                 self.thread_name
             ));
         }
@@ -216,9 +221,14 @@ impl<T> Drop for RunningFlagGuard<'_, T> {
 }
 
 /// Drains a writer slot one target at a time, holding no lock during a write.
+///
+/// `thread_name` only labels the failure log: this writer serves several stores
+/// (the character-table favorites and the typing tab's color presets), so a
+/// message naming one of them would misreport the others.
 fn writer_loop<T: SnapshotTarget + Send + 'static>(
     slot: &Arc<Mutex<WriterSlot<T>>>,
     save: fn(T) -> Result<(), String>,
+    thread_name: &'static str,
 ) {
     let mut running = RunningFlagGuard {
         slot: slot.as_ref(),
@@ -245,7 +255,7 @@ fn writer_loop<T: SnapshotTarget + Send + 'static>(
         };
         if let Err(err) = save(snapshot) {
             crate::runtime_log::log_error(format!(
-                "typing: char table: failed to persist a snapshot: {err}"
+                "typing: {thread_name}: failed to persist a snapshot: {err}"
             ));
         }
     }

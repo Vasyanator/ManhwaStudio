@@ -82,17 +82,21 @@ impl TypingCreatePanelState {
         });
     }
 
+    /// Draws the create panel's text parameters. `presets` is the color-preset set
+    /// its color swatches offer (see [`ColorPresetsBinding`]).
     pub(super) fn draw_params_section(
         &mut self,
         ui: &mut egui::Ui,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
+        presets: &mut ColorPresetsBinding<'_>,
     ) {
         let mut params_changed = false;
         params_changed |= self.draw_main_text_params(
             ui,
             stacked_columns,
             remap_wheel_to_horizontal,
+            presets,
             self.preview_enabled,
             // The create panel can enter the missing-font state too — a preset naming a
             // font that is not loaded (`create_presets::apply_preset_by_name`) and a
@@ -111,7 +115,15 @@ impl TypingCreatePanelState {
         }
     }
 
-    pub(super) fn draw_effects_section(&mut self, ui: &mut egui::Ui, vertical_cards: bool) -> bool {
+    /// Draws the effects panel (the card strip and every card's controls) and
+    /// reports whether anything changed. `presets` is the color-preset set the
+    /// cards' color swatches offer (see [`ColorPresetsBinding`]).
+    pub(super) fn draw_effects_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        vertical_cards: bool,
+        presets: &mut ColorPresetsBinding<'_>,
+    ) -> bool {
         let mut changed = false;
         ui.label(if vertical_cards {
             t!("typing.effects.order_top_to_bottom_hint")
@@ -206,7 +218,11 @@ impl TypingCreatePanelState {
                                     }
                                 });
                                 ui.separator();
-                                changed |= draw_effect_card_controls(ui, &mut self.effects[idx]);
+                                changed |= draw_effect_card_controls(
+                                    ui,
+                                    &mut self.effects[idx],
+                                    presets,
+                                );
                             });
                         });
                         if idx + 1 < effects_len {
@@ -295,6 +311,7 @@ impl TypingCreatePanelState {
                                                                     draw_effect_card_controls(
                                                                         ui,
                                                                         &mut self.effects[idx],
+                                                                        presets,
                                                                     );
                                                             });
                                                     });

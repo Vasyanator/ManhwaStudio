@@ -1745,6 +1745,10 @@ impl CanvasHooks for TypingHooks<'_> {
         // comes from `ProjectPaths`, not from the chapter dir.
         self.top_panel
             .set_project_favorites_path(project.paths.char_favorites_file.clone());
+        // The color presets are TITLE-scoped for the same reason, and the same
+        // per-frame push both binds them and drives their background load.
+        self.top_panel
+            .set_color_presets_path(project.paths.color_presets_file.clone());
         // While an export is deferred behind the whole-project preload, surface a non-blocking
         // "preparing pages N/M" indicator in the same panel slot the export progress uses. Tracked by
         // `has_pending_export` (NOT `preload_all_pages_active`): the pass can drain — including the

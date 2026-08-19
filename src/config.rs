@@ -51,6 +51,10 @@ pub const NOTES_FILE: &str = "translation_notes.txt";
 /// Title-scoped favorite characters of the typing tab's character table. Lives
 /// next to the title's other shared files, so every chapter sees one list.
 pub const CHAR_FAVORITES_FILE: &str = "char_favorites.json";
+/// Title-scoped color presets of the typing tab's color pickers. Title- rather
+/// than chapter-scoped for the same reason as the favorites above: every chapter
+/// of one manga is typeset with one set of colors.
+pub const COLOR_PRESETS_FILE: &str = "color_presets.json";
 pub const SRC_DIR: &str = "src";
 pub const CLEANED_DIR: &str = "cleaned";
 pub const CLEAN_LAYERS_DIR: &str = "clean_layers";

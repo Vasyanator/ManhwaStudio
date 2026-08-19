@@ -36,6 +36,21 @@ use super::*;
 /// sections keep the same rhythm.
 const PARAM_SECTION_GAP_PX: f32 = 3.0;
 
+/// The two conditions that gate what the font section offers.
+///
+/// They travel together because they are read together: one decides whether the
+/// per-font parameter memory is consulted, the other disables every control that
+/// feeds a render. Grouped rather than passed as two more booleans so the section's
+/// parameter list stays readable (and its call sites cannot swap them).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FontSectionGates {
+    /// Per-font parameter memory is enabled for this panel.
+    pub(super) memory_enabled: bool,
+    /// The selected/edited layer's font is not loaded: only the font pickers stay
+    /// live, everything that would re-render is disabled.
+    pub(super) font_missing: bool,
+}
+
 /// Decides the font index the user actually PICKED in the font combo this frame,
 /// if any — the edge that is allowed to write an inline span's font label.
 ///
@@ -161,6 +176,7 @@ impl TypingCreatePanelState {
         ui: &mut egui::Ui,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
+        presets: &mut ColorPresetsBinding<'_>,
         font_memory_enabled: bool,
         font_missing: bool,
     ) -> bool {
@@ -225,8 +241,11 @@ impl TypingCreatePanelState {
                             &mut changed,
                             &mut block_hscroll_by_hovered_param,
                             inline_style.as_mut(),
-                            font_memory_enabled,
-                            font_missing,
+                            presets,
+                            FontSectionGates {
+                                memory_enabled: font_memory_enabled,
+                                font_missing,
+                            },
                         );
                     },
                 );
@@ -339,8 +358,11 @@ impl TypingCreatePanelState {
                     &mut changed,
                     &mut block_hscroll_by_hovered_param,
                     inline_style.as_mut(),
-                    font_memory_enabled,
-                    font_missing,
+                    presets,
+                    FontSectionGates {
+                        memory_enabled: font_memory_enabled,
+                        font_missing,
+                    },
                 );
                 self.draw_metrics_section(
                     ui,
@@ -408,17 +430,22 @@ impl TypingCreatePanelState {
     /// missing-font hint, and the color + size controls. The group/font/hint stay
     /// enabled even when a font is missing so the user can pick a replacement; the
     /// face selector is gated on `!selection_mode`; color + size are gated on
-    /// `!font_missing`. Control code moved verbatim from the former panel body and
-    /// left column.
+    /// `!font_missing`. `presets` decides whether the color swatch opens the
+    /// title-scoped preset picker or the stock egui palette. Control code moved
+    /// verbatim from the former panel body and left column.
     pub(super) fn draw_font_section(
         &mut self,
         ui: &mut egui::Ui,
         changed: &mut bool,
         block_hscroll_by_hovered_param: &mut bool,
         mut inline_style: Option<&mut TypingInlineTagStyle>,
-        font_memory_enabled: bool,
-        font_missing: bool,
+        presets: &mut ColorPresetsBinding<'_>,
+        gates: FontSectionGates,
     ) {
+        let FontSectionGates {
+            memory_enabled: font_memory_enabled,
+            font_missing,
+        } = gates;
         let selection_mode = inline_style.is_some();
         // Комбобокс группы шрифтов показывается на обеих панелях (создание и
         // редактирование); выбор синхронизируется между ними через
@@ -672,8 +699,8 @@ impl TypingCreatePanelState {
         ui.add_enabled_ui(!font_missing, |ui| {
             if let Some(style) = inline_style.as_mut() {
                 let mut text_color = style.text_color.unwrap_or(self.text_color);
-                let color_resp = self.text_color_selector.draw(ui, &mut text_color);
-                *changed |= color_resp.changed;
+                *changed |=
+                    presets.draw_selector(ui, &mut self.text_color_selector, &mut text_color);
                 style.text_color = Some(text_color);
                 let mut font_size_px = style
                     .font_size_px
@@ -687,8 +714,8 @@ impl TypingCreatePanelState {
                 *changed |= font_size_resp.changed();
                 style.font_size_px = Some(font_size_px);
             } else {
-                let color_resp = self.text_color_selector.draw(ui, &mut self.text_color);
-                *changed |= color_resp.changed;
+                *changed |=
+                    presets.draw_selector(ui, &mut self.text_color_selector, &mut self.text_color);
                 let font_size_resp = ui.add(
                     WheelSlider::new(&mut self.font_size_px, 1.0..=256.0)
                         .text(t!("typing.params.size_px_label"))
