@@ -42,8 +42,12 @@ Sites whose page list is an inline script literal (shared scanners in `../html.r
 - `bato.rs`: bato.to Astro island props with the legacy `imgHttps` fallback.
 
 Sites scraped from page markup:
-- `naver.rs`: comic.naver.com viewer HTML, `IMAG<a>_<b>` reading order.
-- `webtoons.rs`: webtoons.com viewer/series, mobile episode-list API, canvas vs. webtoon.
+- `naver.rs`: comic.naver.com viewer HTML; pages are the `id="content_image_*"` images under
+  the episode's own path (the episode's list thumbnail shares that path), `IMAG<a>_<b>` reading
+  order.
+- `webtoons.rs`: webtoons.com; pages are scoped to the `#_imageList` container of the desktop
+  viewer (the rest of the document is the episode-thumbnail strip), a `m.webtoons.com` link is
+  rewritten to `www.`, a series URL goes through the mobile episode-list API; canvas vs. webtoon.
 - `tcbscans.rs`: tcbscans/onepiecechapters/tcb-backup mirrors, `fixed-ratio-content` images.
 - `rawkuma.rs`: rawkuma.net/.com, `<img>` minus WordPress chrome prefixes.
 - `mangafreak.rs`: mangafreak.me and its rotating `ww<N>.` prefixes, fixed CDN path prefix.

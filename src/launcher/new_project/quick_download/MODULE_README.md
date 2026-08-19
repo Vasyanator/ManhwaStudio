@@ -34,7 +34,8 @@ plus the optional `Referer` that site's CDN requires) and the controller does th
 - `http.rs`: `execute_request` and the fetch entry points on top of it — `fetch_text`/`fetch_bytes`/
   `fetch_json_value` (default headers) and `fetch_text_with_headers`/`fetch_json_with_headers`/
   `post_json_value` for sites needing custom headers, a fixed cookie, or a JSON POST. Owns the
-  shared timeout and User-Agent, `DOWNLOAD_PARALLELISM`, and the wasm stubs.
+  shared timeout and User-Agent, the process-wide `ureq` agent, `DOWNLOAD_PARALLELISM` and the
+  pool `install_on_download_pool` runs the image download on, and the wasm stubs.
 - `url_util.rs`: URL normalization, host/query/path extraction, relative link resolution,
   `dedupe_preserve`, `looks_like_image_url`. Unit-tested.
 - `html.rs`: tolerant tag scanner (`HtmlTag`, `extract_html_tags`), `get_html_attr`,
@@ -67,6 +68,11 @@ plus the optional `Referer` that site's CDN requires) and the controller does th
   key must exist in `en.json`, and every `en.json` key must be referenced from source).
 - Nothing here may run on the GUI thread except `QuickDownloadController::poll`, which is
   non-blocking (`try_recv`) by contract.
+- **Downloads run on the module's own thread pool, never on the global rayon one.** They are
+  network-bound and block on sockets: occupying the global pool would stall the app's compute
+  work and cap the fan-out at the core count. `DOWNLOAD_PARALLELISM` is that pool's size, and
+  every request goes through the one shared `ureq` agent so TCP/TLS connections (and the cookie
+  jar) survive between the pages of a chapter.
 - Every failure carries both a localized `user_message` and a technical `log_message`
   (`QuickDownloadError`); no silent fallbacks and no placeholder pages.
 - Images are decoded from the downloaded bytes, never from the URL extension

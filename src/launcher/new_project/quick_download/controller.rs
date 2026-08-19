@@ -25,7 +25,7 @@ Notes:
 Nothing here knows about a specific site; host handling lives in `plan.rs` and `sites/`.
 */
 
-use super::http::{DOWNLOAD_PARALLELISM, fetch_bytes};
+use super::http::{fetch_bytes, install_on_download_pool};
 use super::plan::{QuickDownloadError, SiteDownloadPlan, build_site_download_plan};
 use super::url_util::normalize_http_url;
 use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
@@ -226,11 +226,15 @@ fn load_quick_download(
 
 /// Downloads every image of `plan` in parallel and returns them in plan order.
 ///
-/// Progress is streamed through `progress_tx` as images complete, so the reported order
-/// is arbitrary while the returned vector is sorted back by index.
+/// The work runs on the downloader's own thread pool (`install_on_download_pool`), so the
+/// concurrency is the network fan-out rather than the core count and the global rayon pool
+/// stays free for compute work. Progress is streamed through `progress_tx` as images
+/// complete, so the reported order is arbitrary while the returned vector is sorted back by
+/// index.
 ///
 /// # Errors
-/// Returns the first download or decode error; no partial result is produced.
+/// Returns the first download or decode error, or a pool-creation failure; no partial
+/// result is produced.
 fn download_images_ordered(
     plan: &SiteDownloadPlan,
     progress_tx: &Sender<QuickDownloadWorkerEvent>,
@@ -240,29 +244,33 @@ fn download_images_ordered(
     let referer = plan.referer.clone();
     let progress_tx = progress_tx.clone();
 
-    let mut indexed = plan
-        .image_urls
-        .par_iter()
-        .enumerate()
-        .with_max_len(DOWNLOAD_PARALLELISM)
-        .map(|(index, url)| {
-            let image = download_image(url, referer.as_deref())?;
-            let current = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = progress_tx.send(QuickDownloadWorkerEvent::Progress {
-                stage: "download",
-                current,
-                total,
-            });
-            Ok::<(usize, ImportedImage), QuickDownloadError>((
-                index,
-                ImportedImage {
-                    name: format!("{:04}.png", index + 1),
-                    image,
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // One image per rayon task (`with_max_len(1)`): the default chunking would hand several
+    // URLs to one worker and leave the rest of the pool idle on a short chapter.
+    let downloads = install_on_download_pool(|| {
+        plan.image_urls
+            .par_iter()
+            .enumerate()
+            .with_max_len(1)
+            .map(|(index, url)| {
+                let image = download_image(url, referer.as_deref())?;
+                let current = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = progress_tx.send(QuickDownloadWorkerEvent::Progress {
+                    stage: "download",
+                    current,
+                    total,
+                });
+                Ok::<(usize, ImportedImage), QuickDownloadError>((
+                    index,
+                    ImportedImage {
+                        name: format!("{:04}.png", index + 1),
+                        image,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
+    let mut indexed = downloads?;
     indexed.sort_by_key(|(index, _)| *index);
     Ok(indexed.into_iter().map(|(_, image)| image).collect())
 }

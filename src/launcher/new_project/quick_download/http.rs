@@ -10,6 +10,8 @@ Key constants:
 - DOWNLOAD_PARALLELISM
 
 Key functions:
+- http_agent() - the process-wide `ureq` agent, i.e. the connection pool (native only)
+- install_on_download_pool() - runs the parallel image download on the downloader's own pool
 - execute_request() - the single request builder (headers + optional JSON body) all others use
 - make_request(), fetch_text(), fetch_bytes(), fetch_json_value()
 - fetch_text_with_headers(), fetch_json_with_headers(), post_json_value()
@@ -17,20 +19,98 @@ Key functions:
 Notes:
 The native path uses `ureq`, which is not compiled for wasm; the wasm stubs return a clear
 error instead of a fake response. Keep the `cfg` pairs in sync when editing.
+All requests share ONE agent, so TCP/TLS connections (and the cookie jar) are reused across
+the pages of a chapter instead of being renegotiated per image.
 */
 
 use super::plan::QuickDownloadError;
 use serde_json::Value;
+use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
 use web_time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Upper bound on images handed to one rayon task, i.e. the effective download fan-out.
-pub(crate) const DOWNLOAD_PARALLELISM: usize = 8;
+/// Number of images fetched concurrently by `install_on_download_pool`. This is a network
+/// fan-out, not a CPU one: it is deliberately independent of the core count, since every
+/// worker spends its time waiting on a socket.
+pub(crate) const DOWNLOAD_PARALLELISM: usize = 16;
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36";
+
+/// Process-wide HTTP agent of the quick downloader, i.e. its connection pool.
+#[cfg(not(target_arch = "wasm32"))]
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Returns the shared agent, building it on first use.
+///
+/// A per-request agent would renegotiate TCP+TLS for every page of a chapter; one shared
+/// agent keeps the connections alive. `ureq` caps idle connections at ONE per host by
+/// default, which would defeat the reuse exactly in the parallel case, so the cap is raised
+/// to the download fan-out.
+#[cfg(not(target_arch = "wasm32"))]
+fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(REQUEST_TIMEOUT)
+            .timeout_read(REQUEST_TIMEOUT)
+            .timeout_write(REQUEST_TIMEOUT)
+            .max_idle_connections_per_host(DOWNLOAD_PARALLELISM)
+            .build()
+    })
+}
+
+/// The downloader's own worker pool, or the reason it could not be built. Built once per
+/// process; a failure is reported to the caller rather than silently downgraded.
+#[cfg(not(target_arch = "wasm32"))]
+static DOWNLOAD_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+/// Runs `op` on the quick downloader's own pool of `DOWNLOAD_PARALLELISM` threads.
+///
+/// The pool is separate from the global rayon pool on purpose: image downloads block on
+/// sockets, and blocking the global pool - sized to the CPU count and shared with the app's
+/// compute work - would both stall that work and cap the fan-out at the core count.
+///
+/// # Errors
+/// Returns `QuickDownloadError` when the pool could not be created; `op` is not run then.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn install_on_download_pool<R, F>(op: F) -> Result<R, QuickDownloadError>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    let pool = DOWNLOAD_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(DOWNLOAD_PARALLELISM)
+            .thread_name(|index| format!("quick-dl-{index}"))
+            .build()
+            .map_err(|err| err.to_string())
+    });
+    match pool {
+        Ok(pool) => Ok(pool.install(op)),
+        Err(err) => Err(QuickDownloadError {
+            user_message: t!("launcher.new_project.quick_dl.start_error").to_string(),
+            log_message: format!(
+                "failed to build the quick download thread pool of {DOWNLOAD_PARALLELISM} threads: {err}"
+            ),
+        }),
+    }
+}
+
+/// Web stub twin of `install_on_download_pool`: the web build has no worker pool here, and
+/// the fetch stubs fail before parallelism could matter, so `op` runs on the caller thread.
+///
+/// # Errors
+/// Never fails; the signature matches the native twin.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn install_on_download_pool<R, F>(op: F) -> Result<R, QuickDownloadError>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    Ok(op())
+}
 
 /// Fetches `url` and reads the response body as text.
 ///
@@ -225,11 +305,7 @@ fn execute_request(
     headers: &[(&str, &str)],
     json_body: Option<&Value>,
 ) -> Result<ureq::Response, QuickDownloadError> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(REQUEST_TIMEOUT)
-        .timeout_read(REQUEST_TIMEOUT)
-        .timeout_write(REQUEST_TIMEOUT)
-        .build();
+    let agent = http_agent();
     // A JSON body implies a POST; every other request in this module is a plain GET.
     let mut request = if json_body.is_some() {
         agent.post(url)
