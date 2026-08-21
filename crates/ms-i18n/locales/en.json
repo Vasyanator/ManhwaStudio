@@ -3680,6 +3680,7 @@
   "typing.advanced.form_search_reset_button": "Default parameters",
   "typing.advanced.form_search_section": "Search parameters",
   "typing.advanced.form_shape_label": "Shape:",
+  "typing.advanced.form_tags_lost_status": "Could not put the inline tags back on the chosen shape — it was applied without them.",
   "typing.advanced.form_unevenness_label": "Unevenness at most",
   "typing.advanced.form_variants_incomplete_status": " Shape enumeration is incomplete (limit reached).",
   "typing.advanced.form_variants_shown_status": "Variants: {visible}, showing the first {shown}.",

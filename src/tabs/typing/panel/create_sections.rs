@@ -11,7 +11,10 @@ card factory and the effects JSON serializer.
 The preview section also hosts the per-render font diagnostic rows (which
 characters the renderer's fallback chain drew instead of the selected font,
 and which it could not draw at all) — see `MODULE_README.md`, "Two font
-diagnostics".
+diagnostics" — and the sticky warning of an applied advanced form that could
+not carry its inline tags back (`advanced_form_tags_lost_status`). Both are
+drawn here, and not in the status row above it, because that row belongs to
+the preview render and is overwritten by it.
 
 Notes:
 Extracted verbatim from panel.rs. Methods are pub(super) because
@@ -42,6 +45,21 @@ impl TypingCreatePanelState {
                     },
                 );
             });
+
+            // Sticky warning of the LAST APPLIED advanced form: its inline tags could not
+            // be put back and the form is in effect without them. It is drawn here, and
+            // not in the status row above, because the status row belongs to the preview
+            // render — `queue_preview_render` claims it inside the very call that applies
+            // the form — while a silently dropped `<m …>` style has to stay readable until
+            // the formed text is replaced.
+            if let Some(warning) = self.advanced_form_tags_lost_status() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(warning).color(ui.visuals().warn_fg_color),
+                    )
+                    .wrap(),
+                );
+            }
 
             // Factual per-render font diagnostic of the image shown below: which
             // characters the fallback chain drew instead of the selected font, and

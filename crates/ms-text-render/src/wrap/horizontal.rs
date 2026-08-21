@@ -222,6 +222,7 @@ struct SolveState {
     must_not_expand: bool,
 }
 
+/// Wraps `text` (the WHOLE text of one render, paragraphs included) to `settings`.
 pub(super) fn wrap_text_with_targets_scored(
     text: &str,
     settings: WrapSettings<'_>,
@@ -286,6 +287,7 @@ pub(super) fn estimate_line_capacity_units(
     ((base_width_px / avg_char_width_px).floor() as usize).max(1)
 }
 
+/// Wraps one paragraph of the text `wrap_text_with_targets_scored` was given.
 fn wrap_paragraph_with_targets_scored(
     paragraph: &str,
     settings: WrapSettings<'_>,
@@ -704,6 +706,9 @@ fn collect_line_break_candidates(
     out
 }
 
+/// Builds the last-resort mid-word break candidate for the first remaining block.
+///
+/// `None` when the block must not be split at all.
 fn build_emergency_break_candidate(
     blocks: &[Block],
     max_units: usize,
@@ -1372,6 +1377,74 @@ mod tests {
             if current_target < previous_target {
                 assert!(widths[idx] <= widths[idx - 1], "{widths:?} vs {targets:?}");
             }
+        }
+    }
+
+    // --- Emergency split and letter case -------------------------------------
+    //
+    // `hyphen_dicts: None` in `wrap_text_with_targets` disables dictionary
+    // hyphenation entirely, so these tests exercise the emergency (last resort)
+    // split alone — the only path the removed acronym heuristic could block.
+
+    #[test]
+    fn all_caps_latin_word_is_emergency_split() {
+        // Regression: the emergency guard used to refuse any all-caps Latin block, so
+        // a shouted word with no dictionary break got no last-resort split at all and
+        // overflowed the line.
+        let lines = wrap_text_with_targets("HYPHENATION", 5, None, true, false);
+        assert!(
+            lines.len() > 1,
+            "an all-caps word must be emergency-split: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with('-')),
+            "a wrapped line must carry the emergency hyphen: {lines:?}"
+        );
+        assert_eq!(
+            lines.join("").replace('-', ""),
+            "HYPHENATION",
+            "the split must not lose or add characters: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_caps_word_is_split_whatever_the_text_around_it_looks_like() {
+        // The deliberate behaviour change: a lowercase word next to the shouted one
+        // used to re-arm the acronym guard and leave "HYPHENATION" unbreakable. The
+        // surrounding text has no say any more.
+        let lines = wrap_text_with_targets("the HYPHENATION", 5, None, true, false);
+        assert!(
+            !lines.iter().any(|line| line.trim() == "HYPHENATION"),
+            "the word must not survive whole and overflow the line: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with('-')),
+            "a wrapped line must carry the emergency hyphen: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn emergency_split_does_not_depend_on_letter_case() {
+        // Pin of the new contract: wrapping an uppercase text is the uppercase of
+        // wrapping its lowercase form, in both scripts.
+        for lower_text in ["переносить", "hyphenation"] {
+            let lower = wrap_text_with_targets(lower_text, 6, None, true, false);
+            let upper = wrap_text_with_targets(
+                lower_text.to_uppercase().as_str(),
+                6,
+                None,
+                true,
+                false,
+            );
+            assert!(
+                lower.len() > 1,
+                "the {lower_text} fixture must actually be emergency-split: {lower:?}"
+            );
+            let upper_of_lower = lower
+                .iter()
+                .map(|line| line.to_uppercase())
+                .collect::<Vec<_>>();
+            assert_eq!(upper, upper_of_lower, "lower: {lower:?}");
         }
     }
 }

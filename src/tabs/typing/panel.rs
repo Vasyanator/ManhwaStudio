@@ -135,7 +135,7 @@ use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
 use crate::tabs::typing::tab::TypingExportFormat;
 use crate::tabs::typing::tab::decode_vector_mesh_warp;
 use crate::tabs::typing::render_next::forms::{
-    self, PeakBase, PresetLabel, TextForm, TextFormPreset,
+    self, InlineTagScope, PeakBase, PresetLabel, TextForm, TextFormPreset,
 };
 use crate::tabs::typing::segmentation::Conservatism;
 use crate::tabs::typing::render_next::{FontContent, FontFaceCache, load_font_content};
@@ -1920,6 +1920,21 @@ struct TypingCreatePanelState {
     /// Сформированный (разбитый на строки) текст. Если не пуст — в рендер идёт
     /// именно он, а `text` остаётся исходным. Пуст — рендерится `text`.
     formed_text: String,
+    /// The form in `formed_text` could not carry the inline tags of its source back and
+    /// was applied WITHOUT them (`create_advanced::apply_advanced_form`).
+    ///
+    /// A sticky field of its own and NOT `status_line`, because the create panel — the one
+    /// that hosts the form window — renders a preview, and the render owns that line:
+    /// `queue_preview_render` overwrites it SYNCHRONOUSLY inside the very call that
+    /// applies the form, and `poll_preview_render_results` overwrites it again when the
+    /// render lands. A warning about silently dropped styling has to outlive a render
+    /// cycle, so it is drawn as its own row next to the per-render font diagnostic
+    /// (`create_sections::draw_preview_section`).
+    ///
+    /// Describes the formed text currently in effect: every form application sets or
+    /// clears it, and it is cleared wherever `formed_text` is replaced from another
+    /// source (overlay switch, document load, «Вернуть исходный»).
+    advanced_form_tags_lost: bool,
     /// Какой из двух текстов развёрнут в панели (конкурирующий аккордеон):
     /// `true` — сформированный, `false` — исходный.
     advanced_text_show_formed: bool,
@@ -1956,6 +1971,43 @@ struct TypingCreatePanelState {
 /// из прошедших фильтр.
 const ADVANCED_FORM_DISPLAY_LIMIT: usize = 600;
 
+/// The search text and the scope the engine will strip it with, compared as ONE input.
+///
+/// The forms depend on the pair ONLY through `forms::strip_inline_tags(raw, scope)` — the
+/// break graph, the width alphabet and the markup put back on the applied form all start
+/// there — so two pairs that strip alike ARE the same input and must not read as a base
+/// change. A base change restarts the search AND wipes the window's display filters
+/// (`reset_display_filters`), which is exactly what must not happen for a difference the
+/// engine cannot see.
+///
+/// The difference that would otherwise be reported is the `base_font_size_px` inside
+/// `InlineTagScope::All`. It belongs to the input (it decides whether `<offset=…>` /
+/// `<stretching=…>` are tags at all), but for a text whose tag bodies do not depend on it
+/// — any text without such a tag — every font size gives the same forms, and before the
+/// scope entered the base a size change did not restart the search at all: the metric is
+/// measured in 1/1000 em and `advanced_form_line_height_em` is size-invariant while line
+/// spacing and glyph height/width are in PERCENT (their defaults).
+///
+/// `PartialEq` is manual for that reason and stays reflexive even if the size were `NaN`:
+/// a scope always strips its own text exactly like itself.
+#[derive(Debug, Clone)]
+struct AdvancedFormSearchText {
+    /// СЫРОЙ исходный текст с инлайновыми тегами (`advanced_form_source_text`):
+    /// теги снимает сам движок форм, панель их не трогает.
+    raw: String,
+    /// Какие инлайновые теги движок снимает — производное от «Инлайновых тегов»
+    /// (`advanced_form_inline_tag_scope`).
+    scope: InlineTagScope,
+}
+
+impl PartialEq for AdvancedFormSearchText {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+            && (self.scope == other.scope
+                || forms::scopes_strip_alike(self.raw.as_str(), self.scope, other.scope))
+    }
+}
+
 /// Всё, от чего зависит НАБОР найденных форм, кроме диапазонов фильтров окна.
 ///
 /// Смена базы означает другой текст/шрифт/пресет/ручку перебора, то есть другой
@@ -1972,10 +2024,14 @@ const ADVANCED_FORM_DISPLAY_LIMIT: usize = 600;
 /// (`AdvancedFormParams::clamp_to_supported_range` для ручек и
 /// `advanced_form_line_height_em` для высоты строки), поэтому производное
 /// `PartialEq` рефлексивно и сравнение ключа не может зациклить перезапуск.
+/// The one real that is NOT a field of this struct — the `base_font_size_px` inside
+/// `text.scope` — is covered twice over: `advanced_form_inline_tag_scope` builds it as
+/// `font_size_px.max(1.0)` and `f32::max` returns the operand that is not `NaN`, and
+/// [`AdvancedFormSearchText`]'s own `PartialEq` is reflexive even if it ever were `NaN`.
 #[derive(Debug, Clone, PartialEq)]
 struct AdvancedFormSearchBase {
-    /// Подготовленный исходный текст (`advanced_form_source_text`).
-    source_text: String,
+    /// Текст поиска и область снятия тегов — ОДИН вход, см. [`AdvancedFormSearchText`].
+    text: AdvancedFormSearchText,
     preset: TextFormPreset,
     /// Шрифт/начертание/висячая пунктуация — от них зависят ширины строк.
     metric: AdvancedFormMetricSignature,

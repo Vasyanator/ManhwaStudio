@@ -179,6 +179,277 @@ impl InlineStyleState {
     }
 }
 
+/// Одна inline-конструкция `<...>`, уже разобранная вместе со своим значением.
+///
+/// Это ЕДИНСТВЕННОЕ описание словаря inline-тегов в крейте: и парсер стилей
+/// ([`parse_inline_style_tags`]), и перебор форм (`wrap::forms`, через
+/// [`classify_inline_tag_body`]) спрашивают именно его. Пока словарь один, «тег
+/// для рендера» и «тег для перебора форм» не могут разойтись — а разойдясь, они
+/// сдвинули бы теги применённой формы относительно того, что рисует рендер.
+#[derive(Debug, Clone, PartialEq)]
+enum InlineTag {
+    /// `<b>`/`<strong>` (`None` = настоящий Bold-фейс) или `<b=...>` (faux).
+    BoldOpen(Option<FauxBoldParams>),
+    BoldClose,
+    /// `<i>`/`<em>` (`None` = настоящий Italic-фейс) или `<i=наклон>` (faux).
+    ItalicOpen(Option<f32>),
+    ItalicClose,
+    NoBreakOpen,
+    NoBreakClose,
+    AlignOpen(HorizontalAlign),
+    AlignClose,
+    FontOpen(String),
+    FontClose,
+    SizeOpen(f32),
+    SizeClose,
+    ColorOpen([u8; 4]),
+    ColorClose,
+    LineSpacingOpen([f32; 2]),
+    LineSpacingClose,
+    KerningOpen([f32; 2]),
+    KerningClose,
+    StretchOpen([f32; 2]),
+    StretchClose,
+    OffsetOpen(InlineGlyphOffset),
+    OffsetClose,
+    /// Машиночитаемый `<m ...>` со списком `(ключ, значение)`.
+    MachineOpen(Vec<(char, String)>),
+    MachineClose,
+    /// `<br>`/`<br/>`/`</br>` — парсер превращает его в `'\n'`.
+    Break,
+}
+
+/// Грубая категория inline-тега — всё, что нужно потребителю, который тег не
+/// применяет, а только снимает (перебор форм).
+///
+/// `StyleOpen`/`StyleClose` намеренно не различают вид стиля: снимающему важно
+/// лишь то, что тег есть, и с какой стороны разрыва строки его вернуть на место
+/// (закрывающий — в конец предыдущей строки, открывающий — в начало следующей).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineTagClass {
+    /// `<no-break>`/`<nobreak>`/`<nobr>`.
+    NoBreakOpen,
+    /// `</no-break>`/`</nobreak>`/`</nobr>`.
+    NoBreakClose,
+    /// `<br>` и его написания.
+    Break,
+    /// `<m ...>`; `protects_no_break` — кадр несёт флаг `j` («не разрывать»).
+    MachineOpen { protects_no_break: bool },
+    /// `</m>`.
+    MachineClose,
+    /// Любой другой открывающий тег стиля (`<b>`, `<font=...>`, `<color=...>`, ...).
+    StyleOpen,
+    /// Любой другой закрывающий тег стиля (`</b>`, `</font>`, ...).
+    StyleClose,
+}
+
+impl InlineTag {
+    /// Категория тега для потребителей, которым нужен только словарь.
+    #[must_use]
+    fn class(&self) -> InlineTagClass {
+        match self {
+            Self::BoldOpen(_)
+            | Self::ItalicOpen(_)
+            | Self::AlignOpen(_)
+            | Self::FontOpen(_)
+            | Self::SizeOpen(_)
+            | Self::ColorOpen(_)
+            | Self::LineSpacingOpen(_)
+            | Self::KerningOpen(_)
+            | Self::StretchOpen(_)
+            | Self::OffsetOpen(_) => InlineTagClass::StyleOpen,
+            Self::BoldClose
+            | Self::ItalicClose
+            | Self::AlignClose
+            | Self::FontClose
+            | Self::SizeClose
+            | Self::ColorClose
+            | Self::LineSpacingClose
+            | Self::KerningClose
+            | Self::StretchClose
+            | Self::OffsetClose => InlineTagClass::StyleClose,
+            Self::NoBreakOpen => InlineTagClass::NoBreakOpen,
+            Self::NoBreakClose => InlineTagClass::NoBreakClose,
+            Self::Break => InlineTagClass::Break,
+            Self::MachineOpen(attrs) => InlineTagClass::MachineOpen {
+                protects_no_break: machine_tag_protects_no_break(attrs),
+            },
+            Self::MachineClose => InlineTagClass::MachineClose,
+        }
+    }
+}
+
+/// Несёт ли машиночитаемый тег флаг `j` — «не разрывать содержимое при подборе форм».
+#[must_use]
+fn machine_tag_protects_no_break(attrs: &[(char, String)]) -> bool {
+    attrs.iter().any(|(key, _)| matches!(*key, 'j' | 'J'))
+}
+
+/// Разбирает СОДЕРЖИМОЕ одного `<...>` (без угловых скобок, уже обрезанное по краям).
+///
+/// `None` означает «это не тег»: и парсер стилей, и перебор форм обязаны тогда
+/// оставить последовательность литеральным текстом. Признание тегом зависит и от
+/// ЗНАЧЕНИЯ: `<size=abc>` тегом не является. `base_font_size_px` — тот же кегль,
+/// что уйдёт в рендер: от него зависят процентные значения `<offset=...>` и
+/// `<stretching=...>`, а значит (через проверку на конечность) и само признание
+/// таких тегов.
+///
+/// Порядок проверок — контракт: сначала фиксированный словарь по «сжатому» виду
+/// (без ASCII-пробелов, в нижнем регистре), затем разборщики значений по СЫРОМУ
+/// виду, и лишь в конце машиночитаемый `<m ...>`.
+#[must_use]
+fn parse_inline_tag(raw: &str, base_font_size_px: f32) -> Option<InlineTag> {
+    let raw = raw.trim();
+    let compact = raw
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    let fixed = match compact.as_str() {
+        "b" | "strong" => Some(InlineTag::BoldOpen(None)),
+        "/b" | "/strong" => Some(InlineTag::BoldClose),
+        "i" | "em" => Some(InlineTag::ItalicOpen(None)),
+        "/i" | "/em" => Some(InlineTag::ItalicClose),
+        "no-break" | "nobreak" | "nobr" => Some(InlineTag::NoBreakOpen),
+        "/no-break" | "/nobreak" | "/nobr" => Some(InlineTag::NoBreakClose),
+        "/align" => Some(InlineTag::AlignClose),
+        "/font" => Some(InlineTag::FontClose),
+        "/size" => Some(InlineTag::SizeClose),
+        "/color" => Some(InlineTag::ColorClose),
+        "/line-spacing" => Some(InlineTag::LineSpacingClose),
+        "/kerning" => Some(InlineTag::KerningClose),
+        "/stretching" => Some(InlineTag::StretchClose),
+        "/offset" => Some(InlineTag::OffsetClose),
+        "/m" => Some(InlineTag::MachineClose),
+        "br" | "br/" | "/br" => Some(InlineTag::Break),
+        _ => None,
+    };
+    if fixed.is_some() {
+        return fixed;
+    }
+
+    if let Some(faux_bold) = parse_faux_bold_tag(raw) {
+        return Some(InlineTag::BoldOpen(Some(faux_bold)));
+    }
+    if let Some(slant_deg) = parse_faux_italic_tag(raw) {
+        return Some(InlineTag::ItalicOpen(Some(slant_deg)));
+    }
+    if let Some(align) = parse_align_tag_value(raw) {
+        return Some(InlineTag::AlignOpen(align));
+    }
+    if let Some(font_label) = parse_font_tag_label(raw) {
+        return Some(InlineTag::FontOpen(font_label));
+    }
+    if let Some(font_size_px) = parse_size_tag_value(raw) {
+        return Some(InlineTag::SizeOpen(font_size_px));
+    }
+    if let Some(text_color) = parse_color_tag_value(raw) {
+        return Some(InlineTag::ColorOpen(text_color));
+    }
+    if let Some(line_spacing) = parse_line_spacing_tag_value(raw) {
+        return Some(InlineTag::LineSpacingOpen(line_spacing));
+    }
+    if let Some(kerning) = parse_kerning_tag_value(raw) {
+        return Some(InlineTag::KerningOpen(kerning));
+    }
+    if let Some(stretching) = parse_stretching_tag_value(raw, base_font_size_px) {
+        return Some(InlineTag::StretchOpen(stretching));
+    }
+    if let Some(glyph_offset) = parse_offset_tag_value(raw, base_font_size_px) {
+        return Some(InlineTag::OffsetOpen(glyph_offset));
+    }
+    parse_machine_tag(raw).map(InlineTag::MachineOpen)
+}
+
+/// Категория содержимого одного `<...>`, или `None`, если это не тег.
+///
+/// Тонкая обёртка над [`parse_inline_tag`] для потребителей, которым нужен
+/// только словарь (перебор форм снимает теги и возвращает их обратно). Общий
+/// разборщик — единственная причина, по которой эти два множества тегов не могут
+/// разойтись; см. [`InlineTag`].
+#[must_use]
+pub(crate) fn classify_inline_tag_body(
+    raw: &str,
+    base_font_size_px: f32,
+) -> Option<InlineTagClass> {
+    parse_inline_tag(raw, base_font_size_px).map(|tag| tag.class())
+}
+
+/// Применяет разобранный тег к состоянию парсера.
+///
+/// Закрывает активный span у КАЖДОГО тега, меняющего стиль, и только у них:
+/// `<br>` стиль не меняет и лишь дописывает `'\n'` в plain-текст.
+fn apply_inline_tag(
+    tag: InlineTag,
+    plain_text: &mut String,
+    spans: &mut Vec<InlineStyleSpan>,
+    span_start: &mut usize,
+    state: &mut InlineStyleState,
+    base_font_size_px: f32,
+) {
+    if matches!(tag, InlineTag::Break) {
+        plain_text.push('\n');
+        return;
+    }
+    flush_active_span(plain_text, spans, span_start, state);
+    match tag {
+        InlineTag::BoldOpen(faux) => state.bold_stack.push(faux),
+        InlineTag::BoldClose => {
+            state.bold_stack.pop();
+        }
+        InlineTag::ItalicOpen(slant_deg) => state.italic_stack.push(slant_deg),
+        InlineTag::ItalicClose => {
+            state.italic_stack.pop();
+        }
+        // Оба тега «не разрывать» для рендера — чистые разделители: диапазон
+        // защищает перебор форм (`wrap::forms`), рендеру он ничего не задаёт.
+        InlineTag::NoBreakOpen | InlineTag::NoBreakClose => {}
+        InlineTag::AlignOpen(align) => state.align_stack.push(align),
+        InlineTag::AlignClose => {
+            state.align_stack.pop();
+        }
+        InlineTag::FontOpen(label) => state.font_stack.push(label),
+        InlineTag::FontClose => {
+            state.font_stack.pop();
+        }
+        InlineTag::SizeOpen(font_size_px) => state.size_stack.push(font_size_px),
+        InlineTag::SizeClose => {
+            state.size_stack.pop();
+        }
+        InlineTag::ColorOpen(color) => state.color_stack.push(color),
+        InlineTag::ColorClose => {
+            state.color_stack.pop();
+        }
+        InlineTag::LineSpacingOpen(value) => state.line_spacing_stack.push(value),
+        InlineTag::LineSpacingClose => {
+            state.line_spacing_stack.pop();
+        }
+        InlineTag::KerningOpen(value) => state.kerning_stack.push(value),
+        InlineTag::KerningClose => {
+            state.kerning_stack.pop();
+        }
+        InlineTag::StretchOpen(value) => state.stretch_stack.push(value),
+        InlineTag::StretchClose => {
+            state.stretch_stack.pop();
+        }
+        InlineTag::OffsetOpen(offset) => state.offset_stack.push(offset),
+        InlineTag::OffsetClose => {
+            state.offset_stack.pop();
+        }
+        InlineTag::MachineOpen(attrs) => apply_machine_tag(state, &attrs, base_font_size_px),
+        InlineTag::MachineClose => close_machine_tag(state),
+        // Обработан выше, до закрытия span'а.
+        InlineTag::Break => {}
+    }
+}
+
+/// Разбирает текст с inline-тегами в plain-текст плюс модель span'ов стилей.
+///
+/// Нераспознанная последовательность `<...>` остаётся в plain-тексте ЛИТЕРАЛЬНО:
+/// признание тегом целиком отдано [`parse_inline_tag`] — единственному словарю
+/// крейта. `base_font_size_px` — кегль, от которого считаются процентные
+/// значения `<offset=...>`/`<stretching=...>`.
 pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> ParsedInlineStyles {
     let mut plain_text = String::with_capacity(text.len());
     let mut spans = Vec::<InlineStyleSpan>::new();
@@ -196,159 +467,15 @@ pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> Par
             && let Some(rel_end) = text[i + 1..].find('>')
         {
             let end = i + 1 + rel_end;
-            let raw = text[i + 1..end].trim();
-            let compact = raw
-                .chars()
-                .filter(|character| !character.is_ascii_whitespace())
-                .collect::<String>()
-                .to_ascii_lowercase();
-
-            let handled_tag = match compact.as_str() {
-                "b" | "strong" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    // Bare tag = real Bold face (legacy behavior, no faux params).
-                    state.bold_stack.push(None);
-                    true
-                }
-                "/b" | "/strong" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.bold_stack.pop();
-                    true
-                }
-                "i" | "em" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    // Bare tag = real Italic face (legacy behavior, no faux slant).
-                    state.italic_stack.push(None);
-                    true
-                }
-                "/i" | "/em" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.italic_stack.pop();
-                    true
-                }
-                "no-break" | "nobreak" | "nobr" | "/no-break" | "/nobreak" | "/nobr" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    true
-                }
-                "/align" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.align_stack.pop();
-                    true
-                }
-                "/font" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.font_stack.pop();
-                    true
-                }
-                "/size" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.size_stack.pop();
-                    true
-                }
-                "/color" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.color_stack.pop();
-                    true
-                }
-                "/line-spacing" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.line_spacing_stack.pop();
-                    true
-                }
-                "/kerning" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.kerning_stack.pop();
-                    true
-                }
-                "/stretching" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.stretch_stack.pop();
-                    true
-                }
-                "/offset" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.offset_stack.pop();
-                    true
-                }
-                "/m" => {
-                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    close_machine_tag(&mut state);
-                    true
-                }
-                "br" | "br/" | "/br" => {
-                    plain_text.push('\n');
-                    true
-                }
-                _ => false,
-            };
-            if handled_tag {
-                i = end + 1;
-                continue;
-            }
-
-            if let Some(faux_bold) = parse_faux_bold_tag(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.bold_stack.push(Some(faux_bold));
-                i = end + 1;
-                continue;
-            }
-            if let Some(slant_deg) = parse_faux_italic_tag(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.italic_stack.push(Some(slant_deg));
-                i = end + 1;
-                continue;
-            }
-            if let Some(align) = parse_align_tag_value(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.align_stack.push(align);
-                i = end + 1;
-                continue;
-            }
-            if let Some(font_label) = parse_font_tag_label(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.font_stack.push(font_label);
-                i = end + 1;
-                continue;
-            }
-            if let Some(font_size_px) = parse_size_tag_value(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.size_stack.push(font_size_px);
-                i = end + 1;
-                continue;
-            }
-            if let Some(text_color) = parse_color_tag_value(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.color_stack.push(text_color);
-                i = end + 1;
-                continue;
-            }
-            if let Some(line_spacing) = parse_line_spacing_tag_value(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.line_spacing_stack.push(line_spacing);
-                i = end + 1;
-                continue;
-            }
-            if let Some(kerning) = parse_kerning_tag_value(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.kerning_stack.push(kerning);
-                i = end + 1;
-                continue;
-            }
-            if let Some(stretching) = parse_stretching_tag_value(raw, base_font_size_px) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.stretch_stack.push(stretching);
-                i = end + 1;
-                continue;
-            }
-            if let Some(glyph_offset) = parse_offset_tag_value(raw, base_font_size_px) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                state.offset_stack.push(glyph_offset);
-                i = end + 1;
-                continue;
-            }
-            if let Some(attrs) = parse_machine_tag(raw) {
-                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                apply_machine_tag(&mut state, &attrs, base_font_size_px);
+            if let Some(tag) = parse_inline_tag(&text[i + 1..end], base_font_size_px) {
+                apply_inline_tag(
+                    tag,
+                    &mut plain_text,
+                    &mut spans,
+                    &mut span_start,
+                    &mut state,
+                    base_font_size_px,
+                );
                 i = end + 1;
                 continue;
             }
@@ -1190,7 +1317,7 @@ fn parse_hex_color_rgba(value: &str) -> Option<[u8; 4]> {
 mod tests {
     use super::{
         FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
-        parse_inline_style_tags, remap_inline_style_spans,
+        classify_inline_tag_body, parse_inline_style_tags, remap_inline_style_spans,
     };
     use crate::font_registry::{InlineFontRegistry, RegisteredFontFace};
     use crate::types::{FauxBoldParams, HorizontalAlign};
@@ -2015,5 +2142,59 @@ mod tests {
             .expect("inline font size should produce metrics");
         assert_eq!(metrics.font_size, 30.0);
         assert_eq!(metrics.line_height, 36.0);
+    }
+
+    /// Every tag body the crate has to agree on, plus bodies that must NOT be tags.
+    ///
+    /// The two consumers of the vocabulary are `parse_inline_style_tags` (the renderer) and
+    /// `classify_inline_tag_body` (the form search, through `wrap::forms`). Both go through
+    /// `parse_inline_tag`, so they agree by construction — this corpus is what fails if a
+    /// future change gives either of them a dispatch of its own again.
+    const TAG_BODY_CORPUS: &[&str] = &[
+        // Fixed vocabulary, both cases and both spellings.
+        "b", "B", "strong", "/b", "/strong", "i", "em", "/i", "/em", "no-break", "NoBreak",
+        "nobr", "/no-break", "/nobreak", "/nobr", "/align", "/font", "/size", "/color",
+        "/line-spacing", "/kerning", "/stretching", "/offset", "/m", "br", "br/", "/br",
+        // Parameterized tags, whitespace and quoting variants included.
+        "b=3", "b=default", "b = 3", "strong=5,round", "i=15", "em=-10", "align=center",
+        "align=0.5", "font=Arial", "font=\"PT Sans\"", "size=24", "size=24px", "color=#ff0000",
+        "color=ff00ff80", "line-spacing=10", "line-spacing=2,3", "kerning=5%", "kerning=-4",
+        "stretching=120%,90%", "stretching=12,9", "offset=1,2", "offset=10%,-5%,3,1,15,30",
+        // Machine tags.
+        "m", "m j", "m b=1 c=ff0000", "m q j a=center",
+        // Not tags: unknown names, unreadable values, malformed machine tags.
+        "", " ", "unknown", "unknown=1", "/unknown", "size=abc", "color=zzz", "offset=abc",
+        "stretching=1", "m=1", "main", "font=", "i=abc",
+    ];
+
+    #[test]
+    fn the_tag_vocabulary_is_the_same_for_the_parser_and_the_classifier() {
+        for base_font_size_px in [1.0_f32, 24.0, 240.0] {
+            for body in TAG_BODY_CORPUS {
+                let literal = format!("<{body}>");
+                let parsed = parse_inline_style_tags(&literal, base_font_size_px);
+                // The parser consumed the body exactly when the plain text no longer holds
+                // it literally (`<br>` turns into a newline, every other tag into nothing).
+                let parser_consumed = parsed.plain_text != literal;
+                let classified = classify_inline_tag_body(body, base_font_size_px).is_some();
+                assert_eq!(
+                    parser_consumed, classified,
+                    "<{body}> at {base_font_size_px}px: parser consumed = {parser_consumed}, \
+                     classifier accepted = {classified}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_value_keeps_the_tag_out_of_the_vocabulary() {
+        // Recognition is value-dependent, so a predicate that only knew tag NAMES would
+        // swallow text the renderer is supposed to draw.
+        assert!(classify_inline_tag_body("size=abc", 24.0).is_none());
+        assert_eq!(
+            parse_inline_style_tags("a<size=abc>b", 24.0).plain_text,
+            "a<size=abc>b"
+        );
+        assert!(classify_inline_tag_body("size=24", 24.0).is_some());
     }
 }

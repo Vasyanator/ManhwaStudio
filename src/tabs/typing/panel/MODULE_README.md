@@ -1050,11 +1050,58 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `draw_advanced_form_window`, on every frame the window was open, re-triggered by every
   keystroke — the plain violation of CLAUDE.md §5 the plan's work item B exists to remove.
 - **THE INPUT IS A KEY, AND THE KEY IS THE INVALIDATION.** `AdvancedFormSearchKey` = an
-  `AdvancedFormSearchBase` (prepared source text, preset, `AdvancedFormMetricSignature`, the
-  five knobs that change WHICH forms exist — `filters_prune` is not one of them, see below —
-  and the line height in em) plus the two range filters. A cache whose key
-  differs from the current key is stale; nothing else invalidates it, which is why changing
+  `AdvancedFormSearchBase` (the RAW source text with its inline tags — see the next bullet
+  — the preset, `AdvancedFormMetricSignature`, the five knobs that change WHICH forms exist
+  — `filters_prune` is not one of them, see below — and the line height in em) plus the two
+  range filters. A cache whose key differs from the current key is stale; nothing else invalidates it, which is why changing
   the preset or reopening the window no longer throws the previous result away.
+- **THE ENGINE GETS THE TAGS, AND GIVES THEM BACK.** `advanced_form_source_text` returns
+  `self.text` VERBATIM, inline tags and all. Both consumers of that string strip the tags
+  themselves, each once, from the raw text: `forms::search_forms` (to build the break graph)
+  and `forms::GlyphWidths::build` (to build the width alphabet, which needs the NBSP the
+  strip produces). The panel pre-stripping them was a silent defeat of «Не разрывать» — the
+  engine then saw a text with no tags left to honour. See the "Inline tags: the text arrives
+  RAW and the tags go back" section of `crates/ms-text-render/src/wrap/MODULE_README.md`.
+  - **WHICH tags is `advanced_form_inline_tag_scope`,** derived from
+    `enable_inline_style_tags`: with the flag OFF the renderer draws `<b>` literally, so the
+    search must keep and measure it (`InlineTagScope::NoBreakOnly`); with it ON the renderer
+    consumes it, so the search must not measure markup as letters (`InlineTagScope::All`,
+    carrying the same `font_size_px` the render receives). The scope lives in
+    `AdvancedFormSearchBase` because it changes WHICH forms exist. `run_advanced_form_search`
+    reads it ONCE and hands the same value to the metric build and to the search — the two
+    must never disagree, and `build_advanced_form_glyph_widths_from_spec` therefore takes it
+    as an argument instead of storing a second copy in `AdvancedFormMetricSpec`.
+  - **Known limitation: a shake effect parses the tags the form search measured.** The
+    renderer parses inline tags when `enable_inline_style_tags || preprocess_generated_inline_tags`
+    (`ms-text-render/src/pipeline.rs`), and the Text-Shake preprocess effect sets the second
+    flag whenever its spread is non-zero (`ms-text-render/src/effects/mod.rs`). So with the
+    checkbox OFF *and* a shake active, the render consumes `<b>` while the search kept and
+    MEASURED it: the chosen form is that of a slightly wider text than the one drawn. The
+    scope stays derived from the checkbox alone — it is a user-visible switch, while the
+    effect list is not, and a scope that silently followed an effect would make the same
+    text produce different forms for reasons the window cannot show. Not a regression (the
+    old panel measured the markup at every setting). REMOVE this note when the renderer
+    stops widening its tag vocabulary behind the checkbox — i.e. when the shake preprocess
+    emits its offsets through a channel that is not the user's tag syntax, at which point
+    `preprocess_generated_inline_tags` disappears and the checkbox is the whole truth again.
+  - **`apply_advanced_form` re-tags the CHOSEN form** through
+    `forms::reapply_inline_tags_to_form_text`, using the base of the SHOWN result
+    (`cache.key.base`), not the panel's current text: the window keeps drawing the previous
+    cards while a debounced search runs, so a keystroke in between must not shift the markup.
+    `formed_text` REPLACES the source text in the render, so without this step choosing a
+    form silently erased every `<m …>` style — the panel's default tag form. On a mapping
+    refusal the untagged form text is applied, `runtime_log::log_warn` records why, and the
+    user is told (`typing.advanced.form_tags_lost_status`); a guessed position is never used.
+    The preview CARDS stay tag-free, which is also what makes their widths right.
+  - **That warning does NOT live in `status_line`.** The create panel — the only one that
+    hosts the window — renders a preview, and the preview owns that line: `queue_preview_render`
+    overwrites it synchronously inside the very call that applies the form, and
+    `poll_preview_render_results` overwrites it again when the render lands. The refusal is
+    therefore kept in the sticky `advanced_form_tags_lost` and drawn as its own row by
+    `create_sections::draw_preview_section`, next to the per-render font diagnostic. It
+    describes the formed text in effect, so it is cleared wherever `formed_text` is replaced
+    from another source (overlay switch, document load, «Вернуть исходный»). Any test of it
+    must run with `preview_enabled == true`, or it passes vacuously.
 - **Frame order, exactly:** `poll_advanced_form_font` → `poll_advanced_form_search` (accept a
   finished result) → `schedule_advanced_form_search` (reset ranges on a base change, debounce,
   spawn) → `reorder_advanced_form_cache_if_needed` → `poll_advanced_form_params_save` → draw
@@ -1159,3 +1206,8 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `create_presets.rs` (`font_fallback_status_lines`, `truncated_char_list`); to
   change where they are drawn, see `create_sections.rs::draw_preview_section`; to
   change WHAT the renderer reports, see `crates/ms-text-render/src/fallback_diag.rs`.
+- To change the "the applied form lost its inline tags" warning, see
+  `create_advanced.rs` (`apply_advanced_form` sets `advanced_form_tags_lost`,
+  `advanced_form_tags_lost_status` words it) and `create_sections.rs::draw_preview_section`
+  (where it is drawn). It must never move back into `status_line` — the preview render
+  owns that line.

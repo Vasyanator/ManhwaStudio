@@ -4222,6 +4222,219 @@ paths change.
         );
     }
 
+    /// The panel hands the form engine the RAW editor text, inline tags and all.
+    ///
+    /// It used to strip the no-break tags here. The engine strips them itself — and a
+    /// second strip over an already clean text finds no tags at all, marks every run
+    /// breakable and hyphenates the very range the user protected, so «Не разрывать» was
+    /// silently doing nothing in the advanced-form window.
+    #[test]
+    fn advanced_form_source_text_keeps_the_inline_no_break_tags() {
+        let mut state = advanced_form_fixture_panel();
+        state.text = "пример <no-break>не разрывать</no-break> конец".to_string();
+
+        assert_eq!(state.advanced_form_source_text(), state.text);
+    }
+
+    /// End to end over the panel's OWN width metric: every form the engine returns for the
+    /// panel's source text keeps the protected range on one line, and the metric measures
+    /// the NBSP that replaced its space.
+    ///
+    /// The NBSP exists only after the strip, so a metric built from a pre-stripped text
+    /// would have no advance for it and score every protected space as zero width — which
+    /// is why `forms::GlyphWidths::build` takes the raw text and prepares it itself.
+    #[test]
+    fn advanced_form_search_never_splits_a_no_break_range() {
+        use forms::LineWidthMetric;
+        const PROTECTED: &str = "не\u{00A0}разрывать";
+
+        let mut state = advanced_form_fixture_panel();
+        state.text = "пример <no-break>не разрывать</no-break> конец".to_string();
+        let source = state.advanced_form_source_text();
+        let metric = state
+            .build_advanced_form_glyph_widths(&source)
+            .expect("the fixture font must load");
+        assert!(
+            metric.line_width(PROTECTED) > metric.line_width("неразрывать"),
+            "the metric must know the NBSP the strip produced, not score it as zero width"
+        );
+
+        let mut knobs = AdvancedFormParams::default();
+        knobs.clamp_to_supported_range();
+        // The glyph metric measures in 1/1000 em, so a 120 % line height is 1200 units.
+        let params = knobs.to_search_params(1200.0, None, None);
+        // The metric and the search MUST be given the same scope; the panel derives it once.
+        let result = forms::search_forms(
+            &source,
+            TextFormPreset::FreeNoTree,
+            &metric,
+            &params,
+            state.advanced_form_inline_tag_scope(),
+        );
+
+        assert!(!result.forms.is_empty(), "the search must find some form");
+        for form in &result.forms {
+            assert!(
+                form.lines.iter().any(|line| line.contains(PROTECTED)),
+                "form {:?} split the protected range",
+                form.lines
+            );
+        }
+    }
+
+    /// Смена кегля перезапускает перебор только тогда, когда может изменить его исход.
+    ///
+    /// `base_font_size_px` попал в базу вместе с областью снятия тегов, потому что от него
+    /// зависит признание `<offset=…>`/`<stretching=…>` тегами. Но смена базы ещё и стирает
+    /// сужённые пользователем фильтры окна (`reset_display_filters`), а для текста, чьи теги
+    /// от кегля не зависят, набор форм при этом тот же самый: базы обязаны совпасть.
+    #[test]
+    fn a_font_size_change_alone_does_not_restart_the_form_search() {
+        let mut knobs = AdvancedFormParams::default();
+        knobs.clamp_to_supported_range();
+
+        let mut state = advanced_form_fixture_panel();
+        state.enable_inline_style_tags = true;
+        state.text = "начало <m b=1 c=ff0000>очень важное</m> продолжение конец".to_string();
+        state.font_size_px = 24.0;
+        let small = state.advanced_form_search_base(&knobs);
+        state.font_size_px = 48.0;
+        let large = state.advanced_form_search_base(&knobs);
+        assert_eq!(
+            small, large,
+            "no tag body of this text depends on the font size, so the forms cannot differ"
+        );
+
+        // А тег, признание которого от кегля ЗАВИСИТ, базы обязан развести: при 240 px
+        // процент переполняет f32, значение перестаёт быть конечным — и тегом это уже не
+        // является, то есть текст сегментируется другой.
+        state.text = "начало <offset=2e38%,1>очень важное</offset> конец".to_string();
+        state.font_size_px = 1.0;
+        let tiny = state.advanced_form_search_base(&knobs);
+        state.font_size_px = 240.0;
+        let huge = state.advanced_form_search_base(&knobs);
+        assert_ne!(
+            tiny, huge,
+            "a size that changes what counts as a tag must restart the search"
+        );
+
+        // И сама галка «Инлайновые теги» — всегда смена базы: она меняет и словарь.
+        state.font_size_px = 24.0;
+        let with_tags = state.advanced_form_search_base(&knobs);
+        state.enable_inline_style_tags = false;
+        assert_ne!(with_tags, state.advanced_form_search_base(&knobs));
+    }
+
+    /// Собирает базу поиска и первую найденную форму для текущего состояния панели,
+    /// меряя посимвольно (тест не про метрику).
+    fn first_advanced_form(state: &TypingCreatePanelState) -> (AdvancedFormSearchBase, TextForm) {
+        let mut knobs = AdvancedFormParams::default();
+        knobs.clamp_to_supported_range();
+        let base = state.advanced_form_search_base(&knobs);
+        let metric = forms::CharWidthMetric::new(state.hanging_punctuation);
+        let params = knobs.to_search_params(base.line_height_em * 2.0, None, None);
+        let result = forms::search_forms(
+            &base.text.raw,
+            base.preset,
+            &metric,
+            &params,
+            base.text.scope,
+        );
+        let form = result
+            .forms
+            .into_iter()
+            .find(|form| form.lines.len() > 1)
+            .expect("the fixture text must yield a multi-line form");
+        (base, form)
+    }
+
+    /// Применение формы обязано вернуть инлайновые теги исходного текста.
+    ///
+    /// Сформированный текст ЗАМЕЩАЕТ исходный в рендере
+    /// (`create_apply::effective_render_text`), а перебор форм снимает теги, чтобы не
+    /// мерить разметку как буквы. Без возврата тегов выбор формы молча стирал бы стили
+    /// машинного `<m …>` — а это форма тега, которую панель ставит по умолчанию.
+    #[test]
+    fn applying_a_form_carries_the_inline_tags_of_its_source_back() {
+        let mut state = advanced_form_fixture_panel();
+        state.enable_inline_style_tags = true;
+        state.text = "начало <m b=1 c=ff0000>очень важное</m> продолжение конец".to_string();
+
+        let (base, form) = first_advanced_form(&state);
+        // Сами карточки окна тегов не содержат — их показывают уже очищенными.
+        assert!(
+            !form.lines.iter().any(|line| line.contains('<')),
+            "the form cards must show tag-free lines: {:?}",
+            form.lines
+        );
+
+        state.apply_advanced_form(&form, &base);
+        assert_eq!(state.formed_text.matches("<m b=1 c=ff0000>").count(), 1);
+        assert_eq!(state.formed_text.matches("</m>").count(), 1);
+        assert_eq!(
+            state.advanced_form_tags_lost_status(),
+            None,
+            "a successful re-tag must not report anything"
+        );
+        // Исходный текст не тронут — форма живёт только в `formed_text`.
+        assert!(state.text.contains("<m b=1 c=ff0000>"));
+    }
+
+    /// Со снятой галкой «Инлайновые теги» `<b>` — рисуемый текст: он обязан остаться
+    /// в строках формы, а не быть снятым и возвращённым.
+    #[test]
+    fn a_disabled_inline_tag_flag_keeps_the_markup_inside_the_form_lines() {
+        let mut state = advanced_form_fixture_panel();
+        state.enable_inline_style_tags = false;
+        state.text = "начало <b>очень важное</b> продолжение конец".to_string();
+
+        let (base, form) = first_advanced_form(&state);
+        state.apply_advanced_form(&form, &base);
+        assert_eq!(state.formed_text.matches("<b>").count(), 1);
+        assert_eq!(state.formed_text.matches("</b>").count(), 1);
+        assert_eq!(state.advanced_form_tags_lost_status(), None);
+    }
+
+    /// Форма, построенная НЕ из этого текста, не применяется «как получится»: теги не
+    /// угадываются, а пользователь получает сообщение.
+    ///
+    /// Runs with the preview ENABLED, which is the configuration of the create panel that
+    /// actually hosts the window (`TypingTopPanelState::new` builds it with
+    /// `preview_enabled == true`), and the only one in which the report can be lost:
+    /// `apply_advanced_form` ends in `queue_preview_render`, which claims `status_line`
+    /// for the render status in the same call, and `poll_preview_render_results` claims it
+    /// again when the render lands. With the preview off both return early — which is
+    /// exactly why this guard has to keep it on.
+    #[test]
+    fn a_form_whose_tags_cannot_be_placed_is_applied_without_them_and_reported() {
+        let mut state = advanced_form_fixture_panel();
+        state.preview_enabled = true;
+        state.enable_inline_style_tags = true;
+        state.text = "совершенно другой текст здесь".to_string();
+        let (_, form) = first_advanced_form(&state);
+
+        state.text = "начало <m b=1>очень важное</m> продолжение конец".to_string();
+        let mut knobs = AdvancedFormParams::default();
+        knobs.clamp_to_supported_range();
+        let mismatched_base = state.advanced_form_search_base(&knobs);
+
+        state.apply_advanced_form(&form, &mismatched_base);
+        assert_eq!(state.formed_text, form.to_text());
+        assert!(!state.formed_text.contains('<'));
+        assert_eq!(
+            state.advanced_form_tags_lost_status(),
+            Some(t!("typing.advanced.form_tags_lost_status").to_string()),
+            "the user must be told that the styling was dropped"
+        );
+        // И сообщение обязано пережить ЛЮБУЮ смену строки статуса рендером: она
+        // принадлежит превью, а не этому предупреждению.
+        state.status_line = t!("typing.preview.render_done_status").to_string();
+        assert_eq!(
+            state.advanced_form_tags_lost_status(),
+            Some(t!("typing.advanced.form_tags_lost_status").to_string())
+        );
+    }
+
     /// The built-in interface font is offered as the FIRST entry of the panel font
     /// list, is shown under its localized name, and resolves by the reserved,
     /// non-localized identity that is what actually gets persisted.

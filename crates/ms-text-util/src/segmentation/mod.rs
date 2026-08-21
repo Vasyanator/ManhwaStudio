@@ -39,7 +39,7 @@ use std::collections::HashMap;
 
 pub use base::{
     BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions, Segmenter,
-    build_line_text_and_units, count_layout_units,
+    build_line_text_and_units, count_layout_units, is_line_end_dash_char,
 };
 pub use cyrillic_slavic::CyrillicSlavicSegmenter;
 pub use dictionaries::HyphenationDictionaries;

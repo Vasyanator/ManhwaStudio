@@ -109,7 +109,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `pipeline::render_text_to_image`) and `prewarm_font_system_pool` (re-exported for
   the app to call from a background thread).
 - `inline_styles.rs`: parser/remapper for inline tags, attrs-compatible style spans, and
-  line-level inline alignment markers.
+  line-level inline alignment markers. It owns the crate's SINGLE inline-tag vocabulary:
+  `parse_inline_tag` decides what a `<…>` body means (value- and font-size-dependent), the
+  style parser applies its payload, and `classify_inline_tag_body` exposes the same decision
+  to `wrap/forms.rs`, which strips tags for the form search and puts them back on the applied
+  form. Never grow a second dispatch table — the two would drift and the restored tags would
+  land next to the wrong words.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
   bilinear image sampling, and alpha-bounds trimming. Owns the color-glyph bitmap
   fallback and bitmap-based measurement/bounds only; monochrome glyphs on all

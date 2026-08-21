@@ -234,6 +234,7 @@ impl TypingCreatePanelState {
             advanced_form_font: None,
             advanced_form_font_request: None,
             formed_text: String::new(),
+            advanced_form_tags_lost: false,
             advanced_text_show_formed: false,
             advanced_form_line_range: None,
             advanced_form_width_range: None,

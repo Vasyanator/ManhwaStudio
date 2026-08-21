@@ -21,9 +21,21 @@ Used by:
   решения вынесены в `FormSearchParams`; дедлайна по часам нет (крейт собирается
   и под wasm) — только детерминированные бюджеты по числу узлов.
 
+The input text is RAW, and the tags come back:
+Both search entry points and the width metric (`GlyphWidths::build`) take the text WITH
+its inline tags, plus an `InlineTagScope` saying which of them are markup here. This file
+is the only place that removes them (`strip_inline_tags`, private for exactly that reason)
+and the only place that puts them back (`reapply_inline_tags_to_form_text`, applied to the
+CHOSEN form only). The vocabulary itself is not defined here: it comes from
+`inline_styles::classify_inline_tag_body`, the same parser the renderer uses, so "what is a
+tag" cannot differ between the text a form is built from and the text that gets drawn.
+Handing this file an already stripped string leaves it with no tags to honour — no
+protection and nothing to restore. See `wrap/MODULE_README.md`, "Inline tags: the text
+arrives RAW and the tags go back".
+
 Дерево перебора:
 Текст заранее делится на блоки сегментатором (`segmentation::Segmenter::segment`
-после `soft_hyphenate_overlong`, в режиме `BindingMode::Annotate`):
+после словарной разметки мягкими переносами, в режиме `BindingMode::Annotate`):
 орфографические точки переноса (словарь + существующие дефисы; аварийных разрывов
 нет). Служебные слова (предлоги/частицы/«число + единица») НЕ склеиваются — вместо
 этого стык к следующему блоку несёт категорию консервативности (`Conservatism`).
@@ -74,14 +86,15 @@ Notes:
 */
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
 use super::is_hanging_punctuation;
-use crate::types::parse_machine_tag;
+use crate::inline_styles::{InlineTagClass, classify_inline_tag_body};
 use ms_text_util::segmentation::{
     BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions,
-    build_line_text_and_units, with_default_segmenter,
+    build_line_text_and_units, is_line_end_dash_char, with_default_segmenter,
 };
 
 /// Максимум перечисляемых форм за один прогон (защита от комбинаторного взрыва).
@@ -511,16 +524,30 @@ pub struct GlyphWidths {
 }
 
 impl GlyphWidths {
-    /// Строит таблицу для символов `text` (плюс дефис переноса) выбранным
-    /// шрифтом `attrs` в системе `font_system`.
+    /// Строит таблицу для символов `form_source_text` (плюс дефис переноса)
+    /// выбранным шрифтом `attrs` в системе `font_system`.
+    ///
+    /// `form_source_text` — СЫРОЙ текст формы, ровно тот, что уйдёт в
+    /// [`search_forms`]/[`enumerate_forms`]: инлайновые теги снимаются здесь же
+    /// (какие именно — решает `scope`), а пробелы защищённых диапазонов заменяются на
+    /// NBSP — то есть алфавит и пары кернинга измеряются по тем символам, которые
+    /// реально окажутся в строках формы. Передавать сюда уже очищенный текст
+    /// нельзя: тогда NBSP защищённых диапазонов в алфавит не попадёт и такой
+    /// пробел будет измерен как нулевая ширина, а пара символов по краям
+    /// снятого тега — потеряна.
+    ///
+    /// `scope` ОБЯЗАН совпадать с тем, что получит [`search_forms`]/[`enumerate_forms`]
+    /// для того же текста: иначе метрика меряет не тот алфавит, который сегментируется.
     #[must_use]
     pub fn build(
         font_system: &mut FontSystem,
         attrs: &Attrs<'_>,
-        text: &str,
+        form_source_text: &str,
         hanging: bool,
         tolerance: u32,
+        scope: InlineTagScope,
     ) -> Self {
+        let text = prepare_inline_no_break_text(form_source_text, scope);
         let visible: Vec<char> = text
             .chars()
             .filter(|&ch| ch != SOFT_HYPHEN && ch != '\n' && ch != '\r')
@@ -622,26 +649,161 @@ pub struct FormEnumeration {
     pub nodes_visited: u64,
 }
 
+/// Which inline tags the form search removes from the RAW text it is handed.
+///
+/// The choice is not cosmetic: with «Инлайновые теги» OFF the renderer does not parse
+/// tags at all (`pipeline.rs`, `enable_inline_style_tags`), so `<b>` is literal text the
+/// user wants DRAWN and measured — removing it would make the form describe a text
+/// nobody sees. With the flag ON the renderer consumes the tags, so leaving them in
+/// would measure markup as if it were letters.
+///
+/// The search and its width metric ([`GlyphWidths::build`]) MUST be given the same
+/// value: a mismatch measures a different alphabet than it segments.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InlineTagScope {
+    /// Only the no-break control vocabulary (`<no-break>`/`<nobreak>`/`<nobr>` and the
+    /// machine `<m …>` frame that can carry the `j` flag). Everything else stays literal
+    /// text. This is what the renderer's own single-pick path ([`choose_form`]) uses.
+    NoBreakOnly,
+    /// Every inline tag the renderer's parser consumes.
+    All {
+        /// The `font_size_px` the render of this very text will use.
+        ///
+        /// Recognition of `<offset=…>` / `<stretching=…>` depends on it (a percent value
+        /// is resolved against the font size and a non-finite result stops the body from
+        /// being a tag), so passing a different size here than the render receives would
+        /// let this strip and the renderer disagree about what is markup.
+        base_font_size_px: f32,
+    },
+}
+
+/// What the form search does with one recognized inline tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagAction {
+    /// Leave it in the text: it is not markup at this scope, so the renderer draws it.
+    Keep,
+    /// Remove it and never put it back — a control tag the form itself supersedes.
+    Consume,
+    /// Remove it, and remember it so the APPLIED form carries it back verbatim.
+    Reapply {
+        /// Closing tag: it lands at the END of the preceding line at a break.
+        closing: bool,
+    },
+}
+
+impl InlineTagScope {
+    /// Font size the tag vocabulary is consulted with.
+    ///
+    /// `NoBreakOnly` acts only on the no-break and machine classes, and neither depends
+    /// on the font size (they are decided before any percent value is resolved), so the
+    /// value is arbitrary there — a style tag classified differently at `0.0` than at the
+    /// real size is `Keep`ed either way.
+    #[must_use]
+    fn classify_font_size_px(self) -> f32 {
+        match self {
+            Self::NoBreakOnly => 0.0,
+            Self::All { base_font_size_px } => base_font_size_px,
+        }
+    }
+
+    /// What to do with a tag of `class` at this scope.
+    ///
+    /// `<no-break>` and `<br>` are CONSUMED rather than re-applied, deliberately: a form
+    /// IS a complete line-break decision, so re-emitting the user's manual break would
+    /// fight the form they just picked, and the protected range the no-break tag marks
+    /// has already done its work by the time a form exists. `<br>` is consistent with a
+    /// literal newline here, which the segmenter already treats as ordinary breaking
+    /// whitespace (`ms-text-util`'s `is_breaking_whitespace`).
+    ///
+    /// Machine `<m …>` tags are re-applied at BOTH scopes: they are stripped at both, and
+    /// a stripped tag that is never restored silently destroys the inline bold/colour/
+    /// size/font/offset it carried — they are the panel's DEFAULT tag form.
+    #[must_use]
+    fn action_for(self, class: InlineTagClass) -> TagAction {
+        match class {
+            InlineTagClass::NoBreakOpen | InlineTagClass::NoBreakClose => TagAction::Consume,
+            InlineTagClass::MachineOpen { .. } => TagAction::Reapply { closing: false },
+            InlineTagClass::MachineClose => TagAction::Reapply { closing: true },
+            InlineTagClass::Break => match self {
+                Self::NoBreakOnly => TagAction::Keep,
+                Self::All { .. } => TagAction::Consume,
+            },
+            InlineTagClass::StyleOpen => match self {
+                Self::NoBreakOnly => TagAction::Keep,
+                Self::All { .. } => TagAction::Reapply { closing: false },
+            },
+            InlineTagClass::StyleClose => match self {
+                Self::NoBreakOnly => TagAction::Keep,
+                Self::All { .. } => TagAction::Reapply { closing: true },
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InlineNoBreakRun {
     text: String,
     no_break: bool,
 }
 
-/// Removes no-break inline tags and makes whitespace inside them non-breaking.
+/// One removed inline tag, remembered so the applied form can carry it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagAnchor {
+    /// Byte offset into the PRODUCED stripped text, i.e. its length at the moment the tag
+    /// was met. Recording the produced length rather than an offset into the raw source is
+    /// what makes the anchor immune to the NBSP widening: a protected 1-byte space becomes
+    /// a 2-byte NBSP, so raw byte offsets would drift while these do not.
+    plain_offset: usize,
+    /// The tag exactly as the user wrote it, angle brackets included. Re-emitted verbatim:
+    /// re-serializing from a parsed style model would rewrite `<b>` as `<m b=1>`, normalize
+    /// the user's spelling, and have to invent a nesting for unclosed or stray tags.
+    source: String,
+    /// Closing tag (`</b>`, `</m>`): at a line break it attaches to the end of the
+    /// preceding line, while everything else attaches to the start of the following one.
+    closing: bool,
+}
+
+/// Everything the single strip pass produces from a raw form source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrippedFormText {
+    /// Alternating protected / unprotected runs; concatenated they are the stripped text.
+    runs: Vec<InlineNoBreakRun>,
+    /// Removed tags that must come back onto an applied form, in source order and with
+    /// ascending `plain_offset`.
+    anchors: Vec<TagAnchor>,
+}
+
+/// Removes inline tags from a RAW form source text and makes the whitespace
+/// inside no-break ranges non-breaking (NBSP).
 ///
-/// The source editor text keeps the tags. Form enumeration uses this prepared text,
-/// so applying a form writes `formed_text` without the control tags.
+/// This is the character-level shape of what a form will contain, so it is what a width
+/// metric has to measure ([`GlyphWidths::build`] calls it). It is deliberately PRIVATE:
+/// the strip must happen exactly once per consumer, on the raw text. Handing an already
+/// prepared string to the enumerators would leave them with no tags to find, every run
+/// marked breakable, and the protected ranges hyphenated — the defect this privacy
+/// prevents from coming back.
 #[must_use]
-pub fn prepare_inline_no_break_text(text: &str) -> String {
-    inline_no_break_runs(text)
+fn prepare_inline_no_break_text(text: &str, scope: InlineTagScope) -> String {
+    strip_inline_tags(text, scope)
+        .runs
         .into_iter()
         .map(|run| run.text)
         .collect()
 }
 
-fn inline_no_break_runs(text: &str) -> Vec<InlineNoBreakRun> {
+/// The single strip pass: splits a RAW form source text into protected/unprotected runs
+/// and records every tag it removed.
+///
+/// The vocabulary is not defined here — it comes from `inline_styles::classify_inline_tag_body`,
+/// the same parser the renderer uses, so "what is a tag" cannot differ between the text the
+/// form is built from and the text the renderer draws. `scope` decides only which of the
+/// recognized classes are acted on ([`InlineTagScope::action_for`]).
+#[must_use]
+fn strip_inline_tags(text: &str, scope: InlineTagScope) -> StrippedFormText {
+    let classify_font_size_px = scope.classify_font_size_px();
     let mut runs = Vec::<InlineNoBreakRun>::new();
+    let mut anchors = Vec::<TagAnchor>::new();
+    let mut plain_len = 0usize;
     let mut no_break_depth = 0usize;
     let mut machine_stack = Vec::<bool>::new();
     let mut cursor = 0usize;
@@ -653,43 +815,52 @@ fn inline_no_break_runs(text: &str) -> Vec<InlineNoBreakRun> {
         if ch == '<'
             && let Some(rel_end) = text[cursor + ch.len_utf8()..].find('>')
         {
-            let tag_end = cursor + ch.len_utf8() + rel_end;
-            let raw = text[cursor + ch.len_utf8()..tag_end].trim();
-            let compact = raw
-                .chars()
-                .filter(|character| !character.is_ascii_whitespace())
-                .collect::<String>()
-                .to_ascii_lowercase();
-
-            if matches!(compact.as_str(), "no-break" | "nobreak" | "nobr") {
-                no_break_depth = no_break_depth.saturating_add(1);
-                cursor = tag_end + '>'.len_utf8();
-                continue;
-            }
-            if matches!(compact.as_str(), "/no-break" | "/nobreak" | "/nobr") {
-                no_break_depth = no_break_depth.saturating_sub(1);
-                cursor = tag_end + '>'.len_utf8();
-                continue;
-            }
-            if compact == "/m" {
-                if machine_stack.pop().unwrap_or(false) {
-                    no_break_depth = no_break_depth.saturating_sub(1);
+            let body_start = cursor + ch.len_utf8();
+            let body_end = body_start + rel_end;
+            let after_tag = body_end + '>'.len_utf8();
+            if let Some(class) =
+                classify_inline_tag_body(&text[body_start..body_end], classify_font_size_px)
+            {
+                let action = scope.action_for(class);
+                if action != TagAction::Keep {
+                    // The no-break bookkeeping belongs to the classes that are stripped at
+                    // EVERY scope, so it can never be skipped by a `Keep`.
+                    match class {
+                        InlineTagClass::NoBreakOpen => {
+                            no_break_depth = no_break_depth.saturating_add(1);
+                        }
+                        InlineTagClass::NoBreakClose => {
+                            no_break_depth = no_break_depth.saturating_sub(1);
+                        }
+                        InlineTagClass::MachineOpen { protects_no_break } => {
+                            if protects_no_break {
+                                no_break_depth = no_break_depth.saturating_add(1);
+                            }
+                            machine_stack.push(protects_no_break);
+                        }
+                        InlineTagClass::MachineClose => {
+                            if machine_stack.pop().unwrap_or(false) {
+                                no_break_depth = no_break_depth.saturating_sub(1);
+                            }
+                        }
+                        InlineTagClass::Break
+                        | InlineTagClass::StyleOpen
+                        | InlineTagClass::StyleClose => {}
+                    }
+                    if let TagAction::Reapply { closing } = action {
+                        anchors.push(TagAnchor {
+                            plain_offset: plain_len,
+                            source: text[cursor..after_tag].to_string(),
+                            closing,
+                        });
+                    }
+                    cursor = after_tag;
+                    continue;
                 }
-                cursor = tag_end + '>'.len_utf8();
-                continue;
-            }
-            if let Some(attrs) = parse_machine_tag(raw) {
-                let protects = attrs.iter().any(|(key, _)| matches!(*key, 'j' | 'J'));
-                if protects {
-                    no_break_depth = no_break_depth.saturating_add(1);
-                }
-                machine_stack.push(protects);
-                cursor = tag_end + '>'.len_utf8();
-                continue;
             }
         }
 
-        push_inline_no_break_text(
+        plain_len += push_inline_no_break_text(
             &mut runs,
             &text[cursor..cursor + ch.len_utf8()],
             no_break_depth > 0,
@@ -697,10 +868,37 @@ fn inline_no_break_runs(text: &str) -> Vec<InlineNoBreakRun> {
         cursor += ch.len_utf8();
     }
 
-    runs
+    StrippedFormText { runs, anchors }
 }
 
-fn push_inline_no_break_text(runs: &mut Vec<InlineNoBreakRun>, text: &str, no_break: bool) {
+/// Do two scopes strip `text` to exactly the same thing — same characters, same protected
+/// runs, same tag anchors?
+///
+/// Everything the form engine derives from a (raw text, scope) pair goes through the one
+/// strip pass: the break graph ([`search_forms`]), the width alphabet
+/// ([`GlyphWidths::build`]) and the markup put back on the applied form
+/// ([`reapply_inline_tags_to_form_text`]). Two scopes that strip a text alike are therefore
+/// the SAME input for it, and a caller that caches a search by its input may treat them as
+/// one — this is an exact statement about the engine, not an approximation of it.
+///
+/// That caller is the typing panel. [`InlineTagScope::All`] carries `base_font_size_px`
+/// because the size decides whether `<offset=…>`/`<stretching=…>` are tags at all, so it
+/// genuinely belongs to the input; but for a text whose tag bodies do not depend on it — any
+/// text without such a tag, and any realistic size even with one — a font-size change cannot
+/// move a single form, and restarting the search on it only throws the user's window filters
+/// away.
+#[must_use]
+pub fn scopes_strip_alike(text: &str, a: InlineTagScope, b: InlineTagScope) -> bool {
+    a == b || strip_inline_tags(text, a) == strip_inline_tags(text, b)
+}
+
+/// Appends one source character to the run list and returns how many BYTES it added to the
+/// stripped text (an NBSP substitution makes that differ from the source character's size).
+fn push_inline_no_break_text(
+    runs: &mut Vec<InlineNoBreakRun>,
+    text: &str,
+    no_break: bool,
+) -> usize {
     let prepared = if no_break {
         text.chars()
             .map(|ch| {
@@ -715,18 +913,353 @@ fn push_inline_no_break_text(runs: &mut Vec<InlineNoBreakRun>, text: &str, no_br
         text.to_string()
     };
     if prepared.is_empty() {
-        return;
+        return 0;
     }
+    let added = prepared.len();
     if let Some(last) = runs.last_mut()
         && last.no_break == no_break
     {
         last.text.push_str(prepared.as_str());
-        return;
+        return added;
     }
     runs.push(InlineNoBreakRun {
         text: prepared,
         no_break,
     });
+    added
+}
+
+/// The inline tags of an applied form could not be put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagReapplyError {
+    /// The form text and the stripped source it was built from cannot be aligned:
+    /// at `plain_offset` / `form_offset` there is neither a matching character nor any
+    /// transformation the walk knows (a normalized separator, a line break, a wrap hyphen
+    /// or a consumed soft hyphen).
+    ///
+    /// Reported instead of resynchronizing on a later match: a silently misplaced
+    /// `<font=…>` restyles the wrong words, which is worse than not restyling at all.
+    Unalignable {
+        /// Byte offset into the stripped source text.
+        plain_offset: usize,
+        /// Byte offset into the form text.
+        form_offset: usize,
+    },
+}
+
+impl std::fmt::Display for TagReapplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unalignable {
+                plain_offset,
+                form_offset,
+            } => write!(
+                f,
+                "form text diverges from its source at source byte {plain_offset} / form byte \
+                 {form_offset}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TagReapplyError {}
+
+/// Puts the inline tags of `source_text` back onto `form_text`, verbatim.
+///
+/// `form_text` must be [`TextForm::to_text`] of a form built from THIS `source_text` at
+/// THIS `scope`; the walk aligns the two and inserts each removed tag before the character
+/// it originally preceded. `<no-break>` and (at [`InlineTagScope::All`]) `<br>` are not
+/// restored — see [`InlineTagScope::action_for`].
+///
+/// Placement rules, all of them contract:
+/// - at a line break a CLOSING tag lands at the end of the preceding line (after a wrap
+///   hyphen, so the hyphen stays inside the span it belongs to) and everything else at the
+///   start of the following line;
+/// - several tags at one source position keep their source order, except that a closing
+///   and an opening tag at the same BREAK necessarily go to different lines;
+/// - a tag inside a word that gets hyphenated stays attached to the character it preceded;
+/// - a tag inside a protected range is an ordinary interior position;
+/// - unclosed, nested and stray-closing tags are neither validated nor repaired: the output
+///   is the user's own character sequence with line breaks interposed, so the renderer's
+///   parser sees exactly what it sees for the un-formed text.
+///
+/// # Errors
+/// [`TagReapplyError::Unalignable`] when the two texts cannot be aligned. The caller is
+/// expected to fall back to the untagged `form_text` and say so — never to guess.
+pub fn reapply_inline_tags_to_form_text(
+    source_text: &str,
+    scope: InlineTagScope,
+    form_text: &str,
+) -> Result<String, TagReapplyError> {
+    let stripped = strip_inline_tags(source_text, scope);
+    if stripped.anchors.is_empty() {
+        return Ok(form_text.to_string());
+    }
+    let plain: String = stripped.runs.iter().map(|run| run.text.as_str()).collect();
+    let mut placements = place_tag_anchors(plain.as_str(), form_text, &stripped.anchors)?;
+    // Stable sort: anchors come out of the walk in source order, and only a break can send
+    // a later anchor to an earlier offset (an ill-nested `<i></b>` split across two lines).
+    placements.sort_by_key(|&(offset, _)| offset);
+
+    let extra: usize = stripped
+        .anchors
+        .iter()
+        .map(|anchor| anchor.source.len())
+        .sum();
+    let mut out = String::with_capacity(form_text.len() + extra);
+    let mut copied = 0usize;
+    for (offset, index) in placements {
+        out.push_str(&form_text[copied..offset]);
+        out.push_str(stripped.anchors[index].source.as_str());
+        copied = offset;
+    }
+    out.push_str(&form_text[copied..]);
+    Ok(out)
+}
+
+/// Breaking whitespace, exactly as the segmenter defines it
+/// (`ms-text-util/src/segmentation/base.rs`, `is_breaking_whitespace`): everything
+/// `char::is_whitespace` accepts except NBSP, which a protected range relies on.
+#[must_use]
+fn is_form_breaking_whitespace(ch: char) -> bool {
+    ch.is_whitespace() && ch != NON_BREAKING_SPACE
+}
+
+/// End of the (possibly empty) run of breaking whitespace starting at `from`.
+#[must_use]
+fn breaking_whitespace_run_end(text: &str, from: usize) -> usize {
+    let mut end = from;
+    for ch in text[from..].chars() {
+        if !is_form_breaking_whitespace(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+/// Is the form text about to close a line here, and where do the two sides of that break
+/// begin?
+///
+/// Returns `(offset for a closing tag, offset for everything else)`. An optional wrap
+/// hyphen is skipped first, so a closing tag lands AFTER it — the hyphen belongs to the
+/// word the span covers.
+#[must_use]
+fn peek_form_line_break(
+    plain: &str,
+    src: usize,
+    form_text: &str,
+    tgt: usize,
+) -> Option<(usize, usize)> {
+    let mut at = tgt;
+    if form_text[at..].starts_with('-') && is_form_wrap_hyphen(plain, src, form_text, at) {
+        at += '-'.len_utf8();
+    }
+    form_text[at..]
+        .starts_with('\n')
+        .then(|| (at, at + '\n'.len_utf8()))
+}
+
+/// Is the `'-'` at `tgt` a hyphen the wrap inserted rather than one the source carries?
+///
+/// Unambiguous against a real hard hyphen, which the source has at the same position and
+/// which therefore matches before this is ever consulted.
+///
+/// A wrap hyphen is always followed by the `'\n'` that separates it from the rest of the
+/// source: `build_line_text_and_units` appends `Joint::wrap_suffix` only to a line that
+/// WRAPS (`ms-text-util/src/segmentation/base.rs`), so the last line of a form never ends
+/// on one. End of text is therefore NOT a legal context — accepting it let an alleged form
+/// append a visible character to the text and still be re-tagged.
+#[must_use]
+fn is_form_wrap_hyphen(plain: &str, src: usize, form_text: &str, tgt: usize) -> bool {
+    !plain[src..].starts_with('-') && form_text[tgt + '-'.len_utf8()..].starts_with('\n')
+}
+
+/// The whitespace transformations a form can actually apply to its source text, as the
+/// two-cursor walk of [`place_tag_anchors`] sees them.
+///
+/// This set IS the "refuse rather than guess" contract of
+/// [`reapply_inline_tags_to_form_text`]: anything outside it means the form text does not
+/// come from this source, and a tag placed by a walk that resynchronized on it would
+/// restyle words the user never marked. Each variant is a documented consequence of one
+/// `Joint` kind of `ms-text-util`'s segmenter, so the set can be checked against the code
+/// that produces it rather than against a description of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormWhitespaceStep {
+    /// Equal character counts on both sides: the separator survived the join.
+    /// `Joint::space` carries `" ".repeat(n)` where `n` is the character count of the
+    /// source run, so a source `'\t'`/`'\n'` arrives as `' '` — same count, different
+    /// character — and whitespace the segmenter kept LITERAL inside a block (the
+    /// whitespace around a standalone dash token) arrives unchanged.
+    Normalised { src_char: char, tgt_char: char },
+    /// A whole source run replaced by the single `'\n'` of a break: `Joint::space`'s
+    /// `wrap_suffix` is empty, so the separator vanishes and the two lines are joined by
+    /// `'\n'`.
+    CollapsedIntoBreak,
+    /// A break at a junction the source has NO whitespace at. Only a hyphen junction can
+    /// be one: `Joint::soft_hyphen` appends the wrap hyphen the walk has just consumed and
+    /// `Joint::hard_hyphen` leaves the source's own dash at the end of the head, so the
+    /// character before the `'\n'` is always a dash. `Joint::glue` — the only other
+    /// no-separator junction — belongs to the last block alone and is never a break.
+    BreakAfterDash,
+    /// Leading or trailing whitespace of the WHOLE text, which the segmenter drops:
+    /// `segment_form_blocks` passes `preserve_edge_spaces: false`, and a trailing
+    /// separator is never emitted because the last line does not wrap. There is no
+    /// interior trim — every non-final segment ends on whitespace and keeps it as a
+    /// `Joint::space`.
+    TrimmedTextEdge,
+}
+
+/// Classifies the whitespace boundary at (`src`, `tgt`), or `None` when no form of this
+/// source could have produced it.
+///
+/// `src_run_end` / `tgt_run_end` are the ends of the (possibly empty) breaking-whitespace
+/// runs starting at the two cursors.
+#[must_use]
+fn classify_form_whitespace(
+    plain: &str,
+    src: usize,
+    src_run_end: usize,
+    form_text: &str,
+    tgt: usize,
+    tgt_run_end: usize,
+) -> Option<FormWhitespaceStep> {
+    let src_run = &plain[src..src_run_end];
+    let tgt_run = &form_text[tgt..tgt_run_end];
+    if !src_run.is_empty()
+        && src_run.chars().count() == tgt_run.chars().count()
+        && let (Some(src_char), Some(tgt_char)) = (src_run.chars().next(), tgt_run.chars().next())
+    {
+        return Some(FormWhitespaceStep::Normalised { src_char, tgt_char });
+    }
+    if tgt_run == "\n" {
+        if !src_run.is_empty() {
+            return Some(FormWhitespaceStep::CollapsedIntoBreak);
+        }
+        return form_text[..tgt]
+            .chars()
+            .next_back()
+            .is_some_and(is_line_end_dash_char)
+            .then_some(FormWhitespaceStep::BreakAfterDash);
+    }
+    let at_text_start = src == 0 && tgt == 0;
+    let at_text_end = src_run_end == plain.len() && tgt == form_text.len();
+    (tgt_run.is_empty() && !src_run.is_empty() && (at_text_start || at_text_end))
+        .then_some(FormWhitespaceStep::TrimmedTextEdge)
+}
+
+/// Aligns the stripped source with the form text and returns `(form byte offset, anchor
+/// index)` for every anchor, in anchor order.
+///
+/// Two monotone cursors, one target character consumed per step; the walk never searches,
+/// so it cannot lock onto a later occurrence of a repeated word. Every step is one of: a
+/// literal match, a whitespace boundary the form engine can actually produce
+/// ([`FormWhitespaceStep`] — that enum, not this list, is the authority), a wrap hyphen the
+/// form added ([`is_form_wrap_hyphen`]), or a soft hyphen the segmenter consumed. Anything
+/// else is [`TagReapplyError::Unalignable`].
+fn place_tag_anchors(
+    plain: &str,
+    form_text: &str,
+    anchors: &[TagAnchor],
+) -> Result<Vec<(usize, usize)>, TagReapplyError> {
+    let mut placements = Vec::with_capacity(anchors.len());
+    let mut src = 0usize;
+    let mut tgt = 0usize;
+    let mut next = 0usize;
+
+    loop {
+        // Anchors the source cursor has reached. `<=` and not `==`: a collapsing whitespace
+        // run moves the cursor by more than one character, and its interior anchors are
+        // placed by that step itself.
+        while next < anchors.len() && anchors[next].plain_offset <= src {
+            let offset = match peek_form_line_break(plain, src, form_text, tgt) {
+                Some((close_at, open_at)) => {
+                    if anchors[next].closing {
+                        close_at
+                    } else {
+                        open_at
+                    }
+                }
+                None => tgt,
+            };
+            placements.push((offset, next));
+            next += 1;
+        }
+        if src >= plain.len() && tgt >= form_text.len() {
+            break;
+        }
+
+        let src_ch = plain[src..].chars().next();
+        let tgt_ch = form_text[tgt..].chars().next();
+
+        // A soft hyphen the user typed: the segmenter cuts at one and drops it, so it is in
+        // the source and never in the form.
+        if src_ch == Some(SOFT_HYPHEN) && tgt_ch != Some(SOFT_HYPHEN) {
+            src += SOFT_HYPHEN.len_utf8();
+            continue;
+        }
+
+        if src_ch.is_some_and(is_form_breaking_whitespace)
+            || tgt_ch.is_some_and(is_form_breaking_whitespace)
+        {
+            let src_run_end = breaking_whitespace_run_end(plain, src);
+            let tgt_run_end = breaking_whitespace_run_end(form_text, tgt);
+            let step =
+                classify_form_whitespace(plain, src, src_run_end, form_text, tgt, tgt_run_end)
+                    .ok_or(TagReapplyError::Unalignable {
+                        plain_offset: src,
+                        form_offset: tgt,
+                    })?;
+            match step {
+                // Consume one pair at a time so interior anchors are still seen by the
+                // loop head.
+                FormWhitespaceStep::Normalised { src_char, tgt_char } => {
+                    src += src_char.len_utf8();
+                    tgt += tgt_char.len_utf8();
+                }
+                // The whole run is replaced at once — by a break, or by nothing at a
+                // trimmed edge. Its interior anchors take the two sides of the break.
+                FormWhitespaceStep::CollapsedIntoBreak
+                | FormWhitespaceStep::BreakAfterDash
+                | FormWhitespaceStep::TrimmedTextEdge => {
+                    let close_at = tgt;
+                    let open_at = tgt_run_end;
+                    while next < anchors.len() && anchors[next].plain_offset < src_run_end {
+                        let offset = if anchors[next].closing {
+                            close_at
+                        } else {
+                            open_at
+                        };
+                        placements.push((offset, next));
+                        next += 1;
+                    }
+                    src = src_run_end;
+                    tgt = tgt_run_end;
+                }
+            }
+            continue;
+        }
+
+        if let (Some(s), Some(t)) = (src_ch, tgt_ch)
+            && s == t
+        {
+            src += s.len_utf8();
+            tgt += t.len_utf8();
+            continue;
+        }
+
+        if tgt_ch == Some('-') && is_form_wrap_hyphen(plain, src, form_text, tgt) {
+            tgt += '-'.len_utf8();
+            continue;
+        }
+
+        return Err(TagReapplyError::Unalignable {
+            plain_offset: src,
+            form_offset: tgt,
+        });
+    }
+
+    Ok(placements)
 }
 
 /// Делит строку на ведущую висящую пунктуацию, «ядро» и хвостовую висящую
@@ -940,26 +1473,167 @@ struct EnumContext<'a> {
     truncated: bool,
 }
 
-/// Делит подготовленный `text` на блоки перебора форм.
+/// Segmenter input built from a raw form source text, plus the byte ranges of that
+/// input the user protected with an inline no-break tag.
 ///
-/// Инлайновые `<no-break>`/`<m j>`-диапазоны уже не рвутся (их пробелы стали
-/// NBSP), остальной текст размечается мягкими переносами, после чего сегментатор
-/// строит блоки в режиме [`BindingMode::Annotate`] — граф строится один раз, а
-/// служебные связи помечаются категорией консервативности на стыке.
+/// `protected` ranges are ascending and never overlap or touch: adjacent runs with the
+/// same flag are merged by [`push_inline_no_break_text`], so every range is maximal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedFormText {
+    /// Tag-free text: protected ranges carry NBSP instead of their spaces, the rest is
+    /// marked up with soft hyphens.
+    text: String,
+    /// Ranges of `text` that must end up inside a single block.
+    protected: Vec<Range<usize>>,
+}
+
+/// Снимает инлайновые теги с СЫРОГО текста формы и размечает мягкими переносами
+/// всё, кроме защищённых участков.
+///
+/// Это ЕДИНСТВЕННОЕ место, где перебор форм снимает теги: подавать сюда уже
+/// очищенный текст нельзя — тегов в нём нет, все участки считаются обычными, и
+/// защищённый диапазон получает словарные переносы (ровно тот дефект, из-за
+/// которого «Не разрывать» не работало в окне «Продвинутая форма текста»).
+///
+/// Marking up the unprotected runs one by one is safe because dictionary
+/// hyphenation is local to a word: a run hyphenates exactly as it would inside the
+/// whole text, so a no-break tag never changes how the text OUTSIDE it breaks.
 #[must_use]
-fn segment_form_blocks(seg: &dyn ms_text_util::segmentation::Segmenter, text: &str) -> Vec<Block> {
-    let hyphenated = inline_no_break_runs(text)
-        .into_iter()
-        .map(|run| {
-            if run.no_break {
-                run.text
-            } else {
-                seg.soft_hyphenate_overlong(run.text.as_str())
-            }
-        })
-        .collect::<String>();
-    seg.segment(
-        &hyphenated,
+fn prepare_form_text(
+    seg: &dyn ms_text_util::segmentation::Segmenter,
+    raw: &str,
+    scope: InlineTagScope,
+) -> PreparedFormText {
+    let runs = strip_inline_tags(raw, scope).runs;
+    // Capacity hint only (the string still grows if needed): the bytes freed by the
+    // dropped tags roughly offset the soft hyphens the markup inserts.
+    let mut text = String::with_capacity(raw.len() + raw.len() / 8);
+    let mut protected = Vec::new();
+    for run in runs {
+        let start = text.len();
+        if run.no_break {
+            // Защищённый участок НЕ размечаем мягкими переносами: словарный
+            // перенос внутри него — ровно тот разрыв, который запрещён.
+            text.push_str(run.text.as_str());
+            protected.push(start..text.len());
+        } else {
+            text.push_str(seg.soft_hyphenate_overlong(run.text.as_str()).as_str());
+        }
+    }
+    PreparedFormText { text, protected }
+}
+
+/// Byte ranges the segmenter's blocks occupy in the text it segmented.
+///
+/// Relies on one property of the segmenter (`ms-text-util/src/segmentation/base.rs`):
+/// block texts are ordered, non-overlapping LITERAL substrings of its input, and the
+/// gaps between them hold nothing but breaking whitespace (moved into `Joint::same_line`)
+/// and the soft hyphens it consumed. `tokenize_paragraph` keeps every character,
+/// `build_segments` concatenates tokens verbatim, `segment` trims only a segment's
+/// trailing breaking whitespace, and `split_segment_into_parts` cuts at `SOFT_HYPHEN`
+/// (dropped) or right after a hard hyphen (kept in the head).
+///
+/// Returns `None` when that property does not hold — the gap between two blocks carries
+/// something else, or a block text is not found at all. The mapping would then be shifted
+/// and the caller must decline to use it instead of gluing the wrong junction.
+#[must_use]
+fn block_spans(blocks: &[Block], text: &str) -> Option<Vec<Range<usize>>> {
+    let mut spans = Vec::with_capacity(blocks.len());
+    let mut cursor = 0usize;
+    for block in blocks {
+        let start = cursor + text[cursor..].find(block.text.as_str())?;
+        let gap_is_segmenter_debris = text[cursor..start]
+            .chars()
+            .all(|ch| ch == SOFT_HYPHEN || (ch.is_whitespace() && ch != NON_BREAKING_SPACE));
+        if !gap_is_segmenter_debris {
+            return None;
+        }
+        let end = start + block.text.len();
+        spans.push(start..end);
+        cursor = end;
+    }
+    Some(spans)
+}
+
+/// Стык `head_end .. tail_start` лежит СТРОГО внутри защищённого диапазона?
+///
+/// Стык на самой границе диапазона защищённым не считается: сам защищённый текст
+/// при таком разрыве остаётся целым.
+#[must_use]
+fn junction_is_protected(head_end: usize, tail_start: usize, protected: &[Range<usize>]) -> bool {
+    protected
+        .iter()
+        .any(|range| range.start < head_end && tail_start < range.end)
+}
+
+/// Склеивает соседние блоки, стык между которыми попал внутрь защищённого
+/// диапазона, в один неразрывный блок.
+///
+/// Пробел внутри диапазона уже не разрыв (стал NBSP), словарных переносов там нет
+/// ([`prepare_form_text`]) — остаётся УЖЕ СУЩЕСТВУЮЩИЙ дефис: сегментатор режет по
+/// нему всегда (`allow_hard_hyphen_breaks: true`, это нужно остальному тексту), и
+/// без склейки `<no-break>что-то важное</no-break>` рвался по дефису.
+///
+/// Склейка повторяет [`build_line_text_and_units`]: между блоками вставляется
+/// `same_line`-склейка головного стыка, юниты складываются вместе с ней, а стык
+/// склеенного блока — стык хвостового.
+#[must_use]
+fn glue_protected_junctions(blocks: Vec<Block>, prepared: &PreparedFormText) -> Vec<Block> {
+    if prepared.protected.is_empty() || blocks.len() < 2 {
+        return blocks;
+    }
+    let Some(spans) = block_spans(blocks.as_slice(), prepared.text.as_str()) else {
+        // Не должно случаться: контракт сегментатора описан на `block_spans`. Если
+        // он изменится, лучше потерять защиту дефиса (поведение до этой правки),
+        // чем склеить произвольные блоки по сдвинутой разметке.
+        ms_log::runtime_log::log_warn(
+            "[wrap/forms] segmenter blocks could not be located in the text they were built \
+             from; inline no-break ranges keep their hard-hyphen break points this time",
+        );
+        return blocks;
+    };
+
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    for (idx, block) in blocks.into_iter().enumerate() {
+        let protected_junction = idx > 0
+            && junction_is_protected(spans[idx - 1].end, spans[idx].start, &prepared.protected);
+        if protected_junction
+            && let Some(head) = out.last_mut()
+        {
+            let glue = head.joint.same_line.to_string();
+            head.text.push_str(glue.as_str());
+            head.text.push_str(block.text.as_str());
+            head.unit_count = head
+                .unit_count
+                .saturating_add(glue.chars().count())
+                .saturating_add(block.unit_count);
+            head.joint = block.joint;
+            continue;
+        }
+        out.push(block);
+    }
+    out
+}
+
+/// Делит СЫРОЙ (с инлайновыми тегами) `text` на блоки перебора форм.
+///
+/// Инлайновые теги снимаются здесь ([`prepare_form_text`], область — `scope`), пробелы
+/// защищённых диапазонов становятся NBSP, словарные переносы внутрь этих диапазонов не
+/// ставятся, а после сегментации стыки внутри них склеиваются
+/// ([`glue_protected_junctions`]) — защищённый диапазон гарантированно оказывается
+/// в одном блоке и не рвётся ни по пробелу, ни по словарному, ни по существующему
+/// дефису. Остальной текст сегментатор режет в режиме [`BindingMode::Annotate`]:
+/// граф строится один раз, а служебные связи помечаются категорией
+/// консервативности на стыке.
+#[must_use]
+fn segment_form_blocks(
+    seg: &dyn ms_text_util::segmentation::Segmenter,
+    text: &str,
+    scope: InlineTagScope,
+) -> Vec<Block> {
+    let prepared = prepare_form_text(seg, text, scope);
+    let blocks = seg.segment(
+        prepared.text.as_str(),
         SegmentOptions {
             hanging_punctuation: false,
             preserve_edge_spaces: false,
@@ -968,12 +1642,19 @@ fn segment_form_blocks(seg: &dyn ms_text_util::segmentation::Segmenter, text: &s
             // стык категорией консервативности — фильтрация форм потом.
             binding: BindingMode::Annotate,
         },
-    )
+    );
+    glue_protected_junctions(blocks, &prepared)
 }
 
 /// Перечисляет за один прогон все формы `text`, удовлетворяющие `preset`.
 /// Повторов нет: каждая комбинация разрывов даёт уникальный текст. Ширины строк
 /// берутся из `metric`.
+///
+/// `text` — СЫРОЙ текст с инлайновыми тегами: снимает их (в области `scope`) и
+/// оставляет защищённые диапазоны неразрывными [`segment_form_blocks`]. Строки формы
+/// уже без снятых тегов; вернуть их на применённую форму — дело
+/// [`reapply_inline_tags_to_form_text`]. `scope` обязан совпадать с тем, что получила
+/// метрика ([`GlyphWidths::build`]).
 ///
 /// Это ИСХОДНЫЙ исчерпывающий путь (без ранжирования): порядок форм — порядок
 /// обхода дерева, `quality_milli` не считается ([`UNSCORED_QUALITY_MILLI`]),
@@ -984,6 +1665,7 @@ pub fn enumerate_forms(
     preset: TextFormPreset,
     max_forms: usize,
     metric: &dyn LineWidthMetric,
+    scope: InlineTagScope,
 ) -> FormEnumeration {
     if max_forms == 0 || text.split_whitespace().next().is_none() {
         return FormEnumeration {
@@ -994,7 +1676,7 @@ pub fn enumerate_forms(
     }
 
     with_default_segmenter(|seg| {
-        let blocks = segment_form_blocks(seg, text);
+        let blocks = segment_form_blocks(seg, text, scope);
         if blocks.is_empty() {
             return FormEnumeration {
                 forms: Vec::new(),
@@ -2356,6 +3038,13 @@ fn run_search(ctx: &mut SearchContext<'_>, aspect_max: f64) -> Vec<TextForm> {
 /// остаётся возможным, когда форм не существует в принципе (например `Lens` на
 /// одном блоке).
 ///
+/// `text` — СЫРОЙ текст с инлайновыми тегами: снимает их (в области `scope`) и
+/// оставляет защищённые диапазоны (`<no-break>`/`<nobr>`/`<m …j…>`) неразрывными
+/// [`segment_form_blocks`]. Строки формы уже без снятых тегов; вернуть их на
+/// ПРИМЕНЁННУЮ форму — дело [`reapply_inline_tags_to_form_text`]. `scope` обязан
+/// совпадать с тем, что получила метрика ([`GlyphWidths::build`]): иначе она меряет
+/// не тот алфавит, который сегментируется.
+///
 /// Входные `params` санируются (см. [`FormSearchParams::sanitized`]): гарантии
 /// выше держатся при любых, в том числе враждебных, значениях полей.
 ///
@@ -2373,6 +3062,7 @@ pub fn search_forms(
     preset: TextFormPreset,
     metric: &dyn LineWidthMetric,
     params: &FormSearchParams,
+    scope: InlineTagScope,
 ) -> FormEnumeration {
     if text.split_whitespace().next().is_none() {
         return FormEnumeration {
@@ -2387,7 +3077,7 @@ pub fn search_forms(
     let params = params.sanitized();
 
     with_default_segmenter(|seg| {
-        let blocks = segment_form_blocks(seg, text);
+        let blocks = segment_form_blocks(seg, text, scope);
         if blocks.is_empty() {
             return FormEnumeration {
                 forms: Vec::new(),
@@ -2424,7 +3114,16 @@ pub fn choose_form(
 ) -> Option<Vec<String>> {
     // Здесь шрифт недоступен — используем посимвольную метрику (как раньше).
     let metric = CharWidthMetric::new(true);
-    let enumeration = enumerate_forms(text, preset, DEFAULT_MAX_FORMS, &metric);
+    // Рендер зовёт это ПОСЛЕ разбора inline-стилей, то есть на уже очищенном тексте;
+    // остаются только управляющие теги «не разрывать», и вернуть сюда нечего —
+    // функция отдаёт строки, а не текст.
+    let enumeration = enumerate_forms(
+        text,
+        preset,
+        DEFAULT_MAX_FORMS,
+        &metric,
+        InlineTagScope::NoBreakOnly,
+    );
     let target = target_line_width.max(1) as u32;
     let mut best_key: Option<(bool, usize, u32, u32, u32)> = None;
     let mut best_lines: Option<Vec<String>> = None;
@@ -2548,7 +3247,13 @@ mod tests {
 
     #[test]
     fn enumerate_widen_is_non_decreasing_only() {
-        let result = enumerate_forms("a bb ccc", TextFormPreset::Widen, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "a bb ccc",
+            TextFormPreset::Widen,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
         for form in &result.forms {
             assert!(sequence_matches(&widths_of(form), TextFormPreset::Widen, 0));
@@ -2558,7 +3263,13 @@ mod tests {
     #[test]
     fn enumerate_has_no_duplicates_in_single_pass() {
         let result =
-            enumerate_forms("one two three four", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+            enumerate_forms(
+                "one two three four",
+                TextFormPreset::FreeNoTree,
+                1000,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            );
         let mut seen = std::collections::HashSet::new();
         for form in &result.forms {
             assert!(
@@ -2572,7 +3283,13 @@ mod tests {
 
     #[test]
     fn enumerate_lens_only_returns_bulging_forms() {
-        let result = enumerate_forms("aa b ccc dd e", TextFormPreset::Lens, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "aa b ccc dd e",
+            TextFormPreset::Lens,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         for form in &result.forms {
             assert!(is_lens(&widths_of(form), 0), "{:?}", form.lines);
         }
@@ -2581,7 +3298,13 @@ mod tests {
     #[test]
     fn whitespace_only_breaks_have_zero_cost_and_no_word_breaks() {
         // Короткие слова (<4 символов) не переносятся словарём — только пробелы.
-        let result = enumerate_forms("aa bb cc", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "aa bb cc",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
         for form in &result.forms {
             assert_eq!(form.word_break_count, 0, "{:?}", form.lines);
@@ -2592,11 +3315,14 @@ mod tests {
     #[test]
     fn prepare_inline_no_break_text_strips_tags_and_uses_nbsp() {
         assert_eq!(
-            prepare_inline_no_break_text("aa <no-break>bb cc</no-break> dd"),
+            prepare_inline_no_break_text(
+                "aa <no-break>bb cc</no-break> dd",
+                InlineTagScope::NoBreakOnly,
+            ),
             "aa bb\u{00A0}cc dd"
         );
         assert_eq!(
-            prepare_inline_no_break_text("aa <m j>bb cc</m> dd"),
+            prepare_inline_no_break_text("aa <m j>bb cc</m> dd", InlineTagScope::NoBreakOnly),
             "aa bb\u{00A0}cc dd"
         );
     }
@@ -2608,6 +3334,7 @@ mod tests {
             TextFormPreset::FreeNoTree,
             1000,
             &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
         );
 
         assert!(!result.forms.is_empty());
@@ -2619,16 +3346,257 @@ mod tests {
         }));
     }
 
+    /// Формы обоих входов перебора для СЫРОГО (с тегами) текста — построчно.
+    ///
+    /// Оба входа проверяются вместе: разметку блоков они делят одну
+    /// ([`segment_form_blocks`]), но ходят по дереву по-разному, и защита обязана
+    /// держаться в обоих.
+    fn all_form_lines_of(raw: &str) -> Vec<Vec<String>> {
+        all_form_lines_of_at(raw, InlineTagScope::NoBreakOnly)
+    }
+
+    /// То же, но в заданной области снятия инлайновых тегов.
+    fn all_form_lines_of_at(raw: &str, scope: InlineTagScope) -> Vec<Vec<String>> {
+        let enumerated =
+            enumerate_forms(raw, TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC, scope);
+        let searched = search_forms(
+            raw,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &char_search_params(),
+            scope,
+        );
+        assert!(
+            !enumerated.forms.is_empty(),
+            "enumerate_forms не нашёл ни одной формы для {raw:?}"
+        );
+        assert!(
+            !searched.forms.is_empty(),
+            "search_forms не нашёл ни одной формы для {raw:?}"
+        );
+        enumerated
+            .forms
+            .iter()
+            .chain(searched.forms.iter())
+            .map(|form| form.lines.clone())
+            .collect()
+    }
+
+    /// `fragment` (уже подготовленный: без тегов, с NBSP вместо пробелов) целиком
+    /// лежит на ОДНОЙ строке каждой формы `raw` — то есть защищённый диапазон не
+    /// разорван ни пробелом, ни переносом, ни существующим дефисом.
+    fn assert_protected_range_is_never_split(raw: &str, fragment: &str) {
+        assert_protected_range_is_never_split_at(raw, fragment, InlineTagScope::NoBreakOnly);
+    }
+
+    /// То же, но в заданной области снятия инлайновых тегов.
+    fn assert_protected_range_is_never_split_at(raw: &str, fragment: &str, scope: InlineTagScope) {
+        for lines in all_form_lines_of_at(raw, scope) {
+            assert!(
+                lines.iter().any(|line| line.contains(fragment)),
+                "форма {lines:?} разорвала защищённый диапазон {fragment:?} текста {raw:?}"
+            );
+        }
+    }
+
+    /// Пробел внутри `<no-break>` не разрыв: панель отдаёт движку СЫРОЙ текст, теги
+    /// на месте, и диапазон становится одним блоком.
+    ///
+    /// Регрессия: панель снимала теги сама, движок снимал их ВТОРОЙ раз с уже чистого
+    /// текста, не находил ничего и размечал защищённый диапазон переносами.
+    #[test]
+    fn no_break_range_with_a_space_is_never_split() {
+        assert_protected_range_is_never_split(
+            "пример <no-break>не разрывать</no-break> конец",
+            "не\u{00A0}разрывать",
+        );
+    }
+
+    /// Слово от 4 символов внутри `<no-break>` не переносится по словарю.
+    ///
+    /// Контроль на том же слове без тега обязателен: без него тест прошёл бы и на
+    /// тексте, который словарь вообще не умеет переносить.
+    #[test]
+    fn no_break_range_never_hyphenates_a_long_word() {
+        assert!(
+            all_form_lines_of("начало переносимое конец")
+                .iter()
+                .any(|lines| lines.iter().any(|line| line.ends_with('-'))),
+            "контрольный текст без тега обязан переноситься словарём"
+        );
+        assert_protected_range_is_never_split(
+            "начало <nobr>переносимое</nobr> конец",
+            "переносимое",
+        );
+    }
+
+    /// Существующий дефис внутри `<no-break>` не точка переноса.
+    ///
+    /// Сегментатор режет по таким дефисам всегда (`allow_hard_hyphen_breaks: true` —
+    /// это нужно остальному тексту), поэтому защиту даёт склейка стыков внутри
+    /// диапазона ([`glue_protected_junctions`]).
+    #[test]
+    fn no_break_range_never_breaks_at_a_hard_hyphen() {
+        assert!(
+            all_form_lines_of("текст что-то важное дальше")
+                .iter()
+                .any(|lines| lines.iter().any(|line| line.ends_with("что-"))),
+            "контрольный текст без тега обязан рваться по существующему дефису"
+        );
+        assert_protected_range_is_never_split(
+            "текст <no-break>что-то важное</no-break> дальше",
+            "что-то\u{00A0}важное",
+        );
+    }
+
+    /// Машинный `<m j>` — та же защита, что и `<no-break>`: набор форм совпадает
+    /// построчно. Машинная форма тега — та, которую панель ставит по умолчанию.
+    #[test]
+    fn machine_join_tag_protects_exactly_like_no_break() {
+        assert_eq!(
+            all_form_lines_of("пример <m j>не разрывать</m> конец"),
+            all_form_lines_of("пример <no-break>не разрывать</no-break> конец")
+        );
+        assert_protected_range_is_never_split(
+            "пример <m b j>не разрывать</m> конец",
+            "не\u{00A0}разрывать",
+        );
+    }
+
+    /// Заглавный текст переносится по словарю — что бы ни стояло рядом.
+    ///
+    /// Регрессия, ради которой эвристика «заглавное слово — аббревиатура» была
+    /// удалена целиком. Пока она была относительной («заглавное слово в СМЕШАННОМ
+    /// тексте»), заглавную строку лишала переносов любая строчная латиница рядом:
+    /// инлайновый тег, который движок не снимает (`<b>`, `<i>`, `<font=…>`), или
+    /// одно строчное слово. Теперь регистр не участвует в решении вовсе.
+    #[test]
+    fn all_caps_text_hyphenates_whatever_stands_next_to_it() {
+        for raw in [
+            "ЭТО ПРЕДЛОЖЕНИЕ ПЕРЕНОСИТСЯ",
+            // Тег, который движок НЕ снимает: его строчная латиница попадает в текст
+            // сегментатора и раньше «расколдовывала» защиту аббревиатуры.
+            "<b>ЭТО</b> ПРЕДЛОЖЕНИЕ ПЕРЕНОСИТСЯ",
+            // Одно строчное слово в конце — тот же эффект.
+            "ЭТО ПРЕДЛОЖЕНИЕ ПЕРЕНОСИТСЯ ня",
+            // Снимаемый тег «Не разрывать» тоже ничего не меняет.
+            "СМОТРИ <no-break>СЮДА</no-break> ПЕРЕНОСИМОЕ",
+        ] {
+            assert!(
+                all_form_lines_of(raw)
+                    .iter()
+                    .any(|lines| lines.iter().any(|line| line.ends_with('-'))),
+                "заглавный текст {raw:?} обязан переноситься словарём"
+            );
+        }
+    }
+
+    /// Регрессия: текст БЕЗ тегов даёт ровно те же формы, в том же порядке, что и до
+    /// переноса снятия тегов внутрь движка — со словарными переносами и разрывом по
+    /// существующему дефису включительно.
+    #[test]
+    fn untagged_text_keeps_producing_the_same_forms() {
+        const EXPECTED: [&[&str]; 11] = [
+            &["что-", "то важ-", "ное", "тут"],
+            &["что-", "то важ-", "ное тут"],
+            &["что-", "то важное", "тут"],
+            &["что-", "то важное тут"],
+            &["что-то", "важ-", "ное", "тут"],
+            &["что-то", "важное", "тут"],
+            &["что-то", "важное тут"],
+            &["что-то важ-", "ное", "тут"],
+            &["что-то важ-", "ное тут"],
+            &["что-то важное", "тут"],
+            &["что-то важное тут"],
+        ];
+
+        let result = enumerate_forms(
+            "что-то важное тут",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
+        assert_eq!(result.forms.len(), EXPECTED.len());
+        for (form, expected) in result.forms.iter().zip(EXPECTED) {
+            let lines: Vec<&str> = form.lines.iter().map(String::as_str).collect();
+            assert_eq!(lines.as_slice(), expected);
+        }
+    }
+
+    /// Все написания тега (и закрывающего), незакрытый и вложенный диапазоны.
+    ///
+    /// Проверяется подготовленный текст: из него берут и алфавит метрики
+    /// ([`GlyphWidths::build`]), и блоки перебора, поэтому пропущенное написание
+    /// молча снимало бы защиту целиком.
+    #[test]
+    fn no_break_tag_aliases_close_and_nest_case_insensitively() {
+        const RANGES: [(&str, &str); 9] = [
+            ("<no-break>", "</no-break>"),
+            ("<nobreak>", "</nobreak>"),
+            ("<nobr>", "</nobr>"),
+            ("<NO-BREAK>", "</NO-BREAK>"),
+            ("<NoBreak>", "</nobreak>"),
+            ("<nobr>", "</NOBR>"),
+            ("<m j>", "</m>"),
+            ("<M J>", "</M>"),
+            ("<m j b>", "</m>"),
+        ];
+        for (open, close) in RANGES {
+            assert_eq!(
+                prepare_inline_no_break_text(
+                    &format!("aa {open}bb cc{close} dd"),
+                    InlineTagScope::NoBreakOnly,
+                ),
+                "aa bb\u{00A0}cc dd",
+                "написание {open} … {close}"
+            );
+        }
+
+        // Незакрытый тег защищает до конца текста — иначе редактирование в середине
+        // ввода снимало бы защиту с уже набранного.
+        assert_eq!(
+            prepare_inline_no_break_text("aa <no-break>bb cc", InlineTagScope::NoBreakOnly),
+            "aa bb\u{00A0}cc"
+        );
+        // Вложенность считается глубиной: внутренний закрывающий тег не снимает
+        // внешнюю защиту.
+        assert_eq!(
+            prepare_inline_no_break_text(
+                "aa <no-break>bb <nobr>cc dd</nobr> ee</no-break> ff",
+                InlineTagScope::NoBreakOnly,
+            ),
+            "aa bb\u{00A0}cc\u{00A0}dd\u{00A0}ee ff"
+        );
+        // Закрывающий тег без открывающего — просто ничего не защищает.
+        assert_eq!(
+            prepare_inline_no_break_text("aa</nobr> bb cc", InlineTagScope::NoBreakOnly),
+            "aa bb cc"
+        );
+    }
+
     #[test]
     fn single_short_token_yields_one_form_except_lens() {
         assert_eq!(
-            enumerate_forms("кот", TextFormPreset::FreeNoTree, 64, &CHAR_METRIC)
+            enumerate_forms(
+                "кот",
+                TextFormPreset::FreeNoTree,
+                64,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            )
                 .forms
                 .len(),
             1
         );
         assert!(
-            enumerate_forms("кот", TextFormPreset::Lens, 64, &CHAR_METRIC)
+            enumerate_forms(
+                "кот",
+                TextFormPreset::Lens,
+                64,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            )
                 .forms
                 .is_empty()
         );
@@ -2636,7 +3604,13 @@ mod tests {
 
     #[test]
     fn min_median_and_peakiness_track_line_widths() {
-        let result = enumerate_forms("aa bb ccccc", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "aa bb ccccc",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
         for form in &result.forms {
             let mut widths = widths_of(form);
@@ -2681,7 +3655,13 @@ mod tests {
 
     #[test]
     fn unevenness_matches_mean_abs_deviation_from_median() {
-        let result = enumerate_forms("aa bb ccccc dd", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "aa bb ccccc dd",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
         for form in &result.forms {
             let widths = widths_of(form);
@@ -2716,7 +3696,13 @@ mod tests {
         // «на» — двухбуквенный предлог: отрыв в конец строки → Bold. Единственная
         // служебная связь в тексте, поэтому консервативность не выше Bold.
         let result =
-            enumerate_forms("кот на ветке", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+            enumerate_forms(
+                "кот на ветке",
+                TextFormPreset::FreeNoTree,
+                1000,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            );
         assert!(!result.forms.is_empty());
         // Граф один: в нём есть и безопасные формы, и формы с отрывом предлога.
         assert!(result.forms.iter().any(|f| f.conservatism == Conservatism::Safe));
@@ -2736,7 +3722,13 @@ mod tests {
         // Фильтр по `Safe` оставляет только формы без отрыва служебных слов — это и
         // есть прежнее поведение «склейки предлогов».
         let result =
-            enumerate_forms("кот на ветке", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+            enumerate_forms(
+                "кот на ветке",
+                TextFormPreset::FreeNoTree,
+                1000,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            );
         let safe: Vec<_> = result
             .forms
             .iter()
@@ -2773,7 +3765,13 @@ mod tests {
         let low = MIN_AVAILABLE_MEMORY_BYTES - 1;
         let started = web_time::Instant::now();
         let result = with_memory_source(Some(low), || {
-            enumerate_forms(BIG_TEXT, TextFormPreset::FreeNoTree, usize::MAX, &CHAR_METRIC)
+            enumerate_forms(
+                BIG_TEXT,
+                TextFormPreset::FreeNoTree,
+                usize::MAX,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            )
         });
         assert!(result.truncated, "low memory must truncate enumeration");
         // Остановились рано: перечислили заметно меньше, чем дал бы полный обход
@@ -2794,7 +3792,13 @@ mod tests {
         // Памяти «вдоволь» — защита по памяти молчит, маленький вход исчерпывается.
         let high = MIN_AVAILABLE_MEMORY_BYTES * 16;
         let result = with_memory_source(Some(high), || {
-            enumerate_forms("aa bb cc", TextFormPreset::FreeNoTree, usize::MAX, &CHAR_METRIC)
+            enumerate_forms(
+                "aa bb cc",
+                TextFormPreset::FreeNoTree,
+                usize::MAX,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            )
         });
         assert!(!result.truncated, "small input must complete");
         assert!(!result.forms.is_empty());
@@ -2804,7 +3808,13 @@ mod tests {
     fn max_forms_cap_still_enforced() {
         // Явный маленький cap по-прежнему действует (путь choose_form не затронут).
         let result = with_memory_source(Some(MIN_AVAILABLE_MEMORY_BYTES * 16), || {
-            enumerate_forms(BIG_TEXT, TextFormPreset::FreeNoTree, 5, &CHAR_METRIC)
+            enumerate_forms(
+                BIG_TEXT,
+                TextFormPreset::FreeNoTree,
+                5,
+                &CHAR_METRIC,
+                InlineTagScope::NoBreakOnly,
+            )
         });
         assert!(result.forms.len() <= 5, "got {}", result.forms.len());
         assert!(result.truncated, "more than 5 forms exist → truncated");
@@ -2860,7 +3870,7 @@ Pages wired down:                        333333.\n";
     /// переносимая строка — знаменатель люфта бюджета переносов (план §2.1).
     fn min_possible_width_of(text: &str) -> u32 {
         with_default_segmenter(|seg| {
-            let blocks = segment_form_blocks(seg, text);
+            let blocks = segment_form_blocks(seg, text, InlineTagScope::NoBreakOnly);
             let last = blocks.len();
             (0..last)
                 .map(|index| {
@@ -2982,7 +3992,13 @@ Pages wired down:                        333333.\n";
     #[test]
     fn search_returns_nothing_wider_than_the_aspect_cap() {
         let params = char_search_params();
-        let result = search_forms(MEDIUM_TEXT, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        let result = search_forms(
+            MEDIUM_TEXT,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty(), "text must admit forms under the cap");
         let cap = f64::from(params.aspect_max);
         for form in &result.forms {
@@ -3003,7 +4019,13 @@ Pages wired down:                        333333.\n";
         let min_possible = min_possible_width_of(text);
         assert!(min_possible > 0);
         let params = char_search_params();
-        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        let result = search_forms(
+            text,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
 
         let mut saw_strict_slack = false;
@@ -3038,7 +4060,13 @@ Pages wired down:                        333333.\n";
             ..char_search_params()
         };
         let forced_result =
-            search_forms(forced_text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &forced);
+            search_forms(
+                forced_text,
+                TextFormPreset::FreeNoTree,
+                &CHAR_METRIC,
+                &forced,
+                InlineTagScope::NoBreakOnly,
+            );
         assert!(!forced_result.forms.is_empty(), "narrow forms must exist");
         assert!(
             forced_result.forms.iter().any(|form| {
@@ -3057,7 +4085,13 @@ Pages wired down:                        333333.\n";
         // формы, но окно не должно оставаться пустым (план §2.1).
         let text = "ааааааааааааааааааааааааааааа";
         let params = char_search_params();
-        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        let result = search_forms(
+            text,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert_eq!(result.forms.len(), 1, "fallback must yield the single form");
         let only = &result.forms[0];
         assert_eq!(only.line_count(), 1);
@@ -3068,7 +4102,13 @@ Pages wired down:                        333333.\n";
 
         // Формы может не существовать в принципе — тогда пустой ответ законен.
         assert!(
-            search_forms(text, TextFormPreset::Lens, &CHAR_METRIC, &params)
+            search_forms(
+                text,
+                TextFormPreset::Lens,
+                &CHAR_METRIC,
+                &params,
+                InlineTagScope::NoBreakOnly,
+            )
                 .forms
                 .is_empty()
         );
@@ -3080,7 +4120,13 @@ Pages wired down:                        333333.\n";
             per_bucket: 4,
             ..char_search_params()
         };
-        let result = search_forms(MEDIUM_REPLICA, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        let result = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
 
         let buckets = buckets_of(&result.forms);
@@ -3121,7 +4167,13 @@ Pages wired down:                        333333.\n";
     fn big_replica_completes_within_the_node_budget() {
         assert!(BIG_REPLICA.chars().count() >= 350);
         let params = char_search_params();
-        let result = search_forms(BIG_REPLICA, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        let result = search_forms(
+            BIG_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty(), "a long replica must still get a window");
         assert!(
             result.nodes_visited <= params.node_budget_total,
@@ -3145,6 +4197,7 @@ Pages wired down:                        333333.\n";
             TextFormPreset::FreeNoTree,
             &CHAR_METRIC,
             &char_search_params(),
+            InlineTagScope::NoBreakOnly,
         );
         assert!(!baseline.forms.is_empty());
 
@@ -3157,6 +4210,7 @@ Pages wired down:                        333333.\n";
             TextFormPreset::FreeNoTree,
             &CHAR_METRIC,
             &line_limited,
+            InlineTagScope::NoBreakOnly,
         );
         assert!(!by_lines.forms.is_empty());
         assert!(
@@ -3191,6 +4245,7 @@ Pages wired down:                        333333.\n";
             TextFormPreset::FreeNoTree,
             &CHAR_METRIC,
             &width_limited,
+            InlineTagScope::NoBreakOnly,
         );
         assert!(!by_width.forms.is_empty());
         assert!(
@@ -3222,7 +4277,13 @@ Pages wired down:                        333333.\n";
             line_height_units: 1.0,
             ..FormSearchParams::default()
         };
-        let result = search_forms("a b", TextFormPreset::FreeNoTree, &metric, &params);
+        let result = search_forms(
+            "a b",
+            TextFormPreset::FreeNoTree,
+            &metric,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(
             result.forms.iter().any(|form| form.lines == ["a", "b"]),
             "the two-line form must survive, got {:?}",
@@ -3285,7 +4346,13 @@ Pages wired down:                        333333.\n";
             line_range: Some((2, 2)),
             ..FormSearchParams::default()
         };
-        let result = search_forms("aa bbz cc dd", TextFormPreset::FreeNoTree, &metric, &params);
+        let result = search_forms(
+            "aa bbz cc dd",
+            TextFormPreset::FreeNoTree,
+            &metric,
+            &params,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(
             result
                 .forms
@@ -3306,7 +4373,13 @@ Pages wired down:                        333333.\n";
         // аварийный прогон §2.1 обязателен — и обязан тратить ТОТ ЖЕ бюджет узлов.
         let text = "ааааааааааааааааааааааааааааа";
         let generous = char_search_params();
-        let full = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &generous);
+        let full = search_forms(
+            text,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &generous,
+            InlineTagScope::NoBreakOnly,
+        );
         assert_eq!(full.forms.len(), 1, "a full budget must reach the fallback");
         assert!(!full.truncated);
 
@@ -3318,7 +4391,13 @@ Pages wired down:                        333333.\n";
             ..char_search_params()
         };
         assert!(starved.node_budget_total >= 1, "the test needs a real budget");
-        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &starved);
+        let result = search_forms(
+            text,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &starved,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(result.truncated, "an exhausted budget must be reported");
         assert!(
             result.forms.is_empty(),
@@ -3406,6 +4485,7 @@ Pages wired down:                        333333.\n";
             TextFormPreset::FreeNoTree,
             &CHAR_METRIC,
             &hostile,
+            InlineTagScope::NoBreakOnly,
         );
         assert!(!result.forms.is_empty(), "sanitised params must still search");
 
@@ -3446,6 +4526,7 @@ Pages wired down:                        333333.\n";
             TextFormPreset::FreeNoTree,
             &CHAR_METRIC,
             &char_search_params(),
+            InlineTagScope::NoBreakOnly,
         );
         assert!(result.forms.len() > 10, "expected a rich sample");
         let mut seen: HashSet<Vec<String>> = HashSet::new();
@@ -3460,7 +4541,13 @@ Pages wired down:                        333333.\n";
 
     #[test]
     fn exhaustive_enumeration_keeps_widths_but_stays_unscored() {
-        let result = enumerate_forms("aa bb ccccc", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+        let result = enumerate_forms(
+            "aa bb ccccc",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
         assert!(!result.forms.is_empty());
         for form in &result.forms {
             assert_eq!(form.line_widths, widths_of(form));
@@ -3473,7 +4560,498 @@ Pages wired down:                        333333.\n";
             );
         }
     }
+
+    /// Ножницы для тестов обхода: область `All` с типичным кеглем.
+    const ALL_TAGS: InlineTagScope = InlineTagScope::All {
+        base_font_size_px: 24.0,
+    };
+
+    #[test]
+    fn the_strip_vocabulary_is_the_renderers_vocabulary() {
+        // Тот же корпус, что и у `inline_styles`: если словарь снятия разойдётся с
+        // парсером рендера, теги применённой формы уедут относительно того, что рисуется.
+        for body in [
+            "b", "/b", "i", "em", "font=Arial", "size=24", "color=#ff0000", "align=center",
+            "offset=1,2", "stretching=120%,90%", "m b=1", "/m", "br", "no-break", "/nobr",
+        ] {
+            let text = format!("aa<{body}>bb");
+            assert_eq!(
+                prepare_inline_no_break_text(&text, ALL_TAGS),
+                "aabb",
+                "<{body}> must be stripped at the All scope"
+            );
+        }
+        for body in ["unknown", "size=abc", "m=1", "font=", ""] {
+            let text = format!("aa<{body}>bb");
+            assert_eq!(
+                prepare_inline_no_break_text(&text, ALL_TAGS),
+                text,
+                "<{body}> is not a tag and must stay literal"
+            );
+        }
+    }
+
+    #[test]
+    fn no_break_only_scope_keeps_style_tags_as_literal_text() {
+        // Со снятой галкой «Инлайновые теги» рендер рисует `<b>` буквально — перебор форм
+        // обязан мерить его как текст.
+        assert_eq!(
+            prepare_inline_no_break_text("aa<b>bb</b>cc", InlineTagScope::NoBreakOnly),
+            "aa<b>bb</b>cc"
+        );
+        assert_eq!(
+            prepare_inline_no_break_text("aa<br>bb", InlineTagScope::NoBreakOnly),
+            "aa<br>bb"
+        );
+        // Управляющие теги снимаются в обеих областях.
+        assert_eq!(
+            prepare_inline_no_break_text("aa<no-break>b c</no-break>", InlineTagScope::NoBreakOnly),
+            "aab\u{00A0}c"
+        );
+        assert_eq!(
+            prepare_inline_no_break_text("aa<m b=1>bb</m>", InlineTagScope::NoBreakOnly),
+            "aabb"
+        );
+    }
+
+    #[test]
+    fn anchors_carry_the_tag_verbatim_and_offsets_of_the_stripped_text() {
+        let stripped = strip_inline_tags("aa<b>bb</b>", ALL_TAGS);
+        assert_eq!(
+            stripped.anchors,
+            vec![
+                TagAnchor {
+                    plain_offset: 2,
+                    source: "<b>".to_string(),
+                    closing: false,
+                },
+                TagAnchor {
+                    plain_offset: 4,
+                    source: "</b>".to_string(),
+                    closing: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn anchor_offsets_account_for_the_nbsp_widening() {
+        // Пробел защищённого диапазона становится двухбайтовым NBSP: якорь берёт длину
+        // УЖЕ ОЧИЩЕННОГО текста, поэтому сдвинуться не может.
+        let stripped = strip_inline_tags("<no-break>aa <b>bb</b></no-break>", ALL_TAGS);
+        let offsets: Vec<usize> = stripped
+            .anchors
+            .iter()
+            .map(|anchor| anchor.plain_offset)
+            .collect();
+        assert_eq!(offsets, vec!["aa\u{00A0}".len(), "aa\u{00A0}bb".len()]);
+        assert_eq!(
+            reapply_inline_tags_to_form_text(
+                "<no-break>aa <b>bb</b></no-break>",
+                ALL_TAGS,
+                "aa\u{00A0}bb"
+            ),
+            Ok("aa\u{00A0}<b>bb</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn a_single_line_form_reproduces_the_source_markup_exactly() {
+        // Неправильно вложенные и «висячие» теги не чинятся и не переставляются.
+        for source in [
+            "<b>aa<i>bb</b>cc</i>dd",
+            "</b>aa",
+            "<b><i>aa</i></b>",
+            "<m b=1 c=ff0000>aa</m>",
+        ] {
+            let plain: String = strip_inline_tags(source, ALL_TAGS)
+                .runs
+                .into_iter()
+                .map(|run| run.text)
+                .collect();
+            assert_eq!(
+                reapply_inline_tags_to_form_text(source, ALL_TAGS, plain.as_str()),
+                Ok(source.to_string()),
+                "single-line form must round-trip {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closing_tag_at_a_break_stays_on_the_preceding_line() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>aaa</b> bbb", ALL_TAGS, "aaa\nbbb"),
+            Ok("<b>aaa</b>\nbbb".to_string())
+        );
+    }
+
+    #[test]
+    fn an_opening_tag_at_a_break_starts_the_following_line() {
+        // Якорь стоит ПЕРЕД пробелом разрыва — открывающий тег всё равно уезжает за него.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aaa<b> bbb</b>", ALL_TAGS, "aaa\nbbb"),
+            Ok("aaa\n<b>bbb</b>".to_string())
+        );
+        // И тот же тег, стоящий ПОСЛЕ пробела.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aaa <b>bbb</b>", ALL_TAGS, "aaa\nbbb"),
+            Ok("aaa\n<b>bbb</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn a_wrap_hyphen_stays_inside_the_span_it_belongs_to() {
+        // Словарный перенос: дефис дописан формой, в исходнике его нет.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>краси</b>вый", ALL_TAGS, "краси-\nвый"),
+            Ok("<b>краси-</b>\nвый".to_string())
+        );
+        assert_eq!(
+            reapply_inline_tags_to_form_text("краси<b>вый</b>", ALL_TAGS, "краси-\nвый"),
+            Ok("краси-\n<b>вый</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn an_existing_hard_hyphen_is_not_mistaken_for_a_wrap_hyphen() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("Рао<b>-кун</b>", ALL_TAGS, "Рао-\nкун"),
+            Ok("Рао<b>-\nкун</b>".to_string())
+        );
+        assert_eq!(
+            reapply_inline_tags_to_form_text("Рао-<b>кун</b>", ALL_TAGS, "Рао-\nкун"),
+            Ok("Рао-\n<b>кун</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn a_machine_tag_survives_the_form_it_was_split_by() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text(
+                "aaa <m b=1 c=ff0000>bbb ccc</m> ddd",
+                ALL_TAGS,
+                "aaa bbb\nccc ddd"
+            ),
+            Ok("aaa <m b=1 c=ff0000>bbb\nccc</m> ddd".to_string())
+        );
+    }
+
+    #[test]
+    fn no_break_and_br_are_consumed_and_never_restored() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text(
+                "<no-break>aa bb</no-break> cc",
+                ALL_TAGS,
+                "aa\u{00A0}bb\ncc"
+            ),
+            Ok("aa\u{00A0}bb\ncc".to_string())
+        );
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aa<br>bb", ALL_TAGS, "aa\nbb"),
+            Ok("aa\nbb".to_string())
+        );
+    }
+
+    #[test]
+    fn collapsed_and_normalised_separators_do_not_displace_tags() {
+        // Табуляция/перевод строки нормализуются в пробел с тем же числом символов.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>aa</b>\tbb", ALL_TAGS, "aa bb"),
+            Ok("<b>aa</b> bb".to_string())
+        );
+        // Несколько пробелов схлопываются в один перенос.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>aa</b>   bb", ALL_TAGS, "aa\nbb"),
+            Ok("<b>aa</b>\nbb".to_string())
+        );
+        // Якорь ВНУТРИ схлопнутого прогона.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aa <b>  bb</b>", ALL_TAGS, "aa\nbb"),
+            Ok("aa\n<b>bb</b>".to_string())
+        );
+        // Ведущие пробелы сегментатор выбрасывает.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("  <b>aa</b>", ALL_TAGS, "aa"),
+            Ok("<b>aa</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn a_user_typed_soft_hyphen_is_consumed_without_shifting_tags() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aa\u{00AD}<b>bb</b>", ALL_TAGS, "aabb"),
+            Ok("aa<b>bb</b>".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ill_nested_pair_at_a_break_is_split_across_the_lines_without_panicking() {
+        // `<i></b>` уже неправильно вложен: на разрыве закрывающий уходит в конец
+        // предыдущей строки, открывающий — в начало следующей, и их порядок меняется.
+        // Документированный остаток, а не дефект — чинить чужую разметку здесь нечем,
+        // и рендер увидит ровно тот набор тегов, что и без формы.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aaa<i></b> bbb", ALL_TAGS, "aaa\nbbb"),
+            Ok("aaa</b>\n<i>bbb".to_string())
+        );
+    }
+
+
+    /// The refusal must catch only what the engine cannot produce.
+    ///
+    /// The counterpart of the two refusal tests below: they pin that an illegal
+    /// transformation is rejected, this one pins that no LEGAL one is — every form the
+    /// enumerator actually emits, for texts exercising every whitespace shape the walk
+    /// knows (multiple spaces, tabs, a literal newline kept inside a dash segment, edge
+    /// whitespace, dictionary and hard hyphens, soft hyphens, protected ranges), must
+    /// re-tag and strip back to itself. A tightening of [`classify_form_whitespace`] that
+    /// starts refusing real forms shows up here instead of in the panel.
+    #[test]
+    fn no_form_the_engine_actually_produces_is_refused() {
+        const CORPUS: &[&str] = &[
+            "начало <b>переносимое</b> слово <m c=ff0000>и ещё</m> конец",
+            "слово — <b>другое</b> слово ещё",
+            "начало  \n  — <b>конец</b>",
+            "  <b>ведущие</b> пробелы и хвостовые   ",
+            "Рао<b>-кун</b> сказал что-то <i>важное</i> сегодня",
+            "текст\tс\tтабами <b>и</b> тегами внутри",
+            "<no-break>не разрывать</no-break> дальше <b>жирный</b> текст",
+            "мягкий\u{00AD}перенос <b>внутри</b> слова тоже бывает",
+            "<m j c=ff0000>защищено машинным</m> и <font=Arial>шрифт</font> дальше",
+            "a<b>b</b> c d e f g h i j",
+            "один—два <b>три</b>—четыре пять",
+            "very long english <b>hyphenation</b> candidate words here",
+            "текст <b>с</b>  двумя  пробелами  везде  между  словами",
+        ];
+        for raw in CORPUS {
+            for lines in all_form_lines_of_at(raw, ALL_TAGS) {
+                let form_text = lines.join("\n");
+                let retagged = reapply_inline_tags_to_form_text(raw, ALL_TAGS, form_text.as_str())
+                    .unwrap_or_else(|err| panic!("{raw:?} form {lines:?} refused: {err}"));
+                assert_eq!(
+                    prepare_inline_no_break_text(retagged.as_str(), ALL_TAGS),
+                    form_text,
+                    "{raw:?} form {lines:?}"
+                );
+            }
+            for lines in all_form_lines_of(raw) {
+                let form_text = lines.join("\n");
+                reapply_inline_tags_to_form_text(raw, InlineTagScope::NoBreakOnly, form_text.as_str())
+                    .unwrap_or_else(|err| panic!("nb {raw:?} form {lines:?} refused: {err}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_form_text_that_does_not_come_from_this_source_is_refused() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>aaa</b>", ALL_TAGS, "zzz"),
+            Err(TagReapplyError::Unalignable {
+                plain_offset: 0,
+                form_offset: 0,
+            })
+        );
+        // Отказ, а не пересинхронизация на более позднем совпадении.
+        assert!(
+            reapply_inline_tags_to_form_text("aaa <b>bbb</b>", ALL_TAGS, "aaa bbb extra").is_err()
+        );
+    }
+
+    /// A whitespace change the form engine cannot make is a refusal, not a guess.
+    ///
+    /// The walk enters its whitespace branch whenever EITHER side sees whitespace, so an
+    /// alleged form that invents a separator or swallows one would otherwise be accepted
+    /// and the tags placed around text the user never sees. `Unalignable` is the whole
+    /// safety property of this function, and it has to hold for these two as well.
+    #[test]
+    fn whitespace_the_form_engine_cannot_produce_is_refused() {
+        // A space out of nowhere: the source has none at that junction.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("a<b>b</b>", ALL_TAGS, "a b"),
+            Err(TagReapplyError::Unalignable {
+                plain_offset: 1,
+                form_offset: 1,
+            })
+        );
+        // And a separator that disappeared without a break taking its place: interior
+        // whitespace is only ever normalized or collapsed INTO a break, never dropped.
+        assert_eq!(
+            reapply_inline_tags_to_form_text("a <b>b</b>", ALL_TAGS, "ab"),
+            Err(TagReapplyError::Unalignable {
+                plain_offset: 1,
+                form_offset: 1,
+            })
+        );
+    }
+
+    /// A trailing `'-'` is not a wrap hyphen: the last line of a form never wraps.
+    ///
+    /// `build_line_text_and_units` appends `Joint::wrap_suffix` only for a line that wraps
+    /// (`ms-text-util/src/segmentation/base.rs`), so a hyphen the source does not have can
+    /// only appear before the `'\n'` that separates it from the rest of the source.
+    /// Accepting one at end of text let an alleged form add a visible character.
+    #[test]
+    fn a_trailing_hyphen_no_break_follows_is_not_a_wrap_hyphen() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("<b>abc</b>", ALL_TAGS, "abc-"),
+            Err(TagReapplyError::Unalignable {
+                plain_offset: 3,
+                form_offset: 3,
+            })
+        );
+    }
+
+    /// A literal `'\n'` INSIDE a block keeps the whitespace around it, and the walk must
+    /// map it character by character.
+    ///
+    /// `build_segments` glues a standalone dash token to the previous word together with
+    /// the whitespace tokens on both sides, verbatim (`ms-text-util/src/segmentation/
+    /// base.rs`), so a block's text can contain a real `'\n'` with more whitespace around
+    /// it. Only the run LENGTHS tell that apart from a run the form collapsed into the
+    /// single `'\n'` of a break — "collapse whenever the target is `'\n'`" would eat the
+    /// block's own spaces and displace every later tag.
+    #[test]
+    fn a_literal_newline_inside_a_block_keeps_its_whitespace_run() {
+        const TAGGED: &str = "начало  \n  — <b>конец</b>";
+        let forms = all_form_lines_of_at(TAGGED, ALL_TAGS);
+        assert!(!forms.is_empty());
+        let mut saw_literal_run = false;
+        for lines in forms {
+            let form_text = lines.join("\n");
+            saw_literal_run |= form_text.contains("  \n  —");
+            let retagged = reapply_inline_tags_to_form_text(TAGGED, ALL_TAGS, form_text.as_str())
+                .unwrap_or_else(|err| panic!("form {lines:?} could not be re-tagged: {err}"));
+            for tag in ["<b>", "</b>"] {
+                assert_eq!(
+                    retagged.matches(tag).count(),
+                    1,
+                    "form {lines:?} lost or duplicated {tag}: {retagged:?}"
+                );
+            }
+            // Снятие того же текста возвращает ровно строки формы — значит теги вернулись
+            // на свои места, а пробелы блока никуда не делись.
+            assert_eq!(
+                prepare_inline_no_break_text(retagged.as_str(), ALL_TAGS),
+                form_text
+            );
+        }
+        assert!(
+            saw_literal_run,
+            "the fixture must actually produce a block carrying a literal newline"
+        );
+    }
+
+    #[test]
+    fn a_text_without_reapplied_tags_comes_back_untouched() {
+        assert_eq!(
+            reapply_inline_tags_to_form_text("aaa bbb", ALL_TAGS, "aaa\nbbb"),
+            Ok("aaa\nbbb".to_string())
+        );
+        // Область `NoBreakOnly` якорей стилей не заводит вовсе.
+        assert_eq!(
+            reapply_inline_tags_to_form_text(
+                "<b>aaa</b> bbb",
+                InlineTagScope::NoBreakOnly,
+                "<b>aaa</b>\nbbb"
+            ),
+            Ok("<b>aaa</b>\nbbb".to_string())
+        );
+    }
+
+    #[test]
+    fn style_tags_stay_in_the_form_lines_at_the_no_break_only_scope() {
+        // Со снятой галкой «Инлайновые теги» рендер `<b>` не разбирает и рисует его как
+        // текст: перебор обязан его сохранить И померить, иначе форма описывает текст,
+        // которого пользователь не увидит.
+        let all = all_form_lines_of("aa <b>bbbb</b> cc");
+        assert!(!all.is_empty());
+        for lines in &all {
+            let text = lines.join("\n");
+            assert!(
+                text.contains("<b>") && text.contains("</b>"),
+                "form {lines:?} dropped a tag the renderer draws"
+            );
+        }
+        // Ширины считаются по строкам ВМЕСТЕ с тегами.
+        let result = enumerate_forms(
+            "aa <b>bbbb</b> cc",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+            InlineTagScope::NoBreakOnly,
+        );
+        for form in &result.forms {
+            assert_eq!(form.line_widths, widths_of(form));
+        }
+    }
+
+    #[test]
+    fn style_tags_leave_both_the_form_lines_and_the_widths_at_the_all_scope() {
+        const TAGGED: &str = "aa <b>bbbb</b> <m c=ff0000>cccc</m> <font=Arial>dd</font>";
+        const PLAIN: &str = "aa bbbb cccc dd";
+
+        for lines in all_form_lines_of_at(TAGGED, ALL_TAGS) {
+            assert!(
+                !lines.iter().any(|line| line.contains('<')),
+                "form {lines:?} still carries markup"
+            );
+        }
+        // Сильнее «тегов не видно»: набор форм обязан СОВПАСТЬ с набором форм текста,
+        // в котором тегов не было вовсе — то есть их символы нигде не померены.
+        assert_eq!(
+            all_form_lines_of_at(TAGGED, ALL_TAGS),
+            all_form_lines_of_at(PLAIN, ALL_TAGS)
+        );
+    }
+
+    #[test]
+    fn a_protected_range_survives_the_all_scope_too() {
+        // Три вида разрыва, теперь при снятых тегах стиля.
+        assert_protected_range_is_never_split_at(
+            "пример <no-break>не разрывать</no-break> конец",
+            "не\u{00A0}разрывать",
+            ALL_TAGS,
+        );
+        assert_protected_range_is_never_split_at(
+            "начало <nobr>переносимое</nobr> конец",
+            "переносимое",
+            ALL_TAGS,
+        );
+        assert_protected_range_is_never_split_at(
+            "текст <no-break>что-то важное</no-break> дальше",
+            "что-то\u{00A0}важное",
+            ALL_TAGS,
+        );
+        // Машинный `<m j>` защищает так же — и при этом остаётся возвращаемым.
+        assert_protected_range_is_never_split_at(
+            "пример <m j c=ff0000>не разрывать</m> конец",
+            "не\u{00A0}разрывать",
+            ALL_TAGS,
+        );
+    }
+
+    #[test]
+    fn every_form_of_a_tagged_text_can_be_re_tagged() {
+        const TAGGED: &str = "начало <b>переносимое</b> слово <m c=ff0000>и ещё</m> конец";
+        let lines = all_form_lines_of_at(TAGGED, ALL_TAGS);
+        assert!(!lines.is_empty());
+        for lines in lines {
+            let form_text = lines.join("\n");
+            let retagged = reapply_inline_tags_to_form_text(TAGGED, ALL_TAGS, form_text.as_str())
+                .unwrap_or_else(|err| panic!("form {lines:?} could not be re-tagged: {err}"));
+            // Каждый снятый тег вернулся ровно один раз, в исходном порядке.
+            for tag in ["<b>", "</b>", "<m c=ff0000>", "</m>"] {
+                assert_eq!(
+                    retagged.matches(tag).count(),
+                    1,
+                    "form {lines:?} lost or duplicated {tag}: {retagged:?}"
+                );
+            }
+            // И снятие того же текста возвращает ровно строки формы.
+            assert_eq!(
+                prepare_inline_no_break_text(retagged.as_str(), ALL_TAGS),
+                form_text
+            );
+        }
+    }
 }
-
-
-

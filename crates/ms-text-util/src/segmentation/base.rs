@@ -252,6 +252,10 @@ pub trait Segmenter {
 
     /// Вставить мягкие переносы (`SOFT_HYPHEN`) в одно слово по словарю; `None`,
     /// если слово переносить не нужно.
+    ///
+    /// Letter case is never consulted: an all-caps word hyphenates exactly like
+    /// its lowercase form (see the module README on why the acronym heuristic was
+    /// dropped).
     fn hyphenate_word(&self, word: &str) -> Option<String>;
 
     /// Цена словарного переноса по голове/хвосту слова (для сортировки форм).
@@ -265,6 +269,11 @@ pub trait Segmenter {
 
     /// Вставляет мягкие переносы в «длинные» слова всего текста (≥ 4 символов,
     /// без URL/`@`/уже имеющихся дефисов).
+    ///
+    /// Works the same on a whole text and on a fragment of one: every rule of
+    /// `hyphenate_word` is local to the word, so a caller that hyphenates a text
+    /// piecewise (runs split around inline tags, spans, paragraphs) gets exactly
+    /// the result it would get on the whole text.
     #[must_use]
     fn soft_hyphenate_overlong(&self, text: &str) -> String {
         let ranges = find_word_ranges(text);
@@ -551,7 +560,16 @@ fn is_line_end_dash_token(token: &str) -> bool {
     !trimmed.is_empty() && trimmed.chars().all(is_line_end_dash_char)
 }
 
-fn is_line_end_dash_char(ch: char) -> bool {
+/// Every dash a line may end on: the ASCII hyphen a dictionary break appends
+/// (`Joint::soft_hyphen`) and every dash `is_hard_hyphen_boundary` cuts after, which
+/// `split_segment_into_parts` leaves at the END of the head block.
+///
+/// Public because a consumer that walks a wrapped text back against its source has to
+/// know the same set — a break with no whitespace behind it in the source is legal only
+/// right after one of these. Duplicating the list on the consumer side would let the two
+/// drift apart silently.
+#[must_use]
+pub fn is_line_end_dash_char(ch: char) -> bool {
     matches!(
         ch,
         '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}'
@@ -698,6 +716,23 @@ fn tokenize_paragraph(paragraph: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+/// Test helper: positions of the soft hyphens of `hyphenated`, counted in
+/// characters of the same text WITHOUT them. Lets a test compare the break
+/// POSITIONS of two case variants of one word instead of comparing raw strings.
+#[cfg(test)]
+pub(crate) fn soft_hyphen_positions(hyphenated: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut char_index = 0usize;
+    for ch in hyphenated.chars() {
+        if ch == SOFT_HYPHEN {
+            positions.push(char_index);
+        } else {
+            char_index += 1;
+        }
+    }
+    positions
 }
 
 #[cfg(test)]

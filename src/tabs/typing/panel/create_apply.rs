@@ -64,6 +64,8 @@ impl TypingCreatePanelState {
         // чтобы он не «наследовался» от ранее выбранного оверлея.
         // `apply_render_data_json_with_options` восстановит его из JSON, если есть.
         self.formed_text.clear();
+        // Предупреждение о потерянных тегах относилось к форме ПРОШЛОГО оверлея.
+        self.advanced_form_tags_lost = false;
         self.advanced_text_show_formed = false;
         // Кэш окна форм относится к прошлому оверлею — инвалидируем.
         self.advanced_form_cache = None;
@@ -385,6 +387,9 @@ impl TypingCreatePanelState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // Текст пришёл из документа, а не из применения формы: прошлое предупреждение о
+        // потерянных тегах к нему не относится.
+        self.advanced_form_tags_lost = false;
         self.advanced_text_show_formed = !self.formed_text.trim().is_empty();
         self.allow_moderate_trees = text_params_obj
             .get("allow_moderate_trees")

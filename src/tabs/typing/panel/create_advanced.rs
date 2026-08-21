@@ -36,6 +36,19 @@ on-canvas editor font (`tab/create_upload.rs`). The own-typeface PREVIEW of the 
 cards goes through `widgets::request_font_family`, which reads its file off-thread for
 the same reason.
 
+THE SEARCH INPUT IS THE RAW EDITOR TEXT, AND THE TAGS COME BACK. `advanced_form_source_text`
+returns `self.text` with its inline tags intact: `forms::search_forms` and
+`forms::GlyphWidths::build` each strip them themselves, once, from that raw string. Stripping
+them here first left the engine with no tags to honour, so «Не разрывать» silently did
+nothing. WHICH tags are stripped is `advanced_form_inline_tag_scope` (derived from
+«Инлайновые теги»: with the flag off `<b>` is drawn text and must be measured); the scope
+lives in `AdvancedFormSearchBase` and `run_advanced_form_search` hands the SAME value to the
+metric and to the search. `apply_advanced_form` then puts the tags back on the chosen form
+(`forms::reapply_inline_tags_to_form_text`) from the base of the SHOWN result — `formed_text`
+replaces the source text in the render, so skipping that step erased every `<m …>` style the
+user had applied. See `panel/MODULE_README.md`, "THE ENGINE GETS THE TAGS, AND GIVES THEM
+BACK".
+
 NEITHER IS THE SEARCH ITSELF ON THE GUI THREAD. `AdvancedFormSearchKey` describes the
 whole input; a change to it arms a ~200 ms debounce and then a named
 `typing-form-search` worker that builds the width metric AND runs
@@ -922,6 +935,8 @@ impl TypingCreatePanelState {
             let revert = ui.add_enabled(has_formed, egui::Button::new(t!("typing.advanced.restore_source_button")));
             if revert.clicked() {
                 self.formed_text.clear();
+                // Форма снята — жаловаться на её потерянные теги больше не на что.
+                self.advanced_form_tags_lost = false;
                 self.advanced_text_show_formed = false;
                 self.queue_preview_render();
                 changed = true;
@@ -956,9 +971,45 @@ impl TypingCreatePanelState {
         egui::FontId::new(PREVIEW_FONT_SIZE_PX, egui::FontFamily::Proportional)
     }
 
-    /// Текст, по которому перебираются формы — всегда исходный (`text`).
+    /// Текст, по которому перебираются формы — всегда исходный (`text`), СО ВСЕМИ
+    /// инлайновыми тегами.
+    ///
+    /// Снимать здесь теги нельзя: движок форм (`forms::search_forms` и метрика
+    /// `forms::GlyphWidths`) снимает их сам, именно по ним узнаёт, какие участки
+    /// защищены, и он же возвращает их на ПРИМЕНЁННУЮ форму
+    /// (`forms::reapply_inline_tags_to_form_text`). Панель, отдавшая уже очищенный
+    /// текст, отдаёт текст без единого тега — защищать оказывается нечего,
+    /// «Не разрывать» молча перестаёт работать, а стили `<m …>` теряются навсегда.
     pub(super) fn advanced_form_source_text(&self) -> String {
-        forms::prepare_inline_no_break_text(&self.text)
+        self.text.clone()
+    }
+
+    /// Which inline tags the form engine strips from the source text.
+    ///
+    /// Follows the «Инлайновые теги» checkbox, which is what the render is given
+    /// (`enable_inline_style_tags`). With it OFF the render parses no tags of its own, so
+    /// `<b>` is text the user will SEE drawn: removing it from the search would describe
+    /// the form of a text nobody gets. The no-break vocabulary is stripped at both scopes.
+    ///
+    /// Not "the render never parses tags with the box off": `pipeline.rs` parses when
+    /// `enable_inline_style_tags || preprocess_generated_inline_tags`, and the Text-Shake
+    /// preprocess effect sets the second one as soon as it has a non-zero spread
+    /// (`effects/mod.rs`) — it emits `<offset=…>` tags and the whole prepared text is then
+    /// parsed, the user's `<b>` included. The scope stays derived from the checkbox alone:
+    /// see `panel/MODULE_README.md`, "Known limitation: a shake effect parses the tags the
+    /// form search measured".
+    ///
+    /// The font size is exactly the one that goes to the render
+    /// (`create_apply::build_render_params_for`): whether `<offset=…>`/`<stretching=…>` are
+    /// recognized as tags at all depends on it.
+    pub(super) fn advanced_form_inline_tag_scope(&self) -> forms::InlineTagScope {
+        if self.enable_inline_style_tags {
+            forms::InlineTagScope::All {
+                base_font_size_px: self.font_size_px.max(1.0),
+            }
+        } else {
+            forms::InlineTagScope::NoBreakOnly
+        }
     }
 
     /// The font bytes the width metric may measure with RIGHT NOW: the ones the
@@ -1121,7 +1172,7 @@ impl TypingCreatePanelState {
     }
 
     /// Строит попиксельную метрику ширины (`GlyphWidths`) выбранным шрифтом для
-    /// символов `source_text`. `None`, если шрифт не выбран или его байты ещё не
+    /// символов `form_source_text`. `None`, если шрифт не выбран или его байты ещё не
     /// пришли/не читаются — тогда падаем на посимвольную метрику.
     ///
     /// Тонкая обёртка над [`build_advanced_form_glyph_widths_from_spec`]. Продовый
@@ -1131,9 +1182,13 @@ impl TypingCreatePanelState {
     #[cfg(test)]
     pub(super) fn build_advanced_form_glyph_widths(
         &self,
-        source_text: &str,
+        form_source_text: &str,
     ) -> Option<forms::GlyphWidths> {
-        build_advanced_form_glyph_widths_from_spec(&self.advanced_form_metric_spec(), source_text)
+        build_advanced_form_glyph_widths_from_spec(
+            &self.advanced_form_metric_spec(),
+            form_source_text,
+            self.advanced_form_inline_tag_scope(),
+        )
     }
 }
 
@@ -1143,9 +1198,19 @@ impl TypingCreatePanelState {
 /// посимвольно. Чтения файла здесь НЕТ (байты уже разрешены), но разбор фейса,
 /// сборка `fontdb` и шейпинг алфавита — работа для фонового потока; вызывать её
 /// на GUI-потоке нельзя нигде, кроме тестов.
+///
+/// `form_source_text` — СЫРОЙ текст поиска форм (`advanced_form_source_text`) с
+/// инлайновыми тегами: алфавит метрики снимает их сам (`forms::GlyphWidths::build`),
+/// иначе NBSP защищённых диапазонов в него не попадёт.
+///
+/// `scope` ОБЯЗАН быть тем же, что уйдёт в `forms::search_forms` для этого текста.
+/// Поэтому он приходит отдельным аргументом из `AdvancedFormSearchBase`, а не хранится
+/// в снимке метрики: у обоих потребителей должен быть один источник, иначе метрика
+/// померяет не тот алфавит, который сегментируется.
 fn build_advanced_form_glyph_widths_from_spec(
     spec: &AdvancedFormMetricSpec,
-    source_text: &str,
+    form_source_text: &str,
+    scope: forms::InlineTagScope,
 ) -> Option<forms::GlyphWidths> {
     // Единицы на em для замеров (должно совпадать с метрикой внутри forms).
     const METRIC_EM: f32 = 1000.0;
@@ -1217,9 +1282,10 @@ fn build_advanced_form_glyph_widths_from_spec(
     Some(forms::GlyphWidths::build(
         &mut font_system,
         &attrs,
-        source_text,
+        form_source_text,
         spec.hanging_punctuation,
         forms::DEFAULT_WIDTH_TOLERANCE,
+        scope,
     ))
 }
 
@@ -1324,7 +1390,11 @@ fn run_advanced_form_search(
     spec: &AdvancedFormMetricSpec,
     knobs: AdvancedFormParams,
 ) -> AdvancedFormSearchResult {
-    let glyph_widths = build_advanced_form_glyph_widths_from_spec(spec, &key.base.source_text);
+    // ОДИН источник области снятия тегов на оба потребителя: метрика обязана мерить
+    // тот же алфавит, который сегментирует поиск.
+    let scope = key.base.text.scope;
+    let glyph_widths =
+        build_advanced_form_glyph_widths_from_spec(spec, &key.base.text.raw, scope);
     let char_metric = forms::CharWidthMetric::new(spec.hanging_punctuation);
     let (metric, units_per_em): (&dyn forms::LineWidthMetric, f32) = match glyph_widths.as_ref() {
         Some(glyph_widths) => (glyph_widths, GLYPH_METRIC_UNITS_PER_EM),
@@ -1336,10 +1406,11 @@ fn run_advanced_form_search(
         key.width_range,
     );
     let enumeration = forms::search_forms(
-        &key.base.source_text,
+        &key.base.text.raw,
         key.base.preset,
         metric,
         &params,
+        scope,
     );
     AdvancedFormSearchResult {
         forms: enumeration.forms,
@@ -1569,7 +1640,10 @@ impl TypingCreatePanelState {
         let font_size_px = self.font_size_px.max(1.0);
         let (line_spacing_px, line_spacing_percent) = self.line_spacing.as_px_percent();
         AdvancedFormSearchBase {
-            source_text: self.advanced_form_source_text(),
+            text: AdvancedFormSearchText {
+                raw: self.advanced_form_source_text(),
+                scope: self.advanced_form_inline_tag_scope(),
+            },
             preset: self.advanced_form_preset,
             metric: self.advanced_form_metric_signature(),
             evenness: knobs.evenness,
@@ -1986,10 +2060,62 @@ impl TypingCreatePanelState {
 
     /// Применяет выбранную форму: записывает её как сформированный текст (исходный
     /// `text` не трогаем) и разворачивает сформированный пан.
-    pub(super) fn apply_advanced_form(&mut self, form: &TextForm) {
-        self.formed_text = form.to_text();
+    ///
+    /// Инлайновые теги возвращаются на текст формы ДОСЛОВНО
+    /// (`forms::reapply_inline_tags_to_form_text`): перебор снимал их, чтобы не мерить
+    /// разметку как буквы, а сформированный текст ЗАМЕЩАЕТ исходный в рендере
+    /// (`create_apply::effective_render_text`) — без возврата тегов применение формы
+    /// молча стирало бы стили `<m …>`, которые панель ставит по умолчанию.
+    ///
+    /// `base` — база ПОКАЗАННОГО набора форм, а не текущее состояние панели: она несёт
+    /// ровно тот текст и ту область снятия тегов, из которых выбранная форма построена,
+    /// поэтому правка текста во время debounce (окно продолжает рисовать прежние
+    /// карточки) не может сдвинуть разметку.
+    ///
+    /// Если разметку вернуть не удалось, форма применяется БЕЗ тегов, а пользователь и
+    /// журнал получают об этом сообщение: молчаливая потеря стилей недопустима
+    /// (`CLAUDE.md` §7), а угаданная позиция `<font=…>` хуже отсутствующей.
+    ///
+    /// The user-facing half of that report goes to the STICKY
+    /// [`TypingCreatePanelState::advanced_form_tags_lost`], never to `status_line`: this
+    /// method ends in `queue_preview_render`, which takes the status line over in the same
+    /// call, so a warning left there would not survive to a single frame.
+    pub(super) fn apply_advanced_form(&mut self, form: &TextForm, base: &AdvancedFormSearchBase) {
+        let form_text = form.to_text();
+        self.advanced_form_tags_lost = false;
+        self.formed_text = match forms::reapply_inline_tags_to_form_text(
+            base.text.raw.as_str(),
+            base.text.scope,
+            form_text.as_str(),
+        ) {
+            Ok(retagged) => retagged,
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "typing advanced forms: the chosen form could not carry its inline tags \
+                     back and was applied without them. Reason: {err} Source text length: {} \
+                     Form text length: {} Lines: {}",
+                    base.text.raw.len(),
+                    form_text.len(),
+                    form.lines.len()
+                ));
+                self.advanced_form_tags_lost = true;
+                form_text
+            }
+        };
         self.advanced_text_show_formed = true;
         self.queue_preview_render();
+    }
+
+    /// The warning row the preview section draws when the applied form lost its inline
+    /// tags; `None` when the formed text carries the markup of its source.
+    ///
+    /// The message is the one the log already names, and it stays until the formed text is
+    /// replaced by something else — a render finishing, or any number of them, cannot
+    /// clear it (see [`TypingCreatePanelState::advanced_form_tags_lost`]).
+    #[must_use]
+    pub(super) fn advanced_form_tags_lost_status(&self) -> Option<String> {
+        self.advanced_form_tags_lost
+            .then(|| t!("typing.advanced.form_tags_lost_status").to_string())
     }
 
     /// Плавающее окно поиска форм текста.
@@ -2294,7 +2420,7 @@ impl TypingCreatePanelState {
             && let Some(cache) = cache.as_ref()
             && let Some(form) = cache.forms.get(idx)
         {
-            self.apply_advanced_form(form);
+            self.apply_advanced_form(form, &cache.key.base);
             // После выбора формы окно закрывается.
             open = false;
             changed = true;

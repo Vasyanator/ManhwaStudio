@@ -14,8 +14,11 @@ Key functions (all `pub(crate)`, consumed by the group modules and
 `dictionaries`/`rules`):
 - `sanitize_breaks`         — filter/trim raw dictionary offsets.
 - `dictionary_split_is_valid` / `emergency_boundary_is_safe` / `avoid_emergency_split`
-- `maybe_soft_hyphenate_word` — dictionary soft hyphenation with acronym/digit guards.
+- `maybe_soft_hyphenate_word` — dictionary soft hyphenation with a digit guard.
 - `hyphen_cost`             — break-quality cost tiers (shared with the panel sort).
+
+Letter case is never a criterion here: an all-caps word is hyphenated and split
+exactly like its lowercase form (see the module README).
 */
 
 use super::base::SOFT_HYPHEN;
@@ -85,7 +88,10 @@ pub(crate) fn emergency_boundary_is_safe(text: &str, boundary: usize) -> bool {
         && count_alpha_chars(&text[boundary..]) >= MIN_EDGE_LETTERS
 }
 
-/// Blocks/words that must not be split by an emergency hyphen.
+/// Blocks/words that must not be split by an emergency hyphen: empty, containing
+/// whitespace, URL/e-mail, digits next to letters, or dotted.
+///
+/// Letter case is not a criterion — an all-caps block is split like any other.
 pub(crate) fn avoid_emergency_split(text: &str) -> bool {
     let normalized = text.replace(SOFT_HYPHEN, "");
     if normalized.is_empty() {
@@ -104,15 +110,15 @@ pub(crate) fn avoid_emergency_split(text: &str) -> bool {
     {
         return true;
     }
-    if is_acronym_like(normalized.as_str()) {
-        return true;
-    }
     normalized.contains('.')
 }
 
 /// Inserts dictionary soft hyphens into `word`, or `None` when it should not be
-/// hyphenated (too short, URL/e-mail, already hyphenated, has digits, all-caps
-/// acronym, or no dictionary breaks).
+/// hyphenated (too short, URL/e-mail, already hyphenated, has digits, or no
+/// dictionary breaks).
+///
+/// Letter case is not a criterion: an all-caps word goes through exactly the same
+/// rules as its lowercase form.
 pub(crate) fn maybe_soft_hyphenate_word(
     word: &str,
     dicts: &HyphenationDictionaries,
@@ -129,10 +135,6 @@ pub(crate) fn maybe_soft_hyphenate_word(
     if word.chars().any(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    if is_acronym_like(word) {
-        return None;
-    }
-
     let breaks = dicts.breaks_for_word(word);
     if breaks.is_empty() {
         return None;
@@ -154,20 +156,6 @@ pub(crate) fn hyphen_cost(head_word: &str, tail_word: &str) -> u32 {
     } else {
         4
     }
-}
-
-/// A word entirely of capital letters (at least two).
-fn is_acronym_like(word: &str) -> bool {
-    let mut alpha = 0usize;
-    for ch in word.chars() {
-        if ch.is_alphabetic() {
-            alpha += 1;
-            if !ch.is_uppercase() {
-                return false;
-            }
-        }
-    }
-    alpha >= 2
 }
 
 fn insert_soft_hyphens(word: &str, breaks: &[usize]) -> String {
@@ -209,10 +197,28 @@ mod tests {
     }
 
     #[test]
-    fn avoids_emergency_split_for_urls_acronyms_and_dotted() {
+    fn avoids_emergency_split_for_urls_and_dotted() {
         assert!(avoid_emergency_split("http://x"));
-        assert!(avoid_emergency_split("HTML"));
         assert!(avoid_emergency_split("e.g"));
         assert!(!avoid_emergency_split("hyphenation"));
+    }
+
+    #[test]
+    fn emergency_split_verdicts_do_not_depend_on_letter_case() {
+        // The removed acronym clause used to refuse every all-caps block, leaving a
+        // shouted word with no last-resort split. Every OTHER refusal stands and
+        // none of them looks at the case.
+        assert!(!avoid_emergency_split("HYPHENATION"));
+        assert!(avoid_emergency_split("HTTP://X"));
+        assert!(avoid_emergency_split("E.G"));
+        assert!(avoid_emergency_split("COVID19"));
+        assert!(avoid_emergency_split("ДА ХОТЬ"));
+        for text in ["hyphenation", "http://x", "e.g", "covid19", "да хоть"] {
+            assert_eq!(
+                avoid_emergency_split(text),
+                avoid_emergency_split(text.to_uppercase().as_str()),
+                "the verdict for {text} must not depend on letter case"
+            );
+        }
     }
 }

@@ -75,6 +75,11 @@ pub(super) fn find_dictionary_split_index(
         .or_else(|| best_overflow.map(|(idx, _, _)| idx))
 }
 
+/// Finds the last-resort mid-word split of `text` (ONE wrap block) that still fits
+/// `max_units`.
+///
+/// Returns `None` when the block must not be emergency-split at all
+/// (`avoid_emergency_split`) or when no safe boundary fits.
 pub(super) fn find_emergency_split_index(
     text: &str,
     max_units: usize,
@@ -127,6 +132,8 @@ mod tests {
     #[test]
     fn emergency_split_skips_space_separated_block() {
         assert!(find_emergency_split_index("да хоть", 2, false).is_none());
+        // A whitespace block already has a normal wrap point, in either letter case.
+        assert!(find_emergency_split_index("ДА ХОТЬ", 2, false).is_none());
     }
 
     #[test]

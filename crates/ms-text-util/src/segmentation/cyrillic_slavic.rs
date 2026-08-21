@@ -25,7 +25,10 @@ the dictionary does not guarantee:
   • ь/ъ/й may not start a NEW line (right of a break), but breaking AFTER them is
     fine — "силь-нее", "подъ-езд", "май-ка".
   • Monosyllabic words (one vowel) are not hyphenated: "стол", "край".
-  • All-caps acronyms ("СССР", "HTML") and words with digits are not hyphenated.
+  • Words with digits are not hyphenated: "covid19", "3д".
+  • Letter case is never consulted — an all-caps word hyphenates exactly like its
+    lowercase form. Short acronyms ("СССР", "HTML") stay whole because the TeX
+    dictionary offers no break inside them, not because of a case rule.
 
 Checking only the first and last dictionary break is enough: heads/tails only
 accumulate letters/vowels toward the word interior, so if the edge breaks are
@@ -93,6 +96,12 @@ impl Segmenter for CyrillicSlavicSegmenter {
 
 // --- Dictionary soft hyphenation --------------------------------------------
 
+/// Inserts dictionary soft hyphens into `word`, or `None` when it must not be
+/// hyphenated (too short, URL/e-mail, already hyphenated, digits, monosyllabic, or
+/// no dictionary breaks).
+///
+/// Letter case is not a criterion: an all-caps word goes through exactly the same
+/// rules as its lowercase form.
 fn maybe_soft_hyphenate_word(word: &str, dicts: &HyphenationDictionaries) -> Option<String> {
     if word.chars().count() < 4 {
         return None;
@@ -107,10 +116,6 @@ fn maybe_soft_hyphenate_word(word: &str, dicts: &HyphenationDictionaries) -> Opt
     if word.chars().any(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    // All-caps acronyms ("СССР", "HTML") are not hyphenated.
-    if is_acronym_like(word) {
-        return None;
-    }
     // Monosyllabic words (one vowel) have nowhere to break.
     if count_vowels_visible(word) < 2 {
         return None;
@@ -122,21 +127,6 @@ fn maybe_soft_hyphenate_word(word: &str, dicts: &HyphenationDictionaries) -> Opt
     }
 
     Some(insert_soft_hyphens(word, breaks.as_slice()))
-}
-
-/// A word entirely of capital letters (acronym): at least two letters and no
-/// lowercase among the alphabetic characters.
-fn is_acronym_like(word: &str) -> bool {
-    let mut alpha = 0usize;
-    for ch in word.chars() {
-        if ch.is_alphabetic() {
-            alpha += 1;
-            if !ch.is_uppercase() {
-                return false;
-            }
-        }
-    }
-    alpha >= 2
 }
 
 fn insert_soft_hyphens(word: &str, breaks: &[usize]) -> String {
@@ -306,7 +296,10 @@ fn contains_latin(word: &str) -> bool {
     word.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
-/// Blocks/words that should not be split by an emergency hyphen.
+/// Blocks/words that should not be split by an emergency hyphen: empty, containing
+/// whitespace, URL/e-mail, mixed script, digits next to letters, or dotted.
+///
+/// Letter case is not a criterion — an all-caps block is split like any other.
 pub(crate) fn avoid_emergency_split(text: &str) -> bool {
     let normalized = text.replace(SOFT_HYPHEN, "");
     if normalized.is_empty() {
@@ -325,15 +318,6 @@ pub(crate) fn avoid_emergency_split(text: &str) -> bool {
     }
     if normalized.chars().any(|ch| ch.is_ascii_digit())
         && normalized.chars().any(char::is_alphabetic)
-    {
-        return true;
-    }
-    let alpha_count = normalized.chars().filter(|ch| ch.is_alphabetic()).count();
-    if alpha_count > 1
-        && normalized
-            .chars()
-            .filter(|ch| ch.is_alphabetic())
-            .all(|ch| !contains_cyrillic(ch.encode_utf8(&mut [0; 4])) && ch.is_uppercase())
     {
         return true;
     }
@@ -650,7 +634,7 @@ fn is_nonbreaking_abbreviation(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segmentation::base::{BindingMode, SegmentOptions};
+    use crate::segmentation::base::{BindingMode, SegmentOptions, soft_hyphen_positions};
 
     fn ru() -> CyrillicSlavicSegmenter {
         CyrillicSlavicSegmenter::new(TextLanguage::Ru)
@@ -850,6 +834,82 @@ mod tests {
         );
     }
 
+    // --- Letter case is not a hyphenation criterion -------------------------
+    #[test]
+    fn uppercase_russian_hyphenates_at_the_same_positions_as_lowercase() {
+        let seg = ru();
+        for lower in [
+            "переносится",
+            "предложение",
+            "достопримечательность",
+            "подъезд",
+            "сильнее",
+        ] {
+            let upper = lower.to_uppercase();
+            let lower_breaks = soft_hyphen_positions(seg.soft_hyphenate_overlong(lower).as_str());
+            let upper_breaks =
+                soft_hyphen_positions(seg.soft_hyphenate_overlong(upper.as_str()).as_str());
+            assert!(!lower_breaks.is_empty(), "{lower} must hyphenate at all");
+            assert_eq!(upper_breaks, lower_breaks, "break positions of {upper}");
+        }
+    }
+
+    #[test]
+    fn all_caps_russian_sentence_gets_soft_hyphens() {
+        // The user-visible symptom: an all-caps line used to reach the wrapper with
+        // no hyphenation point at all.
+        let seg = ru();
+        let got = seg
+            .soft_hyphenate_overlong("ЭТО ПРЕДЛОЖЕНИЕ ПЕРЕНОСИТСЯ")
+            .replace(SOFT_HYPHEN, "·");
+        assert_eq!(got, "ЭТО ПРЕД·ЛО·ЖЕ·НИЕ ПЕ·РЕ·НО·СИТ·СЯ");
+    }
+
+    #[test]
+    fn the_dictionary_alone_keeps_short_acronyms_whole() {
+        // This is the whole safety argument for dropping the all-caps heuristic:
+        // nothing but the TeX dictionary protects a short acronym now, and it does.
+        // Verified, not assumed — if one of these ever starts breaking, the
+        // trade-off behind the removal has changed.
+        let seg = ru();
+        for acronym in [
+            "СССР", "США", "ООН", "ГОСТ", "HTML", "NASA", "ASCII", "JSON", "HTTP", "GDPR",
+        ] {
+            assert_eq!(
+                seg.hyphenate_word(acronym),
+                None,
+                "dictionary must offer no break for {acronym}"
+            );
+        }
+        // …in running text too, whatever the case of the text around them.
+        assert_eq!(
+            seg.soft_hyphenate_overlong("Аббревиатура СССР и ГОСТ здесь")
+                .replace(SOFT_HYPHEN, "·"),
+            "Аб·бре·ви·а·ту·ра СССР и ГОСТ здесь"
+        );
+        // Accepted and documented cost of the removal: a PRONOUNCEABLE acronym is
+        // now hyphenated like any other word, in mixed-case text as well.
+        assert!(seg.hyphenate_word("ЮНЕСКО").is_some());
+    }
+
+    #[test]
+    fn hyphenation_of_a_word_does_not_depend_on_its_case() {
+        // A stray lowercase word (or an inline tag's lowercase ASCII) used to flip
+        // the whole text to "mixed" and re-arm the acronym guard; nothing about the
+        // surrounding text can influence a word's hyphenation any more.
+        let seg = ru();
+        assert_eq!(
+            seg.soft_hyphenate_overlong("ЭТО ПРЕДЛОЖЕНИЕ ПЕРЕНОСИТСЯ ня")
+                .replace(SOFT_HYPHEN, "·"),
+            "ЭТО ПРЕД·ЛО·ЖЕ·НИЕ ПЕ·РЕ·НО·СИТ·СЯ ня"
+        );
+        let alone = seg.soft_hyphenate_overlong("ЮНЕСКО");
+        assert!(
+            seg.soft_hyphenate_overlong("Смотри сюда ЮНЕСКО").ends_with(alone.as_str()),
+            "a word must hyphenate the same alone and inside a mixed-case text"
+        );
+    }
+
     #[test]
     fn emergency_split_helpers_match_legacy_behavior() {
         // A space-separated block is never emergency-split.
@@ -859,5 +919,39 @@ mod tests {
         let word = "подъезд";
         let before_hard = word.find('ъ').unwrap_or(0);
         assert!(!emergency_boundary_is_safe(word, before_hard));
+    }
+
+    #[test]
+    fn emergency_split_no_longer_refuses_an_all_caps_latin_block() {
+        // The removed clause used to refuse every all-caps Latin block, leaving a
+        // shouted Latin word with no last-resort split at all. Every OTHER refusal
+        // stands.
+        assert!(!avoid_emergency_split("HYPHENATION"));
+        assert!(avoid_emergency_split("HTTP://X"));
+        assert!(avoid_emergency_split("E.G"));
+        assert!(avoid_emergency_split("COVID19"));
+        assert!(avoid_emergency_split("ДА ХОТЬ"));
+    }
+
+    #[test]
+    fn emergency_split_verdicts_do_not_depend_on_letter_case() {
+        // Pin of the new contract: no refusal consults the case of the block.
+        for text in [
+            "переносить",
+            "да хоть",
+            "подъезд",
+            "ул.Ленина",
+            "ковид19",
+            "смесьLATIN",
+            "hyphenation",
+            "http://x",
+            "e.g",
+        ] {
+            assert_eq!(
+                avoid_emergency_split(text),
+                avoid_emergency_split(text.to_uppercase().as_str()),
+                "the verdict for {text} must not depend on letter case"
+            );
+        }
     }
 }

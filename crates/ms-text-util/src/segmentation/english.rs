@@ -58,6 +58,7 @@ impl Segmenter for EnglishSegmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segmentation::base::{SOFT_HYPHEN, soft_hyphen_positions};
 
     #[test]
     fn english_words_hyphenate_at_dictionary_points() {
@@ -67,6 +68,50 @@ mod tests {
             .expect("English 'hyphenation' hyphenates");
         assert!(hyphenated.contains('\u{00AD}'));
         assert_eq!(hyphenated.replace('\u{00AD}', ""), "hyphenation");
+    }
+
+    #[test]
+    fn uppercase_english_hyphenates_at_the_same_positions_as_lowercase() {
+        let seg = EnglishSegmenter::new();
+        for lower in ["hyphenation", "understanding", "preposition"] {
+            let upper = lower.to_uppercase();
+            let lower_breaks = soft_hyphen_positions(seg.soft_hyphenate_overlong(lower).as_str());
+            let upper_breaks =
+                soft_hyphen_positions(seg.soft_hyphenate_overlong(upper.as_str()).as_str());
+            assert!(!lower_breaks.is_empty(), "{lower} must hyphenate at all");
+            assert_eq!(upper_breaks, lower_breaks, "break positions of {upper}");
+        }
+    }
+
+    #[test]
+    fn all_caps_english_sentence_gets_soft_hyphens() {
+        let seg = EnglishSegmenter::new();
+        let got = seg
+            .soft_hyphenate_overlong("THIS SENTENCE NEEDS HYPHENATION")
+            .replace(SOFT_HYPHEN, "·");
+        assert_eq!(got, "THIS SEN·TENCE NEEDS HY·PHEN·A·TION");
+    }
+
+    #[test]
+    fn the_dictionary_alone_keeps_short_acronyms_whole() {
+        // Verified, not assumed: nothing but the TeX dictionary protects an acronym
+        // now that the all-caps heuristic is gone, and it offers no break for these.
+        let seg = EnglishSegmenter::new();
+        for acronym in ["HTML", "NASA", "ASCII", "JSON", "HTTP", "GDPR"] {
+            assert_eq!(
+                seg.hyphenate_word(acronym),
+                None,
+                "dictionary must offer no break for {acronym}"
+            );
+        }
+        // Accepted and documented cost of the removal: a pronounceable acronym is
+        // now hyphenated like any other word, in mixed-case text as well.
+        assert!(seg.hyphenate_word("UNESCO").is_some());
+        assert_eq!(
+            seg.soft_hyphenate_overlong("the HTML and JSON standard")
+                .replace(SOFT_HYPHEN, "·"),
+            "the HTML and JSON stan·dard"
+        );
     }
 
     #[test]

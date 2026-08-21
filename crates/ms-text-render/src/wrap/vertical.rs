@@ -78,6 +78,7 @@ pub(crate) fn build_vertical_layout_text(request: VerticalWrapRequest<'_>) -> St
     }
 }
 
+/// Splits the whole text into vertical columns.
 fn build_vertical_layout_columns(request: VerticalWrapRequest<'_>) -> Vec<String> {
     let cleaned = request.text.replace('\r', "");
     if cleaned.is_empty() {
@@ -343,6 +344,10 @@ fn should_split_vertical_token(
         }
 }
 
+/// Splits one overlong vertical token into a head that fits `count` units and a tail.
+///
+/// Prefers a dictionary break; falls back to an emergency split, and finally to a
+/// blind character-count cut.
 fn split_vertical_token(
     token: &str,
     count: usize,
@@ -429,7 +434,7 @@ fn tokenize_paragraph(paragraph: &str) -> VecDeque<String> {
 mod tests {
     use super::{
         VERTICAL_HALF_SPACE, VerticalParagraphWrapRequest, VerticalWrapRequest,
-        build_vertical_layout_columns, wrap_vertical_paragraph,
+        build_vertical_layout_columns, split_vertical_token, wrap_vertical_paragraph,
     };
     use crate::types::{TextShape, TextWrapMode};
 
@@ -540,5 +545,35 @@ mod tests {
         });
 
         assert!(columns.join("\n").contains(VERTICAL_HALF_SPACE));
+    }
+
+    // --- Token split and letter case -----------------------------------------
+    //
+    // `split_vertical_token` is exercised directly: it is the only place the vertical
+    // path consults the emergency split, the one the removed acronym heuristic could
+    // block.
+
+    #[test]
+    fn all_caps_latin_token_is_emergency_split() {
+        // Cutting after 7 units is unsafe (the tail "RS" has no vowel), so the
+        // emergency split steps back to the last safe boundary. The removed acronym
+        // refusal used to reject the block outright and hand it to the blind cut.
+        assert_eq!(
+            split_vertical_token("COMPUTERS", 7, None),
+            ("COMPUT".to_string(), "ERS".to_string())
+        );
+    }
+
+    #[test]
+    fn token_split_does_not_depend_on_letter_case() {
+        // Pin of the new contract: no split rule consults the case of the token.
+        for token in ["переносить", "computers"] {
+            let (lower_head, lower_tail) = split_vertical_token(token, 5, None);
+            assert_eq!(
+                split_vertical_token(token.to_uppercase().as_str(), 5, None),
+                (lower_head.to_uppercase(), lower_tail.to_uppercase()),
+                "the {token} split must not depend on letter case"
+            );
+        }
     }
 }

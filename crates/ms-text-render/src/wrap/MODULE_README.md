@@ -45,19 +45,106 @@ output images, or apply effects.
   edge rule — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
   the ranked `search_forms` (see "Form search" below), and `choose_form`). The
   enumerator reuses the shared text segmenter (`segmentation::Segmenter::segment` after
-  `soft_hyphenate_overlong`) so it splits on the same orthographic boundaries as the
-  renderer — keep-together particles, dictionary hyphenation points, and existing hard
+  the dictionary soft-hyphen markup of `prepare_form_text`) so it splits on the same
+  orthographic boundaries as the renderer — keep-together particles, dictionary
+  hyphenation points, and existing hard
   hyphens, with no emergency mid-word splits. Each block carries a `Joint` (how to join to
   the next block on the same line vs. when wrapped) with its break cost/word-break flag. It
   walks a break/no-break decision tree with shape pruning (a branch dies when a closed
   line breaks the shape), and accumulates a per-break "cost" (space 0, hard hyphen 1,
   dictionary hyphenation 2/3/4 by `classify_hyphen` quality) plus a word-break count for
-  the panel's grouping and width/cost sorting. Before enumeration, `<no-break>`/`<nobr>`
-  and machine `<m j>` inline ranges are stripped from the source text and their internal
-  whitespace is converted to NBSP so the generated `formed_text` has no control tags but keeps
-  those ranges as non-breaking blocks. Used by the typing panel's "Продвинутая
+  the panel's grouping and width/cost sorting. Used by the typing panel's "Продвинутая
   форма текста" window and re-exported as `render_next::forms` so the renderer subsystem
   shares the same definitions.
+
+## Inline tags: the text arrives RAW and the tags go back
+
+`enumerate_forms`, `search_forms`, `choose_form` and `GlyphWidths::build` all take the
+**raw** source text — every inline tag included — plus an `InlineTagScope`. `forms.rs` is
+the ONLY place that removes them (`strip_inline_tags`, private for exactly that reason) and
+the ONLY place that puts them back (`reapply_inline_tags_to_form_text`). It strips once per
+consumer, on the raw string. Handing any of them an already stripped text is the defect
+this rule exists to prevent: the tags are gone, every run looks breakable, and the range the
+user protected gets dictionary hyphenation. A caller must therefore never "prepare" the text
+first.
+
+**The vocabulary is not defined here.** `inline_styles::classify_inline_tag_body` — a thin
+wrapper over the same `parse_inline_tag` the renderer's `parse_inline_style_tags` uses — is
+the single authority on what a `<…>` body means. Recognition is value-dependent
+(`<size=abc>` is not a tag) and, for `<offset=…>`/`<stretching=…>`, font-size dependent,
+which is why `InlineTagScope::All` carries `base_font_size_px`. Two dispatch tables would
+mean the form is built from a different text than the one drawn, and every restored tag
+would land next to the wrong word.
+
+**`InlineTagScope` is a correctness switch, not a preference.** With «Инлайновые теги» OFF
+the renderer does not parse tags at all, so `<b>` is literal text the user wants DRAWN and
+measured: `NoBreakOnly` keeps it. With the flag ON the renderer consumes it, so `All` removes
+it. The no-break vocabulary and machine `<m …>` are stripped at BOTH scopes. **The search
+and its width metric must be given the same scope** — a mismatch measures a different
+alphabet than it segments; the typing panel derives it once
+(`create_advanced::advanced_form_inline_tag_scope`) and hands the same value to both.
+
+**What comes back, and what does not.** Style tags and machine `<m …>` are re-emitted
+VERBATIM: re-serializing from a parsed style model would rewrite `<b>` as `<m b=1>`,
+normalize the user's spelling and have to invent a nesting for stray tags. `<no-break>` and
+`<br>` are CONSUMED and never restored — a form IS a complete line-break decision, so
+re-emitting the user's manual break would fight the form just chosen, and the protected
+range has already done its work by the time a form exists. Only the APPLIED form is
+re-tagged; the enumerated ones (and the panel's preview cards) stay tag-free.
+
+**Two scopes that strip a text alike are the same input** (`scopes_strip_alike`, public for
+exactly one reason). Everything the engine derives from a (raw text, scope) pair goes through
+the strip, so a caller that caches a search by its input may treat such scopes as one. The
+typing panel does: `InlineTagScope::All` carries `base_font_size_px` because the size decides
+whether `<offset=…>`/`<stretching=…>` are tags at all, and without this a mere font-size change
+would restart the search and wipe the window's display filters for a text where no tag body
+depends on it.
+
+**Anchors are byte offsets into the PRODUCED stripped text**, recorded as its length at the
+moment the tag was met — so the NBSP widening (a 1-byte space becomes a 2-byte NBSP) is
+already accounted for and cannot shift them.
+
+**Placement is a two-cursor forward walk** over (stripped text, form text) with no searching,
+so it cannot lock onto a later occurrence of a repeated word. Its steps are a literal match, a
+whitespace boundary, a wrap hyphen the form added, and a soft hyphen the segmenter consumed.
+
+The whitespace boundaries it accepts are exactly the four `ms-text-util` `Joint` kinds can
+produce, enumerated as `FormWhitespaceStep` next to the walk — equal-count normalisation
+(`Joint::space` carries `" ".repeat(n)`), a whole run replaced by the single `'\n'` of a break,
+a `'\n'` inserted where the source has no whitespace (only ever right after a dash, because
+that is the one junction without a separator that can break), and the leading/trailing
+whitespace of the WHOLE text (`preserve_edge_spaces: false`; there is no interior trim). A wrap
+hyphen likewise counts as one only when the `'\n'` that separates it from the rest of the
+source follows it — the last line of a form never wraps, so a trailing `'-'` is not one.
+**Refusal is the point of that list**: anything outside it means the form text is not this
+source's, and the walk **refuses** (`TagReapplyError::Unalignable`) instead of resynchronizing —
+a silently misplaced `<font=…>` restyles the wrong words, and a form that invents or swallows a
+space would change what the reader sees. The caller falls back to the untagged form text, logs,
+and tells the user. Both directions are pinned by tests: the illegal cases must be refused, and
+`no_form_the_engine_actually_produces_is_refused` walks every form of a corpus to prove the
+legal ones are not.
+
+At a break a CLOSING tag lands at the end of the preceding line — after the wrap hyphen, so the
+hyphen stays inside the span it belongs to — and everything else at the start of the following
+one.
+
+A protected range is ONE unbreakable block, against all three break kinds:
+
+- **space** — turned into NBSP, which the segmenter does not break on;
+- **dictionary hyphenation** — dictionary soft hyphens are applied to the unprotected
+  runs only, so no soft hyphen is ever placed inside a protected range. Marking the
+  runs up one by one is safe because every hyphenation rule is local to a word
+  (`ms-text-util`'s segmentation README): a run hyphenates exactly as it would inside
+  the whole text, so a no-break tag never changes how the text OUTSIDE it breaks;
+- **existing hard hyphen** — the segmenter always cuts at one (`allow_hard_hyphen_breaks:
+  true`, which the rest of the text needs), so `segment_form_blocks` records the protected
+  byte ranges of the text it feeds the segmenter and afterwards merges every junction that
+  falls strictly inside one (`glue_protected_junctions`). Locating the junctions relies on
+  a documented property of `ms-text-util`'s segmenter (`block_spans`): block texts are
+  ordered, non-overlapping literal substrings of its input. If that ever stops holding, the
+  mapping is refused and logged, and only the hard-hyphen protection degrades.
+
+A junction exactly ON a range boundary is not glued — the protected text stays whole there.
 
 ## Form search (`forms.rs::search_forms`)
 
@@ -154,11 +241,16 @@ Contracts:
 ## Contracts and invariants
 - Wrapping uses normalized text from `pipeline.rs`; inline style byte-offset remapping
   must happen outside or around this module, not by applying original tagged spans here.
+  `forms.rs` is the documented exception and only for text→text work: it strips tags from a
+  raw form source and re-emits them verbatim onto the chosen form, never mapping style spans.
 - `TextWrapMode::None` must preserve caller text except for upstream normalization.
 - `WholeWords` must avoid dictionary/emergency splitting. Minimal, Moderate, and
   Aggressive modes may use increasingly permissive split policy.
 - Dictionary and emergency splits must respect safe text boundaries and must not split
   inside invalid UTF-8 or produce empty head/tail fragments.
+- Neither split looks at letter case: an all-caps word is hyphenated and
+  emergency-split exactly like its lowercase form. `hyphenation.rs::find_emergency_split_index`
+  therefore takes the block alone, with no whole-text context to thread down.
 - Shape wrapping returns warnings when it uses approximate fallback behavior; do not
   hide those warnings.
 - `TextShape::Rectangle`, `Oval`, and `Hexagon` profiles must keep line widths positive

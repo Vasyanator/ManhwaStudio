@@ -39,6 +39,8 @@ pub fn emergency_boundary_is_safe(text: &str, boundary: usize) -> bool {
 
 /// Whether `text` (one wrap block) must never be emergency-hyphenated under the
 /// process-global language's rules.
+///
+/// Letter case is not a criterion — an all-caps block is split like any other.
 #[must_use]
 pub fn avoid_emergency_split(text: &str) -> bool {
     avoid_emergency_split_for(text_language(), text)
@@ -99,5 +101,22 @@ mod tests {
         let apostrophe = word.find('\'').unwrap_or(0);
         assert!(!emergency_boundary_is_safe_for(TextLanguage::Fr, word, apostrophe));
         assert!(!emergency_boundary_is_safe_for(TextLanguage::En, word, apostrophe));
+    }
+
+    #[test]
+    fn an_all_caps_block_is_emergency_split_in_every_group() {
+        // The removed acronym heuristic used to refuse this word in every group,
+        // leaving a shouted word with no last-resort split at all.
+        for language in [
+            TextLanguage::En,
+            TextLanguage::Fr,
+            TextLanguage::Pl,
+            TextLanguage::Ru,
+        ] {
+            assert!(
+                !avoid_emergency_split_for(language, "HYPHENATION"),
+                "{language:?} must allow the last-resort split of an all-caps word"
+            );
+        }
     }
 }

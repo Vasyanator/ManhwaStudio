@@ -75,6 +75,34 @@ clone and switching languages does not reload TeX patterns.
 - Config-free: no submodule reads config. The app seeds the selected language via
   `crate::language::set_text_language` at startup (default `Ru`).
 - Russian is a hard bit-identical contract (golden tests in `cyrillic_slavic`).
+- **Hyphenation never looks at letter case.** Neither `hyphenate_word` nor
+  `rules::avoid_emergency_split` has an all-caps rule: a shouted word hyphenates
+  and emergency-splits exactly like its lowercase form. In manga typesetting
+  all-caps means shouting far more often than it means an acronym, and the
+  heuristic that assumed otherwise had to read the surrounding text to be useful,
+  which made it unpredictable — one lowercase word, or one inline tag the caller
+  does not strip (`<b>`, `<font=…>`), and a whole all-caps line lost every
+  hyphenation point. Short real acronyms (СССР, США, ООН, ГОСТ, HTML, NASA, ASCII,
+  JSON, HTTP, GDPR) stay whole anyway because the TeX dictionary offers no break
+  inside them — that is the entire safety argument and it is verified, not
+  assumed, by `the_dictionary_alone_keeps_short_acronyms_whole` in
+  `cyrillic_slavic` and `english`. Accepted cost: a PRONOUNCEABLE acronym
+  (ЮНЕСКО/UNESCO) is now hyphenated like any other word.
+- **Where a wrapped line's dash ends up is public.** `Joint::soft_hyphen` appends `"-"`
+  to the head line, and `split_segment_into_parts` leaves the source's own dash at the
+  END of the head block, so a line broken with no whitespace behind it in the source
+  always ends on a dash — and not necessarily an ASCII one (`is_line_end_dash_char`:
+  `-` `‐` `‒` `–` `—` `−`). That predicate is `pub` for consumers that walk a wrapped
+  text back against its source (`ms-text-render`'s `wrap/forms.rs`, which re-applies
+  inline tags to a chosen form and refuses anything it cannot align). Widening or
+  narrowing the set changes their notion of a legal break, so it is a shared contract,
+  not a local detail.
+- **A fragment hyphenates like the whole text.** Every rule of `hyphenate_word` is
+  local to the word, so a caller may mark up a text piecewise — runs split around
+  inline no-break tags, spans, paragraphs — and get exactly the whole-text result
+  (`ms-text-render`'s `wrap/forms.rs::prepare_form_text` relies on this). Do not
+  reintroduce a rule that reads the surrounding text without revisiting that
+  caller.
 - `rules::*` read the process-global language; the renderer builds
   `HyphenationDictionaries::for_language(text_language())` so the dictionaries and
   the boundary rules always agree on the language during a render.

@@ -3593,6 +3593,7 @@
   "typing.advanced.form_search_reset_button": "Parámetros por defecto",
   "typing.advanced.form_search_section": "Parámetros de búsqueda",
   "typing.advanced.form_shape_label": "Forma:",
+  "typing.advanced.form_tags_lost_status": "No se pudieron devolver las etiquetas en línea a la forma elegida: se aplicó sin ellas.",
   "typing.advanced.form_unevenness_label": "Irregularidad como máximo",
   "typing.advanced.form_variants_incomplete_status": " La enumeración de formas está incompleta (límite alcanzado).",
   "typing.advanced.form_variants_shown_status": "Variantes: {visible}, mostrando las primeras {shown}.",

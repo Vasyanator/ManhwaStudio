@@ -3680,6 +3680,7 @@
   "typing.advanced.form_search_reset_button": "Параметры по умолчанию",
   "typing.advanced.form_search_section": "Параметры поиска",
   "typing.advanced.form_shape_label": "Форма:",
+  "typing.advanced.form_tags_lost_status": "Не удалось вернуть инлайновые теги на выбранную форму — она применена без них.",
   "typing.advanced.form_unevenness_label": "Неравномерность не более",
   "typing.advanced.form_variants_incomplete_status": " Перебор форм неполный (достигнут предел).",
   "typing.advanced.form_variants_shown_status": "Вариантов: {visible}, показаны первые {shown}.",
