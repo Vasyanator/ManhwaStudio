@@ -27,7 +27,11 @@ notification.
 - `new_project/`: detached new-project workflow.
 - `psd_import_window.rs`: detached PSD/PSB import workflow. Both formats take the same path:
   `ag-psd` tells them apart by the version field in the file header, and the accepted
-  extensions live in one place (`is_supported_document_ext`).
+  extensions live in one place (`is_supported_document_ext`). Plain raster files
+  (`is_supported_image_ext`: png/jpg/jpeg/bmp/webp/tif/tiff) found in the same selection,
+  folder or archive are imported too — each becomes a one-row single-page document whose
+  image is the source page, so it reuses the flattened-PSD `LayerSource::Composite` path.
+  `load_source_from_bytes` is the per-file reader switch; all four scanners go through it.
 - `theme.rs`: launcher visual style helpers.
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.

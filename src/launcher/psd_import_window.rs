@@ -6,7 +6,7 @@ Detached egui window for importing simple Photoshop layers into launcher project
 
 Main responsibilities:
 - render a dark-themed import UI with layer mapping and preview;
-- load PSD/PSB/ZIP/RAR sources on background threads using the `ag-psd` crate;
+- load PSD/PSB/image/ZIP/RAR sources on background threads using the `ag-psd` crate;
 - warn when unsupported complexity is detected (for example layer groups);
 - save selected raster layers into project `src/` and `clean_layers/` without blocking the GUI.
 
@@ -16,6 +16,13 @@ Both `.psd` and `.psb` (Large Document Format) are accepted and share one code p
 and channel lengths), so nothing downstream needs to know which one it got. The extension
 rule lives in `is_supported_document_ext` and is used by all four scanners (picked files,
 folder walk, ZIP, RAR).
+Plain raster files (PNG/JPEG/WebP/BMP/TIFF) sitting next to the documents are accepted as
+well: each one decodes into a single-page document whose only row is the whole image, typed
+as the source page, so it travels the same `LayerSource::Composite` path a flattened PSD
+takes. `is_supported_image_ext` owns that extension rule and, like the document rule, is
+shared by all four scanners; `load_source_from_bytes` picks the reader per file. Images take
+part in the same by-name ordering as the documents, so one lands between the pages it is
+named between rather than at the end of the list.
 This implementation targets simple flat documents. `ag-psd` decodes 8/16/32-bit documents
 (down-converting to 8-bit RGBA), so 16-bit "клин" exports load fine; it exposes the nested
 group hierarchy via `Layer::children`, which we flatten to leaf raster layers and flag with a
@@ -87,6 +94,13 @@ const PREVIEW_RESIZE_GRAB_WIDTH: f32 = 18.0;
 const PREVIEW_CHROME_HEIGHT: f32 = 72.0;
 const PREVIEW_FRAME_VERTICAL_PADDING: f32 = 28.0;
 const PREVIEW_TILE_MAX_HEIGHT: usize = 4096;
+/// Extensions offered by the native "open files" dialog: documents, plain rasters and
+/// archives, i.e. exactly what `scan_selected_files` accepts. Gated out of the web build,
+/// which has no native dialog to filter.
+#[cfg(not(target_arch = "wasm32"))]
+const PICKER_EXTENSIONS: &[&str] = &[
+    "psd", "psb", "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "zip", "rar",
+];
 
 pub struct PsdImportWindowState {
     projects_root: PathBuf,
@@ -133,7 +147,8 @@ struct PsdLayerRow {
 ///
 /// Most rows map to a specific layer. Flattened PSDs (no layer section, only the
 /// merged composite) instead produce a single `Composite` fallback row that reads
-/// the whole-document image via `Psd::rgba()`.
+/// the whole-document image via `Psd::rgba()`. Plain raster imports (PNG/JPEG/...)
+/// reuse that same `Composite` row: the decoded file *is* the document image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LayerSource {
     Layer(usize),
@@ -162,8 +177,9 @@ struct LoadedPsdDocument {
     page: u32,
     /// Flattened leaf raster layers (groups expanded), ordered top-to-bottom.
     layers: Vec<DecodedLayer>,
-    /// Merged composite image, only kept for flattened PSDs that have no usable
-    /// layers (see `LayerSource::Composite`). `None` whenever `layers` is non-empty.
+    /// Merged composite image, kept for flattened PSDs that have no usable layers and
+    /// for plain raster imports, whose single image lives here (see
+    /// `LayerSource::Composite`). `None` whenever `layers` is non-empty.
     composite: Option<DecodedImage>,
 }
 
@@ -865,7 +881,7 @@ impl PsdImportWindowState {
     fn pick_files(&mut self) {
         let Some(paths) = FileDialog::new()
             .set_directory(self.projects_root.clone())
-            .add_filter("Photoshop / ZIP / RAR", &["psd", "zip", "psb", "rar"])
+            .add_filter("Photoshop / Images / ZIP / RAR", PICKER_EXTENSIONS)
             .pick_files()
         else {
             return;
@@ -1463,7 +1479,7 @@ fn run_scan_worker(request: ScanRequest) -> Result<ScanResponse, WorkerError> {
     if documents.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_files").to_string(),
-            log_message: "scan produced zero PSD documents".to_string(),
+            log_message: "scan produced zero importable documents".to_string(),
         });
     }
 
@@ -1506,12 +1522,14 @@ fn scan_selected_files(
         });
     }
 
-    let mut psd_files = Vec::new();
+    let mut source_files = Vec::new();
     let mut archive_files = Vec::new();
     let mut unsupported = Vec::new();
     for path in paths {
         match lowercase_ext(&path).as_deref() {
-            Some(ext) if is_supported_document_ext(ext) => psd_files.push(path),
+            Some(ext) if is_supported_document_ext(ext) || is_supported_image_ext(ext) => {
+                source_files.push(path);
+            }
             Some("zip" | "rar") => archive_files.push(path),
             _ => unsupported.push(path),
         }
@@ -1531,10 +1549,10 @@ fn scan_selected_files(
         });
     }
 
-    if !archive_files.is_empty() && !psd_files.is_empty() {
+    if !archive_files.is_empty() && !source_files.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.select_psd_or_archive").to_string(),
-            log_message: "mixed PSD files and archives in one selection".to_string(),
+            log_message: "mixed documents/images and archives in one selection".to_string(),
         });
     }
 
@@ -1550,7 +1568,7 @@ fn scan_selected_files(
     }
 
     let mut documents = Vec::new();
-    let mut sorted = psd_files;
+    let mut sorted = source_files;
     sorted.sort_by_key(|path| path.as_os_str().to_owned());
     for path in sorted {
         let bytes = fs::read(&path).map_err(|err| WorkerError {
@@ -1562,7 +1580,7 @@ fn scan_selected_files(
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-        documents.push(load_document_from_bytes(
+        documents.push(load_source_from_bytes(
             &file_name,
             extract_page_from_name(&file_name).unwrap_or(1),
             bytes,
@@ -1578,13 +1596,13 @@ fn scan_folder(
 ) -> Result<Vec<LoadedPsdDocument>, WorkerError> {
     let mut found = walk_dir(&path)?
         .into_iter()
-        .filter(|entry| is_supported_document_path(entry))
+        .filter(|entry| is_importable_source_path(entry))
         .collect::<Vec<_>>();
 
     if found.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_folder").to_string(),
-            log_message: format!("no psd/psb files in '{}'", path.display()),
+            log_message: format!("no psd/psb or image files in '{}'", path.display()),
         });
     }
 
@@ -1600,7 +1618,7 @@ fn scan_folder(
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-        documents.push(load_document_from_bytes(
+        documents.push(load_source_from_bytes(
             &file_name,
             extract_page_from_name(&file_name).unwrap_or(1),
             bytes,
@@ -1635,7 +1653,7 @@ fn scan_zip_archive(
         let name = entry.name().replace('\\', "/");
         // Archive members are plain strings; reuse the same extension rule as the
         // filesystem paths so ZIP does not drift from the other three scanners.
-        if !is_supported_document_path(Path::new(&name)) {
+        if !is_importable_source_path(Path::new(&name)) {
             continue;
         }
         let mut bytes = Vec::new();
@@ -1649,7 +1667,10 @@ fn scan_zip_archive(
     if entries.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_zip").to_string(),
-            log_message: format!("no psd/psb entries found in '{}'", zip_path.display()),
+            log_message: format!(
+                "no psd/psb or image entries found in '{}'",
+                zip_path.display()
+            ),
         });
     }
 
@@ -1661,7 +1682,7 @@ fn scan_zip_archive(
             .and_then(|item| item.to_str())
             .unwrap_or("unknown")
             .to_string();
-        documents.push(load_document_from_bytes(
+        documents.push(load_source_from_bytes(
             &file_name,
             extract_page_from_name(&name).unwrap_or(1),
             bytes,
@@ -1699,13 +1720,16 @@ fn scan_rar_archive_from_temp_dir(
 
     let mut found = walk_dir(extract_dir)?
         .into_iter()
-        .filter(|entry| is_supported_document_path(entry))
+        .filter(|entry| is_importable_source_path(entry))
         .collect::<Vec<_>>();
 
     if found.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_rar").to_string(),
-            log_message: format!("no psd/psb entries found in rar '{}'", rar_path.display()),
+            log_message: format!(
+                "no psd/psb or image entries found in rar '{}'",
+                rar_path.display()
+            ),
         });
     }
 
@@ -1730,7 +1754,7 @@ fn scan_rar_archive_from_temp_dir(
             .and_then(|item| item.to_str())
             .unwrap_or("unknown")
             .to_string();
-        documents.push(load_document_from_bytes(
+        documents.push(load_source_from_bytes(
             &file_name,
             extract_page_from_name(&relative_name).unwrap_or(1),
             bytes,
@@ -1844,6 +1868,73 @@ fn extract_archive_with_commands(
             t!("launcher.psd_import.extract_archive_tool_error")
                 .to_string(),
         log_message: format!("no extractor succeeded for '{}'", path.display()),
+    })
+}
+
+/// Decode one scanned file into a `LoadedPsdDocument`, choosing the reader from
+/// `file_name`'s extension: PSD/PSB go to `load_document_from_bytes`, the plain rasters
+/// listed in `SUPPORTED_IMAGE_EXTS` go to `load_image_from_bytes`.
+///
+/// `file_name` is the base name shown in the row table, `page` the one-based page the
+/// document is pre-assigned to, `warnings` the collector for non-fatal document notes
+/// (only the PSD reader adds any). Anything the scanners let through with an unknown
+/// extension falls back to the PSD reader, which reports it as an unreadable document.
+///
+/// # Errors
+/// Propagates the chosen reader's `WorkerError`.
+fn load_source_from_bytes(
+    file_name: &str,
+    page: u32,
+    bytes: Vec<u8>,
+    warnings: &mut Vec<String>,
+) -> Result<LoadedPsdDocument, WorkerError> {
+    if is_supported_image_path(Path::new(file_name)) {
+        return load_image_from_bytes(file_name, page, bytes);
+    }
+    load_document_from_bytes(file_name, page, bytes, warnings)
+}
+
+/// Decode a plain raster file into a single-page document whose only content is the
+/// image itself.
+///
+/// The result carries no layers and keeps the picture in `composite`, so
+/// `build_document_rows` emits exactly one `LayerSource::Composite` row typed as the
+/// source page — the same shape a flattened PSD produces, which is what lets the
+/// preview, validation and import paths stay unchanged.
+///
+/// # Errors
+/// Returns `WorkerError` when the bytes are not a decodable image or decode to an
+/// empty raster.
+fn load_image_from_bytes(
+    file_name: &str,
+    page: u32,
+    bytes: Vec<u8>,
+) -> Result<LoadedPsdDocument, WorkerError> {
+    // Detection is by content rather than by extension, so a JPEG saved as `.png` still
+    // imports, and a non-image wearing an image extension fails here with a message that
+    // names the file instead of being handed to the PSD reader.
+    let decoded = image::load_from_memory(&bytes).map_err(|err| WorkerError {
+        user_message: tf!("launcher.psd_import.read_image_error", file_name = file_name),
+        log_message: format!("failed to decode image '{file_name}': {err}"),
+    })?;
+    let rgba = decoded.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err(WorkerError {
+            user_message: tf!("launcher.psd_import.read_image_error", file_name = file_name),
+            log_message: format!("image '{file_name}' decoded to an empty {width}x{height} raster"),
+        });
+    }
+
+    Ok(LoadedPsdDocument {
+        file_name: file_name.to_string(),
+        page,
+        layers: Vec::new(),
+        composite: Some(DecodedImage {
+            width,
+            height,
+            data: Arc::new(rgba.into_raw()),
+        }),
     })
 }
 
@@ -2323,6 +2414,37 @@ fn is_supported_document_path(path: &Path) -> bool {
         .is_some_and(is_supported_document_ext)
 }
 
+/// Plain raster extensions accepted alongside PSD/PSB documents. Kept aligned with the
+/// launcher's other image import flow (`new_project::open_source`) so a folder that one
+/// accepts is not silently narrowed by the other. Every format here decodes with the
+/// `image` crate's default features.
+const SUPPORTED_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"];
+
+/// Reports whether `ext` names a plain raster file this importer can read.
+///
+/// `ext` is a bare extension without the dot; the comparison is ASCII case-insensitive.
+/// This is the single place that decides which images the picker, the folder walk and
+/// both archive scanners accept, mirroring `is_supported_document_ext` for documents.
+fn is_supported_image_ext(ext: &str) -> bool {
+    SUPPORTED_IMAGE_EXTS
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+}
+
+/// Reports whether `path` points at a plain raster file this importer can read, based on
+/// its extension only. Paths without an extension are rejected.
+fn is_supported_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|item| item.to_str())
+        .is_some_and(is_supported_image_ext)
+}
+
+/// Reports whether `path` is anything the scanners may hand to `load_source_from_bytes`:
+/// a PSD/PSB document or a plain raster page.
+fn is_importable_source_path(path: &Path) -> bool {
+    is_supported_document_path(path) || is_supported_image_path(path)
+}
+
 fn extract_page_from_name(name: &str) -> Option<u32> {
     let path = name.replace('\\', "/");
     let stem = Path::new(&path).file_stem()?.to_str()?;
@@ -2457,6 +2579,150 @@ mod tests {
     }
 
     #[test]
+    fn supported_image_ext_accepts_common_rasters_in_any_case() {
+        for ext in ["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"] {
+            assert!(super::is_supported_image_ext(ext), "{ext} must be accepted");
+            assert!(
+                super::is_supported_image_ext(&ext.to_ascii_uppercase()),
+                "{ext} must be accepted in upper case"
+            );
+        }
+
+        assert!(!super::is_supported_image_ext("psd"));
+        assert!(!super::is_supported_image_ext("zip"));
+        assert!(!super::is_supported_image_ext("txt"));
+        assert!(!super::is_supported_image_ext(""));
+    }
+
+    #[test]
+    fn importable_source_path_covers_documents_and_images() {
+        use std::path::Path;
+
+        assert!(super::is_importable_source_path(Path::new("001.psd")));
+        assert!(super::is_importable_source_path(Path::new("chapter/002.PSB")));
+        assert!(super::is_importable_source_path(Path::new("003.JPG")));
+        assert!(super::is_importable_source_path(Path::new("chapter/004.webp")));
+
+        assert!(!super::is_importable_source_path(Path::new("notes.txt")));
+        assert!(!super::is_importable_source_path(Path::new("chapter.zip")));
+        // No extension at all: a bare name and a dotfile are both rejected.
+        assert!(!super::is_importable_source_path(Path::new("png")));
+        assert!(!super::is_importable_source_path(Path::new(".png")));
+    }
+
+    #[test]
+    fn plain_image_yields_single_source_composite_row() {
+        let bytes = png_fixture_bytes([0, 255, 0]);
+
+        let mut warnings = Vec::new();
+        let document = super::load_source_from_bytes("002.png", 2, bytes, &mut warnings)
+            .expect("png loads as a document");
+        assert!(document.layers.is_empty(), "an image has no layers");
+        assert_eq!(document.page, 2, "page comes from the file stem");
+
+        let rows = super::build_document_rows(&document, 0, &mut warnings);
+
+        assert_eq!(rows.len(), 1, "an image yields exactly one row");
+        let row = &rows[0];
+        assert_eq!(row.file_name, "002.png");
+        assert_eq!(row.import_type, LayerImportType::Source);
+        assert_eq!(row.source, super::LayerSource::Composite);
+        assert_eq!(row.size, (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+        assert!(warnings.is_empty(), "no warnings for a valid image");
+
+        // The decoded pixels must flow through the shared render path unchanged.
+        let documents = std::sync::Arc::new(vec![document]);
+        let image = super::render_layer_rgba(&documents, 0, super::LayerSource::Composite)
+            .expect("image renders");
+        assert_eq!(image.dimensions(), (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+        assert_eq!(image.get_pixel(FIXTURE_WIDTH - 1, FIXTURE_HEIGHT - 1).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn unreadable_image_reports_its_file_name() {
+        let loaded = super::load_source_from_bytes(
+            "broken.png",
+            1,
+            b"not an image".to_vec(),
+            &mut Vec::new(),
+        );
+        let Err(error) = loaded else {
+            panic!("garbage bytes must not load as an image");
+        };
+        assert!(
+            error.log_message.contains("broken.png"),
+            "log names the file: {}",
+            error.log_message
+        );
+    }
+
+    #[test]
+    fn folder_scan_mixes_images_into_the_document_order() {
+        // The end-to-end shape of the feature: a chapter folder holding both PSDs and
+        // plain images must produce one ordered page list, images included.
+        let folder = tempfile::tempdir().expect("temp folder");
+        std::fs::write(folder.path().join("001.psd"), flattened_fixture_bytes(false))
+            .expect("psd fixture written");
+        std::fs::write(folder.path().join("002.png"), png_fixture_bytes([0, 255, 0]))
+            .expect("png fixture written");
+        std::fs::write(folder.path().join("003.jpg"), jpg_fixture_bytes([0, 0, 255]))
+            .expect("jpg fixture written");
+        // Not an importable source: it must be ignored rather than fail the scan.
+        std::fs::write(folder.path().join("notes.txt"), b"ignored").expect("txt written");
+
+        let mut warnings = Vec::new();
+        let documents = super::scan_folder(folder.path().to_path_buf(), &mut warnings)
+            .expect("mixed folder scans");
+
+        let pages = documents
+            .iter()
+            .map(|document| (document.file_name.as_str(), document.page))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pages,
+            vec![("001.psd", 1), ("002.png", 2), ("003.jpg", 3)],
+            "images are placed by name among the documents"
+        );
+        assert!(warnings.is_empty(), "no warnings for a clean mixed folder");
+
+        let mut rows = Vec::new();
+        for (document_index, document) in documents.iter().enumerate() {
+            rows.extend(super::build_document_rows(
+                document,
+                document_index,
+                &mut warnings,
+            ));
+        }
+        super::sort_rows_for_table(&mut rows);
+
+        assert_eq!(rows.len(), 3, "one row per single-image document");
+        for row in &rows {
+            assert_eq!(row.source, super::LayerSource::Composite);
+            assert_eq!(row.import_type, LayerImportType::Source);
+        }
+    }
+
+    #[test]
+    fn table_rows_sort_mixed_documents_and_images_by_name() {
+        // An image dropped into a chapter of PSDs belongs at its by-name position,
+        // not appended after the documents.
+        let mut rows = vec![
+            test_row("3.psd", "clean"),
+            test_row("2.jpg", super::type_source()),
+            test_row("1.psd", "clean"),
+            test_row("10.png", super::type_source()),
+        ];
+
+        super::sort_rows_for_table(&mut rows);
+
+        let names = rows
+            .iter()
+            .map(|row| row.file_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["1.psd", "2.jpg", "3.psd", "10.png"]);
+    }
+
+    #[test]
     fn fully_skipped_document_warning_detects_unassigned_psd() {
         let rows = vec![
             test_row_with_document("assigned.psd", "source", 0, LayerImportType::Source),
@@ -2510,6 +2776,30 @@ mod tests {
             data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
         data
+    }
+
+    /// Encodes a `FIXTURE_WIDTH` x `FIXTURE_HEIGHT` opaque PNG filled with `rgb`.
+    fn png_fixture_bytes(rgb: [u8; 3]) -> Vec<u8> {
+        let image = image::RgbaImage::from_raw(FIXTURE_WIDTH, FIXTURE_HEIGHT, fixture_pixels(rgb))
+            .expect("fixture buffer matches its dimensions");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("png fixture encodes");
+        encoded.into_inner()
+    }
+
+    /// Encodes a `FIXTURE_WIDTH` x `FIXTURE_HEIGHT` opaque JPEG filled with `rgb`.
+    /// JPEG is lossy, so callers must not assert on the decoded pixel values.
+    fn jpg_fixture_bytes(rgb: [u8; 3]) -> Vec<u8> {
+        let image = image::RgbaImage::from_raw(FIXTURE_WIDTH, FIXTURE_HEIGHT, fixture_pixels(rgb))
+            .expect("fixture buffer matches its dimensions");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .to_rgb8()
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .expect("jpeg fixture encodes");
+        encoded.into_inner()
     }
 
     /// Serializes a flattened (layer-less) opaque red document; `psb` selects the
