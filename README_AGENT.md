@@ -886,12 +886,13 @@ egui `Id`, выводимый из текста подписи (`ComboBox::from_
 | `WheelSlider` | Slider с wheel-step, гасит scroll родителя |
 | `WheelComboBox` | ComboBox с wheel-переключением, гасит scroll |
 | `WheelSpinBox` | DragValue с wheel-behaviour |
+| `SearchableComboBox` | Combo box for a CATALOG: a filtering search field, two-line rows (main line optionally in that row's own typeface) and per-row colour/tooltip. Draws no label — the caller does. |
 | `AutocompleteLine` | однострочный ввод с dropdown автодополнения |
 | `SpellcheckedTextEdit` | многострочный `TextEdit` с фоновой орфографией через pure-Rust Hunspell backend и подчёркиванием ошибок |
 | `ViewportColorSelector` | color picker с пипеткой из viewport (egui screenshot event) |
 | `CollapsiblePanel` + `PanelTab` | панельный док (`src/widgets/panel_dock/`) — обязательная основа любой плавающей панели |
 
-**Правило**: не использовать `egui::Slider`, `egui::ComboBox` напрямую в продуктовом UI — использовать Wheel-версии.
+**Правило**: не использовать `egui::Slider`, `egui::ComboBox` напрямую в продуктовом UI — использовать Wheel-версии. When the list is a searchable CATALOG rather than a short enum — hundreds of rows, own-typeface previews, per-row diagnostics — the replacement is `SearchableComboBox` (the same wheel contract plus a search field); the typing font combo is drawn with it through `tabs::typing::panel::create_presets::draw_font_combo`.
 
 **Правило**: любая плавающая панель — это ВКЛАДКА панельного дока. `CollapsiblePanel` + `PanelTab` обязательны; самодельная панель из `Area + Frame::popup` со своей стрелкой сворачивания и `egui::Window` в роли панели — дефект, а не альтернатива. `Area` остаётся за декорациями и временными поверхностями, которые пользователь не может ни закрепить, ни сохранить (тосты, тултипы, привязанные к сцене оверлеи, блокер обучения). Ещё не мигрированные плавающие поверхности cleaning/translation/ps_editor — долг фазы 8, а не прецедент: у новых панелей исключений нет.
 

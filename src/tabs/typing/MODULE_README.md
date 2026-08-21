@@ -504,7 +504,7 @@ saving, and export.
     `Unsupported` via the swash charmap. Script base alphabet comes from the language's `ScriptGroup`
     (Cyrillic or Latin), language-specific letters + typography from the concrete `TextLanguage`.
     Drives the red/yellow font-dropdown highlight + hover tooltip in
-    `create_presets::draw_font_combo_option`. See `panel/MODULE_README.md` for the coverage/cache contract.
+    `create_presets::draw_font_combo` (per-row `primary_color` + `tooltip`). See `panel/MODULE_README.md` for the coverage/cache contract.
   - `presets_io.rs`: what still belongs to `user_config.json` — formula presets, per-effect-kind
     defaults, the legacy inline-tags flag — plus the formula/drawn/vector layout <-> `Value`
     conversions (free fns). Retains only the READ helper `load_text_tab_imported_system_fonts`

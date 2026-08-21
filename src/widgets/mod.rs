@@ -52,6 +52,19 @@ FILE HEADER (widgets/mod.rs)
     `persist.rs` the `PanelLayout` section of `user_config.json`, and `window.rs`
     the detached OS windows a tab can be dragged into (immediate child viewports,
     one per `HostId::SubWindow`).
+  - `SearchableComboBox` (+ `SearchableComboItem`, `SearchableComboResponse`,
+    `RowLayout`): a combo box whose drop-down rows carry a main line (optionally
+    drawn in the row's own `egui::FontFamily`) and a smaller grey second line in
+    the interface font, plus an on-demand search field that filters the list by a
+    case-insensitive substring of either line and colours every match. The search
+    field is a MODE: the popup opens as a plain list, and the field appears — above
+    the list, pushing it down — when the user types into the open popup or presses
+    the square magnifier button the widget draws after the combo button. `width(..)`
+    covers BOTH buttons (`search_button_overhang` reports the difference), and the
+    popup is that wide. `RowLayout` places that second line either UNDER the main
+    one (`Tall`, the default) or AFTER it on the same line (`Wide`, one line per
+    row). Row height is uniform across the list within a layout, and the caller's
+    font resolver is called only for the rows actually drawn this frame.
   - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
     localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
     short-lived background worker, or both — text above the animation. An optional
@@ -67,6 +80,7 @@ mod hangul_keyboard;
 mod help_hint;
 mod marked_scroll;
 pub mod panel_dock;
+mod searchable_combo_box;
 mod seed_spin_box;
 mod spellchecked_line;
 mod text_edit_plus;
@@ -110,6 +124,10 @@ pub use panel_dock::{
     PanelDockOutput, PanelDockState, PanelId, PanelLayoutError, PanelLayoutSnapshot,
     PanelLayoutWriter, PanelNode, PanelSizes, PanelTab, PanelTabHeader, SolvedLayout, SolvedPanel,
     SubWindowNode, TabId,
+};
+#[allow(unused_imports)]
+pub use searchable_combo_box::{
+    RowLayout, SearchableComboBox, SearchableComboItem, SearchableComboResponse,
 };
 #[allow(unused_imports)]
 pub use seed_spin_box::{SeedSpinBox, random_seed};

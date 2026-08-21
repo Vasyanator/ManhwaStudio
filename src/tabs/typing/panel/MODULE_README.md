@@ -759,7 +759,8 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   loader/store item to `pub(crate)` — add a facade wrapper instead.
 - egui own-typeface registration for font previews lives in `crate::widgets::font_preview`
   (`combo_font_family_name` / `is_font_family_bound` / `request_font_family`), shared by
-  `create_presets::draw_font_combo_option` and the settings font UI. It is keyed by
+  `create_presets::draw_font_combo` (through the per-row resolver it lends the combo widget)
+  and the settings font UI. It is keyed by
   `(font identity, content hash, face index)` — see the CACHES bullet above for why the
   content discriminant is load-bearing; `FontEntry::render_identity_name` and
   `FontEntry::content_hash` are `pub(crate)` (via the `font_admin` re-export) precisely so the
@@ -786,6 +787,29 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
 - The `match` on `TextLanguage` (`extra_chars_for_language`) and on `ScriptGroup`
   (`script_chars_for_group`) are exhaustive with no catch-all arm: a new language
   or group must be wired here explicitly (enforced by the compiler).
+
+## The font combo (one helper, two panels)
+- Both panels draw the SAME combo through `create_presets::draw_font_combo(ui, &FontComboSpec)`;
+  the two panels differ only in the spec (id salt, label, width, the inline span's font label,
+  and whether the button must name a MISSING font) and in what they do with the outcome.
+- The widget under it is `crate::widgets::SearchableComboBox` in `RowLayout::Wide`: rows are the
+  display label in the font's OWN face followed by its render identity, and the coverage
+  diagnostics reach the rows as `primary_color` + `tooltip`. Its drop-down opens as a PLAIN
+  list; the filtering field appears only when the user types into it or presses the square
+  magnifier button the widget draws next to the combo button — which is why
+  `font_combo_button_width` budgets the TOTAL width of both buttons (it asks
+  `SearchableComboBox::search_button_overhang` for the magnifier's share) and the edit panel
+  still keeps `FONT_COMBO_FACE_ROW_RESERVE_PT` of its row for the face combo. Preview registration is bounded by the rows actually DRAWN, not by the list length,
+  and is deliberately uncapped (this list is `fonts/` plus imported system fonts, not the OS
+  catalog).
+- `FontComboOutcome::user_pick` is the ONLY value allowed to write an inline span's font label:
+  it is the edge (`create_main_text::font_combo_user_pick`) that separates a genuine pick — a
+  popup commit, even on the already selected row, or a wheel step that moved — from the
+  per-frame resolve + display clamp. Writing `font_idx` there instead would re-emit a `<font>`
+  tag on every frame in which text is merely selected.
+- The two WRITEBACK branches stay at their call sites and are NOT the same: the create panel
+  also clears `missing_font` and consults the per-font parameter memory
+  (`handle_create_font_selection_change`), the edit panel only resets the face index.
 
 ## Two font diagnostics, two questions (do not merge them)
 - STATIC coverage (`font_coverage.rs`, above): "could this FONT serve the selected
@@ -1128,7 +1152,9 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
 - To change when coverage is recomputed, see `facade.rs::begin_frame` (language-change
   detection) and `create_state.rs::spawn_font_reload`.
 - To change the highlight colors / tooltip, see `create_presets.rs`
-  (`draw_font_combo_option`, `font_coverage_tooltip`).
+  (`build_font_combo_rows`, `font_coverage_tooltip`); to change the font combo ITSELF — its
+  rows, caption, width, display clamp or pick edge — see `create_presets::draw_font_combo`
+  and `FontComboSpec`, and only there: both panels draw it through that one helper.
 - To change the per-render fallback rows (wording, colors, truncation), see
   `create_presets.rs` (`font_fallback_status_lines`, `truncated_char_list`); to
   change where they are drawn, see `create_sections.rs::draw_preview_section`; to

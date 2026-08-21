@@ -138,6 +138,89 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   reason the inline selection anchor is the number of CANDIDATE chars the query consumed, never
   the query's own char count (folding can expand one char into several).
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
+- `searchable_combo_box.rs`: combo box whose drop-down rows carry a MAIN line — optionally
+  drawn in that row's own `egui::FontFamily` — and a SECOND line always drawn in the interface
+  font, grey and at EXACTLY half the main line's size at every `primary_size` (no floor: one
+  would make the two lines look alike as soon as the main line got small), plus an on-demand
+  search field that FILTERS the list (case-insensitive substring of either line, empty query
+  matches everything) and colours every occurrence. The widget draws TWO controls: the combo
+  button (caption + the drop-down arrow INSIDE it) and a square magnifier button after it,
+  and `width(..)` is the width of both together — the popup is that wide, the combo button
+  gets what is left, and a caller budgeting a row asks `search_button_overhang(ui,
+  primary_size)` for the difference instead of re-deriving it (the same contract
+  `ai_button::marker_badge_overhang` has). SEARCH IS A MODE, not furniture: the popup opens as
+  a plain list and the field appears only when the user types into the open popup or presses
+  the magnifier — then it takes its own space ABOVE the list, which is pushed down and never
+  covered. The characters that summoned it are taken out of the event queue
+  (`take_typed_text`, pure and unit-tested) and seeded into the query, because nothing holds
+  focus while the field is hidden and the field created later in that same frame would
+  otherwise lose the first keystroke; opening the popup also drops whatever focus another
+  widget held (`Memory::stop_text_input`), or the tab's own text editor would swallow it. The
+  magnifier both opens (straight into search mode) and toggles, and because it sits OUTSIDE
+  the popup's `Area` its click reads as "clicked elsewhere" to egui — the widget takes that
+  close back. It knows nothing about fonts: the caller lends it a resolver `usize -> Option<FontFamily>` and
+  owns the registration those families need (`font_preview.rs`) and the cap on how many it is
+  willing to register. Where the second line goes is the caller's choice of `RowLayout`:
+  `Tall` (the default, «высокий») puts it UNDER the main line, `Wide` («широкий») puts it
+  AFTER the main line on the same text row, which halves the row height and is what makes a
+  long catalog usable. Row height is UNIFORM across the list WITHIN one layout, and it differs
+  BETWEEN layouts — that is the point of the switch. `Tall` reserves the second line's height
+  for every row as soon as ANY row has one; `Wide` reserves none at all and never inspects the
+  items, so its height cannot depend on what filtering leaves on screen. Everything derived
+  from the height follows the layout through one `RowGeometry`: the `show_rows` pitch, the
+  reveal/scroll arithmetic, and the row rect. Uniformity is load-bearing —
+  `ScrollArea::show_rows` positions rows by multiplying one height by an index, so a per-row
+  height would misplace every row after the first odd one, and a conditional second line would
+  make the list jump as filtering changes which rows are shown; the height is pinned through
+  `TextFormat::line_height` rather than trusted to the row's own face, and each row's painter
+  is clipped to its rect so a tall face cannot bleed into its neighbour. Every line of every
+  row, in BOTH layouts, is its own galley that the widget positions ITSELF by BASELINE
+  (`RowBaselines::measure` + `paint_line_on_baseline`), never by its top edge: epaint places a
+  galley's baseline at its own face's ascent, which is 15 pt for the interface font against
+  24 pt for a display face at the same nominal 16 pt, so top-edge painting makes a catalog's
+  ink float from row to row — which reads as uneven row heights — and pulls a `Wide` row's
+  second line off the first. A baseline is derived from the INTERFACE font's metrics at that
+  line's nominal size (`row_baseline` centres the font's line box in the band and takes its
+  baseline); `Tall` gives each line a band of its own (main line band, then second line band)
+  and a baseline inside it, `Wide` has one text row and therefore one shared baseline, and the
+  second line starts after the main line's advance width plus a gap proportional to the main
+  size. Nothing about a row's height or a baseline may be taken from the item's face — the face
+  decides only what the main line looks like and how wide it is; ink that overflows the row is
+  clipped, never accommodated. Each line is highlighted in its own galley, so search colouring
+  is identical in both layouts. The closed button is identical in both layouts too: it shows the
+  selected row's MAIN line only. The open flag is a plain `bool` the widget owns, never
+  `egui::ComboBox::is_open` — see the `WheelComboBox` defect noted under "Contracts and
+  invariants". Keyboard: `Escape` drops a non-empty query AND the search row, and
+  closes the popup otherwise (so at most two presses take a searching user to a closed list),
+  `ArrowUp`/`ArrowDown` move inside the FILTERED list, `Enter` picks; all four are consumed
+  with `InputState::consume_key` INSIDE the popup body, which runs before `Popup::show`'s own
+  unconditional Escape-closes-the-popup check. The matched-character colour is chosen from the
+  row's actual background rather than from the theme, because `Visuals::hyperlink_color` on
+  the light-theme selection fill has less contrast than the plain row text. Matching lives in
+  a GUI-free private submodule and is unit-tested; it reuses
+  `autocomplete_line::ignore_case_prefix_len` instead of re-deriving case folding, scans one
+  CHAR at a time so overlapping occurrences are all covered ("ana" twice in "banana"), and
+  merges touching hits so the ranges it emits stay ordered and disjoint. The search field, while it is shown,
+  re-requests focus on every frame NO widget holds it, because any click elsewhere in the
+  popup surrenders it and nothing else in the popup is focusable; a click outside the popup
+  closes it and keeps the focus it took. A row may carry two OPTIONAL per-item marks, both off
+  by default so a `SearchableComboItem::new`/`with_secondary` row is byte-for-byte what it was
+  before they existed: `primary_color` replaces the row-state colour on the main line's
+  UNMATCHED characters, and `tooltip` is an already-localized hover text (the widget never
+  translates it, and an empty string counts as absent). The search highlight is passed through
+  untouched (`LineColors::primary_row`), so a coloured row still shows where the query hit; the
+  second line keeps `weak_text_color` regardless; and the colour reaches TEXT only — the fill
+  behind the keyboard cursor's row and behind the current selection is what keeps those rows
+  recognisable whatever colour an item asks for. The marks exist for the typing tab's
+  font-coverage diagnostics (`tabs::typing::panel::create_presets`: warning/error colour plus
+  `font_coverage_tooltip`); the widget itself knows nothing about coverage. Because the two
+  fields are public, a struct-literal construction must list them — the constructors plus the
+  `primary_color(..)`/`tooltip(..)` builders are the intended shape. The response reports the
+  written selection (`changed`) and, separately, the row the popup COMMITTED to this frame
+  (`picked`) — a click on the ALREADY selected row writes nothing and is still a deliberate
+  act, which is the only thing that can pin a font on a span whose font already equals the
+  shown row. Its product call site is the typing tab's font combo
+  (`tabs::typing::panel::create_presets::draw_font_combo`, both panels).
 - `viewport_color_selector.rs`: color selector with viewport eyedropper support. Two entry
   points share one frame: `draw` keeps the stock `ui.color_edit_button_srgba` swatch, and
   `draw_with_presets` swaps it for `ColorPresetPicker` when the caller lends a `ColorPresets`
@@ -171,7 +254,14 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   `PopupCloseBehavior::CloseOnClickOutside` or the first click on a cell closes it.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume
   mouse-wheel changes without scrolling parent views.
-- `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets.
+- `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets, and the
+  shared WHEEL-STEP helpers the combo boxes react through (`wheel_steps_if_hovered`,
+  `cycle_wrapped_index`, and the raw per-notch delta behind them). `WheelComboBox` and
+  `SearchableComboBox` both call them, which is the point: one wheel notch must move one row
+  in both, and a copy per widget is how that contract drifts. One step per FRAME is reported
+  however many notches arrived in it — only the sign of the raw delta is read — and
+  `cycle_wrapped_index` reduces an out-of-range index into range before its arithmetic, so a
+  selection the caller has not cleaned up cannot overflow it.
 - `seed_spin_box.rs`: seed value input with random generation support.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip explains a control. The
   tooltip may carry a localized text line, an animated WebP hint from the `ms-gifs` crate, or
@@ -225,6 +315,32 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   function: it keeps no egui state, does no I/O and no logging, and returns the same rects for the
   same inputs. Dock panels stay on `egui::Order::Foreground`, because canvas input gating is z-order
   based.
+- A widget that opens a popup MUST publish the wheel guard while it is open
+  (`publish_combo_popup_open` every frame, `publish_combo_popup_rect` from inside the popup
+  body) and must not react to the wheel itself meanwhile. That duty is what stops a slider
+  under an open list from being dragged by wheel events aimed at the list.
+- A popup widget must derive "is my popup open?" from an id it CONTROLS.
+  `egui::ComboBox::show_ui` re-salts whatever `id_salt` it is given
+  (`egui-0.35.0/src/containers/combo_box.rs:232`), so `ComboBox::is_open(ctx, already_salted_id)`
+  answers `false` forever — `wheel_combo_box.rs` carries that defect and survives only because
+  its popup closure publishes the guard rect before the check runs. `SearchableComboBox` owns
+  a plain `bool` instead; new popup widgets should do the same.
+- A popup whose content can GROW must ask for its height every frame. An `egui::Area` hands
+  its body last frame's content size as this frame's `max_rect`
+  (`egui-0.35.0/src/containers/area.rs:610` + `:666`) and a `ScrollArea` can never exceed it
+  (`scroll_area.rs:763-765`), so a list that shrank once stays short. `SearchableComboBox`
+  calls `Ui::set_min_height` with the row count's natural height before drawing the list. It
+  must be `set_min_height` and never `set_max_height`: the latter unions `max_rect` with
+  `min_rect` and then assigns `cursor.min.y = max_rect.min.y` (`placer.rs:248-258`), which
+  drags the cursor back above the widgets already emitted — that is how the search field
+  ended up painted over the first row. `set_min_height` goes through
+  `Region::expand_to_include_y` (`placer.rs:274-281` + `layout.rs:67-71`) and only extends
+  downward. Salting the popup's id instead would drop the widget's own state and force egui's
+  INVISIBLE sizing pass (`area.rs:444` + `:623-624`) — a blink on every keystroke.
+- `SearchableComboBox`'s per-item font resolver is called ONLY for the rows drawn in the
+  current frame plus the selected row on the closed button. That is a contract, not an
+  optimisation: egui's `add_font` never evicts, so a resolver called for every filtered row
+  every frame would grow the font atlas without bound while the user scrolls a catalog.
 - `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
   (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
   (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but

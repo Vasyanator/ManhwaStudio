@@ -48,6 +48,14 @@ Why — two reasons, both invisible in the type system:
    (§2 below). A stock `egui::Slider` does not participate in the guard and will be driven
    by wheel events meant for the popup.
 
+A `WheelComboBox` is not the only replacement. When the list is a CATALOG the user has to
+search — hundreds of rows, each wanting its own typeface and per-row diagnostics — the
+replacement is `SearchableComboBox` (`src/widgets/searchable_combo_box.rs:334`), which owns the
+same wheel contract and adds a filtering search field. The typing tab's font combo is that case
+and is built on it (`src/tabs/typing/panel/create_presets.rs::draw_font_combo`); it is the only
+product call site so far, and it draws its own label, because unlike `ComboBox` the widget draws
+none.
+
 Known exceptions still in the tree: `src/ai_backend_panel.rs` (the "max loaded models"
 slider, drawn twice) and `src/launcher/new_project/window.rs` (fetch parallelism) use a raw
 `egui::Slider`. Treat them as debt, not a precedent — the typing layout editor's opacity
@@ -62,6 +70,7 @@ Public surface is `src/widgets/mod.rs:43-72`; the module contract is
 |---|---|---|
 | `WheelSlider` | `src/widgets/wheel_slider.rs:39` | `Slider` replacement: hover+wheel = one step (Shift = 5, `SHIFT_WHEEL_STEP_MULTIPLIER`, :37), parent scroll suppressed. Use for every bounded numeric in a panel. |
 | `WheelComboBox` | `src/widgets/wheel_combo_box.rs:35` | `ComboBox` replacement for `show_index`-style enums. Wheel cycles the index when closed; when open it publishes the wheel guard. `new` / `from_label` / `from_id_salt`. |
+| `SearchableComboBox` | `src/widgets/searchable_combo_box.rs:334` | `ComboBox` replacement for a CATALOG: two-line rows (`RowLayout::Tall`/`Wide`), the main line optionally in that row's own `FontFamily`, per-row colour + tooltip, wheel-cycling when closed. Search is a MODE — the popup opens as a plain list and reveals a filtering field when the user types into it or presses the square magnifier button the widget draws beside the combo button. `width(..)` covers both buttons (ask `search_button_overhang` for the difference) and so does the popup. Draws NO label — the caller must. Call site: the typing font combo. |
 | `WheelSpinBox` | `src/widgets/wheel_spin_box.rs:31` | `DragValue` replacement: unbounded/precise numeric entry with the same wheel contract. |
 | `SeedSpinBox` | `src/widgets/seed_spin_box.rs:21` | `u64` seed field + "random" button (`random_seed`, :63+). Self-contained; no `rand` dependency. |
 | `AutocompleteLine` | `src/widgets/autocomplete_line.rs` | Single-line input with an inline-completion popup and a configurable suggestion limit. |

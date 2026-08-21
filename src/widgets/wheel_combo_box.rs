@@ -17,12 +17,14 @@ FILE HEADER (widgets/wheel_combo_box.rs)
     и не считали себя наведёнными под раскрытым списком;
   - a discrete wheel notch is detected from the raw `Event::MouseWheel` events
     (egui 0.35 has no `raw_scroll_delta`), giving one index step per notch, and the
-    smoothed scroll delta is zeroed so a parent `ScrollArea` receives no scroll.
+    smoothed scroll delta is zeroed so a parent `ScrollArea` receives no scroll;
+  - шаг колеса и циклический сдвиг индекса живут в `wheel_input_guard`, общие с
+    `SearchableComboBox`, чтобы поведение двух combobox'ов не разъезжалось.
 */
 #![allow(dead_code)]
 
 use super::wheel_input_guard::{
-    combo_popup_open, publish_combo_popup_open, publish_combo_popup_rect,
+    cycle_wrapped_index, publish_combo_popup_open, publish_combo_popup_rect, wheel_steps_if_hovered,
 };
 use eframe::egui;
 use egui::style::{StyleModifier, WidgetVisuals};
@@ -271,83 +273,9 @@ impl WheelComboBox {
     }
 }
 
+/// Runs the shared wheel reaction for its side effect only: it consumes the frame's smoothed
+/// scroll delta over a hovered closed combo box, so the wheel does not scroll the parent view
+/// past a widget that ignores its own step (`show_ui` has no index to move).
 fn suppress_wheel_scroll_if_hovered(ctx: &Context, response: &Response) {
     let _ = wheel_steps_if_hovered(ctx, response);
-}
-
-fn cycle_wrapped_index(index: usize, len: usize, steps: i32) -> usize {
-    if len == 0 || steps == 0 {
-        return index;
-    }
-
-    let shift = (steps.unsigned_abs() as usize) % len;
-    if steps > 0 {
-        (index + shift) % len
-    } else {
-        (index + len - shift) % len
-    }
-}
-
-fn wheel_steps_if_hovered(ctx: &Context, response: &Response) -> Option<i32> {
-    if combo_popup_open(ctx) {
-        return None;
-    }
-    if !response.hovered() && !response.has_focus() {
-        return None;
-    }
-
-    let (raw_wheel_events, smooth_scroll_delta) =
-        ctx.input(|input| (raw_wheel_events_delta(input), input.smooth_scroll_delta));
-    let raw_wheel_delta = axis_wheel_delta(raw_wheel_events);
-    let smooth_wheel_delta = axis_wheel_delta(smooth_scroll_delta);
-    if raw_wheel_delta.abs() <= f32::EPSILON && smooth_wheel_delta.abs() <= f32::EPSILON {
-        return None;
-    }
-
-    consume_wheel_scroll_delta(ctx);
-    if smooth_wheel_delta.abs() > f32::EPSILON {
-        ctx.request_repaint();
-    }
-
-    if raw_wheel_delta.abs() <= f32::EPSILON {
-        None
-    } else {
-        Some(-wheel_direction(raw_wheel_delta))
-    }
-}
-
-/// Sums the raw (unsmoothed) mouse-wheel delta reported this frame.
-///
-/// egui 0.35 removed `InputState::raw_scroll_delta`, so the per-frame unsmoothed
-/// wheel movement is recovered by summing `Event::MouseWheel` deltas. Unlike
-/// `smooth_scroll_delta`, which ramps over several frames, this is nonzero only on
-/// the frame a physical wheel notch arrives, so it yields exactly one step per notch.
-/// Only the sign is used downstream, so the event `unit` is irrelevant.
-fn raw_wheel_events_delta(input: &egui::InputState) -> egui::Vec2 {
-    input
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            egui::Event::MouseWheel { delta, .. } => Some(*delta),
-            _ => None,
-        })
-        .fold(egui::Vec2::ZERO, |acc, delta| acc + delta)
-}
-
-fn axis_wheel_delta(delta: egui::Vec2) -> f32 {
-    if delta.y.abs() > f32::EPSILON {
-        delta.y
-    } else {
-        delta.x
-    }
-}
-
-fn wheel_direction(wheel_delta: f32) -> i32 {
-    if wheel_delta > 0.0 { 1 } else { -1 }
-}
-
-fn consume_wheel_scroll_delta(ctx: &Context) {
-    ctx.input_mut(|input| {
-        input.smooth_scroll_delta = egui::Vec2::ZERO;
-    });
 }

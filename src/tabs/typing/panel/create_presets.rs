@@ -3,18 +3,27 @@ File: panel/create_presets.rs
 
 Purpose:
 Part of `impl TypingCreatePanelState` extracted verbatim from `panel.rs`:
-create-panel preset and formula-preset apply/save UI, combo-box font-family
-binding, the initial preview request, and the face-index clamp.
+create-panel preset and formula-preset apply/save UI, the shared typing font
+combo, the initial preview request, and the face-index clamp.
 
 Main responsibilities:
 - draw and apply/save named create presets and formula-layout presets;
-- bind an egui font family for combo-box option rendering;
+- own the ONE font combo both typing panels draw (`draw_font_combo`): its rows,
+  its own-typeface previews, its caption, its display clamp and its pick edge;
 - issue the initial preview render request and clamp the selected face index.
 
 It is also the ONE place that maps font diagnostics to colors and wording: the
-STATIC per-font coverage classification (`font_coverage.rs`, combobox option
-colors + `font_coverage_tooltip`) and the FACTUAL per-render fallback report the
-renderer returns (`font_fallback_status_lines`, shown next to the preview).
+STATIC per-font coverage classification (`font_coverage.rs`, the combo rows'
+`primary_color` + `font_coverage_tooltip`) and the FACTUAL per-render fallback
+report the renderer returns (`font_fallback_status_lines`, next to the preview).
+
+Key items of the font combo:
+- FontComboSpec / FontComboOutcome: what a panel lends the combo and what it gets
+  back (the shown font index, the genuine user pick, the button response).
+- FontComboRow (private): one owned row, built before the widget runs so the
+  panel borrow ends before `SearchableComboBox` takes `&mut Ui`.
+- font_combo_selected_position / font_combo_button_width: the pure display clamp
+  and the button width the widget needs (its width is exact, unlike ComboBox's).
 
 Notes:
 Extracted verbatim from `panel.rs`. Methods are `pub(super)` so the `panel`
@@ -23,32 +32,12 @@ the parent module's types and imports.
 */
 
 use super::*;
+use crate::widgets::{RowLayout, SearchableComboBox, SearchableComboItem};
 
 /// Maximum characters listed in one user-facing character list before it is
 /// truncated with a "+N more" suffix. Shared by the static coverage tooltip and
 /// the per-render fallback status so a long text can never blow up the panel.
 const MAX_SHOWN_CHARS: usize = 15;
-
-/// Everything one row of the font combo popup needs (`draw_font_combo_option`).
-///
-/// Bundled into a struct so the draw fn stays under the argument-count lint, and — more
-/// importantly — so the three different notions of a "font name" cannot be swapped at a
-/// call site: `label` is DISPLAY ONLY (override → virtual-group alias → file stem),
-/// `identity` is the resolution/registration key (`FontEntry::render_identity_name`), and
-/// `path` is only where the bytes are read from for the own-typeface preview.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FontComboOption<'a> {
-    pub(super) label: &'a str,
-    pub(super) identity: &'a str,
-    /// `FontEntry::content_hash` of the font behind `identity` — the byte discriminant of
-    /// the egui preview registration (`widgets::font_preview`), so a replaced file is not
-    /// previewed from stale bytes. `0` = content unknown.
-    pub(super) content_hash: u64,
-    pub(super) path: &'a Path,
-    pub(super) face_index: usize,
-    pub(super) selected: bool,
-    pub(super) coverage: &'a FontLanguageCoverage,
-}
 
 /// "Works, but not the way you asked": a font that only partially covers the
 /// typesetting language, or a character drawn by a fallback font instead of the
@@ -60,6 +49,148 @@ pub(super) const FONT_DIAGNOSTIC_WARNING_COLOR: egui::Color32 =
 /// a character no font in the render base could draw (tofu).
 pub(super) const FONT_DIAGNOSTIC_ERROR_COLOR: egui::Color32 =
     egui::Color32::from_rgb(230, 96, 92);
+
+/// Point size of the font combo's row previews, and of its own-typeface closed caption.
+///
+/// Pinned instead of inherited from `SearchableComboBox`'s default so the rows keep exactly
+/// the size the hand-drawn options used before the widget swap (a 14 pt
+/// `Style::override_font_id` per row).
+const FONT_COMBO_PREVIEW_SIZE_PT: f32 = 14.0;
+
+/// Cap on the height of the font combo's drop-down list, in points.
+///
+/// Larger than the 200 pt `Spacing::combo_height` the old popup was bounded by
+/// (`egui-0.35.0/src/style.rs:1466`): one `RowLayout::Wide` row is a single text line, so the
+/// taller list is what makes a font catalog browsable without scrolling.
+const FONT_COMBO_MAX_POPUP_HEIGHT_PT: f32 = 320.0;
+
+/// Width, in points, the edit panel keeps on the font combo's row for the face combo that
+/// follows the combo on the same row.
+///
+/// [`FONT_COMBO_MIN_WIDTH_PT`] for the face button itself plus room for its label and the
+/// spacing between the two — the font combo may take everything else. The create panel needs
+/// no such reserve: its face combo is a row of its own.
+pub(super) const FONT_COMBO_FACE_ROW_RESERVE_PT: f32 = FONT_COMBO_MIN_WIDTH_PT + 50.0;
+
+/// Smallest width, in points, the font combo's BUTTON is ever given — the square search
+/// button that follows it is budgeted on top of this.
+///
+/// The default `Spacing::combo_width` (`egui-0.35.0/src/style.rs:1457`), which is what the
+/// old `egui::ComboBox`-based button used as its MINIMUM width.
+const FONT_COMBO_MIN_WIDTH_PT: f32 = 100.0;
+
+/// Everything one frame of the typing font combo needs from its caller.
+///
+/// The two panels differ only in these five values; everything else about the combo — the
+/// rows, the caption, the display clamp, the pick edge — is identical and lives in
+/// [`TypingCreatePanelState::draw_font_combo`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FontComboSpec<'a> {
+    /// STABLE, language-independent id salt — never a localized caption
+    /// (`egui-docs/05-ids-and-i18n.md` §2). It is what the widget's popup state hangs off.
+    pub(super) id_salt: &'static str,
+    /// The already-localized label drawn AFTER the button, the way `egui::ComboBox` drew it
+    /// (`egui-0.35.0/src/containers/combo_box.rs:252-255`).
+    pub(super) label: &'a str,
+    /// TOTAL width in points of the combo — its button, the gap, and the square search
+    /// button — which the popup inherits. See [`font_combo_button_width`]: the widget's width
+    /// is EXACT, so a caller that passes nothing would visibly shrink the row.
+    pub(super) width: f32,
+    /// The inline span's RAW render label while a text selection is being styled, `None`
+    /// outside inline-selection mode. Display resolution only: it is never written back here.
+    pub(super) inline_font_label: Option<&'a str>,
+    /// `true` when the layer's font is not loaded: the button then names the MISSING font
+    /// instead of a row (create panel only; the edit panel shows a red banner instead).
+    pub(super) font_missing: bool,
+}
+
+/// What one frame of the typing font combo decided.
+#[derive(Debug)]
+pub(super) struct FontComboOutcome {
+    /// Index into `TypingCreatePanelState::fonts` the combo SHOWS as selected, after the
+    /// display clamp. Reproduces the value the old call sites wrote into
+    /// `selected_font_idx`, including the empty-list case (the resolved index survives).
+    pub(super) font_idx: usize,
+    /// The font the user genuinely PICKED this frame — a popup commit (even on the already
+    /// selected row) or a wheel step that moved — else `None`. The ONLY value allowed to
+    /// write an inline span's font label; the per-frame `font_idx` must never do that.
+    pub(super) user_pick: Option<usize>,
+    /// The closed button's response, for hover-driven caller logic.
+    pub(super) response: egui::Response,
+}
+
+/// One row of the typing font combo, materialized for one frame.
+///
+/// Owned on purpose. [`crate::widgets::SearchableComboBox`] borrows both the row texts and
+/// the per-row font resolver while it holds `&mut Ui`; building the rows FIRST is what lets
+/// the `&self` borrow of the panel end before the widget runs, which is the only way the
+/// resolver can be a closure that touches neither `self` nor `ui`.
+#[derive(Debug, Clone)]
+struct FontComboRow {
+    /// Index into `TypingCreatePanelState::fonts`.
+    font_idx: usize,
+    /// DISPLAY ONLY (`font_display_label`): the row's main line and the closed caption.
+    label: String,
+    /// The render identity (`FontEntry::render_identity_name`): the row's second line AND
+    /// the key its own-typeface preview registration is derived from.
+    identity: String,
+    /// `FontEntry::content_hash` — the byte discriminant of that registration, so a replaced
+    /// file is never previewed from stale bytes. `0` = content unknown.
+    content_hash: u64,
+    /// Where the preview's bytes are read from; never part of the registration key.
+    path: PathBuf,
+    /// The face of `path` the preview is rendered from.
+    face_index: usize,
+    /// Coverage colour of the main line; `None` for a font that fully covers the language.
+    color: Option<egui::Color32>,
+    /// Already-localized coverage tooltip; `None` for full coverage.
+    tooltip: Option<String>,
+}
+
+/// Position the font combo SHOWS as selected: where `font_idx` sits among `font_indices`, or
+/// `0` when it is not among them.
+///
+/// That fallback is the historical DISPLAY clamp: a font outside the active group marks the
+/// first visible row instead of no row at all. Pure and total — an empty list yields `0`,
+/// which the caller maps back to "no row exists", so the clamp can never write a font the
+/// user did not pick.
+#[must_use]
+pub(super) fn font_combo_selected_position(
+    font_indices: impl IntoIterator<Item = usize>,
+    font_idx: usize,
+) -> usize {
+    font_indices
+        .into_iter()
+        .position(|idx| idx == font_idx)
+        .unwrap_or(0)
+}
+
+/// TOTAL width, in points, to give the font combo on the current row — its button, the gap
+/// and the square search button together, which is what `SearchableComboBox::width` means.
+///
+/// That width is EXACT and the caption is elided, whereas the old `egui::ComboBox` treated
+/// `Spacing::combo_width` as a MINIMUM and grew to fit its caption
+/// (`egui-0.35.0/src/containers/combo_box.rs:345-361`) — so passing nothing would visibly
+/// shrink both panels. `reserved` is the width the caller still needs on the same row AFTER
+/// the combo and its label (the edit panel shares its row with the face combo). The floor is
+/// [`FONT_COMBO_MIN_WIDTH_PT`] for the button PLUS whatever the widget says its search button
+/// costs, so a cramped row shrinks the drop-down and never the magnifier out of existence.
+#[must_use]
+pub(super) fn font_combo_button_width(ui: &egui::Ui, label: &str, reserved: f32) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    // The colour is irrelevant to a measurement: this galley is never painted.
+    let label_width = ui.ctx().fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_string(), font_id, egui::Color32::WHITE)
+            .size()
+            .x
+    });
+    // Asked of the widget rather than re-derived here: the square's side follows the row
+    // height, which follows `FONT_COMBO_PREVIEW_SIZE_PT` and the active style.
+    let search_button = SearchableComboBox::search_button_overhang(ui, FONT_COMBO_PREVIEW_SIZE_PT);
+    (ui.available_width() - label_width - ui.spacing().item_spacing.x - reserved)
+        .max(FONT_COMBO_MIN_WIDTH_PT + search_button)
+}
 
 impl TypingCreatePanelState {
     pub(super) fn draw_create_presets_section(&mut self, ui: &mut egui::Ui) {
@@ -672,60 +803,198 @@ impl TypingCreatePanelState {
                 });
     }
 
-    /// Рисует один пункт комбобокса шрифтов: подпись `option.label` (ТОЛЬКО отображаемое
-    /// имя) собственным начертанием шрифта `option.identity` (байты берутся из
-    /// `option.path`), с подсветкой/подсказкой по покрытию языка. Возвращает `true` при
-    /// клике.
+    /// Materializes one owned row per font of the ACTIVE group, in catalog order.
     ///
-    /// Регистрация начертания идёт через общий `widgets::font_preview`: имя семейства
-    /// детерминировано по `(идентичность, хеш содержимого, индекс начертания)`, поэтому
-    /// `create_panel` и `edit_panel` с общим egui-`Context` делят одну регистрацию (иначе
-    /// поздняя затирала бы раннюю, и панель рисовала бы чужой шрифт). Первые кадры пункт
-    /// рисуется интерфейсным шрифтом: файл читается ФОНОМ, на GUI-потоке остаётся только
-    /// `Context::add_font`.
-    pub(super) fn draw_font_combo_option(
-        &mut self,
-        ui: &mut egui::Ui,
-        option: &FontComboOption<'_>,
-    ) -> bool {
-        let FontComboOption {
-            label,
-            identity,
-            content_hash,
-            path,
-            face_index,
-            selected,
-            coverage,
-        } = *option;
-        let prev_override = ui.style().override_font_id.clone();
-        if let crate::widgets::PreviewFontFamily::Ready(family) =
-            crate::widgets::request_font_family(
-                ui.ctx(),
-                identity,
-                content_hash,
-                path,
-                face_index,
-            )
-        {
-            ui.style_mut().override_font_id = Some(egui::FontId::new(14.0, family));
+    /// The rows are the combo's index space: `FontComboRow::font_idx` maps a row back to
+    /// `self.fonts`, so a row list built this way can never drift from the positions the
+    /// widget reports (which a separately-kept `filtered_font_indices()` could).
+    ///
+    /// There is deliberately NO cap on how many rows may register an own-typeface preview.
+    /// This list is the project's own `fonts/` plus the fonts the user imported — not the OS
+    /// catalog — and the previous combo registered EVERY filtered font on every frame its
+    /// popup was open. `SearchableComboBox` resolves only the rows it actually draws, so the
+    /// registrations are bounded by the visible rows rather than by the list length.
+    fn build_font_combo_rows(&self) -> Vec<FontComboRow> {
+        self.filtered_font_indices()
+            .into_iter()
+            .filter_map(|font_idx| {
+                let font = self.fonts.get(font_idx)?;
+                // Highlight fonts that do not fully support the typesetting language. The
+                // wording lives in `font_coverage_tooltip`, which returns `None` for `Full`.
+                let color = match font.coverage.support {
+                    FontLanguageSupport::Full => None,
+                    FontLanguageSupport::Partial => Some(FONT_DIAGNOSTIC_WARNING_COLOR),
+                    FontLanguageSupport::Unsupported => Some(FONT_DIAGNOSTIC_ERROR_COLOR),
+                };
+                Some(FontComboRow {
+                    font_idx,
+                    label: self.font_display_label(font),
+                    identity: font.render_identity_name(),
+                    content_hash: font.content_hash(),
+                    path: font.path.clone(),
+                    face_index: font.faces.first().map(|face| face.face_index).unwrap_or(0),
+                    color,
+                    tooltip: font_coverage_tooltip(&font.coverage),
+                })
+            })
+            .collect()
+    }
+
+    /// The text the CLOSED font combo has to show, in every case the old combo covered.
+    ///
+    /// `font_indices` is the combo's row index space (see [`Self::build_font_combo_rows`]);
+    /// it makes the inline label resolve group-preferringly, exactly as the row marking does.
+    fn font_combo_caption(&self, spec: &FontComboSpec<'_>, font_indices: &[usize]) -> String {
+        if spec.font_missing {
+            // Шрифт оверлея не найден: показываем его имя, чтобы было понятно,
+            // какой именно шрифт отсутствует и какой надо заменить.
+            return self
+                .missing_font
+                .as_ref()
+                .map(|name| tf!("typing.params.font_not_found_option", name = name))
+                .unwrap_or_else(|| t!("typing.params.font_placeholder").to_string());
         }
-        // Highlight fonts that do not fully support the program language.
-        let text = match coverage.support {
-            FontLanguageSupport::Full => egui::RichText::new(label),
-            FontLanguageSupport::Partial => {
-                egui::RichText::new(label).color(FONT_DIAGNOSTIC_WARNING_COLOR)
-            }
-            FontLanguageSupport::Unsupported => {
-                egui::RichText::new(label).color(FONT_DIAGNOSTIC_ERROR_COLOR)
+        spec.inline_font_label
+            .map(|label| {
+                // DISPLAY ONLY: resolve the raw render label to its display label (a user
+                // rename override) when a font matches, so the CLOSED combo shows the same
+                // name as the popup rows. The span style's render key is never touched.
+                self.find_font_idx_by_label_preferring_indices(Some(label), font_indices)
+                    .and_then(|idx| self.fonts.get(idx))
+                    .map(|font| self.font_display_label(font))
+                    .unwrap_or_else(|| label.to_string())
+            })
+            .or_else(|| {
+                self.fonts
+                    .get(self.selected_font_idx)
+                    .map(|font| self.font_display_label(font))
+            })
+            .unwrap_or_else(|| t!("typing.params.font_placeholder").to_string())
+    }
+
+    /// Draws ONE frame of the typing font combo — button, label and searchable drop-down —
+    /// and reports what it decided.
+    ///
+    /// Shared verbatim by the create panel and the edit panel: both resolve the same fonts,
+    /// clamp the same way and detect the same pick edge. What they do with
+    /// [`FontComboOutcome::user_pick`] / [`FontComboOutcome::font_idx`] afterwards is NOT
+    /// shared — the two writeback branches genuinely differ and stay at their call sites.
+    ///
+    /// Rows are `RowLayout::Wide`: the display label in the font's OWN face, followed by its
+    /// render identity in the interface font, coloured and explained by the language-coverage
+    /// diagnostics. The closed caption keeps the row's own face too, unless the text it must
+    /// show is not a row at all (a missing font, an unresolvable inline label, or an inline
+    /// font outside the active group) — then it is drawn in the interface font.
+    ///
+    /// Registering the own-typeface preview goes through the shared
+    /// `widgets::font_preview`, keyed by `(identity, content hash, face index)`, so the two
+    /// panels sharing one egui `Context` share one registration. The first frames of a row
+    /// are drawn in the interface font: the file is read in the BACKGROUND and only
+    /// `Context::add_font` happens on the GUI thread.
+    pub(super) fn draw_font_combo(
+        &self,
+        ui: &mut egui::Ui,
+        spec: &FontComboSpec<'_>,
+    ) -> FontComboOutcome {
+        let rows = self.build_font_combo_rows();
+        let font_indices: Vec<usize> = rows.iter().map(|row| row.font_idx).collect();
+        // Resolve the selection's/overlay's current font from its label. When a group is
+        // active this PREFERS the in-group copy over a same-named font outside the group, so
+        // an ambiguous label (e.g. an imported system font colliding with a group member)
+        // does not silently resolve to the wrong entry.
+        let resolved_font_idx = self
+            .find_font_idx_by_label_preferring_indices(spec.inline_font_label, &font_indices)
+            .unwrap_or(self.selected_font_idx);
+        let caption = self.font_combo_caption(spec, &font_indices);
+        // DISPLAY-ONLY clamp: a font outside the active group marks the first visible row, so
+        // a valid row is always shown as selected. In inline-selection mode this clamped
+        // value is NEVER written back into the span style (the caller's writeback is gated on
+        // `user_pick`) — otherwise merely selecting text would bounce the label to a
+        // different font and re-insert a `<font>` tag every frame.
+        let mut position =
+            font_combo_selected_position(font_indices.iter().copied(), resolved_font_idx);
+        // The widget's own caption is the marked row's main line in that row's face, which
+        // equals `caption` in the common case. Override it only when the two DISAGREE — the
+        // missing-font text, an inline label that resolved to nothing, an inline font outside
+        // the active group, or an empty list — so the common case keeps its own typeface.
+        let caption_is_marked_row = rows.get(position).is_some_and(|row| row.label == caption);
+        let items: Vec<SearchableComboItem<'_>> = rows
+            .iter()
+            .map(|row| {
+                // The identity is shown on EVERY row, including the ones where it repeats the
+                // display label. That duplicate is deliberate and was chosen over suppressing
+                // it: a row that sometimes carries a second line and sometimes does not makes
+                // the list ragged, and the reader loses the fixed place to look for the
+                // PostScript name. The two lines still differ visibly — the label is drawn in
+                // the font's own typeface, the identity in the interface font.
+                let mut item = SearchableComboItem::with_secondary(&row.label, &row.identity);
+                if let Some(color) = row.color {
+                    item = item.primary_color(color);
+                }
+                if let Some(tooltip) = row.tooltip.as_deref() {
+                    item = item.tooltip(tooltip);
+                }
+                item
+            })
+            .collect();
+        // The resolver runs while the widget holds `&mut Ui`, so it may touch neither `ui`
+        // nor `self`: it gets an owned `Context` handle and the owned rows, and nothing else.
+        let ctx = ui.ctx().clone();
+        let mut resolve_family = |index: usize| -> Option<egui::FontFamily> {
+            let row = rows.get(index)?;
+            match crate::widgets::request_font_family(
+                &ctx,
+                &row.identity,
+                row.content_hash,
+                &row.path,
+                row.face_index,
+            ) {
+                crate::widgets::PreviewFontFamily::Ready(family) => Some(family),
+                // Both non-ready states draw the row in the interface font, which is what the
+                // widget does for a `None`. `Pending` retries by itself on a later frame.
+                crate::widgets::PreviewFontFamily::Pending
+                | crate::widgets::PreviewFontFamily::Unavailable => None,
             }
         };
-        let mut response = ui.selectable_label(selected, text);
-        if let Some(tooltip) = font_coverage_tooltip(coverage) {
-            response = response.on_hover_text(tooltip);
+        let mut combo = SearchableComboBox::new(spec.id_salt)
+            .row_layout(RowLayout::Wide)
+            .primary_size(FONT_COMBO_PREVIEW_SIZE_PT)
+            .max_popup_height(FONT_COMBO_MAX_POPUP_HEIGHT_PT)
+            .width(spec.width)
+            .item_font(&mut resolve_family);
+        if !caption_is_marked_row {
+            combo = combo.selected_text(caption);
         }
-        let clicked = response.clicked();
-        ui.style_mut().override_font_id = prev_override;
-        clicked
+        // The widget draws no label of its own; `egui::ComboBox` used to draw one after the
+        // button inside its own horizontal row, and dropping it would silently remove the
+        // word «Шрифт» from both panels.
+        let before = position;
+        let (response, picked, changed) = ui
+            .horizontal(|ui| {
+                let outcome = combo.show(ui, &mut position, &items);
+                let label = ui.label(spec.label);
+                (
+                    outcome.response.labelled_by(label.id),
+                    outcome.picked,
+                    outcome.changed,
+                )
+            })
+            .inner;
+        let font_idx = font_indices
+            .get(position)
+            .copied()
+            .unwrap_or(resolved_font_idx);
+        // `changed` is exactly "the widget WROTE the selection this frame" — a click on
+        // another row, `Enter`, or a wheel step — so pairing it with the pre-show position
+        // gives the edge detector the same `(before, after)` the old wheel handling produced.
+        let user_pick =
+            create_main_text::font_combo_user_pick(picked, changed.then_some((before, position)))
+                .and_then(|pos| font_indices.get(pos).copied());
+        FontComboOutcome {
+            font_idx,
+            user_pick,
+            response,
+        }
     }
 
     pub(super) fn ensure_initial_preview_request(&mut self) {

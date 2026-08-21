@@ -28,31 +28,6 @@ pub(super) fn clamp_char_range(text: &str, range: Range<usize>) -> Range<usize> 
     start.min(end)..end.max(start)
 }
 
-pub(super) fn cycle_wrapped_index_in_values(current: &mut usize, values: &[usize], steps: i32) {
-    if steps == 0 || values.is_empty() {
-        return;
-    }
-    let current_pos = values
-        .iter()
-        .position(|value| value == current)
-        .unwrap_or(0);
-    let mut next_pos = i32::try_from(current_pos).unwrap_or(0) + steps;
-    let values_len = i32::try_from(values.len()).unwrap_or(0);
-    while next_pos < 0 {
-        next_pos += values_len;
-    }
-    while next_pos >= values_len {
-        next_pos -= values_len;
-    }
-    if let Some(next_value) = usize::try_from(next_pos)
-        .ok()
-        .and_then(|idx| values.get(idx))
-        .copied()
-    {
-        *current = next_value;
-    }
-}
-
 pub(super) fn char_range_to_byte_range(text: &str, range: &Range<usize>) -> Option<Range<usize>> {
     let clamped = clamp_char_range(text, range.clone());
     let start = char_index_to_byte_index(text, clamped.start)?;

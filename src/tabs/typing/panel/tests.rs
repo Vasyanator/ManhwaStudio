@@ -2496,6 +2496,39 @@ paths change.
         assert_eq!(create_main_text::font_combo_user_pick(None, None), None);
     }
 
+    // The font combo's DISPLAY clamp: which row of the active group is marked as the
+    // current value. A font outside the group marks the first visible row instead of no
+    // row at all — display only, never written back (see `font_combo_user_pick` above).
+    #[test]
+    fn font_combo_display_clamp_marks_the_first_visible_row() {
+        // A font inside the active group marks its own row.
+        assert_eq!(
+            create_presets::font_combo_selected_position([2usize, 5, 9], 5),
+            1
+        );
+        assert_eq!(
+            create_presets::font_combo_selected_position([2usize, 5, 9], 2),
+            0
+        );
+        // A font OUTSIDE the group clamps to the first visible row.
+        assert_eq!(
+            create_presets::font_combo_selected_position([2usize, 5, 9], 7),
+            0
+        );
+    }
+
+    // An EMPTY group answers 0 like every other miss, and the caller maps that position
+    // back through the same row list — which yields nothing, so an empty group can never
+    // write a font index the user did not pick.
+    #[test]
+    fn font_combo_empty_group_maps_back_to_no_font() {
+        let font_indices: Vec<usize> = Vec::new();
+        let position =
+            create_presets::font_combo_selected_position(font_indices.iter().copied(), 4);
+        assert_eq!(position, 0);
+        assert_eq!(font_indices.get(position).copied(), None);
+    }
+
     // `selected_text_contains_inline_tag` detects tags strictly INSIDE the range
     // and ignores an out-of-range / non-boundary range without panicking.
     #[test]

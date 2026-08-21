@@ -920,8 +920,11 @@ fn word_starts(text: &str) -> impl Iterator<Item = usize> + '_ {
 /// found in a lowercased copy cannot be reused on the original string, and streaming
 /// short-circuits on the first mismatch, which is what the per-frame candidate scan does
 /// most of the time.
+///
+/// `pub(super)` so `searchable_combo_box.rs` scans for substring matches with the SAME
+/// folding rules instead of growing a second, subtly different implementation of them.
 #[must_use]
-fn ignore_case_prefix_len(haystack: &str, needle: &str) -> Option<usize> {
+pub(super) fn ignore_case_prefix_len(haystack: &str, needle: &str) -> Option<usize> {
     let mut hay_chars = haystack.chars();
     let mut hay_folded: Option<std::char::ToLowercase> = None;
     let mut consumed = 0usize;
