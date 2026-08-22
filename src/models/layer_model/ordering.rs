@@ -125,6 +125,8 @@ mod tests {
             render_data: None,
             overlay_is_image: None,
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
         }
     }
 
@@ -150,6 +152,8 @@ mod tests {
             render_data: None,
             overlay_is_image: None,
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
         }
     }
 

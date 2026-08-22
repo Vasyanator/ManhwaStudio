@@ -250,6 +250,10 @@ pub fn migrate_chapter_to_v3(
                 deform: placement.deform,
                 rendered_file,
                 mask_clip,
+                // A legacy chapter carries no centering-assist state; both stay absent until the
+                // typing tab first measures/creates them.
+                text_centers: None,
+                centering_frame: None,
             });
             report.migrated_overlays += 1;
         }
@@ -386,6 +390,10 @@ fn additive_merge_for_unsaved(
             deform: inline.deform,
             rendered_file: inline.rendered_file,
             mask_clip: inline.mask_clip,
+            // Carried through verbatim: this is a read→write round trip of an already-inline node, so
+            // dropping these would ERASE a live centering-assist state during an eager migration.
+            text_centers: inline.text_centers,
+            centering_frame: inline.centering_frame,
         });
     }
 
@@ -512,7 +520,7 @@ fn next_backup_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::layer_model::manifest::TransformRec;
+    use crate::models::layer_model::manifest::{CenteringFrameRec, TextCentersRec, TransformRec};
     use eframe::egui::ColorImage;
     use std::fs;
 
@@ -1093,6 +1101,8 @@ mod tests {
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "a")),
                 mask_clip: Some(true),
+                text_centers: None,
+                centering_frame: None,
             }],
         )
         .unwrap();
@@ -1159,6 +1169,8 @@ mod tests {
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "t")),
                 mask_clip: None,
+                text_centers: None,
+                centering_frame: None,
             }],
         )
         .unwrap();
@@ -1275,6 +1287,8 @@ mod tests {
     }
 
     /// Writes a v3 inline text node into `dir`'s page (test setup for the unsaved staging page).
+    ///
+    /// `centering` seeds the schema-v4 centering-assist state on the node (`None` ⇒ never measured).
     #[allow(clippy::too_many_arguments)]
     fn seed_inline_text(
         dir: &Path,
@@ -1283,6 +1297,7 @@ mod tests {
         cx: f32,
         cy: f32,
         existing: &[persist::TextPayloadOut],
+        centering: Option<(TextCentersRec, CenteringFrameRec)>,
     ) {
         // Build the page = existing nodes + the new one, written in one call (full replace).
         let mut outs: Vec<persist::TextPayloadOut> = existing.to_vec();
@@ -1311,6 +1326,8 @@ mod tests {
             deform: None,
             rendered_file: Some(persist::text_image_file_name(page, uid)),
             mask_clip: None,
+            text_centers: centering.map(|(c, _)| c),
+            centering_frame: centering.map(|(_, f)| f),
         });
         persist::write_page_text_payload(dir, None, page, &outs).unwrap();
     }
@@ -1355,6 +1372,8 @@ mod tests {
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "a")),
                 mask_clip: Some(true),
+                text_centers: None,
+                centering_frame: None,
             }],
         )
         .unwrap();
@@ -1410,8 +1429,20 @@ mod tests {
             &committed,
             serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]),
         );
-        // Unsaved staging page 0 already exists with a staged-only inline overlay "s".
-        seed_inline_text(&unsaved, 0, "s", 11.0, 22.0, &[]);
+        // Unsaved staging page 0 already exists with a staged-only inline overlay "s", carrying a live
+        // schema-v4 centering-assist state: `additive_merge_for_unsaved` does a real read→write round
+        // trip of this node, so dropping the two fields there would ERASE that state during migration.
+        let centers = TextCentersRec {
+            mean: Some([7.5, 1.25]),
+            median: Some([7.0, 1.0]),
+        };
+        let frame = CenteringFrameRec {
+            cx: 300.0,
+            cy: 120.5,
+            half_w: 60.25,
+            half_h: 30.75,
+        };
+        seed_inline_text(&unsaved, 0, "s", 11.0, 22.0, &[], Some((centers, frame)));
 
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
         migrate_chapter_to_v3(&committed, &committed, Some(&unsaved), &page_sizes).unwrap();
@@ -1433,6 +1464,16 @@ mod tests {
             s_inline.render_data["staged"], true,
             "staged payload preserved"
         );
+        assert_eq!(
+            s_inline.text_centers,
+            Some(centers),
+            "centering-assist centers survived the additive merge unchanged"
+        );
+        assert_eq!(
+            s_inline.centering_frame,
+            Some(frame),
+            "centering-assist frame survived the additive merge unchanged"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1453,7 +1494,7 @@ mod tests {
             serde_json::json!([overlay("x", 0, "x.png", 100.0, 50.0)]),
         );
         // Unsaved already has a fresher inline edit for "x".
-        seed_inline_text(&unsaved, 0, "x", 999.0, 888.0, &[]);
+        seed_inline_text(&unsaved, 0, "x", 999.0, 888.0, &[], None);
 
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
         migrate_chapter_to_v3(&committed, &committed, Some(&unsaved), &page_sizes).unwrap();

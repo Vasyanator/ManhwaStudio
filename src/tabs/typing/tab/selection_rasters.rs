@@ -106,6 +106,7 @@ impl TypingTextOverlayLayer {
             user_scale: overlay.user_scale,
             rotation_deg: overlay.angle_deg,
             target: TypingEditTarget::Overlay(overlay_idx),
+            has_centering_centers: overlay.has_centering_centers(),
         })
     }
 
@@ -128,6 +129,8 @@ impl TypingTextOverlayLayer {
                 page_idx,
                 uid: raster.uid.clone(),
             },
+            // A raster is not a text layer: it has no renderer-measured centers at all.
+            has_centering_centers: false,
         })
     }
 

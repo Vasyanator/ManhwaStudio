@@ -356,7 +356,8 @@ impl TypingTopPanelState {
             })?;
         // Request the renderer's mean/median centers only while centering assist is on (the default is
         // the byte-identical no-compute fast path). Both centers are always requested so the bound-center
-        // selector can switch without a re-render.
+        // selector can switch without a re-render. The "sticky centers" rule does not apply here: this
+        // builds a BRAND-NEW layer, which by definition has no stored centers to preserve.
         if self.centering_assist_enabled {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
@@ -466,6 +467,7 @@ impl TypingTopPanelState {
                 self.edit_target = Some(selected.target.clone());
                 self.edit_overlay_kind = Some(selected.overlay_kind);
                 self.edit_render_data_snapshot = selected.render_data_json.clone();
+                self.edit_overlay_has_centering_centers = selected.has_centering_centers;
                 self.mode = TypingTopPanelMode::EditText;
             }
             None => {
@@ -476,6 +478,8 @@ impl TypingTopPanelState {
                 self.edit_overlay_kind = None;
                 self.edit_render_data_snapshot = None;
                 self.pending_edit_request = None;
+                // Create mode edits no existing layer, so there are no stored centers to keep alive.
+                self.edit_overlay_has_centering_centers = false;
                 self.mode = TypingTopPanelMode::CreateText;
             }
         }
@@ -637,9 +641,11 @@ impl TypingTopPanelState {
                 let Some(mut render_params) = self.edit_panel.build_render_params() else {
                     return;
                 };
-                // Request the renderer's mean/median centers only while centering assist is on (the
-                // default is the byte-identical no-compute fast path).
-                if self.centering_assist_enabled {
+                // Request the renderer's mean/median centers while centering assist is on OR the
+                // edited layer already HAS stored centers ("sticky centers"): the centers are
+                // persisted, and an assist-off edit that returned all-`None` would erase them. A layer
+                // the assist never touched keeps the byte-identical no-compute fast path.
+                if self.centering_assist_enabled || self.edit_overlay_has_centering_centers {
                     render_params.extra_info = RenderExtraInfoRequest {
                         mean_center: true,
                         median_center: true,

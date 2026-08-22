@@ -26,12 +26,19 @@ Per-kind capability gating (paint / clip / merge / text-render / …) is done in
 ## Persistence
 On disk under `{chapter}/layers/` (staged in `{chapter}_unsaved/layers/`, merged on "save to
 project"):
-- `layers.json` — `LayersManifest`: explicit `schema_version` (now **3**). v2 added
+- `layers.json` — `LayersManifest`: explicit `schema_version` (now **4**). v2 added
   `LayerRec.pinned_by_group` + `GroupRec.collapsed`; **v3 inlines the TEXT payload** onto a text
   `LayerRec` (`render_data`, the rendered-PNG name in `rendered_file`, `mask_clip`,
   `overlay_is_image`, and the reused
   `transform`/`deform` geometry), so `layers.json` is self-sufficient for text and `text_info.json`
-  is read-only legacy. All v3 fields are serde-default `Option`s, so a v2 file still reads cleanly.
+  is read-only legacy. **v4 persists the typing tab's centering-assist state** on a TEXT `LayerRec`:
+  `text_centers` (`TextCentersRec { mean, median }`, the renderer-measured centers in FINAL-IMAGE px
+  of the node's `rendered_file`) and `centering_frame` (`CenteringFrameRec { cx, cy, half_w, half_h }`
+  — center in PAGE px, half-extents in the frame's LOCAL rotated axes, NO rotation stored: the frame's
+  angle is always the overlay's total visual angle, so duplicating it could only go stale). An
+  all-`None` measurement is normalized to an ABSENT `text_centers` at both the write and the read
+  boundary, so "measured nothing" and "never measured" are one on-disk state. All v3/v4 fields are
+  serde-default `Option`s, so an older file still reads cleanly.
   Per-page trees of `LayerRec` nodes ordered bottom-to-top by `z`; carries `groups`, `deform`,
   `effects`, `payload_ref` into `text_images/`; `group_uid` is populated on both raster and text nodes.
 - `ps_p{page:04}_{uid}.png` — each raster layer's pre-effects base pixels.
@@ -118,7 +125,7 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
 
 ## Files
 - `manifest.rs` — serde schema (`LayersManifest`, `PageLayers`, `LayerRec`, `LayerKindRec`,
-  `TransformRec`, `DeformRec`, `GroupRec`, `PayloadRef`).
+  `TransformRec`, `DeformRec`, `TextCentersRec`, `CenteringFrameRec`, `GroupRec`, `PayloadRef`).
 - `compat.rs` — isolated backwards-compatibility: `read_manifest` (raw JSON → version-migrated
   canonical manifest) and the `migrate_value` forward-migration chain. `persist::read_manifest`
   delegates here.
@@ -198,12 +205,22 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     rendered text PNG; `text_image_file_name` is its uid-keyed name. The doc's `flush_page` (whole
     page) and `flush_page_text` (text only, leaving rasters on disk untouched) drive this for every
     `NodeBody::Text`. The doc node carries `text_layer_idx` (the «Группа текста N» axis), authoritative
-    so a flush persists it for NEW overlays too. It also carries `extra_centers`
-    (`RenderedTextExtraInfo`, the typing tab's centering-assist mean/median centers): TRANSIENT —
-    never persisted, written only by `set_text_render` in the SAME mutation as the pixels, and
-    projected back onto the typing runtime by `sync_from_doc`. It lives on the node rather than on
-    that runtime because every render routes through the doc and re-projects on the same call
-    stack, so a runtime-only copy would be wiped by the projection that follows the render.
+    so a flush persists it for NEW overlays too. It also carries the two centering-assist values,
+    PERSISTED since v4:
+    - `extra_centers` (`RenderedTextExtraInfo`, the mean/median centers) — written only by
+      `set_text_render`, in the SAME mutation as the pixels, and projected back onto the typing
+      runtime by `sync_from_doc`. That single-mutation rule is the invariant that makes persisting
+      it safe: the stored centers ALWAYS describe the stored `rendered_file`. It lives on the node
+      rather than on the typing runtime because every render routes through the doc and re-projects
+      on the same call stack, so a runtime-only copy would be wiped by the projection that follows
+      the render. Converted to/from `manifest::TextCentersRec` inside `layer_doc.rs`
+      (`text_centers_rec_from` / `extra_centers_from_rec`) — `ms-text-render` has no serde
+      dependency and must not gain one.
+    - `centering_frame` (`Option<CenteringFrameRec>`, the guide rectangle) — OWNERSHIP is the other
+      way round: the typing runtime is the LIVE owner and this is the durable copy. The typing tab
+      pushes it here from its placement sync (never per frame), and `sync_from_doc` only SEEDS a
+      runtime whose frame is still `None` — a drag in progress must win. Unlike the centers it is
+      NOT tied to the pixels: it is an anchor the user placed and survives every re-render.
   - Unified grouping (PS editor): `save_page_grouping(GroupingEdit)` — one locked manifest RMW (no PNG
     IO) that creates/removes `GroupRec`s, sets `group_uid` on raster + text nodes, toggles collapse /
     group visibility/opacity, applies a complete band `order` (reusing `apply_band_order`), records

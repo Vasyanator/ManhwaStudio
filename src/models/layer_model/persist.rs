@@ -15,8 +15,8 @@ the main dir (both for the manifest and for each PNG), mirroring how `text_image
 */
 
 use super::manifest::{
-    DeformRec, GroupRec, LayerKindRec, LayerRec, LayersManifest, PageLayers, PayloadRef,
-    TextGroupRec, TransformRec,
+    CenteringFrameRec, DeformRec, GroupRec, LayerKindRec, LayerRec, LayersManifest, PageLayers,
+    PayloadRef, TextCentersRec, TextGroupRec, TransformRec,
 };
 use crate::trace::cat;
 use eframe::egui::ColorImage;
@@ -338,6 +338,9 @@ pub fn save_page_rasters(
             mask_clip: layer
                 .mask_clip
                 .or_else(|| existing_mask_clip.get(&layer.uid).copied().flatten()),
+            // TEXT-only fields (schema v4): a raster has no centering-assist state.
+            text_centers: None,
+            centering_frame: None,
         });
     }
 
@@ -591,6 +594,9 @@ pub fn add_page_raster(
         render_data: None,
         overlay_is_image: None,
         mask_clip: None,
+        // TEXT-only fields (schema v4): a raster has no centering-assist state.
+        text_centers: None,
+        centering_frame: None,
     });
     write_manifest(&manifest_path, &manifest)?;
     Ok(file)
@@ -778,6 +784,12 @@ pub struct TextPayloadOut {
     /// Rendered text PNG filename (already on disk from the typing render). `None` ⇒ no image yet.
     pub rendered_file: Option<String>,
     pub mask_clip: Option<bool>,
+    /// Schema v4: the renderer-measured centering-assist centers of `rendered_file`. `None` ⇒ never
+    /// measured; a measurement with neither center MUST be passed as `None` (never as an empty
+    /// record) so the JSON key is omitted.
+    pub text_centers: Option<TextCentersRec>,
+    /// Schema v4: the centering-assist guide rectangle bound to this node. `None` ⇒ no frame yet.
+    pub centering_frame: Option<CenteringFrameRec>,
 }
 
 /// A text node decoded back from `layers.json`, consumed by both tabs (the PS editor's text-layer
@@ -810,6 +822,11 @@ pub struct TextInlineIn {
     /// Rendered text PNG filename in the layers dir (the node's displayed image).
     pub rendered_file: Option<String>,
     pub mask_clip: Option<bool>,
+    /// Schema v4: the persisted centering-assist centers of `rendered_file`. `None` for a pre-v4 node
+    /// (or one the assist never measured).
+    pub text_centers: Option<TextCentersRec>,
+    /// Schema v4: the persisted centering-assist guide rectangle. `None` for a pre-v4 node.
+    pub centering_frame: Option<CenteringFrameRec>,
 }
 
 /// Writes a page's TEXT nodes with their FULL inline payload (schema v3) into `layers.json`,
@@ -992,6 +1009,10 @@ fn text_payload_rec(payload: &TextPayloadOut, ident: &TextIdent) -> LayerRec {
         render_data: Some(payload.render_data.clone()),
         overlay_is_image: payload.is_image.then_some(true),
         mask_clip: payload.mask_clip,
+        // An all-`None` measurement is normalized away here so the JSON key is omitted rather than
+        // written as an empty object (the `skip_serializing_if` contract asserted in the tests).
+        text_centers: payload.text_centers.filter(|c| !c.is_empty()),
+        centering_frame: payload.centering_frame,
     }
 }
 
@@ -1317,6 +1338,10 @@ pub fn load_page_text_nodes(
                 deform: r.deform.clone(),
                 rendered_file: r.rendered_file.clone(),
                 mask_clip: r.mask_clip,
+                // Defensive: a hand-edited file could carry an all-`None` record; treat it as absent
+                // so downstream never distinguishes "measured nothing" from "never measured".
+                text_centers: r.text_centers.filter(|c| !c.is_empty()),
+                centering_frame: r.centering_frame,
             });
             if payload_uid.is_none() && inline.is_none() {
                 // Neither a legacy reference nor an inline payload — nothing to materialize.
@@ -1585,6 +1610,8 @@ mod tests {
             deform: None,
             rendered_file: None,
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
         }
     }
 
@@ -1966,6 +1993,16 @@ mod tests {
                 deform: Some(mesh.clone()),
                 rendered_file: Some("ps_p0000_t1_text.png".into()),
                 mask_clip: Some(true),
+                text_centers: Some(TextCentersRec {
+                    mean: Some([3.5, 4.5]),
+                    median: Some([5.25, 6.75]),
+                }),
+                centering_frame: Some(CenteringFrameRec {
+                    cx: 12.0,
+                    cy: 34.0,
+                    half_w: 40.0,
+                    half_h: 25.0,
+                }),
             }],
         )
         .unwrap();
@@ -1999,6 +2036,15 @@ mod tests {
             "rotation stored as radians, no deg conversion"
         );
         assert_eq!(inline.deform.as_ref().unwrap().points_px, mesh.points_px);
+        // Schema v4 centering-assist state.
+        let centers = inline.text_centers.expect("centers round-trip");
+        assert_eq!(centers.mean, Some([3.5, 4.5]));
+        assert_eq!(centers.median, Some([5.25, 6.75]));
+        let frame = inline.centering_frame.expect("centering frame round-trips");
+        assert!((frame.cx - 12.0).abs() < 1e-4);
+        assert!((frame.cy - 34.0).abs() < 1e-4);
+        assert!((frame.half_w - 40.0).abs() < 1e-4);
+        assert!((frame.half_h - 25.0).abs() < 1e-4);
 
         // A second write that drops the text node preserves the raster (kind-filter both ways).
         write_page_text_payload(&dir, None, 0, &[]).unwrap();
@@ -2060,6 +2106,71 @@ mod tests {
                 .as_ref()
                 .is_some_and(|inline| inline.is_image)
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn centering_state_omits_json_keys_when_absent_and_normalizes_an_empty_measurement() {
+        // Mirrors `text_payload_image_marker_round_trips_and_text_omits_json_key` for the two schema-v4
+        // fields: an absent value must not appear in `layers.json` at all (the `skip_serializing_if`
+        // contract), and a measurement that produced NEITHER center must be normalized to absent rather
+        // than written as an empty object — otherwise "measured nothing" and "never measured" would be
+        // two distinguishable on-disk states for the same runtime meaning.
+        let dir = std::env::temp_dir().join(format!("ml_centering_omit_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut empty_measurement = text_payload_out("t", 0, 0, false);
+        // A null `render_data` reads back as "no inline payload" (see `load_page_text_nodes`), so give
+        // the node real params — this test is about the two centering fields, not the inline gate.
+        empty_measurement.render_data = serde_json::json!({ "text": "hi" });
+        empty_measurement.text_centers = Some(TextCentersRec {
+            mean: None,
+            median: None,
+        });
+        write_page_text_payload(&dir, None, 0, &[empty_measurement]).unwrap();
+
+        let raw = fs::read_to_string(dir.join(MANIFEST_FILE)).expect("manifest written");
+        assert!(
+            !raw.contains("text_centers"),
+            "an all-None measurement must omit the key entirely: {raw}"
+        );
+        assert!(
+            !raw.contains("centering_frame"),
+            "an absent frame must omit the key entirely: {raw}"
+        );
+
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE))
+            .unwrap()
+            .expect("manifest reads back");
+        let rec = manifest
+            .page(0)
+            .and_then(|page| page.tree.iter().find(|r| r.uid == "t"))
+            .expect("text record written");
+        assert!(rec.text_centers.is_none());
+        assert!(rec.centering_frame.is_none());
+
+        let nodes = load_page_text_nodes(&dir, None, 0).unwrap();
+        let inline = nodes[0].inline.as_ref().expect("inline payload");
+        assert!(inline.text_centers.is_none(), "decoded as never-measured");
+        assert!(inline.centering_frame.is_none());
+
+        // A HALF measurement (only one center) is real data and MUST be written.
+        let mut half = text_payload_out("t", 0, 0, false);
+        half.render_data = serde_json::json!({ "text": "hi" });
+        half.text_centers = Some(TextCentersRec {
+            mean: None,
+            median: Some([1.5, 2.5]),
+        });
+        write_page_text_payload(&dir, None, 0, &[half]).unwrap();
+        let nodes = load_page_text_nodes(&dir, None, 0).unwrap();
+        let centers = nodes[0]
+            .inline
+            .as_ref()
+            .and_then(|inline| inline.text_centers)
+            .expect("a half measurement is kept");
+        assert_eq!(centers.mean, None, "the unmeasured half stays absent");
+        assert_eq!(centers.median, Some([1.5, 2.5]));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1259,8 +1259,10 @@ impl TypingTextOverlayLayer {
             return;
         };
         // The shape-variant apply lands in the live overlay runtime, so request the renderer's
-        // mean/median centers while centering assist is on.
-        if self.centering_assist_enabled {
+        // mean/median centers while centering assist is on — or when this layer already HAS stored
+        // centers ("sticky centers"), since those are persisted and an all-`None` result would erase
+        // them. `overlay` is the borrow taken above, so the bit is read before any mutation.
+        if self.centering_assist_enabled || overlay.has_centering_centers() {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

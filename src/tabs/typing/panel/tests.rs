@@ -1919,7 +1919,39 @@ paths change.
             user_scale: 1.0,
             rotation_deg: 0.0,
             target: TypingEditTarget::Overlay(idx),
+            has_centering_centers: false,
         }
+    }
+
+    #[test]
+    fn sticky_centers_bit_mirrors_the_selected_layer_and_clears_in_create_mode() {
+        // D6 "sticky centers": the panel owns `centering_assist_enabled` but not the overlay runtimes,
+        // so the edited layer's "already has stored centers" bit arrives through the selection mirror.
+        // Create mode edits no existing layer, so it must read `false` there.
+        let mut state = TypingTopPanelState::default();
+        assert!(!state.edit_overlay_has_centering_centers, "default is false");
+
+        let mut selected = text_overlay_for_edit(0);
+        selected.has_centering_centers = true;
+        state.sync_selected_overlay_for_edit(Some(selected));
+        assert!(
+            state.edit_overlay_has_centering_centers,
+            "the selected layer's sticky bit is mirrored onto the panel"
+        );
+
+        state.sync_selected_overlay_for_edit(None);
+        assert!(
+            !state.edit_overlay_has_centering_centers,
+            "deselecting drops back to create mode, which has no layer to keep centers for"
+        );
+
+        let mut selected = text_overlay_for_edit(1);
+        selected.has_centering_centers = false;
+        state.sync_selected_overlay_for_edit(Some(selected));
+        assert!(
+            !state.edit_overlay_has_centering_centers,
+            "a layer the assist never touched stays non-sticky"
+        );
     }
 
     #[test]

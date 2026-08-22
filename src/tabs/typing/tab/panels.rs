@@ -505,8 +505,10 @@ impl TypingTextOverlayLayer {
             return;
         };
         // This re-render lands in the live overlay runtime, so request the renderer's mean/median
-        // centers while centering assist is on.
-        if centering_assist_enabled {
+        // centers while centering assist is on OR this layer already HAS stored centers ("sticky
+        // centers" — they are persisted, and a None result would erase them). Read here, BEFORE the
+        // optimistic `overlay.extra` clear further down, which would otherwise hide the sticky bit.
+        if centering_assist_enabled || overlay.has_centering_centers() {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

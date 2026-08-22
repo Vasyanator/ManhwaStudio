@@ -32,7 +32,12 @@ use serde::{Deserialize, Serialize};
 /// becomes self-sufficient for text and `text_info.json` is read-only legacy. All v3 fields are
 /// serde-default `Option`s, so a v2 file (text payload only in `text_info.json`) still reads cleanly
 /// and the load layer folds the legacy payload on read (see `compat.rs` / `layer_doc::ensure_page_loaded`).
-pub const LAYERS_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 persists the typing tab's centering-assist state on a TEXT `LayerRec`: `text_centers` (the
+/// renderer-measured mean/median centers) and `centering_frame` (the guide rectangle). Both are
+/// additive serde-default `Option`s, so a v3 file still reads cleanly (both default to `None`, which
+/// is exactly the pre-v4 behaviour: no centers, no frame).
+pub const LAYERS_SCHEMA_VERSION: u32 = 4;
 
 /// Root of `layers.json`: every page's layer tree in one file (mirrors `text_info.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +212,57 @@ pub struct LayerRec {
     /// default (no clip; rasters default OFF, text defaults per the typing tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask_clip: Option<bool>,
+    /// TEXT node only (schema v4): the renderer-measured centering-assist centers of the pixels in
+    /// `rendered_file` (the typing tab's «центр картинки без учёта пунктуации»). Coordinates are
+    /// FINAL-IMAGE pixels of that PNG, so the record is only meaningful together with it. `None` ⇒
+    /// never measured; a measurement that produced neither center is written as `None` too (the
+    /// record is emitted only when at least one inner center is `Some`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_centers: Option<TextCentersRec>,
+    /// TEXT node only (schema v4): the centering-assist guide rectangle the layer is bound to.
+    /// `None` ⇒ no frame yet (the typing tab creates one lazily when the assist is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centering_frame: Option<CenteringFrameRec>,
+}
+
+/// Renderer-measured centering-assist centers of a TEXT node's rendered image (schema v4).
+///
+/// Both members are FINAL-IMAGE pixel coordinates inside the node's `rendered_file` PNG, i.e. they
+/// describe THOSE pixels and become meaningless if the render changes without them. Each is
+/// independently optional because the renderer computes them only on request. This mirrors
+/// `ms_text_render::RenderedTextExtraInfo`, which deliberately carries no serde derives — the
+/// conversion lives at the persist boundary in `layer_model`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextCentersRec {
+    /// Mean of the glyph coverage, in final-image px. `None` ⇒ not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean: Option<[f32; 2]>,
+    /// Per-line median of the glyph coverage, in final-image px. `None` ⇒ not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median: Option<[f32; 2]>,
+}
+
+impl TextCentersRec {
+    /// True when neither center was measured — such a record must NOT be written (the field stays
+    /// `None` so the JSON key is omitted, per the `skip_serializing_if` contract).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mean.is_none() && self.median.is_none()
+    }
+}
+
+/// The centering-assist guide rectangle of a TEXT node (schema v4).
+///
+/// `cx`/`cy` are PAGE pixels (center-anchored, same space as `TransformRec`). `half_w`/`half_h` are
+/// half-extents along the frame's LOCAL (rotated) axes. NO rotation is stored: the frame's visual
+/// angle is always the overlay's total angle (`transform.rotation` plus the typing tab's vector
+/// `global_rotation_deg`), so duplicating it here could only ever go stale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CenteringFrameRec {
+    pub cx: f32,
+    pub cy: f32,
+    pub half_w: f32,
+    pub half_h: f32,
 }
 
 /// Affine placement of a layer image in page-pixel space (center-anchored, matches the typing tab).

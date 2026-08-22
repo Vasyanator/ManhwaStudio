@@ -897,6 +897,8 @@ fn sync_from_doc_materializes_text_runtimes_for_a_migrated_chapter() {
             deform: None,
             rendered_file: Some(file),
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
         }
     };
     persist::write_page_text_payload(
@@ -1014,6 +1016,8 @@ fn real_interleave_doc_text_survives_empty_loader_completion() {
         deform: None,
         rendered_file: Some(file),
         mask_clip: None,
+        text_centers: None,
+        centering_frame: None,
     };
     persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
 
@@ -2390,6 +2394,8 @@ fn preload_apply_preserves_edits_and_deletions() {
             deform: None,
             rendered_file: Some(file),
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
         });
     }
     persist::write_page_text_payload(&dir, None, 0, &payloads).unwrap();
@@ -2476,6 +2482,8 @@ fn export_overlay_snapshot_is_empty_before_residency_and_populated_after() {
         deform: None,
         rendered_file: Some(file),
         mask_clip: None,
+        text_centers: None,
+        centering_frame: None,
     };
     persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
 
@@ -3129,6 +3137,46 @@ fn centering_chosen_center_uses_mean_when_present() {
 }
 
 #[test]
+fn non_finite_centering_frame_is_not_persisted() {
+    // `serde_json` writes a non-finite float as a bare `null` without erroring, and the next
+    // `read_manifest` then fails to decode that `null` into an `f32` — which leaves the chapter's whole
+    // `layers.json` unreadable AND unwritable. So a frame with any non-finite component must never
+    // reach the record; the placement sync then simply writes nothing and keeps the stored frame.
+    let good = CenteringFrame {
+        center_page_px: [100.0, -20.5],
+        half_size_page_px: [20.0, 10.25],
+    }
+    .to_rec()
+    .expect("an all-finite frame is persisted");
+    assert!((good.cx - 100.0).abs() < 1e-6 && (good.cy + 20.5).abs() < 1e-6);
+    assert!((good.half_w - 20.0).abs() < 1e-6 && (good.half_h - 10.25).abs() < 1e-6);
+
+    for bad in [
+        CenteringFrame {
+            center_page_px: [f32::NAN, 0.0],
+            half_size_page_px: [1.0, 1.0],
+        },
+        CenteringFrame {
+            center_page_px: [0.0, f32::INFINITY],
+            half_size_page_px: [1.0, 1.0],
+        },
+        CenteringFrame {
+            center_page_px: [0.0, 0.0],
+            half_size_page_px: [f32::NEG_INFINITY, 1.0],
+        },
+        CenteringFrame {
+            center_page_px: [0.0, 0.0],
+            half_size_page_px: [1.0, f32::NAN],
+        },
+    ] {
+        assert!(
+            bad.to_rec().is_none(),
+            "a non-finite component must block persistence: {bad:?}"
+        );
+    }
+}
+
+#[test]
 fn centering_frame_corner_drag_lands_pointer_and_fixes_opposite() {
     let frame = CenteringFrame {
         center_page_px: [100.0, 100.0],
@@ -3381,6 +3429,18 @@ fn centering_centers_survive_the_render_round_trip_through_the_doc() {
             deform: None,
             rendered_file: Some(file),
             mask_clip: None,
+            // Schema v4: disk DOES carry the centering-assist state now, so the projection below is
+            // also the close/reopen assertion.
+            text_centers: Some(crate::models::layer_model::manifest::TextCentersRec {
+                mean: Some([0.5, 0.25]),
+                median: Some([0.75, 0.125]),
+            }),
+            centering_frame: Some(crate::models::layer_model::manifest::CenteringFrameRec {
+                cx: 10.0,
+                cy: 20.0,
+                half_w: 15.0,
+                half_h: 12.0,
+            }),
         }],
     )
     .unwrap();
@@ -3393,8 +3453,26 @@ fn centering_centers_survive_the_render_round_trip_through_the_doc() {
     let mut layer = TypingTextOverlayLayer::default();
     layer.sync_from_doc(0, &doc);
     assert_eq!(layer.overlays.len(), 1, "the doc text node projected");
-    // A node loaded from disk carries no centers: nothing was rendered yet.
-    assert_eq!(layer.overlays[0].extra.mean_center, None);
+    // CLOSE/REOPEN: a fresh layer projecting a disk-loaded node recovers BOTH persisted values.
+    // (Before schema v4 this asserted `mean_center == None` — the value was deliberately transient.)
+    assert_eq!(
+        layer.overlays[0].extra.mean_center,
+        Some([0.5, 0.25]),
+        "the persisted mean center is restored on reopen"
+    );
+    assert_eq!(
+        layer.overlays[0].extra.median_center,
+        Some([0.75, 0.125]),
+        "the persisted median center is restored on reopen"
+    );
+    assert_eq!(
+        layer.overlays[0].centering_frame,
+        Some(CenteringFrame {
+            center_page_px: [10.0, 20.0],
+            half_size_page_px: [15.0, 12.0],
+        }),
+        "the persisted guide frame is restored on reopen"
+    );
 
     layer.layer_doc = Some(Arc::new(Mutex::new(doc)));
 
@@ -3436,6 +3514,169 @@ fn centering_centers_survive_the_render_round_trip_through_the_doc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn centering_frame_written_by_the_placement_sync_survives_a_reload() {
+    // The WRITE leg of the frame's ownership contract: the runtime is the live owner, the placement
+    // sync (`sync_overlay_state_into_doc`) is the ONE place it reaches the doc node, and the doc flush
+    // puts it on disk. A frame edit that moves no layer must still come back after a reopen.
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("typ_frame_write_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let img = ColorImage::filled([4, 3], Color32::GREEN);
+    let file = persist::write_text_image(&dir, 0, "tf", &img).unwrap();
+    persist::write_page_text_payload(
+        &dir,
+        None,
+        0,
+        &[persist::TextPayloadOut {
+            uid: "tf".into(),
+            name: "tf".into(),
+            z: 1,
+            layer_idx: 0,
+            pinned: false,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            pinned_by_group: false,
+            payload_uid: "tf".into(),
+            render_data: json!({ "text": "tf" }),
+            is_image: false,
+            transform: crate::models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 20.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            deform: None,
+            rendered_file: Some(file),
+            mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
+        }],
+    )
+    .unwrap();
+
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
+
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc);
+    assert_eq!(layer.overlays.len(), 1);
+    assert_eq!(
+        layer.overlays[0].centering_frame, None,
+        "nothing on disk yet"
+    );
+    layer.layer_doc = Some(Arc::new(Mutex::new(doc)));
+
+    // A corner-resize-shaped edit: only the frame changes, the layer does not move.
+    layer.overlays[0].centering_frame = Some(CenteringFrame {
+        center_page_px: [10.0, 20.0],
+        half_size_page_px: [33.0, 44.0],
+    });
+    let pages = layer.sync_overlay_state_into_doc();
+    assert!(pages.contains(&0), "page 0 carries text");
+
+    let doc_handle = layer.layer_doc.clone().expect("doc wired");
+    {
+        let mut guard = doc_handle.lock().expect("doc lock");
+        guard.flush_page(0, &dir, None).unwrap();
+    }
+
+    // Reopen: a brand-new doc + layer must recover the frame.
+    let mut doc2 = LayerDoc::new();
+    doc2.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
+    let mut layer2 = TypingTextOverlayLayer::default();
+    layer2.sync_from_doc(0, &doc2);
+    assert_eq!(
+        layer2.overlays[0].centering_frame,
+        Some(CenteringFrame {
+            center_page_px: [10.0, 20.0],
+            half_size_page_px: [33.0, 44.0],
+        }),
+        "the frame written by the placement sync survives a reopen"
+    );
+
+    // A LIVE runtime frame is never clobbered by the doc copy: a drag in progress must win.
+    layer2.overlays[0].centering_frame = Some(CenteringFrame {
+        center_page_px: [10.0, 20.0],
+        half_size_page_px: [1.0, 2.0],
+    });
+    layer2.sync_from_doc(0, &doc2);
+    assert_eq!(
+        layer2.overlays[0].centering_frame.map(|f| f.half_size_page_px),
+        Some([1.0, 2.0]),
+        "the doc only SEEDS a frameless runtime, it never overwrites a live frame"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sticky_centers_bit_tracks_the_overlay_and_reaches_the_edit_panel_payload() {
+    // D6 "sticky centers": a layer that ALREADY has renderer-measured centers must keep requesting
+    // them on every later render, even with the assist off, or an assist-off edit would store
+    // all-`None` and ERASE the persisted value. The render dispatch sites are one `||` over this
+    // predicate; what is testable without a GUI context is the predicate and the panel mirror that
+    // carries it to the (panel-owned) edit dispatch.
+    let mut overlay = text_runtime_from_doc_node(
+        "s1",
+        0,
+        [50.0, 60.0],
+        1.0,
+        0.0,
+        None,
+        false,
+        false,
+        0,
+        None,
+        [40, 20],
+        vec![0u8; 40 * 20 * 4],
+    );
+    assert!(
+        !overlay.has_centering_centers(),
+        "a layer the assist never touched is not sticky (keeps the no-compute fast path)"
+    );
+
+    overlay.extra.median_center = Some([1.0, 2.0]);
+    assert!(
+        overlay.has_centering_centers(),
+        "ONE measured center is enough to make the layer sticky"
+    );
+    overlay.extra.median_center = None;
+    overlay.extra.mean_center = Some([3.0, 4.0]);
+    assert!(overlay.has_centering_centers(), "either center counts");
+
+    // The bit must reach the edit-panel payload, which is how the panel-owned edit dispatch (which
+    // cannot see the runtimes) learns that its target already has stored centers.
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.overlays.push(overlay);
+    layer.selected_overlay_idx = Some(0);
+    let selected = layer
+        .selected_item_for_edit(0)
+        .expect("the selected overlay produces an edit payload");
+    assert!(
+        selected.has_centering_centers,
+        "the sticky bit is mirrored onto the edit-panel payload"
+    );
+
+    layer.overlays[0].extra = RenderedTextExtraInfo::default();
+    let selected = layer
+        .selected_item_for_edit(0)
+        .expect("still selected");
+    assert!(
+        !selected.has_centering_centers,
+        "clearing the centers clears the mirrored bit"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4005,6 +4246,8 @@ fn loading_and_re_saving_an_already_schema_two_project_is_a_byte_level_no_op() {
         deform: None,
         rendered_file: Some(file),
         mask_clip: None,
+        text_centers: None,
+        centering_frame: None,
     };
     persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
     let before = std::fs::read(dir.join("layers.json")).expect("layers.json written");

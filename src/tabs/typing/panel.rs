@@ -569,8 +569,13 @@ pub struct TypingTopPanelState {
     /// "Помочь с центровкой" (centering assist) toggle. When on, production text renders request the
     /// renderer's mean/median centers, the canvas draws a page-anchored guide frame with corner handles
     /// over the selected text layer, and the layer stays centered on the bound center across re-renders.
-    /// Transient (NOT persisted), like `auto_typing_debug_visuals`.
+    /// Persisted in `user_config.json` (`TextTab.centering_assist_enabled`); default `false`.
     centering_assist_enabled: bool,
+    /// Mirror of the CURRENTLY EDITED layer's "sticky centers" bit (see
+    /// `TypingSelectedOverlayForEdit::has_centering_centers`). `false` in create mode and whenever
+    /// nothing is selected. The panel owns `centering_assist_enabled` but not the overlay runtimes,
+    /// so this is how the edit dispatch learns that the target already has stored centers.
+    edit_overlay_has_centering_centers: bool,
     /// Which overlay center the assist frame binds to (image / mean / median). Transient; default `Mean`.
     centering_assist_kind: CenteringAssistCenterKind,
     /// "Показывать центр" (show center) toggle inside the centering-assist block. Gates ONLY the drawn
@@ -638,6 +643,11 @@ pub(super) struct TypingSelectedOverlayForEdit {
     /// What the edit panel is targeting — a typing overlay or a raster layer. Rasters use the same
     /// `Image` UI (transform + effects, no text params).
     pub target: TypingEditTarget,
+    /// The selected TEXT overlay already carries renderer-measured centering-assist centers (the
+    /// "sticky centers" bit). Mirrored onto the panel so the EDIT render dispatch keeps requesting
+    /// them even with the assist off, instead of erasing the persisted value. Always `false` for a
+    /// raster target and for an image overlay.
+    pub has_centering_centers: bool,
 }
 
 /// The thing the edit panel currently edits: a typing overlay (by index) or a raster layer (by
@@ -744,6 +754,7 @@ impl Default for TypingTopPanelState {
             auto_typing_extra_downward_shift_percent: 0.0,
             strict_pixel_movement: true,
             centering_assist_enabled: false,
+            edit_overlay_has_centering_centers: false,
             centering_assist_kind: CenteringAssistCenterKind::Mean,
             centering_show_center: true,
             coverage_language: text_language(),

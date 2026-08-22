@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::ColorImage;
 use serde_json::Value;
 
-use super::manifest::{DeformRec, TransformRec};
+use super::manifest::{CenteringFrameRec, DeformRec, TextCentersRec, TransformRec};
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use crate::runtime_log;
 
@@ -147,6 +147,11 @@ pub struct OwnedTextNode {
     pub transform: TransformRec,
     pub deform: Option<DeformRec>,
     pub mask_clip: Option<bool>,
+    /// Schema v4: the renderer-measured centering-assist centers of `image`, already normalized
+    /// (`None` when neither center was measured). Replayed verbatim into `TextPayloadOut`.
+    pub text_centers: Option<TextCentersRec>,
+    /// Schema v4: the centering-assist guide rectangle bound to this node.
+    pub centering_frame: Option<CenteringFrameRec>,
     /// The rendered text image (owned). Encoded to `ps_p{page:04}_{uid}_text.png` only when
     /// `pixels_dirty` or the deterministic file is missing — same rule as the sync flush.
     pub image: ColorImage,
@@ -300,6 +305,8 @@ impl PageSaveJob {
                     deform: node.deform.clone(),
                     rendered_file,
                     mask_clip: node.mask_clip,
+                    text_centers: node.text_centers,
+                    centering_frame: node.centering_frame,
                 });
             }
             persist::write_page_text_payload(layers_dir, fallback_dir, self.page_idx, &text_outs)
@@ -702,6 +709,8 @@ mod tests {
             transform: tf(5.0, 5.0),
             deform: None,
             mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
             image: img([2, 2], c),
             pixels_dirty: true,
         }
@@ -869,6 +878,64 @@ mod tests {
         let texts = persist::load_page_text_nodes(&dir, None, 7).unwrap();
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].uid, "t");
+
+        saver.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The PRODUCTION text write path is the off-thread saver, not `LayerDoc::flush_page`: this test
+    /// pins that `PageSaveJob::run` replays the schema-v4 centering-assist state (`text_centers` +
+    /// `centering_frame`) from the owned node into the manifest, so dropping that replay can no longer
+    /// break persistence with a green suite.
+    #[test]
+    fn text_job_persists_centering_state_through_the_saver() {
+        let dir = temp_dir("centering");
+        let saver = LayerSaver::new();
+        let centers = TextCentersRec {
+            mean: Some([12.5, -3.25]),
+            median: Some([11.0, -2.5]),
+        };
+        let frame = CenteringFrameRec {
+            cx: 400.0,
+            cy: 250.5,
+            half_w: 80.25,
+            half_h: 45.75,
+        };
+        let mut node = text_node("txt", Color32::BLUE);
+        // A real payload is required for the node to load back as a self-sufficient INLINE node: the
+        // helper's `Value::Null` round-trips through `Option<Value>` as absent, which is the
+        // image-overlay representation, not an inline text payload.
+        node.render_data = serde_json::json!({ "text": "txt" });
+        node.text_centers = Some(centers);
+        node.centering_frame = Some(frame);
+        saver.enqueue(PageSaveJob {
+            page_idx: 3,
+            layers_dir: dir.clone(),
+            fallback_dir: None,
+            raster: None,
+            raster_epoch: None,
+            text: Some(TextSavePart { nodes: vec![node] }),
+            text_epoch: Some(1),
+            effects: Vec::new(),
+        });
+        assert!(saver.barrier_blocking().is_empty());
+
+        let texts = persist::load_page_text_nodes(&dir, None, 3).expect("text page loads back");
+        assert_eq!(texts.len(), 1, "the text node persisted");
+        let inline = texts[0]
+            .inline
+            .as_ref()
+            .expect("saver wrote a self-sufficient inline payload");
+        assert_eq!(
+            inline.text_centers,
+            Some(centers),
+            "measured centers survived the off-thread write"
+        );
+        assert_eq!(
+            inline.centering_frame,
+            Some(frame),
+            "guide frame survived the off-thread write"
+        );
 
         saver.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

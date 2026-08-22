@@ -21,10 +21,10 @@ Adding a new schema version (e.g. a future step that retires `layer_idx`/`text_g
   3. drop the now-retired `#[serde(default)]` from the canonical struct — the only reader of the old
      field is the migration step here, against the untyped JSON.
 
-The v2→v3 step (the current top version) is a structural no-op: v3 only ADDED serde-default `Option`
-text-payload fields, so a v2 file is already a valid v3. The cross-file fold (`text_info.json` payload
-→ an inline node) is done on read in `layer_doc::ensure_page_loaded`, not here — `migrate_value` is a
-pure transform over the single `layers.json` Value and cannot see `text_info.json`.
+The v2→v3 and v3→v4 steps (the latter is the current top version) are structural no-ops: each only
+ADDED serde-default `Option` fields, so an older file is already a valid newer one. The cross-file fold
+(`text_info.json` payload → an inline node) is done on read in `layer_doc::ensure_page_loaded`, not here
+— `migrate_value` is a pure transform over the single `layers.json` Value and cannot see `text_info.json`.
 */
 
 use super::manifest::{LayersManifest, LAYERS_SCHEMA_VERSION};
@@ -97,6 +97,15 @@ fn migrate_value(mut value: Value, from_version: u32) -> Value {
     // `render_data`) falls back to the legacy overlay entry; a v3 node builds from the inline payload.
     if from_version < 3 {
         // structurally a no-op; absent inline text fields deserialize to None.
+    }
+
+    // v3 → v4: TEXT nodes gained `text_centers` (the renderer-measured centering-assist mean/median
+    // centers of the rendered PNG) and `centering_frame` (the assist's guide rectangle). Both are
+    // serde-default `Option`s and both were previously in-memory-only state, so a v3 file — which by
+    // definition carries neither — is structurally already a valid v4: the absent fields deserialize
+    // to `None`, which is exactly the pre-v4 runtime meaning (no centers measured, no frame yet).
+    if from_version < 4 {
+        // structurally a no-op; absent centering fields deserialize to None.
     }
 
     // Stamp the canonical version so a later forward-only write records current, not the old number.
@@ -173,11 +182,38 @@ mod tests {
             }]
         });
         let m = manifest_from_value(json, "test").unwrap();
-        assert_eq!(m.schema_version, LAYERS_SCHEMA_VERSION, "re-stamped to current (v3)");
+        assert_eq!(m.schema_version, LAYERS_SCHEMA_VERSION, "re-stamped to current");
         let node = &m.pages[0].tree[0];
         assert!(node.render_data.is_none(), "inline render_data defaults None for a v2 node");
         assert!(node.mask_clip.is_none(), "inline mask_clip defaults None for a v2 node");
         assert!(node.payload_ref.is_some(), "legacy payload_ref preserved");
+    }
+
+    #[test]
+    fn v3_text_node_reads_as_v4_with_centering_fields_defaulting_none() {
+        // A v3 text node carries the inline payload but no centering-assist state (it was in-memory
+        // only before v4); the two v4 fields must default to None and the file re-stamp to current.
+        let json = serde_json::json!({
+            "schema_version": 3,
+            "pages": [{
+                "img_idx": 0,
+                "tree": [{
+                    "uid": "t", "name": "T", "kind": "text", "z": 3,
+                    "layer_idx": 0, "visible": true, "opacity": 1.0,
+                    "render_data": { "text": "hi" },
+                    "rendered_file": "ps_p0000_t_text.png",
+                    "mask_clip": true,
+                    "transform": { "cx": 5.0, "cy": 6.0, "rotation": 0.0, "scale": 1.0 }
+                }]
+            }]
+        });
+        let m = manifest_from_value(json, "test").unwrap();
+        assert_eq!(m.schema_version, LAYERS_SCHEMA_VERSION, "re-stamped to current (v4)");
+        let node = &m.pages[0].tree[0];
+        assert!(node.text_centers.is_none(), "text_centers defaults None for a v3 node");
+        assert!(node.centering_frame.is_none(), "centering_frame defaults None for a v3 node");
+        assert!(node.render_data.is_some(), "existing inline payload preserved");
+        assert_eq!(node.mask_clip, Some(true), "existing inline flags preserved");
     }
 
     #[test]

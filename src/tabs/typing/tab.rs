@@ -2513,28 +2513,69 @@ struct TypingOverlayRuntime {
     size_px: [usize; 2],
     source_rgba: Vec<u8>,
     /// Renderer's mean/median centers (final-image px) for the currently rendered pixels, else
-    /// all-`None`. Populated only while centering assist is enabled; consumed by the assist marker and
-    /// by the frame-binding reconciliation. Reset to default whenever `source_rgba`/`size_px` change
-    /// without matching extras (doc reconcile).
+    /// all-`None`. Requested while centering assist is enabled OR while this overlay already carries a
+    /// center (`has_centering_centers` — the sticky rule that keeps an assist-off edit from erasing the
+    /// stored value); consumed by the assist marker and by the frame-binding reconciliation. PERSISTED
+    /// with the pixels they index (`LayerRec.text_centers`, schema v4) through the doc node's
+    /// `extra_centers`, of which this field is a projection. Reset to default whenever
+    /// `source_rgba`/`size_px` change without matching extras (doc reconcile).
     extra: RenderedTextExtraInfo,
-    /// Transient page-anchored centering-assist guide frame for this overlay, or `None` when no frame
-    /// exists yet. NEVER persisted and NOT reset on re-render (the frame must survive re-renders; only
-    /// the reconciliation reacts to a chosen-center move). Created lazily by the reconciliation when
-    /// assist is on and this overlay is selected.
+    /// Page-anchored centering-assist guide frame for this overlay, or `None` when no frame exists
+    /// yet. NOT reset on re-render (the frame must survive re-renders; only the reconciliation reacts
+    /// to a chosen-center move). Created lazily by the reconciliation when assist is on and this
+    /// overlay is selected. This runtime is the LIVE owner; the durable copy lives on the doc node
+    /// (`NodeBody::Text.centering_frame`, schema v4) and is pushed there by the placement sync.
     centering_frame: Option<CenteringFrame>,
     texture: Option<egui::TextureHandle>,
     display_texture_stale: bool,
     last_texture_used_frame: u64,
 }
 
-/// Transient page-anchored guide frame for the "Помочь с центровкой" (centering assist) feature.
+/// Page-anchored guide frame for the "Помочь с центровкой" (centering assist) feature.
 /// `center_page_px` is bound to the overlay's chosen center (image/mean/median); `half_size_page_px`
-/// is expressed in the frame's LOCAL (rotated) axes. Never persisted; stored per overlay on
-/// `TypingOverlayRuntime` (precedent: `extra`).
+/// is expressed in the frame's LOCAL (rotated) axes. Stored per overlay on `TypingOverlayRuntime`
+/// (precedent: `extra`) and persisted through the doc node as `manifest::CenteringFrameRec`.
+///
+/// NO rotation is carried here or on disk: the frame is drawn at the overlay's TOTAL visual angle
+/// (`angle_deg` + the vector `global_rotation_deg`), so a stored angle could only go stale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CenteringFrame {
     pub(super) center_page_px: [f32; 2],
     pub(super) half_size_page_px: [f32; 2],
+}
+
+impl CenteringFrame {
+    /// Converts this live frame into its on-disk record (page px center + local-axis half extents).
+    ///
+    /// Returns `None` when ANY component is non-finite (NaN / ±∞), i.e. such a frame is not persisted
+    /// and the previously stored one is left alone. This is not cosmetic: `serde_json` writes a
+    /// non-finite float as a bare `null` WITHOUT an error, and the next `read_manifest` then fails to
+    /// decode that `null` into an `f32` — which leaves the chapter's whole `layers.json` both
+    /// unreadable and unwritable (rasters included) until a human edits the JSON by hand. Skipping one
+    /// bad frame is the strictly cheaper outcome.
+    #[must_use]
+    pub(super) fn to_rec(self) -> Option<crate::models::layer_model::manifest::CenteringFrameRec> {
+        let [cx, cy] = self.center_page_px;
+        let [half_w, half_h] = self.half_size_page_px;
+        if !(cx.is_finite() && cy.is_finite() && half_w.is_finite() && half_h.is_finite()) {
+            return None;
+        }
+        Some(crate::models::layer_model::manifest::CenteringFrameRec {
+            cx,
+            cy,
+            half_w,
+            half_h,
+        })
+    }
+
+    /// Rebuilds a live frame from its on-disk record. The inverse of [`CenteringFrame::to_rec`].
+    #[must_use]
+    pub(super) fn from_rec(rec: crate::models::layer_model::manifest::CenteringFrameRec) -> Self {
+        Self {
+            center_page_px: [rec.cx, rec.cy],
+            half_size_page_px: [rec.half_w, rec.half_h],
+        }
+    }
 }
 
 /// The four draggable corners of a `CenteringFrame`, in the frame's LOCAL (unrotated) axes.
@@ -2582,6 +2623,18 @@ struct TypingCenteringFrameDragState {
 }
 
 impl TypingOverlayRuntime {
+    /// True when this overlay ALREADY carries a renderer-measured centering-assist center.
+    ///
+    /// This is the "sticky centers" predicate: a layer that was ever centered keeps requesting the
+    /// centers on every subsequent render even with the assist switched OFF, so an assist-off text
+    /// edit cannot ERASE the persisted value (the renderer would otherwise return all-`None` and
+    /// `set_text_render` would store that). A layer the assist never touched pays nothing — the
+    /// renderer keeps its zero-cost no-compute fast path.
+    #[must_use]
+    pub(super) fn has_centering_centers(&self) -> bool {
+        self.extra.mean_center.is_some() || self.extra.median_center.is_some()
+    }
+
     /// Builds the shared-doc affine placement (`TransformRec`) from this runtime's live
     /// center/rotation/scale. `angle_deg` is stored in degrees on the runtime and converted to
     /// radians for the doc. Single source of truth for the runtime→doc transform mapping, shared by

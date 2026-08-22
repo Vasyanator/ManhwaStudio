@@ -1014,14 +1014,27 @@ saving, and export.
   production text renders request BOTH renderer centers (`RenderExtraInfoRequest`) at the five dispatch
   sites landing in the live overlay runtime (create, edit, vector re-render / Ctrl+wheel / width drag,
   layout-editor re-render, shape-variant apply); the result is carried on `TypingOverlayRuntime.extra`.
-  CENTER OWNERSHIP: `TypingOverlayRuntime.extra` is a PROJECTION of the doc node's transient
+  STICKY CENTERS (behavioural contract): four of those five sites request the centers when the assist is
+  on **OR** when the target layer ALREADY carries a measured center
+  (`TypingOverlayRuntime::has_centering_centers`). The centers are PERSISTED, and the renderer returns
+  all-`None` when they are not requested — so without the OR, one assist-off text edit would ERASE a
+  layer's stored centers. A layer that was ever centered therefore keeps them fresh forever; a layer the
+  assist never touched pays nothing (the renderer keeps its no-compute fast path). The CREATE site is
+  the exception: a brand-new layer has no stored centers, so it stays gated on the flag alone. The two
+  panel-owned sites (create + edit) cannot see the runtimes, so the edited layer's sticky bit rides the
+  selection mirror: `TypingSelectedOverlayForEdit.has_centering_centers` →
+  `TypingTopPanelState::edit_overlay_has_centering_centers` (`false` in create mode). The
+  layout-editor site must read the bit BEFORE its optimistic `overlay.extra` clear.
+  CENTER OWNERSHIP: `TypingOverlayRuntime.extra` is a PROJECTION of the doc node's
   `NodeBody::Text.extra_centers`, not an independent copy. Every text render routes its pixels through
   `route_to_doc(set_text_render(..., extra))`, and `route_to_doc` re-projects the page on the SAME call
   stack, so `sync_from_doc` restores `extra` from the node whenever `pixels_changed`. A runtime-only
   center would therefore be wiped by the projection that immediately follows the render that produced
   it — which is exactly why all three bound-center kinds used to collapse onto the plain image center.
-  Nodes loaded from disk carry no centers (the metric is never persisted), so the fallback in
-  `mesh_geometry::centering_chosen_img_px` still applies until the first assist-enabled render.
+  PERSISTENCE (layers.json schema v4, `LayerRec.text_centers`): the centers are written with the very
+  PNG they describe, so a reopened chapter keeps its bound center instead of falling back to the plain
+  image center. The `mesh_geometry::centering_chosen_img_px` fallback now applies only to a layer the
+  assist genuinely never measured.
   The MEDIAN center weights every layout LINE equally (the renderer collapses each line to one sample
   before taking the median), so it does not snap onto whichever line holds the most glyphs. Leading and
   trailing hanging punctuation is excluded from both centers whenever the layer has hanging punctuation
@@ -1029,8 +1042,20 @@ saving, and export.
   do not react to that setting.
   When OFF the feature keeps a negligible constant per-frame cost (the flag/kind mirror plus an
   early-returning `reconcile_centering_frame` call); renders compute no centers and nothing is drawn.
-  STATE HOME: the guide frame is a transient `Option<CenteringFrame>` on `TypingOverlayRuntime`
-  (precedent: `extra`) — NEVER persisted and NOT reset on re-render (only the reconciliation reacts).
+  STATE HOME: the guide frame is an `Option<CenteringFrame>` on `TypingOverlayRuntime` (precedent:
+  `extra`), NOT reset on re-render (only the reconciliation reacts). It is PERSISTED through the doc
+  node (`NodeBody::Text.centering_frame` → `LayerRec.centering_frame`, schema v4) with the OPPOSITE
+  ownership direction to the centers: the RUNTIME is the live owner and the doc node is the durable
+  copy. WRITE — pushed into the node by `tab/persist.rs::sync_overlay_state_into_doc` only (next to
+  `mask_clip`), never by the per-frame `reconcile_centering_frame`, which would rewrite `layers.json`
+  every frame. READ — `doc_layers.rs::sync_from_doc` fills it ONLY when the runtime's frame is still
+  `None` (a drag in progress must win) and is deliberately NOT gated on `pixels_changed`: the frame is
+  an anchor the user placed, not a property of the pixels. DIRTY MARKING — a frame-only edit moves no
+  layer, so the corner-resize handler (equality-guarded) and the lazy creation call
+  `mark_placement_save_dirty` themselves; the move-driven mutations need nothing, because the move
+  settle already marks it. On disk the frame stores no rotation (`CenteringFrameRec`): its angle is
+  always the overlay's total visual angle. TEXT layers only — an image overlay's chosen center is
+  always the plain image center, so a frame would carry no information there.
   BINDING INVARIANT: while assist is on for the selected text overlay, the chosen center (page px,
   computed by `mesh_geometry::centering_chosen_center_page_px`) equals the frame center.
   `draw_page.rs::reconcile_centering_frame` runs once per frame (before `draw_entries`): it creates the

@@ -394,8 +394,15 @@ impl TypingTextOverlayLayer {
         };
         // This re-render lands in the live overlay runtime (via `apply_edit_overlay_render_result`), so
         // request the renderer's mean/median centers while centering assist is on to keep the frame's
-        // bound center live through Ctrl+wheel rotation / width drag / vector-transform settle.
-        if self.centering_assist_enabled {
+        // bound center live through Ctrl+wheel rotation / width drag / vector-transform settle — or
+        // when the layer already HAS stored centers ("sticky centers"), since those are persisted and
+        // an all-`None` result would erase them.
+        if self.centering_assist_enabled
+            || self
+                .overlays
+                .get(overlay_idx)
+                .is_some_and(TypingOverlayRuntime::has_centering_centers)
+        {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

@@ -1058,11 +1058,22 @@ impl TypingTextOverlayLayer {
                             state.total_angle_deg,
                             CENTERING_FRAME_MIN_HALF_SIZE_PX,
                         );
+                        let mut frame_changed = false;
                         if let Some(overlay) = self.overlays.get_mut(entry.idx) {
-                            overlay.centering_frame = Some(CenteringFrame {
+                            let next = CenteringFrame {
                                 center_page_px: center,
                                 half_size_page_px: half,
-                            });
+                            };
+                            // The frame is persisted (schema v4), so a corner resize that moves NO
+                            // layer must still mark the placement dirty — otherwise it would never be
+                            // written. Equality-guarded: a drag frame where the pointer produced the
+                            // same rectangle must not schedule a redundant `layers.json` rewrite.
+                            frame_changed = overlay.centering_frame != Some(next);
+                            overlay.centering_frame = Some(next);
+                        }
+                        if frame_changed {
+                            // EDIT (centering-frame resize): deferred, like every other placement edit.
+                            self.mark_placement_save_dirty();
                         }
                         ctx.request_repaint();
                     }
@@ -1882,11 +1893,19 @@ impl TypingTextOverlayLayer {
                 (overlay.size_px[1] as f32 * scale * 0.5 * CENTERING_FRAME_DEFAULT_SCALE)
                     .max(CENTERING_FRAME_MIN_HALF_SIZE_PX),
             ];
+            let mut frame_created = false;
             if let Some(overlay) = self.overlays.get_mut(idx) {
                 overlay.centering_frame = Some(CenteringFrame {
                     center_page_px: chosen,
                     half_size_page_px: half,
                 });
+                frame_created = true;
+            }
+            if frame_created {
+                // The frame is persisted (schema v4); the lazy creation is the only chance to record
+                // it when the user never resizes or moves anything afterwards. Runs exactly once per
+                // overlay (the branch is `centering_frame == None`), so it cannot mark per frame.
+                self.mark_placement_save_dirty();
             }
             return;
         };

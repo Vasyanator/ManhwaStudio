@@ -34,7 +34,7 @@ use eframe::egui::ColorImage;
 use ms_text_render::types::RenderedTextExtraInfo;
 use serde_json::Value;
 
-use super::manifest::{DeformRec, TransformRec};
+use super::manifest::{CenteringFrameRec, DeformRec, TextCentersRec, TransformRec};
 use super::ordering::Band;
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use super::saver::{
@@ -53,6 +53,41 @@ fn read_png(path: &Path) -> Option<ColorImage> {
     let rgba = image::open(path).ok()?.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// Converts the renderer's in-memory centering-assist centers into the on-disk record.
+///
+/// Returns `None` when neither center was measured, so the manifest field stays absent and the JSON
+/// key is omitted (the `skip_serializing_if` contract of `LayerRec.text_centers`). This is the ONE
+/// direction of the conversion boundary that keeps `ms-text-render` free of a serde dependency.
+///
+/// A center with any NON-FINITE component (NaN / ±∞) is treated as NOT measured and dropped here,
+/// exactly as an unmeasured one is. This is not cosmetic: `serde_json` serializes a non-finite float
+/// as a bare `null` WITHOUT reporting an error, and the next `read_manifest` then fails to decode
+/// that `null` into an `f32` — which makes the chapter's whole `layers.json` both unreadable and
+/// unwritable (rasters included) until a human edits the JSON by hand. Losing one measurement that
+/// was garbage anyway is the strictly cheaper outcome.
+#[must_use]
+fn text_centers_rec_from(extra: &RenderedTextExtraInfo) -> Option<TextCentersRec> {
+    /// A center is usable only when BOTH components are finite (see the non-finite rationale above).
+    fn finite(c: Option<[f32; 2]>) -> Option<[f32; 2]> {
+        c.filter(|p| p.iter().all(|v| v.is_finite()))
+    }
+    let rec = TextCentersRec {
+        mean: finite(extra.mean_center),
+        median: finite(extra.median_center),
+    };
+    (!rec.is_empty()).then_some(rec)
+}
+
+/// Converts an on-disk centers record back into the renderer's in-memory shape. `None` ⇒ all-`None`,
+/// i.e. "never measured", which is what every pre-v4 node yields.
+#[must_use]
+fn extra_centers_from_rec(rec: Option<TextCentersRec>) -> RenderedTextExtraInfo {
+    RenderedTextExtraInfo {
+        mean_center: rec.and_then(|c| c.mean),
+        median_center: rec.and_then(|c| c.median),
+    }
 }
 
 /// The kind of a unified layer node. Mirrors `manifest::LayerKindRec` (sans `Group`, which is a
@@ -94,13 +129,30 @@ pub enum NodeBody {
         mask_clip: Option<bool>,
         /// Renderer-measured centering-assist centers for `image`, in final-image pixels.
         ///
-        /// TRANSIENT and NEVER persisted: a load from disk starts all-`None` and a render with the
-        /// centering assist enabled fills them in. Held HERE rather than only on the typing tab's
-        /// runtime because `sync_from_doc` rebuilds that runtime from this node — a runtime-only copy
-        /// is wiped by the projection that follows every `set_text_render`. Always written together
-        /// with `image` (see [`LayerDoc::set_text_render`]) so the centers can never describe pixels
-        /// other than the ones stored here.
+        /// PERSISTED since schema v4 (`LayerRec.text_centers`), so a chapter re-open restores the
+        /// bound center instead of collapsing onto the plain image center. Held HERE rather than only
+        /// on the typing tab's runtime because `sync_from_doc` rebuilds that runtime from this node —
+        /// a runtime-only copy is wiped by the projection that follows every `set_text_render`.
+        /// INVARIANT (unchanged by persistence): always written together with `image` (see
+        /// [`LayerDoc::set_text_render`]), so the centers can never describe pixels other than the
+        /// ones stored here.
         extra_centers: RenderedTextExtraInfo,
+        /// The typing tab's centering-assist guide rectangle bound to this node, persisted since
+        /// schema v4 (`LayerRec.centering_frame`).
+        ///
+        /// The typing runtime is the LIVE owner (a drag in progress must win); this is the DURABLE
+        /// copy, pushed here by the typing tab's placement sync and read back when a runtime is
+        /// created. `None` ⇒ no frame yet. Deliberately NOT tied to `image`: the frame is an anchor
+        /// the user places, not a measurement of the pixels, and survives every re-render.
+        ///
+        /// LIMITATION — SET-ONLY. The placement sync only ever writes a `Some` here
+        /// (`tabs/typing/tab/persist.rs`, `sync_overlay_state_into_doc`), because a runtime's `None`
+        /// means "this runtime has not picked the frame up yet", not "the user removed it". There is
+        /// therefore NO path that clears a stored frame. That is correct for every path that exists
+        /// today, but a future "remove the frame" action cannot be built by resetting the runtime to
+        /// `None`: the frame would resurrect from disk on the next reload. Such an action must add an
+        /// explicit clear that reaches this field.
+        centering_frame: Option<CenteringFrameRec>,
     },
 }
 
@@ -532,8 +584,10 @@ impl LayerDoc {
                     is_image: inline.is_image,
                     payload_uid: meta.payload_uid.clone(),
                     mask_clip: inline.mask_clip,
-                    // Disk carries no centers; a render with the centering assist on fills them in.
-                    extra_centers: RenderedTextExtraInfo::default(),
+                    // Schema v4 carries the centers alongside the PNG they describe; a pre-v4 node
+                    // yields all-`None` and the first assist-enabled render fills them in.
+                    extra_centers: extra_centers_from_rec(inline.text_centers),
+                    centering_frame: inline.centering_frame,
                 },
             });
             built_inline.insert(meta.uid.clone(), ());
@@ -645,8 +699,10 @@ impl LayerDoc {
                     is_image,
                     payload_uid: uid,
                     mask_clip,
-                    // Disk carries no centers; a render with the centering assist on fills them in.
+                    // A legacy (pre-v3) overlay entry has no centering-assist state at all; the first
+                    // assist-enabled render fills the centers in and the frame is created lazily.
                     extra_centers: RenderedTextExtraInfo::default(),
+                    centering_frame: None,
                 },
             });
         }
@@ -1140,11 +1196,16 @@ impl LayerDoc {
     /// Replaces a TEXT node's render params, rendered image and centering-assist centers, sets
     /// `pixels_dirty` (so the next flush re-encodes the rendered PNG — mirrors `set_raster_pixels`),
     /// and bumps its generation. No-op if the page/node is absent or the node is not text.
-    /// Persistence happens on `flush_page`; `extra_centers` is transient and never written.
+    /// Persistence happens on `flush_page`; since schema v4 `extra_centers` IS written (into
+    /// `LayerRec.text_centers`), alongside the rendered PNG it describes.
     ///
     /// `extra_centers` MUST be the centers the renderer measured for THIS `image` (all-`None` when
     /// they were not requested). They are stored in the same mutation as the pixels so a later
-    /// projection can never pair one render's centers with another render's pixels.
+    /// projection — or a later flush — can never pair one render's centers with another render's
+    /// pixels. That invariant is what makes persisting them safe: the stored value always describes
+    /// the stored PNG. The typing tab keeps them fresh by requesting the centers on every render of a
+    /// layer that already has them (the "sticky centers" rule), so an assist-off edit does not erase
+    /// a previously measured center.
     pub fn set_text_render(
         &mut self,
         page_idx: usize,
@@ -1535,9 +1596,9 @@ impl LayerDoc {
                 is_image,
                 payload_uid,
                 mask_clip,
-                // Transient: the centering-assist centers are a per-render measurement and are
-                // deliberately not part of the on-disk text payload.
-                extra_centers: _,
+                // Schema v4: both centering-assist values ARE part of the on-disk text payload.
+                extra_centers,
+                centering_frame,
             } = &node.body
             else {
                 continue;
@@ -1583,6 +1644,9 @@ impl LayerDoc {
                 deform: node.deform.clone(),
                 rendered_file,
                 mask_clip: *mask_clip,
+                // An all-`None` measurement is normalized to `None` so the JSON key is omitted.
+                text_centers: text_centers_rec_from(extra_centers),
+                centering_frame: *centering_frame,
             });
         }
         crate::trace_log!(
@@ -1898,9 +1962,9 @@ impl LayerDoc {
                 is_image,
                 payload_uid,
                 mask_clip,
-                // Transient: the centering-assist centers are a per-render measurement and are
-                // deliberately not part of the on-disk text payload.
-                extra_centers: _,
+                // Schema v4: both centering-assist values ARE part of the on-disk text payload.
+                extra_centers,
+                centering_frame,
             } = &node.body
             else {
                 continue;
@@ -1919,6 +1983,8 @@ impl LayerDoc {
                 transform: node.transform,
                 deform: node.deform.clone(),
                 mask_clip: *mask_clip,
+                text_centers: text_centers_rec_from(extra_centers),
+                centering_frame: *centering_frame,
                 image: image.clone(),
                 pixels_dirty: node.pixels_dirty,
             });
@@ -2875,6 +2941,7 @@ mod tests {
                 payload_uid: "tnew".into(),
                 mask_clip: None,
                 extra_centers: RenderedTextExtraInfo::default(),
+                centering_frame: None,
             },
         };
         assert!(doc.add_node(0, new_node));
@@ -3224,6 +3291,7 @@ mod tests {
                 payload_uid: uid.into(),
                 mask_clip: Some(true),
                 extra_centers: RenderedTextExtraInfo::default(),
+                centering_frame: None,
             },
         }
     }
@@ -3279,6 +3347,130 @@ mod tests {
         } else {
             panic!("expected text body");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_finite_centers_are_treated_as_not_measured() {
+        // `serde_json` writes a non-finite float as a bare `null` without erroring, and the next
+        // `read_manifest` then fails to decode that `null` into an `f32` — which makes the chapter's
+        // whole `layers.json` unreadable AND unwritable. So a non-finite center must never reach the
+        // record; it is dropped exactly like an unmeasured one.
+        let only_bad_mean = text_centers_rec_from(&RenderedTextExtraInfo {
+            mean_center: Some([f32::NAN, 1.0]),
+            median_center: None,
+        });
+        assert_eq!(
+            only_bad_mean, None,
+            "a NaN component makes the only center unusable ⇒ no record at all"
+        );
+
+        let mixed = text_centers_rec_from(&RenderedTextExtraInfo {
+            mean_center: Some([1.0, f32::INFINITY]),
+            median_center: Some([3.0, 4.0]),
+        })
+        .expect("the finite median still yields a record");
+        assert_eq!(mixed.mean, None, "the infinite mean was dropped");
+        assert_eq!(
+            mixed.median,
+            Some([3.0, 4.0]),
+            "the finite median was kept untouched"
+        );
+
+        let good = text_centers_rec_from(&RenderedTextExtraInfo {
+            mean_center: Some([-2.5, 0.0]),
+            median_center: Some([-2.0, 0.5]),
+        })
+        .expect("all-finite centers are recorded");
+        assert_eq!(good.mean, Some([-2.5, 0.0]));
+        assert_eq!(good.median, Some([-2.0, 0.5]));
+    }
+
+    #[test]
+    fn centering_state_survives_a_flush_reload_cycle() {
+        // The schema-v4 centering-assist state (renderer centers + guide frame) must survive a doc
+        // flush and a fresh load — that is the whole point of persisting it: closing and reopening a
+        // chapter must not collapse the bound center onto the plain image center.
+        let dir = temp_dir("centering_flush_rt");
+
+        let mut doc = doc_with_empty_page();
+        let mut node = text_node_with_payload("t0");
+        if let NodeBody::Text {
+            extra_centers,
+            centering_frame,
+            ..
+        } = &mut node.body
+        {
+            extra_centers.mean_center = Some([2.5, 1.5]);
+            extra_centers.median_center = Some([2.0, 1.0]);
+            *centering_frame = Some(CenteringFrameRec {
+                cx: 111.0,
+                cy: 222.0,
+                half_w: 30.0,
+                half_h: 20.0,
+            });
+        } else {
+            panic!("expected text body");
+        }
+        doc.add_node(0, node);
+        doc.flush_page(0, &dir, None).unwrap();
+
+        let mut doc2 = LayerDoc::new();
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
+            .unwrap();
+        let t = doc2.node(0, "t0").expect("text node reloads");
+        let NodeBody::Text {
+            extra_centers,
+            centering_frame,
+            ..
+        } = &t.body
+        else {
+            panic!("expected text body");
+        };
+        assert_eq!(
+            extra_centers.mean_center,
+            Some([2.5, 1.5]),
+            "mean center survives the reload"
+        );
+        assert_eq!(
+            extra_centers.median_center,
+            Some([2.0, 1.0]),
+            "median center survives the reload"
+        );
+        let frame = centering_frame.expect("guide frame survives the reload");
+        assert!((frame.cx - 111.0).abs() < 1e-4);
+        assert!((frame.cy - 222.0).abs() < 1e-4);
+        assert!((frame.half_w - 30.0).abs() < 1e-4);
+        assert!((frame.half_h - 20.0).abs() < 1e-4);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_that_measured_no_centers_reloads_as_never_measured() {
+        // The absent case: an all-`None` measurement must not be written, and must reload as
+        // all-`None` rather than as some empty-but-present record.
+        let dir = temp_dir("centering_flush_absent");
+
+        let mut doc = doc_with_empty_page();
+        doc.add_node(0, text_node_with_payload("t0"));
+        doc.flush_page(0, &dir, None).unwrap();
+
+        let mut doc2 = LayerDoc::new();
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
+            .unwrap();
+        let t = doc2.node(0, "t0").expect("text node reloads");
+        let NodeBody::Text {
+            extra_centers,
+            centering_frame,
+            ..
+        } = &t.body
+        else {
+            panic!("expected text body");
+        };
+        assert_eq!(extra_centers, &RenderedTextExtraInfo::default());
+        assert!(centering_frame.is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3661,6 +3853,7 @@ mod tests {
                 payload_uid: "payload-123".into(),
                 mask_clip: None,
                 extra_centers: RenderedTextExtraInfo::default(),
+                centering_frame: None,
             },
         };
 
@@ -3731,6 +3924,7 @@ mod tests {
                 payload_uid: uid.into(),
                 mask_clip: None,
                 extra_centers: RenderedTextExtraInfo::default(),
+                centering_frame: None,
             },
         }
     }

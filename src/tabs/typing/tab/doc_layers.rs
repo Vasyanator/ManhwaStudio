@@ -602,6 +602,7 @@ impl TypingTextOverlayLayer {
                 is_image,
                 mask_clip,
                 extra_centers,
+                centering_frame,
                 ..
             } = &node.body
             else {
@@ -657,6 +658,17 @@ impl TypingTextOverlayLayer {
                             .insert(cache_key, node.generation);
                         to_requeue.push(idx);
                     }
+                    // Centering-assist guide frame (schema v4): the RUNTIME is the live owner, so the
+                    // doc may only SEED a runtime that has no frame yet — never clobber one (a corner
+                    // drag or a reconciliation in progress must win, and the doc copy lags by one
+                    // placement sync). Deliberately NOT gated on `pixels_changed`: the frame is an
+                    // anchor the user placed, not a property of the pixels, so a page whose text never
+                    // re-rendered this session must still recover its stored frame.
+                    if rt.centering_frame.is_none()
+                        && let Some(rec) = *centering_frame
+                    {
+                        rt.centering_frame = Some(CenteringFrame::from_rec(rec));
+                    }
                 }
                 None => {
                     // CREATE: materialize a runtime from the doc node (migrated-chapter case).
@@ -677,6 +689,8 @@ impl TypingTextOverlayLayer {
                     // Assigned here rather than threaded through the (already over-long) constructor:
                     // the centers belong to the node's pixels, which were just projected above.
                     runtime.extra = extra_centers.clone();
+                    // Same rationale as `extra`: seeded here instead of widening the constructor.
+                    runtime.centering_frame = centering_frame.map(CenteringFrame::from_rec);
                     self.overlays.push(runtime);
                     let idx = self.overlays.len() - 1;
                     // Mark the texture generation as projected so a subsequent sync doesn't needlessly

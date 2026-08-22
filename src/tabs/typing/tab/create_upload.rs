@@ -741,6 +741,9 @@ impl TypingTextOverlayLayer {
                     // this node onto the runtime pushed after it, so the doc must already carry them
                     // or the projection would hand the runtime empty centers.
                     extra_centers: decoded.extra.clone(),
+                    // A freshly created overlay has no guide frame yet; the assist creates one lazily
+                    // on the canvas and the placement sync pushes it here.
+                    centering_frame: None,
                 },
             };
             Some((page_idx, node))

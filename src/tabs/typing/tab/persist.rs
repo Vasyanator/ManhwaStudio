@@ -37,6 +37,21 @@ private items that stay there as descendants of module `tab`.
 
 use super::*;
 
+/// One text overlay's MODEL state, snapshotted off the runtime so the doc edit below runs without
+/// borrowing `self.overlays`. Every field is exactly what the doc node must end up holding; a named
+/// struct rather than a tuple because the placement sync keeps gaining fields.
+struct OverlayModelState {
+    uid: String,
+    transform: crate::models::layer_model::manifest::TransformRec,
+    deform: Option<crate::models::layer_model::manifest::DeformRec>,
+    /// The «Группа текста N» axis; `None` when the runtime index does not fit a `u32`.
+    layer_idx: Option<u32>,
+    mask_clip: Option<bool>,
+    /// The centering-assist guide frame, or `None` when this runtime has no frame (which never
+    /// CLEARS a stored one — see the push site).
+    centering_frame: Option<crate::models::layer_model::manifest::CenteringFrameRec>,
+}
+
 impl TypingTextOverlayLayer {
     pub(super) fn poll_save_jobs(&mut self, ctx: &egui::Context) -> bool {
         let recv_result = {
@@ -339,23 +354,12 @@ impl TypingTextOverlayLayer {
     pub(super) fn sync_overlay_state_into_doc(&mut self) -> std::collections::BTreeSet<usize> {
         let mut pages_with_text: std::collections::BTreeSet<usize> =
             std::collections::BTreeSet::new();
-        #[allow(clippy::type_complexity)]
-        let mut state_by_page: HashMap<
-            usize,
-            Vec<(
-                String,
-                crate::models::layer_model::manifest::TransformRec,
-                Option<crate::models::layer_model::manifest::DeformRec>,
-                Option<u32>,
-                Option<bool>,
-            )>,
-        > = HashMap::new();
+        let mut state_by_page: HashMap<usize, Vec<OverlayModelState>> = HashMap::new();
         for overlay in &self.overlays {
             if overlay.kind != TypingOverlayKind::Text {
                 continue;
             }
             pages_with_text.insert(overlay.page_idx);
-            let transform = overlay.transform_rec();
             let deform = overlay.deform_mesh.as_ref().map(|m| {
                 crate::models::layer_model::manifest::DeformRec {
                     cols: m.cols,
@@ -363,27 +367,42 @@ impl TypingTextOverlayLayer {
                     points_px: m.points_px.clone(),
                 }
             });
-            state_by_page.entry(overlay.page_idx).or_default().push((
-                overlay.uid.clone(),
-                transform,
-                deform,
-                u32::try_from(overlay.layer_idx).ok(),
-                Some(overlay.mask_clip_enabled),
-            ));
+            state_by_page
+                .entry(overlay.page_idx)
+                .or_default()
+                .push(OverlayModelState {
+                    uid: overlay.uid.clone(),
+                    transform: overlay.transform_rec(),
+                    deform,
+                    layer_idx: u32::try_from(overlay.layer_idx).ok(),
+                    mask_clip: Some(overlay.mask_clip_enabled),
+                    // The runtime is the LIVE owner of the frame (see `TypingOverlayRuntime`); this is
+                    // the ONE place it reaches the durable doc node. Pushing it from the per-frame
+                    // `reconcile_centering_frame` instead would rewrite `layers.json` every frame.
+                    centering_frame: overlay.centering_frame.and_then(CenteringFrame::to_rec),
+                });
         }
         for (page_idx, states) in state_by_page {
             self.route_to_doc(page_idx, |doc| {
-                for (uid, transform, deform, layer_idx, mask_clip) in &states {
-                    doc.set_transform(page_idx, uid, *transform);
-                    if let Some(node) = doc.node_mut(page_idx, uid) {
-                        node.deform = deform.clone();
-                        node.text_layer_idx = *layer_idx;
+                for st in &states {
+                    doc.set_transform(page_idx, &st.uid, st.transform);
+                    if let Some(node) = doc.node_mut(page_idx, &st.uid) {
+                        node.deform = st.deform.clone();
+                        node.text_layer_idx = st.layer_idx;
                         if let crate::models::layer_model::layer_doc::NodeBody::Text {
                             mask_clip: mc,
+                            centering_frame: cf,
                             ..
                         } = &mut node.body
                         {
-                            *mc = *mask_clip;
+                            *mc = st.mask_clip;
+                            // A runtime whose frame is `None` never clears a stored one: the frame is
+                            // seeded back onto the runtime by `sync_from_doc`, so `None` here only ever
+                            // means "this runtime has not picked the frame up yet" (or that `to_rec`
+                            // refused a non-finite frame, which must likewise not erase a good one).
+                            if let Some(rec) = st.centering_frame {
+                                *cf = Some(rec);
+                            }
                         }
                     }
                 }
