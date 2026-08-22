@@ -53,22 +53,46 @@ Key functions:
   drop-down arrow is NOT its business — it stays inside the combo button, drawn by
   `paint_dropdown_icon`.
 - `layout_line` (private): one line as a single elided text row with coloured matches.
-- `RowBaselines::measure` / `paint_line_on_baseline` (private): every galley of every row is
-  positioned by a BASELINE this widget computes, never by its top edge.
+- `RowBaselines::measure` / `button_caption_baseline` / `paint_line_on_baseline` (private):
+  every galley the widget draws — each line of every row AND the closed button's caption — is
+  positioned by a BASELINE this widget computes, never by its top edge or by its box.
 - `matching::match_ranges` / `matching::item_matches` (private, GUI-free, unit-tested):
   the search predicate and the byte ranges it highlights.
 - `reveal_offset` (private, pure, unit-tested): the scroll offset that brings a row into
   view with the least movement.
 
-A row's lines are separate galleys the widget places by hand, in BOTH layouts. Every baseline
-comes from the INTERFACE font's metrics at the line's nominal size and never from the face a
-row happens to draw its main line in: epaint puts a galley's baseline at its own face's ascent
-(15 pt for the interface font against 24 pt for a display face, both at a nominal 16 pt), so
-painting galleys at their bands' top edges made the ink of a font catalog float up and down
-from row to row — which reads as uneven row heights — and dropped a `Wide` row's second line
-below its first. `Tall` gives each line a band of its own and a baseline inside it; `Wide` has
-one text row, one baseline, and starts the second line after the main line's advance width
-plus the gap.
+A row's lines are separate galleys the widget places by hand, in BOTH layouts, and so is the
+CLOSED BUTTON's caption. Every baseline comes from the INTERFACE font's metrics at the line's
+nominal size and never from the face the text is drawn in: epaint puts a galley's baseline at
+its own face's ascent (15 pt for the interface font against 24 pt for a display face, both at a
+nominal 16 pt) and a pinned `TextFormat::line_height` leaves the whole surplus BELOW that
+baseline (`epaint-0.35.0/src/text/text_layout.rs:965-984`). Placing such a galley by its top
+edge — or, equivalently, centring it by its box — therefore makes the ink of a font catalog
+float up and down from row to row, drops a `Wide` row's second line below its first, and slides
+the button's caption against its top edge as the selected font changes. `Tall` gives each line
+a band of its own and a baseline inside it; `Wide` has one text row, one baseline, and starts
+the second line after the main line's advance width plus the gap; the button has one baseline
+centred in its text area.
+
+The button's height (`button_row_height`, shared with the square search button's side) is the
+content band — the caption's line box or the drop-down icon, whichever is taller — PLUS
+`Spacing::button_padding` on both edges, raised to the minimum interactive height. That padding
+is load-bearing rather than decorative: the caption is laid out inside
+`rect.shrink2(button_padding)`, so a height covering only the bare band would clip every
+caption top and bottom. What the caption is clipped to is the text area horizontally (it must
+not reach under the drop-down triangle) and the FULL button rect vertically, the way a popup
+row is clipped to its whole row rect.
+
+What the button shares with a row is the BASELINE RULE, not the padding: a row reserves
+`ROW_VERTICAL_PADDING` (2 pt) around its band while the button takes egui's own
+`button_padding.y` (1 pt), which is what keeps the control the same height as its neighbours in
+the typing panel. At `primary_size` 14 that is a 24.4 pt button over a 22.4 pt text area, with
+the caption's baseline 16.2 pt below that area's top and 17.2 pt below the button's — against
+18.2 pt for a popup row of the same font. The two agree to within that point; they are not
+identical, and neither one accommodates a face. Glyph INK rising further above the baseline
+than the band allows is clipped by the button rect exactly as a row rect clips it. It is the
+ink actually drawn that overflows, never the face's declared ascent metric — a face may claim a
+1.5 em ascent and put nothing near it.
 
 The per-row marks are the caller's diagnostics and stay out of the widget's own decisions.
 The colour reaches the main line's UNMATCHED characters only — the search highlight still wins
@@ -852,12 +876,15 @@ fn primary_line_height(primary_size: f32) -> f32 {
 /// Height of the widget's button row in points — and therefore the SIDE of its square search
 /// button, which is what makes the two buttons stand exactly as tall as each other.
 ///
-/// The same three-way maximum egui's own combo box takes for its button
-/// (`egui-0.35.0/src/containers/combo_box.rs:361-362`): the caption's line box, the drop-down
-/// icon, and the style's minimum interactive height.
+/// egui's own combo-box geometry: the CONTENT is the taller of the caption's line box and the
+/// drop-down icon (`egui-0.35.0/src/containers/combo_box.rs:361-364`), that content is then
+/// expanded by `Spacing::button_padding` and raised to the minimum interactive height
+/// (`:433-444`, `button_frame`). The vertical padding is part of the height and not an
+/// afterthought: the caption is drawn inside `rect.shrink2(button_padding)`, so a height that
+/// only covered the bare line box would clip the band it reserved by exactly that padding on
+/// both edges, for every face.
 fn button_row_height(ui: &Ui, line_height: f32) -> f32 {
-    line_height
-        .max(ui.spacing().icon_width)
+    (line_height.max(ui.spacing().icon_width) + 2.0 * ui.spacing().button_padding.y)
         .max(ui.spacing().interact_size.y)
 }
 
@@ -919,6 +946,12 @@ fn paint_search_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// rather than wrapped. The caption is drawn from an explicit galley instead of a
 /// `WidgetText` so the selected row's OWN family can be used for it while the triangle stays
 /// in the interface font's colour.
+///
+/// The caption obeys the same BASELINE contract as a popup row ([`button_caption_baseline`]):
+/// it is never placed by its box, because a galley's box puts the baseline at the item face's
+/// own ascent and the caption would then drift with every selected font. Its clip is the text
+/// area horizontally but the FULL button rect vertically — the line band is as tall as the
+/// button's content and clipping it to the padded area would cut it on both edges.
 fn draw_button(
     ui: &mut Ui,
     widget_id: Id,
@@ -1018,13 +1051,37 @@ fn draw_button(
         inner.min,
         egui::pos2(icon_rect.left() - icon_spacing, inner.max.y),
     );
-    let pos = Align2::LEFT_CENTER
-        .align_size_within_rect(galley.size(), text_rect)
-        .min;
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .galley(pos, galley, text_color);
+    // Horizontally the caption is confined to the text area, so it can never reach under the
+    // drop-down triangle; vertically it keeps the WHOLE button, the way a popup row is clipped
+    // to its whole row rect. The line band is exactly as tall as the button's content, so
+    // clipping it to the padded area would shave `button_padding.y` off both edges of every
+    // caption — which is what cut the top of tall faces.
+    let clip = Rect::from_x_y_ranges(text_rect.x_range(), rect.y_range()).intersect(ui.clip_rect());
+    // The band the caption is centred in is the text AREA, not the nominal line height: when
+    // `interact_size.y` or the icon dominates the button's height, the area is the taller of
+    // the two and the caption must stay centred in what is actually there.
+    let baseline = button_caption_baseline(ui, spec.primary_size, inner.height());
+    paint_line_on_baseline(
+        &ui.painter().with_clip_rect(clip),
+        text_rect.left(),
+        inner.top() + baseline,
+        galley,
+        text_color,
+    );
     response
+}
+
+/// Y of the closed button's caption baseline, measured from the top of the button's TEXT AREA
+/// (`rect.shrink2(button_padding)`), in points.
+///
+/// `text_area_height` is that area's height, not the nominal line height, so the caption stays
+/// centred when `Spacing::interact_size` or the drop-down icon decides the button's size. The
+/// baseline comes from the INTERFACE font at `primary_size` and never from the selected row's
+/// face — the same rule, and the same arithmetic, the popup rows follow through
+/// [`RowBaselines::measure`]. Costs the one cached probe galley of [`interface_metrics`], so
+/// call it only on a frame that actually paints a caption.
+fn button_caption_baseline(ui: &Ui, primary_size: f32, text_area_height: f32) -> f32 {
+    row_baseline(interface_metrics(ui, primary_size), text_area_height)
 }
 
 /// Paints the downward triangle that marks a drop-down, filling `rect`.
@@ -2555,6 +2612,181 @@ mod tests {
         // And both land on the row's ONE baseline once placed by it.
         assert!((interface_landed - baseline).abs() < 1e-3);
         assert!((decorative_landed - baseline).abs() < 1e-3);
+    }
+
+    /// What one frame of the CLOSED button actually painted for its caption.
+    #[derive(Clone, Copy, Debug)]
+    struct PaintedCaption {
+        /// The button's own rect, as `draw_button` allocated it.
+        button: Rect,
+        /// Top of the button's TEXT AREA (`rect.shrink2(button_padding)`) — the short rect the
+        /// caption used to be clipped to.
+        text_area_top: f32,
+        /// The baseline the widget's own placement helper asks for, in screen points.
+        expected_baseline: f32,
+        /// The baseline the emitted `Shape::Text` really lands on.
+        painted_baseline: f32,
+        /// Where the glyph's baseline sits INSIDE its galley — the face's own ascent, which is
+        /// what a box placement would have exposed as a per-face shift.
+        face_ascent: f32,
+        /// The clip rect that text shape carries.
+        clip: Rect,
+    }
+
+    /// Draws the closed button for one frame with `family` as the selected row's face and reads
+    /// back the caption egui was actually handed.
+    ///
+    /// Returns `None` when the frame emitted anything other than exactly one text shape, which
+    /// is what every assertion built on it depends on. `TextShape::pos` is the galley's top-left
+    /// (`epaint-0.35.0/src/shapes/text_shape.rs:13-16`) and `ClippedShape::clip_rect` is the
+    /// painter's clip at the time the shape was added (`egui-0.35.0/src/painter.rs:219`), so the
+    /// two together are exactly what this widget decided.
+    fn draw_button_caption_once(ctx: &egui::Context, family: FontFamily) -> Option<PaintedCaption> {
+        let primary_size = 16.0_f32;
+        let line_height = primary_line_height(primary_size);
+        let items = [SearchableComboItem::new("Main")];
+        let mut placement: Option<(Rect, f32, f32)> = None;
+        let input = egui::RawInput {
+            // Pinned so the button is unambiguously inside the frame's clip rect; the caption's
+            // clip is intersected with it and a default-sized screen would make that opaque.
+            screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0))),
+            ..egui::RawInput::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            let height = button_row_height(ui, line_height);
+            let mut resolve = |_: usize| Some(family.clone());
+            let response = draw_button(
+                ui,
+                Id::new("searchable_combo_button_paint_test"),
+                &ButtonSpec {
+                    width: 200.0,
+                    height,
+                    primary_size,
+                    line_height,
+                    open: false,
+                    caption: None,
+                    shown_index: Some(0),
+                },
+                &items,
+                Some(&mut resolve),
+            );
+            let inner = response.rect.shrink2(ui.spacing().button_padding);
+            placement = Some((
+                response.rect,
+                inner.top(),
+                inner.top() + button_caption_baseline(ui, primary_size, inner.height()),
+            ));
+        });
+
+        let (button, text_area_top, expected_baseline) = placement?;
+        let mut captions = output.shapes.iter().filter_map(|clipped| match &clipped.shape {
+            Shape::Text(text) => Some((text, clipped.clip_rect)),
+            Shape::Noop
+            | Shape::Vec(_)
+            | Shape::Circle(_)
+            | Shape::Ellipse(_)
+            | Shape::LineSegment { .. }
+            | Shape::Path(_)
+            | Shape::Rect(_)
+            | Shape::Mesh(_)
+            | Shape::QuadraticBezier(_)
+            | Shape::CubicBezier(_)
+            | Shape::Callback(_) => None,
+        });
+        let (text, clip) = captions.next()?;
+        if captions.next().is_some() {
+            return None;
+        }
+        let face_ascent = galley_baseline(&text.galley)?;
+        Some(PaintedCaption {
+            button,
+            text_area_top,
+            expected_baseline,
+            painted_baseline: text.pos.y + face_ascent,
+            face_ascent,
+            clip,
+        })
+    }
+
+    #[test]
+    fn searchable_combo_button_paints_its_caption_on_one_baseline_and_clips_the_whole_button() {
+        // The defect the user saw, pinned at the PAINT level rather than at the helper: the
+        // closed button used to centre its caption galley by its BOX and clip it to the padded
+        // text area. epaint puts a galley's baseline at the FACE's own ascent and a pinned
+        // `TextFormat::line_height` leaves all the surplus BELOW it, so box placement made the
+        // caption ride up against the button's top edge by a different amount for every face —
+        // and the short clip then cut what was left, top and bottom, for every face alike.
+        let ctx = context_with_decorative_face(1.6);
+        let interface = draw_button_caption_once(&ctx, FontFamily::Proportional);
+        let decorative = draw_button_caption_once(&ctx, FontFamily::Name("decorative".into()));
+        let (Some(interface), Some(decorative)) = (interface, decorative) else {
+            panic!("the closed button must paint exactly one caption for each face");
+        };
+
+        // The two faces really do disagree about their own ascent, which is the whole reason a
+        // box placement could not work — without this the rest would pass vacuously.
+        assert!(
+            (interface.face_ascent - decorative.face_ascent).abs() > 1.0,
+            "the decorative face must have a different ascent for this test to mean anything"
+        );
+        // Both captions land on the ONE baseline the widget computes from the interface font.
+        assert!((interface.painted_baseline - interface.expected_baseline).abs() < 1e-3);
+        assert!((decorative.painted_baseline - decorative.expected_baseline).abs() < 1e-3);
+        assert!((interface.painted_baseline - decorative.painted_baseline).abs() < 1e-3);
+
+        // The caption is clipped to the FULL button vertically, not to the padded text area, so
+        // the band the button reserved is never shaved at either edge.
+        for painted in [interface, decorative] {
+            assert!(painted.clip.top() <= painted.button.top() + 1e-3);
+            assert!(painted.clip.bottom() >= painted.button.bottom() - 1e-3);
+            // Which is strictly more than the area the caption is laid out in: the padding is
+            // real, and clipping to it is what cut the top of tall faces.
+            assert!(painted.clip.top() < painted.text_area_top);
+        }
+    }
+
+    #[test]
+    fn searchable_combo_button_height_keeps_the_line_band_inside_its_padding() {
+        // The second half of the same defect: the button reserved the bare line height, but
+        // painted its caption inside `rect.shrink2(button_padding)` — a text area SHORTER than
+        // the band, which cut the caption by `button_padding.y` at the top and at the bottom of
+        // every font. The height must carry that padding around the band.
+        let ctx = egui::Context::default();
+        let mut measured: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+            let spacing = ui.spacing();
+            let (padding, icon_width, interact) = (
+                spacing.button_padding.y,
+                spacing.icon_width,
+                spacing.interact_size.y,
+            );
+            // A band the icon dominates, the widget's own default (14 x 1.6), and a band far
+            // taller than every floor.
+            for line_height in [1.0_f32, primary_line_height(DEFAULT_PRIMARY_SIZE), 64.0] {
+                measured.push((
+                    line_height,
+                    button_row_height(ui, line_height),
+                    padding,
+                    icon_width,
+                    interact,
+                ));
+            }
+        }));
+        assert_eq!(measured.len(), 3, "every band must be measured");
+        for (line_height, height, padding, icon_width, interact) in measured {
+            // The whole content band fits inside the padded text area the caption is drawn in.
+            let text_area = height - 2.0 * padding;
+            assert!(
+                text_area >= line_height.max(icon_width) - 1e-4,
+                "band {line_height} does not fit in a text area of {text_area}"
+            );
+            // Both floors still apply: the minimum interactive height...
+            assert!(height >= interact - 1e-4);
+            // ...and, for a band no taller than the drop-down icon, the icon plus its padding.
+            if line_height <= icon_width {
+                assert!(((icon_width + 2.0 * padding).max(interact) - height).abs() < 1e-4);
+            }
+        }
     }
 
     #[test]

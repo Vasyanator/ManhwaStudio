@@ -173,13 +173,16 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   height would misplace every row after the first odd one, and a conditional second line would
   make the list jump as filtering changes which rows are shown; the height is pinned through
   `TextFormat::line_height` rather than trusted to the row's own face, and each row's painter
-  is clipped to its rect so a tall face cannot bleed into its neighbour. Every line of every
-  row, in BOTH layouts, is its own galley that the widget positions ITSELF by BASELINE
-  (`RowBaselines::measure` + `paint_line_on_baseline`), never by its top edge: epaint places a
+  is clipped to its rect so a tall face cannot bleed into its neighbour. Every galley the
+  widget draws — each line of every row in BOTH layouts, AND the CLOSED BUTTON's caption — it
+  positions ITSELF by BASELINE (`RowBaselines::measure` / `button_caption_baseline`, then
+  `paint_line_on_baseline`), never by its top edge and never by its box: epaint places a
   galley's baseline at its own face's ascent, which is 15 pt for the interface font against
-  24 pt for a display face at the same nominal 16 pt, so top-edge painting makes a catalog's
-  ink float from row to row — which reads as uneven row heights — and pulls a `Wide` row's
-  second line off the first. A baseline is derived from the INTERFACE font's metrics at that
+  24 pt for a display face at the same nominal 16 pt, and a pinned `line_height` puts all the
+  surplus BELOW that baseline — so top-edge or box placement makes a catalog's
+  ink float from row to row — which reads as uneven row heights — pulls a `Wide` row's
+  second line off the first, and rides the button's caption up against its top edge as the
+  selected font changes. A baseline is derived from the INTERFACE font's metrics at that
   line's nominal size (`row_baseline` centres the font's line box in the band and takes its
   baseline); `Tall` gives each line a band of its own (main line band, then second line band)
   and a baseline inside it, `Wide` has one text row and therefore one shared baseline, and the
@@ -188,9 +191,22 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   decides only what the main line looks like and how wide it is; ink that overflows the row is
   clipped, never accommodated. Each line is highlighted in its own galley, so search colouring
   is identical in both layouts. The closed button is identical in both layouts too: it shows the
-  selected row's MAIN line only. The open flag is a plain `bool` the widget owns, never
-  `egui::ComboBox::is_open` — see the `WheelComboBox` defect noted under "Contracts and
-  invariants". Keyboard: `Escape` drops a non-empty query AND the search row, and
+  selected row's MAIN line only. Its height (`button_row_height`, which is also the square
+  search button's side) is the content band — caption line box or drop-down icon, whichever is
+  taller — plus `Spacing::button_padding` on both edges, raised to the minimum interactive
+  height; that padding is part of the height because the caption is laid out inside
+  `rect.shrink2(button_padding)`, and the caption is clipped to the text area horizontally but
+  to the WHOLE button rect vertically, the way a row clips to its whole row rect. The BASELINE
+  RULE is what button and rows share; the padding is not. A row keeps `ROW_VERTICAL_PADDING`
+  (2 pt) around its band, the button egui's own `button_padding.y` (1 pt) — the button contract
+  that keeps the control in line with its neighbours in the typing panel — so at `primary_size`
+  14 the caption sits 17.2 pt below the button's top against a row's 18.2 pt: within a point of
+  each other, not identical. Nor does the band make a face safe. Glyph INK that rises above the
+  baseline further than the band allows is clipped by the button rect exactly as a row rect
+  clips it; what can overflow is the ink actually drawn, never the face's declared ascent — a
+  face may claim a 1.5 em ascent and put nothing near it. The open flag is a plain `bool` the
+  widget owns, never `egui::ComboBox::is_open` — see the `WheelComboBox` defect noted under
+  "Contracts and invariants". Keyboard: `Escape` drops a non-empty query AND the search row, and
   closes the popup otherwise (so at most two presses take a searching user to a closed list),
   `ArrowUp`/`ArrowDown` move inside the FILTERED list, `Enter` picks; all four are consumed
   with `InputState::consume_key` INSIDE the popup body, which runs before `Popup::show`'s own
