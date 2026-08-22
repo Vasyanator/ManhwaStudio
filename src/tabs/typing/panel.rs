@@ -152,8 +152,8 @@ use crate::tabs::typing::render_next::types::{
     VerticalLineDirection,
 };
 use crate::widgets::{
-    ColorPresets, SeedSpinBox, TextEditPlus, TextEditPlusTextColor, ViewportColorSelector,
-    WheelComboBox, WheelSlider, WheelSpinBox, random_seed,
+    ColorPresets, SeedSpinBox, TabExtras, TextEditPlus, TextEditPlusTextColor,
+    ViewportColorSelector, WheelComboBox, WheelSlider, WheelSpinBox, random_seed,
 };
 use cosmic_text::{Attrs, FontSystem, Metrics, fontdb};
 use eframe::egui;
@@ -211,7 +211,9 @@ mod create_render_data;
 mod create_presets;
 mod create_sections;
 mod create_main_text;
-use create_main_text::collapsing_param_section;
+use create_main_text::{
+    FontSectionGates, ParamSectionId, collapsing_param_section, section_flag_key,
+};
 mod create_advanced;
 mod create_edit;
 mod create_apply;

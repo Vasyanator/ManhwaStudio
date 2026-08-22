@@ -15,10 +15,17 @@ Main responsibilities:
 - own the edge detector (`font_combo_user_pick`) that decides when a font combo
   frame counts as a genuine user pick — the create AND edit panels both use it.
 
+Key structures:
+- ParamSectionId: identity + durable storage of one section (`in_tab` /
+  `not_persisted`).
+- FontSectionGates: the two conditions gating the font section.
+
 Key functions:
 - collapsing_param_section() (free fn): one collapsible section with a strong
-  title, an optional weak right-aligned summary, and a body; state persists per
-  (id_salt, preview_enabled).
+  title, an optional weak right-aligned summary, and a body; the live state is
+  egui memory keyed (id_salt, preview_enabled), the DURABLE state is the drawing
+  tab's `TabExtras` (a section outside a dock tab is `not_persisted`).
+- section_flag_key() (free fn): the `TabExtras` key of one section's flag.
 - draw_main_text_params(): builds the section list and wires the closures.
 - draw_font_section / draw_metrics_section / draw_layout_alignment_section /
   draw_shape_render_section / draw_weight_section / draw_text_processing_section:
@@ -79,6 +86,65 @@ pub(super) fn font_combo_user_pick(
     }
 }
 
+/// Identity and durable storage of one collapsible parameter section.
+///
+/// The three travel together because they are ONE decision — "which section is
+/// this, and where does its expansion state live" — and because a section that
+/// took them apart could store its flag under a key that does not match the egui
+/// id it draws with. Build it with [`ParamSectionId::in_tab`] (persisted) or
+/// [`ParamSectionId::not_persisted`] — a name that has to be typed out, because
+/// the two draw identically and only one of them remembers anything.
+#[derive(Debug)]
+pub(super) struct ParamSectionId<'a> {
+    /// Literal persistence key of the section — an i18n exclusion, never a
+    /// caption. Feeds both the egui id and [`section_flag_key`].
+    id_salt: &'static str,
+    /// The panel instance drawing the section: create = `true`, edit = `false`.
+    /// Constructor-time, not a runtime toggle, and part of BOTH keys, so the two
+    /// panels never share one section state.
+    preview_enabled: bool,
+    /// The drawing tab's durable bag, or `None` when the section has no tab to
+    /// hang state off and is therefore session-only.
+    extras: Option<&'a mut TabExtras>,
+}
+
+impl<'a> ParamSectionId<'a> {
+    /// A section drawn inside a dock tab: its expansion state is stored in that
+    /// tab's `extras` and survives a restart.
+    #[must_use]
+    pub(super) fn in_tab(
+        id_salt: &'static str,
+        preview_enabled: bool,
+        extras: &'a mut TabExtras,
+    ) -> Self {
+        Self {
+            id_salt,
+            preview_enabled,
+            extras: Some(extras),
+        }
+    }
+
+    /// A section whose expansion state is DELIBERATELY not persisted: egui
+    /// memory only, gone on restart.
+    ///
+    /// The right choice only where there is nothing to hang the state off — the
+    /// section is drawn outside any dock tab, and an `egui::Window` has no
+    /// `TabId` whose `TabExtras` could hold the flag (the advanced-form window is
+    /// the only such caller today). What is lost is exactly what
+    /// [`ParamSectionId::in_tab`] exists for: the section comes back at its
+    /// `default_open` in the next session, however the user left it. A section
+    /// drawn INSIDE a dock tab must use `in_tab` — this constructor would compile
+    /// there, draw identically and silently store nothing.
+    #[must_use]
+    pub(super) fn not_persisted(id_salt: &'static str, preview_enabled: bool) -> Self {
+        Self {
+            id_salt,
+            preview_enabled,
+            extras: None,
+        }
+    }
+}
+
 /// Draws a collapsible parameter section styled as a "header bar + left guide
 /// rule".
 ///
@@ -99,24 +165,38 @@ pub(super) fn font_combo_user_pick(
 /// header. egui's built-in indent vline is suppressed for the body so it never
 /// doubles with the guide we paint.
 ///
-/// The open/closed state persists per `(id_salt, preview_enabled)` via
+/// The LIVE open/closed state is egui memory, keyed
 /// `egui::Id::new((id_salt, preview_enabled))`, so the create and edit panels
 /// are independent and the state survives a UI-language switch (the id is
-/// language independent — see `egui-docs/05-ids-and-i18n.md`).
+/// language independent — see `egui-docs/05-ids-and-i18n.md`). That memory is
+/// session-only: this project builds eframe WITHOUT the `persistence` feature.
 ///
-/// `id_salt` is a persistence key (an i18n exclusion), not a caption; the
-/// visible `title`/`summary` are already-localized strings supplied by the
-/// caller. `add_body` paints the section contents when it is open.
+/// `section` carries the identity AND the durable storage of the state — see
+/// [`ParamSectionId`]. The visible `title`/`summary` are already-localized
+/// strings supplied by the caller; `add_body` paints the section contents when
+/// it is open.
 pub(super) fn collapsing_param_section(
     ui: &mut egui::Ui,
-    id_salt: &'static str,
-    preview_enabled: bool,
+    section: ParamSectionId<'_>,
     title: &str,
     default_open: bool,
     summary: Option<&str>,
     add_body: impl FnOnce(&mut egui::Ui),
 ) {
+    let ParamSectionId {
+        id_salt,
+        preview_enabled,
+        extras,
+    } = section;
     let id = egui::Id::new((id_salt, preview_enabled));
+    // The durable default: what the tab stored last, falling back to the caller's
+    // `default_open`. egui memory still wins WITHIN a session — `load_with_default_open`
+    // only consults this on the first frame, which is exactly the frame that has to
+    // reproduce the previous run.
+    let flag_key = section_flag_key(id_salt, preview_enabled);
+    let stored_open = extras
+        .as_ref()
+        .map_or(default_open, |extras| extras.flag(&flag_key, default_open));
 
     // Full-width horizontal extent for the header bar: the section spans the
     // panel width even though the header ROW only sizes to its own content.
@@ -131,7 +211,7 @@ pub(super) fn collapsing_param_section(
     ui.visuals_mut().indent_has_left_vline = false;
 
     let (_toggle, header_inner, body_inner) =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, stored_open)
             .show_header(ui, |ui| {
                 ui.label(egui::RichText::new(title).strong());
                 if let Some(summary) = summary {
@@ -169,20 +249,58 @@ pub(super) fn collapsing_param_section(
         ui.painter().vline(guide_x, body_rect.y_range(), guide_stroke);
     }
 
+    // Write back what the header NOW shows: `show_header(..).body(..)` stores the
+    // post-toggle state in egui memory on every path
+    // (`egui-0.35.0/src/containers/collapsing_header.rs:186,235`), so reloading it
+    // here is what the user just saw. Writing every frame is the expected usage —
+    // `set_flag` raises `changed` only on a real difference, so an untouched
+    // section never marks the dock dirty.
+    if let Some(extras) = extras {
+        let shown_open = egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
+            .map_or(stored_open, |state| state.is_open());
+        extras.set_flag(&flag_key, shown_open, default_open);
+    }
+
     ui.add_space(PARAM_SECTION_GAP_PX);
+}
+
+/// Durable key of one parameter section's expanded/collapsed flag inside its
+/// tab's [`TabExtras`].
+///
+/// `"{id_salt}#create"` / `"{id_salt}#edit"`: `preview_enabled` is the
+/// constructor-time discriminator of the two panel instances (create = `true`,
+/// edit = `false`), not a runtime toggle, so it MUST stay part of the key —
+/// without it the two panels would share one stored flag. `id_salt` is a literal
+/// persistence key, never a caption, so the result is language independent.
+#[must_use]
+pub(super) fn section_flag_key(id_salt: &str, preview_enabled: bool) -> String {
+    let panel = if preview_enabled { "create" } else { "edit" };
+    format!("{id_salt}#{panel}")
 }
 
 impl TypingCreatePanelState {
 
+    /// Draws the six main text-parameter sections plus the advanced-params
+    /// header, and reports whether anything the render depends on changed.
+    ///
+    /// `extras` is the «Параметры» dock tab's persisted state: every section
+    /// drawn here reads its expanded/collapsed flag out of it and writes back
+    /// what it shows (see [`collapsing_param_section`]). `gates` are the font
+    /// section's two conditions, passed through untouched; `stacked_columns =
+    /// false` is the dead "wide" path kept only so the file compiles.
     pub(super) fn draw_main_text_params(
         &mut self,
         ui: &mut egui::Ui,
+        extras: &mut TabExtras,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
         presets: &mut ColorPresetsBinding<'_>,
-        font_memory_enabled: bool,
-        font_missing: bool,
+        gates: FontSectionGates,
     ) -> bool {
+        let FontSectionGates {
+            memory_enabled: font_memory_enabled,
+            font_missing,
+        } = gates;
         let mut changed = false;
         let mut block_hscroll_by_hovered_param = false;
         let inline_selection = if self.preview_enabled {
@@ -233,8 +351,7 @@ impl TypingCreatePanelState {
             if stacked_columns {
                 collapsing_param_section(
                     ui,
-                    "typing.section.font",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.font", preview_enabled, extras),
                     t!("typing.params.font_label"),
                     true,
                     Some(font_summary.as_str()),
@@ -254,8 +371,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.metrics",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.metrics", preview_enabled, extras),
                     t!("typing.section.metrics"),
                     true,
                     None,
@@ -271,8 +387,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.layout",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.layout", preview_enabled, extras),
                     t!("typing.section.layout"),
                     true,
                     Some(layout_summary),
@@ -288,8 +403,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.shape",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.shape", preview_enabled, extras),
                     t!("typing.section.shape"),
                     false,
                     Some(shape_summary.as_str()),
@@ -305,8 +419,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.weight",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.weight", preview_enabled, extras),
                     t!("typing.section.weight"),
                     false,
                     None,
@@ -322,8 +435,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.text_processing",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.text_processing", preview_enabled, extras),
                     t!("typing.section.text_processing"),
                     false,
                     Some(text_processing_summary.as_str()),
@@ -345,6 +457,7 @@ impl TypingCreatePanelState {
                     ui.add_enabled_ui(!selection_mode, |ui| {
                         self.draw_advanced_text_params_section(
                             ui,
+                            extras,
                             &mut changed,
                             &mut block_hscroll_by_hovered_param,
                             "typing_advanced_text_params_right_column",
@@ -406,6 +519,7 @@ impl TypingCreatePanelState {
                     ui.add_enabled_ui(!selection_mode, |ui| {
                         self.draw_advanced_text_params_section(
                             ui,
+                            extras,
                             &mut changed,
                             &mut block_hscroll_by_hovered_param,
                             "typing_advanced_text_params_right_column",

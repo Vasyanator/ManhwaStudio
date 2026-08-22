@@ -13,7 +13,8 @@ Main responsibilities:
   panel order, and write back what the user changed.
 
 Key structures:
-- `PanelDockState`: per-program-tab layouts, last-frame measurements, dirty flag.
+- `PanelDockState`: per-program-tab layouts, last-frame measurements, per-tab
+  extra state (`extras.rs`), dirty flag.
 - `DockArea`: where the dock may place panels this frame.
 - `PanelDock`: the frame driver (`begin` → `tab(..).show(..)` → `end`).
 - `PanelDockOutput`: rects of the panels drawn this frame, each recorded with
@@ -52,6 +53,7 @@ the pointer in the window the press started in.
 
 pub mod cross_window;
 pub mod drag;
+pub mod extras;
 pub mod model;
 pub mod panel;
 pub mod persist;
@@ -67,6 +69,7 @@ use crate::runtime_log;
 
 pub use cross_window::{DropAddress, PanelDropTarget, TabLanding, WindowGeometry};
 pub use drag::{DragSession, DraggedTab, SNAP_DISTANCE, SnapCandidate, SnapTargets};
+pub use extras::TabExtras;
 pub use model::{
     DetachTabOutcome, DockEdge, DockLayout, DockModelError, HostId, MoveTabOutcome, PanelAnchor,
     PanelId, PanelNode, TabId,
@@ -143,7 +146,14 @@ pub(super) type TabTitle<'frame> = Box<dyn Fn() -> String + 'frame>;
 /// `C` is the caller's per-frame context: the body borrows nothing of its own
 /// and reaches the caller's state exclusively through the `&mut C` that `end`
 /// hands to one body at a time.
-pub(super) type TabBody<'frame, C> = Box<dyn FnOnce(&mut egui::Ui, &mut C) + 'frame>;
+///
+/// The third parameter is the tab's own [`TabExtras`] — the persisted per-tab
+/// state the dock keeps for it. Every body takes it, including the ones declared
+/// through [`PanelTab::show`](tab::PanelTab::show), which simply ignore it: the
+/// dock has to take, hand out and store the bag around EVERY body, and a second
+/// body kind would duplicate that path for no gain.
+pub(super) type TabBody<'frame, C> =
+    Box<dyn FnOnce(&mut egui::Ui, &mut C, &mut TabExtras) + 'frame>;
 
 /// One declared tab: its metadata, its title producer and its queued body.
 struct TabEntry<'frame, C> {
@@ -192,6 +202,17 @@ pub struct PanelDockState {
     /// cache. A measurement belongs to the arrangement it was taken in, exactly
     /// like the panel that holds the tab.
     measured: BTreeMap<String, HashMap<TabId, Vec2>>,
+    /// Extra per-tab UI state the dock stores and persists, scoped exactly like
+    /// [`PanelDockState::measured`]: by `AppTab::key()` first, by `TabId` second.
+    ///
+    /// The keying is the same because the reason is the same — the canvas'
+    /// «Лента» is ONE `TabId` declared by three program tabs sharing one state,
+    /// so a `TabId`-only key would leak one arrangement's state into another's.
+    /// It belongs to the STATE and not to `DockLayout` on purpose: «Сбросить
+    /// раскладку» restores the arrangement and must leave what the user expanded
+    /// inside a tab alone, and the per-frame `frame_layout` clone would otherwise
+    /// have to copy it.
+    tab_extras: BTreeMap<String, BTreeMap<TabId, TabExtras>>,
     /// Header/frame overhead the widget measured the last time any panel was
     /// drawn. It is style-dependent, so it is measured rather than assumed; one
     /// value covers every panel because they all draw the same header widget.
@@ -316,6 +337,22 @@ impl PanelDockState {
         }
     }
 
+    /// Installs the extra per-tab state restored from the user config, before
+    /// the first frame of any program tab that uses this state.
+    ///
+    /// Keyed by `AppTab::key()` and then by `TabId`, exactly like the storage it
+    /// fills. Like the layouts, it deliberately does NOT raise `dirty`: what came
+    /// from the config is not a user change, and re-writing it on the first frame
+    /// would be a write per startup.
+    pub fn install_persisted_tab_extras(
+        &mut self,
+        extras: BTreeMap<String, BTreeMap<TabId, TabExtras>>,
+    ) {
+        for (key, tabs) in extras {
+            self.tab_extras.entry(key).or_default().extend(tabs);
+        }
+    }
+
     /// Installs the sub-windows restored from the user config, before the first
     /// frame.
     ///
@@ -348,8 +385,9 @@ impl PanelDockState {
         &self.sub_windows
     }
 
-    /// Hands out a snapshot of every layout and every sub-window when the USER
-    /// changed something since the last call, clearing the dirty flag.
+    /// Hands out a snapshot of every layout, every sub-window and every tab's
+    /// extra state when the USER changed something since the last call, clearing
+    /// the dirty flag.
     ///
     /// The persistence poll: the caller passes what it gets to
     /// [`PanelLayoutWriter::store`](persist::PanelLayoutWriter::store), which
@@ -364,6 +402,7 @@ impl PanelDockState {
         Some(PanelLayoutSnapshot {
             layouts: self.layouts.clone(),
             sub_windows: self.sub_windows.clone(),
+            tab_extras: self.tab_extras.clone(),
         })
     }
 
@@ -543,6 +582,73 @@ impl PanelDockState {
             .entry(layout_key.to_owned())
             .or_default()
             .insert(tab, size);
+    }
+
+    /// Extra state stored for `tab` inside the program tab `layout_key`, if the
+    /// tab ever stored anything.
+    ///
+    /// The key is part of the question for the same reason it is part of
+    /// [`PanelDockState::measured_size`]'s: a tab declared by several program
+    /// tabs keeps one bag per arrangement.
+    #[must_use]
+    pub fn tab_extras(&self, layout_key: &str, tab: TabId) -> Option<&TabExtras> {
+        self.tab_extras.get(layout_key)?.get(&tab)
+    }
+
+    /// Takes the bag of `tab` out of the state for the duration of one body.
+    ///
+    /// The driver hands the returned value to the tab body as `&mut TabExtras`
+    /// and puts it back with [`PanelDockState::put_tab_extras`] afterwards. It is
+    /// REMOVED rather than borrowed because the body runs inside
+    /// `CollapsiblePanel::show`, where no borrow of the dock state may be alive —
+    /// the same closure still has to reach `state` for the measurement it
+    /// reports. A tab that never stored anything yields an empty bag.
+    #[must_use]
+    pub fn take_tab_extras(&mut self, layout_key: &str, tab: TabId) -> TabExtras {
+        self.tab_extras
+            .get_mut(layout_key)
+            .and_then(|tabs| tabs.remove(&tab))
+            .unwrap_or_default()
+    }
+
+    /// Puts a bag taken by [`PanelDockState::take_tab_extras`] back.
+    ///
+    /// An EMPTY bag is not stored (and drops whatever was there): every flag is
+    /// then at its default, which is precisely what persistence must not write.
+    /// Deliberately does not touch `dirty` — whether the body changed anything is
+    /// [`TabExtras::changed`]'s answer, and the driver acts on that one alone.
+    pub fn put_tab_extras(&mut self, layout_key: &str, tab: TabId, extras: TabExtras) {
+        if extras.is_empty() {
+            if let Some(tabs) = self.tab_extras.get_mut(layout_key) {
+                tabs.remove(&tab);
+            }
+            return;
+        }
+        if let Some(tabs) = self.tab_extras.get_mut(layout_key) {
+            tabs.insert(tab, extras);
+            return;
+        }
+        self.tab_extras
+            .entry(layout_key.to_owned())
+            .or_default()
+            .insert(tab, extras);
+    }
+
+    /// Stores the bag of the tab that was just DRAWN and raises `dirty` when —
+    /// and only when — the body really changed one of its flags.
+    ///
+    /// The driver's post-body step, kept out of the drawing loop so the rule is
+    /// unit-testable without a window. `dirty` is persistence's signal that the
+    /// USER changed something, so a body that merely read its extras, or wrote
+    /// back what was already stored, must leave it alone. The change flag is
+    /// bookkeeping for one frame and is cleared before the bag goes back into the
+    /// state.
+    fn finish_tab_extras(&mut self, layout_key: &str, tab: TabId, mut extras: TabExtras) {
+        if extras.changed() {
+            self.dirty = true;
+        }
+        extras.clear_changed();
+        self.put_tab_extras(layout_key, tab, extras);
     }
 
     /// Header/frame overhead measured on the last drawn frame, or the nominal
@@ -1238,6 +1344,13 @@ fn draw_host<'frame, C>(
         let force_visible = carries_tab
             || matches!(drag_phase, DragPhase::Moving { panel, .. } if panel == panel_plan.id);
         let body = entries.get_mut(&active).and_then(|entry| entry.body.take());
+        // The tab's persisted extra state is taken OUT of the dock state for the
+        // duration of the body: the closure below borrows this local, so nothing
+        // of `state` is borrowed across `CollapsiblePanel::show` — which still
+        // has to reach `state` for `remember_measurement` further down. It is
+        // handed to the DRAWN tab only, which is what makes it per-tab state
+        // rather than per-panel state.
+        let mut extras = state.take_tab_extras(layout_key, active);
         let drawn = CollapsiblePanel::new(panel_plan.id, layout_key)
             .geometry(geometry)
             .collapsed(panel_plan.collapsed)
@@ -1251,9 +1364,13 @@ fn draw_host<'frame, C>(
             .accepts_drop(owns_pointer)
             .show(ctx, |ui| {
                 if let Some(body) = body {
-                    body(ui, cx);
+                    body(ui, cx, &mut extras);
                 }
             });
+        // Back into the state, raising `dirty` only for a REAL change — see
+        // `finish_tab_extras`. Outside the `show` closure above, like every other
+        // touch of `state` in this loop.
+        state.finish_tab_extras(layout_key, active, extras);
         chrome = drawn.chrome;
 
         drawn_rects.push(drawn.rect);
@@ -4680,6 +4797,85 @@ mod tests {
             state.measurements("cleaning").unwrap_or(&no_measurements),
         );
         assert_eq!(cleaning.panels[0].assumed_size, Vec2::new(340.0, 160.0));
+    }
+
+    /// Extra per-tab state is keyed exactly like a measurement — by program tab
+    /// first — and for the same reason: the canvas' «Лента» is ONE `TabId`
+    /// declared by three program tabs sharing one dock state, so a `TabId`-only
+    /// key would show «Клининг» whatever the user expanded in «Текст».
+    #[test]
+    fn extra_tab_state_does_not_leak_into_another_program_tabs_layout() {
+        let mut state = PanelDockState::new();
+        let mut extras = state.take_tab_extras("typing", TAB_A);
+        extras.set_flag("params.font", false, true);
+        state.put_tab_extras("typing", TAB_A, extras);
+
+        assert_eq!(
+            state.tab_extras("typing", TAB_A).map(|bag| bag.flag("params.font", true)),
+            Some(false)
+        );
+        // The same tab drawn by ANOTHER program tab knows nothing about it and
+        // falls back to the caller's default.
+        assert!(state.tab_extras("cleaning", TAB_A).is_none());
+        assert!(state.take_tab_extras("cleaning", TAB_A).is_empty());
+        assert!(state.take_tab_extras("cleaning", TAB_A).flag("params.font", true));
+    }
+
+    /// `dirty` is persistence's signal that the USER changed something, and the
+    /// writer is driven off it: a body that only reads its extras — which is what
+    /// every frame of an untouched tab does — must not cause a config write.
+    #[test]
+    fn only_a_real_change_of_the_extra_tab_state_dirties_the_dock() {
+        let mut state = PanelDockState::new();
+        state.ensure_default_layout("typing", single_panel_default_layout);
+        state.clear_dirty();
+
+        // A body that only READS.
+        let extras = state.take_tab_extras("typing", TAB_A);
+        assert!(extras.flag("params.font", true));
+        state.finish_tab_extras("typing", TAB_A, extras);
+        assert!(!state.is_dirty());
+
+        // A body that really CHANGES something.
+        let mut extras = state.take_tab_extras("typing", TAB_A);
+        extras.set_flag("params.font", false, true);
+        state.finish_tab_extras("typing", TAB_A, extras);
+        assert!(state.is_dirty());
+        // …and the bookkeeping flag never reaches the stored value.
+        assert_eq!(
+            state.tab_extras("typing", TAB_A).map(TabExtras::changed),
+            Some(false)
+        );
+        state.clear_dirty();
+
+        // A body writing back what is already stored — the normal per-frame case.
+        let mut extras = state.take_tab_extras("typing", TAB_A);
+        extras.set_flag("params.font", false, true);
+        state.finish_tab_extras("typing", TAB_A, extras);
+        assert!(!state.is_dirty());
+    }
+
+    /// What came from the config is not a user change: re-writing it on the first
+    /// frame would be one config write per startup.
+    #[test]
+    fn installing_persisted_extra_tab_state_does_not_dirty_the_dock() {
+        let mut state = PanelDockState::new();
+        state.ensure_default_layout("typing", single_panel_default_layout);
+        state.clear_dirty();
+
+        let mut stored = TabExtras::default();
+        stored.set_flag("params.font", false, true);
+        state.install_persisted_tab_extras(
+            [("typing".to_owned(), [(TAB_A, stored)].into_iter().collect())]
+                .into_iter()
+                .collect(),
+        );
+
+        assert!(!state.is_dirty());
+        assert_eq!(
+            state.tab_extras("typing", TAB_A).map(|bag| bag.flag("params.font", true)),
+            Some(false)
+        );
     }
 
     /// A `PanelDockOutput` is filled by EVERY window of the dock, and a

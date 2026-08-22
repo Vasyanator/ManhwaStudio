@@ -1851,7 +1851,12 @@ impl CanvasHooks for TypingHooks<'_> {
                 .title(|| t!("typing.panel.params_tab"))
                 .min_size(TYPING_PARAMS_TAB_MIN_SIZE_PX)
                 .initial_size(TYPING_PARAMS_TAB_INITIAL_SIZE_PX)
-                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_params_tab_body(ui));
+                // The only tab of this dock declared WITH its extras: the
+                // collapsible parameter sections keep their expanded/collapsed
+                // state there, which is what makes it survive a restart.
+                .show_with_extras(|ui, cx: &mut TypingDockCx<'_>, extras| {
+                    cx.top_panel.draw_params_tab_body(ui, extras)
+                });
             dock.tab(TYPING_EFFECTS_TAB)
                 .title(|| t!("typing.panel.effects_tab"))
                 .min_size(TYPING_PARAMS_TAB_MIN_SIZE_PX)

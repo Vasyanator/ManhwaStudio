@@ -3654,8 +3654,9 @@ fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'s
     ]
 }
 
-/// Builds this studio window's panel-dock state and restores the persisted arrangement from an
-/// already loaded `user_config.json` snapshot. Performs no I/O.
+/// Builds this studio window's panel-dock state and restores the persisted arrangement — and the
+/// extra per-tab state stored beside it — from an already loaded `user_config.json` snapshot.
+/// Performs no I/O.
 ///
 /// Call once, before the first frame: a restored layout wins over a program tab's default layout,
 /// while an absent, malformed, newer or invalid stored layout silently degrades to it (every reason
@@ -3675,6 +3676,9 @@ fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
     // it has to see them.
     state.install_persisted_layouts(restored.layouts);
     state.install_persisted_sub_windows(restored.sub_windows);
+    // Extra per-tab state (what a tab body stored next to the arrangement) is
+    // independent of both: it belongs to the tab, not to the panel holding it.
+    state.install_persisted_tab_extras(restored.tab_extras);
     state
 }
 

@@ -101,17 +101,33 @@ const DEFAULT_LINE_HEIGHT_EM: f32 = 1.2;
 
 impl TypingCreatePanelState {
 
+    /// Draws the «Дополнительные параметры» header of the «Параметры» tab.
+    ///
+    /// The widget is a plain `egui::CollapsingHeader` (not
+    /// [`collapsing_param_section`]) and stays one: its look is part of the
+    /// panel. `extras` gives it the same DURABLE expansion state as the sections
+    /// around it — the stored flag becomes the header's `default_open`, and what
+    /// the header shows afterwards is written back under
+    /// [`section_flag_key`]. `id_salt` is the section's literal persistence key
+    /// (an i18n exclusion); it is paired with `self.preview_enabled` so the
+    /// create and edit panels stay independent.
     pub(super) fn draw_advanced_text_params_section(
         &mut self,
         ui: &mut egui::Ui,
+        extras: &mut TabExtras,
         changed: &mut bool,
         block_hscroll_by_hovered_param: &mut bool,
         id_salt: &'static str,
     ) {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(t!("typing.advanced.section_header")).id_salt("typing.advanced.section_header")
+        // Same durable-state contract as `collapsing_param_section`: the stored
+        // flag only SEEDS the header, egui memory wins within the session.
+        let advanced_flag_key = section_flag_key(id_salt, self.preview_enabled);
+        let advanced_default_open = false;
+        let advanced_open = extras.flag(&advanced_flag_key, advanced_default_open);
+        let advanced_response = egui::CollapsingHeader::new(t!("typing.advanced.section_header"))
             .id_salt((id_salt, self.preview_enabled))
-            .default_open(false)
+            .default_open(advanced_open)
             .show(ui, |ui| {
                 let prev_mode = self.text_line_mode;
                 let line_mode_combo = WheelComboBox::from_label(t!("typing.advanced.line_mode_combo_label")).id_salt("typing.advanced.line_mode_combo_label")
@@ -235,6 +251,26 @@ impl TypingCreatePanelState {
                     }
                 }
             });
+        // The state id is ASKED OF THE WIDGET, never re-derived: `begin` interacts
+        // with the header rect under the very id its `CollapsingState` is stored
+        // at (`egui-0.35.0/src/containers/collapsing_header.rs:513,537`, and
+        // `Response::id` at `egui-0.35.0/src/response.rs:33`). Re-deriving it with
+        // `ui.make_persistent_id` would be WRONG here: `show` runs `begin` inside
+        // its own `ui.vertical(..)` child, whose `Ui::id` carries an extra
+        // `"child"` step (`egui-0.35.0/src/ui.rs:250-256`). The state is stored on
+        // every path before `show` returns (`collapsing_header.rs:186,235`), so the
+        // reload below is exactly what the user now sees; `set_flag` ignores a
+        // write that changes nothing.
+        let advanced_shown_open = egui::collapsing_header::CollapsingState::load(
+            ui.ctx(),
+            advanced_response.header_response.id,
+        )
+        .map_or(advanced_open, |state| state.is_open());
+        extras.set_flag(
+            &advanced_flag_key,
+            advanced_shown_open,
+            advanced_default_open,
+        );
     }
 
     pub(super) fn draw_formula_layout_controls(
@@ -1976,8 +2012,11 @@ impl TypingCreatePanelState {
         let mut edited: Option<AdvancedFormParams> = None;
         collapsing_param_section(
             ui,
-            "typing.advanced.form_search_section",
-            preview_enabled,
+            // Not persisted, deliberately: this section is drawn inside the
+            // advanced-form `egui::Window`, which is not a dock tab and therefore
+            // has no `TabId` whose `TabExtras` could hold the flag. Its fold is
+            // back at `default_open` in the next session.
+            ParamSectionId::not_persisted("typing.advanced.form_search_section", preview_enabled),
             t!("typing.advanced.form_search_section"),
             false,
             None,

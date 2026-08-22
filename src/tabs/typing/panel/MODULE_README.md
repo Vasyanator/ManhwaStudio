@@ -875,12 +875,46 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   guide. A uniform `PARAM_SECTION_GAP_PX` trailing space keeps open/collapsed
   rhythm even. There is no floating panel heading above the sections anymore
   (the image-only edit panel, which is NOT sectioned, keeps its heading in
-  `facade.rs`). Section open/closed state persists per
-  `egui::Id::new((id_salt, preview_enabled))` so the create and edit panels are
-  independent and state survives a UI-language switch. The `id_salt`s are literal
-  persistence keys (i18n exclusions); titles/summaries are localized. The
-  non-stacked ("wide") layout path is dead code (both call sites pass
-  `stacked_columns = true`) kept only so the file compiles.
+  `facade.rs`). The `id_salt`s are literal persistence keys (i18n exclusions);
+  titles/summaries are localized. The non-stacked ("wide") layout path is dead
+  code (both call sites pass `stacked_columns = true`) kept only so the file
+  compiles.
+- **Section expansion state: egui memory is LIVE, `TabExtras` is DURABLE.** egui
+  memory under `egui::Id::new((id_salt, preview_enabled))` holds what the user
+  clicked and wins within the session; it dies with the process (eframe is built
+  without `persistence`). The durable copy is the `typing.params` tab's
+  `TabExtras`, persisted with the panel arrangement — see
+  `src/tabs/typing/MODULE_README.md` for the whole-tab contract and the key
+  format `section_flag_key` = `"{id_salt}#create|#edit"`. Signatures on the
+  thread (all in this directory):
+  `facade::draw_params_tab_body(ui, extras)` →
+  `create_presets::draw_create_presets_section(ui, extras)` /
+  `create_sections::draw_params_section(ui, extras, stacked_columns, remap, presets)` /
+  `create_edit::draw_edit_params_section(ui, extras, stacked_columns, remap, presets)` →
+  `create_main_text::draw_main_text_params(ui, extras, stacked_columns, remap, presets, gates: FontSectionGates)` →
+  `collapsing_param_section(ui, section: ParamSectionId<'_>, title, default_open, summary, add_body)`
+  and `create_advanced::draw_advanced_text_params_section(ui, extras, changed, block_hscroll, id_salt)`.
+  `ParamSectionId` bundles the section's identity with its storage — build it
+  with `ParamSectionId::in_tab(id_salt, preview_enabled, extras)` (persisted) or
+  `ParamSectionId::not_persisted(id_salt, preview_enabled)`, the honest answer for
+  a section drawn outside a dock tab; the only such caller is the advanced-form
+  window's «Параметры поиска» section. The second name is spelled out because the
+  two constructors DRAW identically and only `in_tab` remembers anything: a
+  section added inside the params tab that reaches for `not_persisted` loses its
+  state with no other symptom. `draw_main_text_params` passes the font
+  section's two conditions as the existing `FontSectionGates` rather than as two
+  more booleans, which also keeps both signatures inside clippy's argument limit.
+  A section READS its flag without side effects and writes back every frame; only
+  a real move marks the dock dirty, so opening the tab never rewrites the config.
+  Harvesting the shown state from a plain `egui::CollapsingHeader` must ASK THE
+  WIDGET for its id (`response.header_response.id`): `show` runs its header in
+  its own `ui.vertical(..)` child, so `Ui::make_persistent_id` on the same salt
+  yields a DIFFERENT id and would silently read nothing. `tests.rs` pins that
+  (`a_collapsing_header_stores_its_state_under_the_id_its_response_reports`)
+  along with the seed/write-back round trip, using `egui::__run_test_ui`. The
+  write-back tests pre-store a `CollapsingState` holding the OPPOSITE of the bag,
+  which is the only shape that fails when the write-back is removed; a seeding
+  test alone passes without it.
 - Bold/italic controls preserve legacy real-face behavior by default. Faux controls
   serialize their seven `text_params` keys on every render-data rebuild; parameterized
   inline tags use the renderer's `<b=...>` / `<i=...>` grammar. The geometry those

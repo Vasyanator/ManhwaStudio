@@ -15,7 +15,8 @@ Main responsibilities:
 
 Key structures:
 - `StoredSection` / `StoredTabLayout` / `StoredPanel` / `StoredAnchor` /
-  `StoredHost` / `StoredSubWindow`: the serde mirror of the section.
+  `StoredHost` / `StoredSubWindow` / `StoredTabExtras` / `StoredTabExtrasMap`:
+  the serde mirror of the section.
 - `PanelLayoutSnapshot`: what is restored and what is written, in one value, plus
   the rule two snapshots fold under (`config_saver::SaverPayload`).
 - `PanelLayoutWriter`: the handle of this section's `config_saver::ConfigSaver`.
@@ -23,7 +24,8 @@ Key structures:
 
 Key functions:
 - `layouts_from_user_settings`, `decode_layout`, `decode_sub_windows`,
-  `encode_layout`, `encode_sub_window`
+  `decode_tab_extras`, `encode_layout`, `encode_sub_window`,
+  `encode_tab_extras`
 - `persist_layouts`, `PanelLayoutWriter::store`, `PanelLayoutWriter::flush_and_join`
 
 Notes:
@@ -49,6 +51,15 @@ of the target inside that list, so a load renumbers the panels 0..n and rewrites
 the anchors onto the new ids. That keeps the file independent of whatever id
 holes a session's inserts and removals left behind.
 
+SHAPE GROWTH. A purely ADDITIVE `#[serde(default)]` field (the per-tab extras
+are the standing example) is not a shape change in the versioning sense and must
+NOT bump `PANEL_LAYOUT_SECTION_VERSION`: no struct here denies unknown fields, so
+an older build reads the section and simply ignores what it does not know, while
+a bump would make that older build refuse to WRITE the section at all
+(`NewerVersion`) and silently stop saving the user's arrangement after a
+downgrade. A bump is for a change that would be MISREAD, not for one that is
+merely unknown.
+
 FORWARD/BACKWARD COMPATIBILITY. A tab the file names but this build does not
 declare is dropped (a removed tab must not wedge the layout); a tab this build
 declares but the file does not name is re-created by the dock's own
@@ -63,6 +74,11 @@ the entire section: every program tab would silently fall back to its default
 arrangement and the first dirty write would make that permanent
 (`StoredAnchor::CanvasControls` is the standing example). Retiring such a tag for
 real means bumping the version and writing a migration, never a plain deletion.
+
+The single EXCEPTION to that monolithic decode is `tab_extras`, which has its own
+tolerant `Deserialize` (`StoredTabExtrasMap`): a malformed value there costs its
+own content and nothing else. The arrangement's policy is deliberately left
+alone — see that type's contract for why the two differ.
 */
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,6 +92,7 @@ use crate::config;
 use crate::config_saver::{self, ConfigSaver, SaverLabels};
 use crate::runtime_log;
 
+use super::extras::TabExtras;
 use super::model::{DockEdge, DockLayout, HostId, PanelAnchor, PanelId, PanelNode, TabId};
 use super::window::SubWindowNode;
 
@@ -264,11 +281,175 @@ struct StoredPanel {
     host: StoredHost,
 }
 
-/// The panel arrangement of one program tab.
+/// Extra per-tab UI state of one tab: the stored form of
+/// [`TabExtras`](super::extras::TabExtras).
+///
+/// A struct rather than a bare map so that a value kind other than a boolean can
+/// be added later as a sibling field, without touching what is already written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct StoredTabExtras {
+    /// Flags that differ from the default their caller passes in; a flag sitting
+    /// at its default is never written.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    flags: BTreeMap<String, bool>,
+}
+
+impl StoredTabExtras {
+    /// `true` when the entry carries nothing at all. Such an entry is never
+    /// produced by [`encode_tab_extras`], so an untouched arrangement's stored
+    /// form is unchanged by this field's existence.
+    fn is_empty(&self) -> bool {
+        self.flags.is_empty()
+    }
+}
+
+/// What [`StoredTabExtrasMap`] had to drop in order to decode a stored value.
+///
+/// Recorded instead of logged on the spot: a `Deserialize` implementation does
+/// not know WHICH program tab it is decoding, and a warning without that key
+/// cannot be acted on. [`decode_tab_extras`] holds the key and logs there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum ExtrasDrop {
+    /// Nothing — the field was absent, empty or fully understood.
+    #[default]
+    Nothing,
+    /// The field itself was not an object (`null`, an array, a scalar), so no
+    /// entry could be read out of it at all.
+    WholeField,
+    /// These tab keys carried something that is not a [`StoredTabExtras`].
+    Entries(Vec<String>),
+}
+
+/// The `tab_extras` field of one stored program tab: the entries that decoded,
+/// plus what had to be dropped to get them.
+///
+/// The ONE hand-decoded field of this section, deliberately so. Everything else
+/// is read by a single `from_value` over [`StoredSection`], which turns any
+/// malformed value into a failure of the WHOLE section (see the file header):
+/// the right trade for the ARRANGEMENT, whose shape nobody writes by hand, and
+/// the wrong one for a cosmetic bag of booleans — losing every panel position of
+/// every program tab, permanently on the next write, over a stray value in the
+/// one field a user is likely to edit is not a trade worth making. So a
+/// `tab_extras` that is not an object, and an entry inside it that is not a
+/// [`StoredTabExtras`], degrade to "no extras for that entry" while the rest of
+/// the section decodes normally.
+///
+/// The tolerance stops there: no other field of this file is weakened by it, and
+/// `StoredAnchor`'s monolithic policy is untouched.
+#[derive(Debug, Clone, Default)]
+struct StoredTabExtrasMap {
+    /// The entries this build could read, keyed by the `TabId` literal.
+    entries: BTreeMap<String, StoredTabExtras>,
+    /// Decode-time bookkeeping, always [`ExtrasDrop::Nothing`] on a value this
+    /// build encoded. Never serialized.
+    dropped: ExtrasDrop,
+}
+
+/// Compares the CONTENT only.
+///
+/// Hand-written for the same reason [`TabExtras`](super::extras::TabExtras)'s is:
+/// [`StoredTabExtrasMap::dropped`] says what one decode had to throw away, not
+/// what the value holds, and a derived implementation would make an
+/// encode/decode round trip compare unequal for a difference the file cannot
+/// carry.
+impl PartialEq for StoredTabExtrasMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Serialize for StoredTabExtrasMap {
+    /// Writes the ENTRIES and nothing else, byte for byte what the plain map
+    /// wrote: the drop record is decode-time bookkeeping and must never reach
+    /// the file. A field whose every entry was dropped therefore serializes as
+    /// empty and is skipped, which is how the garbage leaves the config on the
+    /// next write.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.entries.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredTabExtrasMap {
+    /// Never fails: every unusable shape degrades, see the type's contract.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        Ok(Self::from_stored_value(raw))
+    }
+}
+
+impl StoredTabExtrasMap {
+    /// Wraps an already built map — the encode side, where nothing can be
+    /// dropped.
+    #[must_use]
+    fn from_entries(entries: BTreeMap<String, StoredTabExtras>) -> Self {
+        Self {
+            entries,
+            dropped: ExtrasDrop::Nothing,
+        }
+    }
+
+    /// Decodes one stored value, keeping every entry that is understandable.
+    ///
+    /// The per-entry serde error is deliberately NOT kept: its text quotes the
+    /// offending value, and the log of a degradation must name the KEYS, not
+    /// echo the content of the user's config file. The shape a caller has to
+    /// restore is stated in the warning instead.
+    #[must_use]
+    fn from_stored_value(raw: Value) -> Self {
+        let Value::Object(map) = raw else {
+            return Self {
+                entries: BTreeMap::new(),
+                dropped: ExtrasDrop::WholeField,
+            };
+        };
+        let mut entries = BTreeMap::new();
+        let mut dropped = Vec::new();
+        for (name, value) in map {
+            match serde_json::from_value::<StoredTabExtras>(value) {
+                Ok(entry) => {
+                    entries.insert(name, entry);
+                }
+                // The error is the DECISION here, not a failure to report: its
+                // text quotes the stored value, and only the key may be logged.
+                Err(_) => dropped.push(name),
+            }
+        }
+        let dropped = if dropped.is_empty() {
+            ExtrasDrop::Nothing
+        } else {
+            ExtrasDrop::Entries(dropped)
+        };
+        Self { entries, dropped }
+    }
+
+    /// The entries that decoded.
+    #[must_use]
+    fn entries(&self) -> &BTreeMap<String, StoredTabExtras> {
+        &self.entries
+    }
+
+    /// `true` when no entry survived (or none was stored). Also the
+    /// `skip_serializing_if` predicate of the field.
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The panel arrangement of one program tab, plus the extra per-tab state of the
+/// tabs it holds.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct StoredTabLayout {
     #[serde(default)]
     panels: Vec<StoredPanel>,
+    /// Extra state, keyed by the `TabId` literal. Additive and skipped when
+    /// empty, so a config written before it existed — and one whose tabs store
+    /// nothing — keeps exactly the bytes it has today.
+    ///
+    /// The only TOLERANTLY decoded field of the section: a malformed value here
+    /// costs its own content and nothing else, see [`StoredTabExtrasMap`].
+    #[serde(default, skip_serializing_if = "StoredTabExtrasMap::is_empty")]
+    tab_extras: StoredTabExtrasMap,
 }
 
 /// The whole `PanelLayout` section.
@@ -546,6 +727,57 @@ fn decode_anchor(
     }
 }
 
+/// Rebuilds the extra per-tab state of one program tab.
+///
+/// A tab key absent from `known` is dropped with the same warning a stored PANEL
+/// tab gets, and for the same reason: a tab this build no longer declares must
+/// not keep dragging state around. An entry that carries nothing is not kept
+/// either, so the live state matches what a fresh encode would produce.
+///
+/// Deliberately independent of [`decode_layout`]'s verdict: extras are CONTENT
+/// state, not arrangement, so an unusable stored arrangement (which falls back to
+/// the default) must not also collapse what the user expanded inside a tab.
+///
+/// What [`StoredTabExtrasMap`] had to drop to read the field at all is reported
+/// here, because this is the first place that knows which program tab it
+/// belongs to.
+fn decode_tab_extras(
+    stored: &StoredTabLayout,
+    key: &str,
+    known: &BTreeMap<&'static str, TabId>,
+) -> BTreeMap<TabId, TabExtras> {
+    match &stored.tab_extras.dropped {
+        ExtrasDrop::Nothing => {}
+        ExtrasDrop::WholeField => runtime_log::log_warn(format!(
+            "[panel_dock::persist] `{key}`: the stored `tab_extras` is not an object; the extra \
+             state of every tab of this program tab is dropped, its panel arrangement is kept, \
+             and the next write removes the unusable value. Expected shape: \
+             {{\"<tab id>\": {{\"flags\": {{\"<flag>\": true}}}}}}"
+        )),
+        ExtrasDrop::Entries(names) => runtime_log::log_warn(format!(
+            "[panel_dock::persist] `{key}`: dropping the unreadable extra state stored for the \
+             tab(s) `{names}`; the panel arrangement is kept and the next write removes them. \
+             Expected shape per tab: {{\"flags\": {{\"<flag>\": true}}}}",
+            names = names.join("`, `")
+        )),
+    }
+    let mut decoded = BTreeMap::new();
+    for (name, entry) in stored.tab_extras.entries() {
+        let Some(tab) = known.get(name.as_str()).copied() else {
+            runtime_log::log_warn(format!(
+                "[panel_dock::persist] `{key}`: dropping the extra state stored for the unknown \
+                 tab `{name}`; this build does not declare it"
+            ));
+            continue;
+        };
+        if entry.is_empty() {
+            continue;
+        }
+        decoded.insert(tab, TabExtras::from_flags(entry.flags.clone()));
+    }
+    decoded
+}
+
 /// Decodes the whole section, or `None` when it must not be used.
 ///
 /// `None` means "start from the defaults": the section is absent, malformed, or
@@ -631,6 +863,7 @@ pub fn layouts_from_user_settings(
     let sub_windows = decode_sub_windows(&stored.sub_windows);
     let indices: BTreeSet<u32> = sub_windows.iter().map(|node| node.index).collect();
     let mut layouts = BTreeMap::new();
+    let mut tab_extras = BTreeMap::new();
     for (key, build) in defaults {
         let Some(entry) = stored.tabs.get(*key) else {
             continue;
@@ -639,10 +872,17 @@ pub fn layouts_from_user_settings(
         if let Some(layout) = decode_layout(entry, key, &known, &indices) {
             layouts.insert((*key).to_owned(), layout);
         }
+        // Restored even when the arrangement above was refused: see
+        // `decode_tab_extras`.
+        let extras = decode_tab_extras(entry, key, &known);
+        if !extras.is_empty() {
+            tab_extras.insert((*key).to_owned(), extras);
+        }
     }
     PanelLayoutSnapshot {
         layouts,
         sub_windows,
+        tab_extras,
     }
 }
 
@@ -663,6 +903,11 @@ pub struct PanelLayoutSnapshot {
     pub layouts: BTreeMap<String, DockLayout>,
     /// The detached windows, shared by every program tab.
     pub sub_windows: Vec<SubWindowNode>,
+    /// Extra per-tab state, keyed by `AppTab::key()` and then by `TabId` — the
+    /// same scoping the dock state itself uses. It travels with the arrangement
+    /// because it is written into the same section, but it is folded per program
+    /// tab like the layouts, never replaced wholesale like the window list.
+    pub tab_extras: BTreeMap<String, BTreeMap<TabId, TabExtras>>,
 }
 
 /// Converts one sub-window into its stored form.
@@ -675,14 +920,24 @@ fn encode_sub_window(node: &SubWindowNode) -> StoredSubWindow {
     }
 }
 
-/// Converts one live layout into its stored form.
+/// Converts one live layout, together with the extra state of the tabs it
+/// holds, into its stored form.
 ///
 /// Panels are written in list order and every `PanelAnchor::Panel` target is
 /// rewritten into that order's index, so the file never carries a `PanelId`. An
 /// anchor whose target is not in the layout — unconstructible through the model,
 /// handled because this function must be total — is stored as `Free`.
+///
+/// `extras` is that program tab's whole bag map; it is written as it is, without
+/// being filtered against the layout's tabs. A tab is not required to be in the
+/// arrangement for its state to be worth keeping — a hidden or not-yet-declared
+/// tab still owns what the user expanded in it — and the decode side already
+/// drops what this build no longer declares.
 #[must_use]
-fn encode_layout(layout: &DockLayout) -> StoredTabLayout {
+fn encode_layout(
+    layout: &DockLayout,
+    extras: &BTreeMap<TabId, TabExtras>,
+) -> StoredTabLayout {
     let positions: BTreeMap<PanelId, u32> = layout
         .panels()
         .iter()
@@ -705,7 +960,32 @@ fn encode_layout(layout: &DockLayout) -> StoredTabLayout {
             },
         })
         .collect();
-    StoredTabLayout { panels }
+    StoredTabLayout {
+        panels,
+        tab_extras: StoredTabExtrasMap::from_entries(encode_tab_extras(extras)),
+    }
+}
+
+/// Converts one program tab's extra state into its stored form, dropping every
+/// empty bag.
+///
+/// An empty bag would serialize as `"tab": {}` and grow the config file for a
+/// tab that stores nothing; `skip_serializing_if` cannot reach a map VALUE, so
+/// the filtering happens here.
+#[must_use]
+fn encode_tab_extras(extras: &BTreeMap<TabId, TabExtras>) -> BTreeMap<String, StoredTabExtras> {
+    extras
+        .iter()
+        .filter(|(_, bag)| !bag.is_empty())
+        .map(|(tab, bag)| {
+            (
+                tab.as_str().to_owned(),
+                StoredTabExtras {
+                    flags: bag.flags().clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Converts one anchor into its stored form, mapping a panel target onto its
@@ -740,9 +1020,10 @@ fn encode_anchor(anchor: PanelAnchor, positions: &BTreeMap<PanelId, u32>) -> Sto
 // Writing
 // ---------------------------------------------------------------------------------------
 
-/// Writes the layouts of the program tabs in `snapshot` and its sub-window list
-/// into the `PanelLayout` section of the config file at `path`, leaving every
-/// other program tab's entry and every other config section untouched.
+/// Writes the layouts of the program tabs in `snapshot`, the extra per-tab state
+/// of their tabs and its sub-window list into the `PanelLayout` section of the
+/// config file at `path`, leaving every other program tab's entry and every other
+/// config section untouched.
 ///
 /// The sub-window list is REPLACED rather than merged: it is global to the dock,
 /// so the snapshot that carries it is the whole truth about which windows exist.
@@ -784,8 +1065,27 @@ fn persist_layouts(path: &Path, snapshot: &PanelLayoutSnapshot) -> Result<(), Pa
             StoredSection::default()
         });
         stored.version = Some(PANEL_LAYOUT_SECTION_VERSION);
+        let no_extras = BTreeMap::new();
         for (key, layout) in &snapshot.layouts {
-            stored.tabs.insert(key.clone(), encode_layout(layout));
+            let extras = snapshot.tab_extras.get(key).unwrap_or(&no_extras);
+            stored.tabs.insert(key.clone(), encode_layout(layout, extras));
+        }
+        // A snapshot may carry the extras of a program tab it carries NO layout
+        // for, and that is not a defensive branch: a program tab whose stored
+        // arrangement this build REFUSED keeps its extras
+        // (`layouts_from_user_settings`) but gets no entry in
+        // `PanelDockState::layouts` until it is actually drawn, so a write
+        // triggered by another program tab in that session arrives here with its
+        // extras alone. Its stored panels are the user's — possibly the very ones
+        // that could not be parsed — so they are left untouched and only the
+        // extras are refreshed in place. Pinned by
+        // `an_extras_only_write_keeps_the_stored_panels_of_that_program_tab`.
+        for (key, extras) in &snapshot.tab_extras {
+            if snapshot.layouts.contains_key(key) {
+                continue;
+            }
+            stored.tabs.entry(key.clone()).or_default().tab_extras =
+                StoredTabExtrasMap::from_entries(encode_tab_extras(extras));
         }
         stored.sub_windows = snapshot.sub_windows.iter().map(encode_sub_window).collect();
         let encoded = serde_json::to_value(&stored)
@@ -815,11 +1115,19 @@ impl config_saver::SaverPayload for PanelLayoutSnapshot {
     /// windows. A second feeder would have to teach this fold how they share the
     /// list; the project deliberately does not have one.
     ///
+    /// The extra per-tab state follows the LAYOUTS' rule, not the window list's:
+    /// it is per program tab, so a key the newer snapshot does not carry keeps
+    /// whatever is still pending for it.
+    ///
     /// The same rule serves the debounce window and the retry queue, so "the
     /// last writer of a program tab wins" holds on both paths.
     fn coalesce(&mut self, newer: Self) {
         self.layouts.extend(newer.layouts);
         self.sub_windows = newer.sub_windows;
+        // Per program tab, exactly like the layouts and deliberately NOT like the
+        // window list: a key the newer snapshot says nothing about must keep the
+        // extras that are still pending for it.
+        self.tab_extras.extend(newer.tab_extras);
     }
 }
 
@@ -932,6 +1240,7 @@ mod tests {
                 .map(|(key, layout)| (key.to_owned(), layout))
                 .collect(),
             sub_windows: Vec::new(),
+            tab_extras: BTreeMap::new(),
         }
     }
 
@@ -944,7 +1253,7 @@ mod tests {
     fn section_from(layout: &DockLayout) -> Value {
         let stored = StoredSection {
             version: Some(PANEL_LAYOUT_SECTION_VERSION),
-            tabs: [("test".to_owned(), encode_layout(layout))]
+            tabs: [("test".to_owned(), encode_layout(layout, &BTreeMap::new()))]
                 .into_iter()
                 .collect(),
             sub_windows: Vec::new(),
@@ -1257,6 +1566,353 @@ mod tests {
         assert!(pending.layouts.contains_key("cleaning"));
     }
 
+    /// A bag holding every named flag away from its default — the shape a tab
+    /// body produces by writing what it currently shows.
+    fn extras_with(flags: &[(&str, bool)]) -> TabExtras {
+        let mut extras = TabExtras::default();
+        for (key, value) in flags {
+            extras.set_flag(key, *value, !*value);
+        }
+        extras
+    }
+
+    #[test]
+    fn the_extra_tab_state_survives_a_full_encode_decode_round_trip() {
+        let snapshot = PanelLayoutSnapshot {
+            layouts: [("test".to_owned(), test_default_layout())]
+                .into_iter()
+                .collect(),
+            sub_windows: Vec::new(),
+            tab_extras: [(
+                "test".to_owned(),
+                [
+                    (PARAMS, extras_with(&[("font", false), ("effects", true)])),
+                    (LAYERS, extras_with(&[("list", true)])),
+                ]
+                .into_iter()
+                .collect(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let restored = layouts_from_user_settings(
+            &user_settings_with(section_from_snapshot(&snapshot)),
+            &defaults(),
+        );
+
+        assert_eq!(restored.layouts.get("test"), Some(&test_default_layout()));
+        assert_eq!(restored.tab_extras, snapshot.tab_extras);
+    }
+
+    /// A tab this build no longer declares must not keep dragging its state
+    /// through the config, exactly like a stored panel tab it no longer knows.
+    #[test]
+    fn the_extra_state_of_an_unknown_tab_is_dropped_on_decode() {
+        let mut snapshot = snapshot_of([("test", test_default_layout())]);
+        snapshot.tab_extras.insert(
+            "test".to_owned(),
+            [(PARAMS, extras_with(&[("font", false)]))]
+                .into_iter()
+                .collect(),
+        );
+        let mut section = section_from_snapshot(&snapshot);
+        // A tab key no default layout of this build names, injected the way an
+        // older build would have written it.
+        match section
+            .get_mut("tabs")
+            .and_then(|tabs| tabs.get_mut("test"))
+            .and_then(|entry| entry.get_mut("tab_extras"))
+            .and_then(Value::as_object_mut)
+        {
+            Some(extras) => {
+                extras.insert(
+                    "test.retired".to_owned(),
+                    serde_json::json!({ "flags": { "open": true } }),
+                );
+            }
+            None => unreachable!("the fixture section carries the extras of `test`"),
+        }
+
+        let restored = layouts_from_user_settings(&user_settings_with(section), &defaults());
+
+        let extras = match restored.tab_extras.get("test") {
+            Some(extras) => extras,
+            None => unreachable!("the known tab's extras must survive"),
+        };
+        assert_eq!(extras.len(), 1);
+        assert!(extras.contains_key(&PARAMS));
+    }
+
+    /// The section of a user who stores no extra tab state must keep exactly the
+    /// bytes it has today: the new field is additive and skipped when empty,
+    /// which is also why the section version does NOT change for it.
+    #[test]
+    fn a_layout_without_extra_tab_state_writes_no_extras_at_all() {
+        let no_extras = encode_layout(&test_default_layout(), &BTreeMap::new());
+        assert!(no_extras.tab_extras.is_empty());
+
+        // An EMPTY bag is not an entry either — every flag is at its default.
+        let empty_bag = encode_layout(
+            &test_default_layout(),
+            &[(PARAMS, TabExtras::default())].into_iter().collect(),
+        );
+        assert_eq!(empty_bag, no_extras);
+
+        let json = match serde_json::to_string(&no_extras) {
+            Ok(json) => json,
+            Err(error) => unreachable!("the fixture layout serializes: {error}"),
+        };
+        assert!(!json.contains("tab_extras"), "stored layout: {json}");
+    }
+
+    #[test]
+    fn coalescing_keeps_the_last_extra_tab_state_of_every_program_tab() {
+        let mut pending = snapshot_of([("typing", test_default_layout())]);
+        pending.tab_extras.insert(
+            "typing".to_owned(),
+            [(PARAMS, extras_with(&[("font", false)]))]
+                .into_iter()
+                .collect(),
+        );
+
+        let mut cleaning = snapshot_of([("cleaning", DockLayout::new())]);
+        cleaning.tab_extras.insert(
+            "cleaning".to_owned(),
+            [(LAYERS, extras_with(&[("list", true)]))]
+                .into_iter()
+                .collect(),
+        );
+        pending.coalesce(cleaning);
+
+        let mut newer_typing = snapshot_of([("typing", test_default_layout())]);
+        newer_typing.tab_extras.insert(
+            "typing".to_owned(),
+            [(PARAMS, extras_with(&[("effects", true)]))]
+                .into_iter()
+                .collect(),
+        );
+        pending.coalesce(newer_typing);
+
+        // The newest «typing» bag wins…
+        assert_eq!(
+            pending.tab_extras.get("typing"),
+            Some(&[(PARAMS, extras_with(&[("effects", true)]))]
+                .into_iter()
+                .collect())
+        );
+        // …and the program tab the newest snapshot said nothing about keeps its
+        // pending state instead of losing it to a wholesale replacement.
+        assert_eq!(
+            pending.tab_extras.get("cleaning"),
+            Some(&[(LAYERS, extras_with(&[("list", true)]))]
+                .into_iter()
+                .collect())
+        );
+    }
+
+    /// A section whose panels are valid but whose `tab_extras` is not an object
+    /// at all — the shape a hand edit of the config leaves behind. Only the
+    /// extras may be lost; the arrangement of the SAME program tab must survive,
+    /// because the whole-section decode would otherwise reset every panel the
+    /// user ever moved and the first dirty write would make that permanent.
+    #[test]
+    fn a_malformed_tab_extras_field_keeps_the_arrangement_of_its_program_tab() {
+        for malformed in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("open"),
+        ] {
+            let section = serde_json::json!({
+                "version": PANEL_LAYOUT_SECTION_VERSION,
+                "tabs": { "test": {
+                    "panels": [
+                        { "tabs": ["test.params", "test.effects", "test.layers"],
+                          "anchor": {"kind": "free"}, "pos": [12.0, 34.0] }
+                    ],
+                    "tab_extras": malformed,
+                } },
+                "sub_windows": []
+            });
+
+            let restored = layouts_from_user_settings(&user_settings_with(section), &defaults());
+
+            let layout = match restored.layouts.get("test") {
+                Some(layout) => layout,
+                None => unreachable!("a malformed extras bag must not cost the arrangement"),
+            };
+            // The STORED arrangement, not the default one: one panel holding all
+            // three tabs, at the stored position.
+            assert_eq!(layout.panels().len(), 1);
+            assert_eq!(layout.panels()[0].pos, Pos2::new(12.0, 34.0));
+            assert!(restored.tab_extras.is_empty());
+        }
+    }
+
+    /// Malformed at the ENTRY level (a `flags` map that is not a map of booleans,
+    /// or an entry that is not an object): only that tab's bag is lost.
+    #[test]
+    fn a_malformed_extras_entry_is_dropped_and_its_siblings_survive() {
+        let section = serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "tabs": { "test": {
+                "panels": [
+                    { "tabs": ["test.params", "test.effects", "test.layers"],
+                      "anchor": {"kind": "free"} }
+                ],
+                "tab_extras": {
+                    // A flag that is not a boolean.
+                    "test.params": { "flags": { "font": "yes" } },
+                    // A `flags` slot that is not a map.
+                    "test.effects": { "flags": [] },
+                    // Intact, and the point of the test.
+                    "test.layers": { "flags": { "list": true } },
+                },
+            } },
+            "sub_windows": []
+        });
+
+        let restored = layouts_from_user_settings(&user_settings_with(section), &defaults());
+
+        assert!(restored.layouts.contains_key("test"));
+        let extras = match restored.tab_extras.get("test") {
+            Some(extras) => extras,
+            None => unreachable!("the readable entry must survive its broken siblings"),
+        };
+        assert_eq!(extras.len(), 1);
+        let layers = match extras.get(&LAYERS) {
+            Some(bag) => bag,
+            None => unreachable!("the readable entry is the one of `test.layers`"),
+        };
+        assert!(layers.flag("list", false));
+    }
+
+    /// The blast radius of a malformed bag stops at its own program tab: the
+    /// arrangement AND the extras of every other program tab decode normally.
+    #[test]
+    fn a_malformed_extras_entry_does_not_disturb_the_other_program_tabs() {
+        let two_program_tabs: [LayoutDefault<'static>; 2] = [
+            ("test", test_default_layout as fn() -> DockLayout),
+            ("other", test_default_layout as fn() -> DockLayout),
+        ];
+        let section = serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "tabs": {
+                "test": {
+                    "panels": [
+                        { "tabs": ["test.params", "test.effects", "test.layers"],
+                          "anchor": {"kind": "free"} }
+                    ],
+                    "tab_extras": 17,
+                },
+                "other": {
+                    "panels": [
+                        { "tabs": ["test.params", "test.effects", "test.layers"],
+                          "anchor": {"kind": "free"}, "pos": [50.0, 60.0] }
+                    ],
+                    "tab_extras": { "test.params": { "flags": { "font": false } } },
+                },
+            },
+            "sub_windows": []
+        });
+
+        let restored = layouts_from_user_settings(&user_settings_with(section), &two_program_tabs);
+
+        assert!(restored.layouts.contains_key("test"));
+        assert!(!restored.tab_extras.contains_key("test"));
+        let other = match restored.layouts.get("other") {
+            Some(layout) => layout,
+            None => unreachable!("the untouched program tab keeps its arrangement"),
+        };
+        assert_eq!(other.panels()[0].pos, Pos2::new(50.0, 60.0));
+        let extras = match restored.tab_extras.get("other") {
+            Some(extras) => extras,
+            None => unreachable!("the untouched program tab keeps its extras"),
+        };
+        let params = match extras.get(&PARAMS) {
+            Some(bag) => bag,
+            None => unreachable!("the untouched program tab keeps its `test.params` bag"),
+        };
+        assert!(!params.flag("font", true));
+    }
+
+    /// The converse of the tolerance above, and the reason `decode_tab_extras`
+    /// does not take `decode_layout`'s verdict: an arrangement this build refuses
+    /// (here a tab owned by two panels) falls back to the default, while the
+    /// extra state — which is tab CONTENT, not arrangement — still loads.
+    #[test]
+    fn an_invalid_stored_arrangement_still_restores_the_extra_tab_state() {
+        let section = serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "tabs": { "test": {
+                "panels": [
+                    { "tabs": ["test.params"], "anchor": {"kind": "free"} },
+                    { "tabs": ["test.params"], "anchor": {"kind": "free"} }
+                ],
+                "tab_extras": { "test.params": { "flags": { "font": false } } },
+            } },
+            "sub_windows": []
+        });
+
+        let restored = layouts_from_user_settings(&user_settings_with(section), &defaults());
+
+        assert!(
+            restored.layouts.is_empty(),
+            "the unusable arrangement must fall back to the default"
+        );
+        let extras = match restored.tab_extras.get("test") {
+            Some(extras) => extras,
+            None => unreachable!("the extras of a refused arrangement must still load"),
+        };
+        let params = match extras.get(&PARAMS) {
+            Some(bag) => bag,
+            None => unreachable!("the stored bag is the one of `test.params`"),
+        };
+        assert!(!params.flag("font", true));
+    }
+
+    /// Pins the read-modify-write branch of [`persist_layouts`] that refreshes
+    /// the extras of a program tab the snapshot carries NO layout for.
+    ///
+    /// That state is reachable, not defensive padding: a program tab whose stored
+    /// arrangement was refused keeps its extras (the test above) but gets no
+    /// entry in `PanelDockState::layouts` until it is actually drawn, so any
+    /// write triggered by another program tab in that session carries its extras
+    /// alone. The stored panels are the user's — possibly the very ones this
+    /// build could not parse — and must survive the write untouched.
+    #[test]
+    fn an_extras_only_write_keeps_the_stored_panels_of_that_program_tab() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        let on_disk = user_settings_with(section_from(&test_default_layout()));
+        std::fs::write(&path, serde_json::to_string_pretty(&on_disk)?)?;
+        let stored_panels = on_disk
+            .pointer("/PanelLayout/tabs/test/panels")
+            .cloned();
+        assert!(stored_panels.is_some(), "the fixture writes panels for `test`");
+
+        let mut snapshot = PanelLayoutSnapshot::default();
+        snapshot.tab_extras.insert(
+            "test".to_owned(),
+            [(PARAMS, extras_with(&[("font", false)]))]
+                .into_iter()
+                .collect(),
+        );
+        persist_layouts(&path, &snapshot)?;
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(
+            written.pointer("/PanelLayout/tabs/test/panels").cloned(),
+            stored_panels,
+            "an extras-only write must not touch the stored arrangement"
+        );
+        assert_eq!(
+            written.pointer("/PanelLayout/tabs/test/tab_extras").cloned(),
+            Some(serde_json::json!({ "test.params": { "flags": { "font": false } } })),
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_shipped_defaults_carry_the_current_section_version() {
         let defaults = config::user_config_defaults();
@@ -1292,7 +1948,11 @@ mod tests {
             tabs: snapshot
                 .layouts
                 .iter()
-                .map(|(key, layout)| (key.clone(), encode_layout(layout)))
+                .map(|(key, layout)| {
+                    let no_extras = BTreeMap::new();
+                    let extras = snapshot.tab_extras.get(key).unwrap_or(&no_extras);
+                    (key.clone(), encode_layout(layout, extras))
+                })
                 .collect(),
             sub_windows: snapshot.sub_windows.iter().map(encode_sub_window).collect(),
         };
@@ -1313,6 +1973,7 @@ mod tests {
                 Some(Pos2::new(240.0, 120.0)),
                 Vec2::new(420.0, 560.0),
             )],
+            tab_extras: BTreeMap::new(),
         };
         let restored = layouts_from_user_settings(
             &user_settings_with(section_from_snapshot(&snapshot)),
@@ -1351,6 +2012,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             sub_windows: vec![SubWindowNode::new(1, None, Vec2::new(420.0, 560.0))],
+            tab_extras: BTreeMap::new(),
         };
         let restored = layouts_from_user_settings(
             &user_settings_with(section_from_snapshot(&snapshot)),
@@ -1368,6 +2030,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             sub_windows: Vec::new(),
+            tab_extras: BTreeMap::new(),
         };
         let section = section_from_snapshot(&snapshot);
         snapshot.sub_windows.clear();
@@ -1872,7 +2535,7 @@ mod tests {
             tabs: restored
                 .layouts
                 .iter()
-                .map(|(key, layout)| (key.clone(), encode_layout(layout)))
+                .map(|(key, layout)| (key.clone(), encode_layout(layout, &BTreeMap::new())))
                 .collect(),
             sub_windows: restored.sub_windows.iter().map(encode_sub_window).collect(),
         }) {

@@ -132,14 +132,24 @@ impl TypingTopPanelState {
     /// IMAGE layer — only its transform, because a foreign picture has no text
     /// parameters. A settled edit emits the re-render request itself: the panel
     /// that changed is the one that knows something changed.
-    pub(in crate::tabs::typing) fn draw_params_tab_body(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// `extras` is the tab's own persisted state, handed in by the dock (the tab
+    /// is declared with `PanelTab::show_with_extras`). It carries the
+    /// expanded/collapsed flag of every collapsible section drawn below, which is
+    /// how that state survives a restart — egui memory alone cannot, this build
+    /// compiles eframe without the `persistence` feature.
+    pub(in crate::tabs::typing) fn draw_params_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        extras: &mut TabExtras,
+    ) {
         self.active_main_tab = TypingMainTab::Parameters;
         // Для image-оверлея вкладка «Параметры» показывает только трансформацию, но вкладка
         // «Эффекты» доступна так же, как для текста — эффекты применяются к сторонней картинке.
         let image_edit_only = self.mode == TypingTopPanelMode::EditText
             && self.edit_overlay_kind == Some(TypingOverlayKind::Image);
         if self.mode == TypingTopPanelMode::CreateText {
-            self.create_panel.draw_create_presets_section(ui);
+            self.create_panel.draw_create_presets_section(ui, extras);
             ui.add_space(6.0);
         }
         // The text-params panel is grouped into labelled collapsible sections, so a
@@ -166,7 +176,7 @@ impl TypingTopPanelState {
                     TypingTopPanelMode::CreateText => {
                         self.create_panel.clamp_face_index();
                         self.create_panel
-                            .draw_params_section(ui, true, false, &mut presets);
+                            .draw_params_section(ui, extras, true, false, &mut presets);
                     }
                     TypingTopPanelMode::EditText => {
                         if image_edit_only {
@@ -176,6 +186,7 @@ impl TypingTopPanelState {
                         } else {
                             changed |= self.edit_panel.draw_edit_params_section(
                                 ui,
+                                extras,
                                 true,
                                 false,
                                 &mut presets,

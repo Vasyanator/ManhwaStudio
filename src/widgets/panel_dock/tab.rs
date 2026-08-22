@@ -17,11 +17,14 @@ Key structures:
 
 Key functions:
 - `PanelTab::title`, `visible`, `transparent_until_hover`, `min_size`,
-  `initial_size`, `show`.
+  `initial_size`, `show`, `show_with_extras`.
 
 Notes:
-`show` does NOT draw. It stores `Box<dyn FnOnce(&mut Ui, &mut C) + 'frame>` in
-the dock, which runs it from `PanelDock::end` in panel order. The body captures
+`show` does NOT draw. It stores `Box<dyn FnOnce(&mut Ui, &mut C, &mut TabExtras)
++ 'frame>` in the dock, which runs it from `PanelDock::end` in panel order. A
+body declared through `show` never sees the third argument — `show_with_extras`
+is the declaration for a tab that wants the persisted per-tab state the dock
+keeps for it. The body captures
 none of the caller's state: it receives the caller's per-frame context `C`, which
 `end` lends to one body at a time. That is what lets every tab of one frame reach
 the same heavy caller state without cloning it or wrapping it in a `RefCell`.
@@ -29,6 +32,7 @@ the same heavy caller state without cloning it or wrapping it in a `RefCell`.
 
 use egui::Vec2;
 
+use super::extras::TabExtras;
 use super::model::TabId;
 use super::{PanelDock, TabMeta, TabTitle};
 
@@ -145,7 +149,30 @@ impl<'dock, 'ctx, 'frame, C> PanelTab<'dock, 'ctx, 'frame, C> {
     /// keeps the FIRST declaration and drops this one (with a warning): a
     /// duplicate is a programming error, and silently letting the second
     /// declaration win would make which body runs depend on call order.
+    ///
+    /// A tab that needs the persisted per-tab state the dock keeps for it
+    /// declares its body through [`PanelTab::show_with_extras`] instead.
     pub fn show(self, body: impl FnOnce(&mut egui::Ui, &mut C) + 'frame) {
+        self.show_with_extras(move |ui, cx, _extras| body(ui, cx));
+    }
+
+    /// Queues the tab's body WITH its [`TabExtras`] and ends the declaration.
+    ///
+    /// Identical to [`PanelTab::show`] in every respect but the third argument:
+    /// the bag of extra per-tab state the dock stores for this tab, in this
+    /// program tab, and persists in the `PanelLayout` section of the config next
+    /// to the arrangement. Read it with [`TabExtras::flag`] and write what the
+    /// body currently shows with [`TabExtras::set_flag`] — writing every frame is
+    /// the expected usage, and only a value that really moved marks the dock
+    /// dirty.
+    ///
+    /// The bag is handed to the DRAWN tab of a drawn, expanded panel — the same
+    /// condition under which the body runs at all — so a tab that is hidden, not
+    /// the active one, or collapsed simply keeps whatever it stored last.
+    pub fn show_with_extras(
+        self,
+        body: impl FnOnce(&mut egui::Ui, &mut C, &mut TabExtras) + 'frame,
+    ) {
         let Self {
             dock,
             id,

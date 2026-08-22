@@ -193,7 +193,16 @@ pub(super) fn font_combo_button_width(ui: &egui::Ui, label: &str, reserved: f32)
 }
 
 impl TypingCreatePanelState {
-    pub(super) fn draw_create_presets_section(&mut self, ui: &mut egui::Ui) {
+    /// Draws the create-only presets section of the «Параметры» dock tab.
+    ///
+    /// `extras` is that tab's persisted state; the section's expanded/collapsed
+    /// flag lives in it (see [`collapsing_param_section`]). Draws nothing on the
+    /// edit panel.
+    pub(super) fn draw_create_presets_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        extras: &mut TabExtras,
+    ) {
         if !self.preview_enabled {
             return;
         }
@@ -206,8 +215,7 @@ impl TypingCreatePanelState {
             .unwrap_or_else(|| text_preset_none_label().to_string());
         collapsing_param_section(
             ui,
-            "typing.section.presets",
-            preview_enabled,
+            ParamSectionId::in_tab("typing.section.presets", preview_enabled, extras),
             t!("typing.presets.section_heading"),
             false,
             Some(preset_summary.as_str()),

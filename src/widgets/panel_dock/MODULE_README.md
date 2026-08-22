@@ -24,6 +24,13 @@ three program tabs that share one state, and a global entry made the width the u
 in «Текст» size the «Клининг» panel — which pins no `size_override` and therefore takes its size
 straight from that cache.
 
+The dock also keeps an EXTRA-STATE bag per tab (`PanelDockState::tab_extras`, `extras.rs`): named
+boolean flags that belong to a TAB rather than to a panel, are handed to the tab's body while it
+draws and are persisted in the same `PanelLayout` section as the arrangement. It exists because
+this project builds eframe WITHOUT the `persistence` feature, so egui memory reaches no disk and a
+tab cannot remember anything on its own. First consumer: which collapsible sections of the typing
+tab's «Параметры» are expanded.
+
 ## Architecture
 Three layers, the lower two free of GUI state:
 
@@ -98,7 +105,10 @@ dock.tab(TYPING_LAYERS_TAB)
 let out = dock.end(&mut cx);                                  // solve + draw + write-back
 ```
 
-`show` stores `Box<dyn FnOnce(&mut Ui, &mut C) + 'frame>` and `end(cx)` runs it. A body captures
+`show` stores `Box<dyn FnOnce(&mut Ui, &mut C, &mut TabExtras) + 'frame>` and `end(cx)` runs it. A
+tab that wants the third argument — its own persisted extra state — declares its body with
+`show_with_extras` instead; `show` is the same declaration with that argument ignored, so no
+existing call site is affected. A body captures
 NOTHING of the caller: it receives the caller's per-frame context `C`, which `end` lends to one
 body at a time. That is the point. Capturing borrows directly would only work while no two tabs
 needed the same state, and the typing tab breaks that immediately — its preview, params, effects
@@ -134,6 +144,9 @@ the `id_salt`-revision hack in the old typing panels. Sizes live in `PanelNode::
   `solve()`, `SolvedPanel`, `SolvedLayout`, the per-chain shrink (`ChainContext`), and the layout
   constants `DOCK_GAP`, `COLLAPSED_PANEL_HEIGHT`, `PANEL_MIN_CONTENT_HEIGHT`, `PANEL_MIN_WIDTH`,
   `PANEL_MIN_BODY_HEIGHT`, `DEFAULT_PANEL_SIZE`.
+- `extras.rs`: `TabExtras` — the per-tab bag of named boolean flags the dock stores and persists.
+  Pure like `model.rs` / `solver.rs`: no egui type, no I/O, unit-testable. Edit it to change what a
+  bag may hold or what counts as a change.
 - `tab.rs`: widget #1, `PanelTab` — the per-frame declaration builder returned by `PanelDock::tab`.
 - `panel.rs`: widget #2, `CollapsiblePanel` — draws ONE panel (header strip, active tab's body,
   resize grip, header drag handle, tab drop zone, and the two context menus) and reports what the
@@ -509,7 +522,8 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
   written even then is logged as lost, never dropped silently.
 * **Restore beats default.** `install_persisted_layouts` runs before the first frame, so
   `ensure_default_layout` finds the key taken and never builds over it. Restoring does not raise
-  `dirty` — the config is not a user change.
+  `dirty` — the config is not a user change. The same holds for
+  `install_persisted_tab_extras`, which the same call site feeds from the same snapshot.
 * **A retired stored tag must keep DECODING.** `StoredAnchor` is internally tagged
   (`tag = "kind"`) and carries no `#[serde(other)]`, and the whole section is decoded by ONE
   `serde_json::from_value`, so a tag this build does not know fails the ENTIRE section: every
@@ -529,6 +543,48 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
   version all degrade to the default arrangement, and a newer section is additionally never
   overwritten. `PanelId`s are not stored at all: panels are written in order and an anchor target
   is that order's index, so a load renumbers them and rewrites the anchors.
+
+**Extra tab state in the file.** A program tab's entry carries a `tab_extras` map next to its
+`panels`: `TabId` literal -> `{ "flags": { "<key>": <bool> } }`. Seven rules:
+
+* **Only what differs from its default is written.** `TabExtras::set_flag` takes the default with
+  the value and REMOVES the entry when the two agree, so a section belonging to a user who touched
+  nothing is byte-identical to what an older build wrote — `tab_extras` and `flags` both carry
+  `skip_serializing_if`, and an empty bag is dropped before encoding (`skip_serializing_if` cannot
+  reach a map VALUE). This is what a body written the intended way produces: it writes what it
+  currently shows on EVERY frame, so any other rule would dirty the config on the first frame of
+  every session.
+* **The field is additive, and that is NOT a section-version change.** No struct here denies unknown
+  fields, so an older build reads the section and ignores what it does not know. Bumping
+  `PANEL_LAYOUT_SECTION_VERSION` would instead make that older build refuse to WRITE the section at
+  all (`NewerVersion`) and silently stop saving arrangements after a downgrade. Bump the version for
+  a change that would be MISREAD, never for one that is merely unknown.
+* **The snapshot folds it per program tab**, like `layouts` and deliberately unlike `sub_windows`:
+  it is per-key state, so `SaverPayload::coalesce` extends the map instead of replacing it.
+* **A stored key this build no longer declares is dropped** on decode, resolved against the same
+  `known_tabs` set the stored panels are. Decoding is otherwise INDEPENDENT of the arrangement's
+  verdict: extras are content state, so an unusable stored layout falls back to the default
+  arrangement without also collapsing what the user expanded inside a tab.
+* **This is the one TOLERANTLY decoded field of the section.** `StoredTabExtrasMap` has its own
+  `Deserialize`: a `tab_extras` that is not an object, and an entry inside it that is not
+  `{ "flags": { … } }`, degrade to "no extras for that entry" (logged once per program tab, naming
+  the tab ids and never the stored values) while everything else decodes normally, and the next
+  write removes the unusable value. Everywhere else the monolithic decode stands — losing every
+  panel position of every program tab over a stray value in a cosmetic bag of booleans is not a
+  trade worth making, and the same reasoning does NOT extend to the arrangement, whose shape nobody
+  edits by hand.
+* **Compatibility is on READ, not on round trip — accepted.** An older build reads a file carrying
+  `tab_extras` without trouble, but the first time it WRITES that program tab it drops the field:
+  the writer replaces the whole per-tab entry rather than merging into it. The cost to a user who
+  moves between builds is that the collapsible sections of that program tab's tabs come back at
+  their defaults once; the arrangement itself is unaffected. Accepted deliberately — the alternative
+  is a merge policy in a writer whose simplicity is what makes "the last writer of a program tab
+  wins" checkable.
+* **A panic inside a tab body loses that tab's extras for the frame** — the driver's take / run /
+  put-back around `TabExtras` is not an unwind guard, so a body that panics never reaches
+  `finish_tab_extras`. Harmless HERE and only here: a panic on the GUI thread is fatal for this
+  application, so there is no next frame to be inconsistent with. Do not carry that assumption into
+  a context that catches unwinds.
 
 **Sub-windows in the file.** They live in the section's own `sub_windows` list (`index`, outer
 `pos` — absent where the platform does not report one — and inner `size`), and a panel addresses
@@ -550,7 +606,10 @@ either keep undecoded keys addressable or move the window list under the per-key
 program tab's default layout. `PanelDockState`
 keeps the `fn() -> DockLayout` every caller passes to `ensure_default_layout` precisely so it can
 rebuild one without routing the request back through the caller; that is also why the builder is a
-plain `fn` and not a closure.
+plain `fn` and not a closure. It restores the ARRANGEMENT only: the extra per-tab state lives in the
+state and not in `DockLayout`, so «Сбросить раскладку» deliberately leaves the sections the user
+expanded inside a tab expanded. Where a panel sits is arrangement; what is unfolded inside it is
+content.
 
 ## Contracts and invariants
 - **Both widgets are mandatory.** Every floating panel of the studio is built from
@@ -569,10 +628,28 @@ plain `fn` and not a closure.
   every field the bodies touch — that is what makes the deferred API compile at the call site. A
   lent-in parameter (`TypingDrawParams::panel_dock`) satisfies this by construction, since it is
   disjoint from the callee's `self`.
-- **Tab bodies reach caller state only through `C`.** A body is `FnOnce(&mut Ui, &mut C)`; `end`
+- **Tab bodies reach caller state only through `C`.** A body is
+  `FnOnce(&mut Ui, &mut C, &mut TabExtras)`; `end`
   hands it the context and runs it, one body at a time. Bodies must not capture caller state
   directly — several tabs of one frame legitimately need the same `&mut`, which no set of captured
   borrows can express.
+- **Extra tab state is keyed by program tab FIRST, exactly like a measurement.**
+  `PanelDockState::tab_extras` is `AppTab::key()` -> `TabId` -> `TabExtras`, never `TabId` alone: the
+  canvas' «Лента» is ONE tab id declared by three program tabs that share one dock state, so a
+  global entry would show «Клининг» whatever the user unfolded in «Текст». The bag is TAKEN out of
+  the state for the duration of the body and put back afterwards (`take_tab_extras` /
+  `finish_tab_extras`), because the body runs inside `CollapsiblePanel::show`, where no borrow of the
+  dock state may be alive — the same closure's caller still has to reach `state` for the measurement
+  it reports. It is delivered to the DRAWN tab of a drawn, expanded panel only, which is exactly when
+  a body runs at all.
+- **Extra tab state belongs to the STATE, not to `DockLayout`.** It is not part of the arrangement:
+  «Сбросить раскладку» must not fold the user's sections back up, and `frame_layout` clones a layout
+  every frame.
+- **A body that only READS its extras changes nothing.** `TabExtras::set_flag` raises
+  `TabExtras::changed` only when the stored content really moves, and the driver raises `dirty` from
+  that flag alone. The expected caller writes what it currently shows on every frame, so any weaker
+  rule would make the persistence writer fire once per session start — and `dirty` means the USER
+  changed something.
 - **The solver is a pure function.** `solve()` holds no egui state, performs no I/O and no logging,
   and has no interior mutability. Same inputs => same output, always.
 - **No egui runtime types below `mod.rs`.** `Pos2` / `Vec2` / `Rect` are used as plain geometry;
@@ -812,7 +889,17 @@ plain `fn` and not a closure.
   exactly how the drawn panel starts overflowing its solved rect again.
 - To change what is stored, how a stored layout is repaired, or when it is written, edit
   `persist.rs`; bump `PANEL_LAYOUT_SECTION_VERSION` for a shape change and keep
-  `config::user_config_defaults()` — which reads the constant — in step.
+  `config::user_config_defaults()` — which reads the constant — in step. A purely ADDITIVE
+  `#[serde(default)]` field is NOT a shape change in that sense and must not bump the version:
+  nothing here denies unknown fields, so an older build ignores it, whereas a bump makes that build
+  refuse to write the section at all and lose layout saving on a downgrade (see «Extra tab state in
+  the file»).
+- To change what a tab may store between sessions, edit `extras.rs` (`TabExtras` — what a bag holds
+  and what counts as a change), `PanelDockState::take_tab_extras` / `finish_tab_extras` /
+  `install_persisted_tab_extras` in `mod.rs` (when it is handed out, when it dirties the dock, how it
+  is restored) and `StoredTabExtras` / `StoredTabExtrasMap` / `decode_tab_extras` /
+  `encode_tab_extras` in `persist.rs` (how it is written, and how a malformed stored value
+  degrades). To let a tab READ it, declare that tab's body with `PanelTab::show_with_extras`.
 - To change where a drop that crossed a window border goes — how a monitor coordinate is built,
   which window claims an overlapped point, what a tab or a panel lands on inside the receiving
   window — edit `cross_window.rs`; every rule there is a pure function with a test. To change how

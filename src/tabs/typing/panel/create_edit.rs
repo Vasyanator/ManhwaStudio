@@ -34,10 +34,12 @@ impl TypingCreatePanelState {
 
     /// Draws the edit panel's parameters for the selected layer and reports whether
     /// anything changed. `presets` is the color-preset set its color swatches offer
-    /// (see [`ColorPresetsBinding`]).
+    /// (see [`ColorPresetsBinding`]); `extras` is the «Параметры» dock tab's
+    /// persisted state, which holds the sections' expanded/collapsed flags.
     pub(super) fn draw_edit_params_section(
         &mut self,
         ui: &mut egui::Ui,
+        extras: &mut TabExtras,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
         presets: &mut ColorPresetsBinding<'_>,
@@ -77,8 +79,7 @@ impl TypingCreatePanelState {
                 );
                 collapsing_param_section(
                     ui,
-                    "typing.section.layer",
-                    preview_enabled,
+                    ParamSectionId::in_tab("typing.section.layer", preview_enabled, extras),
                     t!("typing.section.layer"),
                     true,
                     Some(layer_summary.as_str()),
@@ -129,11 +130,16 @@ impl TypingCreatePanelState {
                 ui.separator();
                 changed |= self.draw_main_text_params(
                     ui,
+                    extras,
                     true,
                     remap_wheel_to_horizontal,
                     presets,
-                    false,
-                    font_missing,
+                    // The edit panel never consults the per-font parameter memory:
+                    // the layer's own stored params are the truth here.
+                    FontSectionGates {
+                        memory_enabled: false,
+                        font_missing,
+                    },
                 );
                 if selection_mode {
                     ui.add_space(4.0);
@@ -986,6 +992,7 @@ impl TypingCreatePanelState {
 
                                         self.draw_advanced_text_params_section(
                                             ui,
+                                            extras,
                                             &mut changed,
                                             &mut block_hscroll_by_hovered_param,
                                             "typing_advanced_text_params_edit_columns",

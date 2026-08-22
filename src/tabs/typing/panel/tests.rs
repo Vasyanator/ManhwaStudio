@@ -5889,3 +5889,313 @@ paths change.
         );
         assert_eq!(written, vec!["newer", "newest", "live"]);
     }
+
+    #[test]
+    fn section_flag_key_separates_the_create_and_edit_panels() {
+        let create = section_flag_key("typing.section.font", true);
+        let edit = section_flag_key("typing.section.font", false);
+
+        assert_ne!(
+            create, edit,
+            "the two panel instances must not share one stored flag"
+        );
+        assert_eq!(create, "typing.section.font#create");
+        assert_eq!(edit, "typing.section.font#edit");
+        // Deterministic: the same inputs must address the same stored flag on
+        // every frame and in every session, or the state would not survive.
+        assert_eq!(create, section_flag_key("typing.section.font", true));
+    }
+
+    /// A SPOT CHECK over the salts that existed when it was written, not a
+    /// completeness guarantee: nothing forces a section added later into this
+    /// list, so a green run here does not prove that every drawn section has its
+    /// own slot. Add the salt of any new persisted section by hand.
+    #[test]
+    fn section_flag_keys_of_different_sections_never_collide() {
+        let salts = [
+            "typing.section.font",
+            "typing.section.metrics",
+            "typing.section.layout",
+            "typing.section.shape",
+            "typing.section.weight",
+            "typing.section.text_processing",
+            "typing.section.presets",
+            "typing.section.layer",
+            "typing_advanced_text_params_right_column",
+        ];
+        let mut keys: Vec<String> = salts
+            .iter()
+            .flat_map(|salt| [section_flag_key(salt, true), section_flag_key(salt, false)])
+            .collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+
+        assert_eq!(keys.len(), total, "every drawn section needs its own slot");
+    }
+
+    #[test]
+    fn a_section_flag_round_trips_through_the_tab_extras_bag() {
+        let key = section_flag_key("typing.section.shape", true);
+        let mut extras = TabExtras::default();
+
+        // A section the user expanded away from its `default_open = false`.
+        extras.set_flag(&key, true, false);
+        assert!(extras.changed(), "a real deviation must dirty the dock");
+        assert!(extras.flag(&key, false));
+        // The edit panel's section of the same name is untouched by it.
+        assert!(!extras.flag(&section_flag_key("typing.section.shape", false), false));
+
+        // Collapsing it again returns the flag to its default, which leaves no
+        // trace in the config file.
+        extras.set_flag(&key, false, false);
+        assert!(extras.is_empty(), "a default-valued flag must not be stored");
+        assert!(!extras.flag(&key, false));
+    }
+
+    /// Runs the widget for ONE headless frame with egui's own test helper
+    /// (`egui-0.35.0/src/lib.rs:682`). No input is synthesized: the point is the
+    /// state plumbing (what the section reads, what it stores), not clicking.
+    #[test]
+    fn a_stored_flag_reopens_a_param_section_whose_default_is_closed() {
+        let key = section_flag_key("typing.section.shape", true);
+        let mut extras = TabExtras::default();
+        extras.set_flag(&key, true, false);
+        extras.clear_changed();
+
+        let mut body_drawn = false;
+        egui::__run_test_ui(|ui| {
+            collapsing_param_section(
+                ui,
+                ParamSectionId::in_tab("typing.section.shape", true, &mut extras),
+                "Shape",
+                false,
+                None,
+                |_ui| body_drawn = true,
+            );
+        });
+
+        assert!(
+            body_drawn,
+            "the stored flag must seed the section as expanded, not its default"
+        );
+        assert!(extras.flag(&key, false), "reading must not clear the flag");
+        assert!(
+            !extras.changed(),
+            "a section that only shows what it was told must not dirty the dock"
+        );
+    }
+
+    #[test]
+    fn a_param_section_without_a_stored_flag_follows_its_default_and_stores_nothing() {
+        let mut extras = TabExtras::default();
+        let mut body_drawn = false;
+        egui::__run_test_ui(|ui| {
+            collapsing_param_section(
+                ui,
+                ParamSectionId::in_tab("typing.section.shape", true, &mut extras),
+                "Shape",
+                false,
+                None,
+                |_ui| body_drawn = true,
+            );
+        });
+
+        assert!(!body_drawn, "a default-closed section must start closed");
+        assert!(
+            extras.is_empty(),
+            "a section sitting at its default must leave nothing in the config"
+        );
+        assert!(!extras.changed());
+    }
+
+    /// Pins the assumption `draw_advanced_text_params_section` depends on: the id
+    /// a `CollapsingHeader` stores its state under is the id its header
+    /// `Response` reports, and is NOT what `Ui::make_persistent_id` derives from
+    /// the same salt — `show` runs its header inside its own `ui.vertical(..)`
+    /// child, whose `Ui::id` carries an extra `"child"` step
+    /// (`egui-0.35.0/src/ui.rs:250-256`).
+    #[test]
+    fn a_collapsing_header_stores_its_state_under_the_id_its_response_reports() {
+        let salt = ("typing_advanced_text_params_right_column", true);
+        egui::__run_test_ui(|ui| {
+            let response = egui::CollapsingHeader::new("advanced")
+                .id_salt(salt)
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("body");
+                });
+
+            let stored = egui::collapsing_header::CollapsingState::load(
+                ui.ctx(),
+                response.header_response.id,
+            );
+            assert!(
+                stored.is_some_and(|state| state.is_open()),
+                "the header's own response id must address its stored state"
+            );
+            assert_ne!(
+                ui.make_persistent_id(salt),
+                response.header_response.id,
+                "re-deriving the id from the salt would silently miss the state"
+            );
+        });
+    }
+
+    /// The WRITE-BACK half of the contract, which the seeding tests above cannot
+    /// see: what the user did to the section — not what it was seeded with — is
+    /// what has to land in the bag.
+    ///
+    /// egui memory is pre-seeded with the OPPOSITE of what the bag holds, which
+    /// is exactly the state a click leaves behind: memory wins WITHIN a session
+    /// (`load_with_default_open` consults the stored flag only when memory says
+    /// nothing about the id), so one frame must move the stored flag onto it.
+    /// Without the write-back the bag would keep its old content and the config
+    /// would store nothing while the UI looks perfectly persisted.
+    #[test]
+    fn a_param_section_the_user_expanded_writes_the_new_state_into_the_bag() {
+        let key = section_flag_key("typing.section.shape", true);
+        // Nothing stored: the section sits at its `default_open = false`.
+        let mut extras = TabExtras::default();
+
+        let mut body_drawn = false;
+        egui::__run_test_ui(|ui| {
+            // What a click on the header left behind. The id is the one
+            // `collapsing_param_section` draws with — `ParamSectionId` keeps the
+            // two derivations together precisely so this stays true.
+            let mut opened = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                egui::Id::new(("typing.section.shape", true)),
+                false,
+            );
+            opened.set_open(true);
+            opened.store(ui.ctx());
+
+            collapsing_param_section(
+                ui,
+                ParamSectionId::in_tab("typing.section.shape", true, &mut extras),
+                "Shape",
+                false,
+                None,
+                |_ui| body_drawn = true,
+            );
+        });
+
+        assert!(body_drawn, "the expanded section must draw its body");
+        assert!(
+            extras.flag(&key, false),
+            "the expansion the user performed must reach the bag"
+        );
+        assert!(
+            extras.changed(),
+            "a moved flag must dirty the dock, or the write is never scheduled"
+        );
+    }
+
+    /// The other direction of the same contract: collapsing a section back to its
+    /// `default_open` must REMOVE the stored flag and still count as a change, or
+    /// the config would keep re-opening a section the user closed.
+    #[test]
+    fn a_param_section_the_user_collapsed_clears_its_stored_flag() {
+        let key = section_flag_key("typing.section.shape", true);
+        let mut extras = TabExtras::default();
+        extras.set_flag(&key, true, false);
+        extras.clear_changed();
+
+        egui::__run_test_ui(|ui| {
+            let mut closed = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                egui::Id::new(("typing.section.shape", true)),
+                true,
+            );
+            closed.set_open(false);
+            closed.store(ui.ctx());
+
+            collapsing_param_section(
+                ui,
+                ParamSectionId::in_tab("typing.section.shape", true, &mut extras),
+                "Shape",
+                false,
+                None,
+                |_ui| unreachable!("a collapsed section draws no body"),
+            );
+        });
+
+        assert!(
+            extras.is_empty(),
+            "a flag back at its default must leave no trace in the config"
+        );
+        assert!(extras.changed(), "the removal is a change the dock must write");
+    }
+
+    /// The `Id` egui gives a `CollapsingHeader`, ASKED OF EGUI in a throwaway
+    /// context instead of re-derived by hand.
+    ///
+    /// `show` builds the state id on its own child `Ui`, so
+    /// `ui.make_persistent_id(salt)` is the wrong answer (pinned by
+    /// `a_collapsing_header_stores_its_state_under_the_id_its_response_reports`).
+    /// The id depends only on the salt and on the position in the `Ui` tree
+    /// (`egui-0.35.0/src/ui.rs:250-256`: a child's stable id is
+    /// `parent.id.with("child")`, independent of how many siblings precede it),
+    /// and `egui::__run_test_ui` always starts from the same root `Ui`, so a
+    /// replica drawn as the first widget of a fresh context reports the id the
+    /// real header gets in the tests below.
+    fn advanced_header_state_id(id_salt: &'static str, preview_enabled: bool) -> egui::Id {
+        let mut id = None;
+        egui::__run_test_ui(|ui| {
+            let response = egui::CollapsingHeader::new("advanced")
+                .id_salt((id_salt, preview_enabled))
+                .show(ui, |_ui| {});
+            id = Some(response.header_response.id);
+        });
+        match id {
+            Some(id) => id,
+            None => unreachable!("`__run_test_ui` runs its closure once"),
+        }
+    }
+
+    /// The raw «Дополнительные параметры» `CollapsingHeader` writes back too —
+    /// the subtlest path of the feature, because its id is harvested from the
+    /// header `Response` rather than derived from the salt. A wrong id makes the
+    /// pre-seeded state invisible, the write-back reproduce the seed and this
+    /// test fail; it cannot pass silently.
+    #[test]
+    fn the_advanced_params_header_writes_a_collapse_back_into_the_bag() {
+        const SALT: &str = "typing_advanced_text_params_right_column";
+        let key = section_flag_key(SALT, false);
+        let mut extras = TabExtras::default();
+        // Stored as expanded, as a previous run left it…
+        extras.set_flag(&key, true, false);
+        extras.clear_changed();
+        let header_id = advanced_header_state_id(SALT, false);
+
+        let mut state = TypingCreatePanelState::new(false);
+        let mut changed = false;
+        let mut block_hscroll = false;
+        egui::__run_test_ui(|ui| {
+            // …and collapsed again during this session. The body is not drawn on
+            // this path, which is what keeps the test free of the heavy advanced
+            // controls.
+            let mut closed = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                header_id,
+                true,
+            );
+            closed.set_open(false);
+            closed.store(ui.ctx());
+
+            state.draw_advanced_text_params_section(
+                ui,
+                &mut extras,
+                &mut changed,
+                &mut block_hscroll,
+                SALT,
+            );
+        });
+
+        assert!(
+            extras.is_empty(),
+            "the collapse must clear the stored flag, not keep the old value"
+        );
+        assert!(extras.changed(), "the removal is a change the dock must write");
+    }

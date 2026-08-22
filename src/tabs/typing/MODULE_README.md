@@ -1056,11 +1056,32 @@ saving, and export.
   builder — use `ComboBox::new(id_salt, label)`.
 - The create/edit "Параметры" panel is grouped into collapsible sections by the free fn
   `create_main_text::collapsing_param_section` (a `CollapsingState` with a strong title + optional
-  weak summary). Each section's open/closed state persists per `egui::Id::new((id_salt,
-  preview_enabled))`: the `id_salt` is a LITERAL persistence key (an i18n exclusion, not a caption —
-  section titles come from `t!` keys), and pairing it with `preview_enabled` keeps the create panel
-  (`preview_enabled = true`) and edit panel (`false`) independent while surviving a UI-language switch.
-  Presets (create-only) and the "Слой" width/scale/angle group (edit-only) use the same helper.
+  weak summary). Presets (create-only) and the "Слой" width/scale/angle group (edit-only) use the
+  same helper.
+- **A section's expansion state has TWO owners.** The LIVE state is egui memory under
+  `egui::Id::new((id_salt, preview_enabled))` — it wins within a session and is what the user's
+  clicks move. The DURABLE state is the tab's `TabExtras`
+  (`widgets::panel_dock`), stored in the same `PanelLayout` section of `user_config.json` as the
+  arrangement and written by the same `PanelLayoutWriter`; egui memory alone cannot survive a
+  restart, because this build compiles eframe WITHOUT the `persistence` feature. The `typing.params`
+  tab is therefore declared with `PanelTab::show_with_extras` (`tab.rs`), and the `&mut TabExtras`
+  is threaded down `draw_params_tab_body` → `draw_params_section` / `draw_edit_params_section` /
+  `draw_create_presets_section` → `draw_main_text_params` → `collapsing_param_section` /
+  `draw_advanced_text_params_section`. Each section seeds `load_with_default_open` from the stored
+  flag and writes back what its header shows; `TabExtras::set_flag` drops a flag equal to
+  `default_open` and reports a change only on a real move, so an untouched panel writes nothing.
+- The `TabExtras` key is `create_main_text::section_flag_key` = `"{id_salt}#create|#edit"`. The
+  `id_salt` is a LITERAL persistence key (an i18n exclusion, not a caption — section titles come
+  from `t!` keys), so the state survives a UI-language switch; the `#create` / `#edit` suffix
+  encodes `preview_enabled`, the constructor-time discriminator of the two panel instances, and
+  keeps them independent. One rule for every persisted section, including the plain
+  `egui::CollapsingHeader` of "Дополнительные параметры" (`create_advanced.rs`), which keeps its own
+  look and feeds the flag through `.default_open(..)`.
+- Deliberately NOT persisted (no `TabId` to hang state off, or not egui memory at all):
+  the "Параметры поиска" section of the advanced-form `egui::Window`
+  (`typing.advanced.form_search_section`, passes `None`), the Settings-pane effect-defaults section
+  (`panel/effect_defaults.rs`), and `draw_text_accordion` / the char-table folds, which keep their
+  expansion in their own struct fields.
 
 ## Storage and external boundaries
 - Persistent text assets are under `ProjectPaths::text_images_dir`.

@@ -123,7 +123,7 @@ pub use panel_dock::{
     DockModelError, DragEndContext, HostId, MoveTabOutcome, PanelAnchor, PanelChrome, PanelDock,
     PanelDockOutput, PanelDockState, PanelId, PanelLayoutError, PanelLayoutSnapshot,
     PanelLayoutWriter, PanelNode, PanelSizes, PanelTab, PanelTabHeader, SolvedLayout, SolvedPanel,
-    SubWindowNode, TabId,
+    SubWindowNode, TabExtras, TabId,
 };
 #[allow(unused_imports)]
 pub use searchable_combo_box::{

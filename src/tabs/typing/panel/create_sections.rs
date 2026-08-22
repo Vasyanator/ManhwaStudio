@@ -101,10 +101,13 @@ impl TypingCreatePanelState {
     }
 
     /// Draws the create panel's text parameters. `presets` is the color-preset set
-    /// its color swatches offer (see [`ColorPresetsBinding`]).
+    /// its color swatches offer (see [`ColorPresetsBinding`]); `extras` is the
+    /// «Параметры» dock tab's persisted state, which holds the sections'
+    /// expanded/collapsed flags.
     pub(super) fn draw_params_section(
         &mut self,
         ui: &mut egui::Ui,
+        extras: &mut TabExtras,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
         presets: &mut ColorPresetsBinding<'_>,
@@ -112,19 +115,22 @@ impl TypingCreatePanelState {
         let mut params_changed = false;
         params_changed |= self.draw_main_text_params(
             ui,
+            extras,
             stacked_columns,
             remap_wheel_to_horizontal,
             presets,
-            self.preview_enabled,
-            // The create panel can enter the missing-font state too — a preset naming a
-            // font that is not loaded (`create_presets::apply_preset_by_name`) and a
-            // background reload whose selected identity vanished
-            // (`create_state::poll_font_reload_results`) both set it. Passing a hardcoded
-            // `false` here left that state INVISIBLE: the parameter widgets stayed live
-            // over a font the panel had already refused to keep. The font combo and the
-            // preset combo are drawn outside this gate, so the user can always recover by
-            // picking an available font (which clears the flag).
-            self.missing_font.is_some(),
+            FontSectionGates {
+                memory_enabled: self.preview_enabled,
+                // The create panel can enter the missing-font state too — a preset naming a
+                // font that is not loaded (`create_presets::apply_preset_by_name`) and a
+                // background reload whose selected identity vanished
+                // (`create_state::poll_font_reload_results`) both set it. Passing a hardcoded
+                // `false` here left that state INVISIBLE: the parameter widgets stayed live
+                // over a font the panel had already refused to keep. The font combo and the
+                // preset combo are drawn outside this gate, so the user can always recover by
+                // picking an available font (which clears the flag).
+                font_missing: self.missing_font.is_some(),
+            },
         );
 
         if params_changed {
