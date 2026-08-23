@@ -9,6 +9,18 @@ Main responsibilities:
 - собирать formula-specific glyph metadata, arc-length mapping и rotated bounds/draw;
 - отдельно обрабатывать fallback для `TextLayoutMode::Shape`, когда кривая слишком короткая.
 
+On-path horizontal alignment (`TextRenderParams.align`):
+- `on_path_align_fraction` turns the bias into the share of free arc length placed
+  before the run; `justify` keeps each path's historical default (custom lines 0.0,
+  formula 0.5) because the slider is hidden in the UI while justify is on.
+- Custom lines: `drawn_line_start_offsets` gives each line its own start cursor from
+  that line's align (inline `<align=...>` included). Free space is never clamped to
+  `>= 0`. `drawn_line_drop_side` then drops a glyph past the path end always, and one
+  before the path start only when the line's start offset is negative (alignment-induced
+  overflow) — a plain inline `<offset>` nudge still clamps onto the first point and draws.
+- Formula/shape: `map_formula_target_arc_length` splits the free curve length; the
+  overflow branch keeps its compression and ignores alignment.
+
 Glyph rasterization (formula + custom-line composite pass):
 - Each placed glyph is drawn by rasterizing its true font outline
   (`render_next/vector.rs`) directly into the output via
@@ -154,6 +166,12 @@ struct FormulaGlyphSeed {
     line_idx: usize,
     glyph_idx_in_line: usize,
     glyphs_in_line: usize,
+    /// Horizontal alignment resolved for this glyph's layout line, i.e.
+    /// `params.align` already overridden by an inline `<align=...>` span
+    /// (`compute_inline_line_aligns`). The custom-line path turns it into the
+    /// line's arc-length start offset; the formula path ignores it (its
+    /// arc-length accumulator is one continuous run, not per line).
+    line_align: HorizontalAlign,
     advance_px: f32,
     /// Faux bold/italic style resolved once per seed; the outline seam
     /// (`resolve_glyph_outline`) and the draw transforms consume it.
@@ -1026,6 +1044,151 @@ fn render_text_with_drawn_lines_layout_once(
     })
 }
 
+/// Fraction of a path's free arc length that is placed BEFORE the run.
+///
+/// Mirrors [`HorizontalAlign::offset_fraction`]: `0.0` pins the run to the start
+/// of the path, `0.5` centers it, `1.0` pins it to the end. Justified alignment
+/// stretches lines to the block width and hides the alignment slider in the UI,
+/// so `bias` must never be read there: justify returns `justify_fraction`, which
+/// each on-path layout supplies as its own historical default (custom lines
+/// `0.0` = start of line, formula `0.5` = centered) so justified overlays keep
+/// rendering exactly where they did before alignment was honored on path.
+fn on_path_align_fraction(align: HorizontalAlign, justify_fraction: f32) -> f32 {
+    if align.justify {
+        return justify_fraction;
+    }
+    align.offset_fraction()
+}
+
+/// Arc-length center of the glyph sitting at line cursor `cursor_px`.
+///
+/// `line_offset_px` is the glyph's inline `<offset>` shift along the line
+/// (`InlineGlyphOffset::line_px`); it moves the glyph only, and
+/// [`drawn_line_next_cursor`] takes it back out. Single source of truth for both
+/// the real placement walk and the alignment pre-pass, so the two can never
+/// drift apart.
+fn drawn_line_center_s(cursor_px: f32, advance_px: f32, line_offset_px: f32) -> f32 {
+    cursor_px + advance_px * 0.5 + line_offset_px
+}
+
+/// The line cursor left behind by a glyph centered at `center_s_px`.
+///
+/// Inverse companion of [`drawn_line_center_s`]: it removes `line_offset_px`
+/// again so an inline offset shifts its own glyph without dragging the rest of
+/// the line (that is what `InlineGlyphOffset::shift_following` is for, applied
+/// separately by the callers).
+fn drawn_line_next_cursor(center_s_px: f32, advance_px: f32, line_offset_px: f32) -> f32 {
+    center_s_px + advance_px * 0.5 - line_offset_px
+}
+
+/// Arc-length position where a line's run must start to satisfy `align`.
+///
+/// Returns `(total_len_px - run_len_px) * fraction`, with `fraction` from
+/// [`on_path_align_fraction`] using `0.0` (start of line) as the justify
+/// default. The free space is deliberately NOT clamped to `>= 0`: a run longer
+/// than its line yields a NEGATIVE start, which is exactly what moves the
+/// clipping from the end of the line to its start.
+fn drawn_line_start_offset(total_len_px: f32, run_len_px: f32, align: HorizontalAlign) -> f32 {
+    (total_len_px - run_len_px) * on_path_align_fraction(align, 0.0)
+}
+
+/// Per-line arc-length start offsets that realise the alignment bias on a
+/// custom-line layout.
+///
+/// Each line uses its own [`FormulaGlyphSeed::line_align`] (so inline
+/// `<align=...>` overrides keep working) fed to [`drawn_line_start_offset`].
+/// Lines with no path are absent from the map and start at `0.0`.
+///
+/// A line's `run_len_px` is its FINAL CURSOR, i.e. the `ByLineLength` walk of
+/// [`drawn_line_seed_transform`] replayed through the shared
+/// [`drawn_line_center_s`] / [`drawn_line_next_cursor`] pair: the sum of the
+/// effective advances plus the `shift_following` bumps, which genuinely do move
+/// every following glyph. A plain (non-`shift_following`) inline
+/// `<offset>`/`line_px` deliberately does NOT count, matching the contract
+/// [`drawn_line_next_cursor`] documents: such an offset moves its own glyph
+/// only. Consequence, by design: a glyph nudged forward past the line end by its
+/// own inline offset is invisible to the alignment and can still be clipped, and
+/// one nudged glyph never drags the whole line's alignment. The result is
+/// floored at `0.0` so a line whose `shift_following` bumps run backwards past
+/// the origin cannot produce a negative length.
+///
+/// Accuracy per spacing mode:
+/// - `ByLineLength`: EXACT — that is the recurrence being replayed.
+/// - `MinimumPreviousDistance`: a LOWER BOUND, and the error ACCUMULATES. The
+///   ink search only ever pushes glyphs forward, and every push shifts all
+///   following glyphs, so the shortfall grows along the run with no bound in
+///   principle. Worst case an end-aligned ink-spaced run still loses a clipped
+///   suffix past its line end. Measuring it exactly is impossible here: past
+///   `total_len_px` `sample_drawn_line_path` clamps to the last point, so the
+///   ink search cannot advance and an overflowing run cannot be walked at all.
+fn drawn_line_start_offsets(
+    seeds: &[FormulaGlyphSeed],
+    paths: &[Option<DrawnLinePath>],
+    letter_spacing_mul: f32,
+    letter_spacing_px: f32,
+) -> HashMap<usize, f32> {
+    // Per line: the running cursor and the line's alignment.
+    let mut lines = HashMap::<usize, (f32, HorizontalAlign)>::new();
+    for seed in seeds {
+        let entry = lines.entry(seed.line_idx).or_insert((0.0, seed.line_align));
+        let advance = ((seed.advance_px.max(1.0) * letter_spacing_mul) + letter_spacing_px).max(1.0);
+        let line_offset_px = seed.extended_offset.line_px;
+        let center_s = drawn_line_center_s(entry.0, advance, line_offset_px);
+        entry.0 = drawn_line_next_cursor(center_s, advance, line_offset_px);
+        if seed.extended_offset.shift_following && is_last_seed_in_offset_span_on_line(seeds, seed) {
+            entry.0 += line_offset_px;
+        }
+    }
+
+    lines
+        .into_iter()
+        .filter_map(|(line_idx, (run_len_px, align))| {
+            let path = paths.get(line_idx).and_then(Option::as_ref)?;
+            Some((
+                line_idx,
+                drawn_line_start_offset(path.total_len_px, run_len_px.max(0.0), align),
+            ))
+        })
+        .collect()
+}
+
+/// The end of a line path a glyph center fell off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawnLineDropSide {
+    /// Before the start of the path (`center_s < 0`).
+    BeforeStart,
+    /// Past the end of the path (`center_s > total_len_px`).
+    PastEnd,
+}
+
+/// Decide whether a glyph centered at `center_s_px` must be dropped, and on
+/// which side of its line path.
+///
+/// `sample_drawn_line_path` CLAMPS outside `[0, total_len_px]`, so an
+/// out-of-range glyph would be piled onto the first or last path point instead
+/// of being placed. Past the end that is always wrong, so it is always a drop.
+///
+/// Before the start it is a drop ONLY when the line's own `start_offset_s_px` is
+/// negative — which happens exactly when the run overflows its line and an
+/// end-biased ALIGNMENT pushed the leading glyphs off, where the clipping is
+/// what the user asked for. With a non-negative start offset a negative center
+/// can only come from a manual inline `<offset>` nudge on a leading glyph, whose
+/// historical (and still expected) behaviour is to clamp onto the first path
+/// point and DRAW; dropping it there would silently delete a hand-placed glyph.
+fn drawn_line_drop_side(
+    center_s_px: f32,
+    start_offset_s_px: f32,
+    total_len_px: f32,
+) -> Option<DrawnLineDropSide> {
+    if center_s_px > total_len_px {
+        return Some(DrawnLineDropSide::PastEnd);
+    }
+    if center_s_px < 0.0 && start_offset_s_px < 0.0 {
+        return Some(DrawnLineDropSide::BeforeStart);
+    }
+    None
+}
+
 /// Compute the per-glyph on-path transforms for every seed of a custom line
 /// layout.
 ///
@@ -1033,8 +1196,13 @@ fn render_text_with_drawn_lines_layout_once(
 /// lines that use `MinimumPreviousDistance` spacing, which needs the glyph's ink
 /// contour (derived from its outline); `ByLineLength` lines never extract here.
 /// The returned vector is index-aligned with `seeds`; `None` means the glyph
-/// could not be placed (past the end of its line path or missing sample) and is
-/// dropped by callers.
+/// could not be placed (outside its line path or missing sample) and is dropped
+/// by callers.
+///
+/// Each line's cursor starts at [`drawn_line_start_offsets`], so the alignment
+/// bias positions the run ALONG its line: bias `< 0` starts at the line start
+/// (overflow cut at the end), bias `> 0` ends at the line end (cut at the
+/// start), bias `== 0` cuts evenly at both ends.
 // The placement context needs all four immutable/mutable dependencies; bundling
 // the three caches would not simplify the call site.
 #[allow(clippy::too_many_arguments)]
@@ -1051,12 +1219,18 @@ fn build_drawn_line_transforms(
 ) -> Vec<Option<DrawnLineTransform>> {
     let mut line_offsets = HashMap::<usize, DrawnLinePlacementState>::new();
     let layout_settings = custom_line_layout_settings(params, line_placement_frac, ascent_scaled);
+    let letter_spacing_mul = layout_settings.letter_spacing_mul.clamp(0.0, 8.0);
+    let letter_spacing_px = layout_settings.letter_spacing_px.clamp(-10_000.0, 10_000.0);
+    // Pre-pass: every line's run length must be known before the first glyph is
+    // placed, because the alignment bias decides where that line's cursor starts.
+    let start_offsets =
+        drawn_line_start_offsets(seeds, paths, letter_spacing_mul, letter_spacing_px);
     let mut ctx = DrawnLinePlacementCtx {
         params,
         seeds,
         layout: layout_settings,
-        letter_spacing_mul: layout_settings.letter_spacing_mul.clamp(0.0, 8.0),
-        letter_spacing_px: layout_settings.letter_spacing_px.clamp(-10_000.0, 10_000.0),
+        letter_spacing_mul,
+        letter_spacing_px,
         font_system,
         cache,
         contour_cache,
@@ -1068,7 +1242,17 @@ fn build_drawn_line_transforms(
             transforms.push(None);
             continue;
         };
-        let state = line_offsets.entry(seed.line_idx).or_default();
+        let state = line_offsets
+            .entry(seed.line_idx)
+            .or_insert_with(|| {
+                let start_offset_s_px =
+                    start_offsets.get(&seed.line_idx).copied().unwrap_or(0.0);
+                DrawnLinePlacementState {
+                    offset_s_px: start_offset_s_px,
+                    start_offset_s_px,
+                    ..DrawnLinePlacementState::default()
+                }
+            });
         transforms.push(drawn_line_seed_transform(&mut ctx, seed, path, state));
     }
     apply_drawn_line_group_rotations(seeds, transforms.as_mut_slice());
@@ -1100,7 +1284,13 @@ struct DrawnLinePlacementCtx<'a> {
 /// unchanged. For `MinimumPreviousDistance` it seeds the same arc-length
 /// position, then searches forward so the true minimum ink-to-ink distance to
 /// the previous glyph reaches the kerning-driven `target_gap`. Returns the
-/// blit-ready transform, or `None` when the glyph runs past the path end.
+/// blit-ready transform, or `None` when [`drawn_line_drop_side`] rejects the
+/// glyph: past the path end, or before its start when an end-biased alignment
+/// gave the line a negative start offset. A negative position caused by a plain
+/// inline `<offset>` nudge is NOT a drop — it keeps clamping onto the first path
+/// point, as it always did. The before-start drop still advances the line cursor
+/// (the following glyphs must keep walking); the past-end drop does not need to,
+/// since every later glyph on the line is past the end as well.
 fn drawn_line_seed_transform(
     ctx: &mut DrawnLinePlacementCtx<'_>,
     seed: &FormulaGlyphSeed,
@@ -1113,9 +1303,27 @@ fn drawn_line_seed_transform(
         ((seed.advance_px.max(1.0) * ctx.letter_spacing_mul) + ctx.letter_spacing_px).max(1.0);
     let half_advance = advance * 0.5;
     // Arc-length seed: identical to ByLineLength placement.
-    let mut center_s = state.offset_s_px + half_advance + seed.extended_offset.line_px;
-    if center_s > path.total_len_px {
-        return None;
+    let mut center_s = drawn_line_center_s(state.offset_s_px, advance, seed.extended_offset.line_px);
+    match drawn_line_drop_side(center_s, state.start_offset_s_px, path.total_len_px) {
+        Some(DrawnLineDropSide::BeforeStart) => {
+            // An end-biased alignment pushed this glyph before the line start;
+            // it goes into the same skipped-glyph warning as the end drop.
+            // The cursor MUST still walk: unlike the end drop (where every later
+            // glyph is past the end anyway) a frozen cursor here would collapse
+            // the whole line onto one position and drop all of it.
+            state.offset_s_px =
+                drawn_line_next_cursor(center_s, advance, seed.extended_offset.line_px);
+            if seed.extended_offset.shift_following
+                && is_last_seed_in_offset_span_on_line(ctx.seeds, seed)
+            {
+                state.offset_s_px += seed.extended_offset.line_px;
+            }
+            return None;
+        }
+        // The cursor is deliberately left frozen: every later glyph on this line
+        // is past the end as well, so they all drop anyway.
+        Some(DrawnLineDropSide::PastEnd) => return None,
+        None => {}
     }
 
     let use_ink = vector_line_distance_mode(params, seed.line_idx)
@@ -1151,10 +1359,12 @@ fn drawn_line_seed_transform(
         })?;
     }
 
-    if center_s > path.total_len_px {
+    // The ink search only ever pushes forward, so only `PastEnd` is reachable
+    // here; the shared helper keeps the two guards from ever disagreeing.
+    if drawn_line_drop_side(center_s, state.start_offset_s_px, path.total_len_px).is_some() {
         return None;
     }
-    state.offset_s_px = center_s + half_advance - seed.extended_offset.line_px;
+    state.offset_s_px = drawn_line_next_cursor(center_s, advance, seed.extended_offset.line_px);
     let transform = drawn_line_transform_at(params, seed, path, center_s, &layout)?;
 
     if use_ink {
@@ -1205,6 +1415,11 @@ fn drawn_line_seed_transform(
 #[derive(Debug, Default)]
 struct DrawnLinePlacementState {
     offset_s_px: f32,
+    /// The line's alignment start offset, i.e. the value `offset_s_px` was
+    /// seeded with. Negative exactly when the run overflows its line, which is
+    /// the only case where a glyph before the line start may be dropped
+    /// (see [`drawn_line_drop_side`]).
+    start_offset_s_px: f32,
     previous_contour: Option<PlacedContour>,
     previous_half_advance_px: f32,
     /// World-space half-width of the previous glyph's ink (scaled by width_mul).
@@ -1957,6 +2172,10 @@ fn render_text_with_formula_layout_once(
     }
     let total_advance = total_advance.max(1.0);
     let glyph_count = seeds.len();
+    // One continuous arc-length accumulator spans the WHOLE run here (it is not
+    // reset per line), so the alignment bias is taken from the block-level
+    // `params.align`; per-line inline overrides cannot be honored on this path.
+    let formula_align_fraction = on_path_align_fraction(params.align, 0.5);
 
     let mut transforms = Vec::<FormulaGlyphTransform>::with_capacity(glyph_count);
     let mut formula_line_shifts = HashMap::<usize, f32>::new();
@@ -1990,8 +2209,12 @@ fn render_text_with_formula_layout_once(
             .map(|sample| sample.arc_len_px)
             .unwrap_or(0.0)
             .max(0.0);
-        let target_arc_len_px =
-            map_formula_target_arc_length(center_s, total_advance, curve_len_px);
+        let target_arc_len_px = map_formula_target_arc_length(
+            center_s,
+            total_advance,
+            curve_len_px,
+            formula_align_fraction,
+        );
         let mapped_t01 = formula_t01_for_arc_length(arc_samples.as_slice(), target_arc_len_px);
         let transform =
             formula_program.evaluate_transform_at_t01(&params.formula_layout, &eval, mapped_t01)?;
@@ -2612,6 +2835,7 @@ fn collect_formula_glyph_seeds(
                 line_idx,
                 glyph_idx_in_line,
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
+                line_align,
                 advance_px: 0.0,
                 faux: resolve_faux_counter_flag(
                     faux_style_for_glyph(
@@ -2699,6 +2923,7 @@ fn collect_formula_glyph_seeds(
                 line_idx,
                 glyph_idx_in_line,
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
+                line_align,
                 advance_px: 0.0,
                 faux: hyphen_faux,
                 // The wrapped soft hyphen is real ink and never hangs, so it always
@@ -3274,13 +3499,31 @@ fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) -> bool {
     false
 }
 
-fn map_formula_target_arc_length(center_s_px: f32, text_len_px: f32, curve_len_px: f32) -> f32 {
+/// Map a glyph's run-local arc length onto its formula curve.
+///
+/// When the run FITS the curve, the leftover curve length is split by
+/// `align_fraction` (`0.0` = run pinned to the curve start, `0.5` = centered,
+/// `1.0` = pinned to the curve end); see [`on_path_align_fraction`], which the
+/// caller uses with `0.5` as the justify default so justified formula overlays
+/// keep their historical centering.
+///
+/// When the run OVERFLOWS the curve it is compressed onto the curve
+/// (`center_s * curve_len / text_len`) and `align_fraction` is deliberately
+/// ignored: there is no free space left to distribute, and `Shape`'s fallback
+/// threshold (`detect_shape_layout_fallback_reason`) is defined against exactly
+/// this compression ratio.
+fn map_formula_target_arc_length(
+    center_s_px: f32,
+    text_len_px: f32,
+    curve_len_px: f32,
+    align_fraction: f32,
+) -> f32 {
     if curve_len_px <= 0.0 {
         return 0.0;
     }
     let text_len_px = text_len_px.max(1.0);
     if text_len_px <= curve_len_px {
-        let leading_gap = (curve_len_px - text_len_px) * 0.5;
+        let leading_gap = (curve_len_px - text_len_px) * align_fraction;
         (leading_gap + center_s_px).clamp(0.0, curve_len_px)
     } else {
         (center_s_px * (curve_len_px / text_len_px)).clamp(0.0, curve_len_px)
@@ -3420,11 +3663,18 @@ fn glyph_ink_profile_from_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawnLineTransform, LinePlacementReference, apply_line_placement,
-        drawn_line_glyph_destination_center_raw, find_minimum_ink_distance_center_s,
-        placed_contour_for_transform, sample_drawn_line_path_for_direction,
+        DrawnLineDropSide, DrawnLineTransform, FormulaGlyphSeed, GlyphScaleSettings,
+        HorizontalAlign, KerningSettings, LinePlacementReference, apply_line_placement,
+        drawn_line_center_s, drawn_line_drop_side, drawn_line_glyph_destination_center_raw,
+        drawn_line_next_cursor, drawn_line_start_offset, drawn_line_start_offsets,
+        find_minimum_ink_distance_center_s, map_formula_target_arc_length,
+        on_path_align_fraction, placed_contour_for_transform, sample_drawn_line_path_for_direction,
     };
     use crate::drawn_lines::{DrawnLinePath, DrawnLinePoint};
+    use crate::inline_styles::InlineGlyphOffset;
+    use crate::pipeline::FauxGlyphStyle;
+    use crate::types::KerningMode;
+    use cosmic_text::{CacheKeyFlags, LayoutGlyph, fontdb};
     use crate::glyph_contour::{
         GlyphContour, PlacedContour, min_placed_distance,
     };
@@ -3737,5 +3987,354 @@ mod tests {
             (cap_gh - low_gh).abs() > 1.0,
             "GlyphHeight must not share a baseline: {cap_gh} vs {low_gh}"
         );
+    }
+    /// Non-justified alignment with an explicit bias, for readable test intent.
+    fn biased(bias: f32) -> HorizontalAlign {
+        HorizontalAlign {
+            bias,
+            justify: false,
+        }
+    }
+
+    /// A minimal seed for the alignment pre-pass, which only reads `line_idx`,
+    /// `line_align`, `advance_px` and `extended_offset`. Everything else is
+    /// inert filler so no font machinery is needed.
+    fn align_seed(
+        line_idx: usize,
+        advance_px: f32,
+        line_align: HorizontalAlign,
+        line_px: f32,
+    ) -> FormulaGlyphSeed {
+        FormulaGlyphSeed {
+            glyph: LayoutGlyph {
+                start: 0,
+                end: 1,
+                font_size: 10.0,
+                line_height_opt: None,
+                font_id: fontdb::ID::dummy(),
+                glyph_id: 0,
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                level: 0u8.into(),
+                x_offset: 0.0,
+                y_offset: 0.0,
+                color_opt: None,
+                metadata: 0,
+                cache_key_flags: CacheKeyFlags::empty(),
+            },
+            text_color: [0, 0, 0, 255],
+            origin_x: 0.0,
+            origin_y: 0.0,
+            kerning: KerningSettings {
+                mode: KerningMode::Fixed,
+                spacing_px: 0.0,
+                spacing_percent: 0.0,
+            },
+            glyph_scale: GlyphScaleSettings {
+                width_mul: 1.0,
+                height_mul: 1.0,
+            },
+            glyph_offset_px: [0.0, 0.0],
+            extended_offset: InlineGlyphOffset {
+                line_px,
+                ..InlineGlyphOffset::global_only([0.0, 0.0])
+            },
+            style_offset: 0,
+            offset_span_range: None,
+            line_idx,
+            glyph_idx_in_line: 0,
+            glyphs_in_line: 1,
+            line_align,
+            advance_px,
+            faux: FauxGlyphStyle::NONE,
+            hanging_excluded: false,
+        }
+    }
+
+    /// `count` identical seeds on `line_idx`.
+    fn align_seeds(
+        line_idx: usize,
+        count: usize,
+        advance_px: f32,
+        line_align: HorizontalAlign,
+        line_px: f32,
+    ) -> Vec<FormulaGlyphSeed> {
+        (0..count)
+            .map(|_| align_seed(line_idx, advance_px, line_align, line_px))
+            .collect()
+    }
+
+    /// Walk `count` glyphs of equal `advance` from `start_s` through the shared
+    /// production cursor helpers and return their arc-length centers.
+    fn run_centers(start_s: f32, advance: f32, line_offset_px: f32, count: usize) -> Vec<f32> {
+        let mut cursor = start_s;
+        let mut centers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let center_s = drawn_line_center_s(cursor, advance, line_offset_px);
+            centers.push(center_s);
+            cursor = drawn_line_next_cursor(center_s, advance, line_offset_px);
+        }
+        centers
+    }
+
+    /// `(dropped before the line start, dropped past its end)`, decided by the
+    /// production guard `drawn_line_drop_side` — never by a test-local copy.
+    fn drop_counts(centers: &[f32], start_s: f32, total_len_px: f32) -> (usize, usize) {
+        let mut before = 0usize;
+        let mut past = 0usize;
+        for center_s in centers {
+            match drawn_line_drop_side(*center_s, start_s, total_len_px) {
+                Some(DrawnLineDropSide::BeforeStart) => before += 1,
+                Some(DrawnLineDropSide::PastEnd) => past += 1,
+                None => {}
+            }
+        }
+        (before, past)
+    }
+
+    #[test]
+    fn on_path_align_fraction_matches_the_bias_and_keeps_justify_defaults() {
+        assert!((on_path_align_fraction(HorizontalAlign::LEFT, 0.0) - 0.0).abs() < 1e-6);
+        assert!((on_path_align_fraction(HorizontalAlign::CENTER, 0.0) - 0.5).abs() < 1e-6);
+        assert!((on_path_align_fraction(HorizontalAlign::RIGHT, 0.0) - 1.0).abs() < 1e-6);
+        // Justify hides the slider in the UI, so `bias` must never be read: each
+        // path keeps its own historical default no matter what bias is stored.
+        let justified = HorizontalAlign {
+            bias: 1.0,
+            justify: true,
+        };
+        assert!((on_path_align_fraction(justified, 0.0) - 0.0).abs() < 1e-6);
+        assert!((on_path_align_fraction(justified, 0.5) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn formula_arc_length_splits_the_free_curve_by_the_align_fraction() {
+        // Run of 100px on a 300px curve: 200px of slack to distribute.
+        let center_s = 50.0f32;
+        let start = map_formula_target_arc_length(center_s, 100.0, 300.0, 0.0);
+        let center = map_formula_target_arc_length(center_s, 100.0, 300.0, 0.5);
+        let end = map_formula_target_arc_length(center_s, 100.0, 300.0, 1.0);
+        assert!((start - 50.0).abs() < 1e-3, "start={start}");
+        assert!((center - 150.0).abs() < 1e-3, "center={center}");
+        assert!((end - 250.0).abs() < 1e-3, "end={end}");
+    }
+
+    #[test]
+    fn formula_arc_length_keeps_compressing_on_overflow_regardless_of_alignment() {
+        // 400px of text on a 200px curve: compressed 2x, no slack left to bias.
+        // `Shape`'s fallback threshold is defined against exactly this ratio.
+        let expected = 50.0f32;
+        for fraction in [0.0f32, 0.5, 1.0] {
+            let mapped = map_formula_target_arc_length(100.0, 400.0, 200.0, fraction);
+            assert!(
+                (mapped - expected).abs() < 1e-3,
+                "fraction={fraction} mapped={mapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn drawn_line_start_offset_pins_a_fitting_run_to_the_biased_side() {
+        // 100px run on a 300px line.
+        let left = drawn_line_start_offset(300.0, 100.0, HorizontalAlign::LEFT);
+        let center = drawn_line_start_offset(300.0, 100.0, HorizontalAlign::CENTER);
+        let right = drawn_line_start_offset(300.0, 100.0, HorizontalAlign::RIGHT);
+        assert!((left - 0.0).abs() < 1e-3, "left={left}");
+        assert!((center - 100.0).abs() < 1e-3, "center={center}");
+        assert!((right - 200.0).abs() < 1e-3, "right={right}");
+        // Justified lines keep the historical start-of-line placement.
+        assert!(
+            drawn_line_start_offset(300.0, 100.0, HorizontalAlign::JUSTIFY).abs() < 1e-3,
+            "justify must not move the run"
+        );
+    }
+
+    #[test]
+    fn drawn_line_start_offset_goes_negative_when_the_run_overflows() {
+        // 300px run on a 100px line: the free space is -200px and must NOT be
+        // clamped, otherwise an end-biased run could never clip at its start.
+        let center = drawn_line_start_offset(100.0, 300.0, HorizontalAlign::CENTER);
+        let right = drawn_line_start_offset(100.0, 300.0, HorizontalAlign::RIGHT);
+        assert!((center + 100.0).abs() < 1e-3, "center={center}");
+        assert!((right + 200.0).abs() < 1e-3, "right={right}");
+    }
+
+    #[test]
+    fn start_offsets_place_each_line_run_by_its_own_align() {
+        // Line 0: 3x20px = a 60px run on a 300px line (fits, 240px of slack).
+        // Line 1: 5x40px = a 200px run on a 100px line (overflows by 100px).
+        let paths = vec![Some(straight_path(300.0)), Some(straight_path(100.0))];
+        for (align, fitting, overflowing) in [
+            (HorizontalAlign::LEFT, 0.0f32, 0.0f32),
+            (HorizontalAlign::CENTER, 120.0, -50.0),
+            (HorizontalAlign::RIGHT, 240.0, -100.0),
+        ] {
+            let mut seeds = align_seeds(0, 3, 20.0, align, 0.0);
+            seeds.extend(align_seeds(1, 5, 40.0, align, 0.0));
+            let offsets = drawn_line_start_offsets(seeds.as_slice(), paths.as_slice(), 1.0, 0.0);
+            let line0 = offsets.get(&0).copied().unwrap_or(f32::NAN);
+            let line1 = offsets.get(&1).copied().unwrap_or(f32::NAN);
+            assert!((line0 - fitting).abs() < 1e-3, "{align:?} line0={line0}");
+            assert!(
+                (line1 - overflowing).abs() < 1e-3,
+                "{align:?} line1={line1}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_offsets_skip_lines_without_a_path() {
+        // Line 1 has no path, so it must be absent from the map (and the caller
+        // then starts it at 0.0) instead of dividing by a phantom line length.
+        let paths = vec![Some(straight_path(300.0)), None];
+        let mut seeds = align_seeds(0, 3, 20.0, HorizontalAlign::RIGHT, 0.0);
+        seeds.extend(align_seeds(1, 3, 20.0, HorizontalAlign::RIGHT, 0.0));
+        // Line 2 is past the end of `paths` entirely.
+        seeds.extend(align_seeds(2, 3, 20.0, HorizontalAlign::RIGHT, 0.0));
+        let offsets = drawn_line_start_offsets(seeds.as_slice(), paths.as_slice(), 1.0, 0.0);
+        assert!(offsets.contains_key(&0), "line 0 has a path");
+        assert!(!offsets.contains_key(&1), "line 1 has no path");
+        assert!(!offsets.contains_key(&2), "line 2 is out of range");
+    }
+
+    #[test]
+    fn a_manually_nudged_glyph_does_not_move_its_line_alignment() {
+        // `run_len_px` is the FINAL CURSOR, and a plain inline `line_px` offset
+        // moves only its own glyph. So a nudged run must align identically to an
+        // unnudged one of the same advances, in either direction.
+        let paths = vec![Some(straight_path(300.0))];
+        let plain = drawn_line_start_offsets(
+            align_seeds(0, 3, 20.0, HorizontalAlign::CENTER, 0.0).as_slice(),
+            paths.as_slice(),
+            1.0,
+            0.0,
+        );
+        for line_px in [-25.0f32, 25.0] {
+            let nudged = drawn_line_start_offsets(
+                align_seeds(0, 3, 20.0, HorizontalAlign::CENTER, line_px).as_slice(),
+                paths.as_slice(),
+                1.0,
+                0.0,
+            );
+            assert_eq!(
+                plain.get(&0).copied().map(f32::to_bits),
+                nudged.get(&0).copied().map(f32::to_bits),
+                "line_px={line_px} must not move the alignment"
+            );
+        }
+    }
+
+    #[test]
+    fn start_offsets_apply_letter_spacing_to_the_measured_run() {
+        // 3 glyphs, advance 20 -> run 60; with a 2x multiplier -> 120; the
+        // centered start on a 300px line moves from 120 to 90 accordingly.
+        let paths = vec![Some(straight_path(300.0))];
+        let seeds = align_seeds(0, 3, 20.0, HorizontalAlign::CENTER, 0.0);
+        let doubled = drawn_line_start_offsets(seeds.as_slice(), paths.as_slice(), 2.0, 0.0)
+            .get(&0)
+            .copied()
+            .unwrap_or(f32::NAN);
+        assert!((doubled - 90.0).abs() < 1e-3, "doubled={doubled}");
+    }
+
+    #[test]
+    fn overlong_run_is_clipped_on_the_side_the_bias_points_away_from() {
+        // Five 40px glyphs = a 200px run on a 100px line: 100px must be cut.
+        let paths = vec![Some(straight_path(100.0))];
+        let advance = 40.0f32;
+        for (align, expected, intent) in [
+            (
+                HorizontalAlign::LEFT,
+                (0usize, 2usize),
+                "bias<0 must start at the line start and cut at the END",
+            ),
+            (
+                HorizontalAlign::CENTER,
+                (1, 1),
+                "bias==0 must cut evenly at both ends",
+            ),
+            (
+                HorizontalAlign::RIGHT,
+                (2, 0),
+                "bias>0 must end at the line end and cut at the START",
+            ),
+        ] {
+            let seeds = align_seeds(0, 5, advance, align, 0.0);
+            let start = drawn_line_start_offsets(seeds.as_slice(), paths.as_slice(), 1.0, 0.0)
+                .get(&0)
+                .copied()
+                .unwrap_or(f32::NAN);
+            let centers = run_centers(start, advance, 0.0, 5);
+            assert_eq!(
+                drop_counts(&centers, start, 100.0),
+                expected,
+                "{intent}: start={start} centers={centers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fitting_run_keeps_every_glyph_on_the_line_for_any_bias() {
+        // Three 20px glyphs = a 60px run on a 100px line: nothing may drop, and
+        // an end-biased run must finish exactly at the line end.
+        let total_len = 100.0f32;
+        let run_len = 60.0f32;
+        for bias in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let start = drawn_line_start_offset(total_len, run_len, biased(bias));
+            let centers = run_centers(start, 20.0, 0.0, 3);
+            assert_eq!(
+                drop_counts(&centers, start, total_len),
+                (0, 0),
+                "bias={bias} must keep every glyph: {centers:?}"
+            );
+        }
+        let end_start = drawn_line_start_offset(total_len, run_len, HorizontalAlign::RIGHT);
+        let end_centers = run_centers(end_start, 20.0, 0.0, 3);
+        let last_end = end_centers.last().copied().unwrap_or(0.0) + 10.0;
+        assert!(
+            (last_end - total_len).abs() < 1e-3,
+            "end-aligned run must finish at the line end: {last_end}"
+        );
+    }
+
+    #[test]
+    fn a_negative_inline_nudge_is_clamped_and_drawn_not_dropped() {
+        // Regression guard: on a line the run FITS (start offset >= 0) a glyph
+        // pushed before the path start by a manual `<offset>` must keep its
+        // historical clamp-and-draw behaviour, NOT vanish into the
+        // "не отрисовано символов" warning.
+        assert_eq!(drawn_line_drop_side(-30.0, 0.0, 100.0), None);
+        assert_eq!(drawn_line_drop_side(-30.0, 40.0, 100.0), None);
+        // The same position IS dropped once the alignment itself pushed the run
+        // off the line start.
+        assert_eq!(
+            drawn_line_drop_side(-30.0, -50.0, 100.0),
+            Some(DrawnLineDropSide::BeforeStart)
+        );
+        // Past the end is always a drop, whatever the start offset was, and the
+        // boundaries themselves are inclusive.
+        assert_eq!(
+            drawn_line_drop_side(130.0, 0.0, 100.0),
+            Some(DrawnLineDropSide::PastEnd)
+        );
+        assert_eq!(drawn_line_drop_side(0.0, -50.0, 100.0), None);
+        assert_eq!(drawn_line_drop_side(100.0, 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn inline_line_offset_shifts_only_its_own_glyph() {
+        // The cursor recurrence must cancel `extended_offset.line_px`; that is
+        // what makes the final cursor a pure `Sum(advance)` run length.
+        let shifted = run_centers(0.0, 20.0, 7.0, 4);
+        let plain = run_centers(0.0, 20.0, 0.0, 4);
+        for (idx, (a, b)) in shifted.iter().zip(plain.iter()).enumerate() {
+            assert!(
+                (a - b - 7.0).abs() < 1e-3,
+                "glyph {idx}: shifted={a} plain={b}"
+            );
+        }
+        let last_end = plain.last().copied().unwrap_or(0.0) + 10.0;
+        assert!((last_end - 80.0).abs() < 1e-3, "run length={last_end}");
     }
 }

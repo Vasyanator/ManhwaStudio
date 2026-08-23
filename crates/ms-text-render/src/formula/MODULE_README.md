@@ -77,6 +77,38 @@ the line paths.
   stores the centers into the returned image BEFORE the caller's trim/effects (both
   self-correct the centers). These paths never read `hanging_punctuation`. The
   default (no request) is a byte-identical no-op.
+- Horizontal alignment (`TextRenderParams.align`) positions the run ALONG the path on
+  both on-path layouts, via the shared `on_path_align_fraction`. `justify` never reads
+  `bias` (the slider is hidden in the UI while justify is on) and instead keeps each
+  path's historical default: `0.0` (start of line) for custom lines, `0.5` (centered)
+  for formula/shape.
+  - Custom raster/vector lines: each line's arc-length cursor starts at
+    `drawn_line_start_offset(path.total_len_px, run_len_px, line_align)`, using that
+    line's own align so inline `<align=...>` overrides keep working. The free space is
+    NOT clamped to `>= 0`, so an overlong run gets a negative start and is clipped at
+    the line START instead of its end.
+  - `drawn_line_drop_side` is the single decision point for out-of-range glyphs
+    (`sample_drawn_line_path` clamps, which would pile them onto the first/last point).
+    Past the path end is always a drop. Before the path start is a drop ONLY when the
+    line's start offset is negative, i.e. alignment-induced overflow; a negative position
+    coming from a plain inline `<offset>` nudge still clamps and DRAWS, as it always did.
+    Both drops feed the same skipped-glyph warning; the before-start drop still advances
+    the line cursor, the past-end drop deliberately does not.
+  - `run_len_px` is the line's FINAL CURSOR from replaying the `ByLineLength` recurrence
+    (`drawn_line_center_s`/`drawn_line_next_cursor`): the advance sum plus the
+    `shift_following` bumps, floored at `0.0`. A plain inline `line_px` offset moves its
+    own glyph only and is deliberately NOT counted, so one nudged glyph never drags the
+    line's alignment — at the price that a glyph nudged past the line end is invisible to
+    the alignment and can still be clipped. EXACT for `ByLineLength`. For
+    `MinimumPreviousDistance` it is a lower bound whose error ACCUMULATES and is unbounded
+    in principle: every forward push of the ink search shifts all following glyphs, so an
+    end-aligned ink-spaced run can lose a clipped suffix past its line end.
+  - Formula/shape: the arc-length accumulator is one continuous run for the whole text,
+    so only the block-level `params.align` applies (no per-line override). It splits the
+    free curve length in `map_formula_target_arc_length`. On OVERFLOW that function keeps
+    compressing the run onto the curve and ignores alignment — there is no free space to
+    distribute and `detect_shape_layout_fallback_reason` is defined against exactly that
+    compression ratio.
 - The on-path glyph transform has a single source of truth (`drawn_line_transform_at` +
   `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the ink-distance
   search, and `placed_contour_for_transform` all build the outline->world placement with
