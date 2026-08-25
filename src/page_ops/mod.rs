@@ -3,7 +3,7 @@ File: page_ops/mod.rs
 
 Purpose:
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: reordering,
-inserting (from files or generated blank pages) and deleting pages.
+inserting (from files or generated blank pages), deleting and stitching pages.
 
 Main responsibilities:
 - define the `PageOpKind` request model shared by the page-manager tab and the app;
@@ -14,6 +14,7 @@ Main responsibilities:
 
 Key structures:
 - PageOpKind: one structural operation, indices in the CURRENT page order.
+- StitchPlacement: one source page's affine placement inside a stitched canvas.
 - PageOpOutcome: old->new index mapping produced by a successful operation.
 - PageOpError: typed failure of planning or execution.
 
@@ -33,14 +34,52 @@ mod fs_exec;
 mod json_remap;
 mod plan;
 
+// The stitch UI pre-validates a layout before it can request the operation. It
+// must use the engine's own bounds, not a second copy of the numbers.
+pub(crate) use plan::{STITCH_MAX_SCALE, STITCH_MAX_SIDE_PX, STITCH_MAX_TOTAL_PX};
+
 use std::path::PathBuf;
+
+/// Where one source page lands inside a stitched canvas.
+///
+/// The placement is a pure affine map from the source page's OWN pixels to the
+/// new canvas pixels, and it is the single geometric truth every remapped
+/// artifact of that page is routed through:
+///
+/// ```text
+/// map_point(x, y) = ((x - crop.x) * scale + dx, (y - crop.y) * scale + dy)
+/// map_len(l)      = l * scale
+/// placed size     = (round(crop.w * scale), round(crop.h * scale))
+/// ```
+///
+/// `crop` is `[x, y, w, h]` in the source page's own pixels and must lie inside
+/// that page; `scale` is uniform and must be in `(0, 16]`; `dx`/`dy` are the
+/// top-left of the placed image inside the new canvas, and the whole placed
+/// rectangle must lie inside it. Rotation is deliberately not supported: it
+/// would rotate the page-normalized artifacts of every other category with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StitchPlacement {
+    /// Index of the source page in the CURRENT page order.
+    pub page_idx: usize,
+    /// `[x, y, w, h]` region of the source page that is placed, in its own px.
+    pub crop: [u32; 4],
+    /// Uniform scale factor applied to the cropped region, in `(0, 16]`.
+    pub scale: f32,
+    /// X of the placed image's top-left corner in the new canvas, in new px.
+    pub dx: i64,
+    /// Y of the placed image's top-left corner in the new canvas, in new px.
+    pub dy: i64,
+}
 
 /// One structural page operation over the loaded chapter.
 ///
 /// All indices refer to the CURRENT page order (`ProjectData::pages`) at the
 /// moment the operation is requested; the engine converts them into a full
 /// old-order -> new-order permutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately NOT implemented: `Stitch` carries float geometry, for
+/// which reflexive equality does not hold.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PageOpKind {
     /// Move the page currently at `from` so that it occupies index `to` in the
     /// new order (`to` is an index into the new order, i.e. after `from` was
@@ -61,6 +100,33 @@ pub enum PageOpKind {
     /// All page artifacts are moved into the chapter-local trash directory, not
     /// destroyed, so the operation is manually recoverable.
     Delete { indices: Vec<usize> },
+    /// Merge >= 2 pages into ONE page that takes the position of the lowest
+    /// source index (`primary = min(page_idx)`); the other sources disappear
+    /// from the order and every page after them shifts down.
+    ///
+    /// The new page image is a `width` x `height` PNG filled with `background`
+    /// (straight, non-premultiplied RGBA; `[0, 0, 0, 0]` = transparent) onto
+    /// which each source page is drawn per its [`StitchPlacement`], in list
+    /// order (later entries paint over earlier ones). Page-sized rasters (clean
+    /// overlays, typing masks) are composed the same way, and every page-keyed
+    /// JSON document is merged with its geometry mapped through the placements.
+    ///
+    /// `placements` must hold at least two entries with unique `page_idx`; the
+    /// source page files themselves are moved into the chapter-local trash, so
+    /// the operation is manually recoverable.
+    // TEMPORARY, remove together with the page manager's stitch dialog: that
+    // dialog is the only production constructor and lands with the UI layer of
+    // this feature, so until then the binary target sees the variant as never
+    // constructed (the test target already constructs it, which is why this
+    // cannot be an `expect` — the expectation would be unfulfilled there).
+    #[allow(dead_code, reason = "constructed by the page-manager stitch dialog")]
+    Stitch {
+        placements: Vec<StitchPlacement>,
+        width: u32,
+        height: u32,
+        /// Straight (non-premultiplied) RGBA fill of the uncovered canvas.
+        background: [u8; 4],
+    },
 }
 
 /// Result of a successfully executed page operation.
@@ -119,9 +185,11 @@ pub enum PageOpError {
 /// # Errors
 /// - [`PageOpError::InvalidOp`] — the request does not apply (bad indices,
 ///   unsupported insert extension, deleting every page, un-migrated legacy
-///   documents, stale page list).
-/// - [`PageOpError::Image`] — an inserted file is not a readable image or a
-///   blank page failed to encode.
+///   documents, stale page list, a stitch whose crops/placements fall outside
+///   their page or canvas or whose merged pages share a layer uid).
+/// - [`PageOpError::Image`] — an inserted file is not a readable image, a
+///   blank page failed to encode, or a stitched source page could not be
+///   decoded/composed.
 /// - [`PageOpError::Json`] — an authoritative page-keyed document could not be
 ///   parsed or re-serialized (nothing is changed on disk in that case).
 /// - [`PageOpError::Io`] / [`PageOpError::Journal`] — filesystem failure; the

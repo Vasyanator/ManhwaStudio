@@ -2,11 +2,12 @@
 File: tabs/page_manager/thumbs.rs
 
 Purpose:
-Background worker + GUI-side LRU cache for the page-manager tab: page thumbnail
-decode/downscale and the `layers.json` layer-count scan, both off the GUI thread.
+Background worker + GUI-side LRU caches for the page-manager tab: page thumbnail
+decode/downscale, the larger page previews the stitch window draws, and the
+`layers.json` layer-count scan — all off the GUI thread.
 
 Key structures:
-- ThumbRuntime: worker channels, in-flight tracking, and the thumbnail cache.
+- ThumbRuntime: worker channels, in-flight tracking, and the two caches.
 - ThumbCache<T>: generic LRU cache keyed by page path (payload-agnostic so the
   eviction logic is unit-testable without GPU textures).
 - ThumbJob / ThumbEvent: worker protocol.
@@ -14,6 +15,8 @@ Key structures:
 Key functions:
 - ThumbRuntime::request_thumb_if_needed(): dedup + capped job submission with
   mtime-based revalidation.
+- ThumbRuntime::request_preview_if_needed() / preview_state(): the same pair for
+  the stitch window's page previews.
 - ThumbRuntime::poll(): drains worker events, uploads textures, returns layer scans.
 - scan_layer_counts(): merges saved/unsaved `layers.json` into per-page layer counts.
 
@@ -22,6 +25,9 @@ The worker mirrors the thumbnail thread of `src/tabs/characters.rs`. Cache key
 semantics are (path, mtime): an entry is reused only while the file's mtime is
 unchanged; revalidation is triggered by bumping the generation counter
 (`PageManagerTabState::notify_pages_changed`).
+Thumbnails and previews share the worker, the cancel flag, the epoch counter and
+the in-flight cap, but live in SEPARATE caches: a handful of megapixel-sized
+previews must never evict the card grid's 64 thumbnails.
 */
 
 use ms_thread::{self as thread, JoinHandle};
@@ -41,6 +47,24 @@ const THUMB_CACHE_CAPACITY: usize = 64;
 /// Maximum thumbnail jobs allowed in flight at once; visible cards above the cap
 /// simply retry on a later frame (the tab requests repaints while jobs are pending).
 const MAX_IN_FLIGHT_THUMB_JOBS: usize = 8;
+/// Default long side of a page preview, in pixels: large enough for the stitch
+/// window's zoomed-out board, far below a full-resolution decode.
+pub(super) const PREVIEW_LONG_SIDE_PX: u32 = 1024;
+/// Maximum number of preview entries kept in the GUI-side LRU cache. Previews are
+/// ~25x the pixels of a thumbnail, so the cache is deliberately small and separate.
+///
+/// The stitch board draws at most this many live previews at once
+/// (`stitch.rs::MAX_LIVE_PREVIEWS` is defined FROM this constant): requesting more
+/// than the LRU holds would evict and re-decode them every frame.
+pub(super) const PREVIEW_CACHE_CAPACITY: usize = 6;
+
+/// Which decode a path is currently queued for. Part of the in-flight key so a
+/// page can have a thumbnail and a preview pending at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JobKind {
+    Thumb,
+    Preview,
+}
 
 /// A job for the background worker.
 enum ThumbJob {
@@ -52,6 +76,16 @@ enum ThumbJob {
         known_mtime: Option<SystemTime>,
         /// Generation the request was made for; echoed back so stale entries can be
         /// marked verified.
+        generation: u64,
+        epoch: u64,
+    },
+    /// Decode a page preview: the same image downscaled to `long_side_px`, for the
+    /// stitch window. Never revalidated by mtime — previews are requested while a
+    /// modal dialog is open and the whole cache is dropped when pages change.
+    Preview {
+        path: PathBuf,
+        /// Long side of the produced preview, in pixels.
+        long_side_px: u32,
         generation: u64,
         epoch: u64,
     },
@@ -87,6 +121,27 @@ enum ThumbEvent {
         generation: u64,
         epoch: u64,
     },
+    /// Freshly decoded page preview plus the full image dimensions.
+    PreviewLoaded {
+        path: PathBuf,
+        mtime: Option<SystemTime>,
+        full_size: (u32, u32),
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+        /// Long side the preview was produced for; a later request for a bigger
+        /// preview of the same page must not be served from this entry.
+        long_side_px: u32,
+        generation: u64,
+        epoch: u64,
+    },
+    /// Preview decode failed; the error is logged worker-side.
+    PreviewFailed {
+        path: PathBuf,
+        mtime: Option<SystemTime>,
+        generation: u64,
+        epoch: u64,
+    },
     /// Per-page layer counts merged from the saved + unsaved manifests.
     LayersScanned {
         epoch: u64,
@@ -100,6 +155,51 @@ pub(super) enum ThumbVisual {
     Ready(egui::TextureHandle),
     /// Decode failed; draw an error placeholder instead of retrying every frame.
     Failed,
+}
+
+/// Visual payload of a cached page preview.
+pub(super) enum PreviewVisual {
+    /// Uploaded texture plus the long side it was decoded for.
+    Ready {
+        texture: egui::TextureHandle,
+        long_side_px: u32,
+    },
+    /// Decode failed; the caller draws a placeholder instead of retrying every frame.
+    Failed,
+}
+
+/// What the stitch window can do with a page preview this frame.
+pub(super) enum PreviewState {
+    /// No entry yet: a job is pending (or was just submitted).
+    Pending,
+    /// The page could not be decoded.
+    Failed,
+    /// Ready to draw.
+    Ready {
+        texture: egui::TextureId,
+        /// Size of the preview texture, in points.
+        size: egui::Vec2,
+        /// Full source image dimensions, when known.
+        full_size: Option<(u32, u32)>,
+    },
+}
+
+/// Maps a cached preview entry to what the caller may draw this frame.
+///
+/// A missing entry is [`PreviewState::Pending`]: whether a decode is actually in
+/// flight is the caller's business (it knows whether it requested one).
+fn preview_state_of(entry: Option<&ThumbEntry<PreviewVisual>>) -> PreviewState {
+    match entry {
+        Some(entry) => match &entry.visual {
+            PreviewVisual::Ready { texture, .. } => PreviewState::Ready {
+                texture: texture.id(),
+                size: texture.size_vec2(),
+                full_size: entry.full_size,
+            },
+            PreviewVisual::Failed => PreviewState::Failed,
+        },
+        None => PreviewState::Pending,
+    }
 }
 
 /// One cached thumbnail record. `T` is the visual payload (`ThumbVisual` in
@@ -217,7 +317,9 @@ pub(super) struct ThumbRuntime {
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
     pub(super) cache: ThumbCache<ThumbVisual>,
-    in_flight: HashSet<PathBuf>,
+    /// Separate, much smaller LRU for the stitch window's page previews.
+    preview_cache: ThumbCache<PreviewVisual>,
+    in_flight: HashSet<(JobKind, PathBuf)>,
     texture_serial: u64,
 }
 
@@ -237,6 +339,7 @@ impl Default for ThumbRuntime {
             cancel,
             epoch,
             cache: ThumbCache::new(THUMB_CACHE_CAPACITY),
+            preview_cache: ThumbCache::new(PREVIEW_CACHE_CAPACITY),
             in_flight: HashSet::new(),
             texture_serial: 0,
         }
@@ -261,7 +364,7 @@ impl ThumbRuntime {
     /// in-flight cap is reached. Returns `true` when the caller should keep
     /// requesting repaints (a job is pending or was just submitted).
     pub(super) fn request_thumb_if_needed(&mut self, path: &Path, generation: u64) -> bool {
-        if self.in_flight.contains(path) {
+        if self.is_in_flight(JobKind::Thumb, path) {
             return true;
         }
         let known_mtime = match self.cache.peek(path) {
@@ -273,7 +376,7 @@ impl ThumbRuntime {
             // Over the cap: retry on a later frame once some jobs complete.
             return true;
         }
-        self.in_flight.insert(path.to_path_buf());
+        self.in_flight.insert((JobKind::Thumb, path.to_path_buf()));
         let epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(ThumbJob::Thumb {
             path: path.to_path_buf(),
@@ -282,6 +385,83 @@ impl ThumbRuntime {
             epoch,
         });
         true
+    }
+
+    /// Requests a `long_side_px` preview of `path` unless a preview at least that
+    /// large is already cached for `generation`, the path is already in flight, or
+    /// the shared in-flight cap is reached. Returns `true` when the caller should
+    /// keep requesting repaints (a job is pending or was just submitted).
+    ///
+    /// Pair it with [`Self::preview_state`] exactly as the card grid pairs
+    /// [`Self::request_thumb_if_needed`] with the thumbnail cache lookup.
+    pub(super) fn request_preview_if_needed(
+        &mut self,
+        path: &Path,
+        long_side_px: u32,
+        generation: u64,
+    ) -> bool {
+        if self.is_in_flight(JobKind::Preview, path) {
+            return true;
+        }
+        if let Some(entry) = self.preview_cache.peek(path) {
+            let cached_long_side = match &entry.visual {
+                PreviewVisual::Ready { long_side_px, .. } => Some(*long_side_px),
+                PreviewVisual::Failed => None,
+            };
+            if cached_preview_answers(
+                cached_long_side,
+                entry.verified_generation,
+                long_side_px,
+                generation,
+            ) {
+                return false;
+            }
+        }
+        if self.in_flight.len() >= MAX_IN_FLIGHT_THUMB_JOBS {
+            return true;
+        }
+        self.in_flight.insert((JobKind::Preview, path.to_path_buf()));
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let _ = self.tx.send(ThumbJob::Preview {
+            path: path.to_path_buf(),
+            long_side_px,
+            generation,
+            epoch,
+        });
+        true
+    }
+
+    /// Returns the drawable state of `path`'s preview, marking it most recently
+    /// used. Does NOT submit a job — call [`Self::request_preview_if_needed`] first.
+    pub(super) fn preview_state(&mut self, path: &Path) -> PreviewState {
+        preview_state_of(self.preview_cache.touch_and_get(path))
+    }
+
+    /// Same answer as [`Self::preview_state`], but WITHOUT touching LRU order.
+    ///
+    /// For a page the caller is not allowed to request a preview for (the stitch
+    /// board caps live previews at `PREVIEW_CACHE_CAPACITY`): an entry that is
+    /// still cached may be drawn, yet promoting it would let a capped page evict
+    /// one of the pages that is actually being previewed.
+    pub(super) fn preview_state_cached(&self, path: &Path) -> PreviewState {
+        preview_state_of(self.preview_cache.peek(path))
+    }
+
+    /// Whether a job of `kind` is already queued for `path`.
+    ///
+    /// Scans linearly on purpose: the set never exceeds `MAX_IN_FLIGHT_THUMB_JOBS`
+    /// entries, so this is cheaper than allocating an owned key to hash.
+    fn is_in_flight(&self, kind: JobKind, path: &Path) -> bool {
+        self.in_flight
+            .iter()
+            .any(|(job_kind, job_path)| *job_kind == kind && job_path == path)
+    }
+
+    /// Marks the `kind` job of `path` as finished. Same linear-scan rationale as
+    /// [`Self::is_in_flight`]: no owned key has to be built to look it up.
+    fn clear_in_flight(&mut self, kind: JobKind, path: &Path) {
+        self.in_flight
+            .retain(|(job_kind, job_path)| *job_kind != kind || job_path != path);
     }
 
     /// Submits a layer-count scan of the two `layers.json` manifests.
@@ -298,7 +478,7 @@ impl ThumbRuntime {
         });
     }
 
-    /// Whether any thumbnail job is still in flight.
+    /// Whether any thumbnail or preview job is still in flight.
     pub(super) fn has_in_flight(&self) -> bool {
         !self.in_flight.is_empty()
     }
@@ -311,7 +491,7 @@ impl ThumbRuntime {
             match self.rx.try_recv() {
                 Ok(ThumbEvent::Unchanged { path, generation, epoch }) => {
                     if epoch != self.epoch.load(Ordering::Acquire) { continue; }
-                    self.in_flight.remove(&path);
+                    self.clear_in_flight(JobKind::Thumb, &path);
                     if let Some(entry) = self.cache.peek_mut(&path) {
                         entry.verified_generation = entry.verified_generation.max(generation);
                     }
@@ -327,7 +507,7 @@ impl ThumbRuntime {
                     epoch,
                 }) => {
                     if epoch != self.epoch.load(Ordering::Acquire) { continue; }
-                    self.in_flight.remove(&path);
+                    self.clear_in_flight(JobKind::Thumb, &path);
                     let color = egui::ColorImage::from_rgba_unmultiplied(
                         [thumb_width, thumb_height],
                         &thumb_rgba,
@@ -346,6 +526,48 @@ impl ThumbRuntime {
                         generation,
                     );
                 }
+                Ok(ThumbEvent::PreviewLoaded {
+                    path,
+                    mtime,
+                    full_size,
+                    width,
+                    height,
+                    rgba,
+                    long_side_px,
+                    generation,
+                    epoch,
+                }) => {
+                    if epoch != self.epoch.load(Ordering::Acquire) { continue; }
+                    self.clear_in_flight(JobKind::Preview, &path);
+                    let color = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                    self.texture_serial = self.texture_serial.wrapping_add(1);
+                    let texture = ctx.load_texture(
+                        format!("page-manager-preview-{}", self.texture_serial),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.preview_cache.insert(
+                        path,
+                        PreviewVisual::Ready {
+                            texture,
+                            long_side_px,
+                        },
+                        mtime,
+                        Some(full_size),
+                        generation,
+                    );
+                }
+                Ok(ThumbEvent::PreviewFailed {
+                    path,
+                    mtime,
+                    generation,
+                    epoch,
+                }) => {
+                    if epoch != self.epoch.load(Ordering::Acquire) { continue; }
+                    self.clear_in_flight(JobKind::Preview, &path);
+                    self.preview_cache
+                        .insert(path, PreviewVisual::Failed, mtime, None, generation);
+                }
                 Ok(ThumbEvent::Failed {
                     path,
                     mtime,
@@ -353,7 +575,7 @@ impl ThumbRuntime {
                     epoch,
                 }) => {
                     if epoch != self.epoch.load(Ordering::Acquire) { continue; }
-                    self.in_flight.remove(&path);
+                    self.clear_in_flight(JobKind::Thumb, &path);
                     self.cache
                         .insert(path, ThumbVisual::Failed, mtime, None, generation);
                 }
@@ -366,11 +588,12 @@ impl ThumbRuntime {
         scans
     }
 
-    /// Drops the cache and invalidates queued/in-flight thumbnail replies by epoch.
+    /// Drops both caches and invalidates queued/in-flight replies by epoch.
     pub(super) fn reset(&mut self) {
         // Invalidates queued and already-produced replies without uploading stale textures.
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cache.clear();
+        self.preview_cache.clear();
         self.in_flight.clear();
     }
 }
@@ -403,15 +626,15 @@ fn run_worker(
                     let _ = tx_event.send(ThumbEvent::Unchanged { path, generation, epoch });
                     continue;
                 }
-                match decode_thumb(&path) {
+                match decode_downscaled(&path, THUMB_LONG_SIDE_PX) {
                     Ok(decoded) => {
                         let _ = tx_event.send(ThumbEvent::Loaded {
                             path,
                             mtime,
                             full_size: decoded.full_size,
-                            thumb_width: decoded.thumb_width,
-                            thumb_height: decoded.thumb_height,
-                            thumb_rgba: decoded.thumb_rgba,
+                            thumb_width: decoded.width,
+                            thumb_height: decoded.height,
+                            thumb_rgba: decoded.rgba,
                             generation,
                             epoch,
                         });
@@ -422,6 +645,44 @@ fn run_worker(
                             path.display()
                         ));
                         let _ = tx_event.send(ThumbEvent::Failed {
+                            path,
+                            mtime,
+                            generation,
+                            epoch,
+                        });
+                    }
+                }
+            }
+            ThumbJob::Preview {
+                path,
+                long_side_px,
+                generation,
+                epoch,
+            } => {
+                if epoch != active_epoch.load(Ordering::Acquire) { continue; }
+                let mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok());
+                match decode_downscaled(&path, long_side_px) {
+                    Ok(decoded) => {
+                        let _ = tx_event.send(ThumbEvent::PreviewLoaded {
+                            path,
+                            mtime,
+                            full_size: decoded.full_size,
+                            width: decoded.width,
+                            height: decoded.height,
+                            rgba: decoded.rgba,
+                            long_side_px,
+                            generation,
+                            epoch,
+                        });
+                    }
+                    Err(err) => {
+                        crate::runtime_log::log_warn(format!(
+                            "[page_manager] page preview decode failed\nPath: {}\nLong side: {long_side_px} px\nError: {err}",
+                            path.display()
+                        ));
+                        let _ = tx_event.send(ThumbEvent::PreviewFailed {
                             path,
                             mtime,
                             generation,
@@ -442,33 +703,56 @@ fn run_worker(
     }
 }
 
-/// Result of a successful thumbnail decode: the FULL source dimensions plus the
-/// downscaled RGBA buffer.
-struct DecodedThumbData {
-    full_size: (u32, u32),
-    thumb_width: usize,
-    thumb_height: usize,
-    thumb_rgba: Vec<u8>,
+/// Whether a cached preview entry already answers a request.
+///
+/// `cached_long_side` is the long side the entry was decoded at, or `None` for a
+/// cached decode FAILURE — which is a final answer for its generation, so the
+/// window shows a placeholder instead of re-queueing a doomed decode every frame.
+/// An entry verified for an older generation never answers: `notify_pages_changed`
+/// bumps the generation exactly because the files may have moved underneath.
+fn cached_preview_answers(
+    cached_long_side: Option<u32>,
+    verified_generation: u64,
+    requested_long_side: u32,
+    generation: u64,
+) -> bool {
+    if verified_generation < generation {
+        return false;
+    }
+    match cached_long_side {
+        None => true,
+        // A bigger preview serves a smaller request; a smaller one must be redecoded.
+        Some(cached) => cached >= requested_long_side,
+    }
 }
 
-/// Decodes the page image at `path` and downsizes it so the long side is at most
-/// [`THUMB_LONG_SIDE_PX`].
+/// Result of a successful decode: the FULL source dimensions plus the downscaled
+/// RGBA buffer and its size in pixels.
+struct DecodedImageData {
+    full_size: (u32, u32),
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+}
+
+/// Decodes the page image at `path` and downsizes it so neither side exceeds
+/// `long_side_px`, preserving the aspect ratio. An image already smaller than the
+/// bound is returned untouched (`DynamicImage::thumbnail` never upscales), so the
+/// produced size is at most `long_side_px` on the long side, never exactly it.
 ///
 /// # Errors
 /// Returns the decode error message when the file cannot be opened or decoded.
-fn decode_thumb(path: &Path) -> Result<DecodedThumbData, String> {
+fn decode_downscaled(path: &Path, long_side_px: u32) -> Result<DecodedImageData, String> {
     let img = image::open(path).map_err(|err| err.to_string())?;
     let full_size = (img.width(), img.height());
-    let thumb = img
-        .thumbnail(THUMB_LONG_SIDE_PX, THUMB_LONG_SIDE_PX)
-        .to_rgba8();
-    let thumb_width = thumb.width() as usize;
-    let thumb_height = thumb.height() as usize;
-    Ok(DecodedThumbData {
+    let scaled = img.thumbnail(long_side_px, long_side_px).to_rgba8();
+    let width = usize::try_from(scaled.width()).map_err(|err| err.to_string())?;
+    let height = usize::try_from(scaled.height()).map_err(|err| err.to_string())?;
+    Ok(DecodedImageData {
         full_size,
-        thumb_width,
-        thumb_height,
-        thumb_rgba: thumb.into_raw(),
+        width,
+        height,
+        rgba: scaled.into_raw(),
     })
 }
 
@@ -526,6 +810,20 @@ mod tests {
         insert(&mut cache, "a");
         insert(&mut cache, "a");
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cached_preview_answers_only_a_current_and_large_enough_entry() {
+        // Same generation, decoded at least as large: reuse.
+        assert!(cached_preview_answers(Some(1024), 3, 1024, 3));
+        assert!(cached_preview_answers(Some(2048), 3, 1024, 3));
+        // Decoded smaller than requested: redecode.
+        assert!(!cached_preview_answers(Some(512), 3, 1024, 3));
+        // Stale generation: redecode even if the size fits.
+        assert!(!cached_preview_answers(Some(2048), 2, 1024, 3));
+        // A cached failure is final for its generation, but not across one.
+        assert!(cached_preview_answers(None, 3, 1024, 3));
+        assert!(!cached_preview_answers(None, 2, 1024, 3));
     }
 
     #[test]

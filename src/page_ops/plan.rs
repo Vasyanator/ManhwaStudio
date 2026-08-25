@@ -15,9 +15,15 @@ Key structures:
 - PageOpPlan / PlannedMove / PlannedCreate / PlannedJsonWrite /
   PlannedTrashWrite: the action plan persisted verbatim into the journal.
 
+- PlacementMap / StitchGeometry: the affine of one stitched page and the
+  resolved stitch request every remap of a merged page is routed through.
+- ComposeSource / NewPageContent::ComposedPng: the recipe `fs_exec` executes to
+  build a stitched raster during phase A.
+
 Key functions:
 - permutation_for_op(): op -> permutation + validation (pure).
 - build_plan(): snapshot + op -> PageOpPlan (pure; no filesystem access).
+- build_stitch_geometry(): stitch request + snapshot -> validated affines.
 - canonical page-keyed file-name helpers shared with the scanner.
 
 Notes:
@@ -27,7 +33,7 @@ committed chapter tree and its sibling `{chapter}_unsaved` staging tree.
 No function in this file touches the filesystem.
 */
 
-use super::{PageOpError, PageOpKind};
+use super::{PageOpError, PageOpKind, StitchPlacement};
 use crate::config;
 use crate::page_ops::json_remap;
 use serde::{Deserialize, Serialize};
@@ -154,8 +160,316 @@ fn parse_detection_page_idx(name: &str, suffix: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Stitch geometry.
+//
+// A stitch places N source pages on one canvas. Every page-keyed artifact of a
+// stitched page — normalized bubble uv, absolute page-px layer transforms,
+// detector blocks, page-sized rasters — is remapped through ONE affine per
+// source page, `PlacementMap`. No caller re-derives the formula.
+// ---------------------------------------------------------------------------
+
+/// Inclusive bound on either side of a stitched canvas, in pixels. Larger than
+/// `BLANK_MAX_SIDE_PX` on purpose: a stitched ribbon legitimately exceeds the
+/// size a user would ever type into the blank-page dialog.
+///
+/// Re-exported by `page_ops` so the stitch UI validates against the very value
+/// the engine enforces instead of a copy that can silently drift.
+pub(crate) const STITCH_MAX_SIDE_PX: u32 = 40_000;
+/// Inclusive bound on the stitched canvas area, in pixels. Caps the RGBA
+/// staging buffer of the compose step at ~800 MB. Re-exported by `page_ops`
+/// for the stitch UI's own pre-validation.
+pub(crate) const STITCH_MAX_TOTAL_PX: u64 = 200_000_000;
+/// Inclusive upper bound of a placement's uniform scale factor. Re-exported by
+/// `page_ops` for the stitch UI's own pre-validation.
+pub(crate) const STITCH_MAX_SCALE: f32 = 16.0;
+/// Bound on `|dx|` / `|dy|`. Keeps every placement offset inside `i32`, so the
+/// affine can be built without a lossy integer -> float cast.
+const STITCH_MAX_OFFSET_PX: i64 = 1_000_000;
+
+/// The affine map from one source page's own pixels to the stitched canvas.
+///
+/// Built (and fully validated) by [`PlacementMap::new`]; all remaps of that
+/// page's artifacts go through it, so the three on-disk coordinate spaces stay
+/// distinguishable: page-normalized uv uses [`PlacementMap::map_u`] /
+/// [`PlacementMap::map_v`], absolute page pixels use [`PlacementMap::map_x`] /
+/// [`PlacementMap::map_y`], and layer-image-local pixels are never mapped at
+/// all (the layer PNGs are not resampled).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PlacementMap {
+    page_w: f64,
+    page_h: f64,
+    crop_x: f64,
+    crop_y: f64,
+    crop_w: f64,
+    crop_h: f64,
+    scale: f64,
+    dx: f64,
+    dy: f64,
+    canvas_w: f64,
+    canvas_h: f64,
+    /// Placed rectangle in canvas pixels, `[x, y, w, h]` (rounded once here so
+    /// every consumer agrees on the pixel extent).
+    placed: [u32; 4],
+}
+
+impl PlacementMap {
+    /// Validates one placement against its page and the canvas and returns the
+    /// affine.
+    ///
+    /// `page_size` is the source page's own pixel size, `canvas` the stitched
+    /// page's size. Validation is total: a returned map is guaranteed to place
+    /// a non-empty rectangle fully inside the canvas from a non-empty crop
+    /// fully inside the page.
+    ///
+    /// # Errors
+    /// [`PageOpError::InvalidOp`] for a zero-sized page or crop, a crop leaving
+    /// the page, a non-finite / out-of-range `scale`, an offset beyond
+    /// `STITCH_MAX_OFFSET_PX`, or a placed rectangle leaving the canvas.
+    pub(crate) fn new(
+        placement: &StitchPlacement,
+        page_size: [u32; 2],
+        canvas: [u32; 2],
+    ) -> Result<Self, PageOpError> {
+        let idx = placement.page_idx;
+        if page_size[0] == 0 || page_size[1] == 0 {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch source page {idx} has a zero pixel size {}x{}",
+                page_size[0], page_size[1]
+            )));
+        }
+        let [cx, cy, cw, ch] = placement.crop;
+        if cw == 0 || ch == 0 {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch crop of page {idx} is empty ({cw}x{ch})"
+            )));
+        }
+        let right = cx.checked_add(cw);
+        let bottom = cy.checked_add(ch);
+        if right.is_none_or(|r| r > page_size[0]) || bottom.is_none_or(|b| b > page_size[1]) {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch crop [{cx}, {cy}, {cw}, {ch}] of page {idx} leaves its \
+                 {}x{} image",
+                page_size[0], page_size[1]
+            )));
+        }
+        if !placement.scale.is_finite()
+            || placement.scale <= 0.0
+            || placement.scale > STITCH_MAX_SCALE
+        {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch scale {} of page {idx} is outside (0, {STITCH_MAX_SCALE}]",
+                placement.scale
+            )));
+        }
+        // Range test rather than `abs()`: `i64::MIN.abs()` panics, and this
+        // value comes straight from the UI.
+        let offset_ok = -STITCH_MAX_OFFSET_PX..=STITCH_MAX_OFFSET_PX;
+        if !offset_ok.contains(&placement.dx) || !offset_ok.contains(&placement.dy) {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch offset ({}, {}) of page {idx} exceeds +-{STITCH_MAX_OFFSET_PX} px",
+                placement.dx, placement.dy
+            )));
+        }
+        // The bound above guarantees both offsets fit `i32`, so the conversion
+        // to f64 is exact and needs no lossy `as`.
+        let (Ok(dx_i32), Ok(dy_i32)) = (
+            i32::try_from(placement.dx),
+            i32::try_from(placement.dy),
+        ) else {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch offset ({}, {}) of page {idx} is not representable",
+                placement.dx, placement.dy
+            )));
+        };
+        let scale = f64::from(placement.scale);
+        let dx = f64::from(dx_i32);
+        let dy = f64::from(dy_i32);
+        let placed_w = round_to_u32(f64::from(cw) * scale);
+        let placed_h = round_to_u32(f64::from(ch) * scale);
+        if placed_w == 0 || placed_h == 0 {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch placement of page {idx} rounds to an empty rectangle"
+            )));
+        }
+        if dx < 0.0
+            || dy < 0.0
+            || dx + f64::from(placed_w) > f64::from(canvas[0])
+            || dy + f64::from(placed_h) > f64::from(canvas[1])
+        {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch placement of page {idx} ({placed_w}x{placed_h} at \
+                 ({}, {})) leaves the {}x{} canvas",
+                placement.dx, placement.dy, canvas[0], canvas[1]
+            )));
+        }
+        // `dx`/`dy` are >= 0 and bounded by the canvas here, so the placed
+        // origin is a valid u32.
+        let placed_x = round_to_u32(dx);
+        let placed_y = round_to_u32(dy);
+        Ok(Self {
+            page_w: f64::from(page_size[0]),
+            page_h: f64::from(page_size[1]),
+            crop_x: f64::from(cx),
+            crop_y: f64::from(cy),
+            crop_w: f64::from(cw),
+            crop_h: f64::from(ch),
+            scale,
+            dx,
+            dy,
+            canvas_w: f64::from(canvas[0]),
+            canvas_h: f64::from(canvas[1]),
+            placed: [placed_x, placed_y, placed_w, placed_h],
+        })
+    }
+
+    /// Maps an absolute X in the source page's pixels to canvas pixels.
+    #[must_use]
+    pub(crate) fn map_x(&self, x: f64) -> f64 {
+        (x - self.crop_x) * self.scale + self.dx
+    }
+
+    /// Maps an absolute Y in the source page's pixels to canvas pixels.
+    #[must_use]
+    pub(crate) fn map_y(&self, y: f64) -> f64 {
+        (y - self.crop_y) * self.scale + self.dy
+    }
+
+    /// Maps a page-pixel LENGTH (no origin shift) to canvas pixels. Also the
+    /// right operation for a stored page-size MULTIPLIER (a layer transform's
+    /// `scale`), which is a length in disguise: the layer image it sizes is not
+    /// resampled, so its on-page extent must follow the placement.
+    #[must_use]
+    pub(crate) fn map_len(&self, length: f64) -> f64 {
+        length * self.scale
+    }
+
+    /// Maps a page-normalized U (0..1 over the source page's width) to a
+    /// canvas-normalized U.
+    #[must_use]
+    pub(crate) fn map_u(&self, u: f64) -> f64 {
+        self.map_x(u * self.page_w) / self.canvas_w
+    }
+
+    /// Maps a page-normalized V (0..1 over the source page's height) to a
+    /// canvas-normalized V.
+    #[must_use]
+    pub(crate) fn map_v(&self, v: f64) -> f64 {
+        self.map_y(v * self.page_h) / self.canvas_h
+    }
+
+    /// The placed rectangle in canvas pixels, `[x, y, w, h]`.
+    #[must_use]
+    pub(crate) fn placed_rect(&self) -> [u32; 4] {
+        self.placed
+    }
+
+    /// The crop rectangle in the source page's own pixels, `[x, y, w, h]`.
+    #[must_use]
+    pub(crate) fn crop_rect(&self) -> [u32; 4] {
+        [
+            round_to_u32(self.crop_x),
+            round_to_u32(self.crop_y),
+            round_to_u32(self.crop_w),
+            round_to_u32(self.crop_h),
+        ]
+    }
+}
+
+/// Rounds a non-negative, finite f64 to `u32`, saturating at both ends.
+///
+/// The `as` conversion is reached only for a value already proven finite and
+/// inside `0 ..= u32::MAX`, where it is exact.
+#[must_use]
+fn round_to_u32(value: f64) -> u32 {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded <= 0.0 {
+        return 0;
+    }
+    if rounded >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    rounded as u32
+}
+
+/// Everything the JSON remaps need to know about a stitch: which pages are
+/// merged, where each lands, and how their per-page index axes are re-based.
+#[derive(Debug, Clone)]
+pub(crate) struct StitchGeometry {
+    /// Affine per SOURCE page index (current order), ascending.
+    placements: std::collections::BTreeMap<usize, PlacementMap>,
+    /// Offset added to every `layer_idx` of that source page so the typing
+    /// tab's «Группа текста N» axes of the merged pages stay distinct.
+    /// Computed chapter-wide (over both trees, `layers.json` AND every
+    /// `text_info.json`) so all documents agree on the same re-basing.
+    layer_idx_offsets: std::collections::BTreeMap<usize, u32>,
+    /// New index of the merged page.
+    pub primary_new: usize,
+    /// Canvas size of the stitched page, in pixels.
+    pub canvas: [u32; 2],
+    /// Straight-RGBA fill of the stitched PAGE canvas where no source covers
+    /// it. Page-sized overlays and masks always compose over their own neutral
+    /// background (transparent / black) instead, never over this one.
+    pub background: [u8; 4],
+}
+
+impl StitchGeometry {
+    /// The affine of `old_idx`, or `None` when that page is not stitched.
+    #[must_use]
+    pub(crate) fn placement(&self, old_idx: usize) -> Option<&PlacementMap> {
+        self.placements.get(&old_idx)
+    }
+
+    /// Builds a geometry directly, for tests of the JSON remaps (the normal
+    /// path goes through `build_stitch_geometry`, which needs a full snapshot).
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        placements: Vec<(usize, PlacementMap)>,
+        layer_idx_offsets: Vec<(usize, u32)>,
+        primary_new: usize,
+        canvas: [u32; 2],
+    ) -> Self {
+        Self {
+            placements: placements.into_iter().collect(),
+            layer_idx_offsets: layer_idx_offsets.into_iter().collect(),
+            primary_new,
+            canvas,
+            background: [0, 0, 0, 0],
+        }
+    }
+
+    /// Number of merged source pages.
+    #[must_use]
+    pub(crate) fn source_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// `layer_idx` offset of a source page; 0 for any other page.
+    #[must_use]
+    pub(crate) fn layer_idx_offset(&self, old_idx: usize) -> u32 {
+        self.layer_idx_offsets.get(&old_idx).copied().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Permutation math.
 // ---------------------------------------------------------------------------
+
+/// One source image of a composed page: which file, which part of it, and
+/// where it lands. Paths are title-relative and point at the file's ORIGINAL
+/// location, because composing happens in phase A, before any rename.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ComposeSource {
+    /// Title-relative path of the image to read.
+    pub path: String,
+    /// Pixel size the crop/offset are expressed in (the source PAGE's size). A
+    /// decoded image of a different size is resized to it first — page-sized
+    /// overlays may have been attached with a same-aspect resize.
+    pub page_size: [u32; 2],
+    /// `[x, y, w, h]` region of the source image, in `page_size` pixels.
+    pub crop: [u32; 4],
+    /// `[x, y, w, h]` destination rectangle in the composed canvas.
+    pub dest: [u32; 4],
+}
 
 /// Content of a page created by the operation (journal-serializable so
 /// recovery can re-stage it).
@@ -168,6 +482,18 @@ pub(crate) enum NewPageContent {
         width: u32,
         height: u32,
         rgba: [u8; 4],
+    },
+    /// Compose several cropped/scaled chapter images onto one background,
+    /// painted in list order, and encode the result as a straight-RGBA PNG.
+    /// Every listed source must exist at execution time: the executor never
+    /// invents pixels (a missing source fails the transaction closed, exactly
+    /// like a missing `CopyFile` source).
+    ComposedPng {
+        width: u32,
+        height: u32,
+        /// Straight (non-premultiplied) RGBA fill of the uncovered canvas.
+        background: [u8; 4],
+        sources: Vec<ComposeSource>,
     },
 }
 
@@ -325,7 +651,87 @@ pub(crate) fn permutation_for_op(
                 new_pages: Vec::new(),
             })
         }
+        PageOpKind::Stitch {
+            placements,
+            width,
+            height,
+            background: _,
+        } => stitch_permutation(placements, *width, *height, old_page_count),
     }
+}
+
+/// Index math + canvas/selection validation of a stitch.
+///
+/// Every source page maps to the new index of `primary = min(page_idx)`; pages
+/// after a source shift down by the number of sources before them. The created
+/// page is NOT listed in `new_pages`: its content is built from the chapter
+/// snapshot by `build_stitch_plan`, not from the request alone.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for fewer than two placements, a duplicate or
+/// out-of-range `page_idx`, or a canvas outside the supported size bounds.
+/// Per-placement geometry is validated later, against the page sizes.
+fn stitch_permutation(
+    placements: &[StitchPlacement],
+    width: u32,
+    height: u32,
+    old_page_count: usize,
+) -> Result<Permutation, PageOpError> {
+    if placements.len() < 2 {
+        return Err(PageOpError::InvalidOp(format!(
+            "stitch needs at least 2 pages, got {}",
+            placements.len()
+        )));
+    }
+    let mut sources = BTreeSet::new();
+    for placement in placements {
+        if placement.page_idx >= old_page_count {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch page {} is out of range for {old_page_count} page(s)",
+                placement.page_idx
+            )));
+        }
+        if !sources.insert(placement.page_idx) {
+            return Err(PageOpError::InvalidOp(format!(
+                "stitch lists page {} more than once",
+                placement.page_idx
+            )));
+        }
+    }
+    if width == 0 || height == 0 || width > STITCH_MAX_SIDE_PX || height > STITCH_MAX_SIDE_PX {
+        return Err(PageOpError::InvalidOp(format!(
+            "stitched canvas {width}x{height} is outside [1, {STITCH_MAX_SIDE_PX}] per side"
+        )));
+    }
+    if u64::from(width) * u64::from(height) > STITCH_MAX_TOTAL_PX {
+        return Err(PageOpError::InvalidOp(format!(
+            "stitched canvas {width}x{height} exceeds {STITCH_MAX_TOTAL_PX} pixels"
+        )));
+    }
+
+    let mut old_to_new = Vec::with_capacity(old_page_count);
+    let mut next_new = 0usize;
+    let mut merged_new: Option<usize> = None;
+    for old_idx in 0..old_page_count {
+        if sources.contains(&old_idx) {
+            // The first (lowest) source claims the merged page's slot; the rest
+            // fold onto it without consuming an index.
+            let slot = *merged_new.get_or_insert_with(|| {
+                let slot = next_new;
+                next_new += 1;
+                slot
+            });
+            old_to_new.push(Some(slot));
+        } else {
+            old_to_new.push(Some(next_new));
+            next_new += 1;
+        }
+    }
+    Ok(Permutation {
+        old_to_new,
+        new_page_count: next_new,
+        new_pages: Vec::new(),
+    })
 }
 
 /// Shared shift math for `InsertFiles` / `CreateBlank`: old pages before `at`
@@ -410,6 +816,14 @@ pub(crate) struct ChapterSnapshot {
     /// File name of each current page in `src/`, index-aligned with the
     /// current page order.
     pub page_file_names: Vec<String>,
+    /// Pixel size of each current page, index-aligned with `page_file_names`.
+    /// Filled only for operations that need page geometry (`Stitch`), because
+    /// probing it costs one image-header read per page; empty otherwise.
+    pub page_sizes: Vec<[u32; 2]>,
+    /// True when `alt_vers/` holds anything. The engine never remaps it (its
+    /// files pair with pages by SORTED POSITION, not by name), so an operation
+    /// that changes the page count warns about the resulting misalignment.
+    pub has_alt_vers: bool,
     pub committed: TreeSnapshot,
     pub unsaved: TreeSnapshot,
     pub detection: Vec<DetectionFiles>,
@@ -599,6 +1013,17 @@ impl PlanBuilder {
         self.json_writes.push(PlannedJsonWrite { target, content });
     }
 
+    /// Plans creating a new file at `target` from `content` (staged in phase A
+    /// beside its destination, committed in phase B).
+    fn create(&mut self, target: String, content: NewPageContent) {
+        let temp = self.next_temp(&target);
+        self.creates.push(PlannedCreate {
+            temp,
+            target,
+            content,
+        });
+    }
+
     fn write_trash_extra(&mut self, rel_inside_trash: String, content: String) {
         let target = format!("{}/{rel_inside_trash}", self.trash_root);
         self.trash_writes.push(PlannedTrashWrite { target, content });
@@ -637,16 +1062,54 @@ pub(crate) fn build_plan(
     let trash_root = format!("{}/{TRASH_DIR_NAME}/{trash_id}", snapshot.chapter_rel);
     let mut b = PlanBuilder::new(trash_root.clone(), trash_id);
 
-    plan_src_pages(&mut b, snapshot, map)?;
-    for tree in [&snapshot.committed, &snapshot.unsaved] {
-        plan_clean_overlays(&mut b, snapshot, tree, map);
-        plan_layer_pngs(&mut b, tree, map);
-        plan_layers_manifest(&mut b, tree, map)?;
-        plan_text_info(&mut b, tree, map)?;
-        plan_typing_masks(&mut b, tree, map);
-        plan_bubbles(&mut b, tree, map)?;
+    // A stitch is the one operation that MERGES pages instead of renaming them:
+    // it resolves its request into per-page affines first, and every planner
+    // below then treats a source page as "folded into the merged page" rather
+    // than "renamed to a new key".
+    let stitch = match op {
+        PageOpKind::Stitch {
+            placements,
+            width,
+            height,
+            background,
+        } => Some(build_stitch_geometry(
+            snapshot,
+            placements,
+            [*width, *height],
+            *background,
+            map,
+        )?),
+        PageOpKind::Move { .. }
+        | PageOpKind::InsertFiles { .. }
+        | PageOpKind::CreateBlank { .. }
+        | PageOpKind::Delete { .. } => None,
+    };
+    let stitch = stitch.as_ref();
+
+    if let Some(geo) = stitch
+        && snapshot.has_alt_vers
+    {
+        // `alt_vers/` pairs with pages by sorted position and has no per-file
+        // page key (see this module's MODULE_README), so merging pages shifts
+        // that pairing and there is nothing to rename.
+        b.warn(format!(
+            "{}/{}: alternate versions are position-matched and are NOT remapped;              merging {} page(s) into one shifts their alignment with the pages",
+            snapshot.chapter_rel,
+            config::ALT_VERS_DIR,
+            geo.source_count()
+        ));
     }
-    plan_detection(&mut b, snapshot, map)?;
+
+    plan_src_pages(&mut b, snapshot, map, stitch)?;
+    for tree in [&snapshot.committed, &snapshot.unsaved] {
+        plan_clean_overlays(&mut b, snapshot, tree, map, stitch);
+        plan_layer_pngs(&mut b, tree, map, stitch)?;
+        plan_layers_manifest(&mut b, tree, map, stitch)?;
+        plan_text_info(&mut b, tree, map, stitch)?;
+        plan_typing_masks(&mut b, snapshot, tree, map, stitch);
+        plan_bubbles(&mut b, tree, map, stitch)?;
+    }
+    plan_detection(&mut b, snapshot, map, stitch)?;
     plan_creates(&mut b, snapshot, &permutation);
 
     Ok(PageOpPlan {
@@ -661,15 +1124,174 @@ pub(crate) fn build_plan(
     })
 }
 
+/// Resolves a stitch request against the chapter snapshot.
+///
+/// Validates every placement against its page's real pixel size and the canvas
+/// (via [`PlacementMap::new`]) and computes the chapter-wide `layer_idx`
+/// re-basing: page k's text-group axis is shifted past every axis merged before
+/// it, using the maximum seen across BOTH trees' `layers.json` and every
+/// `text_info.json`, so all those documents agree on one re-basing.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] when the snapshot carries no page sizes, a
+/// placement is geometrically invalid, or the re-based axis would overflow.
+fn build_stitch_geometry(
+    snapshot: &ChapterSnapshot,
+    placements: &[StitchPlacement],
+    canvas: [u32; 2],
+    background: [u8; 4],
+    map: &[Option<usize>],
+) -> Result<StitchGeometry, PageOpError> {
+    if snapshot.page_sizes.len() != snapshot.page_file_names.len() {
+        return Err(PageOpError::InvalidOp(
+            "stitch requires the pixel size of every page, which this chapter \
+             snapshot does not carry"
+                .to_string(),
+        ));
+    }
+    let mut resolved = std::collections::BTreeMap::new();
+    for placement in placements {
+        let size = *snapshot.page_sizes.get(placement.page_idx).ok_or_else(|| {
+            PageOpError::InvalidOp(format!(
+                "stitch page {} has no known pixel size",
+                placement.page_idx
+            ))
+        })?;
+        resolved.insert(
+            placement.page_idx,
+            PlacementMap::new(placement, size, canvas)?,
+        );
+    }
+    let primary_old = *resolved.keys().next().ok_or_else(|| {
+        PageOpError::InvalidOp("stitch has no source pages".to_string())
+    })?;
+    let primary_new = map
+        .get(primary_old)
+        .copied()
+        .flatten()
+        .ok_or_else(|| {
+            PageOpError::InvalidOp(format!(
+                "stitch primary page {primary_old} has no index in the new order"
+            ))
+        })?;
+
+    // `layer_idx` re-basing: each merged page starts past the highest axis of
+    // the pages merged before it, so «Группа текста N» of different pages stay
+    // distinct instead of silently fusing.
+    let mut layer_idx_offsets = std::collections::BTreeMap::new();
+    let mut running: u32 = 0;
+    for old_idx in resolved.keys().copied() {
+        layer_idx_offsets.insert(old_idx, running);
+        if let Some(max_idx) = max_layer_idx_for_page(snapshot, old_idx) {
+            running = running
+                .checked_add(max_idx)
+                .and_then(|v| v.checked_add(1))
+                .ok_or_else(|| {
+                    PageOpError::InvalidOp(
+                        "stitch would overflow the text-group index axis".to_string(),
+                    )
+                })?;
+        }
+    }
+
+    Ok(StitchGeometry {
+        placements: resolved,
+        layer_idx_offsets,
+        primary_new,
+        canvas,
+        background,
+    })
+}
+
+/// Highest `layer_idx` used by page `old_idx` anywhere in the chapter, or
+/// `None` when the page uses no text-group axis at all. Scans both trees'
+/// layer manifests (node and text-group records) and every `text_info.json`.
+fn max_layer_idx_for_page(snapshot: &ChapterSnapshot, old_idx: usize) -> Option<u32> {
+    let mut max: Option<u32> = None;
+    let mut observe = |value: Option<&Value>| {
+        if let Some(idx) = value
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        {
+            max = Some(max.map_or(idx, |current: u32| current.max(idx)));
+        }
+    };
+    for tree in [&snapshot.committed, &snapshot.unsaved] {
+        if let Some(pages) = tree
+            .layers_manifest
+            .as_ref()
+            .and_then(|m| m.get("pages"))
+            .and_then(Value::as_array)
+        {
+            for page in pages {
+                if page
+                    .get("img_idx")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    != Some(old_idx)
+                {
+                    continue;
+                }
+                for rec in page.get("tree").and_then(Value::as_array).into_iter().flatten() {
+                    observe(rec.get("layer_idx"));
+                }
+                for group in page
+                    .get("text_groups")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    observe(group.get("layer_idx"));
+                }
+            }
+        }
+        for file in &tree.text_info {
+            for entry in &file.entries {
+                // A missing img_idx reads as page 0, mirroring the typing loader.
+                let entry_idx = entry
+                    .get("img_idx")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(0);
+                if entry_idx == old_idx {
+                    observe(entry.get("layer_idx"));
+                }
+            }
+        }
+    }
+    max
+}
+
 /// Source page files: rename surviving pages onto the canonical stem of their
 /// NEW index (extension preserved), move deleted pages to the trash.
+///
+/// Under a stitch every source page is trashed instead (its pixels survive in
+/// the composed page) and the merged page is staged as a new PNG, regardless of
+/// the source pages' extensions.
 fn plan_src_pages(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) -> Result<(), PageOpError> {
+    let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let from = format!("{}/{}/{name}", snapshot.chapter_rel, config::SRC_DIR);
+        if let Some(geo) = stitch
+            && let Some(placement) = geo.placement(old_idx)
+        {
+            let page_size = *snapshot.page_sizes.get(old_idx).ok_or_else(|| {
+                PageOpError::InvalidOp(format!("page {old_idx} has no known pixel size"))
+            })?;
+            composed.push(ComposeSource {
+                path: from.clone(),
+                page_size,
+                crop: placement.crop_rect(),
+                dest: placement.placed_rect(),
+            });
+            b.trash(from);
+            continue;
+        }
         match map[old_idx] {
             Some(new_idx) => {
                 let (_, ext) = split_name(name);
@@ -687,27 +1309,62 @@ fn plan_src_pages(
             None => b.trash(from),
         }
     }
+    if let Some(geo) = stitch {
+        b.create(
+            format!(
+                "{}/{}/{}.png",
+                snapshot.chapter_rel,
+                config::SRC_DIR,
+                canonical_page_stem(geo.primary_new)
+            ),
+            NewPageContent::ComposedPng {
+                width: geo.canvas[0],
+                height: geo.canvas[1],
+                background: geo.background,
+                sources: composed,
+            },
+        );
+    }
     Ok(())
 }
 
 /// Clean overlays are keyed by the PAGE'S CURRENT STEM (`{stem}.png`), in both
 /// the committed and unsaved `clean_layers/` dirs.
+///
+/// Under a stitch they are page-sized rasters and therefore COMPOSED, not
+/// renamed: the merged page gets one overlay built on a fully transparent
+/// canvas, so a source page without an overlay contributes a transparent hole
+/// showing the composed page pixels underneath. When no source page has an
+/// overlay, none is created.
 fn plan_clean_overlays(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) {
+    let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let (stem, _) = split_name(name);
-        if !tree.clean_overlay_stems.contains(stem) {
+        let exists = tree.clean_overlay_stems.contains(stem);
+        let from = format!("{}/{}/{stem}.png", tree.tree_rel, config::CLEAN_LAYERS_DIR);
+        if let Some(geo) = stitch
+            && let Some(placement) = geo.placement(old_idx)
+        {
+            if exists && let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                composed.push(ComposeSource {
+                    path: from.clone(),
+                    page_size,
+                    crop: placement.crop_rect(),
+                    dest: placement.placed_rect(),
+                });
+                b.trash(from);
+            }
             continue;
         }
-        let from = format!(
-            "{}/{}/{stem}.png",
-            tree.tree_rel,
-            config::CLEAN_LAYERS_DIR
-        );
+        if !exists {
+            continue;
+        }
         match map[old_idx] {
             Some(new_idx) => {
                 let target = format!(
@@ -721,12 +1378,50 @@ fn plan_clean_overlays(
             None => b.trash(from),
         }
     }
+    if let Some(geo) = stitch
+        && !composed.is_empty()
+    {
+        b.create(
+            format!(
+                "{}/{}/{}.png",
+                tree.tree_rel,
+                config::CLEAN_LAYERS_DIR,
+                canonical_page_stem(geo.primary_new)
+            ),
+            NewPageContent::ComposedPng {
+                width: geo.canvas[0],
+                height: geo.canvas[1],
+                // Straight alpha over the page: uncovered area must stay fully
+                // transparent, not painted.
+                background: [0, 0, 0, 0],
+                sources: composed,
+            },
+        );
+    }
 }
 
 /// Layer PNGs are keyed by the page index embedded in their name
 /// (`ps_p{page:04}_...`); the index prefix is load-bearing because
 /// `persist.rs::prune_orphan_pngs` deletes by that prefix.
-fn plan_layer_pngs(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usize>]) {
+///
+/// A stitch renames them exactly the same way — the pixels are layer-local and
+/// the placement lives in the manifest — but N pages now share one prefix, so
+/// two merged pages carrying the same layer uid would collide on one file name.
+/// Layer uids are UUIDs (`tabs/ps_editor/layers.rs`, `text_payload.rs`
+/// `stable_overlay_uid`) so this cannot normally happen; it is detected and
+/// refused rather than silently overwriting a PNG.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] when two merged pages would produce the same
+/// layer PNG name.
+fn plan_layer_pngs(
+    b: &mut PlanBuilder,
+    tree: &TreeSnapshot,
+    map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
+) -> Result<(), PageOpError> {
+    let mut merged_targets: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for name in &tree.layers_files {
         let Some(old_idx) = parse_layers_png_page_idx(name) else {
             continue;
@@ -746,9 +1441,17 @@ fn plan_layer_pngs(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usize
         }
         match map[old_idx] {
             Some(new_idx) => {
-                if let Some(new_name) =
-                    json_remap::remap_layers_png_name(name, old_idx, new_idx)
+                let new_name = json_remap::remap_layers_png_name(name, old_idx, new_idx)
+                    .unwrap_or_else(|| name.clone());
+                if stitch.is_some_and(|geo| geo.placement(old_idx).is_some())
+                    && let Some(previous) = merged_targets.insert(new_name.clone(), from.clone())
                 {
+                    return Err(PageOpError::InvalidOp(format!(
+                        "stitch would merge pages whose layer PNGs collide: '{previous}' \
+                         and '{from}' both become '{new_name}' (duplicate layer uid)"
+                    )));
+                }
+                if new_name != *name {
                     let target =
                         format!("{}/{}/{new_name}", tree.tree_rel, config::LAYERS_DIR);
                     b.rename(from, target);
@@ -757,6 +1460,7 @@ fn plan_layer_pngs(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usize
             None => b.trash(from),
         }
     }
+    Ok(())
 }
 
 /// `layers/layers.json`: remap `img_idx` and the embedded `ps_p...` file
@@ -766,11 +1470,12 @@ fn plan_layers_manifest(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) -> Result<(), PageOpError> {
     let Some(manifest) = &tree.layers_manifest else {
         return Ok(());
     };
-    let remap = json_remap::remap_layers_manifest(manifest, map)?;
+    let remap = json_remap::remap_layers_manifest(manifest, map, stitch)?;
     for warning in remap.warnings {
         b.warn(format!("{}/layers/layers.json: {warning}", tree.tree_rel));
     }
@@ -799,6 +1504,7 @@ fn plan_text_info(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) -> Result<(), PageOpError> {
     for file in &tree.text_info {
         let (dir_name, dir_files) = match file.location {
@@ -807,7 +1513,7 @@ fn plan_text_info(
                 (config::TEXT_IMAGES_DIR, &tree.text_images_files)
             }
         };
-        let remap = json_remap::remap_text_info(&file.entries, map)?;
+        let remap = json_remap::remap_text_info(&file.entries, map, stitch)?;
         let surviving_files: HashSet<&str> = remap
             .kept
             .iter()
@@ -850,11 +1556,29 @@ fn plan_text_info(
 }
 
 /// Typing-tab page masks `text_images/mask_page_{idx}.png`.
-fn plan_typing_masks(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usize>]) {
+///
+/// Under a stitch these are page-sized rasters and are COMPOSED like the clean
+/// overlays, over a black (inactive) background — the loader thresholds the
+/// decoded luma at 128, so uncovered canvas reads as "not masked".
+fn plan_typing_masks(
+    b: &mut PlanBuilder,
+    snapshot: &ChapterSnapshot,
+    tree: &TreeSnapshot,
+    map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
+) {
+    // Page order, not file-name order: `mask_page_10` sorts before
+    // `mask_page_2` as a string, and the compose order must be by page.
+    let mut by_page: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
     for name in &tree.text_images_files {
-        let Some(old_idx) = parse_typing_mask_page_idx(name) else {
-            continue;
-        };
+        if let Some(old_idx) = parse_typing_mask_page_idx(name) {
+            by_page.insert(old_idx, name.clone());
+        }
+    }
+    let mut composed: Vec<ComposeSource> = Vec::new();
+    for (old_idx, name) in &by_page {
+        let old_idx = *old_idx;
         let from = format!("{}/{}/{name}", tree.tree_rel, config::TEXT_IMAGES_DIR);
         if old_idx >= map.len() {
             b.warn(format!(
@@ -863,6 +1587,20 @@ fn plan_typing_masks(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usi
                 from,
                 map.len()
             ));
+            continue;
+        }
+        if let Some(geo) = stitch
+            && let Some(placement) = geo.placement(old_idx)
+        {
+            if let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                composed.push(ComposeSource {
+                    path: from.clone(),
+                    page_size,
+                    crop: placement.crop_rect(),
+                    dest: placement.placed_rect(),
+                });
+                b.trash(from);
+            }
             continue;
         }
         match map[old_idx] {
@@ -878,6 +1616,26 @@ fn plan_typing_masks(b: &mut PlanBuilder, tree: &TreeSnapshot, map: &[Option<usi
             None => b.trash(from),
         }
     }
+    if let Some(geo) = stitch
+        && !composed.is_empty()
+    {
+        b.create(
+            format!(
+                "{}/{}/{}",
+                tree.tree_rel,
+                config::TEXT_IMAGES_DIR,
+                typing_mask_file_name(geo.primary_new)
+            ),
+            NewPageContent::ComposedPng {
+                width: geo.canvas[0],
+                height: geo.canvas[1],
+                // Opaque black = "no mask here", matching how the typing tab
+                // writes its masks (v, v, v, 255).
+                background: [0, 0, 0, 255],
+                sources: composed,
+            },
+        );
+    }
 }
 
 /// `translation_bubbles.json`: remap `img_idx` + `crop_page_idx`; bubbles of
@@ -887,11 +1645,12 @@ fn plan_bubbles(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) -> Result<(), PageOpError> {
     let Some(entries) = &tree.bubbles else {
         return Ok(());
     };
-    let remap = json_remap::remap_bubbles(entries, map)?;
+    let remap = json_remap::remap_bubbles(entries, map, stitch)?;
     for warning in remap.warnings {
         b.warn(format!(
             "{}/{}: {warning}",
@@ -919,9 +1678,17 @@ fn plan_detection(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     map: &[Option<usize>],
+    stitch: Option<&StitchGeometry>,
 ) -> Result<(), PageOpError> {
+    if let Some(geo) = stitch {
+        plan_stitch_detection(b, snapshot, geo)?;
+    }
     for det in &snapshot.detection {
         let old_idx = det.page_idx;
+        // Stitched pages were handled as one merged group above.
+        if stitch.is_some_and(|geo| geo.placement(old_idx).is_some()) {
+            continue;
+        }
         let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
         let blocks_from = format!("{dir}/{}", detection_blocks_file_name(old_idx));
         let mask_from = format!("{dir}/{}", detection_mask_file_name(old_idx));
@@ -980,6 +1747,131 @@ fn plan_detection(
             }
         }
     }
+    Ok(())
+}
+
+/// Text detection of the STITCHED pages, as one group.
+///
+/// The detector's blocks live in absolute source-page pixels, so they can be
+/// merged — but only when every stitched page's document is trustworthy: valid
+/// JSON, `source_size` equal to the page's real pixel size, and (if it has a
+/// mask) `mask_size` equal to `source_size`. A downscaled or stale mask cannot
+/// be remapped without inventing a scale factor, so the whole group is moved to
+/// the trash with a warning instead — detection output is regenerable, and this
+/// is a deliberate, documented degradation rather than a silent wrong remap.
+///
+/// Either way the stitched pages' own detection files are trashed: they are
+/// keyed to page indices that no longer exist.
+///
+/// # Errors
+/// [`PageOpError::Json`] when the merged document cannot be built or
+/// re-serialized.
+fn plan_stitch_detection(
+    b: &mut PlanBuilder,
+    snapshot: &ChapterSnapshot,
+    geo: &StitchGeometry,
+) -> Result<(), PageOpError> {
+    let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
+    let sources: Vec<&DetectionFiles> = snapshot
+        .detection
+        .iter()
+        .filter(|det| geo.placement(det.page_idx).is_some())
+        .collect();
+    if sources.is_empty() {
+        return Ok(());
+    }
+
+    let mut blockers: Vec<String> = Vec::new();
+    let mut mergeable: Vec<(usize, &Value)> = Vec::new();
+    for det in &sources {
+        match &det.blocks {
+            Some(DetectionBlocks::Parsed(value)) => {
+                let page_size = snapshot
+                    .page_sizes
+                    .get(det.page_idx)
+                    .copied()
+                    .unwrap_or([0, 0]);
+                match json_remap::detection_merge_blocker(
+                    value,
+                    det.has_mask,
+                    page_size,
+                    det.page_idx,
+                ) {
+                    Some(reason) => blockers.push(reason),
+                    None => mergeable.push((det.page_idx, value)),
+                }
+            }
+            Some(DetectionBlocks::Opaque) => blockers.push(format!(
+                "page {}: blocks file is not valid JSON",
+                det.page_idx
+            )),
+            // A mask with no blocks file is never loaded (the loader keys on the
+            // blocks file); it is trashed below and needs no merge decision.
+            None => {}
+        }
+    }
+
+    for det in &sources {
+        if det.blocks.is_some() {
+            b.trash(format!("{dir}/{}", detection_blocks_file_name(det.page_idx)));
+        }
+        if det.has_mask {
+            b.trash(format!("{dir}/{}", detection_mask_file_name(det.page_idx)));
+        }
+    }
+
+    if !blockers.is_empty() {
+        b.warn(format!(
+            "text detection of the stitched pages was moved to the trash instead of \
+             being remapped ({}); re-run detection on the merged page",
+            blockers.join("; ")
+        ));
+        return Ok(());
+    }
+    if mergeable.is_empty() {
+        return Ok(());
+    }
+
+    // Detection masks are page-sized here (verified above), so they compose
+    // exactly like the typing masks, over a black "nothing detected" canvas.
+    let mut composed: Vec<ComposeSource> = Vec::new();
+    for det in &sources {
+        // Only pages whose blocks document was verified above: an unverified
+        // mask has no checked size, and a mask whose page has no blocks file is
+        // never loaded anyway (the loader keys on the blocks file).
+        if !det.has_mask || !mergeable.iter().any(|(idx, _)| *idx == det.page_idx) {
+            continue;
+        }
+        let (Some(placement), Some(page_size)) = (
+            geo.placement(det.page_idx),
+            snapshot.page_sizes.get(det.page_idx).copied(),
+        ) else {
+            continue;
+        };
+        composed.push(ComposeSource {
+            path: format!("{dir}/{}", detection_mask_file_name(det.page_idx)),
+            page_size,
+            crop: placement.crop_rect(),
+            dest: placement.placed_rect(),
+        });
+    }
+    let mask_name = (!composed.is_empty()).then(|| detection_mask_file_name(geo.primary_new));
+    if let Some(name) = &mask_name {
+        b.create(
+            format!("{dir}/{name}"),
+            NewPageContent::ComposedPng {
+                width: geo.canvas[0],
+                height: geo.canvas[1],
+                background: [0, 0, 0, 255],
+                sources: composed,
+            },
+        );
+    }
+    let merged = json_remap::merge_detection_blocks(&mergeable, geo, mask_name.as_deref())?;
+    b.json_writes.push(PlannedJsonWrite {
+        target: format!("{dir}/{}", detection_blocks_file_name(geo.primary_new)),
+        content: to_pretty(&merged)?,
+    });
     Ok(())
 }
 
@@ -1233,6 +2125,10 @@ mod tests {
                 "002.jpg".to_string(),
                 "003.png".to_string(),
             ],
+            // Distinct per-page sizes: a mixed-up coordinate space shows up as a
+            // wrong number instead of an accidental identity.
+            page_sizes: vec![[100, 200], [50, 400], [80, 80], [60, 120]],
+            has_alt_vers: false,
             committed,
             unsaved,
             detection: vec![DetectionFiles {
@@ -1374,6 +2270,359 @@ mod tests {
             planned.from == "ch1/text_images/shared.png"
                 && matches!(planned.dest, MoveDest::Trash { .. })
         }));
+    }
+
+    /// A placement with no crop and no scale, for permutation-only tests.
+    fn whole_page(page_idx: usize, dx: i64, dy: i64, size: [u32; 2]) -> StitchPlacement {
+        StitchPlacement {
+            page_idx,
+            crop: [0, 0, size[0], size[1]],
+            scale: 1.0,
+            dx,
+            dy,
+        }
+    }
+
+    fn stitch_op(placements: Vec<StitchPlacement>, width: u32, height: u32) -> PageOpKind {
+        PageOpKind::Stitch {
+            placements,
+            width,
+            height,
+            background: [0, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn stitch_folds_sources_onto_the_lowest_index() {
+        // Pages 1 and 3 of 5 merge: 0 stays, 1+3 -> 1, 2 -> 2, 4 -> 3.
+        let perm = permutation_for_op(
+            &stitch_op(
+                vec![
+                    whole_page(3, 0, 0, [50, 400]),
+                    whole_page(1, 0, 0, [50, 400]),
+                ],
+                100,
+                400,
+            ),
+            5,
+        )
+        .expect("valid");
+        assert_eq!(
+            map_of(&perm),
+            vec![Some(0), Some(1), Some(2), Some(1), Some(3)]
+        );
+        assert_eq!(perm.new_page_count, 4);
+        // The merged page is not an "inserted" page: its content comes from the
+        // chapter snapshot, not from the request.
+        assert!(perm.new_pages.is_empty());
+
+        // Merging the first two pages of 3 leaves 2 pages, primary at index 0.
+        let perm = permutation_for_op(
+            &stitch_op(
+                vec![whole_page(0, 0, 0, [10, 10]), whole_page(1, 0, 0, [10, 10])],
+                20,
+                10,
+            ),
+            3,
+        )
+        .expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(0), Some(1)]);
+        assert_eq!(perm.new_page_count, 2);
+    }
+
+    #[test]
+    fn stitch_rejects_bad_selections_and_canvases() {
+        // Fewer than two pages.
+        assert!(matches!(
+            permutation_for_op(&stitch_op(vec![whole_page(0, 0, 0, [10, 10])], 10, 10), 3),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // Duplicate page.
+        assert!(matches!(
+            permutation_for_op(
+                &stitch_op(
+                    vec![whole_page(1, 0, 0, [10, 10]), whole_page(1, 0, 0, [10, 10])],
+                    20,
+                    10
+                ),
+                3
+            ),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // Out of range.
+        assert!(matches!(
+            permutation_for_op(
+                &stitch_op(
+                    vec![whole_page(0, 0, 0, [10, 10]), whole_page(3, 0, 0, [10, 10])],
+                    20,
+                    10
+                ),
+                3
+            ),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // Canvas out of bounds (zero, too wide, too many pixels).
+        for (w, h) in [(0, 10), (10, 0), (STITCH_MAX_SIDE_PX + 1, 10), (39_000, 39_000)] {
+            assert!(
+                matches!(
+                    permutation_for_op(
+                        &stitch_op(
+                            vec![whole_page(0, 0, 0, [10, 10]), whole_page(1, 0, 0, [10, 10])],
+                            w,
+                            h
+                        ),
+                        3
+                    ),
+                    Err(PageOpError::InvalidOp(_))
+                ),
+                "canvas {w}x{h} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_map_maps_every_coordinate_space() {
+        // A 100x200 page, cropped to its lower-right 60x150 quadrant, doubled,
+        // and placed at (40, 10) of a 400x400 canvas.
+        let placement = StitchPlacement {
+            page_idx: 0,
+            crop: [20, 40, 60, 150],
+            scale: 2.0,
+            dx: 40,
+            dy: 10,
+        };
+        let map = PlacementMap::new(&placement, [100, 200], [400, 400]).expect("valid");
+        assert_eq!(map.placed_rect(), [40, 10, 120, 300]);
+        assert_eq!(map.crop_rect(), [20, 40, 60, 150]);
+        // Absolute page px -> canvas px.
+        assert!((map.map_x(20.0) - 40.0).abs() < 1e-9, "crop origin maps to dx");
+        assert!((map.map_x(70.0) - 140.0).abs() < 1e-9);
+        assert!((map.map_y(40.0) - 10.0).abs() < 1e-9);
+        assert!((map.map_y(140.0) - 210.0).abs() < 1e-9);
+        // Lengths carry the scale but not the origin.
+        assert!((map.map_len(3.0) - 6.0).abs() < 1e-9);
+        // Page-normalized uv -> canvas-normalized uv: u=0.2 is page px 20,
+        // which is the crop origin, i.e. canvas px 40 = 0.1 of a 400 canvas.
+        assert!((map.map_u(0.2) - 0.1).abs() < 1e-9);
+        // v=0.2 is page px 40 -> canvas px 10 -> 0.025.
+        assert!((map.map_v(0.2) - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn placement_map_rejects_geometry_that_does_not_fit() {
+        let base = StitchPlacement {
+            page_idx: 2,
+            crop: [0, 0, 100, 200],
+            scale: 1.0,
+            dx: 0,
+            dy: 0,
+        };
+        // Crop leaving the page.
+        let mut bad = base;
+        bad.crop = [50, 0, 100, 200];
+        assert!(matches!(
+            PlacementMap::new(&bad, [100, 200], [400, 400]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // Empty crop.
+        let mut bad = base;
+        bad.crop = [0, 0, 0, 200];
+        assert!(matches!(
+            PlacementMap::new(&bad, [100, 200], [400, 400]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // Scale out of range, non-finite, or zero.
+        for scale in [0.0, -1.0, f32::NAN, STITCH_MAX_SCALE + 0.5] {
+            let mut bad = base;
+            bad.scale = scale;
+            assert!(
+                matches!(
+                    PlacementMap::new(&bad, [100, 200], [400, 400]),
+                    Err(PageOpError::InvalidOp(_))
+                ),
+                "scale {scale} must be rejected"
+            );
+        }
+        // Placed rect leaving the canvas (negative and overflowing).
+        let mut bad = base;
+        bad.dx = -1;
+        assert!(matches!(
+            PlacementMap::new(&bad, [100, 200], [400, 400]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        let mut bad = base;
+        bad.dy = 201;
+        assert!(matches!(
+            PlacementMap::new(&bad, [100, 200], [400, 400]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // A zero-sized page has no usable geometry.
+        assert!(matches!(
+            PlacementMap::new(&base, [0, 200], [400, 400]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+    }
+
+    #[test]
+    fn build_plan_stitch_composes_rasters_and_merges_documents() {
+        let snapshot = snapshot_for_plan();
+        // Merge pages 0 (100x200) and 2 (80x80) onto a 180x200 canvas.
+        let op = stitch_op(
+            vec![
+                whole_page(0, 0, 0, [100, 200]),
+                whole_page(2, 100, 0, [80, 80]),
+            ],
+            180,
+            200,
+        );
+        let plan = build_plan(&snapshot, &op, 55).expect("plan builds");
+        assert_eq!(plan.old_to_new, vec![Some(0), Some(1), Some(0), Some(2)]);
+        assert_eq!(plan.new_page_count, 3);
+
+        // Both source pages go to the trash; nothing is destroyed.
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Trash { path } => Some(path.as_str()),
+                MoveDest::Final { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        assert!(trashed.contains(&"ch1/.pageop_trash/55/ch1/src/000.png"));
+        assert!(trashed.contains(&"ch1/.pageop_trash/55/ch1/src/002.jpg"));
+        assert!(trashed.contains(&"ch1/.pageop_trash/55/ch1/clean_layers/000.png"));
+        assert!(trashed.contains(&"ch1/.pageop_trash/55/ch1/clean_layers/002.png"));
+
+        // The merged page is a composed PNG of both sources, in page order.
+        let create = plan
+            .creates
+            .iter()
+            .find(|c| c.target == "ch1/src/000.png")
+            .expect("composed page staged");
+        let NewPageContent::ComposedPng {
+            width,
+            height,
+            sources,
+            ..
+        } = &create.content
+        else {
+            panic!("stitched page must be a composed PNG");
+        };
+        assert_eq!((*width, *height), (180, 200));
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].path, "ch1/src/000.png");
+        assert_eq!(sources[0].dest, [0, 0, 100, 200]);
+        assert_eq!(sources[1].path, "ch1/src/002.jpg");
+        assert_eq!(sources[1].dest, [100, 0, 80, 80]);
+        // Clean overlays of both sources compose onto ONE transparent overlay.
+        let clean = plan
+            .creates
+            .iter()
+            .find(|c| c.target == "ch1/clean_layers/000.png")
+            .expect("composed clean overlay staged");
+        let NewPageContent::ComposedPng {
+            background,
+            sources,
+            ..
+        } = &clean.content
+        else {
+            panic!("composed overlay expected");
+        };
+        assert_eq!(*background, [0, 0, 0, 0]);
+        assert_eq!(sources.len(), 2);
+
+        // Surviving pages compact around the merged one.
+        let finals: Vec<(&str, &str)> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Final { path } => Some((m.from.as_str(), path.as_str())),
+                MoveDest::Trash { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        // Page 1 keeps index 1: an identity rename is never planned.
+        assert!(!finals.iter().any(|(from, _)| *from == "ch1/src/001.png"));
+        assert!(finals.contains(&("ch1/src/003.png", "ch1/src/002.png")));
+        // Layer PNGs of both merged pages now share the primary's prefix.
+        assert!(finals.contains(&(
+            "ch1/layers/ps_p0002_u2_text.png",
+            "ch1/layers/ps_p0000_u2_text.png"
+        )));
+
+        // The two manifest pages became one entry at the merged index.
+        let manifest = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/layers/layers.json")
+            .expect("manifest rewritten");
+        let manifest: Value = serde_json::from_str(&manifest.content).expect("valid json");
+        let pages = manifest["pages"].as_array().expect("pages");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0]["img_idx"], serde_json::json!(0));
+        assert_eq!(pages[0]["tree"].as_array().expect("tree").len(), 2);
+    }
+
+    #[test]
+    fn build_plan_stitch_warns_about_position_matched_alt_versions() {
+        let mut snapshot = snapshot_for_plan();
+        snapshot.has_alt_vers = true;
+        let op = stitch_op(
+            vec![
+                whole_page(0, 0, 0, [100, 200]),
+                whole_page(2, 100, 0, [80, 80]),
+            ],
+            180,
+            200,
+        );
+        let plan = build_plan(&snapshot, &op, 58).expect("plan builds");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("alt_vers")),
+            "merging pages must warn about the alt-version misalignment: {:?}",
+            plan.warnings
+        );
+        // A chapter without alternate versions stays silent.
+        snapshot.has_alt_vers = false;
+        let plan = build_plan(&snapshot, &op, 59).expect("plan builds");
+        assert!(!plan.warnings.iter().any(|w| w.contains("alt_vers")));
+    }
+
+    #[test]
+    fn build_plan_stitch_refuses_pages_sharing_a_layer_uid() {
+        let mut snapshot = snapshot_for_plan();
+        // Page 2 carries the same uid as page 0: both PNGs would become
+        // `ps_p0000_u1.png`.
+        snapshot
+            .committed
+            .layers_files
+            .insert("ps_p0002_u1.png".to_string());
+        let op = stitch_op(
+            vec![
+                whole_page(0, 0, 0, [100, 200]),
+                whole_page(2, 100, 0, [80, 80]),
+            ],
+            180,
+            200,
+        );
+        let err = build_plan(&snapshot, &op, 56).expect_err("uid collision must be refused");
+        assert!(matches!(err, PageOpError::InvalidOp(_)), "got: {err}");
+    }
+
+    #[test]
+    fn build_plan_stitch_needs_page_sizes() {
+        let mut snapshot = snapshot_for_plan();
+        snapshot.page_sizes.clear();
+        let op = stitch_op(
+            vec![
+                whole_page(0, 0, 0, [100, 200]),
+                whole_page(2, 100, 0, [80, 80]),
+            ],
+            180,
+            200,
+        );
+        assert!(matches!(
+            build_plan(&snapshot, &op, 57),
+            Err(PageOpError::InvalidOp(_))
+        ));
     }
 
     #[test]

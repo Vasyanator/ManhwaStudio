@@ -14,7 +14,7 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
    |-- card grid (CentralPanel) virtualized rows, selection, context menu
    |-- status line (bottom)     totals: pages / with clean / bubbles
    |-- orphan-clean section     worker-scanned invalid clean files and attachment candidates
-   `-- dialogs (Windows)        insert / create-blank / delete-confirm
+   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch
 ```
 
 - `PageManagerAction::RequestOp(PageOpKind)` asks the app to quiesce writers,
@@ -29,11 +29,16 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `LayerDoc::version` for resident pages plus a worker-side `layers.json` scan
   (unsaved manifest overrides saved) for everything else.
 - All disk work runs on the worker thread in `thumbs.rs`: thumbnail decode +
-  downscale (long side 192 px) and the manifest scan. Thumbnails live in an LRU
-  cache (64 entries) keyed by (path, mtime); `notify_pages_changed` bumps a
-  generation counter that forces mtime revalidation. Runtime reset also bumps a
-  worker epoch so queued replies cannot upload stale textures; Drop cancellation
-  abandons queued jobs before joining the worker.
+  downscale (long side 192 px), page previews for the stitch window (long side
+  ~1024 px) and the manifest scan. Thumbnails live in an LRU cache (64 entries)
+  keyed by (path, mtime); previews live in a SEPARATE 6-entry LRU so a few
+  megapixel-sized previews cannot evict the card grid's thumbnails. Both share the
+  worker, the cancel flag, the epoch counter and the 8-job in-flight cap (whose key
+  carries the job kind, so one page may have both pending).
+  `notify_pages_changed` bumps a generation counter that forces mtime
+  revalidation. Runtime reset also bumps a worker epoch so queued replies cannot
+  upload stale textures; Drop cancellation abandons queued jobs before joining the
+  worker.
 - The native `rfd` file picker for "insert pages" is blocking and therefore
   runs on its own worker thread; the wasm build resolves it as a cancelled pick.
 - `clean.rs` owns a second, serial worker for `clean_assign` scans, image decoding/resizing,
@@ -50,15 +55,41 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   double-click navigation, and the card context menu.
 - `dialogs.rs`: insert / create-blank / delete-confirm dialogs, the
   `InsertPosition -> at` resolution and the blank-page default-size rule
-  (`default_blank_size`, unit-tested), and the background file picker.
+  (`default_blank_size`, unit-tested), the background file picker, and the
+  `PageManagerDialog` enum every dialog (stitch included) is dispatched through.
 - `thumbs.rs`: worker thread + generic LRU `ThumbCache` (unit-tested) + the
-  `layers.json` layer-count scan.
+  `layers.json` layer-count scan + the stitch window's page previews
+  (`request_preview_if_needed` / `preview_state`, mirroring the thumbnail pair;
+  `preview_state_cached` reads an entry WITHOUT promoting it, for a page the
+  caller may not request a decode for).
+- `stitch_layout.rs`: GUI-free layout core of the "stitch pages" feature
+  (unit-tested): `EditPlacement` and its engine-shaped field tuple, bounding box
+  and `normalize` to a (0,0) origin, edge/alignment snapping during a drag,
+  row/column arrangements, and the fit modes gated by `layout_kind`. Contains no
+  egui widget code and no I/O; see `dev-docs/stitch_pages_plan.md` for the
+  coordinate contract it implements. Its canvas/scale bounds are the ENGINE's,
+  imported from `page_ops` rather than restated, so the dialog can never enable a
+  confirm the engine refuses.
+- `stitch.rs`: the "stitch pages" window — an `egui::Window` with a zoomable,
+  pannable board of draggable page rectangles (camera: `PsViewport` from
+  `tabs/ps_editor/viewport.rs`), the arrangement / fit / background strip, and
+  the confirm that emits `PageOpKind::Stitch`. Only draws and routes input; all
+  geometry decisions live in `stitch_layout.rs`.
 - `clean.rs`: clean worker protocol, attachment-candidate ordering and persistence-path helpers
   (unit-tested), orphan section, and clean-operation confirmations.
 
 ## Contracts and invariants
 - The tab is NOT a `CanvasView` and must not become one; it holds no page
-  textures beyond its own thumbnails.
+  textures beyond its own thumbnails and the bounded preview cache. A
+  full-resolution page is never decoded or uploaded here. The stitch board
+  therefore paints DOWNSCALED previews and REQUESTS at most as many of them as
+  the preview LRU holds (`stitch.rs::MAX_LIVE_PREVIEWS`, defined from
+  `thumbs.rs::PREVIEW_CACHE_CAPACITY`); a page that misses out is drawn as a
+  numbered placeholder with NO caption — never the "loading" one, which would
+  promise an image that is never coming — but an already-cached texture is still
+  drawn (read without touching LRU order), so a rank swap during a pan does not
+  blink the image away. The stitched RESULT is composed by `src/page_ops/` from
+  the untouched originals — the preview resolution never reaches it.
 - `PageOpKind` indices always refer to the CURRENT page order at request time;
   move semantics follow `page_ops/mod.rs` (`to` indexes the NEW order; UI
   position P maps to `to = P - 1`).
@@ -66,7 +97,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   snapshot-out (counting happens after unlock).
 - `notify_pages_changed` must be called by the app after every structural op or
   project reload; it clears the selection and any open dialog because page
-  indices may have shifted.
+  indices may have shifted. A dialog that holds page indices (delete, stitch)
+  must also re-validate them on EVERY frame: `clamp_selection` silently drops
+  out-of-range indices after a reload, so a selection of two can become one
+  under an open window. The stitch window closes itself with a localized error
+  in that case.
 - All user-visible strings are `page_manager.*` keys present in BOTH
   `crates/ms-i18n/locales/en.json` and `ru.json`; `.pageop_trash` and
   `layers.json` are persistence identifiers (i18n-exempt), surfaced only via
@@ -91,7 +126,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - To add a toolbar operation: `mod.rs` (`draw_toolbar`) and, if it needs
   confirmation/input, a dialog in `dialogs.rs`.
 - To change card visuals/badges or selection behavior: `grid.rs`.
-- To change thumbnail decoding, caching, or the layer-count scan: `thumbs.rs`.
+- To change thumbnail/preview decoding, caching, or the layer-count scan: `thumbs.rs`.
+- To change stitch placement math (snapping, arrangements, fit modes, canvas
+  size): `stitch_layout.rs` — never the drawing code.
+- To change how the stitch window looks or reacts (board input, previews,
+  settings strip, the emitted op): `stitch.rs`.
 - To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
   `models/clean_assign.rs` contract.
 - To change what the app must execute: extend `PageManagerAction` (coordinate

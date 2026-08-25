@@ -31,6 +31,8 @@ per frame.
 mod dialogs;
 mod clean;
 mod grid;
+mod stitch;
+mod stitch_layout;
 mod thumbs;
 
 use std::collections::{BTreeSet, HashMap};
@@ -287,7 +289,14 @@ impl PageManagerTabState {
             }
         }
         let size_of = move |idx: usize| known_sizes.get(&idx).copied();
-        self.draw_dialogs(ctx, page_count, &size_of, op_in_progress, &mut actions);
+        self.draw_dialogs(
+            ctx,
+            project,
+            page_infos,
+            &size_of,
+            op_in_progress,
+            &mut actions,
+        );
         self.poll_clean_picker(project, page_infos);
         self.draw_clean_dialog(ctx, project, page_infos, op_in_progress);
 

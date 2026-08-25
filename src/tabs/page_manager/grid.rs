@@ -405,6 +405,21 @@ impl PageManagerTabState {
                 crate::page_ops::PageOpKind::Move { from, to: from + 1 },
             ));
         }
+        // Stitching merges the whole selection into one page, so it needs at
+        // least two selected pages; the selection is re-validated inside the
+        // dialog because `clamp_selection` may shrink it after a reload.
+        if ui
+            .add_enabled(
+                !op_in_progress && self.selection.len() >= 2,
+                egui::Button::new(t!("page_manager.context.stitch_pages_button")),
+            )
+            .on_disabled_hover_text(t!("page_manager.context.stitch_pages_disabled_tooltip"))
+            .clicked()
+        {
+            self.dialog = Some(PageManagerDialog::stitch(
+                self.selection.iter().copied().collect(),
+            ));
+        }
         if ui
             .add_enabled(
                 !op_in_progress && !self.selection.is_empty(),

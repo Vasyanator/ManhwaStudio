@@ -12,8 +12,9 @@ Transaction protocol:
 1. The full plan is written to `{chapter}/page_ops_journal.json` (the A slot,
    atomic temp+rename, fsync'd) BEFORE any other filesystem change.
 2. Phase A (reversible): new files are staged as temps, every affected file is
-   renamed to a unique temp in its own directory. A failure rolls phase A back
-   and removes the journal.
+   renamed to a unique temp in its own directory. Staging happens FIRST, so a
+   composed page (a stitch) reads its source images at their original paths. A
+   failure rolls phase A back and removes the journal.
 3. A separate fsync'd `page_ops_journal.b.json` is created (the commit point),
    then the A slot is removed. If both survive a crash, recovery trusts B.
 4. Phase B (idempotent roll-forward): temps are renamed to final names or
@@ -30,6 +31,9 @@ recognizes `from`/`temp`/`dest` states and fails closed on a missing artifact.
 Key functions:
 - execute(): scan + plan + run the transaction (worker thread only).
 - recover(): resolve a pending journal (called from `ProjectData::load_internal`).
+- encode_composed_png(): the pixel work of a stitch (crop, scale, blend, encode).
+  Recovery NEVER re-runs it: a lost staged file fails the transaction closed,
+  exactly like a vanished external insert source.
 
 Notes:
 Uses `std::fs` directly (not the `crate::storage` seam): the transaction needs
@@ -40,7 +44,7 @@ an inert no-op. Directory fsync is best-effort and Unix-only, mirroring
 */
 
 use super::plan::{
-    self, ChapterSnapshot, DetectionBlocks, DetectionFiles, JOURNAL_B_FILE_NAME,
+    self, ChapterSnapshot, ComposeSource, DetectionBlocks, DetectionFiles, JOURNAL_B_FILE_NAME,
     JOURNAL_FILE_NAME, MoveDest, NewPageContent, PageOpPlan, PlannedCreate, PlannedMove,
     TextInfoFile, TextInfoLocation, TreeSnapshot,
 };
@@ -57,7 +61,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Journal schema version; bump together with any incompatible plan change.
-const JOURNAL_SCHEMA_VERSION: u32 = 1;
+/// v2 added `NewPageContent::ComposedPng` (stitched pages), which an older
+/// binary cannot deserialize.
+const JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 /// Transaction phase recorded in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +139,7 @@ pub(crate) fn execute(
     }
 
     validate_insert_sources(op)?;
-    let snapshot = scan_chapter(paths, pages)?;
+    let snapshot = scan_chapter(paths, pages, op)?;
     let trash_id = current_trash_id();
     let plan = plan::build_plan(&snapshot, op, trash_id)?;
     for warning in &plan.warnings {
@@ -282,21 +288,34 @@ fn validate_insert_sources(op: &PageOpKind) -> Result<(), PageOpError> {
             }
             Ok(())
         }
+        // A stitch reads only chapter-owned files, all of them already listed in
+        // the snapshot; there is no external source to pre-validate.
         PageOpKind::Move { .. }
         | PageOpKind::CreateBlank { .. }
-        | PageOpKind::Delete { .. } => Ok(()),
+        | PageOpKind::Delete { .. }
+        | PageOpKind::Stitch { .. } => Ok(()),
     }
 }
 
 /// Builds the plan input snapshot from the chapter on disk.
 ///
+/// Page pixel sizes are probed (an image-header read, not a decode) only for
+/// operations that need page geometry — a stitch — so the ordinary rename
+/// operations keep costing zero extra I/O per page.
+///
 /// # Errors
 /// - [`PageOpError::InvalidOp`] when the in-memory page list disagrees with
 ///   `src/` (a page file is missing) or the layout has no usable title dir.
+/// - [`PageOpError::Image`] when a page image's header cannot be read while
+///   probing sizes for a stitch.
 /// - [`PageOpError::Json`] when an authoritative page-keyed document
 ///   (`translation_bubbles.json`, `layers.json`, `text_info.json`) is not
 ///   parseable — remapping it blindly would corrupt the chapter.
-fn scan_chapter(paths: &ProjectPaths, pages: &[Page]) -> Result<ChapterSnapshot, PageOpError> {
+fn scan_chapter(
+    paths: &ProjectPaths,
+    pages: &[Page],
+    op: &PageOpKind,
+) -> Result<ChapterSnapshot, PageOpError> {
     let title_dir = &paths.title_dir;
     let chapter_rel = rel_string(&paths.project_dir, title_dir)?;
     let unsaved_rel = rel_string(&paths.unsaved_dir, title_dir)?;
@@ -366,9 +385,27 @@ fn scan_chapter(paths: &ProjectPaths, pages: &[Page]) -> Result<ChapterSnapshot,
     )?;
     let detection = scan_detection(&paths.text_detection_dir)?;
 
+    let needs_sizes = matches!(op, PageOpKind::Stitch { .. });
+    let mut page_sizes = Vec::new();
+    if needs_sizes {
+        page_sizes.reserve(page_file_names.len());
+        for name in &page_file_names {
+            let path = paths.src_dir.join(name);
+            let (width, height) = image::image_dimensions(&path).map_err(|err| {
+                PageOpError::Image(format!(
+                    "could not read the pixel size of page image '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            page_sizes.push([width, height]);
+        }
+    }
+
     Ok(ChapterSnapshot {
         chapter_rel,
         page_file_names,
+        page_sizes,
+        has_alt_vers: !list_dir_entry_names(&paths.alt_vers_dir)?.is_empty(),
         committed,
         unsaved,
         detection,
@@ -491,6 +528,25 @@ fn list_file_names(dir: &Path) -> Result<Vec<String>, PageOpError> {
         if !file_type.is_file() {
             continue;
         }
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Lists every entry name (files AND subdirectories) in `dir`; a missing
+/// directory yields an empty list. Used to detect a non-empty `alt_vers/`,
+/// whose content sits one level deeper than its per-version folders.
+fn list_dir_entry_names(dir: &Path) -> Result<Vec<String>, PageOpError> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries =
+        fs::read_dir(dir).map_err(|err| io_ctx(&err, format!("read dir {}", dir.display())))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io_ctx(&err, format!("read dir {}", dir.display())))?;
         if let Some(name) = entry.file_name().to_str() {
             names.push(name.to_string());
         }
@@ -823,6 +879,14 @@ fn stage_create(title_dir: &Path, create: &PlannedCreate) -> Result<(), PageOpEr
         } => {
             encode_blank_png(&temp, *width, *height, *rgba)?;
         }
+        NewPageContent::ComposedPng {
+            width,
+            height,
+            background,
+            sources,
+        } => {
+            encode_composed_png(title_dir, &temp, *width, *height, *background, sources)?;
+        }
     }
     fsync_file(&temp)
         .map_err(|err| io_ctx(&err, format!("fsync staged file {}", temp.display())))?;
@@ -834,6 +898,106 @@ fn stage_create(title_dir: &Path, create: &PlannedCreate) -> Result<(), PageOpEr
 /// `project.rs::write_png_fast`).
 fn encode_blank_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) -> Result<(), PageOpError> {
     let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    write_rgba_png(path, &img)
+}
+
+/// Composes `sources` onto a `width` x `height` background and writes the
+/// result as a straight-RGBA PNG.
+///
+/// Runs in phase A, BEFORE any rename, so every source is read at its original
+/// chapter path. Sources are painted in list order with straight-alpha "over"
+/// blending, so overlapping placements behave like stacked pages and a page
+/// without a clean overlay leaves the background showing through. A source is
+/// resized to the page size its crop is expressed in when the two disagree
+/// (a clean overlay may have been attached with a same-aspect resize), and a
+/// placement whose destination differs from its crop is resampled — the only
+/// resampling in the whole engine.
+///
+/// # Errors
+/// - [`PageOpError::Image`] when a source cannot be decoded, or its crop or
+///   destination does not fit (the plan is then internally inconsistent and the
+///   transaction must not proceed).
+/// - [`PageOpError::Io`] when the PNG cannot be written.
+fn encode_composed_png(
+    title_dir: &Path,
+    path: &Path,
+    width: u32,
+    height: u32,
+    background: [u8; 4],
+    sources: &[ComposeSource],
+) -> Result<(), PageOpError> {
+    // Bounded by the canvas limits the planner validates (200 MPx => ~800 MB).
+    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba(background));
+    for source in sources {
+        let source_path = title_dir.join(&source.path);
+        let decoded = image::open(&source_path)
+            .map_err(|err| {
+                PageOpError::Image(format!(
+                    "could not decode '{}' while composing {}: {err}",
+                    source_path.display(),
+                    path.display()
+                ))
+            })?
+            .to_rgba8();
+        let [page_w, page_h] = source.page_size;
+        let decoded = if decoded.width() == page_w && decoded.height() == page_h {
+            decoded
+        } else {
+            // The crop rectangle is expressed in PAGE pixels; a page-keyed
+            // raster of a different size (a same-aspect attached clean overlay)
+            // must be brought to that size before it can be cropped.
+            runtime_log::log_warn(format!(
+                "[page-ops] '{}' is {}x{} but its page is {page_w}x{page_h}; \
+                 resizing it before composing",
+                source_path.display(),
+                decoded.width(),
+                decoded.height()
+            ));
+            image::imageops::resize(
+                &decoded,
+                page_w,
+                page_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        };
+        let [crop_x, crop_y, crop_w, crop_h] = source.crop;
+        let [dest_x, dest_y, dest_w, dest_h] = source.dest;
+        let fits = crop_x.checked_add(crop_w).is_some_and(|r| r <= page_w)
+            && crop_y.checked_add(crop_h).is_some_and(|b| b <= page_h)
+            && dest_x.checked_add(dest_w).is_some_and(|r| r <= width)
+            && dest_y.checked_add(dest_h).is_some_and(|b| b <= height)
+            && crop_w > 0
+            && crop_h > 0
+            && dest_w > 0
+            && dest_h > 0;
+        if !fits {
+            return Err(PageOpError::Image(format!(
+                "compose recipe for {} places '{}' crop [{crop_x}, {crop_y}, {crop_w}, \
+                 {crop_h}] of a {page_w}x{page_h} page at [{dest_x}, {dest_y}, {dest_w}, \
+                 {dest_h}] of a {width}x{height} canvas, which does not fit",
+                path.display(),
+                source_path.display()
+            )));
+        }
+        let cropped = image::imageops::crop_imm(&decoded, crop_x, crop_y, crop_w, crop_h);
+        let placed = if crop_w == dest_w && crop_h == dest_h {
+            cropped.to_image()
+        } else {
+            image::imageops::resize(
+                &*cropped,
+                dest_w,
+                dest_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        };
+        image::imageops::overlay(&mut canvas, &placed, i64::from(dest_x), i64::from(dest_y));
+    }
+    write_rgba_png(path, &canvas)
+}
+
+/// Writes an RGBA image as a straight (non-premultiplied) PNG with the
+/// project's fast service settings (`project.rs::write_png_fast`).
+fn write_rgba_png(path: &Path, image: &image::RgbaImage) -> Result<(), PageOpError> {
     let file = fs::File::create(path)
         .map_err(|err| io_ctx(&err, format!("create {}", path.display())))?;
     let mut writer = BufWriter::new(file);
@@ -841,12 +1005,12 @@ fn encode_blank_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) -> Resu
         PngEncoder::new_with_quality(&mut writer, CompressionType::Fast, FilterType::NoFilter);
     image::ImageEncoder::write_image(
         encoder,
-        img.as_raw(),
-        width,
-        height,
+        image.as_raw(),
+        image.width(),
+        image.height(),
         image::ExtendedColorType::Rgba8,
     )
-    .map_err(|err| PageOpError::Image(format!("encode blank page {}: {err}", path.display())))?;
+    .map_err(|err| PageOpError::Image(format!("encode {}: {err}", path.display())))?;
     writer
         .flush()
         .map_err(|err| io_ctx(&err, format!("flush {}", path.display())))?;
@@ -1109,6 +1273,41 @@ mod tests {
 
     const CHAPTER: &str = "ch1";
 
+    /// Whether the fixture's page-sized rasters are opaque marker bytes (cheap,
+    /// and exactly what the rename-only operations need to track identity) or
+    /// genuinely encoded PNGs (required by anything that DECODES them, i.e. a
+    /// stitch).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FixturePixels {
+        Fake,
+        Real,
+    }
+
+    /// Page sizes of the decodable fixture. All different, so a remap that
+    /// confuses two pages' coordinate spaces produces a wrong number instead of
+    /// an accidental identity.
+    const REAL_PAGE_SIZES: [[u32; 2]; 4] = [[8, 6], [4, 10], [6, 6], [5, 5]];
+
+    /// Distinct opaque colour per page, so a composed canvas says which page
+    /// painted which pixel.
+    fn page_color(page_idx: usize) -> [u8; 4] {
+        let base = u8::try_from(page_idx).expect("small page index");
+        [10 + base * 10, 20, 30, 255]
+    }
+
+    fn write_png(path: &Path, size: [u32; 2], rgba: [u8; 4]) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        image::RgbaImage::from_pixel(size[0], size[1], image::Rgba(rgba))
+            .save(path)
+            .expect("write fixture png");
+    }
+
+    fn read_png(path: &Path) -> image::RgbaImage {
+        image::open(path)
+            .unwrap_or_else(|err| panic!("decode {}: {err}", path.display()))
+            .to_rgba8()
+    }
+
     fn project_paths(title: &Path, chapter: &str) -> ProjectPaths {
         let project_dir = title.join(chapter);
         let unsaved_dir = title.join(format!("{chapter}_unsaved"));
@@ -1171,19 +1370,42 @@ mod tests {
     /// - bubbles: committed pages 0/1/3 (page-crop bubble cropping page 1),
     ///   unsaved page 2.
     fn build_fixture() -> Fixture {
+        build_fixture_with(FixturePixels::Fake)
+    }
+
+    /// The same chapter with real PNGs wherever a stitch decodes pixels.
+    fn build_decodable_fixture() -> Fixture {
+        build_fixture_with(FixturePixels::Real)
+    }
+
+    fn build_fixture_with(pixels: FixturePixels) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let title = tmp.path().join("title");
         let paths = project_paths(&title, CHAPTER);
+        let real = pixels == FixturePixels::Real;
 
-        for i in 0..4usize {
-            write(
-                &paths.src_dir.join(format!("{i:03}.png")),
-                format!("SRC-PAGE-{i}").as_bytes(),
-            );
+        for (i, size) in REAL_PAGE_SIZES.iter().enumerate() {
+            let path = paths.src_dir.join(format!("{i:03}.png"));
+            if real {
+                write_png(&path, *size, page_color(i));
+            } else {
+                write(&path, format!("SRC-PAGE-{i}").as_bytes());
+            }
         }
-        write(&paths.clean_layers_dir.join("000.png"), b"CLEAN-0");
-        write(&paths.clean_layers_dir.join("002.png"), b"CLEAN-2");
-        write(&paths.unsaved_clean_layers_dir.join("001.png"), b"UNSAVED-CLEAN-1");
+        if real {
+            // Clean overlays are page-sized; each carries its own red channel.
+            write_png(&paths.clean_layers_dir.join("000.png"), REAL_PAGE_SIZES[0], [100, 0, 0, 255]);
+            write_png(&paths.clean_layers_dir.join("002.png"), REAL_PAGE_SIZES[2], [102, 0, 0, 255]);
+            write_png(
+                &paths.unsaved_clean_layers_dir.join("001.png"),
+                REAL_PAGE_SIZES[1],
+                [201, 0, 0, 255],
+            );
+        } else {
+            write(&paths.clean_layers_dir.join("000.png"), b"CLEAN-0");
+            write(&paths.clean_layers_dir.join("002.png"), b"CLEAN-2");
+            write(&paths.unsaved_clean_layers_dir.join("001.png"), b"UNSAVED-CLEAN-1");
+        }
 
         write(&paths.layers_dir.join("ps_p0000_u1.png"), b"L-BASE-0");
         write(&paths.layers_dir.join("ps_p0000_u1_fx.png"), b"L-FX-0");
@@ -1225,7 +1447,16 @@ mod tests {
         write(&paths.text_images_dir.join("ov1.png"), b"OV-1");
         write(&paths.text_images_dir.join("ov1_layout.png"), b"OV-1-LAYOUT");
         write(&paths.text_images_dir.join("ov3.png"), b"OV-3");
-        write(&paths.text_images_dir.join("mask_page_1.png"), b"TMASK-1");
+        if real {
+            // Typing masks are page-sized, fully "masked" (white) here.
+            write_png(
+                &paths.text_images_dir.join("mask_page_1.png"),
+                REAL_PAGE_SIZES[1],
+                [255, 255, 255, 255],
+            );
+        } else {
+            write(&paths.text_images_dir.join("mask_page_1.png"), b"TMASK-1");
+        }
         write_json(
             &paths.text_images_dir.join("text_info.json"),
             &json!([
@@ -1233,18 +1464,42 @@ mod tests {
                 {"img_idx": 3, "file": "ov3.png", "img_u": 0.4, "img_v": 0.6}
             ]),
         );
-        write(&paths.unsaved_text_images_dir.join("mask_page_2.png"), b"UTMASK-2");
+        if real {
+            write_png(
+                &paths.unsaved_text_images_dir.join("mask_page_2.png"),
+                REAL_PAGE_SIZES[2],
+                [255, 255, 255, 255],
+            );
+        } else {
+            write(&paths.unsaved_text_images_dir.join("mask_page_2.png"), b"UTMASK-2");
+        }
 
+        // The detector's document must describe the page it belongs to: a
+        // stitch refuses to merge one that does not.
+        let detection_size = if real {
+            REAL_PAGE_SIZES[1]
+        } else {
+            [100, 200]
+        };
         write_json(
             &paths.text_detection_dir.join("00001_blocks.json"),
             &json!({
-                "source_size": [100, 200],
-                "mask_size": [100, 200],
+                "page_idx": 1,
+                "source_size": detection_size,
+                "mask_size": detection_size,
                 "blocks": [{"x1": 1.0, "y1": 2.0, "x2": 3.0, "y2": 4.0}],
                 "mask_file": "00001_mask.png"
             }),
         );
-        write(&paths.text_detection_dir.join("00001_mask.png"), b"DMASK-1");
+        if real {
+            write_png(
+                &paths.text_detection_dir.join("00001_mask.png"),
+                REAL_PAGE_SIZES[1],
+                [200, 200, 200, 255],
+            );
+        } else {
+            write(&paths.text_detection_dir.join("00001_mask.png"), b"DMASK-1");
+        }
 
         write_json(
             &paths.bubbles_file,
@@ -1674,7 +1929,7 @@ mod tests {
 
         // Simulate a crash right after phase A: journal (phase "a") + all
         // phase-A renames done, phase B never started.
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 12345).expect("plan");
         let journal_paths = JournalPaths::new(&fx.paths.project_dir);
         let journal_path = journal_paths.a.clone();
@@ -1693,7 +1948,7 @@ mod tests {
         let op = PageOpKind::Move { from: 0, to: 3 };
 
         // Journal at phase "b" with phase A applied...
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 777).expect("plan");
         let journal_paths = JournalPaths::new(&fx.paths.project_dir);
         let journal_path = journal_paths.b.clone();
@@ -1723,7 +1978,7 @@ mod tests {
     fn adjacent_move_stages_both_interdependent_renames_before_b_marker() {
         let fx = build_fixture();
         let op = PageOpKind::Move { from: 0, to: 1 };
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 901).expect("plan");
         let journal_paths = JournalPaths::new(&fx.paths.project_dir);
         write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
@@ -1744,7 +1999,7 @@ mod tests {
     fn recovery_prefers_durable_b_slot_when_a_slot_also_exists() {
         let fx = build_fixture();
         let op = PageOpKind::Move { from: 0, to: 3 };
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 902).expect("plan");
         let paths = JournalPaths::new(&fx.paths.project_dir);
         write_journal(&paths, &plan, JournalPhase::A, &op).expect("journal a");
@@ -1768,7 +2023,7 @@ mod tests {
         let fx = build_fixture();
         let before = walk(&fx.title);
         let op = PageOpKind::Move { from: 0, to: 3 };
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 903).expect("plan");
         let paths = JournalPaths::new(&fx.paths.project_dir);
         write_journal(&paths, &plan, JournalPhase::A, &op).expect("journal a");
@@ -1793,7 +2048,7 @@ mod tests {
             .save(&source)
             .expect("source");
         let op = PageOpKind::InsertFiles { at: 4, files: vec![source.clone()] };
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let plan = plan::build_plan(&snapshot, &op, 904).expect("plan");
         let paths = JournalPaths::new(&fx.paths.project_dir);
         write_journal(&paths, &plan, JournalPhase::A, &op).expect("journal a");
@@ -1811,7 +2066,7 @@ mod tests {
     fn unsafe_journal_path_is_rejected_without_filesystem_changes() {
         let fx = build_fixture();
         let op = PageOpKind::Move { from: 0, to: 3 };
-        let snapshot = scan_chapter(&fx.paths, &fx.pages).expect("scan");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
         let mut plan = plan::build_plan(&snapshot, &op, 905).expect("plan");
         plan.moves[0].from = "../outside.png".to_string();
         let paths = JournalPaths::new(&fx.paths.project_dir);
@@ -1851,6 +2106,305 @@ mod tests {
         assert_eq!(fs::read(fx.paths.src_dir.join("001.png")).expect("old first"), b"SRC-PAGE-0");
         assert_eq!(fs::read(fx.paths.src_dir.join("005.png")).expect("tail"), fs::read(source).expect("source bytes"));
         assert_no_transaction_residue(&fx.title);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stitch: pages 1 (4x10) and 2 (6x6) side by side on a 10x10 canvas.
+    // Page 1 lands at (0, 0), page 2 at (4, 0); the bottom-right corner stays
+    // uncovered, so the background colour must show there.
+    // -----------------------------------------------------------------------
+
+    const STITCH_BACKGROUND: [u8; 4] = [7, 8, 9, 255];
+
+    fn stitch_op() -> PageOpKind {
+        PageOpKind::Stitch {
+            placements: vec![
+                crate::page_ops::StitchPlacement {
+                    page_idx: 1,
+                    crop: [0, 0, 4, 10],
+                    scale: 1.0,
+                    dx: 0,
+                    dy: 0,
+                },
+                crate::page_ops::StitchPlacement {
+                    page_idx: 2,
+                    crop: [0, 0, 6, 6],
+                    scale: 1.0,
+                    dx: 4,
+                    dy: 0,
+                },
+            ],
+            width: 10,
+            height: 10,
+            background: STITCH_BACKGROUND,
+        }
+    }
+
+    /// Compares a stored coordinate with a tolerance: the remap runs in f64 and
+    /// the exact bit pattern of a normalized value is not part of the contract.
+    fn approx(value: &Value, expected: f64) {
+        let actual = value.as_f64().unwrap_or_else(|| panic!("not a number: {value}"));
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    /// Full expected state after `stitch_op()` on the decodable fixture; shared
+    /// by the direct-execute and the roll-forward tests.
+    fn assert_stitched_layout(fx: &Fixture) {
+        // The merged page: page 1 on the left, page 2 top-right, background in
+        // the uncovered corner.
+        let merged = read_png(&fx.paths.src_dir.join("001.png"));
+        assert_eq!(merged.dimensions(), (10, 10));
+        assert_eq!(merged.get_pixel(0, 0), &image::Rgba(page_color(1)));
+        assert_eq!(merged.get_pixel(3, 9), &image::Rgba(page_color(1)));
+        assert_eq!(merged.get_pixel(4, 0), &image::Rgba(page_color(2)));
+        assert_eq!(merged.get_pixel(9, 5), &image::Rgba(page_color(2)));
+        assert_eq!(merged.get_pixel(9, 9), &image::Rgba(STITCH_BACKGROUND));
+        // The other pages kept their pixels and compacted around it.
+        assert_eq!(
+            read_png(&fx.paths.src_dir.join("000.png")).get_pixel(0, 0),
+            &image::Rgba(page_color(0))
+        );
+        assert_eq!(
+            read_png(&fx.paths.src_dir.join("002.png")).get_pixel(0, 0),
+            &image::Rgba(page_color(3))
+        );
+        assert!(!fx.paths.src_dir.join("003.png").exists());
+
+        // Clean overlays: page 2's overlay lands at its placement, the rest of
+        // the merged overlay stays transparent so the page shows through.
+        let clean = read_png(&fx.paths.clean_layers_dir.join("001.png"));
+        assert_eq!(clean.dimensions(), (10, 10));
+        assert_eq!(clean.get_pixel(4, 0), &image::Rgba([102, 0, 0, 255]));
+        assert_eq!(clean.get_pixel(0, 0), &image::Rgba([0, 0, 0, 0]));
+        // Page 0's overlay is untouched.
+        assert_eq!(
+            read_png(&fx.paths.clean_layers_dir.join("000.png")).dimensions(),
+            (8, 6)
+        );
+        let unsaved_clean = read_png(&fx.paths.unsaved_clean_layers_dir.join("001.png"));
+        assert_eq!(unsaved_clean.get_pixel(0, 0), &image::Rgba([201, 0, 0, 255]));
+        assert_eq!(unsaved_clean.get_pixel(9, 9), &image::Rgba([0, 0, 0, 0]));
+
+        // Typing masks compose over black ("not masked").
+        let mask = read_png(&fx.paths.text_images_dir.join("mask_page_1.png"));
+        assert_eq!(mask.dimensions(), (10, 10));
+        assert_eq!(mask.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(mask.get_pixel(9, 9), &image::Rgba([0, 0, 0, 255]));
+        let unsaved_mask =
+            read_png(&fx.paths.unsaved_text_images_dir.join("mask_page_1.png"));
+        assert_eq!(unsaved_mask.get_pixel(4, 0), &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(unsaved_mask.get_pixel(0, 0), &image::Rgba([0, 0, 0, 255]));
+
+        // Layer PNGs of the merged page carry the primary's prefix.
+        assert_eq!(
+            fs::read(fx.paths.layers_dir.join("ps_p0001_u2_text.png")).expect("layer png"),
+            b"L-TEXT-2"
+        );
+        assert!(fx.paths.layers_dir.join("ps_p0000_u1.png").exists());
+
+        // Manifests: page 2's entry became the merged entry at index 1.
+        let manifest = read_json(&fx.paths.layers_dir.join("layers.json"));
+        let pages = manifest["pages"].as_array().expect("pages");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0]["img_idx"], json!(0));
+        assert_eq!(pages[1]["img_idx"], json!(1));
+        assert_eq!(
+            pages[1]["tree"][0]["rendered_file"],
+            json!("ps_p0001_u2_text.png")
+        );
+        let unsaved_manifest = read_json(&fx.paths.unsaved_layers_dir.join("layers.json"));
+        assert_eq!(unsaved_manifest["pages"][0]["img_idx"], json!(1));
+
+        // Bubbles: page-1 anchors renormalize onto the wider canvas, the crop
+        // rect follows the CROPPED page (1), and page 0 is untouched.
+        let bubbles = read_json(&fx.paths.bubbles_file);
+        let bubbles = bubbles.as_array().expect("bubbles");
+        assert_eq!(bubbles.len(), 3);
+        assert_eq!(bubbles[0]["img_idx"], json!(0));
+        approx(&bubbles[0]["img_u"], 0.5);
+        assert_eq!(bubbles[1]["img_idx"], json!(1));
+        approx(&bubbles[1]["img_u"], 0.2);
+        approx(&bubbles[1]["img_v"], 0.5);
+        assert_eq!(bubbles[2]["img_idx"], json!(2));
+        assert_eq!(bubbles[2]["crop_page_idx"], json!(1));
+        let crop = bubbles[2]["crop_rect"].as_array().expect("crop rect");
+        approx(&crop[0], 0.04);
+        approx(&crop[1], 0.1);
+        approx(&crop[2], 0.36);
+        approx(&crop[3], 0.9);
+        let unsaved_bubbles = read_json(&fx.paths.unsaved_bubbles_file);
+        assert_eq!(unsaved_bubbles[0]["img_idx"], json!(1));
+        approx(&unsaved_bubbles[0]["img_u"], 0.52);
+        approx(&unsaved_bubbles[0]["img_v"], 0.18);
+
+        // Legacy typing metadata follows the same rules.
+        let text_info = read_json(&fx.paths.text_images_dir.join("text_info.json"));
+        let entries = text_info.as_array().expect("entries");
+        assert_eq!(entries[0]["img_idx"], json!(1));
+        approx(&entries[0]["img_u"], 0.2);
+        assert_eq!(entries[0]["file"], json!("ov1.png"));
+        assert_eq!(entries[1]["img_idx"], json!(2));
+        approx(&entries[1]["img_u"], 0.4);
+
+        // Detection merged onto the canvas, mask composed.
+        let blocks = read_json(&fx.paths.text_detection_dir.join("00001_blocks.json"));
+        assert_eq!(blocks["page_idx"], json!(1));
+        assert_eq!(blocks["source_size"], json!([10, 10]));
+        assert_eq!(blocks["mask_size"], json!([10, 10]));
+        assert_eq!(blocks["mask_file"], json!("00001_mask.png"));
+        approx(&blocks["blocks"][0]["x1"], 1.0);
+        approx(&blocks["blocks"][0]["y2"], 4.0);
+        assert_eq!(
+            read_png(&fx.paths.text_detection_dir.join("00001_mask.png")).dimensions(),
+            (10, 10)
+        );
+
+        // Both source pages are recoverable from the trash.
+        let trash_base = fx.paths.project_dir.join(super::super::plan::TRASH_DIR_NAME);
+        let ids: Vec<_> = fs::read_dir(&trash_base)
+            .expect("trash exists")
+            .flatten()
+            .collect();
+        assert_eq!(ids.len(), 1, "one transaction trash folder");
+        let trash = ids[0].path();
+        assert!(trash.join("ch1/src/001.png").exists());
+        assert!(trash.join("ch1/src/002.png").exists());
+        assert!(trash.join("ch1/clean_layers/002.png").exists());
+        assert!(trash.join("ch1_unsaved/clean_layers/001.png").exists());
+        // Nothing was archived-and-dropped: a stitch never deletes JSON entries.
+        assert!(!trash.join("ch1/deleted_bubbles.json").exists());
+
+        assert_no_transaction_residue(&fx.title);
+    }
+
+    #[test]
+    fn stitch_merges_two_pages_into_one_in_both_trees() {
+        let fx = build_decodable_fixture();
+        let outcome =
+            super::execute(&fx.paths, &fx.pages, &stitch_op()).expect("stitch executes");
+        assert_eq!(outcome.old_to_new, vec![Some(0), Some(1), Some(1), Some(2)]);
+        assert_eq!(outcome.new_page_count, 3);
+        assert_stitched_layout(&fx);
+    }
+
+    #[test]
+    fn scan_detects_a_non_empty_alt_vers_directory() {
+        let fx = build_decodable_fixture();
+        let op = stitch_op();
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        assert!(!snapshot.has_alt_vers);
+        assert_eq!(snapshot.page_sizes, REAL_PAGE_SIZES.to_vec());
+        // Alternate versions live one level deeper, in per-version folders.
+        write(&fx.paths.alt_vers_dir.join("v1").join("a.png"), b"ALT");
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        assert!(snapshot.has_alt_vers);
+        // A non-geometric operation still pays nothing for page sizes.
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &PageOpKind::Move { from: 0, to: 1 })
+            .expect("scan");
+        assert!(snapshot.page_sizes.is_empty());
+    }
+
+    #[test]
+    fn stitch_trashes_detection_it_cannot_remap() {
+        let fx = build_decodable_fixture();
+        // A mask smaller than its page (the detector's downscaled form) cannot
+        // be remapped: the whole group degrades to the trash instead.
+        write_json(
+            &fx.paths.text_detection_dir.join("00001_blocks.json"),
+            &json!({
+                "page_idx": 1,
+                "source_size": [4, 10],
+                "mask_size": [2, 5],
+                "blocks": [{"x1": 1.0, "y1": 2.0, "x2": 3.0, "y2": 4.0}],
+                "mask_file": "00001_mask.png"
+            }),
+        );
+        write_png(
+            &fx.paths.text_detection_dir.join("00001_mask.png"),
+            [2, 5],
+            [200, 200, 200, 255],
+        );
+        super::execute(&fx.paths, &fx.pages, &stitch_op()).expect("stitch executes");
+        assert!(!fx.paths.text_detection_dir.join("00001_blocks.json").exists());
+        assert!(!fx.paths.text_detection_dir.join("00001_mask.png").exists());
+        let trash_base = fx.paths.project_dir.join(super::super::plan::TRASH_DIR_NAME);
+        let trash = fs::read_dir(&trash_base)
+            .expect("trash exists")
+            .flatten()
+            .next()
+            .expect("one trash folder")
+            .path();
+        assert!(trash.join("ch1/text_detection/00001_blocks.json").exists());
+        assert!(trash.join("ch1/text_detection/00001_mask.png").exists());
+        assert_no_transaction_residue(&fx.title);
+    }
+
+    #[test]
+    fn stitch_crash_after_phase_a_rolls_back_to_original_state() {
+        let fx = build_decodable_fixture();
+        let before = walk(&fx.title);
+        let op = stitch_op();
+
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 5150).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        assert_ne!(before, walk(&fx.title), "phase A must change the tree");
+
+        super::recover(&fx.paths.project_dir).expect("rollback");
+        assert_eq!(before, walk(&fx.title), "rollback restores the exact state");
+        assert!(!journal_paths.a.exists());
+    }
+
+    #[test]
+    fn stitch_crash_mid_phase_b_rolls_forward_to_final_state() {
+        let fx = build_decodable_fixture();
+        let op = stitch_op();
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 5151).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        write_journal(&journal_paths, &plan, JournalPhase::B, &op).expect("journal b");
+
+        // Only part of phase B ran before the "crash": half the final renames,
+        // no created page committed and no JSON written.
+        let finals: Vec<&PlannedMove> = plan
+            .moves
+            .iter()
+            .filter(|m| matches!(m.dest, MoveDest::Final { .. }))
+            .collect();
+        for planned in finals.iter().take(finals.len() / 2) {
+            if let MoveDest::Final { path } = &planned.dest {
+                resolve_move(&fx.title, planned, path).expect("partial B");
+            }
+        }
+        super::recover(&fx.paths.project_dir).expect("roll forward");
+        assert!(!journal_paths.b.exists());
+        assert_stitched_layout(&fx);
+    }
+
+    #[test]
+    fn stitch_recovery_never_recomposes_a_lost_staged_page() {
+        let fx = build_decodable_fixture();
+        let op = stitch_op();
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 5152).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        write_journal(&journal_paths, &plan, JournalPhase::B, &op).expect("journal b");
+        // The composed page is gone and its sources have already been renamed
+        // away: re-running the composition would read half-moved inputs.
+        fs::remove_file(fx.title.join(&plan.creates[0].temp)).expect("lose staged page");
+
+        let err = super::recover(&fx.paths.project_dir).expect_err("must not recompose");
+        assert!(matches!(err, PageOpError::Journal(_)), "got: {err}");
+        assert!(journal_paths.b.exists(), "journal remains for inspection");
     }
 
     #[test]

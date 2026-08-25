@@ -2,7 +2,8 @@
 
 ## Purpose
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: move a
-page, insert pages (from image files or a generated blank), delete pages. An
+page, insert pages (from image files or a generated blank), delete pages,
+stitch several pages into one composed page. An
 operation is executed on disk as a journaled, crash-safe transaction that keeps
 every page-keyed artifact consistent in BOTH trees — the committed chapter dir
 and the sibling `{chapter}_unsaved` staging mirror (the save flow copy-merges
@@ -26,6 +27,10 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   of the page-keyed JSON documents. All filesystem work lives in `fs_exec.rs`.
 - Phase A stages created files and renames every affected file to a unique
   temp (`__ms_pageop_{id}_{n}.mstmp`) in its own directory — fully reversible.
+  Created files include COMPOSED rasters (a stitch): they are staged BEFORE any
+  rename, so the compose step reads the source pages at their original paths.
+  Recovery never re-composes and never re-copies an insert source; a missing
+  staged file fails the transaction closed.
 - The journal uses two durable slots. Phase A is stored in
   `{chapter}/page_ops_journal.json`; after all staged files and every phase-A
   rename have been file/directory-fsynced, phase B is created separately as
@@ -49,9 +54,12 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
 - `mod.rs`: pinned public surface — `PageOpKind`, `PageOpOutcome`,
   `PageOpError`, `execute_page_op`, `recover_pending_page_op`.
 - `plan.rs`: permutation math, canonical page-keyed file-name helpers (with
-  citations to the owning modules), snapshot types, plan types, `build_plan`.
+  citations to the owning modules), snapshot types, plan types, `build_plan`,
+  and the stitch geometry (`PlacementMap` — the ONE affine per stitched page —
+  plus `StitchGeometry`, the resolved stitch request).
 - `json_remap.rs`: bubbles / layers-manifest / text_info / detection-blocks
-  rewrites over `serde_json::Value` (unknown fields survive).
+  rewrites over `serde_json::Value` (unknown fields survive), plus the
+  geometry mapping and document merging of a stitch.
 - `fs_exec.rs`: chapter scanning, journal I/O, phase A/B execution, recovery,
   durability helpers, integration + crash-recovery tests.
 
@@ -83,6 +91,43 @@ Remapped, in committed AND unsaved trees unless noted:
   field inside a parsed blocks file is rewritten when it names the per-page
   default mask. An unparseable blocks file is renamed opaquely (a dangling
   custom `mask_file` degrades gracefully on load: missing file -> empty mask).
+
+A STITCH (`PageOpKind::Stitch`, N pages -> one page at `primary = min(idx)`)
+keeps every rule above for the pages it does not touch and, for the merged
+pages, replaces "rename" with "compose / merge":
+- `src/{stem}.{ext}` — all sources are moved to the trash and ONE composed PNG
+  is staged in their place (always PNG, whatever the sources were), painted in
+  page order over the requested background.
+- `clean_layers/{stem}.png`, `text_images/mask_page_{idx}.png` — page-sized
+  rasters, so they are composed the same way, over a transparent (clean) or
+  opaque-black (mask) canvas; a source page without one contributes nothing.
+  No file is created when no source page had one.
+- `layers/*.png` — still only renamed onto the merged page's prefix. Two merged
+  pages carrying the same layer uid would collide on one file name; uids are
+  UUIDs, and the collision is refused with `InvalidOp` instead of overwriting.
+- `layers/layers.json` — the N page entries become ONE: `tree`, `groups` and
+  `text_groups` concatenated in ascending page order (first page at the
+  BOTTOM), `z` re-ranked densely across the merged bands, `layer_idx` re-based
+  per page so the typing tab's text groups stay distinct. The re-basing offsets
+  are computed chapter-wide (both trees' manifests AND every `text_info.json`)
+  so all documents agree.
+- `translation_bubbles.json` / `text_info.json` — nothing is dropped; entries of
+  merged pages have their geometry mapped through their page's `PlacementMap`
+  (page-normalized uv renormalized onto the canvas, absolute page px
+  translated+scaled, layer-image-local values untouched) and `side` re-derived.
+  A `crop_rect` is mapped through the CROPPED page's placement, not the
+  bubble's own. When `crop_page_idx != img_idx` and both pages are stitched,
+  this preserves the visible crop but moves the image-area rect and text areas
+  to the crop page's placement on reload; the operation emits a runtime warning.
+- `text_detection/` — merged into one document (blocks mapped, `source_size` and
+  `mask_size` set to the canvas, masks composed) ONLY when every stitched page's
+  document is trustworthy: valid JSON, `source_size` equal to the page image,
+  and any mask not downscaled. Otherwise the stitched pages' detection files are
+  moved to the trash with a `runtime_log` warning — deliberate, documented
+  degradation of regenerable data instead of a silent wrong remap.
+- `alt_vers/` is not remapped (see below); when the chapter has any, the plan
+  emits a `runtime_log` warning naming it, because an N->1 operation shifts its
+  positional pairing.
 
 Deliberately NOT touched (each with the reason):
 - `alt_vers/` — alternate-version images pair with pages by SORTED POSITION
@@ -117,6 +162,13 @@ Deliberately NOT touched (each with the reason):
   (`ProjectData::load_internal`), before any reconcile/normalize pass reads
   chapter files. A failed recovery aborts the load; the journal is left in
   place for inspection/retry.
+- The planner is pure and learns page pixel sizes only through
+  `ChapterSnapshot::page_sizes`, which `scan_chapter` fills (an image-header
+  probe per page) ONLY for operations that need geometry — currently just the
+  stitch. A stitch against a snapshot without them fails with `InvalidOp`.
+- A stitch never deletes a page-keyed JSON entry: merging is the whole point, so
+  the `deleted_*.json` archives stay empty for it. Only FILES (the source page
+  images and the rasters replaced by composed ones) go to the trash.
 - Legacy un-migrated documents are rejected, not guessed: bubbles or text_info
   entries in the absolute-ribbon-coordinate format (no `img_idx`, numeric
   `x`/`y`) are keyed by ribbon position — which any page op changes — so
@@ -141,6 +193,10 @@ Deliberately NOT touched (each with the reason):
   + a `plan_*` function in `plan.rs`, scanning in `fs_exec::scan_tree`, and a
   rewrite in `json_remap.rs` if it is a JSON document.
 - Journal format / crash-safety behavior: `fs_exec.rs` (bump
-  `JOURNAL_SCHEMA_VERSION` on incompatible plan changes).
+  `JOURNAL_SCHEMA_VERSION` on incompatible plan changes; it is at 2, raised from
+  1 when `NewPageContent::ComposedPng` was added for the stitch).
+- Stitch geometry: `plan.rs` (`PlacementMap` is the single affine — never
+  re-derive the formula at a call site) + `json_remap.rs` for the per-document
+  application.
 - Canonical file-name formats: they are OWNED by other modules (see the cited
   helpers in `plan.rs`); change them there first, then mirror here.

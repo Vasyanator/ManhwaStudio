@@ -33,9 +33,11 @@ use eframe::egui;
 use ms_thread as thread;
 
 use crate::page_ops::PageOpKind;
+use crate::project::ProjectData;
 use crate::widgets::WheelComboBox;
 use crate::widgets::WheelSpinBox;
 
+use super::stitch::StitchDialogState;
 use super::{PageManagerAction, PageManagerTabState};
 
 /// Default blank-page size when the project is empty or no neighbour size is
@@ -144,6 +146,7 @@ pub(super) enum PageManagerDialog {
     Insert(InsertDialogState),
     Create(CreateDialogState),
     Delete(DeleteDialogState),
+    Stitch(StitchDialogState),
 }
 
 impl PageManagerDialog {
@@ -180,11 +183,19 @@ impl PageManagerDialog {
         PageManagerDialog::Delete(DeleteDialogState { indices })
     }
 
+    /// Fresh "stitch pages" window for the given current page indices
+    /// (ascending; the caller guarantees at least two).
+    pub(super) fn stitch(indices: Vec<usize>) -> Self {
+        PageManagerDialog::Stitch(StitchDialogState::new(indices))
+    }
+
     /// Whether a background file pick is currently pending.
     pub(super) fn picker_active(&self) -> bool {
         match self {
             PageManagerDialog::Insert(state) => state.picker_rx.is_some(),
-            PageManagerDialog::Create(_) | PageManagerDialog::Delete(_) => false,
+            PageManagerDialog::Create(_)
+            | PageManagerDialog::Delete(_)
+            | PageManagerDialog::Stitch(_) => false,
         }
     }
 }
@@ -283,17 +294,19 @@ fn draw_position_combo(
 
 impl PageManagerTabState {
     /// Renders the currently open dialog (if any) and pushes the resulting
-    /// structural-op actions into `actions`. `page_count` is the current number
-    /// of pages; `size_of` resolves a page's pixel size for the create-dialog
-    /// defaults.
+    /// structural-op actions into `actions`. `size_of` resolves a page's pixel
+    /// size for the create-dialog defaults; `project` and `page_infos` are only
+    /// needed by the stitch window (page paths, previews, authoritative sizes).
     pub(super) fn draw_dialogs(
         &mut self,
         ctx: &egui::Context,
-        page_count: usize,
+        project: &ProjectData,
+        page_infos: &std::collections::HashMap<usize, crate::app::PageImageInfo>,
         size_of: &dyn Fn(usize) -> Option<(u32, u32)>,
         op_in_progress: bool,
         actions: &mut Vec<PageManagerAction>,
     ) {
+        let page_count = project.pages.len();
         // Take the dialog out so its mutable state does not alias the rest of
         // `self` (selection, badge caches) borrowed by the draw helpers below.
         let Some(dialog) = self.dialog.take() else {
@@ -309,6 +322,9 @@ impl PageManagerTabState {
             PageManagerDialog::Delete(state) => self
                 .draw_delete_dialog(ctx, state, op_in_progress, actions)
                 .map(PageManagerDialog::Delete),
+            PageManagerDialog::Stitch(state) => self
+                .draw_stitch_dialog(ctx, state, project, page_infos, op_in_progress, actions)
+                .map(PageManagerDialog::Stitch),
         };
         self.dialog = kept;
     }
