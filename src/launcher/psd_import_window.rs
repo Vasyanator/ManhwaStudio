@@ -29,6 +29,15 @@ group hierarchy via `Layer::children`, which we flatten to leaf raster layers an
 warning when groups are present. 16/32-bit documents keep their layer records in the
 `Lr16`/`Lr32` sections, and `ag-psd` reads those, so such a file lists its real layers here
 rather than collapsing to the single composite row.
+Besides "skip / source / clean", a row can be typed as "overlay on clean"
+(`LayerImportType::OverlayOnClean`). Such a row writes no file of its own: before the page's
+clean image is saved it is composited onto it source-over, at the layer's own PSD canvas
+offset, clipped to the clean image. Several overlays may share one page; they are applied in
+PSD hierarchy order. The action is offered only for real layers of a document with three or
+more layer rows, because a two-layer document is already a plain source/clean pair.
+Layer order matters for that feature and is easy to get wrong: `ag-psd` preserves the raw PSD
+record order, which Photoshop writes bottom-to-top, so `LoadedPsdDocument::layers` — and the
+row list built from it — is ordered BOTTOM-FIRST (index 0 = bottommost layer).
 The read path deliberately disables `ReadOptions::total_memory_limit` — see the comment in
 `load_document_from_bytes`.
 */
@@ -41,12 +50,12 @@ use crate::runtime_log;
 use crate::widgets::EditableComboBox;
 use egui::{
     self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Context, Frame, Grid, Id,
-    Layout, Panel, RichText, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
-    ViewportClass,
+    Layout, Panel, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
+    Ui, ViewportClass,
 };
 use ag_psd::psd::{Layer, PixelData, ReadOptions};
 use ag_psd::read_psd;
-use image::RgbaImage;
+use image::{RgbaImage, imageops};
 #[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use std::collections::{BTreeSet, HashMap};
@@ -72,6 +81,11 @@ const PREVIEW_BACKGROUND: Color32 = Color32::from_rgb(18, 18, 20);
 const ERROR_COLOR: Color32 = Color32::from_rgb(214, 104, 104);
 const SUCCESS_COLOR: Color32 = Color32::from_rgb(72, 170, 102);
 const WARNING_COLOR: Color32 = Color32::from_rgb(214, 170, 92);
+/// Frame drawn around the overlay layer inside a composited "overlay on clean" preview.
+const OVERLAY_FRAME_COLOR: Color32 = Color32::from_rgb(96, 176, 255);
+/// Stroke width of that frame, in screen pixels: constant so it stays visible whatever the
+/// preview is scaled to.
+const OVERLAY_FRAME_STROKE_WIDTH: f32 = 2.0;
 // Import-type option labels. Runtime accessors (not `const`) because `t!` is not `const`.
 // These are display labels only; the persisted import type is the `ImportType` enum.
 fn type_skip() -> &'static str {
@@ -82,6 +96,9 @@ fn type_source() -> &'static str {
 }
 fn type_clean() -> &'static str {
     t!("launcher.psd_import.clean_option")
+}
+fn type_overlay_on_clean() -> &'static str {
+    t!("launcher.psd_import.overlay_on_clean_option")
 }
 const ROW_TITLE_MIN_WIDTH: f32 = 120.0;
 const ROW_SIZE_WIDTH: f32 = 72.0;
@@ -131,6 +148,8 @@ pub struct PsdImportWindowState {
     queued_open: Option<OpenProjectSelection>,
 }
 
+/// One assignable line of the import table: a single leaf layer (or the whole-document
+/// composite) of one loaded document, plus the page and action the user assigned to it.
 #[derive(Clone)]
 struct PsdLayerRow {
     row_key: String,
@@ -140,6 +159,10 @@ struct PsdLayerRow {
     size: (u32, u32),
     import_type: LayerImportType,
     document_index: usize,
+    /// Number of leaf raster layers in this row's document, cached here so the render path
+    /// never has to reach back into `loaded_documents`. Gates `LayerImportType::OverlayOnClean`:
+    /// a document with fewer than three layers is already a plain source/clean pair.
+    document_layer_count: usize,
     source: LayerSource,
 }
 
@@ -165,17 +188,27 @@ struct DecodedImage {
     data: Arc<Vec<u8>>,
 }
 
+/// One leaf raster layer of a loaded document, together with its placement on the canvas.
+///
+/// `left`/`top` are the layer's own origin inside the PSD canvas as recorded by Photoshop.
+/// They are signed and not bounded by the canvas: a layer may start left of or above the
+/// origin, extend past its right/bottom edge, or lie entirely outside it. Every consumer
+/// must clip rather than assume the layer fits.
 #[derive(Clone)]
 struct DecodedLayer {
     name: String,
     image: DecodedImage,
+    left: i32,
+    top: i32,
 }
 
 #[derive(Clone)]
 struct LoadedPsdDocument {
     file_name: String,
     page: u32,
-    /// Flattened leaf raster layers (groups expanded), ordered top-to-bottom.
+    /// Flattened leaf raster layers (groups expanded), ordered BOTTOM-FIRST: index 0 is the
+    /// bottommost layer. `ag-psd` preserves the raw PSD record order, and Photoshop writes
+    /// those records bottom-to-top.
     layers: Vec<DecodedLayer>,
     /// Merged composite image, kept for flattened PSDs that have no usable layers and
     /// for plain raster imports, whose single image lives here (see
@@ -183,13 +216,22 @@ struct LoadedPsdDocument {
     composite: Option<DecodedImage>,
 }
 
+/// What the import does with one table row.
+///
+/// `Skip`, `Source` and `Clean` each produce at most one file per page. `OverlayOnClean`
+/// produces no file of its own: the row is composited onto the page's `Clean` image at the
+/// layer's own PSD offset before that image is saved, so one page may carry several of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum LayerImportType {
     Skip,
     Source,
     Clean,
+    OverlayOnClean,
 }
 
+/// State of the single in-flight preview render. `Loading` carries the preview-cache key
+/// the render was started for (see `PsdImportWindowState::preview_key_for_row`), not the
+/// bare row key, so a composited overlay preview is matched to the row that asked for it.
 #[derive(Clone)]
 enum PreviewStatus {
     Idle,
@@ -212,13 +254,34 @@ struct ScanWorkerResult {
 }
 
 struct PreviewWorkerResult {
-    row_key: String,
-    result: Result<Arc<RgbaImage>, WorkerError>,
+    /// Preview-cache key the render was requested under.
+    cache_key: String,
+    result: Result<PreviewRender, WorkerError>,
+}
+
+/// What one preview render produced: the raster to display and, for a composited overlay
+/// preview, the rectangle the overlay occupies inside it.
+struct PreviewRender {
+    image: Arc<RgbaImage>,
+    highlight: Option<PreviewHighlight>,
+}
+
+/// Rectangle of the overlay layer inside a composited preview, in base-image pixels and
+/// already clipped to the base. Kept as integers (the exact pixel bounds); the painter
+/// scales it into screen space exactly like it scales the texture tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewHighlight {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
 }
 
 struct PreviewTexture {
     image: Arc<RgbaImage>,
     tiles: Vec<PreviewTextureTile>,
+    /// Overlay rectangle to outline, or `None` for a plain single-layer preview.
+    highlight: Option<PreviewHighlight>,
 }
 
 struct PreviewTextureTile {
@@ -257,12 +320,34 @@ enum ScanRequest {
     Folder { path: PathBuf },
 }
 
-#[derive(Clone)]
+/// One non-skipped table row handed to the import worker.
+#[derive(Clone, Copy, Debug)]
 struct ImportAssignment {
     page: u32,
     import_type: LayerImportType,
     document_index: usize,
     source: LayerSource,
+}
+
+/// Everything one output page imports: at most one source layer, at most one clean layer,
+/// and any number of overlay layers composited onto that clean layer before it is saved.
+#[derive(Default)]
+struct PageAssignments {
+    source: Option<ImportAssignment>,
+    clean: Option<ImportAssignment>,
+    overlays: Vec<ImportAssignment>,
+}
+
+/// What the preview worker must render for one row.
+///
+/// `base` is `None` for the usual "show this layer's own bitmap" preview. When it is
+/// `Some((document_index, source))` the preview is that base (the page's clean layer) with
+/// this row composited on top at its PSD offset.
+#[derive(Clone, Copy, Debug)]
+struct PreviewRequest {
+    document_index: usize,
+    source: LayerSource,
+    base: Option<(usize, LayerSource)>,
 }
 
 impl PsdImportWindowState {
@@ -534,6 +619,10 @@ impl PsdImportWindowState {
             self.show_page_combo(ui, row_index);
         });
 
+        // Offer the overlay action only where it means something; a row that already
+        // carries it keeps the entry listed so the user can see and change what it is.
+        let overlay_offered = row_offers_overlay(&self.rows[row_index])
+            || self.rows[row_index].import_type == LayerImportType::OverlayOnClean;
         ui.scope(|ui| {
             ui.set_width(ROW_TYPE_WIDTH);
             ComboBox::from_id_salt(("psd_import_type", row_index))
@@ -555,23 +644,30 @@ impl PsdImportWindowState {
                         LayerImportType::Clean,
                         type_clean(),
                     );
+                    if overlay_offered {
+                        ui.selectable_value(
+                            &mut self.rows[row_index].import_type,
+                            LayerImportType::OverlayOnClean,
+                            type_overlay_on_clean(),
+                        );
+                    }
                 });
         });
 
-        if self.rows[row_index].page != page_before
-            && let Err(message) = self.validate_row_change(row_index)
-        {
-            self.rows[row_index].page = page_before;
-            self.rows[row_index].import_type = import_before;
-            self.sync_page_input(row_index);
-            self.status = ImportStatus::Error(message);
-        } else if self.rows[row_index].import_type != import_before
-            && let Err(message) = self.validate_row_change(row_index)
-        {
-            self.rows[row_index].page = page_before;
-            self.rows[row_index].import_type = import_before;
-            self.sync_page_input(row_index);
-            self.status = ImportStatus::Error(message);
+        let row_changed = self.rows[row_index].page != page_before
+            || self.rows[row_index].import_type != import_before;
+        if row_changed {
+            if let Err(message) = self.validate_row_change(row_index) {
+                self.rows[row_index].page = page_before;
+                self.rows[row_index].import_type = import_before;
+                self.sync_page_input(row_index);
+                self.status = ImportStatus::Error(message);
+            } else {
+                // A page or type change can move the selected row's preview onto a
+                // different clean base (or off one), which is a different cache key —
+                // re-request so the stale entry is not served.
+                self.request_selected_preview();
+            }
         }
     }
 
@@ -717,6 +813,11 @@ impl PsdImportWindowState {
                     .stroke(Stroke::new(1.0, Color32::from_rgb(56, 56, 62)))
                     .show(ui, |ui| {
                         ui.set_min_width(container_width);
+                        // Resolve the preview key before borrowing the row: it needs all of
+                        // `self`, and the row borrow below is only disjoint by field.
+                        let preview_key = self
+                            .selected_row
+                            .and_then(|index| self.preview_key_for_row(index));
                         match self.selected_row.and_then(|index| self.rows.get(index)) {
                             Some(row) => {
                                 ui.label(RichText::new(Self::format_row_title_for(row)).strong());
@@ -727,7 +828,10 @@ impl PsdImportWindowState {
                                 );
                                 ui.add_space(10.0);
 
-                                if let Some(preview) = self.preview_cache.get(&row.row_key) {
+                                if let Some(preview) = preview_key
+                                    .as_deref()
+                                    .and_then(|key| self.preview_cache.get(key))
+                                {
                                     let scroll_output = ScrollArea::vertical()
                                         .id_salt("psd_import_preview_scroll")
                                         .vertical_scroll_offset(self.preview_scroll_y)
@@ -757,6 +861,40 @@ impl PsdImportWindowState {
                                                     )),
                                                 );
                                             }
+                                            // Outline where the overlay landed on the clean
+                                            // page, clamped to the painted preview so a
+                                            // partly-off-canvas patch still draws sanely.
+                                            if let Some(highlight) = preview.highlight {
+                                                let frame_rect = egui::Rect::from_min_max(
+                                                    top_left
+                                                        + egui::vec2(
+                                                            highlight.min_x as f32 * scale,
+                                                            highlight.min_y as f32 * scale,
+                                                        ),
+                                                    top_left
+                                                        + egui::vec2(
+                                                            highlight.max_x as f32 * scale,
+                                                            highlight.max_y as f32 * scale,
+                                                        ),
+                                                );
+                                                let visible = frame_rect.intersect(
+                                                    egui::Rect::from_min_size(
+                                                        top_left,
+                                                        preview_size * scale,
+                                                    ),
+                                                );
+                                                if visible.is_positive() {
+                                                    ui.painter().rect_stroke(
+                                                        visible,
+                                                        0.0,
+                                                        Stroke::new(
+                                                            OVERLAY_FRAME_STROKE_WIDTH,
+                                                            OVERLAY_FRAME_COLOR,
+                                                        ),
+                                                        StrokeKind::Inside,
+                                                    );
+                                                }
+                                            }
                                             ui.allocate_space(preview_size * scale);
                                         });
                                     self.preview_scroll_y = scroll_output.state.offset.y;
@@ -767,8 +905,8 @@ impl PsdImportWindowState {
                                         PreviewStatus::Idle => {
                                             ui.label(t!("launcher.psd_import.select_layer_for_preview"));
                                         }
-                                        PreviewStatus::Loading(row_key)
-                                            if row_key == &row.row_key =>
+                                        PreviewStatus::Loading(pending_key)
+                                            if Some(pending_key) == preview_key.as_ref() =>
                                         {
                                             ui.spinner();
                                             ui.label(t!("launcher.psd_import.rendering_layer_status"));
@@ -994,14 +1132,43 @@ impl PsdImportWindowState {
         }
     }
 
+    /// Preview-cache key for a row.
+    ///
+    /// A normal row is keyed by its own `row_key`. An `OverlayOnClean` row that has a clean
+    /// layer to sit on is keyed `"{row_key}@on:{clean_row_key}"`, so re-assigning the clean
+    /// row of that page naturally rebuilds the composite instead of serving the stale one,
+    /// and switching the row back to a normal type falls back to the plain `row_key` entry.
+    ///
+    /// Returns `None` only when `row_index` is out of range.
+    fn preview_key_for_row(&self, row_index: usize) -> Option<String> {
+        let row = self.rows.get(row_index)?;
+        if row.import_type != LayerImportType::OverlayOnClean {
+            return Some(row.row_key.clone());
+        }
+        Some(match self.clean_row_for_page(row.page) {
+            Some(clean) => format!("{}@on:{}", row.row_key, clean.row_key),
+            None => row.row_key.clone(),
+        })
+    }
+
+    /// The row typed as `Clean` on `page`, if any. `validate_all_rows` guarantees at most one.
+    fn clean_row_for_page(&self, page: u32) -> Option<&PsdLayerRow> {
+        self.rows
+            .iter()
+            .find(|row| row.page == page && row.import_type == LayerImportType::Clean)
+    }
+
     fn request_selected_preview(&mut self) {
         let Some(row_index) = self.selected_row else {
+            return;
+        };
+        let Some(cache_key) = self.preview_key_for_row(row_index) else {
             return;
         };
         let Some(row) = self.rows.get(row_index).cloned() else {
             return;
         };
-        if self.preview_cache.contains_key(&row.row_key) {
+        if self.preview_cache.contains_key(&cache_key) {
             self.preview_status = PreviewStatus::Ready;
             return;
         }
@@ -1009,15 +1176,27 @@ impl PsdImportWindowState {
             return;
         };
 
-        let row_key = row.row_key.clone();
+        // An overlay row previews as "the page's clean layer with this patch on top"; every
+        // other row previews as its own raw bitmap. Compositing is image work, so it happens
+        // on this worker thread and never in `fn ui`.
+        let base = (row.import_type == LayerImportType::OverlayOnClean)
+            .then(|| self.clean_row_for_page(row.page))
+            .flatten()
+            .map(|clean| (clean.document_index, clean.source));
+        let request = PreviewRequest {
+            document_index: row.document_index,
+            source: row.source,
+            base,
+        };
+
         let (tx, rx) = mpsc::channel();
         self.pending_preview = Some(rx);
-        self.preview_status = PreviewStatus::Loading(row_key.clone());
+        self.preview_status = PreviewStatus::Loading(cache_key.clone());
         let spawn_result = thread::Builder::new()
             .name("launcher-psd-preview".to_string())
             .spawn(move || {
-                let result = render_preview_image(&documents, row.document_index, row.source);
-                if tx.send(PreviewWorkerResult { row_key, result }).is_err() {
+                let result = render_preview_image(&documents, request);
+                if tx.send(PreviewWorkerResult { cache_key, result }).is_err() {
                     runtime_log::log_warn("[launcher-psd] failed to deliver preview result");
                 }
             });
@@ -1040,9 +1219,12 @@ impl PsdImportWindowState {
             Ok(result) => {
                 ctx.request_repaint();
                 match result.result {
-                    Ok(image) => {
-                        let tiles = match build_preview_texture_tiles(ctx, &result.row_key, &image)
-                        {
+                    Ok(render) => {
+                        let tiles = match build_preview_texture_tiles(
+                            ctx,
+                            &result.cache_key,
+                            &render.image,
+                        ) {
                             Ok(tiles) => tiles,
                             Err(error) => {
                                 runtime_log::log_error(format!(
@@ -1053,8 +1235,14 @@ impl PsdImportWindowState {
                                 return;
                             }
                         };
-                        self.preview_cache
-                            .insert(result.row_key.clone(), PreviewTexture { image, tiles });
+                        self.preview_cache.insert(
+                            result.cache_key.clone(),
+                            PreviewTexture {
+                                image: render.image,
+                                tiles,
+                                highlight: render.highlight,
+                            },
+                        );
                         self.preview_status = PreviewStatus::Ready;
                     }
                     Err(error) => {
@@ -1232,7 +1420,9 @@ impl PsdImportWindowState {
                 LayerImportType::Clean => {
                     clean_by_page.insert(row.page, index);
                 }
-                LayerImportType::Skip => {}
+                // A swap only exchanges the two whole-page roles; overlays are patches on
+                // top of whatever ends up being the clean page and stay where they are.
+                LayerImportType::Skip | LayerImportType::OverlayOnClean => {}
             }
         }
 
@@ -1249,9 +1439,23 @@ impl PsdImportWindowState {
                 self.rows[*clean_index].import_type = LayerImportType::Source;
             }
         }
+        // A swap moves the clean role to a different row, which changes the preview key of
+        // every overlay row on that page; without this the selected overlay preview would
+        // stay unloaded until the user clicked its row again.
+        self.request_selected_preview();
         clear_success_status(&mut self.status);
     }
 
+    /// Check one row against the other rows of its page after the user edited it.
+    ///
+    /// Rows that share a page must agree on size and must not claim the same whole-page
+    /// role twice. `OverlayOnClean` rows are exempt from both: they are deliberately
+    /// smaller than the page they patch, and a page may carry any number of them. The
+    /// "overlay without a clean layer" case is a save-time error (`validate_all_rows`),
+    /// not an edit-time one, so an overlay can be typed before its clean layer is.
+    ///
+    /// # Errors
+    /// Returns the localized message to show the user; the caller reverts the edit.
     fn validate_row_change(&self, row_index: usize) -> Result<(), String> {
         let row = self
             .rows
@@ -1266,6 +1470,11 @@ impl PsdImportWindowState {
                 || other.import_type == LayerImportType::Skip
                 || other.page != row.page
             {
+                continue;
+            }
+            let overlay_involved = row.import_type == LayerImportType::OverlayOnClean
+                || other.import_type == LayerImportType::OverlayOnClean;
+            if overlay_involved {
                 continue;
             }
             if other.size != row.size {
@@ -1322,10 +1531,21 @@ impl PsdImportWindowState {
         }
     }
 
+    /// Check the whole assignment table just before a save.
+    ///
+    /// Enforces: a page number of at least one, one `Source` and one `Clean` per page at
+    /// most, one agreed size per page, an `OverlayOnClean` row only on a page that also has
+    /// a `Clean` row to composite it onto, and at least one non-skipped row overall.
+    /// Overlay rows are exempt from the per-page size agreement (they are partial patches)
+    /// and may repeat on one page, but they do count towards "something is being imported".
+    ///
+    /// # Errors
+    /// Returns the localized message to show the user; the caller aborts the save.
     fn validate_all_rows(&self) -> Result<(), String> {
         let mut imported_rows = 0usize;
         let mut pages_with_source = BTreeSet::new();
         let mut pages_with_clean = BTreeSet::new();
+        let mut pages_with_overlay = BTreeSet::new();
         let mut page_sizes = HashMap::<u32, (u32, u32)>::new();
 
         for row in &self.rows {
@@ -1336,12 +1556,15 @@ impl PsdImportWindowState {
                 return Err(t!("launcher.psd_import.page_min_one").to_string());
             }
             imported_rows += 1;
-            if let Some(existing) = page_sizes.get(&row.page) {
-                if *existing != row.size {
-                    return Err(tf!("launcher.psd_import.page_mixed_sizes_error", row = row.page));
+            // Overlays are partial patches, so they never take part in the page size vote.
+            if row.import_type != LayerImportType::OverlayOnClean {
+                if let Some(existing) = page_sizes.get(&row.page) {
+                    if *existing != row.size {
+                        return Err(tf!("launcher.psd_import.page_mixed_sizes_error", row = row.page));
+                    }
+                } else {
+                    page_sizes.insert(row.page, row.size);
                 }
-            } else {
-                page_sizes.insert(row.page, row.size);
             }
             match row.import_type {
                 LayerImportType::Source => {
@@ -1354,8 +1577,17 @@ impl PsdImportWindowState {
                         return Err(tf!("launcher.psd_import.page_multiple_clean_error", row = row.page, TYPE_CLEAN = type_clean()));
                     }
                 }
+                LayerImportType::OverlayOnClean => {
+                    // Several overlays per page are the point of the action, so there is no
+                    // duplicate check here — only the "needs a clean layer" one below.
+                    pages_with_overlay.insert(row.page);
+                }
                 LayerImportType::Skip => {}
             }
+        }
+
+        if let Some(page) = pages_with_overlay.difference(&pages_with_clean).next() {
+            return Err(tf!("launcher.psd_import.page_overlay_without_clean_error", row = *page, TYPE_OVERLAY = type_overlay_on_clean(), TYPE_CLEAN = type_clean()));
         }
 
         if imported_rows == 0 {
@@ -1408,13 +1640,24 @@ impl PsdImportWindowState {
 }
 
 impl LayerImportType {
+    /// Localized label of this action, as shown in the table's type combo.
     fn label(self) -> &'static str {
         match self {
             Self::Skip => type_skip(),
             Self::Source => type_source(),
             Self::Clean => type_clean(),
+            Self::OverlayOnClean => type_overlay_on_clean(),
         }
     }
+}
+
+/// Whether `row` may be assigned `LayerImportType::OverlayOnClean`.
+///
+/// Only a real layer of a document with three or more layer rows qualifies: a `Composite`
+/// row has neither a canvas offset nor siblings to overlay onto, and a two-layer document is
+/// already a plain source/clean pair with nothing left over to patch with.
+fn row_offers_overlay(row: &PsdLayerRow) -> bool {
+    matches!(row.source, LayerSource::Layer(_)) && row.document_layer_count >= 3
 }
 
 /// Build the import rows for a single PSD document.
@@ -1427,8 +1670,10 @@ fn build_document_rows(
     document_index: usize,
     warnings: &mut Vec<String>,
 ) -> Vec<PsdLayerRow> {
-    // `document.layers` is already flattened (groups expanded) and ordered
-    // top-to-bottom, so no `reverse()` is needed before `auto_assign_types`.
+    // `document.layers` is already flattened (groups expanded) and ordered BOTTOM-FIRST
+    // (index 0 = bottommost, the raw PSD record order `ag-psd` preserves), which is the
+    // order `auto_assign_types` and the overlay stacking both rely on, so no `reverse()`.
+    let layer_count = document.layers.len();
     let mut document_rows = Vec::new();
     for (layer_index, layer) in document.layers.iter().enumerate() {
         document_rows.push(PsdLayerRow {
@@ -1439,6 +1684,7 @@ fn build_document_rows(
             size: (layer.image.width, layer.image.height),
             import_type: LayerImportType::Skip,
             document_index,
+            document_layer_count: layer_count,
             source: LayerSource::Layer(layer_index),
         });
     }
@@ -1461,6 +1707,9 @@ fn build_document_rows(
             // would never touch it anyway.
             import_type: LayerImportType::Source,
             document_index,
+            // A composite row exists precisely because the document has no layers, so the
+            // overlay action can never be offered for it.
+            document_layer_count: layer_count,
             source: LayerSource::Composite,
         }];
     }
@@ -2005,8 +2254,12 @@ fn load_document_from_bytes(
 /// Recursively walk ag-psd's layer tree, collecting leaf raster layers (those with
 /// decoded pixel data) into `out` while flagging whether any groups were present.
 ///
-/// `psd.children` is ordered top-to-bottom and groups are expanded in place, so the
-/// resulting list preserves visual top-to-bottom order.
+/// `psd.children` is ordered BOTTOM-FIRST (index 0 = bottommost): `ag-psd` preserves the raw
+/// PSD record order, which Photoshop writes bottom-to-top. Groups are expanded in place, so
+/// `out` keeps that same bottom-first order.
+///
+/// Each collected layer keeps its canvas offset (`Layer::left` / `Layer::top`), which the
+/// overlay action needs in order to place a partial layer onto the full-page clean image.
 fn collect_leaf_layers(layers: &[Layer], out: &mut Vec<DecodedLayer>, has_groups: &mut bool) {
     for layer in layers {
         if let Some(children) = layer.children.as_ref() {
@@ -2029,8 +2282,32 @@ fn collect_leaf_layers(layers: &[Layer], out: &mut Vec<DecodedLayer>, has_groups
             .clone()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| t!("launcher.psd_import.unnamed_layer").to_string());
-        out.push(DecodedLayer { name, image });
+        out.push(DecodedLayer {
+            name,
+            image,
+            left: psd_offset_to_i32(layer.left),
+            top: psd_offset_to_i32(layer.top),
+        });
     }
+}
+
+/// Convert a PSD layer coordinate (`Layer::left` / `Layer::top`) into an `i32` canvas offset.
+///
+/// The value is a signed 32-bit integer that `ag-psd` surfaces as `f64`, so it may be
+/// negative or reach past the canvas; a missing value means the layer sits at the canvas
+/// origin. Non-finite values fall back to `0` and out-of-range ones are clamped rather than
+/// wrapped.
+fn psd_offset_to_i32(value: Option<f64>) -> i32 {
+    let Some(value) = value else {
+        return 0;
+    };
+    if !value.is_finite() {
+        return 0;
+    }
+    let clamped = value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)).trunc();
+    // `clamped` is finite and inside the `i32` range, so this truncating cast is exact and
+    // cannot wrap (CLAUDE.md §17 "proven safe" exception).
+    clamped as i32
 }
 
 /// Convert an ag-psd `PixelData` (8-bit RGBA after `use_image_data`) into a
@@ -2053,6 +2330,12 @@ fn decoded_image_from_pixel_data(pixel_data: &PixelData) -> Option<DecodedImage>
     })
 }
 
+/// Pre-assign the source/clean pair of a document that has exactly one same-size pair on one
+/// page; everything else is left as `Skip` for the user to assign.
+///
+/// `rows` is in `LoadedPsdDocument::layers` order, i.e. bottom-first, so the lower index is
+/// the bottom layer (the raw scan, typed `Source`) and the higher one the layer painted over
+/// it (the clean, typed `Clean`).
 fn auto_assign_types(rows: &mut [PsdLayerRow]) {
     let mut by_page_and_size: HashMap<(u32, (u32, u32)), Vec<usize>> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
@@ -2074,11 +2357,11 @@ fn auto_assign_types(rows: &mut [PsdLayerRow]) {
 
     let mut indices = pairs[0].clone();
     indices.sort_unstable();
-    if let Some(upper) = rows.get_mut(indices[0]) {
-        upper.import_type = LayerImportType::Source;
+    if let Some(bottom_row) = rows.get_mut(indices[0]) {
+        bottom_row.import_type = LayerImportType::Source;
     }
-    if let Some(lower) = rows.get_mut(indices[1]) {
-        lower.import_type = LayerImportType::Clean;
+    if let Some(top_row) = rows.get_mut(indices[1]) {
+        top_row.import_type = LayerImportType::Clean;
     }
 }
 
@@ -2167,13 +2450,145 @@ fn first_significant_digit(bytes: &[u8], start: usize, end: usize) -> usize {
     index
 }
 
+/// Render the raster a preview should display, on the preview worker thread.
+///
+/// Without `request.base` this is simply the row's own layer bitmap. With a base (the page's
+/// clean layer) the base is rendered first and the row is composited onto it source-over at
+/// its PSD offset, and the returned highlight is the overlay's rectangle inside the base
+/// image, clipped to it — `None` when the overlay falls entirely outside.
+///
+/// # Errors
+/// Propagates the document/layer lookup errors of `render_layer_rgba` and `source_origin`.
 fn render_preview_image(
     documents: &Arc<Vec<LoadedPsdDocument>>,
+    request: PreviewRequest,
+) -> Result<PreviewRender, WorkerError> {
+    let Some(base) = request.base else {
+        let image = render_layer_rgba(documents, request.document_index, request.source)?;
+        return Ok(PreviewRender {
+            image: Arc::new(image),
+            highlight: None,
+        });
+    };
+
+    let mut composed = render_layer_rgba(documents, base.0, base.1)?;
+    let patch = render_layer_rgba(documents, request.document_index, request.source)?;
+    let offset = overlay_offset(
+        documents,
+        base,
+        (request.document_index, request.source),
+    )?;
+    let highlight =
+        overlay_highlight_rect(composed.dimensions(), patch.dimensions(), offset);
+    composite_overlay(&mut composed, &patch, offset);
+    Ok(PreviewRender {
+        image: Arc::new(composed),
+        highlight,
+    })
+}
+
+/// Canvas-space origin of a row's pixels inside its document, in pixels.
+///
+/// A `Composite` source is the whole-canvas merged image by definition, so its origin is
+/// `(0, 0)`. A `Layer` source uses the layer's own recorded offset, which PSD allows to be
+/// negative or to reach past the canvas.
+///
+/// # Errors
+/// Returns a `WorkerError` when the document or layer index no longer exists, mirroring the
+/// bounds errors of `render_layer_rgba`.
+fn source_origin(
+    documents: &[LoadedPsdDocument],
     document_index: usize,
     source: LayerSource,
-) -> Result<Arc<RgbaImage>, WorkerError> {
-    let rgba = render_layer_rgba(documents, document_index, source)?;
-    Ok(Arc::new(rgba))
+) -> Result<(i32, i32), WorkerError> {
+    let document = documents.get(document_index).ok_or_else(|| WorkerError {
+        user_message: t!("launcher.psd_import.psd_doc_gone").to_string(),
+        log_message: format!("missing document index {document_index}"),
+    })?;
+    match source {
+        LayerSource::Composite => Ok((0, 0)),
+        LayerSource::Layer(layer_index) => {
+            let layer = document.layers.get(layer_index).ok_or_else(|| WorkerError {
+                user_message: t!("launcher.psd_import.psd_layer_gone").to_string(),
+                log_message: format!(
+                    "missing layer index {layer_index} in document '{}'",
+                    document.file_name
+                ),
+            })?;
+            Ok((layer.left, layer.top))
+        }
+    }
+}
+
+/// Offset, in base-image pixels, at which the `overlay` row must be drawn onto the `base`
+/// row. Either component may be negative when the overlay starts above or left of the base.
+///
+/// # Errors
+/// Propagates `source_origin`'s document/layer lookup errors.
+fn overlay_offset(
+    documents: &[LoadedPsdDocument],
+    base: (usize, LayerSource),
+    overlay: (usize, LayerSource),
+) -> Result<(i32, i32), WorkerError> {
+    let (base_left, base_top) = source_origin(documents, base.0, base.1)?;
+    let (overlay_left, overlay_top) = source_origin(documents, overlay.0, overlay.1)?;
+    Ok((
+        overlay_left.saturating_sub(base_left),
+        overlay_top.saturating_sub(base_top),
+    ))
+}
+
+/// Draw `overlay` onto `base` in place, source-over, with the overlay's top-left corner at
+/// `offset` (base-image pixels; either component may be negative).
+///
+/// Clipping — including a partly or entirely out-of-bounds overlay, which is a no-op rather
+/// than an error — is handled by `image::imageops::overlay`, which clamps both rectangles
+/// and blends straight (non-premultiplied) RGBA8 source-over via `Pixel::blend`.
+fn composite_overlay(base: &mut RgbaImage, overlay: &RgbaImage, offset: (i32, i32)) {
+    imageops::overlay(base, overlay, i64::from(offset.0), i64::from(offset.1));
+}
+
+/// Rectangle the overlay occupies inside the base image, in base-image pixels, clipped to
+/// the base. Returns `None` when the two do not intersect at all.
+fn overlay_highlight_rect(
+    base_size: (u32, u32),
+    overlay_size: (u32, u32),
+    offset: (i32, i32),
+) -> Option<PreviewHighlight> {
+    let base_width = i64::from(base_size.0);
+    let base_height = i64::from(base_size.1);
+    let left = i64::from(offset.0);
+    let top = i64::from(offset.1);
+    let min_x = left.clamp(0, base_width);
+    let min_y = top.clamp(0, base_height);
+    let max_x = left
+        .saturating_add(i64::from(overlay_size.0))
+        .clamp(0, base_width);
+    let max_y = top
+        .saturating_add(i64::from(overlay_size.1))
+        .clamp(0, base_height);
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    // Every bound was clamped into `0..=base_size`, so the conversions cannot fail.
+    Some(PreviewHighlight {
+        min_x: u32::try_from(min_x).ok()?,
+        min_y: u32::try_from(min_y).ok()?,
+        max_x: u32::try_from(max_x).ok()?,
+        max_y: u32::try_from(max_y).ok()?,
+    })
+}
+
+/// Sort key placing overlay assignments in PSD hierarchy order: by document, then by layer
+/// index. `LoadedPsdDocument::layers` is bottom-first, so ascending keys paint the bottom
+/// overlay first and the topmost one last. A `Composite` source can never be an overlay (the
+/// action is gated on `LayerSource::Layer`), so its arbitrary `0` never affects a real sort.
+fn overlay_stack_key(assignment: &ImportAssignment) -> (usize, usize) {
+    let layer_index = match assignment.source {
+        LayerSource::Layer(index) => index,
+        LayerSource::Composite => 0,
+    };
+    (assignment.document_index, layer_index)
 }
 
 fn run_import_worker(
@@ -2195,12 +2610,19 @@ fn run_import_worker(
         log_message: format!("failed to create '{}': {err}", clean_dir.display()),
     })?;
 
-    let mut by_page: HashMap<u32, HashMap<LayerImportType, ImportAssignment>> = HashMap::new();
+    // A per-type map would collapse duplicates, and a page may legitimately carry several
+    // overlays, so each page gets its own typed bucket instead.
+    let mut by_page: HashMap<u32, PageAssignments> = HashMap::new();
     for assignment in assignments {
-        by_page
-            .entry(assignment.page)
-            .or_default()
-            .insert(assignment.import_type, assignment);
+        let entry = by_page.entry(assignment.page).or_default();
+        match assignment.import_type {
+            // `start_import` filters skipped rows out before they reach the worker; the arm
+            // stays explicit so a future variant cannot be dropped here unnoticed.
+            LayerImportType::Skip => {}
+            LayerImportType::Source => entry.source = Some(assignment),
+            LayerImportType::Clean => entry.clean = Some(assignment),
+            LayerImportType::OverlayOnClean => entry.overlays.push(assignment),
+        }
     }
 
     let mut pages = by_page.keys().copied().collect::<Vec<_>>();
@@ -2208,11 +2630,11 @@ fn run_import_worker(
 
     let mut saved_pages = 0usize;
     for page in pages {
-        let Some(entries) = by_page.get(&page) else {
+        let Some(mut entries) = by_page.remove(&page) else {
             continue;
         };
         let filename = import_filename_for_page(page)?;
-        if let Some(source) = entries.get(&LayerImportType::Source) {
+        if let Some(source) = entries.source {
             let image = render_layer_rgba(&documents, source.document_index, source.source)?;
             image
                 .save(src_dir.join(&filename))
@@ -2223,14 +2645,36 @@ fn run_import_worker(
                     ),
                 })?;
         }
-        if let Some(clean) = entries.get(&LayerImportType::Clean) {
-            let image = render_layer_rgba(&documents, clean.document_index, clean.source)?;
+        if let Some(clean) = entries.clean {
+            let mut image = render_layer_rgba(&documents, clean.document_index, clean.source)?;
+            // The table is sorted alphabetically, so the assignment order says nothing about
+            // stacking; re-sort into PSD hierarchy order (bottom-first) before compositing.
+            entries.overlays.sort_by_key(overlay_stack_key);
+            for overlay in &entries.overlays {
+                let patch = render_layer_rgba(&documents, overlay.document_index, overlay.source)?;
+                let offset = overlay_offset(
+                    &documents,
+                    (clean.document_index, clean.source),
+                    (overlay.document_index, overlay.source),
+                )?;
+                composite_overlay(&mut image, &patch, offset);
+            }
             image
                 .save(clean_dir.join(&filename))
                 .map_err(|err| WorkerError {
                     user_message: t!("launcher.psd_import.save_clean_error").to_string(),
                     log_message: format!("failed to save clean page {page} as '{filename}': {err}"),
                 })?;
+        } else if !entries.overlays.is_empty() {
+            // `validate_all_rows` rejects this before the save starts; reaching it here means
+            // the two checks drifted apart, which is a defect and not a silent no-op.
+            return Err(WorkerError {
+                user_message: tf!("launcher.psd_import.page_overlay_without_clean_error", row = page, TYPE_OVERLAY = type_overlay_on_clean(), TYPE_CLEAN = type_clean()),
+                log_message: format!(
+                    "page {page} has {} overlay assignment(s) but no clean assignment",
+                    entries.overlays.len()
+                ),
+            });
         }
         saved_pages += 1;
     }
@@ -2299,9 +2743,17 @@ fn render_layer_rgba(
     })
 }
 
+/// Upload a finished preview raster to the GPU as one or more full-width tiles.
+///
+/// `cache_key` only names the textures (it is the preview-cache key, so composited overlay
+/// previews get their own texture names). Tiling exists solely to stay under the GPU texture
+/// size limit; the tiles together cover the whole image, top to bottom.
+///
+/// # Errors
+/// Returns a `WorkerError` when the image has zero width or height.
 fn build_preview_texture_tiles(
     ctx: &Context,
-    row_key: &str,
+    cache_key: &str,
     image: &Arc<RgbaImage>,
 ) -> Result<Vec<PreviewTextureTile>, WorkerError> {
     let width = image.width() as usize;
@@ -2317,13 +2769,12 @@ fn build_preview_texture_tiles(
     let mut tile_index = 0usize;
     let mut start_y = 0u32;
 
-    // The full raster stays in RAM; tiling exists only to satisfy GPU texture limits.
     while start_y < image.height() {
         let tile_height = (image.height() - start_y).min(PREVIEW_TILE_MAX_HEIGHT as u32);
         let raw = copy_rgba_tile_rows(image, 0, start_y, image.width(), tile_height);
         let color_image = ColorImage::from_rgba_unmultiplied([width, tile_height as usize], &raw);
         let texture = ctx.load_texture(
-            format!("launcher-psd-preview-{row_key}-{tile_index}"),
+            format!("launcher-psd-preview-{cache_key}-{tile_index}"),
             color_image,
             TextureOptions::LINEAR,
         );
@@ -2743,6 +3194,426 @@ mod tests {
         assert!(!super::has_fully_skipped_document(&rows));
     }
 
+
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+    /// Builds an opaque `width` x `height` RGBA image filled with `rgba`.
+    fn solid_rgba(width: u32, height: u32, rgba: [u8; 4]) -> image::RgbaImage {
+        image::RgbaImage::from_pixel(width, height, image::Rgba(rgba))
+    }
+
+    /// Builds an `ImportAssignment` for one layer of one document, typed as an overlay.
+    fn overlay_assignment(document_index: usize, layer_index: usize) -> super::ImportAssignment {
+        super::ImportAssignment {
+            page: 1,
+            import_type: LayerImportType::OverlayOnClean,
+            document_index,
+            source: LayerSource::Layer(layer_index),
+        }
+    }
+
+    #[test]
+    fn overlay_composites_source_over_at_a_positive_offset() {
+        let mut base = solid_rgba(4, 4, WHITE);
+        let patch = solid_rgba(2, 2, RED);
+
+        super::composite_overlay(&mut base, &patch, (1, 1));
+
+        assert_eq!(base.dimensions(), (4, 4), "the base keeps its own size");
+        assert_eq!(base.get_pixel(1, 1).0, RED, "patch lands at its offset");
+        assert_eq!(base.get_pixel(2, 2).0, RED, "patch covers its full extent");
+        assert_eq!(base.get_pixel(0, 0).0, WHITE, "left of the patch is untouched");
+        assert_eq!(base.get_pixel(3, 3).0, WHITE, "right of the patch is untouched");
+    }
+
+    #[test]
+    fn overlay_transparent_pixels_leave_the_base_visible() {
+        let mut base = solid_rgba(2, 2, WHITE);
+        let patch = solid_rgba(2, 2, [255, 0, 0, 0]);
+
+        super::composite_overlay(&mut base, &patch, (0, 0));
+
+        assert_eq!(
+            base.get_pixel(0, 0).0,
+            WHITE,
+            "a fully transparent overlay pixel is source-over, not a copy"
+        );
+    }
+
+    #[test]
+    fn overlay_clips_at_a_negative_offset() {
+        let mut base = solid_rgba(4, 4, WHITE);
+        let patch = solid_rgba(3, 3, RED);
+
+        // Two of the patch's three rows/columns hang off the top-left corner.
+        super::composite_overlay(&mut base, &patch, (-1, -1));
+
+        assert_eq!(base.dimensions(), (4, 4), "clipping never resizes the base");
+        assert_eq!(base.get_pixel(0, 0).0, RED, "the in-bounds part still lands");
+        assert_eq!(base.get_pixel(1, 1).0, RED, "up to the patch's clipped extent");
+        assert_eq!(base.get_pixel(2, 2).0, WHITE, "and no further");
+    }
+
+    #[test]
+    fn overlay_entirely_outside_the_base_is_a_no_op() {
+        let untouched = solid_rgba(4, 4, WHITE);
+        let patch = solid_rgba(2, 2, RED);
+
+        for offset in [(10, 10), (-5, -5), (-2, 1), (4, 0)] {
+            let mut base = solid_rgba(4, 4, WHITE);
+            super::composite_overlay(&mut base, &patch, offset);
+            assert_eq!(
+                base.as_raw(),
+                untouched.as_raw(),
+                "offset {offset:?} puts the patch outside the base entirely"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_highlight_rect_clips_to_the_base() {
+        // The reference case: a 47x167 patch at (785, 1056) on a 960x1361 clean page.
+        assert_eq!(
+            super::overlay_highlight_rect((960, 1361), (47, 167), (785, 1056)),
+            Some(super::PreviewHighlight {
+                min_x: 785,
+                min_y: 1056,
+                max_x: 832,
+                max_y: 1223,
+            })
+        );
+        assert_eq!(
+            super::overlay_highlight_rect((4, 4), (3, 3), (-1, -1)),
+            Some(super::PreviewHighlight {
+                min_x: 0,
+                min_y: 0,
+                max_x: 2,
+                max_y: 2,
+            }),
+            "a partly clipped overlay reports only its visible part"
+        );
+        assert_eq!(
+            super::overlay_highlight_rect((4, 4), (2, 2), (10, 10)),
+            None,
+            "an overlay outside the base has no frame to draw"
+        );
+        assert_eq!(
+            super::overlay_highlight_rect((4, 4), (2, 2), (-2, 0)),
+            None,
+            "touching the edge from outside still does not intersect"
+        );
+    }
+
+    #[test]
+    fn overlays_stack_bottom_first_by_layer_index() {
+        // `document.layers` is bottom-first, so ascending (document, layer) index means the
+        // bottom overlay is painted first and the topmost one last.
+        let mut assignments = [
+            overlay_assignment(1, 0),
+            overlay_assignment(0, 3),
+            overlay_assignment(0, 1),
+        ];
+        assignments.sort_by_key(super::overlay_stack_key);
+
+        let order = assignments
+            .iter()
+            .map(super::overlay_stack_key)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![(0, 1), (0, 3), (1, 0)]);
+    }
+
+    #[test]
+    fn the_topmost_overlay_is_painted_last() {
+        let mut base = solid_rgba(4, 4, WHITE);
+        // Same offset, so whichever is composited last owns the pixels.
+        let mut stacked = vec![
+            (overlay_assignment(0, 2), solid_rgba(2, 2, GREEN)),
+            (overlay_assignment(0, 0), solid_rgba(2, 2, RED)),
+        ];
+        stacked.sort_by_key(|(assignment, _)| super::overlay_stack_key(assignment));
+
+        for (_, patch) in &stacked {
+            super::composite_overlay(&mut base, patch, (1, 1));
+        }
+
+        assert_eq!(
+            base.get_pixel(1, 1).0,
+            GREEN,
+            "layer index 2 sits above layer index 0 and wins the pixel"
+        );
+    }
+
+    #[test]
+    fn psd_offsets_default_to_the_canvas_origin_and_clamp() {
+        assert_eq!(super::psd_offset_to_i32(None), 0, "a missing offset means 0");
+        assert_eq!(super::psd_offset_to_i32(Some(0.0)), 0);
+        assert_eq!(
+            super::psd_offset_to_i32(Some(-514.0)),
+            -514,
+            "PSD offsets are signed and really do go negative"
+        );
+        assert_eq!(super::psd_offset_to_i32(Some(785.0)), 785);
+        assert_eq!(super::psd_offset_to_i32(Some(f64::NAN)), 0);
+        assert_eq!(super::psd_offset_to_i32(Some(f64::INFINITY)), 0);
+        assert_eq!(
+            super::psd_offset_to_i32(Some(1e30)),
+            i32::MAX,
+            "an out-of-range offset clamps instead of wrapping"
+        );
+        assert_eq!(super::psd_offset_to_i32(Some(-1e30)), i32::MIN);
+    }
+
+    #[test]
+    fn overlay_action_needs_three_layers_and_a_real_layer_source() {
+        let mut row = test_row("009.psd", "клин копия");
+
+        row.document_layer_count = 2;
+        assert!(
+            !super::row_offers_overlay(&row),
+            "a two-layer document is already a plain source/clean pair"
+        );
+
+        row.document_layer_count = 3;
+        assert!(
+            super::row_offers_overlay(&row),
+            "the reference three-layer document offers the overlay action"
+        );
+
+        row.source = LayerSource::Composite;
+        assert!(
+            !super::row_offers_overlay(&row),
+            "a composite row has no canvas offset to place an overlay at"
+        );
+    }
+
+    /// Page size of the reference chapter, used wherever a "full page" row is needed.
+    const PAGE_SIZE: (u32, u32) = (960, 1361);
+    /// Size of a small overlay patch, deliberately different from `PAGE_SIZE`.
+    const PATCH_SIZE: (u32, u32) = (47, 167);
+
+    /// Builds a row with an explicit key, page, size and action, i.e. exactly the fields
+    /// the page-level validation and the preview keying look at.
+    fn sized_row(
+        row_key: &str,
+        page: u32,
+        size: (u32, u32),
+        import_type: LayerImportType,
+    ) -> PsdLayerRow {
+        PsdLayerRow {
+            row_key: row_key.to_string(),
+            file_name: "001.psd".to_string(),
+            page,
+            layer_title: row_key.to_string(),
+            size,
+            import_type,
+            document_index: 0,
+            document_layer_count: 3,
+            source: LayerSource::Layer(0),
+        }
+    }
+
+    /// Window state carrying `rows` and nothing else.
+    ///
+    /// `new` starts a catalog refresh against the given root; the path is intentionally
+    /// non-existent because listing it is read-only (it creates nothing) and no test polls
+    /// the result, so the worker's error is simply dropped.
+    fn state_with_rows(rows: Vec<PsdLayerRow>) -> super::PsdImportWindowState {
+        let mut state = super::PsdImportWindowState::new(std::path::PathBuf::from(
+            "psd-import-window-test-root-does-not-exist",
+        ));
+        state.rows = rows;
+        state
+    }
+
+    #[test]
+    fn overlay_row_size_may_differ_from_the_page() {
+        // The point of the action: a patch is smaller than the page it is composited onto.
+        let state = state_with_rows(vec![
+            sized_row("source", 1, PAGE_SIZE, LayerImportType::Source),
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ]);
+
+        assert!(
+            state.validate_row_change(2).is_ok(),
+            "an overlay is exempt from the per-page size agreement"
+        );
+        assert!(
+            state.validate_row_change(1).is_ok(),
+            "and it does not make the clean row it patches invalid either"
+        );
+    }
+
+    #[test]
+    fn non_overlay_row_size_must_still_match_the_page() {
+        let mut rows = vec![
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::Source),
+        ];
+        let state = state_with_rows(rows.clone());
+        assert!(
+            state.validate_row_change(1).is_err(),
+            "the size exemption must not have disabled the check for every row"
+        );
+
+        // Only the action differs: the very same undersized row is accepted as an overlay.
+        rows[1].import_type = LayerImportType::OverlayOnClean;
+        let state = state_with_rows(rows);
+        assert!(state.validate_row_change(1).is_ok());
+    }
+
+    #[test]
+    fn several_overlays_may_share_one_page() {
+        let state = state_with_rows(vec![
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch_a", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+            sized_row("patch_b", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ]);
+
+        assert!(
+            state.validate_row_change(2).is_ok(),
+            "per-page role uniqueness does not apply to overlays"
+        );
+    }
+
+    #[test]
+    fn a_page_still_takes_only_one_clean_row() {
+        let state = state_with_rows(vec![
+            sized_row("clean_a", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("clean_b", 1, PAGE_SIZE, LayerImportType::Clean),
+        ]);
+
+        assert!(
+            state.validate_row_change(1).is_err(),
+            "two clean rows on one page are still a conflict"
+        );
+    }
+
+    #[test]
+    fn saving_requires_a_clean_row_under_every_overlay() {
+        let mut rows = vec![
+            sized_row("source", 1, PAGE_SIZE, LayerImportType::Source),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ];
+        let state = state_with_rows(rows.clone());
+        assert!(
+            state.validate_all_rows().is_err(),
+            "an overlay has nothing to composite onto without a clean row"
+        );
+
+        rows.push(sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean));
+        let state = state_with_rows(rows);
+        assert!(state.validate_all_rows().is_ok());
+    }
+
+    #[test]
+    fn an_overlay_on_another_page_does_not_borrow_a_clean_row() {
+        let state = state_with_rows(vec![
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 2, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ]);
+
+        assert!(
+            state.validate_all_rows().is_err(),
+            "the clean row must be on the overlay's own page"
+        );
+    }
+
+    #[test]
+    fn a_clean_and_overlay_page_is_something_to_import() {
+        // No source row anywhere: the overlays and their clean layer must still count,
+        // otherwise the save trips the "nothing to import" error.
+        let state = state_with_rows(vec![
+            sized_row("skipped", 1, PAGE_SIZE, LayerImportType::Skip),
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ]);
+
+        assert!(state.validate_all_rows().is_ok());
+    }
+
+    #[test]
+    fn overlay_sizes_stay_out_of_the_page_size_vote() {
+        let mut rows = vec![
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ];
+        let state = state_with_rows(rows.clone());
+        assert!(state.validate_all_rows().is_ok());
+
+        // The same undersized row as a plain source is a genuine mixed-size page.
+        rows[1].import_type = LayerImportType::Source;
+        let state = state_with_rows(rows);
+        assert!(
+            state.validate_all_rows().is_err(),
+            "non-overlay rows of a page must still agree on one size"
+        );
+    }
+
+    #[test]
+    fn overlay_preview_key_names_the_clean_row_it_sits_on() {
+        let state = state_with_rows(vec![
+            sized_row("clean", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ]);
+
+        let overlay_key = state.preview_key_for_row(1);
+        assert!(overlay_key.is_some(), "the row exists");
+        assert_ne!(
+            overlay_key,
+            Some("patch".to_string()),
+            "a composited preview must not be cached under the bare row key"
+        );
+        assert_eq!(
+            state.preview_key_for_row(0),
+            Some("clean".to_string()),
+            "a normal row is keyed by its own row key"
+        );
+    }
+
+    #[test]
+    fn preview_key_follows_a_reassigned_clean_row() {
+        let mut rows = vec![
+            sized_row("clean_a", 1, PAGE_SIZE, LayerImportType::Clean),
+            sized_row("clean_b", 1, PAGE_SIZE, LayerImportType::Skip),
+            sized_row("patch", 1, PATCH_SIZE, LayerImportType::OverlayOnClean),
+        ];
+        let state = state_with_rows(rows.clone());
+        let on_clean_a = state.preview_key_for_row(2);
+
+        // The user points the page at a different clean layer: the cached composite is
+        // stale and must not be reachable under the same key.
+        rows[0].import_type = LayerImportType::Skip;
+        rows[1].import_type = LayerImportType::Clean;
+        let state = state_with_rows(rows.clone());
+        let on_clean_b = state.preview_key_for_row(2);
+        assert_ne!(on_clean_a, on_clean_b, "the key names the clean row");
+
+        // Dropping the overlay action falls back to the plain row key.
+        rows[2].import_type = LayerImportType::Source;
+        let state = state_with_rows(rows);
+        assert_eq!(state.preview_key_for_row(2), Some("patch".to_string()));
+    }
+
+    #[test]
+    fn overlay_without_a_clean_row_keys_as_a_plain_row() {
+        // Edit-time state: the overlay is typed before its clean layer is, so there is
+        // nothing to composite onto and the preview is the layer's own bitmap.
+        let state = state_with_rows(vec![sized_row(
+            "patch",
+            1,
+            PATCH_SIZE,
+            LayerImportType::OverlayOnClean,
+        )]);
+
+        assert_eq!(state.preview_key_for_row(0), Some("patch".to_string()));
+        assert_eq!(state.preview_key_for_row(1), None, "no such row");
+    }
+
+
+
     fn test_row(file_name: &str, layer_title: &str) -> PsdLayerRow {
         test_row_with_document(file_name, layer_title, 0, LayerImportType::Skip)
     }
@@ -2761,6 +3632,7 @@ mod tests {
             size: (1, 1),
             import_type,
             document_index,
+            document_layer_count: 1,
             source: LayerSource::Layer(0),
         }
     }
@@ -2952,7 +3824,8 @@ mod tests {
             height: f64::from(FIXTURE_HEIGHT),
             color_mode: Some(ColorMode::Rgb),
             bits_per_channel: Some(8.0),
-            // Top-to-bottom order, as `collect_leaf_layers` expects.
+            // Bottom-first order, as `collect_leaf_layers` reports it: index 0 is the
+            // bottommost layer.
             children: Some(vec![
                 layer("source", [255, 0, 0]),
                 layer("clean", [0, 0, 255]),
@@ -2989,7 +3862,7 @@ mod tests {
         let rows = super::build_document_rows(&document, 0, &mut warnings);
         assert_eq!(rows.len(), 2, "one row per layer");
         assert_eq!(rows[0].page, 2, "page comes from the file stem, not the ext");
-        // A single same-size pair on one page is auto-assigned top=source, bottom=clean.
+        // A single same-size pair on one page is auto-assigned bottom=source, top=clean.
         assert_eq!(rows[0].import_type, LayerImportType::Source);
         assert_eq!(rows[1].import_type, LayerImportType::Clean);
         assert!(warnings.is_empty(), "no warnings for a flat layer stack");

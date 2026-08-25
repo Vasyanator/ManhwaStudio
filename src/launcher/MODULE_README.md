@@ -32,6 +32,16 @@ notification.
   folder or archive are imported too — each becomes a one-row single-page document whose
   image is the source page, so it reuses the flattened-PSD `LayerSource::Composite` path.
   `load_source_from_bytes` is the per-file reader switch; all four scanners go through it.
+  Layer rows carry a fourth action beside skip/source/clean: "overlay on clean"
+  (`LayerImportType::OverlayOnClean`) writes no file of its own and is instead composited
+  source-over onto the page's clean image at the layer's own PSD canvas offset, clipped to
+  it, before that image is saved. Several overlays may share a page; they are applied in PSD
+  hierarchy order and require a clean row on the same page (`validate_all_rows`). The action
+  is offered only for a `LayerSource::Layer` row of a document with three or more layer rows.
+  Note the layer order this depends on: `ag-psd` preserves the raw PSD record order, so
+  `LoadedPsdDocument::layers` and the rows built from it are BOTTOM-FIRST (index 0 =
+  bottommost). The preview of an overlay row is composited on the preview worker thread and
+  cached under `"{row_key}@on:{clean_row_key}"` so reassigning the clean row rebuilds it.
 - `theme.rs`: launcher visual style helpers.
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
