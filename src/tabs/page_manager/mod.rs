@@ -31,6 +31,8 @@ per frame.
 mod dialogs;
 mod clean;
 mod grid;
+mod split;
+mod split_layout;
 mod stitch;
 mod stitch_layout;
 mod thumbs;
@@ -422,6 +424,38 @@ impl PageManagerTabState {
         } else {
             None
         }
+    }
+
+    /// Pixel size of page `idx`: authoritative geometry first, then the sizes
+    /// probed by the thumbnail and preview decoders. `None` while unknown.
+    ///
+    /// Shared by the stitch and split windows: both need a page's real size to
+    /// build their board, and neither may decode anything on the GUI thread. A
+    /// `None` answer is the caller's cue to request a thumbnail — the thumbnail
+    /// worker's reply carries the full image dimensions.
+    fn page_pixel_size(
+        &mut self,
+        idx: usize,
+        project: &ProjectData,
+        page_infos: &HashMap<usize, PageImageInfo>,
+    ) -> Option<[u32; 2]> {
+        if let Some(info) = page_infos.get(&idx)
+            && info.width_px > 0
+            && info.height_px > 0
+        {
+            return Some([info.width_px, info.height_px]);
+        }
+        let path = &project.pages.get(idx)?.path;
+        let probed = self
+            .thumbs
+            .cache
+            .peek(path)
+            .and_then(|entry| entry.full_size)
+            .or_else(|| match self.thumbs.preview_state(path) {
+                thumbs::PreviewState::Ready { full_size, .. } => full_size,
+                thumbs::PreviewState::Pending | thumbs::PreviewState::Failed => None,
+            })?;
+        (probed.0 > 0 && probed.1 > 0).then_some([probed.0, probed.1])
     }
 
     /// Layer count of page `idx`: live in-memory count for pages resident in the

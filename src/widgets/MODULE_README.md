@@ -277,7 +277,10 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   in both, and a copy per widget is how that contract drifts. One step per FRAME is reported
   however many notches arrived in it — only the sign of the raw delta is read — and
   `cycle_wrapped_index` reduces an out-of-range index into range before its arithmetic, so a
-  selection the caller has not cleaned up cannot overflow it.
+  selection the caller has not cleaned up cannot overflow it. `combo_popup_open` is the one
+  helper re-exported from `mod.rs`: a wheel consumer OUTSIDE this module (a canvas reading the
+  raw wheel delta, e.g. the page manager's split board) must skip its wheel reaction while a
+  list is open, exactly as the wheel widgets here do.
 - `seed_spin_box.rs`: seed value input with random generation support.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip explains a control. The
   tooltip may carry a localized text line, an animated WebP hint from the `ms-gifs` crate, or

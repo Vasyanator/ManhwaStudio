@@ -3,7 +3,8 @@ File: page_ops/mod.rs
 
 Purpose:
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: reordering,
-inserting (from files or generated blank pages), deleting and stitching pages.
+inserting (from files or generated blank pages), deleting, stitching several
+pages into one and splitting one page into several.
 
 Main responsibilities:
 - define the `PageOpKind` request model shared by the page-manager tab and the app;
@@ -15,6 +16,7 @@ Main responsibilities:
 Key structures:
 - PageOpKind: one structural operation, indices in the CURRENT page order.
 - StitchPlacement: one source page's affine placement inside a stitched canvas.
+- SplitAxis: orientation of the parallel cut lines of a split.
 - PageOpOutcome: old->new index mapping produced by a successful operation.
 - PageOpError: typed failure of planning or execution.
 
@@ -71,6 +73,19 @@ pub struct StitchPlacement {
     pub dy: i64,
 }
 
+/// Orientation of the parallel cut lines of a [`PageOpKind::Split`].
+///
+/// `Horizontal` means horizontal lines, i.e. the cut coordinates are Y values
+/// and the resulting parts are stacked top to bottom. `Vertical` is the
+/// transpose. The two are never mixed in one operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitAxis {
+    /// Horizontal cut lines; cuts are Y coordinates, parts run top to bottom.
+    Horizontal,
+    /// Vertical cut lines; cuts are X coordinates, parts run left to right.
+    Vertical,
+}
+
 /// One structural page operation over the loaded chapter.
 ///
 /// All indices refer to the CURRENT page order (`ProjectData::pages`) at the
@@ -100,6 +115,34 @@ pub enum PageOpKind {
     /// All page artifacts are moved into the chapter-local trash directory, not
     /// destroyed, so the operation is manually recoverable.
     Delete { indices: Vec<usize> },
+    /// Cut ONE page into `cuts.len() + 1` parts along parallel cut lines and
+    /// replace it with those parts, in the order given by `order`.
+    ///
+    /// Each part is a crop of the source page; its new page image is the
+    /// cropped pixels, always encoded as PNG. Page-sized rasters (clean
+    /// overlays, typing masks, trustworthy detection masks) are cut the same
+    /// way. Layers are NEVER cut: a layer crossed by a cut moves whole to the
+    /// part holding the largest share of its on-page area (a tie goes to the
+    /// top/left part), so its geometry may legitimately hang off the new page's
+    /// edge. A bubble goes to the part containing its anchor point.
+    ///
+    /// The part the user ordered FIRST takes the source page's index; every
+    /// page after it shifts up by `cuts.len()`. The source page's files are
+    /// moved into the chapter-local trash, so the operation is manually
+    /// recoverable.
+    Split {
+        /// Current index of the page to cut.
+        page_idx: usize,
+        /// Orientation of every cut line.
+        axis: SplitAxis,
+        /// Cut positions in SOURCE pixels along the cut axis: strictly
+        /// increasing, strictly inside the page, every part at least 1 px.
+        cuts: Vec<u32>,
+        /// `order[k]` is the position in the new page order of GEOMETRIC part
+        /// `k` (`k == 0` is the topmost / leftmost part). A permutation of
+        /// `0..cuts.len() + 1`.
+        order: Vec<usize>,
+    },
     /// Merge >= 2 pages into ONE page that takes the position of the lowest
     /// source index (`primary = min(page_idx)`); the other sources disappear
     /// from the order and every page after them shifts down.
@@ -114,12 +157,6 @@ pub enum PageOpKind {
     /// `placements` must hold at least two entries with unique `page_idx`; the
     /// source page files themselves are moved into the chapter-local trash, so
     /// the operation is manually recoverable.
-    // TEMPORARY, remove together with the page manager's stitch dialog: that
-    // dialog is the only production constructor and lands with the UI layer of
-    // this feature, so until then the binary target sees the variant as never
-    // constructed (the test target already constructs it, which is why this
-    // cannot be an `expect` — the expectation would be unfulfilled there).
-    #[allow(dead_code, reason = "constructed by the page-manager stitch dialog")]
     Stitch {
         placements: Vec<StitchPlacement>,
         width: u32,
@@ -186,10 +223,12 @@ pub enum PageOpError {
 /// - [`PageOpError::InvalidOp`] — the request does not apply (bad indices,
 ///   unsupported insert extension, deleting every page, un-migrated legacy
 ///   documents, stale page list, a stitch whose crops/placements fall outside
-///   their page or canvas or whose merged pages share a layer uid).
+///   their page or canvas or whose merged pages share a layer uid, a split
+///   whose cuts are not strictly increasing inside the page or whose `order` is
+///   not a permutation of its parts).
 /// - [`PageOpError::Image`] — an inserted file is not a readable image, a
-///   blank page failed to encode, or a stitched source page could not be
-///   decoded/composed.
+///   blank page failed to encode, or a stitched/split source page could not be
+///   decoded, cropped or composed.
 /// - [`PageOpError::Json`] — an authoritative page-keyed document could not be
 ///   parsed or re-serialized (nothing is changed on disk in that case).
 /// - [`PageOpError::Io`] / [`PageOpError::Journal`] — filesystem failure; the

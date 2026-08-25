@@ -145,6 +145,7 @@ pub use text_edit_plus::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextC
 pub use viewport_color_selector::ViewportColorSelector;
 #[allow(unused_imports)]
 pub use wheel_combo_box::WheelComboBox;
+pub use wheel_input_guard::combo_popup_open;
 #[allow(unused_imports)]
 pub use wheel_slider::WheelSlider;
 #[allow(unused_imports)]

@@ -50,6 +50,15 @@ const MAX_IN_FLIGHT_THUMB_JOBS: usize = 8;
 /// Default long side of a page preview, in pixels: large enough for the stitch
 /// window's zoomed-out board, far below a full-resolution decode.
 pub(super) const PREVIEW_LONG_SIDE_PX: u32 = 1024;
+/// Long side of the page preview the SPLIT window asks for.
+///
+/// That window shows ONE page and the user must be able to see a seam to place a
+/// cut on it, so 1024 px (~7.8 source px per texel on an 8000 px ribbon) is too
+/// coarse. It stays well below a full decode: the worst case is a square page,
+/// whose 2048x2048 RGBA texture costs ~16 MB, and a bigger cached preview also
+/// answers the stitch window's smaller request (`cached_preview_answers`), so the
+/// two windows never fight over the same entry.
+pub(super) const SPLIT_PREVIEW_LONG_SIDE_PX: u32 = 2048;
 /// Maximum number of preview entries kept in the GUI-side LRU cache. Previews are
 /// ~25x the pixels of a thumbnail, so the cache is deliberately small and separate.
 ///

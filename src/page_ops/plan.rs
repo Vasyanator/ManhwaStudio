@@ -15,15 +15,21 @@ Key structures:
 - PageOpPlan / PlannedMove / PlannedCreate / PlannedJsonWrite /
   PlannedTrashWrite: the action plan persisted verbatim into the journal.
 
-- PlacementMap / StitchGeometry: the affine of one stitched page and the
-  resolved stitch request every remap of a merged page is routed through.
+- PlacementMap: the affine of ONE page onto ONE output canvas, shared by the
+  stitch and the split.
+- StitchGeometry / SplitGeometry / PageGeometry: the resolved pixel-identity
+  request every remap of an affected page is routed through.
+- SplitTreeRouting: per-tree layer uid -> part and layer PNG -> new page index
+  tables of a split (the 1 -> N fan-out `old_to_new` cannot express).
 - ComposeSource / NewPageContent::ComposedPng: the recipe `fs_exec` executes to
-  build a stitched raster during phase A.
+  build a stitched or cropped raster during phase A.
 
 Key functions:
 - permutation_for_op(): op -> permutation + validation (pure).
 - build_plan(): snapshot + op -> PageOpPlan (pure; no filesystem access).
 - build_stitch_geometry(): stitch request + snapshot -> validated affines.
+- build_split_geometry(): split request + snapshot -> validated part affines
+  plus the per-tree layer routing.
 - canonical page-keyed file-name helpers shared with the scanner.
 
 Notes:
@@ -33,7 +39,7 @@ committed chapter tree and its sibling `{chapter}_unsaved` staging tree.
 No function in this file touches the filesystem.
 */
 
-use super::{PageOpError, PageOpKind, StitchPlacement};
+use super::{PageOpError, PageOpKind, SplitAxis, StitchPlacement};
 use crate::config;
 use crate::page_ops::json_remap;
 use serde::{Deserialize, Serialize};
@@ -186,7 +192,12 @@ pub(crate) const STITCH_MAX_SCALE: f32 = 16.0;
 /// affine can be built without a lossy integer -> float cast.
 const STITCH_MAX_OFFSET_PX: i64 = 1_000_000;
 
-/// The affine map from one source page's own pixels to the stitched canvas.
+/// The affine map from one source page's own pixels to an output canvas.
+///
+/// Shared by both pixel-identity operations: a STITCH gives every merged page
+/// one map onto the shared canvas, and a SPLIT gives every part one map from
+/// the source page onto that part's own canvas (`crop = the part rect`,
+/// `scale = 1`, `dx = dy = 0`).
 ///
 /// Built (and fully validated) by [`PlacementMap::new`]; all remaps of that
 /// page's artifacts go through it, so the three on-disk coordinate spaces stay
@@ -216,7 +227,7 @@ impl PlacementMap {
     /// Validates one placement against its page and the canvas and returns the
     /// affine.
     ///
-    /// `page_size` is the source page's own pixel size, `canvas` the stitched
+    /// `page_size` is the source page's own pixel size, `canvas` the output
     /// page's size. Validation is total: a returned map is guaranteed to place
     /// a non-empty rectangle fully inside the canvas from a non-empty crop
     /// fully inside the page.
@@ -233,21 +244,21 @@ impl PlacementMap {
         let idx = placement.page_idx;
         if page_size[0] == 0 || page_size[1] == 0 {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch source page {idx} has a zero pixel size {}x{}",
+                "source page {idx} has a zero pixel size {}x{}",
                 page_size[0], page_size[1]
             )));
         }
         let [cx, cy, cw, ch] = placement.crop;
         if cw == 0 || ch == 0 {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch crop of page {idx} is empty ({cw}x{ch})"
+                "crop of page {idx} is empty ({cw}x{ch})"
             )));
         }
         let right = cx.checked_add(cw);
         let bottom = cy.checked_add(ch);
         if right.is_none_or(|r| r > page_size[0]) || bottom.is_none_or(|b| b > page_size[1]) {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch crop [{cx}, {cy}, {cw}, {ch}] of page {idx} leaves its \
+                "crop [{cx}, {cy}, {cw}, {ch}] of page {idx} leaves its \
                  {}x{} image",
                 page_size[0], page_size[1]
             )));
@@ -257,7 +268,7 @@ impl PlacementMap {
             || placement.scale > STITCH_MAX_SCALE
         {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch scale {} of page {idx} is outside (0, {STITCH_MAX_SCALE}]",
+                "placement scale {} of page {idx} is outside (0, {STITCH_MAX_SCALE}]",
                 placement.scale
             )));
         }
@@ -266,7 +277,7 @@ impl PlacementMap {
         let offset_ok = -STITCH_MAX_OFFSET_PX..=STITCH_MAX_OFFSET_PX;
         if !offset_ok.contains(&placement.dx) || !offset_ok.contains(&placement.dy) {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch offset ({}, {}) of page {idx} exceeds +-{STITCH_MAX_OFFSET_PX} px",
+                "placement offset ({}, {}) of page {idx} exceeds +-{STITCH_MAX_OFFSET_PX} px",
                 placement.dx, placement.dy
             )));
         }
@@ -277,7 +288,7 @@ impl PlacementMap {
             i32::try_from(placement.dy),
         ) else {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch offset ({}, {}) of page {idx} is not representable",
+                "placement offset ({}, {}) of page {idx} is not representable",
                 placement.dx, placement.dy
             )));
         };
@@ -288,7 +299,7 @@ impl PlacementMap {
         let placed_h = round_to_u32(f64::from(ch) * scale);
         if placed_w == 0 || placed_h == 0 {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch placement of page {idx} rounds to an empty rectangle"
+                "placement of page {idx} rounds to an empty rectangle"
             )));
         }
         if dx < 0.0
@@ -297,7 +308,7 @@ impl PlacementMap {
             || dy + f64::from(placed_h) > f64::from(canvas[1])
         {
             return Err(PageOpError::InvalidOp(format!(
-                "stitch placement of page {idx} ({placed_w}x{placed_h} at \
+                "placement of page {idx} ({placed_w}x{placed_h} at \
                  ({}, {})) leaves the {}x{} canvas",
                 placement.dx, placement.dy, canvas[0], canvas[1]
             )));
@@ -447,6 +458,492 @@ impl StitchGeometry {
     #[must_use]
     pub(crate) fn layer_idx_offset(&self, old_idx: usize) -> u32 {
         self.layer_idx_offsets.get(&old_idx).copied().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split geometry.
+//
+// A split cuts ONE page along parallel lines into N parts, each of which
+// becomes a page of its own. Every part reuses the same `PlacementMap`
+// primitive as a stitch (`crop` = the part rectangle, `scale` = 1,
+// `dx` = `dy` = 0, canvas = the part size), so all geometry helpers are shared
+// verbatim. What is specific to a split is ROUTING: because one page becomes
+// many, every page-keyed entry must be assigned to exactly ONE part before its
+// geometry can be mapped.
+// ---------------------------------------------------------------------------
+
+/// Inclusive upper bound on the number of parts one split may produce.
+///
+/// The cut list alone already bounds the count (cuts are strictly increasing
+/// pixel positions inside the page), but that bound is the page's pixel extent
+/// — tens of thousands for a ribbon. A request in that range is a malformed
+/// request, not a user intent, and each part costs its own page image, clean
+/// overlay, typing mask and detection document.
+const SPLIT_MAX_PARTS: usize = 256;
+
+/// Per-tree routing of the split page's LAYER records and layer PNG files.
+///
+/// Both maps are keyed by data that is unique inside one tree: a layer uid and
+/// a layer PNG file name. They exist because a split fans ONE page's layers
+/// out onto SEVERAL new pages, which the index-keyed `old_to_new` map cannot
+/// express — it can only name the representative part.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SplitTreeRouting {
+    /// Geometric part each layer node of the split page belongs to, by uid.
+    node_part: std::collections::HashMap<String, usize>,
+    /// New page index each layer PNG of the split page moves to, by file name.
+    file_new_idx: std::collections::HashMap<String, usize>,
+}
+
+impl SplitTreeRouting {
+    /// Builds a routing from the two resolved tables (see
+    /// `json_remap::split_layer_routing`, the only production constructor).
+    #[must_use]
+    pub(crate) fn new(
+        node_part: std::collections::HashMap<String, usize>,
+        file_new_idx: std::collections::HashMap<String, usize>,
+    ) -> Self {
+        Self {
+            node_part,
+            file_new_idx,
+        }
+    }
+
+    /// Geometric part of the layer node `uid`, or `None` when the uid does not
+    /// belong to the split page.
+    #[must_use]
+    pub(crate) fn node_part(&self, uid: &str) -> Option<usize> {
+        self.node_part.get(uid).copied()
+    }
+
+    /// New page index of the layer PNG `file`, or `None` when the file is not
+    /// owned by a node of the split page.
+    #[must_use]
+    pub(crate) fn file_new_idx(&self, file: &str) -> Option<usize> {
+        self.file_new_idx.get(file).copied()
+    }
+}
+
+/// Everything the plan and the JSON remaps need to know about a split: where
+/// the cuts are, what each part looks like, where each part lands in the new
+/// page order, and which layer of which tree belongs to which part.
+#[derive(Debug, Clone)]
+pub(crate) struct SplitGeometry {
+    /// Index of the cut page in the CURRENT page order.
+    source_old_idx: usize,
+    /// Pixel size `[w, h]` of the cut page, needed to turn the page-normalized
+    /// uv of bubbles and typing overlays into the page pixels the cuts live in.
+    page_size: [u32; 2],
+    /// Orientation of the cut lines.
+    axis: SplitAxis,
+    /// Part boundaries along the cut axis in SOURCE pixels: `part_count + 1`
+    /// strictly increasing values starting at 0 and ending at the page extent,
+    /// so geometric part `k` spans `bounds[k] .. bounds[k + 1]`.
+    bounds: Vec<f64>,
+    /// Affine of each geometric part (`0` = topmost / leftmost).
+    parts: Vec<PlacementMap>,
+    /// Pixel size `[w, h]` of each geometric part.
+    part_sizes: Vec<[u32; 2]>,
+    /// Index of each geometric part in the NEW page order.
+    part_new_idx: Vec<usize>,
+    /// Layer routing per tree, keyed by `TreeSnapshot::tree_rel`.
+    trees: std::collections::BTreeMap<String, SplitTreeRouting>,
+    /// Plan-time diagnostics collected while resolving the routing (probe
+    /// failures, orphan PNGs); drained into the plan's warnings.
+    warnings: Vec<String>,
+}
+
+impl SplitGeometry {
+    /// Index of the page being cut, in the current order.
+    #[must_use]
+    pub(crate) fn source_old_idx(&self) -> usize {
+        self.source_old_idx
+    }
+
+    /// Pixel size `[w, h]` of the page being cut.
+    #[must_use]
+    pub(crate) fn page_size(&self) -> [f64; 2] {
+        [f64::from(self.page_size[0]), f64::from(self.page_size[1])]
+    }
+
+    /// Geometric part containing a page-normalized `(u, v)` anchor.
+    #[must_use]
+    pub(crate) fn part_for_uv_point(&self, u: f64, v: f64) -> usize {
+        let [w, h] = self.page_size();
+        self.part_for_point(u * w, v * h)
+    }
+
+    /// Geometric part holding the largest share of a page-normalized
+    /// `[u1, v1, u2, v2]` rectangle.
+    #[must_use]
+    pub(crate) fn part_for_uv_rect(&self, rect: [f64; 4]) -> usize {
+        let [w, h] = self.page_size();
+        self.part_for_page_rect([rect[0] * w, rect[1] * h, rect[2] * w, rect[3] * h])
+    }
+
+    /// Number of geometric parts (`cuts.len() + 1`).
+    #[must_use]
+    pub(crate) fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Affine of geometric part `part`.
+    #[must_use]
+    pub(crate) fn placement(&self, part: usize) -> Option<&PlacementMap> {
+        self.parts.get(part)
+    }
+
+    /// Pixel size `[w, h]` of geometric part `part`.
+    #[must_use]
+    pub(crate) fn part_size(&self, part: usize) -> Option<[u32; 2]> {
+        self.part_sizes.get(part).copied()
+    }
+
+    /// New-order index of geometric part `part`.
+    #[must_use]
+    pub(crate) fn part_new_idx(&self, part: usize) -> Option<usize> {
+        self.part_new_idx.get(part).copied()
+    }
+
+    /// Layer routing of the tree rooted at `tree_rel`.
+    #[must_use]
+    pub(crate) fn routing(&self, tree_rel: &str) -> Option<&SplitTreeRouting> {
+        self.trees.get(tree_rel)
+    }
+
+    /// Geometric part containing the page-pixel point `(x, y)`.
+    ///
+    /// Containment follows the part CROP rectangles exactly: a point sitting
+    /// on a cut line belongs to the part that owns that pixel row/column, i.e.
+    /// the lower / right one. Points outside the page clamp to the first or
+    /// last part.
+    #[must_use]
+    pub(crate) fn part_for_point(&self, x: f64, y: f64) -> usize {
+        let coord = match self.axis {
+            SplitAxis::Horizontal => y,
+            SplitAxis::Vertical => x,
+        };
+        // `bounds` has part_count + 1 entries; the last one is the page extent.
+        for part in 0..self.parts.len() {
+            if coord < self.bounds[part + 1] {
+                return part;
+            }
+        }
+        self.parts.len().saturating_sub(1)
+    }
+
+    /// Geometric part holding the LARGEST share of a polygon's area, in page
+    /// pixels, or `None` when the polygon encloses no area.
+    ///
+    /// This is the exact form of the "the part holding 51% of it" rule: the
+    /// polygon is clipped against each part's slab and compared by shoelace
+    /// area, so a rotated or deformed layer is judged by what it really covers
+    /// rather than by its bounding box. An exact tie resolves to the SMALLER
+    /// part index — the top part for horizontal cuts, the left part for
+    /// vertical ones — which is geometric position, not user order.
+    ///
+    /// The caller must pass a SIMPLE (non-self-intersecting) ring here; a
+    /// footprint that can fold — a deform mesh — must go through
+    /// [`Self::part_for_polygon_group`] instead, one piece per grid cell.
+    #[must_use]
+    pub(crate) fn part_for_polygon(&self, points: &[[f64; 2]]) -> Option<usize> {
+        self.part_for_polygon_group(&[points])
+    }
+
+    /// Geometric part holding the largest share of a footprint made of SEVERAL
+    /// pieces, whose per-part clipped areas are summed in ABSOLUTE value.
+    ///
+    /// This is the fold-correct form of [`Self::part_for_polygon`]. A signed
+    /// shoelace sum over one outer ring cancels the lobes of a self-intersecting
+    /// (folded) footprint, so the clipped area is not the filled area and the
+    /// layer can route to the wrong part. A deform mesh is a regular grid of
+    /// quads and a user CAN fold it in the typing tab, so its area is measured
+    /// cell by cell: each cell is clipped against the part slab and its absolute
+    /// area added, which stays correct however the cells overlap.
+    ///
+    /// Pieces with fewer than three points contribute nothing. Ties resolve
+    /// exactly as in [`Self::part_for_polygon`].
+    #[must_use]
+    pub(crate) fn part_for_polygon_group(&self, pieces: &[&[[f64; 2]]]) -> Option<usize> {
+        let axis_index = match self.axis {
+            SplitAxis::Horizontal => 1,
+            SplitAxis::Vertical => 0,
+        };
+        let mut areas = vec![0.0_f64; self.parts.len()];
+        for points in pieces {
+            if points.len() < 3 {
+                continue;
+            }
+            for (part, area) in areas.iter_mut().enumerate() {
+                let lower = clip_half_plane(points, axis_index, self.bounds[part], true);
+                let slab = clip_half_plane(&lower, axis_index, self.bounds[part + 1], false);
+                *area += polygon_area(&slab);
+            }
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for (part, area) in areas.into_iter().enumerate() {
+            // Strictly greater keeps the FIRST (topmost/leftmost) part on a tie.
+            if best.is_none_or(|(_, best_area)| area > best_area) {
+                best = Some((part, area));
+            }
+        }
+        best.filter(|(_, area)| *area > 0.0).map(|(part, _)| part)
+    }
+
+    /// Geometric part holding the largest share of an axis-aligned page-pixel
+    /// rectangle `[x1, y1, x2, y2]`; falls back to the rectangle's centre point
+    /// when the rectangle is degenerate.
+    #[must_use]
+    pub(crate) fn part_for_page_rect(&self, rect: [f64; 4]) -> usize {
+        let [x1, y1, x2, y2] = rect;
+        let (left, right) = (x1.min(x2), x1.max(x2));
+        let (top, bottom) = (y1.min(y2), y1.max(y2));
+        let quad = [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ];
+        self.part_for_polygon(&quad).unwrap_or_else(|| {
+            self.part_for_point((left + right) * 0.5, (top + bottom) * 0.5)
+        })
+    }
+
+    /// Drains the diagnostics collected while resolving the routing.
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// Attaches a per-tree layer routing to a test geometry.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_routing(mut self, tree_rel: &str, routing: SplitTreeRouting) -> Self {
+        self.trees.insert(tree_rel.to_string(), routing);
+        self
+    }
+
+    /// Builds a geometry directly, for tests of the JSON remaps (the normal
+    /// path goes through `build_split_geometry`, which needs a full snapshot).
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        source_old_idx: usize,
+        axis: SplitAxis,
+        page_size: [u32; 2],
+        cuts: &[u32],
+        order: &[usize],
+    ) -> Self {
+        resolve_split_parts(source_old_idx, axis, page_size, cuts, order)
+            .expect("valid test split geometry")
+    }
+}
+
+/// Resolves the pure part geometry of a split (no tree routing yet).
+///
+/// `order[k]` is the position of geometric part `k` in the new page order,
+/// relative to `source_old_idx` (see [`super::PageOpKind::Split`]).
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for a zero-sized page, a cut list that is not
+/// strictly increasing strictly inside the page, an `order` that is not a
+/// permutation of the parts, or a part that fails [`PlacementMap::new`].
+fn resolve_split_parts(
+    source_old_idx: usize,
+    axis: SplitAxis,
+    page_size: [u32; 2],
+    cuts: &[u32],
+    order: &[usize],
+) -> Result<SplitGeometry, PageOpError> {
+    if page_size[0] == 0 || page_size[1] == 0 {
+        return Err(PageOpError::InvalidOp(format!(
+            "split page {source_old_idx} has a zero pixel size {}x{}",
+            page_size[0], page_size[1]
+        )));
+    }
+    let extent = match axis {
+        SplitAxis::Horizontal => page_size[1],
+        SplitAxis::Vertical => page_size[0],
+    };
+    let mut previous = 0u32;
+    for cut in cuts {
+        // Strictly increasing and strictly inside the page is exactly the
+        // condition "every part is at least 1 px".
+        if *cut <= previous || *cut >= extent {
+            return Err(PageOpError::InvalidOp(format!(
+                "split cuts {cuts:?} of page {source_old_idx} are not strictly increasing \
+                 inside (0, {extent}) along the cut axis"
+            )));
+        }
+        previous = *cut;
+    }
+    let part_count = cuts.len() + 1;
+    if order.len() != part_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "split order has {} entr(ies) for {part_count} part(s)",
+            order.len()
+        )));
+    }
+    let mut seen = vec![false; part_count];
+    for position in order {
+        let slot = seen.get_mut(*position).ok_or_else(|| {
+            PageOpError::InvalidOp(format!(
+                "split order position {position} is out of range for {part_count} part(s)"
+            ))
+        })?;
+        if *slot {
+            return Err(PageOpError::InvalidOp(format!(
+                "split order {order:?} lists position {position} more than once"
+            )));
+        }
+        *slot = true;
+    }
+
+    let mut bounds = Vec::with_capacity(part_count + 1);
+    bounds.push(0u32);
+    bounds.extend_from_slice(cuts);
+    bounds.push(extent);
+
+    let mut parts = Vec::with_capacity(part_count);
+    let mut part_sizes = Vec::with_capacity(part_count);
+    let mut part_new_idx = Vec::with_capacity(part_count);
+    for part in 0..part_count {
+        let start = bounds[part];
+        let length = bounds[part + 1] - start;
+        let (crop, canvas) = match axis {
+            SplitAxis::Horizontal => (
+                [0, start, page_size[0], length],
+                [page_size[0], length],
+            ),
+            SplitAxis::Vertical => (
+                [start, 0, length, page_size[1]],
+                [length, page_size[1]],
+            ),
+        };
+        let placement = StitchPlacement {
+            page_idx: source_old_idx,
+            crop,
+            scale: 1.0,
+            dx: 0,
+            dy: 0,
+        };
+        parts.push(PlacementMap::new(&placement, page_size, canvas)?);
+        part_sizes.push(canvas);
+        // D1: the part the user ordered FIRST keeps the source page's index,
+        // so the parts occupy the contiguous run `source_old_idx ..`.
+        part_new_idx.push(source_old_idx + order[part]);
+    }
+
+    Ok(SplitGeometry {
+        source_old_idx,
+        page_size,
+        axis,
+        bounds: bounds.into_iter().map(f64::from).collect(),
+        parts,
+        part_sizes,
+        part_new_idx,
+        trees: std::collections::BTreeMap::new(),
+        warnings: Vec::new(),
+    })
+}
+
+/// Shoelace area of a simple polygon, in the units of its coordinates. An
+/// empty or degenerate ring yields 0.
+#[must_use]
+fn polygon_area(points: &[[f64; 2]]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for (index, point) in points.iter().enumerate() {
+        let next = points[(index + 1) % points.len()];
+        sum += point[0] * next[1] - next[0] * point[1];
+    }
+    (sum * 0.5).abs()
+}
+
+/// Sutherland-Hodgman clip of a polygon against ONE axis-aligned half-plane.
+///
+/// `axis_index` selects the coordinate (0 = x, 1 = y); `keep_greater` keeps the
+/// side `coord >= limit`, otherwise `coord <= limit`. The clip region is convex
+/// (a half-plane), so the signed area of the result is exact even for a concave
+/// subject polygon such as a deform mesh's boundary ring — the degenerate edges
+/// the algorithm may introduce there contribute zero area.
+#[must_use]
+fn clip_half_plane(
+    points: &[[f64; 2]],
+    axis_index: usize,
+    limit: f64,
+    keep_greater: bool,
+) -> Vec<[f64; 2]> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let inside = |point: &[f64; 2]| {
+        if keep_greater {
+            point[axis_index] >= limit
+        } else {
+            point[axis_index] <= limit
+        }
+    };
+    let intersect = |a: &[f64; 2], b: &[f64; 2]| {
+        let delta = b[axis_index] - a[axis_index];
+        // Both endpoints on the boundary line: no unique crossing, take `b`.
+        if delta.abs() <= f64::EPSILON {
+            return *b;
+        }
+        let t = (limit - a[axis_index]) / delta;
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    };
+    let mut out = Vec::with_capacity(points.len() + 4);
+    for (index, current) in points.iter().enumerate() {
+        let previous = &points[(index + points.len() - 1) % points.len()];
+        let (current_in, previous_in) = (inside(current), inside(previous));
+        if current_in {
+            if !previous_in {
+                out.push(intersect(previous, current));
+            }
+            out.push(*current);
+        } else if previous_in {
+            out.push(intersect(previous, current));
+        }
+    }
+    out
+}
+
+/// Geometry attached to an operation that changes a page's PIXEL identity.
+///
+/// Ordinary operations (move / insert / delete) only re-key files: every page
+/// keeps its own coordinate space, which is [`PageGeometry::None`]. A stitch
+/// maps N pages onto one canvas, a split maps one page onto N canvases; in
+/// both cases the affected documents must additionally be routed and mapped,
+/// and the two cases are mutually exclusive.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PageGeometry<'a> {
+    /// No pixel remapping: pages keep their own coordinate spaces.
+    None,
+    /// Several pages merged onto one canvas.
+    Stitch(&'a StitchGeometry),
+    /// One page cut into several parts.
+    Split(&'a SplitGeometry),
+}
+
+impl<'a> PageGeometry<'a> {
+    /// The stitch geometry, or `None` for any other operation.
+    #[must_use]
+    pub(crate) fn stitch(self) -> Option<&'a StitchGeometry> {
+        match self {
+            Self::Stitch(geo) => Some(geo),
+            Self::None | Self::Split(_) => None,
+        }
+    }
+
+    /// The split geometry, or `None` for any other operation.
+    #[must_use]
+    pub(crate) fn split(self) -> Option<&'a SplitGeometry> {
+        match self {
+            Self::Split(geo) => Some(geo),
+            Self::None | Self::Stitch(_) => None,
+        }
     }
 }
 
@@ -657,7 +1154,97 @@ pub(crate) fn permutation_for_op(
             height,
             background: _,
         } => stitch_permutation(placements, *width, *height, old_page_count),
+        PageOpKind::Split {
+            page_idx,
+            axis: _,
+            cuts,
+            order,
+        } => split_permutation(*page_idx, cuts, order, old_page_count),
     }
+}
+
+/// Index math + cut/order validation of a split.
+///
+/// The `cuts.len() + 1` parts occupy the contiguous run
+/// `page_idx ..= page_idx + cuts.len()` of the new order, geometric part `k`
+/// landing at `page_idx + order[k]`; every page after the split page shifts up
+/// by `cuts.len()`. `old_to_new[page_idx]` is `page_idx` itself — the one
+/// representative the permutation type can carry, which by construction is the
+/// part the user ordered FIRST. The created pages are NOT listed in
+/// `new_pages`: their content is cut out of the chapter snapshot by
+/// `plan_src_pages`, not derivable from the request alone.
+///
+/// The cut positions are checked only for internal consistency here (strictly
+/// increasing, non-empty); whether they fall inside the page needs the page's
+/// pixel size and is checked by [`build_split_geometry`].
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for an out-of-range `page_idx`, an empty cut
+/// list, cuts that are not strictly increasing, more than [`SPLIT_MAX_PARTS`]
+/// parts, or an `order` that is not a permutation of `0..cuts.len() + 1`.
+fn split_permutation(
+    page_idx: usize,
+    cuts: &[u32],
+    order: &[usize],
+    old_page_count: usize,
+) -> Result<Permutation, PageOpError> {
+    if page_idx >= old_page_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "split page {page_idx} is out of range for {old_page_count} page(s)"
+        )));
+    }
+    if cuts.is_empty() {
+        return Err(PageOpError::InvalidOp(
+            "split requested with no cut lines".to_string(),
+        ));
+    }
+    if cuts.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(PageOpError::InvalidOp(format!(
+            "split cuts {cuts:?} are not strictly increasing"
+        )));
+    }
+    let part_count = cuts.len() + 1;
+    if part_count > SPLIT_MAX_PARTS {
+        return Err(PageOpError::InvalidOp(format!(
+            "split into {part_count} parts exceeds the supported maximum of \
+             {SPLIT_MAX_PARTS}"
+        )));
+    }
+    if order.len() != part_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "split order has {} entr(ies) for {part_count} part(s)",
+            order.len()
+        )));
+    }
+    let mut seen = vec![false; part_count];
+    for position in order {
+        let slot = seen.get_mut(*position).ok_or_else(|| {
+            PageOpError::InvalidOp(format!(
+                "split order position {position} is out of range for {part_count} part(s)"
+            ))
+        })?;
+        if *slot {
+            return Err(PageOpError::InvalidOp(format!(
+                "split order {order:?} lists position {position} more than once"
+            )));
+        }
+        *slot = true;
+    }
+
+    let added = part_count - 1;
+    let old_to_new = (0..old_page_count)
+        .map(|i| {
+            Some(match i.cmp(&page_idx) {
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal => i,
+                std::cmp::Ordering::Greater => i + added,
+            })
+        })
+        .collect();
+    Ok(Permutation {
+        old_to_new,
+        new_page_count: old_page_count + added,
+        new_pages: Vec::new(),
+    })
 }
 
 /// Index math + canvas/selection validation of a stitch.
@@ -779,6 +1366,11 @@ pub(crate) struct TreeSnapshot {
     pub clean_overlay_stems: BTreeSet<String>,
     /// Every file name in `layers/`.
     pub layers_files: BTreeSet<String>,
+    /// Pixel size of the layer PNGs of the page a SPLIT cuts, by file name.
+    /// Filled only for `PageOpKind::Split` (an image-header probe per file of
+    /// that one page), because a TEXT layer record stores no `image_size` and
+    /// the split's area rule cannot be evaluated without it. Empty otherwise.
+    pub layer_png_sizes: std::collections::BTreeMap<String, [u32; 2]>,
     /// Parsed `layers/layers.json`, when present.
     pub layers_manifest: Option<Value>,
     /// Every file name in `text_images/`.
@@ -1062,54 +1654,82 @@ pub(crate) fn build_plan(
     let trash_root = format!("{}/{TRASH_DIR_NAME}/{trash_id}", snapshot.chapter_rel);
     let mut b = PlanBuilder::new(trash_root.clone(), trash_id);
 
-    // A stitch is the one operation that MERGES pages instead of renaming them:
-    // it resolves its request into per-page affines first, and every planner
-    // below then treats a source page as "folded into the merged page" rather
-    // than "renamed to a new key".
-    let stitch = match op {
+    // Stitch and split are the two operations that change a page's PIXEL
+    // identity instead of merely re-keying files: they resolve their request
+    // into affines first, and every planner below then treats an affected page
+    // as "merged into" / "cut into" rather than "renamed to a new key".
+    let stitch;
+    let split;
+    let geometry = match op {
         PageOpKind::Stitch {
             placements,
             width,
             height,
             background,
-        } => Some(build_stitch_geometry(
-            snapshot,
-            placements,
-            [*width, *height],
-            *background,
-            map,
-        )?),
+        } => {
+            stitch = build_stitch_geometry(
+                snapshot,
+                placements,
+                [*width, *height],
+                *background,
+                map,
+            )?;
+            PageGeometry::Stitch(&stitch)
+        }
+        PageOpKind::Split {
+            page_idx,
+            axis,
+            cuts,
+            order,
+        } => {
+            let mut resolved = build_split_geometry(snapshot, *page_idx, *axis, cuts, order)?;
+            for warning in resolved.take_warnings() {
+                b.warn(warning);
+            }
+            split = resolved;
+            PageGeometry::Split(&split)
+        }
         PageOpKind::Move { .. }
         | PageOpKind::InsertFiles { .. }
         | PageOpKind::CreateBlank { .. }
-        | PageOpKind::Delete { .. } => None,
+        | PageOpKind::Delete { .. } => PageGeometry::None,
     };
-    let stitch = stitch.as_ref();
 
-    if let Some(geo) = stitch
-        && snapshot.has_alt_vers
-    {
+    if snapshot.has_alt_vers {
         // `alt_vers/` pairs with pages by sorted position and has no per-file
-        // page key (see this module's MODULE_README), so merging pages shifts
-        // that pairing and there is nothing to rename.
-        b.warn(format!(
-            "{}/{}: alternate versions are position-matched and are NOT remapped;              merging {} page(s) into one shifts their alignment with the pages",
-            snapshot.chapter_rel,
-            config::ALT_VERS_DIR,
-            geo.source_count()
-        ));
+        // page key (see this module's MODULE_README), so any change to the page
+        // COUNT shifts that pairing and there is nothing to rename.
+        let shift = match geometry {
+            PageGeometry::Stitch(geo) => Some(format!(
+                "merging {} page(s) into one",
+                geo.source_count()
+            )),
+            PageGeometry::Split(geo) => Some(format!(
+                "cutting one page into {} part(s)",
+                geo.part_count()
+            )),
+            PageGeometry::None => None,
+        };
+        if let Some(shift) = shift {
+            b.warn(format!(
+                "{}/{}: alternate versions are position-matched and are NOT remapped; \
+                 {shift} shifts their alignment with the pages",
+                snapshot.chapter_rel,
+                config::ALT_VERS_DIR,
+            ));
+        }
     }
 
-    plan_src_pages(&mut b, snapshot, map, stitch)?;
+    plan_src_pages(&mut b, snapshot, map, geometry)?;
     for tree in [&snapshot.committed, &snapshot.unsaved] {
-        plan_clean_overlays(&mut b, snapshot, tree, map, stitch);
-        plan_layer_pngs(&mut b, tree, map, stitch)?;
-        plan_layers_manifest(&mut b, tree, map, stitch)?;
-        plan_text_info(&mut b, tree, map, stitch)?;
-        plan_typing_masks(&mut b, snapshot, tree, map, stitch);
-        plan_bubbles(&mut b, tree, map, stitch)?;
+        plan_clean_overlays(&mut b, snapshot, tree, map, geometry);
+        plan_layer_pngs(&mut b, tree, map, geometry)?;
+        plan_layers_manifest(&mut b, tree, map, geometry)?;
+        plan_text_info(&mut b, tree, map, geometry)?;
+        plan_typing_masks(&mut b, snapshot, tree, map, geometry);
+        plan_bubbles(&mut b, tree, map, geometry)?;
     }
-    plan_detection(&mut b, snapshot, map, stitch)?;
+    plan_detection(&mut b, snapshot, map, geometry)?;
     plan_creates(&mut b, snapshot, &permutation);
 
     Ok(PageOpPlan {
@@ -1262,21 +1882,140 @@ fn max_layer_idx_for_page(snapshot: &ChapterSnapshot, old_idx: usize) -> Option<
     max
 }
 
+/// Resolves a split request against the chapter snapshot.
+///
+/// Validates the cut list against the page's real pixel size, builds one
+/// [`PlacementMap`] per part, and resolves the per-tree layer routing (which
+/// layer node and which layer PNG belongs to which part) by the exact-area
+/// rule. Diagnostics produced while routing (an unprobeable text render, a
+/// layer PNG no record claims) are collected into the geometry and drained by
+/// the caller into the plan's warnings.
+///
+/// A malformed layer manifest does not fail here: the routing degrades to
+/// empty and [`json_remap::remap_layers_manifest`] reports the structural
+/// problem with full context when it rewrites the same document.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] when the snapshot carries no page sizes, the
+/// cuts are not strictly increasing strictly inside the page, the `order` is
+/// not a permutation of the parts, a part's placement is invalid, or one layer
+/// PNG of the cut page is claimed by records routed to different parts (see
+/// [`json_remap::split_layer_routing`]).
+fn build_split_geometry(
+    snapshot: &ChapterSnapshot,
+    page_idx: usize,
+    axis: SplitAxis,
+    cuts: &[u32],
+    order: &[usize],
+) -> Result<SplitGeometry, PageOpError> {
+    if snapshot.page_sizes.len() != snapshot.page_file_names.len() {
+        return Err(PageOpError::InvalidOp(
+            "split requires the pixel size of every page, which this chapter \
+             snapshot does not carry"
+                .to_string(),
+        ));
+    }
+    let page_size = *snapshot.page_sizes.get(page_idx).ok_or_else(|| {
+        PageOpError::InvalidOp(format!("split page {page_idx} has no known pixel size"))
+    })?;
+    let mut geometry = resolve_split_parts(page_idx, axis, page_size, cuts, order)?;
+
+    // The routing is per TREE: the committed and the staging manifest are
+    // independent documents that may describe different layers for the page.
+    for tree in [&snapshot.committed, &snapshot.unsaved] {
+        let (routing, warnings) = json_remap::split_layer_routing(
+            tree.layers_manifest.as_ref(),
+            &tree.layer_png_sizes,
+            &geometry,
+        )?;
+        for warning in warnings {
+            geometry
+                .warnings
+                .push(format!("{}/layers: {warning}", tree.tree_rel));
+        }
+        geometry.trees.insert(tree.tree_rel.clone(), routing);
+    }
+    Ok(geometry)
+}
+
+/// Stages one cropped PNG per split part from ONE page-sized raster of the cut
+/// page.
+///
+/// `from` is the raster's title-relative path at its ORIGINAL location (phase A
+/// composes before any rename), `page_size` the pixel size its crop is
+/// expressed in, and `target_for` maps a part's NEW page index to the file the
+/// part's raster must end up at. Every part's crop equals its destination, so
+/// `encode_composed_png` copies the pixels bit-exactly instead of resampling,
+/// and `background` is only ever visible if the source raster decodes smaller
+/// than its page (it is then resized to the page size first).
+fn plan_split_raster_parts(
+    b: &mut PlanBuilder,
+    geo: &SplitGeometry,
+    from: &str,
+    page_size: [u32; 2],
+    background: [u8; 4],
+    target_for: impl Fn(usize) -> String,
+) {
+    for part in 0..geo.part_count() {
+        let (Some(placement), Some(size), Some(new_idx)) = (
+            geo.placement(part),
+            geo.part_size(part),
+            geo.part_new_idx(part),
+        ) else {
+            continue;
+        };
+        b.create(
+            target_for(new_idx),
+            NewPageContent::ComposedPng {
+                width: size[0],
+                height: size[1],
+                background,
+                sources: vec![ComposeSource {
+                    path: from.to_string(),
+                    page_size,
+                    crop: placement.crop_rect(),
+                    dest: placement.placed_rect(),
+                }],
+            },
+        );
+    }
+}
+
 /// Source page files: rename surviving pages onto the canonical stem of their
 /// NEW index (extension preserved), move deleted pages to the trash.
 ///
 /// Under a stitch every source page is trashed instead (its pixels survive in
 /// the composed page) and the merged page is staged as a new PNG, regardless of
-/// the source pages' extensions.
+/// the source pages' extensions. Under a split the cut page is trashed and each
+/// part is staged as its own new PNG, likewise regardless of the source
+/// extension.
 fn plan_src_pages(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
+    let stitch = geometry.stitch();
     let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let from = format!("{}/{}/{name}", snapshot.chapter_rel, config::SRC_DIR);
+        if let Some(geo) = geometry.split()
+            && geo.source_old_idx() == old_idx
+        {
+            let page_size = *snapshot.page_sizes.get(old_idx).ok_or_else(|| {
+                PageOpError::InvalidOp(format!("page {old_idx} has no known pixel size"))
+            })?;
+            plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], |new_idx| {
+                format!(
+                    "{}/{}/{}.png",
+                    snapshot.chapter_rel,
+                    config::SRC_DIR,
+                    canonical_page_stem(new_idx)
+                )
+            });
+            b.trash(from);
+            continue;
+        }
         if let Some(geo) = stitch
             && let Some(placement) = geo.placement(old_idx)
         {
@@ -1336,18 +2075,39 @@ fn plan_src_pages(
 /// canvas, so a source page without an overlay contributes a transparent hole
 /// showing the composed page pixels underneath. When no source page has an
 /// overlay, none is created.
+///
+/// Under a split they are CUT the same way the page image is: each part gets
+/// the corresponding crop of the cut page's overlay, and nothing is created
+/// when the cut page had no overlay.
 fn plan_clean_overlays(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) {
+    let stitch = geometry.stitch();
     let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let (stem, _) = split_name(name);
         let exists = tree.clean_overlay_stems.contains(stem);
         let from = format!("{}/{}/{stem}.png", tree.tree_rel, config::CLEAN_LAYERS_DIR);
+        if let Some(geo) = geometry.split()
+            && geo.source_old_idx() == old_idx
+        {
+            if exists && let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], |new_idx| {
+                    format!(
+                        "{}/{}/{}.png",
+                        tree.tree_rel,
+                        config::CLEAN_LAYERS_DIR,
+                        canonical_page_stem(new_idx)
+                    )
+                });
+                b.trash(from);
+            }
+            continue;
+        }
         if let Some(geo) = stitch
             && let Some(placement) = geo.placement(old_idx)
         {
@@ -1411,6 +2171,13 @@ fn plan_clean_overlays(
 /// `stable_overlay_uid`) so this cannot normally happen; it is detected and
 /// refused rather than silently overwriting a PNG.
 ///
+/// A split is the opposite fan-out: ONE page's PNGs land on SEVERAL prefixes,
+/// which the name's embedded index cannot express. Their destination comes
+/// from the split's per-tree [`SplitTreeRouting`], which resolved each layer
+/// NODE to a part; a PNG that no record of the manifest claims has no part and
+/// falls back to the representative part with a warning (it is an orphan that
+/// `prune_orphan_pngs` will collect anyway).
+///
 /// # Errors
 /// [`PageOpError::InvalidOp`] when two merged pages would produce the same
 /// layer PNG name.
@@ -1418,8 +2185,11 @@ fn plan_layer_pngs(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
+    let stitch = geometry.stitch();
+    let split = geometry.split();
+    let routing = split.and_then(|geo| geo.routing(&tree.tree_rel));
     let mut merged_targets: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for name in &tree.layers_files {
@@ -1437,6 +2207,24 @@ fn plan_layer_pngs(
                 from,
                 map.len()
             ));
+            continue;
+        }
+        // A split routes the cut page's PNGs by NODE, not by the page index in
+        // the name: the parts land on different prefixes.
+        if let Some(geo) = split
+            && geo.source_old_idx() == old_idx
+        {
+            let new_idx = routing.and_then(|r| r.file_new_idx(name)).unwrap_or_else(|| {
+                b.warn(format!(
+                    "layer PNG '{from}' of the split page is not referenced by any layer \
+                     record; it follows the part that keeps the page's index"
+                ));
+                geo.source_old_idx()
+            });
+            if let Some(new_name) = json_remap::remap_layers_png_name(name, old_idx, new_idx) {
+                let target = format!("{}/{}/{new_name}", tree.tree_rel, config::LAYERS_DIR);
+                b.rename(from, target);
+            }
             continue;
         }
         match map[old_idx] {
@@ -1465,17 +2253,19 @@ fn plan_layer_pngs(
 
 /// `layers/layers.json`: remap `img_idx` and the embedded `ps_p...` file
 /// references; page entries of deleted pages are removed and archived in the
-/// trash as `deleted_layers_pages.json`.
+/// trash as `deleted_layers_pages.json`. A stitch folds the merged pages'
+/// entries into one; a split partitions the cut page's entry into one entry per
+/// part that holds at least one layer.
 fn plan_layers_manifest(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
     let Some(manifest) = &tree.layers_manifest else {
         return Ok(());
     };
-    let remap = json_remap::remap_layers_manifest(manifest, map, stitch)?;
+    let remap = json_remap::remap_layers_manifest(manifest, map, geometry, &tree.tree_rel)?;
     for warning in remap.warnings {
         b.warn(format!("{}/layers/layers.json: {warning}", tree.tree_rel));
     }
@@ -1504,7 +2294,7 @@ fn plan_text_info(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
     for file in &tree.text_info {
         let (dir_name, dir_files) = match file.location {
@@ -1513,7 +2303,7 @@ fn plan_text_info(
                 (config::TEXT_IMAGES_DIR, &tree.text_images_files)
             }
         };
-        let remap = json_remap::remap_text_info(&file.entries, map, stitch)?;
+        let remap = json_remap::remap_text_info(&file.entries, map, geometry)?;
         let surviving_files: HashSet<&str> = remap
             .kept
             .iter()
@@ -1559,14 +2349,16 @@ fn plan_text_info(
 ///
 /// Under a stitch these are page-sized rasters and are COMPOSED like the clean
 /// overlays, over a black (inactive) background — the loader thresholds the
-/// decoded luma at 128, so uncovered canvas reads as "not masked".
+/// decoded luma at 128, so uncovered canvas reads as "not masked". Under a
+/// split they are CUT into one mask per part, the same way the page image is.
 fn plan_typing_masks(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) {
+    let stitch = geometry.stitch();
     // Page order, not file-name order: `mask_page_10` sorts before
     // `mask_page_2` as a string, and the compose order must be by page.
     let mut by_page: std::collections::BTreeMap<usize, String> =
@@ -1587,6 +2379,24 @@ fn plan_typing_masks(
                 from,
                 map.len()
             ));
+            continue;
+        }
+        if let Some(geo) = geometry.split()
+            && geo.source_old_idx() == old_idx
+        {
+            if let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                // Opaque black = "no mask here" (the loader thresholds luma at
+                // 128), matching how the typing tab writes its masks.
+                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 255], |new_idx| {
+                    format!(
+                        "{}/{}/{}",
+                        tree.tree_rel,
+                        config::TEXT_IMAGES_DIR,
+                        typing_mask_file_name(new_idx)
+                    )
+                });
+                b.trash(from);
+            }
             continue;
         }
         if let Some(geo) = stitch
@@ -1645,12 +2455,12 @@ fn plan_bubbles(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
     let Some(entries) = &tree.bubbles else {
         return Ok(());
     };
-    let remap = json_remap::remap_bubbles(entries, map, stitch)?;
+    let remap = json_remap::remap_bubbles(entries, map, geometry)?;
     for warning in remap.warnings {
         b.warn(format!(
             "{}/{}: {warning}",
@@ -1678,15 +2488,26 @@ fn plan_detection(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     map: &[Option<usize>],
-    stitch: Option<&StitchGeometry>,
+    geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
+    let stitch = geometry.stitch();
     if let Some(geo) = stitch {
         plan_stitch_detection(b, snapshot, geo)?;
+    }
+    if let Some(geo) = geometry.split() {
+        plan_split_detection(b, snapshot, geo)?;
     }
     for det in &snapshot.detection {
         let old_idx = det.page_idx;
         // Stitched pages were handled as one merged group above.
         if stitch.is_some_and(|geo| geo.placement(old_idx).is_some()) {
+            continue;
+        }
+        // The split page was cut into one document per part above.
+        if geometry
+            .split()
+            .is_some_and(|geo| geo.source_old_idx() == old_idx)
+        {
             continue;
         }
         let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
@@ -1872,6 +2693,114 @@ fn plan_stitch_detection(
         target: format!("{dir}/{}", detection_blocks_file_name(geo.primary_new)),
         content: to_pretty(&merged)?,
     });
+    Ok(())
+}
+
+/// Text detection of the SPLIT page, cut into one document per part.
+///
+/// The detector's blocks live in absolute source-page pixels, so they can be
+/// partitioned — but only when the page's document is trustworthy: valid JSON,
+/// `source_size` equal to the page's real pixel size, (if it has a mask)
+/// `mask_size` equal to `source_size`, and every block carrying a readable
+/// `x1`/`y1`/`x2`/`y2` rectangle. Otherwise the page's detection files go
+/// to the trash with a warning, exactly like the stitch's degradation, because
+/// detection output is regenerable and neither a mask of an unknown scale nor
+/// an unroutable block can be cut without inventing an answer.
+///
+/// Either way the source page's own detection files are trashed: they are keyed
+/// to a page index that no longer exists.
+///
+/// # Errors
+/// [`PageOpError::Json`] when a per-part document cannot be re-serialized.
+fn plan_split_detection(
+    b: &mut PlanBuilder,
+    snapshot: &ChapterSnapshot,
+    geo: &SplitGeometry,
+) -> Result<(), PageOpError> {
+    let old_idx = geo.source_old_idx();
+    let Some(det) = snapshot
+        .detection
+        .iter()
+        .find(|det| det.page_idx == old_idx)
+    else {
+        return Ok(());
+    };
+    let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
+    let blocks_from = format!("{dir}/{}", detection_blocks_file_name(old_idx));
+    let mask_from = format!("{dir}/{}", detection_mask_file_name(old_idx));
+
+    let page_size = snapshot.page_sizes.get(old_idx).copied().unwrap_or([0, 0]);
+    let document = match &det.blocks {
+        Some(DetectionBlocks::Parsed(value)) => {
+            // Two gates, one all-or-nothing decision: the document's declared
+            // sizes must be trustworthy AND every block must be routable to a
+            // part. A block that no part can claim would otherwise be skipped
+            // by all of them and vanish from the chapter.
+            let blocker = json_remap::detection_merge_blocker(
+                value,
+                det.has_mask,
+                page_size,
+                old_idx,
+            )
+            .or_else(|| json_remap::detection_split_blocker(value, old_idx));
+            match blocker {
+                Some(reason) => {
+                    b.warn(format!(
+                        "text detection of the split page was moved to the trash instead of \
+                         being remapped ({reason}); re-run detection on the parts"
+                    ));
+                    None
+                }
+                None => Some(value),
+            }
+        }
+        Some(DetectionBlocks::Opaque) => {
+            b.warn(format!(
+                "text detection of the split page was moved to the trash instead of being \
+                 remapped (page {old_idx}: blocks file is not valid JSON); re-run detection \
+                 on the parts"
+            ));
+            None
+        }
+        // A mask with no blocks file is never loaded (the loader keys on the
+        // blocks file); it is trashed below and needs no decision.
+        None => None,
+    };
+
+    if det.blocks.is_some() {
+        b.trash(blocks_from);
+    }
+    if det.has_mask {
+        b.trash(mask_from.clone());
+    }
+
+    let Some(document) = document else {
+        return Ok(());
+    };
+    if det.has_mask {
+        // Verified page-sized above, so each part's mask is the same crop as
+        // the part's page image.
+        plan_split_raster_parts(b, geo, &mask_from, page_size, [0, 0, 0, 255], |new_idx| {
+            format!("{dir}/{}", detection_mask_file_name(new_idx))
+        });
+    }
+    for part in 0..geo.part_count() {
+        let Some(new_idx) = geo.part_new_idx(part) else {
+            continue;
+        };
+        let mask_name = det.has_mask.then(|| detection_mask_file_name(new_idx));
+        let cut = json_remap::split_detection_blocks(
+            document,
+            geo,
+            part,
+            new_idx,
+            mask_name.as_deref(),
+        )?;
+        b.json_writes.push(PlannedJsonWrite {
+            target: format!("{dir}/{}", detection_blocks_file_name(new_idx)),
+            content: to_pretty(&cut)?,
+        });
+    }
     Ok(())
 }
 
@@ -2085,6 +3014,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            layer_png_sizes: std::collections::BTreeMap::new(),
             layers_manifest: Some(serde_json::json!({
                 "schema_version": 3,
                 "pages": [
@@ -2623,6 +3553,491 @@ mod tests {
             build_plan(&snapshot, &op, 57),
             Err(PageOpError::InvalidOp(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Split.
+    // -----------------------------------------------------------------------
+
+    fn split_op(page_idx: usize, axis: SplitAxis, cuts: &[u32], order: &[usize]) -> PageOpKind {
+        PageOpKind::Split {
+            page_idx,
+            axis,
+            cuts: cuts.to_vec(),
+            order: order.to_vec(),
+        }
+    }
+
+    #[test]
+    fn split_fans_one_page_into_a_contiguous_run_of_parts() {
+        // Page 1 of 4 cut into 3 parts: pages 2 and 3 shift up by 2.
+        let perm = permutation_for_op(
+            &split_op(1, SplitAxis::Horizontal, &[10, 20], &[0, 1, 2]),
+            4,
+        )
+        .expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(1), Some(4), Some(5)]);
+        assert_eq!(perm.new_page_count, 6);
+        // The parts are not "inserted" pages: their pixels are cut out of the
+        // chapter snapshot, not derivable from the request.
+        assert!(perm.new_pages.is_empty());
+
+        // D1: the representative index is the SOURCE index whatever order the
+        // user chose — the part ordered first is the one that lands there.
+        let perm =
+            permutation_for_op(&split_op(2, SplitAxis::Vertical, &[10], &[1, 0]), 4)
+                .expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(1), Some(2), Some(4)]);
+        assert_eq!(perm.new_page_count, 5);
+    }
+
+    #[test]
+    fn split_rejects_bad_pages_cuts_and_orders() {
+        for (case, op) in [
+            ("page out of range", split_op(4, SplitAxis::Horizontal, &[10], &[0, 1])),
+            ("no cuts", split_op(1, SplitAxis::Horizontal, &[], &[0])),
+            (
+                "cuts not strictly increasing",
+                split_op(1, SplitAxis::Horizontal, &[10, 10], &[0, 1, 2]),
+            ),
+            ("order too short", split_op(1, SplitAxis::Horizontal, &[10], &[0])),
+            (
+                "duplicated order position",
+                split_op(1, SplitAxis::Horizontal, &[10], &[0, 0]),
+            ),
+            (
+                "order position out of range",
+                split_op(1, SplitAxis::Horizontal, &[10], &[0, 2]),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    permutation_for_op(&op, 4),
+                    Err(PageOpError::InvalidOp(_))
+                ),
+                "{case} must be rejected"
+            );
+        }
+        // Too many parts.
+        let cuts: Vec<u32> = (1..=u32::try_from(SPLIT_MAX_PARTS).expect("fits")).collect();
+        let order: Vec<usize> = (0..cuts.len() + 1).collect();
+        assert!(matches!(
+            permutation_for_op(&split_op(1, SplitAxis::Horizontal, &cuts, &order), 4),
+            Err(PageOpError::InvalidOp(_))
+        ));
+    }
+
+    #[test]
+    fn split_parts_map_every_coordinate_space_and_reject_empty_parts() {
+        // A 50x400 page cut horizontally at 100 and 250, parts kept in order.
+        let geo = resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[100, 250], &[0, 1, 2])
+            .expect("valid");
+        assert_eq!(geo.part_count(), 3);
+        assert_eq!(geo.part_size(0), Some([50, 100]));
+        assert_eq!(geo.part_size(1), Some([50, 150]));
+        assert_eq!(geo.part_size(2), Some([50, 150]));
+        assert_eq!(geo.part_new_idx(0), Some(1));
+        assert_eq!(geo.part_new_idx(2), Some(3));
+        let middle = geo.placement(1).expect("middle part");
+        assert_eq!(middle.crop_rect(), [0, 100, 50, 150]);
+        assert_eq!(middle.placed_rect(), [0, 0, 50, 150]);
+        // Absolute page px: the first cut is the top of the middle part.
+        assert!(middle.map_y(100.0).abs() < 1e-9);
+        assert!((middle.map_y(175.0) - 75.0).abs() < 1e-9);
+        // Page-normalized v renormalizes onto the part; u is untouched by a
+        // horizontal cut (the part is as wide as the page).
+        assert!(middle.map_v(0.25).abs() < 1e-9);
+        assert!((middle.map_u(0.5) - 0.5).abs() < 1e-9);
+        // A split never resamples, so page-px lengths pass through.
+        assert!((middle.map_len(7.0) - 7.0).abs() < 1e-9);
+
+        // The transpose: a vertical cut renormalizes u and leaves v alone.
+        let geo = resolve_split_parts(0, SplitAxis::Vertical, [50, 400], &[20], &[1, 0])
+            .expect("valid");
+        assert_eq!(geo.part_size(0), Some([20, 400]));
+        assert_eq!(geo.part_size(1), Some([30, 400]));
+        // Reversed order: the LEFT part goes second, the right one first.
+        assert_eq!(geo.part_new_idx(0), Some(1));
+        assert_eq!(geo.part_new_idx(1), Some(0));
+        let right = geo.placement(1).expect("right part");
+        assert!(right.map_x(20.0).abs() < 1e-9);
+        assert!((right.map_v(0.25) - 0.25).abs() < 1e-9);
+
+        // Cuts on or past the borders would produce a zero-sized part.
+        for cut in [0u32, 400] {
+            assert!(
+                matches!(
+                    resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[cut], &[0, 1]),
+                    Err(PageOpError::InvalidOp(_))
+                ),
+                "cut at {cut} must be rejected"
+            );
+        }
+        assert!(matches!(
+            resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[100, 100], &[0, 1, 2]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // A page with no pixels has no geometry at all.
+        assert!(matches!(
+            resolve_split_parts(1, SplitAxis::Horizontal, [50, 0], &[10], &[0, 1]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+    }
+
+    #[test]
+    fn split_assignment_uses_exact_area_with_a_top_left_tie_break() {
+        // A 100x400 page cut in half horizontally.
+        let geo = resolve_split_parts(0, SplitAxis::Horizontal, [100, 400], &[200], &[0, 1])
+            .expect("valid");
+        let rect = |top: f64, bottom: f64| {
+            [[10.0, top], [90.0, top], [90.0, bottom], [10.0, bottom]]
+        };
+        assert_eq!(geo.part_for_polygon(&rect(220.0, 300.0)), Some(1));
+        // 75% above the cut.
+        assert_eq!(geo.part_for_polygon(&rect(140.0, 220.0)), Some(0));
+        // Exactly half on each side: the TOP part wins (geometric position,
+        // not user order).
+        assert_eq!(geo.part_for_polygon(&rect(150.0, 250.0)), Some(0));
+        // A right triangle that is WIDE AT THE BOTTOM: its bounding box spans
+        // the whole page (a tie a bbox rule would resolve to the top part),
+        // but three quarters of its real area sit below the cut.
+        assert_eq!(
+            geo.part_for_polygon(&[[0.0, 0.0], [0.0, 400.0], [100.0, 400.0]]),
+            Some(1)
+        );
+        // A polygon enclosing no area has no majority at all.
+        assert_eq!(
+            geo.part_for_polygon(&[[10.0, 10.0], [90.0, 10.0], [50.0, 10.0]]),
+            None
+        );
+        // Points follow the part CROP rectangles: a point on the cut line
+        // belongs to the part that owns that pixel row.
+        assert_eq!(geo.part_for_point(50.0, 199.9), 0);
+        assert_eq!(geo.part_for_point(50.0, 200.0), 1);
+        // Outside the page, the extreme parts claim the point.
+        assert_eq!(geo.part_for_point(50.0, -20.0), 0);
+        assert_eq!(geo.part_for_point(50.0, 900.0), 1);
+
+        // The transpose: an exact tie across a vertical cut goes LEFT.
+        let geo = resolve_split_parts(0, SplitAxis::Vertical, [400, 100], &[200], &[0, 1])
+            .expect("valid");
+        assert_eq!(
+            geo.part_for_polygon(&[
+                [150.0, 10.0],
+                [250.0, 10.0],
+                [250.0, 90.0],
+                [150.0, 90.0]
+            ]),
+            Some(0)
+        );
+    }
+
+    /// The plan snapshot with page 1 (50x400) carrying a full layer stack, a
+    /// clean overlay, a typing mask and detection data, so a split of that page
+    /// has something to partition in every category.
+    fn snapshot_for_split() -> ChapterSnapshot {
+        let mut snapshot = snapshot_for_plan();
+        snapshot.committed.clean_overlay_stems.insert("001".to_string());
+        for name in ["ps_p0001_top.png", "ps_p0001_bottom.png", "ps_p0001_text.png"] {
+            snapshot.committed.layers_files.insert(name.to_string());
+        }
+        // Only the TEXT node needs a probe: a raster stores its `image_size`.
+        snapshot
+            .committed
+            .layer_png_sizes
+            .insert("ps_p0001_text.png".to_string(), [20, 20]);
+        snapshot.committed.layers_manifest = Some(serde_json::json!({
+            "schema_version": 4,
+            "pages": [
+                {"img_idx": 1,
+                 "groups": [{"uid": "g1", "name": "G", "visible": true, "opacity": 1.0}],
+                 "text_groups": [{"layer_idx": 0, "z": 1, "name": "TG"}],
+                 "tree": [
+                    {"uid": "top", "name": "Top", "kind": "raster", "z": 0,
+                     "visible": true, "opacity": 1.0, "group_uid": "g1",
+                     "base_file": "ps_p0001_top.png", "image_size": [40, 40],
+                     "transform": {"cx": 25.0, "cy": 50.0, "rotation": 0.0, "scale": 1.0}},
+                    {"uid": "text", "name": "T", "kind": "text", "z": 1, "layer_idx": 0,
+                     "visible": true, "opacity": 1.0,
+                     "rendered_file": "ps_p0001_text.png",
+                     "transform": {"cx": 25.0, "cy": 300.0, "rotation": 0.0, "scale": 1.0}},
+                    {"uid": "bottom", "name": "Bottom", "kind": "raster", "z": 2,
+                     "visible": true, "opacity": 1.0, "group_uid": "g1",
+                     "base_file": "ps_p0001_bottom.png", "image_size": [40, 40],
+                     "transform": {"cx": 25.0, "cy": 350.0, "rotation": 0.0, "scale": 1.0}}
+                 ]},
+                {"img_idx": 2, "tree": [
+                    {"uid": "u2", "name": "T", "z": 0, "visible": true,
+                     "opacity": 1.0, "rendered_file": "ps_p0002_u2_text.png"}
+                ]}
+            ]
+        }));
+        snapshot.detection = vec![DetectionFiles {
+            page_idx: 1,
+            blocks: Some(DetectionBlocks::Parsed(serde_json::json!({
+                "page_idx": 1,
+                "source_size": [50, 400],
+                "mask_size": [50, 400],
+                "blocks": [
+                    {"x1": 1.0, "y1": 2.0, "x2": 3.0, "y2": 40.0},
+                    {"x1": 5.0, "y1": 300.0, "x2": 9.0, "y2": 380.0}
+                ],
+                "mask_file": "00001_mask.png"
+            }))),
+            has_mask: true,
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn build_plan_split_cuts_rasters_and_partitions_documents() {
+        let snapshot = snapshot_for_split();
+        // Cut page 1 (50x400) in half; the top part keeps index 1.
+        let plan = build_plan(
+            &snapshot,
+            &split_op(1, SplitAxis::Horizontal, &[200], &[0, 1]),
+            77,
+        )
+        .expect("plan builds");
+        assert_eq!(plan.old_to_new, vec![Some(0), Some(1), Some(3), Some(4)]);
+        assert_eq!(plan.new_page_count, 5);
+
+        // Both parts are staged as PNGs cut out of the source page.
+        let cut_source = |target: &str, crop: [u32; 4], size: (u32, u32)| {
+            let create = plan
+                .creates
+                .iter()
+                .find(|c| c.target == target)
+                .unwrap_or_else(|| panic!("{target} staged"));
+            let NewPageContent::ComposedPng {
+                width,
+                height,
+                sources,
+                ..
+            } = &create.content
+            else {
+                panic!("{target} must be a composed PNG");
+            };
+            assert_eq!((*width, *height), size);
+            assert_eq!(sources.len(), 1, "a split part has exactly one source");
+            assert_eq!(sources[0].crop, crop);
+            // Crop == destination, so `encode_composed_png` copies the pixels
+            // instead of resampling.
+            assert_eq!(sources[0].dest, [0, 0, crop[2], crop[3]]);
+            sources[0].path.clone()
+        };
+        assert_eq!(
+            cut_source("ch1/src/001.png", [0, 0, 50, 200], (50, 200)),
+            "ch1/src/001.png"
+        );
+        assert_eq!(
+            cut_source("ch1/src/002.png", [0, 200, 50, 200], (50, 200)),
+            "ch1/src/001.png"
+        );
+        cut_source("ch1/clean_layers/001.png", [0, 0, 50, 200], (50, 200));
+        cut_source("ch1/clean_layers/002.png", [0, 200, 50, 200], (50, 200));
+        cut_source("ch1/text_images/mask_page_1.png", [0, 0, 50, 200], (50, 200));
+        cut_source("ch1/text_images/mask_page_2.png", [0, 200, 50, 200], (50, 200));
+        cut_source("ch1/text_detection/00001_mask.png", [0, 0, 50, 200], (50, 200));
+        cut_source("ch1/text_detection/00002_mask.png", [0, 200, 50, 200], (50, 200));
+
+        // The originals are recoverable, never destroyed.
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Trash { path } => Some(path.as_str()),
+                MoveDest::Final { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        assert!(trashed.contains(&"ch1/.pageop_trash/77/ch1/src/001.png"));
+        assert!(trashed.contains(&"ch1/.pageop_trash/77/ch1/clean_layers/001.png"));
+        assert!(trashed.contains(&"ch1/.pageop_trash/77/ch1/text_images/mask_page_1.png"));
+
+        // Layer PNGs of ONE page fan out onto DIFFERENT prefixes.
+        let finals: Vec<(&str, &str)> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Final { path } => Some((m.from.as_str(), path.as_str())),
+                MoveDest::Trash { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        // `top` stays on part 0, which keeps index 1: an identity rename is
+        // never planned.
+        assert!(!finals.iter().any(|(from, _)| *from == "ch1/layers/ps_p0001_top.png"));
+        assert!(finals.contains(&(
+            "ch1/layers/ps_p0001_bottom.png",
+            "ch1/layers/ps_p0002_bottom.png"
+        )));
+        assert!(finals.contains(&(
+            "ch1/layers/ps_p0001_text.png",
+            "ch1/layers/ps_p0002_text.png"
+        )));
+        // The untouched pages compact around the parts.
+        assert!(finals.contains(&("ch1/src/002.jpg", "ch1/src/003.jpg")));
+        assert!(finals.contains(&(
+            "ch1/layers/ps_p0002_u2_text.png",
+            "ch1/layers/ps_p0003_u2_text.png"
+        )));
+
+        // The manifest page entry became TWO entries, one per part.
+        let manifest = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/layers/layers.json")
+            .expect("manifest rewritten");
+        let manifest: Value = serde_json::from_str(&manifest.content).expect("valid json");
+        let pages = manifest["pages"].as_array().expect("pages");
+        let by_idx = |idx: u64| {
+            pages
+                .iter()
+                .find(|page| page["img_idx"] == serde_json::json!(idx))
+                .unwrap_or_else(|| panic!("page {idx} present"))
+        };
+        let top = by_idx(1);
+        assert_eq!(top["tree"].as_array().expect("tree").len(), 1);
+        assert_eq!(top["tree"][0]["uid"], serde_json::json!("top"));
+        // Geometry mapped into the part: cy 50 stays 50 in the top part.
+        assert_eq!(top["tree"][0]["transform"]["cy"], serde_json::json!(50.0));
+        // The PS group is duplicated into every part holding a member.
+        assert_eq!(top["groups"].as_array().expect("groups").len(), 1);
+        // No unpinned text node here, so the text-group band is dropped.
+        assert!(top.get("text_groups").is_none());
+
+        let bottom = by_idx(2);
+        assert_eq!(bottom["tree"].as_array().expect("tree").len(), 2);
+        // cy 300 of the source page is cy 100 of the bottom part.
+        assert_eq!(bottom["tree"][0]["transform"]["cy"], serde_json::json!(100.0));
+        assert_eq!(bottom["tree"][1]["transform"]["cy"], serde_json::json!(150.0));
+        // z is re-ranked densely PER PART: the source bands 1 and 2 become 0
+        // and 1, and the text group keeps sharing the text node's band.
+        assert_eq!(bottom["tree"][0]["z"], serde_json::json!(0));
+        assert_eq!(bottom["tree"][1]["z"], serde_json::json!(1));
+        assert_eq!(bottom["text_groups"][0]["z"], serde_json::json!(0));
+        assert_eq!(bottom["groups"].as_array().expect("groups").len(), 1);
+        // Page 2's untouched entry followed the ordinary index shift.
+        assert_eq!(
+            by_idx(3)["tree"][0]["rendered_file"],
+            serde_json::json!("ps_p0003_u2_text.png")
+        );
+
+        // Detection: one document per part, blocks routed by area and mapped.
+        let blocks_of = |target: &str| -> Value {
+            let write = plan
+                .json_writes
+                .iter()
+                .find(|w| w.target == target)
+                .unwrap_or_else(|| panic!("{target} written"));
+            serde_json::from_str(&write.content).expect("valid json")
+        };
+        let first = blocks_of("ch1/text_detection/00001_blocks.json");
+        assert_eq!(first["source_size"], serde_json::json!([50, 200]));
+        assert_eq!(first["mask_size"], serde_json::json!([50, 200]));
+        assert_eq!(first["mask_file"], serde_json::json!("00001_mask.png"));
+        assert_eq!(first["blocks"].as_array().expect("blocks").len(), 1);
+        assert_eq!(first["blocks"][0]["y2"], serde_json::json!(40.0));
+        let second = blocks_of("ch1/text_detection/00002_blocks.json");
+        assert_eq!(second["blocks"].as_array().expect("blocks").len(), 1);
+        // Absolute page px 300 is px 100 of the bottom part.
+        assert_eq!(second["blocks"][0]["y1"], serde_json::json!(100.0));
+        assert_eq!(second["mask_file"], serde_json::json!("00002_mask.png"));
+    }
+
+    #[test]
+    fn build_plan_split_falls_back_to_the_centre_when_a_text_render_cannot_be_probed() {
+        let mut snapshot = snapshot_for_split();
+        // The text node's PNG is unreadable, so its `image_size` stays unknown.
+        snapshot.committed.layer_png_sizes.clear();
+        let plan = build_plan(
+            &snapshot,
+            &split_op(1, SplitAxis::Horizontal, &[200], &[0, 1]),
+            78,
+        )
+        .expect("plan builds");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("'text'") && w.contains("centre point")),
+            "the degradation must be reported: {:?}",
+            plan.warnings
+        );
+        // It still lands on the part its centre (cy 300) sits in, so the layer
+        // is never lost — only the exactness of the rule degrades.
+        let manifest = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/layers/layers.json")
+            .expect("manifest rewritten");
+        let manifest: Value = serde_json::from_str(&manifest.content).expect("valid json");
+        let bottom = manifest["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .find(|page| page["img_idx"] == serde_json::json!(2))
+            .expect("bottom part present");
+        assert!(
+            bottom["tree"]
+                .as_array()
+                .expect("tree")
+                .iter()
+                .any(|rec| rec["uid"] == serde_json::json!("text"))
+        );
+    }
+
+    #[test]
+    fn build_plan_split_needs_page_sizes_and_warns_about_alt_versions() {
+        let mut snapshot = snapshot_for_split();
+        snapshot.has_alt_vers = true;
+        let op = split_op(1, SplitAxis::Horizontal, &[200], &[0, 1]);
+        let plan = build_plan(&snapshot, &op, 79).expect("plan builds");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("alt_vers")),
+            "changing the page count must warn: {:?}",
+            plan.warnings
+        );
+        snapshot.page_sizes.clear();
+        assert!(matches!(
+            build_plan(&snapshot, &op, 80),
+            Err(PageOpError::InvalidOp(_))
+        ));
+    }
+
+    #[test]
+    fn build_plan_split_trashes_detection_it_cannot_cut() {
+        let mut snapshot = snapshot_for_split();
+        // A mask smaller than its page cannot be cut without inventing a scale.
+        snapshot.detection[0].blocks = Some(DetectionBlocks::Parsed(serde_json::json!({
+            "source_size": [50, 400],
+            "mask_size": [25, 200],
+            "blocks": [],
+            "mask_file": "00001_mask.png"
+        })));
+        let plan = build_plan(
+            &snapshot,
+            &split_op(1, SplitAxis::Horizontal, &[200], &[0, 1]),
+            81,
+        )
+        .expect("plan builds");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("text detection")),
+            "the degradation must be reported: {:?}",
+            plan.warnings
+        );
+        assert!(
+            !plan
+                .json_writes
+                .iter()
+                .any(|w| w.target.contains("text_detection")),
+            "no detection document may be written"
+        );
+        assert!(
+            !plan
+                .creates
+                .iter()
+                .any(|c| c.target.contains("text_detection")),
+            "no detection mask may be cut"
+        );
     }
 
     #[test]

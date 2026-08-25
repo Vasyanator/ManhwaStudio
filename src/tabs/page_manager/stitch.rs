@@ -82,7 +82,7 @@ pub(super) struct StitchDialogState {
     /// Source page indices in the CURRENT page order, ascending.
     pages: Vec<usize>,
     /// One placement per entry of `pages`, in the same order. Empty until every
-    /// page's pixel size is known (see `PageManagerTabState::stitch_page_size`).
+    /// page's pixel size is known (see `PageManagerTabState::page_pixel_size`).
     placements: Vec<EditPlacement>,
     /// Cross-axis alignment of the quick arrangements and of the fit modes.
     align: CrossAlign,
@@ -430,7 +430,7 @@ impl PageManagerTabState {
         let mut sizes: Vec<[u32; 2]> = Vec::with_capacity(state.pages.len());
         let mut missing = false;
         for &idx in &state.pages {
-            match self.stitch_page_size(idx, project, page_infos) {
+            match self.page_pixel_size(idx, project, page_infos) {
                 Some(size) => sizes.push(size),
                 None => {
                     missing = true;
@@ -453,33 +453,6 @@ impl PageManagerTabState {
         // The initial layout is the plan's default: a row in ascending page-index
         // order, centred on the cross axis, nothing resampled.
         stitch_layout::arrange_row(&mut state.placements, state.align);
-    }
-
-    /// Pixel size of page `idx`: authoritative geometry first, then the sizes
-    /// probed by the thumbnail and preview decoders. `None` while unknown.
-    fn stitch_page_size(
-        &mut self,
-        idx: usize,
-        project: &ProjectData,
-        page_infos: &HashMap<usize, PageImageInfo>,
-    ) -> Option<[u32; 2]> {
-        if let Some(info) = page_infos.get(&idx)
-            && info.width_px > 0
-            && info.height_px > 0
-        {
-            return Some([info.width_px, info.height_px]);
-        }
-        let path = &project.pages[idx].path;
-        let probed = self
-            .thumbs
-            .cache
-            .peek(path)
-            .and_then(|entry| entry.full_size)
-            .or_else(|| match self.thumbs.preview_state(path) {
-                PreviewState::Ready { full_size, .. } => full_size,
-                PreviewState::Pending | PreviewState::Failed => None,
-            })?;
-        (probed.0 > 0 && probed.1 > 0).then_some([probed.0, probed.1])
     }
 
     /// Draws the board: camera input, page dragging with snapping, and painting.

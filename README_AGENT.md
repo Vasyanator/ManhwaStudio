@@ -453,7 +453,7 @@ Source page dimensions come from `PageImageInfo`; source page `PageTexture` hand
   and deletion. `draw` returns `PageManagerAction` (`RequestOp(PageOpKind)` / `OpenPageIn`),
   executed by `app.rs`.
 - **`src/page_ops/`** — GUI-free engine for STRUCTURAL page operations (Move / InsertFiles /
-  CreateBlank / Delete / Stitch). Pages are position-keyed everywhere, so an operation is a journaled
+  CreateBlank / Delete / Stitch / Split). Pages are position-keyed everywhere, so an operation is a journaled
   crash-safe transaction that consistently remaps ALL page-keyed artifacts in BOTH trees
   (committed chapter dir and `_unsaved` staging): `src/{idx:03}`, `clean_layers/`,
   `layers/layers.json` + `ps_p{idx:04}_*` PNGs, `translation_bubbles.json` (`img_idx`,
@@ -463,9 +463,13 @@ Source page dimensions come from `PageImageInfo`; source page `PageTexture` hand
   `{chapter}/.pageop_trash/{id}/`, never destroyed. `recover_pending_page_op` runs at the very
   start of `ProjectData::load_internal`. `alt_vers/` is intentionally NOT remapped
   (position-matched by sorted filename, no reliable per-file key — see its MODULE_README).
-  Stitch (N pages -> one) is the only op that MERGES: it composes the page-sized rasters in
-  phase A and merges the page-keyed JSON documents through one affine per source page
-  (`plan::PlacementMap`), instead of renaming — see its MODULE_README.
+  Stitch (N pages -> one) and Split (one page -> N ordered parts along parallel cuts) are the
+  two ops that change a page's PIXEL identity instead of only re-keying files: they build the
+  page-sized rasters in phase A and map the page-keyed JSON documents through one affine per
+  source page / per part (`plan::PlacementMap`, selected by `plan::PageGeometry`). A split
+  additionally ROUTES every entry to exactly one part — bubbles by their anchor, layers by the
+  exact area of their footprint (never cut, they move whole), detector blocks by their rect —
+  see its MODULE_README for the full rule set.
 - **Runtime contract (`app.rs::start_page_op`)**: structural ops are NOT staged — they apply
   immediately to both trees and are not undone by discarding unsaved changes. Before the
   transaction the app quiesces every chapter writer (flush PS/typing layers + pending bubble

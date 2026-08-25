@@ -37,6 +37,7 @@ use crate::project::ProjectData;
 use crate::widgets::WheelComboBox;
 use crate::widgets::WheelSpinBox;
 
+use super::split::SplitDialogState;
 use super::stitch::StitchDialogState;
 use super::{PageManagerAction, PageManagerTabState};
 
@@ -147,6 +148,7 @@ pub(super) enum PageManagerDialog {
     Create(CreateDialogState),
     Delete(DeleteDialogState),
     Stitch(StitchDialogState),
+    Split(SplitDialogState),
 }
 
 impl PageManagerDialog {
@@ -189,13 +191,20 @@ impl PageManagerDialog {
         PageManagerDialog::Stitch(StitchDialogState::new(indices))
     }
 
+    /// Fresh "split page" window for the given current page index (the caller
+    /// guarantees exactly one page is selected).
+    pub(super) fn split(page_idx: usize) -> Self {
+        PageManagerDialog::Split(SplitDialogState::new(page_idx))
+    }
+
     /// Whether a background file pick is currently pending.
     pub(super) fn picker_active(&self) -> bool {
         match self {
             PageManagerDialog::Insert(state) => state.picker_rx.is_some(),
             PageManagerDialog::Create(_)
             | PageManagerDialog::Delete(_)
-            | PageManagerDialog::Stitch(_) => false,
+            | PageManagerDialog::Stitch(_)
+            | PageManagerDialog::Split(_) => false,
         }
     }
 }
@@ -325,6 +334,9 @@ impl PageManagerTabState {
             PageManagerDialog::Stitch(state) => self
                 .draw_stitch_dialog(ctx, state, project, page_infos, op_in_progress, actions)
                 .map(PageManagerDialog::Stitch),
+            PageManagerDialog::Split(state) => self
+                .draw_split_dialog(ctx, state, project, page_infos, op_in_progress, actions)
+                .map(PageManagerDialog::Split),
         };
         self.dialog = kept;
     }

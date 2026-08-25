@@ -59,7 +59,12 @@ pub(super) fn publish_combo_popup_rect(ctx: &egui::Context, rect: Rect) {
     });
 }
 
-pub(super) fn combo_popup_open(ctx: &egui::Context) -> bool {
+/// Whether a combo-box popup is open this frame (or was on the previous one).
+///
+/// Wheel-aware consumers — including canvases that read the raw wheel delta, such
+/// as the page manager's split board — must skip their wheel reaction while it is
+/// true, so the wheel belongs to the open list alone.
+pub fn combo_popup_open(ctx: &egui::Context) -> bool {
     let Some(guard) =
         ctx.data(|data| data.get_temp::<OpenComboPopupGuard>(Id::new(OPEN_COMBO_POPUP_GUARD_ID)))
     else {

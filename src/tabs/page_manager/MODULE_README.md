@@ -14,7 +14,7 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
    |-- card grid (CentralPanel) virtualized rows, selection, context menu
    |-- status line (bottom)     totals: pages / with clean / bubbles
    |-- orphan-clean section     worker-scanned invalid clean files and attachment candidates
-   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch
+   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch / split
 ```
 
 - `PageManagerAction::RequestOp(PageOpKind)` asks the app to quiesce writers,
@@ -30,8 +30,9 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   (unsaved manifest overrides saved) for everything else.
 - All disk work runs on the worker thread in `thumbs.rs`: thumbnail decode +
   downscale (long side 192 px), page previews for the stitch window (long side
-  ~1024 px) and the manifest scan. Thumbnails live in an LRU cache (64 entries)
-  keyed by (path, mtime); previews live in a SEPARATE 6-entry LRU so a few
+  ~1024 px) and for the split window (~2048 px, because one page must show a seam
+  sharply enough to place a cut on it), and the manifest scan. Thumbnails live in
+  an LRU cache (64 entries) keyed by (path, mtime); previews live in a SEPARATE 6-entry LRU so a few
   megapixel-sized previews cannot evict the card grid's thumbnails. Both share the
   worker, the cancel flag, the epoch counter and the 8-job in-flight cap (whose key
   carries the job kind, so one page may have both pending).
@@ -56,9 +57,10 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - `dialogs.rs`: insert / create-blank / delete-confirm dialogs, the
   `InsertPosition -> at` resolution and the blank-page default-size rule
   (`default_blank_size`, unit-tested), the background file picker, and the
-  `PageManagerDialog` enum every dialog (stitch included) is dispatched through.
+  `PageManagerDialog` enum every dialog (stitch and split included) is dispatched
+  through.
 - `thumbs.rs`: worker thread + generic LRU `ThumbCache` (unit-tested) + the
-  `layers.json` layer-count scan + the stitch window's page previews
+  `layers.json` layer-count scan + the stitch/split windows' page previews
   (`request_preview_if_needed` / `preview_state`, mirroring the thumbnail pair;
   `preview_state_cached` reads an entry WITHOUT promoting it, for a page the
   caller may not request a decode for).
@@ -70,6 +72,20 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   coordinate contract it implements. Its canvas/scale bounds are the ENGINE's,
   imported from `page_ops` rather than restated, so the dialog can never enable a
   confirm the engine refuses.
+- `split_layout.rs`: GUI-free core of the "split page" feature (unit-tested):
+  cut coordinates -> parts, the part order and its SWAP semantics, cut insertion
+  and removal that keep `order` a permutation without disturbing the user's
+  chosen order, drag clamping, and the validation that mirrors the engine's
+  `PageOpKind::Split` preconditions. Axis-agnostic: everything is expressed along
+  ONE axis as an extent in source pixels.
+- `split.rs`: the "split page" window — an `egui::Window` with the same
+  `PsViewport` board as the stitch window, showing one page with parallel cut
+  lines (all horizontal XOR all vertical), a grab handle per line that carries a
+  delete button, a per-part order picker (`WheelComboBox` placed at an absolute
+  rect through `Ui::new_child`), and the confirm that emits `PageOpKind::Split`.
+  Only draws and routes input; all math lives in `split_layout.rs`. The picker
+  PLACEMENT is itself pure and unit-tested (`order_widget_rects`), as is the
+  handle drag (`dragged_cut_value`).
 - `stitch.rs`: the "stitch pages" window — an `egui::Window` with a zoomable,
   pannable board of draggable page rectangles (camera: `PsViewport` from
   `tabs/ps_editor/viewport.rs`), the arrangement / fit / background strip, and
@@ -90,6 +106,33 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   drawn (read without touching LRU order), so a rank swap during a pan does not
   blink the image away. The stitched RESULT is composed by `src/page_ops/` from
   the untouched originals — the preview resolution never reaches it.
+- Cut coordinates of the split window are SOURCE pixels, never preview pixels:
+  the board's world space IS the page's pixel space, so the preview resolution
+  limits only what the user can SEE, never the precision of what is emitted. A
+  cut handle stores ONLY its perpendicular coordinate — it is drawn at the
+  viewport centre along its line, which is what makes it slide back to the middle
+  instead of needing an along-line position. A handle drag applies the pointer's
+  DELTA, never its absolute position: at a ribbon's fit zoom one screen point is
+  tens of source pixels, so snapping the line to the pointer would throw away the
+  grab offset as a jump of hundreds of pixels.
+- EVERY part of the split board carries an order picker, at every zoom. The
+  picker keeps a fixed SCREEN size and may overhang a part narrower than itself
+  (on a webtoon ribbon at fit zoom the page is a few dozen points wide, so a
+  picker sized to the part would never appear at all — and the window offers no
+  other way to reorder). Along the cut axis the pickers form a non-overtaking
+  sequence whose pitch shrinks until they all fit the board, so a later picker
+  can never fully cover an earlier one.
+- The split board's wheel and its order pickers are mutually exclusive: a
+  `WheelComboBox` cycles its selection on a wheel notch even while CLOSED, and
+  egui reports the board as `hovered` underneath it (a click-only widget over a
+  `click_and_drag` one leaves the board in `hits.drag`, and `hovered` is the
+  union). The board therefore refuses the wheel over any picker rect — otherwise
+  one notch would zoom AND silently swap two parts, emitting an order the user
+  never chose.
+- The split confirm is refused while the page PREVIEW failed to decode, even
+  though the page size is known from `page_infos`: the operation is immediate and
+  is not undone by discarding unsaved changes, so it is never offered over a page
+  the user cannot see.
 - `PageOpKind` indices always refer to the CURRENT page order at request time;
   move semantics follow `page_ops/mod.rs` (`to` indexes the NEW order; UI
   position P maps to `to = P - 1`).
@@ -100,8 +143,12 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   indices may have shifted. A dialog that holds page indices (delete, stitch)
   must also re-validate them on EVERY frame: `clamp_selection` silently drops
   out-of-range indices after a reload, so a selection of two can become one
-  under an open window. The stitch window closes itself with a localized error
-  in that case.
+  under an open window. The stitch and split windows close themselves with a
+  localized error in that case.
+- A board that reads the RAW wheel delta (both windows do, because the wheel unit
+  is not a distance) must skip its wheel reaction while a combo popup is open —
+  `widgets::combo_popup_open`, the guard of `egui-docs/04-widgets.md` §2 — or the
+  board zooms underneath an open order picker.
 - All user-visible strings are `page_manager.*` keys present in BOTH
   `crates/ms-i18n/locales/en.json` and `ru.json`; `.pageop_trash` and
   `layers.json` are persistence identifiers (i18n-exempt), surfaced only via
@@ -131,6 +178,10 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   size): `stitch_layout.rs` — never the drawing code.
 - To change how the stitch window looks or reacts (board input, previews,
   settings strip, the emitted op): `stitch.rs`.
+- To change split cut/part/order math (validation, insertion, drag bounds, the
+  resulting page numbers): `split_layout.rs` — never the drawing code.
+- To change how the split window looks or reacts (cut lines, handles, order
+  pickers, the emitted op): `split.rs`.
 - To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
   `models/clean_assign.rs` contract.
 - To change what the app must execute: extend `PageManagerAction` (coordinate

@@ -3,7 +3,8 @@
 ## Purpose
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: move a
 page, insert pages (from image files or a generated blank), delete pages,
-stitch several pages into one composed page. An
+stitch several pages into one composed page, split one page into several
+ordered parts. An
 operation is executed on disk as a journaled, crash-safe transaction that keeps
 every page-keyed artifact consistent in BOTH trees — the committed chapter dir
 and the sibling `{chapter}_unsaved` staging mirror (the save flow copy-merges
@@ -27,8 +28,9 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   of the page-keyed JSON documents. All filesystem work lives in `fs_exec.rs`.
 - Phase A stages created files and renames every affected file to a unique
   temp (`__ms_pageop_{id}_{n}.mstmp`) in its own directory — fully reversible.
-  Created files include COMPOSED rasters (a stitch): they are staged BEFORE any
-  rename, so the compose step reads the source pages at their original paths.
+  Created files include COMPOSED rasters (a stitch) and CROPPED ones (a split):
+  they are staged BEFORE any rename, so the compose step reads the source pages
+  at their original paths.
   Recovery never re-composes and never re-copies an insert source; a missing
   staged file fails the transaction closed.
 - The journal uses two durable slots. Phase A is stored in
@@ -55,11 +57,13 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   `PageOpError`, `execute_page_op`, `recover_pending_page_op`.
 - `plan.rs`: permutation math, canonical page-keyed file-name helpers (with
   citations to the owning modules), snapshot types, plan types, `build_plan`,
-  and the stitch geometry (`PlacementMap` — the ONE affine per stitched page —
-  plus `StitchGeometry`, the resolved stitch request).
+  and the pixel-identity geometry: `PlacementMap` (the ONE affine from a page
+  to an output canvas, shared by both ops), `StitchGeometry`, `SplitGeometry` +
+  `SplitTreeRouting`, and the `PageGeometry` enum every planner takes.
 - `json_remap.rs`: bubbles / layers-manifest / text_info / detection-blocks
   rewrites over `serde_json::Value` (unknown fields survive), plus the
-  geometry mapping and document merging of a stitch.
+  geometry mapping and document merging of a stitch and the routing +
+  partitioning of a split.
 - `fs_exec.rs`: chapter scanning, journal I/O, phase A/B execution, recovery,
   durability helpers, integration + crash-recovery tests.
 
@@ -129,6 +133,81 @@ pages, replaces "rename" with "compose / merge":
   emits a `runtime_log` warning naming it, because an N->1 operation shifts its
   positional pairing.
 
+A SPLIT (`PageOpKind::Split`, one page -> N parts along parallel cuts) is the
+inverse and reuses the same machinery. Each geometric part `k` (0 = topmost /
+leftmost) is a crop of the source page at `[x_k, y_k, w_k, h_k]` becoming a page
+of exactly that size, i.e. a `PlacementMap` with `scale = 1`, `dx = dy = 0`.
+`order[k]` places part `k` at new index `page_idx + order[k]`, so the parts
+occupy a contiguous run starting at the source page's own index and every later
+page shifts up by `cuts.len()`; `old_to_new[page_idx]` is `page_idx` (the one
+representative the permutation type can carry).
+
+What is CUT vs. what MOVES WHOLE:
+- CUT, one crop per part: `src/{stem}.{ext}` (always re-encoded as PNG,
+  whatever the source was), `clean_layers/{stem}.png`,
+  `text_images/mask_page_{idx}.png` and — only when trustworthy —
+  `text_detection/{idx:05}_mask.png`. The crop equals the destination, so the
+  pixels are copied bit-exactly (no resampling anywhere in a split). The
+  originals go to the trash.
+- MOVE WHOLE: every LAYER. A layer crossed by a cut is never split; it goes to
+  ONE part and its geometry is mapped through that part, so it may legitimately
+  hang off the new page's edge (negative or over-size coordinates).
+
+Routing rules (each entry must land on exactly ONE part):
+- **Layers — the exact-area rule.** The part holding the largest share of the
+  layer's on-page AREA wins; an exact tie goes to the TOP part (horizontal cuts)
+  or the LEFT part (vertical cuts) — geometric position, never user order. The
+  footprint is a real polygon clipped against the cut half-planes and compared
+  by shoelace area, not a bounding box: a `deform` mesh when the node has one
+  (the mesh OVERRIDES the transform), otherwise the four `local_to_world`
+  corners of the layer image. A mesh is measured CELL BY CELL — the absolute
+  area of every grid quad, summed per part — never from its outer boundary
+  ring: a user can FOLD a mesh in the typing tab and a self-intersecting ring's
+  lobes cancel in the signed shoelace sum, so its area is not the filled area.
+  A TEXT node stores
+  `image_size: None`, so its size is PROBED from `rendered_file` at scan time;
+  when the probe fails the node falls back to its transform CENTRE point and the
+  plan warns — a documented degradation, never a silent violation.
+- **Layer PNGs.** One page's PNGs fan out onto DIFFERENT `ps_p{page:04}_`
+  prefixes, which the index embedded in the name cannot express, so a per-tree
+  `uid -> part` / `file -> new page index` routing decides. A PNG no layer
+  record claims follows the part that keeps the page's index, with a warning.
+  ONE file claimed by records routed to DIFFERENT parts is REFUSED with
+  `InvalidOp` naming the file and the two parts: a file can only move to one
+  prefix, so any answer would leave a record pointing at a PNG owned by another
+  page, and `prune_orphan_pngs` prunes by that prefix. There are no shared-file
+  semantics to guess — the same refusal the stitch applies to a duplicate uid.
+- **Layer manifest.** The page entry becomes one entry per part that holds a
+  layer. `z` is a per-page band axis, so it is re-ranked densely inside each
+  part. A `GroupRec` / `TextGroupRec` whose members land on several parts is
+  DUPLICATED into each of them (group uids are page-scoped — every `LayerDoc`
+  group operation takes a `page_idx`), and omitted from parts holding no member.
+  `layer_idx` is NOT re-based: different parts are different pages.
+- **Bubbles.** A bubble ALWAYS goes to the part containing its ANCHOR point,
+  including an image bubble whose visible area may mostly lie elsewhere (a
+  user-fixed rule).
+- **A page-crop bubble whose `crop_page_idx` is the split page.** The crop link
+  is preserved, not dropped: `crop_page_idx` is remapped to the part holding the
+  majority of `crop_rect`, the rect is renormalized into that part and clamped
+  back into `[0, 1]`, and a clamp that actually trims is warned about. Dropping
+  the link would silently degrade the bubble to a plain image bubble.
+- **Legacy `text_info.json`.** Routed by its deform mesh's cell area when it
+  has one, otherwise by its decoded centre point: this document does not record the
+  overlay's extent, so an area test is impossible here. In a v3 chapter the
+  authoritative record of the same overlay is the `layers.json` node, which IS
+  judged by the exact-area rule.
+- **Detection.** The stitch's trustworthiness gate (`source_size` equal to the
+  page image, mask not downscaled) PLUS a routability gate: every block must be
+  an object carrying numeric `x1`/`y1`/`x2`/`y2`, because a split partitions the
+  block list and a block no part can claim would be skipped by all of them and
+  vanish. Both gates are all-or-nothing and are evaluated ONCE, before any
+  per-part document is built; when either fails, the page's detection files go
+  to the trash with a warning instead of being cut. When they pass,
+  each part gets its own `{idx:05}_blocks.json` (blocks routed by the area of
+  their rectangle, mapped into the part, `source_size` = `mask_size` = the part
+  size) and its own cropped mask.
+- `alt_vers/` warns for the same reason as a stitch: the page count changed.
+
 Deliberately NOT touched (each with the reason):
 - `alt_vers/` — alternate-version images pair with pages by SORTED POSITION
   inside each `alt_vers/<name>/` subfolder (`cleaning/tools/stamp.rs::
@@ -162,13 +241,17 @@ Deliberately NOT touched (each with the reason):
   (`ProjectData::load_internal`), before any reconcile/normalize pass reads
   chapter files. A failed recovery aborts the load; the journal is left in
   place for inspection/retry.
-- The planner is pure and learns page pixel sizes only through
-  `ChapterSnapshot::page_sizes`, which `scan_chapter` fills (an image-header
-  probe per page) ONLY for operations that need geometry — currently just the
-  stitch. A stitch against a snapshot without them fails with `InvalidOp`.
-- A stitch never deletes a page-keyed JSON entry: merging is the whole point, so
-  the `deleted_*.json` archives stay empty for it. Only FILES (the source page
-  images and the rasters replaced by composed ones) go to the trash.
+- The planner is pure and learns pixel sizes only through the snapshot, which
+  `scan_chapter` fills ONLY for the operations that need geometry (stitch and
+  split): `ChapterSnapshot::page_sizes` is an image-header probe per page, and
+  `TreeSnapshot::layer_png_sizes` an image-header probe per layer PNG of the
+  page a split cuts. A stitch or split against a snapshot without page sizes
+  fails with `InvalidOp`; a missing layer-PNG size only degrades that layer's
+  routing to its centre point, with a warning.
+- Neither a stitch nor a split deletes a page-keyed JSON entry: merging and
+  cutting keep every entry, so the `deleted_*.json` archives stay empty for
+  them. Only FILES (the source page images and the rasters replaced by composed
+  or cropped ones) go to the trash.
 - Legacy un-migrated documents are rejected, not guessed: bubbles or text_info
   entries in the absolute-ribbon-coordinate format (no `img_idx`, numeric
   `x`/`y`) are keyed by ribbon position — which any page op changes — so
@@ -195,8 +278,15 @@ Deliberately NOT touched (each with the reason):
 - Journal format / crash-safety behavior: `fs_exec.rs` (bump
   `JOURNAL_SCHEMA_VERSION` on incompatible plan changes; it is at 2, raised from
   1 when `NewPageContent::ComposedPng` was added for the stitch).
-- Stitch geometry: `plan.rs` (`PlacementMap` is the single affine — never
-  re-derive the formula at a call site) + `json_remap.rs` for the per-document
-  application.
+- Stitch / split geometry: `plan.rs` (`PlacementMap` is the single affine —
+  never re-derive the formula at a call site; `SplitGeometry::part_for_*` is the
+  single routing decision) + `json_remap.rs` for the per-document application.
+- Split routing of layers: `json_remap.rs` (`split_layer_routing`,
+  `assign_layer_part`, `deform_mesh_cells`) + `plan.rs` (`SplitTreeRouting`,
+  `SplitGeometry::part_for_polygon_group` — the fold-correct area sum).
+- Split routing of detection blocks: `json_remap.rs`
+  (`detection_merge_blocker` + `detection_split_blocker` are the two gates,
+  `split_detection_blocks` builds a part's document and fails closed on
+  anything the gates should have caught).
 - Canonical file-name formats: they are OWNED by other modules (see the cited
   helpers in `plan.rs`); change them there first, then mirror here.

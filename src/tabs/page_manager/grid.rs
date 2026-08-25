@@ -420,6 +420,20 @@ impl PageManagerTabState {
                 self.selection.iter().copied().collect(),
             ));
         }
+        // Splitting cuts ONE page into several, so it is defined for exactly one
+        // selected page; the index is re-validated inside the dialog because
+        // `clamp_selection` may drop it after a reload.
+        if ui
+            .add_enabled(
+                !op_in_progress && single.is_some(),
+                egui::Button::new(t!("page_manager.context.split_page_button")),
+            )
+            .on_disabled_hover_text(t!("page_manager.context.split_page_disabled_tooltip"))
+            .clicked()
+            && let Some(page_idx) = single
+        {
+            self.dialog = Some(PageManagerDialog::split(page_idx));
+        }
         if ui
             .add_enabled(
                 !op_in_progress && !self.selection.is_empty(),

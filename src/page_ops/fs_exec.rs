@@ -13,7 +13,8 @@ Transaction protocol:
    atomic temp+rename, fsync'd) BEFORE any other filesystem change.
 2. Phase A (reversible): new files are staged as temps, every affected file is
    renamed to a unique temp in its own directory. Staging happens FIRST, so a
-   composed page (a stitch) reads its source images at their original paths. A
+   composed page (a stitch) or a cropped part (a split) reads its source images
+   at their original paths. A
    failure rolls phase A back and removes the journal.
 3. A separate fsync'd `page_ops_journal.b.json` is created (the commit point),
    then the A slot is removed. If both survive a crash, recovery trusts B.
@@ -31,7 +32,8 @@ recognizes `from`/`temp`/`dest` states and fails closed on a missing artifact.
 Key functions:
 - execute(): scan + plan + run the transaction (worker thread only).
 - recover(): resolve a pending journal (called from `ProjectData::load_internal`).
-- encode_composed_png(): the pixel work of a stitch (crop, scale, blend, encode).
+- encode_composed_png(): the pixel work of a stitch (crop, scale, blend,
+  encode) and of a split (one source, crop == destination, so a bit-exact copy).
   Recovery NEVER re-runs it: a lost staged file fails the transaction closed,
   exactly like a vanished external insert source.
 
@@ -288,26 +290,29 @@ fn validate_insert_sources(op: &PageOpKind) -> Result<(), PageOpError> {
             }
             Ok(())
         }
-        // A stitch reads only chapter-owned files, all of them already listed in
-        // the snapshot; there is no external source to pre-validate.
+        // A stitch and a split read only chapter-owned files, all of them
+        // already listed in the snapshot; there is no external source to
+        // pre-validate.
         PageOpKind::Move { .. }
         | PageOpKind::CreateBlank { .. }
         | PageOpKind::Delete { .. }
-        | PageOpKind::Stitch { .. } => Ok(()),
+        | PageOpKind::Stitch { .. }
+        | PageOpKind::Split { .. } => Ok(()),
     }
 }
 
 /// Builds the plan input snapshot from the chapter on disk.
 ///
 /// Page pixel sizes are probed (an image-header read, not a decode) only for
-/// operations that need page geometry — a stitch — so the ordinary rename
-/// operations keep costing zero extra I/O per page.
+/// operations that need page geometry — a stitch or a split — so the ordinary
+/// rename operations keep costing zero extra I/O per page. A split additionally
+/// probes the layer PNGs of the page it cuts (see [`scan_tree`]).
 ///
 /// # Errors
 /// - [`PageOpError::InvalidOp`] when the in-memory page list disagrees with
 ///   `src/` (a page file is missing) or the layout has no usable title dir.
 /// - [`PageOpError::Image`] when a page image's header cannot be read while
-///   probing sizes for a stitch.
+///   probing sizes for a stitch or a split.
 /// - [`PageOpError::Json`] when an authoritative page-keyed document
 ///   (`translation_bubbles.json`, `layers.json`, `text_info.json`) is not
 ///   parseable — remapping it blindly would corrupt the chapter.
@@ -369,12 +374,24 @@ fn scan_chapter(
         }
     }
 
+    // A split needs the pixel size of the layer PNGs of the page it cuts: a
+    // TEXT layer record stores none, and without it the exact-area rule that
+    // routes a layer to a part cannot be evaluated.
+    let split_page_idx = match op {
+        PageOpKind::Split { page_idx, .. } => Some(*page_idx),
+        PageOpKind::Move { .. }
+        | PageOpKind::InsertFiles { .. }
+        | PageOpKind::CreateBlank { .. }
+        | PageOpKind::Delete { .. }
+        | PageOpKind::Stitch { .. } => None,
+    };
     let committed = scan_tree(
         chapter_rel.clone(),
         &paths.clean_layers_dir,
         &paths.layers_dir,
         &paths.text_images_dir,
         &paths.bubbles_file,
+        split_page_idx,
     )?;
     let unsaved = scan_tree(
         unsaved_rel,
@@ -382,10 +399,11 @@ fn scan_chapter(
         &paths.unsaved_layers_dir,
         &paths.unsaved_text_images_dir,
         &paths.unsaved_bubbles_file,
+        split_page_idx,
     )?;
     let detection = scan_detection(&paths.text_detection_dir)?;
 
-    let needs_sizes = matches!(op, PageOpKind::Stitch { .. });
+    let needs_sizes = matches!(op, PageOpKind::Stitch { .. } | PageOpKind::Split { .. });
     let mut page_sizes = Vec::new();
     if needs_sizes {
         page_sizes.reserve(page_file_names.len());
@@ -414,12 +432,18 @@ fn scan_chapter(
 
 /// Scans one tree (committed or unsaved). Missing directories/files yield
 /// empty sets / `None`; unparseable authoritative JSON is an error.
+///
+/// `split_page_idx` is `Some` only for a split, and then the pixel size of
+/// every layer PNG of THAT page is probed (an image-header read per file of one
+/// page, never a decode). A PNG whose header cannot be read is simply absent
+/// from the map; the planner degrades to a centre-point assignment and warns.
 fn scan_tree(
     tree_rel: String,
     clean_layers_dir: &Path,
     layers_dir: &Path,
     text_images_dir: &Path,
     bubbles_file: &Path,
+    split_page_idx: Option<usize>,
 ) -> Result<TreeSnapshot, PageOpError> {
     let clean_overlay_stems = list_file_names(clean_layers_dir)?
         .into_iter()
@@ -434,6 +458,28 @@ fn scan_tree(
         list_file_names(text_images_dir)?.into_iter().collect();
 
     let layers_manifest = read_json_if_exists(&layers_dir.join("layers.json"))?;
+
+    let mut layer_png_sizes: std::collections::BTreeMap<String, [u32; 2]> =
+        std::collections::BTreeMap::new();
+    if let Some(page_idx) = split_page_idx {
+        for name in &layers_files {
+            if !name.ends_with(".png")
+                || plan::parse_layers_png_page_idx(name) != Some(page_idx)
+            {
+                continue;
+            }
+            let path = layers_dir.join(name);
+            match image::image_dimensions(&path) {
+                Ok((width, height)) => {
+                    layer_png_sizes.insert(name.clone(), [width, height]);
+                }
+                Err(err) => runtime_log::log_warn(format!(
+                    "[page-ops] could not read the pixel size of layer image '{}' ({err});                      the split will route that layer by its centre point",
+                    path.display()
+                )),
+            }
+        }
+    }
 
     let mut text_info = Vec::new();
     for (location, dir) in [
@@ -467,6 +513,7 @@ fn scan_tree(
         tree_rel,
         clean_overlay_stems,
         layers_files,
+        layer_png_sizes,
         layers_manifest,
         text_images_files,
         text_info,
@@ -903,6 +950,10 @@ fn encode_blank_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) -> Resu
 
 /// Composes `sources` onto a `width` x `height` background and writes the
 /// result as a straight-RGBA PNG.
+///
+/// A SPLIT part is the degenerate one-source case: its crop equals its
+/// destination, so the resize branch below is skipped and the pixels are copied
+/// bit-exactly out of the source page.
 ///
 /// Runs in phase A, BEFORE any rename, so every source is read at its original
 /// chapter path. Sources are painted in list order with straight-alpha "over"
@@ -2405,6 +2456,269 @@ mod tests {
         let err = super::recover(&fx.paths.project_dir).expect_err("must not recompose");
         assert!(matches!(err, PageOpError::Journal(_)), "got: {err}");
         assert!(journal_paths.b.exists(), "journal remains for inspection");
+    }
+
+    // -----------------------------------------------------------------------
+    // Split: page 1 (4x10) cut horizontally at y = 4 into a 4x4 top part
+    // (keeping index 1) and a 4x6 bottom part (index 2). Pages 2 and 3 shift
+    // up by one.
+    // -----------------------------------------------------------------------
+
+    const SPLIT_TOP_COLOR: [u8; 4] = [200, 10, 10, 255];
+    const SPLIT_BOTTOM_COLOR: [u8; 4] = [10, 10, 200, 255];
+
+    fn split_op() -> PageOpKind {
+        PageOpKind::Split {
+            page_idx: 1,
+            axis: crate::page_ops::SplitAxis::Horizontal,
+            cuts: vec![4],
+            order: vec![0, 1],
+        }
+    }
+
+    /// Paints page 1 in two horizontal bands (so the cut is observable in the
+    /// pixels) and gives it a real layer stack in the unsaved tree, one layer
+    /// per side of the cut, so the layer PNGs fan out onto two prefixes.
+    fn prepare_split_fixture(fx: &Fixture) {
+        let [width, height] = REAL_PAGE_SIZES[1];
+        let mut page = image::RgbaImage::new(width, height);
+        for (_, y, pixel) in page.enumerate_pixels_mut() {
+            *pixel = image::Rgba(if y < 4 {
+                SPLIT_TOP_COLOR
+            } else {
+                SPLIT_BOTTOM_COLOR
+            });
+        }
+        page.save(fx.paths.src_dir.join("001.png"))
+            .expect("write banded split page");
+
+        write(&fx.paths.unsaved_layers_dir.join("ps_p0001_top.png"), b"UL-TOP");
+        write(&fx.paths.unsaved_layers_dir.join("ps_p0001_bot.png"), b"UL-BOT");
+        write_json(
+            &fx.paths.unsaved_layers_dir.join("layers.json"),
+            &json!({
+                "schema_version": 4,
+                "pages": [{
+                    "img_idx": 1,
+                    "groups": [{"uid": "g1", "name": "G", "visible": true, "opacity": 1.0}],
+                    "tree": [
+                        {"uid": "top", "name": "T", "kind": "raster", "z": 0,
+                         "visible": true, "opacity": 1.0, "group_uid": "g1",
+                         "base_file": "ps_p0001_top.png", "image_size": [2, 2],
+                         "transform": {"cx": 2.0, "cy": 1.0, "rotation": 0.0, "scale": 1.0}},
+                        {"uid": "bot", "name": "B", "kind": "raster", "z": 1,
+                         "visible": true, "opacity": 1.0, "group_uid": "g1",
+                         "base_file": "ps_p0001_bot.png", "image_size": [2, 2],
+                         "transform": {"cx": 2.0, "cy": 8.0, "rotation": 0.0, "scale": 1.0}}
+                    ]
+                }]
+            }),
+        );
+    }
+
+    /// Full expected state after `split_op()` on the prepared fixture; shared
+    /// by the direct-execute and the roll-forward tests.
+    fn assert_split_layout(fx: &Fixture) {
+        // The two parts carry exactly their band of the source pixels.
+        let top = read_png(&fx.paths.src_dir.join("001.png"));
+        assert_eq!(top.dimensions(), (4, 4));
+        assert_eq!(top.get_pixel(0, 0), &image::Rgba(SPLIT_TOP_COLOR));
+        assert_eq!(top.get_pixel(3, 3), &image::Rgba(SPLIT_TOP_COLOR));
+        let bottom = read_png(&fx.paths.src_dir.join("002.png"));
+        assert_eq!(bottom.dimensions(), (4, 6));
+        assert_eq!(bottom.get_pixel(0, 0), &image::Rgba(SPLIT_BOTTOM_COLOR));
+        assert_eq!(bottom.get_pixel(3, 5), &image::Rgba(SPLIT_BOTTOM_COLOR));
+        // The other pages kept their pixels and shifted up by one.
+        assert_eq!(
+            read_png(&fx.paths.src_dir.join("000.png")).get_pixel(0, 0),
+            &image::Rgba(page_color(0))
+        );
+        assert_eq!(
+            read_png(&fx.paths.src_dir.join("003.png")).get_pixel(0, 0),
+            &image::Rgba(page_color(2))
+        );
+        assert_eq!(
+            read_png(&fx.paths.src_dir.join("004.png")).get_pixel(0, 0),
+            &image::Rgba(page_color(3))
+        );
+
+        // Page-sized rasters are cut the same way, in both trees.
+        let unsaved_top = read_png(&fx.paths.unsaved_clean_layers_dir.join("001.png"));
+        assert_eq!(unsaved_top.dimensions(), (4, 4));
+        assert_eq!(unsaved_top.get_pixel(0, 0), &image::Rgba([201, 0, 0, 255]));
+        assert_eq!(
+            read_png(&fx.paths.unsaved_clean_layers_dir.join("002.png")).dimensions(),
+            (4, 6)
+        );
+        assert_eq!(
+            read_png(&fx.paths.text_images_dir.join("mask_page_1.png")).dimensions(),
+            (4, 4)
+        );
+        assert_eq!(
+            read_png(&fx.paths.text_images_dir.join("mask_page_2.png")).dimensions(),
+            (4, 6)
+        );
+        // A mask of an untouched page follows the ordinary index shift.
+        assert!(
+            fx.paths
+                .unsaved_text_images_dir
+                .join("mask_page_3.png")
+                .exists()
+        );
+
+        // Layer PNGs of ONE page landed on TWO prefixes.
+        assert_eq!(
+            fs::read(fx.paths.unsaved_layers_dir.join("ps_p0001_top.png")).expect("top layer"),
+            b"UL-TOP"
+        );
+        assert_eq!(
+            fs::read(fx.paths.unsaved_layers_dir.join("ps_p0002_bot.png")).expect("bot layer"),
+            b"UL-BOT"
+        );
+        // An orphan PNG no record claims follows the part keeping the index.
+        assert!(fx.paths.unsaved_layers_dir.join("ps_p0001_uu.png").exists());
+        // The committed tree's page-2 layer followed the index shift.
+        assert!(fx.paths.layers_dir.join("ps_p0003_u2_text.png").exists());
+
+        // The unsaved manifest page became TWO entries, one per part.
+        let manifest = read_json(&fx.paths.unsaved_layers_dir.join("layers.json"));
+        let pages = manifest["pages"].as_array().expect("pages");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0]["img_idx"], json!(1));
+        assert_eq!(pages[0]["tree"][0]["uid"], json!("top"));
+        assert_eq!(pages[0]["tree"][0]["transform"]["cy"], json!(1.0));
+        assert_eq!(pages[0]["tree"][0]["z"], json!(0));
+        assert_eq!(pages[1]["img_idx"], json!(2));
+        assert_eq!(pages[1]["tree"][0]["uid"], json!("bot"));
+        // Page px 8 of the source is px 4 of the bottom part, and the band
+        // axis is re-ranked densely inside each part.
+        assert_eq!(pages[1]["tree"][0]["transform"]["cy"], json!(4.0));
+        assert_eq!(pages[1]["tree"][0]["z"], json!(0));
+        assert_eq!(pages[1]["tree"][0]["base_file"], json!("ps_p0002_bot.png"));
+        // The shared PS group is duplicated into both parts.
+        assert_eq!(pages[0]["groups"][0]["uid"], json!("g1"));
+        assert_eq!(pages[1]["groups"][0]["uid"], json!("g1"));
+
+        // Bubbles: the page-1 bubble follows its anchor into the bottom part,
+        // and the page-crop bubble's crop is routed by area and clamped.
+        let bubbles = read_json(&fx.paths.bubbles_file);
+        let bubbles = bubbles.as_array().expect("bubbles");
+        assert_eq!(bubbles.len(), 3);
+        assert_eq!(bubbles[0]["img_idx"], json!(0));
+        assert_eq!(bubbles[1]["img_idx"], json!(2));
+        approx(&bubbles[1]["img_u"], 0.5);
+        approx(&bubbles[1]["img_v"], 1.0 / 6.0);
+        assert_eq!(bubbles[2]["img_idx"], json!(4));
+        assert_eq!(bubbles[2]["crop_page_idx"], json!(2));
+        let crop = bubbles[2]["crop_rect"].as_array().expect("crop rect");
+        approx(&crop[0], 0.1);
+        approx(&crop[1], 0.0);
+        approx(&crop[2], 0.9);
+        approx(&crop[3], 5.0 / 6.0);
+        assert_eq!(read_json(&fx.paths.unsaved_bubbles_file)[0]["img_idx"], json!(3));
+
+        // Legacy typing metadata follows the same routing.
+        let text_info = read_json(&fx.paths.text_images_dir.join("text_info.json"));
+        let entries = text_info.as_array().expect("entries");
+        assert_eq!(entries[0]["img_idx"], json!(2));
+        approx(&entries[0]["img_v"], 1.0 / 6.0);
+        assert_eq!(entries[0]["file"], json!("ov1.png"));
+        assert_eq!(entries[1]["img_idx"], json!(4));
+
+        // Detection: one document and one mask per part, blocks routed by area.
+        let first = read_json(&fx.paths.text_detection_dir.join("00001_blocks.json"));
+        assert_eq!(first["page_idx"], json!(1));
+        assert_eq!(first["source_size"], json!([4, 4]));
+        assert_eq!(first["mask_size"], json!([4, 4]));
+        assert_eq!(first["mask_file"], json!("00001_mask.png"));
+        assert_eq!(first["blocks"].as_array().expect("blocks").len(), 1);
+        approx(&first["blocks"][0]["y2"], 4.0);
+        let second = read_json(&fx.paths.text_detection_dir.join("00002_blocks.json"));
+        assert_eq!(second["source_size"], json!([4, 6]));
+        assert!(second["blocks"].as_array().expect("blocks").is_empty());
+        assert_eq!(
+            read_png(&fx.paths.text_detection_dir.join("00001_mask.png")).dimensions(),
+            (4, 4)
+        );
+        assert_eq!(
+            read_png(&fx.paths.text_detection_dir.join("00002_mask.png")).dimensions(),
+            (4, 6)
+        );
+
+        // The source page's own files are recoverable from the trash.
+        let trash_base = fx.paths.project_dir.join(super::super::plan::TRASH_DIR_NAME);
+        let ids: Vec<_> = fs::read_dir(&trash_base)
+            .expect("trash exists")
+            .flatten()
+            .collect();
+        assert_eq!(ids.len(), 1, "one transaction trash folder");
+        let trash = ids[0].path();
+        assert!(trash.join("ch1/src/001.png").exists());
+        assert!(trash.join("ch1_unsaved/clean_layers/001.png").exists());
+        assert!(trash.join("ch1/text_images/mask_page_1.png").exists());
+        // A split never deletes a JSON entry.
+        assert!(!trash.join("ch1/deleted_bubbles.json").exists());
+
+        assert_no_transaction_residue(&fx.title);
+    }
+
+    #[test]
+    fn split_cuts_one_page_into_two_in_both_trees() {
+        let fx = build_decodable_fixture();
+        prepare_split_fixture(&fx);
+        let outcome =
+            super::execute(&fx.paths, &fx.pages, &split_op()).expect("split executes");
+        assert_eq!(outcome.old_to_new, vec![Some(0), Some(1), Some(3), Some(4)]);
+        assert_eq!(outcome.new_page_count, 5);
+        assert_split_layout(&fx);
+    }
+
+    #[test]
+    fn split_crash_after_phase_a_rolls_back_to_original_state() {
+        let fx = build_decodable_fixture();
+        prepare_split_fixture(&fx);
+        let before = walk(&fx.title);
+        let op = split_op();
+
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 6150).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        assert_ne!(before, walk(&fx.title), "phase A must change the tree");
+
+        super::recover(&fx.paths.project_dir).expect("rollback");
+        assert_eq!(before, walk(&fx.title), "rollback restores the exact state");
+        assert!(!journal_paths.a.exists());
+    }
+
+    #[test]
+    fn split_crash_mid_phase_b_rolls_forward_to_final_state() {
+        let fx = build_decodable_fixture();
+        prepare_split_fixture(&fx);
+        let op = split_op();
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 6151).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        write_journal(&journal_paths, &plan, JournalPhase::B, &op).expect("journal b");
+
+        // Only part of phase B ran before the "crash": half the final renames,
+        // no created part committed and no JSON written.
+        let finals: Vec<&PlannedMove> = plan
+            .moves
+            .iter()
+            .filter(|m| matches!(m.dest, MoveDest::Final { .. }))
+            .collect();
+        for planned in finals.iter().take(finals.len() / 2) {
+            if let MoveDest::Final { path } = &planned.dest {
+                resolve_move(&fx.title, planned, path).expect("partial B");
+            }
+        }
+        super::recover(&fx.paths.project_dir).expect("roll forward");
+        assert!(!journal_paths.b.exists());
+        assert_split_layout(&fx);
     }
 
     #[test]
