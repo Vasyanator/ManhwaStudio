@@ -42,6 +42,9 @@ notification.
   `LoadedPsdDocument::layers` and the rows built from it are BOTTOM-FIRST (index 0 =
   bottommost). The preview of an overlay row is composited on the preview worker thread and
   cached under `"{row_key}@on:{clean_row_key}"` so reassigning the clean row rebuilds it.
+  Every preview is painted over a repeating transparency checkerboard (one cached texture, one
+  quad with a repeating UV rect), not over the flat dark container fill: transparent holes must
+  read as holes rather than as black ink.
 - `theme.rs`: launcher visual style helpers.
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.

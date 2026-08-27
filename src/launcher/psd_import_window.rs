@@ -38,6 +38,9 @@ more layer rows, because a two-layer document is already a plain source/clean pa
 Layer order matters for that feature and is easy to get wrong: `ag-psd` preserves the raw PSD
 record order, which Photoshop writes bottom-to-top, so `LoadedPsdDocument::layers` — and the
 row list built from it — is ordered BOTTOM-FIRST (index 0 = bottommost layer).
+Every preview is painted over a transparency checkerboard (`checker_color_image`, one repeating
+texture cached in the state) instead of the flat dark container fill: a fully transparent hole in
+a layer is otherwise indistinguishable from painted black ink and gets reported as a decoding bug.
 The read path deliberately disables `ReadOptions::total_memory_limit` — see the comment in
 `load_document_from_bytes`.
 */
@@ -86,6 +89,20 @@ const OVERLAY_FRAME_COLOR: Color32 = Color32::from_rgb(96, 176, 255);
 /// Stroke width of that frame, in screen pixels: constant so it stays visible whatever the
 /// preview is scaled to.
 const OVERLAY_FRAME_STROKE_WIDTH: f32 = 2.0;
+/// Light square of the transparency checkerboard painted behind every preview bitmap.
+///
+/// The two checker greys exist to disambiguate *absent* pixels from *painted* ones: over the
+/// near-black `PREVIEW_BACKGROUND` a fully transparent hole in a "клин" layer reads as a solid
+/// black ink blob. Both greys are deliberately far from black ink and from white paper.
+const CHECKER_LIGHT: Color32 = Color32::from_rgb(84, 84, 88);
+/// Dark square of the transparency checkerboard. See [`CHECKER_LIGHT`].
+const CHECKER_DARK: Color32 = Color32::from_rgb(64, 64, 68);
+/// Side of one checker square in screen pixels. Constant on screen (the checker is painted at
+/// one texel per screen pixel), so it never zooms with the preview and never turns to moiré on
+/// a heavily downscaled page.
+const CHECKER_SQUARE_PX: u16 = 10;
+/// Side of the uploaded checker tile: exactly one 2x2-square period of the pattern.
+const CHECKER_TILE_PX: u16 = CHECKER_SQUARE_PX * 2;
 // Import-type option labels. Runtime accessors (not `const`) because `t!` is not `const`.
 // These are display labels only; the persisted import type is the `ImportType` enum.
 fn type_skip() -> &'static str {
@@ -133,6 +150,9 @@ pub struct PsdImportWindowState {
     preview_scroll_y: f32,
     preview_scroll_by_page: HashMap<u32, f32>,
     preview_container_width: Option<f32>,
+    /// Repeating transparency checkerboard painted under the preview bitmap, uploaded once on
+    /// first use. Kept in the state because a `TextureHandle` frees its GPU texture on drop.
+    preview_checker: Option<TextureHandle>,
     title_input: String,
     chapter_input: String,
     title_combo: EditableComboBox,
@@ -366,6 +386,7 @@ impl PsdImportWindowState {
             preview_scroll_y: 0.0,
             preview_scroll_by_page: HashMap::new(),
             preview_container_width: None,
+            preview_checker: None,
             title_input: String::new(),
             chapter_input: String::new(),
             title_combo: EditableComboBox::new("launcher_psd_import_title")
@@ -786,7 +807,27 @@ impl PsdImportWindowState {
         }
     }
 
+    /// Returns the repeating transparency-checker texture, uploading it on first use.
+    ///
+    /// The returned handle is a cheap refcounted clone of the cached one; the cached handle is
+    /// what keeps the GPU texture alive, so it must stay in `self`.
+    fn checker_texture(&mut self, ctx: &Context) -> TextureHandle {
+        self.preview_checker
+            .get_or_insert_with(|| {
+                ctx.load_texture(
+                    "launcher-psd-preview-checker",
+                    checker_color_image(),
+                    // Repeat wrap: the whole checkerboard is one quad with a UV rect wider
+                    // than 1, so the pattern must tile in the sampler rather than in a loop.
+                    TextureOptions::NEAREST_REPEAT,
+                )
+            })
+            .clone()
+    }
+
     fn show_preview_panel(&mut self, ui: &mut Ui) {
+        // Resolved before the row/preview borrows below: uploading needs `&mut self`.
+        let checker = self.checker_texture(ui.ctx());
         ui.heading(t!("launcher.psd_import.preview_label"));
         ui.add_space(8.0);
         let outer_rect = ui.available_rect_before_wrap();
@@ -844,6 +885,23 @@ impl PsdImportWindowState {
                                             let scale =
                                                 preview_scale_to_width(preview_size, available.x);
                                             let top_left = ui.min_rect().min;
+                                            let image_rect = egui::Rect::from_min_size(
+                                                top_left,
+                                                preview_size * scale,
+                                            );
+                                            // Transparency checkerboard under every tile: a
+                                            // fully transparent hole in a layer must read as a
+                                            // hole, not as black ink on the dark container.
+                                            // One quad with a repeating UV rect, anchored at
+                                            // the image origin so it scrolls with the picture.
+                                            if image_rect.is_positive() {
+                                                ui.painter().image(
+                                                    checker.id(),
+                                                    image_rect,
+                                                    checker_uv_rect(image_rect.size()),
+                                                    Color32::WHITE,
+                                                );
+                                            }
                                             for tile in &preview.tiles {
                                                 let tile_rect = egui::Rect::from_min_size(
                                                     top_left
@@ -877,12 +935,7 @@ impl PsdImportWindowState {
                                                             highlight.max_y as f32 * scale,
                                                         ),
                                                 );
-                                                let visible = frame_rect.intersect(
-                                                    egui::Rect::from_min_size(
-                                                        top_left,
-                                                        preview_size * scale,
-                                                    ),
-                                                );
+                                                let visible = frame_rect.intersect(image_rect);
                                                 if visible.is_positive() {
                                                     ui.painter().rect_stroke(
                                                         visible,
@@ -2909,6 +2962,42 @@ fn preview_scale_to_width(source_size: egui::Vec2, available_width: f32) -> f32 
     (available_width / source_size.x).max(0.05)
 }
 
+/// Builds the checkerboard tile uploaded once as a repeating texture: one 2x2-square period,
+/// `CHECKER_TILE_PX` on a side, with [`CHECKER_LIGHT`] in the top-left square.
+fn checker_color_image() -> ColorImage {
+    let side = usize::from(CHECKER_TILE_PX);
+    let square = usize::from(CHECKER_SQUARE_PX);
+    let mut pixels = Vec::with_capacity(side * side);
+    for y in 0..side {
+        for x in 0..side {
+            // The parity of the square index (not of the pixel) picks the colour.
+            let light = (x / square + y / square) % 2 == 0;
+            pixels.push(if light { CHECKER_LIGHT } else { CHECKER_DARK });
+        }
+    }
+    ColorImage::new([side, side], pixels)
+}
+
+/// UV rectangle that tiles the checker texture across a painted area of `painted_size` screen
+/// pixels at exactly one texel per screen pixel.
+///
+/// The rectangle starts at the texture origin, so the pattern is anchored to the painted
+/// area's top-left corner and scrolls with it. Returns `Rect::ZERO` for a degenerate or
+/// non-finite size, which paints nothing.
+fn checker_uv_rect(painted_size: egui::Vec2) -> egui::Rect {
+    if !(painted_size.x.is_finite() && painted_size.y.is_finite())
+        || painted_size.x <= 0.0
+        || painted_size.y <= 0.0
+    {
+        return egui::Rect::ZERO;
+    }
+    let tile = f32::from(CHECKER_TILE_PX);
+    egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(painted_size.x / tile, painted_size.y / tile),
+    )
+}
+
 fn clear_success_status(status: &mut ImportStatus) {
     if matches!(status, ImportStatus::Success(_)) {
         *status = ImportStatus::Idle;
@@ -3877,6 +3966,47 @@ mod tests {
                 image.get_pixel(FIXTURE_WIDTH - 1, FIXTURE_HEIGHT - 1).0,
                 expected,
                 "psb layer {layer_index} pixels survive the 8-byte channel lengths"
+            );
+        }
+    }
+    #[test]
+    fn checker_tile_alternates_by_square_not_by_pixel() {
+        let image = super::checker_color_image();
+        let side = usize::from(super::CHECKER_TILE_PX);
+        assert_eq!(image.size, [side, side], "one full 2x2-square period");
+        let at = |x: usize, y: usize| image.pixels[y * side + x];
+        let square = usize::from(super::CHECKER_SQUARE_PX);
+        // Neighbours inside one square share a colour; crossing the square border flips it.
+        assert_eq!(at(0, 0), super::CHECKER_LIGHT);
+        assert_eq!(at(square - 1, square - 1), super::CHECKER_LIGHT);
+        assert_eq!(at(square, 0), super::CHECKER_DARK);
+        assert_eq!(at(0, square), super::CHECKER_DARK);
+        assert_eq!(at(square, square), super::CHECKER_LIGHT);
+    }
+
+    #[test]
+    fn checker_uv_repeats_once_per_tile_of_screen_pixels() {
+        let tile = f32::from(super::CHECKER_TILE_PX);
+        // Three tiles wide, two and a half tall: the UV rect counts repeats, not pixels.
+        let uv = super::checker_uv_rect(egui::vec2(tile * 3.0, tile * 2.5));
+        assert_eq!(uv.min, egui::Pos2::ZERO, "anchored at the image origin");
+        assert!((uv.width() - 3.0).abs() < f32::EPSILON);
+        assert!((uv.height() - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn checker_uv_is_empty_for_degenerate_sizes() {
+        for size in [
+            egui::vec2(0.0, 100.0),
+            egui::vec2(100.0, 0.0),
+            egui::vec2(-10.0, 10.0),
+            egui::vec2(f32::NAN, 10.0),
+            egui::vec2(10.0, f32::INFINITY),
+        ] {
+            assert_eq!(
+                super::checker_uv_rect(size),
+                egui::Rect::ZERO,
+                "degenerate size {size:?} must paint nothing"
             );
         }
     }
