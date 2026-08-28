@@ -18,7 +18,8 @@ records the directory role and the coverage/cache contract, to avoid duplication
 ## Files and submodules
 See the parent `MODULE_README.md` for the full per-file catalog
 (`facade.rs`, `create_state.rs`, `create_*`, `fonts.rs`, `font_provider.rs`,
-`font_coverage.rs`, `presets_io.rs`, `font_settings_store.rs`, `fonts_data.rs`, ...). Edit
+`font_coverage.rs`, `presets_io.rs`, `font_settings_store.rs`, `fonts_data.rs`,
+`local_presets.rs`, `local_preset_preview.rs`, ...). Edit
 here for panel state/UI, font loading, and coverage; edit `render_next/` for the renderer.
 
 ## Per-font settings persistence (`fonts_data.rs` + `font_settings_store.rs`)
@@ -240,16 +241,31 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   resolution key, never persisted, and never sent to the renderer.
 
 ## Create-preset persistence (`presets_store.rs` + `create_presets.rs`)
-- Create presets live in `fonts/presets.json` — **VERSION 1**, owned by `presets_store.rs`, and
+- Create presets live in `fonts/presets.json` — **VERSION 2**, owned by `presets_store.rs`, and
   NOT in `user_config.json` any more (phase 5 of `dev-docs/font_identity_postscript_plan.md`).
   ```jsonc
-  { "version": 1,
+  { "version": 2,
     "presets": { "ВВД": { "font": "d_CCShoutOut",
-                          "profiles": { "d_CCShoutOut": { "schema": 2, … } } } } }
+                          "profiles": { "d_CCShoutOut": { "schema": 2, … } } },
+                 "Крик": { "identity_mode": "local_preset",
+                           "local_presets": [ { "id": "3f2a…", "name": "Жирный",
+                                                "profile": { "text_params": { … "font": "…" },
+                                                             "effects": [ … ] } } ],
+                           "selected_local_preset": 0 } },
+    // The document-level DEFAULT local set: the one the panel owns while NO global preset
+    // is applied (`dev-docs/local_presets_plan.md` §5).
+    "local_presets": [ { "id": "9c17…", "name": "Обычный", "profile": { … } } ],
+    "selected_local_preset": 0 }
   ```
   `primary_font_key` + `primary_font_path` + `primary_font_label` collapsed into ONE `font` key
   (the identity). Unset fields and empty maps are omitted; preset names and profile keys are
-  `BTreeMap`s so the file is byte-stable across saves.
+  `BTreeMap`s so the file is byte-stable across saves. THE TWO IDENTITY MODES OWN DISJOINT
+  PAYLOADS: a `font`-mode preset carries `font` + `profiles`, a `local_preset`-mode one carries
+  `local_presets` + `selected_local_preset` and no font at all.
+- VERSION 2 IS A GATE, NOT A MIGRATION. A `version: 1` document decodes as v2 with the new
+  fields at their defaults; nothing is rewritten eagerly and nothing is converted. The number
+  was bumped only so an OLDER build REFUSES the document (`PresetsStoreError::NewerVersion`)
+  instead of round-tripping it and dropping every local preset in it.
 - PRESET NAMES ARE USER DATA, stored VERBATIM. Nothing trims or folds them, so `" Рао-кун "`
   and `"Рао-кун"` are two presets; trimming collapsed them in the file's `BTreeMap` and one of
   them disappeared without a word. Only a completely empty name is dropped (it can address no
@@ -286,6 +302,25 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   (additive — theirs is added, ours is kept) and the write is retried ONCE. What was merged in
   comes back as `PresetStoreEvent::MergedFromDisk` and is adopted by the panel, or its next
   snapshot would drop those presets again. A second conflict in a row is reported, not fought.
+  THE DEFAULT LOCAL SET FOLLOWS THE SAME BIAS (`merge_default_local_set`), **RECONCILED BY THE
+  STABLE ID** (`same_local_preset` == `LocalPreset::id` equality):
+  - same id → the SAME logical row, and OURS WINS: we are the newer writer and the user is
+    looking at our version, so the disk version is dropped rather than appended;
+  - an id present only on disk → APPENDED after ours, both sides in user order;
+  - our rows keep their order, so our selection index stays valid.
+
+  The key must not be the name (names repeat and may be empty) and must not be the index (that
+  is the panel's cursor into the list ON SCREEN). Comparing (name, profile), as this did first,
+  made an EDITED row unrecognisable: two instances editing the same logical row produced two
+  different snapshots, neither recognised the other as itself, and every conflicting save
+  appended one more historical version that nothing would ever remove — unbounded growth with
+  no tombstone and no way for the user to tell the versions apart. Letting a non-empty snapshot
+  set SUPERSEDE the disk one, with the loser only logged, was the earlier defect in the same
+  place — the one place in this module where two app instances destroyed each other's data.
+  The accepted asymmetry is `fonts_data`'s: with no tombstone, a row the OTHER instance deleted
+  while we still hold it comes back on our next save. The set is bounded by the number of
+  LOGICAL rows either instance ever had, not by the number of conflicting saves; a row that
+  comes back can be deleted again, one that was destroyed cannot be recovered.
 - SAVING CAPTURES THE SESSION MEMORY ONLY. `save_current_preset` no longer copies the CURRENT
   font's profile into every other loaded font's key — the fan-out that turned 67 real profiles
   into 162 stored ones (87 % of `user_config.json`) and made a preset claim parameters for
@@ -332,6 +367,201 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   again. Measured on the real user config: 524 KB → 10 KB, with `fonts/presets.json` at 127 KB
   (its residue is the profile bodies whose fonts are no longer installed and therefore stay
   schema 1 verbatim).
+
+## Parameter identity mode (`local_presets.rs`)
+
+The create panel has TWO owners for its text parameters and effect chain
+(`dev-docs/local_presets_plan.md`), selected by `ParamIdentityMode` and persisted per panel in
+`user_config.TextTab.param_identity_mode` (`presets_io::load_text_tab_param_identity_mode`;
+an unknown value reads back as `Font`).
+
+- `Font` (the default, and the only mode older builds knew): the parameters belong to the
+  SELECTED FONT. A font switch stores the outgoing font's snapshot and restores the incoming
+  one; the write layer is `DefaultProfileWrite` (below).
+- `LocalPreset`: the parameters belong to the selected LOCAL PRESET (`LocalPreset { name,
+  profile }` — a verbatim name plus a FULL render-data snapshot, FONT INCLUDED). The font is
+  then an ordinary parameter and NOTHING is bound to it: in this mode nothing may read or
+  write `fonts_data.fonts.<identity>.profile` or `font_profiles_by_identity`.
+
+The switch between the two is a LABELLED PAIR OF MUTUALLY EXCLUSIVE CHECKBOXES on one row
+(`create_main_text::draw_param_identity_mode_checkboxes`):
+`Идентичность: [ ] Шрифт  [x] Локальный пресет`. EXACTLY ONE is always checked — clicking the
+unchecked one switches the mode, clicking the checked one does NOTHING — because the panel
+must never end up with neither owner for its parameters. Only a box that became CHECKED
+requests a switch, which is what makes the second click inert. Neither box carries an
+`id_salt` on purpose: `Checkbox` takes its id from `Ui::next_auto_id`, not from the localized
+label, so a live language switch cannot reset it.
+
+ONE DISPATCH POINT. Every parameter edit funnels through
+`local_presets::store_current_params_snapshot`, which routes on TWO axes — the mode and
+whether a GLOBAL preset is applied:
+
+| mode | global preset | destination |
+|---|---|---|
+| `Font` | no | session profile memory + the font's persisted default (`UpdateFontDefault`) |
+| `Font` | yes | session profile memory only (`PresetOnly`) |
+| `LocalPreset` | no | the selected local preset AND the document-level DEFAULT set (debounced) |
+| `LocalPreset` | yes | the selected local preset only; it reaches disk when the global preset is saved |
+
+With NO local preset selected the panel is a scratch pad — the edit is stored nowhere.
+`create_render_data::sync_current_font_profile_memory` is now only a legacy-named alias of the
+dispatch and carries its own removal condition.
+
+THE INDEX IS THE CURSOR, THE ID IS THE IDENTITY — the confusion between the two is what the
+merge defect above was made of.
+- `selected_local_preset` is an INDEX into the list ON SCREEN. It is the panel's selection key
+  and nothing else: it is meaningful only inside that one list, it shifts when a row is
+  deleted, and it is validated against the list length wherever it is read or decoded.
+  Deleting the SELECTED preset clears the selection (the parameters on screen stay, but belong
+  to nobody); deleting one BEFORE it shifts the selection back one step.
+- `LocalPreset::id` is a UUID minted ONCE, persisted in `presets.json`, and carried through
+  rename, parameter edit, save/load, parking/restore and global-preset apply. It is the ONLY
+  key the cross-instance merge may use. Names are user data, stored verbatim, may repeat and
+  may be empty, so a name is not an identity either.
+- A brand-new preset gets a RANDOM (v4) id: two app instances mint ids concurrently with no
+  shared state, so a counter would hand both the same number. A row read from a document
+  written before the field existed gets a DETERMINISTIC (v5) id over a frozen namespace plus
+  its position, verbatim name and snapshot (`panel::legacy_local_preset_id`), so every
+  instance and every load of that document mint THE SAME id; the first save persists it and
+  nothing re-mints afterwards. A random id there would be worse than none — the two instances
+  would disagree on the first merge and append forever. A stored id that is not a UUID costs
+  that ONE row a re-mint (with a warning), never the document, and a duplicate id inside one
+  array is broken by a fresh v4.
+
+THE LIVE-SET INVARIANT (`local_presets::default_local_set_snapshot`), which does NOT mention
+the identity mode: the LIVE set (`local_presets` + `selected_local_preset`) is the selected
+GLOBAL preset's set when one is selected, and the document-level DEFAULT set otherwise.
+- Applying ANY global preset installs THAT preset's set — the EMPTY set of a font-mode preset
+  included — and PARKS the default set in `default_local_set`
+  (`park_default_local_set_for_global_preset`, called before `selected_preset_name` becomes
+  `Some`, from both `apply_preset_by_name` and `save_current_preset`).
+- Deselecting («Нет» → `deselect_global_preset`) restores the live set from that parked copy
+  in BOTH identity modes — ENTRIES AND SELECTION, the selection validated against the restored
+  list. Restoring only the entries dropped the selection, marked the set dirty and PERSISTED
+  `selected_local_preset: null`. In `LocalPreset` mode the restored preset's snapshot is
+  applied too (exactly as `select_local_preset` would), which is what makes the restore the
+  true inverse of the park: restoring the selection WITHOUT its parameters would leave the
+  global preset's parameters on screen owned by a default local preset, and the next keystroke
+  would overwrite it. In `Font` mode nothing is applied and nothing on screen changes — the
+  mode owns the parameters there — and the restored selection is inert until the mode changes
+  (entering `LocalPreset` mode clears it anyway). Nothing is marked dirty: the set comes back
+  exactly as it was parked, so it already matches disk.
+- With no global preset applied `default_local_set` is NOT read and NOT kept in sync: the
+  write snapshot is derived from the live set on demand. Marking the set dirty must therefore
+  copy nothing — it runs on every frame of a slider drag.
+
+A LOCAL PRESET CARRIES ITS PROFILE HASH. `LocalPreset.profile` is private; it is read through
+`profile()` and replaced only through `set_profile()`, which re-computes `profile_hash`
+(`panel::local_preset_profile_hash`). That hash is the preview cache key, read once per drawn
+combo row per frame — deriving it by serializing the JSON on the GUI thread was per-frame
+waste, and the invariant that pays for the field is "the key changes exactly when the rendered
+pixels would".
+
+THE COMBO ROW OF A LOCAL PRESET IS A PICTURE, NOT A `selectable_label`
+(`create_main_text::draw_local_preset_image_row`). A preview is a TRANSPARENT render, so the
+row paints a FLAT GREY behind it and marks a SELECTED row with an OUTLINE — a
+`selectable_label` would lay its opaque blue fill over the picture. The backdrop is ONE OF
+THREE GREYS (`local_preset_preview::PreviewBackdrop`, levels 232 / 128 / 64), not a
+transparency checkerboard: the row exists to show what the preset looks like, and a pattern
+competes with the preset's own colours instead of setting them off.
+
+WHICH GREY IS DECIDED BY CONTRAST, from the preset's own colours, in the user's order of
+priority: THE LAST VISIBLE OUTLINE'S COLOUR FIRST (weight 4), the main text colour second
+(weight 1). `local_preset_preview::choose_preview_backdrop` scores each grey as the pair
+`(W*min(contrast_outline, T) + min(contrast_main, T), W*contrast_outline + contrast_main)`
+compared lexicographically, with `T = BACKDROP_CONTRAST_ENOUGH = 80` and the outline terms
+DROPPED when the preset has no visible outline. The saturation at `T` is the whole point: it
+is what lets the MEDIUM grey win when both extremes are perfect for one colour and invisible
+for the other (white text in a black outline). The outline colour is the LAST matching element
+of the `effects` array (`last_visible_outline_color`) — outline-like kinds are `stroke`,
+`glow_v1`, `glow_v2`, `soft_glow` and their read aliases, never `shadow`, which is an offset
+drop shadow and not a contour — because effects are applied front-to-back and each one
+composites UNDER the source, so the last is the outermost. The main colour comes from the
+DECODED `TextRenderParams::text_color` and NEVER from the raw JSON: schema 2 strips
+`text_color` when it equals the frozen default black. Luminance is the tab's single rule,
+`render_store::shape_variant_luminance` (Rec.709 over white, 0..255) — exposed as a VALUE for
+this, since a three-way choice cannot be made from the two-way
+`use_dark_shape_variant_checkerboard`; the panel must not grow a second luminance rule.
+
+THE BACKDROP DECIDES THE ROW'S WHOLE PALETTE — grey, 1 px border, hover tint and selection
+outline — so neither cue can disappear into a backdrop of its own value: the dark blue is the
+outline of the LIGHT grey, the light blue of the MEDIUM and DARK ones; the hover tint is black
+on the light grey and white on the other two. THE CHOICE IS MADE WHERE THE PROFILE IS DECODED
+(`local_preset_preview::preview_backdrop`, once per REQUESTED render) and is carried on the
+cache SLOT so it survives `Pending` -> `Ready`; the row only reads it, because the row runs
+once per drawn preset per frame and must not parse JSON.
+
+THE POPUP SHOWS AT MOST `LOCAL_PRESET_POPUP_MAX_ROWS` ROWS
+(`create_main_text::local_preset_popup_height`). The height is derived from the LIVE row pitch
+(row height + button padding + item spacing), never from a pixel constant, and is a CAP only
+(`ComboBox::height` -> `ScrollArea::max_height`): a short list is fully visible, a long one
+scrolls after the cap. Without it the popup falls back to egui's `Spacing::combo_height`, which
+is barely three preview rows.
+
+THE POPUP'S ROW COUNT IS PART OF ITS `id_salt`, AND ITS ROWS ARE ALL THE SAME HEIGHT. Both
+halves guard ONE defect: a combo popup is an `Area`, an `Area` remembers its size under a fixed
+id, that size is fed back as the body's `max_rect` every frame and rewritten from the content's
+own `min_size`, and a sizing pass runs only for an id with no stored state — so under a
+constant id the popup's height is MONOTONICALLY NON-INCREASING for the whole session, and
+stored areas are never pruned.
+- The salt carries `create_main_text::local_preset_popup_id_bucket(row_count)`, clamped to
+  `1..=LOCAL_PRESET_POPUP_MAX_ROWS` so that the id changes EXACTLY when the height does. Without
+  it, applying a global preset (which swaps the live local-preset set wholesale, the EMPTY set
+  of a font-mode preset included) and switching back to «Нет» left the popup pinned at the
+  handful of rows it was measured at. The font-group combo already uses the same idiom.
+- Every popup row is `LOCAL_PRESET_ROW_HEIGHT_PT` tall, the image row included: a preview is
+  scaled to the popup width, so its own height varies per preset, and the `Pending` / `Failed`
+  fallback is a selectable BUTTON sized to the same height rather than a bare
+  `selectable_label` (18 pt). The FIRST opening at any row count always happens while the
+  previews are still `Pending`, so a shorter fallback row would pin that count's height ~20 %
+  short, permanently.
+The two TEXT rows (the empty selection, «create») stay plain `selectable_label`s — a text row
+has nothing transparent to show, and their height is bounded by the preset-row pitch the cap is
+computed from.
+
+THE FACE COMBO IS HIDDEN WHEN THE FONT HAS ONE FACE OR NONE
+(`create_main_text::draw_font_section`). Nothing is lost by not drawing it — a one-item
+`selectable_value` cannot move, `cycle_wrapped_index` returns early for `len <= 1`, and the
+write-back would store what it just read — but `clamp_face_index` MUST still run on the hidden
+path, otherwise a `selected_face_idx` inherited from a many-faced font would survive with no
+widget left to reveal it.
+
+A LOCAL PRESET IS NEVER STORED WITHOUT A SNAPSHOT. Under `missing_font` the panel sits on a
+NEIGHBOUR of a font it could not resolve, so `store_current_local_preset_snapshot` refuses to
+write; `create_local_preset` therefore refuses the creation outright and says so through the
+status line, instead of persisting `"profile": null`.
+
+The default set is written through the SAME `presets.json` writer as the global presets, after
+a `LOCAL_PRESETS_SAVE_DEBOUNCE` window closed by the per-frame `tick_local_presets_save`
+(`facade::begin_frame`); the STRUCTURAL operations (create, delete) write immediately, because
+they are one gesture each and there is no burst to coalesce.
+
+THE CLEAN/DIRTY RULE: the default set is clean only once a write actually SUCCEEDED, never
+because a writer was spawned. `local_presets_generation` counts the changes,
+`local_presets_saved_generation` the highest generation a `PresetStoreEvent::Saved` reported,
+and `default_local_set_is_unsaved()` compares them. A `PresetStoreEvent::SaveFailed` re-arms
+the debounce (`rearm_default_local_set_after_failed_save`) — but NOT for a failure
+`PresetsStoreError::is_retryable` calls permanent (persistence disabled for the session, a
+newer on-disk schema, an unserializable snapshot), and not past
+`LOCAL_PRESETS_SAVE_MAX_RETRIES` consecutive attempts; both guards would otherwise spin a
+write-and-log loop every debounce window for the rest of the session. Neither guard loses
+data: the set stays dirty, so the next edit still writes it — and so does
+`flush_pending_local_presets_save`, the app-exit flush `MangaApp::on_exit` calls next to
+`font_admin::flush_pending_saves` (facade → `TypingTabState` → panel), which is what keeps an
+edit made inside the debounce window from dying with the detached writer thread.
+
+THE EXIT FLUSH WRITES SYNCHRONOUSLY ON THE GUI THREAD, AND THAT IS A DELIBERATE TRADE-OFF, not
+an oversight of the "never block the GUI thread" rule (CLAUDE.md §5). It is the same shape the
+PRE-EXISTING `font_admin::flush_pending_saves` has used at `src/app.rs:3421` for `fonts_data.json`,
+and it is bounded in the only sense that matters: no GUI frame follows `on_exit` and no thread
+outlives it, so there is nothing left to keep responsive, and the work is ONE atomic write of
+the same small document the debounced writer would have written. A deadline (write on a thread,
+give up after N ms) does not make this safe — it trades a hang the user can SEE for a silent
+loss of the edit they just made, on exactly the pathological filesystem where the write matters
+most, and it cannot cancel a `write`/`fsync` already in flight anyway. The accepted residual
+risk is a stalled network- or FUSE-backed fonts directory holding the process open at quit;
+`presets.json` lives next to the fonts, so a fonts directory that hangs has already hung the
+session long before this call.
 
 ## Built-in interface font (the bundled `fonts/ui` stack as a selectable font)
 - The panel font list carries ONE synthetic entry (`FontEntry.kind =
@@ -1206,8 +1436,13 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   document, see `doc_store.rs` — and only there; to change what a preset CAPTURES, how it is
   seeded off-thread or how a legacy one is converted, see `create_presets.rs`
   (`save_current_preset`, `read_presets_seed`, `migrate_legacy_presets`).
-- To change WHICH profile layer a parameter edit writes (font default vs. applied preset), see
+- To change WHICH owner a parameter edit is written to, see
+  `local_presets::store_current_params_snapshot` — the one dispatch — and, for the font-mode
+  layer split (font default vs. applied preset),
   `create_render_data::store_current_font_profile_by_idx` and `panel::DefaultProfileWrite`.
+- To change a local-preset operation (create from defaults, select, rename, delete) or the
+  persistence of the default local set, see `local_presets.rs`; for the combo's row previews,
+  see `local_preset_preview.rs`.
 - To change the persisted `text_params` FORMAT (a new key, a default, the version), see
   `text_params_schema.rs` — and only there; the writer is
   `create_render_data::build_render_data_json_with_font`, the reader is

@@ -164,6 +164,7 @@ use egui::{Align, Color32, ColorImage, Id, Rect, TextureHandle, TextureOptions, 
 #[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -203,6 +204,9 @@ const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
 // Per-effect-kind default parameter overrides, keyed by the effect discriminator
 // string (see `effect_defaults::effect_kind_key`); value = the one-card JSON object.
 const TEXT_TAB_EFFECT_DEFAULTS_KEY: &str = "effect_defaults";
+// Parameter-identity mode of the create panel: `"font"` or `"local_preset"`. Any other
+// value (including a missing key) reads back as `ParamIdentityMode::Font`.
+const TEXT_TAB_PARAM_IDENTITY_MODE_KEY: &str = "param_identity_mode";
 const INLINE_TAG_DIM_TEXT_COLOR: Color32 = Color32::from_gray(120);
 const INLINE_TAG_CONTENT_TEXT_COLOR: Color32 = Color32::WHITE;
 mod facade;
@@ -217,6 +221,13 @@ use create_main_text::{
 mod create_advanced;
 mod create_edit;
 mod create_apply;
+// The LOCAL-PRESET identity mode: the ownership dispatch every parameter edit funnels
+// through, the local-preset operations (create/select/rename/delete) and the debounced
+// persistence of the document-level default set (`dev-docs/local_presets_plan.md` §5).
+mod local_presets;
+// Off-GUI-thread renderer of the local-preset combo row previews (owned by the create
+// panel through `TypingCreatePanelState::local_preset_previews`).
+mod local_preset_preview;
 // The SINGLE owner of the persisted `render_data.text_params` schema (version, frozen
 // defaults, write/read). `pub(in crate::tabs::typing)` because the tab-side codec and
 // the PSD export read stored payloads through it too.
@@ -272,6 +283,211 @@ pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults
 // `font_settings_store::…`.
 pub(crate) use font_settings_store::seed_imported_system_fonts_from_config;
 
+/// Who owns the create panel's text parameters and its whole effect chain: the selected
+/// FONT (the historical behaviour) or the selected LOCAL PRESET.
+///
+/// This is a PANEL-LEVEL CONVENIENCE ONLY. It decides one thing — where the next parameter
+/// edit is stored and which snapshot a selection change restores. It does NOT touch the font
+/// RENDER IDENTITY (`FontEntry::render_identity_name`), the `render_next::FontProvider`, the
+/// inline `<font=…>` tags, or anything else the renderer sees: in both modes the rendered
+/// text names exactly the font the user picked.
+///
+/// Persisted per panel in `user_config.TextTab.param_identity_mode` and, per saved global
+/// preset, in `fonts/presets.json`. See `dev-docs/local_presets_plan.md` §§1 and 5 for the
+/// full ownership rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ParamIdentityMode {
+    /// Parameters and effects belong to the SELECTED FONT: switching the font stores the
+    /// outgoing font's snapshot and restores the incoming one. The default, and the only
+    /// mode any build before this feature knew.
+    #[default]
+    Font,
+    /// Parameters and effects belong to the SELECTED LOCAL PRESET; the font is then an
+    /// ordinary parameter of that snapshot, and nothing is bound to the font at all.
+    LocalPreset,
+}
+
+impl ParamIdentityMode {
+    /// Spelling stored in `user_config.TextTab.param_identity_mode` (`dev-docs/local_presets_plan.md`
+    /// §3, D7). The same two words spell the mode inside `fonts/presets.json`, but that
+    /// document encodes it independently (it OMITS the default instead of writing it), so
+    /// the two codecs stay separate on purpose.
+    #[must_use]
+    pub(super) fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Font => "font",
+            Self::LocalPreset => "local_preset",
+        }
+    }
+
+    /// Inverse of [`Self::as_config_str`]. An absent or UNRECOGNISED value falls back to
+    /// [`Self::Font`] — the mode every build understands and the one that owns the
+    /// historical payload. The fallback is silent here because a missing key is the normal
+    /// state of every config written before this feature.
+    #[must_use]
+    pub(super) fn from_config_str(stored: Option<&str>) -> Self {
+        match stored {
+            Some(value) if value == Self::LocalPreset.as_config_str() => Self::LocalPreset,
+            _ => Self::Font,
+        }
+    }
+}
+
+/// One LOCAL PRESET: a stable identity, a user-visible name and the full snapshot it
+/// restores.
+///
+/// **THE INDEX IS THE CURSOR, THE ID IS THE IDENTITY.** The panel SELECTS by index in the
+/// owning ordered `Vec` (`selected_local_preset`, `dev-docs/local_presets_plan.md` §3, D3):
+/// the index answers "which row on screen", and it is meaningful only inside the one list
+/// that is on screen right now. The id ([`LocalPreset::id`]) answers "which logical preset",
+/// across renames, reorderings, saves, loads and app INSTANCES, and it is the only key the
+/// cross-instance merge may use (`presets_store::merge_default_local_set`). Treating the
+/// index as an identity is what let two instances editing the SAME row append each other's
+/// version on every conflicting save, growing the document without bound.
+///
+/// `name` is USER DATA and is kept VERBATIM — never trimmed, folded or deduplicated. Two
+/// local presets may carry the very same name, and an empty name is legal; the name is not
+/// an identity either, which is what makes the name row a plain rename box.
+///
+/// `profile` is a FULL render-data snapshot in exactly the shape
+/// `create_render_data::build_font_profile_json_for_idx` produces —
+/// `{"text_params": {…, "font": <identity>}, "effects": […]}`. Unlike a font profile it
+/// therefore carries the FONT ITSELF, because in local-preset mode the font is just another
+/// parameter of the preset.
+/// The `profile` is reached through [`LocalPreset::profile`] and replaced only through
+/// [`LocalPreset::set_profile`], because it carries a CACHED HASH: `profile_hash` must
+/// equal [`local_preset_profile_hash`] of the snapshot at all times. The hash is the
+/// preview cache key (`local_preset_preview`), which is read once per drawn combo row per
+/// frame — serializing every visible preset's JSON on the GUI thread to derive it was pure
+/// per-frame waste, so it is computed once, where the snapshot is written.
+#[derive(Debug, Clone)]
+pub(super) struct LocalPreset {
+    /// Name shown in the local-preset combo. Verbatim user data (see above).
+    pub(super) name: String,
+    /// Stable identity, minted ONCE at creation and persisted. Private and immutable after
+    /// construction: rename, edit, save, load and global-preset apply all carry it through
+    /// unchanged, which is the whole point of it (see the type doc).
+    id: Uuid,
+    /// Full render-data snapshot, font included. Private: see the type doc.
+    profile: Value,
+    /// [`local_preset_profile_hash`] of `profile`. Maintained by [`LocalPreset::with_id`]
+    /// (which every constructor goes through) and by [`LocalPreset::set_profile`]; never
+    /// written directly.
+    profile_hash: u64,
+}
+
+impl Default for LocalPreset {
+    fn default() -> Self {
+        Self::new(String::new(), Value::Null)
+    }
+}
+
+impl LocalPreset {
+    /// A BRAND-NEW local preset: a freshly minted identity, `name` verbatim and `profile` as
+    /// its snapshot, hashed once.
+    ///
+    /// The id is a random (v4) UUID because two app instances mint ids CONCURRENTLY with no
+    /// shared state — a counter would hand the same number to both. Use
+    /// [`LocalPreset::with_id`] for a preset that already HAS an identity (anything read
+    /// from a document); minting a new one there would defeat the merge.
+    #[must_use]
+    pub(super) fn new(name: String, profile: Value) -> Self {
+        Self::with_id(Uuid::new_v4(), name, profile)
+    }
+
+    /// A local preset carrying an identity it ALREADY has — the decode path
+    /// (`presets_store::decode_local_presets`), which either read the id from the document
+    /// or minted it deterministically with [`legacy_local_preset_id`].
+    #[must_use]
+    pub(super) fn with_id(id: Uuid, name: String, profile: Value) -> Self {
+        let profile_hash = local_preset_profile_hash(&profile);
+        Self {
+            name,
+            id,
+            profile,
+            profile_hash,
+        }
+    }
+
+    /// The stable identity of this preset. THE key of the cross-instance merge; never the
+    /// panel's selection key, which is the index (see the type doc).
+    #[must_use]
+    pub(super) fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// The stored render-data snapshot.
+    #[must_use]
+    pub(super) fn profile(&self) -> &Value {
+        &self.profile
+    }
+
+    /// Hash of the stored snapshot — the preview cache key, valid without re-serializing.
+    #[must_use]
+    pub(super) fn profile_hash(&self) -> u64 {
+        self.profile_hash
+    }
+
+    /// Replaces the snapshot and re-hashes it. THE ONLY write path for `profile`.
+    pub(super) fn set_profile(&mut self, profile: Value) {
+        self.profile_hash = local_preset_profile_hash(&profile);
+        self.profile = profile;
+    }
+}
+
+/// Namespace of the DETERMINISTIC local-preset ids ([`legacy_local_preset_id`]).
+///
+/// A random constant, generated once and frozen: changing it re-mints the id of every row
+/// carried over from a pre-id document, so two builds would disagree about the same row and
+/// the merge defect the id exists to close would re-open. Never edit these bytes.
+const LEGACY_LOCAL_PRESET_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6c, 0x8f, 0x2a, 0x41, 0x9d, 0x3e, 0x4b, 0x77, 0xa1, 0x05, 0xe2, 0x63, 0x8b, 0x4f, 0x91, 0xd0,
+]);
+
+/// The id a local preset gets when it is read from a document written BEFORE the id existed
+/// (or one whose stored id is unusable).
+///
+/// DETERMINISTIC BY CONTRACT: a v5 (namespaced SHA-1) UUID over the row's position in its
+/// array plus its verbatim name and snapshot. Every app instance, and every load of the same
+/// document, therefore mints the SAME id for the same row. A random id here would be worse
+/// than no id at all — the two instances would disagree on the very first merge and append
+/// each other's rows forever, which is exactly the defect the id was introduced to fix.
+///
+/// The consequence of the position being in the mix is that the ids of a legacy document are
+/// pinned to it as it was WRITTEN; the first save by this build persists them, and from then
+/// on nothing re-mints. Rows copied into a global preset by a legacy document deliberately
+/// mint the same ids as the default set's copies: they ARE the same logical rows, and the
+/// two arrays are never merged against each other.
+#[must_use]
+pub(super) fn legacy_local_preset_id(index: usize, name: &str, profile: &Value) -> Uuid {
+    // NUL-separated so a name ending in the separator cannot forge a different row's input.
+    let material = format!(
+        "{index}\u{0}{name}\u{0}{}",
+        serde_json::to_string(profile).unwrap_or_default()
+    );
+    Uuid::new_v5(&LEGACY_LOCAL_PRESET_ID_NAMESPACE, material.as_bytes())
+}
+
+/// 64-bit hash of a local preset's render-data snapshot.
+///
+/// The whole snapshot is folded in — every text parameter AND the whole effect chain — so
+/// the value changes whenever anything the preview renders changes. That is the contract
+/// the preview cache depends on: the key must change exactly when the rendered pixels
+/// would. A snapshot that cannot be serialized (numerically impossible for a value parsed
+/// from JSON) folds in as an empty string, which merely merges two keys and costs one
+/// redundant render.
+///
+/// In-process only: never persisted, never compared across runs.
+#[must_use]
+pub(super) fn local_preset_profile_hash(profile: &Value) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(profile)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
 /// One saved create preset: the font it selects plus the per-font parameter profiles it
 /// restores. Persisted in `fonts/presets.json` (`presets_store`), never in `user_config`.
 ///
@@ -286,10 +502,30 @@ pub(crate) use font_settings_store::seed_imported_system_fonts_from_config;
 /// The profiles here are the preset's OWN overrides; the font's DEFAULT profile lives in
 /// `fonts_data.fonts.<identity>.profile` ("variant A" of the same plan), so presets stay
 /// independent of each other and of what every font remembers on disk.
+///
+/// A preset also remembers the PARAMETER IDENTITY MODE it was saved in and, in
+/// [`ParamIdentityMode::LocalPreset`] mode, its own set of local presets: applying the preset
+/// installs that mode and that set. The two modes own DISJOINT payloads —
+/// `font` + `font_profiles` are the payload of [`ParamIdentityMode::Font`], `local_presets` +
+/// `selected_local_preset` are the payload of [`ParamIdentityMode::LocalPreset`] — and the
+/// unused half is simply left at its default rather than being cleared on every switch.
+///
+/// A preset written BEFORE this feature decodes with `identity_mode: Font`, an EMPTY
+/// `local_presets` and `selected_local_preset: None`; nothing migrates
+/// (`dev-docs/local_presets_plan.md` §6).
 #[derive(Debug, Clone, Default)]
 struct TypingCreatePreset {
     font: String,
     font_profiles: HashMap<String, Value>,
+    /// Which of the two payloads above this preset actually carries.
+    identity_mode: ParamIdentityMode,
+    /// The preset's own local presets, in USER ORDER (the order is meaningful and is never
+    /// sorted). Meaningful only in [`ParamIdentityMode::LocalPreset`] mode.
+    local_presets: Vec<LocalPreset>,
+    /// Index into `local_presets` of the local preset that was selected when the global
+    /// preset was saved, or `None` for "no local preset selected". Validated against the
+    /// length of `local_presets` on read: an out-of-range index decodes to `None`.
+    selected_local_preset: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -311,16 +547,46 @@ enum PresetStoreEvent {
     Seeded {
         /// Presets read from `fonts/presets.json`.
         presets: HashMap<String, TypingCreatePreset>,
+        /// The document-level DEFAULT local set read alongside them (empty when the
+        /// document carries none). It travels with the presets because both halves live in
+        /// the one document and a save writes them together.
+        default_local: presets_store::DefaultLocalSet,
         /// `Some` only when the document was missing or corrupt, i.e. when the one-shot
         /// migration out of `user_config.json` still has to run. An empty vector means
         /// there was nothing to migrate — the legacy-key cleanup still runs.
         legacy: Option<Vec<presets_store::LegacyPresetEntry>>,
     },
-    /// A save found presets another running app instance had written and merged them into
-    /// the document; the panel adopts them so its next snapshot cannot drop them again.
-    MergedFromDisk(HashMap<String, TypingCreatePreset>),
-    /// A save failed. Carries the technical reason for the log line and the status line.
-    SaveFailed(String),
+    /// A save found data another running app instance had written and merged it into the
+    /// document; the panel adopts it so its next snapshot cannot drop it again.
+    MergedFromDisk {
+        /// Presets that were on disk but not in the saved snapshot.
+        presets: HashMap<String, TypingCreatePreset>,
+        /// DEFAULT local presets that were on disk but not in the saved snapshot and were
+        /// APPENDED to it (`presets_store::SaveReport::appended_default_local`). Empty when
+        /// nothing was appended.
+        default_local: Vec<LocalPreset>,
+    },
+    /// A save COMPLETED. The panel marks its DEFAULT local set clean up to the generation
+    /// the written snapshot carried — a set is clean only once a write actually succeeded,
+    /// never merely because a writer was spawned.
+    Saved {
+        /// `TypingCreatePanelState::local_presets_generation` at the moment the snapshot
+        /// was taken. See `local_presets::default_local_set_is_unsaved`.
+        default_local_generation: u64,
+    },
+    /// A save failed. Carries the technical reason for the log line and the status line,
+    /// the generation the lost snapshot carried, and whether re-attempting it could ever
+    /// succeed (`presets_store::PresetsStoreError::is_retryable`).
+    SaveFailed {
+        /// Technical reason, already logged; shown in the panel status line.
+        reason: String,
+        /// Generation of the snapshot that did NOT reach disk.
+        default_local_generation: u64,
+        /// `false` for a failure this build can never recover from on its own (persistence
+        /// disabled for the session, a newer on-disk schema): re-arming the debounce for
+        /// one of those would spin a retry every debounce window forever.
+        retryable: bool,
+    },
 }
 
 /// What kind of evidence resolved a font reference persisted by an OLDER build
@@ -1802,6 +2068,54 @@ struct TypingCreatePanelState {
     preset_store_rx: Receiver<PresetStoreEvent>,
     selected_preset_name: Option<String>,
     preset_name_input: String,
+    /// Who owns the next parameter edit: the selected FONT or the selected LOCAL PRESET.
+    /// Create panel only — the edit panel is constructed with the default [`ParamIdentityMode::Font`]
+    /// and never offers the switch. Persisted in `user_config.TextTab.param_identity_mode`.
+    identity_mode: ParamIdentityMode,
+    /// The LIVE local-preset set: what the local-preset combo lists and what an edit in
+    /// [`ParamIdentityMode::LocalPreset`] mode is stored into.
+    ///
+    /// WHOSE set this is depends on `selected_preset_name`: with no global preset applied it
+    /// is the document-level DEFAULT set (mirrored into `default_local_set` and persisted
+    /// there), with one applied it is that global preset's own set, which reaches disk only
+    /// when the global preset is saved (`dev-docs/local_presets_plan.md` §5).
+    local_presets: Vec<LocalPreset>,
+    /// Index into `local_presets`, or `None` for "nothing selected" — in which case an edit
+    /// in [`ParamIdentityMode::LocalPreset`] mode goes NOWHERE and the panel is a scratch pad.
+    selected_local_preset: Option<usize>,
+    /// Rename box mirror of the selected local preset's name. Verbatim: never trimmed.
+    local_preset_name_input: String,
+    /// The document-level DEFAULT local set while it is PARKED, i.e. while a global preset
+    /// is applied and the live set belongs to that preset.
+    ///
+    /// THE LIVE-SET INVARIANT (`local_presets::default_local_set_snapshot`): the live set is
+    /// the selected global preset's set when one is selected, and the DEFAULT set otherwise.
+    /// So this field is meaningful only while `selected_preset_name.is_some()`; with no
+    /// global preset applied `local_presets` IS the default set and this field is not read.
+    default_local_set: presets_store::DefaultLocalSet,
+    /// Debounce anchor of the default-set save: `Some(first_edit_at)` while a write is owed
+    /// and not yet handed to a writer. Consumed by `local_presets::tick_local_presets_save`,
+    /// which the per-frame `TypingTopPanelState::begin_frame` calls. See
+    /// `LOCAL_PRESETS_SAVE_DEBOUNCE`.
+    local_presets_dirty_since: Option<Instant>,
+    /// Monotonic counter bumped by every change to the DEFAULT local set.
+    ///
+    /// Together with `local_presets_saved_generation` it answers "is the default set on
+    /// disk?" — the anchor above cannot, because it is cleared when a writer is SPAWNED and
+    /// a spawned write may still fail (`PresetStoreEvent::SaveFailed`).
+    local_presets_generation: u64,
+    /// The highest generation a save reported as WRITTEN. `< local_presets_generation` means
+    /// the default set is still owed to disk.
+    local_presets_saved_generation: u64,
+    /// Consecutive automatic retries after a retryable save failure, capped by
+    /// `LOCAL_PRESETS_SAVE_MAX_RETRIES`. Reset by a success and by any new edit; the cap is
+    /// what keeps a permanently failing disk from re-writing (and re-logging) every debounce
+    /// window forever. The data is not lost when the cap is reached: the set stays dirty and
+    /// the next edit — or the app-exit flush — writes it.
+    local_presets_save_retries: u8,
+    /// Rendered row previews of the local-preset combo. Owns its own worker thread and
+    /// texture cache; must be `clear()`ed whenever `font_provider` is replaced.
+    local_preset_previews: local_preset_preview::LocalPresetPreviewCache,
     formula_presets_by_name: HashMap<String, TypingFormulaPreset>,
     selected_formula_preset_name: Option<String>,
     formula_preset_name_input: String,

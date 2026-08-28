@@ -157,7 +157,10 @@ use codec::*;
 pub(in crate::tabs::typing) use codec::decode_vector_mesh_warp;
 mod mesh_geometry;
 use mesh_geometry::*;
-mod render_store;
+// The transparency checkerboard and its light/dark luminance rule live here and are
+// the project's ONLY ones, so the sibling `panel` module reaches them directly (as it
+// already does for `codec`) instead of growing a second copy.
+pub(in crate::tabs::typing) mod render_store;
 use render_store::*;
 mod create_upload;
 mod doc_layers;
@@ -830,6 +833,17 @@ impl TypingTabState {
     #[must_use]
     pub fn centering_assist_enabled(&self) -> bool {
         self.top_panel.centering_assist_enabled()
+    }
+
+    /// Writes a still-owed DEFAULT local-preset set immediately, on the calling thread.
+    /// Returns whether there was anything to flush.
+    ///
+    /// Called from `MangaApp::on_exit` next to `font_admin::flush_pending_saves`, and for the
+    /// same reason: the create panel persists its local presets through a multi-second
+    /// debounce, and the debounced writer is a detached thread that dies with the process.
+    /// A no-op when nothing is owed, which is the normal case.
+    pub fn flush_pending_local_presets_save(&mut self) -> bool {
+        self.top_panel.flush_pending_local_presets_save()
     }
 
     /// Current "Показывать центр" toggle, read on exit to persist to `user_config`.

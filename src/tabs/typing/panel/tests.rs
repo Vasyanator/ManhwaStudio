@@ -977,6 +977,7 @@ paths change.
         TypingCreatePreset {
             font: primary.to_string(),
             font_profiles,
+            ..TypingCreatePreset::default()
         }
     }
 
@@ -1398,6 +1399,7 @@ paths change.
             .preset_store_tx
             .send(PresetStoreEvent::Seeded {
                 presets: HashMap::new(),
+                default_local: presets_store::DefaultLocalSet::default(),
                 legacy: Some(legacy),
             })
             .expect("the receiving end lives in the panel");
@@ -1606,8 +1608,12 @@ paths change.
 
         create_presets::run_presets_save(
             &blocked,
-            &presets,
+            &presets_store::StoredDocument {
+                presets,
+                default_local: presets_store::DefaultLocalSet::default(),
+            },
             presets_store::next_save_ticket(),
+            0,
             // No config cleanup: a failed save must not reach it, and a test must never
             // touch the real `user_config.json`.
             None,
@@ -1650,10 +1656,15 @@ paths change.
         // 1. A save that FAILS leaves the legacy keys exactly where they are.
         let blocked = dir.join("blocked");
         fs::write(&blocked, "not a directory").expect("seed blocker file");
+        let document = presets_store::StoredDocument {
+            presets,
+            default_local: presets_store::DefaultLocalSet::default(),
+        };
         create_presets::run_presets_save(
             &blocked,
-            &presets,
+            &document,
             presets_store::next_save_ticket(),
+            0,
             Some(&config),
             &state.preset_store_tx,
         );
@@ -1668,8 +1679,9 @@ paths change.
         // 2. A save that SUCCEEDS writes the document durably and only then cleans up.
         create_presets::run_presets_save(
             &dir,
-            &presets,
+            &document,
             presets_store::next_save_ticket(),
+            0,
             Some(&config),
             &state.preset_store_tx,
         );
@@ -1700,6 +1712,10 @@ paths change.
         let mut stored = HashMap::new();
         stored.insert("Сохранённый".to_string(), preset_named("Beta-Regular", HashMap::new()));
         stored.insert("С диска".to_string(), preset_named("Gamma-Regular", HashMap::new()));
+        let stored = presets_store::StoredDocument {
+            presets: stored,
+            default_local: presets_store::DefaultLocalSet::default(),
+        };
         presets_store::save(&dir, &stored, presets_store::next_save_ticket()).expect("seed file");
 
         let mut state = TypingCreatePanelState::new(false);
@@ -1789,7 +1805,10 @@ paths change.
 
         state
             .preset_store_tx
-            .send(PresetStoreEvent::MergedFromDisk(merged))
+            .send(PresetStoreEvent::MergedFromDisk {
+                presets: merged,
+                default_local: Vec::new(),
+            })
             .expect("the panel owns the receiver");
         state.poll_preset_store_events();
 

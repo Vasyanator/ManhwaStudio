@@ -7,7 +7,7 @@ one-shot migration that moved it out of `user_config.json`
 (`dev-docs/font_identity_postscript_plan.md`, phase 5).
 
 Main responsibilities:
-- define the versioned schema (`version: 1`) and its serde mirror;
+- define the versioned schema (`version: 2`) and its serde mirror;
 - load the document as a typed `LoadOutcome` (`Missing` / `Loaded` / `Invalid`) so a corrupt
   file is never silently degraded to empty (which the next save would then overwrite);
 - quarantine a corrupt document to `presets.json.bad` (rename, else copy), and DISABLE saving
@@ -24,10 +24,14 @@ Main responsibilities:
   `fonts_data.json` demonstrably holds that list.
 
 Key types:
-- `StoredPresets` (name -> `TypingCreatePreset`, the decoded document)
-- `LoadOutcome` (Missing / Loaded { presets, fingerprint } / Invalid)
+- `StoredDocument` (the whole decoded document: the presets plus the DEFAULT local set)
+- `StoredPresets` (name -> `TypingCreatePreset`, the preset map of that document)
+- `DefaultLocalSet` (the document's default local presets + the selected index)
+- `LoadOutcome` (Missing / Loaded { document, fingerprint } / Invalid)
 - `LegacyCreatePreset` (one preset exactly as an older build stored it)
-- `SaveReport` (what a successful save merged in from another app instance)
+- `SaveReport` (what a successful save merged in from another app instance: its presets, and
+  the DEFAULT local presets appended to this snapshot — both halves merge ADDITIVELY, nothing
+  on disk is ever superseded)
 - `QuarantineOutcome` (what happened to a corrupt document: moved / copied / failed)
 - `PresetsStoreError` (typed save failure: directory, serialization, write, version,
   persistence disabled, conflict)
@@ -44,6 +48,24 @@ duplicated here: they belong to `doc_store`, shared with `fonts_data`. The RESOL
 legacy font references to identities is deliberately NOT here either: it needs the panel's
 font list and lives in `create_presets::migrate_legacy_presets`.
 
+SCHEMA 2 added the second PARAMETER IDENTITY MODE (`dev-docs/local_presets_plan.md` §6):
+each preset may carry `identity_mode` + `local_presets` + `selected_local_preset`, and the
+document carries the same pair at top level as the DEFAULT local set. A `version: 1`
+document decodes as v2 with those fields at their defaults — NOTHING migrates and nothing is
+rewritten eagerly. The version was still bumped so an OLDER build refuses the document
+(`PresetsStoreError::NewerVersion`) instead of silently dropping every local preset in it.
+
+LOCAL PRESETS ARE ORDERED AND SELECTED BY INDEX, but IDENTIFIED BY A STABLE ID: the array
+order is user data and is never sorted, names may repeat and may be empty, and
+`selected_local_preset` is an index that is VALIDATED against the array length on read (out
+of range -> `None`). Every row carries an `id` (`LocalPreset::id`) that is minted once and
+persisted; a row from a document written before that field existed is given a DETERMINISTIC
+id on read (`decode_local_preset_id` -> `legacy_local_preset_id`), so every instance agrees
+on it. The two-instance merge of the DEFAULT set reconciles BY ID — same id means the same
+logical row and OURS wins, an id seen only on disk is APPENDED (`merge_default_local_set`).
+It never lets one instance's set supersede the other's, and it can no longer accumulate one
+row per conflicting save the way the old (name, profile) key did.
+
 PRESET NAMES ARE USER DATA AND ARE STORED VERBATIM. Nothing here trims, folds or otherwise
 edits a name: `" Рао-кун "` and `"Рао-кун"` are two different presets, and silently
 collapsing them (which trimming did) destroyed one of them without a word.
@@ -53,8 +75,9 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Current on-disk schema version of `fonts/presets.json`.
-pub(super) const PRESETS_VERSION: u32 = 1;
+/// Current on-disk schema version of `fonts/presets.json`. Bumped to 2 by the local-preset
+/// feature so an older build refuses the document instead of dropping its local presets.
+pub(super) const PRESETS_VERSION: u32 = 2;
 
 /// File name of the create-preset document inside the app fonts directory.
 const PRESETS_FILE_NAME: &str = "presets.json";
@@ -67,8 +90,41 @@ const LEGACY_CREATE_PRESETS_KEY: &str = "create_presets";
 /// migrated preset map so the config stops carrying it forever.
 const LEGACY_USE_SYSTEM_FONTS_KEY: &str = "use_system_fonts";
 
-/// Decoded document: preset name -> the preset itself.
+/// On-disk spelling of [`ParamIdentityMode::LocalPreset`]. The `Font` mode has no spelling
+/// at all: it is the default and is OMITTED from the document.
+const IDENTITY_MODE_LOCAL_PRESET: &str = "local_preset";
+
+/// On-disk spelling of [`ParamIdentityMode::Font`]. Never written (the default is omitted),
+/// but accepted on read, because an explicit `"font"` is the obvious hand edit.
+const IDENTITY_MODE_FONT: &str = "font";
+
+/// Decoded preset map of the document: preset name -> the preset itself.
 pub(super) type StoredPresets = HashMap<String, TypingCreatePreset>;
+
+/// The DEFAULT local-preset set of the document: the set that owns the panel's edits while
+/// the panel is in [`ParamIdentityMode::LocalPreset`] mode and NO global preset is applied
+/// (`dev-docs/local_presets_plan.md` §5).
+///
+/// The order of `local_presets` is USER DATA and is never sorted; `selected_local_preset`
+/// indexes into it and is validated against its length on read.
+#[derive(Debug, Clone, Default)]
+pub(super) struct DefaultLocalSet {
+    /// The local presets themselves, in user order.
+    pub(super) local_presets: Vec<LocalPreset>,
+    /// Index of the selected local preset, or `None` for "nothing selected".
+    pub(super) selected_local_preset: Option<usize>,
+}
+
+/// The whole decoded `presets.json`: the named global presets plus the document-level
+/// default local set. This is what [`load_outcome`] returns and what [`save`] writes; the
+/// two halves live in ONE document, so they are loaded, merged and written as one unit.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StoredDocument {
+    /// Global presets by name.
+    pub(super) presets: StoredPresets,
+    /// The default local set (see [`DefaultLocalSet`]).
+    pub(super) default_local: DefaultLocalSet,
+}
 
 /// One preset as stored on disk. Unset fields are omitted so the document stays minimal
 /// (the "JSON slimming" rule of the identity plan).
@@ -84,6 +140,42 @@ struct PresetFileEntry {
     /// ("variant A" of `dev-docs/font_identity_postscript_plan.md`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, Value>,
+    /// Parameter identity mode this preset was saved in, as the on-disk string. `None` —
+    /// the omitted default — means [`ParamIdentityMode::Font`], which is also what an
+    /// unrecognised string decodes to (with a warning naming it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_mode: Option<String>,
+    /// The preset's OWN local presets, in user order. Payload of the local-preset mode,
+    /// omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_presets: Vec<LocalPresetFileEntry>,
+    /// Index into `local_presets`; omitted when nothing was selected, and decoded as
+    /// `None` when it does not address an existing entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_local_preset: Option<usize>,
+}
+
+/// One local preset as stored on disk: a VERBATIM name plus a full render-data snapshot.
+///
+/// Both fields are omitted when they carry nothing (an empty name, a null profile), by the
+/// same document-slimming rule as everything else here; both decode back to the same value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LocalPresetFileEntry {
+    /// STABLE IDENTITY of the row ([`LocalPreset::id`]), as a hyphenated UUID. Always
+    /// written by this build; absent in a document written before the field existed, and
+    /// then re-minted DETERMINISTICALLY on read ([`decode_local_preset_id`]).
+    ///
+    /// Typed as a `String`, not a `Uuid`, on purpose: a hand-edited or truncated value must
+    /// cost this ONE row a re-mint, not fail the whole document into `Invalid` and have the
+    /// user's presets quarantined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    /// User-visible name, stored byte for byte — never trimmed, folded or deduplicated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    name: String,
+    /// Full render-data snapshot (`{"text_params": {…, "font": …}, "effects": […]}`).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    profile: Value,
 }
 
 /// Serde mirror of the whole `presets.json` document. Every field has a serde default so a
@@ -97,6 +189,14 @@ struct PresetsFile {
     /// Presets by name. `BTreeMap` so the file is byte-stable across saves.
     #[serde(default)]
     presets: BTreeMap<String, PresetFileEntry>,
+    /// The DEFAULT local set of the document, in user order; omitted when empty. NOT keyed
+    /// and NOT sorted — see [`DefaultLocalSet`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_presets: Vec<LocalPresetFileEntry>,
+    /// Index into the top-level `local_presets`; omitted when absent, decoded as `None`
+    /// when out of range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_local_preset: Option<usize>,
 }
 
 /// Result of reading `presets.json`, mirroring `fonts_data::LoadOutcome`.
@@ -109,8 +209,8 @@ pub(super) enum LoadOutcome {
     Missing,
     /// Successfully parsed document.
     Loaded {
-        /// The decoded presets.
-        presets: StoredPresets,
+        /// The decoded document: the presets AND the default local set.
+        document: StoredDocument,
         /// Fingerprint of the exact bytes read — this reader's optimistic-concurrency
         /// baseline for its first save.
         fingerprint: doc_store::DocumentFingerprint,
@@ -147,6 +247,12 @@ pub(super) struct SaveReport {
     /// them. They are already part of the document that was just written; the caller adopts
     /// them into its own state so its next snapshot does not drop them again.
     pub(super) merged_from_disk: StoredPresets,
+    /// DEFAULT local presets that were on disk but not in the saved snapshot, in the order
+    /// they were APPENDED to it (see the merge rule in [`save`]). Empty when the on-disk set
+    /// held nothing this snapshot did not already carry. Like `merged_from_disk`, they are
+    /// already part of the document that was just written and the caller must take them
+    /// over, or its next snapshot would drop them again.
+    pub(super) appended_default_local: Vec<LocalPreset>,
 }
 
 /// Typed failure of a `presets.json` save. Every variant names the file it was working on
@@ -176,7 +282,7 @@ pub(super) enum PresetsStoreError {
     /// The atomic write itself failed; see [`doc_store::AtomicWriteError`].
     Write(doc_store::AtomicWriteError),
     /// The document on disk declares a schema version this build does not understand.
-    /// Rewriting it as v1 would silently drop every field that version added.
+    /// Rewriting it as v2 would silently drop every field that newer version added.
     NewerVersion {
         /// The version the on-disk document declares.
         found: u32,
@@ -195,6 +301,36 @@ pub(super) enum PresetsStoreError {
         /// Whether the on-disk document could be parsed at all.
         parsable: bool,
     },
+}
+
+impl PresetsStoreError {
+    /// Whether re-attempting the very same save could ever succeed.
+    ///
+    /// The debounced DEFAULT-local-set writer re-arms itself only on a retryable failure
+    /// (`local_presets::rearm_default_local_set_after_failed_save`): re-arming on a
+    /// permanent one would rewrite, fail and re-log every debounce window for the rest of
+    /// the session without ever getting the data to disk.
+    ///
+    /// PERMANENT: [`Self::PersistenceDisabled`] (the only copy of the document is corrupt
+    /// and could not be moved aside — nothing may be written to that path for the rest of
+    /// the session), [`Self::NewerVersion`] (this build can never write a document whose
+    /// schema it does not understand) and [`Self::Serialize`] (the same snapshot would fail
+    /// to serialize again).
+    ///
+    /// RETRYABLE: everything environmental — the directory, the read-back, the write itself,
+    /// and a conflict with another app instance.
+    #[must_use]
+    pub(super) fn is_retryable(&self) -> bool {
+        match self {
+            Self::CreateDir { .. }
+            | Self::ReadExisting { .. }
+            | Self::Write(_)
+            | Self::Conflict { .. } => true,
+            Self::Serialize { .. }
+            | Self::NewerVersion { .. }
+            | Self::PersistenceDisabled { .. } => false,
+        }
+    }
 }
 
 impl std::fmt::Display for PresetsStoreError {
@@ -284,7 +420,7 @@ fn load_outcome_from_file(path: &Path) -> LoadOutcome {
         ));
     }
     LoadOutcome::Loaded {
-        presets: decode(file),
+        document: decode(file),
         fingerprint: doc_store::fingerprint(&raw),
     }
 }
@@ -364,30 +500,158 @@ pub(super) fn quarantine_bad_file(fonts_dir: &Path) -> QuarantineOutcome {
 
 /// Converts the serde mirror into the decoded runtime form.
 ///
-/// Names are taken VERBATIM (see the file header). Only a completely empty name is dropped:
-/// it can address no preset in the combo and the user cannot have typed it.
-fn decode(file: PresetsFile) -> StoredPresets {
-    file.presets
+/// Names are taken VERBATIM (see the file header). Only a completely empty PRESET name is
+/// dropped: it can address no preset in the combo and the user cannot have typed it. Local
+/// preset names are NOT subject to that rule — they are addressed by index, so an empty one
+/// is perfectly usable.
+///
+/// A `version: 1` document simply has none of the local-preset keys, so it decodes with
+/// [`ParamIdentityMode::Font`], an empty set and no selection: the migration is the absence
+/// of one.
+fn decode(file: PresetsFile) -> StoredDocument {
+    let presets = file
+        .presets
         .into_iter()
         .filter(|(name, _)| !name.is_empty())
         .map(|(name, entry)| {
+            let local_presets = decode_local_presets(entry.local_presets);
+            let selected_local_preset = validate_selection(
+                entry.selected_local_preset,
+                local_presets.len(),
+                &format!("preset '{name}'"),
+            );
             (
                 name,
                 TypingCreatePreset {
                     font: entry.font,
                     font_profiles: entry.profiles.into_iter().collect(),
+                    identity_mode: decode_identity_mode(entry.identity_mode.as_deref()),
+                    local_presets,
+                    selected_local_preset,
                 },
             )
+        })
+        .collect();
+    let local_presets = decode_local_presets(file.local_presets);
+    let selected_local_preset = validate_selection(
+        file.selected_local_preset,
+        local_presets.len(),
+        "the default local set",
+    );
+    StoredDocument {
+        presets,
+        default_local: DefaultLocalSet {
+            local_presets,
+            selected_local_preset,
+        },
+    }
+}
+
+/// Decodes one stored parameter identity mode.
+///
+/// An ABSENT value is the omitted default, [`ParamIdentityMode::Font`]. An UNRECOGNISED
+/// string also decodes to `Font` — the safe half, since it owns the payload every build
+/// understands — but is LOGGED with the offending value, because it is either a hand edit or
+/// a document from a build this one does not know.
+fn decode_identity_mode(stored: Option<&str>) -> ParamIdentityMode {
+    match stored {
+        None | Some(IDENTITY_MODE_FONT) => ParamIdentityMode::Font,
+        Some(IDENTITY_MODE_LOCAL_PRESET) => ParamIdentityMode::LocalPreset,
+        Some(unknown) => {
+            crate::runtime_log::log_warn(format!(
+                "typing presets: unknown identity_mode '{unknown}' in presets.json; falling \
+                 back to '{IDENTITY_MODE_FONT}' (the font owns the parameters)."
+            ));
+            ParamIdentityMode::Font
+        }
+    }
+}
+
+/// Decodes an ORDERED array of local presets, preserving the stored order exactly — the
+/// order is user data and the index into it is the panel's SELECTION key.
+///
+/// Each row keeps (or is given) its STABLE ID, which is what the cross-instance merge
+/// reconciles by; see [`decode_local_preset_id`] for where an id comes from when the
+/// document has none, and [`merge_default_local_set`] for what it is used for.
+///
+/// IDS ARE UNIQUE WITHIN THE ARRAY. A document that repeats one (only reachable by hand
+/// editing, or by copying a row inside the file) would make the merge treat two rows as one;
+/// the duplicate is given a fresh identity instead, with a warning.
+fn decode_local_presets(stored: Vec<LocalPresetFileEntry>) -> Vec<LocalPreset> {
+    let mut seen: HashSet<Uuid> = HashSet::with_capacity(stored.len());
+    stored
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut id = decode_local_preset_id(index, &entry);
+            if !seen.insert(id) {
+                crate::runtime_log::log_warn(format!(
+                    "typing presets: local preset #{index} ('{}') repeats the id {id} of an \
+                     earlier entry; giving it a fresh one so the two stay distinct.",
+                    entry.name
+                ));
+                id = Uuid::new_v4();
+                seen.insert(id);
+            }
+            LocalPreset::with_id(id, entry.name, entry.profile)
         })
         .collect()
 }
 
+/// The stable id of ONE stored local preset: the one in the document, or a deterministic
+/// mint when the document has none.
+///
+/// A document written before the id existed carries no `id` at all, and a hand-edited one
+/// may carry something that is not a UUID. Both mint through
+/// [`legacy_local_preset_id`], which is a pure function of the row's position and content —
+/// so a second app instance loading THE SAME document mints THE SAME id and the merge still
+/// recognises the row. Anything non-deterministic here (a random id, a timestamp) would put
+/// the unbounded-growth defect straight back.
+fn decode_local_preset_id(index: usize, entry: &LocalPresetFileEntry) -> Uuid {
+    match entry.id.as_deref() {
+        Some(stored) => match Uuid::parse_str(stored) {
+            Ok(id) => id,
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "typing presets: local preset #{index} ('{}') carries the unusable id \
+                     '{stored}' ({err}); minting the deterministic legacy id instead.",
+                    entry.name
+                ));
+                legacy_local_preset_id(index, &entry.name, &entry.profile)
+            }
+        },
+        None => legacy_local_preset_id(index, &entry.name, &entry.profile),
+    }
+}
+
+/// Validates a stored `selected_local_preset` against the length of the list it indexes.
+///
+/// Returns `None` for an absent or OUT-OF-RANGE index, so no caller can ever index a list
+/// with it. `owner` names the place for the log line ("preset 'X'" / "the default local
+/// set"); an out-of-range index is a data anomaly and is logged rather than swallowed.
+fn validate_selection(stored: Option<usize>, len: usize, owner: &str) -> Option<usize> {
+    let selected = stored?;
+    if selected < len {
+        return Some(selected);
+    }
+    crate::runtime_log::log_warn(format!(
+        "typing presets: selected_local_preset {selected} of {owner} addresses no entry \
+         ({len} local preset(s) stored); treating it as no selection."
+    ));
+    None
+}
+
 /// Converts the decoded runtime form into the serde mirror, stamping the current version.
 /// Names are written VERBATIM; a preset with a completely empty name is dropped.
-fn encode(presets: &StoredPresets) -> PresetsFile {
+///
+/// Everything the local-preset feature added is OMITTED when it carries nothing, so a
+/// document that uses only the font mode is byte-identical to what schema 1 wrote apart from
+/// the version number.
+fn encode(document: &StoredDocument) -> PresetsFile {
     PresetsFile {
         version: PRESETS_VERSION,
-        presets: presets
+        presets: document
+            .presets
             .iter()
             .filter(|(name, _)| !name.is_empty())
             .map(|(name, preset)| {
@@ -400,11 +664,38 @@ fn encode(presets: &StoredPresets) -> PresetsFile {
                             .iter()
                             .map(|(key, profile)| (key.clone(), profile.clone()))
                             .collect(),
+                        identity_mode: encode_identity_mode(preset.identity_mode),
+                        local_presets: encode_local_presets(&preset.local_presets),
+                        selected_local_preset: preset.selected_local_preset,
                     },
                 )
             })
             .collect(),
+        local_presets: encode_local_presets(&document.default_local.local_presets),
+        selected_local_preset: document.default_local.selected_local_preset,
     }
+}
+
+/// On-disk spelling of a parameter identity mode, or `None` for the default that is OMITTED.
+fn encode_identity_mode(mode: ParamIdentityMode) -> Option<String> {
+    match mode {
+        ParamIdentityMode::Font => None,
+        ParamIdentityMode::LocalPreset => Some(IDENTITY_MODE_LOCAL_PRESET.to_string()),
+    }
+}
+
+/// Encodes local presets in ORDER; the array order is user data and is never sorted. The
+/// stable id is ALWAYS written — a row that reached this build without one has already been
+/// given a deterministic id on read, and persisting it is what stops it being re-minted.
+fn encode_local_presets(local_presets: &[LocalPreset]) -> Vec<LocalPresetFileEntry> {
+    local_presets
+        .iter()
+        .map(|preset| LocalPresetFileEntry {
+            id: Some(preset.id().to_string()),
+            name: preset.name.clone(),
+            profile: preset.profile().clone(),
+        })
+        .collect()
 }
 
 /// Per-target-file writer state: the newest snapshot already written and what this process
@@ -475,7 +766,7 @@ fn block_persistence(fonts_dir: &Path) {
     state.entry(path).or_default().blocked = true;
 }
 
-/// Atomically writes a full snapshot of `presets` to `fonts/presets.json`, creating the
+/// Atomically writes a full snapshot of `document` to `fonts/presets.json`, creating the
 /// fonts directory if it does not yet exist.
 ///
 /// `ticket` comes from [`next_save_ticket`], taken where the snapshot was made: a snapshot
@@ -490,6 +781,10 @@ fn block_persistence(fonts_dir: &Path) {
 /// the write is retried once. What was merged in comes back in [`SaveReport`] so the caller
 /// can adopt it; otherwise its next snapshot would drop those presets again.
 ///
+/// MERGING THE DEFAULT LOCAL SET follows the same additive bias — see
+/// [`merge_default_local_set`] for the rule and for what stands in for the missing merge
+/// key.
+///
 /// DURABILITY. The containing directory is fsynced before this returns
 /// ([`doc_store::Durability::ContentsAndDirectory`]), because the caller DELETES the presets
 /// from `user_config.json` once this succeeded: without the directory flush a power loss in
@@ -502,7 +797,7 @@ fn block_persistence(fonts_dir: &Path) {
 /// the user just saved is otherwise lost without a word.
 pub(super) fn save(
     fonts_dir: &Path,
-    presets: &StoredPresets,
+    document: &StoredDocument,
     ticket: u64,
 ) -> Result<SaveReport, PresetsStoreError> {
     let path = data_path(fonts_dir);
@@ -527,7 +822,7 @@ pub(super) fn save(
         });
     }
 
-    let mut snapshot = presets.clone();
+    let mut snapshot = document.clone();
     let mut report = SaveReport::default();
     // Two attempts: the first may discover another instance's document, which is merged in;
     // the second writes the merged result. A conflict on the retry means the other instance
@@ -542,13 +837,14 @@ pub(super) fn save(
                 let (Some(disk), 0) = (disk, attempt) else {
                     return Err(PresetsStoreError::Conflict { path, parsable });
                 };
-                for (name, preset) in disk {
+                for (name, preset) in disk.presets {
                     // Ours wins a name clash: this snapshot is what the user has on screen.
-                    if !snapshot.contains_key(&name) {
-                        snapshot.insert(name.clone(), preset.clone());
+                    if !snapshot.presets.contains_key(&name) {
+                        snapshot.presets.insert(name.clone(), preset.clone());
                         report.merged_from_disk.insert(name, preset);
                     }
                 }
+                merge_default_local_set(&path, &mut snapshot, disk.default_local, &mut report);
                 crate::runtime_log::log_info(format!(
                     "typing presets: {} changed under us (another app instance); merged {} \
                      preset(s) from disk and retrying the save.",
@@ -570,6 +866,95 @@ pub(super) fn save(
     })
 }
 
+/// Reconciles the DEFAULT local set of a pending snapshot with the one another app instance
+/// left on disk.
+///
+/// THE MERGE IS ADDITIVE, exactly like the preset half above and like `fonts_data`: an entry
+/// present on disk but not in this snapshot is APPENDED to it, ours first, both sides in
+/// user order. Nothing on disk is ever dropped — two app instances editing their own default
+/// sets used to silently overwrite each other, with the loser only logged.
+///
+/// THE COMPARISON KEY IS THE STABLE ID ([`LocalPreset::id`]) AND NOTHING ELSE. Neither the
+/// name nor the index is an identity — names may repeat or be empty
+/// (`dev-docs/local_presets_plan.md` §3, D3) and the index is only the panel's cursor into
+/// the list on screen. The rule is therefore:
+/// - **same id → the same logical row, and OURS WINS.** We are the newer writer and the user
+///   is looking at our version, so the disk version is dropped, not appended;
+/// - **an id only on disk → APPENDED**, after ours, in disk order;
+/// - **our rows keep their order**, so our selection index stays valid.
+///
+/// Comparing (name, profile) instead — which is what this did before — is what made the set
+/// grow WITHOUT BOUND: two instances editing the same logical row produce two different
+/// snapshots, neither recognises the other as itself, and every conflicting save appends one
+/// more historical version that nothing will ever remove.
+///
+/// THE SELECTION INDEX STAYS OURS: it points into the live set the user is looking at, and
+/// appending at the END cannot invalidate it. The only exception is a snapshot with NO local
+/// presets at all, which has no selection to keep and takes the disk set whole.
+///
+/// THE ACCEPTED ASYMMETRY, the same one `fonts_data`'s merge carries: with no tombstone, a row
+/// the OTHER instance deleted while we still hold it comes back on our next save. That is the
+/// deliberate "never destroy the last clue" bias — the set is now bounded by the number of
+/// LOGICAL rows either instance ever had, not by the number of conflicting saves, and a row
+/// that returns can be deleted again, while one that was destroyed cannot be recovered.
+///
+/// Appending into `snapshot` and reporting in `report` happen together: the appended entries
+/// are about to be written, so the caller must take them over as well.
+fn merge_default_local_set(
+    path: &Path,
+    snapshot: &mut StoredDocument,
+    disk: DefaultLocalSet,
+    report: &mut SaveReport,
+) {
+    if disk.local_presets.is_empty() {
+        return;
+    }
+    if snapshot.default_local.local_presets.is_empty() {
+        // The whole set, selection included: an empty snapshot has nothing of its own to
+        // preserve, and this is the case the additive rule exists for — a panel that never
+        // entered local-preset mode would otherwise erase the set on its first save.
+        report.appended_default_local = disk.local_presets.clone();
+        snapshot.default_local = disk;
+        return;
+    }
+    let appended: Vec<LocalPreset> = disk
+        .local_presets
+        .into_iter()
+        .filter(|theirs| {
+            !snapshot
+                .default_local
+                .local_presets
+                .iter()
+                .any(|ours| same_local_preset(ours, theirs))
+        })
+        .collect();
+    if appended.is_empty() {
+        return;
+    }
+    crate::runtime_log::log_info(format!(
+        "typing presets: {} carried {} default local preset(s) this panel does not have \
+         (another app instance wrote them); appending them after the {} on screen rather \
+         than superseding them.",
+        path.display(),
+        appended.len(),
+        snapshot.default_local.local_presets.len()
+    ));
+    snapshot
+        .default_local
+        .local_presets
+        .extend(appended.iter().cloned());
+    report.appended_default_local = appended;
+}
+
+/// Whether two local presets are the SAME LOGICAL ENTRY: same stable id. Their names and
+/// snapshots may well differ — that is the normal case of two instances having edited the
+/// same row, and it is precisely what must NOT produce two rows. See
+/// [`merge_default_local_set`].
+#[must_use]
+pub(super) fn same_local_preset(a: &LocalPreset, b: &LocalPreset) -> bool {
+    a.id() == b.id()
+}
+
 /// What [`inspect_existing`] found in front of a pending write.
 #[derive(Debug)]
 enum ExistingState {
@@ -579,7 +964,7 @@ enum ExistingState {
     Conflict {
         /// The freshly parsed on-disk document, or `None` when it cannot be parsed at all
         /// (then it must not be overwritten: it is the only copy of whatever it holds).
-        disk: Option<StoredPresets>,
+        disk: Option<StoredDocument>,
         /// Fingerprint of the on-disk bytes — the caller's new baseline once merged.
         fingerprint: doc_store::DocumentFingerprint,
     },
@@ -631,13 +1016,13 @@ fn inspect_existing(
     })
 }
 
-/// Serializes `presets` and writes them over `path` durably. Returns the fingerprint of the
+/// Serializes `document` and writes it over `path` durably. Returns the fingerprint of the
 /// bytes just written — the caller's new baseline.
 fn write_document(
     path: &Path,
-    presets: &StoredPresets,
+    document: &StoredDocument,
 ) -> Result<doc_store::DocumentFingerprint, PresetsStoreError> {
-    let file = encode(presets);
+    let file = encode(document);
     let mut text =
         serde_json::to_string_pretty(&file).map_err(|err| PresetsStoreError::Serialize {
             reason: err.to_string(),
@@ -841,11 +1226,19 @@ mod tests {
     }
 
     /// Unwraps a `Loaded` outcome or panics naming the actual variant.
-    fn expect_loaded(outcome: LoadOutcome) -> StoredPresets {
+    fn expect_loaded(outcome: LoadOutcome) -> StoredDocument {
         match outcome {
-            LoadOutcome::Loaded { presets, .. } => presets,
+            LoadOutcome::Loaded { document, .. } => document,
             LoadOutcome::Missing => panic!("expected Loaded, got Missing"),
             LoadOutcome::Invalid => panic!("expected Loaded, got Invalid"),
+        }
+    }
+
+    /// A document carrying only global presets — the shape every schema-1 test uses.
+    fn document(presets: StoredPresets) -> StoredDocument {
+        StoredDocument {
+            presets,
+            default_local: DefaultLocalSet::default(),
         }
     }
 
@@ -856,7 +1249,16 @@ mod tests {
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), value.clone()))
                 .collect(),
+            ..TypingCreatePreset::default()
         }
+    }
+
+    /// One local preset with a distinguishable profile, so a test can see WHICH one it is.
+    fn local(name: &str, marker: f32) -> LocalPreset {
+        LocalPreset::new(
+            name.to_string(),
+            json!({"text_params": {"schema": 2, "font_size_px": marker}}),
+        )
     }
 
     /// The document round-trips: one font key per preset, per-preset profiles preserved.
@@ -872,9 +1274,9 @@ mod tests {
             ),
         );
         presets.insert("Пустой".to_string(), preset("", &[]));
-        save(&dir, &presets, next_save_ticket()).expect("save presets");
+        save(&dir, &document(presets), next_save_ticket()).expect("save presets");
 
-        let loaded = expect_loaded(load_outcome(&dir));
+        let loaded = expect_loaded(load_outcome(&dir)).presets;
         assert_eq!(loaded.len(), 2);
         let vvd = loaded.get("ВВД").expect("preset ВВД survives");
         assert_eq!(vvd.font, "d_CCShoutOut");
@@ -895,7 +1297,7 @@ mod tests {
         let mut presets = StoredPresets::new();
         presets.insert(" Рао-кун ".to_string(), preset("Alpha-Regular", &[]));
         presets.insert("Рао-кун".to_string(), preset("Beta-Regular", &[]));
-        save(&dir, &presets, next_save_ticket()).expect("save presets");
+        save(&dir, &document(presets), next_save_ticket()).expect("save presets");
 
         let raw = fs::read_to_string(data_path(&dir)).expect("read written file");
         let value: Value = serde_json::from_str(&raw).expect("valid JSON");
@@ -909,7 +1311,7 @@ mod tests {
             Some(&json!("Beta-Regular"))
         );
 
-        let loaded = expect_loaded(load_outcome(&dir));
+        let loaded = expect_loaded(load_outcome(&dir)).presets;
         assert_eq!(loaded.len(), 2, "both presets must survive a round trip");
         assert_eq!(
             loaded.get(" Рао-кун ").map(|p| p.font.as_str()),
@@ -923,23 +1325,26 @@ mod tests {
     }
 
     /// The written document carries exactly ONE font key per preset (the identity), and
-    /// omits everything unset. The three legacy `primary_font_*` keys are gone for good.
+    /// omits everything unset — including every key schema 2 added. The three legacy
+    /// `primary_font_*` keys are gone for good, and the version is now 2, so an older build
+    /// refuses the document instead of dropping the local presets it cannot represent.
     #[test]
-    fn written_document_is_version_one_with_a_single_font_key() {
+    fn written_document_is_version_two_with_a_single_font_key() {
         let dir = unique_temp_dir("shape");
         let mut presets = StoredPresets::new();
         presets.insert("A".to_string(), preset("Some-Font", &[]));
-        save(&dir, &presets, next_save_ticket()).expect("save presets");
+        save(&dir, &document(presets), next_save_ticket()).expect("save presets");
 
         let raw = fs::read_to_string(data_path(&dir)).expect("read written file");
         let value: Value = serde_json::from_str(&raw).expect("valid JSON");
-        assert_eq!(value.pointer("/version"), Some(&json!(1)));
+        assert_eq!(value.pointer("/version"), Some(&json!(2)));
         assert_eq!(value.pointer("/presets/A/font"), Some(&json!("Some-Font")));
         let entry = value
             .pointer("/presets/A")
             .and_then(Value::as_object)
             .expect("preset object");
-        // `profiles` is omitted when empty; no legacy key is ever written.
+        // `profiles` is omitted when empty; no legacy key is ever written, and neither is
+        // any of the local-preset keys while the preset stays in the font mode.
         assert_eq!(entry.keys().collect::<Vec<_>>(), vec!["font"]);
         for legacy in [
             "primary_font_key",
@@ -948,6 +1353,12 @@ mod tests {
         ] {
             assert!(!entry.contains_key(legacy), "'{legacy}' must not be written");
         }
+        let root = value.as_object().expect("document object");
+        assert_eq!(
+            root.keys().collect::<Vec<_>>(),
+            vec!["presets", "version"],
+            "an unused default local set must not appear in the document at all"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -957,7 +1368,7 @@ mod tests {
     #[test]
     fn a_successful_save_makes_the_directory_entry_durable() {
         let dir = unique_temp_dir("durable");
-        save(&dir, &StoredPresets::new(), next_save_ticket()).expect("save presets");
+        save(&dir, &StoredDocument::default(), next_save_ticket()).expect("save presets");
         let steps = doc_store::recorded_steps(&data_path(&dir));
         assert_eq!(
             steps,
@@ -1010,7 +1421,8 @@ mod tests {
 
         let mut presets = StoredPresets::new();
         presets.insert("Новый".to_string(), preset("Alpha-Regular", &[]));
-        let err = save(&dir, &presets, next_save_ticket()).expect_err("the save must be refused");
+        let err = save(&dir, &document(presets), next_save_ticket())
+            .expect_err("the save must be refused");
         assert!(
             matches!(err, PresetsStoreError::PersistenceDisabled { .. }),
             "unexpected variant: {err:?}"
@@ -1032,8 +1444,8 @@ mod tests {
         // A regular FILE where the fonts directory is expected: `create_dir_all` fails.
         let blocked = dir.join("blocked");
         fs::write(&blocked, "not a directory").expect("seed blocker file");
-        let err =
-            save(&blocked, &StoredPresets::new(), next_save_ticket()).expect_err("save must fail");
+        let err = save(&blocked, &StoredDocument::default(), next_save_ticket())
+            .expect_err("save must fail");
         assert!(
             matches!(err, PresetsStoreError::CreateDir { .. }),
             "unexpected variant: {err:?}"
@@ -1056,10 +1468,10 @@ mod tests {
         // Tickets are taken in snapshot order; the writers reach the file out of order.
         let older_ticket = next_save_ticket();
         let newer_ticket = next_save_ticket();
-        save(&dir, &newer, newer_ticket).expect("newer save");
-        save(&dir, &older, older_ticket).expect("older save is a no-op, not an error");
+        save(&dir, &document(newer), newer_ticket).expect("newer save");
+        save(&dir, &document(older), older_ticket).expect("older save is a no-op, not an error");
 
-        let loaded = expect_loaded(load_outcome(&dir));
+        let loaded = expect_loaded(load_outcome(&dir)).presets;
         assert_eq!(
             loaded.get("A").map(|preset| preset.font.as_str()),
             Some("New-Font")
@@ -1076,25 +1488,25 @@ mod tests {
         // Instance A saves and remembers its baseline.
         let mut ours = StoredPresets::new();
         ours.insert("Наш".to_string(), preset("Alpha-Regular", &[]));
-        save(&dir, &ours, next_save_ticket()).expect("first save");
+        save(&dir, &document(ours.clone()), next_save_ticket()).expect("first save");
 
         // Instance B (a different process) writes a document A has never seen.
         let mut theirs = StoredPresets::new();
         theirs.insert("Наш".to_string(), preset("Alpha-Regular", &[]));
         theirs.insert("Чужой".to_string(), preset("Beta-Regular", &[]));
-        let raw = serde_json::to_string_pretty(&encode(&theirs)).expect("serialize");
+        let raw = serde_json::to_string_pretty(&encode(&document(theirs))).expect("serialize");
         fs::write(data_path(&dir), format!("{raw}\n")).expect("other instance writes");
 
         // Instance A saves again: the conflict is detected, merged and retried.
         ours.insert("Ещё наш".to_string(), preset("Gamma-Regular", &[]));
-        let report = save(&dir, &ours, next_save_ticket()).expect("merged save");
+        let report = save(&dir, &document(ours), next_save_ticket()).expect("merged save");
         assert_eq!(
             report.merged_from_disk.keys().collect::<Vec<_>>(),
             vec!["Чужой"],
             "what the other instance added must be reported back to the panel"
         );
 
-        let loaded = expect_loaded(load_outcome(&dir));
+        let loaded = expect_loaded(load_outcome(&dir)).presets;
         let mut names: Vec<&str> = loaded.keys().map(String::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["Ещё наш", "Наш", "Чужой"]);
@@ -1111,7 +1523,7 @@ mod tests {
             json!({"version": 99, "presets": {}, "future": true}).to_string(),
         )
         .expect("seed newer document");
-        let err = save(&dir, &StoredPresets::new(), next_save_ticket())
+        let err = save(&dir, &StoredDocument::default(), next_save_ticket())
             .expect_err("a newer document must not be replaced");
         assert!(
             matches!(err, PresetsStoreError::NewerVersion { found: 99 }),
@@ -1120,6 +1532,521 @@ mod tests {
         let raw = fs::read_to_string(data_path(&dir)).expect("read back");
         assert!(raw.contains("\"future\""), "the newer document is intact");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A SCHEMA-1 DOCUMENT decodes as schema 2 with every new field at its default, and is
+    /// NOT rewritten by the mere act of reading it: there is no migration at all
+    /// (`dev-docs/local_presets_plan.md` §6).
+    #[test]
+    fn a_version_one_document_decodes_as_version_two_with_defaults() {
+        let dir = unique_temp_dir("v1_decode");
+        let seed = json!({
+            "version": 1,
+            "presets": {
+                "ВВД": {
+                    "font": "d_CCShoutOut",
+                    "profiles": {"d_CCShoutOut": {"schema": 2}}
+                }
+            }
+        })
+        .to_string();
+        fs::write(data_path(&dir), &seed).expect("seed v1 document");
+
+        let loaded = expect_loaded(load_outcome(&dir));
+        let vvd = loaded.presets.get("ВВД").expect("the v1 preset survives");
+        assert_eq!(vvd.font, "d_CCShoutOut");
+        assert_eq!(vvd.identity_mode, ParamIdentityMode::Font);
+        assert!(vvd.local_presets.is_empty());
+        assert_eq!(vvd.selected_local_preset, None);
+        assert!(loaded.default_local.local_presets.is_empty());
+        assert_eq!(loaded.default_local.selected_local_preset, None);
+        assert_eq!(
+            fs::read_to_string(data_path(&dir)).expect("read back"),
+            seed,
+            "reading a v1 document must not rewrite it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The local-preset payload round-trips losslessly: the ARRAY ORDER is preserved (a
+    /// local preset is addressed by index), names are verbatim — including an empty one —
+    /// and both the per-preset and the document-level selection come back.
+    #[test]
+    fn local_presets_round_trip_in_order_with_their_selection() {
+        let dir = unique_temp_dir("local_round_trip");
+        let mut presets = StoredPresets::new();
+        presets.insert(
+            "ВВД".to_string(),
+            TypingCreatePreset {
+                identity_mode: ParamIdentityMode::LocalPreset,
+                local_presets: vec![local("Яркий", 1.0), local("", 2.0), local("Яркий", 3.0)],
+                selected_local_preset: Some(2),
+                ..TypingCreatePreset::default()
+            },
+        );
+        let stored = StoredDocument {
+            presets,
+            default_local: DefaultLocalSet {
+                local_presets: vec![local("По умолчанию", 4.0), local("Второй", 5.0)],
+                selected_local_preset: Some(1),
+            },
+        };
+        save(&dir, &stored, next_save_ticket()).expect("save presets");
+
+        let raw = fs::read_to_string(data_path(&dir)).expect("read written file");
+        let value: Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(
+            value.pointer("/presets/ВВД/identity_mode"),
+            Some(&json!("local_preset"))
+        );
+        assert_eq!(
+            value
+                .pointer("/presets/ВВД/local_presets")
+                .and_then(Value::as_array)
+                .map(|rows| rows
+                    .iter()
+                    .map(|row| row.pointer("/name").and_then(Value::as_str).unwrap_or(""))
+                    .collect::<Vec<_>>()),
+            Some(vec!["Яркий", "", "Яркий"]),
+            "the array order is user data and must be written as given"
+        );
+        // The document-slimming rule reaches into the rows too: an empty name is omitted.
+        // The STABLE ID is not subject to it — it is always written, or the next load would
+        // re-mint it and two instances would stop recognising the row.
+        let unnamed = value
+            .pointer("/presets/ВВД/local_presets/1")
+            .and_then(Value::as_object)
+            .expect("second row object");
+        assert_eq!(unnamed.keys().collect::<Vec<_>>(), vec!["id", "profile"]);
+        assert_eq!(value.pointer("/selected_local_preset"), Some(&json!(1)));
+
+        let loaded = expect_loaded(load_outcome(&dir));
+        let vvd = loaded.presets.get("ВВД").expect("preset survives");
+        assert_eq!(vvd.identity_mode, ParamIdentityMode::LocalPreset);
+        assert_eq!(vvd.selected_local_preset, Some(2));
+        assert_eq!(
+            vvd.local_presets
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Яркий", "", "Яркий"]
+        );
+        assert_eq!(vvd.local_presets[2].profile, local("Яркий", 3.0).profile);
+        // Every row comes back with the identity it was written with: the id is what the
+        // cross-instance merge reconciles by, so a round trip that re-minted it would be a
+        // silent identity change.
+        assert_eq!(
+            vvd.local_presets
+                .iter()
+                .map(LocalPreset::id)
+                .collect::<Vec<_>>(),
+            stored
+                .presets
+                .get("ВВД")
+                .expect("the preset we saved")
+                .local_presets
+                .iter()
+                .map(LocalPreset::id)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            loaded
+                .default_local
+                .local_presets
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["По умолчанию", "Второй"]
+        );
+        assert_eq!(loaded.default_local.selected_local_preset, Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `selected_local_preset` that addresses no entry decodes to NO SELECTION, at both
+    /// levels of the document: nothing may ever index a list with a stored number.
+    #[test]
+    fn an_out_of_range_selected_local_preset_decodes_to_no_selection() {
+        let dir = unique_temp_dir("selection_range");
+        fs::write(
+            data_path(&dir),
+            json!({
+                "version": 2,
+                "presets": {
+                    "A": {
+                        "identity_mode": "local_preset",
+                        "local_presets": [{"name": "Один", "profile": {}}],
+                        "selected_local_preset": 7
+                    },
+                    "B": {"selected_local_preset": 0}
+                },
+                "selected_local_preset": 3
+            })
+            .to_string(),
+        )
+        .expect("seed document");
+
+        let loaded = expect_loaded(load_outcome(&dir));
+        let a = loaded.presets.get("A").expect("preset A");
+        assert_eq!(a.local_presets.len(), 1, "the entries themselves survive");
+        assert_eq!(a.selected_local_preset, None);
+        assert_eq!(
+            loaded.presets.get("B").and_then(|b| b.selected_local_preset),
+            None,
+            "an index into an EMPTY list addresses nothing either"
+        );
+        assert_eq!(loaded.default_local.selected_local_preset, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An `identity_mode` this build does not know falls back to the FONT mode — the half
+    /// every build understands — instead of failing the whole document. An explicit
+    /// `"font"` is accepted, though it is never written.
+    #[test]
+    fn an_unknown_identity_mode_falls_back_to_the_font_mode() {
+        let dir = unique_temp_dir("bad_identity_mode");
+        fs::write(
+            data_path(&dir),
+            json!({
+                "version": 2,
+                "presets": {
+                    "A": {"font": "Alpha-Regular", "identity_mode": "телепатия"},
+                    "B": {"font": "Beta-Regular", "identity_mode": "font"},
+                    "C": {"font": "Gamma-Regular", "identity_mode": "local_preset"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed document");
+
+        let loaded = expect_loaded(load_outcome(&dir)).presets;
+        assert_eq!(
+            loaded.get("A").map(|preset| preset.identity_mode),
+            Some(ParamIdentityMode::Font)
+        );
+        assert_eq!(
+            loaded.get("B").map(|preset| preset.identity_mode),
+            Some(ParamIdentityMode::Font)
+        );
+        assert_eq!(
+            loaded.get("C").map(|preset| preset.identity_mode),
+            Some(ParamIdentityMode::LocalPreset),
+            "the known spelling must still decode"
+        );
+        // The font payload of the unknown-mode preset is untouched: nothing is dropped.
+        assert_eq!(
+            loaded.get("A").map(|preset| preset.font.as_str()),
+            Some("Alpha-Regular")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// TWO APP INSTANCES, DEFAULT LOCAL SET. A snapshot that carries NO local presets never
+    /// writes its emptiness over the set another instance saved: the set is adopted whole
+    /// and reported back, exactly like a merged preset.
+    #[test]
+    fn an_empty_default_local_set_adopts_the_one_another_instance_wrote() {
+        let dir = unique_temp_dir("adopt_default_local");
+        let mut ours = StoredPresets::new();
+        ours.insert("Наш".to_string(), preset("Alpha-Regular", &[]));
+        save(&dir, &document(ours.clone()), next_save_ticket()).expect("first save");
+
+        // Instance B writes a default local set this process has never seen.
+        let theirs = StoredDocument {
+            presets: StoredPresets::new(),
+            default_local: DefaultLocalSet {
+                local_presets: vec![local("Чужой", 9.0)],
+                selected_local_preset: Some(0),
+            },
+        };
+        let raw = serde_json::to_string_pretty(&encode(&theirs)).expect("serialize");
+        fs::write(data_path(&dir), format!("{raw}\n")).expect("other instance writes");
+
+        let report = save(&dir, &document(ours), next_save_ticket()).expect("merged save");
+        assert_eq!(
+            report
+                .appended_default_local
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Чужой"],
+            "the set must be reported so the panel can take it over",
+        );
+
+        let loaded = expect_loaded(load_outcome(&dir));
+        assert_eq!(
+            loaded
+                .default_local
+                .local_presets
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Чужой"],
+            "the adopted set is part of the document that was just written"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same rule, and the DEFECT it replaces: a non-empty snapshot set
+    /// used to SUPERSEDE the on-disk one, so two app instances silently overwrote each
+    /// other's default local set. The merge is additive — theirs is appended after ours,
+    /// user order preserved on both sides, our selection index untouched.
+    #[test]
+    fn a_default_local_set_from_another_instance_is_appended_not_superseded() {
+        let dir = unique_temp_dir("keep_default_local");
+        let mut ours = StoredDocument::default();
+        ours.default_local.local_presets = vec![local("Наш", 1.0)];
+        ours.default_local.selected_local_preset = Some(0);
+        save(&dir, &ours, next_save_ticket()).expect("first save");
+
+        let theirs = StoredDocument {
+            presets: StoredPresets::new(),
+            default_local: DefaultLocalSet {
+                local_presets: vec![local("Чужой", 9.0), local("Второй чужой", 8.0)],
+                selected_local_preset: Some(1),
+            },
+        };
+        let raw = serde_json::to_string_pretty(&encode(&theirs)).expect("serialize");
+        fs::write(data_path(&dir), format!("{raw}\n")).expect("other instance writes");
+
+        let report = save(&dir, &ours, next_save_ticket()).expect("merged save");
+        assert_eq!(
+            report
+                .appended_default_local
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Чужой", "Второй чужой"],
+            "what came from disk must be reported so the panel adopts it too",
+        );
+        let loaded = expect_loaded(load_outcome(&dir));
+        assert_eq!(
+            loaded
+                .default_local
+                .local_presets
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Наш", "Чужой", "Второй чужой"],
+            "ours first, theirs appended, both in user order",
+        );
+        assert_eq!(
+            loaded.default_local.selected_local_preset,
+            Some(0),
+            "the selection index is ours and appending at the end cannot invalidate it",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE MERGE KEY IS THE STABLE ID. The row we wrote a moment ago comes back from disk
+    /// EDITED BY THE OTHER INSTANCE — a different name and a different snapshot — and is
+    /// still recognised as the same logical row: ours wins and nothing is appended. A row
+    /// that merely shares a name has its own id and is a genuinely different row, so it is
+    /// kept.
+    ///
+    /// The defect this replaces: with (name, profile) as the key, the edited row was
+    /// unrecognisable and every conflicting save appended one more historical version of it
+    /// (see `presets_grow_without_bound_...` below).
+    #[test]
+    fn a_default_local_preset_is_recognised_by_id_however_it_was_edited() {
+        let dir = unique_temp_dir("dedup_default_local");
+        let shared = local("Общий", 1.0);
+        let mut ours = StoredDocument::default();
+        ours.default_local.local_presets = vec![shared.clone(), local("Наш", 2.0)];
+        save(&dir, &ours, next_save_ticket()).expect("first save");
+
+        // The other instance holds the very same row — RENAMED and re-edited — plus a
+        // DIFFERENT preset of its own that happens to carry the same name.
+        let edited = LocalPreset::with_id(
+            shared.id(),
+            "Общий (у них)".to_string(),
+            json!({"text_params": {"schema": 2, "font_size_px": 7.0}}),
+        );
+        let theirs = StoredDocument {
+            presets: StoredPresets::new(),
+            default_local: DefaultLocalSet {
+                local_presets: vec![edited, local("Общий", 5.0)],
+                selected_local_preset: None,
+            },
+        };
+        let raw = serde_json::to_string_pretty(&encode(&theirs)).expect("serialize");
+        fs::write(data_path(&dir), format!("{raw}\n")).expect("other instance writes");
+
+        let report = save(&dir, &ours, next_save_ticket()).expect("merged save");
+        assert_eq!(report.appended_default_local.len(), 1);
+        let loaded = expect_loaded(load_outcome(&dir));
+        assert_eq!(
+            loaded
+                .default_local
+                .local_presets
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Общий", "Наш", "Общий"],
+            "our version of the shared row wins, the same-named different one is appended",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// REPEATED CONFLICTS DO NOT GROW THE SET. The regression test for the defect the stable
+    /// id was introduced for: two instances take turns editing THE SAME logical row, each
+    /// save conflicting with the other's. Under the old (name, profile) key every round
+    /// appended one more version of that row and nothing ever removed it; under the id key
+    /// the set stays exactly as long as it started.
+    #[test]
+    fn repeated_conflicting_saves_of_one_row_never_grow_the_default_local_set() {
+        let dir = unique_temp_dir("bounded_default_local");
+        let shared = local("Общий", 1.0);
+        let mut ours = StoredDocument::default();
+        ours.default_local.local_presets = vec![shared.clone()];
+        ours.default_local.selected_local_preset = Some(0);
+        save(&dir, &ours, next_save_ticket()).expect("first save");
+
+        for round in 0..5 {
+            // The other instance edits ITS copy of the same logical row and writes it.
+            let theirs = StoredDocument {
+                presets: StoredPresets::new(),
+                default_local: DefaultLocalSet {
+                    local_presets: vec![LocalPreset::with_id(
+                        shared.id(),
+                        format!("Общий {round}"),
+                        json!({"text_params": {"schema": 2, "font_size_px": 10.0 + f64::from(round)}}),
+                    )],
+                    selected_local_preset: Some(0),
+                },
+            };
+            let raw = serde_json::to_string_pretty(&encode(&theirs)).expect("serialize");
+            fs::write(data_path(&dir), format!("{raw}\n")).expect("other instance writes");
+
+            // We edit OUR copy of the same row and save into the conflict.
+            ours.default_local.local_presets = vec![LocalPreset::with_id(
+                shared.id(),
+                format!("Наш {round}"),
+                json!({"text_params": {"schema": 2, "font_size_px": 20.0 + f64::from(round)}}),
+            )];
+            let report = save(&dir, &ours, next_save_ticket()).expect("merged save");
+            assert!(
+                report.appended_default_local.is_empty(),
+                "round {round}: the other instance's version of OUR row is not a new row",
+            );
+            let loaded = expect_loaded(load_outcome(&dir));
+            assert_eq!(
+                loaded
+                    .default_local
+                    .local_presets
+                    .iter()
+                    .map(|preset| preset.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![format!("Наш {round}").as_str()],
+                "round {round}: one logical row stays one row, and ours is the version kept",
+            );
+            assert_eq!(loaded.default_local.selected_local_preset, Some(0));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A document written BEFORE the stable id existed mints its ids DETERMINISTICALLY: the
+    /// same document loaded twice (which is what two app instances do) yields the same ids,
+    /// so the merge recognises the rows instead of appending them. Once saved, the minted ids
+    /// are persisted and survive verbatim.
+    #[test]
+    fn a_pre_id_document_mints_the_same_ids_on_every_load() {
+        let dir = unique_temp_dir("legacy_local_ids");
+        // Hand-written v2 document without any `id` key — exactly what the build before this
+        // field wrote.
+        let raw = json!({
+            "version": PRESETS_VERSION,
+            "presets": {},
+            "local_presets": [
+                {"name": "Первый", "profile": {"text_params": {"schema": 2}}},
+                {"name": "", "profile": {"text_params": {"schema": 2, "font_size_px": 9.0}}},
+            ],
+            "selected_local_preset": 1,
+        });
+        fs::write(
+            data_path(&dir),
+            serde_json::to_string_pretty(&raw).expect("serialize"),
+        )
+        .expect("seed legacy document");
+
+        let first = expect_loaded(load_outcome(&dir)).default_local.local_presets;
+        let second = expect_loaded(load_outcome(&dir)).default_local.local_presets;
+        assert_eq!(
+            first.iter().map(LocalPreset::id).collect::<Vec<_>>(),
+            second.iter().map(LocalPreset::id).collect::<Vec<_>>(),
+            "a pre-id document must mint the SAME ids on every load, or two instances would \
+             never recognise each other's rows",
+        );
+        assert_ne!(
+            first[0].id(),
+            first[1].id(),
+            "two rows of one document must not share an identity",
+        );
+
+        let document = StoredDocument {
+            presets: StoredPresets::new(),
+            default_local: DefaultLocalSet {
+                local_presets: first.clone(),
+                selected_local_preset: Some(1),
+            },
+        };
+        save(&dir, &document, next_save_ticket()).expect("save the minted ids");
+        assert_eq!(
+            expect_loaded(load_outcome(&dir))
+                .default_local
+                .local_presets
+                .iter()
+                .map(LocalPreset::id)
+                .collect::<Vec<_>>(),
+            first.iter().map(LocalPreset::id).collect::<Vec<_>>(),
+            "the minted ids are persisted, so nothing re-mints them again",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The retryability classification the debounced writer re-arms on. A permanent failure
+    /// must never re-arm, or the panel would rewrite and re-log every debounce window for
+    /// the rest of the session.
+    #[test]
+    fn only_environmental_save_failures_are_retryable() {
+        assert!(
+            PresetsStoreError::CreateDir {
+                dir: PathBuf::from("/nope"),
+                reason: "denied".to_string(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            PresetsStoreError::ReadExisting {
+                path: PathBuf::from("/nope"),
+                reason: "denied".to_string(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            PresetsStoreError::Conflict {
+                path: PathBuf::from("/nope"),
+                parsable: true,
+            }
+            .is_retryable()
+        );
+        assert!(
+            !PresetsStoreError::PersistenceDisabled {
+                path: PathBuf::from("/nope"),
+            }
+            .is_retryable(),
+            "nothing may be written to that path for the rest of the session",
+        );
+        assert!(
+            !PresetsStoreError::NewerVersion { found: 99 }.is_retryable(),
+            "this build can never write a schema it does not understand",
+        );
+        assert!(
+            !PresetsStoreError::Serialize {
+                reason: "NaN".to_string(),
+            }
+            .is_retryable(),
+            "the same snapshot would fail to serialize again",
+        );
     }
 
     /// The legacy reader takes the payload verbatim, in the REAL user shape: absolute

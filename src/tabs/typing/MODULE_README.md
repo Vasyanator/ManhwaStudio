@@ -404,6 +404,13 @@ saving, and export.
     source of truth). Re-exported at the typing-module level (`tab::PageView`) so `mask.rs` can name it.
   - `layout_editor.rs`: vector-line layout-editor free fns (frame/line hit-test, draw, conversions).
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
+    Also the project's ONLY transparency checkerboard for text previews
+    (`paint_shape_variant_checkerboard`, used by the shape-variant menu; `pub(super)`) and the
+    ONLY luminance rule for judging rendered text against a backdrop:
+    `shape_variant_luminance` (Rec.709 over white, 0..255) with its two-way form
+    `use_dark_shape_variant_checkerboard`. The VALUE is `pub(in crate::tabs::typing)` because
+    the sibling `panel` module picks one of three flat greys behind a local-preset row and
+    must not grow a second luminance rule to do it.
   - `export.rs`: PNG/PSD export jobs + page composition/flatten free fns.
   - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
   - `helpers.rs`: selection→page resolution, bubble/area seed text (incl. the `BubbleClass::Hint`
@@ -440,11 +447,45 @@ saving, and export.
     as a `PresetStoreEvent` and is applied by ONE per-frame drain,
     `poll_preset_store_events` (seed install, migration, presets merged in from another app
     instance, save failure -> status line).
+  - `local_presets.rs`: the LOCAL-PRESET parameter identity mode
+    (`dev-docs/local_presets_plan.md`). Owns THE ownership dispatch every parameter edit
+    funnels through (`store_current_params_snapshot`: font profile vs. selected local preset,
+    crossed with whether a global preset is applied), the create/select/deselect/rename/delete
+    operations behind the combo and name row, the LIVE-SET INVARIANT
+    (`default_local_set_snapshot` / `park_default_local_set_for_global_preset` /
+    `restore_default_local_set_after_deselect`: the live set is the selected GLOBAL preset's
+    set when one is selected and the document-level DEFAULT set otherwise), the debounced
+    off-thread persistence of that default set plus its clean/dirty generation rule and the
+    app-exit flush, and the mode switch itself (persisted in
+    `user_config.TextTab.param_identity_mode`). EDIT HERE for anything about local presets
+    except their storage schema (`panel/presets_store.rs`) and their row previews
+    (`local_preset_preview.rs`); the contracts — identity vs. index, the ownership matrix, the
+    merge-by-id rule — are in `panel/MODULE_README.md`. Nothing here may touch
+    `fonts_data.fonts.<identity>.profile` or `font_profiles_by_identity`: in this mode the
+    font owns nothing.
+  - `local_preset_preview.rs`: the off-GUI-thread preview renderer of the LOCAL PRESET combo
+    (`dev-docs/local_presets_plan.md` §8). Owns `LocalPresetPreviewCache`: one long-lived
+    `typing-local-preset-preview` worker thread, at most 4 renders outstanding, a
+    least-recently-requested cache keyed by hash(35-char-capped name, preset profile JSON, row
+    height), and the GUI-tick texture upload. Parameters come from
+    `tab::codec::text_render_params_from_render_data`, so a preview is drawn by exactly the same
+    parameter path (and full effect chain) as the canvas; only `text`, `text_wrap_mode`,
+    `new_line_after_sentence` and `enable_inline_style_tags` are overridden, to force ONE line.
+    The worker downscales to the row height before sending, so the egui atlas never holds a
+    full-size render. A failed render (missing font) is a STATE, logged once; the row falls back
+    to `preview_label(name)`. The font provider is NOT part of the key — a font reload must call
+    `LocalPresetPreviewCache::clear`. Also owns `PreviewBackdrop` and the CONTRAST RULE that
+    picks one of its three flat greys for a row from the preset's own colours (last visible
+    outline first, main text colour second) — see `panel/MODULE_README.md` for the formula.
   - `create_sections.rs`: top-level section drawing (preview/params/effects/right actions) + effects_json.
   - `create_main_text.rs`: main text-param UI. The "Параметры" sub-tab is grouped into six
     collapsible sections (font / glyph metrics / layout & alignment / shape & smoothing / typeface
     style / text processing) drawn by the `pub(super)` free fn `collapsing_param_section`, followed by
-    the unchanged advanced-params header. Also inline offset + alignment controls. The former
+    the unchanged advanced-params header. In the CREATE panel the font section opens with the
+    PARAMETER IDENTITY MODE switch (above the font-group combo, which stays a plain filter) and,
+    in `ParamIdentityMode::LocalPreset`, the local-preset combo with per-row preview images plus
+    the rename/delete row — the row is DISABLED while nothing is selected. Also inline offset +
+    alignment controls. The former
     left/right column split is gone; the non-stacked ("wide") path is dead (both call sites pass
     `stacked_columns = true`).
   - `create_advanced.rs`: advanced params — formula/shape layout, spacing, text accordion, and the
@@ -510,7 +551,9 @@ saving, and export.
     conversions (free fns). Retains only the READ helper `load_text_tab_imported_system_fonts`
     for the one-time legacy migration (see `font_settings_store`); the imported-fonts WRITE path
     moved to `fonts_data.rs`, and the CREATE PRESETS moved to `presets_store.rs`.
-  - `presets_store.rs`: the SINGLE owner of `fonts/presets.json` (version 1) — schema, typed
+  - `presets_store.rs`: the SINGLE owner of `fonts/presets.json` (version 2 — the version that
+    added the identity mode, the per-preset local-preset sets and the document-level default
+    set; a v1 document decodes as v2 with those at their defaults) — schema, typed
     `LoadOutcome`, quarantine, the atomic + crash-durable + optimistically-concurrent save with
     a TYPED error, the read of the legacy `user_config` payload and the deletion of the
     migrated `TextTab` keys. Preset NAMES are stored verbatim (never trimmed, so two names that

@@ -56,6 +56,10 @@ impl TypingTopPanelState {
         // migration once its background read lands, adopt what another app instance wrote,
         // and surface any background save failure instead of losing it.
         self.create_panel.poll_preset_store_events();
+        // Closes the DEFAULT local-set debounce window: an edit in local-preset mode with no
+        // global preset applied marks the set dirty, and this is the tick that turns it into
+        // one off-thread document write per burst (`local_presets::LOCAL_PRESETS_SAVE_DEBOUNCE`).
+        self.create_panel.tick_local_presets_save();
         self.create_panel.reset_text_input_focus_tracking();
         self.edit_panel.reset_text_input_focus_tracking();
         if self.create_panel.fonts_reload_in_flight() || self.edit_panel.fonts_reload_in_flight() {
@@ -73,6 +77,10 @@ impl TypingTopPanelState {
         }
         if self.mode == TypingTopPanelMode::CreateText {
             self.create_panel.poll_preview_render_results(ctx);
+            // Uploads whatever the local-preset preview worker finished. Runs BEFORE the
+            // dock draws the rows, so a texture that landed this frame is already there
+            // when the combo asks for it.
+            self.create_panel.poll_local_preset_previews(ctx);
             self.create_panel.ensure_initial_preview_request();
             if self.create_panel.render_in_flight {
                 ctx.request_repaint();
@@ -495,6 +503,18 @@ impl TypingTopPanelState {
         &mut self,
     ) -> Option<crate::settings_shared::SettingsDeepLink> {
         self.pending_settings_link.take()
+    }
+
+    /// Writes a still-owed DEFAULT local-preset set immediately, on the calling thread.
+    /// Returns whether there was anything to flush.
+    ///
+    /// The app-exit hook (`MangaApp::on_exit`), alongside
+    /// `font_admin::flush_pending_saves`: the set is persisted through a multi-second
+    /// debounce whose writer is a detached thread that dies with the process, so a rename or
+    /// a parameter edit made a second before closing used to be lost. Local presets belong
+    /// to the CREATE panel only, so only that one is asked.
+    pub(in crate::tabs::typing) fn flush_pending_local_presets_save(&mut self) -> bool {
+        self.create_panel.flush_pending_local_presets_save()
     }
 
     pub(in crate::tabs::typing) fn is_mask_panel_open(&self) -> bool {

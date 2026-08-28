@@ -9,8 +9,9 @@ create panel plus the font-profile memory sync used on font selection changes.
 Main responsibilities:
 - build image-effect and full render-data JSON (per-font and per-index profiles);
 - serialize and apply shape / formula / drawn-lines layout parameters;
-- store and sync the current font profile in per-font memory and react to a font
-  selection change.
+- store the current font profile in per-font memory and react to a font selection
+  change (which is a no-op for the per-font memory in local-preset mode, where the
+  font is an ordinary parameter — see `local_presets.rs`).
 
 Notes:
 `use super::*;` pulls in the parent module's types and imports. Methods are
@@ -541,16 +542,44 @@ impl TypingCreatePanelState {
         self.active_font_identity = Some(identity);
     }
 
+    /// Stores the parameters on screen with whoever owns them — the LEGACY NAME of
+    /// [`Self::store_current_params_snapshot`], which is the real dispatch
+    /// (`local_presets.rs`, `dev-docs/local_presets_plan.md` §5).
+    ///
+    /// Kept only because two of its call sites live in `create_sections.rs`, a file this
+    /// change is not allowed to touch. REMOVAL CONDITION: rename those two calls (and the
+    /// one in `create_apply::adjust_font_size_by_wheel_steps`, plus the three in this file
+    /// and `create_state.rs`) to `store_current_params_snapshot` and delete this method. New
+    /// code must call the dispatch directly — in local-preset mode this name is a lie, since
+    /// nothing goes into the per-font memory then.
     pub(super) fn sync_current_font_profile_memory(&mut self) {
-        if !self.preview_enabled {
-            return;
-        }
-        self.store_current_font_profile_by_idx(self.selected_font_idx);
+        self.store_current_params_snapshot();
     }
 
+    /// Reacts to the user picking a DIFFERENT font in the create panel. Returns whether any
+    /// panel parameter changed as a result.
+    ///
+    /// In [`ParamIdentityMode::Font`] mode the font is the parameter KEY: the outgoing
+    /// font's snapshot is stored and the incoming font's snapshot (session memory, else its
+    /// persisted default) is restored over the panel.
+    ///
+    /// In [`ParamIdentityMode::LocalPreset`] mode the font is an ORDINARY PARAMETER of the
+    /// selected local preset: nothing is stored per font and nothing is restored, the
+    /// selection simply stands and the new font becomes part of the preset's snapshot.
     pub(super) fn handle_create_font_selection_change(&mut self, prev_font_idx: usize) -> bool {
         if !self.preview_enabled {
             return false;
+        }
+        if self.identity_mode == ParamIdentityMode::LocalPreset {
+            // No per-font store, no per-font restore: only the face index has to follow the
+            // new font, and the snapshot the local preset owns has to record the change.
+            // `active_font_identity` still follows the SELECTION — it is also the anchor a
+            // background font reload restores the selection by (`poll_font_reload_results`),
+            // and leaving it on the previous font would hand the user that font back.
+            self.active_font_identity = self.current_font_identity();
+            self.clamp_face_index();
+            self.store_current_params_snapshot();
+            return true;
         }
         self.store_current_font_profile_by_idx(prev_font_idx);
         let Some(new_identity) = self.current_font_identity() else {

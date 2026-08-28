@@ -578,15 +578,41 @@ pub(super) fn shape_variant_panel_pos(
     Pos2::new(x, y)
 }
 
-pub(super) fn use_dark_shape_variant_checkerboard(text_color: [u8; 4]) -> bool {
-    let r = f32::from(text_color[0]);
-    let g = f32::from(text_color[1]);
-    let b = f32::from(text_color[2]);
-    let a = f32::from(text_color[3]) / 255.0;
-    let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) * a + 255.0 * (1.0 - a);
-    luminance >= 140.0
+/// THE PROJECT'S ONLY luminance rule for judging rendered text against a backdrop:
+/// the Rec.709 relative luminance of `color` composited over WHITE, in `0.0..=255.0`.
+///
+/// The composite over white is what makes a TRANSLUCENT colour judged as it will actually
+/// be seen rather than as its opaque form. `color` is RGBA8, straight (non-premultiplied).
+/// The result is finite; a neutral grey `[v, v, v, 255]` maps to exactly `v`, because the
+/// three Rec.709 coefficients sum to 1.
+///
+/// Exposed as a VALUE, not only as the two-way [`use_dark_shape_variant_checkerboard`]
+/// verdict, because the create panel's local-preset rows choose between THREE flat greys
+/// and must not grow a second luminance rule to do it.
+#[must_use]
+pub(in crate::tabs::typing) fn shape_variant_luminance(color: [u8; 4]) -> f32 {
+    let r = f32::from(color[0]);
+    let g = f32::from(color[1]);
+    let b = f32::from(color[2]);
+    let a = f32::from(color[3]) / 255.0;
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) * a + 255.0 * (1.0 - a)
 }
 
+/// Whether a transparency checkerboard behind `text_color` must use its DARK variant.
+///
+/// The two-way form of [`shape_variant_luminance`]: `>= 140` means the ink is LIGHT and
+/// therefore needs the DARK board. `text_color` is RGBA8, straight (non-premultiplied).
+#[must_use]
+pub(super) fn use_dark_shape_variant_checkerboard(text_color: [u8; 4]) -> bool {
+    shape_variant_luminance(text_color) >= 140.0
+}
+
+/// Paints a transparency checkerboard into `rect`, plus a 1 px border of its own value.
+///
+/// `rounding` is the corner radius in points; `dark` picks the variant, normally from
+/// [`use_dark_shape_variant_checkerboard`]. Alternate cells are clipped to `rect.shrink(1.0)`
+/// so no cell can spill over the border. Painting only — nothing is allocated in the `Ui`,
+/// so the caller owns the layout.
 pub(super) fn paint_shape_variant_checkerboard(
     painter: &egui::Painter,
     rect: Rect,

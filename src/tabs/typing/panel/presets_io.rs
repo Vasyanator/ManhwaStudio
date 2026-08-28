@@ -10,6 +10,7 @@ Main responsibilities:
 - load the LEGACY TextTab imported-system-fonts path list (read-only migration input);
 - load, default, and save the formula presets;
 - load and save the per-effect-kind defaults;
+- load and save the create panel's parameter identity mode;
 - convert formula, drawn-lines, and vector-lines layouts to and from serde_json Value.
 
 Scope note:
@@ -40,6 +41,45 @@ pub(super) fn load_text_tab_use_legacy_inline_tags() -> bool {
         .and_then(|text_tab| text_tab.get(TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Reads the create panel's PARAMETER IDENTITY MODE from
+/// `user_config.TextTab.param_identity_mode` (`dev-docs/local_presets_plan.md` §3, D7).
+///
+/// An unreadable file, malformed JSON, a missing key or an unknown spelling all yield
+/// [`ParamIdentityMode::Font`]: the mode every build understands, and the one a config
+/// written before this feature implies. Reads a small document on the CONSTRUCTION path,
+/// exactly like `load_text_tab_formula_presets` and `load_text_tab_effect_defaults` beside it.
+#[must_use]
+pub(super) fn load_text_tab_param_identity_mode() -> ParamIdentityMode {
+    let user_settings_file = config::user_config_path();
+    let Ok(raw) = fs::read_to_string(user_settings_file) else {
+        return ParamIdentityMode::Font;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        return ParamIdentityMode::Font;
+    };
+    let stored = payload
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(TEXT_TAB_PARAM_IDENTITY_MODE_KEY))
+        .and_then(Value::as_str);
+    ParamIdentityMode::from_config_str(stored)
+}
+
+/// Persists the create panel's parameter identity mode to
+/// `user_config.TextTab.param_identity_mode` (read-modify-write, mirroring
+/// `save_text_tab_effect_defaults`).
+///
+/// # Errors
+/// Returns a human-readable message on any I/O or serialization failure. Callers must run
+/// this OFF the GUI thread — it rewrites `user_config.json`.
+pub(super) fn save_text_tab_param_identity_mode(mode: ParamIdentityMode) -> Result<(), String> {
+    update_text_tab_value(
+        &config::user_config_path(),
+        TEXT_TAB_PARAM_IDENTITY_MODE_KEY,
+        Value::String(mode.as_config_str().to_string()),
+    )
 }
 
 pub(super) fn default_text_tab_formula_presets() -> HashMap<String, TypingFormulaPreset> {

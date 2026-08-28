@@ -264,16 +264,27 @@ impl TypingCreatePanelState {
                 if let Some(steps) = preset_combo.wheel_steps {
                     cycle_wrapped_index(&mut preset_idx, preset_len, steps);
                 }
-                self.selected_preset_name = if preset_idx == 0 {
+                // NOT written into `self.selected_preset_name` before the dispatch below:
+                // `apply_preset_by_name` has to see the PREVIOUS selection to know whether
+                // this is the transition that parks the default local set.
+                let next_selected = if preset_idx == 0 {
                     None
                 } else {
                     names.get(preset_idx - 1).cloned()
                 };
-                if self.selected_preset_name != prev_selected
-                    && let Some(name) = self.selected_preset_name.clone()
-                {
-                    self.apply_preset_by_name(name);
-                    self.queue_preview_render();
+                if next_selected != prev_selected {
+                    match next_selected {
+                        Some(name) => {
+                            self.apply_preset_by_name(name);
+                            self.queue_preview_render();
+                        }
+                        // «Нет»: ownership goes back to the panel itself. The session font
+                        // profiles simply become the fonts' own again, and the LIVE local
+                        // set — which belonged to the preset that was just dropped, in
+                        // EITHER identity mode — goes back to the parked document default
+                        // (`restore_default_local_set_after_deselect`).
+                        None => self.deselect_global_preset(),
+                    }
                 }
             });
             ui.horizontal(|ui| {
@@ -310,14 +321,51 @@ impl TypingCreatePanelState {
     /// proof of identity. A preset that names no font at all (an empty `font`, only
     /// reachable for a preset saved with an empty font list) keeps the current selection
     /// and is not a missing font.
+    /// Drops the global-preset selection («Нет» in the combo) and gives the live local set
+    /// back to the document default.
+    ///
+    /// The inverse of the `no preset` → `preset` transition
+    /// (`local_presets::park_default_local_set_for_global_preset`), and like it, it does NOT
+    /// look at the identity mode: the live-set invariant does not mention the mode, and
+    /// gating the restore on it left the panel owning the DEFAULT set while holding a global
+    /// preset's — the first edit then persisted the preset's set over the user's own.
+    pub(super) fn deselect_global_preset(&mut self) {
+        self.selected_preset_name = None;
+        self.restore_default_local_set_after_deselect();
+    }
+
     pub(super) fn apply_preset_by_name(&mut self, name: String) {
         let Some(preset) = self.presets_by_name.get(&name).cloned() else {
             return;
         };
+        // THE LIVE-SET INVARIANT (`local_presets::default_local_set_snapshot`): from the next
+        // line on the live local set belongs to this global preset, so the DEFAULT set has to
+        // be parked FIRST — while `selected_preset_name` still says the panel owns it. A
+        // no-op when a preset was already applied.
+        self.park_default_local_set_for_global_preset();
         // Marked applied BEFORE any profile is stored: from here on every parameter write
         // belongs to THIS preset's working set, not to the font's persisted default
         // (`create_render_data::store_current_font_profile_by_idx`, variant A).
         self.selected_preset_name = Some(name);
+        // The MODE travels with the preset and is installed FIRST, because it decides which
+        // of the two disjoint payloads below is the preset's real content. Persisting it
+        // here keeps a restart in the mode the user last worked in (plan §3, D7).
+        if self.identity_mode != preset.identity_mode {
+            self.identity_mode = preset.identity_mode;
+            self.persist_param_identity_mode();
+        }
+        if preset.identity_mode == ParamIdentityMode::LocalPreset {
+            // A local-preset preset carries no font and no per-font profiles at all: its
+            // whole payload is the set and the selection inside it.
+            self.apply_local_preset_payload(preset.local_presets, preset.selected_local_preset);
+            self.clamp_face_index();
+            return;
+        }
+        // A FONT-mode preset owns an EMPTY local set, and installing it is not cosmetic: the
+        // live set must be the applied preset's in both identity modes, or switching to
+        // «Пресет» under this preset would hand the panel the DEFAULT set to edit while the
+        // preset owns it (`local_presets::apply_local_preset_payload`).
+        self.apply_local_preset_payload(preset.local_presets, preset.selected_local_preset);
         // Applying a preset replaces the SESSION memory only; each font's persisted default
         // profile is left alone (a preset is an independent overlay, not a rewrite of what
         // every font remembers on disk).
@@ -467,6 +515,10 @@ impl TypingCreatePanelState {
     /// (87 % of `user_config.json`) and, worse, made a preset claim parameters for fonts it
     /// was never configured for. Each font's own remembered parameters live in
     /// `fonts_data.fonts.<identity>.profile` and need no copy.
+    ///
+    /// The preset also records the PARAMETER IDENTITY MODE it was saved in and, in
+    /// [`ParamIdentityMode::LocalPreset`] mode, the whole local-preset set plus the selection
+    /// inside it — that mode's entire payload (`dev-docs/local_presets_plan.md` §5).
     pub(super) fn save_current_preset(&mut self) {
         if !self.preview_enabled {
             return;
@@ -476,15 +528,33 @@ impl TypingCreatePanelState {
             return;
         }
 
-        self.sync_current_font_profile_memory();
+        self.store_current_params_snapshot();
 
-        self.presets_by_name.insert(
-            preset_name.clone(),
-            TypingCreatePreset {
+        // The two identity modes own DISJOINT payloads and each preset carries exactly one
+        // of them. In local-preset mode `font` must stay EMPTY: a non-empty font would send
+        // `apply_preset_by_name` down its MISSING PRIMARY FONT rule for a preset whose font
+        // is not its own identity at all, and the per-font profiles are meaningless there.
+        let preset = match self.identity_mode {
+            ParamIdentityMode::Font => TypingCreatePreset {
                 font: self.current_font_identity().unwrap_or_default(),
                 font_profiles: self.font_profiles_by_identity.to_map(),
+                identity_mode: ParamIdentityMode::Font,
+                local_presets: Vec::new(),
+                selected_local_preset: None,
             },
-        );
+            ParamIdentityMode::LocalPreset => TypingCreatePreset {
+                font: String::new(),
+                font_profiles: HashMap::new(),
+                identity_mode: ParamIdentityMode::LocalPreset,
+                local_presets: self.local_presets.clone(),
+                selected_local_preset: self.selected_local_preset,
+            },
+        };
+        self.presets_by_name.insert(preset_name.clone(), preset);
+        // Saving APPLIES the new preset, so the live set becomes ITS set from here on and
+        // the DEFAULT set has to be parked first — same transition as `apply_preset_by_name`
+        // (`local_presets::park_default_local_set_for_global_preset`).
+        self.park_default_local_set_for_global_preset();
         self.selected_preset_name = Some(preset_name);
         self.spawn_presets_save(false);
     }
@@ -504,28 +574,49 @@ impl TypingCreatePanelState {
     /// touch the real fonts directory; the write itself is covered by `presets_store`'s own
     /// tests and by `run_presets_save`, which a test drives synchronously (same precedent as
     /// `font_settings_store::persist_off_thread`).
-    fn spawn_presets_save(&self, then_clean_user_config: bool) {
+    pub(super) fn spawn_presets_save(&self, then_clean_user_config: bool) {
         if cfg!(test) {
             return;
         }
-        let presets = self.presets_by_name.clone();
+        // The document is BOTH halves: the named presets and the panel's copy of the
+        // document-level default local set. The mirror is used, never the live set — while a
+        // global preset is applied the live set is THAT preset's, and writing it as the
+        // default one would overwrite the user's own (`local_presets::default_local_set_snapshot`).
+        let document = presets_store::StoredDocument {
+            presets: self.presets_by_name.clone(),
+            default_local: self.default_local_set_snapshot(),
+        };
         let fonts_dir = self.fonts_dir.clone();
         let events = self.preset_store_tx.clone();
         // Ticket taken HERE, where the snapshot is: it is what keeps a slow writer from
         // putting an older state of the document back over a newer one.
         let ticket = presets_store::next_save_ticket();
+        // Taken here for the same reason: it is the generation of THIS snapshot, and it is
+        // what the outcome event marks clean (or re-arms) on the GUI thread.
+        let generation = self.local_presets_generation;
         let spawn_result = thread::Builder::new()
             .name("typing-save-create-presets".to_string())
             .spawn(move || {
                 // The config path is resolved HERE, off the GUI thread, and handed down
                 // explicitly so the whole chain can be tested against a temp file.
                 let clean_config = then_clean_user_config.then(config::user_config_path);
-                run_presets_save(&fonts_dir, &presets, ticket, clean_config.as_deref(), &events);
+                run_presets_save(
+                    &fonts_dir,
+                    &document,
+                    ticket,
+                    generation,
+                    clean_config.as_deref(),
+                    &events,
+                );
             });
         if let Err(err) = spawn_result {
+            // A failed spawn is environmental and retryable: the next attempt may well get
+            // its thread.
             report_preset_save_failure(
                 &self.preset_store_tx,
                 &format!("cannot spawn the presets.json writer thread: {err}"),
+                generation,
+                true,
             );
         }
     }
@@ -548,8 +639,13 @@ impl TypingCreatePanelState {
     pub(super) fn poll_preset_store_events(&mut self) {
         loop {
             match self.preset_store_rx.try_recv() {
-                Ok(PresetStoreEvent::Seeded { presets, legacy }) => {
+                Ok(PresetStoreEvent::Seeded {
+                    presets,
+                    default_local,
+                    legacy,
+                }) => {
                     self.install_seeded_presets(presets);
+                    self.install_seeded_default_local_set(default_local);
                     if let Some(legacy) = legacy {
                         if self.font_list_is_authoritative {
                             self.finish_legacy_presets_migration(legacy);
@@ -558,16 +654,36 @@ impl TypingCreatePanelState {
                         }
                     }
                 }
-                Ok(PresetStoreEvent::MergedFromDisk(presets)) => {
+                Ok(PresetStoreEvent::MergedFromDisk {
+                    presets,
+                    default_local,
+                }) => {
                     // Written by another app instance and already part of the document on
                     // disk; adopting them keeps the next snapshot from dropping them again.
                     // Ours wins a name clash — it is what is on screen.
                     for (name, preset) in presets {
                         self.presets_by_name.entry(name).or_insert(preset);
                     }
+                    // The DEFAULT local presets the save APPENDED are additive by the same
+                    // rule (`presets_store::merge_default_local_set`): ours are kept, theirs
+                    // are added after them.
+                    self.adopt_appended_default_local_presets(default_local);
                 }
-                Ok(PresetStoreEvent::SaveFailed(reason)) => {
+                Ok(PresetStoreEvent::Saved {
+                    default_local_generation,
+                }) => self.note_default_local_set_saved(default_local_generation),
+                Ok(PresetStoreEvent::SaveFailed {
+                    reason,
+                    default_local_generation,
+                    retryable,
+                }) => {
                     self.status_line = tf!("typing.presets.save_error_status", err = reason);
+                    // A failed write must not leave the DEFAULT local set marked clean: the
+                    // edits it was carrying are still only in memory.
+                    self.rearm_default_local_set_after_failed_save(
+                        default_local_generation,
+                        retryable,
+                    );
                 }
                 // The senders live in the panel itself, so the channel cannot be
                 // disconnected while the panel exists; both idle cases end the drain.
@@ -668,7 +784,14 @@ impl TypingCreatePanelState {
                     .into_iter()
                     .map(|(key, profile)| (key, self.upgrade_profile_to_current_schema(profile)))
                     .collect();
-                (name, TypingCreatePreset { font, font_profiles })
+                (
+                    name,
+                    TypingCreatePreset {
+                        font,
+                        font_profiles,
+                        ..TypingCreatePreset::default()
+                    },
+                )
             })
             .collect()
     }
@@ -1083,7 +1206,7 @@ pub(super) fn spawn_presets_seed(fonts_dir: &Path, events: &Sender<PresetStoreEv
 pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
     match presets_store::load_outcome(fonts_dir) {
         presets_store::LoadOutcome::Loaded {
-            presets,
+            document,
             fingerprint,
         } => {
             presets_store::set_baseline(
@@ -1092,7 +1215,8 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
             );
             (
                 PresetStoreEvent::Seeded {
-                    presets,
+                    presets: document.presets,
+                    default_local: document.default_local,
                     legacy: None,
                 },
                 true,
@@ -1101,6 +1225,7 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
         presets_store::LoadOutcome::Missing => (
             PresetStoreEvent::Seeded {
                 presets: HashMap::new(),
+                default_local: presets_store::DefaultLocalSet::default(),
                 legacy: Some(presets_store::load_legacy_presets()),
             },
             false,
@@ -1124,6 +1249,7 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
             (
                 PresetStoreEvent::Seeded {
                     presets: HashMap::new(),
+                    default_local: presets_store::DefaultLocalSet::default(),
                     legacy: Some(presets_store::load_legacy_presets()),
                 },
                 false,
@@ -1140,24 +1266,44 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
 /// `Ok`, and `save` returns only once the document AND its directory entry are durable
 /// (`doc_store::Durability::ContentsAndDirectory`). Without that a power loss between the
 /// two could leave the presets in neither file.
+///
+/// `default_local_generation` travels with the outcome in BOTH directions: a success marks
+/// the panel's DEFAULT local set clean up to it, a failure re-arms the debounce for it. It is
+/// the panel's `local_presets_generation` at the moment `document` was snapshotted.
 pub(super) fn run_presets_save(
     fonts_dir: &Path,
-    presets: &HashMap<String, TypingCreatePreset>,
+    document: &presets_store::StoredDocument,
     ticket: u64,
+    default_local_generation: u64,
     clean_user_config: Option<&Path>,
     events: &Sender<PresetStoreEvent>,
 ) {
-    match presets_store::save(fonts_dir, presets, ticket) {
+    match presets_store::save(fonts_dir, document, ticket) {
         Ok(report) => {
-            if !report.merged_from_disk.is_empty() {
-                // Same reasoning as above: a closed channel means the panel is gone.
-                let _ = events.send(PresetStoreEvent::MergedFromDisk(report.merged_from_disk));
+            if !report.merged_from_disk.is_empty() || !report.appended_default_local.is_empty() {
+                // Whatever the save merged in is already part of the document on disk, so
+                // the panel must take it over or its next snapshot would drop it again.
+                // Same reasoning as elsewhere: a closed channel means the panel is gone.
+                let _ = events.send(PresetStoreEvent::MergedFromDisk {
+                    presets: report.merged_from_disk,
+                    default_local: report.appended_default_local,
+                });
             }
+            // The DEFAULT local set becomes clean HERE and only here — a spawned writer is
+            // not a written document.
+            let _ = events.send(PresetStoreEvent::Saved {
+                default_local_generation,
+            });
             if let Some(user_settings_file) = clean_user_config {
                 clean_migrated_user_config_keys(fonts_dir, user_settings_file);
             }
         }
-        Err(err) => report_preset_save_failure(events, &err.to_string()),
+        Err(err) => report_preset_save_failure(
+            events,
+            &err.to_string(),
+            default_local_generation,
+            err.is_retryable(),
+        ),
     }
 }
 
@@ -1203,11 +1349,26 @@ fn clean_migrated_user_config_keys(fonts_dir: &Path, user_settings_file: &Path) 
 /// Logs a preset-save failure and hands the technical reason to the GUI thread, which turns
 /// it into a visible status line. The localization happens THERE, not here: `tf!` is a
 /// catalog lookup and the message belongs to the frame that shows it.
-pub(super) fn report_preset_save_failure(events: &Sender<PresetStoreEvent>, reason: &str) {
+///
+/// `default_local_generation` is the generation of the snapshot that did NOT reach disk and
+/// `retryable` whether attempting it again could ever succeed
+/// (`presets_store::PresetsStoreError::is_retryable`); together they let the panel re-arm the
+/// debounced DEFAULT local-set save instead of losing its edits
+/// (`local_presets::rearm_default_local_set_after_failed_save`).
+pub(super) fn report_preset_save_failure(
+    events: &Sender<PresetStoreEvent>,
+    reason: &str,
+    default_local_generation: u64,
+    retryable: bool,
+) {
     crate::runtime_log::log_error(format!("typing: failed to save fonts/presets.json: {reason}"));
     // A closed channel means the panel that would show the message is gone; the log line
     // above is then the whole record, so the send result is deliberately ignored.
-    let _ = events.send(PresetStoreEvent::SaveFailed(reason.to_string()));
+    let _ = events.send(PresetStoreEvent::SaveFailed {
+        reason: reason.to_string(),
+        default_local_generation,
+        retryable,
+    });
 }
 
 /// Build the hover tooltip for a font dropdown item, or `None` when the font

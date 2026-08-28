@@ -8,7 +8,8 @@ management, and font-index lookup helpers.
 
 Main responsibilities:
 - construct the create-panel state with an EMPTY font list — the constructor reads no
-  font file at all (CLAUDE.md §5); the list arrives from a background load;
+  font file at all (CLAUDE.md §5); the list arrives from a background load; the create
+  panel's parameter identity mode comes from `user_config.TextTab`;
 - track focused text inputs and eyedropper activation per frame;
 - manage the selected font group and pending group requests;
 - spawn and poll background font reloads (folder fonts + imported system-font paths),
@@ -113,6 +114,15 @@ impl TypingCreatePanelState {
             super::create_presets::spawn_presets_seed(&fonts_dir, &preset_store_tx);
         }
         let formula_presets_by_name = load_text_tab_formula_presets();
+        // The parameter-identity mode is a per-panel preference of the CREATE panel and is
+        // read from `user_config.TextTab` (a small document the constructor already reads
+        // for the formula presets and the effect defaults). The edit panel never offers the
+        // switch, so it stays on the default `Font` mode without touching the config at all.
+        let identity_mode = if preview_enabled {
+            load_text_tab_param_identity_mode()
+        } else {
+            ParamIdentityMode::Font
+        };
         let (request_tx, result_rx) = spawn_preview_render_worker();
         // The list is not loaded yet, so the honest status is "loading", not "no fonts".
         let status_line = t!("typing.fonts.reloading_status").to_string();
@@ -140,6 +150,18 @@ impl TypingCreatePanelState {
             preset_store_rx,
             selected_preset_name: None,
             preset_name_input: String::new(),
+            identity_mode,
+            // The local-preset set arrives with the off-thread `presets.json` seed, exactly
+            // like the global presets: the panel starts with none.
+            local_presets: Vec::new(),
+            selected_local_preset: None,
+            local_preset_name_input: String::new(),
+            default_local_set: presets_store::DefaultLocalSet::default(),
+            local_presets_dirty_since: None,
+            local_presets_generation: 0,
+            local_presets_saved_generation: 0,
+            local_presets_save_retries: 0,
+            local_preset_previews: local_preset_preview::LocalPresetPreviewCache::new(),
             formula_presets_by_name,
             selected_formula_preset_name: None,
             formula_preset_name_input: String::new(),
@@ -407,6 +429,10 @@ impl TypingCreatePanelState {
                     // Rebuild the render font source from the new list so renders and
                     // inline `<font=...>` tags resolve against the reloaded fonts.
                     self.font_provider = Arc::new(TabFontProvider::from_fonts(&self.fonts));
+                    // The local-preset row previews were rendered through the PREVIOUS
+                    // provider and their cache key does not carry it, so a reload (an
+                    // imported, replaced or removed font) must invalidate them wholesale.
+                    self.local_preset_previews.clear();
                     // The width-metric bytes were resolved by the PREVIOUS provider, so a
                     // reload (a replaced, moved or re-imported font file) invalidates them
                     // even when the identity is unchanged. Dropping them re-asks the new
@@ -488,6 +514,11 @@ impl TypingCreatePanelState {
                         // change what a fresh panel shows.
                         self.sync_current_font_profile_memory();
                     } else if self.preview_enabled
+                        // In local-preset mode the font owns NOTHING: restoring its profile
+                        // here would overwrite the selected local preset's parameters with a
+                        // per-font snapshot the panel is not supposed to read at all
+                        // (`dev-docs/local_presets_plan.md` §5).
+                        && self.identity_mode == ParamIdentityMode::Font
                         && restored.is_some()
                         && let Some(identity) = self.current_font_identity()
                     {

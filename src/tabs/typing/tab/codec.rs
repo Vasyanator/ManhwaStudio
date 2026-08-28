@@ -41,7 +41,26 @@ use super::*;
 use crate::tabs::typing::panel::text_params_schema;
 use serde_json::Map;
 
-pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRenderParams> {
+/// Decodes a stored render-data object — `{"text_params": {…}, "effects": […]}` — into the
+/// renderer's `TextRenderParams`, folding the `effects` array into `effects_json` so the
+/// whole effect chain travels with the parameters.
+///
+/// `text_params` is read through the schema owner, so a schema-2 payload gets the frozen
+/// defaults for its omitted keys and a schema-1 payload keeps the legacy per-field
+/// fallbacks (including the historical font-name chain). `formed_text`, when non-empty,
+/// replaces `text` and forces `TextWrapMode::None`, matching what the panel renders.
+///
+/// Returns `None` when the value is not an object, carries no `text_params` object, or
+/// names no font at all — the ONE thing that cannot be defaulted.
+///
+/// `pub(in crate::tabs::typing)` rather than `pub(super)`: besides `tab` and its submodules
+/// (the overlay render pipeline and the shape-variant preview grid), the typing panel's
+/// local-preset preview cache (`panel/local_preset_preview.rs`) decodes preset profiles
+/// through it, so the preview is rendered by exactly the same parameter path as the canvas.
+#[must_use]
+pub(in crate::tabs::typing) fn text_render_params_from_render_data(
+    render_data: &Value,
+) -> Option<TextRenderParams> {
     let render_obj = render_data.as_object()?;
     let stored_params = render_obj.get("text_params")?.as_object()?;
     // Read every parameter through the schema owner: a schema-2 payload omits values

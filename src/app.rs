@@ -3422,6 +3422,19 @@ impl eframe::App for MangaApp {
             runtime_log::log_info("[app] on_exit: flushed a pending fonts_data.json write");
         }
 
+        // 6a) Flush a still-pending DEFAULT local-preset set. Same shape and same reason as
+        // the step above, for the other debounced typing store: a local preset renamed or
+        // re-parameterised inside its debounce window would otherwise die with the detached
+        // writer thread. No-op when nothing is owed. Why this write is synchronous here — and
+        // why a deadline would trade a visible hang for a silent loss — is argued at
+        // `local_presets::flush_pending_local_presets_save` and in
+        // `src/tabs/typing/panel/MODULE_README.md`.
+        if self.typing_tab.flush_pending_local_presets_save() {
+            runtime_log::log_info(
+                "[app] on_exit: flushed a pending fonts/presets.json local-preset write",
+            );
+        }
+
         // 7) Flush the dockable-panel layouts. A last poll first, because the frame that raised
         // the dirty flag may be the one the close arrived in and no further frame will poll it;
         // then the writer's own debounce window is drained synchronously and its thread joined.
