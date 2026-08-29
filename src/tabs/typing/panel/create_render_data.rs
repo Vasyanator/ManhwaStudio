@@ -586,6 +586,13 @@ impl TypingCreatePanelState {
             return false;
         };
         self.active_font_identity = Some(new_identity.clone());
+        // A FONT-mode preset stores the font itself (`capture_current_preset`), so the switch
+        // alone already makes the applied global preset differ from disk — before any
+        // parameter is touched. Marked HERE, once, so both branches below are symmetric: the
+        // fresh-font branch would reach the ordinary dispatch (which marks) while the branch
+        // that finds a session profile returns early and would mark nothing at all, leaving
+        // the user with no unsaved-changes warning for a change the save really writes.
+        self.mark_selected_global_preset_dirty();
         if let Some(profile) = self.font_profiles_by_identity.get(&new_identity).cloned() {
             self.apply_render_data_json_with_options(&profile, false);
             self.clamp_face_index();

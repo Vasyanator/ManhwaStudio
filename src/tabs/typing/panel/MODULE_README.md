@@ -321,10 +321,70 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   while we still hold it comes back on our next save. The set is bounded by the number of
   LOGICAL rows either instance ever had, not by the number of conflicting saves; a row that
   comes back can be deleted again, one that was destroyed cannot be recovered.
-- SAVING CAPTURES THE SESSION MEMORY ONLY. `save_current_preset` no longer copies the CURRENT
-  font's profile into every other loaded font's key — the fan-out that turned 67 real profiles
-  into 162 stored ones (87 % of `user_config.json`) and made a preset claim parameters for
-  fonts it was never configured for.
+- SAVING CAPTURES THE SESSION MEMORY ONLY. `capture_current_preset` — the ONE payload builder,
+  shared by create and save — does not copy the CURRENT font's profile into every other loaded
+  font's key; that fan-out turned 67 real profiles into 162 stored ones (87 % of
+  `user_config.json`) and made a preset claim parameters for fonts it was never configured for.
+- THE PANEL EDITS THE SELECTED PRESET; IT DOES NOT "SAVE A NAME".
+  - The combo lists «Нет», an ACTION row that CREATES a preset, then the sorted names.
+    `create_global_preset` names the preset itself (`typing.presets.default_name`, the LOWEST
+    free 1-based index, so an index freed by a rename or a deletion is reused) and inherits
+    `capture_current_preset`, so creation never depends on the name box.
+    **THE WHEEL MUST NEVER REACH THE CREATE ROW** (`global_preset_wheel_target` cycles «Нет» +
+    the real presets only) — the create row exists in the popup alone, or a stray scroll over
+    the closed combo would mint presets. Same rule and same shape as the local-preset combo.
+    The popup's TOTAL ROW COUNT is folded into its `id_salt`
+    (`create_presets::global_preset_popup_id_bucket`) for the reason spelled out for the
+    local-preset combo below — the list grows in place, and a popup `Area` remembers its size
+    under a fixed id and can only shrink. The bucket's cap comes from the LIVE style
+    (`Spacing::combo_height` over a lower bound on the row pitch), because this combo sets no
+    height of its own.
+    A CREATION IS REFUSED UNDER `missing_font`, with the reason in the status line — the same
+    rule `create_local_preset` follows: the panel then sits on a NEIGHBOUR of a font it could
+    not resolve, and the capture would record that substituted font as the new preset's own.
+  - `preset_name_input` is the RENAME buffer of the selection, re-synced on every selection
+    change and disabled when nothing is selected. `save_current_preset` commits BOTH halves of
+    the selected preset. THE NAME IS THE IDENTITY (it is the `presets_by_name` key), so a
+    rename is remove-then-insert, and an empty name or one another preset already holds is
+    REFUSED with a status line rather than applied — the second would silently destroy that
+    other preset. THE BUFFER IS TAKEN VERBATIM, whitespace included, by the same rule that
+    stores names verbatim: trimming read a buffer prefilled with `" Рао-кун "` as a rename to
+    `"Рао-кун"` — refused as taken when that preset existed, silently re-keying when it did
+    not — and hid a whitespace-only rename from the warning. Only a COMPLETELY empty name is
+    refused, because that is the one the store drops on write.
+  - `delete_selected_preset` drops the preset and then goes through `deselect_global_preset`,
+    the SAME path «Нет» takes, because that is what runs
+    `restore_default_local_set_after_deselect`. Clearing the selection directly would leave the
+    live local set as the DELETED preset's, breaking THE LIVE-SET INVARIANT below.
+    KNOWN CONSEQUENCE, deliberately not fixed: the cross-instance merge is additive with NO
+    TOMBSTONE (`presets_store::save`, `PresetStoreEvent::MergedFromDisk`), so a preset deleted
+    here can be re-added by a SECOND running app instance's next save. Same accepted asymmetry
+    as everywhere else in this document — what comes back can be deleted again.
+- THE UNSAVED-CHANGES WARNING IS A FLAG PLUS A STRING COMPARE, NEVER A PER-FRAME COMPARISON.
+  `selected_preset_dirty` is raised at the ONE parameter-edit dispatch
+  (`local_presets::store_current_params_snapshot`, through `mark_selected_global_preset_dirty`)
+  and by the structural local-preset operations that mutate a global preset's live set; it is
+  cleared by create, by a successful save, by an apply and by a deselect, and RE-RAISED on
+  `PresetStoreEvent::SaveFailed` — clean only once a write actually SUCCEEDED, the same rule
+  `rearm_default_local_set_after_failed_save` follows. A PENDING RENAME counts as unsaved too
+  and is computed inline (`selected_preset_has_unsaved_changes`), because it is a string
+  compare — a VERBATIM one, like the save. Deciding this by rebuilding the would-be-saved
+  payload each frame would clone the whole session profile map or local-preset vector on the
+  GUI thread, against a document that reaches ~127 KB.
+  Everything the SAVE writes raises the flag, not only a parameter edit: switching the FONT
+  under a font-mode preset does (the preset stores the font), and so does switching the
+  IDENTITY MODE (it decides which of the two disjoint payloads the preset carries). Both are
+  reached outside the parameter dispatch, so both mark it themselves.
+  THE RE-RAISE IS PER SNAPSHOT, NOT PER SELECTION. `PresetStoreEvent::SaveFailed` carries the
+  name of the global preset that was applied when the lost snapshot was taken (captured in
+  `spawn_presets_save` next to the ticket and the generation, and for the same reason), and the
+  flag is re-raised only when that name is still the CURRENT selection. The event arrives whole
+  frames later and a debounced DEFAULT-local-set write carries no global preset at all, so
+  re-raising on "something is selected" marked a preset the user had just selected, and never
+  edited, unsaved for the rest of its selection. RESIDUAL LIMITATION, deliberately out of
+  scope: ONE flag tracks ONE selection, so a preset DESELECTED before its failed write lands is
+  not marked when it is selected again — the failure is still reported in the status line, and
+  per-preset dirty tracking would need a per-preset flag this panel does not have.
 - NOTHING IS READ ON THE GUI THREAD. `create_presets::spawn_presets_seed` (called from
   `create_state::new`) starts a worker running `read_presets_seed`; the panel begins with NO
   presets and installs them from `PresetStoreEvent::Seeded` in the per-frame drain. Reading

@@ -438,7 +438,8 @@ saving, and export.
   - `create_state.rs`: `TypingCreatePanelState` construction, focus/eyedropper tracking, font-group
     management and font-index lookup.
   - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
-  - `create_presets.rs`: create/formula preset apply & save UI, font-combo binding, face-index clamp.
+  - `create_presets.rs`: global create-preset UI (apply, create, rename, save, delete) and the
+    formula-preset apply/save UI, font-combo binding, face-index clamp.
     Also owns the preset SIDE of `fonts/presets.json`: the OFF-THREAD seed
     (`spawn_presets_seed` -> `read_presets_seed`), the deferred one-shot migration out of
     `user_config.TextTab.create_presets` (`finish_legacy_presets_migration` ->

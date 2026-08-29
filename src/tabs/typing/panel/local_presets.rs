@@ -79,8 +79,30 @@ impl TypingCreatePanelState {
         match self.identity_mode {
             ParamIdentityMode::Font => {
                 self.store_current_font_profile_by_idx(self.selected_font_idx);
+                // The store above writes into the SESSION profile memory, which is exactly
+                // what an applied GLOBAL preset would save, so the edit it carried now owes
+                // a write to disk. Marked here rather than inside the store, which has no
+                // way to tell an edit apart from a re-store of an unchanged value; in the
+                // other branch the store decides for itself, because it refuses an unchanged
+                // snapshot and a scratch-pad panel with no local preset selected.
+                self.mark_selected_global_preset_dirty();
             }
             ParamIdentityMode::LocalPreset => self.store_current_local_preset_snapshot(),
+        }
+    }
+
+    /// Records that the SELECTED GLOBAL preset now differs from what `fonts/presets.json`
+    /// holds, which is what the create panel's unsaved-changes warning shows.
+    ///
+    /// A no-op with no global preset applied: the panel then owns its parameters and the
+    /// DEFAULT local set does its own clean/dirty accounting
+    /// ([`Self::mark_default_local_set_dirty`]). The state is a FLAG rather than a comparison
+    /// for the same reason that one is: this runs on every frame of a slider drag, and
+    /// rebuilding the would-be-saved payload there would clone the whole session profile map
+    /// or local-preset vector on the GUI thread, per frame.
+    pub(super) fn mark_selected_global_preset_dirty(&mut self) {
+        if self.selected_preset_name.is_some() {
+            self.selected_preset_dirty = true;
         }
     }
 
@@ -111,6 +133,8 @@ impl TypingCreatePanelState {
         preset.set_profile(snapshot);
         if self.owns_default_local_set() {
             self.mark_default_local_set_dirty();
+        } else {
+            self.mark_selected_global_preset_dirty();
         }
     }
 
@@ -279,6 +303,11 @@ impl TypingCreatePanelState {
             &self.fonts_dir,
             &document,
             presets_store::next_save_ticket(),
+            // The selection this snapshot was taken under. No GUI frame follows the exit
+            // flush, so nothing will ever drain the outcome event — it is passed for the
+            // same reason the generation is: the event must describe the snapshot it
+            // reports on, whoever reads it.
+            self.selected_preset_name.as_deref(),
             self.local_presets_generation,
             // No legacy-config cleanup: that ordering belongs to the migration alone.
             None,
@@ -350,6 +379,12 @@ impl TypingCreatePanelState {
             self.selected_local_preset = None;
             self.local_preset_name_input.clear();
         }
+        // The mode IS part of a global preset (`TypingCreatePreset.identity_mode`) and it
+        // decides which of the two DISJOINT payloads that preset carries, so switching it
+        // under an applied preset changes the preset's very shape. The store above cannot
+        // report that: in `LocalPreset` mode it early-returns for a scratch-pad panel with
+        // nothing selected, and it always runs in the OUTGOING mode anyway.
+        self.mark_selected_global_preset_dirty();
         self.persist_param_identity_mode();
     }
 
@@ -428,6 +463,10 @@ impl TypingCreatePanelState {
         self.store_current_params_snapshot();
         if self.owns_default_local_set() {
             self.flush_default_local_set_now();
+        } else {
+            // The live set belongs to the applied GLOBAL preset, and it reaches disk only
+            // when that preset is saved — so the preset is now unsaved.
+            self.mark_selected_global_preset_dirty();
         }
         self.queue_preview_render();
     }
@@ -437,10 +476,18 @@ impl TypingCreatePanelState {
     ///
     /// Names are user data and may repeat (D3), so the uniqueness is a courtesy for the
     /// COMBO, not an invariant — nothing downstream depends on it.
+    ///
+    /// The search is BOUNDED by the pigeonhole argument (one more candidate than there are
+    /// presets), never open-ended: a catalog entry that lost its `{index}` placeholder makes
+    /// every indexed candidate the SAME string, and an unbounded search would then spin on the
+    /// GUI thread forever instead of degrading to a repeated name. The runtime `locale/*.json`
+    /// catalogs are user-editable, so that is a reachable state, not a hypothetical one — the
+    /// global-preset sibling (`create_presets::free_default_preset_name`) is bounded for the
+    /// same reason.
     #[must_use]
     fn free_local_preset_default_name(&self) -> String {
-        let mut index = self.local_presets.len() + 1;
-        loop {
+        let taken = self.local_presets.len();
+        for index in 1..=taken + 1 {
             let candidate = tf!("typing.local_presets.default_name", index = index);
             if !self
                 .local_presets
@@ -449,8 +496,9 @@ impl TypingCreatePanelState {
             {
                 return candidate;
             }
-            index += 1;
         }
+        // Degenerate catalog (see above): a duplicate name is a courtesy lost, not a defect.
+        tf!("typing.local_presets.default_name", index = taken + 1)
     }
 
     /// Selects the local preset at `index` and applies its whole snapshot — parameters,
@@ -486,6 +534,8 @@ impl TypingCreatePanelState {
         self.clamp_face_index();
         if self.owns_default_local_set() {
             self.mark_default_local_set_dirty();
+        } else {
+            self.mark_selected_global_preset_dirty();
         }
         self.queue_preview_render();
     }
@@ -502,6 +552,8 @@ impl TypingCreatePanelState {
         self.local_preset_name_input.clear();
         if self.owns_default_local_set() {
             self.mark_default_local_set_dirty();
+        } else {
+            self.mark_selected_global_preset_dirty();
         }
     }
 
@@ -521,6 +573,8 @@ impl TypingCreatePanelState {
         preset.name = name;
         if self.owns_default_local_set() {
             self.mark_default_local_set_dirty();
+        } else {
+            self.mark_selected_global_preset_dirty();
         }
     }
 
@@ -551,6 +605,8 @@ impl TypingCreatePanelState {
         };
         if self.owns_default_local_set() {
             self.flush_default_local_set_now();
+        } else {
+            self.mark_selected_global_preset_dirty();
         }
     }
 
@@ -1164,6 +1220,9 @@ mod tests {
         state.create_local_preset();
         state.font_size_px = 88.0;
         state.store_current_params_snapshot();
+        // Creation is what mints a global preset now; the name field renames the one that is
+        // selected, and the save commits both halves.
+        state.create_global_preset();
         state.preset_name_input = "Локальный".to_string();
 
         state.save_current_preset();
@@ -1207,6 +1266,7 @@ mod tests {
         state.create_local_preset();
         state.identity_mode = ParamIdentityMode::Font;
         state.font_size_px = 17.0;
+        state.create_global_preset();
         state.preset_name_input = "Шрифтовой".to_string();
 
         state.save_current_preset();
@@ -1486,6 +1546,8 @@ mod tests {
             .preset_store_tx
             .send(PresetStoreEvent::SaveFailed {
                 reason: "диск полон".to_string(),
+                // The debounced DEFAULT-local-set write carries no global preset.
+                selected_preset_name: None,
                 default_local_generation: generation,
                 retryable: true,
             })

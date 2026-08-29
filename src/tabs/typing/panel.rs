@@ -575,11 +575,18 @@ enum PresetStoreEvent {
         default_local_generation: u64,
     },
     /// A save failed. Carries the technical reason for the log line and the status line,
-    /// the generation the lost snapshot carried, and whether re-attempting it could ever
-    /// succeed (`presets_store::PresetsStoreError::is_retryable`).
+    /// the identity of the global preset the lost snapshot belonged to, the generation that
+    /// snapshot carried, and whether re-attempting it could ever succeed
+    /// (`presets_store::PresetsStoreError::is_retryable`).
     SaveFailed {
         /// Technical reason, already logged; shown in the panel status line.
         reason: String,
+        /// Name of the GLOBAL preset selected when the lost snapshot was taken, `None` when
+        /// none was. It travels with the outcome for the same reason the generation does:
+        /// the event says WHICH state failed to reach disk, so the panel can re-raise the
+        /// unsaved-changes warning for that preset only and not for whatever happens to be
+        /// selected when the failure lands.
+        selected_preset_name: Option<String>,
         /// Generation of the snapshot that did NOT reach disk.
         default_local_generation: u64,
         /// `false` for a failure this build can never recover from on its own (persistence
@@ -2066,8 +2073,31 @@ struct TypingCreatePanelState {
     /// (which needs THIS panel's font list, hence the GUI-thread half), adopts presets
     /// another app instance wrote, and surfaces a save failure in the status line.
     preset_store_rx: Receiver<PresetStoreEvent>,
+    /// Name of the GLOBAL preset currently applied, or `None` for «Нет». The name IS the
+    /// preset's identity (it is the `presets_by_name` key), so renaming one is a
+    /// remove-then-insert (`create_presets::save_current_preset`).
     selected_preset_name: Option<String>,
+    /// RENAME buffer of the selected global preset, kept in sync with `selected_preset_name`
+    /// on every selection change (apply, create, delete, «Нет»). Meaningless — and the text
+    /// box drawing it is disabled — while no preset is selected: there is nothing to rename
+    /// then, and this is not a "name the next preset" box (creation names itself).
     preset_name_input: String,
+    /// Whether the selected global preset carries changes that are NOT on disk yet, driving
+    /// the section's unsaved-changes warning.
+    ///
+    /// A FLAG, not a per-frame comparison: deciding this by rebuilding the would-be-saved
+    /// payload would clone the whole session profile map (or the whole local-preset vector)
+    /// on the GUI thread once per frame, and `fonts/presets.json` reaches ~127 KB. It is
+    /// raised at the ONE parameter-edit dispatch (`local_presets::store_current_params_snapshot`)
+    /// and by the structural local-preset operations, and cleared only when a preset is
+    /// created, saved, applied or deselected. A PENDING RENAME is deliberately NOT recorded
+    /// here — it is a plain string compare of `preset_name_input`, see
+    /// `create_presets::selected_preset_has_unsaved_changes`.
+    selected_preset_dirty: bool,
+    /// Whether the global-preset section's «Удалить» button is ARMED, i.e. the user clicked
+    /// it once and the next plain click deletes the selected preset. Cleared by any
+    /// selection change and as soon as the pointer leaves the armed button.
+    preset_delete_armed: bool,
     /// Who owns the next parameter edit: the selected FONT or the selected LOCAL PRESET.
     /// Create panel only — the edit panel is constructed with the default [`ParamIdentityMode::Font`]
     /// and never offers the switch. Persisted in `user_config.TextTab.param_identity_mode`.

@@ -1563,6 +1563,7 @@ paths change.
         state.preview_enabled = true;
         state.selected_font_idx = 0;
         state.font_size_px = 51.0;
+        state.create_global_preset();
         state.preset_name_input = "P".to_string();
         state.save_current_preset();
 
@@ -1573,6 +1574,504 @@ paths change.
             vec!["Krik-Regular"],
             "only the font whose parameters are on screen may be captured"
         );
+    }
+
+    /// A create panel with fonts, the preview pipeline enabled and no preset selected — the
+    /// starting point of every global-preset editing test below.
+    fn preset_editing_panel() -> TypingCreatePanelState {
+        let mut state = state_with_migration_fonts();
+        state.preview_enabled = true;
+        state.selected_font_idx = 0;
+        state
+    }
+
+    /// The combo's «create» row mints a preset that INHERITS what is on screen, selects it,
+    /// binds the rename buffer to it and leaves nothing unsaved. In `Font` mode the payload is
+    /// the current font plus the session profile memory.
+    #[test]
+    fn creating_a_global_preset_inherits_the_font_mode_state() {
+        let mut state = preset_editing_panel();
+        state.font_size_px = 43.0;
+
+        state.create_global_preset();
+
+        let name = state
+            .selected_preset_name
+            .clone()
+            .expect("creating a preset selects it");
+        assert_eq!(
+            state.preset_name_input, name,
+            "the rename buffer is bound to the selection"
+        );
+        let saved = state
+            .presets_by_name
+            .get(&name)
+            .expect("the created preset is stored under its own name");
+        assert_eq!(saved.identity_mode, ParamIdentityMode::Font);
+        assert_eq!(saved.font, "Krik-Regular");
+        assert!(
+            saved.font_profiles.contains_key("Krik-Regular"),
+            "the session profile memory is the font-mode payload"
+        );
+        assert!(
+            !state.selected_preset_has_unsaved_changes(),
+            "a preset written FROM the screen owes no save"
+        );
+    }
+
+    /// The same row in `LocalPreset` mode captures the other payload: the whole live local
+    /// set plus the selection inside it, and NO font (a non-empty font would send the apply
+    /// down its missing-font rule).
+    #[test]
+    fn creating_a_global_preset_inherits_the_local_preset_mode_state() {
+        let mut state = preset_editing_panel();
+        state.identity_mode = ParamIdentityMode::LocalPreset;
+        state.create_local_preset();
+
+        state.create_global_preset();
+
+        let name = state
+            .selected_preset_name
+            .clone()
+            .expect("creating a preset selects it");
+        let saved = state
+            .presets_by_name
+            .get(&name)
+            .expect("the created preset is stored under its own name");
+        assert_eq!(saved.identity_mode, ParamIdentityMode::LocalPreset);
+        assert_eq!(saved.local_presets.len(), 1);
+        assert_eq!(saved.selected_local_preset, Some(0));
+        assert!(
+            saved.font.is_empty() && saved.font_profiles.is_empty(),
+            "the font-mode payload must stay empty in local-preset mode"
+        );
+    }
+
+    /// THE NAME IS THE IDENTITY: saving under a new name MOVES the map key and carries the
+    /// payload with it — the old key must not survive as a duplicate.
+    #[test]
+    fn renaming_a_global_preset_moves_the_map_key() {
+        let mut state = preset_editing_panel();
+        state.font_size_px = 61.0;
+        state.create_global_preset();
+        let created = state
+            .selected_preset_name
+            .clone()
+            .expect("creating a preset selects it");
+
+        state.preset_name_input = "Крик".to_string();
+        state.save_current_preset();
+
+        assert_eq!(state.selected_preset_name.as_deref(), Some("Крик"));
+        assert!(
+            !state.presets_by_name.contains_key(&created),
+            "the old key must not survive the rename"
+        );
+        let saved = state
+            .presets_by_name
+            .get("Крик")
+            .expect("the preset is stored under the new name");
+        assert_eq!(saved.font, "Krik-Regular");
+        assert_eq!(state.presets_by_name.len(), 1);
+        assert!(!state.selected_preset_has_unsaved_changes());
+    }
+
+    /// Renaming ONTO another preset's name is refused, not applied: the name is the map key,
+    /// so applying it would silently destroy that other preset. Both stay intact.
+    #[test]
+    fn renaming_a_global_preset_onto_a_taken_name_is_refused() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        state.preset_name_input = "Первый".to_string();
+        state.save_current_preset();
+        state.font_size_px = 12.0;
+        state.create_global_preset();
+        state.preset_name_input = "Второй".to_string();
+        state.save_current_preset();
+
+        state.preset_name_input = "Первый".to_string();
+        state.save_current_preset();
+
+        assert_eq!(
+            state.selected_preset_name.as_deref(),
+            Some("Второй"),
+            "a refused rename leaves the selection alone"
+        );
+        assert_eq!(state.presets_by_name.len(), 2);
+        assert!(state.presets_by_name.contains_key("Первый"));
+        assert!(state.presets_by_name.contains_key("Второй"));
+        assert!(
+            !state.status_line.is_empty(),
+            "the refusal must be reported to the user"
+        );
+        assert!(
+            state.selected_preset_has_unsaved_changes(),
+            "the pending rename is still pending, so the preset is still unsaved"
+        );
+    }
+
+    /// An EMPTY name is refused, and nothing is stored under it. Empty means EMPTY: a name
+    /// made of spaces is a legitimate name (see
+    /// `a_whitespace_padded_preset_name_is_saved_verbatim`), and only the one the store
+    /// drops on write is refused here.
+    #[test]
+    fn saving_a_global_preset_under_an_empty_name_is_refused() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        let created = state
+            .selected_preset_name
+            .clone()
+            .expect("creating a preset selects it");
+
+        state.preset_name_input = String::new();
+        state.save_current_preset();
+
+        assert_eq!(state.selected_preset_name.as_deref(), Some(created.as_str()));
+        assert_eq!(state.presets_by_name.len(), 1);
+        assert!(state.presets_by_name.contains_key(&created));
+        assert!(!state.status_line.is_empty());
+    }
+
+    /// PRESET NAMES ARE USER DATA, STORED VERBATIM. A padded name survives a save unchanged
+    /// and is NOT read as a rename to its trimmed form: trimming here refused the save as
+    /// "name taken" whenever the trimmed name existed (so the parameter edit could never be
+    /// saved at all) and silently re-keyed the preset when it did not.
+    #[test]
+    fn a_whitespace_padded_preset_name_is_saved_verbatim() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        // The trimmed spelling exists as a SEPARATE preset, which is what made the trimming
+        // defect visible: the padded one could then never be saved.
+        state.preset_name_input = "Рао-кун".to_string();
+        state.save_current_preset();
+        state.create_global_preset();
+        state.preset_name_input = " Рао-кун ".to_string();
+
+        state.save_current_preset();
+
+        assert_eq!(
+            state.selected_preset_name.as_deref(),
+            Some(" Рао-кун "),
+            "the padded name is a name of its own, not a rename to the trimmed one",
+        );
+        assert!(state.presets_by_name.contains_key(" Рао-кун "));
+        assert!(state.presets_by_name.contains_key("Рао-кун"));
+        assert_eq!(state.presets_by_name.len(), 2);
+        assert!(
+            !state.selected_preset_has_unsaved_changes(),
+            "the buffer and the selection match byte for byte, so nothing is pending",
+        );
+
+        // And re-saving the padded preset without touching the buffer is an ordinary save,
+        // not a collision with its trimmed namesake.
+        state.font_size_px = 29.0;
+        state.store_current_params_snapshot();
+        assert!(state.selected_preset_has_unsaved_changes());
+        state.save_current_preset();
+        assert!(!state.selected_preset_has_unsaved_changes());
+        assert_eq!(state.presets_by_name.len(), 2);
+    }
+
+    /// A pending rename is compared VERBATIM too: dropping the padding of a stored name is a
+    /// real rename and must show up as unsaved.
+    #[test]
+    fn a_whitespace_only_rename_counts_as_an_unsaved_change() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        state.preset_name_input = " Рао-кун ".to_string();
+        state.save_current_preset();
+        assert!(!state.selected_preset_has_unsaved_changes());
+
+        state.preset_name_input = "Рао-кун".to_string();
+
+        assert!(
+            state.selected_preset_has_unsaved_changes(),
+            "the name is the identity, so trimming it is a rename like any other",
+        );
+    }
+
+    /// Applying a preset RE-BINDS the rename buffer to it: the buffer is the selection's
+    /// name, so leaving the previous preset's name in it would turn the next «Сохранить»
+    /// into an unrequested rename.
+    #[test]
+    fn applying_a_global_preset_rebinds_the_rename_buffer() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        state.preset_name_input = "Первый".to_string();
+        state.save_current_preset();
+        state.create_global_preset();
+        state.preset_name_input = "Второй".to_string();
+        state.save_current_preset();
+
+        state.apply_preset_by_name("Первый".to_string());
+
+        assert_eq!(state.selected_preset_name.as_deref(), Some("Первый"));
+        assert_eq!(
+            state.preset_name_input, "Первый",
+            "the buffer follows the selection",
+        );
+        assert!(
+            !state.selected_preset_has_unsaved_changes(),
+            "what is on screen after an apply is the preset's own content",
+        );
+
+        // A name that resolves to nothing changes neither the selection nor its buffer.
+        state.apply_preset_by_name("Третий".to_string());
+        assert_eq!(state.selected_preset_name.as_deref(), Some("Первый"));
+        assert_eq!(state.preset_name_input, "Первый");
+    }
+
+    /// A FAILED save re-raises the unsaved-changes warning only for the preset the LOST
+    /// SNAPSHOT belonged to. The event carries that identity for the same reason it carries
+    /// the generation: it arrives frames later, and a debounced DEFAULT-local-set write
+    /// carries no global preset at all.
+    #[test]
+    fn a_failed_save_re_arms_only_the_preset_its_snapshot_belonged_to() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        state.preset_name_input = "Первый".to_string();
+        state.save_current_preset();
+        state.create_global_preset();
+        state.preset_name_input = "Второй".to_string();
+        state.save_current_preset();
+        assert!(!state.selected_preset_has_unsaved_changes());
+
+        // A write that belonged to the OTHER preset.
+        send_preset_save_failure(&mut state, Some("Первый"));
+        assert!(
+            !state.selected_preset_dirty,
+            "a failure that belonged to another preset must not mark this one unsaved",
+        );
+        // A debounced default-local-set write, which had no global preset at all.
+        send_preset_save_failure(&mut state, None);
+        assert!(
+            !state.selected_preset_dirty,
+            "a failure that belonged to no preset must not mark one either",
+        );
+        assert!(
+            state.status_line.contains("диск полон"),
+            "the failure itself is still reported",
+        );
+
+        // And the one that really did lose this preset's snapshot.
+        send_preset_save_failure(&mut state, Some("Второй"));
+        assert!(state.selected_preset_dirty);
+        assert!(state.selected_preset_has_unsaved_changes());
+    }
+
+    /// Pushes one `SaveFailed` through the panel's own channel and drains it, as the
+    /// per-frame poll would. `preset` is the global preset the lost snapshot belonged to.
+    fn send_preset_save_failure(state: &mut TypingCreatePanelState, preset: Option<&str>) {
+        state
+            .preset_store_tx
+            .send(PresetStoreEvent::SaveFailed {
+                reason: "диск полон".to_string(),
+                selected_preset_name: preset.map(str::to_string),
+                default_local_generation: state.local_presets_generation,
+                retryable: true,
+            })
+            .expect("the panel owns the receiver");
+        state.poll_preset_store_events();
+    }
+
+    /// The default name of a created preset is the LOWEST free index, not "one past the
+    /// count": after renaming (or deleting) the preset holding index 2, the next created one
+    /// takes that index back.
+    #[test]
+    fn a_created_preset_takes_the_lowest_free_default_name() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        assert_eq!(
+            state.selected_preset_name.as_deref(),
+            Some(tf!("typing.presets.default_name", index = 1).as_str()),
+        );
+        state.create_global_preset();
+        state.create_global_preset();
+        // Frees index 2 by renaming the preset that holds it.
+        state.apply_preset_by_name(tf!("typing.presets.default_name", index = 2));
+        state.preset_name_input = "Крик".to_string();
+        state.save_current_preset();
+
+        state.create_global_preset();
+
+        assert_eq!(
+            state.selected_preset_name.as_deref(),
+            Some(tf!("typing.presets.default_name", index = 2).as_str()),
+            "the freed index is reused instead of counting past the stored presets",
+        );
+        assert_eq!(state.presets_by_name.len(), 4);
+    }
+
+    /// A GLOBAL preset is never minted while the panel sits on a SUBSTITUTED font: the
+    /// capture would record that neighbour as the preset's own. Same rule, same refusal path
+    /// as `local_presets::create_local_preset`.
+    #[test]
+    fn creating_a_global_preset_is_refused_while_the_font_is_missing() {
+        let mut state = preset_editing_panel();
+        state.missing_font = Some("Пропавший".to_string());
+        state.status_line = "всё хорошо".to_string();
+
+        state.create_global_preset();
+
+        assert!(state.presets_by_name.is_empty());
+        assert_eq!(state.selected_preset_name, None);
+        assert!(state.preset_name_input.is_empty());
+        assert_eq!(
+            state.status_line,
+            t!("typing.presets.create_blocked_missing_font").to_string(),
+            "the refusal must be visible, not silent",
+        );
+    }
+
+    /// SWITCHING THE FONT under a FONT-mode preset changes the preset: the font itself is
+    /// part of its payload (`capture_current_preset`). The branch taken when the incoming
+    /// font already has a session profile returns before the parameter dispatch, so it used
+    /// to mark nothing and the user got no warning for a change the save really writes.
+    #[test]
+    fn switching_to_a_known_font_marks_the_selected_preset_unsaved() {
+        let mut state = preset_editing_panel();
+        // Give the second font a session profile, so the switch below takes the branch that
+        // restores it instead of the fresh-font one.
+        state.selected_font_idx = 1;
+        state.font_size_px = 24.0;
+        state.store_current_params_snapshot();
+        state.selected_font_idx = 0;
+        state.handle_create_font_selection_change(1);
+        state.create_global_preset();
+        assert!(!state.selected_preset_has_unsaved_changes());
+
+        state.selected_font_idx = 1;
+        state.handle_create_font_selection_change(0);
+
+        assert!(
+            state.selected_preset_dirty,
+            "the preset stores the font, so a font switch is an unsaved change",
+        );
+    }
+
+    /// SWITCHING THE IDENTITY MODE under an applied preset changes which of the two DISJOINT
+    /// payloads that preset carries, so it is an unsaved change even though no parameter was
+    /// touched — and the store the switch runs first cannot report it (in `LocalPreset` mode
+    /// it early-returns for a scratch-pad panel with nothing selected).
+    #[test]
+    fn switching_the_identity_mode_marks_the_selected_preset_unsaved() {
+        let mut state = preset_editing_panel();
+        // Switching OUT of `LocalPreset` mode with nothing selected is the case the mode
+        // switch has to mark by itself: the store it runs first is the local-preset one,
+        // which early-returns for a scratch-pad panel and therefore marks nothing.
+        state.identity_mode = ParamIdentityMode::LocalPreset;
+        state.create_global_preset();
+        assert_eq!(state.selected_local_preset, None);
+        assert!(!state.selected_preset_has_unsaved_changes());
+
+        state.set_param_identity_mode(ParamIdentityMode::Font);
+
+        assert_eq!(state.identity_mode, ParamIdentityMode::Font);
+        assert!(
+            state.selected_preset_dirty,
+            "the mode decides the preset's payload shape, so switching it is unsaved",
+        );
+
+        // With no preset applied there is nothing to mark.
+        state.deselect_global_preset();
+        state.selected_preset_dirty = false;
+        state.set_param_identity_mode(ParamIdentityMode::LocalPreset);
+        assert!(!state.selected_preset_dirty);
+    }
+
+    /// Deleting the selected preset removes it AND goes back through the «Нет» path, which is
+    /// what restores the PARKED default local set. Skipping that would leave the live set as
+    /// the deleted preset's — the live-set invariant of
+    /// `local_presets::default_local_set_snapshot`.
+    #[test]
+    fn deleting_a_global_preset_restores_the_parked_default_local_set() {
+        let mut state = preset_editing_panel();
+        state.identity_mode = ParamIdentityMode::LocalPreset;
+        state.create_local_preset();
+        let parked_name = state.local_presets[0].name.clone();
+        state.create_global_preset();
+        let created = state
+            .selected_preset_name
+            .clone()
+            .expect("creating a preset selects it");
+        // The preset's own set now diverges from the parked default one.
+        state.create_local_preset();
+        assert_eq!(state.local_presets.len(), 2);
+
+        state.delete_selected_preset();
+
+        assert!(!state.presets_by_name.contains_key(&created));
+        assert_eq!(state.selected_preset_name, None);
+        assert!(state.preset_name_input.is_empty());
+        assert!(!state.preset_delete_armed);
+        assert_eq!(
+            state.local_presets.len(),
+            1,
+            "the parked DEFAULT local set must come back with the deselection"
+        );
+        assert_eq!(state.local_presets[0].name, parked_name);
+    }
+
+    /// The unsaved-changes warning is driven by a FLAG raised at the ONE parameter-edit
+    /// dispatch and cleared by a successful save — never by a per-frame payload comparison.
+    #[test]
+    fn a_parameter_edit_marks_the_selected_preset_unsaved_until_it_is_saved() {
+        let mut state = preset_editing_panel();
+        state.create_global_preset();
+        assert!(!state.selected_preset_has_unsaved_changes());
+
+        state.font_size_px = 77.0;
+        state.store_current_params_snapshot();
+
+        assert!(
+            state.selected_preset_has_unsaved_changes(),
+            "a parameter edit under an applied preset is an unsaved change"
+        );
+
+        state.save_current_preset();
+
+        assert!(!state.selected_preset_has_unsaved_changes());
+        let name = state
+            .selected_preset_name
+            .clone()
+            .expect("the preset stays selected");
+        let saved = state
+            .presets_by_name
+            .get(&name)
+            .expect("the preset is stored");
+        let stored_size = saved
+            .font_profiles
+            .get("Krik-Regular")
+            .and_then(|body| body.pointer("/text_params/font_size_px"))
+            .and_then(Value::as_f64)
+            .expect("the edited size reaches the preset payload");
+        assert!((stored_size - 77.0).abs() < 1e-6);
+    }
+
+    /// A parameter edit with NO preset applied marks nothing: the panel owns its parameters
+    /// then, and the warning belongs to a preset that does not exist.
+    #[test]
+    fn a_parameter_edit_without_a_preset_marks_nothing_unsaved() {
+        let mut state = preset_editing_panel();
+        state.font_size_px = 31.0;
+        state.store_current_params_snapshot();
+
+        assert!(!state.selected_preset_dirty);
+        assert!(!state.selected_preset_has_unsaved_changes());
+    }
+
+    /// THE WHEEL NEVER CREATES A PRESET: its virtual list is «Нет» plus the real presets, so
+    /// a full cycle visits exactly those rows and never the popup's «create» row.
+    #[test]
+    fn the_global_preset_wheel_never_reaches_the_create_row() {
+        assert_eq!(create_presets::global_preset_wheel_target(None, 2, 1), Some(Some(0)));
+        assert_eq!(create_presets::global_preset_wheel_target(Some(0), 2, 1), Some(Some(1)));
+        // Past the last preset the cycle wraps to «Нет», not to a third row.
+        assert_eq!(create_presets::global_preset_wheel_target(Some(1), 2, 1), Some(None));
+        assert_eq!(create_presets::global_preset_wheel_target(None, 2, -1), Some(Some(1)));
+        // Nothing to move to, and no step at all, both report "no change".
+        assert_eq!(create_presets::global_preset_wheel_target(None, 0, 1), None);
+        assert_eq!(create_presets::global_preset_wheel_target(Some(0), 2, 0), None);
     }
 
     /// Unique temp directory for a preset-store test. Never the real `fonts/` and never the
@@ -1613,6 +2112,8 @@ paths change.
                 default_local: presets_store::DefaultLocalSet::default(),
             },
             presets_store::next_save_ticket(),
+            // No global preset was applied when this snapshot was taken.
+            None,
             0,
             // No config cleanup: a failed save must not reach it, and a test must never
             // touch the real `user_config.json`.
@@ -1664,8 +2165,9 @@ paths change.
             &blocked,
             &document,
             presets_store::next_save_ticket(),
+            None,
             0,
-            Some(&config),
+            Some(config.as_path()),
             &state.preset_store_tx,
         );
         let after_failure: Value =
@@ -1681,8 +2183,9 @@ paths change.
             &dir,
             &document,
             presets_store::next_save_ticket(),
+            None,
             0,
-            Some(&config),
+            Some(config.as_path()),
             &state.preset_store_tx,
         );
         assert_eq!(
