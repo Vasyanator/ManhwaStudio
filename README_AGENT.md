@@ -403,6 +403,7 @@ The window a user sees first is placed from the self-versioned `Window` section 
 | `types.rs` | `CanvasState`, `RuntimeBubble`, `BubbleAction`, `BubbleType`, `BubbleMode`, etc. |
 
 **Canvas geometry**: страницы раскладываются в стабильных world-координатах (unscaled source size + fixed content width), а screen `image_rect` получается только через camera-like `zoom`; directed zoom всегда якорится на world-точку под курсором/в центре viewport и корректирует оба scroll offset-а без ветвления "курсор над страницей / вне страницы".
+Cross-tab viewport sync carries `CanvasViewportSnapshot { zoom, scroll_offset, laid_out }`: `laid_out` is false for a canvas that has never run a scene pass, and such a snapshot transfers the ZOOM ONLY — its zero offset is not a place the user ever looked at, so appliers must leave the destination canvas free to run its own centering and keep any pending focus.
 Source page dimensions come from `PageImageInfo`; source page `PageTexture` handles are cache residency and may be dropped. NEAREST source textures are lazy and scoped to high-zoom pixel inspection near the active page window.
 **Tiling**: `OVERLAY_TILE_SIDE` — размер тайла overlay; `TEXT_DETECTOR_MASK_TILE_SIDE` — тайл маски детектора.
 **Debounce**: `TEXT_UPSERT_DEBOUNCE_SECS` — задержка flush bubble upsert → model.

@@ -204,6 +204,15 @@ shared `CanvasViewportSnapshot`, publishes it only from the active canvas after 
 canvas is drawn, and applies it only to the canvas being entered. Inactive canvases must
 not be scrolled or re-anchored every frame.
 
+`CanvasViewportSnapshot::laid_out` says whether the snapshot's `scroll_offset` means anything:
+it mirrors `scene.scroll_inner_rect.is_some()`, which is `Some` only after a real scene pass. A
+snapshot published by a canvas that was never drawn (the app seeds the shared snapshot from a
+fresh `CanvasView`, and a project reload can hand it to another tab before any canvas has laid
+out) carries the initial `Vec2::ZERO`, not a viewed position. `apply_viewport_snapshot` therefore
+applies the ZOOM ONLY for such a snapshot and touches neither the scroll offset, nor the pending
+zoom anchor / focus, nor the centering state: an unusable snapshot is not a navigation intent and
+must not supersede a pending focus or pin the canvas to the left edge for its whole life.
+
 `CanvasView::focus_page` is deferred navigation: it applies the zoom immediately and records
 a `pending_focus` request that the draw pass resolves into a scroll offset once the target
 page's world rect (and its center, when not passed explicitly) is known — so focusing a canvas
@@ -224,9 +233,44 @@ across layers. The grid is drawn in one late overlay pass (`draw_pixel_grid_over
 layers. Overlay and text-mask tile draws viewport-cull tiles against the visible clip rect.
 
 Directed zoom is anchored in content/world space and clamps the requested horizontal
-scroll offset to the current scrollable range. The canvas creates horizontal scroll range
-before the visual strip fully reaches viewport width, so anchor compensation has a stable
-X range before the old overflow point.
+scroll offset to the current scrollable range.
+
+The scrollable strip (`canvas_row_screen_width_for_content`) is the widest of three demands:
+the viewport, the content row (page image plus its aside gutters), and the widest PAGE image
+grown by `RIBBON_SIDE_FREE_SPACE_FACTOR` (0.9) of its own width on each side. So the lateral
+free space the ribbon can slide into is proportional to the page, not to the viewport — a narrow
+webtoon ribbon and a wide manga page get the same freedom relative to their own width — while
+the content term keeps a far aside column reachable and the viewport term guarantees that a
+strip which already fits creates NO scroll range and is centered by the row inset alone (this is
+what keeps zoomed-out content centered). A scroll range still appears before the visible strip
+reaches viewport width (as soon as `2.8 * widest_page_screen_width > viewport_width`), so the
+zoom anchor keeps its stable X range before the overflow point.
+
+Two coordinate spaces meet here and must not be confused: CONTENT space (world * zoom) and
+SCROLL-OFFSET space, which the `ScrollArea` measures from the strip's left edge. They differ by
+`viewport_content_inset_x` (the content row is centered inside the strip). Every content-space
+abscissa turned into a scroll offset passes through that inset and is clamped to
+`[0, max_scroll_offset_x_for_viewport]` — both `scroll_offset_for_zoom_anchor` and
+`try_apply_pending_focus` do so, which is what makes focusing the center of the widest page land
+on exactly the centered offset.
+
+Horizontal centering is a one-shot with a delayed latch (`HorizontalCenteringState`). Page sizes
+arrive asynchronously, so the strip widths grow over the first frames; latching on the first
+frame would center the canvas on the smallest geometry of the session and never correct it. The
+canvas therefore keeps re-centering while the geometry is PROVISIONAL — some project page has
+neither a resolvable size nor a `SourcePageLoadState::Failed` verdict — and latches for good as
+soon as the geometry settles. It also latches immediately, and permanently, on any competing
+intent: an offset read back that is not the one the canvas requested (a user scroll), a laid-out
+snapshot restore, or an applied page focus.
+
+The "user scroll" verdict is only valid against a frame in which the canvas actually requested an
+offset, so two kinds of frame are skipped whole — one with an unusable viewport width (`<= 1.0`,
+a collapsing dock layout or an unsized canvas rect) and a provisional one whose strip fits the
+viewport (no scroll range to request). Both forget the pending request instead of latching:
+comparing the next read-back against a request that was never made would misread egui's own clamp
+as a user scroll and pin the ribbon to the left edge, which is precisely the failure being fixed.
+The centering reads its viewport width from `scene.scroll_inner_rect` (falling back to
+`canvas_rect` on the very first frame), the same source as the other two space mappings.
 
 ## Files and submodules
 - `mod.rs`: public facade, hook trait, render orchestration, and synchronization with

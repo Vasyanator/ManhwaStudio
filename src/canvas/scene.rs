@@ -33,6 +33,12 @@ Key functions:
 Notes:
 - Bubble runtime/persistence remain in `bubble_runtime.rs`.
 - Clean-overlay runtime remains in `overlay_runtime.rs`.
+- The scrollable strip is `max(viewport, content_row, widest_page * (1 + 2 *
+  RIBBON_SIDE_FREE_SPACE_FACTOR))`, so the lateral free space is proportional to the widest PAGE
+  while a strip that fits still creates no scroll range at all.
+- Automatic horizontal centering keeps re-centering while page geometry is still provisional and
+  latches (`HorizontalCenteringState`) on settled geometry, a user scroll, or an explicit
+  navigation intent.
 */
 
 use super::bubble_aside_ui;
@@ -47,7 +53,7 @@ use super::{
     BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
     OnTopFocusMode, ViewTransform,
 };
-use crate::app::{PageImageInfo, PageTexture};
+use crate::app::{PageImageInfo, PageTexture, SourcePageLoadState};
 use crate::project::ProjectData;
 use crate::runtime_log;
 use crate::widgets::panel_dock::PanelDockState;
@@ -56,7 +62,16 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use std::collections::HashMap;
 
-const HORIZONTAL_SCROLL_EARLY_FACTOR: f32 = 1.7;
+/// Lateral free space kept beyond each edge of the WIDEST page of the ribbon, expressed as a
+/// fraction of that page's own screen width. When the pages drive the layout, the scrollable strip
+/// is `widest_page * (1 + 2 * RIBBON_SIDE_FREE_SPACE_FACTOR)` wide, so how far the ribbon can slide
+/// sideways is proportional to the PAGE rather than to the viewport: a narrow webtoon ribbon and a
+/// wide manga page get the same freedom relative to their own width.
+const RIBBON_SIDE_FREE_SPACE_FACTOR: f32 = 0.9;
+
+/// Tolerance (screen points) for recognizing the horizontal scroll offset read back after a frame
+/// as the one this canvas itself requested. Anything further away is a user scroll.
+const HORIZONTAL_CENTER_READBACK_EPS_PX: f32 = 0.5;
 
 /// Screen-point margin by which the viewport is expanded before testing page
 /// visibility. Matches the pre-existing `ui.clip_rect().expand(256.0)` used to
@@ -64,10 +79,41 @@ const HORIZONTAL_SCROLL_EARLY_FACTOR: f32 = 1.7;
 /// to the old allocation-based test while decoupling it from the allocation.
 const PAGE_VISIBILITY_MARGIN_PX: f32 = 256.0;
 
+/// State of the canvas' automatic horizontal centering.
+///
+/// The canvas must open centered on the ribbon. Page geometry is not known on the first frames
+/// (`page_infos` is seeded with zero sizes and filled asynchronously), so both the content width
+/// and the widest-page width — and with them the centered offset — keep growing; centering
+/// therefore stays live until the geometry settles instead of latching on the smallest strip of
+/// the session. It stops permanently the moment the view is driven by anything else: a user
+/// horizontal scroll, a laid-out viewport-snapshot restore, or a page focus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum HorizontalCenteringState {
+    /// Centering may still run. `last_requested_x` is the horizontal offset this canvas last
+    /// asked the `ScrollArea` for, or `None` before the first request; a read-back that differs
+    /// from it means the user moved the view.
+    Live { last_requested_x: Option<f32> },
+    /// Centering is over and never resumes for this canvas.
+    Latched,
+}
+
+/// The two world-space widths the strip layout is built from.
+#[derive(Debug, Clone, Copy)]
+struct CanvasStripWorldWidths {
+    /// Widest content row: page image plus the aside gutters reserved around it. At least `1.0`.
+    content: f32,
+    /// Widest page IMAGE alone, without any gutters. At least `1.0`.
+    max_page: f32,
+}
+
 pub(super) struct CanvasSceneState {
     pub(super) page_rects: Vec<Rect>,
     pub(super) page_world_rects: Vec<Rect>,
     pub(super) content_world_width: f32,
+    /// Widest page IMAGE width in world pixels across the ribbon, excluding the aside gutters
+    /// reserved around it (unlike `content_world_width`, which includes them). Drives the
+    /// page-proportional lateral free space of the scrollable strip. Grows while pages decode.
+    pub(super) max_page_world_width: f32,
     pub(super) page_aside_presence: HashMap<usize, [bool; 2]>,
     pub(super) page_aside_widths: HashMap<usize, [f32; 2]>,
     pub(super) scroll_center_idx: usize,
@@ -85,7 +131,9 @@ pub(super) struct CanvasSceneState {
     /// cursors/input over the bars (mirrors egui's bar placement).
     pub(super) scroll_vertical_bar_rect: Option<Rect>,
     pub(super) scroll_horizontal_bar_rect: Option<Rect>,
-    pub(super) initial_horizontal_scroll_centered: bool,
+    /// Whether the automatic horizontal centering may still run. See
+    /// [`HorizontalCenteringState`] for the invariant.
+    pub(super) horizontal_centering: HorizontalCenteringState,
     pub(super) pending_zoom_anchor: Option<PendingZoomAnchor>,
     pub(super) pending_scroll_offset: Option<Vec2>,
     /// Deferred `CanvasView::focus_page` request waiting for the target page's world rect (and
@@ -156,6 +204,7 @@ impl Default for CanvasSceneState {
             page_rects: Vec::new(),
             page_world_rects: Vec::new(),
             content_world_width: 1.0,
+            max_page_world_width: 1.0,
             page_aside_presence: HashMap::new(),
             page_aside_widths: HashMap::new(),
             scroll_center_idx: 0,
@@ -170,7 +219,9 @@ impl Default for CanvasSceneState {
             scroll_content_size: Vec2::ZERO,
             scroll_vertical_bar_rect: None,
             scroll_horizontal_bar_rect: None,
-            initial_horizontal_scroll_centered: false,
+            horizontal_centering: HorizontalCenteringState::Live {
+                last_requested_x: None,
+            },
             pending_zoom_anchor: None,
             pending_scroll_offset: None,
             pending_focus: None,
@@ -186,31 +237,52 @@ impl Default for CanvasSceneState {
 }
 
 impl CanvasView {
-    fn canvas_horizontal_scroll_threshold(viewport_width: f32) -> f32 {
-        viewport_width.max(1.0) / HORIZONTAL_SCROLL_EARLY_FACTOR
-    }
-
+    /// Screen width of the row allocated for every page — that is, of the whole scrollable strip.
+    ///
+    /// The strip is the widest of three demands, all in screen (zoomed) points:
+    /// - the viewport, so that a strip which already fits creates NO horizontal scroll range and
+    ///   is centered by the row inset alone (this is what keeps zoomed-out content centered);
+    /// - the content row (page image plus the aside gutters reserved around it), so the far aside
+    ///   column always stays reachable by scrolling;
+    /// - the widest page plus `RIBBON_SIDE_FREE_SPACE_FACTOR` of its width of free space on each
+    ///   side, which is the lateral slack the user navigates the ribbon with.
+    ///
+    /// Because the third term reaches viewport width already at
+    /// `2.8 * max_page_screen_width > viewport_width`, a horizontal scroll range still appears
+    /// before the visible content fills the viewport, which is what the directed-zoom anchor
+    /// compensation relies on.
+    #[must_use]
     pub(super) fn canvas_row_screen_width_for_content(
         viewport_width: f32,
         content_screen_width: f32,
+        max_page_screen_width: f32,
     ) -> f32 {
         let viewport_width = viewport_width.max(1.0);
         let content_screen_width = content_screen_width.max(1.0);
-        let threshold = Self::canvas_horizontal_scroll_threshold(viewport_width);
-        if content_screen_width <= threshold {
-            viewport_width
-        } else {
-            viewport_width + content_screen_width - threshold
-        }
+        let page_driven_width =
+            max_page_screen_width.max(0.0) * (1.0 + 2.0 * RIBBON_SIDE_FREE_SPACE_FACTOR);
+        viewport_width
+            .max(content_screen_width)
+            .max(page_driven_width)
     }
 
+    /// Row width and the in-row left offset at which a page image of `image_screen_width` is drawn.
+    ///
+    /// The content row is centered inside the strip and the page image is centered inside the
+    /// content row, so a page stays visually centered in the viewport at the centered scroll
+    /// offset regardless of how wide the strip is.
+    #[must_use]
     fn canvas_page_x_layout(
         viewport_width: f32,
         content_screen_width: f32,
+        max_page_screen_width: f32,
         image_screen_width: f32,
     ) -> (f32, f32) {
-        let row_screen_width =
-            Self::canvas_row_screen_width_for_content(viewport_width, content_screen_width);
+        let row_screen_width = Self::canvas_row_screen_width_for_content(
+            viewport_width,
+            content_screen_width,
+            max_page_screen_width,
+        );
         let centered_strip_inset_x = ((row_screen_width - content_screen_width).max(0.0)) * 0.5;
         let image_offset_x = ((content_screen_width - image_screen_width) * 0.5).max(0.0);
         (row_screen_width, centered_strip_inset_x + image_offset_x)
@@ -247,17 +319,33 @@ impl CanvasView {
             .intersects(viewport.expand(PAGE_VISIBILITY_MARGIN_PX))
     }
 
-    fn viewport_content_inset_x(&self, viewport_width: f32) -> f32 {
+    /// Screen width of the scrollable strip for the CURRENT scene geometry and zoom.
+    #[must_use]
+    fn canvas_row_screen_width(&self, viewport_width: f32) -> f32 {
+        let zoom = self.state.zoom;
+        Self::canvas_row_screen_width_for_content(
+            viewport_width,
+            self.scene.content_world_width.max(1.0) * zoom,
+            self.scene.max_page_world_width.max(0.0) * zoom,
+        )
+    }
+
+    /// Distance (screen points) from the strip's left edge to the content row's left edge.
+    ///
+    /// This is the offset between CONTENT space (where world coordinates scale into) and
+    /// SCROLL-OFFSET space (which the `ScrollArea` measures from the strip's left edge). Every
+    /// content-space point must pass through it before being used as a scroll offset.
+    #[must_use]
+    pub(super) fn viewport_content_inset_x(&self, viewport_width: f32) -> f32 {
         let scaled_content_width = self.scene.content_world_width.max(1.0) * self.state.zoom;
-        let row_width =
-            Self::canvas_row_screen_width_for_content(viewport_width, scaled_content_width);
+        let row_width = self.canvas_row_screen_width(viewport_width);
         ((row_width - scaled_content_width).max(0.0)) * 0.5
     }
 
+    /// Largest valid horizontal scroll offset for `viewport_width`; `0.0` when the strip fits.
+    #[must_use]
     pub(super) fn max_scroll_offset_x_for_viewport(&self, viewport_width: f32) -> f32 {
-        let scaled_content_width = self.scene.content_world_width.max(1.0) * self.state.zoom;
-        let row_width =
-            Self::canvas_row_screen_width_for_content(viewport_width, scaled_content_width);
+        let row_width = self.canvas_row_screen_width(viewport_width);
         (row_width - viewport_width.max(1.0)).max(0.0)
     }
 
@@ -275,22 +363,85 @@ impl CanvasView {
         ]
     }
 
+    /// Ends the automatic horizontal centering for good.
+    ///
+    /// Called by every navigation intent that installs an explicit horizontal offset of its own
+    /// (a laid-out viewport-snapshot restore, an applied page focus), so the centering can never
+    /// pull the view back afterwards.
+    pub(super) fn latch_horizontal_centering(&mut self) {
+        self.scene.horizontal_centering = HorizontalCenteringState::Latched;
+    }
+
+    /// Horizontal-centering offset to request from the `ScrollArea` this frame, or `None` when the
+    /// canvas must not drive the offset.
+    ///
+    /// `geometry_settled` states whether the strip geometry can still grow (see
+    /// [`Self::canvas_page_geometry_settled`]). While it is provisional the canvas keeps
+    /// RE-centering every frame, because an offset centered on a partially decoded ribbon is not
+    /// centered on the final one; once it settles, the request is the last one. A read-back offset
+    /// that is not the one this canvas last requested is a user scroll and latches the centering
+    /// permanently — the user owns the view from then on.
+    ///
+    /// Two frames are skipped without any state change other than forgetting the pending request:
+    /// an unusable `viewport_width` (`<= 1.0`) and a provisional geometry with no scroll range.
+    /// Both mean "this canvas requested nothing this frame", so the next read-back must not be
+    /// compared against an older request.
     pub(super) fn initial_horizontal_center_scroll_offset(
         &mut self,
         viewport_width: f32,
+        geometry_settled: bool,
     ) -> Option<Vec2> {
-        if self.scene.initial_horizontal_scroll_centered {
+        let last_requested_x = match self.scene.horizontal_centering {
+            HorizontalCenteringState::Latched => return None,
+            HorizontalCenteringState::Live { last_requested_x } => last_requested_x,
+        };
+        // A frame drawn at a degenerate width (a collapsing or animating dock layout, a canvas
+        // rect that has not been sized yet) carries no usable geometry: the `max(1.0)` guards
+        // inside the width helpers would turn nearly the whole strip into scroll range and center
+        // the view on garbage — which, on settled geometry, would then be LATCHED. Skip such a
+        // frame entirely: no latch, and no recorded request, because the offset the `ScrollArea`
+        // reports for it says nothing about what the user did.
+        if viewport_width <= 1.0 {
+            self.scene.horizontal_centering = HorizontalCenteringState::Live {
+                last_requested_x: None,
+            };
+            return None;
+        }
+        if let Some(requested_x) = last_requested_x
+            && (self.scene.scroll_offset.x - requested_x).abs() > HORIZONTAL_CENTER_READBACK_EPS_PX
+        {
+            self.latch_horizontal_centering();
             return None;
         }
         let max_scroll_x = self.max_scroll_offset_x_for_viewport(viewport_width);
         if max_scroll_x <= f32::EPSILON {
+            // The strip fits the viewport: the row inset alone centers the content and there is
+            // nothing to scroll.
+            if geometry_settled {
+                // Settled geometry means it stays that way, so stop watching.
+                self.latch_horizontal_centering();
+            } else {
+                // Provisional geometry can regain a scroll range later (a page still decoding, a
+                // viewport widened by the startup maximize, an aside side disappearing). Drop the
+                // stale request: we did NOT request an offset this frame, so the next read-back is
+                // not ours to compare against — egui clamps the offset to 0 here, and matching that
+                // 0 against an older request would be misread as a user scroll and would latch the
+                // ribbon against the left edge for good.
+                self.scene.horizontal_centering = HorizontalCenteringState::Live {
+                    last_requested_x: None,
+                };
+            }
             return None;
         }
-        self.scene.initial_horizontal_scroll_centered = true;
-        Some(egui::vec2(
-            max_scroll_x * 0.5,
-            self.scene.scroll_offset.y.max(0.0),
-        ))
+        let centered_x = max_scroll_x * 0.5;
+        self.scene.horizontal_centering = if geometry_settled {
+            HorizontalCenteringState::Latched
+        } else {
+            HorizontalCenteringState::Live {
+                last_requested_x: Some(centered_x),
+            }
+        };
+        Some(egui::vec2(centered_x, self.scene.scroll_offset.y.max(0.0)))
     }
 
     fn canvas_row_width_for_page(&self, page_idx: usize, image_width: f32) -> f32 {
@@ -337,12 +488,20 @@ impl CanvasView {
         (image_width + symmetric_side_extra * 2.0).max(1.0)
     }
 
-    fn canvas_content_world_width(
+    /// World-space widths of the page strip, both measured in one pass over the project pages.
+    ///
+    /// Pages whose size is not resolvable yet are skipped, so both widths GROW while the source
+    /// loader decodes the ribbon.
+    #[must_use]
+    fn canvas_strip_world_widths(
         &self,
         project: &ProjectData,
         page_infos: &HashMap<usize, PageImageInfo>,
-    ) -> f32 {
-        let mut content_width = 1.0f32;
+    ) -> CanvasStripWorldWidths {
+        let mut widths = CanvasStripWorldWidths {
+            content: 1.0,
+            max_page: 1.0,
+        };
         for page in &project.pages {
             let Some(page_info) = page_infos.get(&page.idx) else {
                 continue;
@@ -353,10 +512,36 @@ impl CanvasView {
             if page_size_px.x <= 0.0 || page_size_px.y <= 0.0 {
                 continue;
             }
-            content_width =
-                content_width.max(self.canvas_row_width_for_page(page.idx, page_size_px.x));
+            widths.content = widths
+                .content
+                .max(self.canvas_row_width_for_page(page.idx, page_size_px.x));
+            widths.max_page = widths.max_page.max(page_size_px.x);
         }
-        content_width
+        widths
+    }
+
+    /// True when no page can still change the strip geometry: every project page either has a
+    /// resolvable content size or has permanently failed to load.
+    ///
+    /// `page_infos` is seeded with zero sizes and filled asynchronously, so the strip widths grow
+    /// over the first frames of a session. A FAILED page counts as settled: it will never gain a
+    /// size, and waiting for it would keep the canvas re-centering forever.
+    #[must_use]
+    fn canvas_page_geometry_settled(
+        project: &ProjectData,
+        page_infos: &HashMap<usize, PageImageInfo>,
+    ) -> bool {
+        project.pages.iter().all(|page| {
+            page_infos.get(&page.idx).is_some_and(|info| {
+                if page_info_content_size(info).is_some() {
+                    return true;
+                }
+                match info.load_state {
+                    SourcePageLoadState::Loading | SourcePageLoadState::Available => false,
+                    SourcePageLoadState::Failed => true,
+                }
+            })
+        })
     }
 
     pub(super) fn capture_pending_zoom_anchor(
@@ -488,10 +673,24 @@ impl CanvasView {
             .pending_zoom_anchor
             .map(|anchor| self.scroll_offset_for_zoom_anchor(anchor))
             .or_else(|| self.scene.pending_scroll_offset.take());
-        let content_world_width = self.canvas_content_world_width(project, page_infos);
+        let strip_widths = self.canvas_strip_world_widths(project, page_infos);
+        let content_world_width = strip_widths.content;
         self.scene.content_world_width = content_world_width;
-        let requested_offset = requested_offset
-            .or_else(|| self.initial_horizontal_center_scroll_offset(frame.canvas_rect.width()));
+        self.scene.max_page_world_width = strip_widths.max_page;
+        // The strip widths above still grow while pages decode, so the centering must know
+        // whether the geometry it would latch on is the final one.
+        let geometry_settled = Self::canvas_page_geometry_settled(project, page_infos);
+        // Viewport width for the centering comes from the last scene pass' inner rect, the same
+        // source `scroll_offset_for_zoom_anchor` and `try_apply_pending_focus` map through, so all
+        // three space mappings can never disagree. `canvas_rect` only backs the very first frame,
+        // before any scene pass has produced an inner rect.
+        let centering_viewport_width = self
+            .scene
+            .scroll_inner_rect
+            .map_or(frame.canvas_rect.width(), |rect| rect.width());
+        let requested_offset = requested_offset.or_else(|| {
+            self.initial_horizontal_center_scroll_offset(centering_viewport_width, geometry_settled)
+        });
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(self.scroll_area_id_salt)
             .auto_shrink([false, false])
@@ -775,8 +974,16 @@ impl CanvasView {
         let image_size = page_size_px * self.state.zoom;
         let viewport_width = ui.clip_rect().width().max(1.0);
         let content_screen_width = content_world_width.max(1.0) * self.state.zoom;
-        let (row_screen_width, image_left_offset) =
-            Self::canvas_page_x_layout(viewport_width, content_screen_width, image_size.x);
+        // The widest page is read from the scene state rather than passed in: `draw_canvas_scene`
+        // stores it in the same pass that produces `content_world_width`, so both describe the
+        // same frame's geometry.
+        let max_page_screen_width = self.scene.max_page_world_width.max(0.0) * self.state.zoom;
+        let (row_screen_width, image_left_offset) = Self::canvas_page_x_layout(
+            viewport_width,
+            content_screen_width,
+            max_page_screen_width,
+            image_size.x,
+        );
         let row_size = egui::vec2(row_screen_width, image_size.y);
         let row_sense = if hook_claims_shift_drag {
             Sense::hover()
@@ -1617,10 +1824,14 @@ mod tests {
 
     /// Builds a `CanvasView` with the scene state needed by the pure scroll/zoom
     /// helpers, without touching any live egui `Ui`/`Context`.
+    ///
+    /// Models a ribbon of one page filling the whole content row (no aside gutters), so the
+    /// widest-page width equals the content width.
     fn view_with_layout(zoom: f32, content_world_width: f32, viewport: Rect) -> CanvasView {
         let mut view = CanvasView::default();
         view.state.zoom = zoom;
         view.scene.content_world_width = content_world_width;
+        view.scene.max_page_world_width = content_world_width;
         view.scene.scroll_inner_rect = Some(viewport);
         view
     }
@@ -1813,8 +2024,12 @@ mod tests {
         // so this assertion would fail.
         let viewport_width = 1000.0_f32;
         let content_world_width = 1400.0_f32;
+        // Widest page IMAGE of the strip below (the 1400px-wide first page); it drives the
+        // page-proportional strip width the same way the runtime scene state does.
+        let max_page_world_width = 1400.0_f32;
         for zoom in [0.2_f32, 1.0, 2.5, 5.0] {
             let content_screen_width = content_world_width * zoom;
+            let max_page_screen_width = max_page_world_width * zoom;
             // Page sizes in source pixels and their world top offsets down the strip.
             let pages: [(Vec2, f32); 3] = [
                 (egui::vec2(1400.0, 1000.0), 17.0),
@@ -1831,6 +2046,7 @@ mod tests {
                 let (_row_w, image_left_offset) = CanvasView::canvas_page_x_layout(
                     viewport_width,
                     content_screen_width,
+                    max_page_screen_width,
                     image_size.x,
                 );
                 // The row top advances with the world top (same accumulation as layout),
@@ -1880,6 +2096,8 @@ mod tests {
         const SIMULATED_ITEM_SPACING_Y: f32 = 12.0;
         let zoom = 1.0_f32;
         let content_screen_width = content_world_width * zoom;
+        // Widest page IMAGE of the strip below.
+        let max_page_screen_width = 1400.0_f32 * zoom;
         let pages: [(Vec2, f32); 3] = [
             (egui::vec2(1400.0, 1000.0), 17.0),
             (egui::vec2(900.0, 1300.0), 1017.0),
@@ -1895,6 +2113,7 @@ mod tests {
             let (_row_w, image_left_offset) = CanvasView::canvas_page_x_layout(
                 viewport_width,
                 content_screen_width,
+                max_page_screen_width,
                 image_size.x,
             );
             // Inject the incidental spacing egui would insert between consecutive rows: it
@@ -1954,11 +2173,15 @@ mod tests {
     fn centered_scroll_keeps_pages_centered_across_widths() {
         let viewport_width = 1000.0;
         let content_screen_width = 1400.0;
+        // The widest page of the strip; the centering identity below must hold for whatever
+        // lateral free space it adds to the row.
+        let max_page_screen_width = 1400.0;
 
         for image_screen_width in [1400.0, 1000.0, 640.0] {
             let (row_width, image_left_offset) = CanvasView::canvas_page_x_layout(
                 viewport_width,
                 content_screen_width,
+                max_page_screen_width,
                 image_screen_width,
             );
             let centered_scroll_offset = (row_width - viewport_width).max(0.0) * 0.5;

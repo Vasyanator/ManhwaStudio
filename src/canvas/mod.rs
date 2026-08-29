@@ -9,6 +9,9 @@ Main types:
 - `CanvasHintRow` / `CanvasHintHelp` / `CanvasBottomHint`: per-tab content of the collapsible
   bottom-center keyboard-shortcut hint overlay (label + key rows, each row optionally carrying a
   "?" help icon); `bottom_hint == None` hides it.
+- `CanvasViewportSnapshot`: cross-tab viewport transfer (`zoom`, `scroll_offset`, `laid_out`);
+  `laid_out == false` means the offset came from a canvas that never ran a scene pass and only the
+  zoom may be transferred.
 - `CanvasFrameParams`: per-frame viewport/interaction flags shared by scene + viewport passes.
 - `CanvasScenePageFrame`: geometry snapshot for one page row within the scene pass.
 - `OverlayUploadBudget`: per-frame clean-overlay upload budget used to keep GUI responsive.
@@ -233,6 +236,13 @@ use std::time::UNIX_EPOCH;
 pub struct CanvasViewportSnapshot {
     pub zoom: f32,
     pub scroll_offset: Vec2,
+    /// Whether `scroll_offset` was produced by a canvas that has actually run a scene pass.
+    ///
+    /// A snapshot of a canvas that never ran a scene pass carries NO usable scroll offset — the
+    /// offset is still the initial `Vec2::ZERO`, not a place the user ever looked at. Appliers
+    /// must take the zoom only from such a snapshot and leave the destination canvas free to run
+    /// its own initial centering.
+    pub laid_out: bool,
 }
 
 pub(crate) const BUBBLE_ORIGINAL_SPELLCHECK_DISABLED_KEY: &str = "spellcheck_original_disabled";
@@ -1060,15 +1070,31 @@ impl CanvasView {
         self.scroll_area_id_salt = id_salt;
     }
 
+    /// Current zoom plus scroll offset of this canvas, for cross-tab viewport synchronization.
+    ///
+    /// `laid_out` reports whether the offset means anything: `scroll_inner_rect` is `Some` only
+    /// after a real scene pass, so a canvas that was never drawn publishes a zoom-only snapshot.
+    #[must_use]
     pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {
         CanvasViewportSnapshot {
             zoom: self.state.zoom,
             scroll_offset: self.scene.scroll_offset,
+            laid_out: self.scene.scroll_inner_rect.is_some(),
         }
     }
 
+    /// Restores `snapshot` onto this canvas: the zoom applies immediately, the scroll offset is
+    /// queued for the next draw.
+    ///
+    /// A snapshot with `laid_out == false` carries no usable offset (see
+    /// [`CanvasViewportSnapshot::laid_out`]): only its zoom is applied, and every pending
+    /// navigation request as well as the automatic horizontal centering are left untouched — an
+    /// unusable snapshot is not a navigation intent and must not supersede a pending focus.
     pub fn apply_viewport_snapshot(&mut self, snapshot: CanvasViewportSnapshot) {
         self.state.zoom = snapshot.zoom.clamp(0.2, 5.0);
+        if !snapshot.laid_out {
+            return;
+        }
         let scroll_offset = egui::vec2(
             snapshot.scroll_offset.x.max(0.0),
             snapshot.scroll_offset.y.max(0.0),
@@ -1079,7 +1105,7 @@ impl CanvasView {
         // A snapshot restore is a full explicit viewport and the newest navigation intent: it
         // supersedes any not-yet-applied deferred page focus.
         self.scene.pending_focus = None;
-        self.scene.initial_horizontal_scroll_centered = true;
+        self.latch_horizontal_centering();
     }
 
     /// Current page index plus the page-local source-pixel point shown at the center of the
@@ -1125,7 +1151,9 @@ impl CanvasView {
     /// must be known from a scene layout (the layout is zoom-independent, so a stale-but-present
     /// rect from the last draw is fine) and the focus center must be explicit or derivable from
     /// `page_infos`. Returns `true` when the request was applied (and cleared); an unresolvable
-    /// request stays pending for a later call. Invoked from `draw` twice: before the frame clears
+    /// request stays pending for a later call. The resolved offset is expressed in scroll-offset
+    /// space and clamped to the current scrollable range, so focusing the center of the widest page
+    /// yields exactly the centered offset. Invoked from `draw` twice: before the frame clears
     /// the previous layout (same-frame apply for an already-laid-out canvas) and after the scene
     /// pass (freshly opened canvas whose first layout just happened).
     fn try_apply_pending_focus(&mut self, page_infos: &HashMap<usize, PageImageInfo>) -> bool {
@@ -1149,12 +1177,21 @@ impl CanvasView {
             .scroll_inner_rect
             .map_or(Vec2::ZERO, |rect| rect.size());
         let content_center = (world_rect.min.to_vec2() + center) * zoom;
-        let offset = content_center - viewport * 0.5;
-        let offset = egui::vec2(offset.x.max(0.0), offset.y.max(0.0));
+        // X must be mapped from CONTENT space into SCROLL-OFFSET space, exactly like
+        // `scroll_offset_for_zoom_anchor` does: the content row is centered inside the strip, so a
+        // content-space abscissa is `viewport_content_inset_x` short of the matching scroll
+        // offset. Without the inset the view lands that far to the left (and usually clamps to the
+        // left edge outright). Clamping to the real scrollable range keeps the request inside what
+        // the `ScrollArea` can honour, so the offset published to the other tabs is the applied one.
+        let max_scroll_x = self.max_scroll_offset_x_for_viewport(viewport.x);
+        let offset_x = (content_center.x + self.viewport_content_inset_x(viewport.x)
+            - viewport.x * 0.5)
+            .clamp(0.0, max_scroll_x);
+        let offset = egui::vec2(offset_x, (content_center.y - viewport.y * 0.5).max(0.0));
         self.scene.scroll_offset = offset;
         self.scene.pending_scroll_offset = Some(offset);
         self.scene.pending_zoom_anchor = None;
-        self.scene.initial_horizontal_scroll_centered = true;
+        self.latch_horizontal_centering();
         true
     }
 
@@ -3158,6 +3195,7 @@ mod tests {
         let snapshot = CanvasViewportSnapshot {
             zoom: 2.25,
             scroll_offset: egui::vec2(120.0, 340.0),
+            laid_out: true,
         };
 
         canvas.apply_viewport_snapshot(snapshot);
@@ -3169,6 +3207,45 @@ mod tests {
             Some(snapshot.scroll_offset)
         );
         assert!(canvas.scene.pending_zoom_anchor.is_none());
+    }
+
+    #[test]
+    fn never_laid_out_snapshot_applies_zoom_only() {
+        // Contract: a snapshot published by a canvas that never ran a scene pass carries a
+        // meaningless `Vec2::ZERO` offset. Applying it must not pin the destination canvas to the
+        // left edge, must not consume its pending focus, and must not burn its initial centering.
+        let mut canvas = CanvasView::default();
+        canvas.focus_page(2, Some(egui::vec2(10.0, 10.0)), 1.0);
+
+        canvas.apply_viewport_snapshot(CanvasViewportSnapshot {
+            zoom: 3.0,
+            scroll_offset: Vec2::ZERO,
+            laid_out: false,
+        });
+
+        assert!((canvas.zoom() - 3.0).abs() <= f32::EPSILON);
+        assert!(canvas.scene.pending_scroll_offset.is_none());
+        assert!(
+            canvas.scene.pending_focus.is_some(),
+            "an unusable snapshot must not supersede a pending focus"
+        );
+        assert_eq!(
+            canvas.scene.horizontal_centering,
+            scene::HorizontalCenteringState::Live {
+                last_requested_x: None
+            }
+        );
+    }
+
+    #[test]
+    fn viewport_snapshot_reports_layout_state() {
+        // Contract: `laid_out` mirrors "a scene pass has happened", i.e. `scroll_inner_rect`.
+        let mut canvas = CanvasView::default();
+        assert!(!canvas.viewport_snapshot().laid_out);
+
+        canvas.scene.scroll_inner_rect =
+            Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        assert!(canvas.viewport_snapshot().laid_out);
     }
 
     /// Builds a loaded `PageImageInfo` for the deferred-focus tests.
@@ -3208,11 +3285,17 @@ mod tests {
         page_infos.insert(3, page_info(200, 400));
         assert!(canvas.try_apply_pending_focus(&page_infos));
         assert!(canvas.scene.pending_focus.is_none());
-        // content center = (world_min + page_size/2) * zoom = (225, 450);
-        // offset = center - viewport/2 = (-175, 150) -> x clamps to 0.
+        // content center = (world_min + page_size/2) * zoom = (225, 450); y = 450 - 600/2 = 150.
+        // The default scene geometry (content 1.0 world px) makes the strip fit the 800px
+        // viewport, so the horizontal scroll range is empty and x clamps to 0 for lack of ANY
+        // valid offset, not because the mapping bottoms out.
+        assert_eq!(canvas.max_scroll_offset_x_for_viewport(800.0), 0.0);
         assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(0.0, 150.0)));
         assert_eq!(canvas.scene.scroll_offset, egui::vec2(0.0, 150.0));
-        assert!(canvas.scene.initial_horizontal_scroll_centered);
+        assert_eq!(
+            canvas.scene.horizontal_centering,
+            scene::HorizontalCenteringState::Latched
+        );
         // Applied request is gone: the next call is a no-op.
         assert!(!canvas.try_apply_pending_focus(&page_infos));
     }
@@ -3255,6 +3338,7 @@ mod tests {
         canvas.apply_viewport_snapshot(CanvasViewportSnapshot {
             zoom: 1.0,
             scroll_offset: egui::vec2(5.0, 6.0),
+            laid_out: true,
         });
         assert!(canvas.scene.pending_focus.is_none());
         assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(5.0, 6.0)));
@@ -3262,14 +3346,110 @@ mod tests {
 
     #[test]
     fn horizontal_scroll_range_starts_before_content_reaches_viewport_width() {
+        // A ribbon whose widest page is narrow enough (2.8 * page <= viewport) still fits, so no
+        // scroll range appears; a slightly wider page already creates one, well before the visible
+        // content reaches viewport width. Content == page here (no aside gutters).
         let viewport_width = 1000.0;
 
         assert_eq!(
-            CanvasView::canvas_row_screen_width_for_content(viewport_width, 500.0),
+            CanvasView::canvas_row_screen_width_for_content(viewport_width, 300.0, 300.0),
             viewport_width
         );
         assert!(
-            CanvasView::canvas_row_screen_width_for_content(viewport_width, 700.0) > viewport_width
+            CanvasView::canvas_row_screen_width_for_content(viewport_width, 400.0, 400.0)
+                > viewport_width
+        );
+    }
+
+    #[test]
+    fn ribbon_side_free_space_is_proportional_to_the_widest_page() {
+        // Contract: when the page-driven term dominates, the free space beyond EACH edge of the
+        // widest page is `RIBBON_SIDE_FREE_SPACE_FACTOR` of that page's screen width, no matter
+        // how wide the viewport is.
+        let max_page_screen_width = 500.0_f32;
+        for viewport_width in [400.0_f32, 1000.0, 1400.0] {
+            let row = CanvasView::canvas_row_screen_width_for_content(
+                viewport_width,
+                max_page_screen_width,
+                max_page_screen_width,
+            );
+            let free_space_per_side = (row - max_page_screen_width) * 0.5;
+            assert!(
+                (free_space_per_side - 0.9 * max_page_screen_width).abs() <= 1e-3,
+                "viewport {viewport_width}: free space {free_space_per_side} per side"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_aside_content_keeps_the_far_column_reachable() {
+        // Contract: content wider than the page-driven strip (a page with two aside columns on
+        // both sides) still fits inside the row, so the far aside column stays scrollable to.
+        let max_page_screen_width = 200.0_f32;
+        let content_screen_width = 2000.0_f32; // > 2.8 * 200
+        let row = CanvasView::canvas_row_screen_width_for_content(
+            1000.0,
+            content_screen_width,
+            max_page_screen_width,
+        );
+        assert!(
+            row >= content_screen_width,
+            "row {row} must not cut off the {content_screen_width}px content"
+        );
+    }
+
+    #[test]
+    fn zoomed_out_content_stays_centered_without_scroll_range() {
+        // Hard contract: zooming out until the whole strip fits must leave NO horizontal scroll
+        // range and center the content in the viewport through the row inset alone.
+        let mut canvas = CanvasView::default();
+        canvas.scene.content_world_width = 800.0;
+        canvas.scene.max_page_world_width = 600.0;
+        let viewport_width = 1000.0_f32;
+        // 2.8 * 600 * zoom <= 1000  =>  zoom <= 0.595; 0.2 is the minimum zoom of the canvas.
+        canvas.state.zoom = 0.2;
+
+        let content_screen_width = 800.0 * 0.2;
+        assert_eq!(canvas.max_scroll_offset_x_for_viewport(viewport_width), 0.0);
+        assert!(
+            (canvas.viewport_content_inset_x(viewport_width)
+                - (viewport_width - content_screen_width) * 0.5)
+                .abs()
+                <= 1e-3
+        );
+    }
+
+    #[test]
+    fn focusing_the_widest_page_center_matches_the_centered_offset() {
+        // Contract: focusing the center of the widest page must produce exactly the offset the
+        // initial centering produces (`max_scroll / 2`). This is the identity that the
+        // content-space -> scroll-offset-space mapping in `try_apply_pending_focus` exists for.
+        let page_size = egui::vec2(900.0, 1200.0);
+        let content_world_width = 1400.0_f32;
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let mut canvas = CanvasView::default();
+        canvas.state.zoom = 1.5;
+        canvas.scene.content_world_width = content_world_width;
+        canvas.scene.max_page_world_width = page_size.x;
+        canvas.scene.scroll_inner_rect = Some(viewport);
+        // The page is centered inside the content row, exactly as `reserve_canvas_page_frame`
+        // lays it out.
+        canvas.scene.page_world_rects = vec![Rect::from_min_size(
+            egui::pos2((content_world_width - page_size.x) * 0.5, 0.0),
+            page_size,
+        )];
+
+        let max_scroll_x = canvas.max_scroll_offset_x_for_viewport(viewport.width());
+        assert!(max_scroll_x > 0.0, "the test geometry must be scrollable");
+
+        canvas.focus_page(0, Some(page_size * 0.5), canvas.state.zoom);
+        assert!(canvas.try_apply_pending_focus(&HashMap::new()));
+
+        assert!(
+            (canvas.scene.scroll_offset.x - max_scroll_x * 0.5).abs() <= 1e-2,
+            "focused x {} must equal the centered offset {}",
+            canvas.scene.scroll_offset.x,
+            max_scroll_x * 0.5
         );
     }
 
@@ -3277,6 +3457,7 @@ mod tests {
     fn zoom_anchor_x_offset_is_clamped_to_scrollable_range() {
         let mut canvas = CanvasView::default();
         canvas.scene.content_world_width = 400.0;
+        canvas.scene.max_page_world_width = 400.0;
         canvas.state.zoom = 1.0;
         let anchor = crate::canvas::types::PendingZoomAnchor {
             viewport_local: egui::vec2(900.0, 0.0),
@@ -3293,18 +3474,171 @@ mod tests {
 
     #[test]
     fn initial_horizontal_scroll_is_centered_once_when_range_exists() {
+        // Settled geometry: the very first centering request is also the last one.
         let mut canvas = CanvasView::default();
         canvas.scene.content_world_width = 800.0;
+        canvas.scene.max_page_world_width = 700.0;
         canvas.state.zoom = 1.0;
         let viewport_width = 1000.0;
         let max_scroll_x = canvas.max_scroll_offset_x_for_viewport(viewport_width);
 
-        let first_offset = canvas.initial_horizontal_center_scroll_offset(viewport_width);
-        let second_offset = canvas.initial_horizontal_center_scroll_offset(viewport_width);
+        let first_offset = canvas.initial_horizontal_center_scroll_offset(viewport_width, true);
+        let second_offset = canvas.initial_horizontal_center_scroll_offset(viewport_width, true);
 
         assert!(max_scroll_x > 0.0);
         assert_eq!(first_offset, Some(egui::vec2(max_scroll_x * 0.5, 0.0)));
         assert!(second_offset.is_none());
+    }
+
+    #[test]
+    fn centering_follows_growing_geometry_until_it_settles() {
+        // Contract: page sizes arrive asynchronously, so the strip keeps growing over the first
+        // frames. The canvas must re-center on each new geometry instead of latching on the
+        // smallest one, and the LAST offset must be the center of the FINAL range.
+        let mut canvas = CanvasView::default();
+        canvas.state.zoom = 1.0;
+        let viewport_width = 1000.0;
+        // Simulated per-frame growth: only the last frame reports settled geometry.
+        let growth = [(400.0_f32, 400.0_f32), (900.0, 700.0), (1600.0, 1200.0)];
+
+        let mut last_offset = None;
+        for (frame_index, (content, max_page)) in growth.into_iter().enumerate() {
+            canvas.scene.content_world_width = content;
+            canvas.scene.max_page_world_width = max_page;
+            let settled = frame_index + 1 == growth.len();
+            if let Some(offset) = canvas.initial_horizontal_center_scroll_offset(viewport_width, settled)
+            {
+                // The `ScrollArea` honours the request; the next frame reads it back.
+                canvas.scene.scroll_offset = offset;
+                last_offset = Some(offset);
+            }
+        }
+
+        let final_max_scroll = canvas.max_scroll_offset_x_for_viewport(viewport_width);
+        assert!(final_max_scroll > 0.0);
+        assert_eq!(last_offset, Some(egui::vec2(final_max_scroll * 0.5, 0.0)));
+        // Settled geometry latches: no further centering, ever.
+        assert!(
+            canvas
+                .initial_horizontal_center_scroll_offset(viewport_width, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_horizontal_scroll_freezes_the_centering() {
+        // Contract: any read-back offset that is not the one the canvas asked for is the user's,
+        // and it stops the automatic centering permanently — even while the geometry is still
+        // provisional and would otherwise keep re-centering.
+        let mut canvas = CanvasView::default();
+        canvas.state.zoom = 1.0;
+        canvas.scene.content_world_width = 900.0;
+        canvas.scene.max_page_world_width = 700.0;
+        let viewport_width = 1000.0;
+
+        let requested = canvas
+            .initial_horizontal_center_scroll_offset(viewport_width, false)
+            .expect("provisional geometry with a scroll range must center");
+        // The user drags the ribbon sideways after that frame.
+        canvas.scene.scroll_offset = requested + egui::vec2(120.0, 0.0);
+
+        assert!(
+            canvas
+                .initial_horizontal_center_scroll_offset(viewport_width, false)
+                .is_none()
+        );
+        assert_eq!(
+            canvas.scene.horizontal_centering,
+            scene::HorizontalCenteringState::Latched
+        );
+        // Growing geometry must not revive it.
+        canvas.scene.content_world_width = 2000.0;
+        canvas.scene.max_page_world_width = 1600.0;
+        assert!(
+            canvas
+                .initial_horizontal_center_scroll_offset(viewport_width, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_frame_without_scroll_range_does_not_poison_provisional_centering() {
+        // Contract: a provisional frame whose strip happens to fit the viewport requests nothing,
+        // so it must also forget the request of the previous frame. Otherwise the offset egui
+        // clamps to 0 on that frame would be read back as a user scroll and latch the ribbon
+        // against the left edge — the exact symptom this whole change removes.
+        let mut canvas = CanvasView::default();
+        canvas.state.zoom = 1.0;
+        let viewport_width = 1000.0;
+
+        // Frame 1: a scroll range exists, the canvas centers and remembers its request.
+        canvas.scene.content_world_width = 900.0;
+        canvas.scene.max_page_world_width = 700.0;
+        let centered = canvas
+            .initial_horizontal_center_scroll_offset(viewport_width, false)
+            .expect("a provisional frame with a scroll range must center");
+        canvas.scene.scroll_offset = centered;
+
+        // Frame 2: the geometry shrinks below the viewport (an aside side disappeared, a page
+        // decoded smaller than reserved), so the strip fits and egui clamps the offset to 0.
+        canvas.scene.content_world_width = 200.0;
+        canvas.scene.max_page_world_width = 200.0;
+        assert!(
+            canvas
+                .initial_horizontal_center_scroll_offset(viewport_width, false)
+                .is_none()
+        );
+        canvas.scene.scroll_offset = Vec2::ZERO;
+        assert_eq!(
+            canvas.scene.horizontal_centering,
+            scene::HorizontalCenteringState::Live {
+                last_requested_x: None
+            },
+            "a frame that requested nothing must not leave a request behind"
+        );
+
+        // Frame 3: the range reappears; the canvas must still be centering.
+        canvas.scene.content_world_width = 900.0;
+        canvas.scene.max_page_world_width = 700.0;
+        assert_eq!(
+            canvas.initial_horizontal_center_scroll_offset(viewport_width, false),
+            Some(centered),
+            "the centering must survive a frame that had no scroll range"
+        );
+    }
+
+    #[test]
+    fn degenerate_viewport_width_never_latches_the_centering() {
+        // Contract (closes a pre-existing hole): a frame drawn at an unusable width — a
+        // collapsing dock layout, a canvas rect not sized yet — must be skipped outright. Before
+        // this guard, settled geometry would latch on the garbage offset such a frame produces and
+        // the content would end up centered on the viewport's left edge at the real width.
+        let mut canvas = CanvasView::default();
+        canvas.state.zoom = 1.0;
+        canvas.scene.content_world_width = 900.0;
+        canvas.scene.max_page_world_width = 700.0;
+
+        assert!(
+            canvas
+                .initial_horizontal_center_scroll_offset(0.0, true)
+                .is_none()
+        );
+        assert_eq!(
+            canvas.scene.horizontal_centering,
+            scene::HorizontalCenteringState::Live {
+                last_requested_x: None
+            },
+            "a degenerate frame must neither latch nor record a request"
+        );
+
+        // The first usable frame still centers.
+        let viewport_width = 1000.0;
+        let max_scroll_x = canvas.max_scroll_offset_x_for_viewport(viewport_width);
+        assert!(max_scroll_x > 0.0);
+        assert_eq!(
+            canvas.initial_horizontal_center_scroll_offset(viewport_width, true),
+            Some(egui::vec2(max_scroll_x * 0.5, 0.0))
+        );
     }
 
     #[test]
