@@ -14,7 +14,7 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
    |-- card grid (CentralPanel) virtualized rows, selection, context menu
    |-- status line (bottom)     totals: pages / with clean / bubbles
    |-- orphan-clean section     worker-scanned invalid clean files and attachment candidates
-   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch / split
+   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch / split / crop
 ```
 
 - `PageManagerAction::RequestOp(PageOpKind)` asks the app to quiesce writers,
@@ -30,10 +30,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   (unsaved manifest overrides saved) for everything else.
 - All disk work runs on the worker thread in `thumbs.rs`: thumbnail decode +
   downscale (long side 192 px), page previews for the stitch window (long side
-  ~1024 px) and for the split window (~2048 px, because one page must show a seam
-  sharply enough to place a cut on it), and the manifest scan. Thumbnails live in
-  an LRU cache (64 entries) keyed by (path, mtime); previews live in a SEPARATE 6-entry LRU so a few
-  megapixel-sized previews cannot evict the card grid's thumbnails. Both share the
+  ~1024 px) and for the split and crop windows (~2048 px, because one page must
+  show a seam or a horizon sharply enough to place a cut or a crop edge on it),
+  and the manifest scan. Thumbnails live in an LRU cache (64 entries) keyed by
+  (path, mtime); previews live in a SEPARATE 6-entry LRU so a few megapixel-sized
+  previews cannot evict the card grid's thumbnails. Both share the
   worker, the cancel flag, the epoch counter and the 8-job in-flight cap (whose key
   carries the job kind, so one page may have both pending).
   `notify_pages_changed` bumps a generation counter that forces mtime
@@ -57,10 +58,10 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - `dialogs.rs`: insert / create-blank / delete-confirm dialogs, the
   `InsertPosition -> at` resolution and the blank-page default-size rule
   (`default_blank_size`, unit-tested), the background file picker, and the
-  `PageManagerDialog` enum every dialog (stitch and split included) is dispatched
-  through.
+  `PageManagerDialog` enum every dialog (stitch, split and crop included) is
+  dispatched through.
 - `thumbs.rs`: worker thread + generic LRU `ThumbCache` (unit-tested) + the
-  `layers.json` layer-count scan + the stitch/split windows' page previews
+  `layers.json` layer-count scan + the stitch/split/crop windows' page previews
   (`request_preview_if_needed` / `preview_state`, mirroring the thumbnail pair;
   `preview_state_cached` reads an entry WITHOUT promoting it, for a page the
   caller may not request a decode for).
@@ -88,6 +89,33 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `PageOpKind::Split`. Only draws and routes input; all math lives in
   `split_layout.rs`. The picker PLACEMENT is itself pure and unit-tested
   (`order_widget_rects`), as is the handle drag (`dragged_cut_value`).
+- `crop_layout.rs`: GUI-free core of the "crop page" feature (unit-tested): the
+  `CropFrame` rect in ROTATED-CANVAS pixels and its invariants, the 8 resize
+  handles plus the move region with their screen-constant grab rects and the
+  corner-beats-edge-beats-move hit-test priority, the per-edge clamped drag
+  (delta-driven, never inverting, never below `min_size`), aspect-ratio locking,
+  the centred fit helpers, the rectangle INSCRIBED in the rotated page (the "no
+  empty corners" fit, solved from the two half-plane constraints the rotation
+  imposes), the translation that carries a frame from one rotated canvas into
+  another, the rotation arithmetic that normalizes `(quarter_turns, angle_deg)`
+  into the canonical pair, and the validation that mirrors the engine's crop
+  preconditions. Contains no egui code and no I/O:
+  screen geometry uses its own `ScreenRect` in points, which the window converts
+  to `egui::Rect`. It deliberately does NOT compute the rotated-canvas size —
+  that bounding box is the engine's (`page_ops::RotatedPage`) and arrives as a
+  `canvas: [u32; 2]` parameter, exactly as its angle bound is imported from
+  `page_ops` rather than restated.
+- `crop.rs`: the "crop page" window — an `egui::Window` with the same
+  `PsViewport` board as the split window, showing ONE page rotated by the chosen
+  quarter turns plus a fine straightening angle, with a draggable crop frame,
+  eight screen-constant handles and a move region over it, the region outside
+  the frame veiled, an aspect-ratio preset row with a "fit inside the page"
+  button, and the confirm that emits `PageOpKind::Crop`. Only draws and routes
+  input: the frame math is `crop_layout.rs`'s and the canvas geometry is the
+  engine's (`page_ops::crop_geometry::RotatedPage`). Its pure helpers are
+  unit-tested
+  (`screen_delta_to_canvas`, `page_quad_screen`, `aspect_ratio`,
+  `quantize_angle`, `validate_state`, `confirm_enabled`, `build_crop_op`).
 - `stitch.rs`: the "stitch pages" window — an `egui::Window` with a zoomable,
   pannable board of draggable page rectangles (camera: `PsViewport` from
   `tabs/ps_editor/viewport.rs`), the arrangement / fit / background strip, and
@@ -159,6 +187,56 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   though the page size is known from `page_infos`: the operation is immediate and
   is not undone by discarding unsaved changes, so it is never offered over a page
   the user cannot see.
+- The crop board's WORLD space is the ROTATED CANVAS' pixel space, not the source
+  page's. The crop frame is therefore axis-aligned on screen at every rotation —
+  which is what `crop_layout`'s `ScreenRect` handle geometry and hit test require
+  — and what is drawn rotated is the PAGE, as a textured `epaint::Mesh` quad whose
+  four corners come from the engine's own `RotatedPage::map_point`. The preview
+  and the emitted rect can therefore never disagree about where the page sits,
+  and the screen->canvas conversion of a drag is a plain division by the zoom:
+  the rotation is carried by the world basis and must not be applied a second
+  time.
+- Crop frame coordinates are ROTATED-CANVAS pixels, never preview pixels — the
+  same rule the split window's cut coordinates follow, for the same reason. A
+  frame drag applies the pointer's DELTA from the frame the drag STARTED on,
+  never its absolute position. The grab region is decided ONCE, on
+  `drag_started`, by `crop_layout::hit_test`; a board drag that started on no
+  handle is a pan. The hit test is deliberately not delegated to nine
+  overlapping `ui.interact` rects, because egui would then resolve the
+  corner-beats-edge priority by registration order instead of by the table
+  `crop_layout` states and tests.
+- A rotation of whole quarter turns is LOSSLESS (an integer pixel permutation)
+  and the confirm strip stays silent about it. A non-zero fine angle is not: the
+  page is resampled, bubbles' text rectangles degrade to the bounding boxes of
+  their rotated selves, and detection data is discarded. That case carries a
+  visible warning, gated on `angle_deg == 0.0` — the same exactness rule the
+  engine's `PageRotation::is_identity` uses.
+- Only a QUARTER TURN (or an aspect-preset change) rebuilds the crop frame, and
+  only a quarter turn re-fits the camera: it transposes the canvas, so the old
+  coordinates mean something else and the board's aspect flips. A change of the
+  FINE angle must PRESERVE both — it only grows or shrinks the canvas around a
+  page that stays centred in it, so the frame and the camera are translated by
+  half the size change (`crop_layout::recentre_frame`) and stay over the same
+  page content. Re-fitting there would make straightening by eye at working zoom
+  impossible, which is the entire purpose of that control. Every rotation change
+  goes through `crop_layout::normalize_rotation`, so straightening past ±45°
+  rolls into the next quarter turn instead of leaving an angle the engine
+  refuses, and through `quantize_angle`, so the slider and the spin box store one
+  precision instead of one silently coarsening the other.
+- The crop board needs an EXPLICIT pan affordance, and it is the middle button.
+  Once the frame's screen rect covers the board, `crop_layout::hit_test` answers
+  `Move` at every pixel — which the DEFAULT full-canvas frame does at any working
+  zoom — so "drag where the frame is not" leaves no pannable pixel and every pan
+  attempt would silently shift the crop instead. A middle-button drag therefore
+  pans from anywhere, a drag outside the frame still pans, and the cursor (hand
+  vs. resize arrow) says which a press will do.
+- A straightening tool owes the user a "fit inside the page" affordance: a frame
+  spanning the whole rotated canvas always contains the transparent wedges the
+  rotation leaves. `crop_layout::largest_inscribed_frame` is the largest frame
+  guaranteed to contain page pixels everywhere, honouring a locked ratio.
+- The crop confirm, like the split one, is refused while the page PREVIEW failed
+  to decode: the operation is immediate and is not undone by discarding unsaved
+  changes, so it is never offered over a page the user cannot see.
 - `PageOpKind` indices always refer to the CURRENT page order at request time;
   move semantics follow `page_ops/mod.rs` (`to` indexes the NEW order; UI
   position P maps to `to = P - 1`).
@@ -209,6 +287,14 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   never the drawing code.
 - To change how the split window looks or reacts (cut lines, handles, order
   pickers, the emitted op): `split.rs`.
+- To change crop frame math (handle geometry and hit-test priority, drag
+  clamping, aspect-ratio locking, the fit helpers, rotation normalization,
+  validation): `crop_layout.rs` — never the drawing code.
+- To change how the crop window looks or reacts (the rotated preview quad, the
+  veil, the handles, the rotation and ratio controls, the emitted op): `crop.rs`.
+- To change what a rotated canvas IS (its bounding box, the point mappings, crop
+  legality): `page_ops/crop_geometry.rs` — both the window and the engine import
+  it, and neither may restate it.
 - To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
   `models/clean_assign.rs` contract.
 - To change what the app must execute: extend `PageManagerAction` (coordinate

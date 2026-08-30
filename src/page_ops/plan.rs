@@ -15,15 +15,19 @@ Key structures:
 - PageOpPlan / PlannedMove / PlannedCreate / PlannedJsonWrite /
   PlannedTrashWrite: the action plan persisted verbatim into the journal.
 
-- PlacementMap: the affine of ONE page onto ONE output canvas, shared by the
-  stitch and the split.
-- StitchGeometry / SplitGeometry / PageGeometry: the resolved pixel-identity
-  request every remap of an affected page is routed through.
+- PlacementMap: the affine of ONE page onto ONE output canvas — a rotation
+  (`crop_geometry::RotatedPage`), then a crop, then a uniform scale and a
+  translation — shared by the stitch, the split and the crop; the first two
+  place with the identity rotation, the crop is the one rotating placement.
+- StitchGeometry / SplitGeometry / CropGeometry / PageGeometry: the resolved
+  pixel-identity request every remap of an affected page is routed through.
+  `PageGeometry` has no per-variant accessor on purpose — see its doc.
 - SplitTreeRouting: per-tree layer uid -> part and layer PNG -> new page index
   tables of a split (the 1 -> N fan-out `old_to_new` cannot express), plus the
   PNGs whose only claimants sit on deleted parts.
-- ComposeSource / NewPageContent::ComposedPng: the recipe `fs_exec` executes to
-  build a stitched or cropped raster during phase A.
+- ComposeSource / ComposeRotation / NewPageContent::ComposedPng: the recipe
+  `fs_exec` executes to build a stitched, cut or rotated+cropped raster during
+  phase A.
 
 Key functions:
 - permutation_for_op(): op -> permutation + validation (pure).
@@ -31,6 +35,8 @@ Key functions:
 - build_stitch_geometry(): stitch request + snapshot -> validated affines.
 - build_split_geometry(): split request + snapshot -> validated part affines
   plus the per-tree layer routing.
+- build_crop_geometry(): crop request + snapshot -> the validated rotating
+  affine plus the per-tree set of layers the new frame removes.
 - validate_split_routing(): the single legality rule of a split's `order` /
   `deleted` arrays, shared by the index-math and the geometry validator.
 - canonical page-keyed file-name helpers shared with the scanner.
@@ -42,6 +48,7 @@ committed chapter tree and its sibling `{chapter}_unsaved` staging tree.
 No function in this file touches the filesystem.
 */
 
+use super::crop_geometry::{PageRotation, RotatedPage};
 use super::{PageOpError, PageOpKind, SplitAxis, StitchPlacement};
 use crate::config;
 use crate::page_ops::json_remap;
@@ -202,16 +209,36 @@ const STITCH_MAX_OFFSET_PX: i64 = 1_000_000;
 /// the source page onto that part's own canvas (`crop = the part rect`,
 /// `scale = 1`, `dx = dy = 0`).
 ///
-/// Built (and fully validated) by [`PlacementMap::new`]; all remaps of that
-/// page's artifacts go through it, so the three on-disk coordinate spaces stay
-/// distinguishable: page-normalized uv uses [`PlacementMap::map_u`] /
-/// [`PlacementMap::map_v`], absolute page pixels use [`PlacementMap::map_x`] /
-/// [`PlacementMap::map_y`], and layer-image-local pixels are never mapped at
-/// all (the layer PNGs are not resampled).
+/// The affine is a ROTATION of the source page, then a crop, then a uniform
+/// scale and a translation:
+///
+/// ```text
+/// (rx, ry)        = rotation(x, y)                 // page px -> rotated canvas px
+/// map_point(x, y) = ((rx - crop.x) * scale + dx, (ry - crop.y) * scale + dy)
+/// ```
+///
+/// Both existing operations place with [`PageRotation::IDENTITY`], for which
+/// the rotation step returns its input bit-for-bit and the whole map collapses
+/// to the separable crop/scale/translate it has always been. A ROTATING
+/// placement reads its `crop` in the ROTATED CANVAS' pixels (see
+/// [`RotatedPage`]) rather than in the source page's own, which is what keeps
+/// [`PlacementMap::crop_rect`] an exact axis-aligned rectangle instead of a
+/// bounding-box approximation.
+///
+/// Built (and fully validated) by [`PlacementMap::new`] /
+/// [`PlacementMap::with_rotation`]; all remaps of that page's artifacts go
+/// through it, so the three on-disk coordinate spaces stay distinguishable:
+/// page-normalized uv uses [`PlacementMap::map_uv`], absolute page pixels use
+/// [`PlacementMap::map_point`], and layer-image-local pixels are never mapped
+/// at all (the layer PNGs are not resampled). A stored MAGNITUDE (a length, a
+/// half-extent, a page-size multiplier) is not a coordinate and uses
+/// [`PlacementMap::map_extent`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PlacementMap {
-    page_w: f64,
-    page_h: f64,
+    /// Source page plus the rotation applied BEFORE the crop. The crop fields
+    /// below live in this rotated canvas' pixel space, which equals the source
+    /// page's own space whenever the rotation is the identity.
+    source: RotatedPage,
     crop_x: f64,
     crop_y: f64,
     crop_w: f64,
@@ -227,21 +254,40 @@ pub(crate) struct PlacementMap {
 }
 
 impl PlacementMap {
-    /// Validates one placement against its page and the canvas and returns the
-    /// affine.
-    ///
-    /// `page_size` is the source page's own pixel size, `canvas` the output
-    /// page's size. Validation is total: a returned map is guaranteed to place
-    /// a non-empty rectangle fully inside the canvas from a non-empty crop
-    /// fully inside the page.
+    /// Validates one NON-ROTATING placement against its page and the canvas and
+    /// returns the affine. See [`PlacementMap::with_rotation`] for the full
+    /// contract; this is that function with [`PageRotation::IDENTITY`], which is
+    /// what both pixel-identity operations request.
     ///
     /// # Errors
-    /// [`PageOpError::InvalidOp`] for a zero-sized page or crop, a crop leaving
-    /// the page, a non-finite / out-of-range `scale`, an offset beyond
-    /// `STITCH_MAX_OFFSET_PX`, or a placed rectangle leaving the canvas.
+    /// As [`PlacementMap::with_rotation`].
     pub(crate) fn new(
         placement: &StitchPlacement,
         page_size: [u32; 2],
+        canvas: [u32; 2],
+    ) -> Result<Self, PageOpError> {
+        Self::with_rotation(placement, page_size, PageRotation::IDENTITY, canvas)
+    }
+
+    /// Validates one placement of a page ROTATED by `rotation` against the
+    /// canvas and returns the affine.
+    ///
+    /// `page_size` is the source page's own pixel size and `canvas` the output
+    /// page's size. `placement.crop` is read in the pixel space of the ROTATED
+    /// canvas of `page_size` under `rotation` — identical to the page's own
+    /// space when the rotation is the identity. Validation is total: a returned
+    /// map is guaranteed to place a non-empty rectangle fully inside the canvas
+    /// from a non-empty crop fully inside its source space.
+    ///
+    /// # Errors
+    /// [`PageOpError::InvalidOp`] for a zero-sized page or crop, a crop leaving
+    /// the rotated canvas, a rotation whose canvas does not fit `u32`, a
+    /// non-finite / out-of-range `scale`, an offset beyond
+    /// `STITCH_MAX_OFFSET_PX`, or a placed rectangle leaving the canvas.
+    pub(crate) fn with_rotation(
+        placement: &StitchPlacement,
+        page_size: [u32; 2],
+        rotation: PageRotation,
         canvas: [u32; 2],
     ) -> Result<Self, PageOpError> {
         let idx = placement.page_idx;
@@ -251,21 +297,11 @@ impl PlacementMap {
                 page_size[0], page_size[1]
             )));
         }
+        let source = RotatedPage::new(page_size, rotation)?;
         let [cx, cy, cw, ch] = placement.crop;
-        if cw == 0 || ch == 0 {
-            return Err(PageOpError::InvalidOp(format!(
-                "crop of page {idx} is empty ({cw}x{ch})"
-            )));
-        }
-        let right = cx.checked_add(cw);
-        let bottom = cy.checked_add(ch);
-        if right.is_none_or(|r| r > page_size[0]) || bottom.is_none_or(|b| b > page_size[1]) {
-            return Err(PageOpError::InvalidOp(format!(
-                "crop [{cx}, {cy}, {cw}, {ch}] of page {idx} leaves its \
-                 {}x{} image",
-                page_size[0], page_size[1]
-            )));
-        }
+        // The single crop-legality rule lives on `RotatedPage`; it is the same
+        // one the UI preview uses, so the two cannot disagree.
+        source.validate_crop(placement.crop, &format!("page {idx}"))?;
         if !placement.scale.is_finite()
             || placement.scale <= 0.0
             || placement.scale > STITCH_MAX_SCALE
@@ -321,8 +357,7 @@ impl PlacementMap {
         let placed_x = round_to_u32(dx);
         let placed_y = round_to_u32(dy);
         Ok(Self {
-            page_w: f64::from(page_size[0]),
-            page_h: f64::from(page_size[1]),
+            source,
             crop_x: f64::from(cx),
             crop_y: f64::from(cy),
             crop_w: f64::from(cw),
@@ -336,48 +371,190 @@ impl PlacementMap {
         })
     }
 
-    /// Maps an absolute X in the source page's pixels to canvas pixels.
+    /// Maps an absolute POINT in the source page's pixels to canvas pixels.
+    ///
+    /// The one coordinate mapping of the placement: the rotation makes X depend
+    /// on Y and vice versa, so the two axes can never be mapped apart (see
+    /// [`PlacementMap::map_x_without_y`] for the only exception and its price).
     #[must_use]
-    pub(crate) fn map_x(&self, x: f64) -> f64 {
-        (x - self.crop_x) * self.scale + self.dx
+    pub(crate) fn map_point(&self, x: f64, y: f64) -> (f64, f64) {
+        let (rx, ry) = self.source.map_point(x, y);
+        (
+            (rx - self.crop_x) * self.scale + self.dx,
+            (ry - self.crop_y) * self.scale + self.dy,
+        )
     }
 
-    /// Maps an absolute Y in the source page's pixels to canvas pixels.
+    /// Maps a page-normalized POINT (`u`, `v` over the source page's width and
+    /// height) to a canvas-normalized point.
     #[must_use]
-    pub(crate) fn map_y(&self, y: f64) -> f64 {
-        (y - self.crop_y) * self.scale + self.dy
+    pub(crate) fn map_uv(&self, u: f64, v: f64) -> (f64, f64) {
+        let [page_w, page_h] = self.source.page_size();
+        let (x, y) = self.map_point(u * f64::from(page_w), v * f64::from(page_h));
+        (x / self.canvas_w, y / self.canvas_h)
     }
 
-    /// Maps a page-pixel LENGTH (no origin shift) to canvas pixels. Also the
-    /// right operation for a stored page-size MULTIPLIER (a layer transform's
-    /// `scale`), which is a length in disguise: the layer image it sizes is not
-    /// resampled, so its on-page extent must follow the placement.
+    /// Maps an absolute page-pixel X WITHOUT its Y, or `None` when the
+    /// placement rotates.
+    ///
+    /// Only a half-specified stored point (a detection block carrying `x1` but
+    /// no `y1`, a `img_u` with no `img_v`) needs this. A non-rotating placement
+    /// is separable, so the answer is exact; a rotating one cannot map one axis
+    /// without the other, and the caller must refuse or gate out such a
+    /// document instead of guessing the missing coordinate.
     #[must_use]
-    pub(crate) fn map_len(&self, length: f64) -> f64 {
-        length * self.scale
+    pub(crate) fn map_x_without_y(&self, x: f64) -> Option<f64> {
+        self.source
+            .is_identity()
+            .then_some((x - self.crop_x) * self.scale + self.dx)
     }
 
-    /// Maps a page-normalized U (0..1 over the source page's width) to a
-    /// canvas-normalized U.
+    /// Maps an absolute page-pixel Y WITHOUT its X, or `None` when the
+    /// placement rotates. See [`PlacementMap::map_x_without_y`].
     #[must_use]
-    pub(crate) fn map_u(&self, u: f64) -> f64 {
-        self.map_x(u * self.page_w) / self.canvas_w
+    pub(crate) fn map_y_without_x(&self, y: f64) -> Option<f64> {
+        self.source
+            .is_identity()
+            .then_some((y - self.crop_y) * self.scale + self.dy)
     }
 
-    /// Maps a page-normalized V (0..1 over the source page's height) to a
-    /// canvas-normalized V.
+    /// Maps a page-normalized U WITHOUT its V, or `None` when the placement
+    /// rotates. See [`PlacementMap::map_x_without_y`].
     #[must_use]
-    pub(crate) fn map_v(&self, v: f64) -> f64 {
-        self.map_y(v * self.page_h) / self.canvas_h
+    pub(crate) fn map_u_without_v(&self, u: f64) -> Option<f64> {
+        let page_w = f64::from(self.source.page_size()[0]);
+        self.map_x_without_y(u * page_w)
+            .map(|x| x / self.canvas_w)
+    }
+
+    /// Maps a page-normalized V WITHOUT its U, or `None` when the placement
+    /// rotates. See [`PlacementMap::map_x_without_y`].
+    #[must_use]
+    pub(crate) fn map_v_without_u(&self, v: f64) -> Option<f64> {
+        let page_h = f64::from(self.source.page_size()[1]);
+        self.map_y_without_x(v * page_h)
+            .map(|y| y / self.canvas_h)
+    }
+
+    /// Maps a page-pixel MAGNITUDE — a length, a half-extent, or a stored
+    /// page-size MULTIPLIER such as a layer transform's `scale` — to canvas
+    /// pixels.
+    ///
+    /// Not a coordinate: it has no origin and no direction, so neither the
+    /// crop's translation nor the rotation applies to it (a rotation is rigid
+    /// and preserves lengths). Only the uniform scale does. A layer image sized
+    /// by such a multiplier is never resampled, so its on-page extent must
+    /// follow the placement.
+    #[must_use]
+    pub(crate) fn map_extent(&self, magnitude: f64) -> f64 {
+        magnitude * self.scale
+    }
+
+    /// Maps an axis-aligned rectangle of ABSOLUTE page pixels, given as
+    /// `[x1, y1, x2, y2]` (two opposite corners).
+    ///
+    /// An axis-aligned rectangle is not closed under rotation, so this is the
+    /// one place where the mapping is allowed to be an approximation, and only
+    /// when the placement actually rotates: the result is then the axis-aligned
+    /// BOUNDING BOX of the mapped quad, normalized to `x1 <= x2, y1 <= y2`.
+    /// Without a rotation the two given corners are mapped as they stand, which
+    /// is exact and preserves the orientation of a stored inverted rectangle.
+    #[must_use]
+    pub(crate) fn map_px_rect(&self, rect: [f64; 4]) -> [f64; 4] {
+        self.map_rect(rect, false)
+    }
+
+    /// Maps an axis-aligned page-normalized rectangle `[u1, v1, u2, v2]`.
+    /// Same contract as [`PlacementMap::map_px_rect`].
+    #[must_use]
+    pub(crate) fn map_uv_rect(&self, rect: [f64; 4]) -> [f64; 4] {
+        self.map_rect(rect, true)
+    }
+
+    /// Shared body of the two rectangle mappings; `normalized` selects the uv
+    /// space over absolute page pixels.
+    fn map_rect(&self, rect: [f64; 4], normalized: bool) -> [f64; 4] {
+        let [a1, b1, a2, b2] = rect;
+        let map = |x: f64, y: f64| {
+            if normalized {
+                self.map_uv(x, y)
+            } else {
+                self.map_point(x, y)
+            }
+        };
+        let (x1, y1) = map(a1, b1);
+        let (x2, y2) = map(a2, b2);
+        if !self.rotates() {
+            return [x1, y1, x2, y2];
+        }
+        // The other two corners only exist once the map rotates; before that
+        // they are redundant and computing them would cost precision for
+        // nothing.
+        let (x3, y3) = map(a1, b2);
+        let (x4, y4) = map(a2, b1);
+        let xs = [x1, x2, x3, x4];
+        let ys = [y1, y2, y3, y4];
+        [
+            xs.iter().copied().fold(f64::INFINITY, f64::min),
+            ys.iter().copied().fold(f64::INFINITY, f64::min),
+            xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        ]
+    }
+
+    /// Whether this placement rotates its source page.
+    ///
+    /// The one question consumers currently need to ask: a `true` here means
+    /// `crop_rect()` is read in the rotated canvas and the pixels must be
+    /// rotated before being cropped. The rotation ITSELF is not exposed until an
+    /// operation carries one.
+    #[must_use]
+    pub(crate) fn rotates(&self) -> bool {
+        !self.source.is_identity()
+    }
+
+    /// The rotation this placement applies to its source page before cropping.
+    ///
+    /// Needed by the two consumers that must reproduce it outside this type: the
+    /// pixel executor (which turns it into a [`ComposeSource::rotation`] recipe)
+    /// and the document remaps (which add its angle to every STORED angle of a
+    /// page-placed object). [`PageRotation::IDENTITY`] for a stitch and a split.
+    #[must_use]
+    pub(crate) fn rotation(&self) -> PageRotation {
+        self.source.rotation()
+    }
+
+    /// Total clockwise rotation of the placement in RADIANS, `0.0` when it does
+    /// not rotate. See [`PageRotation::total_radians`].
+    #[must_use]
+    pub(crate) fn rotation_radians(&self) -> f64 {
+        self.source.rotation().total_radians()
+    }
+
+    /// Total clockwise rotation of the placement in DEGREES, `0.0` when it does
+    /// not rotate. See [`PageRotation::total_degrees`].
+    #[must_use]
+    pub(crate) fn rotation_degrees(&self) -> f64 {
+        self.source.rotation().total_degrees()
     }
 
     /// The placed rectangle in canvas pixels, `[x, y, w, h]`.
+    ///
+    /// Exact and axis-aligned for every placement: the rotation happens BEFORE
+    /// the crop, so what is placed is always an upright rectangle.
     #[must_use]
     pub(crate) fn placed_rect(&self) -> [u32; 4] {
         self.placed
     }
 
-    /// The crop rectangle in the source page's own pixels, `[x, y, w, h]`.
+    /// The crop rectangle `[x, y, w, h]` in the placement's SOURCE space: the
+    /// rotated canvas of the source page, which is the page's own pixel space
+    /// whenever the placement does not rotate.
+    ///
+    /// A consumer that copies pixels (`ComposeSource`) must therefore rotate the
+    /// page into that canvas first when [`PlacementMap::rotates`] is true; for
+    /// the stitch and the split it is false and the rect indexes the page image
+    /// directly.
     #[must_use]
     pub(crate) fn crop_rect(&self) -> [u32; 4] {
         [
@@ -1025,13 +1202,333 @@ fn clip_half_plane(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Crop geometry.
+//
+// A crop ROTATES one page and keeps a rectangular region of the rotated
+// canvas. Like a split part it is one `PlacementMap` with `scale = 1` and
+// `dx = dy = 0` — the difference is that its `PageRotation` is not the
+// identity, so the map's `crop` is read in the ROTATED CANVAS' pixels and the
+// pixel executor must rotate before it crops.
+//
+// What is specific to a crop is not routing (the page count does not change and
+// there is only one destination) but SURVIVAL: an entry whose footprint still
+// overlaps the kept region moves with the page and may hang off its edge, while
+// an entry lying entirely outside it is archived exactly as a page delete would
+// archive it.
+// ---------------------------------------------------------------------------
+
+/// Per-tree record of what the crop DROPS: the layer nodes of the cropped page
+/// that fall entirely outside the kept region, and the layer PNGs only they
+/// reference.
+///
+/// Keyed by data unique inside one tree (a layer uid, a layer PNG file name),
+/// exactly like [`SplitTreeRouting`], and for the same reason: the decision
+/// needs the manifest and the probed PNG sizes, which only the plan-time
+/// snapshot carries, while the consumers (`plan_layer_pngs`,
+/// `json_remap::remap_layers_manifest`) see one document at a time.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CropTreeRouting {
+    /// Uids of the cropped page's layer records that survive nowhere.
+    dropped_nodes: std::collections::HashSet<String>,
+    /// Layer PNGs of the cropped page referenced ONLY by dropped records. A
+    /// claim from a SURVIVING record always wins — that record still needs the
+    /// pixels — so this set is disjoint from the surviving records' files.
+    dropped_files: std::collections::HashSet<String>,
+}
+
+impl CropTreeRouting {
+    /// Builds a routing from the resolved sets (see
+    /// `json_remap::crop_layer_routing`, the only production constructor).
+    #[must_use]
+    pub(crate) fn new(
+        dropped_nodes: std::collections::HashSet<String>,
+        dropped_files: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            dropped_nodes,
+            dropped_files,
+        }
+    }
+
+    /// Whether the layer record `uid` falls entirely outside the kept region.
+    #[must_use]
+    pub(crate) fn is_dropped_node(&self, uid: &str) -> bool {
+        self.dropped_nodes.contains(uid)
+    }
+
+    /// Whether `file` is referenced only by dropped records, so that it must be
+    /// trashed instead of staying with the page.
+    #[must_use]
+    pub(crate) fn is_dropped_file(&self, file: &str) -> bool {
+        self.dropped_files.contains(file)
+    }
+}
+
+/// Everything the plan and the JSON remaps need to know about a crop: which
+/// page is rotated, by how much, which region of the rotated canvas survives,
+/// the one affine every artifact of that page is mapped through, and which of
+/// that page's layers do not survive it.
+#[derive(Debug, Clone)]
+pub(crate) struct CropGeometry {
+    /// Index of the cropped page in the CURRENT page order. Unchanged by the
+    /// operation: a crop's `old_to_new` is the identity.
+    source_old_idx: usize,
+    /// Pixel size `[w, h]` of the source page, the space bubbles' normalized uv
+    /// and layers' absolute px are expressed in.
+    page_size: [u32; 2],
+    /// Kept region `[x, y, w, h]` of the rotated canvas — the new page size.
+    rect: [u32; 4],
+    /// The affine: source page pixels -> new page pixels.
+    placement: PlacementMap,
+    /// Dropped layers per tree, keyed by `TreeSnapshot::tree_rel`.
+    trees: std::collections::BTreeMap<String, CropTreeRouting>,
+    /// Plan-time diagnostics collected while resolving what survives; drained
+    /// into the plan's warnings by `build_plan`.
+    warnings: Vec<String>,
+}
+
+impl CropGeometry {
+    /// Index of the cropped page, in the current order (also its new index).
+    #[must_use]
+    pub(crate) fn source_old_idx(&self) -> usize {
+        self.source_old_idx
+    }
+
+    /// Pixel size `[w, h]` of the source page, as floats.
+    #[must_use]
+    pub(crate) fn page_size(&self) -> [f64; 2] {
+        [f64::from(self.page_size[0]), f64::from(self.page_size[1])]
+    }
+
+    /// Pixel size `[w, h]` of the page AFTER the operation (the crop rect).
+    #[must_use]
+    pub(crate) fn new_size(&self) -> [u32; 2] {
+        [self.rect[2], self.rect[3]]
+    }
+
+    /// The single affine of the operation: source page px -> new page px.
+    #[must_use]
+    pub(crate) fn placement(&self) -> &PlacementMap {
+        &self.placement
+    }
+
+    /// The rotation applied before the crop.
+    #[must_use]
+    pub(crate) fn rotation(&self) -> PageRotation {
+        self.placement.rotation()
+    }
+
+    /// Whether the rotation RESAMPLES (a non-zero fine angle) rather than
+    /// permuting pixels.
+    ///
+    /// The single gate of every lossy degradation this operation applies: under
+    /// a pure quarter turn an axis-aligned stored rectangle maps to an
+    /// axis-aligned rectangle exactly and detection stays remappable, so none of
+    /// them applies.
+    #[must_use]
+    pub(crate) fn resamples(&self) -> bool {
+        self.placement.rotation().is_fine()
+    }
+
+    /// Whether the source-page point `(x, y)` (absolute page pixels) lands
+    /// inside the kept region.
+    ///
+    /// Boundary-inclusive: a point exactly on the new page's edge is on the
+    /// page, matching [`RotatedPage::validate_crop`]'s corner-based coordinates.
+    #[must_use]
+    pub(crate) fn keeps_point(&self, x: f64, y: f64) -> bool {
+        let [w, h] = self.new_size();
+        let (mx, my) = self.placement.map_point(x, y);
+        (0.0..=f64::from(w)).contains(&mx) && (0.0..=f64::from(h)).contains(&my)
+    }
+
+    /// [`Self::keeps_point`] for a page-normalized `(u, v)` anchor.
+    #[must_use]
+    pub(crate) fn keeps_uv_point(&self, u: f64, v: f64) -> bool {
+        let [w, h] = self.page_size();
+        self.keeps_point(u * w, v * h)
+    }
+
+    /// Whether any part of a footprint made of several page-pixel polygon
+    /// pieces survives the crop, or `None` when the footprint encloses no area
+    /// at all (the caller must then fall back to a point test).
+    ///
+    /// The pieces are summed in ABSOLUTE area after clipping, exactly like
+    /// [`SplitGeometry::part_for_polygon_group`]: a deform mesh can be FOLDED,
+    /// and the lobes of a self-intersecting ring cancel in a signed shoelace
+    /// sum, so a single outer ring would answer for the wrong shape.
+    #[must_use]
+    pub(crate) fn keeps_polygon_group(&self, pieces: &[&[[f64; 2]]]) -> Option<bool> {
+        let [w, h] = self.new_size();
+        let (right, bottom) = (f64::from(w), f64::from(h));
+        let mut total = 0.0_f64;
+        let mut kept = 0.0_f64;
+        for points in pieces {
+            if points.len() < 3 {
+                continue;
+            }
+            let mapped: Vec<[f64; 2]> = points
+                .iter()
+                .map(|point| {
+                    let (x, y) = self.placement.map_point(point[0], point[1]);
+                    [x, y]
+                })
+                .collect();
+            total += polygon_area(&mapped);
+            // Clip against the four edges of the kept region; the result's
+            // absolute area is the part of this piece that survives.
+            let clipped = clip_half_plane(&mapped, 0, 0.0, true);
+            let clipped = clip_half_plane(&clipped, 0, right, false);
+            let clipped = clip_half_plane(&clipped, 1, 0.0, true);
+            let clipped = clip_half_plane(&clipped, 1, bottom, false);
+            kept += polygon_area(&clipped);
+        }
+        (total > 0.0).then_some(kept > 0.0)
+    }
+
+    /// [`Self::keeps_polygon_group`] for a single simple ring.
+    #[must_use]
+    pub(crate) fn keeps_polygon(&self, points: &[[f64; 2]]) -> Option<bool> {
+        self.keeps_polygon_group(&[points])
+    }
+
+    /// Whether an axis-aligned page-pixel rectangle `[x1, y1, x2, y2]` still
+    /// overlaps the kept region; a degenerate rectangle degrades to its centre
+    /// point, mirroring [`SplitGeometry::part_for_page_rect`].
+    #[must_use]
+    pub(crate) fn keeps_page_rect(&self, rect: [f64; 4]) -> bool {
+        let [x1, y1, x2, y2] = rect;
+        let (left, right) = (x1.min(x2), x1.max(x2));
+        let (top, bottom) = (y1.min(y2), y1.max(y2));
+        let quad = [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ];
+        self.keeps_polygon(&quad)
+            .unwrap_or_else(|| self.keeps_point((left + right) * 0.5, (top + bottom) * 0.5))
+    }
+
+    /// [`Self::keeps_page_rect`] for a page-normalized `[u1, v1, u2, v2]`.
+    #[must_use]
+    pub(crate) fn keeps_uv_rect(&self, rect: [f64; 4]) -> bool {
+        let [w, h] = self.page_size();
+        self.keeps_page_rect([rect[0] * w, rect[1] * h, rect[2] * w, rect[3] * h])
+    }
+
+    /// Dropped-layer routing of the tree rooted at `tree_rel`.
+    #[must_use]
+    pub(crate) fn routing(&self, tree_rel: &str) -> Option<&CropTreeRouting> {
+        self.trees.get(tree_rel)
+    }
+
+    /// Drains the diagnostics collected while resolving what survives.
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// Attaches a per-tree dropped-layer routing to a test geometry.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_routing(mut self, tree_rel: &str, routing: CropTreeRouting) -> Self {
+        self.trees.insert(tree_rel.to_string(), routing);
+        self
+    }
+
+    /// Builds a geometry directly, for tests of the JSON remaps (the normal
+    /// path goes through `build_crop_geometry`, which needs a full snapshot).
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        source_old_idx: usize,
+        page_size: [u32; 2],
+        quarter_turns: u8,
+        angle_deg: f64,
+        rect: [u32; 4],
+    ) -> Self {
+        resolve_crop(source_old_idx, page_size, quarter_turns, angle_deg, rect)
+            .expect("valid test crop geometry")
+    }
+}
+
+/// Resolves a crop request into its rotated canvas and its single affine.
+///
+/// `rect` is `[x, y, w, h]` in the ROTATED CANVAS' pixels; the resulting page
+/// is exactly that size, so the placement has `scale = 1` and `dx = dy = 0` —
+/// the same degenerate affine a split part uses, with a real rotation in front
+/// of it.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for a zero-sized page, `quarter_turns` outside
+/// `0..=3`, a fine angle outside `(-45, 45)`, a rotated canvas that does not fit
+/// `u32` or exceeds [`STITCH_MAX_TOTAL_PX`], or a crop rectangle that is empty
+/// or leaves the canvas.
+fn resolve_crop(
+    source_old_idx: usize,
+    page_size: [u32; 2],
+    quarter_turns: u8,
+    angle_deg: f64,
+    rect: [u32; 4],
+) -> Result<CropGeometry, PageOpError> {
+    let rotation = PageRotation::new(quarter_turns, angle_deg)?;
+    let rotated = RotatedPage::new(page_size, rotation)?;
+    let canvas = rotated.canvas_size();
+    // Kept local: the plan needs the canvas only to bound the staging buffer and
+    // to validate the rectangle — every consumer works in page or new-page
+    // pixels, and re-deriving the canvas belongs to `RotatedPage`.
+    // The rotated canvas becomes a staging RGBA buffer in the executor, so it
+    // falls under the same memory bound as a stitched canvas.
+    if u64::from(canvas[0]) * u64::from(canvas[1]) > STITCH_MAX_TOTAL_PX {
+        return Err(PageOpError::InvalidOp(format!(
+            "rotating page {source_old_idx} ({}x{}) by {} deg needs a {}x{} canvas, which \
+             exceeds {STITCH_MAX_TOTAL_PX} pixels",
+            page_size[0],
+            page_size[1],
+            rotation.total_degrees(),
+            canvas[0],
+            canvas[1]
+        )));
+    }
+    rotated.validate_crop(rect, &format!("page {source_old_idx}"))?;
+    let placement = PlacementMap::with_rotation(
+        &StitchPlacement {
+            page_idx: source_old_idx,
+            crop: rect,
+            scale: 1.0,
+            dx: 0,
+            dy: 0,
+        },
+        page_size,
+        rotation,
+        [rect[2], rect[3]],
+    )?;
+    Ok(CropGeometry {
+        source_old_idx,
+        page_size,
+        rect,
+        placement,
+        trees: std::collections::BTreeMap::new(),
+        warnings: Vec::new(),
+    })
+}
+
 /// Geometry attached to an operation that changes a page's PIXEL identity.
 ///
 /// Ordinary operations (move / insert / delete) only re-key files: every page
 /// keeps its own coordinate space, which is [`PageGeometry::None`]. A stitch
-/// maps N pages onto one canvas, a split maps one page onto N canvases; in
-/// both cases the affected documents must additionally be routed and mapped,
-/// and the two cases are mutually exclusive.
+/// maps N pages onto one canvas, a split maps one page onto N canvases, a crop
+/// rotates one page and keeps a region of it; in every case the affected
+/// documents must additionally be routed and mapped, and the cases are mutually
+/// exclusive.
+///
+/// This enum deliberately exposes NO `stitch()` / `split()` / `crop()`
+/// accessor. Such an accessor is exhaustive in exactly one place — its own body
+/// — so a new variant added there returns `None` everywhere else and is
+/// SILENTLY IGNORED by every planner and remap, which is a data-loss bug the
+/// compiler would never point at. Every consumer must therefore destructure
+/// this enum with its own exhaustive `match`, so that adding a variant fails to
+/// compile at every site that has to reconsider it (AGENTS.md §17).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PageGeometry<'a> {
     /// No pixel remapping: pages keep their own coordinate spaces.
@@ -1040,44 +1537,71 @@ pub(crate) enum PageGeometry<'a> {
     Stitch(&'a StitchGeometry),
     /// One page cut into several parts.
     Split(&'a SplitGeometry),
-}
-
-impl<'a> PageGeometry<'a> {
-    /// The stitch geometry, or `None` for any other operation.
-    #[must_use]
-    pub(crate) fn stitch(self) -> Option<&'a StitchGeometry> {
-        match self {
-            Self::Stitch(geo) => Some(geo),
-            Self::None | Self::Split(_) => None,
-        }
-    }
-
-    /// The split geometry, or `None` for any other operation.
-    #[must_use]
-    pub(crate) fn split(self) -> Option<&'a SplitGeometry> {
-        match self {
-            Self::Split(geo) => Some(geo),
-            Self::None | Self::Stitch(_) => None,
-        }
-    }
+    /// One page rotated and cropped in place.
+    Crop(&'a CropGeometry),
 }
 
 // ---------------------------------------------------------------------------
 // Permutation math.
 // ---------------------------------------------------------------------------
 
-/// One source image of a composed page: which file, which part of it, and
-/// where it lands. Paths are title-relative and point at the file's ORIGINAL
-/// location, because composing happens in phase A, before any rename.
+/// Rotation the executor applies to a compose source BEFORE cropping it.
+///
+/// Mirrors the [`PageRotation`] the placement was built with, in the raw form a
+/// journal can carry (the geometry types are `pub(crate)` and not
+/// serializable). The executor re-validates it through
+/// [`PageRotation::new`] / [`RotatedPage::new`], so a corrupt journal cannot
+/// reach the pixel loop with an out-of-range angle.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ComposeRotation {
+    /// Clockwise 90-degree steps, `0..=3`.
+    pub quarter_turns: u8,
+    /// Fine straightening angle in degrees, clockwise-positive, in `(-45, 45)`.
+    pub angle_deg: f64,
+}
+
+/// One source image of a composed page: which file, how it is rotated, which
+/// part of it, and where it lands. Paths are title-relative and point at the
+/// file's ORIGINAL location, because composing happens in phase A, before any
+/// rename.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ComposeSource {
     /// Title-relative path of the image to read.
     pub path: String,
-    /// Pixel size the crop/offset are expressed in (the source PAGE's size). A
+    /// Pixel size the rotation is applied to (the source PAGE's size). A
     /// decoded image of a different size is resized to it first — page-sized
     /// overlays may have been attached with a same-aspect resize.
     pub page_size: [u32; 2],
-    /// `[x, y, w, h]` region of the source image, in `page_size` pixels.
+    /// Rotation applied to the `page_size` image before cropping, or `None`
+    /// when the source is used upright. `crop` is then read in the ROTATED
+    /// CANVAS' pixels rather than in `page_size`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<ComposeRotation>,
+    /// Resample this source with NEAREST NEIGHBOUR instead of a smooth filter,
+    /// at EVERY step that can resample it: the page-size pre-resize, the
+    /// rotation, and the crop-to-destination resize.
+    ///
+    /// TRUE FOR EVERY MASK, ON EVERY OPERATION — a stitch, a split and a crop
+    /// alike. Both mask families this engine moves are strictly binary by
+    /// construction: the typing mask is painted by
+    /// `MaskBrush::paint_binary_mask_segment` and re-thresholded at luma 128 on
+    /// load (`tabs/typing/mask.rs`), and a detection mask is normalized to
+    /// `0`/`255` by `text_detector::parse_mask_alpha_from_blob` /
+    /// `glyph_mask_into_alpha`, whose loader promotes ANY non-zero byte to fully
+    /// masked. A smooth filter therefore does not merely blur such a raster, it
+    /// changes what it MEANS: every interpolated pixel of a detection mask reads
+    /// as masked, so the mask silently GROWS outwards, and a typing mask's edge
+    /// shifts to wherever the interpolation crosses 128.
+    ///
+    /// The flag lives here rather than on [`ComposeRotation`] because the
+    /// property belongs to the raster, not to one step. That is what lets one
+    /// answer cover all three: a stitch and a split never rotate, but they still
+    /// reach the page-size pre-resize whenever a mask file is not page-sized,
+    /// and that step must not smooth it either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nearest: bool,
+    /// `[x, y, w, h]` region of the source image, in `page_size` pixels — or in
+    /// the rotated canvas' pixels when `rotation` is `Some`.
     pub crop: [u32; 4],
     /// `[x, y, w, h]` destination rectangle in the composed canvas.
     pub dest: [u32; 4],
@@ -1276,7 +1800,57 @@ pub(crate) fn permutation_for_op(
             order,
             deleted,
         } => split_permutation(*page_idx, cuts, order, deleted, old_page_count),
+        PageOpKind::Crop {
+            page_idx,
+            quarter_turns,
+            angle_deg,
+            rect,
+        } => crop_permutation(*page_idx, *quarter_turns, *angle_deg, *rect, old_page_count),
     }
+}
+
+/// Index math + request validation of a crop.
+///
+/// A crop replaces one page with a rotated, cropped version of itself: the page
+/// COUNT is unchanged and `old_to_new` is the IDENTITY, so no other page is
+/// touched by the permutation. The new page is not listed in `new_pages`: its
+/// content is cut out of the chapter snapshot by `plan_src_pages`, exactly as a
+/// split part's is, not derivable from the request alone.
+///
+/// Only the request's self-consistency is checked here — the rotation ranges and
+/// a non-empty rectangle. Whether the rectangle fits the ROTATED CANVAS needs
+/// the page's pixel size and is checked by [`build_crop_geometry`].
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for an out-of-range `page_idx`, `quarter_turns`
+/// outside `0..=3`, a fine angle outside `(-45, 45)`, or a zero-sized `rect`.
+fn crop_permutation(
+    page_idx: usize,
+    quarter_turns: u8,
+    angle_deg: f64,
+    rect: [u32; 4],
+    old_page_count: usize,
+) -> Result<Permutation, PageOpError> {
+    if page_idx >= old_page_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "crop page {page_idx} is out of range for {old_page_count} page(s)"
+        )));
+    }
+    // Validated here as well as in the geometry so a bad request is refused
+    // even by a caller that only asks for the permutation (the page manager
+    // pre-validates that way).
+    PageRotation::new(quarter_turns, angle_deg)?;
+    if rect[2] == 0 || rect[3] == 0 {
+        return Err(PageOpError::InvalidOp(format!(
+            "crop [{}, {}, {}, {}] of page {page_idx} is empty",
+            rect[0], rect[1], rect[2], rect[3]
+        )));
+    }
+    Ok(Permutation {
+        old_to_new: (0..old_page_count).map(Some).collect(),
+        new_page_count: old_page_count,
+        new_pages: Vec::new(),
+    })
 }
 
 /// Index math + cut/order validation of a split.
@@ -1757,12 +2331,14 @@ pub(crate) fn build_plan(
     let trash_root = format!("{}/{TRASH_DIR_NAME}/{trash_id}", snapshot.chapter_rel);
     let mut b = PlanBuilder::new(trash_root.clone(), trash_id);
 
-    // Stitch and split are the two operations that change a page's PIXEL
+    // Stitch, split and crop are the operations that change a page's PIXEL
     // identity instead of merely re-keying files: they resolve their request
     // into affines first, and every planner below then treats an affected page
-    // as "merged into" / "cut into" rather than "renamed to a new key".
+    // as "merged into" / "cut into" / "recropped" rather than "renamed to a new
+    // key".
     let stitch;
     let split;
+    let crop;
     let geometry = match op {
         PageOpKind::Stitch {
             placements,
@@ -1794,6 +2370,33 @@ pub(crate) fn build_plan(
             split = resolved;
             PageGeometry::Split(&split)
         }
+        PageOpKind::Crop {
+            page_idx,
+            quarter_turns,
+            angle_deg,
+            rect,
+        } => {
+            let mut resolved =
+                build_crop_geometry(snapshot, *page_idx, *quarter_turns, *angle_deg, *rect)?;
+            for warning in resolved.take_warnings() {
+                b.warn(warning);
+            }
+            crop = resolved;
+            // Degrading user data must never be silent: name every lossy
+            // consequence of a fine angle up front, before the per-document
+            // warnings that repeat it with their own counts.
+            if crop.resamples() {
+                b.warn(format!(
+                    "crop of page {page_idx}: the {:.3} deg fine angle RESAMPLES every \
+                     page-sized raster (a pure quarter turn would not); stored axis-aligned \
+                     rectangles (bubble rect_coords and text_areas) degrade to the bounding \
+                     box of the rotated rectangle, and the page's text-detection files are \
+                     moved to the trash instead of being remapped wrongly",
+                    crop.rotation().total_degrees()
+                ));
+            }
+            PageGeometry::Crop(&crop)
+        }
         PageOpKind::Move { .. }
         | PageOpKind::InsertFiles { .. }
         | PageOpKind::CreateBlank { .. }
@@ -1806,21 +2409,35 @@ pub(crate) fn build_plan(
         // COUNT shifts that pairing and there is nothing to rename.
         let shift = match geometry {
             PageGeometry::Stitch(geo) => Some(format!(
-                "merging {} page(s) into one",
+                "merging {} page(s) into one shifts their alignment with the pages",
                 geo.source_count()
             )),
             // The alignment shift follows the page COUNT, so only the parts
             // that actually become pages count here.
             PageGeometry::Split(geo) => Some(format!(
-                "cutting one page into {} part(s)",
+                "cutting one page into {} part(s) shifts their alignment with the pages",
                 geo.kept_count()
             )),
+            // A crop does NOT change the page count, so the positional pairing
+            // itself survives — page k still pairs with the k-th alternate
+            // version. What changes is the page's SIZE: the alternate version
+            // is now a differently sized (and differently oriented) image of the
+            // same page, which the stamp tool overlays by position, so it no
+            // longer lines up with the page it belongs to.
+            PageGeometry::Crop(geo) => {
+                let [w, h] = geo.new_size();
+                Some(format!(
+                    "cropping page {} to {w}x{h} keeps their positional pairing but leaves \
+                     the alternate version at the page's OLD size and orientation",
+                    geo.source_old_idx()
+                ))
+            }
             PageGeometry::None => None,
         };
         if let Some(shift) = shift {
             b.warn(format!(
                 "{}/{}: alternate versions are position-matched and are NOT remapped; \
-                 {shift} shifts their alignment with the pages",
+                 {shift}",
                 snapshot.chapter_rel,
                 config::ALT_VERS_DIR,
             ));
@@ -2062,6 +2679,117 @@ fn build_split_geometry(
     Ok(geometry)
 }
 
+/// Resolves a crop request against the chapter snapshot.
+///
+/// Validates the rotation and the crop rectangle against the page's real pixel
+/// size (via [`resolve_crop`]) and resolves, per tree, which layer records of
+/// the page fall entirely outside the kept region and which layer PNGs only
+/// those records reference. Diagnostics produced while deciding (an unprobeable
+/// text render, a record with no placement at all) are collected into the
+/// geometry and drained by the caller into the plan's warnings.
+///
+/// A malformed layer manifest does not fail here: the routing degrades to empty
+/// — nothing is dropped, which is the safe direction — and
+/// [`json_remap::remap_layers_manifest`] reports the structural problem with
+/// full context when it rewrites the same document.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] when the snapshot carries no page sizes, the page
+/// index has no size, or the request is rejected by [`resolve_crop`].
+fn build_crop_geometry(
+    snapshot: &ChapterSnapshot,
+    page_idx: usize,
+    quarter_turns: u8,
+    angle_deg: f64,
+    rect: [u32; 4],
+) -> Result<CropGeometry, PageOpError> {
+    if snapshot.page_sizes.len() != snapshot.page_file_names.len() {
+        return Err(PageOpError::InvalidOp(
+            "crop requires the pixel size of every page, which this chapter \
+             snapshot does not carry"
+                .to_string(),
+        ));
+    }
+    let page_size = *snapshot.page_sizes.get(page_idx).ok_or_else(|| {
+        PageOpError::InvalidOp(format!("crop page {page_idx} has no known pixel size"))
+    })?;
+    let mut geometry = resolve_crop(page_idx, page_size, quarter_turns, angle_deg, rect)?;
+
+    // Per TREE: the committed and the staging manifest are independent
+    // documents that may describe different layers for the same page.
+    for tree in [&snapshot.committed, &snapshot.unsaved] {
+        let (routing, warnings) = json_remap::crop_layer_routing(
+            tree.layers_manifest.as_ref(),
+            &tree.layer_png_sizes,
+            &geometry,
+        );
+        for warning in warnings {
+            geometry
+                .warnings
+                .push(format!("{}/layers: {warning}", tree.tree_rel));
+        }
+        geometry.trees.insert(tree.tree_rel.clone(), routing);
+    }
+    Ok(geometry)
+}
+
+/// Stages the ONE rotated + cropped PNG a crop produces from a page-sized
+/// raster of the cropped page.
+///
+/// `from` is the raster's title-relative path at its ORIGINAL location (phase A
+/// composes before any rename) and `page_size` the pixel size the rotation is
+/// applied to. `nearest` selects nearest-neighbour sampling for a raster whose
+/// values are categorical (a typing or detection MASK) instead of continuous.
+///
+/// Every raster of the page goes through the SAME rotation and the SAME crop
+/// rectangle, which is what keeps them all exactly the new page's size.
+fn plan_crop_raster(
+    b: &mut PlanBuilder,
+    geo: &CropGeometry,
+    from: &str,
+    page_size: [u32; 2],
+    background: [u8; 4],
+    nearest: bool,
+    target: String,
+) {
+    let [width, height] = geo.new_size();
+    b.create(
+        target,
+        NewPageContent::ComposedPng {
+            width,
+            height,
+            background,
+            sources: vec![crop_compose_source(geo, from, page_size, nearest)],
+        },
+    );
+}
+
+/// The single [`ComposeSource`] of a crop: the whole page, rotated, cropped to
+/// the kept region and placed at the origin of the new page.
+fn crop_compose_source(
+    geo: &CropGeometry,
+    from: &str,
+    page_size: [u32; 2],
+    nearest: bool,
+) -> ComposeSource {
+    let rotation = geo.rotation();
+    ComposeSource {
+        path: from.to_string(),
+        page_size,
+        // Always recorded, even for a zero rotation: the executor's short
+        // circuit (an identity rotation copies the buffer) keeps that case
+        // bit-exact, and an explicit recipe is easier to audit in a journal
+        // than an implicit one.
+        rotation: Some(ComposeRotation {
+            quarter_turns: rotation.quarter().steps(),
+            angle_deg: rotation.angle_deg(),
+        }),
+        nearest,
+        crop: geo.placement().crop_rect(),
+        dest: geo.placement().placed_rect(),
+    }
+}
+
 /// Stages one cropped PNG per split part from ONE page-sized raster of the cut
 /// page.
 ///
@@ -2069,15 +2797,19 @@ fn build_split_geometry(
 /// composes before any rename), `page_size` the pixel size its crop is
 /// expressed in, and `target_for` maps a part's NEW page index to the file the
 /// part's raster must end up at. Every part's crop equals its destination, so
-/// `encode_composed_png` copies the pixels bit-exactly instead of resampling,
-/// and `background` is only ever visible if the source raster decodes smaller
-/// than its page (it is then resized to the page size first).
+/// `encode_composed_png` copies the pixels bit-exactly instead of resampling.
+///
+/// `nearest` is the raster's sampling policy (see [`ComposeSource::nearest`]).
+/// A split never rotates and never scales, so the ONLY step it can reach is the
+/// page-size pre-resize — which happens exactly when the source raster is not
+/// page-sized, and which must not smooth a MASK.
 fn plan_split_raster_parts(
     b: &mut PlanBuilder,
     geo: &SplitGeometry,
     from: &str,
     page_size: [u32; 2],
     background: [u8; 4],
+    nearest: bool,
     target_for: impl Fn(usize) -> String,
 ) {
     for part in 0..geo.part_count() {
@@ -2100,6 +2832,10 @@ fn plan_split_raster_parts(
                 sources: vec![ComposeSource {
                     path: from.to_string(),
                     page_size,
+                    // A stitch and a split never rotate: the crop indexes the page image
+                    // directly (`PlacementMap::rotates()` is false for both).
+                    rotation: None,
+                    nearest,
                     crop: placement.crop_rect(),
                     dest: placement.placed_rect(),
                 }],
@@ -2115,24 +2851,59 @@ fn plan_split_raster_parts(
 /// the composed page) and the merged page is staged as a new PNG, regardless of
 /// the source pages' extensions. Under a split the cut page is trashed and each
 /// part is staged as its own new PNG, likewise regardless of the source
-/// extension.
+/// extension. Under a crop the cropped page is trashed and ONE rotated+cropped
+/// PNG is staged at the same index (the page count does not change).
 fn plan_src_pages(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
     map: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
-    let stitch = geometry.stitch();
+    // Exhaustive by design (see `PageGeometry`): a new pixel-identity operation
+    // must fail to compile HERE, so that whoever adds it has to decide what
+    // this planner does with it instead of silently falling through to the
+    // plain-rename path.
+    let (stitch, split, crop) = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let from = format!("{}/{}/{name}", snapshot.chapter_rel, config::SRC_DIR);
-        if let Some(geo) = geometry.split()
+        if let Some(geo) = crop
             && geo.source_old_idx() == old_idx
         {
             let page_size = *snapshot.page_sizes.get(old_idx).ok_or_else(|| {
                 PageOpError::InvalidOp(format!("page {old_idx} has no known pixel size"))
             })?;
-            plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], |new_idx| {
+            plan_crop_raster(
+                b,
+                geo,
+                &from,
+                page_size,
+                // Straight alpha: whatever the rotation leaves uncovered at the
+                // corners of the new page must be transparent, not painted.
+                [0, 0, 0, 0],
+                false,
+                format!(
+                    "{}/{}/{}.png",
+                    snapshot.chapter_rel,
+                    config::SRC_DIR,
+                    canonical_page_stem(geo.source_old_idx())
+                ),
+            );
+            b.trash(from);
+            continue;
+        }
+        if let Some(geo) = split
+            && geo.source_old_idx() == old_idx
+        {
+            let page_size = *snapshot.page_sizes.get(old_idx).ok_or_else(|| {
+                PageOpError::InvalidOp(format!("page {old_idx} has no known pixel size"))
+            })?;
+            plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], false, |new_idx| {
                 format!(
                     "{}/{}/{}.png",
                     snapshot.chapter_rel,
@@ -2152,6 +2923,10 @@ fn plan_src_pages(
             composed.push(ComposeSource {
                 path: from.clone(),
                 page_size,
+                // A stitch and a split never rotate: the crop indexes the page image
+                // directly (`PlacementMap::rotates()` is false for both).
+                rotation: None,
+                nearest: false,
                 crop: placement.crop_rect(),
                 dest: placement.placed_rect(),
             });
@@ -2206,6 +2981,9 @@ fn plan_src_pages(
 /// Under a split they are CUT the same way the page image is: each part gets
 /// the corresponding crop of the cut page's overlay, and nothing is created
 /// when the cut page had no overlay.
+///
+/// Under a crop they are ROTATED AND CROPPED with the very same transform as
+/// the page image, which is what keeps them exactly the new page's size.
 fn plan_clean_overlays(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
@@ -2213,17 +2991,45 @@ fn plan_clean_overlays(
     map: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) {
-    let stitch = geometry.stitch();
+    // Exhaustive by design; see `plan_src_pages` and `PageGeometry`.
+    let (stitch, split, crop) = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     let mut composed: Vec<ComposeSource> = Vec::new();
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let (stem, _) = split_name(name);
         let exists = tree.clean_overlay_stems.contains(stem);
         let from = format!("{}/{}/{stem}.png", tree.tree_rel, config::CLEAN_LAYERS_DIR);
-        if let Some(geo) = geometry.split()
+        if let Some(geo) = crop
             && geo.source_old_idx() == old_idx
         {
             if exists && let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
-                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], |new_idx| {
+                plan_crop_raster(
+                    b,
+                    geo,
+                    &from,
+                    page_size,
+                    [0, 0, 0, 0],
+                    false,
+                    format!(
+                        "{}/{}/{}.png",
+                        tree.tree_rel,
+                        config::CLEAN_LAYERS_DIR,
+                        canonical_page_stem(geo.source_old_idx())
+                    ),
+                );
+                b.trash(from);
+            }
+            continue;
+        }
+        if let Some(geo) = split
+            && geo.source_old_idx() == old_idx
+        {
+            if exists && let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], false, |new_idx| {
                     format!(
                         "{}/{}/{}.png",
                         tree.tree_rel,
@@ -2242,6 +3048,10 @@ fn plan_clean_overlays(
                 composed.push(ComposeSource {
                     path: from.clone(),
                     page_size,
+                    // A stitch and a split never rotate: the crop indexes the page image
+                    // directly (`PlacementMap::rotates()` is false for both).
+                    rotation: None,
+                    nearest: false,
                     crop: placement.crop_rect(),
                     dest: placement.placed_rect(),
                 });
@@ -2305,6 +3115,11 @@ fn plan_clean_overlays(
 /// falls back to the representative part with a warning (it is an orphan that
 /// `prune_orphan_pngs` will collect anyway).
 ///
+/// A crop keeps every prefix (the page index does not change), so a surviving
+/// layer's PNG is simply left alone. The PNGs referenced ONLY by records that
+/// fall entirely outside the kept region are trashed with those records, exactly
+/// as a deleted page's are.
+///
 /// # Errors
 /// [`PageOpError::InvalidOp`] when two merged pages would produce the same
 /// layer PNG name.
@@ -2314,9 +3129,15 @@ fn plan_layer_pngs(
     map: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
-    let stitch = geometry.stitch();
-    let split = geometry.split();
+    // Exhaustive by design; see `plan_src_pages` and `PageGeometry`.
+    let (stitch, split, crop) = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     let routing = split.and_then(|geo| geo.routing(&tree.tree_rel));
+    let crop_routing = crop.and_then(|geo| geo.routing(&tree.tree_rel));
     let mut merged_targets: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for name in &tree.layers_files {
@@ -2334,6 +3155,17 @@ fn plan_layer_pngs(
                 from,
                 map.len()
             ));
+            continue;
+        }
+        // A crop keeps the page's index, so a surviving PNG needs no rename at
+        // all; only the ones whose last claimant fell outside the frame move —
+        // into the trash, never destroyed.
+        if let Some(geo) = crop
+            && geo.source_old_idx() == old_idx
+        {
+            if crop_routing.is_some_and(|r| r.is_dropped_file(name)) {
+                b.trash(from);
+            }
             continue;
         }
         // A split routes the cut page's PNGs by NODE, not by the page index in
@@ -2389,10 +3221,13 @@ fn plan_layer_pngs(
 }
 
 /// `layers/layers.json`: remap `img_idx` and the embedded `ps_p...` file
-/// references; page entries of deleted pages are removed and archived in the
-/// trash as `deleted_layers_pages.json`. A stitch folds the merged pages'
-/// entries into one; a split partitions the cut page's entry into one entry per
-/// part that holds at least one layer.
+/// references; everything the operation REMOVES is archived in the trash as
+/// `deleted_layers_pages.json` — a page deleted whole contributes its entry, and
+/// a page that survives but loses records (a split's deleted part, a crop's
+/// removed frame) contributes an entry holding just those records. A stitch
+/// folds the merged pages' entries into one; a split partitions the cut page's
+/// entry into one entry per part that holds at least one layer; a crop keeps one
+/// entry and drops the records the new frame removed.
 fn plan_layers_manifest(
     b: &mut PlanBuilder,
     tree: &TreeSnapshot,
@@ -2488,6 +3323,10 @@ fn plan_text_info(
 /// overlays, over a black (inactive) background — the loader thresholds the
 /// decoded luma at 128, so uncovered canvas reads as "not masked". Under a
 /// split they are CUT into one mask per part, the same way the page image is.
+///
+/// Under a crop they are rotated and cropped with the page's transform, but with
+/// NEAREST-NEIGHBOUR sampling: the loader thresholds the mask, so interpolating
+/// it would turn a hard edge into a band of half-masked pixels.
 fn plan_typing_masks(
     b: &mut PlanBuilder,
     snapshot: &ChapterSnapshot,
@@ -2495,7 +3334,13 @@ fn plan_typing_masks(
     map: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) {
-    let stitch = geometry.stitch();
+    // Exhaustive by design; see `plan_src_pages` and `PageGeometry`.
+    let (stitch, split, crop) = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     // Page order, not file-name order: `mask_page_10` sorts before
     // `mask_page_2` as a string, and the compose order must be by page.
     let mut by_page: std::collections::BTreeMap<usize, String> =
@@ -2518,13 +3363,40 @@ fn plan_typing_masks(
             ));
             continue;
         }
-        if let Some(geo) = geometry.split()
+        if let Some(geo) = crop
+            && geo.source_old_idx() == old_idx
+        {
+            if let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
+                plan_crop_raster(
+                    b,
+                    geo,
+                    &from,
+                    page_size,
+                    // Opaque black = "no mask here" (the loader thresholds luma
+                    // at 128), so the corners the rotation leaves uncovered read
+                    // as unmasked.
+                    [0, 0, 0, 255],
+                    // Categorical values: nearest neighbour keeps the mask
+                    // binary instead of fringing its edges with grey.
+                    true,
+                    format!(
+                        "{}/{}/{}",
+                        tree.tree_rel,
+                        config::TEXT_IMAGES_DIR,
+                        typing_mask_file_name(geo.source_old_idx())
+                    ),
+                );
+                b.trash(from);
+            }
+            continue;
+        }
+        if let Some(geo) = split
             && geo.source_old_idx() == old_idx
         {
             if let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
                 // Opaque black = "no mask here" (the loader thresholds luma at
                 // 128), matching how the typing tab writes its masks.
-                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 255], |new_idx| {
+                plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 255], true, |new_idx| {
                     format!(
                         "{}/{}/{}",
                         tree.tree_rel,
@@ -2543,6 +3415,12 @@ fn plan_typing_masks(
                 composed.push(ComposeSource {
                     path: from.clone(),
                     page_size,
+                    // A stitch and a split never rotate: the crop indexes the page image
+                    // directly (`PlacementMap::rotates()` is false for both).
+                    rotation: None,
+                    // A typing mask is CATEGORICAL: its loader thresholds it, so a
+                    // smooth pre-resize of an off-size mask would shift its edge.
+                    nearest: true,
                     crop: placement.crop_rect(),
                     dest: placement.placed_rect(),
                 });
@@ -2627,12 +3505,21 @@ fn plan_detection(
     map: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) -> Result<(), PageOpError> {
-    let stitch = geometry.stitch();
+    // Exhaustive by design; see `plan_src_pages` and `PageGeometry`.
+    let (stitch, split, crop) = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     if let Some(geo) = stitch {
         plan_stitch_detection(b, snapshot, geo)?;
     }
-    if let Some(geo) = geometry.split() {
+    if let Some(geo) = split {
         plan_split_detection(b, snapshot, geo)?;
+    }
+    if let Some(geo) = crop {
+        plan_crop_detection(b, snapshot, geo)?;
     }
     for det in &snapshot.detection {
         let old_idx = det.page_idx;
@@ -2641,10 +3528,11 @@ fn plan_detection(
             continue;
         }
         // The split page was cut into one document per part above.
-        if geometry
-            .split()
-            .is_some_and(|geo| geo.source_old_idx() == old_idx)
-        {
+        if split.is_some_and(|geo| geo.source_old_idx() == old_idx) {
+            continue;
+        }
+        // The cropped page's document was rewritten (or trashed) above.
+        if crop.is_some_and(|geo| geo.source_old_idx() == old_idx) {
             continue;
         }
         let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
@@ -2809,6 +3697,12 @@ fn plan_stitch_detection(
         composed.push(ComposeSource {
             path: format!("{dir}/{}", detection_mask_file_name(det.page_idx)),
             page_size,
+            // A stitch and a split never rotate: the crop indexes the page image
+            // directly (`PlacementMap::rotates()` is false for both).
+            rotation: None,
+            // A detection mask is CATEGORICAL, and its loader promotes ANY
+            // non-zero byte to fully masked, so smoothing it grows the mask.
+            nearest: true,
             crop: placement.crop_rect(),
             dest: placement.placed_rect(),
         });
@@ -2879,7 +3773,7 @@ fn plan_split_detection(
                 page_size,
                 old_idx,
             )
-            .or_else(|| json_remap::detection_split_blocker(value, old_idx));
+            .or_else(|| json_remap::detection_rect_blocker(value, old_idx));
             match blocker {
                 Some(reason) => {
                     b.warn(format!(
@@ -2917,7 +3811,7 @@ fn plan_split_detection(
     if det.has_mask {
         // Verified page-sized above, so each part's mask is the same crop as
         // the part's page image.
-        plan_split_raster_parts(b, geo, &mask_from, page_size, [0, 0, 0, 255], |new_idx| {
+        plan_split_raster_parts(b, geo, &mask_from, page_size, [0, 0, 0, 255], true, |new_idx| {
             format!("{dir}/{}", detection_mask_file_name(new_idx))
         });
     }
@@ -2941,6 +3835,140 @@ fn plan_split_detection(
             content: to_pretty(&cut)?,
         });
     }
+    Ok(())
+}
+
+/// Text detection of the CROPPED page.
+///
+/// Two outcomes, chosen by the rotation alone:
+/// - a PURE QUARTER TURN (or no rotation at all) keeps every stored rectangle
+///   axis-aligned, so the document is REMAPPED: blocks are mapped through the
+///   crop's placement, blocks lying entirely outside the kept region are
+///   dropped (with a count in a warning), `source_size`/`mask_size` become the
+///   new page size, and the page's mask is rotated and cropped with
+///   nearest-neighbour sampling so it stays binary.
+/// - a FINE ANGLE cannot be expressed by an axis-aligned `x1/y1/x2/y2`
+///   rectangle, so the page's detection files go to the TRASH with a warning
+///   instead of being remapped wrongly — the same all-or-nothing degradation of
+///   regenerable data the stitch and the split already apply to an untrustworthy
+///   document.
+///
+/// The trust gates ([`json_remap::detection_merge_blocker`] for the declared
+/// sizes and [`json_remap::detection_rect_blocker`] for complete block
+/// rectangles) apply to the remapping branch exactly as they do to a split.
+///
+/// # Errors
+/// [`PageOpError::Json`] when the remapped document cannot be built or
+/// re-serialized.
+fn plan_crop_detection(
+    b: &mut PlanBuilder,
+    snapshot: &ChapterSnapshot,
+    geo: &CropGeometry,
+) -> Result<(), PageOpError> {
+    let old_idx = geo.source_old_idx();
+    let Some(det) = snapshot
+        .detection
+        .iter()
+        .find(|det| det.page_idx == old_idx)
+    else {
+        return Ok(());
+    };
+    let dir = format!("{}/{}", snapshot.chapter_rel, config::TEXT_DETECTION_DIR);
+    let blocks_from = format!("{dir}/{}", detection_blocks_file_name(old_idx));
+    let mask_from = format!("{dir}/{}", detection_mask_file_name(old_idx));
+    let page_size = snapshot.page_sizes.get(old_idx).copied().unwrap_or([0, 0]);
+
+    // A fine angle is decided BEFORE the document is even inspected: no
+    // axis-aligned block list can describe a page rotated by a free angle, so
+    // there is nothing to gate.
+    let document = if geo.resamples() {
+        b.warn(format!(
+            "text detection of page {old_idx} was moved to the trash instead of being \
+             remapped: its blocks are axis-aligned rectangles and cannot describe a page \
+             rotated by {:.3} deg; re-run detection on the cropped page",
+            geo.rotation().total_degrees()
+        ));
+        None
+    } else {
+        match &det.blocks {
+            Some(DetectionBlocks::Parsed(value)) => {
+                let blocker =
+                    json_remap::detection_merge_blocker(value, det.has_mask, page_size, old_idx)
+                        .or_else(|| json_remap::detection_rect_blocker(value, old_idx));
+                match blocker {
+                    Some(reason) => {
+                        b.warn(format!(
+                            "text detection of the cropped page was moved to the trash instead \
+                             of being remapped ({reason}); re-run detection on the cropped page"
+                        ));
+                        None
+                    }
+                    None => Some(value),
+                }
+            }
+            Some(DetectionBlocks::Opaque) => {
+                b.warn(format!(
+                    "text detection of the cropped page was moved to the trash instead of \
+                     being remapped (page {old_idx}: blocks file is not valid JSON); re-run \
+                     detection on the cropped page"
+                ));
+                None
+            }
+            // A mask with no blocks file is never loaded (the loader keys on
+            // the blocks file); it is trashed below and needs no decision.
+            None => None,
+        }
+    };
+
+    let Some(document) = document else {
+        // Degraded: the page's detection artifacts are keyed to a page whose
+        // pixel space no longer exists, so they go to the trash rather than
+        // staying as a wrong overlay.
+        if det.blocks.is_some() {
+            b.trash(blocks_from);
+        }
+        if det.has_mask {
+            b.trash(mask_from);
+        }
+        return Ok(());
+    };
+
+    let mask_name = det.has_mask.then(|| detection_mask_file_name(old_idx));
+    if det.has_mask {
+        // Verified page-sized by the gate above, so the mask takes exactly the
+        // page's transform and ends up exactly the new page's size.
+        plan_crop_raster(
+            b,
+            geo,
+            &mask_from,
+            page_size,
+            [0, 0, 0, 255],
+            // Categorical values: a detection mask must stay binary.
+            true,
+            format!("{dir}/{}", detection_mask_file_name(old_idx)),
+        );
+        b.trash(mask_from);
+    }
+    let (remapped, dropped) = json_remap::crop_detection_blocks(
+        document,
+        geo,
+        old_idx,
+        mask_name.as_deref(),
+    )?;
+    if dropped > 0 {
+        b.warn(format!(
+            "crop of page {old_idx}: {dropped} text-detection block(s) lay entirely outside \
+             the kept region and were dropped; detection output is regenerable"
+        ));
+    }
+    // The rewritten body supersedes the original at the SAME path (a crop does
+    // not change the page index), so the original is discarded rather than
+    // renamed.
+    b.discard(blocks_from);
+    b.json_writes.push(PlannedJsonWrite {
+        target: format!("{dir}/{}", detection_blocks_file_name(old_idx)),
+        content: to_pretty(&remapped)?,
+    });
     Ok(())
 }
 
@@ -3464,18 +4492,72 @@ mod tests {
         let map = PlacementMap::new(&placement, [100, 200], [400, 400]).expect("valid");
         assert_eq!(map.placed_rect(), [40, 10, 120, 300]);
         assert_eq!(map.crop_rect(), [20, 40, 60, 150]);
-        // Absolute page px -> canvas px.
-        assert!((map.map_x(20.0) - 40.0).abs() < 1e-9, "crop origin maps to dx");
-        assert!((map.map_x(70.0) - 140.0).abs() < 1e-9);
-        assert!((map.map_y(40.0) - 10.0).abs() < 1e-9);
-        assert!((map.map_y(140.0) - 210.0).abs() < 1e-9);
-        // Lengths carry the scale but not the origin.
-        assert!((map.map_len(3.0) - 6.0).abs() < 1e-9);
+        assert!(!map.rotates());
+        // Absolute page px -> canvas px. The crop origin maps to (dx, dy).
+        let (x, y) = map.map_point(20.0, 40.0);
+        assert!((x - 40.0).abs() < 1e-9 && (y - 10.0).abs() < 1e-9);
+        let (x, y) = map.map_point(70.0, 140.0);
+        assert!((x - 140.0).abs() < 1e-9 && (y - 210.0).abs() < 1e-9);
+        // Magnitudes carry the scale but not the origin.
+        assert!((map.map_extent(3.0) - 6.0).abs() < 1e-9);
         // Page-normalized uv -> canvas-normalized uv: u=0.2 is page px 20,
-        // which is the crop origin, i.e. canvas px 40 = 0.1 of a 400 canvas.
-        assert!((map.map_u(0.2) - 0.1).abs() < 1e-9);
+        // which is the crop origin, i.e. canvas px 40 = 0.1 of a 400 canvas;
         // v=0.2 is page px 40 -> canvas px 10 -> 0.025.
-        assert!((map.map_v(0.2) - 0.025).abs() < 1e-9);
+        let (u, v) = map.map_uv(0.2, 0.2);
+        assert!((u - 0.1).abs() < 1e-9);
+        assert!((v - 0.025).abs() < 1e-9);
+        // A non-rotating placement maps one axis without the other, exactly.
+        assert_eq!(map.map_x_without_y(20.0), Some(40.0));
+        assert_eq!(map.map_y_without_x(40.0), Some(10.0));
+        let lone_u = map.map_u_without_v(0.2).expect("separable without rotation");
+        assert!((lone_u - 0.1).abs() < 1e-9);
+        let lone_v = map.map_v_without_u(0.2).expect("separable without rotation");
+        assert!((lone_v - 0.025).abs() < 1e-9);
+        // An axis-aligned rect keeps its two given corners, inverted or not.
+        assert_eq!(map.map_px_rect([70.0, 140.0, 20.0, 40.0]), [
+            140.0, 210.0, 40.0, 10.0
+        ]);
+    }
+
+    #[test]
+    fn placement_map_rotation_is_exact_for_a_quarter_turn() {
+        // The same 100x200 page turned 90 deg clockwise: its rotated canvas is
+        // 200x100, and the crop is read in THAT space.
+        let placement = StitchPlacement {
+            page_idx: 0,
+            crop: [20, 10, 60, 50],
+            scale: 1.0,
+            dx: 0,
+            dy: 0,
+        };
+        let rotation = PageRotation::new(1, 0.0).expect("valid rotation");
+        let map = PlacementMap::with_rotation(&placement, [100, 200], rotation, [60, 50])
+            .expect("valid");
+        assert!(map.rotates());
+        assert_eq!(map.crop_rect(), [20, 10, 60, 50]);
+        assert_eq!(map.placed_rect(), [0, 0, 60, 50]);
+        // Page (0, 0) is canvas (200, 0) after the turn, i.e. (180, -10) after
+        // the crop — outside the part, which is legal for a mapped point.
+        assert_eq!(map.map_point(0.0, 0.0), (180.0, -10.0));
+        // Page (30, 30) -> turned (170, 30) -> cropped (150, 20). Exact.
+        assert_eq!(map.map_point(30.0, 30.0), (150.0, 20.0));
+        // One axis alone is no longer defined.
+        assert_eq!(map.map_x_without_y(30.0), None);
+        assert_eq!(map.map_y_without_x(30.0), None);
+        assert_eq!(map.map_u_without_v(0.5), None);
+        assert_eq!(map.map_v_without_u(0.5), None);
+        // An axis-aligned rect becomes the bounding box of the mapped quad,
+        // normalized: the turn swaps and mirrors the corners.
+        assert_eq!(map.map_px_rect([30.0, 30.0, 40.0, 50.0]), [
+            130.0, 20.0, 150.0, 30.0
+        ]);
+        // A crop leaving the ROTATED canvas is refused (200x100, not 100x200).
+        let mut bad = placement;
+        bad.crop = [20, 150, 60, 50];
+        assert!(matches!(
+            PlacementMap::with_rotation(&bad, [100, 200], rotation, [60, 50]),
+            Err(PageOpError::InvalidOp(_))
+        ));
     }
 
     #[test]
@@ -3906,14 +4988,15 @@ mod tests {
         assert_eq!(middle.crop_rect(), [0, 100, 50, 150]);
         assert_eq!(middle.placed_rect(), [0, 0, 50, 150]);
         // Absolute page px: the first cut is the top of the middle part.
-        assert!(middle.map_y(100.0).abs() < 1e-9);
-        assert!((middle.map_y(175.0) - 75.0).abs() < 1e-9);
+        assert!(middle.map_point(0.0, 100.0).1.abs() < 1e-9);
+        assert!((middle.map_point(0.0, 175.0).1 - 75.0).abs() < 1e-9);
         // Page-normalized v renormalizes onto the part; u is untouched by a
         // horizontal cut (the part is as wide as the page).
-        assert!(middle.map_v(0.25).abs() < 1e-9);
-        assert!((middle.map_u(0.5) - 0.5).abs() < 1e-9);
-        // A split never resamples, so page-px lengths pass through.
-        assert!((middle.map_len(7.0) - 7.0).abs() < 1e-9);
+        let (u, v) = middle.map_uv(0.5, 0.25);
+        assert!(v.abs() < 1e-9);
+        assert!((u - 0.5).abs() < 1e-9);
+        // A split never resamples, so page-px magnitudes pass through.
+        assert!((middle.map_extent(7.0) - 7.0).abs() < 1e-9);
 
         // The transpose: a vertical cut renormalizes u and leaves v alone.
         let geo = resolve_split_parts(0, SplitAxis::Vertical, [50, 400], &[20], &[1, 0], &[false, false])
@@ -3924,8 +5007,8 @@ mod tests {
         assert_eq!(geo.part_new_idx(0), Some(1));
         assert_eq!(geo.part_new_idx(1), Some(0));
         let right = geo.placement(1).expect("right part");
-        assert!(right.map_x(20.0).abs() < 1e-9);
-        assert!((right.map_v(0.25) - 0.25).abs() < 1e-9);
+        assert!(right.map_point(20.0, 0.0).0.abs() < 1e-9);
+        assert!((right.map_uv(0.0, 0.25).1 - 0.25).abs() < 1e-9);
 
         // Cuts on or past the borders would produce a zero-sized part.
         for cut in [0u32, 400] {
@@ -4306,6 +5389,28 @@ mod tests {
         let tree = cut_page[0]["tree"].as_array().expect("tree");
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0]["uid"], serde_json::json!("top"));
+
+        // The deleted part's layer RECORDS are archived, not merely dropped:
+        // their PNGs are recoverable from the trash, but the transform, group
+        // membership and a text node's typed text live only in the manifest.
+        let write = plan
+            .trash_writes
+            .iter()
+            .find(|w| w.target.ends_with(DELETED_LAYERS_PAGES_FILE))
+            .unwrap_or_else(|| {
+                panic!("the deleted part's records must be archived: {:?}", plan.trash_writes)
+            });
+        let archived: Value = serde_json::from_str(&write.content).expect("valid json");
+        let archived = archived.as_array().expect("array");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["img_idx"], serde_json::json!(1));
+        let uids: Vec<&str> = archived[0]["tree"]
+            .as_array()
+            .expect("tree")
+            .iter()
+            .filter_map(|rec| rec["uid"].as_str())
+            .collect();
+        assert_eq!(uids, vec!["text", "bottom"], "{archived:?}");
     }
 
     #[test]
@@ -4476,6 +5581,394 @@ mod tests {
                 .any(|c| c.target.contains("text_detection")),
             "no detection mask may be cut"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Crop: one page rotated and cropped in place.
+    // -----------------------------------------------------------------------
+
+    /// A crop request over the shared fixture's page 1 (50x400).
+    fn crop_op(page_idx: usize, quarter_turns: u8, angle_deg: f64, rect: [u32; 4]) -> PageOpKind {
+        PageOpKind::Crop {
+            page_idx,
+            quarter_turns,
+            angle_deg,
+            rect,
+        }
+    }
+
+    /// The split fixture serves the crop unchanged: page 1 carries every
+    /// category a crop touches (clean overlay, typing mask, layers with a
+    /// probed text render, detection blocks + mask).
+    fn snapshot_for_crop() -> ChapterSnapshot {
+        snapshot_for_split()
+    }
+
+    #[test]
+    fn crop_permutation_is_the_identity_and_rejects_bad_requests() {
+        let perm = permutation_for_op(&crop_op(1, 1, 0.0, [0, 0, 200, 50]), 4).expect("valid");
+        // The page COUNT does not change and no index moves.
+        assert_eq!(
+            map_of(&perm),
+            vec![Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(perm.new_page_count, 4);
+        assert!(perm.new_pages.is_empty());
+
+        for bad in [
+            // Page index out of range.
+            crop_op(4, 0, 0.0, [0, 0, 10, 10]),
+            // Quarter turns outside 0..=3.
+            crop_op(1, 4, 0.0, [0, 0, 10, 10]),
+            // Fine angle outside (-45, 45), and a non-finite one.
+            crop_op(1, 0, 45.0, [0, 0, 10, 10]),
+            crop_op(1, 0, -45.0, [0, 0, 10, 10]),
+            crop_op(1, 0, f64::NAN, [0, 0, 10, 10]),
+            // Zero-sized rectangles.
+            crop_op(1, 0, 0.0, [0, 0, 0, 10]),
+            crop_op(1, 0, 0.0, [0, 0, 10, 0]),
+        ] {
+            assert!(
+                matches!(permutation_for_op(&bad, 4), Err(PageOpError::InvalidOp(_))),
+                "must be refused: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crop_geometry_maps_every_coordinate_space_and_validates_the_rect() {
+        // 100x200 page turned 90 CW -> a 200x100 canvas; keep its right half.
+        let geo = CropGeometry::for_tests(1, [100, 200], 1, 0.0, [100, 0, 100, 100]);
+        assert_eq!(geo.new_size(), [100, 100]);
+        assert!(!geo.resamples());
+        let map = geo.placement();
+        // Page (0, 0) -> canvas (200, 0) -> new page (100, 0).
+        assert_eq!(map.map_point(0.0, 0.0), (100.0, 0.0));
+        // Page (100, 200) -> canvas (0, 100) -> new page (-100, 100): off the
+        // new page's left edge, which a kept layer may legitimately be.
+        assert_eq!(map.map_point(100.0, 200.0), (-100.0, 100.0));
+        // A magnitude is not a coordinate: scale 1 leaves it alone.
+        assert!((map.map_extent(7.5) - 7.5).abs() < f64::EPSILON);
+        // The stored angle a page-placed object must gain.
+        assert!((map.rotation_degrees() - 90.0).abs() < 1e-12);
+        assert!((map.rotation_radians() - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+
+        // Survival: the page's top-left quadrant lands in the kept half.
+        assert!(geo.keeps_point(10.0, 10.0));
+        assert!(!geo.keeps_point(90.0, 190.0));
+        assert!(geo.keeps_uv_point(0.1, 0.1));
+        // A box straddling the frame edge survives; one entirely past it does not.
+        assert!(geo.keeps_page_rect([40.0, 10.0, 60.0, 30.0]));
+        assert!(!geo.keeps_page_rect([80.0, 150.0, 95.0, 190.0]));
+
+        // A rectangle leaving the ROTATED canvas is refused, in the canvas'
+        // own axes (200x100, not the page's 100x200).
+        assert!(resolve_crop(1, [100, 200], 1, 0.0, [0, 0, 200, 100]).is_ok());
+        assert!(resolve_crop(1, [100, 200], 1, 0.0, [0, 0, 100, 200]).is_err());
+        assert!(resolve_crop(1, [100, 200], 1, 0.0, [1, 0, 200, 100]).is_err());
+        assert!(resolve_crop(1, [0, 200], 1, 0.0, [0, 0, 10, 10]).is_err());
+    }
+
+    #[test]
+    fn crop_refuses_a_rotated_canvas_beyond_the_staging_budget() {
+        // The rotated canvas becomes an RGBA staging buffer in the executor, so
+        // it carries the same pixel budget as a stitched canvas — checked on the
+        // CANVAS, which a rotation makes larger than the page it came from.
+        // 7000x7000 = 49 MPx, comfortably inside the 200 MPx budget.
+        assert!(u64::from(7_000u32) * u64::from(7_000u32) < STITCH_MAX_TOTAL_PX);
+        assert!(resolve_crop(1, [7_000, 7_000], 0, 0.0, [0, 0, 10, 10]).is_ok());
+        // 20000x20000 = 400 MPx, twice the budget.
+        assert!(matches!(
+            resolve_crop(1, [20_000, 20_000], 0, 0.0, [0, 0, 10, 10]),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        // A page that fits upright but whose ROTATED canvas does not: 45 deg
+        // grows each side by ~sqrt(2), i.e. the area by 2.
+        let snug = 12_000u32;
+        assert!(resolve_crop(1, [snug, snug], 0, 0.0, [0, 0, 10, 10]).is_ok());
+        let err = resolve_crop(1, [snug, snug], 0, 44.0, [0, 0, 10, 10])
+            .expect_err("the rotated canvas exceeds the budget");
+        assert!(
+            format!("{err}").contains("exceeds"),
+            "the message must name the budget: {err}"
+        );
+    }
+
+    #[test]
+    fn build_plan_crop_rotates_every_raster_with_one_transform() {
+        let snapshot = snapshot_for_crop();
+        // Page 1 is 50x400; a 90 CW turn gives a 400x50 canvas, of which the
+        // left half is kept.
+        let plan = build_plan(&snapshot, &crop_op(1, 1, 0.0, [0, 0, 200, 50]), 90)
+            .expect("plan builds");
+        assert_eq!(
+            plan.old_to_new,
+            vec![Some(0), Some(1), Some(2), Some(3)],
+            "a crop moves no page"
+        );
+        assert_eq!(plan.new_page_count, 4);
+
+        // Every page-sized raster of the page is staged with the SAME page
+        // size, the SAME rotation and the SAME crop, so they all come out
+        // exactly the new page's size.
+        let staged: Vec<(&str, u32, u32, &ComposeSource)> = plan
+            .creates
+            .iter()
+            .filter_map(|create| match &create.content {
+                NewPageContent::ComposedPng {
+                    width,
+                    height,
+                    sources,
+                    ..
+                } => Some((create.target.as_str(), *width, *height, sources.first()?)),
+                NewPageContent::CopyFile { .. } | NewPageContent::BlankPng { .. } => None,
+            })
+            .collect();
+        let expect_raster = |target: &str, nearest: bool| {
+            let (_, width, height, source) = staged
+                .iter()
+                .find(|(name, _, _, _)| *name == target)
+                .unwrap_or_else(|| panic!("{target} must be staged: {staged:?}"));
+            assert_eq!((*width, *height), (200, 50), "{target} size");
+            assert_eq!(source.page_size, [50, 400], "{target} page size");
+            assert_eq!(source.crop, [0, 0, 200, 50], "{target} crop");
+            assert_eq!(source.dest, [0, 0, 200, 50], "{target} dest");
+            let rotation = source.rotation.expect("a crop always records a rotation");
+            assert_eq!(rotation.quarter_turns, 1, "{target} quarter turns");
+            assert!(rotation.angle_deg == 0.0, "{target} angle");
+            // The sampling policy belongs to the RASTER, so it governs the
+            // page-size pre-resize as well as the rotation.
+            assert_eq!(source.nearest, nearest, "{target} sampling");
+        };
+        expect_raster("ch1/src/001.png", false);
+        expect_raster("ch1/clean_layers/001.png", false);
+        // Masks are categorical and must not be interpolated.
+        expect_raster("ch1/text_images/mask_page_1.png", true);
+        expect_raster("ch1/text_detection/00001_mask.png", true);
+
+        // The originals stay recoverable in the trash.
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter(|m| matches!(m.dest, MoveDest::Trash { .. }))
+            .map(|m| m.from.as_str())
+            .collect();
+        for original in [
+            "ch1/src/001.png",
+            "ch1/clean_layers/001.png",
+            "ch1/text_images/mask_page_1.png",
+            "ch1/text_detection/00001_mask.png",
+        ] {
+            assert!(trashed.contains(&original), "{original} must be trashed");
+        }
+        // No other page's files move at all: the permutation is the identity.
+        assert!(
+            !plan.moves.iter().any(|m| m.from.contains("/000.")
+                || m.from.contains("/002.")
+                || m.from.contains("/003.")),
+            "untouched pages must not move: {:?}",
+            plan.moves
+        );
+    }
+
+    #[test]
+    fn build_plan_crop_remaps_detection_under_a_quarter_turn() {
+        let snapshot = snapshot_for_crop();
+        let plan = build_plan(&snapshot, &crop_op(1, 1, 0.0, [0, 0, 200, 50]), 91)
+            .expect("plan builds");
+        let write = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/text_detection/00001_blocks.json")
+            .expect("the detection document is REMAPPED, not trashed");
+        let document: Value = serde_json::from_str(&write.content).expect("valid json");
+        assert_eq!(document["source_size"], serde_json::json!([200, 50]));
+        assert_eq!(document["mask_size"], serde_json::json!([200, 50]));
+        assert_eq!(document["mask_file"], serde_json::json!("00001_mask.png"));
+        let blocks = document["blocks"].as_array().expect("blocks");
+        // The first block (y 2..40 of the page) rotates out of the kept half and
+        // is dropped; the second (y 300..380) lands inside it.
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let coord = |key: &str| blocks[0][key].as_f64().expect("number");
+        assert!((coord("x1") - 20.0).abs() < 1e-9, "{blocks:?}");
+        assert!((coord("y1") - 5.0).abs() < 1e-9, "{blocks:?}");
+        assert!((coord("x2") - 100.0).abs() < 1e-9, "{blocks:?}");
+        assert!((coord("y2") - 9.0).abs() < 1e-9, "{blocks:?}");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("entirely outside")),
+            "the dropped block must be reported: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_crop_trashes_detection_under_a_fine_angle() {
+        let snapshot = snapshot_for_crop();
+        // 50x400 at 5 deg -> an 85x403 canvas; keep a rectangle inside it.
+        let plan = build_plan(&snapshot, &crop_op(1, 0, 5.0, [0, 0, 80, 400]), 92)
+            .expect("plan builds");
+        assert!(
+            !plan
+                .json_writes
+                .iter()
+                .any(|w| w.target.contains("text_detection")),
+            "an axis-aligned block list cannot describe a freely rotated page"
+        );
+        assert!(
+            !plan
+                .creates
+                .iter()
+                .any(|c| c.target.contains("text_detection")),
+            "no detection mask may be produced"
+        );
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter(|m| matches!(m.dest, MoveDest::Trash { .. }))
+            .map(|m| m.from.as_str())
+            .collect();
+        assert!(trashed.contains(&"ch1/text_detection/00001_blocks.json"));
+        assert!(trashed.contains(&"ch1/text_detection/00001_mask.png"));
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("RESAMPLES")),
+            "the fine-angle degradations must be named up front: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("text detection") && w.contains("trash")),
+            "the detection degradation must be reported: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_crop_archives_everything_the_frame_removed() {
+        let mut snapshot = snapshot_for_crop();
+        // One bubble inside the kept band, one below it.
+        snapshot.committed.bubbles = Some(vec![
+            serde_json::json!({"id": 1, "img_idx": 1, "img_u": 0.5, "img_v": 0.1,
+                               "side": "left", "text": "in", "original_text": "in"}),
+            serde_json::json!({"id": 2, "img_idx": 1, "img_u": 0.5, "img_v": 0.9,
+                               "side": "left", "text": "out", "original_text": "out"}),
+        ]);
+        // Keep only the top 100 px of the 50x400 page, with no rotation: the
+        // "top" layer (cy 50) survives, "text" (cy 300) and "bottom" (cy 350)
+        // do not, and the position-less text_info entry reads as the page
+        // centre (y 200), which is also gone.
+        let plan = build_plan(&snapshot, &crop_op(1, 0, 0.0, [0, 0, 50, 100]), 95)
+            .expect("plan builds");
+
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter(|m| matches!(m.dest, MoveDest::Trash { .. }))
+            .map(|m| m.from.as_str())
+            .collect();
+        // A layer that survives nowhere takes its exclusively-claimed PNG with
+        // it; a surviving layer's PNG is left exactly where it is.
+        assert!(trashed.contains(&"ch1/layers/ps_p0001_text.png"), "{trashed:?}");
+        assert!(trashed.contains(&"ch1/layers/ps_p0001_bottom.png"), "{trashed:?}");
+        assert!(!trashed.contains(&"ch1/layers/ps_p0001_top.png"), "{trashed:?}");
+        assert!(
+            !plan
+                .moves
+                .iter()
+                .any(|m| m.from == "ch1/layers/ps_p0001_top.png"),
+            "a crop never renames a layer PNG: the page index does not move"
+        );
+        // The archived typing overlay's PNG follows its entry into the trash.
+        assert!(
+            trashed.contains(&"ch1/text_images/typing_overlay_p0001_1.png"),
+            "{trashed:?}"
+        );
+
+        // Removed JSON entries are ARCHIVED, never silently dropped.
+        let archived = |name: &str| -> Value {
+            let write = plan
+                .trash_writes
+                .iter()
+                .find(|w| w.target.ends_with(name))
+                .unwrap_or_else(|| {
+                    panic!("{name} must be archived: {:?}", plan.trash_writes)
+                });
+            serde_json::from_str(&write.content).expect("valid json")
+        };
+        let bubbles = archived(DELETED_BUBBLES_FILE);
+        let bubbles = bubbles.as_array().expect("array");
+        assert_eq!(bubbles.len(), 1);
+        assert_eq!(bubbles[0]["id"], serde_json::json!(2));
+        assert_eq!(archived(DELETED_TEXT_INFO_FILE).as_array().expect("array").len(), 1);
+        // A dropped LAYER record carries the layer's transform, its group
+        // membership and — for a TEXT node — the typed text itself. Only its
+        // rendered PNG goes to the trash, so without this archive that metadata
+        // would be destroyed irrecoverably.
+        let layers = archived(DELETED_LAYERS_PAGES_FILE);
+        let layers = layers.as_array().expect("array");
+        assert_eq!(layers.len(), 1, "one page contributed dropped records");
+        // The page's ORIGINAL index, as for a page deleted whole.
+        assert_eq!(layers[0]["img_idx"], serde_json::json!(1));
+        let archived_tree = layers[0]["tree"].as_array().expect("tree");
+        let uids: Vec<&str> = archived_tree
+            .iter()
+            .filter_map(|rec| rec["uid"].as_str())
+            .collect();
+        assert_eq!(uids, vec!["text", "bottom"], "{archived_tree:?}");
+        // Records are archived VERBATIM, in the page's own coordinate space.
+        assert_eq!(
+            archived_tree[1]["transform"]["cy"],
+            serde_json::json!(350.0)
+        );
+        // The group a dropped record belonged to travels with it.
+        assert_eq!(layers[0]["groups"][0]["uid"], serde_json::json!("g1"));
+
+        // The manifest keeps ONE page entry with only the surviving layer.
+        let manifest: Value = serde_json::from_str(
+            &plan
+                .json_writes
+                .iter()
+                .find(|w| w.target == "ch1/layers/layers.json")
+                .expect("the manifest is rewritten")
+                .content,
+        )
+        .expect("valid json");
+        let page = manifest["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .find(|page| page["img_idx"] == serde_json::json!(1))
+            .expect("page 1 still exists");
+        let tree = page["tree"].as_array().expect("tree");
+        assert_eq!(tree.len(), 1, "{tree:?}");
+        assert_eq!(tree[0]["uid"], serde_json::json!("top"));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("entirely outside the kept region")),
+            "every drop must be reported: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn build_plan_crop_needs_page_sizes_and_warns_about_alt_versions() {
+        let mut snapshot = snapshot_for_crop();
+        snapshot.has_alt_vers = true;
+        let op = crop_op(1, 1, 0.0, [0, 0, 200, 50]);
+        let plan = build_plan(&snapshot, &op, 93).expect("plan builds");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("alt_vers") && w.contains("OLD size")),
+            "the page SIZE change must warn even though the count did not: {:?}",
+            plan.warnings
+        );
+        snapshot.page_sizes.clear();
+        assert!(matches!(
+            build_plan(&snapshot, &op, 94),
+            Err(PageOpError::InvalidOp(_))
+        ));
     }
 
     #[test]

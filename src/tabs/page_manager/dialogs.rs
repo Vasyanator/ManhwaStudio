@@ -37,6 +37,7 @@ use crate::project::ProjectData;
 use crate::widgets::WheelComboBox;
 use crate::widgets::WheelSpinBox;
 
+use super::crop::CropDialogState;
 use super::split::SplitDialogState;
 use super::stitch::StitchDialogState;
 use super::{PageManagerAction, PageManagerTabState};
@@ -149,6 +150,7 @@ pub(super) enum PageManagerDialog {
     Delete(DeleteDialogState),
     Stitch(StitchDialogState),
     Split(SplitDialogState),
+    Crop(CropDialogState),
 }
 
 impl PageManagerDialog {
@@ -197,6 +199,12 @@ impl PageManagerDialog {
         PageManagerDialog::Split(SplitDialogState::new(page_idx))
     }
 
+    /// Fresh "crop page" window for the given current page index (the caller
+    /// guarantees exactly one page is selected).
+    pub(super) fn crop(page_idx: usize) -> Self {
+        PageManagerDialog::Crop(CropDialogState::new(page_idx))
+    }
+
     /// Whether a background file pick is currently pending.
     pub(super) fn picker_active(&self) -> bool {
         match self {
@@ -204,7 +212,8 @@ impl PageManagerDialog {
             PageManagerDialog::Create(_)
             | PageManagerDialog::Delete(_)
             | PageManagerDialog::Stitch(_)
-            | PageManagerDialog::Split(_) => false,
+            | PageManagerDialog::Split(_)
+            | PageManagerDialog::Crop(_) => false,
         }
     }
 }
@@ -337,6 +346,9 @@ impl PageManagerTabState {
             PageManagerDialog::Split(state) => self
                 .draw_split_dialog(ctx, state, project, page_infos, op_in_progress, actions)
                 .map(PageManagerDialog::Split),
+            PageManagerDialog::Crop(state) => self
+                .draw_crop_dialog(ctx, state, project, page_infos, op_in_progress, actions)
+                .map(PageManagerDialog::Crop),
         };
         self.dialog = kept;
     }

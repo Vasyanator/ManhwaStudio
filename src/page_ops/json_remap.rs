@@ -19,7 +19,7 @@ Key functions:
   to which part (the exact-area rule); refuses one PNG claimed by records of
   different surviving parts, and reports the PNGs claimed only by deleted ones.
 - remap_detection_blocks(): `mask_file` default-name rewrite for one page.
-- detection_merge_blocker() / detection_split_blocker(): the all-or-nothing
+- detection_merge_blocker() / detection_rect_blocker(): the all-or-nothing
   trust gates a page's detection document must pass before it is remapped.
 - merge_detection_blocks() / split_detection_blocks(): the detection document
   of a stitched page / of one split part.
@@ -41,22 +41,42 @@ never re-homed on a surviving part. This file is the only place
 those affines touch JSON. Three on-disk coordinate spaces must never be
 confused:
 - page-normalized uv (bubble `img_u`/`img_v`, `rect_coords`, `text_areas`,
-  `crop_rect`, legacy `u`/`v`, `points_uv`, `transform_uv`) -> `map_u`/`map_v`;
+  `crop_rect`, legacy `u`/`v`, `points_uv`, `transform_uv`) -> `map_uv`;
 - absolute page pixels (`transform.cx/cy`, `deform.points_px`,
   `centering_frame.cx/cy`, detector `blocks`, `img_x_px`/`img_y_px`) ->
-  `map_x`/`map_y`;
+  `map_point`;
 - layer-image-local pixels (`image_size`, `text_centers`, `render_data` text
   params, `raster_transform`) -> UNTOUCHED, because the layer PNGs are never
-  resampled. Scalar page-pixel LENGTHS (`transform.scale`, a centering frame's
-  half-extents, a legacy overlay's `scale`) multiply by the placement scale.
+  resampled. Scalar page-pixel MAGNITUDES (`transform.scale`, a centering
+  frame's half-extents, a legacy overlay's `scale`) are not coordinates and use
+  `map_extent`, which applies the scale but never the rotation.
+Both coordinate mappings take a POINT, never one axis at a time, because a
+placement may rotate. The two exceptions are documented where they occur: an
+axis-aligned RECT (`rect_coords`, `text_areas`, detector blocks) degrades to
+the bounding box of the mapped quad under a rotation, and a HALF-SPECIFIED
+point is mapped only while the placement does not rotate.
 */
 
 use super::PageOpError;
 use super::plan::{
-    PageGeometry, PlacementMap, SplitGeometry, SplitTreeRouting, StitchGeometry,
-    layers_png_prefix,
+    CropGeometry, CropTreeRouting, PageGeometry, PlacementMap, SplitGeometry, SplitTreeRouting,
+    StitchGeometry, layers_png_prefix,
 };
 use serde_json::{Map, Value};
+
+/// The per-variant view of a [`PageGeometry`], destructured EXHAUSTIVELY.
+///
+/// `PageGeometry` deliberately exposes no accessor (see its doc): an accessor is
+/// exhaustive in one place only, so a new variant would silently read as "no
+/// geometry" in every remap. Each remap therefore destructures the enum itself,
+/// which is why this pattern is repeated instead of factored out — the
+/// repetition IS the compile-time reminder that a new pixel-identity operation
+/// must be considered at every one of these sites.
+type GeometryParts<'a> = (
+    Option<&'a StitchGeometry>,
+    Option<&'a SplitGeometry>,
+    Option<&'a CropGeometry>,
+);
 
 // ---------------------------------------------------------------------------
 // Shared numeric helpers.
@@ -107,22 +127,61 @@ fn read_u32_pair(value: Option<&Value>) -> Option<[u32; 2]> {
 
 /// Maps a `{u_key, v_key}` page-normalized pair in place. Returns true when a
 /// value was rewritten.
+///
+/// An entry carrying only ONE of the two keys is not a point: a non-rotating
+/// placement maps it exactly all the same (its axes are independent), while a
+/// rotating one leaves it untouched, because the missing coordinate cannot be
+/// guessed. A document that may hold such half-specified entries must therefore
+/// be gated out before a rotating placement is applied to it.
 fn map_uv_keys(
     obj: &mut Map<String, Value>,
     u_key: &str,
     v_key: &str,
     placement: &PlacementMap,
 ) -> bool {
-    let mut changed = false;
-    if let Some(u) = get_f64(obj, u_key) {
-        put_f64(obj, u_key, placement.map_u(u));
-        changed = true;
+    match (get_f64(obj, u_key), get_f64(obj, v_key)) {
+        (Some(u), Some(v)) => {
+            let (mapped_u, mapped_v) = placement.map_uv(u, v);
+            put_f64(obj, u_key, mapped_u);
+            put_f64(obj, v_key, mapped_v);
+            true
+        }
+        (Some(u), None) => map_half_pair(obj, u_key, placement.map_u_without_v(u)),
+        (None, Some(v)) => map_half_pair(obj, v_key, placement.map_v_without_u(v)),
+        (None, None) => false,
     }
-    if let Some(v) = get_f64(obj, v_key) {
-        put_f64(obj, v_key, placement.map_v(v));
-        changed = true;
+}
+
+/// Maps an `{x_key, y_key}` ABSOLUTE page-pixel pair in place. Returns true
+/// when a value was rewritten. Half-specified pairs behave as in
+/// [`map_uv_keys`].
+fn map_px_keys(
+    obj: &mut Map<String, Value>,
+    x_key: &str,
+    y_key: &str,
+    placement: &PlacementMap,
+) -> bool {
+    match (get_f64(obj, x_key), get_f64(obj, y_key)) {
+        (Some(x), Some(y)) => {
+            let (mapped_x, mapped_y) = placement.map_point(x, y);
+            put_f64(obj, x_key, mapped_x);
+            put_f64(obj, y_key, mapped_y);
+            true
+        }
+        (Some(x), None) => map_half_pair(obj, x_key, placement.map_x_without_y(x)),
+        (None, Some(y)) => map_half_pair(obj, y_key, placement.map_y_without_x(y)),
+        (None, None) => false,
     }
-    changed
+}
+
+/// Writes back the single mapped coordinate of a half-specified pair, or leaves
+/// the entry alone when the placement could not map one axis on its own.
+fn map_half_pair(obj: &mut Map<String, Value>, key: &str, mapped: Option<f64>) -> bool {
+    let Some(value) = mapped else {
+        return false;
+    };
+    put_f64(obj, key, value);
+    true
 }
 
 /// Maps a `[u, v]` page-normalized point array in place.
@@ -136,12 +195,15 @@ fn map_uv_point(value: &mut Value, placement: &PlacementMap) -> bool {
     ) else {
         return false;
     };
-    array[0] = number(placement.map_u(u));
-    array[1] = number(placement.map_v(v));
+    let (mapped_u, mapped_v) = placement.map_uv(u, v);
+    array[0] = number(mapped_u);
+    array[1] = number(mapped_v);
     true
 }
 
-/// Maps an `[x1, y1, x2, y2]` page-normalized rect array in place.
+/// Maps an `[x1, y1, x2, y2]` page-normalized rect array in place. The rect is
+/// axis-aligned, so a ROTATING placement can only return its bounding box (see
+/// `PlacementMap::map_uv_rect`).
 fn map_uv_rect(value: &mut Value, placement: &PlacementMap) -> bool {
     let Some(array) = value.as_array_mut() else {
         return false;
@@ -153,10 +215,10 @@ fn map_uv_rect(value: &mut Value, placement: &PlacementMap) -> bool {
     let Some(coords) = coords else {
         return false;
     };
-    array[0] = number(placement.map_u(coords[0]));
-    array[1] = number(placement.map_v(coords[1]));
-    array[2] = number(placement.map_u(coords[2]));
-    array[3] = number(placement.map_v(coords[3]));
+    let mapped = placement.map_uv_rect([coords[0], coords[1], coords[2], coords[3]]);
+    for (slot, value) in array.iter_mut().zip(mapped) {
+        *slot = number(value);
+    }
     true
 }
 
@@ -176,8 +238,9 @@ fn map_px_points(value: &mut Value, placement: &PlacementMap) -> bool {
         ) else {
             continue;
         };
-        pair[0] = number(placement.map_x(x));
-        pair[1] = number(placement.map_y(y));
+        let (mapped_x, mapped_y) = placement.map_point(x, y);
+        pair[0] = number(mapped_x);
+        pair[1] = number(mapped_y);
         changed = true;
     }
     changed
@@ -195,12 +258,68 @@ fn map_uv_points(value: &mut Value, placement: &PlacementMap) -> bool {
     changed
 }
 
-/// Scales a stored page-pixel LENGTH (or a page-size multiplier such as a
-/// layer transform's `scale`) with the placement.
+/// Scales a stored page-pixel MAGNITUDE (a length, a half-extent, or a
+/// page-size multiplier such as a layer transform's `scale`) with the
+/// placement. A magnitude has no origin and no direction, so a rotation never
+/// applies to it — see `PlacementMap::map_extent`.
 fn scale_key(obj: &mut Map<String, Value>, key: &str, placement: &PlacementMap) {
     if let Some(value) = get_f64(obj, key) {
-        put_f64(obj, key, placement.map_len(value));
+        put_f64(obj, key, placement.map_extent(value));
     }
+}
+
+/// Adds the placement's page rotation to a STORED angle of a page-placed
+/// object, in the unit `delta` is given in, and re-canonicalizes the result.
+///
+/// A stored angle describes an orientation RELATIVE TO THE PAGE, so when the
+/// page itself turns the angle must turn with it or the object is drawn
+/// unrotated on a rotated page. `keys` lists the accepted spellings of the field
+/// in priority order (`text_info` accepts `rotation_deg` and its legacy `angle`
+/// alias); the FIRST one present is rewritten. When none is present the first
+/// key is inserted with the delta, because the readers default a missing angle
+/// to zero and zero is no longer the right orientation.
+///
+/// `full_turn` is one whole turn in that unit (`360.0` for degrees, `TAU` for
+/// radians) and the sum is wrapped into the half-open `[-full/2, +full/2)`,
+/// mirroring `tabs/typing/tab/geometry.rs::normalize_angle_deg`. Wrapping
+/// matters because these operations COMPOSE: four quarter-turn crops of one page
+/// would otherwise store `2*PI` where `0` means the same thing, and the number
+/// is surfaced to the user as a degree readout. A wrapped angle is
+/// indistinguishable to every reader — they all go through `sin`/`cos` — so
+/// re-canonicalizing here is safe even though the typing tab's interactive
+/// wheel/drag paths deliberately let `transform.rotation` grow unbounded
+/// between edits.
+///
+/// A zero `delta` writes nothing at all — not even a wrap of an already-stored
+/// value: a non-rotating placement must leave the document byte-identical, which
+/// is what keeps a stitch and a split pixel-identical operations.
+fn add_stored_angle(
+    obj: &mut Map<String, Value>,
+    keys: &[&str],
+    delta: f64,
+    full_turn: f64,
+) -> bool {
+    if delta == 0.0 {
+        return false;
+    }
+    let wrap = |angle: f64| -> f64 {
+        if !angle.is_finite() || full_turn <= 0.0 {
+            return angle;
+        }
+        let half = full_turn / 2.0;
+        (angle + half).rem_euclid(full_turn) - half
+    };
+    for key in keys {
+        if let Some(current) = get_f64(obj, key) {
+            put_f64(obj, key, wrap(current + delta));
+            return true;
+        }
+    }
+    let Some(first) = keys.first() else {
+        return false;
+    };
+    put_f64(obj, first, wrap(delta));
+    true
 }
 
 /// Result of remapping the bubbles array.
@@ -238,6 +357,15 @@ pub(crate) struct BubblesRemap {
 ///   placement is then mapped into that part. A `crop_rect` on the cut page
 ///   follows the part holding the majority of the CROPPED AREA instead, and is
 ///   clamped back into `[0, 1]` after mapping.
+/// - with a CROP geometry, a bubble on the cropped page KEEPS its page (the
+///   index never changes) and has its placement mapped through the crop, so it
+///   may hang off the new page's edge. A bubble whose whole footprint fell
+///   outside the kept region is archived exactly like a bubble of a deleted
+///   page. Survival is judged by the bubble's `rect_coords` box — not by its
+///   anchor alone as the split does, because the question here is "does
+///   anything of it remain visible", and an anchor-only test would archive a
+///   bubble whose box still overlaps the frame; a bubble without a readable
+///   box falls back to its anchor point.
 ///
 /// # Errors
 /// [`PageOpError::InvalidOp`] when an entry is not an object, still uses the
@@ -249,6 +377,13 @@ pub(crate) fn remap_bubbles(
     old_to_new: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) -> Result<BubblesRemap, PageOpError> {
+    // Exhaustive by design (see `PageGeometry` and `GeometryParts`).
+    let (stitch, split, crop): GeometryParts<'_> = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     let mut kept = Vec::with_capacity(entries.len());
     let mut deleted = Vec::new();
     let mut changed = false;
@@ -296,9 +431,24 @@ pub(crate) fn remap_bubbles(
             }
             Some(new_idx) => {
                 let mut new_obj = obj.clone();
+                // A bubble of the CROPPED page whose whole footprint fell
+                // outside the kept region is archived exactly like a bubble of
+                // a deleted page — never silently dropped, never relocated.
+                if let Some(geo) = crop
+                    && geo.source_old_idx() == old_idx
+                    && !bubble_survives_crop(obj, geo)
+                {
+                    warnings.push(format!(
+                        "bubble entry #{pos} lies entirely outside the kept region of the \
+                         cropped page {old_idx}; archived in the trash"
+                    ));
+                    deleted.push(entry.clone());
+                    changed = true;
+                    continue;
+                }
                 // A split routes the bubble by its anchor point, so its target
                 // page is a PART, not the index map's representative.
-                let split_part = geometry.split().filter(|geo| geo.source_old_idx() == old_idx).map(
+                let split_part = split.filter(|geo| geo.source_old_idx() == old_idx).map(
                     |geo| {
                         let u = get_f64(obj, "img_u").unwrap_or(0.5);
                         let v = get_f64(obj, "img_v").unwrap_or(0.5);
@@ -308,7 +458,7 @@ pub(crate) fn remap_bubbles(
                 // A bubble anchored in a DELETED part is archived exactly like a
                 // bubble of a deleted page, not moved to a neighbouring part:
                 // the user asked for that content to go away.
-                if let (Some(geo), Some(part)) = (geometry.split(), split_part)
+                if let (Some(geo), Some(part)) = (split, split_part)
                     && geo.is_deleted_part(part)
                 {
                     warnings.push(format!(
@@ -319,7 +469,7 @@ pub(crate) fn remap_bubbles(
                     changed = true;
                     continue;
                 }
-                let new_idx = match (geometry.split(), split_part) {
+                let new_idx = match (split, split_part) {
                     (Some(geo), Some(part)) => geo.part_new_idx(part).ok_or_else(|| {
                         PageOpError::InvalidOp(format!(
                             "split part {part} has no index in the new order"
@@ -331,10 +481,13 @@ pub(crate) fn remap_bubbles(
                     new_obj.insert("img_idx".to_string(), Value::from(new_idx));
                     changed = true;
                 }
-                let placement = match (geometry, split_part) {
-                    (PageGeometry::Stitch(geo), _) => geo.placement(old_idx),
-                    (PageGeometry::Split(geo), Some(part)) => geo.placement(part),
-                    (PageGeometry::None | PageGeometry::Split(_), _) => None,
+                let placement = match (stitch, split, split_part, crop) {
+                    (Some(geo), _, _, _) => geo.placement(old_idx),
+                    (_, Some(geo), Some(part), _) => geo.placement(part),
+                    (_, _, _, Some(geo)) if geo.source_old_idx() == old_idx => {
+                        Some(geo.placement())
+                    }
+                    _ => None,
                 };
                 if let Some(placement) = placement
                     && apply_bubble_geometry(&mut new_obj, placement)
@@ -342,7 +495,7 @@ pub(crate) fn remap_bubbles(
                     changed = true;
                 }
                 let (crop_changed, crop_warnings) =
-                    remap_crop_fields(&mut new_obj, old_to_new, old_idx, pos, geometry);
+                    remap_crop_fields(&mut new_obj, old_to_new, old_idx, pos, (stitch, split, crop));
                 changed |= crop_changed;
                 warnings.extend(crop_warnings);
                 kept.push(Value::Object(new_obj));
@@ -413,8 +566,10 @@ fn apply_bubble_geometry(obj: &mut Map<String, Value>, placement: &PlacementMap)
 
 /// Rewrites `crop_page_idx` in one bubble object; removes `crop_page_idx` +
 /// `crop_rect` when the crop target page was deleted; maps `crop_rect` through
-/// the CROP page's placement when that page is stitched, or through the winning
-/// PART's placement when that page is split. Returns `(changed, warnings)`.
+/// the CROP page's placement when that page is stitched, through the winning
+/// PART's placement when that page is split, or through the crop transform when
+/// that page is the one being rotated and cropped. Returns
+/// `(changed, warnings)`.
 ///
 /// The split case never drops the crop link: the cropped page still exists, cut
 /// into parts, so `crop_page_idx` is remapped to the part holding the majority
@@ -423,13 +578,24 @@ fn apply_bubble_geometry(obj: &mut Map<String, Value>, placement: &PlacementMap)
 /// also what the reader does, `canvas/mod.rs::image_bubble_crop_rect`) and the
 /// trim is reported, so a page-crop bubble degrades to a smaller crop instead
 /// of silently becoming a plain image bubble.
+///
+/// A page CROP keeps the target page's index, so only the rect moves: it is
+/// mapped through the crop transform and clamped back into `[0, 1]`, and only a
+/// rect with NOTHING left inside the kept region loses its link — the same rule
+/// as a crop of a deleted split part, for the same reason (the link would
+/// otherwise show an unrelated region).
 fn remap_crop_fields(
     obj: &mut Map<String, Value>,
     old_to_new: &[Option<usize>],
     bubble_idx: usize,
     entry_pos: usize,
-    geometry: PageGeometry<'_>,
+    geometry: (
+        Option<&StitchGeometry>,
+        Option<&SplitGeometry>,
+        Option<&CropGeometry>,
+    ),
 ) -> (bool, Vec<String>) {
+    let (stitch, split, crop) = geometry;
     let Some(crop_idx) = obj.get("crop_page_idx").and_then(Value::as_u64) else {
         return (false, Vec::new());
     };
@@ -452,16 +618,21 @@ fn remap_crop_fields(
             )],
         );
     }
-    if let Some(geo) = geometry.split()
+    if let Some(geo) = split
         && geo.source_old_idx() == crop_idx
     {
         return remap_split_crop_fields(obj, geo, crop_idx, entry_pos);
+    }
+    if let Some(geo) = crop
+        && geo.source_old_idx() == crop_idx
+    {
+        return remap_page_crop_crop_fields(obj, geo, crop_idx, entry_pos);
     }
     match old_to_new[crop_idx] {
         Some(new_idx) => {
             let mut warnings = Vec::new();
             if crop_idx != bubble_idx
-                && geometry.stitch().is_some_and(|geo| {
+                && stitch.is_some_and(|geo| {
                     geo.placement(bubble_idx).is_some() && geo.placement(crop_idx).is_some()
                 })
             {
@@ -478,7 +649,7 @@ fn remap_crop_fields(
             }
             // The crop rect is normalized against the CROPPED page, so it
             // follows that page's placement — not the bubble's own.
-            if let Some(placement) = geometry.stitch().and_then(|geo| geo.placement(crop_idx))
+            if let Some(placement) = stitch.and_then(|geo| geo.placement(crop_idx))
                 && let Some(rect) = obj.get_mut("crop_rect")
             {
                 changed |= map_uv_rect(rect, placement);
@@ -537,12 +708,7 @@ fn remap_split_crop_fields(
         changed = true;
     }
     if let Some(rect) = stored {
-        let mapped = [
-            placement.map_u(rect[0]),
-            placement.map_v(rect[1]),
-            placement.map_u(rect[2]),
-            placement.map_v(rect[3]),
-        ];
+        let mapped = placement.map_uv_rect(rect);
         let clamped = mapped.map(|value| value.clamp(0.0, 1.0));
         if clamped != mapped {
             warnings.push(format!(
@@ -562,6 +728,92 @@ fn remap_split_crop_fields(
         ));
     }
     (changed, warnings)
+}
+
+/// The `crop_page_idx == <rotated and cropped page>` case of
+/// [`remap_crop_fields`].
+///
+/// The page index does not change, so only the rect moves: it is mapped through
+/// the crop transform (a bounding box when the crop rotates by a fine angle,
+/// exact otherwise) and clamped back into `[0, 1]`, which is also what the
+/// reader does (`canvas/mod.rs::image_bubble_crop_rect`). A rect with NOTHING
+/// left inside the kept region loses its link, exactly as a crop of a deleted
+/// split part does — showing the same index would show an unrelated region.
+fn remap_page_crop_crop_fields(
+    obj: &mut Map<String, Value>,
+    geo: &CropGeometry,
+    crop_idx: usize,
+    entry_pos: usize,
+) -> (bool, Vec<String>) {
+    let mut warnings = Vec::new();
+    // Mirror of the reader's effective crop: an absent `crop_rect` means a
+    // small default box around the bubble's own anchor.
+    let stored = read_uv_rect(obj.get("crop_rect"));
+    let effective = stored.unwrap_or_else(|| {
+        let u = get_f64(obj, "img_u").unwrap_or(0.5);
+        let v = get_f64(obj, "img_v").unwrap_or(0.5);
+        [u - 0.05, v - 0.05, u + 0.05, v + 0.05]
+    });
+    if !geo.keeps_uv_rect(effective) {
+        obj.remove("crop_page_idx");
+        obj.remove("crop_rect");
+        warnings.push(format!(
+            "bubble entry #{entry_pos} cropped a region of page {crop_idx} that the crop \
+             removed entirely; its crop link was removed"
+        ));
+        return (true, warnings);
+    }
+    let Some(rect) = stored else {
+        warnings.push(format!(
+            "bubble entry #{entry_pos} crops the cropped page but stores no crop_rect; its \
+             crop follows the page's new frame unchanged"
+        ));
+        return (false, warnings);
+    };
+    let mapped = geo.placement().map_uv_rect(rect);
+    let clamped = mapped.map(|value| value.clamp(0.0, 1.0));
+    if clamped != mapped {
+        warnings.push(format!(
+            "bubble entry #{entry_pos} crops a region of page {crop_idx} that reaches past \
+             the new frame; its crop was trimmed to what the crop kept"
+        ));
+    }
+    obj.insert(
+        "crop_rect".to_string(),
+        Value::Array(clamped.iter().map(|value| number(*value)).collect()),
+    );
+    (true, warnings)
+}
+
+/// Whether a bubble still has any of its footprint inside the kept region of a
+/// crop.
+///
+/// Evidence order: the bubble's own `rect_coords` box (the image area the user
+/// sees), then — when that box cannot be read — its `img_u`/`img_v` anchor,
+/// which defaults to the page centre exactly as the reader's does. The box is
+/// preferred deliberately: the question a crop asks is "does anything of this
+/// bubble remain visible", not the split's "which part owns it", and an
+/// anchor-only test would archive a bubble whose box still overlaps the frame.
+fn bubble_survives_crop(obj: &Map<String, Value>, geo: &CropGeometry) -> bool {
+    if let Some(rect) = bubble_uv_rect(obj) {
+        return geo.keeps_uv_rect(rect);
+    }
+    let u = get_f64(obj, "img_u").unwrap_or(0.5);
+    let v = get_f64(obj, "img_v").unwrap_or(0.5);
+    geo.keeps_uv_point(u, v)
+}
+
+/// Reads a bubble's `rect_coords` box as a page-normalized `[u1, v1, u2, v2]`,
+/// or `None` when either corner is missing or unreadable.
+fn bubble_uv_rect(obj: &Map<String, Value>) -> Option<[f64; 4]> {
+    let rect = obj.get("rect_coords")?.as_object()?;
+    let corner = |key: &str| -> Option<(f64, f64)> {
+        let point = rect.get(key)?.as_object()?;
+        Some((get_f64(point, "img_u")?, get_f64(point, "img_v")?))
+    };
+    let (u1, v1) = corner("p1")?;
+    let (u2, v2) = corner("p2")?;
+    Some([u1, v1, u2, v2])
 }
 
 /// Reads a `[u1, v1, u2, v2]` page-normalized rectangle.
@@ -616,6 +868,14 @@ pub(crate) struct TextInfoRemap {
 /// IS judged by the exact-area rule. `layer_idx` is not re-based: parts are
 /// different pages, so their text-group axes are distinct for free.
 ///
+/// With a CROP geometry, an entry on the cropped page keeps its page and is
+/// mapped through the crop transform, so it may hang off the new page's edge.
+/// An entry whose whole footprint fell outside the kept region is archived with
+/// its overlay PNG recorded for trashing, exactly like an entry of a deleted
+/// page. Survival is judged by the same evidence the split routes by: the
+/// deform mesh's cell areas when there is one, otherwise the decoded centre
+/// point (this document does not record the overlay's extent).
+///
 /// # Errors
 /// [`PageOpError::InvalidOp`] for the legacy absolute-coordinate placement
 /// family (numeric `x`/`y`, no modern or bare normalized coordinates): those
@@ -626,6 +886,13 @@ pub(crate) fn remap_text_info(
     old_to_new: &[Option<usize>],
     geometry: PageGeometry<'_>,
 ) -> Result<TextInfoRemap, PageOpError> {
+    // Exhaustive by design (see `PageGeometry` and `GeometryParts`).
+    let (stitch, split_geo, crop): GeometryParts<'_> = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
     let mut kept = Vec::with_capacity(entries.len());
     let mut deleted = Vec::new();
     let mut deleted_files = Vec::new();
@@ -687,10 +954,31 @@ pub(crate) fn remap_text_info(
                 changed = true;
             }
             Some(new_idx) => {
+                // An entry of the CROPPED page whose whole footprint fell
+                // outside the kept region follows the deleted-page arm above:
+                // archived, with its PNG (and `*_layout.png` companion)
+                // recorded for trashing.
+                if let Some(geo) = crop
+                    && geo.source_old_idx() == old_idx
+                    && !text_info_survives_crop(obj, geo)
+                {
+                    if let Some(file) = obj.get("file").and_then(Value::as_str) {
+                        let trimmed = file.trim();
+                        if !trimmed.is_empty() {
+                            deleted_files.push(trimmed.to_string());
+                        }
+                    }
+                    warnings.push(format!(
+                        "text_info entry #{pos} lies entirely outside the kept region of the \
+                         cropped page {old_idx}; archived in the trash"
+                    ));
+                    deleted.push(entry.clone());
+                    changed = true;
+                    continue;
+                }
                 // A split routes the entry to a PART; the index map can only
                 // name the representative one.
-                let split = geometry
-                    .split()
+                let split = split_geo
                     .filter(|geo| geo.source_old_idx() == old_idx)
                     .map(|geo| (geo, text_info_part(obj, geo)));
                 // An overlay on a DELETED part follows the deleted-page arm
@@ -722,10 +1010,15 @@ pub(crate) fn remap_text_info(
                         })?;
                         (target, geo.placement(part))
                     }
-                    None => (
-                        new_idx,
-                        geometry.stitch().and_then(|geo| geo.placement(old_idx)),
-                    ),
+                    None => {
+                        let placement = stitch.and_then(|geo| geo.placement(old_idx)).or_else(
+                            || {
+                                crop.filter(|geo| geo.source_old_idx() == old_idx)
+                                    .map(CropGeometry::placement)
+                            },
+                        );
+                        (new_idx, placement)
+                    }
                 };
                 if new_idx != old_idx || !has_img_idx || placement.is_some() {
                     let mut new_obj = obj.clone();
@@ -733,8 +1026,9 @@ pub(crate) fn remap_text_info(
                     if let Some(placement) = placement {
                         apply_text_info_geometry(&mut new_obj, placement);
                         // Only a stitch re-bases the text-group axis; a split
-                        // separates the pages, so their axes cannot collide.
-                        if let Some(geo) = geometry.stitch() {
+                        // separates the pages, so their axes cannot collide, and
+                        // a crop keeps ONE page, so its axis is untouched.
+                        if let Some(geo) = stitch {
                             offset_layer_idx(&mut new_obj, geo.layer_idx_offset(old_idx));
                         }
                     }
@@ -756,22 +1050,20 @@ pub(crate) fn remap_text_info(
     })
 }
 
-/// Maps one legacy `text_info.json` overlay entry onto a stitched canvas.
+/// Maps one legacy `text_info.json` overlay entry into a placement's canvas.
 ///
 /// Mirrors the position vocabulary of `text_payload::decode_overlay_placement`:
 /// absolute `img_x_px`/`img_y_px` win over normalized `img_u`/`u` +
 /// `img_v`/`v`, a `deform_mesh` may store either `points_px` or the legacy
-/// `points_uv`, and `transform_uv` is a quad of normalized corners. Rotation is
-/// left alone (a uniform scale preserves angles) while `scale`/`user_scale` —
+/// `points_uv`, and `transform_uv` is a quad of normalized corners. The entry's
+/// stored angle (`rotation_deg`, or its legacy `angle` alias, in DEGREES) gains
+/// the placement's own page rotation: a uniform scale preserves angles, but a
+/// ROTATING placement does not, and an overlay whose angle did not turn with its
+/// page would be drawn unrotated on a rotated page. `scale`/`user_scale` —
 /// a page-pixel size factor of a NON-resampled overlay PNG — follows the
 /// placement scale, exactly like `TransformRec::scale` in `layers.json`.
 fn apply_text_info_geometry(obj: &mut Map<String, Value>, placement: &PlacementMap) {
-    if let Some(x) = get_f64(obj, "img_x_px") {
-        put_f64(obj, "img_x_px", placement.map_x(x));
-    }
-    if let Some(y) = get_f64(obj, "img_y_px") {
-        put_f64(obj, "img_y_px", placement.map_y(y));
-    }
+    map_px_keys(obj, "img_x_px", "img_y_px", placement);
     map_uv_keys(obj, "img_u", "img_v", placement);
     map_uv_keys(obj, "u", "v", placement);
     if let Some(mesh) = obj.get_mut("deform_mesh").and_then(Value::as_object_mut) {
@@ -787,6 +1079,14 @@ fn apply_text_info_geometry(obj: &mut Map<String, Value>, placement: &PlacementM
     }
     scale_key(obj, "scale", placement);
     scale_key(obj, "user_scale", placement);
+    // Stored in DEGREES here (`text_payload::encode_overlay_transform` writes
+    // `rotation_deg`; `angle` is the legacy alias the decoder still accepts).
+    add_stored_angle(
+        obj,
+        &["rotation_deg", "angle"],
+        placement.rotation_degrees(),
+        360.0,
+    );
 }
 
 /// Geometric part a legacy `text_info.json` overlay entry belongs to.
@@ -824,6 +1124,41 @@ fn text_info_part(obj: &Map<String, Value>, geo: &SplitGeometry) -> usize {
         }
     };
     geo.part_for_point(x, y)
+}
+
+/// Whether a legacy `text_info.json` overlay entry keeps any of its footprint
+/// inside the kept region of a crop.
+///
+/// The crop mirror of [`text_info_part`], with the same evidence order and the
+/// same limitation: a `deform_mesh` supplies a real polygon and is judged by
+/// area (summed over its grid CELLS, which stays correct for a folded mesh),
+/// while without one only the decoded centre point is known — this document does
+/// not record the overlay's extent. The centre-of-page default is a real
+/// POSITION, not an absence of evidence, so an entry with no stored placement is
+/// judged by whether the crop kept the page centre.
+fn text_info_survives_crop(obj: &Map<String, Value>, geo: &CropGeometry) -> bool {
+    let [page_w, page_h] = geo.page_size();
+    if let Some(mesh) = obj.get("deform_mesh")
+        && let Some(cells) = deform_mesh_cells(mesh, Some([page_w, page_h]))
+    {
+        let pieces: Vec<&[[f64; 2]]> = cells.iter().map(Vec::as_slice).collect();
+        if let Some(keeps) = geo.keeps_polygon_group(&pieces) {
+            return keeps;
+        }
+    }
+    let (x, y) = match (get_f64(obj, "img_x_px"), get_f64(obj, "img_y_px")) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            let u = get_f64(obj, "img_u")
+                .or_else(|| get_f64(obj, "u"))
+                .unwrap_or(0.5);
+            let v = get_f64(obj, "img_v")
+                .or_else(|| get_f64(obj, "v"))
+                .unwrap_or(0.5);
+            (u * page_w, v * page_h)
+        }
+    };
+    geo.keeps_point(x, y)
 }
 
 /// The GRID CELL quads of a stored deform mesh, in absolute page pixels: one
@@ -921,7 +1256,20 @@ fn offset_layer_idx(obj: &mut Map<String, Value>, offset: u32) {
 pub(crate) struct LayersRemap {
     /// The full manifest with surviving pages remapped and re-sorted.
     pub manifest: Value,
-    /// Page entries of deleted pages, verbatim (archived in the trash).
+    /// Page entries the operation REMOVED, archived verbatim in the trash as
+    /// `deleted_layers_pages.json`.
+    ///
+    /// One entry per page that lost records, in either of two shapes — both
+    /// carry the page's ORIGINAL `img_idx`, so the archive reads uniformly:
+    /// - a page deleted WHOLE contributes its entry exactly as it stood;
+    /// - a page that SURVIVES but lost part of its tree (a split's deleted
+    ///   part, a crop's removed frame) contributes an entry holding just the
+    ///   dropped records plus the groups they belonged to (see
+    ///   [`archived_layer_page`]).
+    ///
+    /// Never empty when records were dropped: only a layer's rendered PNG goes
+    /// to the trash, so this document is the sole surviving copy of its
+    /// transform, its group membership and a TEXT node's typed text.
     pub deleted_pages: Vec<Value>,
     pub changed: bool,
     pub warnings: Vec<String>,
@@ -942,10 +1290,13 @@ pub(crate) struct LayersRemap {
 /// layer geometry mapped into the stitched canvas. With a SPLIT geometry the
 /// cut page's single entry is PARTITIONED into one entry per part that holds at
 /// least one layer (see [`split_page_layers`]), each mapped into that part.
+/// With a CROP geometry the cropped page keeps its single entry, the records
+/// that fall entirely outside the kept region are dropped from it (see
+/// [`crop_page_layers`]) and the rest are mapped through the crop.
 ///
-/// `tree_rel` names the tree this manifest belongs to; a split's layer routing
-/// is resolved per tree, because the committed and the staging manifest are
-/// independent documents.
+/// `tree_rel` names the tree this manifest belongs to; a split's and a crop's
+/// layer routing are resolved per tree, because the committed and the staging
+/// manifest are independent documents.
 ///
 /// # Errors
 /// - [`PageOpError::Json`] when the manifest root is not an object.
@@ -956,9 +1307,15 @@ pub(crate) fn remap_layers_manifest(
     geometry: PageGeometry<'_>,
     tree_rel: &str,
 ) -> Result<LayersRemap, PageOpError> {
-    let split_routing = geometry
-        .split()
-        .and_then(|geo| geo.routing(tree_rel));
+    // Exhaustive by design (see `PageGeometry` and `GeometryParts`).
+    let (stitch, split, crop): GeometryParts<'_> = match geometry {
+        PageGeometry::None => (None, None, None),
+        PageGeometry::Stitch(geo) => (Some(geo), None, None),
+        PageGeometry::Split(geo) => (None, Some(geo), None),
+        PageGeometry::Crop(geo) => (None, None, Some(geo)),
+    };
+    let split_routing = split.and_then(|geo| geo.routing(tree_rel));
+    let crop_routing = crop.and_then(|geo| geo.routing(tree_rel));
     let Some(root) = manifest.as_object() else {
         return Err(PageOpError::Json(
             "layers.json root is not a JSON object".to_string(),
@@ -1026,20 +1383,34 @@ pub(crate) fn remap_layers_manifest(
                         }
                     }
                 }
-                if let Some(geo) = geometry.split()
+                if let Some(geo) = split
                     && geo.source_old_idx() == old_idx
                 {
                     kept.extend(split_page_layers(
                         &new_page,
                         geo,
                         split_routing,
+                        &mut deleted_pages,
                         &mut warnings,
                     )?);
                     changed = true;
                     continue;
                 }
-                if let Some(placement) = geometry.stitch().and_then(|geo| geo.placement(old_idx)) {
-                    let offset = geometry.stitch().map_or(0, |geo| geo.layer_idx_offset(old_idx));
+                if let Some(geo) = crop
+                    && geo.source_old_idx() == old_idx
+                {
+                    kept.push(Value::Object(crop_page_layers(
+                        &new_page,
+                        geo,
+                        crop_routing,
+                        &mut deleted_pages,
+                        &mut warnings,
+                    )));
+                    changed = true;
+                    continue;
+                }
+                if let Some(placement) = stitch.and_then(|geo| geo.placement(old_idx)) {
+                    let offset = stitch.map_or(0, |geo| geo.layer_idx_offset(old_idx));
                     apply_page_layers_geometry(&mut new_page, placement, offset);
                     if merged.insert(old_idx, new_page).is_some() {
                         return Err(PageOpError::Json(format!(
@@ -1087,7 +1458,10 @@ pub(crate) fn remap_layers_manifest(
 /// Per layer record: `transform.cx/cy` and `deform.points_px` are absolute page
 /// pixels and move with the placement; `transform.scale` and a centering
 /// frame's `half_w`/`half_h` are page-pixel magnitudes and follow the scale;
-/// `transform.rotation` is unchanged (a uniform scale preserves angles); and
+/// `transform.rotation` (RADIANS) gains the placement's page rotation, which is
+/// zero for a stitch and a split and non-zero only for a crop — a uniform scale
+/// preserves angles, a rotation does not, and a layer whose angle did not turn
+/// with its page would be drawn unrotated on a rotated page; and
 /// `image_size`, `text_centers`, `render_data` are layer-image-local, so they
 /// are left exactly as they are — the layer PNG is not resampled.
 fn apply_page_layers_geometry(
@@ -1101,13 +1475,16 @@ fn apply_page_layers_geometry(
                 continue;
             };
             if let Some(transform) = rec.get_mut("transform").and_then(Value::as_object_mut) {
-                if let Some(cx) = get_f64(transform, "cx") {
-                    put_f64(transform, "cx", placement.map_x(cx));
-                }
-                if let Some(cy) = get_f64(transform, "cy") {
-                    put_f64(transform, "cy", placement.map_y(cy));
-                }
+                map_px_keys(transform, "cx", "cy", placement);
                 scale_key(transform, "scale", placement);
+                // `TransformRec::rotation` is stored in RADIANS
+                // (`layer_model/persist.rs`), unlike `text_info`'s degrees.
+                add_stored_angle(
+                    transform,
+                    &["rotation"],
+                    placement.rotation_radians(),
+                    std::f64::consts::TAU,
+                );
             }
             if let Some(points) = rec
                 .get_mut("deform")
@@ -1120,12 +1497,7 @@ fn apply_page_layers_geometry(
                 .get_mut("centering_frame")
                 .and_then(Value::as_object_mut)
             {
-                if let Some(cx) = get_f64(frame, "cx") {
-                    put_f64(frame, "cx", placement.map_x(cx));
-                }
-                if let Some(cy) = get_f64(frame, "cy") {
-                    put_f64(frame, "cy", placement.map_y(cy));
-                }
+                map_px_keys(frame, "cx", "cy", placement);
                 scale_key(frame, "half_w", placement);
                 scale_key(frame, "half_h", placement);
             }
@@ -1498,6 +1870,97 @@ fn layer_world_quad(
     ]
 }
 
+/// The `groups` / `text_groups` records of `page` that `tree`'s records belong
+/// to, in the manifest's own order.
+///
+/// A `GroupRec` is claimed by any record carrying its `uid` in `group_uid`; a
+/// `TextGroupRec` band is keyed by the `layer_idx` of the UNPINNED text nodes of
+/// the set (a pinned text owns its own band instead), which is exactly the set
+/// the manifest contract says the bands describe. Group uids are page-scoped, so
+/// the same group may legitimately be claimed by several of the sets one page
+/// is broken into.
+fn page_groups_for(page: &Map<String, Value>, tree: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let members: std::collections::HashSet<&str> = tree
+        .iter()
+        .filter_map(|rec| rec.get("group_uid")?.as_str())
+        .collect();
+    let groups: Vec<Value> = page
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|group| {
+            group
+                .get("uid")
+                .and_then(Value::as_str)
+                .is_some_and(|uid| members.contains(uid))
+        })
+        .cloned()
+        .collect();
+    let band_owners: std::collections::HashSet<u64> = tree
+        .iter()
+        .filter(|rec| {
+            rec.get("kind").and_then(Value::as_str) == Some("text")
+                && !rec.get("pinned").and_then(Value::as_bool).unwrap_or(false)
+        })
+        .filter_map(|rec| rec.get("layer_idx")?.as_u64())
+        .collect();
+    let text_groups: Vec<Value> = page
+        .get("text_groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|group| {
+            group
+                .get("layer_idx")
+                .and_then(Value::as_u64)
+                .is_some_and(|idx| band_owners.contains(&idx))
+        })
+        .cloned()
+        .collect();
+    (groups, text_groups)
+}
+
+/// Builds the trash-archive entry for layer records dropped from a page that
+/// itself SURVIVES the operation (a split's deleted part, a crop's removed
+/// frame).
+///
+/// Shape: the SAME page-entry object the whole-page archive uses, so
+/// `deleted_layers_pages.json` stays one uniform array of page entries whatever
+/// removed the records, and a manual recovery reads it the same way in both
+/// cases. It carries the page's ORIGINAL `img_idx` (like a page deleted whole),
+/// the dropped records VERBATIM — their coordinates are in the page's own
+/// pre-operation space, because the geometry mapping is applied per surviving
+/// set and never touches these — and the group / text-group records those
+/// layers belonged to, whose names and bands are not recoverable from a layer
+/// record alone. Every other key of the page entry is inherited, so
+/// unknown/future fields survive.
+///
+/// Archiving is NOT optional: only a dropped layer's rendered PNG goes to the
+/// trash, while its transform, its group membership and — for a TEXT node — the
+/// typed text itself live solely in this document.
+fn archived_layer_page(
+    page: &Map<String, Value>,
+    old_idx: usize,
+    dropped: Vec<Value>,
+) -> Map<String, Value> {
+    let (groups, text_groups) = page_groups_for(page, &dropped);
+    let mut entry = page.clone();
+    // The page's own index BEFORE the operation: the archive describes what the
+    // chapter looked like when the records still existed.
+    entry.insert("img_idx".to_string(), Value::from(old_idx));
+    entry.insert("tree".to_string(), Value::Array(dropped));
+    // Match the manifest writer, which omits these keys when empty.
+    for (key, items) in [("groups", groups), ("text_groups", text_groups)] {
+        if items.is_empty() {
+            entry.remove(key);
+        } else {
+            entry.insert(key.to_string(), Value::Array(items));
+        }
+    }
+    entry
+}
+
 /// Partitions the already-file-remapped page entry of the SPLIT page into one
 /// entry per part that holds at least one layer.
 ///
@@ -1520,7 +1983,10 @@ fn layer_world_quad(
 /// their «Группа текста N» axes are distinct without any offset.
 ///
 /// A part the request DELETED yields no entry at all: its records are dropped
-/// with it and reported in `warnings`, never re-homed on a surviving part.
+/// with it and reported in `warnings`, never re-homed on a surviving part. They
+/// are ARCHIVED into `archived` first (see [`archived_layer_page`]) — only their
+/// PNGs go to the trash, so the records themselves are the sole copy of the
+/// layer's transform, group membership and typed text.
 ///
 /// # Errors
 /// [`PageOpError::Json`] when a SURVIVING part has no placement or no index in
@@ -1529,6 +1995,7 @@ fn split_page_layers(
     page: &Map<String, Value>,
     geo: &SplitGeometry,
     routing: Option<&SplitTreeRouting>,
+    archived: &mut Vec<Value>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Value>, PageOpError> {
     let mut per_part: Vec<Vec<Value>> = vec![Vec::new(); geo.part_count()];
@@ -1553,9 +2020,11 @@ fn split_page_layers(
         }
     }
 
-    let source_groups = page.get("groups").and_then(Value::as_array);
-    let source_text_groups = page.get("text_groups").and_then(Value::as_array);
     let mut out = Vec::with_capacity(geo.part_count());
+    // Records of every deleted part, in geometric part order, archived as ONE
+    // entry: the archive describes what was removed from the PAGE, not from
+    // each part.
+    let mut dropped: Vec<Value> = Vec::new();
     for (part, tree) in per_part.into_iter().enumerate() {
         if tree.is_empty() {
             continue;
@@ -1563,12 +2032,15 @@ fn split_page_layers(
         // A deleted part produces no manifest entry: its records are dropped
         // together with the page they would have described, never moved onto a
         // surviving part. Their PNGs are trashed by `plan_layer_pngs` via the
-        // routing's deleted-file set.
+        // routing's deleted-file set, and the records themselves are archived
+        // below — the PNG alone does not carry the layer's metadata.
         if geo.is_deleted_part(part) {
             warnings.push(format!(
-                "{} layer record(s) of deleted split part {part} were discarded with it",
+                "{} layer record(s) of deleted split part {part} were discarded with it \
+                 and archived in the trash",
                 tree.len()
             ));
+            dropped.extend(tree);
             continue;
         }
         let (Some(placement), Some(new_idx)) = (geo.placement(part), geo.part_new_idx(part))
@@ -1578,43 +2050,8 @@ fn split_page_layers(
             )));
         };
 
-        // PS groups: keep the ones this part's nodes actually belong to.
-        let members: std::collections::HashSet<&str> = tree
-            .iter()
-            .filter_map(|rec| rec.get("group_uid")?.as_str())
-            .collect();
-        let groups: Vec<Value> = source_groups
-            .into_iter()
-            .flatten()
-            .filter(|group| {
-                group
-                    .get("uid")
-                    .and_then(Value::as_str)
-                    .is_some_and(|uid| members.contains(uid))
-            })
-            .cloned()
-            .collect();
-        // Text-group bands: keyed by the layer_idx of the UNPINNED text nodes
-        // of this part (a pinned text owns its own band instead).
-        let band_owners: std::collections::HashSet<u64> = tree
-            .iter()
-            .filter(|rec| {
-                rec.get("kind").and_then(Value::as_str) == Some("text")
-                    && !rec.get("pinned").and_then(Value::as_bool).unwrap_or(false)
-            })
-            .filter_map(|rec| rec.get("layer_idx")?.as_u64())
-            .collect();
-        let text_groups: Vec<Value> = source_text_groups
-            .into_iter()
-            .flatten()
-            .filter(|group| {
-                group
-                    .get("layer_idx")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|idx| band_owners.contains(&idx))
-            })
-            .cloned()
-            .collect();
+        // PS groups and text-group bands this part's nodes actually claim.
+        let (groups, text_groups) = page_groups_for(page, &tree);
 
         let mut entry = page.clone();
         entry.insert("img_idx".to_string(), Value::from(new_idx));
@@ -1631,7 +2068,249 @@ fn split_page_layers(
         apply_page_layers_geometry(&mut entry, placement, 0);
         out.push(Value::Object(entry));
     }
+    if !dropped.is_empty() {
+        archived.push(Value::Object(archived_layer_page(
+            page,
+            geo.source_old_idx(),
+            dropped,
+        )));
+    }
     Ok(out)
+}
+
+/// Resolves which layer records of the CROPPED page fall entirely outside the
+/// kept region, and which layer PNGs only those records reference, for ONE tree.
+///
+/// The crop counterpart of [`split_layer_routing`]. It answers a keep/drop
+/// question instead of a which-part question, so it cannot fail: a crop keeps
+/// the page's index, so no PNG has to move to a new prefix and the "one file,
+/// two destinations" refusal of a split has no analogue here.
+///
+/// `layer_png_sizes` supplies the pixel size of the page's layer PNGs (probed by
+/// `fs_exec::scan_chapter`), which is the ONLY way to size a TEXT node — its
+/// record stores `image_size: None`.
+///
+/// A malformed manifest yields an EMPTY routing, i.e. nothing is dropped, which
+/// is the safe direction: [`remap_layers_manifest`] runs later over the same
+/// document and reports the structural problem with full context.
+#[must_use]
+pub(crate) fn crop_layer_routing(
+    manifest: Option<&Value>,
+    layer_png_sizes: &std::collections::BTreeMap<String, [u32; 2]>,
+    geo: &CropGeometry,
+) -> (CropTreeRouting, Vec<String>) {
+    let mut dropped_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Files a SURVIVING record claims; such a claim always wins, because that
+    // record still needs the pixels.
+    let mut kept_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut warnings = Vec::new();
+
+    let page = manifest
+        .and_then(Value::as_object)
+        .and_then(|root| root.get("pages"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .find(|page| {
+            page.get("img_idx")
+                .and_then(Value::as_u64)
+                .and_then(|idx| usize::try_from(idx).ok())
+                == Some(geo.source_old_idx())
+        });
+    let Some(page) = page else {
+        return (
+            CropTreeRouting::new(dropped_nodes, dropped_files),
+            warnings,
+        );
+    };
+
+    for rec in page
+        .get("tree")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+    {
+        let survives = layer_survives_crop(rec, layer_png_sizes, geo, &mut warnings);
+        if let Some(uid) = rec.get("uid").and_then(Value::as_str) {
+            if !survives {
+                dropped_nodes.insert(uid.to_string());
+            }
+        } else if !survives {
+            // Without a uid the manifest pass cannot recognize the record, so
+            // it would be kept anyway; say so rather than dropping it blindly.
+            warnings.push(
+                "a layer record of the cropped page has no uid and could not be dropped even \
+                 though it lies outside the kept region; it stays on the page"
+                    .to_string(),
+            );
+            continue;
+        }
+        for key in ["base_file", "rendered_file"] {
+            let Some(name) = rec.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            // Only the cropped page's OWN PNGs can be orphaned by this
+            // operation; a cross-page reference belongs to another page.
+            if super::plan::parse_layers_png_page_idx(name) != Some(geo.source_old_idx()) {
+                continue;
+            }
+            if survives {
+                kept_files.insert(name.to_string());
+                dropped_files.remove(name);
+            } else if !kept_files.contains(name) {
+                dropped_files.insert(name.to_string());
+            }
+        }
+    }
+    (
+        CropTreeRouting::new(dropped_nodes, dropped_files),
+        warnings,
+    )
+}
+
+/// Whether ONE layer record keeps any of its footprint inside the kept region of
+/// a crop.
+///
+/// The crop mirror of [`assign_layer_part`], with the same order of evidence,
+/// strongest first:
+/// 1. a `deform` mesh — it OVERRIDES the affine transform, so the summed
+///    absolute area of its grid CELLS is the layer's real footprint;
+/// 2. the transform quad — the four `local_to_world` corners of the layer image,
+///    which needs the image size (`image_size` for a raster, a probed
+///    `rendered_file` for a TEXT node that stores none);
+/// 3. the transform CENTRE point, when the size is unknown. A documented
+///    degradation of the stated rule, so it always warns.
+///
+/// A record with NO placement evidence at all (neither a mesh nor a transform)
+/// is KEPT: dropping it would destroy user data as a side effect of a fallback,
+/// not because the geometry said so. That mirrors `assign_layer_part`'s
+/// first-surviving-part fallback, which likewise never destroys.
+fn layer_survives_crop(
+    rec: &Map<String, Value>,
+    layer_png_sizes: &std::collections::BTreeMap<String, [u32; 2]>,
+    geo: &CropGeometry,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let name = rec
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("<no uid>")
+        .to_string();
+    if let Some(mesh) = rec.get("deform")
+        && let Some(cells) = deform_mesh_cells(mesh, None)
+    {
+        let pieces: Vec<&[[f64; 2]]> = cells.iter().map(Vec::as_slice).collect();
+        if let Some(keeps) = geo.keeps_polygon_group(&pieces) {
+            return keeps;
+        }
+    }
+    let Some(transform) = rec.get("transform").and_then(Value::as_object) else {
+        warnings.push(format!(
+            "layer '{name}' of the cropped page has no transform and no deform mesh; it is \
+             kept on the page instead of being judged by area"
+        ));
+        return true;
+    };
+    let cx = get_f64(transform, "cx").unwrap_or(0.0);
+    let cy = get_f64(transform, "cy").unwrap_or(0.0);
+    match layer_image_size(rec, layer_png_sizes) {
+        Some([width, height]) if width > 0.0 && height > 0.0 => {
+            let rotation = get_f64(transform, "rotation").unwrap_or(0.0);
+            let scale = get_f64(transform, "scale").unwrap_or(1.0);
+            let quad = layer_world_quad(cx, cy, rotation, scale, width, height);
+            if let Some(keeps) = geo.keeps_polygon(&quad) {
+                return keeps;
+            }
+        }
+        _ => warnings.push(format!(
+            "layer '{name}' of the cropped page has no measurable image size (a text render \
+             whose PNG could not be probed); it was judged by its centre point instead of by \
+             area"
+        )),
+    }
+    geo.keeps_point(cx, cy)
+}
+
+/// Rewrites the already-file-remapped page entry of the CROPPED page.
+///
+/// The page itself survives, so exactly ONE entry comes out — even when every
+/// record was dropped, because the page still exists and its (now empty) entry
+/// must stay. Layers are never cut: a record that keeps any of its footprint
+/// inside the kept region moves whole and its geometry is mapped through the
+/// crop, so it may legitimately hang off the new page's edge. A record that
+/// survives nowhere is dropped with its exclusively-claimed PNGs (trashed by
+/// `plan_layer_pngs`) and ARCHIVED into `archived` (see
+/// [`archived_layer_page`]), exactly as a deleted split part's records are: the
+/// PNG alone does not carry the layer's transform, its group membership or a
+/// text node's typed text.
+///
+/// `z` is re-ranked densely afterwards because it is a per-page band axis and
+/// dropping records leaves gaps in it; `GroupRec` / `TextGroupRec` entries whose
+/// last member was dropped are removed, matching the manifest writer, which
+/// omits those keys when empty.
+fn crop_page_layers(
+    page: &Map<String, Value>,
+    geo: &CropGeometry,
+    routing: Option<&CropTreeRouting>,
+    archived: &mut Vec<Value>,
+    warnings: &mut Vec<String>,
+) -> Map<String, Value> {
+    let mut dropped: Vec<Value> = Vec::new();
+    let tree: Vec<Value> = page
+        .get("tree")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rec| {
+            let outside = rec
+                .as_object()
+                .and_then(|obj| obj.get("uid"))
+                .and_then(Value::as_str)
+                .is_some_and(|uid| {
+                    routing.is_some_and(|routing| routing.is_dropped_node(uid))
+                });
+            if outside {
+                dropped.push((*rec).clone());
+            }
+            !outside
+        })
+        .cloned()
+        .collect();
+    if !dropped.is_empty() {
+        warnings.push(format!(
+            "{} layer record(s) lay entirely outside the kept region of the cropped \
+             page and were dropped with it; the records are archived in the trash and the \
+             PNGs only they referenced went there too",
+            dropped.len()
+        ));
+        archived.push(Value::Object(archived_layer_page(
+            page,
+            geo.source_old_idx(),
+            dropped,
+        )));
+    }
+
+    // PS groups and text-group bands whose last member is gone: same membership
+    // rules as `split_page_layers`, applied to the one surviving entry.
+    let (groups, text_groups) = page_groups_for(page, &tree);
+
+    let mut entry = page.clone();
+    entry.insert("tree".to_string(), Value::Array(tree));
+    for (key, items) in [("groups", groups), ("text_groups", text_groups)] {
+        if items.is_empty() {
+            entry.remove(key);
+        } else {
+            entry.insert(key.to_string(), Value::Array(items));
+        }
+    }
+    rerank_page_bands(&mut entry);
+    // `layer_idx` is NOT re-based: a crop keeps ONE page, so its text-group axis
+    // cannot collide with another page's.
+    apply_page_layers_geometry(&mut entry, geo.placement(), 0);
+    entry
 }
 
 /// Re-ranks the shared per-page Z band axis of one manifest page entry densely
@@ -1787,24 +2466,31 @@ pub(crate) fn detection_merge_blocker(
     None
 }
 
-/// Why the SPLIT cannot route a detection document's BLOCKS, or `None` when it
-/// can.
+/// Why a detection document's BLOCKS cannot be mapped as RECTANGLES, or `None`
+/// when they can.
 ///
 /// Complements [`detection_merge_blocker`], which only judges the document's
-/// declared sizes. A split partitions the block list — every block must land in
-/// exactly ONE part's document — so a block whose rectangle cannot be read is
-/// not routable: it is not an object, or it is missing one of the numeric
-/// `x1`/`y1`/`x2`/`y2` coordinates. Such an entry must not be dropped silently
-/// (every part would skip it and it would survive nowhere), so it blocks the
-/// whole group and the caller trashes the page's detection files with a
-/// warning — the same all-or-nothing degradation of regenerable data the size
-/// checks already use.
+/// declared sizes. Two operations need a COMPLETE rectangle per block and are
+/// gated by this:
+/// - a SPLIT partitions the block list, so every block must land in exactly ONE
+///   part's document; a block whose rectangle cannot be read is not routable and
+///   would be skipped by every part, surviving nowhere;
+/// - a CROP maps the blocks through a ROTATING placement, which cannot map one
+///   axis without the other ([`PlacementMap::map_x_without_y`]), so a
+///   half-specified block cannot be mapped at all.
+///
+/// A block is unreadable when it is not an object or is missing one of the
+/// numeric `x1`/`y1`/`x2`/`y2` coordinates. Such an entry must never be dropped
+/// silently, so it blocks the whole document and the caller trashes the page's
+/// detection files with a warning — the same all-or-nothing degradation of
+/// regenerable data the size checks already use.
 ///
 /// Validating here, ONCE, is what keeps the decision in a single place:
-/// [`split_detection_blocks`] then treats a malformed block as a contract
-/// violation and fails closed instead of skipping it.
+/// [`split_detection_blocks`] and [`crop_detection_blocks`] then treat a
+/// malformed block as a contract violation and fail closed instead of skipping
+/// it.
 #[must_use]
-pub(crate) fn detection_split_blocker(blocks: &Value, page_idx: usize) -> Option<String> {
+pub(crate) fn detection_rect_blocker(blocks: &Value, page_idx: usize) -> Option<String> {
     let items = blocks.as_object()?.get("blocks")?.as_array()?;
     for (index, block) in items.iter().enumerate() {
         let Some(obj) = block.as_object() else {
@@ -1869,14 +2555,43 @@ pub(crate) fn merge_detection_blocks(
                 continue;
             };
             let mut mapped = obj.clone();
-            for (key, is_x) in [("x1", true), ("x2", true), ("y1", false), ("y2", false)] {
-                if let Some(value) = get_f64(&mapped, key) {
-                    let mapped_value = if is_x {
-                        placement.map_x(value)
-                    } else {
-                        placement.map_y(value)
-                    };
-                    put_f64(&mut mapped, key, mapped_value);
+            // A complete rectangle is mapped as a rectangle; the merge gate
+            // does not require one, so a block missing a coordinate still gets
+            // every coordinate it does have mapped along its own axis. Only a
+            // ROTATING placement cannot do that, and there the incomplete block
+            // is a hard failure rather than a silently half-mapped entry.
+            match (
+                get_f64(&mapped, "x1"),
+                get_f64(&mapped, "y1"),
+                get_f64(&mapped, "x2"),
+                get_f64(&mapped, "y2"),
+            ) {
+                (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                    let [mx1, my1, mx2, my2] = placement.map_px_rect([x1, y1, x2, y2]);
+                    put_f64(&mut mapped, "x1", mx1);
+                    put_f64(&mut mapped, "y1", my1);
+                    put_f64(&mut mapped, "x2", mx2);
+                    put_f64(&mut mapped, "y2", my2);
+                }
+                _ => {
+                    for (key, along_x) in [("x1", true), ("x2", true), ("y1", false), ("y2", false)]
+                    {
+                        let Some(value) = get_f64(&mapped, key) else {
+                            continue;
+                        };
+                        let axis_mapped = if along_x {
+                            placement.map_x_without_y(value)
+                        } else {
+                            placement.map_y_without_x(value)
+                        };
+                        let Some(axis_mapped) = axis_mapped else {
+                            return Err(PageOpError::Json(format!(
+                                "text-detection page {page_idx} has a block without a complete \
+                                 x1/y1/x2/y2 rectangle, which a rotating placement cannot map"
+                            )));
+                        };
+                        put_f64(&mut mapped, key, axis_mapped);
+                    }
                 }
             }
             blocks_out.push(Value::Object(mapped));
@@ -1909,7 +2624,7 @@ pub(crate) fn merge_detection_blocks(
 /// what `save_text_detection_page` writes. Non-geometry keys are inherited so
 /// unknown fields survive.
 ///
-/// PRECONDITION: `document` has already passed [`detection_split_blocker`], so
+/// PRECONDITION: `document` has already passed [`detection_rect_blocker`], so
 /// every block is routable. A malformed block is therefore a contract
 /// violation and fails the operation instead of being skipped — skipping it in
 /// every part would delete it from the chapter without a trace.
@@ -1961,10 +2676,11 @@ pub(crate) fn split_detection_blocks(
             continue;
         }
         let mut mapped = obj.clone();
-        put_f64(&mut mapped, "x1", placement.map_x(x1));
-        put_f64(&mut mapped, "x2", placement.map_x(x2));
-        put_f64(&mut mapped, "y1", placement.map_y(y1));
-        put_f64(&mut mapped, "y2", placement.map_y(y2));
+        let [mx1, my1, mx2, my2] = placement.map_px_rect([x1, y1, x2, y2]);
+        put_f64(&mut mapped, "x1", mx1);
+        put_f64(&mut mapped, "x2", mx2);
+        put_f64(&mut mapped, "y1", my1);
+        put_f64(&mut mapped, "y2", my2);
         blocks_out.push(Value::Object(mapped));
     }
     let part_size = Value::Array(vec![Value::from(size[0]), Value::from(size[1])]);
@@ -1977,6 +2693,89 @@ pub(crate) fn split_detection_blocks(
         Value::String(mask_file.unwrap_or_default().to_string()),
     );
     Ok(Value::Object(root))
+}
+
+/// Builds the text-detection document of the CROPPED page and reports how many
+/// blocks the crop removed.
+///
+/// The detector's blocks are ABSOLUTE page pixels, so each is mapped through the
+/// crop's placement; a block that keeps any of its rectangle inside the kept
+/// region survives (and may reach past the new page's edge, exactly like a
+/// layer), while one lying entirely outside is dropped and counted. Detection
+/// output is regenerable, so a dropped block is reported as a warning count
+/// rather than archived. `source_size` and `mask_size` become the new page size
+/// and `mask_file` names the page's rotated mask, or is empty when the page had
+/// none — matching what `save_text_detection_page` writes. Non-geometry keys are
+/// inherited so unknown fields survive.
+///
+/// PRECONDITION: `document` has already passed [`detection_merge_blocker`] and
+/// [`detection_rect_blocker`], and the crop does NOT rotate by a fine angle (the
+/// caller trashes the document in that case, because an axis-aligned rectangle
+/// cannot describe a freely rotated page). A malformed block is therefore a
+/// contract violation and fails the operation instead of being skipped.
+///
+/// # Errors
+/// [`PageOpError::Json`] when a block is not an object or lacks a numeric
+/// `x1`/`y1`/`x2`/`y2` rectangle.
+pub(crate) fn crop_detection_blocks(
+    document: &Value,
+    geo: &CropGeometry,
+    new_idx: usize,
+    mask_file: Option<&str>,
+) -> Result<(Value, usize), PageOpError> {
+    let placement = geo.placement();
+    let mut root = document.as_object().cloned().unwrap_or_default();
+    let mut blocks_out: Vec<Value> = Vec::new();
+    let mut dropped = 0usize;
+    for (index, block) in document
+        .get("blocks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        // Fail closed: the gates above accepted this document, so anything
+        // unreadable here is an internal inconsistency, never a reason to drop
+        // the entry silently.
+        let Some(obj) = block.as_object() else {
+            return Err(PageOpError::Json(format!(
+                "text-detection blocks[{index}] of the cropped page is not a JSON object"
+            )));
+        };
+        let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+            get_f64(obj, "x1"),
+            get_f64(obj, "y1"),
+            get_f64(obj, "x2"),
+            get_f64(obj, "y2"),
+        ) else {
+            return Err(PageOpError::Json(format!(
+                "text-detection blocks[{index}] of the cropped page has no numeric \
+                 x1/y1/x2/y2 rectangle"
+            )));
+        };
+        if !geo.keeps_page_rect([x1, y1, x2, y2]) {
+            dropped += 1;
+            continue;
+        }
+        let mut mapped = obj.clone();
+        let [mx1, my1, mx2, my2] = placement.map_px_rect([x1, y1, x2, y2]);
+        put_f64(&mut mapped, "x1", mx1);
+        put_f64(&mut mapped, "y1", my1);
+        put_f64(&mut mapped, "x2", mx2);
+        put_f64(&mut mapped, "y2", my2);
+        blocks_out.push(Value::Object(mapped));
+    }
+    let [width, height] = geo.new_size();
+    let new_size = Value::Array(vec![Value::from(width), Value::from(height)]);
+    root.insert("page_idx".to_string(), Value::from(new_idx));
+    root.insert("source_size".to_string(), new_size.clone());
+    root.insert("mask_size".to_string(), new_size);
+    root.insert("blocks".to_string(), Value::Array(blocks_out));
+    root.insert(
+        "mask_file".to_string(),
+        Value::String(mask_file.unwrap_or_default().to_string()),
+    );
+    Ok((Value::Object(root), dropped))
 }
 
 #[cfg(test)]
@@ -2852,6 +3651,34 @@ mod tests {
             "discarded layer records must be reported: {:?}",
             out.warnings
         );
+        // The deleted part's records are ARCHIVED, not merely dropped: their
+        // PNGs go to the trash, but the transform, the group membership and a
+        // text node's typed text exist nowhere else.
+        assert_eq!(out.deleted_pages.len(), 1, "{:?}", out.deleted_pages);
+        let archived = &out.deleted_pages[0];
+        // The page's ORIGINAL index, as for a page deleted whole.
+        assert_eq!(archived["img_idx"], json!(1));
+        let uids: Vec<&str> = archived["tree"]
+            .as_array()
+            .expect("tree")
+            .iter()
+            .filter_map(|rec| rec["uid"].as_str())
+            .collect();
+        assert_eq!(uids, vec!["text", "bottom"], "{archived:?}");
+        // Verbatim, in the page's own pre-operation coordinate space.
+        approx(&archived["tree"][1]["transform"]["cy"], 350.0);
+        // Only the groups the dropped records CLAIM travel with them: "bottom"
+        // carries `group_uid: g1`, while g2 is claimed by nobody and stays out.
+        let groups: Vec<&str> = archived["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .filter_map(|group| group["uid"].as_str())
+            .collect();
+        assert_eq!(groups, vec!["g1"], "{archived:?}");
+        // The dropped TEXT node owns text band `layer_idx: 0`, whose name lives
+        // only in the band record — so that record is archived with it.
+        assert_eq!(archived["text_groups"][0]["name"], json!("TG"), "{archived:?}");
     }
 
     #[test]
@@ -3044,11 +3871,11 @@ mod tests {
         };
         let good = json!({"x1": 1.0, "y1": 2.0, "x2": 3.0, "y2": 40.0});
         // A well-formed document passes the gate untouched.
-        assert!(detection_split_blocker(&document(json!([good.clone()])), 1).is_none());
+        assert!(detection_rect_blocker(&document(json!([good.clone()])), 1).is_none());
 
         // A non-object element: every part would skip it, so it blocks the group.
         let non_object = document(json!([good.clone(), "legacy"]));
-        let reason = detection_split_blocker(&non_object, 1).expect("blocked");
+        let reason = detection_rect_blocker(&non_object, 1).expect("blocked");
         assert!(reason.contains("blocks[1]"), "{reason}");
         assert!(
             split_detection_blocks(&non_object, &geometry, 0, 1, None).is_err(),
@@ -3057,7 +3884,7 @@ mod tests {
 
         // An object missing one coordinate: same all-or-nothing decision.
         let missing = document(json!([{"x1": 1.0, "y1": 2.0, "x2": 3.0}]));
-        let reason = detection_split_blocker(&missing, 1).expect("blocked");
+        let reason = detection_rect_blocker(&missing, 1).expect("blocked");
         assert!(reason.contains("y2"), "{reason}");
         assert!(split_detection_blocks(&missing, &geometry, 1, 2, None).is_err());
     }
@@ -3070,5 +3897,406 @@ mod tests {
         );
         assert_eq!(remap_layers_png_name("ps_p0002_u2.png", 2, 2), None);
         assert_eq!(remap_layers_png_name("other.png", 2, 5), None);
+    }
+
+    /// Asserts a mapped JSON number equals `expected` within float tolerance.
+    fn approx(value: &Value, expected: f64) {
+        let got = read_f64(value)
+            .unwrap_or_else(|| panic!("expected a number, got {value}"));
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "expected {expected}, got {got}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Crop: page 1 (100x400) turned 90 CW onto a 400x100 canvas, of which the
+    // LEFT half is kept, i.e. a 200x100 page. Under that turn the page's
+    // BOTTOM half (y 200..400) becomes the canvas' LEFT half and survives,
+    // while its top half is cropped away.
+    // -----------------------------------------------------------------------
+
+    /// The crop described above.
+    fn crop_cw90_left_half() -> CropGeometry {
+        CropGeometry::for_tests(1, [100, 400], 1, 0.0, [0, 0, 200, 100])
+    }
+
+    /// A crop with no rotation at all: page 1's left column is kept.
+    fn crop_left_column() -> CropGeometry {
+        CropGeometry::for_tests(1, [100, 400], 0, 0.0, [0, 0, 40, 400])
+    }
+
+    /// Old -> new index map of every crop: the identity over 3 pages.
+    fn crop_map() -> Vec<Option<usize>> {
+        vec![Some(0), Some(1), Some(2)]
+    }
+
+    #[test]
+    fn crop_keeps_an_overlapping_bubble_and_archives_one_outside_the_frame() {
+        let geo = crop_left_column();
+        let entries = vec![
+            // Straddles the right edge of the kept column (u 0.4 == x 40).
+            json!({"id": 1, "img_idx": 1, "img_u": 0.35, "img_v": 0.5, "side": "left",
+                   "rect_coords": {"p1": {"img_u": 0.3, "img_v": 0.4},
+                                   "p2": {"img_u": 0.5, "img_v": 0.6}}}),
+            // Entirely to the right of the kept column.
+            json!({"id": 2, "img_idx": 1, "img_u": 0.8, "img_v": 0.5, "side": "right",
+                   "rect_coords": {"p1": {"img_u": 0.7, "img_v": 0.4},
+                                   "p2": {"img_u": 0.9, "img_v": 0.6}}}),
+            // Another page: untouched by a crop.
+            json!({"id": 3, "img_idx": 0, "img_u": 0.9, "img_v": 0.9, "side": "right"}),
+        ];
+        let out = remap_bubbles(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        assert!(out.changed);
+        assert_eq!(out.deleted.len(), 1, "{:?}", out.deleted);
+        assert_eq!(out.deleted[0]["id"], json!(2));
+        assert!(
+            out.warnings.iter().any(|w| w.contains("entirely outside")),
+            "archiving must be reported: {:?}",
+            out.warnings
+        );
+        assert_eq!(out.kept.len(), 2);
+        // The survivor keeps its page and is renormalized onto the 40x400 page:
+        // u 0.35 of 100 px = 35 px = u 0.875 of 40 px.
+        assert_eq!(out.kept[0]["img_idx"], json!(1));
+        approx(&out.kept[0]["img_u"], 0.875);
+        approx(&out.kept[0]["img_v"], 0.5);
+        // Its box legitimately reaches past the new page's right edge.
+        approx(&out.kept[0]["rect_coords"]["p2"]["img_u"], 1.25);
+        // The other page's bubble is untouched.
+        assert_eq!(out.kept[1]["img_idx"], json!(0));
+        approx(&out.kept[1]["img_u"], 0.9);
+    }
+
+    #[test]
+    fn crop_bubble_without_a_box_falls_back_to_its_anchor() {
+        let geo = crop_left_column();
+        let entries = vec![
+            json!({"id": 1, "img_idx": 1, "img_u": 0.2, "img_v": 0.5}),
+            json!({"id": 2, "img_idx": 1, "img_u": 0.9, "img_v": 0.5}),
+        ];
+        let out = remap_bubbles(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.kept[0]["id"], json!(1));
+        assert_eq!(out.deleted.len(), 1);
+        assert_eq!(out.deleted[0]["id"], json!(2));
+    }
+
+    #[test]
+    fn crop_maps_a_page_crop_bubbles_rect_and_drops_a_link_it_removed() {
+        let geo = crop_left_column();
+        let entries = vec![
+            // Crops the left half of page 1: survives, trimmed to the new frame.
+            json!({"id": 1, "img_idx": 0, "img_u": 0.5, "img_v": 0.5, "side": "left",
+                   "bubble_class": "image", "image_source_type": "page_crop",
+                   "crop_page_idx": 1, "crop_rect": [0.0, 0.25, 0.6, 0.75]}),
+            // Crops a region the crop removed entirely.
+            json!({"id": 2, "img_idx": 0, "img_u": 0.5, "img_v": 0.5, "side": "left",
+                   "bubble_class": "image", "image_source_type": "page_crop",
+                   "crop_page_idx": 1, "crop_rect": [0.7, 0.1, 0.9, 0.2]}),
+        ];
+        let out = remap_bubbles(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        // The page index never changes: a crop keeps the page it cropped.
+        assert_eq!(out.kept[0]["crop_page_idx"], json!(1));
+        let rect = out.kept[0]["crop_rect"].as_array().expect("rect");
+        // u 0.0..0.6 of the 100 px page is 0..60 px, clamped to the 40 px page.
+        approx(&rect[0], 0.0);
+        approx(&rect[1], 0.25);
+        approx(&rect[2], 1.0);
+        approx(&rect[3], 0.75);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("trimmed")),
+            "the trim must be reported: {:?}",
+            out.warnings
+        );
+        // Nothing of the second bubble's crop survived: the link is removed
+        // rather than left pointing at an unrelated region.
+        assert!(out.kept[1].get("crop_page_idx").is_none());
+        assert!(out.kept[1].get("crop_rect").is_none());
+    }
+
+    #[test]
+    fn crop_adds_the_page_angle_to_every_stored_angle() {
+        let geo = crop_cw90_left_half();
+        let manifest = json!({
+            "schema_version": 4,
+            "pages": [{"img_idx": 1, "tree": [
+                {"uid": "a", "name": "A", "kind": "raster", "z": 0, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 50.0, "cy": 300.0, "rotation": 0.25, "scale": 2.0}},
+                {"uid": "b", "name": "B", "kind": "raster", "z": 1, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 50.0, "cy": 320.0, "scale": 1.0}}
+            ]}]
+        });
+        let out = remap_layers_manifest(&manifest, &crop_map(), PageGeometry::Crop(&geo), "ch1")
+            .expect("remaps");
+        let tree = out.manifest["pages"][0]["tree"].as_array().expect("tree");
+        // A quarter turn is +pi/2 radians on top of whatever was stored.
+        let quarter = std::f64::consts::FRAC_PI_2;
+        approx(&tree[0]["transform"]["rotation"], 0.25 + quarter);
+        // A record with NO stored angle gains one: zero is no longer correct.
+        approx(&tree[1]["transform"]["rotation"], quarter);
+        // A magnitude is not a coordinate and a rotation does not touch it.
+        approx(&tree[0]["transform"]["scale"], 2.0);
+        // Page (50, 300) -> canvas (400 - 300, 50) = (100, 50) -> new page
+        // (100, 50): the crop keeps the canvas origin.
+        approx(&tree[0]["transform"]["cx"], 100.0);
+        approx(&tree[0]["transform"]["cy"], 50.0);
+
+        // The same rule in DEGREES for the legacy typing document.
+        let entries = vec![
+            json!({"img_idx": 1, "file": "ov.png", "img_x_px": 50.0, "img_y_px": 300.0,
+                   "rotation_deg": 10.0, "scale": 1.5}),
+            json!({"img_idx": 1, "file": "ov2.png", "img_x_px": 50.0, "img_y_px": 320.0}),
+        ];
+        let out = remap_text_info(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        assert_eq!(out.kept.len(), 2, "{:?}", out.deleted);
+        approx(&out.kept[0]["rotation_deg"], 100.0);
+        approx(&out.kept[1]["rotation_deg"], 90.0);
+        approx(&out.kept[0]["scale"], 1.5);
+        approx(&out.kept[0]["img_x_px"], 100.0);
+        approx(&out.kept[0]["img_y_px"], 50.0);
+    }
+
+    #[test]
+    fn a_stored_angle_wraps_instead_of_accumulating_past_a_full_turn() {
+        // These operations COMPOSE: without wrapping, four quarter-turn crops
+        // would store a full turn where zero means the same thing, and the value
+        // is surfaced to the user as a degree readout.
+        let geo = crop_cw90_left_half();
+        let manifest = json!({
+            "pages": [{"img_idx": 1, "tree": [
+                // 3.0 rad + pi/2 = 4.571, past pi: wraps into [-pi, pi).
+                {"uid": "a", "name": "A", "kind": "raster", "z": 0, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 50.0, "cy": 300.0, "rotation": 3.0, "scale": 1.0}}
+            ]}]
+        });
+        let out = remap_layers_manifest(&manifest, &crop_map(), PageGeometry::Crop(&geo), "ch1")
+            .expect("remaps");
+        let stored = read_f64(&out.manifest["pages"][0]["tree"][0]["transform"]["rotation"])
+            .expect("a number");
+        approx(
+            &out.manifest["pages"][0]["tree"][0]["transform"]["rotation"],
+            3.0 + std::f64::consts::FRAC_PI_2 - std::f64::consts::TAU,
+        );
+        assert!(
+            (-std::f64::consts::PI..std::f64::consts::PI).contains(&stored),
+            "radians must land in [-pi, pi), got {stored}"
+        );
+
+        // Degrees follow the SAME convention as the typing tab's own
+        // `normalize_angle_deg`: [-180, 180).
+        let entries = vec![json!({
+            "img_idx": 1, "file": "ov.png", "img_x_px": 50.0, "img_y_px": 300.0,
+            "rotation_deg": 100.0
+        })];
+        let out = remap_text_info(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        // 100 + 90 = 190 -> -170, not 190.
+        approx(&out.kept[0]["rotation_deg"], -170.0);
+    }
+
+    #[test]
+    fn a_non_rotating_placement_still_leaves_every_stored_angle_alone() {
+        // The pixel-identity guarantee of a stitch and a split: adding a zero
+        // angle must not even rewrite the field.
+        let geo = split_in_half();
+        let manifest = json!({
+            "schema_version": 4,
+            "pages": [{"img_idx": 1, "tree": [
+                {"uid": "a", "name": "A", "kind": "raster", "z": 0, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 50.0, "cy": 50.0, "rotation": 0.25, "scale": 1.0}},
+                {"uid": "b", "name": "B", "kind": "raster", "z": 1, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 50.0, "cy": 60.0, "scale": 1.0}}
+            ]}]
+        });
+        let out = remap_layers_manifest(&manifest, &split_map(), PageGeometry::Split(&geo), "ch1")
+            .expect("remaps");
+        let tree = out.manifest["pages"][0]["tree"].as_array().expect("tree");
+        assert_eq!(tree[0]["transform"]["rotation"], json!(0.25));
+        assert!(
+            tree[1]["transform"].get("rotation").is_none(),
+            "a zero page angle must not invent a stored angle"
+        );
+    }
+
+    #[test]
+    fn crop_drops_a_layer_outside_the_frame_and_orphans_only_its_own_png() {
+        let geo = crop_left_column();
+        let manifest = json!({
+            "schema_version": 4,
+            "pages": [{"img_idx": 1,
+                "groups": [{"uid": "g1", "name": "G", "visible": true, "opacity": 1.0}],
+                "tree": [
+                    // Inside the kept 40 px column.
+                    {"uid": "in", "name": "I", "kind": "raster", "z": 0, "visible": true,
+                     "opacity": 1.0, "group_uid": "g1", "base_file": "ps_p0001_in.png",
+                     "image_size": [20, 20],
+                     "transform": {"cx": 20.0, "cy": 100.0, "rotation": 0.0, "scale": 1.0}},
+                    // Entirely to the right of it.
+                    {"uid": "out", "name": "O", "kind": "raster", "z": 1, "visible": true,
+                     "opacity": 1.0, "base_file": "ps_p0001_out.png",
+                     "image_size": [20, 20],
+                     "transform": {"cx": 80.0, "cy": 100.0, "rotation": 0.0, "scale": 1.0}}
+                ]}]
+        });
+        let sizes = std::collections::BTreeMap::new();
+        let (routing, warnings) = crop_layer_routing(Some(&manifest), &sizes, &geo);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!routing.is_dropped_node("in"));
+        assert!(routing.is_dropped_node("out"));
+        assert!(routing.is_dropped_file("ps_p0001_out.png"));
+        assert!(!routing.is_dropped_file("ps_p0001_in.png"));
+
+        let geo = geo.with_routing("ch1", routing);
+        let mut out =
+            remap_layers_manifest(&manifest, &crop_map(), PageGeometry::Crop(&geo), "ch1")
+                .expect("remaps");
+        assert!(out.changed);
+        let pages = out.manifest["pages"].as_array().expect("pages");
+        // ONE entry: the page survives, only records were dropped.
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0]["img_idx"], json!(1));
+        let tree = pages[0]["tree"].as_array().expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0]["uid"], json!("in"));
+        // The band axis is re-ranked densely after the drop.
+        assert_eq!(tree[0]["z"], json!(0));
+        // The group keeps its only surviving member.
+        assert_eq!(pages[0]["groups"][0]["uid"], json!("g1"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("entirely outside the kept region")),
+            "the drop must be reported: {:?}",
+            out.warnings
+        );
+        // Same archive as a deleted split part: the dropped record's metadata
+        // survives in the trash, not only its PNG.
+        assert_eq!(out.deleted_pages.len(), 1, "{:?}", out.deleted_pages);
+        let archived = &out.deleted_pages[0];
+        assert_eq!(archived["img_idx"], json!(1));
+        let uids: Vec<&str> = archived["tree"]
+            .as_array()
+            .expect("tree")
+            .iter()
+            .filter_map(|rec| rec["uid"].as_str())
+            .collect();
+        assert_eq!(uids, vec!["out"], "{archived:?}");
+        approx(&archived["tree"][0]["transform"]["cx"], 80.0);
+        // The dropped record claimed no group, so none is carried over.
+        assert!(archived.get("groups").is_none(), "{archived:?}");
+        out.warnings.clear();
+    }
+
+    #[test]
+    fn a_crop_that_removes_nothing_writes_no_layer_archive() {
+        // The archive must stay empty when the frame kept every record, so a
+        // manual recovery never has to guess whether a file means anything.
+        let geo = crop_left_column();
+        let manifest = json!({
+            "pages": [{"img_idx": 1, "tree": [
+                {"uid": "in", "name": "I", "kind": "raster", "z": 0, "visible": true,
+                 "opacity": 1.0, "image_size": [20, 20],
+                 "transform": {"cx": 20.0, "cy": 100.0, "rotation": 0.0, "scale": 1.0}}
+            ]}]
+        });
+        let sizes = std::collections::BTreeMap::new();
+        let (routing, _) = crop_layer_routing(Some(&manifest), &sizes, &geo);
+        let geo = geo.with_routing("ch1", routing);
+        let out = remap_layers_manifest(&manifest, &crop_map(), PageGeometry::Crop(&geo), "ch1")
+            .expect("remaps");
+        assert!(out.deleted_pages.is_empty(), "{:?}", out.deleted_pages);
+    }
+
+    #[test]
+    fn crop_keeps_a_layer_it_cannot_measure_and_says_so() {
+        let geo = crop_left_column();
+        let manifest = json!({
+            "pages": [{"img_idx": 1, "tree": [
+                // No transform and no mesh: nothing to judge, so it stays.
+                {"uid": "blind", "name": "B", "kind": "raster", "z": 0,
+                 "visible": true, "opacity": 1.0},
+                // A TEXT node whose render could not be probed: judged by its
+                // centre point instead of by area, with a warning.
+                {"uid": "text", "name": "T", "kind": "text", "z": 1,
+                 "visible": true, "opacity": 1.0,
+                 "rendered_file": "ps_p0001_text.png",
+                 "transform": {"cx": 20.0, "cy": 100.0, "rotation": 0.0, "scale": 1.0}}
+            ]}]
+        });
+        let sizes = std::collections::BTreeMap::new();
+        let (routing, warnings) = crop_layer_routing(Some(&manifest), &sizes, &geo);
+        assert!(!routing.is_dropped_node("blind"));
+        assert!(!routing.is_dropped_node("text"));
+        assert!(
+            warnings.iter().any(|w| w.contains("no transform")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("centre point")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn crop_archives_a_text_info_entry_outside_the_frame_with_its_png() {
+        let geo = crop_left_column();
+        let entries = vec![
+            json!({"img_idx": 1, "file": "in.png", "img_x_px": 20.0, "img_y_px": 100.0}),
+            json!({"img_idx": 1, "file": "out.png", "img_x_px": 80.0, "img_y_px": 100.0}),
+        ];
+        let out = remap_text_info(&entries, &crop_map(), PageGeometry::Crop(&geo))
+            .expect("remaps");
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.kept[0]["file"], json!("in.png"));
+        assert_eq!(out.deleted.len(), 1);
+        assert_eq!(out.deleted[0]["file"], json!("out.png"));
+        assert_eq!(out.deleted_files, vec!["out.png".to_string()]);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("entirely outside")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn crop_detection_maps_blocks_exactly_under_a_quarter_turn() {
+        let geo = crop_cw90_left_half();
+        let document = json!({
+            "page_idx": 1,
+            "source_size": [100, 400],
+            "mask_size": [100, 400],
+            // In the page's BOTTOM half, which the turn moves into the kept
+            // LEFT half of the canvas.
+            "blocks": [
+                {"x1": 10.0, "y1": 300.0, "x2": 30.0, "y2": 340.0, "text": "kept"},
+                {"x1": 10.0, "y1": 20.0, "x2": 30.0, "y2": 60.0, "text": "gone"}
+            ],
+            "mask_file": "00001_mask.png"
+        });
+        assert!(detection_rect_blocker(&document, 1).is_none());
+        let (out, dropped) =
+            crop_detection_blocks(&document, &geo, 1, Some("00001_mask.png")).expect("maps");
+        assert_eq!(dropped, 1);
+        let blocks = out["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], json!("kept"));
+        // (x, y) -> (400 - y, x): the rectangle stays an exact rectangle.
+        approx(&blocks[0]["x1"], 60.0);
+        approx(&blocks[0]["y1"], 10.0);
+        approx(&blocks[0]["x2"], 100.0);
+        approx(&blocks[0]["y2"], 30.0);
+        assert_eq!(out["source_size"], json!([200, 100]));
+        assert_eq!(out["mask_size"], json!([200, 100]));
+        assert_eq!(out["page_idx"], json!(1));
     }
 }

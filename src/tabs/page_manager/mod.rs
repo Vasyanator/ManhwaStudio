@@ -30,6 +30,8 @@ per frame.
 
 mod dialogs;
 mod clean;
+mod crop;
+mod crop_layout;
 mod grid;
 mod split;
 mod split_layout;

@@ -4,7 +4,8 @@ File: page_ops/mod.rs
 Purpose:
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: reordering,
 inserting (from files or generated blank pages), deleting, stitching several
-pages into one and splitting one page into several.
+pages into one, splitting one page into several, and rotating + cropping one
+page in place.
 
 Main responsibilities:
 - define the `PageOpKind` request model shared by the page-manager tab and the app;
@@ -17,6 +18,9 @@ Key structures:
 - PageOpKind: one structural operation, indices in the CURRENT page order.
 - StitchPlacement: one source page's affine placement inside a stitched canvas.
 - SplitAxis: orientation of the parallel cut lines of a split.
+- PageRotation / RotatedPage: the page-rotation model (quarter turns + a fine
+  straightening angle) with its canvas size and point mappings, shared with the
+  page-manager UI so both sides use one set of formulas.
 - PageOpOutcome: old->new index mapping produced by a successful operation.
 - PageOpError: typed failure of planning or execution.
 
@@ -32,6 +36,11 @@ overlay autosave pause) before executing an operation, and must reload the
 project afterwards. Must never run on the GUI thread.
 */
 
+// Exposed as a MODULE rather than through item re-exports: the page-manager UI
+// imports it directly (`crate::page_ops::crop_geometry::…`) so that a rotation
+// preview uses the engine's own canvas size, point mappings and crop legality
+// rule instead of a second copy of the formulas.
+pub(crate) mod crop_geometry;
 mod fs_exec;
 mod json_remap;
 mod plan;
@@ -39,6 +48,10 @@ mod plan;
 // The stitch UI pre-validates a layout before it can request the operation. It
 // must use the engine's own bounds, not a second copy of the numbers.
 pub(crate) use plan::{STITCH_MAX_SCALE, STITCH_MAX_SIDE_PX, STITCH_MAX_TOTAL_PX};
+// Same rule for a page ROTATION: its canvas size, its point mappings and the
+// legality of a crop rectangle are the engine's formulas, and a UI preview
+// imports them instead of restating them.
+pub(crate) use crop_geometry::MAX_FINE_ANGLE_DEG;
 
 use std::path::PathBuf;
 
@@ -50,15 +63,19 @@ use std::path::PathBuf;
 ///
 /// ```text
 /// map_point(x, y) = ((x - crop.x) * scale + dx, (y - crop.y) * scale + dy)
-/// map_len(l)      = l * scale
+/// map_extent(m)   = m * scale
 /// placed size     = (round(crop.w * scale), round(crop.h * scale))
 /// ```
 ///
 /// `crop` is `[x, y, w, h]` in the source page's own pixels and must lie inside
 /// that page; `scale` is uniform and must be in `(0, 16]`; `dx`/`dy` are the
 /// top-left of the placed image inside the new canvas, and the whole placed
-/// rectangle must lie inside it. Rotation is deliberately not supported: it
-/// would rotate the page-normalized artifacts of every other category with it.
+/// rectangle must lie inside it. A STITCH placement never rotates: merging N
+/// pages onto one canvas has no rotation to express, so the request type
+/// carries none and the engine builds it with [`PageRotation::IDENTITY`]. The
+/// affine itself is rotation-capable — a rotating placement first maps the page
+/// through a [`RotatedPage`], and its `crop` is then read in that rotated
+/// canvas' pixels rather than the page's own.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StitchPlacement {
     /// Index of the source page in the CURRENT page order.
@@ -155,6 +172,47 @@ pub enum PageOpKind {
         /// into a page. Same length as `order`; at least one part must survive
         /// (deleting every part is a `Delete` of the page and is refused).
         deleted: Vec<bool>,
+    },
+    /// Rotate ONE page and replace it with a rectangular region of the
+    /// rotated result. The page COUNT is unchanged and `old_to_new` is the
+    /// identity: only this page's size and content change.
+    ///
+    /// The rotation is applied FIRST, producing a ROTATED CANVAS which is the
+    /// axis-aligned bounding box of the rotated page with the page centred in
+    /// it; `rect` then selects the kept region of that canvas. Every
+    /// page-sized raster (clean overlay, typing mask, trustworthy detection
+    /// mask) is rotated and cropped identically, and every page-keyed document
+    /// has its geometry mapped through the same transform.
+    ///
+    /// EXACTNESS: with `angle_deg == 0.0` the operation is bit-exact — a
+    /// quarter turn is an integer pixel permutation and the crop copies pixels
+    /// unchanged, so no resampling happens anywhere. A non-zero `angle_deg`
+    /// resamples, and additionally DEGRADES two things that cannot represent a
+    /// rotated rectangle: the axis-aligned rects stored by bubbles
+    /// (`rect_coords`, `text_areas`) become the bounding box of the rotated
+    /// rect, and detection documents are moved to the trash with a warning
+    /// rather than remapped wrongly (they are regenerable). Both degradations
+    /// are reported as runtime warnings.
+    ///
+    /// CONTENT OUTSIDE THE FRAME: an entry that still overlaps the kept region
+    /// survives and may hang off the new page's edge, exactly as a layer
+    /// crossed by a split cut does. An entry lying ENTIRELY outside the kept
+    /// region is archived the way [`PageOpKind::Delete`] archives a page's
+    /// entries, never silently dropped. The source page's files are moved into
+    /// the chapter-local trash, so the operation is manually recoverable.
+    Crop {
+        /// Current index of the page to crop.
+        page_idx: usize,
+        /// Clockwise 90-degree steps applied before the fine angle; `0..=3`.
+        quarter_turns: u8,
+        /// Fine straightening angle in DEGREES, clockwise-positive, applied
+        /// about the centre of the quarter-turned page. Must lie strictly
+        /// inside `(-45.0, 45.0)`; a larger rotation belongs in
+        /// `quarter_turns`.
+        angle_deg: f64,
+        /// Kept region `[x, y, w, h]` in the ROTATED CANVAS's pixel space.
+        /// Must be fully inside the canvas with `w >= 1` and `h >= 1`.
+        rect: [u32; 4],
     },
     /// Merge >= 2 pages into ONE page that takes the position of the lowest
     /// source index (`primary = min(page_idx)`); the other sources disappear
