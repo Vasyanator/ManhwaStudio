@@ -126,10 +126,16 @@ pub enum PageOpKind {
     /// top/left part), so its geometry may legitimately hang off the new page's
     /// edge. A bubble goes to the part containing its anchor point.
     ///
-    /// The part the user ordered FIRST takes the source page's index; every
-    /// page after it shifts up by `cuts.len()`. The source page's files are
-    /// moved into the chapter-local trash, so the operation is manually
-    /// recoverable.
+    /// A part may also be DELETED instead of becoming a page (`deleted[k]`):
+    /// its pixels are never written and every entry routed to it (bubbles,
+    /// layers, layer PNGs, detection blocks, `text_info` overlays) is archived
+    /// or trashed exactly as it would be by [`PageOpKind::Delete`] — never
+    /// relocated onto a surviving part.
+    ///
+    /// The surviving part the user ordered FIRST takes the source page's index;
+    /// every page after it shifts up by `kept - 1`, where `kept` is the number
+    /// of parts not deleted. The source page's files are moved into the
+    /// chapter-local trash, so the operation is manually recoverable.
     Split {
         /// Current index of the page to cut.
         page_idx: usize,
@@ -138,10 +144,17 @@ pub enum PageOpKind {
         /// Cut positions in SOURCE pixels along the cut axis: strictly
         /// increasing, strictly inside the page, every part at least 1 px.
         cuts: Vec<u32>,
-        /// `order[k]` is the position in the new page order of GEOMETRIC part
-        /// `k` (`k == 0` is the topmost / leftmost part). A permutation of
-        /// `0..cuts.len() + 1`.
+        /// `order[k]` is the position of GEOMETRIC part `k` (`k == 0` is the
+        /// topmost / leftmost part) among ALL parts, deleted ones included: a
+        /// permutation of `0..cuts.len() + 1`. Deleted parts keep a position so
+        /// that the relative order of the survivors is read off directly; the
+        /// engine compacts the surviving positions into consecutive page
+        /// indices.
         order: Vec<usize>,
+        /// `deleted[k] == true` drops geometric part `k` instead of turning it
+        /// into a page. Same length as `order`; at least one part must survive
+        /// (deleting every part is a `Delete` of the page and is refused).
+        deleted: Vec<bool>,
     },
     /// Merge >= 2 pages into ONE page that takes the position of the lowest
     /// source index (`primary = min(page_idx)`); the other sources disappear
@@ -224,8 +237,9 @@ pub enum PageOpError {
 ///   unsupported insert extension, deleting every page, un-migrated legacy
 ///   documents, stale page list, a stitch whose crops/placements fall outside
 ///   their page or canvas or whose merged pages share a layer uid, a split
-///   whose cuts are not strictly increasing inside the page or whose `order` is
-///   not a permutation of its parts).
+///   whose cuts are not strictly increasing inside the page, whose `order` is
+///   not a permutation of its parts, whose `deleted` has the wrong length or
+///   which deletes every part).
 /// - [`PageOpError::Image`] — an inserted file is not a readable image, a
 ///   blank page failed to encode, or a stitched/split source page could not be
 ///   decoded, cropped or composed.

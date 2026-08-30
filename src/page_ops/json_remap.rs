@@ -17,7 +17,7 @@ Key functions:
   entry per part.
 - split_layer_routing(): which layer node / layer PNG of the split page belongs
   to which part (the exact-area rule); refuses one PNG claimed by records of
-  different parts.
+  different surviving parts, and reports the PNGs claimed only by deleted ones.
 - remap_detection_blocks(): `mask_file` default-name rewrite for one page.
 - detection_merge_blocker() / detection_split_blocker(): the all-or-nothing
   trust gates a page's detection document must pass before it is remapped.
@@ -35,7 +35,9 @@ purely index-keyed — a page keeps its own coordinate space. A `Stitch` maps a
 merged page's geometry through that page's `PlacementMap`; a `Split` first
 ROUTES each entry to one part (bubbles by their anchor, layers by the exact
 area of their footprint, detector blocks by the area of their rectangle) and
-then maps it through that part's `PlacementMap`. This file is the only place
+then maps it through that part's `PlacementMap`. An entry routed to a part the
+request DELETED is archived exactly as an entry of a deleted PAGE would be,
+never re-homed on a surviving part. This file is the only place
 those affines touch JSON. Three on-disk coordinate spaces must never be
 confused:
 - page-normalized uv (bubble `img_u`/`img_v`, `rect_coords`, `text_areas`,
@@ -303,6 +305,20 @@ pub(crate) fn remap_bubbles(
                         geo.part_for_uv_point(u, v)
                     },
                 );
+                // A bubble anchored in a DELETED part is archived exactly like a
+                // bubble of a deleted page, not moved to a neighbouring part:
+                // the user asked for that content to go away.
+                if let (Some(geo), Some(part)) = (geometry.split(), split_part)
+                    && geo.is_deleted_part(part)
+                {
+                    warnings.push(format!(
+                        "bubble entry #{pos} is anchored in deleted split part {part}; \
+                         archived in the trash instead of being moved to another part"
+                    ));
+                    deleted.push(entry.clone());
+                    changed = true;
+                    continue;
+                }
                 let new_idx = match (geometry.split(), split_part) {
                     (Some(geo), Some(part)) => geo.part_new_idx(part).ok_or_else(|| {
                         PageOpError::InvalidOp(format!(
@@ -496,6 +512,18 @@ fn remap_split_crop_fields(
         [u - 0.05, v - 0.05, u + 0.05, v + 0.05]
     });
     let part = geo.part_for_uv_rect(effective);
+    if geo.is_deleted_part(part) {
+        // The cropped region was deleted with its part. Drop the crop link,
+        // exactly as `remap_crop_fields` does for a deleted page: keeping the
+        // stale index would show a crop of an unrelated page.
+        obj.remove("crop_page_idx");
+        obj.remove("crop_rect");
+        warnings.push(format!(
+            "bubble entry #{entry_pos} cropped deleted split part {part} of page \
+             {crop_idx}; its crop link was removed"
+        ));
+        return (true, warnings);
+    }
     let (Some(placement), Some(new_idx)) = (geo.placement(part), geo.part_new_idx(part)) else {
         warnings.push(format!(
             "bubble entry #{entry_pos} crop page {crop_idx} has no split part {part}; \
@@ -665,6 +693,26 @@ pub(crate) fn remap_text_info(
                     .split()
                     .filter(|geo| geo.source_old_idx() == old_idx)
                     .map(|geo| (geo, text_info_part(obj, geo)));
+                // An overlay on a DELETED part follows the deleted-page arm
+                // above: archived, with its PNG (and `*_layout.png` companion)
+                // recorded for trashing — never re-homed on a surviving part.
+                if let Some((geo, part)) = split
+                    && geo.is_deleted_part(part)
+                {
+                    if let Some(file) = obj.get("file").and_then(Value::as_str) {
+                        let trimmed = file.trim();
+                        if !trimmed.is_empty() {
+                            deleted_files.push(trimmed.to_string());
+                        }
+                    }
+                    warnings.push(format!(
+                        "text_info entry #{pos} sits on deleted split part {part}; archived \
+                         in the trash instead of being moved to another part"
+                    ));
+                    deleted.push(entry.clone());
+                    changed = true;
+                    continue;
+                }
                 let (new_idx, placement) = match split {
                     Some((geo, part)) => {
                         let target = geo.part_new_idx(part).ok_or_else(|| {
@@ -750,6 +798,12 @@ fn apply_text_info_geometry(obj: &mut Map<String, Value>, placement: &PlacementM
 /// (summed over the mesh's grid CELLS, which stays correct for a folded mesh);
 /// without one only the centre point is known, because this document does not
 /// record the overlay's extent at all.
+///
+/// The centre-of-page default is a real POSITION, not an absence of evidence:
+/// the loader draws such an entry at the page centre, so it belongs to the part
+/// covering that point even when the request deletes it. This is deliberately
+/// unlike `assign_layer_part`'s no-placement case, which has no position at all
+/// and must fall back to a surviving part.
 fn text_info_part(obj: &Map<String, Value>, geo: &SplitGeometry) -> usize {
     let [page_w, page_h] = geo.page_size();
     if let Some(mesh) = obj.get("deform_mesh")
@@ -975,7 +1029,12 @@ pub(crate) fn remap_layers_manifest(
                 if let Some(geo) = geometry.split()
                     && geo.source_old_idx() == old_idx
                 {
-                    kept.extend(split_page_layers(&new_page, geo, split_routing)?);
+                    kept.extend(split_page_layers(
+                        &new_page,
+                        geo,
+                        split_routing,
+                        &mut warnings,
+                    )?);
                     changed = true;
                     continue;
                 }
@@ -1208,10 +1267,15 @@ fn merge_stitched_pages(
 /// [`remap_layers_manifest`] runs later over the same document and reports the
 /// structural problem with full context.
 ///
+/// A record IS routed to a deleted part, so that [`split_page_layers`] can tell
+/// it apart from an unroutable record and drop it with that part; the PNGs only
+/// such records reference are reported as deleted files, for `plan_layer_pngs`
+/// to trash.
+///
 /// # Errors
 /// [`PageOpError::InvalidOp`] when ONE layer PNG of the cut page is referenced
-/// by records that route to DIFFERENT parts. The file can only move to one
-/// `ps_p{page:04}_` prefix, so any other answer would leave a record pointing
+/// by records that route to DIFFERENT SURVIVING parts. The file can only move
+/// to one `ps_p{page:04}_` prefix, so any other answer would leave a record pointing
 /// at a PNG owned by another page — and `persist.rs::prune_orphan_pngs` prunes
 /// by that prefix, so a later save of the owning page would delete a PNG the
 /// other page still references. There are no shared-file semantics to fall
@@ -1226,8 +1290,11 @@ pub(crate) fn split_layer_routing(
         std::collections::HashMap::new();
     let mut file_new_idx: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    // Which geometric part first claimed each file, so a second claim from a
-    // different part can be refused instead of silently overwriting.
+    // PNGs whose only claimants sit on deleted parts; a later surviving claim
+    // removes a name from here, because that record still needs the pixels.
+    let mut deleted_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Which SURVIVING geometric part first claimed each file, so a second claim
+    // from a different one can be refused instead of silently overwriting.
     let mut file_part: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut warnings = Vec::new();
@@ -1246,7 +1313,10 @@ pub(crate) fn split_layer_routing(
                 == Some(geo.source_old_idx())
         });
     let Some(page) = page else {
-        return Ok((SplitTreeRouting::new(node_part, file_new_idx), warnings));
+        return Ok((
+            SplitTreeRouting::new(node_part, file_new_idx, deleted_files),
+            warnings,
+        ));
     };
 
     for rec in page
@@ -1257,17 +1327,36 @@ pub(crate) fn split_layer_routing(
         .filter_map(Value::as_object)
     {
         let part = assign_layer_part(rec, layer_png_sizes, geo, &mut warnings);
-        let Some(new_idx) = geo.part_new_idx(part) else {
-            continue;
-        };
+        // Routed FIRST, deleted parts included: a node must be distinguishable
+        // from an unroutable one, which follows the first surviving part
+        // instead of being dropped.
         if let Some(uid) = rec.get("uid").and_then(Value::as_str) {
             node_part.insert(uid.to_string(), part);
         } else {
             warnings.push(
-                "a layer record of the split page has no uid; it follows the first part"
+                "a layer record of the split page has no uid; it follows the first \
+                 surviving part"
                     .to_string(),
             );
         }
+        let Some(new_idx) = geo.part_new_idx(part) else {
+            // The part was DELETED: the record vanishes with it (its bucket is
+            // discarded by `split_page_layers`) and the PNGs only it references
+            // become deletion candidates. They are trashed rather than renamed
+            // onto a surviving part, unless a surviving record claims the same
+            // file below.
+            for key in ["base_file", "rendered_file"] {
+                let Some(name) = rec.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if super::plan::parse_layers_png_page_idx(name) == Some(geo.source_old_idx())
+                    && !file_new_idx.contains_key(name)
+                {
+                    deleted_files.insert(name.to_string());
+                }
+            }
+            continue;
+        };
         // Only the CUT page's own PNGs fan out; a cross-page reference keeps
         // following the ordinary index map.
         for key in ["base_file", "rendered_file"] {
@@ -1286,10 +1375,16 @@ pub(crate) fn split_layer_routing(
                     )));
                 }
                 file_new_idx.insert(name.to_string(), new_idx);
+                // A surviving record needs the pixels, so it outranks any claim
+                // an earlier deleted record made on the same file.
+                deleted_files.remove(name);
             }
         }
     }
-    Ok((SplitTreeRouting::new(node_part, file_new_idx), warnings))
+    Ok((
+        SplitTreeRouting::new(node_part, file_new_idx, deleted_files),
+        warnings,
+    ))
 }
 
 /// Geometric part ONE layer record belongs to, by the exact-area rule.
@@ -1306,7 +1401,11 @@ pub(crate) fn split_layer_routing(
 ///    missing render). That is a documented degradation of the stated rule, so
 ///    it always pushes a warning.
 ///
-/// A record with no placement at all falls back to the first (top/left) part.
+/// A record with NO placement evidence at all (neither a mesh nor a transform)
+/// cannot be routed geometrically, so it falls back to the first SURVIVING part
+/// — never to the literal part 0, which the request may have deleted. Dropping
+/// such a record would destroy user data as a side effect of a fallback, not
+/// because the geometry said so.
 fn assign_layer_part(
     rec: &Map<String, Value>,
     layer_png_sizes: &std::collections::BTreeMap<String, [u32; 2]>,
@@ -1326,9 +1425,11 @@ fn assign_layer_part(
     let Some(transform) = rec.get("transform").and_then(Value::as_object) else {
         warnings.push(format!(
             "layer '{name}' of the split page has no transform and no deform mesh; it \
-             follows the first part"
+             follows the first surviving part"
         ));
-        return 0;
+        // Not a literal 0: part 0 may be DELETED, and a record the engine could
+        // not route must never be destroyed by that fallback.
+        return geo.first_kept_part();
     };
     let cx = get_f64(transform, "cx").unwrap_or(0.0);
     let cy = get_f64(transform, "cy").unwrap_or(0.0);
@@ -1418,13 +1519,17 @@ fn layer_world_quad(
 /// `layer_idx` is deliberately NOT re-based: the parts are different pages, so
 /// their «Группа текста N» axes are distinct without any offset.
 ///
+/// A part the request DELETED yields no entry at all: its records are dropped
+/// with it and reported in `warnings`, never re-homed on a surviving part.
+///
 /// # Errors
-/// [`PageOpError::Json`] when a part has no placement or no index in the new
-/// order (an internally inconsistent geometry).
+/// [`PageOpError::Json`] when a SURVIVING part has no placement or no index in
+/// the new order (an internally inconsistent geometry).
 fn split_page_layers(
     page: &Map<String, Value>,
     geo: &SplitGeometry,
     routing: Option<&SplitTreeRouting>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<Value>, PageOpError> {
     let mut per_part: Vec<Vec<Value>> = vec![Vec::new(); geo.part_count()];
     for rec in page
@@ -1439,8 +1544,10 @@ fn split_page_layers(
             .and_then(Value::as_str)
             .and_then(|uid| routing.and_then(|routing| routing.node_part(uid)))
             // An unrouted node (no uid, or a manifest the routing pass could
-            // not read) follows the first part; the routing pass warned.
-            .unwrap_or(0);
+            // not read) follows the first SURVIVING part; the routing pass
+            // warned. It must not default to part 0, which may be deleted —
+            // the record would then vanish without the user asking for it.
+            .unwrap_or_else(|| geo.first_kept_part());
         if let Some(sink) = per_part.get_mut(part) {
             sink.push(rec.clone());
         }
@@ -1451,6 +1558,17 @@ fn split_page_layers(
     let mut out = Vec::with_capacity(geo.part_count());
     for (part, tree) in per_part.into_iter().enumerate() {
         if tree.is_empty() {
+            continue;
+        }
+        // A deleted part produces no manifest entry: its records are dropped
+        // together with the page they would have described, never moved onto a
+        // surviving part. Their PNGs are trashed by `plan_layer_pngs` via the
+        // routing's deleted-file set.
+        if geo.is_deleted_part(part) {
+            warnings.push(format!(
+                "{} layer record(s) of deleted split part {part} were discarded with it",
+                tree.len()
+            ));
             continue;
         }
         let (Some(placement), Some(new_idx)) = (geo.placement(part), geo.part_new_idx(part))
@@ -1570,7 +1688,10 @@ fn remap_layer_rec_files(
         };
         // A split's PNGs of the cut page fan out onto SEVERAL prefixes, so the
         // routing (keyed by file name) wins over the index map, which can only
-        // name the representative part.
+        // name the representative part. A PNG of a DELETED part has no routing
+        // entry and falls back to the index map here, but the record carrying
+        // it is dropped by `split_page_layers` right after, so that name never
+        // reaches disk.
         let new_idx = split.and_then(|routing| routing.file_new_idx(name)).or_else(|| {
             if file_idx >= old_to_new.len() {
                 return None;
@@ -2378,12 +2499,37 @@ mod tests {
     /// Page 1 of 3, a 100x400 page cut in half horizontally, parts in order:
     /// the top part keeps index 1, the bottom one takes index 2.
     fn split_in_half() -> SplitGeometry {
-        SplitGeometry::for_tests(1, SplitAxis::Horizontal, [100, 400], &[200], &[0, 1])
+        SplitGeometry::for_tests(
+            1,
+            SplitAxis::Horizontal,
+            [100, 400],
+            &[200],
+            &[0, 1],
+            &[false, false],
+        )
     }
 
     /// Old -> new index map of [`split_in_half`]: page 2 shifts up by one.
     fn split_map() -> Vec<Option<usize>> {
         vec![Some(0), Some(1), Some(3)]
+    }
+
+    /// [`split_in_half`] with the BOTTOM part DELETED: exactly one part
+    /// survives, so the split degenerates into a crop of page 1.
+    fn split_half_bottom_deleted() -> SplitGeometry {
+        SplitGeometry::for_tests(
+            1,
+            SplitAxis::Horizontal,
+            [100, 400],
+            &[200],
+            &[0, 1],
+            &[false, true],
+        )
+    }
+
+    /// Old -> new index map of [`split_half_bottom_deleted`]: nothing shifts.
+    fn split_deleted_map() -> Vec<Option<usize>> {
+        vec![Some(0), Some(1), Some(2)]
     }
 
     #[test]
@@ -2407,7 +2553,10 @@ mod tests {
         let out = remap_bubbles(&entries, &split_map(), PageGeometry::Split(&geometry))
             .expect("remaps");
         assert!(out.changed);
-        assert!(out.deleted.is_empty(), "a split never drops a bubble");
+        assert!(
+            out.deleted.is_empty(),
+            "a split that deletes no part never drops a bubble"
+        );
 
         let bottom = &out.kept[0];
         // Page px y = 0.75 * 400 = 300 -> the bottom part, at index 2.
@@ -2431,6 +2580,52 @@ mod tests {
         // The body rect follows the bubble; the part above the cut maps to a
         // negative v, which is exactly the "hangs off the edge" case.
         assert_eq!(image["rect_coords"]["p1"]["img_v"], json!(-1.0));
+    }
+
+    #[test]
+    fn split_archives_bubbles_of_a_deleted_part_instead_of_moving_them() {
+        let entries = vec![
+            // Anchored at page px y = 300 -> the DELETED bottom part.
+            json!({"id": 1, "img_idx": 1, "img_u": 0.6, "img_v": 0.75, "side": "left"}),
+            // Anchored at page px y = 100 -> the surviving top part.
+            json!({"id": 2, "img_idx": 1, "img_u": 0.6, "img_v": 0.25, "side": "left"}),
+            // A bubble on the untouched page 0 that crops the deleted part.
+            json!({"id": 3, "img_idx": 0, "img_u": 0.5, "img_v": 0.5,
+                   "bubble_class": "image", "image_source_type": "page_crop",
+                   "crop_page_idx": 1, "crop_rect": [0.1, 0.6, 0.9, 0.9]}),
+        ];
+        let geometry = split_half_bottom_deleted();
+        let out = remap_bubbles(&entries, &split_deleted_map(), PageGeometry::Split(&geometry))
+            .expect("remaps");
+        assert!(out.changed);
+        // The bubble of the deleted part is ARCHIVED, never re-anchored onto
+        // the surviving part.
+        assert_eq!(out.deleted.len(), 1);
+        assert_eq!(out.deleted[0]["id"], json!(1));
+        assert!(out.kept.iter().all(|entry| entry["id"] != json!(1)));
+        assert!(
+            out.warnings.iter().any(|w| w.contains("deleted split part")),
+            "the archived bubble must be reported: {:?}",
+            out.warnings
+        );
+
+        let survivor = out
+            .kept
+            .iter()
+            .find(|entry| entry["id"] == json!(2))
+            .expect("the top part's bubble survives");
+        assert_eq!(survivor["img_idx"], json!(1));
+        assert_eq!(survivor["img_v"], json!(0.5));
+
+        // The crop link into the deleted part is dropped, not left pointing at
+        // a stale index.
+        let cropper = out
+            .kept
+            .iter()
+            .find(|entry| entry["id"] == json!(3))
+            .expect("the cropping bubble survives on its own page");
+        assert!(cropper.get("crop_page_idx").is_none());
+        assert!(cropper.get("crop_rect").is_none());
     }
 
     #[test]
@@ -2492,6 +2687,32 @@ mod tests {
         assert_eq!(out.kept[1]["deform_mesh"]["points_px"][0], json!([10.0, 100.0]));
         // Its own centre moved with the part, into negative page space.
         assert_eq!(out.kept[1]["img_y_px"], json!(-190.0));
+    }
+
+    #[test]
+    fn split_archives_text_info_of_a_deleted_part_with_its_overlay_file() {
+        let entries = vec![
+            json!({"img_idx": 1, "file": "gone.png", "img_x_px": 50.0, "img_y_px": 300.0}),
+            json!({"img_idx": 1, "file": "kept.png", "img_x_px": 50.0, "img_y_px": 100.0}),
+        ];
+        let geometry = split_half_bottom_deleted();
+        let out =
+            remap_text_info(&entries, &split_deleted_map(), PageGeometry::Split(&geometry))
+                .expect("remaps");
+        assert!(out.changed);
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.kept[0]["file"], json!("kept.png"));
+        assert_eq!(out.kept[0]["img_idx"], json!(1));
+        // Archived like an entry of a deleted PAGE, and its overlay PNG is
+        // recorded so the plan can trash it instead of orphaning it.
+        assert_eq!(out.deleted.len(), 1);
+        assert_eq!(out.deleted[0]["file"], json!("gone.png"));
+        assert_eq!(out.deleted_files, vec!["gone.png".to_string()]);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("deleted split part")),
+            "the archived overlay must be reported: {:?}",
+            out.warnings
+        );
     }
 
     /// A page-1 manifest whose layers are spread across a 100x400 page.
@@ -2589,11 +2810,63 @@ mod tests {
     }
 
     #[test]
+    fn split_drops_layer_records_of_a_deleted_part_and_marks_their_pngs() {
+        let manifest = split_manifest();
+        let geometry = split_half_bottom_deleted();
+        let (routing, warnings) =
+            split_layer_routing(Some(&manifest), &text_png_sizes(), &geometry)
+                .expect("routes");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The records are still ROUTED to the deleted part — that is what tells
+        // them apart from records the pass could not route at all.
+        assert_eq!(routing.node_part("bottom"), Some(1));
+        assert_eq!(routing.node_part("text"), Some(1));
+        // ...but they get no destination page, and their PNGs are marked for
+        // the trash instead of being renamed onto the surviving part.
+        assert_eq!(routing.file_new_idx("ps_p0001_bottom.png"), None);
+        assert_eq!(routing.file_new_idx("ps_p0001_text.png"), None);
+        assert!(routing.is_deleted_file("ps_p0001_bottom.png"));
+        assert!(routing.is_deleted_file("ps_p0001_text.png"));
+        assert_eq!(routing.file_new_idx("ps_p0001_top.png"), Some(1));
+        assert!(!routing.is_deleted_file("ps_p0001_top.png"));
+
+        let geometry = geometry.with_routing("ch1", routing);
+        let out = remap_layers_manifest(
+            &manifest,
+            &split_deleted_map(),
+            PageGeometry::Split(&geometry),
+            "ch1",
+        )
+        .expect("remaps");
+        assert!(out.changed);
+        let pages = out.manifest["pages"].as_array().expect("pages");
+        assert_eq!(pages.len(), 1, "only the surviving part keeps an entry");
+        assert_eq!(pages[0]["img_idx"], json!(1));
+        let tree = pages[0]["tree"].as_array().expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0]["uid"], json!("top"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("deleted split part 1")),
+            "discarded layer records must be reported: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
     fn split_assigns_layers_by_exact_area_not_by_the_unrotated_footprint() {
         // Unequal parts: 0..300 and 300..400, so a rotation really changes the
         // answer instead of cancelling out.
         let geometry =
-            SplitGeometry::for_tests(1, SplitAxis::Horizontal, [50, 400], &[300], &[0, 1]);
+            SplitGeometry::for_tests(
+                1,
+                SplitAxis::Horizontal,
+                [50, 400],
+                &[300],
+                &[0, 1],
+                &[false, false],
+            );
         let node = |rotation: f64| {
             json!({"pages": [{"img_idx": 1, "tree": [
                 {"uid": "wide", "kind": "raster", "z": 0, "visible": true, "opacity": 1.0,

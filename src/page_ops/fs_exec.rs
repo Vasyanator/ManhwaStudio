@@ -2473,6 +2473,7 @@ mod tests {
             axis: crate::page_ops::SplitAxis::Horizontal,
             cuts: vec![4],
             order: vec![0, 1],
+            deleted: vec![false, false],
         }
     }
 

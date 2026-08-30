@@ -8,12 +8,15 @@ parallel cut lines (all horizontal XOR all vertical), an order picker per
 resulting part, and a confirm that emits `PageOpKind::Split`.
 
 Key structures:
-- SplitDialogState: the dialog's own state (axis, cuts, part order, camera).
+- SplitDialogState: the dialog's own state (axis, cuts, part order and drop
+  mask, camera).
 
 Key functions:
 - PageManagerTabState::draw_split_dialog(): the per-frame window.
 - build_split_op(): state -> the engine request (pure).
 - order_widget_rects(): where every part's order picker is placed (pure).
+- draw_order_widgets(): the per-part picker, including its "Delete" entry.
+- paint_deleted_parts(): the veil over the parts the confirm will discard.
 - dragged_cut_value(): a handle drag delta -> the new cut coordinate (pure).
 - layout_error_message(): SplitLayoutError -> localized user text.
 
@@ -82,8 +85,10 @@ const COORD_LIMIT_PX: f32 = 1.0e8;
 /// re-validated against the current page count on every frame, because
 /// `clamp_selection` may silently drop it after a reload.
 ///
-/// Invariant maintained by every mutation here: `order.len() == cuts.len() + 1`
-/// and `order` is a permutation of `0..order.len()` (see `split_layout`).
+/// Invariant maintained by every mutation here:
+/// `order.len() == deleted.len() == cuts.len() + 1`, and `order` is a
+/// permutation of `0..order.len()` over ALL parts, deleted ones included (see
+/// `split_layout`).
 pub(super) struct SplitDialogState {
     /// Index of the page being cut, in the CURRENT page order.
     page_idx: usize,
@@ -95,6 +100,10 @@ pub(super) struct SplitDialogState {
     cuts: Vec<u32>,
     /// `order[k]` = page position of geometric part `k` (see `split_layout`).
     order: Vec<usize>,
+    /// `deleted[k]` = geometric part `k` is discarded instead of becoming a
+    /// page. Parallel to `order`, which keeps a deleted part's position so that
+    /// un-deleting it restores its own place.
+    deleted: Vec<bool>,
     /// Board camera.
     viewport: PsViewport,
     /// Whether the camera has already been fit to the page.
@@ -115,6 +124,7 @@ impl SplitDialogState {
             axis: SplitAxis::Horizontal,
             cuts: Vec::new(),
             order: split_layout::default_order(1),
+            deleted: split_layout::default_deleted(1),
             viewport: PsViewport::default(),
             camera_fitted: false,
             context_cut: None,
@@ -140,6 +150,7 @@ impl SplitDialogState {
         self.axis = axis;
         self.cuts.clear();
         self.order = split_layout::default_order(1);
+        self.deleted = split_layout::default_deleted(1);
         self.camera_fitted = false;
     }
 }
@@ -425,12 +436,13 @@ fn u32_to_f32(value: u32) -> f32 {
 /// (extent `0`), which is also what keeps the confirm button disabled then.
 fn build_split_op(state: &SplitDialogState) -> Result<PageOpKind, SplitLayoutError> {
     let extent = state.extent();
-    split_layout::validate(extent, &state.cuts, &state.order)?;
+    split_layout::validate(extent, &state.cuts, &state.order, &state.deleted)?;
     Ok(PageOpKind::Split {
         page_idx: state.page_idx,
         axis: state.axis,
         cuts: state.cuts.clone(),
         order: state.order.clone(),
+        deleted: state.deleted.clone(),
     })
 }
 
@@ -463,8 +475,14 @@ fn layout_error_message(error: SplitLayoutError) -> String {
             "page_manager.split_dialog.cuts_not_increasing_error",
             index = index + 1
         ),
-        SplitLayoutError::OrderNotPermutation { .. } => {
+        // Both are the same thing to the user: the dialog's part bookkeeping fell
+        // apart and reopening the window is the only useful advice.
+        SplitLayoutError::OrderNotPermutation { .. }
+        | SplitLayoutError::DeletedLengthMismatch { .. } => {
             t!("page_manager.split_dialog.order_invalid_error").to_string()
+        }
+        SplitLayoutError::AllPartsDeleted => {
+            t!("page_manager.split_dialog.all_parts_deleted_error").to_string()
         }
     }
 }
@@ -610,6 +628,7 @@ impl PageManagerTabState {
         self.handle_split_board_input(ui, state, rect, &response, page_size, &picker_rects);
         let view = state.viewport.transform(rect);
         self.paint_split_page(ui, state, project, rect, &view, page_size);
+        paint_deleted_parts(ui, state, rect, &view, page_size);
         draw_cut_lines(ui, state, rect, &view, page_size);
         draw_order_widgets(ui, state, rect, &view, page_size);
         board_context_menu(state, &response, &view, page_size);
@@ -843,7 +862,12 @@ fn draw_cut_lines(
         }
     }
     for index in to_delete.into_iter().rev() {
-        split_layout::remove_cut(&mut state.cuts, &mut state.order, index);
+        split_layout::remove_cut(
+            &mut state.cuts,
+            &mut state.order,
+            &mut state.deleted,
+            index,
+        );
     }
 }
 
@@ -881,7 +905,16 @@ fn paint_cross(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 }
 
 /// Draws the order picker of every visible part, in its top-right corner, and
-/// applies the swap the user picked.
+/// applies the choice the user made.
+///
+/// Each picker lists one entry per page rank the part could take, followed by a
+/// single "Delete" entry that drops the part instead of turning it into a page.
+/// A rank entry shows the REAL page number that rank produces, so deleting a
+/// part renumbers every picker below it on the next frame.
+///
+/// A DELETED part's list offers one rank more than there are survivors right
+/// now: picking a number un-deletes it, and the ranks it may take are the ranks
+/// of the world that pick creates.
 fn draw_order_widgets(
     ui: &mut egui::Ui,
     state: &mut SplitDialogState,
@@ -891,46 +924,136 @@ fn draw_order_widgets(
 ) {
     let page_idx = state.page_idx;
     // One entry per geometric part; empty while the page is uncut, because one
-    // part is nothing to order yet.
+    // part is nothing to order, and no picker means no way to delete it either.
+    // Two or more parts CAN all be marked over successive frames — nothing here
+    // gates the last survivor's Delete entry, because a picker whose contents
+    // change shape with the state is worse than a refused confirm. That state is
+    // caught by `SplitLayoutError::AllPartsDeleted` in the confirm strip.
     let picker_rects = split_order_widget_rects(state, board, view, page_size);
-    let count = picker_rects.len();
-    if count < 2 {
+    if picker_rects.len() < 2 {
         return;
     }
-    let mut swap: Option<(usize, usize)> = None;
+    let kept = split_layout::kept_count(&state.deleted);
+    let delete_color = ui.visuals().error_fg_color;
+    let mut choice: Option<(usize, split_layout::PartChoice)> = None;
     for (part_index, picker_rect) in picker_rects.iter().enumerate() {
         let Some(rect) = *picker_rect else {
             continue;
         };
-        let Some(mut selected) = state.order.get(part_index).copied() else {
-            continue;
+        let rank = split_layout::survivor_rank(&state.order, &state.deleted, part_index);
+        // A deleted part rejoins the survivors when a number is picked, so it may
+        // take one rank more than the survivors currently occupy.
+        let ranks = if rank.is_some() { kept } else { kept + 1 };
+        let rank_label = |candidate: usize| {
+            tf!(
+                "page_manager.split_dialog.order_item",
+                position = candidate + 1,
+                page = split_layout::page_number_for_position(page_idx, candidate)
+            )
+        };
+        let selected_text = match rank {
+            Some(rank) => egui::RichText::new(rank_label(rank)),
+            None => egui::RichText::new(t!("page_manager.split_dialog.order_delete_item"))
+                .color(delete_color),
         };
         // `new_child` places the picker at an absolute rect WITHOUT advancing the
         // board's cursor (`Ui::place` does the same internally, but only accepts a
-        // `Widget`, which `WheelComboBox::show_index` is not).
+        // `Widget`, which the combo box is not).
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        // Item `i` is "take page position i", whose resulting page number does
-        // not depend on the current order — so the same caption serves both the
-        // list and the selected text (which is item `order[part]`).
-        let response = WheelComboBox::from_id_salt(("page_manager_split_order", part_index))
+        let mut picked: Option<split_layout::PartChoice> = None;
+        // Built from `show_ui_with_wheel` rather than `show_index` ON PURPOSE:
+        // `show_index` cycles the WHOLE list on a wheel notch — even over a CLOSED
+        // picker, and `cycle_wrapped_index` WRAPS — so one stray notch past the
+        // last rank would land on "Delete" and discard a part's content without a
+        // click. Here the list and the wheel are separate: the wheel branch below
+        // defers to `split_layout::wheel_choice`, which walks the numeric ranks
+        // alone, so Delete is reachable by CLICK only.
+        let picker = WheelComboBox::from_id_salt(("page_manager_split_order", part_index))
             .width(ORDER_WIDGET_WIDTH_POINTS)
-            .show_index(&mut child, &mut selected, count, |i| {
-                tf!(
-                    "page_manager.split_dialog.order_item",
-                    position = i + 1,
-                    page = split_layout::page_number_for_position(page_idx, i)
-                )
+            .selected_text(selected_text)
+            .show_ui_with_wheel(&mut child, |ui| {
+                for candidate in 0..ranks {
+                    if ui
+                        .selectable_label(rank == Some(candidate), rank_label(candidate))
+                        .clicked()
+                    {
+                        picked = Some(split_layout::PartChoice::Rank(candidate));
+                    }
+                }
+                let delete_item =
+                    egui::RichText::new(t!("page_manager.split_dialog.order_delete_item"))
+                        .color(delete_color);
+                if ui.selectable_label(rank.is_none(), delete_item).clicked() {
+                    picked = Some(split_layout::PartChoice::Delete);
+                }
             });
-        if response.changed() {
-            swap = Some((part_index, selected));
+        // The wheel's decision itself lives in `split_layout::wheel_choice`, where
+        // it is unit-tested: it walks the numeric ranks alone and never yields
+        // Delete, and it yields nothing at all over an already deleted part.
+        if let Some(steps) = picker.wheel_steps
+            && let Some(stepped) = split_layout::wheel_choice(rank, kept, steps)
+        {
+            picked = Some(stepped);
+        }
+        if let Some(picked) = picked {
+            choice = Some((part_index, picked));
         }
     }
-    if let Some((part_index, position)) = swap {
-        split_layout::swap_positions(&mut state.order, part_index, position);
+    // Applied after the loop: the ranks every picker was drawn from must stay the
+    // ones the user saw this frame.
+    if let Some((part_index, picked)) = choice {
+        split_layout::apply_choice(&mut state.order, &mut state.deleted, part_index, picked);
+    }
+}
+
+/// Veils every part marked for deletion, so the board shows what the confirm is
+/// about to discard rather than only saying so in the picker.
+///
+/// Theme colors only (`ui.visuals()`): the veil must stay readable in both the
+/// light and the dark theme, and a fixed RGB would invert its meaning in one of
+/// them.
+fn paint_deleted_parts(
+    ui: &egui::Ui,
+    state: &SplitDialogState,
+    board: egui::Rect,
+    view: &ViewTransform,
+    page_size: [u32; 2],
+) {
+    if !state.deleted.iter().any(|gone| *gone) {
+        return;
+    }
+    let painter = ui.painter_at(board);
+    let visuals = ui.visuals();
+    // `gamma_multiply` scales the premultiplied color, so an opaque theme color
+    // becomes a translucent veil of the same hue instead of a flat overlay.
+    let veil = visuals.extreme_bg_color.gamma_multiply(0.72);
+    let edge = visuals.error_fg_color.gamma_multiply(0.85);
+    let axis = state.axis;
+    let parts = split_layout::parts(axis_extent(axis, page_size), &state.cuts);
+    // Cuts are inserted sorted and dragged through `clamp_cut`, so they stay
+    // strictly increasing and `parts` returns exactly one entry per flag; `zip`
+    // stops at the shorter side so even a desynced mask cannot index out of range.
+    for (part, gone) in parts.iter().zip(state.deleted.iter()) {
+        if !*gone {
+            continue;
+        }
+        let screen = view
+            .world_rect_to_screen(part_world_rect(axis, *part, page_size))
+            .intersect(board);
+        if !screen.is_positive() {
+            continue;
+        }
+        painter.rect_filled(screen, egui::CornerRadius::ZERO, veil);
+        painter.rect_stroke(
+            screen,
+            egui::CornerRadius::ZERO,
+            egui::Stroke::new(1.5, edge),
+            egui::StrokeKind::Inside,
+        );
     }
 }
 
@@ -972,7 +1095,13 @@ fn board_context_menu(
         // A refused insert (the click landed on a page edge or on an existing
         // line) is a deliberate no-op: there is nothing to add and nothing the
         // user needs to be told.
-        split_layout::insert_cut(extent, &mut state.cuts, &mut state.order, value);
+        split_layout::insert_cut(
+            extent,
+            &mut state.cuts,
+            &mut state.order,
+            &mut state.deleted,
+            value,
+        );
     }
 }
 
@@ -1002,7 +1131,13 @@ fn draw_split_settings(ui: &mut egui::Ui, state: &mut SplitDialogState) {
         {
             // `suggest_cut` only proposes a coordinate strictly inside a part of
             // at least 2 px, so this insert cannot be refused.
-            split_layout::insert_cut(extent, &mut state.cuts, &mut state.order, value);
+            split_layout::insert_cut(
+                extent,
+                &mut state.cuts,
+                &mut state.order,
+                &mut state.deleted,
+                value,
+            );
         }
     });
     ui.add_space(4.0);
@@ -1014,8 +1149,9 @@ fn draw_split_settings(ui: &mut egui::Ui, state: &mut SplitDialogState) {
     ui.add_space(4.0);
 }
 
-/// Draws the bottom strip: the resulting part count, the validation message, the
-/// "applied immediately" warning, and the confirm / cancel buttons.
+/// Draws the bottom strip: the resulting page count, the validation message, the
+/// discarded-content warning, the "applied immediately" warning, and the
+/// confirm / cancel buttons.
 ///
 /// `preview_failed` disables the confirm and explains why: a split is immediate
 /// and irreversible, so it is never offered over a page the board could not
@@ -1028,7 +1164,13 @@ fn draw_split_actions(
     confirm_clicked: &mut bool,
     close_clicked: &mut bool,
 ) {
-    let validation = split_layout::validate(state.extent(), &state.cuts, &state.order);
+    let validation = split_layout::validate(
+        state.extent(),
+        &state.cuts,
+        &state.order,
+        &state.deleted,
+    );
+    let dropped = state.deleted.iter().filter(|gone| **gone).count();
     ui.add_space(6.0);
     // While the page size is still being probed the extent is 0, which validates
     // as "too small to cut" — a true statement about an unknown page and a
@@ -1038,15 +1180,32 @@ fn draw_split_actions(
     } else {
         match validation {
             Ok(()) => {
+                // The KEPT parts, not the geometric ones: a deleted part becomes
+                // no page, and counting it here would promise a page that will
+                // never exist.
                 ui.label(tf!(
                     "page_manager.split_dialog.parts_label",
-                    count = split_layout::part_count(&state.cuts)
+                    count = split_layout::kept_count(&state.deleted)
                 ));
             }
             Err(error) => {
                 ui.colored_label(ui.visuals().warn_fg_color, layout_error_message(error));
             }
         }
+    }
+    // Deleting user content silently is not acceptable: say what is discarded
+    // before the confirm, not after it.
+    if dropped > 0 {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tf!(
+                    "page_manager.split_dialog.deleted_parts_warning",
+                    count = dropped
+                ))
+                .color(ui.visuals().warn_fg_color),
+            )
+            .wrap(),
+        );
     }
     if preview_failed {
         ui.add(
@@ -1322,13 +1481,17 @@ mod tests {
         state.page_size = Some([800, 6000]);
         state.cuts = vec![1000, 2000];
         state.order = vec![2, 0, 1];
+        state.deleted = vec![false, true, false];
         // A redundant set keeps the user's work.
         state.set_axis(SplitAxis::Horizontal);
         assert_eq!(state.cuts, vec![1000, 2000]);
-        // A real switch drops it: the coordinates belong to the other axis.
+        assert_eq!(state.deleted, vec![false, true, false]);
+        // A real switch drops it: the coordinates belong to the other axis, and
+        // so do the parts the drop mask referred to.
         state.set_axis(SplitAxis::Vertical);
         assert!(state.cuts.is_empty());
         assert_eq!(state.order, vec![0]);
+        assert_eq!(state.deleted, vec![false]);
         assert_eq!(state.extent(), 800);
     }
 
@@ -1338,17 +1501,21 @@ mod tests {
         state.page_size = Some([800, 6000]);
         state.cuts = vec![2000, 4000];
         state.order = vec![2, 1, 0];
+        state.deleted = vec![false, true, false];
         match build_split_op(&state) {
             Ok(PageOpKind::Split {
                 page_idx,
                 axis,
                 cuts,
                 order,
+                deleted,
             }) => {
                 assert_eq!(page_idx, 4);
                 assert_eq!(axis, SplitAxis::Horizontal);
                 assert_eq!(cuts, vec![2000, 4000]);
+                // The order stays a permutation over ALL parts, deleted included.
                 assert_eq!(order, vec![2, 1, 0]);
+                assert_eq!(deleted, vec![false, true, false]);
             }
             other => panic!("expected a Split op, got {other:?}"),
         }
@@ -1365,5 +1532,28 @@ mod tests {
             build_split_op(&unknown),
             Err(SplitLayoutError::PageTooSmall { extent: 0 })
         );
+    }
+
+    /// D5: deleting every part would destroy the page, so the request is refused
+    /// (and the confirm button, gated on the same `validate`, stays disabled);
+    /// keeping exactly one part is a CROP and must be allowed.
+    #[test]
+    fn build_split_op_refuses_deleting_every_part_but_allows_a_crop() {
+        let mut state = SplitDialogState::new(2);
+        state.page_size = Some([800, 6000]);
+        state.cuts = vec![2000, 4000];
+        state.order = vec![0, 1, 2];
+        state.deleted = vec![true, true, true];
+        assert_eq!(
+            build_split_op(&state),
+            Err(SplitLayoutError::AllPartsDeleted)
+        );
+        state.deleted = vec![true, false, true];
+        match build_split_op(&state) {
+            Ok(PageOpKind::Split { deleted, .. }) => {
+                assert_eq!(deleted, vec![true, false, true]);
+            }
+            other => panic!("a one-part crop must be a legal request, got {other:?}"),
+        }
     }
 }

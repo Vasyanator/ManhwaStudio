@@ -20,7 +20,8 @@ Key structures:
 - StitchGeometry / SplitGeometry / PageGeometry: the resolved pixel-identity
   request every remap of an affected page is routed through.
 - SplitTreeRouting: per-tree layer uid -> part and layer PNG -> new page index
-  tables of a split (the 1 -> N fan-out `old_to_new` cannot express).
+  tables of a split (the 1 -> N fan-out `old_to_new` cannot express), plus the
+  PNGs whose only claimants sit on deleted parts.
 - ComposeSource / NewPageContent::ComposedPng: the recipe `fs_exec` executes to
   build a stitched or cropped raster during phase A.
 
@@ -30,6 +31,8 @@ Key functions:
 - build_stitch_geometry(): stitch request + snapshot -> validated affines.
 - build_split_geometry(): split request + snapshot -> validated part affines
   plus the per-tree layer routing.
+- validate_split_routing(): the single legality rule of a split's `order` /
+  `deleted` arrays, shared by the index-math and the geometry validator.
 - canonical page-keyed file-name helpers shared with the scanner.
 
 Notes:
@@ -490,23 +493,33 @@ const SPLIT_MAX_PARTS: usize = 256;
 /// express — it can only name the representative part.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SplitTreeRouting {
-    /// Geometric part each layer node of the split page belongs to, by uid.
+    /// Geometric part each layer node of the split page belongs to, by uid,
+    /// DELETED parts included — the consumer drops those records, and must be
+    /// able to tell them from records it could not route at all.
     node_part: std::collections::HashMap<String, usize>,
     /// New page index each layer PNG of the split page moves to, by file name.
     file_new_idx: std::collections::HashMap<String, usize>,
+    /// Layer PNGs of the split page referenced ONLY by records on deleted
+    /// parts. They are trashed rather than renamed: no surviving manifest
+    /// entry references them any more. Disjoint from `file_new_idx` — a claim
+    /// from a surviving record always wins, because that record still needs
+    /// the pixels.
+    deleted_files: std::collections::HashSet<String>,
 }
 
 impl SplitTreeRouting {
-    /// Builds a routing from the two resolved tables (see
+    /// Builds a routing from the resolved tables (see
     /// `json_remap::split_layer_routing`, the only production constructor).
     #[must_use]
     pub(crate) fn new(
         node_part: std::collections::HashMap<String, usize>,
         file_new_idx: std::collections::HashMap<String, usize>,
+        deleted_files: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             node_part,
             file_new_idx,
+            deleted_files,
         }
     }
 
@@ -522,6 +535,13 @@ impl SplitTreeRouting {
     #[must_use]
     pub(crate) fn file_new_idx(&self, file: &str) -> Option<usize> {
         self.file_new_idx.get(file).copied()
+    }
+
+    /// Whether `file` is referenced only by layer records of DELETED parts, so
+    /// that it must be trashed instead of following a part.
+    #[must_use]
+    pub(crate) fn is_deleted_file(&self, file: &str) -> bool {
+        self.deleted_files.contains(file)
     }
 }
 
@@ -545,8 +565,14 @@ pub(crate) struct SplitGeometry {
     parts: Vec<PlacementMap>,
     /// Pixel size `[w, h]` of each geometric part.
     part_sizes: Vec<[u32; 2]>,
-    /// Index of each geometric part in the NEW page order.
-    part_new_idx: Vec<usize>,
+    /// Index of each geometric part in the NEW page order, `None` for a part
+    /// the request DELETED instead of turning into a page. The `Some` values
+    /// are the consecutive run `source_old_idx ..` in the survivors' own order.
+    part_new_idx: Vec<Option<usize>>,
+    /// Geometric part that keeps the source page's index — the survivor the
+    /// user ordered first. Always a part with a `Some` `part_new_idx`, because
+    /// deleting every part is refused.
+    first_kept_part: usize,
     /// Layer routing per tree, keyed by `TreeSnapshot::tree_rel`.
     trees: std::collections::BTreeMap<String, SplitTreeRouting>,
     /// Plan-time diagnostics collected while resolving the routing (probe
@@ -600,10 +626,43 @@ impl SplitGeometry {
         self.part_sizes.get(part).copied()
     }
 
-    /// New-order index of geometric part `part`.
+    /// New-order index of geometric part `part`, or `None` when the part was
+    /// DELETED by the request (or `part` is out of range).
+    ///
+    /// `None` is the engine-wide signal "nothing of this part becomes a page":
+    /// every entry routed to it must be archived or trashed as
+    /// [`super::PageOpKind::Delete`] would do it, never relocated onto a
+    /// surviving neighbour.
     #[must_use]
     pub(crate) fn part_new_idx(&self, part: usize) -> Option<usize> {
-        self.part_new_idx.get(part).copied()
+        self.part_new_idx.get(part).copied().flatten()
+    }
+
+    /// Whether geometric part `part` was deleted by the request. An out-of-range
+    /// part is not "deleted" — it does not exist.
+    #[must_use]
+    pub(crate) fn is_deleted_part(&self, part: usize) -> bool {
+        matches!(self.part_new_idx.get(part), Some(None))
+    }
+
+    /// Number of parts that survive as pages (at least 1).
+    #[must_use]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.part_new_idx.iter().filter(|idx| idx.is_some()).count()
+    }
+
+    /// Geometric part that keeps the source page's index: the fallback target
+    /// for anything of the cut page that could not be routed to a part.
+    #[must_use]
+    pub(crate) fn first_kept_part(&self) -> usize {
+        self.first_kept_part
+    }
+
+    /// New-order index of [`Self::first_kept_part`]. Equal to the source page's
+    /// own index: the surviving parts occupy the run starting there.
+    #[must_use]
+    pub(crate) fn first_kept_new_idx(&self) -> usize {
+        self.source_old_idx
     }
 
     /// Layer routing of the tree rooted at `tree_rel`.
@@ -725,6 +784,8 @@ impl SplitGeometry {
 
     /// Builds a geometry directly, for tests of the JSON remaps (the normal
     /// path goes through `build_split_geometry`, which needs a full snapshot).
+    ///
+    /// `deleted` has one flag per part, exactly like the request field.
     #[cfg(test)]
     pub(crate) fn for_tests(
         source_old_idx: usize,
@@ -732,27 +793,34 @@ impl SplitGeometry {
         page_size: [u32; 2],
         cuts: &[u32],
         order: &[usize],
+        deleted: &[bool],
     ) -> Self {
-        resolve_split_parts(source_old_idx, axis, page_size, cuts, order)
+        resolve_split_parts(source_old_idx, axis, page_size, cuts, order, deleted)
             .expect("valid test split geometry")
     }
 }
 
 /// Resolves the pure part geometry of a split (no tree routing yet).
 ///
-/// `order[k]` is the position of geometric part `k` in the new page order,
-/// relative to `source_old_idx` (see [`super::PageOpKind::Split`]).
+/// `order[k]` is the position of geometric part `k` among ALL parts, deleted
+/// ones included, and `deleted[k]` drops part `k` instead of turning it into a
+/// page (see [`super::PageOpKind::Split`]). The surviving parts are compacted
+/// here: ranked by their `order` value among themselves, they take the
+/// consecutive new indices `source_old_idx ..`, so the deleted parts leave no
+/// gap in the new page order.
 ///
 /// # Errors
 /// [`PageOpError::InvalidOp`] for a zero-sized page, a cut list that is not
 /// strictly increasing strictly inside the page, an `order` that is not a
-/// permutation of the parts, or a part that fails [`PlacementMap::new`].
+/// permutation of the parts, a `deleted` of the wrong length, a request that
+/// deletes every part, or a part that fails [`PlacementMap::new`].
 fn resolve_split_parts(
     source_old_idx: usize,
     axis: SplitAxis,
     page_size: [u32; 2],
     cuts: &[u32],
     order: &[usize],
+    deleted: &[bool],
 ) -> Result<SplitGeometry, PageOpError> {
     if page_size[0] == 0 || page_size[1] == 0 {
         return Err(PageOpError::InvalidOp(format!(
@@ -777,31 +845,24 @@ fn resolve_split_parts(
         previous = *cut;
     }
     let part_count = cuts.len() + 1;
-    if order.len() != part_count {
-        return Err(PageOpError::InvalidOp(format!(
-            "split order has {} entr(ies) for {part_count} part(s)",
-            order.len()
-        )));
-    }
-    let mut seen = vec![false; part_count];
-    for position in order {
-        let slot = seen.get_mut(*position).ok_or_else(|| {
-            PageOpError::InvalidOp(format!(
-                "split order position {position} is out of range for {part_count} part(s)"
-            ))
-        })?;
-        if *slot {
-            return Err(PageOpError::InvalidOp(format!(
-                "split order {order:?} lists position {position} more than once"
-            )));
-        }
-        *slot = true;
-    }
+    validate_split_routing(part_count, order, deleted)?;
 
     let mut bounds = Vec::with_capacity(part_count + 1);
     bounds.push(0u32);
     bounds.extend_from_slice(cuts);
     bounds.push(extent);
+
+    // D5: the survivors take consecutive indices starting at the source page's
+    // own, ranked by their `order` value among THEMSELVES — the deleted parts
+    // keep their position in `order` but consume no index.
+    let mut rank_of_part = vec![None; part_count];
+    let mut survivors: Vec<usize> = (0..part_count).filter(|part| !deleted[*part]).collect();
+    survivors.sort_by_key(|part| order[*part]);
+    for (rank, part) in survivors.iter().enumerate() {
+        rank_of_part[*part] = Some(source_old_idx + rank);
+    }
+    // Checked non-empty by `validate_split_routing`.
+    let first_kept_part = survivors.first().copied().unwrap_or(0);
 
     let mut parts = Vec::with_capacity(part_count);
     let mut part_sizes = Vec::with_capacity(part_count);
@@ -828,9 +889,7 @@ fn resolve_split_parts(
         };
         parts.push(PlacementMap::new(&placement, page_size, canvas)?);
         part_sizes.push(canvas);
-        // D1: the part the user ordered FIRST keeps the source page's index,
-        // so the parts occupy the contiguous run `source_old_idx ..`.
-        part_new_idx.push(source_old_idx + order[part]);
+        part_new_idx.push(rank_of_part[part]);
     }
 
     Ok(SplitGeometry {
@@ -841,9 +900,65 @@ fn resolve_split_parts(
         parts,
         part_sizes,
         part_new_idx,
+        first_kept_part,
         trees: std::collections::BTreeMap::new(),
         warnings: Vec::new(),
     })
+}
+
+/// Validates the per-part routing arrays of a split and returns how many parts
+/// SURVIVE as pages.
+///
+/// `order` must be a permutation of `0..part_count` over ALL parts (deleted
+/// ones keep their position, see [`super::PageOpKind::Split`]) and `deleted`
+/// must have one flag per part. Shared by [`resolve_split_parts`] and
+/// [`split_permutation`], which validate the same request from two directions
+/// (geometry and index math) and must never disagree about what is legal.
+///
+/// # Errors
+/// [`PageOpError::InvalidOp`] for a length mismatch of either array, an order
+/// position out of range or repeated, or a request that deletes every part —
+/// that request is a [`super::PageOpKind::Delete`] of the page and must go
+/// through it, so that "a chapter keeps at least one page" stays one rule in
+/// one place.
+fn validate_split_routing(
+    part_count: usize,
+    order: &[usize],
+    deleted: &[bool],
+) -> Result<usize, PageOpError> {
+    if order.len() != part_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "split order has {} entr(ies) for {part_count} part(s)",
+            order.len()
+        )));
+    }
+    if deleted.len() != part_count {
+        return Err(PageOpError::InvalidOp(format!(
+            "split deletion flags have {} entr(ies) for {part_count} part(s)",
+            deleted.len()
+        )));
+    }
+    let mut seen = vec![false; part_count];
+    for position in order {
+        let slot = seen.get_mut(*position).ok_or_else(|| {
+            PageOpError::InvalidOp(format!(
+                "split order position {position} is out of range for {part_count} part(s)"
+            ))
+        })?;
+        if *slot {
+            return Err(PageOpError::InvalidOp(format!(
+                "split order {order:?} lists position {position} more than once"
+            )));
+        }
+        *slot = true;
+    }
+    let kept = deleted.iter().filter(|flag| !**flag).count();
+    if kept == 0 {
+        return Err(PageOpError::InvalidOp(
+            "split cannot delete every part: use a page delete instead".to_string(),
+        ));
+    }
+    Ok(kept)
 }
 
 /// Shoelace area of a simple polygon, in the units of its coordinates. An
@@ -1159,20 +1274,22 @@ pub(crate) fn permutation_for_op(
             axis: _,
             cuts,
             order,
-        } => split_permutation(*page_idx, cuts, order, old_page_count),
+            deleted,
+        } => split_permutation(*page_idx, cuts, order, deleted, old_page_count),
     }
 }
 
 /// Index math + cut/order validation of a split.
 ///
-/// The `cuts.len() + 1` parts occupy the contiguous run
-/// `page_idx ..= page_idx + cuts.len()` of the new order, geometric part `k`
-/// landing at `page_idx + order[k]`; every page after the split page shifts up
-/// by `cuts.len()`. `old_to_new[page_idx]` is `page_idx` itself — the one
-/// representative the permutation type can carry, which by construction is the
-/// part the user ordered FIRST. The created pages are NOT listed in
-/// `new_pages`: their content is cut out of the chapter snapshot by
-/// `plan_src_pages`, not derivable from the request alone.
+/// The `kept` surviving parts (`kept = cuts.len() + 1 - deleted parts`) occupy
+/// the contiguous run `page_idx ..= page_idx + kept - 1` of the new order,
+/// ranked by their `order` value among themselves; every page after the split
+/// page shifts up by `kept - 1` (which is 0 when a single part is kept — a
+/// crop, and a legal request). `old_to_new[page_idx]` is `page_idx` itself —
+/// the one representative the permutation type can carry, which by
+/// construction is the surviving part the user ordered FIRST. The created
+/// pages are NOT listed in `new_pages`: their content is cut out of the
+/// chapter snapshot by `plan_src_pages`, not derivable from the request alone.
 ///
 /// The cut positions are checked only for internal consistency here (strictly
 /// increasing, non-empty); whether they fall inside the page needs the page's
@@ -1181,11 +1298,13 @@ pub(crate) fn permutation_for_op(
 /// # Errors
 /// [`PageOpError::InvalidOp`] for an out-of-range `page_idx`, an empty cut
 /// list, cuts that are not strictly increasing, more than [`SPLIT_MAX_PARTS`]
-/// parts, or an `order` that is not a permutation of `0..cuts.len() + 1`.
+/// parts, or a routing rejected by [`validate_split_routing`] (bad `order`
+/// permutation, `deleted` of the wrong length, every part deleted).
 fn split_permutation(
     page_idx: usize,
     cuts: &[u32],
     order: &[usize],
+    deleted: &[bool],
     old_page_count: usize,
 ) -> Result<Permutation, PageOpError> {
     if page_idx >= old_page_count {
@@ -1210,28 +1329,12 @@ fn split_permutation(
              {SPLIT_MAX_PARTS}"
         )));
     }
-    if order.len() != part_count {
-        return Err(PageOpError::InvalidOp(format!(
-            "split order has {} entr(ies) for {part_count} part(s)",
-            order.len()
-        )));
-    }
-    let mut seen = vec![false; part_count];
-    for position in order {
-        let slot = seen.get_mut(*position).ok_or_else(|| {
-            PageOpError::InvalidOp(format!(
-                "split order position {position} is out of range for {part_count} part(s)"
-            ))
-        })?;
-        if *slot {
-            return Err(PageOpError::InvalidOp(format!(
-                "split order {order:?} lists position {position} more than once"
-            )));
-        }
-        *slot = true;
-    }
+    let kept = validate_split_routing(part_count, order, deleted)?;
 
-    let added = part_count - 1;
+    // `kept >= 1` is guaranteed above, so this cannot underflow; it is 0 when
+    // exactly one part survives, i.e. the split degenerates into a crop and no
+    // page index moves.
+    let added = kept - 1;
     let old_to_new = (0..old_page_count)
         .map(|i| {
             Some(match i.cmp(&page_idx) {
@@ -1681,8 +1784,10 @@ pub(crate) fn build_plan(
             axis,
             cuts,
             order,
+            deleted,
         } => {
-            let mut resolved = build_split_geometry(snapshot, *page_idx, *axis, cuts, order)?;
+            let mut resolved =
+                build_split_geometry(snapshot, *page_idx, *axis, cuts, order, deleted)?;
             for warning in resolved.take_warnings() {
                 b.warn(warning);
             }
@@ -1704,9 +1809,11 @@ pub(crate) fn build_plan(
                 "merging {} page(s) into one",
                 geo.source_count()
             )),
+            // The alignment shift follows the page COUNT, so only the parts
+            // that actually become pages count here.
             PageGeometry::Split(geo) => Some(format!(
                 "cutting one page into {} part(s)",
-                geo.part_count()
+                geo.kept_count()
             )),
             PageGeometry::None => None,
         };
@@ -1897,16 +2004,17 @@ fn max_layer_idx_for_page(snapshot: &ChapterSnapshot, old_idx: usize) -> Option<
 ///
 /// # Errors
 /// [`PageOpError::InvalidOp`] when the snapshot carries no page sizes, the
-/// cuts are not strictly increasing strictly inside the page, the `order` is
-/// not a permutation of the parts, a part's placement is invalid, or one layer
-/// PNG of the cut page is claimed by records routed to different parts (see
-/// [`json_remap::split_layer_routing`]).
+/// cuts are not strictly increasing strictly inside the page, the routing
+/// arrays are rejected by [`validate_split_routing`], a part's placement is
+/// invalid, or one layer PNG of the cut page is claimed by records routed to
+/// different SURVIVING parts (see [`json_remap::split_layer_routing`]).
 fn build_split_geometry(
     snapshot: &ChapterSnapshot,
     page_idx: usize,
     axis: SplitAxis,
     cuts: &[u32],
     order: &[usize],
+    deleted: &[bool],
 ) -> Result<SplitGeometry, PageOpError> {
     if snapshot.page_sizes.len() != snapshot.page_file_names.len() {
         return Err(PageOpError::InvalidOp(
@@ -1918,7 +2026,23 @@ fn build_split_geometry(
     let page_size = *snapshot.page_sizes.get(page_idx).ok_or_else(|| {
         PageOpError::InvalidOp(format!("split page {page_idx} has no known pixel size"))
     })?;
-    let mut geometry = resolve_split_parts(page_idx, axis, page_size, cuts, order)?;
+    let mut geometry = resolve_split_parts(page_idx, axis, page_size, cuts, order, deleted)?;
+
+    // Deleting user content must never be silent: state how many parts were
+    // dropped and where their artifacts went, before any per-document warning.
+    let dropped = geometry.part_count() - geometry.kept_count();
+    if dropped > 0 {
+        let parts: Vec<usize> = (0..geometry.part_count())
+            .filter(|part| geometry.is_deleted_part(*part))
+            .collect();
+        geometry.warnings.push(format!(
+            "split of page {page_idx}: {dropped} of {} part(s) deleted (geometric part(s) \
+             {parts:?}); their pixels stay recoverable in the chapter trash, and every \
+             bubble, layer, layer PNG, detection block and text overlay routed to them is \
+             archived or trashed instead of being moved to a surviving part",
+            geometry.part_count()
+        ));
+    }
 
     // The routing is per TREE: the committed and the staging manifest are
     // independent documents that may describe different layers for the page.
@@ -1957,6 +2081,9 @@ fn plan_split_raster_parts(
     target_for: impl Fn(usize) -> String,
 ) {
     for part in 0..geo.part_count() {
+        // A part with no new index was DELETED by the request: skipping it is
+        // the deletion itself — nothing is staged, so the part's pixels are
+        // never written and survive only in the trashed source page.
         let (Some(placement), Some(size), Some(new_idx)) = (
             geo.placement(part),
             geo.part_size(part),
@@ -2214,12 +2341,22 @@ fn plan_layer_pngs(
         if let Some(geo) = split
             && geo.source_old_idx() == old_idx
         {
+            // A PNG claimed ONLY by records on deleted parts goes to the trash
+            // with those records: it must never be renamed onto a surviving
+            // part, whose manifest no longer references it.
+            if routing.is_some_and(|r| r.is_deleted_file(name)) {
+                b.trash(from);
+                continue;
+            }
             let new_idx = routing.and_then(|r| r.file_new_idx(name)).unwrap_or_else(|| {
                 b.warn(format!(
                     "layer PNG '{from}' of the split page is not referenced by any layer \
-                     record; it follows the part that keeps the page's index"
+                     record; it follows the surviving part that keeps the page's index"
                 ));
-                geo.source_old_idx()
+                // Not `source_old_idx()` by accident: that index IS the first
+                // surviving part's new index, and an orphan must land on a part
+                // that still exists.
+                geo.first_kept_new_idx()
             });
             if let Some(new_name) = json_remap::remap_layers_png_name(name, old_idx, new_idx) {
                 let target = format!("{}/{}/{new_name}", tree.tree_rel, config::LAYERS_DIR);
@@ -2785,6 +2922,9 @@ fn plan_split_detection(
         });
     }
     for part in 0..geo.part_count() {
+        // A deleted part gets no blocks document at all; `split_detection_blocks`
+        // keeps only the blocks owned by the part it is called for, so the blocks
+        // of a deleted part are dropped with it and never land on a neighbour.
         let Some(new_idx) = geo.part_new_idx(part) else {
             continue;
         };
@@ -3559,12 +3699,26 @@ mod tests {
     // Split.
     // -----------------------------------------------------------------------
 
+    /// A split request that keeps every part.
     fn split_op(page_idx: usize, axis: SplitAxis, cuts: &[u32], order: &[usize]) -> PageOpKind {
+        let deleted = vec![false; order.len()];
+        split_op_deleted(page_idx, axis, cuts, order, &deleted)
+    }
+
+    /// A split request with an explicit per-part deletion flag.
+    fn split_op_deleted(
+        page_idx: usize,
+        axis: SplitAxis,
+        cuts: &[u32],
+        order: &[usize],
+        deleted: &[bool],
+    ) -> PageOpKind {
         PageOpKind::Split {
             page_idx,
             axis,
             cuts: cuts.to_vec(),
             order: order.to_vec(),
+            deleted: deleted.to_vec(),
         }
     }
 
@@ -3589,6 +3743,109 @@ mod tests {
                 .expect("valid");
         assert_eq!(map_of(&perm), vec![Some(0), Some(1), Some(2), Some(4)]);
         assert_eq!(perm.new_page_count, 5);
+    }
+
+    #[test]
+    fn split_deleted_parts_consume_no_index_and_compact_the_survivors() {
+        // Page 1 of 4 cut into 3 parts with the MIDDLE one deleted: two parts
+        // survive, so the later pages shift up by 1, not by 2.
+        let op = split_op_deleted(
+            1,
+            SplitAxis::Horizontal,
+            &[10, 20],
+            &[0, 1, 2],
+            &[false, true, false],
+        );
+        let perm = permutation_for_op(&op, 4).expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(1), Some(3), Some(4)]);
+        assert_eq!(perm.new_page_count, 5);
+
+        // Several parts deleted at once, and the survivors keep the RELATIVE
+        // order the user gave them: part 3 is ordered before part 0.
+        let op = split_op_deleted(
+            0,
+            SplitAxis::Vertical,
+            &[10, 20, 30],
+            &[3, 1, 2, 0],
+            &[false, true, true, false],
+        );
+        let perm = permutation_for_op(&op, 3).expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(2), Some(3)]);
+        assert_eq!(perm.new_page_count, 4);
+        let geo = resolve_split_parts(
+            0,
+            SplitAxis::Vertical,
+            [40, 10],
+            &[10, 20, 30],
+            &[3, 1, 2, 0],
+            &[false, true, true, false],
+        )
+        .expect("valid");
+        // Part 3 was ordered first, so it takes the source index; part 0
+        // follows it. The deleted parts have no index at all.
+        assert_eq!(geo.part_new_idx(3), Some(0));
+        assert_eq!(geo.part_new_idx(0), Some(1));
+        assert_eq!(geo.part_new_idx(1), None);
+        assert_eq!(geo.part_new_idx(2), None);
+        assert!(geo.is_deleted_part(1) && geo.is_deleted_part(2));
+        assert!(!geo.is_deleted_part(3));
+        assert_eq!(geo.kept_count(), 2);
+        // The fallback target for anything unroutable is a SURVIVING part.
+        assert_eq!(geo.first_kept_part(), 3);
+        assert_eq!(geo.first_kept_new_idx(), 0);
+
+        // D3: keeping exactly one part is a crop — the page count is unchanged
+        // and the shift is zero.
+        let op = split_op_deleted(1, SplitAxis::Horizontal, &[10], &[0, 1], &[false, true]);
+        let perm = permutation_for_op(&op, 4).expect("valid");
+        assert_eq!(map_of(&perm), vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(perm.new_page_count, 4);
+    }
+
+    #[test]
+    fn split_rejects_deleting_every_part_and_bad_deletion_flags() {
+        for (case, op) in [
+            (
+                "every part deleted",
+                split_op_deleted(1, SplitAxis::Horizontal, &[10], &[0, 1], &[true, true]),
+            ),
+            (
+                "deletion flags too short",
+                split_op_deleted(1, SplitAxis::Horizontal, &[10], &[0, 1], &[false]),
+            ),
+            (
+                "deletion flags too long",
+                split_op_deleted(
+                    1,
+                    SplitAxis::Horizontal,
+                    &[10],
+                    &[0, 1],
+                    &[false, false, false],
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(permutation_for_op(&op, 4), Err(PageOpError::InvalidOp(_))),
+                "{case} must be rejected"
+            );
+        }
+        // The geometry pass validates the same request independently and must
+        // agree with the index pass about what is legal.
+        assert!(matches!(
+            resolve_split_parts(
+                1,
+                SplitAxis::Horizontal,
+                [50, 400],
+                &[100],
+                &[0, 1],
+                &[true, true]
+            ),
+            Err(PageOpError::InvalidOp(_))
+        ));
+        assert!(matches!(
+            resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[100], &[0, 1], &[true]),
+            Err(PageOpError::InvalidOp(_))
+        ));
     }
 
     #[test]
@@ -3630,8 +3887,15 @@ mod tests {
     #[test]
     fn split_parts_map_every_coordinate_space_and_reject_empty_parts() {
         // A 50x400 page cut horizontally at 100 and 250, parts kept in order.
-        let geo = resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[100, 250], &[0, 1, 2])
-            .expect("valid");
+        let geo = resolve_split_parts(
+            1,
+            SplitAxis::Horizontal,
+            [50, 400],
+            &[100, 250],
+            &[0, 1, 2],
+            &[false, false, false],
+        )
+        .expect("valid");
         assert_eq!(geo.part_count(), 3);
         assert_eq!(geo.part_size(0), Some([50, 100]));
         assert_eq!(geo.part_size(1), Some([50, 150]));
@@ -3652,7 +3916,7 @@ mod tests {
         assert!((middle.map_len(7.0) - 7.0).abs() < 1e-9);
 
         // The transpose: a vertical cut renormalizes u and leaves v alone.
-        let geo = resolve_split_parts(0, SplitAxis::Vertical, [50, 400], &[20], &[1, 0])
+        let geo = resolve_split_parts(0, SplitAxis::Vertical, [50, 400], &[20], &[1, 0], &[false, false])
             .expect("valid");
         assert_eq!(geo.part_size(0), Some([20, 400]));
         assert_eq!(geo.part_size(1), Some([30, 400]));
@@ -3667,19 +3931,33 @@ mod tests {
         for cut in [0u32, 400] {
             assert!(
                 matches!(
-                    resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[cut], &[0, 1]),
+                    resolve_split_parts(
+                        1,
+                        SplitAxis::Horizontal,
+                        [50, 400],
+                        &[cut],
+                        &[0, 1],
+                        &[false, false],
+                    ),
                     Err(PageOpError::InvalidOp(_))
                 ),
                 "cut at {cut} must be rejected"
             );
         }
         assert!(matches!(
-            resolve_split_parts(1, SplitAxis::Horizontal, [50, 400], &[100, 100], &[0, 1, 2]),
+            resolve_split_parts(
+                1,
+                SplitAxis::Horizontal,
+                [50, 400],
+                &[100, 100],
+                &[0, 1, 2],
+                &[false, false, false],
+            ),
             Err(PageOpError::InvalidOp(_))
         ));
         // A page with no pixels has no geometry at all.
         assert!(matches!(
-            resolve_split_parts(1, SplitAxis::Horizontal, [50, 0], &[10], &[0, 1]),
+            resolve_split_parts(1, SplitAxis::Horizontal, [50, 0], &[10], &[0, 1], &[false, false]),
             Err(PageOpError::InvalidOp(_))
         ));
     }
@@ -3687,7 +3965,7 @@ mod tests {
     #[test]
     fn split_assignment_uses_exact_area_with_a_top_left_tie_break() {
         // A 100x400 page cut in half horizontally.
-        let geo = resolve_split_parts(0, SplitAxis::Horizontal, [100, 400], &[200], &[0, 1])
+        let geo = resolve_split_parts(0, SplitAxis::Horizontal, [100, 400], &[200], &[0, 1], &[false, false])
             .expect("valid");
         let rect = |top: f64, bottom: f64| {
             [[10.0, top], [90.0, top], [90.0, bottom], [10.0, bottom]]
@@ -3719,7 +3997,7 @@ mod tests {
         assert_eq!(geo.part_for_point(50.0, 900.0), 1);
 
         // The transpose: an exact tie across a vertical cut goes LEFT.
-        let geo = resolve_split_parts(0, SplitAxis::Vertical, [400, 100], &[200], &[0, 1])
+        let geo = resolve_split_parts(0, SplitAxis::Vertical, [400, 100], &[200], &[0, 1], &[false, false])
             .expect("valid");
         assert_eq!(
             geo.part_for_polygon(&[
@@ -3942,6 +4220,166 @@ mod tests {
         // Absolute page px 300 is px 100 of the bottom part.
         assert_eq!(second["blocks"][0]["y1"], serde_json::json!(100.0));
         assert_eq!(second["mask_file"], serde_json::json!("00002_mask.png"));
+    }
+
+    #[test]
+    fn build_plan_split_discards_a_deleted_part_and_trashes_only_its_artifacts() {
+        let snapshot = snapshot_for_split();
+        // Cut page 1 (50x400) in half and DELETE the bottom part: the split
+        // degenerates into a crop, so no page index moves.
+        let plan = build_plan(
+            &snapshot,
+            &split_op_deleted(1, SplitAxis::Horizontal, &[200], &[0, 1], &[false, true]),
+            79,
+        )
+        .expect("plan builds");
+        assert_eq!(plan.old_to_new, vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(plan.new_page_count, 4);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("1 of 2 part(s) deleted")),
+            "deleting user content must be reported: {:?}",
+            plan.warnings
+        );
+
+        // Only the surviving part is staged, in every page-sized category.
+        let staged = |target: &str| plan.creates.iter().any(|c| c.target == target);
+        for kept in [
+            "ch1/src/001.png",
+            "ch1/clean_layers/001.png",
+            "ch1/text_images/mask_page_1.png",
+            "ch1/text_detection/00001_mask.png",
+        ] {
+            assert!(staged(kept), "{kept} must be staged");
+        }
+        for dropped in [
+            "ch1/src/002.png",
+            "ch1/clean_layers/002.png",
+            "ch1/text_images/mask_page_2.png",
+            "ch1/text_detection/00002_mask.png",
+        ] {
+            assert!(!staged(dropped), "{dropped} belongs to the deleted part");
+        }
+        assert!(
+            !plan
+                .json_writes
+                .iter()
+                .any(|w| w.target == "ch1/text_detection/00002_blocks.json"),
+            "the deleted part gets no detection document"
+        );
+
+        // The deleted part's layer PNGs go to the TRASH, never onto a
+        // surviving part's prefix; the survivor's PNG stays where it is.
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Trash { .. } => Some(m.from.as_str()),
+                MoveDest::Final { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        assert!(trashed.contains(&"ch1/layers/ps_p0001_bottom.png"));
+        assert!(trashed.contains(&"ch1/layers/ps_p0001_text.png"));
+        assert!(!trashed.contains(&"ch1/layers/ps_p0001_top.png"));
+        assert!(
+            !plan.moves.iter().any(|m| matches!(
+                &m.dest,
+                MoveDest::Final { path } if path.contains("ps_p0002_")
+            )),
+            "nothing of the deleted part may be renamed onto another page"
+        );
+
+        // The manifest keeps ONE entry: the deleted part's records are gone.
+        let manifest = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/layers/layers.json")
+            .expect("manifest rewritten");
+        let manifest: Value = serde_json::from_str(&manifest.content).expect("valid json");
+        let pages = manifest["pages"].as_array().expect("pages");
+        let cut_page: Vec<&Value> = pages
+            .iter()
+            .filter(|page| page["img_idx"] == serde_json::json!(1))
+            .collect();
+        assert_eq!(cut_page.len(), 1, "one entry for the one surviving part");
+        let tree = cut_page[0]["tree"].as_array().expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0]["uid"], serde_json::json!("top"));
+    }
+
+    #[test]
+    fn build_plan_split_keeps_an_unroutable_layer_on_a_surviving_part() {
+        let mut snapshot = snapshot_for_split();
+        // A record the engine CANNOT route: no deform mesh, no transform. Its
+        // PNG is referenced by nothing else.
+        snapshot
+            .committed
+            .layers_files
+            .insert("ps_p0001_placeless.png".to_string());
+        let manifest = snapshot
+            .committed
+            .layers_manifest
+            .as_mut()
+            .expect("fixture manifest");
+        manifest["pages"][0]["tree"]
+            .as_array_mut()
+            .expect("tree")
+            .push(serde_json::json!({
+                "uid": "placeless", "name": "P", "kind": "raster", "z": 3,
+                "visible": true, "opacity": 1.0,
+                "base_file": "ps_p0001_placeless.png"
+            }));
+
+        // Cut page 1 in half and delete the TOP part, so the old literal
+        // "follows part 0" fallback would have destroyed the record.
+        let plan = build_plan(
+            &snapshot,
+            &split_op_deleted(1, SplitAxis::Horizontal, &[200], &[0, 1], &[true, false]),
+            80,
+        )
+        .expect("plan builds");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("'placeless'") && w.contains("first surviving part")),
+            "the unroutable record must be reported: {:?}",
+            plan.warnings
+        );
+
+        // It survives on the kept part, with its PNG left in place — a record
+        // the geometry could not place is never deleted as a side effect.
+        let manifest = plan
+            .json_writes
+            .iter()
+            .find(|w| w.target == "ch1/layers/layers.json")
+            .expect("manifest rewritten");
+        let manifest: Value = serde_json::from_str(&manifest.content).expect("valid json");
+        let cut_page = manifest["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .find(|page| page["img_idx"] == serde_json::json!(1))
+            .expect("the surviving part keeps the page index");
+        assert!(
+            cut_page["tree"]
+                .as_array()
+                .expect("tree")
+                .iter()
+                .any(|rec| rec["uid"] == serde_json::json!("placeless")),
+            "the unroutable record must survive: {cut_page}"
+        );
+        let trashed: Vec<&str> = plan
+            .moves
+            .iter()
+            .filter_map(|m| match &m.dest {
+                MoveDest::Trash { .. } => Some(m.from.as_str()),
+                MoveDest::Final { .. } | MoveDest::Discard => None,
+            })
+            .collect();
+        assert!(!trashed.contains(&"ch1/layers/ps_p0001_placeless.png"));
+        // The genuinely deleted part's own PNG still goes to the trash.
+        assert!(trashed.contains(&"ch1/layers/ps_p0001_top.png"));
     }
 
     #[test]

@@ -137,10 +137,19 @@ A SPLIT (`PageOpKind::Split`, one page -> N parts along parallel cuts) is the
 inverse and reuses the same machinery. Each geometric part `k` (0 = topmost /
 leftmost) is a crop of the source page at `[x_k, y_k, w_k, h_k]` becoming a page
 of exactly that size, i.e. a `PlacementMap` with `scale = 1`, `dx = dy = 0`.
-`order[k]` places part `k` at new index `page_idx + order[k]`, so the parts
-occupy a contiguous run starting at the source page's own index and every later
-page shifts up by `cuts.len()`; `old_to_new[page_idx]` is `page_idx` (the one
-representative the permutation type can carry).
+`order[k]` is part `k`'s position among ALL parts (a permutation of
+`0..cuts.len() + 1`) and `deleted[k]` drops part `k` instead of turning it into
+a page. The SURVIVING parts, ranked by their `order` value among themselves,
+take the consecutive new indices `page_idx ..`, so they occupy a contiguous run
+starting at the source page's own index and every later page shifts up by
+`kept - 1`; `old_to_new[page_idx]` is `page_idx` (the one representative the
+permutation type can carry, always the first surviving part). Keeping exactly
+one part is legal — geometrically a crop, and then nothing shifts. Deleting
+every part, and a `deleted` whose length differs from the part count, are
+refused with `InvalidOp`: emptying a chapter stays the `Delete` planner's single
+rule. Both validators (`split_permutation` for the index math and
+`resolve_split_parts` for the geometry) share `validate_split_routing` so they
+cannot disagree about what is legal.
 
 What is CUT vs. what MOVES WHOLE:
 - CUT, one crop per part: `src/{stem}.{ext}` (always re-encoded as PNG,
@@ -154,6 +163,19 @@ What is CUT vs. what MOVES WHOLE:
   hang off the new page's edge (negative or over-size coordinates).
 
 Routing rules (each entry must land on exactly ONE part):
+- **A DELETED part is a `Delete` of that part.** `SplitGeometry::part_new_idx`
+  returns `None` for it, and that `None` is the engine-wide signal "nothing of
+  this part becomes a page": no raster is staged for it, no detection document
+  is written, its bubbles go to `deleted_bubbles.json`, its `text_info` entries
+  to `deleted_text_info.json` with their overlay PNGs (and `*_layout.png`
+  companions) trashed, its layer records are dropped from the manifest and the
+  PNGs only they reference are trashed, and a page-crop link into it is removed
+  exactly as for a deleted page. Nothing routed to a deleted part is ever
+  relocated onto a surviving one — the plan warns how many parts were dropped
+  and what that archived. Every fallback that used to point at "part 0" or at
+  the source page's index must point at `first_kept_part` /
+  `first_kept_new_idx`, so an unroutable entry cannot vanish into a deleted
+  part.
 - **Layers — the exact-area rule.** The part holding the largest share of the
   layer's on-page AREA wins; an exact tie goes to the TOP part (horizontal cuts)
   or the LEFT part (vertical cuts) — geometric position, never user order. The
@@ -171,8 +193,10 @@ Routing rules (each entry must land on exactly ONE part):
 - **Layer PNGs.** One page's PNGs fan out onto DIFFERENT `ps_p{page:04}_`
   prefixes, which the index embedded in the name cannot express, so a per-tree
   `uid -> part` / `file -> new page index` routing decides. A PNG no layer
-  record claims follows the part that keeps the page's index, with a warning.
-  ONE file claimed by records routed to DIFFERENT parts is REFUSED with
+  record claims follows the first SURVIVING part, with a warning; a PNG claimed
+  only by records on deleted parts is trashed, and a claim from a surviving
+  record always outranks one from a deleted record (that record still needs the
+  pixels). ONE file claimed by records routed to DIFFERENT surviving parts is REFUSED with
   `InvalidOp` naming the file and the two parts: a file can only move to one
   prefix, so any answer would leave a record pointing at a PNG owned by another
   page, and `prune_orphan_pngs` prunes by that prefix. There are no shared-file
@@ -190,7 +214,9 @@ Routing rules (each entry must land on exactly ONE part):
   is preserved, not dropped: `crop_page_idx` is remapped to the part holding the
   majority of `crop_rect`, the rect is renormalized into that part and clamped
   back into `[0, 1]`, and a clamp that actually trims is warned about. Dropping
-  the link would silently degrade the bubble to a plain image bubble.
+  the link would silently degrade the bubble to a plain image bubble. The one
+  exception is a crop of a DELETED part: there is no page to point at, so the
+  link is removed, as for a deleted crop page.
 - **Legacy `text_info.json`.** Routed by its deform mesh's cell area when it
   has one, otherwise by its decoded centre point: this document does not record the
   overlay's extent, so an area test is impossible here. In a v3 chapter the
@@ -248,10 +274,12 @@ Deliberately NOT touched (each with the reason):
   page a split cuts. A stitch or split against a snapshot without page sizes
   fails with `InvalidOp`; a missing layer-PNG size only degrades that layer's
   routing to its centre point, with a warning.
-- Neither a stitch nor a split deletes a page-keyed JSON entry: merging and
-  cutting keep every entry, so the `deleted_*.json` archives stay empty for
-  them. Only FILES (the source page images and the rasters replaced by composed
-  or cropped ones) go to the trash.
+- A stitch never deletes a page-keyed JSON entry, and neither does a split that
+  keeps every part: merging and cutting preserve every entry, so the
+  `deleted_*.json` archives stay empty for them and only FILES (the source page
+  images and the rasters replaced by composed or cropped ones) go to the trash.
+  A split with a DELETED part is the exception and behaves like a page delete
+  for the entries routed to that part alone (see the split routing rules).
 - Legacy un-migrated documents are rejected, not guessed: bubbles or text_info
   entries in the absolute-ribbon-coordinate format (no `img_idx`, numeric
   `x`/`y`) are keyed by ribbon position — which any page op changes — so
@@ -281,6 +309,10 @@ Deliberately NOT touched (each with the reason):
 - Stitch / split geometry: `plan.rs` (`PlacementMap` is the single affine —
   never re-derive the formula at a call site; `SplitGeometry::part_for_*` is the
   single routing decision) + `json_remap.rs` for the per-document application.
+- Split part DELETION: `plan.rs` (`validate_split_routing` is the single
+  legality rule, `resolve_split_parts` the survivor ranking); every consumer
+  branches on `SplitGeometry::part_new_idx` being `None` — grep it before
+  adding a new per-part loop, and never default such a loop to part 0.
 - Split routing of layers: `json_remap.rs` (`split_layer_routing`,
   `assign_layer_part`, `deform_mesh_cells`) + `plan.rs` (`SplitTreeRouting`,
   `SplitGeometry::part_for_polygon_group` — the fold-correct area sum).

@@ -73,19 +73,21 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   imported from `page_ops` rather than restated, so the dialog can never enable a
   confirm the engine refuses.
 - `split_layout.rs`: GUI-free core of the "split page" feature (unit-tested):
-  cut coordinates -> parts, the part order and its SWAP semantics, cut insertion
-  and removal that keep `order` a permutation without disturbing the user's
-  chosen order, drag clamping, and the validation that mirrors the engine's
+  cut coordinates -> parts, the part order and its SWAP semantics, the drop mask
+  that marks a part as discarded, cut insertion and removal that keep `order` a
+  permutation and `deleted` aligned with it without disturbing the user's chosen
+  order, drag clamping, and the validation that mirrors the engine's
   `PageOpKind::Split` preconditions. Axis-agnostic: everything is expressed along
   ONE axis as an extent in source pixels.
 - `split.rs`: the "split page" window — an `egui::Window` with the same
   `PsViewport` board as the stitch window, showing one page with parallel cut
   lines (all horizontal XOR all vertical), a grab handle per line that carries a
   delete button, a per-part order picker (`WheelComboBox` placed at an absolute
-  rect through `Ui::new_child`), and the confirm that emits `PageOpKind::Split`.
-  Only draws and routes input; all math lives in `split_layout.rs`. The picker
-  PLACEMENT is itself pure and unit-tested (`order_widget_rects`), as is the
-  handle drag (`dragged_cut_value`).
+  rect through `Ui::new_child`) whose list ends with a "Delete" entry, a veil
+  over every part that entry marked, and the confirm that emits
+  `PageOpKind::Split`. Only draws and routes input; all math lives in
+  `split_layout.rs`. The picker PLACEMENT is itself pure and unit-tested
+  (`order_widget_rects`), as is the handle drag (`dragged_cut_value`).
 - `stitch.rs`: the "stitch pages" window — an `egui::Window` with a zoomable,
   pannable board of draggable page rectangles (camera: `PsViewport` from
   `tabs/ps_editor/viewport.rs`), the arrangement / fit / background strip, and
@@ -122,6 +124,30 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   other way to reorder). Along the cut axis the pickers form a non-overtaking
   sequence whose pitch shrinks until they all fit the board, so a later picker
   can never fully cover an earlier one.
+- A split part is targeted by TWO parallel arrays, the same pair the engine's
+  request carries: `order` stays a permutation of `0..parts` over ALL parts
+  (deleted ones included) and `deleted[k]` says whether part `k` becomes a page.
+  A deleted part therefore keeps its position, so un-deleting it restores its own
+  place for free, and every cut edit stays on the permutation math it was tested
+  against: `insert_cut` gives the new half its parent's drop flag, `remove_cut`
+  keeps the flag of the part whose POSITION survived. A part's PAGE NUMBER is its
+  rank among the SURVIVORS (`survivor_rank`), never its raw `order` value, so
+  deleting a part renumbers the rest with no further bookkeeping. Deleting EVERY
+  part is refused (`SplitLayoutError::AllPartsDeleted`, confirm disabled, engine
+  refuses it too); keeping exactly ONE is legal and is how a crop is expressed.
+  The confirm strip counts SURVIVORS and warns, whenever any part is marked, that
+  the discarded parts' bubbles, layers and clean overlay go with them.
+- The order picker's "Delete" entry is reachable by CLICK ONLY. It is why the
+  picker is built from `WheelComboBox::show_ui_with_wheel` and not from
+  `show_index`: `show_index` cycles its WHOLE list on a wheel notch — even over a
+  CLOSED picker — and `cycle_wrapped_index` wraps, so one stray notch past the
+  last rank would discard a part's content without a click. The wheel's decision
+  is `split_layout::wheel_choice` — GUI-free and unit-tested precisely because it
+  is safety-critical: it walks the numeric ranks alone and can never yield
+  Delete, and a deleted part holds no rank, so a notch over it does nothing.
+  A cut-line removal that merges two parts keeps the deletion mark only when BOTH
+  halves carried it: a deleted part shows "Delete" instead of a page number, so a
+  rule keyed on the halves' positions would discard content unpredictably.
 - The split board's wheel and its order pickers are mutually exclusive: a
   `WheelComboBox` cycles its selection on a wheel notch even while CLOSED, and
   egui reports the board as `hovered` underneath it (a click-only widget over a
@@ -179,7 +205,8 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - To change how the stitch window looks or reacts (board input, previews,
   settings strip, the emitted op): `stitch.rs`.
 - To change split cut/part/order math (validation, insertion, drag bounds, the
-  resulting page numbers): `split_layout.rs` — never the drawing code.
+  drop mask, survivor ranks, the resulting page numbers): `split_layout.rs` —
+  never the drawing code.
 - To change how the split window looks or reacts (cut lines, handles, order
   pickers, the emitted op): `split.rs`.
 - To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
