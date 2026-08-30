@@ -169,6 +169,26 @@ per-frame `bubble_text_edit_ids` registry (unconditionally — a right-click doe
 cannot be reproduced outside its owning `Ui`. One captured id covers both derivations and cannot
 silently drift when a salt is renamed.
 
+KNOWN INCOMPLETE — the Hangul keyboard cannot type into an ImageBubble's per-area fields. The
+keyboard is finished and wired for ordinary bubbles only. An ImageBubble's editable card draws three
+fields per text area (`bubble_aside_ui.rs`, salts `aside_img_original` / `aside_img_description` /
+`aside_img_translation`) that have NO `context_menu` and never call
+`note_focused_bubble_text_input`, so they never enter `bubble_text_edit_ids` and can never become a
+`hangul_target`. The consequence is worse than "the feature is unavailable there": `hangul_target` is
+STICKY, so focusing an image-area field leaves the previously focused ordinary field as the target,
+and if that field is still drawn this frame an Insert silently splices into IT — a field the user is
+not typing in. Wiring the area fields requires three things, none of them local: (1) `BubbleTextField`
+(`types.rs`) has only `Original` / `Translation` and no notion of an area index or of the description
+field, so the field identity that keys `bubble_text_edit_ids`, `FocusedBubbleTextInput`,
+`HangulInsertTarget` and `BubbleMenuCommand::OpenHangulKeyboard` must grow an area dimension, and
+every match on it be revisited; (2) the three fields need the `context_menu` + focus-notification
+calls their ordinary siblings have; (3) `apply_hangul_keyboard_insert` writes
+`bubble.original_text` / `bubble.text` on the runtime bubble, but an area's text lives in the
+per-frame `area_drafts` buffers committed by `apply_image_area_edits`, so the splice needs a second
+write path (or the drafts need to be addressable outside the draw closure). Do not "fix" this by
+widening the sticky target's validity — the misdirection above is the reason the target is validated
+against the per-frame registry in the first place.
+
 The canvas' own controls («Лента») are a DOCK TAB, not a panel of the canvas' own making. The
 canvas owns the tab's identity and body — `CANVAS_RIBBON_TAB` (the literal `"canvas.ribbon"`),
 `CanvasView::ribbon_tab_title` (the one lookup of `canvas.ribbon.tab_title`),

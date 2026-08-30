@@ -606,7 +606,8 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
         }
         // Image bubbles are gated by their own option and always contribute their area translations
         // (independent of the original/translation source mode used for text bubbles). They are
-        // never barriers either: requirement 7 lets a hint bind across an image bubble.
+        // never barriers either: a hint binds across an image bubble (the forward-binding rule in
+        // `panels/MODULE_README.md`, "Hint attachment in `composition.rs`").
         if is_image_bubble(bubble) {
             if options.include_image_bubbles && !image_bubble_area_translations(bubble).is_empty() {
                 filtered.push((bubble, true));
@@ -2065,8 +2066,9 @@ mod tests {
 
     #[test]
     fn compose_plain_keeps_a_hint_across_an_excluded_image_bubble() {
-        // An image bubble excluded by its own option leaves no barrier: requirement 7 lets a hint
-        // bind across image bubbles, whether or not they are included.
+        // An image bubble excluded by its own option leaves no barrier: a hint binds across image
+        // bubbles whether or not they are included (`panels/MODULE_README.md`, "Hint attachment in
+        // `composition.rs`").
         let mut image = image_bubble("area", Map::new());
         image.id = 2;
         image.img_v = 0.2;

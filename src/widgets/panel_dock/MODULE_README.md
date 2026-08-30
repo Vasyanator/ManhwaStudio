@@ -520,6 +520,12 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
   on a doubling, capped backoff; a newer snapshot is folded OVER the held one by the same per-tab
   rule the debounce uses; the shutdown makes the final attempt; and an arrangement that cannot be
   written even then is logged as lost, never dropped silently.
+* **The layout write is NOT crash-atomic.** `config::update_user_config_file` re-serializes the
+  WHOLE config and hands it to `Storage::write`, which on the desktop backend is a plain
+  `std::fs::write`: truncate in place, no temp file, no rename, no fsync. A crash or power loss
+  during that write can leave a truncated `user_config.json`, and the loss is then every stored
+  arrangement plus every other section, not one panel. Known and unfixed; the fix belongs in
+  `src/config.rs` / `crates/ms-storage`, not in this directory.
 * **Restore beats default.** `install_persisted_layouts` runs before the first frame, so
   `ensure_default_layout` finds the key taken and never builds over it. Restoring does not raise
   `dirty` — the config is not a user change. The same holds for

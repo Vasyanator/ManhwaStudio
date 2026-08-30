@@ -1277,6 +1277,15 @@ session long before this call.
   instances quarantining one title's document in the same instant can pick one name twice and
   the second replaces the first copy — closing it needs a rename-without-replace primitive
   `Storage` does not expose, and the loss is one copy of an already-corrupt file.
+- **Only a FULL `cargo test` run is evidence about this module.** Many tests here assert on
+  localized text and therefore depend on the process-global `ms-i18n` catalog, which is installed
+  by `ms_i18n::set_locale` from tests living in OTHER modules (`src/tabs/wiki.rs`,
+  `src/widgets/panel_dock/window.rs`, `src/tabs/cleaning/tools/watermark_removal.rs`, ...). A
+  filtered run leaves the catalog empty, `t!`/`tf!` return the bare key, and those assertions
+  fail: measured 2026-08-30, `cargo test --bin manhwastudio_rs tabs::typing::panel::` gives 4
+  failures while `cargo test --workspace` is green. A few font tests are order-sensitive for the
+  same reason (`font_settings_store::test_lock`, the system-font index build counter). Never open
+  a defect from a filtered run — reproduce it in a full run first.
 
 ## Advanced-form search: the knobs and the presentation order
 (`advanced_form_params.rs` + `text_forms::order_advanced_forms`; spec:

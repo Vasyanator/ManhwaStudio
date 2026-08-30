@@ -190,5 +190,6 @@ detection cannot be fooled by punctuation inside strings or comments.
   `name` in `_meta`; no derived `untranslated` list).
 - To change how untranslated keys are listed, see `compute_untranslated` /
   `values_equal_to_source` / `run_untranslated` (the `--untranslated <tag>` mode).
-- The generated audit lives at `docs/i18n_migration_report.md` (regenerate with
-  `python3 tools/i18n_extract.py --dry-run --report docs/i18n_migration_report.md`).
+- The audit is a GENERATED artefact and is deliberately not kept in the tree — it goes
+  stale the moment a key changes. Regenerate it on demand:
+  `python3 tools/i18n_extract.py --dry-run --report dev-docs/i18n_migration_report.md`.

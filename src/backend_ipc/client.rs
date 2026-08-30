@@ -1532,17 +1532,19 @@ mod tests {
     //      point of the whole rework).
     //
     // It is `#[ignore]`d so normal `cargo test`/CI never spawns Python. Run it
-    // on demand (see docs/ipc_rework/LIVE_INTEGRATION.md):
+    // on demand (see "Live cross-language test" in src/backend_ipc/MODULE_README.md):
     //
-    //   MS_IPC_PYTHON=venv_new/bin/python \
-    //     cargo test --lib backend_ipc::client::tests::live_ -- --ignored --nocapture
+    //   MS_IPC_PYTHON=venv/bin/python \
+    //     cargo test --bin manhwastudio_rs \
+    //     backend_ipc::client::tests::live_ -- --ignored --nocapture
     //
-    // `MS_IPC_PYTHON` selects the interpreter (default `venv/bin/python`). It
-    // must be a venv whose torch actually imports, otherwise the backend's
-    // health-snapshot worker raises and never publishes a `health` event (see
-    // the run note).
+    // `MS_IPC_PYTHON` selects the interpreter (default `venv/bin/python`). The
+    // crate has no lib target, hence `--bin`. Prefer a venv whose torch imports:
+    // the pushed `health` event still arrives without it (a raising service is
+    // isolated by `_safe_service_health` in modules/ai_backend/server.py), but
+    // the snapshot then carries error placeholders instead of real service data.
     #[test]
-    #[ignore = "spawns the real Python backend; run manually, see docs/ipc_rework/LIVE_INTEGRATION.md"]
+    #[ignore = "spawns the real Python backend; run manually, see the live-test section of src/backend_ipc/MODULE_README.md"]
     fn live_backend_roundtrip_and_health_push() {
         use std::io::Read as _;
         use std::path::Path;
@@ -1724,11 +1726,12 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(8)).unwrap_or_else(|_| {
             panic!(
                 "no pushed health event within 8s (server->client push). The frame \
-                 protocol is fine, but the backend's health worker only publishes a \
-                 `health` event after `_build_health_snapshot` succeeds; if torch \
-                 cannot import in {python}, `surya.health()` raises and the worker \
-                 never publishes. Re-run with MS_IPC_PYTHON pointing at a venv whose \
-                 torch imports."
+                 protocol is fine, so this is a genuine failure of the health worker, \
+                 not an environment problem: `_build_health_snapshot` routes every \
+                 service through `_safe_service_health`, so even a venv whose torch \
+                 cannot import still publishes a `health` event carrying an \
+                 `{{\"status\": \"error\"}}` placeholder for that service. Check that the \
+                 backend at {python} started its health worker at all."
             )
         });
         eprintln!(

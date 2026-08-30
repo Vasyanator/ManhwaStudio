@@ -207,6 +207,26 @@ is an author note addressed to the translator, not a replica.
   page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
   files are written to the chapter unsaved staging `image_bubbles/` directory and stored as
   chapter-relative paths so the saved chapter can resolve them after commit.
+- Translation also owns the hint-bubble shortcut: `H` creates a `BubbleClass::Hint` under the
+  pointer. Unlike `Q`/`Shift+Q` it is a REGISTERED hotkey
+  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `app.rs`, default `Key::H` with no modifiers, scope
+  `Tab(Translation)`), so it appears in Settings → Hotkeys, is rebindable, and inherits the
+  rising-edge semantics of the hotkey manager instead of a hand-rolled armed gate.
+- HINT ATTACHMENT is the reason a hint exists, and it is a contract of this tab, not a formatting
+  detail. A hint is an author note addressed to the translator: it carries ONE line in
+  `Bubble.text`, points at an anchor and owns an area exactly like an ordinary aside text bubble
+  (canvas geometry, `src/canvas/MODULE_README.md`), and its only job is to be injected into the
+  composed prompt next to the replica it comments on. Binding is FORWARD, in composition sort
+  order (`img_v`, or the replica-order spin box the hint shares with every other class): a hint
+  attaches to the next ORDINARY replica after it, skipping image bubbles and other hints. Two
+  consequences that must not be re-derived by hand: (1) the authoring rule is "place a hint ABOVE
+  the replica it annotates" — a hint below its replica binds to the wrong one or becomes trailing;
+  (2) a hint is emitted only if its target replica is emitted, so a hint in front of an
+  already-translated (filtered) replica emits NOTHING, while a hint with no following replica at
+  all is trailing and is force-emitted at the very end past the character limit. That asymmetry is
+  deliberate. The full rule — the barrier model, `classify_hint_bindings`, the atomic
+  hint+replica limit admission, and the `merge_same_character` interaction — is documented once,
+  in `panels/MODULE_README.md`; do not restate it elsewhere.
 - `build_bubble_footer` is a class dispatch placed AFTER the shared replica-order spin box, so every
   bubble class inherits the order control: `Image` gets the image source/crop controls, `Hint` gets
   only the `hint_show_outside_translation` checkbox, and `Text` gets the character autocomplete.

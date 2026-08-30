@@ -37,6 +37,19 @@ on unix and the WS endpoint published via `set_ws_endpoint()` on windows. The ba
 supervisor (a different module) parses the backend's `MS_BACKEND_WS_PORT=<port>` line
 and calls `set_ws_endpoint(port, token)`.
 
+### Rejected alternatives (do not re-propose)
+Three ways out of "CPython on Windows cannot bind AF_UNIX" were weighed; the WS fallback won.
+
+- **Bump the managed Python to the release that adds Windows AF_UNIX (3.15).** Not reachable:
+  the managed runtime is pinned to 3.11 (`installer::utils::PYTHON_VERSION_REQUEST`) and the
+  compiled ML stack (torch and the rest) publishes no cp315 wheels.
+- **A Rust ctypes shim so the Python side speaks AF_UNIX anyway**, either hosting the socket or
+  — with client/server roles flipped — dialling it. Rejected: a hand-written FFI layer on the
+  IPC hot path, for one platform, reusable nowhere else.
+- **Loopback WebSocket (chosen).** Dependency-light on both sides (`tungstenite` in Rust,
+  `wsproto` in Python), and it is the only transport a browser can ever use — so a future web
+  client reuses this module's codec unchanged instead of needing a fourth transport.
+
 Socket isolation: `backend_socket_path()` normally yields the shared
 `manhwastudio_backend_socket` path. Under `--ignore-installed`, `main.rs` calls
 `seed_isolated_backend_socket_name(program_dir)` right after CLI parsing, which appends
@@ -79,6 +92,34 @@ is ephemeral and published per process.
   (loopback only) so the x86_64-pc-windows-gnu target keeps building.
 - The GUI thread never blocks here: all backend I/O runs on the reader/I-O worker
   threads; callers use `call`/`begin_call` with timeouts.
+
+## Live cross-language test (`live_backend_roundtrip_and_health_push`)
+The only test here that talks to a REAL Python backend instead of the in-process `TestServer`. It
+is `#[ignore]`d, so ordinary `cargo test` and CI never spawn Python. It spawns `ai_backend.py` on a
+UNIQUE temp socket (`ms_ipc_live_<pid>_<ns>` in the temp dir, so a real backend is never clobbered),
+connects a real `BackendClient` to it, and asserts: the `hello` handshake populates
+`backend_version`; a `health` call returns the contracted keys (`ok`, `service == "mf_ai_backend"`,
+`backend_version`, `is_torch_available`) with no blob; a `browser.command` `version` call answers;
+and `subscribe(TOPIC_HEALTH)` receives a SERVER-PUSHED `health` event within 8 s (the point of the
+whole framed-protocol rework). A `Drop` guard kills the backend and removes the temp socket/log even
+on panic. Run it from the repo root:
+
+```sh
+MS_IPC_PYTHON=venv/bin/python \
+  cargo test --bin manhwastudio_rs \
+  backend_ipc::client::tests::live_ -- --ignored --nocapture
+```
+
+`MS_IPC_PYTHON` picks the interpreter (default `venv/bin/python`); `--ignored` is required and
+`--nocapture` shows the `[live] …` progress lines. There is no lib target, hence `--bin`.
+
+Torch caveat: the pushed event comes from the backend's health worker, which publishes only after
+`_build_health_snapshot` returns. Individual services are isolated by `_safe_service_health`
+(`modules/ai_backend/server.py`) — one that raises (e.g. `surya.health()`, which imports torch
+unconditionally) yields a `{"status":"error"}` sub-entry instead of sinking the snapshot — so a venv
+with a broken torch still pushes events, just with error placeholders and `is_torch_available:
+false`. A timeout at step (3) is therefore a real backend/protocol failure, not an expected torch
+symptom: read the backend log the test prints before blaming the environment.
 
 ## Editing map
 - To change the wire format or size guards, see `frame.rs` (+ `protocol.rs` guards) and

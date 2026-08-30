@@ -348,6 +348,38 @@ prompts instead of blocking the GUI thread.
   `Context::set_fonts` replaces the whole definition set and would drop the families other
   subsystems add at runtime (typing font previews/editors), which then panics in epaint;
   `Context::fonts` panics before the first frame and must not be called from a loader.
+- PARAMETER-CLUMP CONSOLIDATION HAS A SETTLED SCOPE, and the boundary is recorded here so it is not
+  re-litigated. A 2026-07 multi-agent review of `src/` (four external reviewers plus one cross-pool
+  reviewer) inventoried every function threading a large loose-argument clump. Its general principle
+  stands: consolidate into an owned `Copy` snapshot/context struct built AT the call boundary, never
+  into a context that borrows a whole tab or the whole `CanvasView` — most argument explosions in
+  `tabs/cleaning/` are deliberate disjoint-borrow workarounds and need a durable STATE split, not a
+  call-site bag. Two of its recommendations shipped and are the exemplars to copy: `PageView`
+  (`tabs/typing/tab/mesh_geometry.rs`, the `(page_idx, image_rect, zoom)` viewport triple) and the
+  canvas' `BubbleMenuContext` / `BubbleMenuOutcome` / `BubbleMenuCommand` (`canvas/types.rs`), which
+  replaced a 16-parameter menu call with seven `&mut bool` out-flags.
+  The following were examined at the same time and DELIBERATELY left as they are. Do not re-propose
+  them as cleanups without new evidence; a wide signature is not by itself a defect.
+  - `export_dispatch_ready` (`tabs/typing/tab.rs`, three `bool`s): a pure, `#[must_use]`, documented
+    and unit-tested predicate. A struct would add a type without removing a failure mode.
+  - The typing mask kernels — `flood_fill_mask_from_seed` (`tabs/typing/mask.rs`) and the mask
+    painters: owned-buffer worker kernels whose parameters have no natural grouping; `TypingPageMask`
+    is already used where it fits and the local `#[allow(clippy::too_many_arguments)]` carries its
+    justification at the site. The one carve-out still worth taking opportunistically is
+    `erase: bool` → a `MaskStrokeMode` enum (not done as of this writing).
+  - Numeric kernels and rasterizers where the parameters ARE the algorithm: the SOR/Poisson/Lab
+    kernels in `tabs/cleaning/tools/gradient.rs`, the circle rasterizers in `tools/mask_brush.rs`,
+    the pure leaves of `tabs/typing/tab/mesh_geometry.rs`, `pack_aside_slots` and
+    `reserve_canvas_page_frame` in `canvas/`, `evaluate_bubble_shape`'s scoring internals
+    (`tabs/typing/auto_typing.rs`), and the `studio_bootstrap.rs` spawns.
+  - `TypingExportPageJob` and the render-request structs in `tabs/typing/tab/render_store.rs`: both
+    review pools independently found these already ARE the target pattern. Use them as the model;
+    do not "consolidate" them further.
+  - The `use super::*` re-export style in typing's descendant modules is a consequence of the
+    documented descendant-module design, not a defect to fix on its own. Unwinding it into explicit
+    imports is only possible after the panel state splits it depends on, and is not worth doing
+    before them. Import breadth in `app.rs`, `tabs/translation/tab.rs` and `layer_model/persist.rs`
+    is legitimate — they are composition roots and a persistence boundary.
 
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in

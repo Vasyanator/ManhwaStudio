@@ -21,7 +21,7 @@ check-mac = "zigbuild --target x86_64-apple-darwin --bin manhwastudio_rs"
 # Web build (Variant A: browser threads via wasm atomics). Requires nightly +
 # rust-src because it recompiles std with the atomics/bulk-memory features set
 # below. Invoke as: `cargo +nightly wcheck` / `cargo +nightly wbuild`.
-# See build-wasm.sh and docs/WEB_PORT.md.
+# See build-wasm.sh and dev-docs/WEB_PORT.md.
 wcheck = "check --target wasm32-unknown-unknown -Z build-std=std,panic_abort --features web --bin manhwastudio_rs"
 wbuild = "build --release --target wasm32-unknown-unknown -Z build-std=std,panic_abort --features web --bin manhwastudio_rs"
 

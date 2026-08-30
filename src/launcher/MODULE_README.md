@@ -45,6 +45,11 @@ notification.
   Every preview is painted over a repeating transparency checkerboard (one cached texture, one
   quad with a repeating UV rect), not over the flat dark container fill: transparent holes must
   read as holes rather than as black ink.
+  Two deliberate non-goals of the PSB work, not gaps to be "fixed" on sight: (1) there is no PSB
+  EXPORT — the typing tab's `TypingExportFormat` (`src/tabs/typing/tab.rs`) offers `Png`/`Psd` only,
+  and `psb` exists nowhere outside this module; (2) the font-card import filter stays `psd`-only
+  (`src/tabs/settings/typesetting/font_groups.rs`, the rfd `add_filter` for the font card), even
+  though `ag-psd` would read a `.psb` there. Both are scope decisions; widen them only on request.
 - `theme.rs`: launcher visual style helpers.
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
@@ -72,6 +77,12 @@ the child windows. See `src/tutorial/MODULE_README.md` for the engine contract.
   plus the marker `= true`); a config read error skips it (never blocks the user).
 
 ## Editing map
+- **Reproducing a first run** (the language modal, or anything else gated on a virgin config):
+  launch the built binary with the working directory set to an EMPTY scratch dir and pass
+  `--test-launcher --no-ai`. `config::resolve_runtime_root()` finds no program markers in either
+  the cwd or the exe dir and falls back to the cwd, so the whole config tree — including
+  `General.first_run_languages_confirmed` — is created inside that scratch dir and the real
+  installation is untouched.
 - To change launcher startup or return values, edit `mod.rs` and `state.rs`.
 - To change root polling, page routing, or window lifecycle, edit `app.rs`.
 - To change the main menu or update notice, edit `main_page.rs`.

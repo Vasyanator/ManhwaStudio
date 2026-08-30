@@ -20,6 +20,19 @@ Model resolution order: an existing local file under `MODEL_DIR` → the remote 
 `.tar.xz`/`.txz` archives are extracted to a stable `<archive stem>.pth` cache name so a later
 catalog-name lookup finds them.
 
+### Upstream model sources
+The third-party stack ships no weights and no downloader of its own: `reline` runs the pipeline,
+`resselt` detects the architecture and loads the state dict, `resr` does tiling/inference (versions
+observed in `venv`: 1.4.4 / 1.4.1 / 1.1.0). Everything a user can pick therefore comes from one of
+two places:
+
+- `CATALOG_URL` (`https://mdb.yor.ovh/v1/files`, `service.py`) — the same catalog endpoint the
+  upstream GUIs (`rewaifu/reline-web`, `breadyk/reline-local-GUI`) read; entries carry `filename`
+  and `url`, and the published artifacts are Torch checkpoints or `.tar.xz` archives of one. That
+  observation dates from the 2026-05 upstream survey and has not been re-verified since.
+- `EXTRA_MODELS` (`service.py`) — models the catalog does not publish, each with a `source` URL
+  for manual placement when no direct `url` exists.
+
 ## Files and submodules
 - `__init__.py`: docstring only. Deliberately re-exports nothing so importing the package stays
   cheap; import `service` explicitly.
@@ -33,6 +46,14 @@ catalog-name lookup finds them.
 ## Contracts and invariants
 - Reline checkpoints are Torch files kept under `ManhwaStudio_AI_Models/side_models/Reline`
   (`MODEL_DIR`, derived from `config.MODELS_DIR`).
+- TORCH CHECKPOINTS ONLY — this is a hard upstream constraint, not a policy of ours. The `upscale`
+  node is a thin wrapper over `resselt.load_from_file` (`reline/nodes/upscale/node.py`), and that
+  function dispatches on the file extension: `.pt` / `.pth` / `.ckpt` / `.safetensors`, and raises
+  `ValueError("Unsupported model file extension …")` for anything else
+  (`resselt/registry.py`, `load_from_file`). ONNX super-resolution models therefore CANNOT be routed
+  through Reline — adding `.onnx` to `MODEL_SUFFIXES` would only move the failure from resolution to
+  load time. An ONNX SR path needs its own node/service (the project's ONNX runtime lives elsewhere,
+  see `crates/ms-onnx`), not a wider filter here.
 - The third-party `reline` package receives LOCAL model paths only; it never downloads. Catalog
   resolution, download, and archive extraction are owned by `service.py`.
 - `EXTRA_MODELS` is the escape hatch for models the remote catalog does not publish. An entry with

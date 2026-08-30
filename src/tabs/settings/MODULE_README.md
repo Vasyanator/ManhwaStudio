@@ -157,6 +157,12 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   (`reveal_highlight_until`, a `web_time::Instant`) — see the typesetting submodule for the
   `TypesettingFontGroups` implementation. After consumption the user can collapse the revealed
   blocks again. Add a `SettingsDeepLink` variant + a `navigate_to` arm per new target.
+- Rejected alternative (do not re-propose): driving deep links through the tutorial engine
+  (`src/tutorial/`). It is feature-gated (`tutorial` in `Cargo.toml`, off by default, so the reveal
+  would vanish in a normal build) and step-scripted rather than addressable, i.e. it is a guided-tour
+  player, not a general "reveal this setting" bus. `navigate_to` + `pending_reveal` is the vehicle,
+  and the reveal highlight is painted by the pane itself (`paint_reveal_highlight` in the
+  typesetting submodule), independent of the tutorial overlay.
 
 ## Contracts and invariants
 - Do not block the GUI thread with file writes, Python process work, backend probes, or command

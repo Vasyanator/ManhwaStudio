@@ -130,6 +130,29 @@ GUI-free крейты под `crates/`. Слой логики извлечён �
   typing panel, which offers the whole stack as ONE selectable font — see the Render
   section and `src/tabs/typing/panel/MODULE_README.md`.
 
+- **`ms-storage`** (`crates/ms-storage`) — GUI-free слой хранения: объект-безопасный
+  синхронный трейт `Storage` с типизированными ошибками (`StorageError`) и тремя бэкендами.
+  На десктопе приложение держит `Arc<dyn Storage>` = `PassthroughStorage` (абсолютный путь
+  используется дословно, без нормализации и root-guard'а — это поведенчески то же самое, что
+  прямые `std::fs`-вызовы); `NativeStorage` — тот же `std::fs`, но с виртуальным корнем и
+  защитой от выхода за него (для песочниц); `MemStorage` — виртуальная ФС в памяти, сессионное
+  хранилище веб-сборки (гидратируется из IndexedDB и сбрасывается в него слоем веб-персистентности
+  приложения). Виртуальные пути всегда относительны корню и разделяются `/` (`path::normalize`).
+  Только std + `thiserror` + `web-time`, `native.rs`/`passthrough.rs` cfg-выключены на wasm,
+  поэтому крейт собирается и под `x86_64-*`, и под `wasm32-unknown-unknown`.
+  ⚠️ `Storage::write` — это `std::fs::write`: перезапись файла на месте, без temp+rename и без
+  fsync, так что запись конфига не атомарна к падению процесса.
+- **`ms-thread`** (`crates/ms-thread`) — кросс-таргетный шим создания потоков: реэкспортирует
+  `std::thread`-совместимую поверхность (`spawn`, `Builder`, `JoinHandle`, `sleep`, `yield_now`,
+  `current`, `scope`, `available_parallelism`). На нативных таргетах это прямой `std::thread`,
+  на `wasm32` создание потоков идёт через `wasm_thread` (Web Workers), потому что
+  `std::thread::spawn` в браузере не поддержан и паникует в рантайме. Точка вызова пишется как
+  `use ms_thread as thread;` и остаётся таргетно-нейтральной без других правок.
+  ⚠️ Поток, создаваемый на пути, который исполняется и в вебе, обязан заводиться через
+  `ms_thread`. Прямой `std::thread` остаётся законным только в коде, отключённом на wasm
+  (`#[cfg(not(target_arch = "wasm32"))]` — например `ui_fonts::install_with_roots`).
+  Детали — `crates/ms-thread/MODULE_README.md`.
+
 Бинарник держит стабильные пути через реэкспорт-шимы: `crate::runtime_log` / `crate::trace`
 / `crate::text_punctuation` = соответствующие крейты; `crate::tabs::typing::render_next` =
 `ms_text_render`, `crate::tabs::typing::segmentation` = `ms_text_util::segmentation`
