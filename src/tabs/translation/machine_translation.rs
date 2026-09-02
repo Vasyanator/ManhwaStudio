@@ -948,7 +948,16 @@ fn send_mt_progress(evt_tx: &Sender<WorkerEvent>, progress: WorkerProgressSnapsh
     });
 }
 
-fn translate_texts_via_translator(
+/// Dispatches a blocking MT request to the backend selected by `service`.
+///
+/// `texts` are translated as one batch. The outer `Err` is a provider-level
+/// failure; the inner per-text `Result` is that text's own outcome. BLOCKING
+/// network I/O (DeepL additionally self-throttles): callers must run it on a
+/// worker thread, never on the GUI thread.
+///
+/// `pub(crate)` because the cleaning tab reuses it for its prompt translator;
+/// duplicating the three-arm match there would let the two dispatchers drift.
+pub(crate) fn translate_texts_via_translator(
     service: MtService,
     source_lang: &str,
     target_lang: &str,

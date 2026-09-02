@@ -64,6 +64,7 @@ from .inpaint.lama import LamaInpaintService
 from .inpaint.lama_mpe import LamaMpeInpaintService
 from .inpaint.sdxl import SdxlInpaintService
 from .inpaint.flux_fill import FluxFillInpaintService
+from .inpaint.flux2_klein import Flux2KleinInpaintService
 from .watermark.service import WatermarkRemovalService
 from .reline.service import RelineService
 from .translate.machine_translation import MachineTranslationService
@@ -111,6 +112,7 @@ class AppState:
     aot_inpaint: AotInpaintService
     sdxl_inpaint: SdxlInpaintService
     flux_fill_inpaint: FluxFillInpaintService
+    flux2_klein_inpaint: Flux2KleinInpaintService
     watermark: WatermarkRemovalService
     reline: RelineService
     machine_translation: MachineTranslationService
@@ -161,6 +163,7 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
             "lama_mpe": _safe_service_health(state.lama_mpe_inpaint),
             "aot": _safe_service_health(state.aot_inpaint),
             "flux_fill": _safe_service_health(state.flux_fill_inpaint),
+            "flux2_klein": _safe_service_health(state.flux2_klein_inpaint),
         },
         # Watermark removal is a domain of its own, not an inpaint engine: it
         # predicts a mask instead of consuming one, so it gets a top-level key.
@@ -243,6 +246,7 @@ def run_server(
         aot_inpaint=AotInpaintService(model_manager),
         sdxl_inpaint=SdxlInpaintService(model_manager, lama_inpaint_service),
         flux_fill_inpaint=FluxFillInpaintService(model_manager),
+        flux2_klein_inpaint=Flux2KleinInpaintService(model_manager),
         watermark=WatermarkRemovalService(model_manager),
         reline=RelineService(),
         machine_translation=MachineTranslationService(),

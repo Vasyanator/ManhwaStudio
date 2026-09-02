@@ -17,7 +17,7 @@ Submodules:
 
 mod adv_rec;
 pub(crate) mod backend_health;
-mod machine_translation;
+pub(crate) mod machine_translation;
 mod machine_translators;
 mod ocr;
 mod ocr_case_fix;

@@ -97,6 +97,51 @@ pub const METHOD_INPAINT_SDXL_UNLOAD: &str = "inpaint.sdxl.unload";
 pub const METHOD_INPAINT_FLUX_FILL: &str = "inpaint.flux_fill";
 pub const METHOD_INPAINT_FLUX_FILL_UNLOAD: &str = "inpaint.flux_fill.unload";
 pub const METHOD_INPAINT_FLUX_FILL_STATUS: &str = "inpaint.flux_fill.status";
+/// FLUX.2 klein region edit (streaming). Request header carries `image_len`,
+/// `mask_len` and `params`; the blob is `region.png ++ mask.png` (mask L8, exactly
+/// the region size). The response header carries `image_len` and the blob is the
+/// edited region as an RGB PNG of exactly the region size.
+pub const METHOD_INPAINT_FLUX2_KLEIN: &str = "inpaint.flux2_klein";
+/// Reports whether the FLUX.2 klein components resolve on disk plus the host's
+/// current VRAM/RAM figures.
+pub const METHOD_INPAINT_FLUX2_KLEIN_STATUS: &str = "inpaint.flux2_klein.status";
+/// Predicts the VRAM/RAM cost of one FLUX.2 klein run for the given `params` and
+/// region size, and whether it fits.
+pub const METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE: &str = "inpaint.flux2_klein.estimate";
+/// Releases the resident FLUX.2 klein pipeline.
+pub const METHOD_INPAINT_FLUX2_KLEIN_UNLOAD: &str = "inpaint.flux2_klein.unload";
+/// Encodes the `params.prompt` with the Qwen3 text encoder and keeps the
+/// embeddings in the backend's prompt cache (streaming: reading the ~16 GB encoder
+/// takes ~106 s, and the progress frames carry `phase`/`step`/`total`/`label` just
+/// like a generation). Afterwards `.status` reports `prompt_cached = true` for that
+/// prompt and a generation skips the encoder entirely.
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD: &str =
+    "inpaint.flux2_klein.prompt_cache.build";
+/// Lists the saved prompt-cache LIBRARY entries of the encoder family named by
+/// `params`. The answer carries the family name plus one record per entry (name,
+/// the prompt it was built from, and when it was created).
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST: &str =
+    "inpaint.flux2_klein.prompt_cache.list";
+/// Stores the cached embeddings of `params.prompt` in the library under
+/// `params.name`. A name already taken is refused with an explicit error rather
+/// than overwritten. One-shot.
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE: &str =
+    "inpaint.flux2_klein.prompt_cache.save";
+/// Loads library entry `params.name` into the backend's live cache and answers with
+/// the `prompt` it was built from, so the tool can show what was actually loaded. An
+/// entry belonging to a different encoder family is refused. One-shot.
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD: &str =
+    "inpaint.flux2_klein.prompt_cache.load";
+/// Writes library entry `params.name` to the file `params.path`, for handing it to
+/// someone else. One-shot.
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT: &str =
+    "inpaint.flux2_klein.prompt_cache.export";
+/// Takes the file `params.path` into the library. A file built for a DIFFERENT
+/// encoder family is still imported — into that family's folder, so it is not lost —
+/// and the answer says so; such an entry does not appear in the current family's
+/// listing and cannot be loaded. One-shot.
+pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
+    "inpaint.flux2_klein.prompt_cache.import";
 
 // --- Visible watermark removal ---
 /// Predicts a watermark mask for the request blob; responds with an L8 mask PNG

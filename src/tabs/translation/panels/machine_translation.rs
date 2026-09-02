@@ -141,8 +141,8 @@ pub struct MtPanelActions {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MtLanguage {
-    code: &'static str,
+pub(crate) struct MtLanguage {
+    pub(crate) code: &'static str,
     /// Display label source: either a stable i18n catalog key (resolved at render
     /// time) or a plain English literal for languages without a catalog entry.
     /// The wire `code` is the persisted identity, so the label is free to localize.
@@ -153,12 +153,12 @@ impl MtLanguage {
     /// Localized display label. Runtime (not `const`) because `t!` is not const;
     /// a catalog miss (plain-literal titles) falls back to the stored string.
     #[must_use]
-    fn title(&self) -> &'static str {
+    pub(crate) fn title(&self) -> &'static str {
         ms_i18n::lookup(self.title).unwrap_or(self.title)
     }
 }
 
-const MT_SOURCE_LANGUAGES: &[MtLanguage] = &[
+pub(crate) const MT_SOURCE_LANGUAGES: &[MtLanguage] = &[
     MtLanguage {
         code: "auto",
         title: "translation.mt_panel.auto_detect_lang",

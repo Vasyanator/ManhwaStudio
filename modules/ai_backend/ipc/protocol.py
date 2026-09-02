@@ -125,6 +125,23 @@ METHOD_INPAINT_SDXL_UNLOAD = "inpaint.sdxl.unload"          # POST /inpaint/sdxl
 METHOD_INPAINT_FLUX_FILL = "inpaint.flux_fill"             # FLUX.1-Fill (streams download+gen)
 METHOD_INPAINT_FLUX_FILL_UNLOAD = "inpaint.flux_fill.unload"
 METHOD_INPAINT_FLUX_FILL_STATUS = "inpaint.flux_fill.status"  # quant catalog + download state
+# FLUX.2 klein 9B region editing: the mask is a PERMISSION TO CHANGE and every
+# pixel outside it comes back byte-identical. All weights are user-supplied
+# paths, so there is no download phase — the streamed phases are `load`/`generate`.
+METHOD_INPAINT_FLUX2_KLEIN = "inpaint.flux2_klein"                    # streams load+gen progress
+METHOD_INPAINT_FLUX2_KLEIN_STATUS = "inpaint.flux2_klein.status"      # components + free memory
+METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE = "inpaint.flux2_klein.estimate"  # RAM/VRAM forecast
+METHOD_INPAINT_FLUX2_KLEIN_UNLOAD = "inpaint.flux2_klein.unload"
+# Prompt-cache library: a prompt embedding costs a 16 GB encoder read to produce
+# and ~4 MiB to keep, so it can be built without generating, stored in
+# `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, listed, loaded
+# back, and moved in and out of that library.
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD = "inpaint.flux2_klein.prompt_cache.build"
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST = "inpaint.flux2_klein.prompt_cache.list"
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE = "inpaint.flux2_klein.prompt_cache.save"
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD = "inpaint.flux2_klein.prompt_cache.load"
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT = "inpaint.flux2_klein.prompt_cache.export"
+METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cache.import"
 
 # --- Visible watermark removal ---
 # Primary flow is `watermark.detect` (mask only, fed to the existing inpainters);
@@ -182,6 +199,16 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX_FILL,
         METHOD_INPAINT_FLUX_FILL_UNLOAD,
         METHOD_INPAINT_FLUX_FILL_STATUS,
+        METHOD_INPAINT_FLUX2_KLEIN,
+        METHOD_INPAINT_FLUX2_KLEIN_STATUS,
+        METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
+        METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
+        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
         METHOD_WATERMARK_DETECT,
         METHOD_WATERMARK_REMOVE,
         METHOD_WATERMARK_STATUS,

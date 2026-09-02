@@ -31,6 +31,22 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `sdxl.py`: `inpaint.sdxl` (+ `.unload`) — streaming, with a latent-preview PNG blob per `progress`.
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
+- `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.estimate`, `.unload`, and the six
+  `.prompt_cache.*` methods) — FLUX.2 klein region editing. Streams `load`/`generate` phases
+  (never `download`: the weights are user-supplied paths) and returns `image_len` + the
+  OOM-recovery report (`oom_recovered`, `applied`) in the response header. `.estimate` is the only
+  inpaint method taking a region size instead of image bytes.
+  **`applied` must always carry all five names of `_APPLIED_FLAGS`**: the Rust client parses it as
+  one struct and ignores an incomplete object outright, so omitting a key does not degrade the
+  answer — it throws the whole OOM-recovery report away.
+  `prompt_cache.build` is the second streaming method of the group (same
+  `{phase, step, total, label}` frames through the shared `_progress_forwarder`, no blob): it
+  encodes a prompt without generating anything, and reading the text encoder takes ~106 s, so a
+  silent wait is not acceptable. `prompt_cache.list`/`.save`/`.load`/`.export`/`.import` are plain
+  request/response. Names and paths are forwarded VERBATIM — `_require_non_empty_str` only checks
+  that the field arrived as a non-empty string; what makes a path or a name acceptable is the
+  service's business (`require_prompt_file_source`, `sanitize_name_component`), and duplicating
+  those rules here would give two answers to one question.
 - `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
   (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
   method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).

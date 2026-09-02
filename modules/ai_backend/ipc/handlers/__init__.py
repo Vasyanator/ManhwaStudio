@@ -37,3 +37,4 @@ from . import translate    # noqa: F401  — translate.deep
 from . import browser      # noqa: F401  — browser.command (Selenium / CloakBrowser)
 from . import flux_fill     # noqa: F401  — inpaint.flux_fill (+ unload, + status)
 from . import watermark     # noqa: F401  — watermark.detect / .remove / .status / .unload
+from . import flux2_klein   # noqa: F401  — inpaint.flux2_klein (+ status, estimate, unload)

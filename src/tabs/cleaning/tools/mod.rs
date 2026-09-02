@@ -6,7 +6,7 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
   - Конкретные инструменты вкладки cleaning:
     `ZamazkaTool`, `StampTool`, `GradientFillTool`, `TextureSynthesisInpaintTool`,
     `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`,
-    `FluxFillInpaintTool`, `WatermarkRemovalTool`.
+    `FluxFillInpaintTool`, `WatermarkRemovalTool`, `Flux2KleinTool`.
 - Внутренние модули без экспорта:
   - `watermark_library` — библиотека измеренных знаков на диске; используется
     режимом «По главе» из `watermark_removal.rs`.
@@ -55,3 +55,6 @@ mod watermark_library_window;
 
 mod watermark_removal;
 pub use watermark_removal::WatermarkRemovalTool;
+
+mod flux2_klein;
+pub use flux2_klein::Flux2KleinTool;

@@ -49,9 +49,9 @@ FILE HEADER (tabs/cleaning/tab.rs)
 */
 use super::autoclean::{autoclean_page, UnevenBackgroundTool};
 use super::tools::{
-    AotInpaintTool, CleaningCursorOccluder, CleaningTool, FluxFillInpaintTool, GradientFillTool,
-    LamaInpaintTool, LamaMpeInpaintTool, SdxlInpaintTool, StampTool, StrokeModifiers, StrokePoint,
-    TextureSynthesisInpaintTool, WatermarkRemovalTool, ZamazkaTool,
+    AotInpaintTool, CleaningCursorOccluder, CleaningTool, Flux2KleinTool, FluxFillInpaintTool,
+    GradientFillTool, LamaInpaintTool, LamaMpeInpaintTool, SdxlInpaintTool, StampTool,
+    StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool, ZamazkaTool,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
@@ -170,10 +170,10 @@ const CLEANING_PANEL_CHROME_WIDTH_PX: f32 = 16.0;
 
 const BRUSH_TOOL_INDICES: [usize; 2] = [0, 1];
 const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
-// Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков) —
-// отдельной строкой. Индекс, отсутствующий в этих массивах, зарегистрирован, но не
-// рисуется ни в одной группе панели инструментов.
-const AREA_EDIT_TOOL_INDICES: [usize; 3] = [7, 8, 9];
+// Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков,
+// FLUX.2 klein) — отдельной строкой. Индекс, отсутствующий в этих массивах,
+// зарегистрирован, но не рисуется ни в одной группе панели инструментов.
+const AREA_EDIT_TOOL_INDICES: [usize; 4] = [7, 8, 9, 10];
 
 /// Every tool index the «Инструменты клина» tab draws a button for, in draw order.
 ///
@@ -708,6 +708,7 @@ impl Default for CleaningTabState {
             Box::<SdxlInpaintTool>::default(),
             Box::<FluxFillInpaintTool>::default(),
             Box::<WatermarkRemovalTool>::default(),
+            Box::<Flux2KleinTool>::default(),
         ];
         let mut state = Self {
             canvas,

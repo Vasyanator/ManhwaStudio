@@ -2,9 +2,9 @@
 File: modules/ai_backend/inpaint/test_lease_protocol.py
 
 Purpose:
-Pins the `LoadedModelManager` lease protocol of all five inpaint services
-(`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`) against one specific way of
-getting it wrong: reporting a failed INFERENCE as a failed LOAD.
+Pins the `LoadedModelManager` lease protocol of all six inpaint services
+(`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`, `flux2_klein`) against one
+specific way of getting it wrong: reporting a failed INFERENCE as a failed LOAD.
 
 Main responsibilities:
 - verify a model whose load succeeded is registered with `mark_loaded()` even
@@ -21,7 +21,7 @@ Notes:
   replaced by a stub that installs a stand-in model under the service's own
   model key, and each service's inference step by one that raises. Everything in
   between — the lease calls, their ordering, the `finally` — is the real code.
-- The five services deliberately share one table of cases: the protocol is a
+- The six services deliberately share one table of cases: the protocol is a
   cross-service contract, and a fix applied to only some of them is exactly the
   inconsistency these tests exist to catch.
 """
@@ -29,6 +29,7 @@ Notes:
 from __future__ import annotations
 
 import io
+import pathlib
 import unittest
 from contextlib import ExitStack
 from typing import Any, Callable
@@ -36,13 +37,17 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from modules.ai_backend.inpaint import aot, flux_fill, lama, lama_mpe, sdxl
+from modules.ai_backend.inpaint import aot, flux2_klein, flux_fill, lama, lama_mpe, sdxl
 from modules.ai_backend.runtime.model_manager import LoadedModelManager
 
 #: Message raised by every stand-in inference below.
 _BOOM = "inference exploded"
 
 _SDXL_MODEL_PATH = "/models/sdxl-inpaint.safetensors"
+
+#: FLUX.2 klein validates its three component paths eagerly, so the case builder
+#: points them all at a directory that certainly exists.
+_FLUX2_KLEIN_PATH = str(pathlib.Path(__file__).resolve().parent)
 
 #: One case: `(service, invoke)`, where `invoke()` runs a single request whose
 #: LOAD succeeds and whose INFERENCE raises.
@@ -58,6 +63,11 @@ def _png_bytes(mode: str, color: object, size: tuple[int, int] = (16, 16)) -> by
 
 IMAGE_PNG = _png_bytes("RGB", (128, 128, 128))
 MASK_PNG = _png_bytes("L", 255)
+
+#: FLUX.2 klein refuses a region smaller than 128 px per side (see
+#: `flux2_klein.validate_region_size`), so it gets its own pair.
+REGION_PNG = _png_bytes("RGB", (128, 128, 128), size=(128, 128))
+REGION_MASK_PNG = _png_bytes("L", 255, size=(128, 128))
 
 
 class _StubModel:
@@ -177,6 +187,45 @@ def _case_flux_fill(
     )
 
 
+def _case_flux2_klein(
+    stack: ExitStack, manager: LoadedModelManager
+) -> tuple[Any, Callable[[], None]]:
+    service = flux2_klein.Flux2KleinInpaintService(manager)
+
+    def ensure(
+        _normalized: dict[str, Any], model_key: str, _report: Any, *, region_hw: tuple[int, int]
+    ) -> _StubModel:
+        service._pipe = _StubModel()
+        service._active_key = model_key
+        return service._pipe
+
+    stack.enter_context(patch.object(flux2_klein, "_clear_torch_cache", lambda: None))
+    stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
+    # Phase 1 (the prompt encoder) and the pre-load memory guard are separate
+    # concerns with their own tests; this case is about the lease protocol only.
+    stack.enter_context(
+        patch.object(
+            service,
+            "_prompt_embeds_locked",
+            lambda _normalized, _report: {"prompt": object(), "negative": None},
+        )
+    )
+    stack.enter_context(
+        patch.object(service, "_require_headroom_locked", lambda *_a, **_k: None)
+    )
+    stack.enter_context(patch.object(service, "_generate_locked", _explode))
+    # The region must survive `validate_region_size`, so this case uses its own
+    # 128x128 image instead of the shared 16x16 one.
+    params = {
+        "text_encoder_path": _FLUX2_KLEIN_PATH,
+        "transformer_path": _FLUX2_KLEIN_PATH,
+        "vae_path": _FLUX2_KLEIN_PATH,
+    }
+    return service, lambda: service.inpaint_image_bytes(
+        REGION_PNG, REGION_MASK_PNG, params=params
+    )
+
+
 #: `(name, builder, load method)` per inpaint service.
 _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("lama_v2", _case_lama, "_ensure_inpainter_locked"),
@@ -184,6 +233,7 @@ _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("aot", _case_aot, "_ensure_model_locked"),
     ("sdxl", _case_sdxl, "_ensure_pipeline_locked"),
     ("flux_fill", _case_flux_fill, "_ensure_pipeline_locked"),
+    ("flux2_klein", _case_flux2_klein, "_ensure_pipeline_locked"),
 )
 
 

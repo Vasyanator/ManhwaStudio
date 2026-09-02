@@ -33,6 +33,8 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── inpaint.py     — inpaint.lama_v2 / .lama_mpe / .aot (+ unloads)
                 ├── sdxl.py        — inpaint.sdxl (+ unload); streaming via ProgressEmitter
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
+                ├── flux2_klein.py — inpaint.flux2_klein (+ status, estimate, unload,
+                │                    prompt_cache.build/list/save/load/export/import); streaming
                 ├── watermark.py   — watermark.detect / .remove / .status / .unload; streaming
                 ├── reline.py      — reline.models / reline.process
                 ├── device.py      — device.get / .set / .cuda_diagnostics

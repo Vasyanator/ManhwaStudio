@@ -60,10 +60,10 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
 - `detection/`: text detectors (`textdetector.ctd` / `.paddle` / `.surya`) plus the vendored
   ComicTextDetector implementation in `detection/textdetector/`. See `detection/MODULE_README.md`.
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
-  `.flux_fill`), the standalone LaMa V2 runtime module, and the vendored `lama_runtime_bundle/`.
-  See `inpaint/MODULE_README.md`.
+  `.flux_fill` / `.flux2_klein`), the standalone LaMa V2 runtime module, and the vendored
+  `lama_runtime_bundle/`. See `inpaint/MODULE_README.md`.
 - `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
-  A domain of its own, not a sixth inpainter: it PREDICTS a mask instead of consuming one, and its
+  A domain of its own, not an inpainter: it PREDICTS a mask instead of consuming one, and its
   weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`
   (`config.WATERMARK_DIR`). See `watermark/MODULE_README.md`.
 - `reline/`: Reline pipeline adapter and catalog-backed downloader (`reline.models`,

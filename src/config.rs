@@ -586,6 +586,15 @@ pub fn watermark_removal_settings_path() -> PathBuf {
     data_dir().join("watermark_removal_settings.json")
 }
 
+/// Dedicated settings file for the «FLUX.2 klein» region-edit cleaning tool
+/// (model paths, prompt, generation and memory-placement parameters), kept out of
+/// `user_config.json` for the same reason as the SDXL, FLUX.1-Fill and watermark
+/// ones: its background saves must not race the canvas-settings saver.
+#[must_use]
+pub fn flux2_klein_settings_path() -> PathBuf {
+    data_dir().join("flux2_klein_settings.json")
+}
+
 /// Root of the reusable watermark LIBRARY: one self-contained directory per entry
 /// (metadata JSON, the `c`/`s` planes, the correlation template and the calibration
 /// crops that produced it).

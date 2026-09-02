@@ -804,6 +804,15 @@ impl RegionEditorSession {
 pub struct RegionEditToolBase {
     window_id: String,
     selection_multiple: Option<usize>,
+    /// Smallest accepted side of a selection, in source pixels. `0` = no floor.
+    /// Set through [`RegionEditToolBase::with_min_selection`].
+    min_selection_px: usize,
+    /// Largest accepted selection AREA, in source pixels squared. `0` = uncapped.
+    /// Set through [`RegionEditToolBase::with_max_selection_area`].
+    max_selection_area_px2: usize,
+    /// Largest accepted ratio between the long and the short side. `0.0` = uncapped.
+    /// Set through [`RegionEditToolBase::with_max_aspect_ratio`].
+    max_selection_aspect: f32,
     selecting_page_idx: Option<usize>,
     selection_start_scene: Option<Pos2>,
     selection_current_scene: Option<Pos2>,
@@ -827,6 +836,9 @@ impl RegionEditToolBase {
         Self {
             window_id: window_id.into(),
             selection_multiple,
+            min_selection_px: 0,
+            max_selection_area_px2: 0,
+            max_selection_aspect: 0.0,
             selecting_page_idx: None,
             selection_start_scene: None,
             selection_current_scene: None,
@@ -843,6 +855,81 @@ impl RegionEditToolBase {
             editor: None,
             force_center_after_load: false,
         }
+    }
+
+    /// Refuses a finished selection whose shorter side is below `px` source pixels.
+    ///
+    /// Additive builder: the floor is checked in [`RegionEditToolBase::end_selection`],
+    /// NOT while dragging, so the user keeps seeing the rectangle they are drawing and
+    /// gets the reason named in the tool hint instead of a rectangle that silently
+    /// refuses to appear. `0` (the default) disables the check.
+    #[must_use]
+    pub fn with_min_selection(mut self, px: usize) -> Self {
+        self.min_selection_px = px;
+        self
+    }
+
+    /// Refuses a finished selection whose area exceeds `px2` source pixels squared.
+    ///
+    /// Additive builder with the same "checked on release, reported in the hint"
+    /// contract as [`RegionEditToolBase::with_min_selection`]. `0` (the default)
+    /// disables the check. Models with a hard latent budget need this: a selection
+    /// three times the trained area does not fail gracefully backend-side.
+    #[must_use]
+    pub fn with_max_selection_area(mut self, px2: usize) -> Self {
+        self.max_selection_area_px2 = px2;
+        self
+    }
+
+    /// Refuses a finished selection whose long side is more than `ratio` times its
+    /// short side.
+    ///
+    /// Additive builder with the same "checked on release, reported in the hint"
+    /// contract as the two above. A non-finite or non-positive `ratio` (the default
+    /// is `0.0`) disables the check.
+    #[must_use]
+    pub fn with_max_aspect_ratio(mut self, ratio: f32) -> Self {
+        self.max_selection_aspect = ratio;
+        self
+    }
+
+    /// Checks a finished selection against the optional min-side / max-area /
+    /// max-aspect limits. Returns the user-facing reason for the first violated one.
+    fn check_selection_limits(&self, source_rect: OverlayRectPx) -> Result<(), String> {
+        let (w, h) = (source_rect.w, source_rect.h);
+        if self.min_selection_px > 0 && w.min(h) < self.min_selection_px {
+            return Err(tf!(
+                "cleaning.region.min_selection_error",
+                min = self.min_selection_px,
+                w = w,
+                h = h
+            ));
+        }
+        // Saturating: a pathological rect cannot be turned into an overflow panic here.
+        if self.max_selection_area_px2 > 0 && w.saturating_mul(h) > self.max_selection_area_px2 {
+            return Err(tf!(
+                "cleaning.region.max_selection_area_error",
+                max = self.max_selection_area_px2,
+                w = w,
+                h = h
+            ));
+        }
+        if self.max_selection_aspect.is_finite() && self.max_selection_aspect > 0.0 {
+            let long = w.max(h);
+            let short = w.min(h).max(1);
+            // Integer comparison instead of a float division: `long/short > ratio`
+            // rearranged, so the check cannot drift with rounding.
+            let limit = (self.max_selection_aspect * short as f32).floor();
+            if (long as f32) > limit {
+                return Err(tf!(
+                    "cleaning.region.max_aspect_error",
+                    ratio = format!("{:.0}", self.max_selection_aspect),
+                    w = w,
+                    h = h
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
@@ -882,6 +969,14 @@ impl RegionEditToolBase {
         let Some(mut selection) = self.build_selection(canvas, page_idx, start, current) else {
             return;
         };
+        // Size limits are checked here, on release, so the drag itself stays visible
+        // and an over- or undersized selection is REFUSED WITH A REASON instead of
+        // silently producing no rectangle.
+        if let Err(err) = self.check_selection_limits(selection.source_rect) {
+            self.pending_selection = None;
+            self.load_error = Some(err);
+            return;
+        }
         selection.overlay_chunk = capture_overlay_chunk(canvas, page_idx, selection.scene_rect);
         self.pending_selection = Some(selection);
         self.load_error = None;
@@ -915,6 +1010,24 @@ impl RegionEditToolBase {
             && mult > 1
         {
             ui.small(tf!("cleaning.region.selection_multiple_hint", mult = mult));
+        }
+        if self.min_selection_px > 0 {
+            ui.small(tf!(
+                "cleaning.region.min_selection_hint",
+                min = self.min_selection_px
+            ));
+        }
+        if self.max_selection_area_px2 > 0 {
+            ui.small(tf!(
+                "cleaning.region.max_selection_area_hint",
+                max = self.max_selection_area_px2
+            ));
+        }
+        if self.max_selection_aspect.is_finite() && self.max_selection_aspect > 0.0 {
+            ui.small(tf!(
+                "cleaning.region.max_aspect_hint",
+                ratio = format!("{:.0}", self.max_selection_aspect)
+            ));
         }
         if self.pending_job_id.is_some() {
             ui.small(t!("cleaning.region.loading_selection_status"));
