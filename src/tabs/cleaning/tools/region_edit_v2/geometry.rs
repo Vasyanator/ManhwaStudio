@@ -289,10 +289,10 @@ pub struct FrameChrome {
     pub gap: f32,
     /// Smallest width, in screen points, the chrome rows may have.
     ///
-    /// The rows carry a status sentence and three captioned buttons, so they cannot inherit
-    /// the frame's SCREEN width: a minimum-side frame at the canvas' minimum zoom is a few
-    /// points wide, and rows that narrow either spill their text over the artwork or floor
-    /// three buttons at one point each. The rows are widened symmetrically about the frame's
+    /// The rows carry a status sentence and the chrome's captioned buttons, so they cannot
+    /// inherit the frame's SCREEN width: a minimum-side frame at the canvas' minimum zoom is a
+    /// few points wide, and rows that narrow either spill their text over the artwork or floor
+    /// every button at one point. The rows are widened symmetrically about the frame's
     /// centre to reach this width, and the hitbox grows with them so keep-in-view still holds
     /// them on screen.
     pub min_row_w: f32,

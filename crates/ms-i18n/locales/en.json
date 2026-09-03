@@ -504,6 +504,8 @@
   "cleaning.region_frame.button.apply": "Apply",
   "cleaning.region_frame.button.cancel": "Cancel",
   "cleaning.region_frame.button.clear_mask": "Erase mask",
+  "cleaning.region_frame.button.compare": "Compare",
+  "cleaning.region_frame.button.compare_tooltip": "Hold to hide the result and see the original underneath",
   "cleaning.region_frame.layer_tooltip": "Mask layer to paint into: {name}",
   "cleaning.region_frame.status.free": "Free",
   "cleaning.region_frame.status.invalid_size": "Invalid size",

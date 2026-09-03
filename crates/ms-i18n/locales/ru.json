@@ -504,6 +504,8 @@
   "cleaning.region_frame.button.apply": "Применить",
   "cleaning.region_frame.button.cancel": "Отменить",
   "cleaning.region_frame.button.clear_mask": "Стереть маску",
+  "cleaning.region_frame.button.compare": "Сравнить",
+  "cleaning.region_frame.button.compare_tooltip": "Удерживайте, чтобы скрыть результат и увидеть оригинал под ним",
   "cleaning.region_frame.layer_tooltip": "Слой маски для рисования: {name}",
   "cleaning.region_frame.status.free": "Свободно",
   "cleaning.region_frame.status.invalid_size": "Некорректный размер",

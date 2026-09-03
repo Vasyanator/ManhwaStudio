@@ -23,7 +23,7 @@ Key functions:
 - `handle_brush_gestures()`, `paint_brush_cursor()`: the brush gestures and ring the frame has
   to own itself, because `tab.rs` delivers no key, wheel or cursor hook over an occluded pointer
 - `derive_lock()`, `derive_visual()`, `derive_buttons()`, `stroke_erases()`,
-  `keep_in_view_px()`: the pure rules
+  `result_hidden()`, `keep_in_view_px()`: the pure rules
 - `fold_pending()`: queued panel requests, dropped when the frame no longer allows them
 
 Notes:
@@ -33,6 +33,10 @@ canvas wheel scrolling. The area sits on `Order::Middle`, below the dock panels
 (`Order::Foreground`), which is also what makes `tab.rs`'s z-order occlusion test treat the
 frame as canvas-blocking. Every hover and drag decision goes through a `Response` from
 `Ui::interact`, never through a raw pointer position (`egui-docs/06-overlays.md` §5).
+The chrome row holds four buttons — «Применить», «Сравнить», «Отменить», «Стереть маску» —
+and «Сравнить» is a MOMENTARY HOLD, not a toggle: while its pointer button is down the pending
+result layer is not painted, so the original pixels show through. That is why the row is sensed
+BEFORE the frame's contents are painted.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§1, §2 D1-D6/D10, §10).
 */
 
@@ -65,12 +69,20 @@ const CHROME_GAP: f32 = 4.0;
 const BUTTON_GAP: f32 = 4.0;
 /// Smallest width the chrome rows may have, in screen points.
 ///
-/// The rows carry a status sentence and three captioned buttons, and they must NOT inherit
+/// The rows carry a status sentence and FOUR captioned buttons, and they must NOT inherit
 /// the frame's screen width: the canvas zooms down to 0.2, so a minimum-side frame is barely
 /// a dozen points wide there and rows that narrow would spill their text over the artwork and
-/// floor each button at a point. Chosen to hold the three chrome captions in the project's
-/// languages at `render`'s 12 pt chrome font; anything that still does not fit is elided.
-const CHROME_MIN_W: f32 = 240.0;
+/// floor each button at a point.
+///
+/// Sized from the captions themselves, not guessed: at `egui::TextStyle::Button` (13 pt
+/// proportional) the widest Russian caption, «Стереть маску», measures 85.1 pt and a button
+/// adds `2 × button_padding.x` = 8 pt, so a slot must be at least 93.1 pt wide; four slots
+/// separated by `BUTTON_GAP` need `4 × 93.1 + 3 × 4 = 384.4`. 400.0 gives a 97 pt slot, which
+/// clears every Russian and English caption with a little headroom for a different UI font.
+/// The longer Romance translations («Effacer le masque» at 103.4 pt) still do not fit and are
+/// ELIDED by `chrome_button`'s `truncate()`; the tooltip always carries the full text.
+/// `chrome_caption_slots_hold_the_russian_and_english_captions` keeps this claim honest.
+const CHROME_MIN_W: f32 = 400.0;
 
 /// Side of a freshly spawned frame, in source page pixels, before the consumer's constraints
 /// snap it. Large enough to be a useful edit region on a manhwa strip and small enough to
@@ -155,7 +167,7 @@ impl FrameOutcome {
     }
 }
 
-/// Which of the four actions are currently available.
+/// Which of the five actions are currently available.
 ///
 /// Decided once here so the frame's own button row and the dock panel that repeats these
 /// actions can never disagree about what is allowed.
@@ -165,6 +177,10 @@ pub struct FrameButtons {
     pub process: bool,
     /// «Применить»: a result is pending.
     pub apply: bool,
+    /// «Сравнить»: a result is pending, i.e. there is something to hide. Exactly the same
+    /// condition as `apply` — the button exists to show what is UNDER the pending result, and
+    /// there is nothing to compare while the frame is free or a run has not answered yet.
+    pub compare: bool,
     /// «Отменить»: a result is pending, or work is running and can be cancelled.
     pub cancel: bool,
     /// «Стереть маску»: the mask stack holds something to erase.
@@ -239,9 +255,23 @@ fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty:
             && matches!(lock, FrameLock::Free | FrameLock::MaskPainted)
             && (!mask_empty || allows_empty_mask),
         apply: has_result,
+        compare: has_result,
         cancel: has_result || processing,
         clear_mask: !mask_empty,
     }
+}
+
+/// Whether the pending result layer must stay HIDDEN this frame, so the user sees the
+/// original pixels under it.
+///
+/// `compare_held` is the momentary «Сравнить» button's state, settled when the button row is
+/// sensed; this is read when the contents are painted. Re-checking `buttons.compare` here is
+/// therefore not redundant: it is what guarantees that a result which disappeared between the
+/// two — applied or cancelled from the dock panel, or dropped by the host tool — can never
+/// leave the frame hiding something. A held flag alone is never allowed to hide anything.
+#[must_use]
+fn result_hidden(buttons: FrameButtons, compare_held: bool) -> bool {
+    buttons.compare && compare_held
 }
 
 /// The actions a dock panel queued for the next pass.
@@ -433,6 +463,14 @@ pub struct RegionFrame {
     /// `Some` for exactly as long as the stroke's button is held, which is also what makes it
     /// the frame's "a stroke is in flight" flag (`derive_lock`, `drag_active`).
     last_paint_px: Option<(i32, i32)>,
+    /// Whether the chrome's «Сравнить» button is being HELD right now, which hides the pending
+    /// result so the original pixels show through.
+    ///
+    /// Recomputed from scratch in every drawn pass (`draw_rows`) as "the button is enabled AND
+    /// its pointer button is down on it" — never toggled and never accumulated, so it cannot
+    /// outlive the press. Private on purpose: it is a momentary gesture, not frame state a
+    /// host may set. `result_hidden` re-checks the enablement at read time as well.
+    compare_held: bool,
     /// Actions pressed in a dock panel, waiting to be folded into the next outcome.
     /// A panel body cannot act directly (it runs inside `CanvasView::draw`), so it raises
     /// these flags and the next pass consumes them — the `CleaningDockOut` rule at tool scope.
@@ -479,6 +517,7 @@ impl RegionFrame {
             brush: MaskBrush::default(),
             erase: false,
             last_paint_px: None,
+            compare_held: false,
             pending: PendingRequests::default(),
             hitbox: None,
         }
@@ -677,6 +716,8 @@ impl RegionFrame {
     fn cancel_gestures(&mut self) {
         self.drag = None;
         self.last_paint_px = None;
+        // A hold is a gesture too: nothing may keep hiding a result the frame no longer draws.
+        self.compare_held = false;
     }
 
     /// Whether a gesture of the frame is in flight: a move or resize drag, or a paint/erase
@@ -991,13 +1032,18 @@ impl RegionFrame {
 
         let lock = self.lock();
         let visual = derive_visual(lock, self.size_violation());
+        // The button row is sensed BEFORE the contents are painted, because «Сравнить» is a
+        // MOMENTARY hold: the frame must react in the very frame the press arrives, or the
+        // result would stay visible until the next unrelated input event repaints the canvas.
+        // The rows lie strictly below the frame body and below the bottom handles, so drawing
+        // them first changes neither the picture nor any widget's pointer claim.
+        self.draw_rows(ui, hitbox, frame_screen.bottom(), visual, &mut outcome);
         self.paint_contents(ui, frame_screen, lock);
         render::paint_frame_border(ui.painter(), frame_screen, visual);
         render::paint_handles(ui.painter(), frame_screen, visual, lock.is_free());
 
         let strip = Rect::from_min_max(hitbox.min, pos2(hitbox.max.x, hitbox.min.y + TOP_STRIP_H));
         self.draw_strip(ui, strip);
-        self.draw_rows(ui, hitbox, frame_screen.bottom(), visual, &mut outcome);
         // Last, so the ring sits above the mask previews, the border and the chrome.
         self.paint_brush_cursor(ui, &body, frame_screen, rect_px);
         outcome
@@ -1005,11 +1051,19 @@ impl RegionFrame {
 
     /// Paints the mask layers and, on top of them, the pending result (§6 of the design:
     /// index order, the result last).
+    ///
+    /// The result is SKIPPED while «Сравнить» is held (`result_hidden`), which is the whole
+    /// point of that button: the user sees the original pixels under the pending result. The
+    /// mask layers keep drawing in both states — they are the user's own marking, equally
+    /// present before and after the run, and blinking them would disturb the comparison.
     fn paint_contents(&mut self, ui: &mut egui::Ui, frame_screen: Rect, lock: FrameLock) {
         let ctx = ui.ctx().clone();
         self.masks.ensure_textures(&ctx);
         self.masks.draw(ui.painter(), frame_screen);
-        if let Some(result) = self.result.as_mut() {
+        let hidden = result_hidden(self.buttons(), self.compare_held);
+        if let Some(result) = self.result.as_mut()
+            && !hidden
+        {
             result.ensure_texture(&ctx);
             result.draw(ui.painter(), frame_screen);
         }
@@ -1246,13 +1300,17 @@ impl RegionFrame {
         }
     }
 
-    /// Paints the button row and the status line below the frame, and records what was pressed.
+    /// Paints the button row and the status line below the frame, records what was pressed,
+    /// and settles `compare_held` for this frame.
     ///
     /// The rows take their horizontal extent from the HITBOX, not from the frame's screen
     /// rect: the hitbox is the frame widened to `CHROME_MIN_W` when the zoom made the frame
     /// narrower than its own chrome, and it is also what the keep-in-view clamp holds inside
     /// the viewport, so laying the rows out anywhere else would put them where nothing
     /// guarantees they are reachable.
+    ///
+    /// Runs BEFORE `paint_contents` in the pass: «Сравнить» is a momentary hold and its effect
+    /// on the result layer must land in the same frame as the press.
     fn draw_rows(&mut self, ui: &mut egui::Ui, hitbox: Rect, frame_bottom: f32, visual: FrameVisual, outcome: &mut FrameOutcome) {
         // Measured from the outer edge of the bottom handles, not from the frame itself, or
         // the button row would be painted over the two corner discs and the bottom midpoint one.
@@ -1266,14 +1324,22 @@ impl RegionFrame {
         render::paint_status_text(ui.painter(), status, &self.status_text(), visual);
 
         let enabled = self.buttons();
-        let slots = split_row(buttons, 3);
-        if chrome_button(ui, slots[0], "apply", t!("cleaning.region_frame.button.apply"), enabled.apply) {
+        // «Сравнить» sits next to «Применить»: both act on the pending result, and the two are
+        // enabled by exactly the same condition.
+        let slots = split_row(buttons, 4);
+        if chrome_button(ui, slots[0], "apply", t!("cleaning.region_frame.button.apply"), enabled.apply).clicked() {
             outcome.apply_requested = true;
         }
-        if chrome_button(ui, slots[1], "cancel", t!("cleaning.region_frame.button.cancel"), enabled.cancel) {
+        let compare = chrome_button(ui, slots[1], "compare", t!("cleaning.region_frame.button.compare"), enabled.compare)
+            .on_hover_text(t!("cleaning.region_frame.button.compare_tooltip"));
+        // Recomputed from scratch, never toggled: the hold ends by itself when the pointer
+        // button is released, and ANDing it with the enablement means applying or cancelling
+        // the result cannot strand the frame with an invisible one.
+        self.compare_held = enabled.compare && compare.is_pointer_button_down_on();
+        if chrome_button(ui, slots[2], "cancel", t!("cleaning.region_frame.button.cancel"), enabled.cancel).clicked() {
             outcome.cancel_requested = true;
         }
-        if chrome_button(ui, slots[2], "clear_mask", t!("cleaning.region_frame.button.clear_mask"), enabled.clear_mask) {
+        if chrome_button(ui, slots[3], "clear_mask", t!("cleaning.region_frame.button.clear_mask"), enabled.clear_mask).clicked() {
             outcome.clear_mask_requested = true;
         }
     }
@@ -1318,22 +1384,25 @@ fn split_row(row: Rect, count: usize) -> Vec<Rect> {
         .collect()
 }
 
-/// One button of the chrome row. Returns whether it was pressed this frame.
+/// One button of the chrome row. Returns the button's own `Response`.
+///
+/// The `Response` rather than a `bool`, because the row holds both CLICK buttons (`.clicked()`)
+/// and the momentary «Сравнить» hold (`.is_pointer_button_down_on()`): a second, subtly
+/// different button construction living next to this one would eventually drift from it in the
+/// disabled scope, the id salt, the truncation or the minimum size.
 ///
 /// `id_suffix` is a non-localized literal so the widget id survives a language switch; the
 /// caption is the localized text and is never an id source. The caption is TRUNCATED to the
-/// slot: `CHROME_MIN_W` holds the three chrome captions in the project's languages, but a
+/// slot: `CHROME_MIN_W` is sized to hold the four Russian and English chrome captions, but a
 /// longer translation must be elided rather than painted over the neighbouring button.
 #[must_use]
-fn chrome_button(ui: &mut egui::Ui, rect: Rect, id_suffix: &'static str, label: &str, enabled: bool) -> bool {
+fn chrome_button(ui: &mut egui::Ui, rect: Rect, id_suffix: &'static str, label: &str, enabled: bool) -> egui::Response {
     let mut builder = egui::UiBuilder::new().max_rect(rect).id_salt((FRAME_AREA_ID, id_suffix));
     if !enabled {
         builder = builder.disabled();
     }
-    ui.scope_builder(builder, |ui| {
-        ui.put(rect, egui::Button::new(label).truncate().min_size(rect.size())).clicked()
-    })
-    .inner
+    ui.scope_builder(builder, |ui| ui.put(rect, egui::Button::new(label).truncate().min_size(rect.size())))
+        .inner
 }
 
 #[cfg(test)]
@@ -1418,19 +1487,20 @@ mod tests {
     #[test]
     fn buttons_of_a_free_frame_with_an_empty_mask() {
         let b = derive_buttons(FrameLock::Free, None, true, false);
-        assert_eq!(b, FrameButtons { process: false, apply: false, cancel: false, clear_mask: false });
+        assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: false, clear_mask: false });
     }
 
     #[test]
     fn buttons_of_a_painted_frame() {
         let b = derive_buttons(FrameLock::MaskPainted, None, false, false);
-        assert_eq!(b, FrameButtons { process: true, apply: false, cancel: false, clear_mask: true });
+        assert_eq!(b, FrameButtons { process: true, apply: false, compare: false, cancel: false, clear_mask: true });
     }
 
     #[test]
     fn buttons_of_a_painted_frame_with_an_invalid_size() {
         let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, false);
         assert!(!b.process, "an invalid size must block processing");
+        assert!(!b.compare, "there is no result to compare against yet");
         assert!(b.clear_mask, "erasing the mask is how the user gets back to a free frame");
     }
 
@@ -1439,13 +1509,14 @@ mod tests {
     #[test]
     fn buttons_of_a_pending_result() {
         let b = derive_buttons(FrameLock::ResultPending, None, false, false);
-        assert_eq!(b, FrameButtons { process: false, apply: true, cancel: true, clear_mask: true });
+        assert_eq!(b, FrameButtons { process: false, apply: true, compare: true, cancel: true, clear_mask: true });
     }
 
     #[test]
     fn buttons_while_processing() {
         let b = derive_buttons(FrameLock::Processing, None, false, false);
-        assert_eq!(b, FrameButtons { process: false, apply: false, cancel: true, clear_mask: true });
+        // No result exists yet, so there is nothing for «Сравнить» to hide.
+        assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: true, clear_mask: true });
     }
 
     // -----------------------------------------------------------------------------------
@@ -1506,7 +1577,10 @@ mod tests {
         // A tall page, a short viewport, and a frame far below the visible part of it.
         let page = screen(0.0, 0.0, 800.0, 4000.0);
         let usable = screen(0.0, 0.0, 800.0, 600.0);
-        let start = rect_px(100, 2000, 200, 200);
+        // x is chosen so the 400 pt-wide chrome (the frame is only 200 pt) sits comfortably
+        // inside the usable rect: this case is about the Y correction, and an x that needed
+        // one too would stop it proving "only the y axis needed a correction".
+        let start = rect_px(300, 2000, 200, 200);
 
         let placement = PagePlacement { screen: page, w: 800, h: 4000, zoom: 1.0 };
         let free = keep_in_view_px(FrameLock::Free, start, &placement, usable);
@@ -1569,8 +1643,9 @@ mod tests {
     #[test]
     fn captures_pointer_covers_the_body_the_strip_and_both_rows() {
         // Wider than `CHROME_MIN_W`, so the hitbox is the frame's own width plus the margin
-        // the handles stick out into.
-        let body = screen(200.0, 300.0, 500.0, 500.0);
+        // the handles stick out into — that is the case this test is written for, and it is
+        // why the body must stay wider than the minimum chrome width (500 > 400).
+        let body = screen(200.0, 300.0, 700.0, 500.0);
         let frame = placed_frame(body);
 
         assert!(frame.captures_pointer(body.center()), "the frame body");
@@ -1586,7 +1661,10 @@ mod tests {
 
     #[test]
     fn captures_pointer_is_false_just_outside_the_hitbox() {
-        let body = screen(200.0, 300.0, 500.0, 500.0);
+        // Again wider than `CHROME_MIN_W`: the horizontal assertions below are about the
+        // handle margin, and a frame narrower than the chrome would put the hitbox edge at the
+        // widened row instead, so the test would stop proving what it was written to prove.
+        let body = screen(200.0, 300.0, 700.0, 500.0);
         let frame = placed_frame(body);
         let above = body.top() - chrome().above() - 1.0;
         let below = body.bottom() + chrome().below() + 1.0;
@@ -1686,16 +1764,122 @@ mod tests {
     #[test]
     fn split_row_fills_the_row_without_overlapping() {
         let row = screen(0.0, 0.0, 300.0, 24.0);
-        let slots = split_row(row, 3);
-        assert_eq!(slots.len(), 3);
-        assert!((slots[0].left() - row.left()).abs() < 1e-3);
-        assert!((slots[2].right() - row.right()).abs() < 1e-3, "{:?}", slots[2]);
-        assert!(slots[0].right() <= slots[1].left(), "slots must not overlap");
+        for count in [3, 4] {
+            let slots = split_row(row, count);
+            assert_eq!(slots.len(), count);
+            assert!((slots[0].left() - row.left()).abs() < 1e-3, "count {count}: {:?}", slots[0]);
+            let last = slots[count - 1];
+            assert!((last.right() - row.right()).abs() < 1e-3, "count {count}: {last:?}");
+            for pair in slots.windows(2) {
+                assert!(pair[0].right() <= pair[1].left(), "count {count}: slots must not overlap: {pair:?}");
+                assert!((pair[1].left() - pair[0].right() - BUTTON_GAP).abs() < 1e-3, "count {count}: one gap between slots");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // «Сравнить»: a momentary hold, never a toggle
+    // -----------------------------------------------------------------------------------
+
+    /// A frame holding a 4x4 pending result, so `buttons().compare` is enabled.
+    fn frame_with_a_result() -> RegionFrame {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.page_idx = Some(0);
+        frame.rect_px = Some(rect_px(0, 0, 4, 4));
+        frame.set_result(Some(ResultLayer::new(egui::ColorImage::filled([4, 4], Color32::WHITE))));
+        frame
+    }
+
+    /// The whole point of the button: while it is held the result layer is not painted, so the
+    /// original pixels under it show through.
+    #[test]
+    fn holding_compare_hides_the_pending_result() {
+        let mut frame = frame_with_a_result();
+        assert!(frame.buttons().compare, "a pending result is exactly when comparing is offered");
+        assert!(!result_hidden(frame.buttons(), frame.compare_held), "nothing is hidden until the button is held");
+
+        frame.compare_held = true;
+        assert!(result_hidden(frame.buttons(), frame.compare_held), "a held «Сравнить» must hide the result");
+    }
+
+    /// The hold may not outlive the thing it hides. `compare_held` is settled when the button
+    /// row is sensed and read when the contents are painted; if the result is applied or
+    /// cancelled in between — from the dock panel, or by the host tool — a stale flag would
+    /// leave the frame hiding a layer that no longer exists, with no way to get the picture
+    /// back until the next press.
+    #[test]
+    fn a_held_compare_cannot_survive_the_result_disappearing() {
+        let mut frame = frame_with_a_result();
+        frame.compare_held = true;
+        assert!(result_hidden(frame.buttons(), frame.compare_held));
+
+        // The host applied or cancelled the result.
+        frame.set_result(None);
+        assert!(!frame.buttons().compare, "with no result there is nothing to compare");
+        assert!(!result_hidden(frame.buttons(), frame.compare_held), "a stale hold must hide nothing");
+
+        // And releasing the frame drops the flag outright, like every other gesture in flight.
+        let mut frame = frame_with_a_result();
+        frame.compare_held = true;
+        frame.reset();
+        assert!(!frame.compare_held, "`reset` ends the hold with the other gestures");
+    }
+
+    /// «Сравнить» is enabled by exactly the condition «Применить» is: both act on the pending
+    /// result, and a user who can apply one can always look under it first.
+    #[test]
+    fn compare_is_offered_exactly_when_apply_is() {
+        for lock in [FrameLock::Free, FrameLock::MaskPainted, FrameLock::ResultPending, FrameLock::Processing] {
+            for mask_empty in [false, true] {
+                let b = derive_buttons(lock, None, mask_empty, false);
+                assert_eq!(b.compare, b.apply, "lock {lock:?}, mask_empty {mask_empty}");
+            }
+        }
+    }
+
+    /// `CHROME_MIN_W` claims to hold the FOUR chrome captions in Russian and English; this is
+    /// what keeps that claim honest. The captions are read out of the shipped catalogs, so
+    /// adding a button or lengthening a caption fails here instead of silently eliding in the
+    /// running app. Measured with egui's own default proportional font, which is a proxy for
+    /// the bundled UI stack — hence the headroom `CHROME_MIN_W` carries.
+    #[test]
+    fn chrome_caption_slots_hold_the_russian_and_english_captions() {
+        let keys = [
+            "cleaning.region_frame.button.apply",
+            "cleaning.region_frame.button.compare",
+            "cleaning.region_frame.button.cancel",
+            "cleaning.region_frame.button.clear_mask",
+        ];
+        let row = Rect::from_min_max(pos2(0.0, 0.0), pos2(CHROME_MIN_W, BUTTONS_H));
+        let slot_w = split_row(row, keys.len())[0].width();
+
+        let ctx = egui::Context::default();
+        let _output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font_id = egui::TextStyle::Button.resolve(ui.style());
+            // A `Button` lays its caption out inside the slot minus its horizontal padding on
+            // both sides; anything wider is what `truncate()` elides.
+            let text_w = slot_w - 2.0 * ui.spacing().button_padding.x;
+            for (tag, source) in ms_i18n::embedded_locales() {
+                if *tag != "ru" && *tag != "en" {
+                    continue;
+                }
+                let catalog: serde_json::Value = serde_json::from_str(source).expect("a shipped catalog is valid JSON");
+                for key in keys {
+                    let caption = catalog.get(key).and_then(serde_json::Value::as_str).unwrap_or_else(|| panic!("{tag}: {key} is missing"));
+                    let galley = ui.painter().layout_no_wrap(caption.to_owned(), font_id.clone(), Color32::WHITE);
+                    assert!(
+                        galley.size().x <= text_w,
+                        "{tag}: «{caption}» needs {:.1} pt but a chrome slot offers {text_w:.1} pt — raise CHROME_MIN_W",
+                        galley.size().x
+                    );
+                }
+            }
+        });
     }
 
     /// The chrome must not inherit the frame's SCREEN width. The canvas zooms down to 0.2, so
     /// a 64 px minimum-side frame is 12.8 pt wide there — a plate that could hold neither the
-    /// status sentence nor three captioned buttons, and text that would spill over the page.
+    /// status sentence nor four captioned buttons, and text that would spill over the page.
     #[test]
     fn a_frame_narrower_than_the_chrome_still_gets_readable_rows() {
         let narrow = Rect::from_min_size(pos2(400.0, 300.0), vec2(12.8, 12.8));
@@ -1703,9 +1887,10 @@ mod tests {
         assert!((hitbox.width() - CHROME_MIN_W).abs() < 1e-3, "{hitbox:?}");
         assert!((hitbox.center().x - narrow.center().x).abs() < 1e-3, "the chrome stays centred on the frame");
 
-        // The button row is laid out on that width, so every slot stays clickable.
+        // The button row is laid out on that width, so every one of the FOUR slots stays
+        // clickable — and wide enough for a caption, which is the sizing rule of `CHROME_MIN_W`.
         let row = Rect::from_min_max(pos2(hitbox.left(), 0.0), pos2(hitbox.right(), BUTTONS_H));
-        for slot in split_row(row, 3) {
+        for slot in split_row(row, 4) {
             assert!(slot.width() > 20.0, "a chrome button slot must stay usable: {slot:?}");
         }
 
@@ -2022,3 +2207,4 @@ mod tests {
         assert_eq!(frame.lock(), FrameLock::Free);
     }
 }
+

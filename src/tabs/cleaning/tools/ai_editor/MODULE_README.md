@@ -77,12 +77,15 @@ allows it, so a panel can never start a run the frame refuses.
   and under it the host's own row — «Обработать», «Применить», «Отменить» — the green «no mask
   needed» line while that is what a click would do, the frame's status line, the size
   requirements while the size is invalid, and the last message.
-- The frame's own chrome keeps «Применить» / «Отменить» / «Стереть маску» and the status line.
+- The frame's own chrome keeps «Применить» / «Сравнить» / «Отменить» / «Стереть маску» and the
+  status line.
 
-«Обработать» exists ONLY in the left panel: the frame's chrome row has three buttons and none
+«Обработать» exists ONLY in the left panel: the frame's chrome row has four buttons and none
 of them is the run. «Применить» / «Отменить» are repeated there because a frame holding a
 result is LOCKED, and a locked frame may scroll out of view entirely — its chrome row is then
-unreachable and the panel is the only way to resolve the result.
+unreachable and the panel is the only way to resolve the result. «Сравнить» is deliberately
+NOT repeated: it hides the result layer so the user can look at the pixels under it, and a
+frame that scrolled out of view has nothing to look at.
 
 ## Files and submodules
 - `mod.rs`: `AiEditorTool` (the `CleaningTool` impl), the run path, the D7 size check

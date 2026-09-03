@@ -501,6 +501,8 @@
   "cleaning.region_frame.button.apply": "Aplicar",
   "cleaning.region_frame.button.cancel": "Cancelar",
   "cleaning.region_frame.button.clear_mask": "Apagar máscara",
+  "cleaning.region_frame.button.compare": "Comparar",
+  "cleaning.region_frame.button.compare_tooltip": "Segure para ocultar o resultado e ver o original por baixo",
   "cleaning.region_frame.layer_tooltip": "Camada de máscara na qual pintar: {name}",
   "cleaning.region_frame.status.free": "Livre",
   "cleaning.region_frame.status.invalid_size": "Tamanho inválido",

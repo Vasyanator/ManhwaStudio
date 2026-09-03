@@ -103,7 +103,20 @@ that owns the context, the canvas and the project at once:
   and the next pass re-checks the same enablement table. Queued requests are folded at the TOP
   of the pass, so they survive the off-screen early return — which is exactly the state that
   strands the user otherwise. «Обработать» has no chrome button at all: the row holds exactly
-  «Применить», «Отменить» and «Стереть маску», so starting a run is always a panel action.
+  «Применить», «Сравнить», «Отменить» and «Стереть маску», so starting a run is always a panel
+  action. «Сравнить» is the one chrome button a panel must NOT repeat — a frame that scrolled
+  out of view has nothing to look at.
+- **«Сравнить» is a MOMENTARY HOLD, not a toggle, and it is the only button that is not a
+  request.** It is enabled by exactly the condition «Применить» is (a result is pending), and
+  while its pointer button is down the pending result layer is not painted, so the original
+  pixels show through. `compare_held` is recomputed from scratch in every drawn pass as
+  "enabled AND `Response::is_pointer_button_down_on`" — never toggled, never accumulated — and
+  `result_hidden` re-checks the enablement again when the contents are painted, so a result
+  applied or cancelled mid-hold can never leave the frame hiding a layer that is gone. The MASK
+  layers keep drawing in both states: they are the user's own marking, equally present before
+  and after a run, and blinking them would disturb the comparison rather than help it. This is
+  also why the button row is sensed BEFORE the frame's contents are painted — a hold sensed
+  after them would apply one frame late, and egui may not repaint again until the release.
 - **`block_canvas_zoom()` must stay `false` in the host tool.** That flag also disables the
   clean-overlay undo shortcuts for the whole session (`tab.rs`). Block precisely instead:
   `RegionFrame::captures_pointer` over the hitbox, and `drag_active()` for

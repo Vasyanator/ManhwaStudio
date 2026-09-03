@@ -501,6 +501,8 @@
   "cleaning.region_frame.button.apply": "Appliquer",
   "cleaning.region_frame.button.cancel": "Annuler",
   "cleaning.region_frame.button.clear_mask": "Effacer le masque",
+  "cleaning.region_frame.button.compare": "Comparer",
+  "cleaning.region_frame.button.compare_tooltip": "Maintenez pour masquer le résultat et voir l'original en dessous",
   "cleaning.region_frame.layer_tooltip": "Calque de masque dans lequel peindre : {name}",
   "cleaning.region_frame.status.free": "Libre",
   "cleaning.region_frame.status.invalid_size": "Taille non valide",
