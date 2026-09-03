@@ -25,15 +25,16 @@ Save operations collect overlay snapshots from the shared model and write `clean
 worker thread.
 
 This tab HOSTS the shared panel dock (`src/widgets/panel_dock`), and every floating surface it has
-is a dock tab. It declares FIVE: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
+is a dock tab. It declares SIX: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
 `CanvasView::draw_ribbon_tab_body`, declared through `canvas::declare_ribbon_tab` — the canvas' one
-declaration of it) plus four of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
+declaration of it) plus five of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
 the quick-clean toggle and the save status), «Инструменты клина» (`cleaning.tools`: the tool picker,
 rows wrapping to the panel width), «Выбранный инструмент» (`cleaning.active_tool`:
-`CleaningTool::draw_ui`) and «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
-quick-clean parameters, its two run buttons and its progress). Its default arrangement is
-`cleaning_default_dock_layout` — five panels, handed to the dock both by
-`app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
+`CleaningTool::draw_ui`), «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
+quick-clean parameters, its two run buttons and its progress) and «Редактор области»
+(`cleaning.area_editor`: `CleaningTool::draw_main_panel`, the MAIN interface of a tool that edits a
+region on the canvas). Its default arrangement is `cleaning_default_dock_layout` — six panels,
+handed to the dock both by `app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
 dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
 `CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
 three floating surfaces these tabs replaced performed theirs. The dock state is NOT owned here: it is
@@ -81,7 +82,12 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `dev-docs/watermark_chapter_decomposition_plan.md`. Consumed by the «По главе (точное
   вычитание)» mode of `tools/watermark_removal.rs`; `mod.rs` keeps an `allow(dead_code)` for the
   refinement surface the tool deliberately does not use (see the comment there).
-- `tools/`: cleaning tool trait, brush/region-edit bases, local fill tools, stamp tool, AI-backed
+- `tools/`: cleaning tool trait — including the three additive, defaulted methods a tool that
+  places something on the canvas uses (`set_panel_rects`, fed from `panel_rects` after
+  `canvas.draw`; `wants_main_panel`, which drives the «Редактор области» tab's visibility; and
+  `draw_main_panel`, that tab's body, bound by the same "a body may not mutate the tab" rule as
+  `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
+  its first consumer (`tools/ai_editor/`), local fill tools, stamp tool, AI-backed
   inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management window and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
@@ -127,6 +133,21 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   why their rects are carried out of the hook rather than pushed straight into the field. A rect is
   never pushed into it directly: it arrives through `PanelDockOutput::drawn_panels`, which answers
   for the MAIN window alone.
+- «Лента» holds the LEFT viewport edge and «Редактор области» hangs UNDER it. Not beside it: the
+  ribbon is itself `ViewportEdge::Left`, so anchoring a panel to the ribbon's `Left` would place
+  that panel outside the dock area and the solver's whole-chain translation would un-flush the
+  ribbon. And not the other way round either — the area editor is hidden for every tool but one,
+  and a ribbon anchored to it would depend on a panel that usually is not there. As a LEAF nothing
+  is anchored to it, so `panel_dock::frame_layout` dropping it for a frame re-anchors no dependant
+  and the other five panels are laid out at exactly the rects they get without the tab. The area
+  editor took a fresh `PanelId` rather than a renumbering, so «Лента» keeps the id every canvas
+  program tab gives it.
+- Two of the six tabs are CONDITIONAL and both are declared on every frame, hidden through
+  `.visible(..)`: the quick-clean tab follows `quick_text_mask_panel_open`, and «Редактор области»
+  follows the ACTIVE TOOL's `CleaningTool::wants_main_panel()`, re-asked every frame and never
+  cached — a cached answer would keep the panel of the tool the app started with. Its `min_size`
+  and `initial_size` are FIXED constants, not caption-derived ones, for the same reason as
+  «Выбранный инструмент»: the body is opaque per-tool UI whose captions this tab cannot measure.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — every
@@ -169,7 +190,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `cleaning_default_dock_layout` in the same file, and both places have to agree. The «Лента» tab's
   own content, sizes, title and declaration (`canvas::declare_ribbon_tab`) live in `src/canvas/`.
 - To change what a dock tab SHOWS, edit `draw_clean_tab_body` / `draw_tools_tab_body` /
-  `draw_active_tool_tab_body` / `draw_quick_clean_tab_body` in `tab.rs`; to change what a click
+  `draw_active_tool_tab_body` / `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` in
+  `tab.rs`; to change what a click
   there DOES, add a field to `CleaningDockOut` and apply it in `apply_dock_out`.
 - To change how the tool buttons are laid out or how narrow the tool panel may get, edit
   `draw_tool_button_rows` (rows wrap automatically; a caption never wraps) and the pair

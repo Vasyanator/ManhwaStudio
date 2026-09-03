@@ -39,6 +39,15 @@ region: `snap_selection_end` clamps to the page edge AFTER snapping to the multi
 `build_composited_region_image` re-derives the crop by ratio from the decoded page — a tool with a
 hard size contract must therefore re-validate `editor.image.size` on its own run path.
 
+The region-editor WINDOW is not the only shape a region tool can take. `region_edit_v2/` is the
+alternative: a selection FRAME that lives on the canvas for the whole editing session, with its
+own handles, N mask layers, a result preview and a chrome of its own, driven from
+`CleaningTool::draw_overlay_ui` instead of a floating window. It replaces the window flow for the
+tools built on it; `RegionEditToolBase` and every tool on it stay exactly as they are. Its first
+and so far only consumer is `ai_editor/`, which also carries the UI split the framework assumes:
+a compact part in «Выбранный инструмент» (`draw_ui`) and a main part in its own dock panel
+(`draw_main_panel`).
+
 AI-backed tools (`lama.rs`, `lama_mpe.rs`, `aot.rs`, `sdxl.rs`) send region and mask as raw PNG
 bytes in the IPC request blob (no base64), ensure required app-managed models through `ai_models.rs`,
 verify backend health, call the Python AI backend via `backend_ipc::shared_client()`, validate the
@@ -182,6 +191,12 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - `aot.rs`: AOT backend inpaint and `inpaint.aot` IPC calls.
 - `region_edit_test.rs`: development-only mask-inpaint pipeline test tool; it is not exported by
   `mod.rs`.
+- `region_edit_v2/`: the on-canvas region-editing FRAMEWORK (frame, mask layers, geometry,
+  painting, input). It has its own `MODULE_README.md`; a tool built on it drives `RegionFrame`
+  from `draw_overlay_ui` and must not duplicate the helpers `base.rs` already exposes.
+- `ai_editor/`: the «ИИ-редактор области» tool — the framework's only consumer so far, and the
+  only tool with a MAIN dock panel (`wants_main_panel`). Its step-1 processing is a labelled
+  PLACEHOLDER, not a backend call. Own `MODULE_README.md`.
 
 ## Contracts and invariants
 - Tools must mutate clean overlays through `CanvasView` APIs such as `replace_overlay_region*` and
@@ -308,6 +323,19 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   section requires a reachable backend.
 - Tool pointer capture and zoom/scroll blocking are part of the canvas contract. An open region
   editor must block canvas zoom and capture pointer input inside its window.
+- `CleaningTool` carries three additive, defaulted methods for tools that place something on the
+  canvas: `set_panel_rects` (pushed by the tab each frame after `canvas.draw` and before
+  `draw_overlay_ui`, so a tool can cut the dock panels out of the viewport), `wants_main_panel`
+  and `draw_main_panel`. `draw_main_panel` runs inside `CanvasView::draw` and therefore may
+  mutate only the tool itself — a button there raises a flag consumed by the next
+  `draw_overlay_ui`, the `CleaningDockOut` rule at tool scope.
+- `capture_overlay_chunk`, `overlay_rect_to_scene_rect`, `scene_pointer_to_image_px` and
+  `scene_pos_to_source_xy` are `pub(super)` free functions of `base.rs`: the whole `tools`
+  subtree reuses them, and a copy of any of them in a tool is a defect.
+- An on-canvas tool must NOT return `true` from `block_canvas_zoom()`: that flag also disables
+  the clean-overlay undo shortcuts (`tab.rs`), which is acceptable for a modal editor window but
+  not for a surface that lives on the canvas for a whole session. Block precisely instead
+  (`captures_canvas_pointer` over the surface, drag-scroll only while a drag is live).
 
 ## Editing map
 - To add a new cleaning tool, implement `CleaningTool`, export it from `mod.rs`, and register it in
@@ -336,6 +364,11 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - To change reference-crop intake (background measurement, alignment, the refusal wording) or the
   auto-match ranking, edit `watermark_entry.rs`; to change the library screen itself, edit
   `watermark_library_window.rs`.
+- To change the on-canvas region frame (its geometry, lock rules, painting or input), edit
+  `region_edit_v2/` and read its `MODULE_README.md` first. To change what the area editor DOES
+  with that frame — its placeholder processing, its apply check or either of its two panels —
+  edit `ai_editor/`; where its main panel sits by default is `cleaning_default_dock_layout` in
+  `../tab.rs`.
 - To change Python backend IPC method names, request/response blob layout, model selection, unload
   behavior, or model ensure logic, edit the relevant AI tool file and keep `ai_models.rs` as the
   model boundary.

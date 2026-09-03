@@ -6,7 +6,8 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
   - Конкретные инструменты вкладки cleaning:
     `ZamazkaTool`, `StampTool`, `GradientFillTool`, `TextureSynthesisInpaintTool`,
     `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`,
-    `FluxFillInpaintTool`, `WatermarkRemovalTool`, `Flux2KleinTool`.
+    `FluxFillInpaintTool`, `WatermarkRemovalTool`, `Flux2KleinTool`,
+    `AiEditorTool`.
 - Внутренние модули без экспорта:
   - `watermark_library` — библиотека измеренных знаков на диске; используется
     режимом «По главе» из `watermark_removal.rs`.
@@ -14,6 +15,8 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
     эталонных кадров, отображение вердиктов и подбор записей по подписи знака.
   - `watermark_library_window` — окно управления библиотекой, открываемое из
     инструмента.
+  - `region_edit_v2` — the on-canvas region-editing framework (`RegionFrame`, its mask
+    layers and its geometry). Consumed by `ai_editor`; see its own `MODULE_README.md`.
 */
 mod base;
 
@@ -58,3 +61,8 @@ pub use watermark_removal::WatermarkRemovalTool;
 
 mod flux2_klein;
 pub use flux2_klein::Flux2KleinTool;
+
+mod region_edit_v2;
+
+mod ai_editor;
+pub use ai_editor::AiEditorTool;

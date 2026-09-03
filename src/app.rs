@@ -4770,6 +4770,7 @@ mod tests {
             TabId::new("cleaning.tools"),
             TabId::new("cleaning.active_tool"),
             TabId::new("cleaning.quick_clean"),
+            TabId::new("cleaning.area_editor"),
         ];
         const TYPING_TABS: &[TabId] = &[
             CANVAS_RIBBON_TAB,

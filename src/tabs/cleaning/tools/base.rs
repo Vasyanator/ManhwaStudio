@@ -200,6 +200,28 @@ pub trait CleaningTool {
         false
     }
 
+    /// Rects of the dock panels drawn over the canvas THIS frame, in screen points.
+    ///
+    /// Pushed by the tab after `canvas.draw` returns and before `draw_overlay_ui`, so a tool
+    /// that places something on the canvas can cut the panels out of the viewport and never
+    /// hide behind one. Tools that place nothing ignore it.
+    fn set_panel_rects(&mut self, _rects: &[egui::Rect]) {}
+
+    /// Whether this tool wants the main «Редактор области» dock panel shown.
+    ///
+    /// The tab declares that tab every frame and drives its visibility from this answer, so a
+    /// tool that returns `false` costs nothing but the declaration.
+    fn wants_main_panel(&self) -> bool {
+        false
+    }
+
+    /// Body of the main «Редактор области» dock panel.
+    ///
+    /// Same rules as `draw_ui`: it runs inside `CanvasView::draw` and may mutate only the
+    /// tool itself. It must NOT touch the canvas — a button here raises a flag that the tool
+    /// consumes at the top of its next `draw_overlay_ui`.
+    fn draw_main_panel(&mut self, _ui: &mut egui::Ui) {}
+
     fn draw_overlay_ui(
         &mut self,
         _ctx: &egui::Context,
@@ -3444,7 +3466,14 @@ fn composite_source_over(base: &mut egui::ColorImage, overlay: &egui::ColorImage
     }
 }
 
-fn capture_overlay_chunk(
+/// Copies the clean-overlay pixels of `page_idx` under `scene_rect` into a standalone image.
+///
+/// `scene_rect` is in scene (== screen) points; it is converted to overlay pixels first, so a
+/// rect that maps to an empty region yields `None`, as does a page with no overlay allocated.
+/// `pub(super)` so the whole `tools` subtree can reuse it instead of copying it (D10 of
+/// `dev-docs/region_edit_v2_plan.md`).
+#[must_use]
+pub(super) fn capture_overlay_chunk(
     canvas: &CanvasView,
     page_idx: usize,
     scene_rect: Rect,
@@ -3486,7 +3515,12 @@ fn clamp_scene_pos_to_rect(pos: Pos2, rect: Rect) -> Pos2 {
     )
 }
 
-fn scene_pos_to_source_xy(
+/// A scene (== screen) position as SOURCE PAGE PIXELS of the page drawn at `page_scene_rect`.
+///
+/// The position is clamped into the page, so the result is always inside
+/// `0..=source_w` / `0..=source_h`. `pub(super)` for reuse across the `tools` subtree (D10).
+#[must_use]
+pub(super) fn scene_pos_to_source_xy(
     scene_pos: Pos2,
     page_scene_rect: Rect,
     source_w: usize,
@@ -3499,7 +3533,13 @@ fn scene_pos_to_source_xy(
     (x, y)
 }
 
-fn scene_pointer_to_image_px(
+/// A scene (== screen) position as a pixel index of the image drawn into `image_rect`.
+///
+/// The result is clamped to `0..image_size[i]`, i.e. it is always a valid index, and a
+/// degenerate `image_rect` cannot divide by zero. `pub(super)` for reuse across the `tools`
+/// subtree (D10).
+#[must_use]
+pub(super) fn scene_pointer_to_image_px(
     scene_pos: Pos2,
     image_rect: Rect,
     image_size: [usize; 2],
@@ -3547,7 +3587,12 @@ fn expand_overlay_rect(rect: OverlayRectPx, w: usize, h: usize, margin: usize) -
     }
 }
 
-fn overlay_rect_to_scene_rect(
+/// An overlay-pixel rectangle as a scene (== screen) rect inside `page_scene_rect`.
+///
+/// `None` when the overlay or the rectangle is empty, or when the mapped rect is degenerate.
+/// `pub(super)` for reuse across the `tools` subtree (D10).
+#[must_use]
+pub(super) fn overlay_rect_to_scene_rect(
     page_scene_rect: Rect,
     overlay_w: usize,
     overlay_h: usize,
