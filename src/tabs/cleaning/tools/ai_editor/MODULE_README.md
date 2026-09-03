@@ -74,8 +74,9 @@ allows it, so a panel can never start a run the frame refuses.
   radius and paint/erase mode, the mask-layer switch (drawn only for two or more layers), the
   mask actions, and the painted-pixel count per layer while anything is painted.
 - «Редактор области» (`draw_main_panel`): `AiEngine::draw_parameters` for the selected engine,
-  and under it the host's own row — «Обработать», «Применить», «Отменить» — the frame's status
-  line, the size requirements while the size is invalid, and the last message.
+  and under it the host's own row — «Обработать», «Применить», «Отменить» — the green «no mask
+  needed» line while that is what a click would do, the frame's status line, the size
+  requirements while the size is invalid, and the last message.
 - The frame's own chrome keeps «Применить» / «Отменить» / «Стереть маску» and the status line.
 
 «Обработать» exists ONLY in the left panel: the frame's chrome row has three buttons and none
@@ -106,9 +107,16 @@ unreachable and the panel is the only way to resolve the result.
   nothing else: a rectangle the new engine refuses turns the frame RED, blocks «Обработать»
   and gets its requirements spelled out in the left panel. That is the designed behaviour, not
   a gap.
-- **`allows_empty_mask()` and the three setters are re-read EVERY frame.** FLUX.2 klein derives
-  the empty-mask rule from a checkbox in its own panel, so a copy taken at the switch goes
-  stale on the next click.
+- **`allows_empty_mask()` and the three setters are re-read EVERY frame.** The contract allows an
+  engine to derive the rule from one of its own parameters, so a copy taken at the switch could
+  go stale on the next click. No engine does today — FLUX.2 klein answers `true` unconditionally,
+  because an empty mask is one of its two working MODES rather than a missing input.
+- **The green «no mask needed» line is the HOST's and is generic.** `draw_empty_mask_hint` draws
+  it under «Обработать» exactly while the mask stack holds nothing AND the selected engine's
+  `allows_empty_mask()` is `true`. It reports a permission and never grants one — the frame's own
+  `FrameButtons::process` is still the gate — so an engine that cannot run without a mask simply
+  never shows it. What an engine's mask MEANS stays in that engine's own panel body: this line
+  says only that a run may start with nothing painted.
 - **A per-frame push is not permission to work per frame.** Because `set_region` runs every
   frame and the rectangle moves on every scrolled pixel (the keep-in-view clamp), the host tells
   the engine whether the geometry has SETTLED (`!drag_active()`, which covers a move drag, a
@@ -159,8 +167,9 @@ unreachable and the panel is the only way to resolve the result.
   `poll_engine`, `accept_result` — in that order, they are one pipeline.
 - To change what the compact panel offers: `draw_engine_picker`, `draw_brush_controls`,
   `draw_layer_picker`, `draw_mask_actions`, `draw_mask_summary`.
-- To change what the main panel shows: `draw_main_panel` and `draw_host_actions`. Where that
-  panel SITS is `cleaning_default_dock_layout` in `../../tab.rs`.
+- To change what the main panel shows: `draw_main_panel`, `draw_host_actions` and
+  `draw_empty_mask_hint`. Where that panel SITS is `cleaning_default_dock_layout` in
+  `../../tab.rs`.
 - To change an engine, or to add one: `engines/`, never here. To change what the host may ASK
   of an engine: `engine.rs`, and record the change in `dev-docs/region_edit_v2_plan.md` §13.3.
 - To change the size requirements or the mask layers a run uses: the ENGINE's `constraints()`

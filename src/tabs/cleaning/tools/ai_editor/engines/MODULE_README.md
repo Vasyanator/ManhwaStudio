@@ -28,8 +28,9 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   `.status`, `.estimate`, `.unload`, and the six `.prompt_cache.*` methods). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
-  mask layer and puts its bytes on the wire verbatim. A checkbox in its panel (`whole_region`)
-  switches it to editing the WHOLE region instead — see the contracts below. Size contract:
+  mask layer and puts its bytes on the wire verbatim. Leaving that layer EMPTY is the other
+  working mode — the whole region is regenerated — and it is derived, not chosen; see the
+  contracts below. Size contract:
   multiple of 16, shortest side >= 128 px, area <= 1 MP, aspect not steeper than 8:1, declared
   through `constraints()` AND re-checked against the actual region size on the run path. The prompt
   field is doubled: an optional user-language field plus a Google/Yandex/DeepL picker and a «↓»
@@ -102,16 +103,28 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   no longer changes on the release frame itself. Everything that is NOT the geometry (a parameter,
   the memory preset, a loaded prompt cache, a finished run, the settings load) still arms the
   forecast directly, and a test pins that.
-- FLUX.2 klein's `whole_region` is a WORKING MODE, not a memory profile: no `MemoryPreset` owns it,
-  choosing a preset must not move it, and `MemoryPresetValues` must not gain a field for it. The
-  request blob keeps its shape in this mode — a mask is still sent, a SOLID one (every byte `255`,
-  built by `mask_for_run`), because the backend refuses `whole_region = true` unless the mask really
-  is uniform. The host's painted layer is never overwritten by the mode: the engine builds the solid
-  buffer BESIDE it and never reads it, so clearing the checkbox restores the user's work byte for
-  byte. The mode is also what `allows_empty_mask()` reports, which is how the frame stops demanding
-  a non-empty mask; the host must re-read that whenever the engine's parameters change. Backend-side
-  `mask_dilate_px` is ignored here (the slider is faded to say so) while `mask_feather_px` keeps
-  working and softens the join between the region and the page.
+- FLUX.2 klein's `whole_region` is a WORKING MODE that is DERIVED FROM THE PAINTED MASK and is not a
+  setting: there is no switch, no persisted field and no `MemoryPresetValues` entry for it, and
+  `mask_for_run` is the ONLY place the decision is made — it returns the wire buffer and the flag
+  together, so the two can never disagree. An empty layer means "edit the whole region" and yields a
+  SOLID mask (every byte `255`) with `whole_region = true`, because the backend refuses that flag
+  unless the mask really is uniform; anything painted means "edit only what is under it" and travels
+  verbatim with `whole_region = false`. The threshold is "any byte above zero": one painted pixel is
+  already a mask, so a stray dot can never become permission to regenerate everything. The host's
+  painted layer is never overwritten — the solid buffer is built BESIDE it — and `allows_empty_mask()`
+  is therefore unconditionally `true`, which is what stops the frame demanding a non-empty mask. It
+  is the HOST that tells the user an empty mask is legal (`AiEditorTool::draw_empty_mask_hint`), not
+  this engine. `whole_region` also travels as `false` on every path that only ASKS the backend
+  something (`.status`, `.estimate`, the prompt-cache calls): no mask exists there, which is why
+  `to_params` takes the flag instead of reading it. Backend-side `mask_dilate_px` is ignored when
+  nothing is painted; the slider is no longer faded for that (the engine cannot see the host's mask
+  stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
+  instead. `mask_feather_px` keeps working either way and softens the join between the region and the
+  page.
+- A settings file written before the mode was derived carries a `whole_region` key that maps to no
+  field. `Flux2KleinSettings` does NOT use `deny_unknown_fields`, so serde drops it and the document
+  loads with every other setting intact; no migration exists for it and none may be added. A test
+  pins that such a document loads identically to the same document without the key.
 - FLUX.2 klein RUNS WITHOUT A LOCAL TEXT ENCODER when the prompt is already cached: the denoise and
   the VAE decode never read the encoder, so a `.msprompt` carried to a machine that never downloaded
   the 16 GB Qwen3 is enough. The run gate (`flux2_run_block_reason`) therefore waives the

@@ -88,6 +88,22 @@ const BRUSH_RADIUS_MAX_PX: usize = 200;
 /// The picker sections, in the order they are drawn. A section with no engine is skipped.
 const ENGINE_SECTIONS: [EngineSection; 2] = [EngineSection::WithoutPrompt, EngineSection::WithPrompt];
 
+/// How much taller than an ordinary button «Обработать» is drawn.
+///
+/// It is the panel's primary action and sits in a row with two secondary ones, so it is given
+/// half again their height. Only the SPACING is scaled — the widget, its colours and its shape
+/// stay the theme's, so the button reads as emphasised rather than as a different control.
+const PROCESS_BUTTON_EMPHASIS: f32 = 1.5;
+
+/// Colour of a line that reports a state the user may act on and nothing is wrong with.
+///
+/// Deliberately the host's own constant rather than a value borrowed from an engine: the
+/// engines each own their status palette (`FLUX2_STATUS_OK_COLOR` and its siblings), and a
+/// host that reached into one of them would change appearance with the selected engine.
+/// A literal instead of `Visuals`: egui has no "affirmative" role in its palette — the
+/// nearest, `error_fg_color`, means the opposite of this.
+const AREA_EDITOR_HINT_OK_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 255, 130);
+
 /// Why a pending result could not be merged into the clean overlay.
 ///
 /// Both variants exist because `CanvasView::replace_overlay_region_px` would otherwise
@@ -816,7 +832,8 @@ impl AiEditorTool {
     }
 
     /// Draws the host's own part of the main panel: the run button, the two actions that
-    /// resolve a pending result, the frame's status line and the last message.
+    /// resolve a pending result, the green «no mask needed» hint, the frame's status line
+    /// and the last message.
     ///
     /// «Обработать» lives HERE and nowhere else: the frame's own chrome row carries only
     /// Применить / Отменить / Стереть маску. Applying and cancelling are repeated here because
@@ -826,10 +843,25 @@ impl AiEditorTool {
         let enabled = self.frame.buttons();
         let block_reason = self.engine().and_then(AiEngine::run_block_reason);
         ui.horizontal_wrapped(|ui| {
-            let process = ui.add_enabled(
-                enabled.process && block_reason.is_none(),
-                egui::Button::new(t!("cleaning.tools.area_editor.process_button")),
+            // `interact_size.y` is what actually sets a button's height — a `Button` takes the
+            // larger of it and its padded text — so the emphasis is applied there, and the
+            // padding is scaled with it or the label would rattle inside a taller frame.
+            // The base is measured rather than assumed, so the button keeps its proportion if
+            // the theme's font or spacing changes.
+            let base_height = ui.spacing().interact_size.y.max(
+                ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
             );
+            let process = ui
+                .scope(|ui| {
+                    let spacing = ui.spacing_mut();
+                    spacing.button_padding *= PROCESS_BUTTON_EMPHASIS;
+                    spacing.interact_size.y = base_height * PROCESS_BUTTON_EMPHASIS;
+                    ui.add_enabled(
+                        enabled.process && block_reason.is_none(),
+                        egui::Button::new(t!("cleaning.tools.area_editor.process_button")),
+                    )
+                })
+                .inner;
             // The engine's own reason is more specific than the generic hint, so it wins when
             // there is one: "no model selected" beats "paint a mask first".
             let process = match block_reason.as_ref() {
@@ -852,6 +884,7 @@ impl AiEditorTool {
                 self.frame.request_cancel();
             }
         });
+        self.draw_empty_mask_hint(ui);
         ui.label(self.frame.status_text());
         if let Some(violation) = self.frame.size_violation() {
             let text = match violation {
@@ -870,6 +903,33 @@ impl AiEditorTool {
                 ui.small(&message.text);
             }
         }
+    }
+
+    /// Says, in green under «Обработать», that a run may start with nothing painted.
+    ///
+    /// Drawn exactly while BOTH halves hold: no mask layer holds a single pixel, and the
+    /// selected engine accepts an empty mask. It answers the question the button itself
+    /// cannot — an enabled «Обработать» over an empty mask looks the same as one over a
+    /// painted mask, so without this line the only way to learn that painting is optional
+    /// is to click and see. The rule is generic on purpose: an engine that cannot run
+    /// without a mask simply never shows it, and the frame's own gate
+    /// (`FrameButtons::process`) refuses the run for that engine anyway — this line only
+    /// reports the permission, it never grants one.
+    ///
+    /// Deliberately NOT a hint about the OTHER half: "paint the area the model may change"
+    /// belongs to the engine's own panel body, which is where the mask's meaning is
+    /// explained and where it differs from engine to engine.
+    fn draw_empty_mask_hint(&self, ui: &mut egui::Ui) {
+        if !self.frame.masks().is_empty() {
+            return;
+        }
+        if !self.engine().is_some_and(AiEngine::allows_empty_mask) {
+            return;
+        }
+        ui.small(
+            egui::RichText::new(t!("cleaning.tools.area_editor.no_mask_hint"))
+                .color(AREA_EDITOR_HINT_OK_COLOR),
+        );
     }
 
     /// Spells out the size the ACTIVE engine wants, under the sentence that says the current

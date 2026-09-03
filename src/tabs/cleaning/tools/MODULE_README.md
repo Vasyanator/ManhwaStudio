@@ -154,6 +154,10 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `commit_overlay_page_to_model`; they must not write `CleanOverlaysModel` storage directly.
 - Region, mask, and output image dimensions must match before processing or applying a result.
   Empty images or empty masks should return the original region or a clear user-facing error.
+  The one deliberate exception is the area editor's FLUX.2 klein engine, where an empty PAINTED
+  mask is a working mode rather than missing input: it is turned into a solid all-`255` wire mask
+  before the request is built, so what reaches the backend is never an empty mask either. The rule
+  above is about the WIRE, and it still holds without exception there.
 - File decode, source-page loading, AI calls, model scans/downloads, and CPU-heavy inpaint must run
   off the GUI thread. GUI code may poll channels, update textures, and apply prepared patches.
 - Shared model locks must be held only long enough to snapshot or apply data. Do not hold them

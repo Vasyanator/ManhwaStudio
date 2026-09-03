@@ -14,17 +14,18 @@ The mask means "you MAY change what is under it" — the inverse of the mask-inp
 which is why the engine declares exactly ONE mask layer and puts its bytes on the wire
 verbatim.
 
-Working modes (`Flux2KleinSettings::whole_region`, a MODE and not a memory profile,
-which is why no `MemoryPreset` owns it):
-- off (default): the painted mask decides, and `allows_empty_mask()` is `false`, so the
-  host's own frame button refuses a run with nothing painted.
-- on: the WHOLE selected region is regenerated and no painting is required, which is what
-  `allows_empty_mask() == true` tells the host. The request still carries a mask, a SOLID
-  one built by `mask_for_run`, because the backend refuses `whole_region = true` unless the
-  mask really is uniformly 255. The host's painted mask is never consulted in this mode, so
-  it comes back untouched the moment the switch is cleared. `mask_dilate_px` is ignored
-  backend-side here (the slider is faded to say so); `mask_feather_px` keeps working and is
-  what softens the join between the regenerated region and the page.
+Working modes are DERIVED from the painted mask, not chosen: there is no switch and no
+persisted field, and `mask_for_run` is the only place the decision is made.
+- something painted: only what is under the mask may change. The painted buffer goes on
+  the wire verbatim and `whole_region` travels as `false`.
+- nothing painted: the WHOLE selected region is regenerated. The request keeps its shape —
+  a mask is still sent, a SOLID one built by `mask_for_run`, because the backend refuses
+  `whole_region = true` unless the mask really is uniformly 255. `mask_dilate_px` is
+  ignored backend-side then (there is no contour to grow); `mask_feather_px` keeps working
+  and is what softens the join between the regenerated region and the page.
+`allows_empty_mask()` is therefore unconditionally `true`: an empty mask is a legal run
+rather than a refusal, and the host is what tells the user so (its own green hint under
+«Обработать»).
 
 Selection contract (checked twice, on purpose):
 - `constraints()` declares multiple of 16, shortest side >= 128 px, area <= 1 MP, aspect not
@@ -561,19 +562,6 @@ struct Flux2KleinSettings {
     /// `unload_text_encoder_after_encode` is on, the peak is set by the transformer and
     /// this flag no longer moves it.
     text_encoder_fp8: bool,
-    /// Edit the WHOLE selected region instead of a painted mask.
-    ///
-    /// A working MODE, not a memory profile, which is why it is deliberately absent
-    /// from [`MemoryPresetValues`]: choosing a preset must never turn it on or off.
-    /// When it is set the tool still sends a mask — a SOLID one, every byte `255`,
-    /// exactly the region size — because that is the contract the backend validates
-    /// (`whole_region = true` with a non-solid mask is refused). The user's painted
-    /// mask is left untouched in the session so that clearing the checkbox brings it
-    /// back; see [`Flux2SessionState::mask_for_run`].
-    ///
-    /// The backend IGNORES `mask_dilate_px` in this mode (there is no contour to grow)
-    /// while `mask_feather_px` keeps working and softens the region's join to the page.
-    whole_region: bool,
     mask_dilate_px: u32,
     mask_feather_px: u32,
     color_match: bool,
@@ -623,9 +611,6 @@ impl Default for Flux2KleinSettings {
             // Never defaulted on: quantizing the encoder is a quality trade the user
             // makes deliberately.
             text_encoder_fp8: false,
-            // Off by default: painting the permitted area is the tool's normal flow, and
-            // a settings file written before this field existed must keep that flow.
-            whole_region: false,
             mask_dilate_px: 16,
             // 12 px, not 6: with a correct ramp (its width IS `mask_feather_px`) 6 px still
             // leaves a visible step — measured +9.8% excess gradient on the mask contour
@@ -689,7 +674,6 @@ impl Flux2KleinSettings {
             unload_transformer_before_vae: self.unload_transformer_before_vae,
             unload_text_encoder_after_encode: self.unload_text_encoder_after_encode,
             text_encoder_fp8: self.text_encoder_fp8,
-            whole_region: self.whole_region,
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
             color_match: self.color_match,
@@ -705,11 +689,16 @@ impl Flux2KleinSettings {
     /// `self` must already be `normalized()`. `seed` is `null` unless the user pinned
     /// one, which is what the backend expects for "pick a fresh seed".
     ///
-    /// `whole_region` travels with the request but does NOT replace the mask: the blob
-    /// still carries one, and the backend refuses `whole_region = true` unless that mask
-    /// is solid. [`Flux2SessionState::mask_for_run`] is what makes it so.
+    /// `whole_region` is NOT a setting and is therefore passed in rather than read from
+    /// `self`: it is derived from the painted mask by [`mask_for_run`], which builds the
+    /// buffer and the flag together. It does not replace the mask — the blob still carries
+    /// one, and the backend refuses `whole_region = true` unless that mask is solid.
+    ///
+    /// Every path that only ASKS the backend something (`.status`, `.estimate`, the
+    /// prompt-cache calls) passes `false`: no mask exists for those, and `true` would make
+    /// the backend apply the mode's parameter overrides — and log them — on a polling path.
     #[must_use]
-    fn to_params(&self) -> Value {
+    fn to_params(&self, whole_region: bool) -> Value {
         json!({
             "text_encoder_path": self.text_encoder_path,
             "transformer_path": self.transformer_path,
@@ -727,7 +716,7 @@ impl Flux2KleinSettings {
             "unload_transformer_before_vae": self.unload_transformer_before_vae,
             "unload_text_encoder_after_encode": self.unload_text_encoder_after_encode,
             "text_encoder_fp8": self.text_encoder_fp8,
-            "whole_region": self.whole_region,
+            "whole_region": whole_region,
             "mask_dilate_px": self.mask_dilate_px,
             "mask_feather_px": self.mask_feather_px,
             "color_match": self.color_match,
@@ -1171,8 +1160,10 @@ impl Flux2SessionState {
     /// Starts a run on a worker thread. A second run is refused while one is in flight.
     ///
     /// `mask` is the L8 buffer that actually goes on the wire — the host's painted layer,
-    /// or a solid one under `whole_region` — and `mask_size` is the region size both it and
-    /// `region` describe. The pair is validated by the caller before it gets here.
+    /// or the solid one built for the whole-region mode — and `mask_size` is the region size
+    /// both it and `region` describe. `whole_region` is the flag [`mask_for_run`] derived
+    /// alongside that buffer and must not be re-derived here: the two have to agree, or the
+    /// backend refuses the pair. The sizes are validated by the caller before it gets here.
     ///
     /// # Errors
     /// Returns the localized "already running" message when a run is still in flight.
@@ -1180,6 +1171,7 @@ impl Flux2SessionState {
         &mut self,
         region: egui::ColorImage,
         mask: Vec<u8>,
+        whole_region: bool,
         mask_size: [usize; 2],
         settings: &Flux2KleinSettings,
         progress: &Arc<Mutex<Flux2Progress>>,
@@ -1194,8 +1186,15 @@ impl Flux2SessionState {
         let progress = Arc::clone(progress);
         let (tx, rx) = mpsc::channel::<Flux2JobResult>();
         thread::spawn(move || {
-            let result =
-                run_flux2_klein(&region, &mask, mask_size, &settings, &progress, generation);
+            let result = run_flux2_klein(
+                &region,
+                &mask,
+                whole_region,
+                mask_size,
+                &settings,
+                &progress,
+                generation,
+            );
             let _ = tx.send(Flux2JobResult {
                 source: region,
                 result,
@@ -1290,18 +1289,25 @@ impl Flux2SessionState {
     }
 }
 
-/// The L8 mask a run actually puts on the wire, region-sized either way.
+/// The L8 mask a run actually puts on the wire, region-sized either way, together with the
+/// `whole_region` flag that must accompany it.
 ///
-/// `painted` is the host's mask layer, exactly `w * h` bytes. With `whole_region` set the
-/// model may change every pixel, and the backend proves that by REQUIRING a solid mask
-/// alongside the flag — so a fresh all-`255` buffer is built here rather than the painted
-/// one being overwritten. That is the whole point of building it: the host's layer keeps
-/// whatever the user painted, and clearing the switch brings their work back untouched.
-fn mask_for_run(painted: &[u8], whole_region: bool) -> Vec<u8> {
-    if whole_region {
-        vec![255u8; painted.len()]
+/// This is the ONE place the working mode is decided, and it is DERIVED, never chosen: an
+/// empty `painted` layer means "edit the whole region", anything painted means "edit only
+/// what is under it". A single painted pixel is already a mask — the threshold is "any byte
+/// above zero" and nothing softer, so a stray dot cannot be mistaken for an empty layer.
+///
+/// `painted` is the host's mask layer, exactly `w * h` bytes. In the whole-region case the
+/// model may change every pixel and the backend proves that by REQUIRING a solid mask
+/// alongside the flag, so a fresh all-`255` buffer is built here rather than the host's
+/// layer being overwritten — the host's `MaskStack` is never written to by the engine at
+/// all, which is what keeps the user's painting theirs.
+#[must_use]
+fn mask_for_run(painted: &[u8]) -> (Vec<u8>, bool) {
+    if painted.iter().any(|value| *value > 0) {
+        (painted.to_vec(), false)
     } else {
-        painted.to_vec()
+        (vec![255u8; painted.len()], true)
     }
 }
 
@@ -1643,8 +1649,10 @@ impl Flux2KleinEngine {
             // with the query; without them the backend answers about whatever it used
             // last, i.e. about nothing until a generation has succeeded. The PROMPT
             // travels for the same reason: `prompt_cached` is an answer about one
-            // specific prompt, not about the tool in general.
-            let params = self.settings.normalized().to_params();
+            // specific prompt, not about the tool in general. The mode goes as `false`:
+            // there is no mask behind a catalog query, and the backend's own `.status`
+            // probe forces the same value for the same reason.
+            let params = self.settings.normalized().to_params(false);
             self.status_query_prompt = Some(self.settings.prompt.trim().to_string());
             let (tx, rx) = mpsc::channel();
             self.status_rx = Some(rx);
@@ -1698,7 +1706,9 @@ impl Flux2KleinEngine {
             return;
         }
         self.estimate_wanted = false;
-        let params = self.settings.normalized().to_params();
+        // The forecast is about memory, which the working mode does not move: the peak is
+        // set by the weights and the region size, not by which pixels the mask permits.
+        let params = self.settings.normalized().to_params(false);
         let (tx, rx) = mpsc::channel();
         self.estimate_rx = Some(rx);
         thread::spawn(move || {
@@ -2173,11 +2183,12 @@ impl AiEngine for Flux2KleinEngine {
         }]
     }
 
-    /// «Работа без маски» is exactly this flag: with it set the whole region is
-    /// regenerated and there is nothing to paint, so the host must stop demanding a
-    /// non-empty mask. The host re-reads this whenever the parameters change.
+    /// Unconditionally `true`: an empty mask is not a missing input here, it is the
+    /// whole-region MODE ([`mask_for_run`] turns it into a solid mask at run time). There
+    /// is no parameter left that could make it `false`, so the host's per-frame re-read
+    /// costs nothing and simply keeps agreeing with this.
     fn allows_empty_mask(&self) -> bool {
-        self.settings.whole_region
+        true
     }
 
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
@@ -2341,11 +2352,18 @@ impl AiEngine for Flux2KleinEngine {
         if let Some(reason) = region_block_reason(size) {
             return Err(reason);
         }
-        // The painted layer is never overwritten: under `whole_region` a solid buffer is
-        // built beside it, which is what the backend requires alongside the flag.
-        let mask = mask_for_run(&masks[0], self.settings.whole_region);
-        self.session
-            .start_run(region, mask, size, &self.settings, &self.progress)?;
+        // The mode is decided HERE, from the mask the host handed over, and nowhere else:
+        // an empty layer becomes the solid buffer the whole-region mode requires, while a
+        // painted one travels verbatim. The host's layer is never overwritten either way.
+        let (mask, whole_region) = mask_for_run(&masks[0]);
+        self.session.start_run(
+            region,
+            mask,
+            whole_region,
+            size,
+            &self.settings,
+            &self.progress,
+        )?;
         // A run may have to load weights it did not have; the catalog and the forecast are
         // stale afterwards.
         self.status_wanted = true;
@@ -2504,7 +2522,7 @@ struct Flux2PanelCtx<'a> {
 
 impl Flux2PanelCtx<'_> {
     /// Draws the whole «Редактор области» body for this engine: its progress bar and run
-    /// status, the prompt block, the parameters, and the working-mode switch.
+    /// status, the prompt block, the parameters, and the note on what the mask means.
     ///
     /// No scroll area and no run button: the panel that hosts this body owns its scrolling,
     /// and «Обработать» / «Применить» / «Отменить» belong to the frame and its host
@@ -2519,7 +2537,7 @@ impl Flux2PanelCtx<'_> {
         }
         self.draw_prompt(ui);
         self.draw_params(ui, region);
-        self.draw_mode_controls(ui);
+        draw_flux2_mask_hint(ui);
     }
 
     /// Draws the prompt block: the optional user-language field with its translator
@@ -3000,32 +3018,22 @@ impl Flux2PanelCtx<'_> {
             },
         );
     }
+}
 
-    /// Draws the working-mode switch: «Работа без маски», which decides whether the
-    /// painted mask is consulted at all.
-    ///
-    /// The brush itself is NOT here: the radius, paint/erase, clear and fill belong to the
-    /// host's «Выбранный инструмент» panel, which drives the frame's one `MaskBrush` for
-    /// every engine. What stays is the one control that changes the MEANING of the mask —
-    /// with the switch on, the host is told to accept an empty mask
-    /// ([`Flux2KleinEngine::allows_empty_mask`]) and the painted layer is never read, so it
-    /// survives the mode byte for byte.
-    fn draw_mode_controls(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label(t!("cleaning.tools.flux2_klein.mask_heading"));
-        *self.settings_changed |= ui
-            .checkbox(
-                &mut self.settings.whole_region,
-                t!("cleaning.tools.flux2_klein.whole_region_label"),
-            )
-            .on_hover_text(t!("cleaning.tools.flux2_klein.whole_region_hint"))
-            .changed();
-        if self.settings.whole_region {
-            ui.small(t!("cleaning.tools.flux2_klein.whole_region_mask_hint"));
-            return;
-        }
-        ui.small(t!("cleaning.tools.flux2_klein.mask_hint"));
-    }
+/// Explains what the mask MEANS for this engine, and what an empty one means.
+///
+/// A free function and not a [`Flux2PanelCtx`] method because it reads no state at all:
+/// there is no control here and nothing to change. The working mode is derived from the
+/// mask itself ([`mask_for_run`]), and the brush — radius, paint/erase, clear and fill —
+/// belongs to the host's «Выбранный инструмент» panel, which drives the frame's one
+/// `MaskBrush` for every engine. Both halves of the rule are stated at once because the
+/// user picks between them by painting or not painting rather than by reading a state
+/// back; the host adds its own green line under «Обработать» while the empty half is what
+/// a click would actually do.
+fn draw_flux2_mask_hint(ui: &mut egui::Ui) {
+    ui.separator();
+    ui.label(t!("cleaning.tools.flux2_klein.mask_heading"));
+    ui.small(t!("cleaning.tools.flux2_klein.mask_hint"));
 }
 
 /// The first reason a run cannot start that this ENGINE can see, or `None` when it can.
@@ -3559,30 +3567,22 @@ fn draw_advanced_section(
                 ui.set_opacity(saved_opacity);
             }
             *changed |= fp8.changed();
-            // Growing the mask contour has no meaning when the mask is the whole region:
-            // the backend IGNORES `mask_dilate_px` under `whole_region`, so the slider is
-            // faded to say so. It stays live, like the fp8 checkbox above — the user may
-            // be about to clear the switch — and `set_opacity` is a painter property, so
-            // nothing moves (`egui-docs/02-painting.md`). Feathering is NOT faded: it
-            // still softens how the regenerated region joins the rest of the page.
-            let dilate_ignored = settings.whole_region;
-            let saved_opacity = ui.opacity();
-            if dilate_ignored {
-                ui.set_opacity(saved_opacity * FLUX2_FADED_CONTROL_OPACITY);
-            }
-            let dilate = ui.add(
-                WheelSlider::new(&mut settings.mask_dilate_px, 0..=FLUX2_DILATE_MAX)
-                    .text(t!("cleaning.common.mask_expand_label")),
-            );
-            let dilate = if dilate_ignored {
-                dilate.on_hover_text(t!("cleaning.tools.flux2_klein.mask_expand_hint_ignored"))
-            } else {
-                dilate
-            };
-            if dilate_ignored {
-                ui.set_opacity(saved_opacity);
-            }
-            *changed |= dilate.changed();
+            // Growing the mask contour has no meaning while nothing is painted: the mask
+            // is then the whole region and the backend IGNORES `mask_dilate_px`. Unlike
+            // the fp8 checkbox above, this one is NOT faded, because the state it depends
+            // on is unknowable here — the working mode is derived from the painted mask at
+            // RUN time and the host pushes an engine the rectangle and the availability
+            // flags, never the mask stack. The condition goes into the hover text instead,
+            // where it is true at every moment rather than only at the drawn one.
+            // Feathering is unaffected either way: it still softens how the regenerated
+            // region joins the rest of the page.
+            *changed |= ui
+                .add(
+                    WheelSlider::new(&mut settings.mask_dilate_px, 0..=FLUX2_DILATE_MAX)
+                        .text(t!("cleaning.common.mask_expand_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_expand_hint"))
+                .changed();
             *changed |= ui
                 .add(
                     WheelSlider::new(&mut settings.mask_feather_px, 0..=FLUX2_FEATHER_MAX)
@@ -3742,9 +3742,11 @@ fn draw_flux2_progress_ui(ui: &mut egui::Ui, progress: &Mutex<Flux2Progress>) {
 ///
 /// `settings` must already be `normalized()`. `mask` is the L8 edit-permission mask in
 /// region coordinates and must be exactly `mask_size[0] * mask_size[1]` bytes matching
-/// `image.size`. `generation` is the progress generation claimed by `start_run`: every
-/// write into `progress`, including the terminal one that always clears the bar before
-/// returning, is dropped once a newer run (or a cancel) has retired it.
+/// `image.size`; `whole_region` is the mode [`mask_for_run`] derived for exactly that
+/// buffer and travels with it, because the backend validates the two against each other.
+/// `generation` is the progress generation claimed by `start_run`: every write into
+/// `progress`, including the terminal one that always clears the bar before returning, is
+/// dropped once a newer run (or a cancel) has retired it.
 ///
 /// # Errors
 /// Returns a user-facing message when the region violates the model's size contract,
@@ -3754,12 +3756,21 @@ fn draw_flux2_progress_ui(ui: &mut egui::Ui, progress: &Mutex<Flux2Progress>) {
 fn run_flux2_klein(
     image: &egui::ColorImage,
     mask: &[u8],
+    whole_region: bool,
     mask_size: [usize; 2],
     settings: &Flux2KleinSettings,
     progress: &Arc<Mutex<Flux2Progress>>,
     generation: u64,
 ) -> Result<Flux2RunOutcome, String> {
-    let outcome = run_flux2_klein_pass(image, mask, mask_size, settings, progress, generation);
+    let outcome = run_flux2_klein_pass(
+        image,
+        mask,
+        whole_region,
+        mask_size,
+        settings,
+        progress,
+        generation,
+    );
     // The bar is cleared on EVERY exit, including the early validation refusals above
     // the IPC call, because `start_run` raised it before the worker even started.
     update_progress(progress, generation, |state| {
@@ -3775,6 +3786,7 @@ fn run_flux2_klein(
 fn run_flux2_klein_pass(
     image: &egui::ColorImage,
     mask: &[u8],
+    whole_region: bool,
     mask_size: [usize; 2],
     settings: &Flux2KleinSettings,
     progress: &Arc<Mutex<Flux2Progress>>,
@@ -3792,6 +3804,10 @@ fn run_flux2_klein_pass(
     if let Some(reason) = region_block_reason(image.size) {
         return Err(reason);
     }
+    // Unreachable through `mask_for_run`, which turns an empty layer into the solid mask
+    // of the whole-region mode; kept because this function validates what it is HANDED
+    // rather than trusting its caller, exactly as the two size checks above do, and an
+    // all-zero mask would otherwise reach the backend as "change nothing".
     if !mask.iter().any(|value| *value > 0) {
         return Err(t!("cleaning.tools.flux2_klein.empty_mask_error").to_string());
     }
@@ -3801,7 +3817,7 @@ fn run_flux2_klein_pass(
     let header = json!({
         "image_len": image_png.len(),
         "mask_len": mask_png.len(),
-        "params": settings.to_params(),
+        "params": settings.to_params(whole_region),
     });
     let blob = concat_image_mask(&image_png, &mask_png);
 
@@ -4087,7 +4103,9 @@ fn unload_flux2_klein() -> Result<(), String> {
 /// `settings` must already be `normalized()`.
 #[must_use]
 fn flux2_prompt_cache_header(settings: &Flux2KleinSettings, extra: &[(&str, Value)]) -> Value {
-    let mut header = json!({ "params": settings.to_params() });
+    // The mode is `false` here as on every other query path: a prompt-cache call carries
+    // no mask, and only the text-encoder path of `params` is read from it anyway.
+    let mut header = json!({ "params": settings.to_params(false) });
     // `json!` above always builds an object; the guard keeps this total rather than
     // relying on that from a distance.
     if let Some(map) = header.as_object_mut() {
@@ -4462,10 +4480,15 @@ fn settings_from_json(value: &Value) -> Flux2KleinSettings {
         settings.prompt = FLUX2_DEFAULT_PROMPT.to_string();
     }
     // `text_encoder_fp8` needs no migration: its default is `false` for EVERY placement,
-    // which is exactly what serde's `#[serde(default)]` already produces. The same holds
-    // for `whole_region`: it depends on no sibling field, so a file written before it
-    // existed loads with the painted-mask flow the user had, and a file that carries it
-    // keeps their choice.
+    // which is exactly what serde's `#[serde(default)]` already produces.
+    //
+    // A file written by a build that still had the «Работа без маски» checkbox carries a
+    // `whole_region` key that no longer maps to a field. No migration is needed for it
+    // either, and none may be added: the struct does NOT use `deny_unknown_fields`, so
+    // serde drops the key silently, the document loads with every other setting intact,
+    // and the next save simply writes it out without that key. The mode it used to hold
+    // is derived from the painted mask now (`mask_for_run`), so there is nothing left for
+    // a stored value to mean.
     settings
 }
 
@@ -4765,25 +4788,25 @@ mod tests {
         assert_eq!(norm.mt_service, "google");
         assert_eq!(norm.source_lang, "auto");
         assert_eq!(norm.text_encoder_path, "/models/qwen3");
-        assert!(norm.to_params()["unload_transformer_before_vae"].is_boolean());
-        assert!(norm.to_params()["unload_text_encoder_after_encode"].is_boolean());
-        assert!(norm.to_params()["text_encoder_fp8"].is_boolean());
+        assert!(norm.to_params(false)["unload_transformer_before_vae"].is_boolean());
+        assert!(norm.to_params(false)["unload_text_encoder_after_encode"].is_boolean());
+        assert!(norm.to_params(false)["text_encoder_fp8"].is_boolean());
     }
 
     #[test]
     fn params_omit_the_seed_unless_pinned() {
         let settings = Flux2KleinSettings::default().normalized();
-        assert_eq!(settings.to_params()["seed"], Value::Null);
+        assert_eq!(settings.to_params(false)["seed"], Value::Null);
         let pinned = Flux2KleinSettings {
             use_seed: true,
             seed: 42,
             ..Flux2KleinSettings::default()
         }
         .normalized();
-        assert_eq!(pinned.to_params()["seed"], json!(42));
+        assert_eq!(pinned.to_params(false)["seed"], json!(42));
         // The distilled checkpoint has no negative prompt and must never grow a field
         // for one.
-        assert!(pinned.to_params().get("negative_prompt").is_none());
+        assert!(pinned.to_params(false).get("negative_prompt").is_none());
     }
 
     #[test]
@@ -4878,8 +4901,9 @@ mod tests {
         for x in 6..40 {
             painted[10 * 64 + x] = 255;
         }
-        let sent = mask_for_run(&painted, false);
+        let (sent, whole_region) = mask_for_run(&painted);
         assert_eq!(sent, painted, "the painted layer travels byte for byte");
+        assert!(!whole_region, "something is painted, so only that may change");
         // The bytes that actually reach the wire are checked, not the intention.
         let png = encode_mask_png_l8(&sent, 64, 64).expect("encode the painted mask");
         let decoded = image::load_from_memory(&png).expect("decode").to_luma8();
@@ -4965,7 +4989,7 @@ mod tests {
             ..Flux2KleinSettings::default()
         }
         .normalized();
-        let header = flux2_status_header(&settings.to_params());
+        let header = flux2_status_header(&settings.to_params(false));
         let params = header
             .get("params")
             .expect("`.status` without `params` makes the backend answer about the paths of the last successful run, i.e. about nothing");
@@ -4977,7 +5001,7 @@ mod tests {
         assert_eq!(params["vae_path"], json!("/models/vae"));
         // Paths the user has not filled in yet still travel, as empty strings: that is
         // exactly the question the component panel asks.
-        let empty = flux2_status_header(&Flux2KleinSettings::default().normalized().to_params());
+        let empty = flux2_status_header(&Flux2KleinSettings::default().normalized().to_params(false));
         assert_eq!(empty["params"]["text_encoder_path"], json!(""));
     }
 
@@ -5232,110 +5256,89 @@ mod tests {
         }
     }
 
+    /// The mode is not a setting any more, so the only thing left to pin about the wire
+    /// is that the flag the caller derived is the flag that reaches the backend.
     #[test]
-    fn whole_region_is_off_by_default_and_survives_the_wire() {
-        let settings = Flux2KleinSettings::default();
-        assert!(
-            !settings.whole_region,
-            "the painted-mask flow is the default one"
-        );
-        let params = Flux2KleinSettings {
-            whole_region: true,
-            ..runnable_settings()
+    fn the_derived_mode_is_what_reaches_the_wire() {
+        for whole_region in [false, true] {
+            let params = runnable_settings().normalized().to_params(whole_region);
+            assert_eq!(params["whole_region"], json!(whole_region));
+            // The mode never replaces the mask parameters: feathering still reaches the
+            // backend and still means what it means in both.
+            assert_eq!(params["mask_feather_px"], json!(12));
         }
-        .normalized()
-        .to_params();
-        assert_eq!(params["whole_region"], json!(true));
-        // The flag never replaces the mask parameters: feathering still reaches the
-        // backend and still means what it means.
-        assert_eq!(params["mask_feather_px"], json!(12));
     }
 
+    /// A settings file written by a build that still had the «Работа без маски» checkbox
+    /// carries a `whole_region` key nothing maps to any more. The struct does not use
+    /// `deny_unknown_fields`, so the document must load with every other setting intact
+    /// rather than falling back to defaults.
     #[test]
-    fn a_settings_file_without_whole_region_loads_it_off() {
-        // A document written before the field existed: no `whole_region` key at all.
+    fn a_settings_file_carrying_the_removed_whole_region_field_still_loads() {
         let old = json!({
             "text_encoder_path": "/a",
             "transformer_path": "/b",
             "vae_path": "/c",
             "placement": "sequential_cpu_offload",
+            "whole_region": true,
             "mask_dilate_px": 8
         });
         let migrated = settings_from_json(&old);
-        assert!(
-            !migrated.whole_region,
-            "an old file must keep the painted-mask flow"
-        );
-        // The neighbouring migration still works and is not disturbed by the new field.
-        assert!(migrated.unload_transformer_before_vae);
+        assert_eq!(migrated.text_encoder_path, "/a", "the removed key must not cost the rest");
+        assert_eq!(migrated.transformer_path, "/b");
+        assert_eq!(migrated.vae_path, "/c");
         assert_eq!(migrated.mask_dilate_px, 8);
+        // The neighbouring placement migration still runs on such a document.
+        assert!(migrated.unload_transformer_before_vae);
 
-        // A file that carries the field keeps whatever the user chose.
-        let carried = settings_from_json(&json!({ "whole_region": true }));
-        assert!(carried.whole_region);
-    }
-
-    #[test]
-    fn whole_region_belongs_to_no_memory_preset() {
-        // Applying a preset must not touch the mode in either direction: it is how the
-        // tool works, not a memory profile.
-        for preset in MemoryPreset::selectable() {
-            let mut on = Flux2KleinSettings {
-                whole_region: true,
-                ..Flux2KleinSettings::default()
-            };
-            preset.apply(&mut on);
-            assert!(on.whole_region, "{preset:?} must not clear the mode");
-
-            let mut off = Flux2KleinSettings::default();
-            preset.apply(&mut off);
-            assert!(!off.whole_region, "{preset:?} must not set the mode");
+        // The same document without the key loads identically: the key means nothing now.
+        let mut without = old.clone();
+        if let Some(map) = without.as_object_mut() {
+            map.remove("whole_region");
         }
-        // ...and it must not move the picker either: `detect` compares the seven fields
-        // a preset owns, and this is not one of them.
-        let mut settings = Flux2KleinSettings::default();
-        MemoryPreset::Balanced.apply(&mut settings);
-        let before = MemoryPreset::detect(&settings);
-        settings.whole_region = true;
+        let plain = settings_from_json(&without);
         assert_eq!(
-            MemoryPreset::detect(&settings),
-            before,
-            "the mode must not push the picker to «Пользовательский»"
+            serde_json::to_value(&migrated).expect("serialize"),
+            serde_json::to_value(&plain).expect("serialize"),
+            "a stale `whole_region` key may not change a single loaded setting"
         );
     }
 
     /// The empty-mask rule LEFT the engine's gate in the port: the host's frame enforces
-    /// it and asks the engine only whether an empty mask is meaningful at all. Everything
-    /// else the gate used to refuse is refused exactly as before.
+    /// it and asks the engine only whether an empty mask is meaningful at all. It always
+    /// is here, and no setting may make it otherwise. Everything else the gate used to
+    /// refuse is refused exactly as before.
     #[test]
-    fn an_empty_mask_blocks_a_run_only_while_the_mode_is_off() {
+    fn an_empty_mask_is_always_a_legal_run_for_this_engine() {
         let mut engine = Flux2KleinEngine {
             settings: runnable_settings(),
             ..Flux2KleinEngine::default()
         };
         assert!(
-            !engine.allows_empty_mask(),
-            "nothing painted and no whole-region mode: the host must refuse the run"
-        );
-        engine.settings.whole_region = true;
-        assert!(
             engine.allows_empty_mask(),
-            "whole-region mode needs no painted mask"
+            "nothing painted is the whole-region mode, not a missing input"
         );
         assert!(
             engine.run_block_reason().is_none(),
             "with paths and a prompt the engine's own half of the gate is clear"
         );
+        // Every parameter the panel offers, at a value away from its default: none of
+        // them may turn the empty-mask answer back into a refusal.
+        engine.settings.mask_dilate_px = 0;
+        engine.settings.mask_feather_px = 0;
+        engine.settings.color_match = false;
+        MemoryPreset::MinRam.apply(&mut engine.settings);
+        assert!(engine.allows_empty_mask(), "no parameter may gate the empty-mask rule");
 
-        // Every other gate still applies in the new mode.
+        // Every other gate still applies.
         engine.settings.prompt = "   ".to_string();
         assert!(engine.run_block_reason().is_some(), "a blank prompt still blocks");
         engine.settings = Flux2KleinSettings {
-            whole_region: true,
             vae_path: String::new(),
             ..runnable_settings()
         };
         assert!(engine.run_block_reason().is_some(), "a missing path still blocks");
+        assert!(engine.allows_empty_mask(), "a blocked run is still a maskless one");
     }
 
     #[test]
@@ -5393,17 +5396,14 @@ mod tests {
         assert!(flux2_run_block_reason(&no_prompt, Some(true)).is_some());
     }
 
+    /// The whole rule, in one place: nothing painted is the whole-region mode and yields
+    /// the solid mask the backend demands alongside the flag; anything painted is the
+    /// masked mode and travels verbatim.
     #[test]
-    fn whole_region_sends_a_solid_mask_and_keeps_the_painted_one() {
-        // The layer the host paints and hands over: a real stroke, not a full region.
-        let mut painted = vec![0u8; 32 * 16];
-        for x in 2..14 {
-            painted[4 * 32 + x] = 255;
-        }
-        let painted_px = painted.iter().filter(|value| **value > 0).count();
-        assert!(painted_px > 0 && painted_px < painted.len(), "a real stroke");
-
-        let sent = mask_for_run(&painted, true);
+    fn an_empty_mask_becomes_a_solid_one_and_a_painted_one_travels_verbatim() {
+        let empty = vec![0u8; 32 * 16];
+        let (sent, whole_region) = mask_for_run(&empty);
+        assert!(whole_region, "nothing painted means the whole region may change");
         // The bytes that actually reach the wire are checked, not the intention: the
         // buffer is encoded and decoded back exactly as `run_flux2_klein_pass` does it.
         let png = encode_mask_png_l8(&sent, 32, 16).expect("encode the solid mask");
@@ -5413,10 +5413,35 @@ mod tests {
             decoded.pixels().all(|pixel| pixel.0[0] == 255),
             "the backend refuses whole_region unless every mask byte is 255"
         );
+        assert_eq!(empty, vec![0u8; 32 * 16], "the host's layer is never written through");
 
-        // The solid buffer is built BESIDE the host's layer, never through it, so clearing
-        // the switch brings the user's work back exactly as it was.
-        assert_eq!(mask_for_run(&painted, false), painted);
+        // A real stroke: the painted layer decides, and it reaches the wire unchanged.
+        let mut painted = vec![0u8; 32 * 16];
+        for x in 2..14 {
+            painted[4 * 32 + x] = 255;
+        }
+        let painted_px = painted.iter().filter(|value| **value > 0).count();
+        assert!(painted_px > 0 && painted_px < painted.len(), "a real stroke");
+        assert_eq!(mask_for_run(&painted), (painted.clone(), false));
+    }
+
+    /// The boundary of the derived rule. One pixel is a mask — the threshold is "any byte
+    /// above zero" and nothing softer, because a stray dot the user has not noticed must
+    /// not silently become permission to regenerate the entire region.
+    #[test]
+    fn a_single_painted_pixel_is_already_a_mask() {
+        for idx in [0usize, 5, 32 * 16 - 1] {
+            let mut painted = vec![0u8; 32 * 16];
+            painted[idx] = 255;
+            let (sent, whole_region) = mask_for_run(&painted);
+            assert!(!whole_region, "one pixel at {idx} is a mask, not an empty layer");
+            assert_eq!(sent, painted, "and it travels exactly as painted");
+        }
+        // The other side of the same boundary: a layer that is entirely 255 is a painted
+        // mask covering everything, so it is sent as one rather than re-derived as the
+        // whole-region mode. The bytes on the wire are identical either way.
+        let solid = vec![255u8; 32 * 16];
+        assert_eq!(mask_for_run(&solid), (solid.clone(), false));
     }
 
     #[test]
@@ -5460,7 +5485,7 @@ mod tests {
             ..Flux2KleinSettings::default()
         }
         .normalized();
-        let header = flux2_status_header(&settings.to_params());
+        let header = flux2_status_header(&settings.to_params(false));
         assert_eq!(header["params"]["prompt"], json!("remove the sfx"));
     }
 

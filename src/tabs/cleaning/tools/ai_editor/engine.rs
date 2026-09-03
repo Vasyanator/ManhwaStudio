@@ -121,10 +121,11 @@ pub trait AiEngine {
     /// The mask layers the engine wants painted, in painting order. Must not be empty.
     fn mask_layers(&self) -> Vec<MaskLayerSpec>;
 
-    /// Whether a run with every mask layer empty is meaningful (FLUX.2's «Работа без
-    /// маски»). The host relaxes the frame's non-empty-mask rule exactly when this is
-    /// `true`, and re-reads it whenever the engine's parameters change, because an engine
-    /// may make it depend on one of them.
+    /// Whether a run with every mask layer empty is meaningful — for FLUX.2 klein it is,
+    /// because an empty mask IS its whole-region working mode. The host relaxes the frame's
+    /// non-empty-mask rule exactly when this is `true`, tells the user so with its own
+    /// green line under «Обработать», and re-reads the answer whenever the engine's
+    /// parameters change, because an engine may make it depend on one of them.
     fn allows_empty_mask(&self) -> bool;
 
     /// Draws the engine's parameters, its own progress bar and its engine-specific status —
