@@ -132,6 +132,12 @@ METHOD_INPAINT_FLUX2_KLEIN = "inpaint.flux2_klein"                    # streams 
 METHOD_INPAINT_FLUX2_KLEIN_STATUS = "inpaint.flux2_klein.status"      # components + free memory
 METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE = "inpaint.flux2_klein.estimate"  # RAM/VRAM forecast
 METHOD_INPAINT_FLUX2_KLEIN_UNLOAD = "inpaint.flux2_klein.unload"
+# Per-component residency actions. `.status` reports, for the text encoder, the
+# transformer and the VAE, where the weights are and which actions are possible;
+# this method performs ONE of those actions. Streaming, because loading the 16 GB
+# encoder takes ~100 s, and it claims the same single progress bar a generation
+# does, so the two can never run at once.
+METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION = "inpaint.flux2_klein.component_action"
 # Prompt-cache library: a prompt embedding costs a 16 GB encoder read to produce
 # and ~4 MiB to keep, so it can be built without generating, stored in
 # `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, listed, loaded
@@ -203,6 +209,7 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX2_KLEIN_STATUS,
         METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
         METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
+        METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,

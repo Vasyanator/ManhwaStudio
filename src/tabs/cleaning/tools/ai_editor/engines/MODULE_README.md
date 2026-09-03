@@ -25,7 +25,8 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
 ## Files and submodules
 - `mod.rs`: the catalog — `all_engines()` and nothing else.
 - `flux2_klein.rs`: the FLUX.2 klein engine (IPC methods `inpaint.flux2_klein` streaming,
-  `.status`, `.estimate`, `.unload`, and the six `.prompt_cache.*` methods). The user paints the
+  `.status`, `.estimate`, `.unload`, `.component_action` streaming, and the six
+  `.prompt_cache.*` methods). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
   mask layer and puts its bytes on the wire verbatim. Leaving that layer EMPTY is the other
@@ -165,6 +166,25 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   `constraints()`, the run path re-validates the actual region against `region_block_reason`, and
   `flux2_run_block_reason` answers only for the model paths and the prompt. A test pins that
   `constraints()` and `region_block_reason` accept exactly the same regions.
+- FLUX.2 klein reports PER-COMPONENT RESIDENCY and lets the user act on it. `.status`
+  answers a `components` block — for the text encoder, the transformer and the VAE — carrying
+  `residency` (`not_loaded` / `ram` / `gpu` / `offloaded` / `mixed`; five states because
+  accelerate's offload leaves the parameters on `meta` with the bytes in a host map, and a load
+  can leave a component genuinely split) and `actions`, the list of what may be done to it right
+  now. **`actions` is the AUTHORITY and is never re-derived on this side**: the rule depends on
+  the accelerate hooks, the pipeline-wide model cache key and the memory guard, so duplicating it
+  in Rust would put the matrix in two languages and drift on the first edit. The three-state rule
+  the optional `.status` fields already carry applies to the whole block: an ABSENT `components`
+  is NOT KNOWN and never "not loaded", with `components_busy` saying the service could not take
+  the lock a generation holds for its whole run; while it is busy the block reports that instead
+  of stale rows and draws no buttons. A residency literal this build does not know leaves the row
+  stateless and shows the literal on hover, and an unknown action is dropped from that row rather
+  than guessed at. The transformer and the VAE load and unload TOGETHER — one cache key describes
+  a whole pipeline — and their button hovers say so. Acting on a component is the streaming
+  `.component_action`, which claims the SAME progress bar as a generation and a
+  `.prompt_cache.build`; all three are therefore mutually exclusive, and every "wait for the
+  current operation" gate reads `flux2_pipeline_busy` across the three rather than one receiver.
+  The pinned wire contract is `dev-docs/flux2_component_residency.md`.
 - Every `t!` key of this engine lives under `cleaning.tools.flux2_klein.*`; the run/cancel wording
   it shares with the older editors stays under `cleaning.mask_editor.*`.
 

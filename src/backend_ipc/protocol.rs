@@ -110,6 +110,21 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_STATUS: &str = "inpaint.flux2_klein.status"
 pub const METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE: &str = "inpaint.flux2_klein.estimate";
 /// Releases the resident FLUX.2 klein pipeline.
 pub const METHOD_INPAINT_FLUX2_KLEIN_UNLOAD: &str = "inpaint.flux2_klein.unload";
+/// Loads, unloads or moves ONE FLUX.2 klein component (text encoder, transformer,
+/// VAE). Streaming, like `.prompt_cache.build`, because reading the ~16 GB text
+/// encoder takes ~100 s; it therefore claims the same single progress bar and can
+/// never run beside a generation.
+///
+/// Request header: `component` (`text_encoder` / `transformer` / `vae`), `action`
+/// (`load` / `unload` / `to_ram` / `to_gpu` / `warmup`) and the normalized `params`
+/// every other FLUX.2 call carries. The response repeats the `.status` `components`
+/// block as it stands AFTER the action, plus `components_busy`.
+///
+/// An action the component's own `actions` list does not offer, a service already
+/// busy, and a memory guard refusal are all ERRORS with an actionable message —
+/// never a silent no-op. The wire contract is `dev-docs/flux2_component_residency.md`.
+pub const METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION: &str =
+    "inpaint.flux2_klein.component_action";
 /// Encodes the `params.prompt` with the Qwen3 text encoder and keeps the
 /// embeddings in the backend's prompt cache (streaming: reading the ~16 GB encoder
 /// takes ~106 s, and the progress frames carry `phase`/`step`/`total`/`label` just

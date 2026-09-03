@@ -6,6 +6,7 @@ Methods hosted here:
     inpaint.flux2_klein.status    — component availability + free memory.
     inpaint.flux2_klein.estimate  — RAM/VRAM forecast for one run.
     inpaint.flux2_klein.unload    — drop the loaded pipeline.
+    inpaint.flux2_klein.component_action — one per-component residency action, streaming.
     inpaint.flux2_klein.prompt_cache.build  — encode the prompt only, streaming.
     inpaint.flux2_klein.prompt_cache.list   — library entries of this encoder.
     inpaint.flux2_klein.prompt_cache.save   — store the cached prompt by name.
@@ -32,6 +33,7 @@ from typing import Any
 
 from ..protocol import (
     METHOD_INPAINT_FLUX2_KLEIN,
+    METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
     METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
@@ -240,6 +242,53 @@ def _handle_inpaint_flux2_klein_unload(
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_UNLOAD, _handle_inpaint_flux2_klein_unload)
+
+
+def _handle_inpaint_flux2_klein_component_action(
+    ctx: HandlerContext,
+    header: dict[str, Any],
+    blob: bytes,
+    cancel_event: threading.Event,
+) -> tuple[dict[str, Any], bytes]:
+    """Perform one per-component residency action; no image is produced.
+
+    Streams the same `phase:"load"` frames as a generation, because a component
+    load reads up to 18 GB from disk and a silent wait is not acceptable.
+
+    `component` and `action` are only checked to have ARRIVED here; which values
+    are legal, and which are possible for that component right now, is the
+    service's single answer (`_require_component_name` / `_require_action_name` /
+    `_require_action_available_locked`) — duplicating the matrix in this layer is
+    exactly the drift the contract puts it in one place to avoid.
+
+    Cancellation follows the shared inpaint contract: checked before the call and
+    after it returns, never inside a weight read.
+    """
+    if cancel_event.is_set():
+        raise Interrupted("inpaint.flux2_klein.component_action canceled before start.")
+    params_raw = _require_params(header)
+    component = _require_non_empty_str(header, "component")
+    action = _require_non_empty_str(header, "action")
+    try:
+        result = ctx.state.flux2_klein_inpaint.component_action(
+            params_raw,
+            component=component,
+            action=action,
+            progress_callback=_progress_forwarder(ctx),
+        )
+    except (ValueError, FileNotFoundError):
+        raise
+    except Exception:  # noqa: BLE001
+        if cancel_event.is_set():
+            raise Interrupted("inpaint.flux2_klein.component_action canceled.") from None
+        traceback.print_exc()
+        raise
+    if cancel_event.is_set():
+        raise Interrupted("inpaint.flux2_klein.component_action canceled.")
+    return dict(result), b""
+
+
+register(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION, _handle_inpaint_flux2_klein_component_action)
 
 
 # ---------------------------------------------------------------------------

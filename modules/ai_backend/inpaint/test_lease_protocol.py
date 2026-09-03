@@ -3,8 +3,10 @@ File: modules/ai_backend/inpaint/test_lease_protocol.py
 
 Purpose:
 Pins the `LoadedModelManager` lease protocol of all six inpaint services
-(`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`, `flux2_klein`) against one
-specific way of getting it wrong: reporting a failed INFERENCE as a failed LOAD.
+(`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`, `flux2_klein`) — plus FLUX.2
+klein's second leased entry point, `component_action`'s user-pressed pipeline
+load — against one specific way of getting it wrong: reporting a failed
+INFERENCE as a failed LOAD.
 
 Main responsibilities:
 - verify a model whose load succeeded is registered with `mark_loaded()` even
@@ -226,7 +228,45 @@ def _case_flux2_klein(
     )
 
 
-#: `(name, builder, load method)` per inpaint service.
+def _case_flux2_klein_component_action(
+    stack: ExitStack, manager: LoadedModelManager
+) -> tuple[Any, Callable[[], None]]:
+    """FLUX.2 klein's SECOND leased path: a user-pressed per-component load.
+
+    `component_action("transformer", "load")` builds the same pipeline a run
+    does and warms it up afterwards, so it owes the same two `try` scopes: the
+    warm-up is not part of the load, and a warm-up failure must leave the
+    manager holding a resident, evictable entry.
+    """
+    service = flux2_klein.Flux2KleinInpaintService(manager)
+
+    def ensure(
+        _normalized: dict[str, Any], model_key: str, _report: Any, *, region_hw: tuple[int, int]
+    ) -> _StubModel:
+        service._pipe = _StubModel()
+        service._active_key = model_key
+        return service._pipe
+
+    stack.enter_context(patch.object(flux2_klein, "_clear_torch_cache", lambda: None))
+    stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
+    # The pre-load memory guard has its own tests; this case is about the lease.
+    stack.enter_context(
+        patch.object(service, "_require_pipeline_headroom_locked", lambda *_a, **_k: None)
+    )
+    # The warm-up is this path's "inference": it runs with the pipeline already
+    # resident, so a failure here is a failed RUN, never a failed load.
+    stack.enter_context(patch.object(service, "_warmup_pipeline_locked", _explode))
+    params = {
+        "text_encoder_path": _FLUX2_KLEIN_PATH,
+        "transformer_path": _FLUX2_KLEIN_PATH,
+        "vae_path": _FLUX2_KLEIN_PATH,
+    }
+    return service, lambda: service.component_action(
+        params, component="transformer", action="load"
+    )
+
+
+#: `(name, builder, load method)` per leased inpaint path.
 _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("lama_v2", _case_lama, "_ensure_inpainter_locked"),
     ("lama_mpe", _case_lama_mpe, "_ensure_model_locked"),
@@ -234,6 +274,11 @@ _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("sdxl", _case_sdxl, "_ensure_pipeline_locked"),
     ("flux_fill", _case_flux_fill, "_ensure_pipeline_locked"),
     ("flux2_klein", _case_flux2_klein, "_ensure_pipeline_locked"),
+    (
+        "flux2_klein.component_action",
+        _case_flux2_klein_component_action,
+        "_ensure_pipeline_locked",
+    ),
 )
 
 

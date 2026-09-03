@@ -34,6 +34,7 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── sdxl.py        — inpaint.sdxl (+ unload); streaming via ProgressEmitter
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
                 ├── flux2_klein.py — inpaint.flux2_klein (+ status, estimate, unload,
+                │                    component_action,
                 │                    prompt_cache.build/list/save/load/export/import); streaming
                 ├── watermark.py   — watermark.detect / .remove / .status / .unload; streaming
                 ├── reline.py      — reline.models / reline.process

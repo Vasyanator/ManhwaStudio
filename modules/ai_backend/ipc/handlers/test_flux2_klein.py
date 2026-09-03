@@ -27,6 +27,11 @@ Coverage:
 - error mapping: ValueError / FileNotFoundError / generic Exception propagate
   (the dispatcher maps them to `response{status:"error"}`);
 - cancel before start and cancel observed after the service returns;
+- `inpaint.flux2_klein.component_action`: it streams the `load` phase, requires a
+  non-empty `component` and `action`, forwards both VERBATIM (the legal
+  vocabulary and the per-component availability are the service's single answer,
+  never re-derived here), returns the post-action snapshot, and propagates every
+  refusal;
 - the six `inpaint.flux2_klein.prompt_cache.*` methods: `build` streams the
   prompt phase and is cancellable, `name`/`path` are required non-empty strings,
   `overwrite` defaults to `false`, an import's `name` is optional and trimmed,
@@ -47,6 +52,7 @@ from modules.ai_backend.ipc.protocol import (
     HEADER_KIND,
     KIND_PROGRESS,
     METHOD_INPAINT_FLUX2_KLEIN,
+    METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
     METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
@@ -80,6 +86,14 @@ BUILD_PROGRESS_SCRIPT = (
     ("load", 9, 9, "Выгрузка текстового энкодера"),
 )
 
+#: What `component_action` streams: the `phase:"load"` scale again — a component
+#: load reads up to 18 GB and must not be a silent wait.
+COMPONENT_ACTION_PROGRESS_SCRIPT = (
+    ("load", 0, 9, "Подготовка загрузки FLUX.2 klein"),
+    ("load", 1, 9, "Загрузка трансформера"),
+    ("load", 6, 9, "Прогрев модели"),
+)
+
 
 class _FakeFlux2KleinService:
     """Stand-in for `AppState.flux2_klein_inpaint`."""
@@ -97,6 +111,8 @@ class _FakeFlux2KleinService:
         self.estimate_calls: list[dict[str, Any]] = []
         #: (method, params, extra kwargs) per prompt-cache call.
         self.prompt_cache_calls: list[tuple[str, Any, dict[str, Any]]] = []
+        #: (params, component, action) per `component_action` call.
+        self.component_action_calls: list[tuple[Any, str, str]] = []
         self.unload_calls = 0
         self.unload_return = True
 
@@ -131,6 +147,33 @@ class _FakeFlux2KleinService:
     def unload(self) -> bool:
         self.unload_calls += 1
         return self.unload_return
+
+    def component_action(
+        self,
+        params: dict[str, Any] | None,
+        *,
+        component: str,
+        action: str,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        self.component_action_calls.append((params, component, action))
+        if progress_callback is not None:
+            for frame in COMPONENT_ACTION_PROGRESS_SCRIPT:
+                progress_callback(*frame)
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return {
+            "component": component,
+            "action": action,
+            "performed": True,
+            "components": {
+                "text_encoder": {"residency": "not_loaded", "actions": ["load"]},
+                "transformer": {"residency": "gpu", "actions": ["unload", "to_ram"]},
+                "vae": {"residency": "gpu", "actions": ["unload", "warmup"]},
+            },
+            "components_busy": False,
+            "device": "cuda:0",
+        }
 
     # ---- prompt-cache library ----
     def prompt_cache_build(
@@ -484,6 +527,93 @@ def test_unload_reports_whether_anything_was_dropped(unloaded: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-component residency actions
+# ---------------------------------------------------------------------------
+def test_component_action_streams_the_load_phase_and_returns_the_snapshot() -> None:
+    svc = _FakeFlux2KleinService()
+    emitter, disp = _emitter()
+    params = {"transformer_path": "/t", "vae_path": "/v"}
+
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    header, blob = handler(
+        _ctx(svc, emitter=emitter),
+        {"params": params, "component": "transformer", "action": "load"},
+        b"",
+        _no_cancel(),
+    )
+
+    assert [(f[0]["phase"], f[0]["step"]) for f in disp.frames] == [
+        (phase, step) for phase, step, _total, _label in COMPONENT_ACTION_PROGRESS_SCRIPT
+    ]
+    assert all(frame_blob == b"" for _h, frame_blob in disp.frames)
+    assert svc.component_action_calls == [(params, "transformer", "load")]
+    assert header["components_busy"] is False
+    assert header["components"]["transformer"]["actions"] == ["unload", "to_ram"]
+    assert blob == b""
+
+
+def test_component_action_without_an_emitter_still_answers() -> None:
+    svc = _FakeFlux2KleinService()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    header, _blob = handler(
+        _ctx(svc), {"params": None, "component": "vae", "action": "warmup"}, b"", _no_cancel()
+    )
+    assert header["performed"] is True
+    assert svc.component_action_calls == [({}, "vae", "warmup")]
+
+
+@pytest.mark.parametrize("field", ["component", "action"])
+@pytest.mark.parametrize("value", [None, "", "   ", 7])
+def test_component_action_requires_both_names(field: str, value: Any) -> None:
+    header: dict[str, Any] = {"params": {}, "component": "vae", "action": "warmup"}
+    if value is None:
+        header.pop(field)
+    else:
+        header[field] = value
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    with pytest.raises(ValueError):
+        handler(_ctx(_FakeFlux2KleinService()), header, b"", _no_cancel())
+
+
+def test_component_action_does_not_second_guess_the_service_vocabulary() -> None:
+    # The handler forwards whatever arrived; which names are legal, and which are
+    # possible right now, is the service's single answer.
+    svc = _FakeFlux2KleinService()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    handler(
+        _ctx(svc), {"params": {}, "component": "tokenizer", "action": "to_gpu"}, b"", _no_cancel()
+    )
+    assert svc.component_action_calls == [({}, "tokenizer", "to_gpu")]
+
+
+@pytest.mark.parametrize(
+    "exc", [ValueError("не в списке доступных"), RuntimeError("FLUX.2 klein занят")]
+)
+def test_a_refused_component_action_propagates(exc: BaseException) -> None:
+    svc = _FakeFlux2KleinService(raise_exc=exc)
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    with pytest.raises(type(exc)):
+        handler(
+            _ctx(svc),
+            {"params": {}, "component": "text_encoder", "action": "load"},
+            b"",
+            _no_cancel(),
+        )
+
+
+def test_component_action_honours_cancellation_before_start() -> None:
+    svc = _FakeFlux2KleinService()
+    cancel = threading.Event()
+    cancel.set()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION)
+    with pytest.raises(Interrupted):
+        handler(
+            _ctx(svc), {"params": {}, "component": "vae", "action": "warmup"}, b"", cancel
+        )
+    assert svc.component_action_calls == []
+
+
+# ---------------------------------------------------------------------------
 # Prompt-cache library
 # ---------------------------------------------------------------------------
 def test_prompt_cache_build_streams_the_prompt_phase() -> None:
@@ -636,6 +766,7 @@ def test_prompt_cache_import_refuses_a_non_string_name(bad_name: Any) -> None:
 
 def test_every_prompt_cache_method_is_registered() -> None:
     for method in (
+        METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,

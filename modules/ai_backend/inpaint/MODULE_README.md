@@ -45,8 +45,8 @@ Every service follows the same shape and is safe to copy from when adding a seve
 - `flux_fill.py`: `FluxFillInpaintService` — FLUX.1-Fill-dev (`inpaint.flux_fill`, `.unload`,
   `.status`, streaming). See the FLUX section.
 - `flux2_klein.py`: `Flux2KleinInpaintService` — FLUX.2 klein 9B region editing
-  (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload` and the `.prompt_cache.*` family,
-  streaming). See the FLUX.2 klein section.
+  (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action` and the
+  `.prompt_cache.*` family, streaming). See the FLUX.2 klein sections.
 - `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_klein.py`, `test_lease_protocol.py`: pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
   modules are injected into `sys.modules`, and `test_lease_protocol.py` stubs each service's load and
@@ -451,6 +451,73 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   safetensors-backed, not GGUF — and last, so a failed round trip of the largest component still
   leaves the smaller ones re-homed.
 
+### FLUX.2 klein: per-component residency and actions
+The wire contract is `dev-docs/flux2_component_residency.md`; `ipc/PROTOCOL.md §5.4` carries the
+client-facing half. What this module owns:
+
+- **One probe, reused, never a third.** `_module_residency` answers `not_loaded` / `ram` / `gpu` /
+  `offloaded` / `mixed` from the two probes this file already relied on: the `_hf_hook` presence
+  check (an accelerate hook owning the module IS `offloaded`, whatever the parameters momentarily
+  say) and the device-TYPE count over `parameters()` + `buffers()` that
+  `_require_components_materialized` uses. `hf_device_map` is unusable here — `from_single_file`
+  discards `device_map`. `meta` without a visible hook is `offloaded` too: `accelerate.cpu_offload`
+  keeps the bytes in a host weights map and its hook may sit on a submodule. **`mixed` is reported,
+  never rounded** — rounding a half-placed pipeline is how it becomes a device mismatch several
+  frames inside the VAE instead of a named problem.
+- **`_component_actions` is the AUTHORITY, and it lives only here.** The client renders the list and
+  must never re-derive it. Its invariants and the reasons are in the function's own docstring; the
+  short version: the text encoder never offers `to_gpu` (the load-order memory contract), the
+  transformer never offers `warmup` (no such path exists — the warm-up forwards the VAE only), and
+  `load`/`unload` appear on BOTH the transformer and the VAE because `_model_key` describes a whole
+  pipeline and one of them alone can neither be dropped nor loaded.
+- **Deliberate omissions, because they cannot be done honestly today.** The VAE gets no
+  `to_ram`/`to_gpu`: no helper exists and `_decode_once` follows `vae.device`, so a host-resident
+  VAE would silently move the next decode onto the CPU. A transformer that is `offloaded` or `mixed`
+  gets no move either: under accelerate the parameters are on `meta` and the hooks would have to be
+  removed first (`remove_all_hooks`), and `.to(device)` on a genuinely mixed module raises as often
+  as it succeeds. Adding either one requires per-component residency bookkeeping in place of the
+  whole-pipeline `_model_key`, plus per-component phases in `forecast_memory` — a much larger change
+  than exposing the helpers that already exist.
+- **`status` never blocks, and that is load-bearing.** A generation holds `self._lock` for its
+  entire run, so the residency probe takes it with `acquire(blocking=False)` and reports
+  `components_busy: true` with the `residency`/`actions` keys ABSENT when it cannot. Absent means
+  "not known", never "not loaded". Everything else `status` reports is read WITHOUT the lock —
+  `self._pipe` / `self._device` are single attribute loads and `prompt_cached` is one dict
+  membership test, all atomic under the GIL with no compound invariant to protect. Do not put the
+  lock back: taking it made a status poll wait out a whole generation, which is exactly what makes
+  `components_busy` unobservable and the feature dead.
+- **The guard is not optional on a button.** `component_action`'s pipeline load runs
+  `_require_pipeline_headroom_locked` (`denoise` + `decode` phases), a transformer restore runs
+  `_require_restore_headroom_locked` (`denoise`), and an encoder load runs the very
+  `_require_encode_headroom_locked` that `prompt_cache.build` uses. All three are
+  `_require_memory_headroom` over the ONE `forecast_memory` — never a second calculation. The
+  restore deliberately does not discount the resident pipeline: the transformer is on the host at
+  that moment, so only the VAE's ~0.2 GB is over-charged, and erring toward a refusal is the correct
+  direction for a guard whose failure mode is the kernel OOM killer.
+- **KNOWN GAP: a user-pressed text-encoder load takes no model-manager lease.** `_model_key` names a
+  whole pipeline-plus-encoder bundle and `_unload_key` refuses when `self._pipe is None`, so leasing
+  a pipeline key for an encoder-only residency would register an entry the manager could never
+  evict. Memory SAFETY is unaffected — the pre-load guard reads the actual free host memory, which a
+  resident encoder has already reduced — but `max_loaded_models` under-counts an encoder loaded this
+  way until the user unloads it or the next run replaces it, and it is never auto-evicted to make
+  room for another service. Removal condition: give the service per-component residency bookkeeping
+  (a resident-bundle key that can name "encoder only"), at which point this becomes a normal lease.
+  The new residency in `status` is what makes such an encoder visible in the meantime.
+- **`unload()` and the per-component «unload» are different operations.** `unload()` (the `.unload`
+  wire method) drops the pipeline AND the encoder; `_unload_pipeline_locked`, which the
+  transformer/VAE action uses, drops the pipeline only — a user unloading the VAE must not silently
+  pay for a 16 GB encoder re-read.
+- The lease protocol is unchanged and binding on the new path: the lease is taken before
+  `self._lock`, the load scope ends at `_ensure_pipeline_locked`, and `mark_load_failed` is reported
+  from that scope only. `test_lease_protocol.py` pins `component_action`'s load beside the six
+  services. Two things are specific to it and must survive any edit: **only `load` takes a lease at
+  all** (`_LEASED_ACTIONS`) — `to_gpu` and `warmup` change no key and cannot race an eviction, since
+  `_unload_key` needs the lock the action holds throughout — and **the `finally` resolves the lease
+  on every path** with an idempotent `mark_load_failed()` before `release()`. `release()` does NOT
+  clear the manager's `loading` flag, so the busy refusal and the "action no longer available"
+  refusal, both of which fire AFTER the lease is taken, would otherwise leave that key flagged
+  `loading` forever and make the next `begin_model_use` for it wait on a load that never finishes.
+
 ### ROCm staging obligation
 On a ROCm Torch build, a host→device copy out of a safetensors file mapping stalls in amdkfd (~1-2 s
 per tensor ≥1 MiB). Any weight move here must route through `runtime/rocm_mmap_transfer.py`:
@@ -506,7 +573,17 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   matches those names exactly; do not rename one side alone.
 - To change the memory gate or its advice, see `forecast_memory`, `_require_memory_headroom` and
   `_preset_advice`. Never add a second forecast: `estimate` and the gate must be the same
-  arithmetic.
+  arithmetic. Its three per-action entry points are `_require_pipeline_headroom_locked`,
+  `_require_restore_headroom_locked` and `_require_encode_headroom_locked`.
+- To change what `status` reports per component, or which buttons the FLUX.2 panel offers, see
+  `_module_residency` (where the weights are), `_component_actions` (the authoritative matrix —
+  it exists only there) and `Flux2KleinInpaintService._components_locked` /
+  `_components_residency_nowait`. To change what an action DOES, see `component_action` and its
+  `_*_action_locked` helpers; each one delegates to the helper the generation path already uses
+  (`_ensure_pipeline_locked`, `_warmup_pipeline_locked`, `_park_transformer_off_device`,
+  `_restore_transformer_to_device`, `_ensure_text_encoder_locked`, `_release_text_encoder_locked`)
+  — do not add a second implementation of a move. Keep the wire literals in step with
+  `dev-docs/flux2_component_residency.md` and `ipc/PROTOCOL.md §5.4`.
 - To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked` /
   `_encode_prompt_phase`, and `_prompt_cache_key` for what invalidates a cached embedding.
 - To change the prompt-cache LIBRARY, see the `prompt_cache_*` methods of the service

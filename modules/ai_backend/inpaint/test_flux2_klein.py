@@ -32,7 +32,20 @@ Main responsibilities:
   refusal a `.msprompt` load owes the user (foreign encoder, other sequence
   length, other dtype, other fp8, foreign container, newer version), the name
   collision rule, an import filed under the family recorded IN THE FILE, and a
-  `build` that encodes without building a pipeline and lets the encoder go.
+  `build` that encodes without building a pipeline and lets the encoder go;
+- verify the per-component residency probe answers each of its five states from a
+  module whose parameters sit on the corresponding devices, that `mixed` is never
+  rounded into a neighbouring one, and that an accelerate hook means `offloaded`
+  whatever the parameters momentarily say;
+- verify the per-component `actions` invariants of the wire contract (the encoder
+  never offers `to_gpu`, the transformer never a `warmup`, `load`/`unload` always
+  on BOTH pipeline components) and that `status` merges residency into the
+  existing entries without disturbing their disk facts;
+- verify `status` omits residency with `components_busy: true` — rather than
+  waiting — while another thread holds the service lock;
+- verify every refusal path of `component_action`: an unknown component or
+  action, an action outside the component's current list, a busy service, and
+  each of the three memory-guard refusals.
 
 Notes:
 - Fake `torch`, `diffusers` and `transformers` modules are injected into
@@ -2933,6 +2946,571 @@ class UnloadTests(unittest.TestCase):
 
         self.assertFalse(service._unload_key("flux2_klein:b"))
         self.assertIsNotNone(service._pipe)
+
+
+# ---------------------------------------------------------------------------
+# Per-component residency and actions
+# ---------------------------------------------------------------------------
+class _ResidencyModule:
+    """Weight-bearing module stand-in for `_module_residency`.
+
+    Only the surface the probe reads: `parameters()`, `buffers()` and, when
+    `hooked` is set, the `_hf_hook` attribute accelerate leaves behind.
+    """
+
+    def __init__(
+        self,
+        *parameter_devices: str,
+        buffer_devices: tuple[str, ...] = (),
+        hooked: bool = False,
+    ) -> None:
+        self._parameters = [_ResidencyModule._tensor(name) for name in parameter_devices]
+        self._buffers = [_ResidencyModule._tensor(name) for name in buffer_devices]
+        if hooked:
+            self._hf_hook = object()
+
+    @staticmethod
+    def _tensor(device_type: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(device=types.SimpleNamespace(type=device_type))
+
+    def parameters(self) -> list[types.SimpleNamespace]:
+        return list(self._parameters)
+
+    def buffers(self) -> list[types.SimpleNamespace]:
+        return list(self._buffers)
+
+
+class ComponentResidencyTests(unittest.TestCase):
+    """`_module_residency` answers where the weights ARE, never a rounded guess."""
+
+    def test_no_component_is_not_loaded(self) -> None:
+        self.assertEqual(svc._module_residency(None), svc.RESIDENCY_NOT_LOADED)
+
+    def test_every_tensor_on_the_host_is_ram(self) -> None:
+        module = _ResidencyModule("cpu", "cpu", buffer_devices=("cpu",))
+        self.assertEqual(svc._module_residency(module), svc.RESIDENCY_RAM)
+
+    def test_every_tensor_on_the_card_is_gpu(self) -> None:
+        module = _ResidencyModule("cuda", "cuda", buffer_devices=("cuda",))
+        self.assertEqual(svc._module_residency(module), svc.RESIDENCY_GPU)
+
+    def test_an_accelerate_hook_means_offloaded_whatever_the_parameters_say(self) -> None:
+        # Under `model_cpu_offload` the parameters are on the host between
+        # forwards and on the card during one; reporting that momentary truth as
+        # `ram`/`gpu` would be a value the user cannot act on.
+        self.assertEqual(
+            svc._module_residency(_ResidencyModule("cpu", hooked=True)), svc.RESIDENCY_OFFLOADED
+        )
+        self.assertEqual(
+            svc._module_residency(_ResidencyModule("cuda", hooked=True)), svc.RESIDENCY_OFFLOADED
+        )
+
+    def test_meta_parameters_are_offloaded_even_without_a_visible_hook(self) -> None:
+        # `accelerate.cpu_offload` moves the parameters to `meta` and keeps the
+        # bytes in a host weights map; the hook may sit on a submodule.
+        module = _ResidencyModule("meta", "meta")
+        self.assertEqual(svc._module_residency(module), svc.RESIDENCY_OFFLOADED)
+
+    def test_a_split_component_is_mixed_and_is_not_rounded(self) -> None:
+        for devices in (("cpu", "cuda"), ("meta", "cuda"), ("cpu", "meta"), ("cpu", "cuda", "meta")):
+            with self.subTest(devices=devices):
+                self.assertEqual(
+                    svc._module_residency(_ResidencyModule(*devices)), svc.RESIDENCY_MIXED
+                )
+
+    def test_a_buffer_left_behind_makes_it_mixed_too(self) -> None:
+        module = _ResidencyModule("cuda", "cuda", buffer_devices=("cpu",))
+        self.assertEqual(svc._module_residency(module), svc.RESIDENCY_MIXED)
+
+    def test_a_module_holding_no_weights_is_not_loaded(self) -> None:
+        self.assertEqual(svc._module_residency(_ResidencyModule()), svc.RESIDENCY_NOT_LOADED)
+        self.assertEqual(svc._module_residency(object()), svc.RESIDENCY_NOT_LOADED)
+
+
+class ComponentActionsMatrixTests(unittest.TestCase):
+    """`_component_actions` is the AUTHORITY; the invariants of the wire contract."""
+
+    def _actions(self, component: str, residency: str, *, loaded: bool = True) -> list[str]:
+        return svc._component_actions(component, residency, pipeline_loaded=loaded)
+
+    def test_the_text_encoder_never_offers_to_gpu(self) -> None:
+        # `_encode_prompts_locked` pins the host unconditionally, and the whole
+        # load-order memory contract depends on it.
+        for residency in (
+            svc.RESIDENCY_NOT_LOADED,
+            svc.RESIDENCY_RAM,
+            svc.RESIDENCY_GPU,
+            svc.RESIDENCY_OFFLOADED,
+            svc.RESIDENCY_MIXED,
+        ):
+            for loaded in (False, True):
+                with self.subTest(residency=residency, pipeline_loaded=loaded):
+                    self.assertNotIn(
+                        "to_gpu", self._actions("text_encoder", residency, loaded=loaded)
+                    )
+
+    def test_the_transformer_never_offers_a_warmup(self) -> None:
+        # The warm-up forwards the VAE only; there is no transformer path to run.
+        for residency in (
+            svc.RESIDENCY_NOT_LOADED,
+            svc.RESIDENCY_RAM,
+            svc.RESIDENCY_GPU,
+            svc.RESIDENCY_OFFLOADED,
+            svc.RESIDENCY_MIXED,
+        ):
+            for loaded in (False, True):
+                with self.subTest(residency=residency, pipeline_loaded=loaded):
+                    self.assertNotIn(
+                        "warmup", self._actions("transformer", residency, loaded=loaded)
+                    )
+
+    def test_load_and_unload_always_appear_on_both_pipeline_components(self) -> None:
+        # They act on the pipeline as a whole: `_model_key` describes a whole
+        # pipeline, so one of them alone cannot be dropped or loaded.
+        for residency in (svc.RESIDENCY_GPU, svc.RESIDENCY_RAM, svc.RESIDENCY_OFFLOADED,
+                          svc.RESIDENCY_MIXED):
+            with self.subTest(residency=residency):
+                transformer = self._actions("transformer", residency)
+                vae = self._actions("vae", residency)
+                self.assertIn("unload", transformer)
+                self.assertIn("unload", vae)
+                self.assertNotIn("load", transformer)
+                self.assertNotIn("load", vae)
+        for component in ("transformer", "vae"):
+            with self.subTest(component=component):
+                self.assertEqual(
+                    self._actions(component, svc.RESIDENCY_NOT_LOADED, loaded=False), ["load"]
+                )
+
+    def test_the_text_encoder_loads_and_unloads_on_its_own(self) -> None:
+        self.assertEqual(
+            self._actions("text_encoder", svc.RESIDENCY_NOT_LOADED, loaded=True), ["load"]
+        )
+        self.assertEqual(self._actions("text_encoder", svc.RESIDENCY_RAM, loaded=False), ["unload"])
+
+    def test_the_transformer_moves_only_between_the_two_plain_states(self) -> None:
+        self.assertEqual(self._actions("transformer", svc.RESIDENCY_GPU), ["unload", "to_ram"])
+        self.assertEqual(self._actions("transformer", svc.RESIDENCY_RAM), ["unload", "to_gpu"])
+        # Under accelerate the move must be ABSENT, not merely disabled: the
+        # parameters are on `meta` and the hooks would have to be removed first.
+        self.assertEqual(self._actions("transformer", svc.RESIDENCY_OFFLOADED), ["unload"])
+        self.assertEqual(self._actions("transformer", svc.RESIDENCY_MIXED), ["unload"])
+
+    def test_the_vae_offers_a_warmup_only_where_it_can_run(self) -> None:
+        self.assertEqual(self._actions("vae", svc.RESIDENCY_GPU), ["unload", "warmup"])
+        for residency in (svc.RESIDENCY_RAM, svc.RESIDENCY_OFFLOADED, svc.RESIDENCY_MIXED):
+            with self.subTest(residency=residency):
+                self.assertEqual(self._actions("vae", residency), ["unload"])
+
+    def test_the_vae_is_never_moved_by_hand(self) -> None:
+        # No helper exists, and a host-resident VAE would silently make the next
+        # decode run on the CPU (`_decode_once` follows `vae.device`).
+        for residency in (svc.RESIDENCY_GPU, svc.RESIDENCY_RAM, svc.RESIDENCY_MIXED):
+            with self.subTest(residency=residency):
+                actions = self._actions("vae", residency)
+                self.assertNotIn("to_ram", actions)
+                self.assertNotIn("to_gpu", actions)
+
+    def test_the_order_follows_the_wire_contract(self) -> None:
+        for component in ("transformer", "vae"):
+            for residency in (svc.RESIDENCY_GPU, svc.RESIDENCY_RAM):
+                with self.subTest(component=component, residency=residency):
+                    actions = self._actions(component, residency)
+                    positions = [svc.COMPONENT_ACTIONS.index(name) for name in actions]
+                    self.assertEqual(positions, sorted(positions))
+
+
+class ComponentStatusTests(_TempTreeCase):
+    """`status` merges residency into the existing per-component entries."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name, replacement in (
+            ("is_torch_available", lambda: True),
+            (
+                "memory_snapshot",
+                lambda *_a, **_k: {
+                    "vram_total": 0, "vram_free": 0, "ram_total": 0, "ram_free": 0
+                },
+            ),
+            ("_resolve_selected_backend_device", lambda _fallback: "cuda:0"),
+        ):
+            attr_patch = patch.object(svc, name, replacement)
+            attr_patch.start()
+            self.addCleanup(attr_patch.stop)
+        self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
+
+    def test_an_idle_service_reports_every_component_as_not_loaded(self) -> None:
+        out = self.service.status(self.params())
+        self.assertFalse(out["components_busy"])
+        for name in svc.ACTIONABLE_COMPONENTS:
+            with self.subTest(component=name):
+                self.assertEqual(out["components"][name]["residency"], svc.RESIDENCY_NOT_LOADED)
+                self.assertEqual(out["components"][name]["actions"], ["load"])
+        # The disk facts of the SAME entries are untouched.
+        self.assertEqual(
+            out["components"]["transformer"]["path"], self.paths["transformer_path"]
+        )
+        self.assertTrue(out["components"]["transformer"]["exists"])
+
+    def test_the_tokenizer_and_the_scheduler_carry_no_residency(self) -> None:
+        out = self.service.status(self.params())
+        for name in ("tokenizer", "scheduler"):
+            with self.subTest(component=name):
+                self.assertNotIn("residency", out["components"][name])
+                self.assertNotIn("actions", out["components"][name])
+
+    def test_a_loaded_pipeline_is_reported_per_component(self) -> None:
+        self.service._pipe = types.SimpleNamespace(
+            transformer=_ResidencyModule("cuda"), vae=_ResidencyModule("cuda")
+        )
+        self.service._active_key = "flux2_klein:test"
+        out = self.service.status(self.params())
+        self.assertEqual(out["components"]["transformer"]["residency"], svc.RESIDENCY_GPU)
+        self.assertEqual(out["components"]["transformer"]["actions"], ["unload", "to_ram"])
+        self.assertEqual(out["components"]["vae"]["actions"], ["unload", "warmup"])
+        self.assertTrue(out["loaded"])
+
+    def test_a_resident_encoder_is_reported_even_without_a_pipeline(self) -> None:
+        # `loaded` is pipeline-only, so this is the one place a service holding
+        # 16 GB of Qwen3 becomes visible.
+        self.service._text_encoder = _ResidencyModule("cpu")
+        out = self.service.status(self.params())
+        self.assertFalse(out["loaded"])
+        self.assertEqual(out["components"]["text_encoder"]["residency"], svc.RESIDENCY_RAM)
+        self.assertEqual(out["components"]["text_encoder"]["actions"], ["unload"])
+
+    def test_a_half_placed_pipeline_is_reported_as_mixed(self) -> None:
+        self.service._pipe = types.SimpleNamespace(
+            transformer=_ResidencyModule("cuda", "cpu"), vae=_ResidencyModule("cuda")
+        )
+        self.service._active_key = "flux2_klein:test"
+        out = self.service.status(self.params())
+        self.assertEqual(out["components"]["transformer"]["residency"], svc.RESIDENCY_MIXED)
+        self.assertEqual(out["components"]["transformer"]["actions"], ["unload"])
+
+    def test_a_busy_service_omits_the_residency_instead_of_waiting(self) -> None:
+        # A generation holds the lock for its ENTIRE run, so the probe takes it
+        # without waiting. The absent keys mean "not known", never "not loaded".
+        import threading
+
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with self.service._lock:
+                holding.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(10))
+
+        out = self.service.status(self.params())
+        self.assertTrue(out["components_busy"])
+        for name in svc.ACTIONABLE_COMPONENTS:
+            with self.subTest(component=name):
+                self.assertNotIn("residency", out["components"][name])
+                self.assertNotIn("actions", out["components"][name])
+        # Everything that does not need the lock is still answered.
+        self.assertTrue(out["available"])
+        self.assertEqual(out["components"]["vae"]["path"], self.paths["vae_path"])
+        self.assertEqual(out["device"], "cuda:0")
+
+
+class ComponentActionTests(_TempTreeCase):
+    """`component_action` performs the action or says why it cannot."""
+
+    TRANSFORMER_BYTES = 18_157_185_168
+    TEXT_ENCODER_BYTES = 16_381_516_808
+    VAE_BYTES = 168_120_878
+    GIB = 1024**3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.recorder = _PatchRecorder()
+        self.torch = _install_fake_torch(self.recorder)
+        modules_patch = patch.dict(sys.modules, {"torch": self.torch, "torch.nn": self.torch.nn})
+        modules_patch.start()
+        self.addCleanup(modules_patch.stop)
+
+        sizes = {
+            self.paths["transformer_path"]: self.TRANSFORMER_BYTES,
+            self.paths["text_encoder_path"]: self.TEXT_ENCODER_BYTES,
+            self.paths["vae_path"]: self.VAE_BYTES,
+        }
+        self.memory = {
+            "ram_free": int(64 * self.GIB),
+            "ram_total": int(64 * self.GIB),
+            "vram_free": int(31 * self.GIB),
+            "vram_total": int(32 * self.GIB),
+        }
+        for name, replacement in (
+            ("patched_module_to", self.recorder),
+            ("_clear_torch_cache", lambda: None),
+            ("_resolve_selected_backend_device", lambda _fallback: "cuda:0"),
+            ("_weight_bytes", lambda path: sizes.get(path, 0)),
+            ("memory_snapshot", lambda *_a, **_k: dict(self.memory)),
+        ):
+            attr_patch = patch.object(svc, name, replacement)
+            attr_patch.start()
+            self.addCleanup(attr_patch.stop)
+
+        self.manager = LoadedModelManager()
+        self.service = svc.Flux2KleinInpaintService(self.manager)
+        self.service._device = _FakeDevice("cuda:0")
+        self.decoded = Image.fromarray(np.full((64, 64, 3), 200, dtype=np.uint8), "RGB")
+        self.pipe = types.SimpleNamespace(
+            vae=_make_fake_vae(self.torch.nn.Module, self.decoded, device_type="cuda"),
+            transformer=self.torch.nn.Module("transformer", ptr=0x4000, device_type="cuda"),
+            text_encoder=None,
+            image_processor=_FakeImageProcessor(),
+        )
+        self.builds = 0
+
+        def _ensure(normalized, model_key, report, *, region_hw):
+            self.builds += 1
+            self.region_hw = region_hw
+            self.pipe.transformer.to(self.service._device)
+            self.pipe.vae.to(self.service._device)
+            self.service._pipe = self.pipe
+            self.service._active_key = model_key
+            return self.pipe
+
+        ensure_patch = patch.object(self.service, "_ensure_pipeline_locked", _ensure)
+        ensure_patch.start()
+        self.addCleanup(ensure_patch.stop)
+
+    def _install(self, **overrides: object) -> str:
+        """Put the fake pipeline in place under its real model key."""
+        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
+        key = svc._model_key(normalized)
+        self.service._pipe = self.pipe
+        self.service._active_key = key
+        return key
+
+    def _act(self, component: str, action: str, **overrides: object) -> dict[str, object]:
+        return self.service.component_action(
+            self.params(**overrides), component=component, action=action
+        )
+
+    # ---- vocabulary ----
+    def test_an_unknown_component_is_a_request_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._act("tokenizer", "load")
+        self.assertIn("неизвестный компонент", str(caught.exception))
+
+    def test_an_unknown_action_is_a_request_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._act("vae", "explode")
+        self.assertIn("неизвестное действие", str(caught.exception))
+
+    def test_an_action_outside_the_current_list_is_refused_naming_what_is_possible(self) -> None:
+        # Nothing is loaded, so «warmup» cannot be performed on the VAE.
+        with self.assertRaises(ValueError) as caught:
+            self._act("vae", "warmup")
+        message = str(caught.exception)
+        self.assertIn("«warmup»", message)
+        self.assertIn("«load»", message)
+        self.assertEqual(self.builds, 0)
+
+    def test_the_transformer_is_never_warmed_up_through_this_method(self) -> None:
+        self._install()
+        with self.assertRaises(ValueError):
+            self._act("transformer", "warmup")
+
+    def test_a_refused_load_leaves_no_entry_stuck_in_loading(self) -> None:
+        # The pipeline is already loaded, so «load» is not in the transformer's
+        # current actions — but the lease was taken BEFORE the check. Releasing
+        # it without resolving it would flag the key `loading` for good and make
+        # the next request for it wait forever.
+        self._install()
+        with self.assertRaises(ValueError):
+            self._act("transformer", "load")
+        self.assertEqual(self.manager.health()["loading_model_count"], 0)
+        # And the very next legitimate action still goes through.
+        self.assertTrue(self._act("vae", "unload")["performed"])
+
+    def test_an_unleased_action_never_touches_the_model_manager(self) -> None:
+        # `to_gpu` and `warmup` act on a pipeline that is already resident and
+        # change no key; an eviction cannot race them because `_unload_key` takes
+        # the lock this action holds throughout.
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+        self._act("transformer", "to_gpu", placement="full_gpu")
+        self._act("vae", "warmup", placement="full_gpu")
+        health = self.manager.health()
+        self.assertEqual(health["loading_model_count"], 0)
+        self.assertEqual(health["active_model_count"], 0)
+        self.assertEqual(health["resident_model_count"], 0)
+
+    def test_the_text_encoder_is_never_moved_to_the_gpu(self) -> None:
+        self.service._text_encoder = _ResidencyModule("cpu")
+        with self.assertRaises(ValueError):
+            self._act("text_encoder", "to_gpu")
+
+    # ---- busy ----
+    def test_a_busy_service_refuses_instead_of_waiting(self) -> None:
+        import threading
+
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with self.service._lock:
+                holding.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(10))
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._act("transformer", "load")
+        self.assertIn("занят", str(caught.exception))
+        self.assertEqual(self.builds, 0)
+        # Nothing was left leased behind the refusal — and, crucially, no entry
+        # was left flagged `loading`: the next request for that key would wait on
+        # a load that never finishes.
+        health = self.manager.health()
+        self.assertEqual(health["active_model_count"], 0)
+        self.assertEqual(health["loading_model_count"], 0)
+        self.assertEqual(health["resident_model_count"], 0)
+
+    # ---- the pipeline pair ----
+    def test_loading_the_transformer_builds_the_whole_pipeline_and_warms_it_up(self) -> None:
+        result = self._act("transformer", "load")
+        self.assertEqual(self.builds, 1)
+        self.assertTrue(result["performed"])
+        self.assertFalse(result["components_busy"])
+        self.assertEqual(result["components"]["vae"]["residency"], svc.RESIDENCY_GPU)
+        self.assertEqual(self.pipe.vae.warmup_calls, 1)
+        # It is registered with the model manager exactly as a generation would.
+        self.assertEqual(self.manager.health()["resident_model_count"], 1)
+        self.assertEqual(self.manager.health()["active_model_count"], 0)
+
+    def test_the_load_is_asked_for_the_smallest_valid_region(self) -> None:
+        self._act("vae", "load")
+        self.assertEqual(self.region_hw, (svc.MIN_REGION_SIDE, svc.MIN_REGION_SIDE))
+
+    def test_unloading_the_vae_drops_the_pipeline_but_keeps_the_encoder(self) -> None:
+        key = self._install()
+        self.manager.begin_model_use(key).mark_loaded()
+        self.service._text_encoder = _ResidencyModule("cpu")
+
+        result = self._act("vae", "unload")
+        self.assertTrue(result["performed"])
+        self.assertIsNone(self.service._pipe)
+        # The encoder is NOT part of the pipeline and must not be a silent
+        # casualty of an unload the user asked for on the VAE.
+        self.assertIsNotNone(self.service._text_encoder)
+        self.assertEqual(result["components"]["text_encoder"]["residency"], svc.RESIDENCY_RAM)
+        self.assertEqual(self.manager.health()["resident_model_count"], 0)
+
+    # ---- moving the transformer ----
+    def test_parking_the_transformer_reports_it_in_ram_afterwards(self) -> None:
+        self._install(placement="full_gpu")
+        result = self._act("transformer", "to_ram", placement="full_gpu")
+        self.assertTrue(result["performed"])
+        self.assertEqual(result["components"]["transformer"]["residency"], svc.RESIDENCY_RAM)
+        self.assertEqual(result["components"]["transformer"]["actions"], ["unload", "to_gpu"])
+
+    def test_restoring_the_transformer_moves_it_inside_the_staging_patch(self) -> None:
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+        self.pipe.transformer.moves.clear()
+
+        result = self._act("transformer", "to_gpu", placement="full_gpu")
+        self.assertTrue(result["performed"])
+        self.assertEqual(result["components"]["transformer"]["residency"], svc.RESIDENCY_GPU)
+        self.assertEqual([depth for _target, depth in self.pipe.transformer.moves], [1])
+
+    def test_a_failed_restore_invalidates_the_cached_pipeline(self) -> None:
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise _FakeOutOfMemoryError("HIP out of memory")
+
+        with patch.object(svc, "_restore_transformer_to_device", _boom):
+            with self.assertRaises(_FakeOutOfMemoryError):
+                self._act("transformer", "to_gpu", placement="full_gpu")
+        # Its transformer is on the host, so the key no longer describes it: the
+        # next request must rebuild rather than cache-hit onto a mismatch.
+        self.assertIsNone(self.service._pipe)
+        self.assertIsNone(self.service._active_key)
+
+    # ---- the text encoder ----
+    def test_loading_the_text_encoder_keeps_it_and_reports_it(self) -> None:
+        loaded = _ResidencyModule("cpu")
+        with patch.object(
+            self.service,
+            "_ensure_text_encoder_locked",
+            lambda _n, _r, what: (loaded, ("k",), _FakeDevice("cpu")),
+        ):
+            result = self._act("text_encoder", "load")
+        self.assertTrue(result["performed"])
+        self.assertIs(self.service._text_encoder, loaded)
+        self.assertEqual(result["components"]["text_encoder"]["residency"], svc.RESIDENCY_RAM)
+        self.assertEqual(result["components"]["text_encoder"]["actions"], ["unload"])
+
+    def test_unloading_the_text_encoder_leaves_the_pipeline_alone(self) -> None:
+        self._install()
+        self.service._text_encoder = _ResidencyModule("cpu")
+        result = self._act("text_encoder", "unload")
+        self.assertTrue(result["performed"])
+        self.assertIsNone(self.service._text_encoder)
+        self.assertIsNotNone(self.service._pipe)
+
+    # ---- the memory guard ----
+    def test_a_pipeline_load_that_does_not_fit_is_refused_before_anything_is_read(self) -> None:
+        self.memory["vram_free"] = int(8 * self.GIB)
+        with self.assertRaises(RuntimeError) as caught:
+            self._act("transformer", "load", placement="encoder_cpu")
+        message = str(caught.exception)
+        self.assertIn("видеопамяти на cuda:0", message)
+        self.assertIn("Загрузка не начата", message)
+        self.assertEqual(self.builds, 0)
+        # A refused load leaves nothing resident and nothing leased.
+        health = self.manager.health()
+        self.assertEqual(health["resident_model_count"], 0)
+        self.assertEqual(health["active_model_count"], 0)
+        self.assertEqual(health["loading_model_count"], 0)
+
+    def test_an_encoder_load_goes_through_the_same_standalone_encode_guard(self) -> None:
+        # 16 GiB of Qwen3 on a host with 12 GiB free: the same refusal a
+        # `prompt_cache.build` gets, with the same numbers.
+        self.memory["ram_free"] = int(12 * self.GIB)
+        with self.assertRaises(RuntimeError) as caught:
+            self._act("text_encoder", "load")
+        message = str(caught.exception)
+        self.assertIn("оперативной памяти на этап «кодирование промпта (кэширование)»", message)
+        self.assertIsNone(self.service._text_encoder)
+
+    def test_a_restore_that_does_not_fit_is_refused_before_the_copy(self) -> None:
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+        self.pipe.transformer.moves.clear()
+        self.memory["vram_free"] = int(4 * self.GIB)
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._act("transformer", "to_gpu", placement="full_gpu")
+        self.assertIn("видеопамяти на cuda:0 на этап «денойз»", str(caught.exception))
+        self.assertEqual(self.pipe.transformer.moves, [])
+        # The pipeline is untouched: a refusal is not an invalidation.
+        self.assertIsNotNone(self.service._pipe)
+
+    # ---- the warm-up ----
+    def test_warming_up_the_vae_runs_one_tiny_decode(self) -> None:
+        self._install(placement="full_gpu")
+        result = self._act("vae", "warmup", placement="full_gpu")
+        self.assertTrue(result["performed"])
+        self.assertEqual(self.pipe.vae.warmup_calls, 1)
+        self.assertEqual(self.pipe.vae.decode_calls, 0)
 
 
 class EffectiveStepsTests(unittest.TestCase):

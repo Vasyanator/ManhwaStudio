@@ -3,9 +3,19 @@ File: modules/ai_backend/inpaint/flux2_klein.py
 
 Purpose:
 FLUX.2 klein 9B region-editing service for the Python AI backend (methods
-`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload` and the
-`.prompt_cache.*` family; streaming). It edits a user-selected page REGION with
-`diffusers.Flux2KleinInpaintPipeline`.
+`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action`
+and the `.prompt_cache.*` family; streaming). It edits a user-selected page
+REGION with `diffusers.Flux2KleinInpaintPipeline`.
+
+Per-component residency (`dev-docs/flux2_component_residency.md`):
+`status` reports, per weight-bearing component, WHERE its weights are
+(`_module_residency` → `not_loaded` / `ram` / `gpu` / `offloaded` / `mixed`) and
+WHICH actions are possible right now (`_component_actions`). That action list is
+the authority the client renders — the matrix lives here and nowhere else.
+`component_action` performs one of them, streaming `phase:"load"` progress, under
+the same memory guard and the same lease protocol a generation uses. Both the
+probe and the whole of `status` take the service lock WITHOUT waiting, because a
+generation holds it for its entire run.
 
 Prompt-cache library:
 Encoding a prompt costs a 16 GB read of the Qwen3 encoder, and the resulting
@@ -379,6 +389,49 @@ _MEMORY_PRESETS = (
 #: encoder is absent because it is not part of the pipeline any more — the prompt
 #: phase loads it after this one is placed, and it never goes on the device.
 _MMAP_BACKED_COMPONENTS = ("vae", "transformer")
+
+
+# ---------------------------------------------------------------------------
+# Per-component residency and actions (dev-docs/flux2_component_residency.md)
+# ---------------------------------------------------------------------------
+# Three labels ("not loaded" / "in RAM" / "on the GPU") are not enough to be
+# honest here: under `sequential_cpu_offload` accelerate moves the parameters to
+# the `meta` device and keeps the bytes in a host weights map, so the component
+# is in neither place, and a load can leave part of a component behind — which is
+# exactly what `_require_components_materialized` already exists to catch.
+
+#: The component does not exist in the service right now.
+RESIDENCY_NOT_LOADED = "not_loaded"
+#: Every parameter and buffer is on the host.
+RESIDENCY_RAM = "ram"
+#: Every parameter and buffer is on the compute device.
+RESIDENCY_GPU = "gpu"
+#: An accelerate hook owns it: the parameters sit on `meta` (or are pulled back
+#: and forth around each forward) and the bytes live in a host weights map.
+RESIDENCY_OFFLOADED = "offloaded"
+#: Genuinely split across devices. REPORTED, never rounded to a neighbouring
+#: state: rounding is how a half-placed pipeline turns into a device mismatch
+#: several frames inside the VAE instead of a named problem.
+RESIDENCY_MIXED = "mixed"
+
+#: The three weight-bearing components a client can ask about or act on. The
+#: tokenizer and the scheduler carry no weights and are absent on purpose.
+ACTIONABLE_COMPONENTS = ("text_encoder", "transformer", "vae")
+
+#: Every action name the wire accepts, in the order `actions` lists them, so the
+#: UI's button order is decided here and not re-derived per client.
+COMPONENT_ACTIONS = ("load", "unload", "to_ram", "to_gpu", "warmup")
+
+#: Actions that run under a `LoadedModelManager` lease. Only `load` does: it is
+#: the one action that can make a NEW key resident, which is the whole of what a
+#: lease accounts for. `unload` and `to_ram` only release. `to_gpu` and `warmup`
+#: act on a pipeline that is already resident under `_active_key` and change no
+#: key, and a lease there would be worse than useless: an eviction cannot race
+#: them anyway (the eviction callback `_unload_key` takes `self._lock`, which the
+#: action holds throughout), while a lease whose load never happens has to be
+#: aborted by hand or its manager entry stays `loading` forever and the next
+#: request for that key waits on it.
+_LEASED_ACTIONS = ("load",)
 
 
 # =====================================================================
@@ -1567,40 +1620,81 @@ class Flux2KleinInpaintService:
         and the client is expected to warn that only ready caches will work —
         `prompt_cache.build` and any new prompt are refused until an encoder is
         configured.
+
+        **Per-component residency.** The three weight-bearing entries of
+        `components` also carry `residency` (a `RESIDENCY_*` literal) and
+        `actions` (what the client may offer right now, see
+        `_component_actions`) — but only when the service lock was free. A
+        generation holds that lock for its ENTIRE run, so the probe takes it
+        WITHOUT waiting: otherwise this poll would block the handler for minutes.
+        When it is busy the two keys are simply absent and `components_busy` is
+        `true`; an absent key means "not known" and never "not loaded", the same
+        three-state rule the client already applies to `prompt_cached`.
+
+        **This call never blocks.** Everything else it reports is read without
+        the lock: `self._pipe` / `self._device` are single attribute loads and a
+        prompt-cache membership test is one dict lookup, all atomic under the
+        GIL, with no compound invariant for a lock to protect. Taking the lock
+        for them made a status poll wait out a whole generation.
         """
         paths = _lenient_paths(params) or dict(self._last_paths)
-        roots = component_search_roots(paths)
-        tokenizer_dir = discover_component_dir(roots, _TOKENIZER_SUBDIR, _TOKENIZER_MARKERS)
-        scheduler_dir = discover_component_dir(roots, _SCHEDULER_SUBDIR, (_SCHEDULER_MARKER,))
-
-        components = {
-            "text_encoder": _path_state(paths.get("text_encoder_path")),
-            "transformer": _path_state(paths.get("transformer_path")),
-            "vae": _path_state(paths.get("vae_path")),
-            "tokenizer": {
-                "found": tokenizer_dir is not None,
-                "path": str(tokenizer_dir) if tokenizer_dir is not None else "",
-            },
-            "scheduler": {
-                "found": scheduler_dir is not None,
-                "path": str(scheduler_dir) if scheduler_dir is not None else "",
-            },
-        }
+        components = _component_states(paths)
         prompt_cached = self._prompt_cached(params)
         reason = _first_unavailable_reason(components, prompt_cached=prompt_cached)
-        with self._lock:
-            loaded = self._pipe is not None
+        residency, busy = self._components_residency_nowait()
+        if residency is not None:
+            for name, state in residency.items():
+                components[name].update(state)
         device = self._device_label()
         return {
             "available": reason is None,
             "reason": reason,
             "components": components,
+            "components_busy": busy,
             "memory": memory_snapshot(device),
-            "loaded": loaded,
+            "loaded": self._pipe is not None,
             "device": device,
             "prompt_cached": prompt_cached,
             "text_encoder_available": text_encoder_available(paths),
         }
+
+    def _components_residency_nowait(self) -> tuple[dict[str, dict[str, Any]] | None, bool]:
+        """`(per-component residency + actions, busy)` without ever waiting.
+
+        Returns `(None, True)` when the service lock is held — by a generation,
+        by a component action or by a prompt-cache build. The probe itself must
+        run under the lock: it iterates a module's `parameters()` while a
+        concurrent load may still be moving them.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None, True
+        try:
+            return self._components_locked(), False
+        finally:
+            self._lock.release()
+
+    def _components_locked(self) -> dict[str, dict[str, Any]]:
+        """Residency and available actions of the three weight-bearing components.
+
+        Caller must hold `self._lock`. `pipeline_loaded` is passed to
+        `_component_actions` rather than derived from each component's own
+        residency, so the "load and unload act on the pipeline as a whole"
+        invariant holds structurally instead of by coincidence.
+        """
+        pipeline_loaded = self._pipe is not None
+        modules = {
+            "text_encoder": self._text_encoder,
+            "transformer": getattr(self._pipe, "transformer", None),
+            "vae": getattr(self._pipe, "vae", None),
+        }
+        out: dict[str, dict[str, Any]] = {}
+        for name in ACTIONABLE_COMPONENTS:
+            residency = _module_residency(modules[name])
+            out[name] = {
+                "residency": residency,
+                "actions": _component_actions(name, residency, pipeline_loaded=pipeline_loaded),
+            }
+        return out
 
     def _device_label(self) -> str:
         """The device this service runs on: the loaded one, else the planned one.
@@ -1613,11 +1707,12 @@ class Flux2KleinInpaintService:
         build uses, so the two cannot disagree. Callers pair it with
         `loaded` / `ready`, which say whether the answer is a fact or a plan.
 
-        Takes `self._lock` itself and resolves the plan outside it: device
-        detection imports torch on its first call and must not extend the lock.
+        Takes NO lock. `self._device` is a single attribute load — atomic under
+        the GIL, with no compound invariant a lock could protect — and this
+        method is on `status()`'s path, which must answer while a generation
+        holds the lock for its entire run instead of waiting minutes for it.
         """
-        with self._lock:
-            device = self._device
+        device = self._device
         if device is not None:
             return str(device)
         return _resolve_selected_backend_device("cuda")
@@ -1685,15 +1780,27 @@ class Flux2KleinInpaintService:
         with self._lock:
             had_encoder = self._text_encoder is not None
             self._release_text_encoder_locked()
-            if self._pipe is None:
-                return had_encoder
-            key = self._active_key
-            self._pipe = None
-            self._active_key = None
-            _clear_torch_cache()
-            if key is not None:
-                self._model_manager.mark_unloaded(key)
-            return True
+            return self._unload_pipeline_locked() or had_encoder
+
+    def _unload_pipeline_locked(self) -> bool:
+        """Drop the resident pipeline; `False` when none was loaded.
+
+        Caller must hold `self._lock`. The text encoder is deliberately NOT
+        touched: it is not a pipeline component here (`_ensure_pipeline_locked`
+        builds the pipeline with `text_encoder=None`) and the per-component
+        «unload» of the transformer or the VAE must not silently cost the user a
+        16 GB re-read of the encoder as well. `unload()` drops both, which is
+        what the `.unload` wire method promises.
+        """
+        if self._pipe is None:
+            return False
+        key = self._active_key
+        self._pipe = None
+        self._active_key = None
+        _clear_torch_cache()
+        if key is not None:
+            self._model_manager.mark_unloaded(key)
+        return True
 
     # ---- main entry ----
     def inpaint_image_bytes(
@@ -1924,6 +2031,325 @@ class Flux2KleinInpaintService:
             # host copy.
             pipeline_resident=False,
             encoder_resident=encoder_resident,
+        )
+
+    # ---- per-component actions ----
+    def component_action(
+        self,
+        params: dict[str, Any] | None,
+        *,
+        component: str,
+        action: str,
+        progress_callback: ProgressCb | None = None,
+    ) -> dict[str, Any]:
+        """Perform one per-component action and return the snapshot after it.
+
+        `component` is one of `ACTIONABLE_COMPONENTS` and `action` one of
+        `COMPONENT_ACTIONS`; the pair must be present in that component's CURRENT
+        `actions` list (`_component_actions`), which is re-checked here under the
+        lock rather than trusted from whatever snapshot the client last saw.
+
+        Streaming, like `prompt_cache.build`: reading the encoder takes ~106 s
+        and the transformer 18 GB, so progress is reported on the shared
+        `phase:"load"` scale and this call claims the same single progress bar a
+        generation does.
+
+        Returns `{"component", "action", "performed", "components",
+        "components_busy": False, "device"}`. `performed` is `False` for an
+        action that turned out to be a no-op (a warm-up the placement skips).
+
+        **Refusals are errors, never silent no-ops**, because the button the user
+        pressed either happened or must say why it did not:
+
+        - `ValueError` — unknown component or action, invalid params, or an
+          action that is not in that component's current `actions`;
+        - `RuntimeError` — the service is busy (a generation holds the lock for
+          its entire run, and this call takes it WITHOUT waiting rather than
+          hanging the handler for minutes), or the pre-load memory guard refuses;
+        - `FileNotFoundError` — a component path is gone.
+
+        The lease protocol is the one every other path here follows: the lease is
+        taken BEFORE `self._lock`, only the action that can make a new key
+        resident takes one at all (`_LEASED_ACTIONS`), and `mark_load_failed` is
+        reported from the load scope only — see `_load_pipeline_action_locked`.
+        The `finally` additionally resolves a lease no load scope ever reached,
+        so a refusal cannot leave a manager entry stuck in `loading`.
+        """
+        component = _require_component_name(component)
+        action = _require_action_name(action)
+        normalized = normalize_flux2_klein_params(params)
+        self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
+        report = _progress_reporter(progress_callback, "load", LOAD_PHASE_STEPS)
+        model_key = _model_key(normalized)
+
+        # Advisory busy check, deliberately BEFORE the lease. `begin_model_use`
+        # waits on `_condition` while another thread is loading the same key, and
+        # a generation holds `self._lock` across its whole load — so without this
+        # the busy refusal this method owes the user would instead become a
+        # multi-minute wait inside the model manager. It is racy by construction
+        # (a generation can start in the window below); the authoritative check is
+        # the non-blocking acquire further down, which only ever turns the race
+        # into a late refusal, never into a wrong answer.
+        self._refuse_when_busy(component, action)
+
+        lease = None
+        if action in _LEASED_ACTIONS:
+            lease = self._model_manager.begin_model_use(
+                model_key, unload_callback=lambda: self._unload_key(model_key)
+            )
+        try:
+            if not self._lock.acquire(blocking=False):
+                raise RuntimeError(_component_busy_message(component, action))
+            try:
+                try:
+                    self._require_action_available_locked(component, action)
+                    performed = self._component_action_locked(
+                        normalized, model_key, component, action, report, lease
+                    )
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    raise
+                self._last_error = None
+                components = self._components_locked()
+            finally:
+                self._lock.release()
+        finally:
+            if lease is not None:
+                # Resolve the lease before releasing it, on EVERY path. A lease
+                # taken with `needs_load` that is released without either
+                # `mark_loaded` or `mark_load_failed` leaves its manager entry
+                # flagged `loading` forever, and the next `begin_model_use` for
+                # that key then waits on a load that will never finish — which is
+                # what the busy refusal and the "action no longer available"
+                # refusal above would otherwise do, both of which happen after
+                # the lease is taken. `mark_load_failed()` is idempotent and a
+                # strict no-op once the load has been reported either way, so it
+                # cannot undo the `mark_loaded` of a successful load whose
+                # WARM-UP then failed (the lease-protocol contract).
+                lease.mark_load_failed()
+                lease.release()
+
+        log.info(
+            "FLUX.2 klein: действие «%s» над компонентом «%s» выполнено (%s).",
+            action,
+            component,
+            "состояние изменено" if performed else "изменений не потребовалось",
+        )
+        return {
+            "component": component,
+            "action": action,
+            "performed": bool(performed),
+            "components": components,
+            "components_busy": False,
+            "device": self._device_label(),
+        }
+
+    def _refuse_when_busy(self, component: str, action: str) -> None:
+        """Raise the busy refusal when the service lock is not free right now.
+
+        Advisory only — see the comment at its call site in `component_action`.
+        The lock is released immediately, so nothing is held across the
+        `begin_model_use` that follows; holding it there is the deadlock the
+        lease protocol exists to prevent.
+        """
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError(_component_busy_message(component, action))
+        self._lock.release()
+
+    def _require_action_available_locked(self, component: str, action: str) -> None:
+        """Refuse an action that is not in `component`'s current `actions` list.
+
+        Caller must hold `self._lock`. The message names what IS possible right
+        now, because the usual cause is a client acting on a snapshot that a
+        generation, an eviction or another action has since invalidated.
+
+        # Raises
+        `ValueError` naming the component, the refused action and the ones that
+        are available.
+        """
+        available = self._components_locked()[component]["actions"]
+        if action in available:
+            return
+        offered = ", ".join(f"«{name}»" for name in available) if available else "нет ни одного"
+        raise ValueError(
+            f"FLUX.2 klein: действие «{action}» сейчас недоступно для компонента "
+            f"«{component}». Доступно: {offered}. Обновите состояние компонентов и "
+            f"повторите — состояние могло измениться после последнего запроса."
+        )
+
+    def _component_action_locked(
+        self,
+        normalized: dict[str, Any],
+        model_key: str,
+        component: str,
+        action: str,
+        report: Callable[[int, str], None],
+        lease: Any,
+    ) -> bool:
+        """Dispatch one already-validated action; `True` when something changed.
+
+        Caller must hold `self._lock`, and `lease` is the model-manager lease for
+        the actions that take one (`None` otherwise). Every branch reuses the
+        helper the generation path already uses — nothing here is a second
+        implementation of a move, a load or a warm-up.
+        """
+        if action == "load":
+            if component == "text_encoder":
+                return self._load_text_encoder_action_locked(normalized, report)
+            return self._load_pipeline_action_locked(normalized, model_key, report, lease)
+        if action == "unload":
+            if component == "text_encoder":
+                released = self._text_encoder is not None
+                self._release_text_encoder_locked()
+                return released
+            return self._unload_pipeline_locked()
+        if action == "to_ram":
+            report(LOAD_STEP_PLACEMENT, "Выгрузка трансформера в оперативную память")
+            return _park_transformer_off_device(self._pipe, normalized["placement"])
+        if action == "to_gpu":
+            return self._restore_transformer_action_locked(normalized, report)
+        # `warmup`: the only remaining action, and the VAE is its only component.
+        return self._warmup_pipeline_locked(self._pipe, normalized, report)
+
+    def _load_text_encoder_action_locked(
+        self, normalized: dict[str, Any], report: Callable[[int, str], None]
+    ) -> bool:
+        """Read the Qwen3 encoder and KEEP it. Caller must hold `self._lock`.
+
+        Gated by `_require_encode_headroom_locked` — the same `encode_standalone`
+        phase `prompt_cache.build` is gated by, so a user-pressed load of the
+        16 GB encoder is refused with the same numbers and the same advice
+        instead of letting the kernel pick a victim.
+
+        **No model-manager lease is taken**, and unlike `prompt_cache.build` that
+        is a limitation rather than a clean consequence: `_model_key` names a
+        whole pipeline-plus-encoder bundle and `_unload_key` refuses when
+        `self._pipe is None`, so leasing a pipeline key for an encoder-only
+        residency would register an entry the manager could never evict. Memory
+        SAFETY is unaffected — the guard above reads the actual free host memory,
+        which a resident encoder has already reduced — but `max_loaded_models`
+        under-counts an encoder loaded this way until the user unloads it or the
+        next run replaces it. See `inpaint/MODULE_README.md`.
+        """
+        self._require_encode_headroom_locked(normalized)
+        report(LOAD_STEP_PREPARE, "Подготовка загрузки текстового энкодера")
+        encoder, encoder_key, _device = self._ensure_text_encoder_locked(
+            normalized, report, what="загрузка текстового энкодера"
+        )
+        self._text_encoder = encoder
+        self._text_encoder_key = encoder_key
+        report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер загружен")
+        return True
+
+    def _load_pipeline_action_locked(
+        self,
+        normalized: dict[str, Any],
+        model_key: str,
+        report: Callable[[int, str], None],
+        lease: Any,
+    ) -> bool:
+        """Build and warm up the transformer + VAE. Caller must hold `self._lock`.
+
+        The lease boundary is the same one `inpaint_image_bytes` documents and
+        for the same reason: the load scope ends at `_ensure_pipeline_locked`,
+        because everything after it runs with the pipeline already resident, and
+        reporting a failed warm-up as a failed LOAD would clear the manager's
+        `resident` flag and drop its unload callback while 18 GB still occupy
+        VRAM.
+        """
+        try:
+            self._require_pipeline_headroom_locked(normalized, model_key)
+            report(LOAD_STEP_PREPARE, "Подготовка загрузки FLUX.2 klein")
+            pipe = self._ensure_pipeline_locked(
+                normalized,
+                model_key,
+                report,
+                # No image is produced here; the smallest valid region is what the
+                # log line names, exactly as in `_require_encode_headroom_locked`.
+                region_hw=(MIN_REGION_SIDE, MIN_REGION_SIDE),
+            )
+        except Exception:
+            if lease is not None and lease.needs_load:
+                lease.mark_load_failed()
+            raise
+        if lease is not None and lease.needs_load:
+            lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+        self._warmup_pipeline_locked(pipe, normalized, report)
+        return True
+
+    def _restore_transformer_action_locked(
+        self, normalized: dict[str, Any], report: Callable[[int, str], None]
+    ) -> bool:
+        """Move a parked transformer back onto the device. Caller holds `self._lock`.
+
+        Gated by `_require_restore_headroom_locked` first, because this is a full
+        9B host->device copy. A failure here leaves the transformer on the host
+        while `_active_key` still claims a placed pipeline, so the cached
+        pipeline is invalidated exactly as `_decode_locked` does after a failed
+        restore — the next request then rebuilds instead of cache-hitting onto a
+        device mismatch. The original error is re-raised.
+        """
+        self._require_restore_headroom_locked(normalized)
+        report(LOAD_STEP_PLACEMENT, "Возврат трансформера на устройство")
+        try:
+            _restore_transformer_to_device(self._pipe, self._device)
+        except Exception as exc:
+            self._invalidate_pipeline_locked(
+                "трансформер не удалось вернуть на устройство по запросу пользователя", exc
+            )
+            raise
+        return True
+
+    def _require_pipeline_headroom_locked(self, normalized: dict[str, Any], model_key: str) -> None:
+        """Gate a user-pressed pipeline load on the free memory.
+
+        Caller must hold `self._lock`. This is the SAME gate a generation runs
+        (`_require_memory_headroom` over `forecast_memory`) with the same
+        reserves and the same actionable refusal — a button that loads 18 GB of
+        transformer must not be a way around the guard that exists because the
+        kernel's OOM killer once closed this user's editor. Only `denoise` and
+        `decode` are listed: no prompt is encoded here, so charging the encode
+        phase would refuse a load that fits.
+
+        The region is the smallest valid one, exactly as in
+        `_require_encode_headroom_locked`: the phases are dominated by the
+        weights, and no latent and no pixel is produced by a load.
+        """
+        pipeline_resident = self._pipe is not None and self._active_key == model_key
+        _require_memory_headroom(
+            normalized,
+            MIN_REGION_SIDE,
+            MIN_REGION_SIDE,
+            _resolve_selected_backend_device("cuda"),
+            phases=("denoise", "decode"),
+            pipeline_resident=pipeline_resident,
+            # The encoder is not read by a pipeline load, so nothing of it is
+            # discounted: what it holds is already missing from the free-memory
+            # figures this compares against.
+            encoder_resident=False,
+        )
+
+    def _require_restore_headroom_locked(self, normalized: dict[str, Any]) -> None:
+        """Gate moving a parked transformer back onto the device.
+
+        Caller must hold `self._lock`. A 9B host->device copy is exactly the
+        allocation the guard exists for, so it runs the `denoise` phase of the
+        same forecast. `pipeline_resident=False` deliberately: the transformer is
+        on the HOST right now, so its device bytes are not held — the VAE's ~0.2
+        GB is therefore charged twice, and erring toward a refusal is the correct
+        direction for a guard whose failure mode is an out-of-memory kill.
+        """
+        _require_memory_headroom(
+            normalized,
+            MIN_REGION_SIDE,
+            MIN_REGION_SIDE,
+            _resolve_selected_backend_device("cuda"),
+            phases=("denoise",),
+            pipeline_resident=False,
+            encoder_resident=(
+                self._text_encoder is not None
+                and self._text_encoder_key == self._encoder_key(normalized, "cpu")
+            ),
         )
 
     def _current_family(self, params: dict[str, Any] | None) -> tuple[str, str] | None:
@@ -2286,6 +2712,11 @@ class Flux2KleinInpaintService:
         looks up — so it can never claim a hit the run would miss. `whole_region`
         is cleared before normalizing: it cannot change the key, and clearing it
         keeps `_whole_region_overrides`'s log line out of a polling path.
+
+        Takes NO lock: a `dict` membership test with tuple-of-primitives keys is
+        one atomic C-level operation under the GIL, and `_store_embeds` is the
+        only writer. Waiting for the lock here made a status poll block for the
+        whole of a running generation.
         """
         if not isinstance(params, dict):
             return False
@@ -2297,9 +2728,7 @@ class Flux2KleinInpaintService:
             normalized = normalize_flux2_klein_params(probe)
         except ValueError:
             return False
-        key = self._prompt_cache_key(normalized, normalized["prompt"])
-        with self._lock:
-            return key in self._prompt_cache
+        return self._prompt_cache_key(normalized, normalized["prompt"]) in self._prompt_cache
 
     # ---- phase 2: the prompt ----
     def _prompt_cache_key(self, normalized: dict[str, Any], text: str) -> tuple[Any, ...]:
@@ -2422,35 +2851,12 @@ class Flux2KleinInpaintService:
         caller that forgot it (the two public entry points check earlier only to
         avoid loading a pipeline they would then throw away).
         """
-        require_text_encoder(normalized, what="кодирование промпта")
-
-        import torch
+        encoder, encoder_key, device = self._ensure_text_encoder_locked(
+            normalized, report, what="кодирование промпта"
+        )
 
         from diffusers import Flux2KleinInpaintPipeline
-        from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
-
-        dtype = torch.bfloat16 if normalized["dtype"] == "bfloat16" else torch.float16
-        device = torch.device("cpu")
-        encoder_key = self._encoder_key(normalized, str(device))
-
-        report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
-        encoder = self._text_encoder if self._text_encoder_key == encoder_key else None
-        if encoder is None:
-            self._release_text_encoder_locked()
-            # No `device_map`: it exists to load straight into VRAM, and this
-            # phase deliberately never touches the accelerator. `patched_module_to`
-            # still wraps the load because `low_cpu_mem_usage` moves tensors with
-            # `nn.Module.to` even between host allocations.
-            with patched_module_to():
-                encoder = _load_text_encoder(
-                    Qwen3ForCausalLM,
-                    normalized["text_encoder_path"],
-                    dtype=dtype,
-                    device_map=None,
-                    low_cpu_mem_usage=normalized["low_cpu_mem_usage"],
-                )
-            if normalized["text_encoder_fp8"]:
-                _quantize_text_encoder_fp8(encoder)
+        from transformers import Qwen2TokenizerFast
 
         roots = component_search_roots(normalized)
         tokenizer_dir = _require_component_dir(
@@ -2490,6 +2896,61 @@ class Flux2KleinInpaintService:
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер оставлен в памяти")
             self._text_encoder = encoder
             self._text_encoder_key = encoder_key
+
+    def _ensure_text_encoder_locked(
+        self, normalized: dict[str, Any], report: Callable[[int, str], None], *, what: str
+    ) -> tuple[Any, tuple[Any, ...], Any]:
+        """Return `(encoder, encoder key, host device)`, reading it from disk if needed.
+
+        Caller must hold `self._lock`. THE one place the Qwen3 encoder is
+        constructed: `_encode_prompts_locked` and the user-pressed
+        `component_action("text_encoder", "load")` both go through it, so there
+        is a single loader path and a single place the fp8 quantization happens.
+
+        It does NOT publish the encoder into `self._text_encoder` — who keeps it
+        is the caller's decision (`unload_text_encoder_after_encode` for the
+        encode path, unconditionally for the explicit load), and an encoder that
+        was already resident under the same key is returned untouched.
+
+        The device is always the HOST: the encoder never goes on the accelerator,
+        because by the time it is read the 18 GB transformer is already there
+        (see `_encode_prompts_locked` and the load-order contract). `what` names
+        the operation in the refusal raised when no encoder is installed.
+
+        # Raises
+        `FileNotFoundError` / `ValueError` from `require_text_encoder` when no
+        encoder is configured on this machine, and whatever the loader raises.
+        """
+        require_text_encoder(normalized, what=what)
+
+        import torch
+
+        dtype = torch.bfloat16 if normalized["dtype"] == "bfloat16" else torch.float16
+        device = torch.device("cpu")
+        encoder_key = self._encoder_key(normalized, str(device))
+
+        report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
+        if self._text_encoder is not None and self._text_encoder_key == encoder_key:
+            return self._text_encoder, encoder_key, device
+
+        from transformers import Qwen3ForCausalLM
+
+        self._release_text_encoder_locked()
+        # No `device_map`: it exists to load straight into VRAM, and this phase
+        # deliberately never touches the accelerator. `patched_module_to` still
+        # wraps the load because `low_cpu_mem_usage` moves tensors with
+        # `nn.Module.to` even between host allocations.
+        with patched_module_to():
+            encoder = _load_text_encoder(
+                Qwen3ForCausalLM,
+                normalized["text_encoder_path"],
+                dtype=dtype,
+                device_map=None,
+                low_cpu_mem_usage=normalized["low_cpu_mem_usage"],
+            )
+        if normalized["text_encoder_fp8"]:
+            _quantize_text_encoder_fp8(encoder)
+        return encoder, encoder_key, device
 
     def _encoder_key(self, normalized: dict[str, Any], device: str) -> tuple[Any, ...]:
         """Identity of a resident text encoder: path, dtype, fp8 and where it sits."""
@@ -3218,6 +3679,157 @@ def _require_components_materialized(pipe: Any, device: Any) -> None:
         f"FLUX.2 klein: после размещения часть весов осталась не на «{device}» — {'; '.join(offenders)}. "
         "Запуск остановлен здесь, а не внутри VAE: загрузчик проигнорировал параметр размещения, "
         "и оперативная память, которая нужна текстовому энкодеру следующим шагом, не освободилась."
+    )
+
+
+def _module_residency(module: Any) -> str:
+    """Where `module`'s weights actually are, as one `RESIDENCY_*` wire literal.
+
+    This is the honest answer the FLUX.2 parameter panel shows per component, and
+    it deliberately reuses the two probes this file already relies on instead of
+    inventing a third:
+
+    1. `hasattr(module, "_hf_hook")` — an accelerate hook owns the module, which
+       is how diffusers itself discriminates the offload placements
+       (`pipeline_utils` checks the hook class). The answer is then `offloaded`
+       whatever the parameters currently say: under `model_cpu_offload` they sit
+       on the host between forwards and on the accelerator during one, and
+       reporting that momentary truth as `ram`/`gpu` would be a value the user
+       cannot act on.
+    2. the device-TYPE count over `parameters()` + `buffers()`, exactly as
+       `_require_components_materialized` does it. Types, not full specs:
+       `cuda` and `cuda:0` are the same card here.
+
+    `meta` without a hook is `offloaded` too: `accelerate.cpu_offload` moves the
+    parameters to `meta` and keeps the bytes in a host weights map, and the hook
+    it leaves behind may sit on a submodule rather than on the component root.
+
+    More than one device type is `mixed` and is returned as such. A module with
+    no parameters and no buffers holds no weights anywhere, so it answers
+    `not_loaded` — that is also what a test double answers, which is correct
+    rather than merely convenient.
+
+    `None` (no such component) answers `not_loaded`.
+    """
+    if module is None:
+        return RESIDENCY_NOT_LOADED
+    if hasattr(module, "_hf_hook"):
+        return RESIDENCY_OFFLOADED
+
+    parameters = getattr(module, "parameters", None)
+    buffers = getattr(module, "buffers", None)
+    if not callable(parameters) or not callable(buffers):
+        return RESIDENCY_NOT_LOADED
+
+    kinds: set[str] = set()
+    for tensor in list(parameters()) + list(buffers()):
+        where = getattr(getattr(tensor, "device", None), "type", None)
+        if where:
+            kinds.add(str(where))
+    if not kinds:
+        return RESIDENCY_NOT_LOADED
+    if len(kinds) > 1:
+        return RESIDENCY_MIXED
+    only = next(iter(kinds))
+    if only == "meta":
+        return RESIDENCY_OFFLOADED
+    if only == "cpu":
+        return RESIDENCY_RAM
+    return RESIDENCY_GPU
+
+
+def _component_actions(component: str, residency: str, *, pipeline_loaded: bool) -> list[str]:
+    """The actions that are genuinely possible for `component` right now.
+
+    This list is the AUTHORITY the client renders: the rule lives here and
+    nowhere else, because a matrix expressed twice in two languages drifts on the
+    first edit. Ordered by `COMPONENT_ACTIONS`, so the button order is decided
+    here too.
+
+    The invariants of `dev-docs/flux2_component_residency.md` §3, and why:
+
+    - the text encoder never offers `to_gpu`. `_encode_prompts_locked` pins
+      `torch.device("cpu")` unconditionally and the load-order memory contract
+      depends on it — 18.3 GB of transformer plus 16.4 GB of encoder do not fit
+      on this project's 34.2 GB reference card.
+    - the transformer never offers `warmup`. There is no such path: the warm-up
+      forwards the VAE only (`_warmup_vae_decode`), and building a transformer
+      forward just to have a button would be a fake.
+    - `load` and `unload` appear on BOTH the transformer and the VAE, always
+      together, because they act on the PIPELINE as a whole. Per-component
+      load/unload of one of them is not safe today: `_model_key` describes a
+      whole pipeline, so dropping one component would make the next request
+      cache-hit onto a broken pipeline, and `forecast_memory`'s `resident`
+      discount cannot represent a half-loaded one.
+    - the VAE offers no `to_ram`/`to_gpu`. No helper exists for it, and a
+      host-resident VAE is not a memory win the user can see: `_decode_once`
+      follows `vae.device`, so the next decode would silently run on the CPU.
+    - a transformer that is `offloaded` or `mixed` offers no move either. Under
+      accelerate the move must be ABSENT rather than disabled (meta tensors, and
+      the hooks would have to be removed first), and `.to(device)` on a mixed
+      module raises "Cannot copy out of meta tensor" as often as it succeeds.
+    """
+    if component == "text_encoder":
+        # The encoder is not a pipeline component here, so it loads and unloads
+        # on its own; `pipeline_loaded` says nothing about it.
+        return ["load"] if residency == RESIDENCY_NOT_LOADED else ["unload"]
+
+    if not pipeline_loaded:
+        return ["load"]
+
+    actions = ["unload"]
+    if component == "transformer":
+        if residency == RESIDENCY_GPU:
+            actions.append("to_ram")
+        elif residency == RESIDENCY_RAM:
+            actions.append("to_gpu")
+    elif component == "vae" and residency == RESIDENCY_GPU:
+        # Warming up a VAE that is not materialized on the device is refused by
+        # `_require_components_materialized`, so it is not offered there.
+        actions.append("warmup")
+    return sorted(actions, key=COMPONENT_ACTIONS.index)
+
+
+def _require_component_name(value: Any) -> str:
+    """Validate a wire `component` name against `ACTIONABLE_COMPONENTS`.
+
+    # Raises
+    `ValueError` naming the accepted values. The tokenizer and the scheduler are
+    rejected here on purpose: they carry no weights, so no residency and no
+    action of this family means anything for them.
+    """
+    name = str(value or "").strip()
+    if name in ACTIONABLE_COMPONENTS:
+        return name
+    accepted = ", ".join(f"«{item}»" for item in ACTIONABLE_COMPONENTS)
+    raise ValueError(
+        f"FLUX.2 klein: неизвестный компонент «{name}». Допустимые значения: {accepted}."
+    )
+
+
+def _require_action_name(value: Any) -> str:
+    """Validate a wire `action` name against `COMPONENT_ACTIONS`.
+
+    # Raises
+    `ValueError` naming the accepted values. Whether the action is possible for
+    the component RIGHT NOW is a separate question, answered under the service
+    lock by `Flux2KleinInpaintService._require_action_available_locked`.
+    """
+    name = str(value or "").strip()
+    if name in COMPONENT_ACTIONS:
+        return name
+    accepted = ", ".join(f"«{item}»" for item in COMPONENT_ACTIONS)
+    raise ValueError(
+        f"FLUX.2 klein: неизвестное действие «{name}». Допустимые значения: {accepted}."
+    )
+
+
+def _component_busy_message(component: str, action: str) -> str:
+    """The refusal text for an action requested while the service is busy."""
+    return (
+        f"FLUX.2 klein занят: действие «{action}» над компонентом «{component}» сейчас "
+        "невозможно. Генерация или другая операция удерживают модель до своего "
+        "завершения — дождитесь её окончания и повторите."
     )
 
 
@@ -4494,6 +5106,33 @@ def _path_state(path: str | None) -> dict[str, Any]:
     if not raw:
         return {"path": "", "exists": False, "size_bytes": 0}
     return {"path": raw, "exists": Path(raw).exists(), "size_bytes": _weight_bytes(raw)}
+
+
+def _component_states(paths: dict[str, str]) -> dict[str, Any]:
+    """The five `status.components` entries built from the paths alone.
+
+    Disk facts only, and deliberately lock-free: the three user-supplied paths
+    become `{path, exists, size_bytes}` and the two discovered directories become
+    `{found, path}`. The residency of the components that are actually loaded is
+    merged on top of this by `Flux2KleinInpaintService.status`, which is the part
+    that needs the service lock.
+    """
+    roots = component_search_roots(paths)
+    tokenizer_dir = discover_component_dir(roots, _TOKENIZER_SUBDIR, _TOKENIZER_MARKERS)
+    scheduler_dir = discover_component_dir(roots, _SCHEDULER_SUBDIR, (_SCHEDULER_MARKER,))
+    return {
+        "text_encoder": _path_state(paths.get("text_encoder_path")),
+        "transformer": _path_state(paths.get("transformer_path")),
+        "vae": _path_state(paths.get("vae_path")),
+        "tokenizer": {
+            "found": tokenizer_dir is not None,
+            "path": str(tokenizer_dir) if tokenizer_dir is not None else "",
+        },
+        "scheduler": {
+            "found": scheduler_dir is not None,
+            "path": str(scheduler_dir) if scheduler_dir is not None else "",
+        },
+    }
 
 
 def _first_unavailable_reason(components: dict[str, Any], *, prompt_cached: bool) -> str | None:

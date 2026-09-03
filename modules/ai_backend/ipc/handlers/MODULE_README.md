@@ -31,8 +31,8 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `sdxl.py`: `inpaint.sdxl` (+ `.unload`) — streaming, with a latent-preview PNG blob per `progress`.
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
-- `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.estimate`, `.unload`, and the six
-  `.prompt_cache.*` methods) — FLUX.2 klein region editing. Streams `load`/`generate` phases
+- `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.estimate`, `.unload`,
+  `.component_action`, and the six `.prompt_cache.*` methods) — FLUX.2 klein region editing. Streams `load`/`generate` phases
   (never `download`: the weights are user-supplied paths) and returns `image_len` + the
   OOM-recovery report (`oom_recovered`, `applied`) in the response header. `.estimate` is the only
   inpaint method taking a region size instead of image bytes.
@@ -47,6 +47,12 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   that the field arrived as a non-empty string; what makes a path or a name acceptable is the
   service's business (`require_prompt_file_source`, `sanitize_name_component`), and duplicating
   those rules here would give two answers to one question.
+  `component_action` is the THIRD streaming method of the group and follows the same rule:
+  `component` and `action` are forwarded verbatim, because which names are legal and which are
+  possible for a component right now is the service's single answer (`ACTIONABLE_COMPONENTS`,
+  `COMPONENT_ACTIONS`, `_require_action_available_locked`) — the per-component action matrix must
+  exist in exactly one place or it drifts on the first edit. See `PROTOCOL.md §5.4`
+  ("per-component residency") and `dev-docs/flux2_component_residency.md`.
 - `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
   (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
   method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).

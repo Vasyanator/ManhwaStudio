@@ -98,8 +98,25 @@ IPC (`backend_ipc::protocol`):
   never builds a path into it. An imported file of a foreign family is stored under
   that family and reported as such; it does not appear in this family's listing and
   the backend refuses to load it, which is expected and is surfaced as a warning.
+- `.component_action` — STREAMING, one per-component load / unload / move / warm-up.
+  Header: `component`, `action` and the normalized `params`; the answer repeats the
+  `.status` `components` block as it stands after the action. It claims the SAME progress
+  bar as a generation and a `.prompt_cache.build`, so the three are mutually exclusive.
+  The wire contract is `dev-docs/flux2_component_residency.md`.
 
 Contracts:
+- PER-COMPONENT RESIDENCY is reported by `.status` and rendered under the presence
+  catalog: `components[<name>].residency` is one of `not_loaded` / `ram` / `gpu` /
+  `offloaded` / `mixed` — five and not three, because accelerate's offload leaves the
+  parameters on `meta` with the bytes in a host map, and a load can leave a component
+  genuinely split. An ABSENT `components` means NOT KNOWN and never "not loaded"
+  (`components_busy` then says the service could not take its lock), a residency literal
+  this build does not know leaves the row stateless with the literal on hover, and an
+  unknown ACTION is dropped from that row. Which actions are possible is the SERVICE's
+  decision and travels in `actions`: this side renders that list and never re-derives it,
+  because the rule depends on the accelerate hooks, the pipeline-wide model cache key and
+  the memory guard, none of which the UI can see. The transformer and the VAE load and
+  unload TOGETHER for that cache-key reason, and their hovers say so.
 - The GUI thread never blocks: settings I/O, every IPC call, the native file pickers,
   the machine translation of the prompt and even the one-frame cancel write all run on
   `ms_thread::spawn` workers and `AiEngine::poll` only drains channels.
@@ -112,7 +129,9 @@ Contracts:
   terminal "the bar is done" — is dropped. A cancel and a moved frame both retire the
   current generation and cancel the request behind it. The bar lives in this engine's own
   panel: there is no shared progress vocabulary between engines
-  (`dev-docs/region_edit_v2_plan.md` §13.2 D13).
+  (`dev-docs/region_edit_v2_plan.md` §13.2 D13). THREE operations claim it — a generation,
+  `.prompt_cache.build` and `.component_action` — and every gate that means "wait for the
+  current operation" reads `flux2_pipeline_busy` over all three rather than one receiver.
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
   dispatcher (`translate_texts_via_translator`) instead of a second copy of it. It is
@@ -784,6 +803,267 @@ impl Flux2Component {
     }
 }
 
+/// Where one component's weights are RIGHT NOW, as `.status` reports it.
+///
+/// The wire literals are pinned by `dev-docs/flux2_component_residency.md` §2 and are
+/// stable. Three labels are not enough and the two extra ones are not decoration:
+/// under `sequential_cpu_offload` accelerate moves the parameters to the `meta` device
+/// and keeps the bytes in a host weights map, so the component is neither in RAM nor on
+/// the GPU (`Offloaded`), and a load can leave part of a component behind (`Mixed`).
+/// Neither is ever rounded to one of the other three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2Residency {
+    /// The component does not exist in the service right now.
+    NotLoaded,
+    /// Every parameter and buffer is on the host.
+    Ram,
+    /// Every parameter and buffer is on the compute device.
+    Gpu,
+    /// An accelerate hook owns it: the parameters sit on `meta`, the bytes in a host
+    /// weights map.
+    Offloaded,
+    /// Genuinely split across devices.
+    Mixed,
+}
+
+impl Flux2Residency {
+    /// The wire literal of this state.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::NotLoaded => "not_loaded",
+            Self::Ram => "ram",
+            Self::Gpu => "gpu",
+            Self::Offloaded => "offloaded",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// Reads a residency literal.
+    ///
+    /// `None` for anything this build does not know — a NEWER backend that reports a
+    /// state added after this release. The honest answer there is "not known": coercing
+    /// an unknown literal into `NotLoaded` would tell the user their weights are gone,
+    /// and into any of the others would name a device nobody reported.
+    fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::NotLoaded,
+            Self::Ram,
+            Self::Gpu,
+            Self::Offloaded,
+            Self::Mixed,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.wire() == value)
+    }
+
+    /// The localized name of the state.
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotLoaded => t!("cleaning.tools.flux2_klein.component_residency_not_loaded"),
+            Self::Ram => t!("cleaning.tools.flux2_klein.component_residency_ram"),
+            Self::Gpu => t!("cleaning.tools.flux2_klein.component_residency_gpu"),
+            Self::Offloaded => t!("cleaning.tools.flux2_klein.component_residency_offloaded"),
+            Self::Mixed => t!("cleaning.tools.flux2_klein.component_residency_mixed"),
+        }
+    }
+
+    /// The colour the state is drawn in, `None` for a neutral line.
+    ///
+    /// GREEN is "loaded and wholly on one device" — and that includes `Ram`, because the
+    /// text encoder can NEVER be on the GPU (prompt encoding pins `torch.device("cpu")`),
+    /// so amber there would call the ideal state a problem. AMBER is "loaded, but in a
+    /// state that needs the explanation its hover carries". NEUTRAL is "nothing is
+    /// loaded", which is not a fault either.
+    fn color(self) -> Option<Color32> {
+        match self {
+            Self::NotLoaded => None,
+            Self::Ram | Self::Gpu => Some(FLUX2_STATUS_OK_COLOR),
+            Self::Offloaded | Self::Mixed => Some(FLUX2_STATUS_WARN_COLOR),
+        }
+    }
+
+    /// The hover that explains the state, for the two that are not self-explanatory.
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::NotLoaded | Self::Ram | Self::Gpu => None,
+            Self::Offloaded => Some(t!(
+                "cleaning.tools.flux2_klein.component_residency_offloaded_hint"
+            )),
+            Self::Mixed => Some(t!("cleaning.tools.flux2_klein.component_residency_mixed_hint")),
+        }
+    }
+}
+
+/// The three components the residency block describes, in display order.
+///
+/// The tokenizer and the scheduler are deliberately absent: they are configuration files
+/// rather than weights, so there is no residency to report and no action to offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2ComponentId {
+    TextEncoder,
+    Transformer,
+    Vae,
+}
+
+impl Flux2ComponentId {
+    /// The wire name, which is also the key of this component in the `components` object.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Transformer => "transformer",
+            Self::Vae => "vae",
+        }
+    }
+
+    /// The three components in the order the block draws them.
+    fn all() -> [Self; 3] {
+        [Self::TextEncoder, Self::Transformer, Self::Vae]
+    }
+
+    /// The localized component name, the SAME one the presence catalog above uses: one
+    /// component must not carry two names in two adjacent blocks.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TextEncoder => t!("cleaning.tools.flux2_klein.component_text_encoder"),
+            Self::Transformer => t!("cleaning.tools.flux2_klein.component_transformer"),
+            Self::Vae => t!("cleaning.tools.flux2_klein.component_vae"),
+        }
+    }
+
+    /// The hover that says what the component IS — the block reports where the weights
+    /// are, which means nothing to a user who does not know what each part does.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::TextEncoder => t!("cleaning.tools.flux2_klein.component_text_encoder_hint"),
+            Self::Transformer => t!("cleaning.tools.flux2_klein.component_transformer_hint"),
+            Self::Vae => t!("cleaning.tools.flux2_klein.component_vae_hint"),
+        }
+    }
+}
+
+/// One action the BACKEND offered for a component.
+///
+/// Which of them are possible is decided by the service alone and travels in the
+/// component's `actions` list; this side renders what it is given and never re-derives
+/// the matrix — it depends on the accelerate hooks, the model cache key and the memory
+/// guard, none of which this side can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2ComponentAction {
+    Load,
+    Unload,
+    ToRam,
+    ToGpu,
+    Warmup,
+}
+
+impl Flux2ComponentAction {
+    /// The wire literal of the action.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Unload => "unload",
+            Self::ToRam => "to_ram",
+            Self::ToGpu => "to_gpu",
+            Self::Warmup => "warmup",
+        }
+    }
+
+    /// Reads an action literal, `None` for one this build does not know.
+    ///
+    /// Such an entry is DROPPED from the list rather than shown: a button whose caption
+    /// is untranslatable and whose effect is unknown cannot honestly be offered, and
+    /// guessing an effect from a wire name is exactly what this design exists to avoid.
+    /// The rest of the list still renders, so a newer backend loses one button instead of
+    /// the whole block.
+    fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::Load,
+            Self::Unload,
+            Self::ToRam,
+            Self::ToGpu,
+            Self::Warmup,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.wire() == value)
+    }
+
+    /// The button caption.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Load => t!("cleaning.tools.flux2_klein.component_action_load_button"),
+            Self::Unload => t!("cleaning.tools.flux2_klein.component_action_unload_button"),
+            Self::ToRam => t!("cleaning.tools.flux2_klein.component_action_to_ram_button"),
+            Self::ToGpu => t!("cleaning.tools.flux2_klein.component_action_to_gpu_button"),
+            Self::Warmup => t!("cleaning.tools.flux2_klein.component_action_warmup_button"),
+        }
+    }
+}
+
+/// The hover of one action button.
+///
+/// `load` and `unload` on the TRANSFORMER and the VAE get their own text: the model cache
+/// key describes a whole pipeline, so dropping one of the two alone would make the next
+/// request hit a broken cache entry — they load and unload TOGETHER, and the user has to
+/// be told that before pressing rather than after.
+fn component_action_tooltip(id: Flux2ComponentId, action: Flux2ComponentAction) -> &'static str {
+    let pipeline_pair = matches!(id, Flux2ComponentId::Transformer | Flux2ComponentId::Vae);
+    match (action, pipeline_pair) {
+        (Flux2ComponentAction::Load, true) => {
+            t!("cleaning.tools.flux2_klein.component_action_load_pair_tooltip")
+        }
+        (Flux2ComponentAction::Unload, true) => {
+            t!("cleaning.tools.flux2_klein.component_action_unload_pair_tooltip")
+        }
+        (Flux2ComponentAction::Load, false) => {
+            t!("cleaning.tools.flux2_klein.component_action_load_tooltip")
+        }
+        (Flux2ComponentAction::Unload, false) => {
+            t!("cleaning.tools.flux2_klein.component_action_unload_tooltip")
+        }
+        (Flux2ComponentAction::ToRam, _) => {
+            t!("cleaning.tools.flux2_klein.component_action_to_ram_tooltip")
+        }
+        (Flux2ComponentAction::ToGpu, _) => {
+            t!("cleaning.tools.flux2_klein.component_action_to_gpu_tooltip")
+        }
+        (Flux2ComponentAction::Warmup, _) => {
+            t!("cleaning.tools.flux2_klein.component_action_warmup_tooltip")
+        }
+    }
+}
+
+/// One row of the residency block: where a component is, and what may be done to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Flux2ComponentResidency {
+    id: Flux2ComponentId,
+    /// The parsed state; `None` when the backend reported none, or reported a literal
+    /// this build does not know ([`Flux2Residency::from_wire`]).
+    residency: Option<Flux2Residency>,
+    /// The literal the backend actually sent, kept verbatim so an unrecognised one can
+    /// still be shown on hover instead of vanishing without trace.
+    residency_wire: String,
+    /// The actions the BACKEND offered, in the order it listed them, with the ones this
+    /// build does not know dropped. This is the whole button set — nothing is added here.
+    actions: Vec<Flux2ComponentAction>,
+}
+
+/// The `components` / `components_busy` pair of a `.status` or `.component_action` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2ComponentSnapshot {
+    /// One row per component the backend described, in [`Flux2ComponentId::all`] order.
+    ///
+    /// `None` means NOT KNOWN — the field was absent (the service could not take its lock
+    /// without waiting) or was not an object. It must never read as "not loaded": that is
+    /// the same three-state rule `prompt_cached` and `text_encoder_available` already
+    /// carry, and here it decides whether the user is told their 16 GB encoder is gone.
+    components: Option<Vec<Flux2ComponentResidency>>,
+    /// The service could not answer without waiting for the lock a generation holds for
+    /// its whole run. `false` when the field is absent, which is also what a backend that
+    /// predates the block reports — it then has no `components` either, so the block
+    /// reports "not known" rather than "busy".
+    components_busy: bool,
+}
+
 /// The `.status` answer: whether a run can start at all, plus the host's memory.
 #[derive(Debug, Clone, Default)]
 struct Flux2Status {
@@ -820,6 +1100,61 @@ struct Flux2Status {
     /// `None` is "not known": a backend that predates the field, or no answer yet. It must
     /// not read as `Some(false)`, which is what the warning line and the encode gates act on.
     text_encoder_available: Option<bool>,
+    /// Where each component's weights are, and what may be done to them. Three-state:
+    /// see [`Flux2ComponentSnapshot::components`].
+    components: Flux2ComponentSnapshot,
+}
+
+/// What the per-component residency block shows this frame.
+///
+/// A separate decision from the drawing so the three-state rule can be asserted without a
+/// live `Ui`: the difference between "busy", "the backend said nothing" and "everything is
+/// unloaded" is exactly what this block must never blur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2ComponentBlock<'a> {
+    /// No `.status` answer at all. The catalog above already says so; a second "not known"
+    /// line under it would be noise.
+    Hidden,
+    /// The service could not read the residencies without waiting for the lock a
+    /// generation holds. The block says THAT and draws neither stale states nor buttons —
+    /// every one of them would be about a moment that has passed.
+    Busy,
+    /// There is an answer, but it carries no `components`: a backend that predates the
+    /// block. Reported as "not known", never as "not loaded".
+    Unknown,
+    /// One row per component the backend described.
+    Rows(&'a [Flux2ComponentResidency]),
+}
+
+/// Decides what the residency block shows from the last `.status` answer.
+fn flux2_component_block(status: Option<&Flux2Status>) -> Flux2ComponentBlock<'_> {
+    let Some(status) = status else {
+        return Flux2ComponentBlock::Hidden;
+    };
+    // Busy wins over a `components` the backend may still have sent: it says the
+    // residencies could not be read, so whatever came with it is not current.
+    if status.components.components_busy {
+        return Flux2ComponentBlock::Busy;
+    }
+    match status.components.components.as_deref() {
+        Some(rows) => Flux2ComponentBlock::Rows(rows),
+        None => Flux2ComponentBlock::Unknown,
+    }
+}
+
+/// Whether the backend's ONE pipeline — and with it the single shared progress bar — is
+/// held right now by one of the three long operations that claim it.
+///
+/// A generation, a `.prompt_cache.build` and a `.component_action` all take the service's
+/// lock for minutes and all call [`begin_progress_generation`], so starting a second one
+/// would both queue behind the first and steal its bar. Every gate that means "wait for
+/// the current operation" reads this, and nothing re-derives it field by field.
+fn flux2_pipeline_busy(
+    run_in_flight: bool,
+    prompt_cache_in_flight: bool,
+    component_action_in_flight: bool,
+) -> bool {
+    run_in_flight || prompt_cache_in_flight || component_action_in_flight
 }
 
 /// The `.estimate` answer: the backend's own forecast for the current parameters.
@@ -1026,10 +1361,11 @@ struct Flux2PromptCacheGates {
 /// Decides which prompt-cache controls are live.
 ///
 /// `prompt_cached` is the three-state answer from `.status` for the CURRENT prompt
-/// (`None` = not known yet, or a backend that does not report the field). `busy` covers
-/// both a prompt-cache operation and a generation already in flight, because the two
-/// share the one progress bar and the backend's one pipeline. `name` is the save-name
-/// field and `has_selection` says whether the library combo points at an entry.
+/// (`None` = not known yet, or a backend that does not report the field). `busy` is
+/// [`flux2_pipeline_busy`] — a prompt-cache operation, a generation OR a per-component
+/// action already in flight — because all three share the one progress bar and the
+/// backend's one pipeline. `name` is the save-name field and `has_selection` says whether
+/// the library combo points at an entry.
 ///
 /// Building needs the encoder on disk and something to encode. Saving additionally needs
 /// a cache that actually exists — `None` is not a promise that one does — and a name to
@@ -1495,6 +1831,15 @@ pub struct Flux2KleinEngine {
     estimate_wanted: bool,
     unload_rx: Option<Receiver<Result<(), String>>>,
     unload_status: Option<String>,
+    /// The per-component action (load / unload / move / warm up) that may be in flight.
+    /// One channel and one operation, like the prompt cache: it holds the backend's one
+    /// pipeline and claims the shared progress bar.
+    component_action_rx: Option<Receiver<Result<Flux2ComponentSnapshot, String>>>,
+    /// What the action in flight is, kept so its outcome can name the component the user
+    /// pressed and the failure log can carry the wire pair. Taken when the answer lands.
+    component_action_pending: Option<(Flux2ComponentId, Flux2ComponentAction)>,
+    /// User-facing line about the last component action, shown under the residency block.
+    component_action_status: Option<String>,
     translate_rx: Option<Receiver<Result<String, String>>>,
     translate_status: Option<String>,
     picker_rx: Option<Receiver<Option<PathBuf>>>,
@@ -1537,6 +1882,9 @@ impl Default for Flux2KleinEngine {
             estimate_wanted: false,
             unload_rx: None,
             unload_status: None,
+            component_action_rx: None,
+            component_action_pending: None,
+            component_action_status: None,
             translate_rx: None,
             translate_status: None,
             picker_rx: None,
@@ -1639,10 +1987,11 @@ impl Flux2KleinEngine {
         if self.status_wanted
             && self.ai_backend_available
             && self.status_rx.is_none()
-            && self.session.run_rx.is_none()
-            // A prompt-cache build holds the backend for ~106 s; asking it about the
-            // catalog meanwhile only queues a call behind that.
-            && self.prompt_cache_rx.is_none()
+            // A prompt-cache build holds the backend for ~106 s and a component action for
+            // as long; asking about the catalog meanwhile only queues a call behind it.
+            // `.status` itself takes the lock a generation holds for its whole run, which
+            // is also why the residency block reports `components_busy` instead of waiting.
+            && !self.pipeline_busy()
         {
             self.status_wanted = false;
             // The catalog is a question ABOUT the paths in the settings, so they go
@@ -1701,7 +2050,7 @@ impl Flux2KleinEngine {
         if !self.estimate_wanted
             || !self.ai_backend_available
             || self.estimate_rx.is_some()
-            || self.session.run_rx.is_some()
+            || self.pipeline_busy()
         {
             return;
         }
@@ -1735,6 +2084,102 @@ impl Flux2KleinEngine {
                 self.unload_status = Some(tf!("cleaning.inpaint.unload_error", err = err));
             }
             Err(TryRecvError::Disconnected) => self.unload_rx = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Whether one of the three long operations holds the backend's pipeline and the
+    /// shared progress bar. See [`flux2_pipeline_busy`] for why all three count.
+    fn pipeline_busy(&self) -> bool {
+        flux2_pipeline_busy(
+            self.session.run_rx.is_some(),
+            self.prompt_cache_rx.is_some(),
+            self.component_action_rx.is_some(),
+        )
+    }
+
+    /// Starts one per-component action on a worker thread.
+    ///
+    /// Streaming and claiming the shared progress bar exactly as
+    /// [`Self::start_prompt_cache_build`] does — loading the ~16 GB text encoder takes
+    /// ~100 s — which is also what makes it mutually exclusive with a generation.
+    ///
+    /// Whether the action is POSSIBLE is not decided here: the service listed it, and
+    /// re-deriving that rule on this side would duplicate a matrix that depends on the
+    /// accelerate hooks and the memory guard. This side only refuses to start a second
+    /// operation while one is in flight; a refusal for any other reason comes back from
+    /// the backend as an error with an actionable message.
+    fn start_component_action(&mut self, id: Flux2ComponentId, action: Flux2ComponentAction) {
+        if self.pipeline_busy() {
+            return;
+        }
+        let header = flux2_component_action_header(&self.settings.normalized(), id, action);
+        let generation = begin_progress_generation(&self.progress);
+        let progress = Arc::clone(&self.progress);
+        let (tx, rx) = mpsc::channel();
+        self.component_action_rx = Some(rx);
+        self.component_action_pending = Some((id, action));
+        self.component_action_status = Some(tf!(
+            "cleaning.tools.flux2_klein.component_action_running_status",
+            name = id.label(),
+            action = action.label()
+        ));
+        thread::spawn(move || {
+            let _ = tx.send(run_flux2_component_action(header, &progress, generation));
+        });
+    }
+
+    /// Drains the component-action channel into the residency block.
+    ///
+    /// A successful action answers with the snapshot AFTER it, which is written straight
+    /// into the catalog so the rows stop describing the state the user has just changed.
+    /// `.status` is re-armed as well: the action moved weights, so `device` and `loaded`
+    /// are stale too, and only a full answer can refresh them.
+    fn poll_component_action(&mut self) {
+        let Some(rx) = self.component_action_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(snapshot)) => {
+                self.component_action_rx = None;
+                self.component_action_pending = None;
+                // Written into the catalog only when one exists; without an answer to
+                // attach it to there is nothing to show it beside, and the re-armed
+                // `.status` below brings back the whole thing anyway.
+                if let Some(status) = self.status.as_mut() {
+                    status.components = snapshot;
+                }
+                self.status_wanted = true;
+                self.component_action_status =
+                    Some(t!("cleaning.tools.flux2_klein.component_action_done_status").to_string());
+            }
+            Ok(Err(err)) => {
+                self.component_action_rx = None;
+                let pending = self.component_action_pending.take();
+                // The user gets the localized sentence; the log gets the wire pair, which
+                // is what makes a refusal ("that action is not offered", "the memory guard
+                // says no") attributable to a component and an action.
+                let (component, action) = pending.map_or(("?", "?"), |(id, action)| {
+                    (id.wire(), action.wire())
+                });
+                crate::runtime_log::log_warn(format!(
+                    "[cleaning] FLUX.2 klein component action failed. Component: {component}. Action: {action}. Error: {err}"
+                ));
+                self.component_action_status = Some(tf!(
+                    "cleaning.tools.flux2_klein.component_action_error",
+                    err = err
+                ));
+                // The action may have moved weights before it failed, so the rows on
+                // screen are no longer trustworthy.
+                self.status_wanted = true;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.component_action_rx = None;
+                self.component_action_pending = None;
+                self.component_action_status =
+                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
+                self.status_wanted = true;
+            }
             Err(TryRecvError::Empty) => {}
         }
     }
@@ -1992,8 +2437,7 @@ impl Flux2KleinEngine {
         if self.prompt_cache_list_wanted
             && self.ai_backend_available
             && self.prompt_cache_list_rx.is_none()
-            && self.prompt_cache_rx.is_none()
-            && self.session.run_rx.is_none()
+            && !self.pipeline_busy()
         {
             self.prompt_cache_list_wanted = false;
             let header = self.prompt_cache_header(&[]);
@@ -2198,11 +2642,14 @@ impl AiEngine for Flux2KleinEngine {
         let mut unload_requested = false;
         let mut translate_requested = false;
         let mut prompt_cache_action: Option<Flux2PromptCacheAction> = None;
+        let mut component_action: Option<(Flux2ComponentId, Flux2ComponentAction)> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
         // Read before the destructure below borrows `settings` apart: the cache state is
         // derived from `status` AND `settings`, so it cannot be computed while both are
         // held by the context.
         let prompt_cache_state = self.prompt_cache_state();
+        // Same reason, and it reads three receivers the destructure hands out separately.
+        let pipeline_busy = self.pipeline_busy();
         let region = self.region_size();
         {
             let Self {
@@ -2212,6 +2659,7 @@ impl AiEngine for Flux2KleinEngine {
                 estimate,
                 estimate_error,
                 unload_status,
+                component_action_status,
                 translate_status,
                 translate_rx,
                 estimate_rx,
@@ -2235,6 +2683,8 @@ impl AiEngine for Flux2KleinEngine {
                 estimate: estimate.as_ref(),
                 estimate_error: estimate_error.as_deref(),
                 unload_status,
+                component_action_status: component_action_status.as_deref(),
+                pipeline_busy,
                 translate_status: translate_status.as_deref(),
                 translate_busy: translate_rx.is_some(),
                 estimate_busy: estimate_rx.is_some(),
@@ -2256,6 +2706,7 @@ impl AiEngine for Flux2KleinEngine {
                 unload_requested: &mut unload_requested,
                 translate_requested: &mut translate_requested,
                 prompt_cache_action: &mut prompt_cache_action,
+                component_action: &mut component_action,
                 picker_requested: &mut picker_requested,
             };
             panel.draw(ui, region);
@@ -2290,6 +2741,9 @@ impl AiEngine for Flux2KleinEngine {
                 self.start_picker(Flux2PickerPurpose::PromptCacheImport);
             }
             None => {}
+        }
+        if let Some((id, action)) = component_action {
+            self.start_component_action(id, action);
         }
         if let Some(purpose) = picker_requested {
             self.start_picker(purpose);
@@ -2381,6 +2835,7 @@ impl AiEngine for Flux2KleinEngine {
         self.poll_settings_load();
         self.poll_and_maybe_query_status();
         self.poll_unload();
+        self.poll_component_action();
         self.poll_translate();
         self.poll_prompt_cache();
         self.poll_and_maybe_query_prompt_cache_list();
@@ -2486,6 +2941,13 @@ struct Flux2PanelCtx<'a> {
     estimate: Option<&'a Flux2Estimate>,
     estimate_error: Option<&'a str>,
     unload_status: &'a mut Option<String>,
+    /// The engine's line about the last per-component action, drawn under the block.
+    component_action_status: Option<&'a str>,
+    /// One of the three long operations holds the backend's pipeline and the shared
+    /// progress bar ([`flux2_pipeline_busy`]). Everything that means "wait for the current
+    /// operation to finish" is gated on THIS and not on one receiver: a generation closes
+    /// the prompt-cache controls for exactly the same reason a cache build does.
+    pipeline_busy: bool,
     translate_status: Option<&'a str>,
     translate_busy: bool,
     estimate_busy: bool,
@@ -2516,6 +2978,8 @@ struct Flux2PanelCtx<'a> {
     translate_requested: &'a mut bool,
     /// The one prompt-cache control the user pressed this frame, if any.
     prompt_cache_action: &'a mut Option<Flux2PromptCacheAction>,
+    /// The one per-component action button the user pressed this frame, if any.
+    component_action: &'a mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
     /// At most one file dialog request per frame.
     picker_requested: &'a mut Option<Flux2PickerPurpose>,
 }
@@ -2687,7 +3151,10 @@ impl Flux2PanelCtx<'_> {
             self.prompt_cache_name_input,
             self.prompt_cache_selected.is_some(),
             self.ai_backend_available,
-            self.prompt_cache_busy,
+            // NOT `prompt_cache_busy`: a generation and a component action hold the same
+            // pipeline and the same progress bar, so starting a cache operation under one
+            // of them would both queue behind it and steal its bar.
+            self.pipeline_busy,
         );
         // The two encode-only controls need their own explanation when it is the missing
         // encoder that closed them: the generic tooltip tells the user to fill in a path,
@@ -2708,7 +3175,7 @@ impl Flux2PanelCtx<'_> {
         let mut action: Option<Flux2PromptCacheAction> = None;
 
         ui.horizontal_wrapped(|ui| {
-            if prompt_cache_button(
+            if flux2_gated_button(
                 ui,
                 gates.build,
                 t!("cleaning.tools.flux2_klein.prompt_cache_build_button"),
@@ -2734,7 +3201,7 @@ impl Flux2PanelCtx<'_> {
                     .hint_text(t!("cleaning.tools.flux2_klein.prompt_cache_name_hint"))
                     .desired_width(field_width),
             );
-            if prompt_cache_button(
+            if flux2_gated_button(
                 ui,
                 gates.save,
                 t!("cleaning.tools.flux2_klein.prompt_cache_save_button"),
@@ -2770,7 +3237,7 @@ impl Flux2PanelCtx<'_> {
                     Flux2PromptCacheAction::Import,
                 ),
             ] {
-                if prompt_cache_button(ui, enabled, caption, tooltip, disabled_tooltip) {
+                if flux2_gated_button(ui, enabled, caption, tooltip, disabled_tooltip) {
                     action = Some(requested);
                 }
             }
@@ -2880,6 +3347,11 @@ impl Flux2PanelCtx<'_> {
         let unload_requested = &mut *self.unload_requested;
         let picker_requested = &mut *self.picker_requested;
         let unload_status = &mut *self.unload_status;
+        let component_action = &mut *self.component_action;
+        let component_action_status = self.component_action_status;
+        // The buttons of the block are the backend's own list; this only says whether the
+        // pipeline is free to run one right now.
+        let component_actions_enabled = self.ai_backend_available && !self.pipeline_busy;
         let status = self.status;
         let status_error = self.status_error;
         let estimate = self.estimate;
@@ -2998,6 +3470,15 @@ impl Flux2PanelCtx<'_> {
 
                 ui.separator();
                 draw_status_ui(ui, status, status_error, region);
+                draw_component_residency_ui(
+                    ui,
+                    status,
+                    component_actions_enabled,
+                    component_action,
+                );
+                if let Some(text) = component_action_status {
+                    ui.small(text);
+                }
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .small_button(t!("cleaning.tools.flux2_klein.refresh_status_button"))
@@ -3165,12 +3646,13 @@ fn draw_path_row(
     });
 }
 
-/// Draws one prompt-cache button and reports whether it was clicked.
+/// Draws one gated action button of this engine and reports whether it was clicked.
 ///
-/// Every one of the five is disabled for a reason the user cannot see from the button
-/// itself (no cache yet, no selection, an unreachable backend), so a disabled tooltip is
-/// not optional here — it is the only place that reason is stated.
-fn prompt_cache_button(
+/// Shared by the prompt-cache controls and the per-component actions. Every one of them is
+/// disabled for a reason the user cannot see from the button itself (no cache yet, no
+/// selection, an unreachable backend, an operation already running), so a disabled tooltip
+/// is not optional here — it is the only place that reason is stated.
+fn flux2_gated_button(
     ui: &mut egui::Ui,
     enabled: bool,
     caption: &str,
@@ -3473,6 +3955,85 @@ fn draw_status_ui(
     }
 }
 
+/// Draws the per-component residency block under the presence catalog.
+///
+/// One row per component: its localized name (hovering says what the component IS), where
+/// its weights are as a coloured label (hovering explains `offloaded` and `mixed`, which
+/// nobody can be expected to read off the word alone), and the action buttons the BACKEND
+/// listed. Which actions exist is never re-derived here — see [`Flux2ComponentAction`].
+///
+/// `enabled` is the local "the pipeline is free" gate and nothing else; a disabled button
+/// still says on hover why it cannot be pressed. `action` receives the one button pressed
+/// this frame, in the same at-most-one shape the prompt-cache block uses.
+fn draw_component_residency_ui(
+    ui: &mut egui::Ui,
+    status: Option<&Flux2Status>,
+    enabled: bool,
+    action: &mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
+) {
+    let block = flux2_component_block(status);
+    if matches!(block, Flux2ComponentBlock::Hidden) {
+        return;
+    }
+    ui.label(t!("cleaning.tools.flux2_klein.component_residency_heading"));
+    match block {
+        // Handled above; repeated so a new variant cannot slip through a catch-all.
+        Flux2ComponentBlock::Hidden => {}
+        Flux2ComponentBlock::Busy => {
+            ui.small(t!("cleaning.tools.flux2_klein.component_residency_busy_status"));
+        }
+        Flux2ComponentBlock::Unknown => {
+            ui.small(t!(
+                "cleaning.tools.flux2_klein.component_residency_unknown_status"
+            ));
+        }
+        Flux2ComponentBlock::Rows(rows) => {
+            for row in rows {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(row.id.label()).on_hover_text(row.id.hint());
+                    draw_component_residency_label(ui, row);
+                    for offered in &row.actions {
+                        if flux2_gated_button(
+                            ui,
+                            enabled,
+                            offered.label(),
+                            component_action_tooltip(row.id, *offered),
+                            t!("cleaning.tools.flux2_klein.component_action_disabled_tooltip"),
+                        ) {
+                            *action = Some((row.id, *offered));
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Draws the residency of one row: the coloured state, with the hover that explains it.
+///
+/// A state this build does not know is drawn as "not known" — never as one of the five —
+/// and the literal the backend sent goes into the hover, so a newer backend's answer can
+/// still be read off the screen instead of disappearing.
+fn draw_component_residency_label(ui: &mut egui::Ui, row: &Flux2ComponentResidency) {
+    let Some(residency) = row.residency else {
+        let response = ui.small(t!("cleaning.tools.flux2_klein.component_residency_unknown"));
+        if !row.residency_wire.is_empty() {
+            response.on_hover_text(tf!(
+                "cleaning.tools.flux2_klein.component_residency_unrecognized_hint",
+                value = row.residency_wire
+            ));
+        }
+        return;
+    };
+    let response = match residency.color() {
+        Some(color) => ui.colored_label(color, residency.label()),
+        None => ui.small(residency.label()),
+    };
+    if let Some(hint) = residency.hint() {
+        response.on_hover_text(hint);
+    }
+}
+
 /// Draws the nested advanced section: placement, dtype, VAE flags, text-encoder memory
 /// handling and mask shaping.
 fn draw_advanced_section(
@@ -3523,9 +4084,19 @@ fn draw_advanced_section(
                     t!("cleaning.tools.flux2_klein.low_cpu_mem_usage_label"),
                 )
                 .changed();
-            *changed |= ui.checkbox(&mut settings.vae_tiling, "VAE tiling").changed();
             *changed |= ui
-                .checkbox(&mut settings.vae_slicing, "VAE slicing")
+                .checkbox(
+                    &mut settings.vae_tiling,
+                    t!("cleaning.tools.flux2_klein.vae_tiling_label"),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.vae_tiling_hint"))
+                .changed();
+            *changed |= ui
+                .checkbox(
+                    &mut settings.vae_slicing,
+                    t!("cleaning.tools.flux2_klein.vae_slicing_label"),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.vae_slicing_hint"))
                 .changed();
             *changed |= ui
                 .checkbox(
@@ -4021,6 +4592,58 @@ fn parse_flux2_status(header: &Value) -> Flux2Status {
         // raises a warning, so a backend that never reports the field must not be read as
         // "you have no encoder".
         text_encoder_available: header.get("text_encoder_available").and_then(Value::as_bool),
+        components: parse_flux2_component_snapshot(header),
+    }
+}
+
+/// Reads the `components` / `components_busy` pair out of an answer header.
+///
+/// Shared by `.status` and `.component_action`, which report the same block — the second
+/// answers with the snapshot AFTER the action, so one parser keeps the two from drifting.
+///
+/// An ABSENT (or non-object) `components` yields `None`, i.e. "not known". A component
+/// the object does not mention simply gets no row; an `actions` entry this build does not
+/// know is dropped from that row's list, and an unrecognised `residency` leaves the row's
+/// state `None` with the raw literal kept. Nothing here invents a state or an action.
+fn parse_flux2_component_snapshot(header: &Value) -> Flux2ComponentSnapshot {
+    let components = header
+        .get("components")
+        .and_then(Value::as_object)
+        .map(|object| {
+            Flux2ComponentId::all()
+                .into_iter()
+                .filter_map(|id| {
+                    let entry = object.get(id.wire())?;
+                    let residency_wire = entry
+                        .get("residency")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let actions = entry
+                        .get("actions")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .filter_map(Flux2ComponentAction::from_wire)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(Flux2ComponentResidency {
+                        id,
+                        residency: Flux2Residency::from_wire(&residency_wire),
+                        residency_wire,
+                        actions,
+                    })
+                })
+                .collect()
+        });
+    Flux2ComponentSnapshot {
+        components,
+        components_busy: header
+            .get("components_busy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -4081,6 +4704,71 @@ fn unload_flux2_klein() -> Result<(), String> {
         )
         .map_err(map_flux2_call_error)?;
     Ok(())
+}
+
+/// Builds the `.component_action` request header.
+///
+/// `component` and `action` sit at the TOP LEVEL beside `params`, in the same shape the
+/// prompt-cache calls put their `name`/`path` beside it — `params` is the normalized
+/// settings every other FLUX.2 call carries, and it is what tells the backend which model
+/// paths, placement and memory flags the action is about. Without it the backend would act
+/// on the paths of its last successful generation, i.e. on nothing until one has run.
+///
+/// `settings` must already be `normalized()`.
+#[must_use]
+fn flux2_component_action_header(
+    settings: &Flux2KleinSettings,
+    component: Flux2ComponentId,
+    action: Flux2ComponentAction,
+) -> Value {
+    // The mode is `false` on every path that only ASKS or MOVES something: no mask exists
+    // behind a component action, exactly as behind `.status` and the prompt-cache calls.
+    json!({
+        "component": component.wire(),
+        "action": action.wire(),
+        "params": settings.to_params(false),
+    })
+}
+
+/// Runs one per-component action and returns the residency snapshot that follows it.
+///
+/// Streaming, and it drives the SAME bar a generation and a `.prompt_cache.build` drive:
+/// loading the ~16 GB text encoder takes ~100 s. `generation` is the progress generation
+/// claimed on the GUI thread; every write is dropped once a newer operation — or a cancel
+/// — has retired it, and the bar is cleared on EVERY exit.
+///
+/// `header` must already carry `component`, `action` and the normalized `params`
+/// (`dev-docs/flux2_component_residency.md` §4).
+///
+/// # Errors
+/// Returns a user-facing message when the backend refuses the action (it is not in that
+/// component's `actions` list, the service is busy, or the memory guard says no), when it
+/// does not know the method, or when it is unreachable.
+fn run_flux2_component_action(
+    header: Value,
+    progress: &Arc<Mutex<Flux2Progress>>,
+    generation: u64,
+) -> Result<Flux2ComponentSnapshot, String> {
+    let outcome = flux2_stream_call(
+        backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
+        header,
+        &[],
+        |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
+        |phase, step, total, label| {
+            update_progress(progress, generation, |state| {
+                state.phase = phase;
+                state.step = step;
+                state.total = total;
+                state.label = label;
+            });
+        },
+    )
+    .map(|(header, _blob)| parse_flux2_component_snapshot(&header));
+    update_progress(progress, generation, |state| {
+        state.active = false;
+        state.cancel_id = None;
+    });
+    outcome
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5909,6 +6597,425 @@ mod tests {
                 hover.contains("{family}"),
                 "locale `{tag}`: the hover line carries the family, `{hover}` does not"
             );
+        }
+    }
+
+    /// A `.status` answer carrying the full residency block of the pinned contract
+    /// (`dev-docs/flux2_component_residency.md` §3).
+    fn status_with_components() -> Flux2Status {
+        parse_flux2_status(&json!({
+            "available": true,
+            "components": {
+                "text_encoder": { "residency": "ram", "actions": ["unload"] },
+                "transformer": { "residency": "gpu", "actions": ["unload", "to_ram"] },
+                "vae": { "residency": "offloaded", "actions": ["unload", "warmup"] },
+            },
+        }))
+    }
+
+    #[test]
+    fn every_residency_literal_survives_the_round_trip() {
+        for residency in [
+            Flux2Residency::NotLoaded,
+            Flux2Residency::Ram,
+            Flux2Residency::Gpu,
+            Flux2Residency::Offloaded,
+            Flux2Residency::Mixed,
+        ] {
+            assert_eq!(Flux2Residency::from_wire(residency.wire()), Some(residency));
+        }
+        // A state added by a newer backend is "not known" and is never coerced into one
+        // of the five — `NotLoaded` in particular would claim the weights are gone.
+        for unknown in ["", "vram", "not-loaded", "NotLoaded", "disk"] {
+            assert_eq!(
+                Flux2Residency::from_wire(unknown),
+                None,
+                "`{unknown}` must not be read as a known state"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_residency_claims_no_state_and_keeps_the_literal() {
+        let status = parse_flux2_status(&json!({
+            "components": { "vae": { "residency": "nvme", "actions": ["unload"] } },
+        }));
+        let rows = status
+            .components
+            .components
+            .as_deref()
+            .expect("the block was reported");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].residency, None, "an unknown literal is not a state");
+        assert_eq!(
+            rows[0].residency_wire, "nvme",
+            "the literal is kept so the hover can still show what the backend said"
+        );
+        // The actions the backend listed are unaffected: it is the service that decides
+        // them, and it did not stop being the authority because of one unknown state.
+        assert_eq!(rows[0].actions, vec![Flux2ComponentAction::Unload]);
+    }
+
+    #[test]
+    fn every_action_literal_survives_the_round_trip_and_an_unknown_one_is_dropped() {
+        for action in [
+            Flux2ComponentAction::Load,
+            Flux2ComponentAction::Unload,
+            Flux2ComponentAction::ToRam,
+            Flux2ComponentAction::ToGpu,
+            Flux2ComponentAction::Warmup,
+        ] {
+            assert_eq!(
+                Flux2ComponentAction::from_wire(action.wire()),
+                Some(action)
+            );
+        }
+        assert_eq!(Flux2ComponentAction::from_wire("quantize"), None);
+
+        // One unknown entry costs its own button and nothing else: the rest of the list
+        // still renders, so a newer backend does not blank the row.
+        let status = parse_flux2_status(&json!({
+            "components": {
+                "transformer": { "residency": "gpu", "actions": ["unload", "quantize", "to_ram"] },
+            },
+        }));
+        let rows = status
+            .components
+            .components
+            .as_deref()
+            .expect("the block was reported");
+        assert_eq!(
+            rows[0].actions,
+            vec![Flux2ComponentAction::Unload, Flux2ComponentAction::ToRam]
+        );
+    }
+
+    #[test]
+    fn an_absent_components_block_is_not_known_and_never_not_loaded() {
+        // A backend that predates the block, or one that could not take its lock.
+        let silent = parse_flux2_status(&json!({ "available": true }));
+        assert_eq!(
+            silent.components.components, None,
+            "an absent field is not an empty catalog and not a set of unloaded components"
+        );
+        assert!(!silent.components.components_busy);
+        assert_eq!(
+            flux2_component_block(Some(&silent)),
+            Flux2ComponentBlock::Unknown
+        );
+        // No answer at all draws nothing: the catalog above already says the state is
+        // not known, and a second line saying it would be noise.
+        assert_eq!(flux2_component_block(None), Flux2ComponentBlock::Hidden);
+        // A `components` that is not an object is refused rather than half-read.
+        let broken = parse_flux2_status(&json!({ "components": "later" }));
+        assert_eq!(broken.components.components, None);
+    }
+
+    #[test]
+    fn a_busy_answer_reports_that_instead_of_stale_rows_and_offers_no_buttons() {
+        let busy = parse_flux2_status(&json!({
+            "components_busy": true,
+            // Even if rows travelled with it, they describe a moment that has passed.
+            "components": { "vae": { "residency": "gpu", "actions": ["unload"] } },
+        }));
+        assert!(busy.components.components_busy);
+        assert_eq!(
+            flux2_component_block(Some(&busy)),
+            Flux2ComponentBlock::Busy,
+            "busy wins over rows: the residencies could not be read"
+        );
+    }
+
+    #[test]
+    fn the_button_set_is_exactly_what_the_backend_listed() {
+        let status = status_with_components();
+        let rows = status
+            .components
+            .components
+            .as_deref()
+            .expect("the block was reported");
+        let listed: Vec<(Flux2ComponentId, Vec<Flux2ComponentAction>)> = rows
+            .iter()
+            .map(|row| (row.id, row.actions.clone()))
+            .collect();
+        // Exactly the payload of the pinned contract, in `Flux2ComponentId::all` order and
+        // with no action added by this side: the service is the authority on the matrix.
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    Flux2ComponentId::TextEncoder,
+                    vec![Flux2ComponentAction::Unload]
+                ),
+                (
+                    Flux2ComponentId::Transformer,
+                    vec![Flux2ComponentAction::Unload, Flux2ComponentAction::ToRam]
+                ),
+                (
+                    Flux2ComponentId::Vae,
+                    vec![Flux2ComponentAction::Unload, Flux2ComponentAction::Warmup]
+                ),
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.residency).collect::<Vec<_>>(),
+            vec![
+                Some(Flux2Residency::Ram),
+                Some(Flux2Residency::Gpu),
+                Some(Flux2Residency::Offloaded)
+            ]
+        );
+        // A component the backend did not mention gets no row rather than an invented one.
+        let partial = parse_flux2_status(&json!({
+            "components": { "vae": { "residency": "not_loaded", "actions": [] } },
+        }));
+        let partial_rows = partial
+            .components
+            .components
+            .as_deref()
+            .expect("the block was reported");
+        assert_eq!(partial_rows.len(), 1);
+        assert_eq!(partial_rows[0].id, Flux2ComponentId::Vae);
+        assert!(partial_rows[0].actions.is_empty());
+    }
+
+    #[test]
+    fn only_the_two_states_that_need_explaining_are_amber_and_carry_a_hover() {
+        // `ram` must not be amber: the text encoder can never be on the GPU, so RAM is its
+        // ideal state rather than a compromise.
+        assert_eq!(Flux2Residency::Ram.color(), Some(FLUX2_STATUS_OK_COLOR));
+        assert_eq!(Flux2Residency::Gpu.color(), Some(FLUX2_STATUS_OK_COLOR));
+        assert_eq!(Flux2Residency::NotLoaded.color(), None);
+        for state in [Flux2Residency::Offloaded, Flux2Residency::Mixed] {
+            assert_eq!(state.color(), Some(FLUX2_STATUS_WARN_COLOR));
+            assert!(
+                state.hint().is_some(),
+                "{state:?} is not self-explanatory and must carry a hover"
+            );
+        }
+        for state in [
+            Flux2Residency::NotLoaded,
+            Flux2Residency::Ram,
+            Flux2Residency::Gpu,
+        ] {
+            assert!(state.hint().is_none(), "{state:?} explains itself");
+        }
+    }
+
+    #[test]
+    fn the_pipeline_pair_says_so_on_the_two_components_it_is_true_of() {
+        // The transformer and the VAE load and unload TOGETHER — the model cache key
+        // describes a whole pipeline — and the hover is where the user learns it.
+        let pair = component_action_tooltip(
+            Flux2ComponentId::Transformer,
+            Flux2ComponentAction::Unload,
+        );
+        assert_eq!(
+            pair,
+            component_action_tooltip(Flux2ComponentId::Vae, Flux2ComponentAction::Unload)
+        );
+        assert_ne!(
+            pair,
+            component_action_tooltip(
+                Flux2ComponentId::TextEncoder,
+                Flux2ComponentAction::Unload
+            ),
+            "the encoder unloads alone and must not claim otherwise"
+        );
+        let pair_load =
+            component_action_tooltip(Flux2ComponentId::Vae, Flux2ComponentAction::Load);
+        assert_eq!(
+            pair_load,
+            component_action_tooltip(Flux2ComponentId::Transformer, Flux2ComponentAction::Load)
+        );
+        assert_ne!(
+            pair_load,
+            component_action_tooltip(Flux2ComponentId::TextEncoder, Flux2ComponentAction::Load)
+        );
+        // Moving and warming up act on one component, so the pair wording must not leak
+        // into them even on the two components it is true of for load/unload.
+        assert_eq!(
+            component_action_tooltip(Flux2ComponentId::Vae, Flux2ComponentAction::ToRam),
+            component_action_tooltip(Flux2ComponentId::TextEncoder, Flux2ComponentAction::ToRam)
+        );
+    }
+
+    #[test]
+    fn the_component_action_request_names_the_component_the_action_and_the_paths() {
+        let settings = runnable_settings().normalized();
+        let header = flux2_component_action_header(
+            &settings,
+            Flux2ComponentId::TextEncoder,
+            Flux2ComponentAction::Load,
+        );
+        assert_eq!(header.get("component").and_then(Value::as_str), Some("text_encoder"));
+        assert_eq!(header.get("action").and_then(Value::as_str), Some("load"));
+        let params = header.get("params").expect("the paths travel with the action");
+        assert_eq!(
+            params.get("text_encoder_path").and_then(Value::as_str),
+            Some(settings.text_encoder_path.as_str()),
+            "without them the backend would act on its last generation's paths"
+        );
+        assert_eq!(
+            params.get("whole_region").and_then(Value::as_bool),
+            Some(false),
+            "no mask exists behind a component action"
+        );
+    }
+
+    #[test]
+    fn a_component_action_answer_is_read_with_the_same_parser_as_a_status() {
+        // `.component_action` answers with the snapshot AFTER the action, in the same
+        // shape `.status` reports it, so one parser must serve both.
+        let answer = json!({
+            "components_busy": false,
+            "components": { "vae": { "residency": "gpu", "actions": ["unload", "warmup"] } },
+        });
+        assert_eq!(
+            parse_flux2_component_snapshot(&answer),
+            parse_flux2_status(&answer).components
+        );
+    }
+
+    #[test]
+    fn a_generation_closes_the_prompt_cache_controls_just_as_a_cache_job_does() {
+        // The gate has always documented that `busy` covers a generation too; the panel
+        // used to pass only the prompt-cache receiver, which left «Кэшировать» clickable
+        // in the middle of a run — and it would have stolen the run's progress bar.
+        let mut engine = Flux2KleinEngine::default();
+        assert!(!engine.pipeline_busy());
+        let open = flux2_prompt_cache_gates(
+            &cacheable_settings(),
+            Some(true),
+            Some(true),
+            "entry",
+            true,
+            true,
+            engine.pipeline_busy(),
+        );
+        assert!(open.build && open.save && open.load && open.export && open.import);
+
+        // Each of the three long operations closes them, and each on its own.
+        let (_run_tx, run_rx) = mpsc::channel();
+        engine.session.run_rx = Some(run_rx);
+        assert!(engine.pipeline_busy(), "a generation holds the pipeline");
+        let during_run = flux2_prompt_cache_gates(
+            &cacheable_settings(),
+            Some(true),
+            Some(true),
+            "entry",
+            true,
+            true,
+            engine.pipeline_busy(),
+        );
+        assert_eq!(
+            during_run,
+            Flux2PromptCacheGates {
+                build: false,
+                save: false,
+                load: false,
+                export: false,
+                import: false
+            }
+        );
+        engine.session.run_rx = None;
+
+        let (_action_tx, action_rx) = mpsc::channel();
+        engine.component_action_rx = Some(action_rx);
+        assert!(
+            engine.pipeline_busy(),
+            "a component action holds it for as long as a cache build does"
+        );
+        engine.component_action_rx = None;
+
+        let (_cache_tx, cache_rx) = mpsc::channel();
+        engine.prompt_cache_rx = Some(cache_rx);
+        assert!(engine.pipeline_busy());
+    }
+
+    #[test]
+    fn every_catalog_carries_the_residency_block_strings() {
+        // A translation that drops `{value}`, `{name}` or `{action}` compiles and passes
+        // the key-existence test while leaving the user with a sentence that names nothing.
+        let interpolated = [
+            (
+                "cleaning.tools.flux2_klein.component_residency_unrecognized_hint",
+                vec!["{value}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.component_action_running_status",
+                vec!["{name}", "{action}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.component_action_error",
+                vec!["{err}"],
+            ),
+        ];
+        let plain = [
+            "cleaning.tools.flux2_klein.component_residency_heading",
+            "cleaning.tools.flux2_klein.component_residency_busy_status",
+            "cleaning.tools.flux2_klein.component_residency_unknown_status",
+            "cleaning.tools.flux2_klein.component_residency_unknown",
+            "cleaning.tools.flux2_klein.component_text_encoder_hint",
+            "cleaning.tools.flux2_klein.component_transformer_hint",
+            "cleaning.tools.flux2_klein.component_vae_hint",
+            "cleaning.tools.flux2_klein.component_action_disabled_tooltip",
+            "cleaning.tools.flux2_klein.component_action_done_status",
+            "cleaning.tools.flux2_klein.component_action_load_pair_tooltip",
+            "cleaning.tools.flux2_klein.component_action_unload_pair_tooltip",
+            "cleaning.tools.flux2_klein.vae_tiling_label",
+            "cleaning.tools.flux2_klein.vae_tiling_hint",
+            "cleaning.tools.flux2_klein.vae_slicing_label",
+            "cleaning.tools.flux2_klein.vae_slicing_hint",
+        ];
+        for (tag, source) in ms_i18n::embedded_locales() {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let entry = |key: &str| -> String {
+                catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"))
+                    .to_owned()
+            };
+            for key in plain {
+                assert!(
+                    !entry(key).trim().is_empty(),
+                    "locale `{tag}`: `{key}` is empty"
+                );
+            }
+            for (key, placeholders) in &interpolated {
+                let text = entry(key);
+                for placeholder in placeholders {
+                    assert!(
+                        text.contains(placeholder),
+                        "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not"
+                    );
+                }
+            }
+            // Every residency and every action needs a name of its own: two states drawn
+            // with the same word would make the block unreadable in that language.
+            let mut residencies = Vec::new();
+            for suffix in ["not_loaded", "ram", "gpu", "offloaded", "mixed"] {
+                let text = entry(&format!(
+                    "cleaning.tools.flux2_klein.component_residency_{suffix}"
+                ));
+                assert!(
+                    !residencies.contains(&text),
+                    "locale `{tag}`: two residencies share the wording `{text}`"
+                );
+                residencies.push(text);
+            }
+            for suffix in ["load", "unload", "to_ram", "to_gpu", "warmup"] {
+                for kind in ["button", "tooltip"] {
+                    let key =
+                        format!("cleaning.tools.flux2_klein.component_action_{suffix}_{kind}");
+                    assert!(
+                        !entry(&key).trim().is_empty(),
+                        "locale `{tag}`: `{key}` is empty"
+                    );
+                }
+            }
         }
     }
 
