@@ -33,7 +33,8 @@ rows wrapping to the panel width), «Выбранный инструмент» (
 `CleaningTool::draw_ui`), «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
 quick-clean parameters, its two run buttons and its progress) and «Редактор области»
 (`cleaning.area_editor`: `CleaningTool::draw_main_panel`, the MAIN interface of a tool that edits a
-region on the canvas). Its default arrangement is `cleaning_default_dock_layout` — six panels,
+region on the canvas — for «ИИ-редактор области» that is the SELECTED engine's own parameter panel
+plus the run/apply/cancel row and the frame's status line). Its default arrangement is `cleaning_default_dock_layout` — six panels,
 handed to the dock both by `app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
 dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
 `CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
@@ -87,7 +88,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `canvas.draw`; `wants_main_panel`, which drives the «Редактор области» tab's visibility; and
   `draw_main_panel`, that tab's body, bound by the same "a body may not mutate the tab" rule as
   `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
-  its first consumer (`tools/ai_editor/`), local fill tools, stamp tool, AI-backed
+  its only consumer `tools/ai_editor/`, which HOSTS the AI engines (FLUX.2 klein is the first) and
+  splits their UI across those two tabs, local fill tools, stamp tool, AI-backed
   inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management window and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.

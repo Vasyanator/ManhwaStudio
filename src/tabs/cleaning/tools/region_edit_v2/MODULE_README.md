@@ -40,8 +40,10 @@ that owns the context, the canvas and the project at once:
 ## Files and submodules
 - `geometry.rs`: every rule of the design that is maths. GUI-free; uses `Rect`/`Pos2`/`Vec2` as
   plain geometry only and must never touch `Ui`, `Context`, `Painter` or a texture.
-- `layers.rs`: `MaskStack` (per-layer L8 buffer, O(1) set-pixel counter, tinted preview, partial
-  texture upload, per-stroke undo) and `ResultLayer`. No brush radius policy lives here.
+- `layers.rs`: `MaskLayerSpec` (what a consumer declares about one layer: its tint and the
+  catalog key of its name), `MaskStack` (per-layer L8 buffer, O(1) set-pixel counter, tinted
+  preview, partial texture upload, per-stroke undo) and `ResultLayer`. No brush radius policy
+  lives here.
 - `input.rs`: `HandleKind`, the handle hit rects and arcs, and `moved_rect_px` /
   `resized_rect_px`. Every drag is measured from an anchor captured on `drag_started`, never
   accumulated per frame.
@@ -100,7 +102,8 @@ that owns the context, the canvas and the project at once:
   `FrameButtons` and `FrameOutcome`; a panel queues through `request_apply` / `request_cancel`
   and the next pass re-checks the same enablement table. Queued requests are folded at the TOP
   of the pass, so they survive the off-screen early return — which is exactly the state that
-  strands the user otherwise.
+  strands the user otherwise. «Обработать» has no chrome button at all: the row holds exactly
+  «Применить», «Отменить» and «Стереть маску», so starting a run is always a panel action.
 - **`block_canvas_zoom()` must stay `false` in the host tool.** That flag also disables the
   clean-overlay undo shortcuts for the whole session (`tab.rs`). Block precisely instead:
   `RegionFrame::captures_pointer` over the hitbox, and `drag_active()` for
@@ -113,6 +116,15 @@ that owns the context, the canvas and the project at once:
   of a drag already claimed through a `Response`, and the mouse button state — are gated on one.
 - **Colours: red wins over green.** A locked frame whose size stopped satisfying the consumer is
   drawn red and its status line says it must be released first.
+- **The consumer's shape is PUSHED in, and a change never resizes the frame.** A host publishes
+  `set_constraints`, `set_mask_layers` and `set_allows_empty_mask` when the active consumer
+  changes, and re-pushes the last one every frame because a consumer may derive it from one of
+  its own parameters. `set_constraints` only re-validates: a rectangle the new consumer refuses
+  turns the frame red and blocks «Обработать» rather than being snapped, because the user placed
+  that rectangle by hand. `set_mask_layers` RE-CREATES the stack whenever the declaration
+  differs, so it is refused (logged, no-op) unless the frame is free — the same protection the
+  lock gives painted work everywhere else. `set_allows_empty_mask` relaxes the non-empty-mask
+  requirement of «Обработать» and NOTHING else: the size check and the lock still apply.
 - **The frame applies nothing.** `update` borrows the canvas SHARED and reports intent through
   `FrameOutcome`; the tool performs it with `&mut CanvasView`, and must refuse a result whose
   size differs from `rect_px` — `replace_overlay_region_px` silently rescales.
@@ -143,6 +155,8 @@ that owns the context, the canvas and the project at once:
 - To change the lock rules, the button enablement, the status line or the pass order:
   `frame.rs`.
 - To change how a mask layer stores, previews or uploads its pixels: `layers.rs`.
+- To change what a consumer may declare about a layer, or how a consumer switch re-shapes the
+  frame: `MaskLayerSpec` in `layers.rs` and the three setters in `frame.rs`.
 - To add a consumer, build the tool beside this directory and drive `RegionFrame` from its
   `CleaningTool::draw_overlay_ui`; do not add tool-specific state here. The worked example is
   `../ai_editor/`, the framework's first consumer.

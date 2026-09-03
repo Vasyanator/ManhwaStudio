@@ -2,66 +2,80 @@
 File: ai_editor/mod.rs
 
 Purpose:
-The «ИИ-редактор области» cleaning tool: the first consumer of the on-canvas region-editing
-framework (`../region_edit_v2/`). It owns a `RegionFrame` with TWO mask layers, drives it from
-`CleaningTool::draw_overlay_ui`, and performs the two actions the frame is not allowed to
-perform itself — running the consumer and merging its result into the clean overlay.
-
-In step 1 the consumer is a labelled PLACEHOLDER (`stub.rs`): there is no AI backend here, no
-IPC method and no model. The tool exists so the whole path — paint, process, preview, apply,
-undo — runs for real while the framework is still young.
+The «ИИ-редактор области» cleaning tool: the HOST that puts the on-canvas region-editing
+framework (`../region_edit_v2/`) and a catalog of AI engines (`engines/`) together. The host
+owns the rectangle, the mask stack, the pending result and the apply path; an engine owns its
+parameters, its settings file, its wire protocol and its worker threads.
 
 Main responsibilities:
 - own the frame and hand it the dock-panel rects and the page count every frame
-- turn a `FrameOutcome` into work: process, apply, cancel, clear
+- own the engine catalog, the selected engine, and the frame state that follows from it:
+  size constraints, mask layers, and whether an empty mask is a legal run (D15/D16)
+- push the per-frame facts an engine may not cache: backend/Torch availability, the frame
+  rectangle, and — read back — whether it currently accepts an empty mask
+- run one job: load the source region on a worker, hand it to the engine, poll it, and turn
+  the answer into the frame's pending result or into a user-facing failure (D14)
 - refuse a result whose size is not exactly the frame rect (D7), with a message and a log
-- draw the two panel bodies: the compact brush controls and the main region panel
+- draw the two panel bodies: the compact engine picker + brush controls, and the selected
+  engine's own parameter panel
 
 Key structures:
 - `AiEditorTool`: the `CleaningTool` implementation
-- `StubLayer`: what one mask layer means — its preview tint, its placeholder fill, its name
+- `PendingLoad`: the region-load job in flight, and the rectangle it was started for
 - `ApplyError`: why a pending result could not be merged into the clean overlay
 - `CaptureError`: why the clean-overlay pixels under the frame could not be captured
 
 Key functions:
-- `AiEditorTool::run_stub()`, `apply_result()`: the two `&mut CanvasView` actions
-- `capture_base()`: the clean base under the frame; transparent ONLY for a page with no overlay
+- `start_run()`, `poll_region_load()`, `poll_engine()`: the three steps of one run
+- `apply_result()`: the only `&mut CanvasView` action
+- `select_engine()`: applies an engine's constraints and mask layers to the frame
+- `capture_clean_overlay()`: the clean chunk that is composited over the page crop
 - `check_result_fits()`: the D7 size check, pure and unit-tested
 
+Submodules:
+- `engine`: the `AiEngine` contract between this host and the engines it hosts
+- `engines`: the engine catalog, one module per engine
+
 Notes:
-`block_canvas_zoom()` stays `false` (D5): that flag also disables the clean-overlay undo
-shortcuts for the whole session. Blocking is precise instead — `captures_canvas_pointer` over
-the frame's hitbox and `block_canvas_drag_scroll_on_primary` while a frame drag is in flight.
-Canvas drag-scroll additionally needs Space held (`canvas/scene.rs`), so mask painting can
-never scroll the page out from under the brush.
-Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md`.
+NOTHING here decodes an image on the GUI thread: the source region is produced by the shared
+region loader worker of `base.rs` (`spawn_region_loader_thread`, reused rather than copied,
+D10/D14), and the engine runs its own workers. `block_canvas_zoom()` stays `false` (D5): that
+flag also disables the clean-overlay undo shortcuts for the whole session. Blocking is precise
+instead — `captures_canvas_pointer` over the hitbox and `block_canvas_drag_scroll_on_primary`
+only during a live gesture. Canvas drag-scroll additionally needs Space held
+(`canvas/scene.rs`), so mask painting can never scroll the page out from under the brush.
+Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
-mod stub;
+mod engine;
+mod engines;
 
-use super::base::{CleaningTool, StrokePoint, capture_overlay_chunk, overlay_rect_to_scene_rect};
-use super::region_edit_v2::frame::{FrameHost, FrameLock, RegionFrame};
+use super::base::{
+    CleaningTool, RegionLoadRequest, RegionLoadResult, StrokePoint, capture_overlay_chunk, overlay_rect_to_scene_rect,
+    spawn_region_loader_thread,
+};
+use super::region_edit_v2::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::region_edit_v2::geometry::{FrameConstraints, SizeViolation};
 use super::region_edit_v2::layers::ResultLayer;
 use crate::canvas::{CanvasView, OverlayRectPx};
 use crate::project::ProjectData;
 use crate::widgets::WheelSlider;
 use eframe::egui;
-use egui::{Color32, Pos2};
+use egui::Pos2;
+use engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 
-/// Size requirements the PLACEHOLDER consumer imposes on the frame.
+/// Size requirements a frame carries while NO engine could be selected.
 ///
-/// They are the shape a real inpainting model imposes — a latent-friendly multiple, a useful
-/// shortest side, a memory ceiling and an aspect ceiling — with values chosen so the frame's
-/// snapping and its red "invalid size" state can be exercised. They are handed to
-/// `RegionFrame::new` once, at construction: the frame has no setter for them, and a step-2
-/// consumer that must switch constraints at run time adds one together with its caller
-/// (`dev-docs/region_edit_v2_plan.md` §11).
-const STUB_CONSTRAINTS: FrameConstraints = FrameConstraints {
-    multiple: 8,
-    min_side: 64,
-    max_area: Some(4 * 1024 * 1024),
-    max_aspect: Some(8.0),
+/// Reachable only when `engines::all_engines()` returns an empty catalog, which is a build
+/// mistake rather than a runtime state — the constructor logs it. The values impose nothing, so
+/// the frame stays grey and «Обработать» is refused for want of an engine, not for its size.
+const NO_ENGINE_CONSTRAINTS: FrameConstraints = FrameConstraints {
+    multiple: 1,
+    min_side: 1,
+    max_area: None,
+    max_aspect: None,
 };
 
 /// Smallest and largest brush radius, in region pixels, the compact panel offers.
@@ -71,46 +85,8 @@ const STUB_CONSTRAINTS: FrameConstraints = FrameConstraints {
 const BRUSH_RADIUS_MIN_PX: usize = 1;
 const BRUSH_RADIUS_MAX_PX: usize = 200;
 
-/// What one mask layer of this tool means.
-///
-/// The three facts live together because they must not drift apart: the preview the user
-/// paints with, the colour the placeholder writes for it, and the name both panels show. The
-/// LENGTH of `AI_EDITOR_LAYERS` is also the frame's layer count.
-#[derive(Debug, Clone, Copy)]
-struct StubLayer {
-    /// Catalog key of the layer's name. Resolved at draw time, never cached, so the name
-    /// follows a language switch.
-    name_key: &'static str,
-    /// Colour of the layer's translucent preview inside the frame.
-    tint: Color32,
-    /// Colour the placeholder writes into the result where this layer is painted.
-    fill: Color32,
-}
-
-/// The two mask layers of the step-1 tool, in painting order: a later layer wins where two
-/// overlap, in the preview and in the placeholder result alike.
-const AI_EDITOR_LAYERS: [StubLayer; 2] = [
-    StubLayer {
-        name_key: "cleaning.tools.area_editor.layer_white",
-        tint: Color32::from_rgb(90, 180, 255),
-        fill: Color32::WHITE,
-    },
-    StubLayer {
-        name_key: "cleaning.tools.area_editor.layer_grey",
-        tint: Color32::from_rgb(255, 150, 80),
-        fill: Color32::from_rgb(128, 128, 128),
-    },
-];
-
-/// Localized name of layer `idx`, or its index when the tool is asked about a layer it does
-/// not define (unreachable while the frame is built from `AI_EDITOR_LAYERS`).
-#[must_use]
-fn layer_name(idx: usize) -> String {
-    AI_EDITOR_LAYERS.get(idx).map_or_else(
-        || (idx + 1).to_string(),
-        |layer| ms_i18n::lookup(layer.name_key).unwrap_or(layer.name_key).to_string(),
-    )
-}
+/// The picker sections, in the order they are drawn. A section with no engine is skipped.
+const ENGINE_SECTIONS: [EngineSection; 2] = [EngineSection::WithoutPrompt, EngineSection::WithPrompt];
 
 /// Why a pending result could not be merged into the clean overlay.
 ///
@@ -179,10 +155,10 @@ fn check_result_fits(
 
 /// Why the clean-overlay pixels under the frame could not be captured.
 ///
-/// A capture failure is a real error, never a silent fallback: the ONLY case that legitimately
-/// yields a transparent base is a page with no clean overlay allocated at all, which is that
-/// page's true clean state (`dev-docs/region_edit_v2_plan.md` §11). Every other outcome would
-/// mean applying the result wipes real clean-overlay pixels with transparency, unnoticed.
+/// A capture failure is a real error, never a silent fallback: a page whose clean overlay is
+/// not allocated at all simply HAS no clean pixels, and the loader composites nothing over the
+/// page crop for it. Every other outcome would mean handing the engine a region that does not
+/// show what the user is looking at, unnoticed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum CaptureError {
     /// The page is not laid out, or the region does not map onto its overlay.
@@ -217,27 +193,113 @@ struct ToolMessage {
     error: bool,
 }
 
-/// The step-1 area editor: an on-canvas `RegionFrame` plus a placeholder consumer.
-#[derive(Debug)]
+/// The region-load job in flight, and what it was started for.
+///
+/// The rectangle is captured HERE rather than re-read from the frame when the load lands: the
+/// frame is locked for the whole run, so the two cannot diverge, and carrying it makes the
+/// size validation of the arriving region a comparison against the job's own contract.
+#[derive(Debug, Clone, Copy)]
+struct PendingLoad {
+    job_id: u64,
+    page_idx: usize,
+    rect: OverlayRectPx,
+}
+
+/// The «ИИ-редактор области» tool: an on-canvas `RegionFrame` in front of a catalog of engines.
 pub struct AiEditorTool {
     frame: RegionFrame,
+    /// Every hosted engine, built once at construction: they hold live channels and worker
+    /// state, so they are kept for the session rather than rebuilt per frame.
+    engines: Vec<Box<dyn AiEngine>>,
+    /// Index into `engines` of the engine the panels and the run path address. Out of range
+    /// only for an empty catalog, which every accessor treats as "no engine".
+    selected: usize,
     /// Dock-panel rects of THIS frame, handed over by the tab before `draw_overlay_ui`. They
     /// are cut out of the viewport so the frame never hides behind a panel.
     panel_rects: Vec<egui::Rect>,
     message: Option<ToolMessage>,
+    /// Last availability the tab pushed, forwarded to the selected engine every frame.
+    backend_available: bool,
+    torch_available: bool,
+    /// The shared region loader (`base.rs`), reused rather than copied (D10/D14): it decodes
+    /// the page off the GUI thread and composites the clean overlay over the crop.
+    load_tx: Sender<Option<RegionLoadRequest>>,
+    load_rx: Receiver<RegionLoadResult>,
+    load_thread: Option<JoinHandle<()>>,
+    next_job_id: u64,
+    /// `Some` between «Обработать» and the moment the region reaches the engine. Clearing it
+    /// abandons the job: the answer is then dropped on its job id.
+    pending_load: Option<PendingLoad>,
+}
+
+impl std::fmt::Debug for AiEditorTool {
+    /// Hand-written: `Box<dyn AiEngine>` is not `Debug`, and an engine's state is pixel and
+    /// channel data that would drown the frame's own fields anyway.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiEditorTool")
+            .field("frame", &self.frame)
+            .field("engines", &self.engines.iter().map(|engine| engine.id()).collect::<Vec<_>>())
+            .field("selected", &self.selected)
+            .field("pending_load", &self.pending_load)
+            .finish()
+    }
 }
 
 impl Default for AiEditorTool {
     fn default() -> Self {
+        let engines = engines::all_engines();
+        let (constraints, layers) = match engines.first() {
+            Some(engine) => (engine.constraints(), engine.mask_layers()),
+            None => {
+                crate::runtime_log::log_error(
+                    "[cleaning/ai_editor] the engine catalog is empty: the area editor can paint a mask but can run nothing",
+                );
+                (NO_ENGINE_CONSTRAINTS, Vec::new())
+            }
+        };
+        let (load_tx, load_rx, load_thread) = spawn_region_loader_thread();
         Self {
-            frame: RegionFrame::new(STUB_CONSTRAINTS, &AI_EDITOR_LAYERS.map(|layer| layer.tint)),
+            frame: RegionFrame::new(constraints, &layers),
+            engines,
+            selected: 0,
             panel_rects: Vec::new(),
             message: None,
+            backend_available: false,
+            torch_available: false,
+            load_tx,
+            load_rx,
+            load_thread: Some(load_thread),
+            next_job_id: 1,
+            pending_load: None,
+        }
+    }
+}
+
+impl Drop for AiEditorTool {
+    /// Stops the region loader worker. Without it the thread outlives the tool and holds the
+    /// last decoded page — tens of megabytes — for the rest of the session.
+    fn drop(&mut self) {
+        // The worker is already gone if the send fails; there is nothing to report and nothing
+        // to recover, so the error is deliberately discarded here and only here.
+        let _ = self.load_tx.send(None);
+        if let Some(thread) = self.load_thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
 impl AiEditorTool {
+    /// The selected engine, or `None` when the catalog is empty.
+    #[must_use]
+    fn engine(&self) -> Option<&dyn AiEngine> {
+        self.engines.get(self.selected).map(AsRef::as_ref)
+    }
+
+    /// The selected engine, mutably. `None` when the catalog is empty.
+    fn engine_mut(&mut self) -> Option<&mut (dyn AiEngine + 'static)> {
+        self.engines.get_mut(self.selected).map(AsMut::as_mut)
+    }
+
     /// Whether the mask may still be edited: no result waits and nothing is running.
     ///
     /// Editing the mask under a pending result would make that result describe a mask that no
@@ -266,20 +328,53 @@ impl AiEditorTool {
         self.message = Some(ToolMessage { text, error: true });
     }
 
-    /// The clean-overlay pixels under `rect` of page `page_idx`.
+    /// Selects engine `idx` and re-shapes the frame around it (D15/D16).
     ///
-    /// A page whose clean overlay has not been allocated yet has no clean pixels at all, so the
-    /// base is fully transparent — that is the page's true state, not a stand-in, and it is the
-    /// only case in which a transparent base is produced. Once an overlay EXISTS, a capture
-    /// that fails or comes back the wrong size is an error: substituting transparency there
-    /// would make the applied result erase real clean pixels with nothing, silently.
+    /// Refused while the frame is not free: engines declare different mask layers, so the
+    /// switch would discard painted work. The picker is disabled in that state, and this guard
+    /// is the same rule stated where it is enforceable.
+    ///
+    /// The new constraints are applied WITHOUT resizing the frame: a rectangle the new engine
+    /// refuses turns the frame red and blocks «Обработать», which is the designed way for the
+    /// user to see that this engine wants a different size.
+    fn select_engine(&mut self, idx: usize) {
+        if idx == self.selected || idx >= self.engines.len() || !self.frame.lock().is_free() {
+            return;
+        }
+        // A run cannot be in flight (the frame would be locked), but a load job might have been
+        // abandoned by a cancel that has not been polled yet; dropping it here keeps its answer
+        // from reaching the newly selected engine.
+        self.pending_load = None;
+        self.selected = idx;
+        self.message = None;
+        let Some(engine) = self.engines.get(idx) else {
+            return;
+        };
+        let constraints = engine.constraints();
+        let layers = engine.mask_layers();
+        let allows_empty = engine.allows_empty_mask();
+        self.frame.set_constraints(constraints);
+        self.frame.set_mask_layers(&layers);
+        self.frame.set_allows_empty_mask(allows_empty);
+    }
+
+    /// The clean-overlay pixels under `rect` of page `page_idx`, or `None` when the page has
+    /// no clean overlay allocated at all.
+    ///
+    /// `None` is the page's TRUE clean state, not a stand-in: the loader then composites
+    /// nothing over the page crop, which is exactly right. Once an overlay EXISTS, a capture
+    /// that fails or comes back the wrong size is an error — handing the engine the bare page
+    /// there would hide every clean edit the user already made.
     ///
     /// # Errors
     /// [`CaptureError::NotMapped`] when the page is not laid out or the region does not map
     /// onto its overlay, and [`CaptureError::ChunkSize`] when the captured chunk is not exactly
-    /// the region size. (`build_stub_result` re-checks the chunk against the MASK STACK's size;
-    /// this check is against the frame's rectangle and carries the page index into the log.)
-    fn capture_base(canvas: &CanvasView, page_idx: usize, rect: OverlayRectPx) -> Result<egui::ColorImage, CaptureError> {
+    /// the region size.
+    fn capture_clean_overlay(
+        canvas: &CanvasView,
+        page_idx: usize,
+        rect: OverlayRectPx,
+    ) -> Result<Option<egui::ColorImage>, CaptureError> {
         let not_mapped = CaptureError::NotMapped {
             page: page_idx,
             x: rect.x,
@@ -288,7 +383,7 @@ impl AiEditorTool {
             h: rect.h,
         };
         let Some([overlay_w, overlay_h]) = canvas.overlay_size(page_idx) else {
-            return Ok(egui::ColorImage::filled([rect.w, rect.h], Color32::TRANSPARENT));
+            return Ok(None);
         };
         let page_rect = canvas.page_scene_rect(page_idx).ok_or(not_mapped)?;
         let scene_rect = overlay_rect_to_scene_rect(page_rect, overlay_w, overlay_h, rect).ok_or(not_mapped)?;
@@ -304,15 +399,15 @@ impl AiEditorTool {
                 chunk_h: chunk.size[1],
             });
         }
-        Ok(chunk)
+        Ok(Some(chunk))
     }
 
-    /// Runs the placeholder consumer and hands the frame its result.
+    /// Step 1 of a run: asks the loader worker for the source region under the frame (D14).
     ///
-    /// Synchronous on purpose: the placeholder is one image clone plus one pass per mask layer
-    /// over the region, with no decode, no file and no network, so it cannot block the GUI
-    /// thread (D9). The real consumer will run on a worker and report through a channel.
-    fn run_stub(&mut self, canvas: &CanvasView) {
+    /// The frame is marked as processing immediately, so it is locked for the whole load — the
+    /// rectangle the answer is validated against cannot move under it. Nothing is decoded here:
+    /// the GUI thread only captures the clean-overlay chunk it already has in memory.
+    fn start_run(&mut self, canvas: &CanvasView, project: &ProjectData) {
         let (Some(page_idx), Some(rect)) = (self.frame.page_idx(), self.frame.rect_px()) else {
             self.report_error(
                 t!("cleaning.tools.area_editor.error_no_frame").to_string(),
@@ -320,24 +415,219 @@ impl AiEditorTool {
             );
             return;
         };
-        let base = match Self::capture_base(canvas, page_idx, rect) {
-            Ok(base) => base,
+        let Some(engine) = self.engine() else {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_no_engine").to_string(),
+                &"the engine catalog is empty",
+            );
+            return;
+        };
+        if let Some(reason) = engine.run_block_reason() {
+            let detail = format!("engine {} refused the run", engine.id());
+            self.report_error(reason, &detail);
+            return;
+        }
+        let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) else {
+            self.report_error(
+                tf!("cleaning.tools.area_editor.error_page_missing", page = page_idx + 1),
+                &format!("page {page_idx} is not in the project"),
+            );
+            return;
+        };
+        let page_path = page.path.clone();
+        let Some(source_size) = page_source_size(canvas, page_idx, canvas.zoom()) else {
+            self.report_error(
+                tf!("cleaning.tools.area_editor.error_page_missing", page = page_idx + 1),
+                &format!("page {page_idx} is not laid out, so its source size is unknown"),
+            );
+            return;
+        };
+        let overlay_chunk = match Self::capture_clean_overlay(canvas, page_idx, rect) {
+            Ok(chunk) => chunk,
             Err(error) => {
                 self.report_error(tf!("cleaning.tools.area_editor.error_no_overlay", page = page_idx + 1), &error);
                 return;
             }
         };
-        let fills = AI_EDITOR_LAYERS.map(|layer| layer.fill);
-        match stub::build_stub_result(&base, self.frame.masks(), &fills) {
-            Ok(image) => {
-                self.frame.set_result(Some(ResultLayer::new(image)));
-                self.report_info(t!("cleaning.tools.area_editor.processed_status").to_string());
-            }
-            Err(error) => self.report_error(
-                t!("cleaning.tools.area_editor.error_process_failed").to_string(),
-                &error,
-            ),
+
+        let job_id = self.next_job_id;
+        self.next_job_id = self.next_job_id.saturating_add(1);
+        let request = RegionLoadRequest {
+            job_id,
+            page_idx,
+            source_rect: rect,
+            source_size,
+            page_path,
+            overlay_chunk,
+            shared_overlays_model: canvas.clean_overlays_model_handle(),
+        };
+        if self.load_tx.send(Some(request)).is_err() {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_region_load").to_string(),
+                &"the region loader worker is gone",
+            );
+            return;
         }
+        self.pending_load = Some(PendingLoad { job_id, page_idx, rect });
+        self.frame.set_processing(true);
+        self.report_info(t!("cleaning.tools.area_editor.loading_region_status").to_string());
+    }
+
+    /// Step 2: drains the loader and hands a finished region to the engine.
+    ///
+    /// A result whose job id is not the awaited one belongs to an abandoned run and is dropped.
+    /// A dead worker is reported once, against the job it stranded, rather than leaving the
+    /// frame locked on a run that can never finish.
+    fn poll_region_load(&mut self) {
+        loop {
+            match self.load_rx.try_recv() {
+                Ok(result) => {
+                    if self.pending_load.map(|pending| pending.job_id) != Some(result.job_id) {
+                        continue;
+                    }
+                    let Some(pending) = self.pending_load.take() else {
+                        continue;
+                    };
+                    match result.image {
+                        Ok(region) => self.hand_region_to_engine(pending, region),
+                        Err(error) => {
+                            self.frame.set_processing(false);
+                            self.report_error(t!("cleaning.tools.area_editor.error_region_load").to_string(), &error);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.pending_load.take().is_some() {
+                        self.frame.set_processing(false);
+                        self.report_error(
+                            t!("cleaning.tools.area_editor.error_region_load").to_string(),
+                            &"the region loader worker died with a job in flight",
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Validates a loaded region against the job's rectangle and starts the engine run.
+    ///
+    /// Every size the trait promises an engine is checked HERE, because the loader derives its
+    /// crop from the decoded FILE and a page file whose dimensions disagree with the overlay
+    /// yields a region of a different size. Handing that on would make the engine refuse a
+    /// request the host was supposed to guarantee.
+    fn hand_region_to_engine(&mut self, pending: PendingLoad, region: egui::ColorImage) {
+        let rect = pending.rect;
+        let expected = [rect.w, rect.h];
+        if region.size != expected {
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_region_size").to_string(),
+                &format!(
+                    "the loaded region is {}x{}, the frame region is {}x{}",
+                    region.size[0], region.size[1], rect.w, rect.h
+                ),
+            );
+            return;
+        }
+        let masks = self.frame.masks();
+        let mask_bytes = rect.w.saturating_mul(rect.h);
+        if masks.size() != (rect.w, rect.h) {
+            let (mask_w, mask_h) = masks.size();
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_region_size").to_string(),
+                &format!("the mask stack is {mask_w}x{mask_h}, the frame region is {}x{}", rect.w, rect.h),
+            );
+            return;
+        }
+        let masks: Vec<Vec<u8>> = (0..masks.layer_count()).map(|idx| masks.bytes(idx).to_vec()).collect();
+        if masks.iter().any(|layer| layer.len() != mask_bytes) {
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_region_size").to_string(),
+                &format!("a mask layer does not hold {mask_bytes} bytes: {:?}", masks.iter().map(Vec::len).collect::<Vec<_>>()),
+            );
+            return;
+        }
+
+        let request = EngineRunRequest {
+            page_idx: pending.page_idx,
+            rect_px: rect,
+            region,
+            masks,
+        };
+        let outcome = match self.engine_mut() {
+            Some(engine) => engine.start(request),
+            None => Err(t!("cleaning.tools.area_editor.error_no_engine").to_string()),
+        };
+        match outcome {
+            Ok(()) => self.report_info(t!("cleaning.tools.area_editor.run_started_status").to_string()),
+            Err(reason) => {
+                self.frame.set_processing(false);
+                self.report_error(reason, &"the engine refused the run request");
+            }
+        }
+    }
+
+    /// Step 3: polls the selected engine and turns a terminal answer into frame state.
+    ///
+    /// Runs EVERY frame, panel visible or not: an engine drains its channels here, so skipping
+    /// it would strand a finished run — and, for FLUX.2 klein, would also stop the debounced
+    /// settings saver that runs inside `poll`, silently losing model paths and prompts.
+    fn poll_engine(&mut self, ctx: &egui::Context) {
+        let Some(engine) = self.engine_mut() else {
+            return;
+        };
+        let poll = engine.poll(ctx);
+        match poll {
+            // A run that is still going, or none at all: the frame's own lock already says so.
+            EnginePoll::Idle | EnginePoll::Running => {}
+            EnginePoll::Done(image) => self.accept_result(image),
+            EnginePoll::Failed(reason) => {
+                self.frame.set_processing(false);
+                self.report_error(reason, &"the engine reported a failed run");
+            }
+        }
+    }
+
+    /// Stores a finished run as the frame's pending result, or refuses it on size (D7).
+    ///
+    /// The check is against the frame's CURRENT rectangle, which is the one the run started
+    /// with — the frame is locked for the whole run — so a mismatch means the engine answered
+    /// about something else and the result must not be applied anywhere.
+    fn accept_result(&mut self, image: egui::ColorImage) {
+        self.frame.set_processing(false);
+        let Some(rect) = self.frame.rect_px() else {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                &"a result arrived for a frame that has no rectangle",
+            );
+            return;
+        };
+        if image.size != [rect.w, rect.h] {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_size_mismatch").to_string(),
+                &format!(
+                    "the engine answered {}x{}, the frame region is {}x{}",
+                    image.size[0], image.size[1], rect.w, rect.h
+                ),
+            );
+            return;
+        }
+        self.frame.set_result(Some(ResultLayer::new(image)));
+        self.report_info(t!("cleaning.tools.area_editor.result_ready_status").to_string());
+    }
+
+    /// Abandons whatever is in flight: the engine's run, and the region load that precedes it.
+    fn cancel_run(&mut self) {
+        self.pending_load = None;
+        if let Some(engine) = self.engine_mut() {
+            engine.cancel();
+        }
+        self.frame.set_processing(false);
+        self.frame.set_result(None);
     }
 
     /// Merges the pending result into the clean overlay and releases the frame.
@@ -377,7 +667,57 @@ impl AiEditorTool {
         self.report_info(t!("cleaning.tools.area_editor.applied_status").to_string());
     }
 
-    /// Draws the brush row of the compact panel: radius, paint/erase, undo and clear.
+    /// Draws the engine picker: toggle buttons in one row per non-empty section (§13.1).
+    ///
+    /// Disabled as a whole while the frame is locked (D15): engines declare different mask
+    /// layers, so a switch would have to discard painted work. The disabled tooltip says that,
+    /// because "the button is grey" is not a reason a user can act on.
+    fn draw_engine_picker(&mut self, ui: &mut egui::Ui) {
+        if self.engines.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, t!("cleaning.tools.area_editor.error_no_engine"));
+            return;
+        }
+        let locked = !self.frame.lock().is_free();
+        let mut requested: Option<usize> = None;
+        for section in ENGINE_SECTIONS {
+            // Captions are resolved here, before the row closure, so the closure borrows only
+            // this local list and not `self.engines`.
+            let entries: Vec<(usize, String)> = self
+                .engines
+                .iter()
+                .enumerate()
+                .filter(|(_, engine)| engine.section() == section)
+                .map(|(idx, engine)| (idx, engine.title()))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            ui.label(match section {
+                EngineSection::WithoutPrompt => t!("cleaning.tools.area_editor.section_without_prompt"),
+                EngineSection::WithPrompt => t!("cleaning.tools.area_editor.section_with_prompt"),
+            });
+            ui.horizontal_wrapped(|ui| {
+                // Inside a wrapping layout egui defaults widget text to `Wrap`, which would
+                // break a long engine name over two LINES instead of moving its button to the
+                // next ROW — the same fix `tab.rs::draw_tool_button_rows` makes.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for (idx, title) in entries {
+                    let response = ui.add_enabled(!locked, egui::Button::new(title).selected(idx == self.selected));
+                    if response
+                        .on_disabled_hover_text(t!("cleaning.tools.area_editor.engine_locked_hint"))
+                        .clicked()
+                    {
+                        requested = Some(idx);
+                    }
+                }
+            });
+        }
+        if let Some(idx) = requested {
+            self.select_engine(idx);
+        }
+    }
+
+    /// Draws the brush row of the compact panel: radius and paint/erase mode.
     fn draw_brush_controls(&mut self, ui: &mut egui::Ui) {
         let mut radius = self.frame.brush_mut().radius_px();
         if ui
@@ -402,12 +742,22 @@ impl AiEditorTool {
     }
 
     /// Draws the mask-layer picker of the compact panel.
+    ///
+    /// The layer names come from the FRAME, which holds what the active engine declared, so a
+    /// switch renames the buttons without this panel knowing anything about engines. A single
+    /// layer needs no picker — the switch would be a button that cannot do anything.
     fn draw_layer_picker(&mut self, ui: &mut egui::Ui) {
+        if self.frame.masks().layer_count() < 2 {
+            return;
+        }
         ui.label(t!("cleaning.tools.area_editor.mask_layer_label"));
         let mut active = self.frame.masks().active();
+        let labels: Vec<(usize, String)> = (0..self.frame.masks().layer_count())
+            .map(|idx| (idx, self.frame.layer_label(idx)))
+            .collect();
         ui.horizontal_wrapped(|ui| {
-            for idx in 0..self.frame.masks().layer_count() {
-                ui.selectable_value(&mut active, idx, layer_name(idx));
+            for (idx, label) in labels {
+                ui.selectable_value(&mut active, idx, label);
             }
         });
         self.frame.masks_mut().set_active(active);
@@ -417,6 +767,7 @@ impl AiEditorTool {
     fn draw_mask_actions(&mut self, ui: &mut egui::Ui) {
         let editable = self.mask_editable();
         let has_mask = !self.frame.masks().is_empty();
+        let mut nothing_to_undo = false;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
@@ -426,7 +777,7 @@ impl AiEditorTool {
                 .clicked()
                 && !self.frame.masks_mut().undo()
             {
-                self.report_info(t!("cleaning.tools.area_editor.nothing_to_undo").to_string());
+                nothing_to_undo = true;
             }
             if ui
                 .add_enabled(
@@ -438,16 +789,56 @@ impl AiEditorTool {
                 self.frame.masks_mut().clear_all();
             }
         });
+        if nothing_to_undo {
+            self.report_info(t!("cleaning.tools.area_editor.nothing_to_undo").to_string());
+        }
     }
 
-    /// Draws «Применить» and «Отменить» — the two actions that resolve a pending result.
+    /// One line per mask layer with its painted-pixel count, while anything is painted.
     ///
-    /// The captions and the enablement come from the frame, and the presses go back through
-    /// `RegionFrame::request_*`, so this panel and the frame's own button row can never
-    /// disagree about what is allowed or perform two different things.
-    fn draw_result_actions(&mut self, ui: &mut egui::Ui) {
+    /// It answers the one question neither the frame's chrome nor its status line can: the
+    /// frame stays LOCKED — green, unmovable, unresizable — while a SINGLE mask pixel is set
+    /// anywhere inside it, and a stray dot is invisible at a low zoom. The counts name the
+    /// layer that still holds something, so the user can undo that stroke instead of erasing
+    /// the whole mask to get the frame back.
+    fn draw_mask_summary(&self, ui: &mut egui::Ui) {
+        let masks = self.frame.masks();
+        if masks.is_empty() {
+            return;
+        }
+        for idx in 0..masks.layer_count() {
+            ui.small(tf!(
+                "cleaning.tools.area_editor.layer_row",
+                name = self.frame.layer_label(idx),
+                count = masks.layer_set_px(idx)
+            ));
+        }
+    }
+
+    /// Draws the host's own part of the main panel: the run button, the two actions that
+    /// resolve a pending result, the frame's status line and the last message.
+    ///
+    /// «Обработать» lives HERE and nowhere else: the frame's own chrome row carries only
+    /// Применить / Отменить / Стереть маску. Applying and cancelling are repeated here because
+    /// a frame holding a result is LOCKED and a locked frame may scroll out of view entirely —
+    /// its chrome row is then unreachable and this panel is the only way to resolve the result.
+    fn draw_host_actions(&mut self, ui: &mut egui::Ui) {
         let enabled = self.frame.buttons();
+        let block_reason = self.engine().and_then(AiEngine::run_block_reason);
         ui.horizontal_wrapped(|ui| {
+            let process = ui.add_enabled(
+                enabled.process && block_reason.is_none(),
+                egui::Button::new(t!("cleaning.tools.area_editor.process_button")),
+            );
+            // The engine's own reason is more specific than the generic hint, so it wins when
+            // there is one: "no model selected" beats "paint a mask first".
+            let process = match block_reason.as_ref() {
+                Some(reason) => process.on_disabled_hover_text(reason),
+                None => process.on_hover_text(t!("cleaning.tools.area_editor.process_hint")),
+            };
+            if process.clicked() {
+                self.frame.request_process();
+            }
             if ui
                 .add_enabled(enabled.apply, egui::Button::new(t!("cleaning.region_frame.button.apply")))
                 .clicked()
@@ -461,21 +852,34 @@ impl AiEditorTool {
                 self.frame.request_cancel();
             }
         });
+        ui.label(self.frame.status_text());
+        if let Some(violation) = self.frame.size_violation() {
+            let text = match violation {
+                SizeViolation::NotMultiple => t!("cleaning.tools.area_editor.violation_multiple"),
+                SizeViolation::TooSmall => t!("cleaning.tools.area_editor.violation_min_side"),
+                SizeViolation::AreaTooLarge => t!("cleaning.tools.area_editor.violation_max_area"),
+                SizeViolation::AspectTooSteep => t!("cleaning.tools.area_editor.violation_aspect"),
+            };
+            ui.colored_label(ui.visuals().error_fg_color, text);
+            self.draw_size_requirements(ui);
+        }
+        if let Some(message) = self.message.as_ref() {
+            if message.error {
+                ui.colored_label(ui.visuals().error_fg_color, &message.text);
+            } else {
+                ui.small(&message.text);
+            }
+        }
     }
 
-    /// Draws the frame's page, its rectangle and the active size requirements.
-    fn draw_geometry_section(&self, ui: &mut egui::Ui) {
-        let (Some(page_idx), Some(rect)) = (self.frame.page_idx(), self.frame.rect_px()) else {
-            return;
-        };
-        ui.label(tf!(
-            "cleaning.tools.area_editor.frame_geometry",
-            page = page_idx + 1,
-            x = rect.x,
-            y = rect.y,
-            w = rect.w,
-            h = rect.h
-        ));
+    /// Spells out the size the ACTIVE engine wants, under the sentence that says the current
+    /// one is wrong.
+    ///
+    /// Drawn only while the frame is invalid: the numbers are what the user needs to resize
+    /// towards, and naming them at every other moment would be noise beside a frame that is
+    /// already the right shape. This is also the only place a switch to an engine with
+    /// stricter requirements becomes actionable rather than merely red (D16).
+    fn draw_size_requirements(&self, ui: &mut egui::Ui) {
         let constraints = self.frame.constraints();
         ui.small(tf!(
             "cleaning.tools.area_editor.constraint_multiple",
@@ -487,27 +891,6 @@ impl AiEditorTool {
         }
         if let Some(max_aspect) = constraints.max_aspect {
             ui.small(tf!("cleaning.tools.area_editor.constraint_max_aspect", aspect = max_aspect));
-        }
-        if let Some(violation) = self.frame.size_violation() {
-            let text = match violation {
-                SizeViolation::NotMultiple => t!("cleaning.tools.area_editor.violation_multiple"),
-                SizeViolation::TooSmall => t!("cleaning.tools.area_editor.violation_min_side"),
-                SizeViolation::AreaTooLarge => t!("cleaning.tools.area_editor.violation_max_area"),
-                SizeViolation::AspectTooSteep => t!("cleaning.tools.area_editor.violation_aspect"),
-            };
-            ui.colored_label(ui.visuals().error_fg_color, text);
-        }
-    }
-
-    /// Draws one row per mask layer with its painted-pixel count.
-    fn draw_layers_section(&self, ui: &mut egui::Ui) {
-        let masks = self.frame.masks();
-        for idx in 0..masks.layer_count() {
-            ui.small(tf!(
-                "cleaning.tools.area_editor.layer_row",
-                name = layer_name(idx),
-                count = masks.layer_set_px(idx)
-            ));
         }
     }
 }
@@ -521,25 +904,29 @@ impl CleaningTool for AiEditorTool {
         t!("cleaning.tools.area_editor.title")
     }
 
-    /// The step-1 placeholder runs locally: it needs no Python backend and no Torch.
+    /// Whatever the SELECTED engine needs. The tab gates the tool button on this, so a tool
+    /// whose current engine wants Torch is offered exactly like the Torch tools beside it.
     fn pytorch_required(&self) -> bool {
-        false
+        self.engine().is_some_and(AiEngine::requires_torch)
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
         // The frame keeps its placement (`reset` does), but nothing it held may survive a tool
         // switch: an unapplied result would come back as a preview over a page the user has
-        // meanwhile edited.
+        // meanwhile edited, and a run in flight would answer about a rectangle nobody sees.
+        self.cancel_run();
         self.frame.reset();
         self.message = None;
     }
 
-    /// The compact part of the tool's interface, in «Выбранный инструмент».
+    /// The compact part of the tool's interface, in «Выбранный инструмент» (§13.1).
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        self.draw_brush_controls(ui);
+        self.draw_engine_picker(ui);
         ui.separator();
+        self.draw_brush_controls(ui);
         self.draw_layer_picker(ui);
         self.draw_mask_actions(ui);
+        self.draw_mask_summary(ui);
         ui.separator();
         ui.small(t!("cleaning.tools.area_editor.main_panel_hint"));
     }
@@ -548,42 +935,29 @@ impl CleaningTool for AiEditorTool {
         true
     }
 
-    /// The main part, in the «Редактор области» dock panel.
+    /// The main part, in the «Редактор области» dock panel: the selected engine's own
+    /// parameters, and the host actions and status under them (§13.1).
     ///
     /// It runs inside `CanvasView::draw` and therefore mutates only the tool: every action
     /// raises a flag the frame consumes at the top of the next pass, re-checked against the
     /// frame's own enablement table.
-    ///
-    /// «Применить» and «Отменить» are repeated here on purpose. A frame holding a pending
-    /// result is LOCKED, and its own button row is only as wide as the frame is on screen, so
-    /// on a zoomed-out strip the user could otherwise reach neither and would have no way to
-    /// resolve the result at all.
     fn draw_main_panel(&mut self, ui: &mut egui::Ui) {
-        ui.small(t!("cleaning.tools.area_editor.placeholder_notice"));
-        ui.separator();
-        self.draw_geometry_section(ui);
-        ui.separator();
-        self.draw_layers_section(ui);
-        ui.separator();
-        if ui
-            .add_enabled(
-                self.frame.buttons().process,
-                egui::Button::new(t!("cleaning.tools.area_editor.process_button")),
-            )
-            .on_hover_text(t!("cleaning.tools.area_editor.process_hint"))
-            .clicked()
-        {
-            self.frame.request_process();
-        }
-        self.draw_result_actions(ui);
-        ui.label(self.frame.status_text());
-        if let Some(message) = self.message.as_ref() {
-            if message.error {
-                ui.colored_label(ui.visuals().error_fg_color, &message.text);
-            } else {
-                ui.small(&message.text);
+        match self.engine_mut() {
+            Some(engine) => engine.draw_parameters(ui),
+            None => {
+                ui.colored_label(ui.visuals().error_fg_color, t!("cleaning.tools.area_editor.error_no_engine"));
             }
         }
+        ui.separator();
+        self.draw_host_actions(ui);
+    }
+
+    fn set_ai_backend_available(&mut self, available: bool) {
+        self.backend_available = available;
+    }
+
+    fn set_ai_backend_torch_available(&mut self, available: bool) {
+        self.torch_available = available;
     }
 
     fn set_panel_rects(&mut self, rects: &[egui::Rect]) {
@@ -591,32 +965,62 @@ impl CleaningTool for AiEditorTool {
         self.panel_rects.extend_from_slice(rects);
     }
 
-    /// The frame's whole per-frame pass, plus whatever it asked for.
+    /// The frame's whole per-frame pass, the engine's per-frame pushes, and one step of the
+    /// run in flight.
     ///
     /// This is the only hook that owns the context, the canvas and the project at once, which
     /// is why the pass lives here rather than in `draw_cursor` (§10.1 of the design).
+    ///
+    /// The order is load-bearing:
+    /// 1. `allows_empty_mask` is read back BEFORE the pass, because the engine may derive it
+    ///    from a parameter the user changed in this same frame's panel body, which ran earlier
+    ///    inside `CanvasView::draw`. A stale copy would silently block or allow a run (§13.5).
+    /// 2. the frame pass settles the rectangle, so the `set_region` push below carries THIS
+    ///    frame's rectangle — pushing it after a run has started would look like a moved frame
+    ///    to an engine that treats that as "a different image" and cancels the run.
+    /// 3. the outcome is acted on, then the load and the engine are polled, so a run started
+    ///    this frame gets its first poll in the next one, never inside its own start.
     fn draw_overlay_ui(&mut self, ctx: &egui::Context, canvas: &mut CanvasView, project: &ProjectData) {
+        let allows_empty = self.engine().is_some_and(AiEngine::allows_empty_mask);
+        self.frame.set_allows_empty_mask(allows_empty);
+
         let host = FrameHost {
             panel_rects: &self.panel_rects,
             page_count: project.pages.len(),
         };
         let outcome = self.frame.update(ctx, canvas, host);
+
+        // `drag_active()` is the frame's own answer to "is a gesture in flight?" — a move
+        // drag, a resize drag or a mask stroke — and it is read AFTER the pass, so the frame
+        // on which the pointer was released already reports settled. A paint stroke cannot
+        // change the rectangle at all, but it is deliberately included: an engine must be
+        // able to treat "settled" as "the user's hand is off the frame".
+        let settled = !self.frame.drag_active();
+        let (backend, torch, region) = (self.backend_available, self.torch_available, self.frame.rect_px());
+        if let Some(engine) = self.engine_mut() {
+            engine.set_backend_available(backend);
+            engine.set_torch_available(torch);
+            engine.set_region(region, settled);
+        }
+
         if outcome.clear_mask_requested {
             self.frame.masks_mut().clear_all();
         }
         if outcome.cancel_requested {
-            self.frame.set_processing(false);
-            self.frame.set_result(None);
+            self.cancel_run();
             self.report_info(t!("cleaning.tools.area_editor.cancelled_status").to_string());
         }
         // Process before apply: the two are mutually exclusive by `FrameButtons`, and running
         // first keeps the order the buttons sit in.
         if outcome.process_requested {
-            self.run_stub(canvas);
+            self.start_run(canvas, project);
         }
         if outcome.apply_requested {
             self.apply_result(canvas);
         }
+
+        self.poll_region_load();
+        self.poll_engine(ctx);
     }
 
     /// The frame's hitbox swallows canvas input; nothing outside it does.
@@ -659,6 +1063,9 @@ impl CleaningTool for AiEditorTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::Color32;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }
@@ -710,24 +1117,88 @@ mod tests {
         assert!(check_result_fits([64, 33], rect(0, 0, 64, 32), None).is_err());
     }
 
-    /// Every layer the tool defines must have a name the catalog can resolve, and the frame is
-    /// built with exactly one preview tint per layer.
+    /// The catalog must not be empty, every engine must name itself uniquely, and every mask
+    /// layer it declares must have a name the catalog can resolve — the picker and the frame's
+    /// layer chips both show those strings.
     #[test]
-    fn every_layer_has_a_name_and_a_tint() {
+    fn every_hosted_engine_is_usable_by_the_picker() {
         let tool = AiEditorTool::default();
-        assert_eq!(tool.frame.masks().layer_count(), AI_EDITOR_LAYERS.len());
-        for idx in 0..AI_EDITOR_LAYERS.len() {
-            assert!(!layer_name(idx).is_empty());
+        assert!(!tool.engines.is_empty(), "the picker would have nothing to offer");
+        let mut ids: Vec<&str> = tool.engines.iter().map(|engine| engine.id()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "engine ids are used as widget id stems and must be unique");
+        for engine in &tool.engines {
+            assert!(!engine.title().is_empty(), "engine {} has no picker caption", engine.id());
+            let layers = engine.mask_layers();
+            assert!(!layers.is_empty(), "engine {} declares no mask layer", engine.id());
+            for layer in &layers {
+                assert!(
+                    ms_i18n::lookup(layer.label_key).is_some(),
+                    "engine {} names a mask layer with an unknown key {}",
+                    engine.id(),
+                    layer.label_key
+                );
+            }
         }
+    }
+
+    /// The frame is built around the engine that is selected at construction, so the very
+    /// first painted stroke already goes into the layers that engine asked for.
+    #[test]
+    fn the_frame_starts_shaped_by_the_selected_engine() {
+        let tool = AiEditorTool::default();
+        let engine = tool.engine().expect("the catalog is not empty");
+        assert_eq!(tool.frame.masks().layer_count(), engine.mask_layers().len());
+        assert_eq!(tool.frame.constraints().multiple, engine.constraints().multiple);
+        assert_eq!(tool.frame.constraints().min_side, engine.constraints().min_side);
+    }
+
+    /// D15: the picker may not switch engines while the frame holds work, because engines
+    /// declare different mask layers and the switch re-creates the stack.
+    #[test]
+    fn a_locked_frame_refuses_an_engine_switch() {
+        let mut tool = AiEditorTool::default();
+        let first = tool.selected;
+        tool.frame.set_processing(true);
+        tool.select_engine(first + 1);
+        assert_eq!(tool.selected, first, "a processing frame must keep its engine");
+        tool.frame.set_processing(false);
+        tool.frame
+            .set_result(Some(ResultLayer::new(egui::ColorImage::filled([2, 2], Color32::WHITE))));
+        tool.select_engine(first + 1);
+        assert_eq!(tool.selected, first, "a frame holding a result must keep its engine too");
+    }
+
+    /// The engine's answer is the only thing that decides whether an empty mask may run, and
+    /// it is re-read rather than cached: FLUX.2 klein derives it from a checkbox in its own
+    /// panel (§13.5), so a copy taken at the switch would go stale on the next click.
+    #[test]
+    fn the_empty_mask_rule_follows_the_selected_engine() {
+        let mut tool = AiEditorTool::default();
+        let allows = tool.engine().is_some_and(AiEngine::allows_empty_mask);
+        tool.frame.set_allows_empty_mask(allows);
+        // The frame relaxes only on demand; without the push it refuses an empty-mask run.
+        tool.frame.set_allows_empty_mask(false);
+        assert!(!tool.frame.buttons().process, "an empty mask blocks the run until an engine allows it");
+    }
+
+    /// The tab gates the tool button on this, so it must describe the engine that would
+    /// actually run rather than the tool as a category.
+    #[test]
+    fn the_torch_requirement_comes_from_the_selected_engine() {
+        let tool = AiEditorTool::default();
+        let expected = tool.engine().is_some_and(AiEngine::requires_torch);
+        assert_eq!(tool.pytorch_required(), expected);
     }
 
     /// D5, pinned. `block_canvas_zoom()` does not only block zooming: `tab.rs` refuses the
     /// clean-overlay Ctrl+Z / Ctrl+Shift+Z shortcuts for any tool that returns `true`
-    /// (`handle_history_hotkeys`, `src/tabs/cleaning/tab.rs:1744-1753`) and the zoom shortcuts
-    /// with it (`zoom_by_shortcut` / `reset_zoom_shortcut`, `:888-908`). Ten of the twelve
-    /// registered tools DO override it to `true`, so copying a sibling is the likely edit —
-    /// and this tool lives on the canvas for the WHOLE editing session, so inheriting `true`
-    /// would kill canvas zoom and clean-overlay undo for the session with nothing else failing.
+    /// (`handle_history_hotkeys`) and the zoom shortcuts with it. Ten of the twelve registered
+    /// tools DO override it to `true`, so copying a sibling is the likely edit — and this tool
+    /// lives on the canvas for the WHOLE editing session, so inheriting `true` would kill
+    /// canvas zoom and clean-overlay undo for the session with nothing else failing.
     #[test]
     fn the_area_editor_never_blocks_canvas_zoom_or_the_undo_shortcuts() {
         let tool = AiEditorTool::default();
@@ -737,9 +1208,9 @@ mod tests {
         assert!(!tool.block_canvas_drag_scroll_on_primary(), "an idle frame blocks nothing");
     }
 
-    /// A transparent base is the page's TRUE clean state only while the page has no overlay
-    /// allocated. Once one exists, substituting transparency for a failed capture would make
-    /// apply erase real clean pixels with nothing, with no message and no log.
+    /// A capture error must name the page and the region: the loader composites the clean
+    /// overlay over the page crop, so a silently skipped chunk would hand the model a region
+    /// without the user's existing clean edits.
     #[test]
     fn a_capture_error_names_the_page_and_the_region() {
         let error = CaptureError::NotMapped { page: 4, x: 10, y: 20, w: 64, h: 32 };
@@ -777,5 +1248,165 @@ mod tests {
         tool.frame
             .set_result(Some(ResultLayer::new(egui::ColorImage::filled([2, 2], Color32::WHITE))));
         assert!(!tool.mask_editable());
+    }
+
+    /// Cancelling must release the frame AND abandon the load job, or the region that is still
+    /// being decoded would arrive later and start a run the user already stopped.
+    #[test]
+    fn cancelling_abandons_the_pending_region_load() {
+        let mut tool = AiEditorTool::default();
+        tool.pending_load = Some(PendingLoad { job_id: 7, page_idx: 0, rect: rect(0, 0, 64, 64) });
+        tool.frame.set_processing(true);
+        tool.cancel_run();
+        assert!(tool.pending_load.is_none());
+        assert_eq!(tool.frame.lock(), FrameLock::Free);
+    }
+
+    /// A stale answer — one from a job that was abandoned — must be dropped on its id rather
+    /// than started, and must not disturb the frame.
+    #[test]
+    fn a_region_from_an_abandoned_job_is_ignored() {
+        let mut tool = AiEditorTool::default();
+        tool.pending_load = Some(PendingLoad { job_id: 2, page_idx: 0, rect: rect(0, 0, 64, 64) });
+        // The loader is a real worker here; feed the tool the answer of job 1 directly.
+        tool.hand_region_to_engine(
+            PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4) },
+            egui::ColorImage::filled([8, 8], Color32::WHITE),
+        );
+        assert!(
+            tool.message.as_ref().is_some_and(|message| message.error),
+            "a region of the wrong size must be refused, never rescaled"
+        );
+        assert!(tool.frame.result().is_none());
+    }
+
+    /// What one `RecordingEngine` was asked to do, shared with the test that installed it.
+    #[derive(Debug, Default)]
+    struct EngineCalls {
+        polls: usize,
+        cancels: usize,
+        backend: Option<bool>,
+        torch: Option<bool>,
+        region: Option<Option<OverlayRectPx>>,
+        /// What the last `set_region` push reported about the frame's gesture state.
+        geometry_settled: Option<bool>,
+        started: Option<(usize, usize, usize)>,
+    }
+
+    /// A minimal `AiEngine` that records what the host does to it and answers whatever the
+    /// test queued. It exists because the host's contract with an engine is entirely about
+    /// CALL ORDER and per-frame pushes, which no real engine can observe for us.
+    struct RecordingEngine {
+        calls: Rc<RefCell<EngineCalls>>,
+        answer: EnginePoll,
+    }
+
+    impl AiEngine for RecordingEngine {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+        fn title(&self) -> String {
+            "recording".to_string()
+        }
+        fn section(&self) -> EngineSection {
+            EngineSection::WithoutPrompt
+        }
+        fn requires_torch(&self) -> bool {
+            false
+        }
+        fn constraints(&self) -> FrameConstraints {
+            FrameConstraints { multiple: 1, min_side: 1, max_area: None, max_aspect: None }
+        }
+        fn mask_layers(&self) -> Vec<engine::MaskLayerSpec> {
+            vec![engine::MaskLayerSpec { tint: Color32::RED, label_key: "cleaning.region_frame.status.free" }]
+        }
+        fn allows_empty_mask(&self) -> bool {
+            false
+        }
+        fn draw_parameters(&mut self, _ui: &mut egui::Ui) {}
+        fn run_block_reason(&self) -> Option<String> {
+            None
+        }
+        fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
+            self.calls.borrow_mut().started = Some((request.page_idx, request.region.size[0], request.masks.len()));
+            Ok(())
+        }
+        fn poll(&mut self, _ctx: &egui::Context) -> EnginePoll {
+            self.calls.borrow_mut().polls += 1;
+            std::mem::replace(&mut self.answer, EnginePoll::Idle)
+        }
+        fn cancel(&mut self) {
+            self.calls.borrow_mut().cancels += 1;
+        }
+        fn set_backend_available(&mut self, available: bool) {
+            self.calls.borrow_mut().backend = Some(available);
+        }
+        fn set_torch_available(&mut self, available: bool) {
+            self.calls.borrow_mut().torch = Some(available);
+        }
+        fn set_region(&mut self, region: Option<OverlayRectPx>, geometry_settled: bool) {
+            let mut calls = self.calls.borrow_mut();
+            calls.region = Some(region);
+            calls.geometry_settled = Some(geometry_settled);
+        }
+    }
+
+    /// Installs a single `RecordingEngine` answering `answer`, and returns the tool plus the
+    /// shared call record.
+    fn tool_with_recording_engine(answer: EnginePoll) -> (AiEditorTool, Rc<RefCell<EngineCalls>>) {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let mut tool = AiEditorTool::default();
+        tool.engines = vec![Box::new(RecordingEngine { calls: Rc::clone(&calls), answer })];
+        tool.selected = 0;
+        (tool, calls)
+    }
+
+    /// The regression this whole round exists to prevent: an engine that is never polled never
+    /// drains its channels — a finished run is stranded, and FLUX.2 klein's debounced settings
+    /// saver, which lives inside `poll`, never writes, silently losing model paths and prompts
+    /// on exit. The host polls once per frame, panel visible or not.
+    #[test]
+    fn the_selected_engine_is_polled_on_every_frame() {
+        let ctx = egui::Context::default();
+        let (mut tool, calls) = tool_with_recording_engine(EnginePoll::Idle);
+        for _ in 0..3 {
+            tool.poll_engine(&ctx);
+        }
+        assert_eq!(calls.borrow().polls, 3, "one poll per frame, unconditionally");
+    }
+
+    /// A failed run releases the frame and is reported to the user; it must not leave the
+    /// frame locked on work that is over.
+    #[test]
+    fn a_failed_run_releases_the_frame_and_is_reported() {
+        let ctx = egui::Context::default();
+        let (mut tool, _calls) = tool_with_recording_engine(EnginePoll::Failed("boom".to_string()));
+        tool.frame.set_processing(true);
+        tool.poll_engine(&ctx);
+        assert_eq!(tool.frame.lock(), FrameLock::Free);
+        let message = tool.message.as_ref().expect("a failure must be shown");
+        assert!(message.error && message.text == "boom", "{message:?}");
+    }
+
+    /// «Отменить» must reach the ENGINE, not only the frame: a run left going would keep a
+    /// worker and a backend job alive and would answer about a frame the user released.
+    #[test]
+    fn cancelling_reaches_the_engine() {
+        let (mut tool, calls) = tool_with_recording_engine(EnginePoll::Running);
+        tool.frame.set_processing(true);
+        tool.cancel_run();
+        assert_eq!(calls.borrow().cancels, 1);
+        assert_eq!(tool.frame.lock(), FrameLock::Free);
+    }
+
+    /// D7 on the ENGINE's answer: a result that is not exactly the frame rectangle never
+    /// becomes a pending result, because applying it would nearest-rescale it over the page.
+    #[test]
+    fn an_engine_answer_of_the_wrong_size_is_refused() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.set_processing(true);
+        tool.accept_result(egui::ColorImage::filled([8, 8], Color32::WHITE));
+        assert!(tool.frame.result().is_none(), "an unplaced frame has no rectangle to match");
+        assert!(tool.message.as_ref().is_some_and(|message| message.error));
     }
 }

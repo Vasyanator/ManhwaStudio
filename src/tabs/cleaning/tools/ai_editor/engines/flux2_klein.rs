@@ -1,47 +1,53 @@
 /*
-FILE HEADER (cleaning/tools/flux2_klein.rs)
+FILE HEADER (cleaning/tools/ai_editor/engines/flux2_klein.rs)
 
 Purpose:
-The «Редактирование области (FLUX.2 klein)» cleaning tool: the user selects a page
-region, paints WHERE the model is allowed to change pixels, writes a prompt, and the
-Python backend regenerates only that area. Built on `RegionEditToolBase` alone — the
-mask base is deliberately NOT used, because its mask means "remove what is under it"
-while this one means "you MAY change what is under it"; everything outside the painted
-area must survive the round trip untouched.
+The FLUX.2 klein ENGINE of the «ИИ-редактор области» tool. The HOST owns the on-canvas
+frame — the rectangle, the painted mask stack, the pending result and Применить/Отменить.
+This file owns everything model-specific: the parameters and their persistence, the memory
+presets, the RAM/VRAM forecast, the prompt-cache library, the request/response wire
+contracts, the OOM recovery, the worker thread and its own progress bar. It implements
+`super::super::engine::AiEngine` and never touches `CanvasView`, `ProjectData` or the frame.
+
+The mask means "you MAY change what is under it" — the inverse of the mask-inpaint tools'
+"remove what is under it". Everything outside it must survive the round trip untouched,
+which is why the engine declares exactly ONE mask layer and puts its bytes on the wire
+verbatim.
 
 Working modes (`Flux2KleinSettings::whole_region`, a MODE and not a memory profile,
 which is why no `MemoryPreset` owns it):
-- off (default): the painted mask decides, and an empty mask blocks the run.
-- on: the WHOLE selected region is regenerated, no painting required. The painting
-  controls disappear, the overlay is not drawn and pointer drags over the preview are
-  ignored — the mask the user already painted is kept verbatim and comes back the
-  moment the switch is cleared. The request still carries a mask, a SOLID one built by
-  `Flux2SessionState::mask_for_run`, because the backend refuses `whole_region = true`
-  unless the mask really is uniformly 255. `mask_dilate_px` is ignored backend-side in
-  this mode (the slider is faded to say so); `mask_feather_px` keeps working and is
+- off (default): the painted mask decides, and `allows_empty_mask()` is `false`, so the
+  host's own frame button refuses a run with nothing painted.
+- on: the WHOLE selected region is regenerated and no painting is required, which is what
+  `allows_empty_mask() == true` tells the host. The request still carries a mask, a SOLID
+  one built by `mask_for_run`, because the backend refuses `whole_region = true` unless the
+  mask really is uniformly 255. The host's painted mask is never consulted in this mode, so
+  it comes back untouched the moment the switch is cleared. `mask_dilate_px` is ignored
+  backend-side here (the slider is faded to say so); `mask_feather_px` keeps working and is
   what softens the join between the regenerated region and the page.
 
 Selection contract (checked twice, on purpose):
-- multiple of 16 (`RegionEditToolBase::new(.., Some(16))`), shortest side >= 128 px,
-  area <= 1 MP, aspect not steeper than 8:1 (the three additive base builders).
-- The base clamps a snapped selection to the page edge AFTER snapping, and
-  `build_composited_region_image` re-derives the crop by RATIO from the decoded page,
-  so neither the multiple nor the area is guaranteed on `editor.image`. The run path
-  therefore re-validates the ACTUAL region size and refuses with a named reason.
+- `constraints()` declares multiple of 16, shortest side >= 128 px, area <= 1 MP, aspect not
+  steeper than 8:1. The frame snaps and validates against them, so a rectangle that reaches
+  `start` has already satisfied every one of them.
+- The run path re-validates the ACTUAL region size (`region_block_reason`, on the worker as
+  well) and refuses with a named reason: a host that hands over a region of another size
+  gets an explanation instead of a request the backend would reject.
 
 Key items:
-- `Flux2KleinTool`: the `CleaningTool` implementation and its wiring.
+- `Flux2KleinEngine`: the `AiEngine` implementation and its wiring.
 - `Flux2KleinSettings`: everything persisted to `flux2_klein_settings.json`
   (`config::flux2_klein_settings_path`), loaded/saved on worker threads.
   `normalized()` is the ONLY value ever put on the wire.
-- `Flux2SessionState`: per-region-editor state — the L8 edit-permission mask and its
-  incrementally patched preview texture, the undo stack and the run channel.
+- `Flux2SessionState`: the run channel and the per-RUN undo stack. The painted mask is NOT
+  here — it belongs to the host's `MaskStack` and arrives in `EngineRunRequest::masks`.
 - `MemoryPreset`: four built-in placement/VAE/text-encoder configurations plus `Custom`,
   which is never chosen by hand — it is what `detect` reports when the seven fields a
   preset owns match no preset.
 - `Flux2Status` / `Flux2Estimate`: the `.status` component catalog and the backend's
   own VRAM/RAM forecast. The forecast is COMPUTED BY THE BACKEND; this file only
-  displays it.
+  displays it. Its geometry input is the region SIZE, so `set_region` arms it on a
+  settled size change and never on a move — see that method for the full rule.
 
 IPC (`backend_ipc::protocol`):
 - `inpaint.flux2_klein` — streaming. Header `{image_len, mask_len, params}`, blob
@@ -50,12 +56,12 @@ IPC (`backend_ipc::protocol`):
   size, validated by STRICT equality before use (`image_len` is REQUIRED; an answer
   without it is refused). Progress frames carry `phase` (`load`/`generate`), `step`,
   `total`, `label` and no preview blob. The request goes out through `begin_call`, so
-  its id is known and «Отмена» can stop it with `CallHandle::cancel`.
+  its id is known and a cancel can stop it with `CallHandle::cancel`.
 - The backend may RECOVER from an out-of-memory failure during the VAE decode by
   retrying it with the transformer unloaded (and, if needed, VAE tiling/slicing on).
   The five memory flags it actually used come back in `applied`; this side writes them
   into the settings and saves them, so the next run takes the cheap path immediately,
-  and says so in the editor status line when `oom_recovered` is set. A partial `applied`
+  and says so in the engine's status line when `oom_recovered` is set. A partial `applied`
   object is ignored wholesale.
 - `.status`, `.estimate`, `.unload` — one-shot. `.status` and `.estimate` carry the
   normalized `params`: both are questions ABOUT the paths in the request, and a
@@ -95,11 +101,17 @@ IPC (`backend_ipc::protocol`):
 Contracts:
 - The GUI thread never blocks: settings I/O, every IPC call, the native file pickers,
   the machine translation of the prompt and even the one-frame cancel write all run on
-  `ms_thread::spawn` workers and the GUI polls a channel.
-- ONE progress bar serves every run of the tool, so it is claimed by GENERATION: a run
+  `ms_thread::spawn` workers and `AiEngine::poll` only drains channels.
+- `poll` is called every frame whether the parameter panel is visible or not; nothing
+  `draw_parameters` does may be a precondition of it. The reverse is not true: the intents
+  the panel raises (re-query the catalog, start a translation, open a picker) are folded
+  back at the end of `draw_parameters` itself, so a click acts on the frame it happened in.
+- ONE progress bar serves every run of the engine, so it is claimed by GENERATION: a run
   takes the next number when it starts, and a write from an older one — including the
-  terminal "the bar is done" — is dropped. Cancel, Escape and a new region all retire
-  the current generation and cancel the request behind it.
+  terminal "the bar is done" — is dropped. A cancel and a moved frame both retire the
+  current generation and cancel the request behind it. The bar lives in this engine's own
+  panel: there is no shared progress vocabulary between engines
+  (`dev-docs/region_edit_v2_plan.md` §13.2 D13).
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
   dispatcher (`translate_texts_via_translator`) instead of a second copy of it. It is
@@ -110,22 +122,25 @@ Contracts:
   the flag, and at most one query is ever in flight, so editing the prompt cannot turn
   a keystroke into a request. A `prompt_cached` answer is shown only while the prompt it
   was asked about still equals the one in the field.
-- Apply goes through the base's footer, i.e. `CanvasView::replace_overlay_region_px`.
-  This tool never writes `CleanOverlaysModel` storage itself.
+- The answer of a run is PIXELS and nothing else (D12): `EnginePoll::Done` carries a
+  `ColorImage` of exactly the frame rectangle. Merging it into the clean overlay is the
+  HOST's job; this file never writes `CleanOverlaysModel` storage and never touches
+  `CanvasView`.
 - The model is distilled: 4 steps and `guidance_scale = 1.0` are the defaults and
   there is no negative prompt — do not add a field for one.
 */
-use super::base::{CleaningTool, RegionEditToolBase, RegionEditorSession, StrokePoint};
+use super::super::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
 use crate::backend_ipc::{self, CallError};
-use crate::canvas::CanvasView;
+use crate::canvas::OverlayRectPx;
 use crate::config;
-use crate::project::ProjectData;
+use crate::tabs::cleaning::tools::base::RegionEditToolBase;
+use crate::tabs::cleaning::tools::region_edit_v2::geometry::FrameConstraints;
 use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::tabs::translation::machine_translation::{MtService, translate_texts_via_translator};
 use crate::tabs::translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};
-use crate::widgets::{AiButton, AiRequirement, SeedSpinBox, WheelComboBox, WheelSlider};
+use crate::widgets::{SeedSpinBox, WheelComboBox, WheelSlider};
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
+use egui::Color32;
 use image::{ColorType, ImageEncoder};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
@@ -193,10 +208,11 @@ const FLUX2_FADED_CONTROL_OPACITY: f32 = 0.45;
 /// The field takes whatever is left, so the button never wraps onto its own line.
 const FLUX2_CACHE_NAME_BUTTON_RESERVE: f32 = 140.0;
 
-/// Tint of the edit-permission overlay painted over the region.
-const FLUX2_MASK_PREVIEW_RGB: [u8; 3] = [80, 200, 255];
-/// Opacity of that overlay. Low enough that the artwork under it stays readable.
-const FLUX2_MASK_PREVIEW_ALPHA: u8 = 90;
+/// Preview tint of the engine's single mask layer, i.e. of the edit-permission area.
+///
+/// Opaque on purpose: `MaskStack` scales the alpha itself so the mask stays translucent
+/// over the artwork, and a tint that arrived already translucent would be darkened twice.
+const FLUX2_MASK_TINT: Color32 = Color32::from_rgb(80, 200, 255);
 
 /// The prompt a fresh settings file starts from, and the one substituted for an
 /// absent or blank prompt in an existing one.
@@ -563,6 +579,12 @@ struct Flux2KleinSettings {
     color_match: bool,
     max_sequence_length: u32,
     /// Brush radius of the mask painter, in region pixels. UI-only, never sent.
+    ///
+    /// Nothing reads it since the brush became the HOST's: the frame's `MaskBrush` is shared by
+    /// every engine and owns the live radius. The field is kept rather than deleted because the
+    /// file it lives in is the user's and dropping it would silently discard a value they chose;
+    /// remove it, with `FLUX2_BRUSH_MIN`/`FLUX2_BRUSH_MAX` and its clamp, once the host round has
+    /// decided where a shared brush radius is persisted.
     brush_radius: u32,
 }
 
@@ -828,9 +850,9 @@ struct Flux2Estimate {
     breakdown: Vec<(String, u64)>,
 }
 
-/// Live progress shared between the run worker and the editor UI.
+/// Live progress shared between the run worker and the engine's own panel.
 ///
-/// ONE instance is owned by the tool and reused by every run, so it is claimed by
+/// ONE instance is owned by the engine and reused by every run, so it is claimed by
 /// GENERATION: [`begin_progress_generation`] hands the next number to a starting run
 /// and every later write from an older one — including its terminal `active = false` —
 /// is dropped by [`update_progress`]. Without that, a cancelled worker finishing a
@@ -1002,7 +1024,7 @@ enum Flux2PromptCacheAction {
 ///
 /// A named struct with a free constructor rather than five expressions inline in the UI,
 /// for the same reason [`flux2_run_block_reason`] is a free function: the gates are the
-/// contract worth testing, and a [`Flux2EditorCtx`] cannot be built outside a frame.
+/// contract worth testing, and a [`Flux2PanelCtx`] cannot be built outside a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Flux2PromptCacheGates {
     build: bool,
@@ -1110,270 +1132,61 @@ fn format_prompt_cache_created(value: Option<&Value>) -> String {
 // Per-session state
 // ---------------------------------------------------------------------------------------
 
-/// Which way the brush writes into the mask.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum BrushMode {
-    #[default]
-    Paint,
-    Erase,
+/// What one poll of the run channel found.
+///
+/// `Done` and `Failed` are TERMINAL and are produced exactly once: the receiver is dropped
+/// before either is returned, so the next poll answers `Idle`.
+enum Flux2RunPoll {
+    /// No run has been started, or the last one has already been reported.
+    Idle,
+    /// A run is still in flight.
+    Running,
+    /// The run finished; the image is exactly the region the run started from.
+    Done(egui::ColorImage),
+    /// The run failed, with an already-localized message.
+    Failed(String),
 }
 
-/// State scoped to ONE open region editor session.
+/// State of the engine's runs: the channel the worker answers on and the region images
+/// that preceded the runs already reported.
 ///
-/// It holds the edit-permission mask (L8 in region coordinates, `255` = the model may
-/// change this pixel), the tinted preview drawn over the region and patched in place
-/// as the brush moves, the undo stack and the run channel. Everything is dropped when
-/// the editor opens a different region.
+/// The painted MASK is deliberately not here and must not come back: the host's `MaskStack`
+/// owns it and hands its bytes over in `EngineRunRequest::masks`.
 #[derive(Default)]
 struct Flux2SessionState {
-    /// `scroll_id` of the editor session this state belongs to.
-    scroll_id: Option<u64>,
-    /// `width * height` bytes, region coordinates. Empty until a session is bound.
-    /// Only ever holds `0` or `255`, which is what lets `mask_set_px` be maintained
-    /// incrementally.
-    mask: Vec<u8>,
-    mask_size: [usize; 2],
-    /// How many mask pixels are non-zero, kept in step with every write into `mask`.
-    ///
-    /// The run gate asks "is anything painted?" on EVERY frame of an open editor, and
-    /// answering it by scanning a megabyte-sized mask each time is pure waste — the
-    /// scan is longest precisely when the answer is "no".
-    mask_set_px: usize,
-    /// Tinted RGBA overlay kept in lockstep with `mask`, so a stroke never has to
-    /// rebuild a megapixel image from scratch.
-    mask_preview: Option<egui::ColorImage>,
-    mask_texture: Option<TextureHandle>,
-    /// Half-open `(x0, y0, x1, y1)` box of preview pixels changed since the last
-    /// upload. `None` = nothing to patch.
-    mask_dirty: Option<(usize, usize, usize, usize)>,
-    /// Region images from before each applied run, most recent last.
+    /// Region images from before each finished run, most recent last, bounded by
+    /// [`FLUX2_UNDO_LIMIT`].
     undo_stack: Vec<egui::ColorImage>,
     run_rx: Option<Receiver<Flux2JobResult>>,
-    /// Last painted pixel of the current drag, so a fast mouse leaves a line and not
-    /// a dotted trail.
-    last_drag_px: Option<(i32, i32)>,
-    brush_mode: BrushMode,
 }
 
 impl Flux2SessionState {
-    /// Binds the state to the editor session `scroll_id` with a region of `size`.
-    ///
-    /// Returns `true` when this was a NEW session (everything was reset), which the
-    /// caller uses to re-arm the memory forecast for the new region size.
-    fn sync_session(&mut self, scroll_id: u64, size: [usize; 2]) -> bool {
-        if self.scroll_id == Some(scroll_id) && self.mask_size == size {
-            return false;
-        }
-        self.scroll_id = Some(scroll_id);
-        self.mask_size = size;
-        self.mask = vec![0u8; size[0].saturating_mul(size[1])];
-        self.mask_set_px = 0;
-        self.mask_preview = Some(egui::ColorImage::filled(size, Color32::TRANSPARENT));
-        self.mask_texture = None;
-        self.mask_dirty = None;
-        self.undo_stack.clear();
-        self.last_drag_px = None;
-        // Dropping the receiver detaches the in-flight worker: its result is discarded
-        // instead of landing on a different region.
-        self.run_rx = None;
-        true
-    }
-
-    /// Clears the whole session (Escape, tool deactivation, editor closed).
+    /// Drops the run history. The caller is responsible for the run in flight
+    /// ([`Self::cancel_run`]) — dropping the receiver alone would leave the backend
+    /// generating an image nothing can receive.
     fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Whether any pixel is allowed to change. An empty mask makes a run pointless and
-    /// is refused before it starts.
-    ///
-    /// O(1): the count is maintained by the writers, not recomputed here.
-    fn has_mask(&self) -> bool {
-        self.mask_set_px > 0
-    }
-
-    /// The L8 mask a run actually puts on the wire, region-sized either way.
-    ///
-    /// With `whole_region` set the model may change every pixel, and the backend proves
-    /// that by REQUIRING a solid mask alongside the flag — so a fresh all-`255` buffer is
-    /// built here rather than the painted one being overwritten. That is the whole reason
-    /// this is a separate buffer: `self.mask` keeps whatever the user painted, and
-    /// clearing the checkbox brings their work back untouched.
-    fn mask_for_run(&self, whole_region: bool) -> Vec<u8> {
-        if whole_region {
-            vec![255u8; self.mask.len()]
-        } else {
-            self.mask.clone()
-        }
-    }
-
-    /// Sets every mask pixel to `value` and marks the whole preview dirty.
-    fn fill_mask(&mut self, value: u8) {
-        if self.mask.is_empty() {
-            return;
-        }
-        for pixel in &mut self.mask {
-            *pixel = value;
-        }
-        self.mask_set_px = if value == 0 { 0 } else { self.mask.len() };
-        let [w, h] = self.mask_size;
-        let color = mask_preview_color(value);
-        if let Some(preview) = self.mask_preview.as_mut() {
-            for pixel in &mut preview.pixels {
-                *pixel = color;
-            }
-        }
-        self.mark_dirty(0, 0, w, h);
-    }
-
-    /// Paints one brush segment from `from` to `to` with `radius`, writing `255`
-    /// (paint) or `0` (erase). Returns `true` when at least one pixel changed.
-    fn paint_segment(
-        &mut self,
-        from: (i32, i32),
-        to: (i32, i32),
-        radius: i32,
-        erase: bool,
-    ) -> bool {
-        if self.mask.is_empty() {
-            return false;
-        }
-        let value = if erase { 0 } else { 255 };
-        let dx = to.0 - from.0;
-        let dy = to.1 - from.1;
-        // One stamp per pixel of the longer axis: consecutive discs then always
-        // overlap, so no gaps appear however fast the pointer moves.
-        let steps = dx.abs().max(dy.abs()).max(0);
-        let mut changed = false;
-        for step in 0..=steps {
-            let (cx, cy) = if steps == 0 {
-                (from.0, from.1)
-            } else {
-                (
-                    from.0 + dx * step / steps,
-                    from.1 + dy * step / steps,
-                )
-            };
-            changed |= self.stamp_disc(cx, cy, radius, value);
-        }
-        changed
-    }
-
-    /// Writes `value` into every mask pixel within `radius` of `(cx, cy)`.
-    fn stamp_disc(&mut self, cx: i32, cy: i32, radius: i32, value: u8) -> bool {
-        let [w, h] = self.mask_size;
-        if w == 0 || h == 0 {
-            return false;
-        }
-        let radius = radius.max(1);
-        let radius_sq = radius.saturating_mul(radius);
-        // Clamp the scan box to the region first: index math below is then plain
-        // `usize` arithmetic that cannot leave the buffer.
-        let x0 = (cx - radius).max(0) as usize;
-        let y0 = (cy - radius).max(0) as usize;
-        let x1 = ((cx + radius + 1).max(0) as usize).min(w);
-        let y1 = ((cy + radius + 1).max(0) as usize).min(h);
-        if x0 >= x1 || y0 >= y1 {
-            return false;
-        }
-        let color = mask_preview_color(value);
-        let mut changed = false;
-        for y in y0..y1 {
-            let dy = y as i32 - cy;
-            let row = y * w;
-            for x in x0..x1 {
-                let dx = x as i32 - cx;
-                if dx * dx + dy * dy > radius_sq {
-                    continue;
-                }
-                let idx = row + x;
-                if self.mask[idx] == value {
-                    continue;
-                }
-                self.mask[idx] = value;
-                // The buffer holds only 0 and 255, so a change is always a 0 <-> 255
-                // transition and the counter follows it exactly.
-                if value == 0 {
-                    self.mask_set_px = self.mask_set_px.saturating_sub(1);
-                } else {
-                    self.mask_set_px = self.mask_set_px.saturating_add(1);
-                }
-                if let Some(preview) = self.mask_preview.as_mut() {
-                    preview.pixels[idx] = color;
-                }
-                changed = true;
-            }
-        }
-        if changed {
-            self.mark_dirty(x0, y0, x1, y1);
-        }
-        changed
-    }
-
-    /// Grows the pending preview-upload box to cover the half-open `(x0, y0, x1, y1)`.
-    fn mark_dirty(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
-        self.mask_dirty = Some(match self.mask_dirty {
-            Some((px0, py0, px1, py1)) => (px0.min(x0), py0.min(y0), px1.max(x1), py1.max(y1)),
-            None => (x0, y0, x1, y1),
-        });
-    }
-
-    /// Uploads the overlay texture, patching only the dirty box when one already
-    /// exists. A full re-upload of a megapixel overlay every brush frame would be the
-    /// single most expensive thing this tool does; `set_partial` keeps it proportional
-    /// to the stroke.
-    fn ensure_mask_texture(&mut self, ctx: &egui::Context, scroll_id: u64) {
-        let Some(preview) = self.mask_preview.as_ref() else {
-            self.mask_texture = None;
-            return;
-        };
-        let Some(texture) = self.mask_texture.as_mut() else {
-            self.mask_texture = Some(ctx.load_texture(
-                format!("cleaning-flux2-klein-mask-{scroll_id}"),
-                preview.clone(),
-                TextureOptions::NEAREST,
-            ));
-            self.mask_dirty = None;
-            return;
-        };
-        let Some((x0, y0, x1, y1)) = self.mask_dirty.take() else {
-            return;
-        };
-        let [w, _] = self.mask_size;
-        let (patch_w, patch_h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
-        if patch_w == 0 || patch_h == 0 {
-            return;
-        }
-        let mut pixels = Vec::with_capacity(patch_w * patch_h);
-        for y in y0..y1 {
-            let row = y * w;
-            pixels.extend_from_slice(&preview.pixels[row + x0..row + x1]);
-        }
-        texture.set_partial(
-            [x0, y0],
-            egui::ColorImage::new([patch_w, patch_h], pixels),
-            TextureOptions::NEAREST,
-        );
+        self.undo_stack.clear();
     }
 
     /// Starts a run on a worker thread. A second run is refused while one is in flight.
     ///
-    /// The mask sent is [`Self::mask_for_run`], i.e. the painted one, or a solid buffer
-    /// when `settings.whole_region` is set. Either way the painted mask survives the run.
+    /// `mask` is the L8 buffer that actually goes on the wire — the host's painted layer,
+    /// or a solid one under `whole_region` — and `mask_size` is the region size both it and
+    /// `region` describe. The pair is validated by the caller before it gets here.
+    ///
+    /// # Errors
+    /// Returns the localized "already running" message when a run is still in flight.
     fn start_run(
         &mut self,
-        editor: &mut RegionEditorSession,
+        region: egui::ColorImage,
+        mask: Vec<u8>,
+        mask_size: [usize; 2],
         settings: &Flux2KleinSettings,
         progress: &Arc<Mutex<Flux2Progress>>,
-    ) {
+    ) -> Result<(), String> {
         if self.run_rx.is_some() {
-            editor.status =
-                Some(t!("cleaning.mask_editor.processing_already_running_status").to_string());
-            return;
+            return Err(t!("cleaning.mask_editor.processing_already_running_status").to_string());
         }
-        let image = editor.image.clone();
-        let mask = self.mask_for_run(settings.whole_region);
-        let mask_size = self.mask_size;
         let settings = settings.normalized();
         // Claimed here rather than on the worker: the claim then happens in the order
         // the user pressed the button, whatever order the threads start in.
@@ -1382,40 +1195,40 @@ impl Flux2SessionState {
         let (tx, rx) = mpsc::channel::<Flux2JobResult>();
         thread::spawn(move || {
             let result =
-                run_flux2_klein(&image, &mask, mask_size, &settings, &progress, generation);
+                run_flux2_klein(&region, &mask, mask_size, &settings, &progress, generation);
             let _ = tx.send(Flux2JobResult {
-                source: image,
+                source: region,
                 result,
             });
         });
         self.run_rx = Some(rx);
-        editor.status = Some(t!("cleaning.mask_editor.processing_background_status").to_string());
+        Ok(())
     }
 
     /// Abandons the run in flight: its answer is discarded, its progress generation is
     /// retired so it can neither move nor stop the bar of whatever runs next, and the
     /// backend is told to stop instead of finishing a generation nobody will see.
+    /// Returns `true` when there was a run to abandon.
     ///
     /// A no-op detail that matters: `run_rx` is dropped first, so a result that lands
-    /// between the two statements is discarded rather than applied to the region.
+    /// between the two statements is discarded rather than reported as a finished run.
     ///
     /// During the short window before the request reaches the wire (the region and mask
     /// are still being encoded) there is no id to cancel yet; the run is detached all
     /// the same and its answer is dropped, the backend simply finishes it.
-    fn cancel_run(
-        &mut self,
-        editor: &mut RegionEditorSession,
-        progress: &Arc<Mutex<Flux2Progress>>,
-    ) {
+    fn cancel_run(&mut self, progress: &Arc<Mutex<Flux2Progress>>) -> bool {
+        if self.run_rx.is_none() {
+            return false;
+        }
         self.run_rx = None;
         if let Some(id) = retire_progress_generation(progress) {
             spawn_flux2_cancel(id);
         }
-        editor.status = Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
+        true
     }
 
-    /// Polls the run channel and applies a finished run. Returns `true` while a run is
-    /// still in flight.
+    /// Polls the run channel and reports what it found, writing the user-facing line for
+    /// the engine's own status slot into `status`.
     ///
     /// A finished run also writes the memory flags the backend actually used back into
     /// `settings` (setting `settings_changed`, which the caller turns into a background
@@ -1423,12 +1236,12 @@ impl Flux2SessionState {
     /// one take the cheap path from the start.
     fn poll_run(
         &mut self,
-        editor: &mut RegionEditorSession,
         settings: &mut Flux2KleinSettings,
         settings_changed: &mut bool,
-    ) -> bool {
+        status: &mut Option<String>,
+    ) -> Flux2RunPoll {
         let Some(rx) = self.run_rx.as_ref() else {
-            return false;
+            return Flux2RunPoll::Idle;
         };
         match rx.try_recv() {
             Ok(job) => {
@@ -1436,30 +1249,30 @@ impl Flux2SessionState {
                 match job.result {
                     Ok(outcome) => {
                         self.push_undo(job.source);
-                        editor.image = outcome.image;
-                        editor.texture_dirty = true;
                         if let Some(applied) = outcome.applied {
                             *settings_changed |= apply_backend_flags(settings, applied);
                         }
-                        editor.status = Some(if outcome.oom_recovered {
+                        *status = Some(if outcome.oom_recovered {
                             t!("cleaning.tools.flux2_klein.oom_recovered_status").to_string()
                         } else {
                             t!("cleaning.mask_editor.processing_done_status").to_string()
                         });
+                        Flux2RunPoll::Done(outcome.image)
                     }
                     Err(err) => {
-                        editor.status =
-                            Some(tf!("cleaning.mask_editor.processing_error", err = err));
+                        let message = tf!("cleaning.mask_editor.processing_error", err = err);
+                        *status = Some(message.clone());
+                        Flux2RunPoll::Failed(message)
                     }
                 }
-                false
             }
-            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Empty) => Flux2RunPoll::Running,
             Err(TryRecvError::Disconnected) => {
                 self.run_rx = None;
-                editor.status =
-                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-                false
+                let message =
+                    t!("cleaning.mask_editor.processing_thread_crashed_error").to_string();
+                *status = Some(message.clone());
+                Flux2RunPoll::Failed(message)
             }
         }
     }
@@ -1475,16 +1288,20 @@ impl Flux2SessionState {
         }
         self.undo_stack.push(image);
     }
+}
 
-    /// Restores the region image from before the last applied run.
-    fn undo_last_run(&mut self, editor: &mut RegionEditorSession) {
-        let Some(image) = self.undo_stack.pop() else {
-            editor.status = Some(t!("cleaning.mask_editor.no_state_for_undo_status").to_string());
-            return;
-        };
-        editor.image = image;
-        editor.texture_dirty = true;
-        editor.status = Some(t!("cleaning.mask_editor.reverted_status").to_string());
+/// The L8 mask a run actually puts on the wire, region-sized either way.
+///
+/// `painted` is the host's mask layer, exactly `w * h` bytes. With `whole_region` set the
+/// model may change every pixel, and the backend proves that by REQUIRING a solid mask
+/// alongside the flag — so a fresh all-`255` buffer is built here rather than the painted
+/// one being overwritten. That is the whole point of building it: the host's layer keeps
+/// whatever the user painted, and clearing the switch brings their work back untouched.
+fn mask_for_run(painted: &[u8], whole_region: bool) -> Vec<u8> {
+    if whole_region {
+        vec![255u8; painted.len()]
+    } else {
+        painted.to_vec()
     }
 }
 
@@ -1517,21 +1334,6 @@ fn apply_backend_flags(settings: &mut Flux2KleinSettings, applied: Flux2AppliedF
     changed
 }
 
-/// Overlay colour of a mask value: tinted where the model may paint, transparent
-/// where it may not.
-fn mask_preview_color(value: u8) -> Color32 {
-    if value == 0 {
-        Color32::TRANSPARENT
-    } else {
-        Color32::from_rgba_unmultiplied(
-            FLUX2_MASK_PREVIEW_RGB[0],
-            FLUX2_MASK_PREVIEW_RGB[1],
-            FLUX2_MASK_PREVIEW_RGB[2],
-            FLUX2_MASK_PREVIEW_ALPHA,
-        )
-    }
-}
-
 // ---------------------------------------------------------------------------------------
 // File pickers
 // ---------------------------------------------------------------------------------------
@@ -1540,7 +1342,7 @@ fn mask_preview_color(value: u8) -> Color32 {
 ///
 /// Five of the variants fill in a model path; the last two carry a prompt-cache entry in
 /// or out of the library and do NOT touch the settings — they start an IPC call instead
-/// (see [`Flux2KleinTool::poll_picker`]).
+/// (see [`Flux2KleinEngine::poll_picker`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flux2PickerPurpose {
     TextEncoderDir,
@@ -1612,13 +1414,26 @@ fn spawn_flux2_picker(_purpose: Flux2PickerPurpose) -> Receiver<Option<PathBuf>>
 }
 
 // ---------------------------------------------------------------------------------------
-// The tool
+// The engine
 // ---------------------------------------------------------------------------------------
 
-/// The «Редактирование области (FLUX.2 klein)» cleaning tool.
-pub struct Flux2KleinTool {
-    region_base: RegionEditToolBase,
+/// The FLUX.2 klein engine of the «ИИ-редактор области» tool.
+///
+/// Everything here is engine-owned state; the frame rectangle, the painted mask and the
+/// pending result belong to the host and reach this type only through `AiEngine`.
+pub struct Flux2KleinEngine {
     session: Flux2SessionState,
+    /// The frame rectangle the forecast and the status line describe, `None` while the tool
+    /// has no frame. Published by the host through [`AiEngine::set_region`].
+    region: Option<OverlayRectPx>,
+    /// A region SIZE change is waiting for the frame's geometry to settle before it arms the
+    /// forecast. It cannot be re-derived by comparing rectangles on the settling frame: the
+    /// rectangle usually does not change on the frame the pointer is released, so the size
+    /// change would be forgotten and the forecast would never be re-armed.
+    region_resize_pending: bool,
+    /// User-facing line about the last run (started, finished, recovered, failed,
+    /// cancelled), shown in this engine's own panel under the progress bar.
+    run_status: Option<String>,
     settings: Flux2KleinSettings,
     settings_rx: Option<Receiver<Flux2KleinSettings>>,
     settings_loaded: bool,
@@ -1668,8 +1483,9 @@ pub struct Flux2KleinTool {
     estimate: Option<Flux2Estimate>,
     estimate_rx: Option<Receiver<Result<Flux2Estimate, String>>>,
     estimate_error: Option<String>,
-    /// Same one-shot arming as `status_wanted`; re-armed whenever a parameter or the
-    /// region changed, so the forecast follows the controls without flooding the IPC.
+    /// Same one-shot arming as `status_wanted`; re-armed whenever a parameter changed and,
+    /// for the geometry, only by a SETTLED region SIZE change ([`AiEngine::set_region`]), so
+    /// the forecast follows the controls without flooding the IPC from scrolling or dragging.
     estimate_wanted: bool,
     unload_rx: Option<Receiver<Result<(), String>>>,
     unload_status: Option<String>,
@@ -1681,14 +1497,13 @@ pub struct Flux2KleinTool {
     ai_backend_available: bool,
 }
 
-impl Default for Flux2KleinTool {
+impl Default for Flux2KleinEngine {
     fn default() -> Self {
-        let mut tool = Self {
-            region_base: RegionEditToolBase::new("flux2_klein", Some(FLUX2_SELECTION_MULTIPLE))
-                .with_min_selection(FLUX2_MIN_SELECTION_PX)
-                .with_max_selection_area(FLUX2_MAX_SELECTION_AREA_PX2)
-                .with_max_aspect_ratio(FLUX2_MAX_SELECTION_ASPECT),
+        let mut engine = Self {
             session: Flux2SessionState::default(),
+            region: None,
+            region_resize_pending: false,
+            run_status: None,
             settings: Flux2KleinSettings::default(),
             settings_rx: None,
             settings_loaded: false,
@@ -1723,12 +1538,12 @@ impl Default for Flux2KleinTool {
             progress: Arc::new(Mutex::new(Flux2Progress::default())),
             ai_backend_available: false,
         };
-        tool.request_settings_load();
-        tool
+        engine.request_settings_load();
+        engine
     }
 }
 
-impl Flux2KleinTool {
+impl Flux2KleinEngine {
     /// Reads the settings file on a worker thread (never on the GUI thread).
     fn request_settings_load(&mut self) {
         let (tx, rx) = mpsc::channel();
@@ -1761,6 +1576,11 @@ impl Flux2KleinTool {
 
     /// Writes dirty settings on a worker thread, at most one save in flight, and never
     /// before the initial load finished (which would clobber the file).
+    ///
+    /// It is driven from [`AiEngine::poll`] and from nowhere else, which is why the host must
+    /// poll the selected engine EVERY frame, panel visible or not: without that call nothing
+    /// ever writes the settings file and every model path, memory preset and prompt is lost on
+    /// exit, with no error anywhere.
     fn poll_and_maybe_save(&mut self) {
         if let Some(rx) = self.save_rx.as_ref() {
             match rx.try_recv() {
@@ -1768,7 +1588,7 @@ impl Flux2KleinTool {
                 Err(TryRecvError::Empty) => return,
             }
         }
-        if !self.dirty || !self.settings_loaded {
+        if !settings_save_due(self.dirty, self.settings_loaded, self.save_rx.is_some()) {
             return;
         }
         self.dirty = false;
@@ -1848,9 +1668,9 @@ impl Flux2KleinTool {
         )
     }
 
-    /// Polls the `.estimate` query and arms a new one when the parameters or the region
-    /// changed. `region` is the open editor's size; without an open editor there is
-    /// nothing to forecast.
+    /// Polls the `.estimate` query and sends a new one when something armed
+    /// `estimate_wanted`. `region` is the frame rectangle's size; without a frame there is
+    /// nothing to forecast and the arming is kept for the next frame that has one.
     fn poll_and_maybe_query_estimate(&mut self, region: Option<[usize; 2]>) {
         if let Some(rx) = self.estimate_rx.as_ref() {
             match rx.try_recv() {
@@ -2022,8 +1842,8 @@ impl Flux2KleinTool {
     ///
     /// Streaming, and it claims the shared progress bar exactly as a generation does —
     /// reading the ~16 GB Qwen3 encoder takes ~106 s and the user needs to see it move.
-    /// Claiming the generation here, on the GUI thread, is what makes «Отмена», a new
-    /// region and a closed editor able to retire and cancel it, just like a run.
+    /// Claiming the generation here, on the GUI thread, is what makes a cancel and a moved
+    /// frame able to retire and stop it, just like a run.
     fn start_prompt_cache_build(&mut self) {
         if self.prompt_cache_rx.is_some() {
             return;
@@ -2206,7 +2026,7 @@ impl Flux2KleinTool {
     /// Applies one finished prompt-cache operation and returns the line to show for it.
     ///
     /// Save and import both change the library, so both re-arm `.list`: the combo must
-    /// show the new entry without the user closing and reopening the editor. A load whose
+    /// show the new entry without the user reopening the panel. A load whose
     /// `encoder_verified` came back `false` additionally raises the one-off notice that the
     /// entry's encoder identity was taken on trust.
     fn apply_prompt_cache_outcome(&mut self, outcome: Flux2PromptCacheOutcome) -> String {
@@ -2278,88 +2098,89 @@ impl Flux2KleinTool {
         }
     }
 
-    /// Drops the per-region-editor state and abandons any run still in flight.
+    /// Size requirements this engine imposes on the frame rectangle, in source page pixels.
     ///
-    /// Retiring the progress generation is the point of going through here instead of
-    /// calling `Flux2SessionState::clear` directly: the session no longer owns the
-    /// worker after `clear`, so without this the abandoned run would keep driving the
-    /// bar over the next session and the backend would keep generating an image that
-    /// nothing can receive.
-    fn clear_session(&mut self) {
-        self.session.clear();
-        if let Some(id) = retire_progress_generation(&self.progress) {
-            spawn_flux2_cancel(id);
+    /// Not a `const`: `max_area` is a `u64` and the limit is declared in `usize`, and a
+    /// saturating widening is not available in a constant. Saturating rather than panicking
+    /// keeps the comparison monotonic on a target where the two widths differ.
+    fn frame_constraints() -> FrameConstraints {
+        FrameConstraints {
+            multiple: FLUX2_SELECTION_MULTIPLE,
+            min_side: FLUX2_MIN_SELECTION_PX,
+            max_area: Some(u64::try_from(FLUX2_MAX_SELECTION_AREA_PX2).unwrap_or(u64::MAX)),
+            max_aspect: Some(FLUX2_MAX_SELECTION_ASPECT),
         }
+    }
+
+    /// Region size the forecast and the status line describe, `None` without a frame.
+    fn region_size(&self) -> Option<[usize; 2]> {
+        self.region.map(|rect| [rect.w, rect.h])
     }
 }
 
-impl CleaningTool for Flux2KleinTool {
-    fn tool_id(&self) -> &'static str {
+/// Whether two frame rectangles describe the same region.
+///
+/// `OverlayRectPx` derives no `PartialEq`, and adding one to the canvas types for this
+/// engine alone is not this module's call.
+fn same_region(a: Option<&OverlayRectPx>, b: Option<&OverlayRectPx>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+/// Whether two frame rectangles describe the same region SIZE.
+///
+/// Separate from [`same_region`] because the memory forecast is a question about the SIZE
+/// alone: a rectangle that only moved forecasts identically, and asking the backend again
+/// would be a round trip per scrolled pixel.
+fn same_region_size(a: Option<&OverlayRectPx>, b: Option<&OverlayRectPx>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.w == b.w && a.h == b.h,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+impl AiEngine for Flux2KleinEngine {
+    fn id(&self) -> &'static str {
         "flux2_klein"
     }
 
-    fn title(&self) -> &'static str {
-        t!("cleaning.tools.flux2_klein.title")
+    fn title(&self) -> String {
+        t!("cleaning.tools.flux2_klein.title").to_string()
     }
 
-    fn pytorch_required(&self) -> bool {
+    fn section(&self) -> EngineSection {
+        EngineSection::WithPrompt
+    }
+
+    fn requires_torch(&self) -> bool {
         true
     }
 
-    fn deactivate(&mut self, _canvas: &mut CanvasView) {
-        self.region_base.cancel_selection();
-        self.clear_session();
+    fn constraints(&self) -> FrameConstraints {
+        Self::frame_constraints()
     }
 
-    fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        self.region_base.draw_ui_hint(ui);
-        ui.small(t!("cleaning.tools.flux2_klein.description_hint"));
-        ui.small(t!("cleaning.tools.flux2_klein.paths_hint"));
+    /// ONE layer: the area the model is allowed to change. A second layer would have no
+    /// meaning on the wire — the request carries exactly one mask.
+    fn mask_layers(&self) -> Vec<MaskLayerSpec> {
+        vec![MaskLayerSpec {
+            tint: FLUX2_MASK_TINT,
+            label_key: "cleaning.tools.flux2_klein.mask_heading",
+        }]
     }
 
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.region_base.cancel_selection();
-            self.clear_session();
-            return true;
-        }
-        false
+    /// «Работа без маски» is exactly this flag: with it set the whole region is
+    /// regenerated and there is nothing to paint, so the host must stop demanding a
+    /// non-empty mask. The host re-reads this whenever the parameters change.
+    fn allows_empty_mask(&self) -> bool {
+        self.settings.whole_region
     }
 
-    fn set_ai_backend_available(&mut self, available: bool) {
-        self.ai_backend_available = available;
-    }
-
-    fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
-        self.region_base.wants_primary_stroke(point)
-    }
-
-    fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
-        self.region_base.begin_selection(canvas, point);
-    }
-
-    fn stroke_update(&mut self, canvas: &mut CanvasView, _from: StrokePoint, to: StrokePoint) {
-        self.region_base.update_selection(canvas, to);
-    }
-
-    fn stroke_end(&mut self, canvas: &mut CanvasView) {
-        self.region_base.end_selection(canvas);
-    }
-
-    fn draw_overlay_ui(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-    ) {
-        self.poll_settings_load();
-        self.poll_and_maybe_query_status();
-        self.poll_unload();
-        self.poll_translate();
-        self.poll_prompt_cache();
-        self.poll_and_maybe_query_prompt_cache_list();
-        self.poll_picker();
-
+    fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         let mut settings_changed = false;
         let mut want_status = false;
         let mut want_estimate = false;
@@ -2367,17 +2188,13 @@ impl CleaningTool for Flux2KleinTool {
         let mut translate_requested = false;
         let mut prompt_cache_action: Option<Flux2PromptCacheAction> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
-        // Read before the destructure below borrows `settings` mutably: the on-open
-        // callback and the editor body are handed to the base in the same call, so the
-        // callback cannot reach the settings itself.
-        let whole_region = self.settings.whole_region;
-        // Same reason: the cache state is derived from `status` AND `settings`, so it
-        // cannot be computed while both are borrowed apart by the destructure.
+        // Read before the destructure below borrows `settings` apart: the cache state is
+        // derived from `status` AND `settings`, so it cannot be computed while both are
+        // held by the context.
         let prompt_cache_state = self.prompt_cache_state();
+        let region = self.region_size();
         {
             let Self {
-                region_base,
-                session,
                 settings,
                 status,
                 status_error,
@@ -2397,10 +2214,10 @@ impl CleaningTool for Flux2KleinTool {
                 prompt_cache_name_input,
                 progress,
                 ai_backend_available,
+                run_status,
                 ..
             } = self;
-            let mut editor_ctx = Flux2EditorCtx {
-                session,
+            let mut panel = Flux2PanelCtx {
                 settings,
                 status: status.as_ref(),
                 status_error: status_error.as_deref(),
@@ -2420,6 +2237,7 @@ impl CleaningTool for Flux2KleinTool {
                 prompt_cache_selected,
                 prompt_cache_name_input,
                 progress,
+                run_status: run_status.as_deref(),
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
                 want_status: &mut want_status,
@@ -2429,23 +2247,7 @@ impl CleaningTool for Flux2KleinTool {
                 prompt_cache_action: &mut prompt_cache_action,
                 picker_requested: &mut picker_requested,
             };
-            region_base.draw_overlay_ui(
-                ctx,
-                canvas,
-                project,
-                t!("cleaning.tools.flux2_klein.title"),
-                |editor| {
-                    if editor.status.is_none() {
-                        editor.status = Some(if whole_region {
-                            t!("cleaning.tools.flux2_klein.whole_region_editor_hint_status")
-                                .to_string()
-                        } else {
-                            t!("cleaning.tools.flux2_klein.editor_hint_status").to_string()
-                        });
-                    }
-                },
-                |ui, editor| editor_ctx.draw_body(ui, editor),
-            );
+            panel.draw(ui, region);
         }
 
         if settings_changed {
@@ -2490,50 +2292,176 @@ impl CleaningTool for Flux2KleinTool {
             self.unload_status =
                 Some(t!("cleaning.tools.flux2_klein.unload_requested_status").to_string());
         }
+    }
 
-        let region = if self.region_base.has_open_editor() {
-            Some(self.session.mask_size)
-        } else {
-            None
-        };
-        self.poll_and_maybe_query_estimate(region);
+    /// Only the engine's own half of the gate — the model paths and the prompt. The
+    /// rectangle is already validated against [`Self::constraints`] by the frame, and the
+    /// non-empty-mask rule is [`Self::allows_empty_mask`].
+    fn run_block_reason(&self) -> Option<String> {
+        flux2_run_block_reason(&self.settings, self.prompt_cache_state())
+    }
 
-        // The editor is gone (applied or cancelled): drop its per-session state so the
-        // next region starts with an empty mask and an empty undo stack.
-        if !self.region_base.has_open_editor() && self.session.scroll_id.is_some() {
-            self.clear_session();
+    /// Validates the host's request and starts the run.
+    ///
+    /// The size guarantees of `EngineRunRequest` are CHECKED rather than trusted: a request
+    /// whose region or mask does not match `rect_px` would otherwise be encoded onto the
+    /// wire and rejected by the backend with a message about the protocol instead of about
+    /// the region. The user-facing refusal names the region; the numbers go to the log.
+    ///
+    /// # Errors
+    /// Returns a localized message when a run is already in flight, when the region or the
+    /// masks do not match `rect_px`, or when the region size breaks a model constraint.
+    fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
+        let EngineRunRequest {
+            page_idx,
+            rect_px,
+            region,
+            masks,
+        } = request;
+        let size = [rect_px.w, rect_px.h];
+        let expected_bytes = rect_px.w.saturating_mul(rect_px.h);
+        let mask_ok = masks.len() == 1 && masks[0].len() == expected_bytes;
+        if region.size != size || !mask_ok {
+            crate::runtime_log::log_warn(format!(
+                "[cleaning] FLUX.2 klein run request does not match the frame: page {page_idx}, rect {}x{} at ({}, {}), region {}x{}, {} mask layer(s) of {:?} bytes, expected {expected_bytes}",
+                rect_px.w,
+                rect_px.h,
+                rect_px.x,
+                rect_px.y,
+                region.size[0],
+                region.size[1],
+                masks.len(),
+                masks.iter().map(Vec::len).collect::<Vec<_>>()
+            ));
+            return Err(t!("cleaning.region.invalid_selection_size_error").to_string());
         }
+        // Re-validated here as well as on the worker: the frame snaps to the same
+        // constraints, but a host that hands over another size must be told which rule it
+        // broke rather than have the backend refuse the blob.
+        if let Some(reason) = region_block_reason(size) {
+            return Err(reason);
+        }
+        // The painted layer is never overwritten: under `whole_region` a solid buffer is
+        // built beside it, which is what the backend requires alongside the flag.
+        let mask = mask_for_run(&masks[0], self.settings.whole_region);
+        self.session
+            .start_run(region, mask, size, &self.settings, &self.progress)?;
+        // A run may have to load weights it did not have; the catalog and the forecast are
+        // stale afterwards.
+        self.status_wanted = true;
+        self.estimate_wanted = true;
+        self.run_status =
+            Some(t!("cleaning.mask_editor.processing_background_status").to_string());
+        Ok(())
+    }
+
+    /// Drains every channel the engine owns and reports the run.
+    ///
+    /// Called whether the parameter panel is drawn or not, which is why all the polling
+    /// lives here: a finished run must land even while the panel is closed.
+    fn poll(&mut self, ctx: &egui::Context) -> EnginePoll {
+        self.poll_settings_load();
+        self.poll_and_maybe_query_status();
+        self.poll_unload();
+        self.poll_translate();
+        self.poll_prompt_cache();
+        self.poll_and_maybe_query_prompt_cache_list();
+        self.poll_picker();
+
+        let mut settings_changed = false;
+        let run = self.session.poll_run(
+            &mut self.settings,
+            &mut settings_changed,
+            &mut self.run_status,
+        );
+        if settings_changed {
+            self.dirty = true;
+            self.estimate_wanted = true;
+        }
+
+        let region = self.region_size();
+        self.poll_and_maybe_query_estimate(region);
         self.poll_and_maybe_save();
+
+        match run {
+            Flux2RunPoll::Idle => EnginePoll::Idle,
+            Flux2RunPoll::Running => {
+                // The progress bar moves on backend frames, not on user input, so the GUI
+                // has to be woken even when nothing is touched.
+                ctx.request_repaint();
+                EnginePoll::Running
+            }
+            Flux2RunPoll::Done(image) => EnginePoll::Done(image),
+            Flux2RunPoll::Failed(err) => EnginePoll::Failed(err),
+        }
     }
 
-    fn draw_cursor(
-        &mut self,
-        ui: &mut egui::Ui,
-        canvas: &CanvasView,
-        pointer_scene_pos: Option<egui::Pos2>,
-    ) {
-        self.region_base.draw_cursor(ui, canvas, pointer_scene_pos);
+    fn cancel(&mut self) {
+        if self.session.cancel_run(&self.progress) {
+            self.run_status =
+                Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
+        }
     }
 
-    fn captures_canvas_pointer(&self, pointer_pos: egui::Pos2) -> bool {
-        self.region_base.editor_window_contains(pointer_pos)
+    fn set_backend_available(&mut self, available: bool) {
+        self.ai_backend_available = available;
     }
 
-    fn block_canvas_zoom(&self) -> bool {
-        self.region_base.has_open_editor()
+    /// Deliberately empty: the run button is the host's `AiButton` with
+    /// `AiRequirement::Torch`, which resolves the runtime's presence itself. Storing a
+    /// second copy of that answer here could only ever disagree with it.
+    fn set_torch_available(&mut self, _available: bool) {}
+
+    /// Publishes the frame rectangle, and arms the memory forecast only on a SETTLED SIZE
+    /// change.
+    ///
+    /// The rectangle itself is stored unconditionally, so the status line keeps printing the
+    /// live size while the user drags. The `.estimate` round trip is what is gated, on two
+    /// rules that are one bug each if dropped:
+    /// - the forecast depends on the SIZE alone, so a pure position change arms nothing —
+    ///   the host pushes this every frame and the frame's keep-in-view clamp moves the
+    ///   rectangle whenever the canvas is scrolled, which used to re-arm the forecast
+    ///   continuously;
+    /// - a resize drag publishes a new size every rendered frame, so the change is held in
+    ///   `region_resize_pending` until `geometry_settled` — one request when the handle is
+    ///   released, no matter how many sizes the drag passed through.
+    ///
+    /// The cancel-and-clear half stays keyed to the rectangle's IDENTITY: a rectangle that
+    /// moved describes another part of the page, so a run in flight would answer about the
+    /// previous one and the pre-run images kept for chaining runs stop describing anything.
+    /// In practice it fires only on a deliberate move — a frame holding a run or a result is
+    /// locked and neither the user nor the keep-in-view clamp moves it — but the engine
+    /// cannot see the frame's lock and must not depend on it.
+    fn set_region(&mut self, region: Option<OverlayRectPx>, geometry_settled: bool) {
+        if !same_region_size(self.region.as_ref(), region.as_ref()) {
+            self.region_resize_pending = true;
+        }
+        if !same_region(self.region.as_ref(), region.as_ref()) {
+            self.region = region;
+            if self.session.cancel_run(&self.progress) {
+                self.run_status =
+                    Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
+            }
+            self.session.clear();
+        }
+        if self.region_resize_pending && geometry_settled {
+            self.region_resize_pending = false;
+            self.estimate_wanted = true;
+        }
     }
 }
 
 // ---------------------------------------------------------------------------------------
-// Editor body
+// Parameter panel body
 // ---------------------------------------------------------------------------------------
 
-/// Everything the editor body may read or mutate, borrowed for exactly one frame.
+/// Everything the parameter panel may read or mutate, borrowed for exactly one frame.
 ///
-/// It exists so the body can be split into small methods instead of one closure with a
-/// dozen captured references, while `region_base` is mutably borrowed by the base.
-struct Flux2EditorCtx<'a> {
-    session: &'a mut Flux2SessionState,
+/// It exists so the panel can be split into small methods instead of one function with a
+/// dozen locals, and so the intents the controls raise (re-query the catalog, open a
+/// picker, start a translation) travel back to the engine as plain flags rather than as
+/// work done from inside a widget closure.
+struct Flux2PanelCtx<'a> {
     settings: &'a mut Flux2KleinSettings,
     status: Option<&'a Flux2Status>,
     status_error: Option<&'a str>,
@@ -2555,6 +2483,8 @@ struct Flux2EditorCtx<'a> {
     prompt_cache_selected: &'a mut Option<String>,
     prompt_cache_name_input: &'a mut String,
     progress: &'a Arc<Mutex<Flux2Progress>>,
+    /// The engine's own line about the last run, drawn under the progress bar.
+    run_status: Option<&'a str>,
     ai_backend_available: bool,
     /// Set when a control changed a persisted value.
     settings_changed: &'a mut bool,
@@ -2572,55 +2502,24 @@ struct Flux2EditorCtx<'a> {
     picker_requested: &'a mut Option<Flux2PickerPurpose>,
 }
 
-impl Flux2EditorCtx<'_> {
-    /// Draws the whole region-editor body: scrollable controls plus the painted
-    /// preview, then the fixed run/undo row. The status line and Отмена/Применить are
-    /// appended by `RegionEditToolBase::draw_overlay_ui`.
-    fn draw_body(&mut self, ui: &mut egui::Ui, editor: &mut RegionEditorSession) {
-        if self.session.sync_session(editor.scroll_id, editor.image.size) {
-            // A different region: `sync_session` has already detached the previous
-            // run's receiver, so retire its progress generation too and stop it
-            // backend-side instead of letting it drive this region's bar.
-            if let Some(id) = retire_progress_generation(self.progress) {
-                spawn_flux2_cancel(id);
-            }
-            *self.want_estimate = true;
+impl Flux2PanelCtx<'_> {
+    /// Draws the whole «Редактор области» body for this engine: its progress bar and run
+    /// status, the prompt block, the parameters, and the working-mode switch.
+    ///
+    /// No scroll area and no run button: the panel that hosts this body owns its scrolling,
+    /// and «Обработать» / «Применить» / «Отменить» belong to the frame and its host
+    /// (`dev-docs/region_edit_v2_plan.md` §13.1).
+    ///
+    /// `region` is the frame rectangle's size, `None` while the tool has no frame; the
+    /// controls that describe a region are then simply not drawn.
+    fn draw(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
+        draw_flux2_progress_ui(ui, self.progress);
+        if let Some(status) = self.run_status {
+            ui.small(status);
         }
-        let running = self
-            .session
-            .poll_run(editor, self.settings, self.settings_changed);
-        let scroll_id = editor.scroll_id;
-
-        // Keep the action row fixed while a long parameter list scrolls, and keep
-        // mouse-drag out of the scroll sources so dragging the preview paints instead
-        // of scrolling the panel.
-        let scroll_max_h = (ui.ctx().content_rect().height() - 200.0).max(240.0);
-        egui::ScrollArea::vertical()
-            .id_salt(("cleaning_flux2_klein_body_scroll", scroll_id))
-            .max_height(scroll_max_h)
-            .auto_shrink([false, true])
-            .scroll_source(
-                egui::scroll_area::ScrollSource::SCROLL_BAR
-                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if RegionEditToolBase::draw_region_editor_zoom_controls(ui, editor) {
-                        ui.ctx().request_repaint();
-                    }
-                });
-                draw_flux2_progress_ui(ui, self.progress);
-                self.draw_prompt(ui);
-                self.draw_params(ui, scroll_id, editor.image.size);
-                self.draw_brush_controls(ui);
-                self.draw_preview(ui, editor, running);
-            });
-
-        ui.separator();
-        self.draw_actions(ui, editor, running);
-        if running {
-            ui.ctx().request_repaint();
-        }
+        self.draw_prompt(ui);
+        self.draw_params(ui, region);
+        self.draw_mode_controls(ui);
     }
 
     /// Draws the prompt block: the optional user-language field with its translator
@@ -2743,7 +2642,7 @@ impl Flux2EditorCtx<'_> {
                     t!("cleaning.tools.flux2_klein.prompt_not_cached_status"),
                 );
             }
-            // Not known yet — see `Flux2KleinTool::prompt_cache_state`. A neutral line,
+            // Not known yet — see `Flux2KleinEngine::prompt_cache_state`. A neutral line,
             // never the warning one: the answer is outstanding, not negative.
             None => {
                 ui.small(t!("cleaning.tools.flux2_klein.prompt_cache_unknown_status"));
@@ -2955,7 +2854,7 @@ impl Flux2EditorCtx<'_> {
     /// Draws the collapsed-by-default parameter section: model paths, generation
     /// parameters, the memory preset with its forecast, the nested advanced section,
     /// and the backend catalog/unload controls.
-    fn draw_params(&mut self, ui: &mut egui::Ui, scroll_id: u64, region: [usize; 2]) {
+    fn draw_params(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
         let settings = &mut *self.settings;
         let changed = &mut *self.settings_changed;
         let want_status = &mut *self.want_status;
@@ -2970,7 +2869,7 @@ impl Flux2EditorCtx<'_> {
         let estimate_busy = self.estimate_busy;
         RegionEditToolBase::draw_region_editor_collapsible_section(
             ui,
-            ("cleaning_flux2_klein_params", scroll_id),
+            "cleaning_flux2_klein_params",
             t!("cleaning.tools.flux2_klein.params_heading"),
             false,
             |ui| {
@@ -3077,7 +2976,7 @@ impl Flux2EditorCtx<'_> {
                     *want_estimate = true;
                 }
 
-                draw_advanced_section(ui, scroll_id, settings, changed);
+                draw_advanced_section(ui, settings, changed);
 
                 ui.separator();
                 draw_status_ui(ui, status, status_error, region);
@@ -3102,15 +3001,16 @@ impl Flux2EditorCtx<'_> {
         );
     }
 
-    /// Draws the mask section: the whole-region switch, and — unless it is on — the
-    /// brush row (paint/erase, the two whole-mask shortcuts) and the radius slider.
+    /// Draws the working-mode switch: «Работа без маски», which decides whether the
+    /// painted mask is consulted at all.
     ///
-    /// The painting controls are HIDDEN rather than faded when the switch is on: unlike
-    /// the fp8 checkbox in the advanced section, which the user may be about to make
-    /// relevant again by clearing a neighbouring flag, these edit a mask that this mode
-    /// does not consult at all, and leaving them live would let a stray click destroy
-    /// work that clearing the switch is supposed to bring back intact.
-    fn draw_brush_controls(&mut self, ui: &mut egui::Ui) {
+    /// The brush itself is NOT here: the radius, paint/erase, clear and fill belong to the
+    /// host's «Выбранный инструмент» panel, which drives the frame's one `MaskBrush` for
+    /// every engine. What stays is the one control that changes the MEANING of the mask —
+    /// with the switch on, the host is told to accept an empty mask
+    /// ([`Flux2KleinEngine::allows_empty_mask`]) and the painted layer is never read, so it
+    /// survives the mode byte for byte.
+    fn draw_mode_controls(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(t!("cleaning.tools.flux2_klein.mask_heading"));
         *self.settings_changed |= ui
@@ -3125,217 +3025,16 @@ impl Flux2EditorCtx<'_> {
             return;
         }
         ui.small(t!("cleaning.tools.flux2_klein.mask_hint"));
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(
-                &mut self.session.brush_mode,
-                BrushMode::Paint,
-                t!("cleaning.tools.flux2_klein.brush_paint_button"),
-            );
-            ui.selectable_value(
-                &mut self.session.brush_mode,
-                BrushMode::Erase,
-                t!("cleaning.tools.flux2_klein.brush_erase_button"),
-            );
-            if ui
-                .button(t!("cleaning.tools.flux2_klein.mask_clear_button"))
-                .clicked()
-            {
-                self.session.fill_mask(0);
-            }
-            if ui
-                .button(t!("cleaning.tools.flux2_klein.mask_fill_button"))
-                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_fill_tooltip"))
-                .clicked()
-            {
-                self.session.fill_mask(255);
-            }
-        });
-        *self.settings_changed |= ui
-            .add(
-                WheelSlider::new(
-                    &mut self.settings.brush_radius,
-                    FLUX2_BRUSH_MIN..=FLUX2_BRUSH_MAX,
-                )
-                .text(t!("cleaning.tools.flux2_klein.brush_radius_label")),
-            )
-            .changed();
-    }
-
-    /// Draws the region with the edit-permission overlay on top and handles brush
-    /// input over it. Under `whole_region` neither happens: the overlay is not painted
-    /// and pointer drags are ignored, so the stored mask survives the mode untouched.
-    ///
-    /// The base's `draw_region_editor_image_with_stroke_input` cannot be reused: it
-    /// owns the whole image response and offers no hook to paint the mask over it,
-    /// which is the entire point of this preview.
-    fn draw_preview(
-        &mut self,
-        ui: &mut egui::Ui,
-        editor: &mut RegionEditorSession,
-        running: bool,
-    ) {
-        RegionEditToolBase::ensure_region_editor_texture(editor, ui.ctx());
-        self.session.ensure_mask_texture(ui.ctx(), editor.scroll_id);
-        // The whole region is being edited, so there is no permitted-area contour to
-        // show and nothing to paint. The texture is still kept in step above, so the
-        // overlay reappears exactly as it was the moment the switch is cleared.
-        let whole_region = self.settings.whole_region;
-        // Cloned so the draw closure does not borrow `self.session` while `editor` is
-        // borrowed; a `TextureHandle` clone is a refcount bump.
-        let mask_texture = if whole_region {
-            None
-        } else {
-            self.session.mask_texture.clone()
-        };
-        let preview_size = editor.zoomed_image_size();
-        let image_size = editor.image.size;
-        let scroll_id = editor.scroll_id;
-        let radius = self.settings.brush_radius.clamp(FLUX2_BRUSH_MIN, FLUX2_BRUSH_MAX);
-        let brush_mode = self.session.brush_mode;
-        let session = &mut *self.session;
-
-        RegionEditToolBase::draw_region_editor_scroll_area(ui, scroll_id, preview_size, |ui| {
-            let Some(texture) = editor.texture.as_ref() else {
-                return;
-            };
-            let response = ui.add(
-                egui::Image::new((texture.id(), preview_size))
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            if let Some(mask_texture) = mask_texture.as_ref() {
-                ui.painter().image(
-                    mask_texture.id(),
-                    response.rect,
-                    Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
-
-            let (primary_down, secondary_down, mods, z_down) = ui.ctx().input(|i| {
-                (
-                    i.pointer.primary_down(),
-                    i.pointer.secondary_down(),
-                    i.modifiers,
-                    i.key_down(egui::Key::Z),
-                )
-            });
-            // The base owns Ctrl/Z + wheel and the scrub-drag zoom; while either is
-            // active the pointer is a zoom gesture, not a brush.
-            let zoom_modifier_down = mods.ctrl || mods.command || z_down;
-            if zoom_modifier_down || editor.zoom_drag_active || running || whole_region {
-                session.last_drag_px = None;
-            }
-
-            if let Some(pointer_pos) = response.interact_pointer_pos()
-                && response.rect.contains(pointer_pos)
-                && (primary_down || secondary_down)
-                && !zoom_modifier_down
-                && !editor.zoom_drag_active
-                && !running
-                // The stored mask is the user's work and this mode does not read it;
-                // a drag over the preview must not silently rewrite it.
-                && !whole_region
-            {
-                let to = pointer_to_image_px(pointer_pos, response.rect, image_size);
-                let from = session.last_drag_px.unwrap_or(to);
-                // The right button always erases, whatever the mode picker says: it is
-                // the one gesture users expect to undo a stray stroke without a trip
-                // to the toolbar.
-                let erase = secondary_down || (brush_mode == BrushMode::Erase && primary_down);
-                session.paint_segment(from, to, i32::try_from(radius).unwrap_or(i32::MAX), erase);
-                session.last_drag_px = Some(to);
-                ui.ctx().request_repaint();
-            }
-
-            if !(primary_down || secondary_down) {
-                session.last_drag_px = None;
-            }
-        });
-    }
-
-    /// Draws the run / undo / cancel row, naming on hover every reason the run button
-    /// is disabled.
-    fn draw_actions(&mut self, ui: &mut egui::Ui, editor: &mut RegionEditorSession, running: bool) {
-        let block_reason = self.run_block_reason(editor.image.size);
-        // A prompt-cache build owns the same progress bar and the same backend pipeline,
-        // so a generation started on top of it would fight both.
-        let can_run =
-            !running && !self.prompt_cache_busy && block_reason.is_none() && self.ai_backend_available;
-        let can_undo = !running && !self.session.undo_stack.is_empty();
-        let run_hint = block_reason.clone().unwrap_or_else(|| {
-            if self.prompt_cache_busy {
-                t!("cleaning.mask_editor.processing_already_running_status").to_string()
-            } else if self.ai_backend_available {
-                if self.settings.whole_region {
-                    t!("cleaning.tools.flux2_klein.whole_region_run_hint").to_string()
-                } else {
-                    t!("cleaning.tools.flux2_klein.run_hint").to_string()
-                }
-            } else {
-                t!("cleaning.mask_editor.backend_unavailable_status").to_string()
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let run = AiButton::new(
-                t!("cleaning.tools.flux2_klein.run_button"),
-                AiRequirement::Torch,
-            )
-            .and_enabled(can_run)
-            .draw(ui);
-            let response = run
-                .response
-                .on_hover_text(run_hint.clone())
-                .on_disabled_hover_text(run_hint);
-            if response.clicked() {
-                // A run may have to load weights it did not have; the catalog and the
-                // forecast are stale afterwards.
-                *self.want_status = true;
-                *self.want_estimate = true;
-                self.session.start_run(editor, self.settings, self.progress);
-            }
-            if ui
-                .add_enabled(
-                    can_undo,
-                    egui::Button::new(t!("cleaning.mask_editor.revert_button")),
-                )
-                .clicked()
-            {
-                self.session.undo_last_run(editor);
-            }
-            if running {
-                ui.spinner();
-                if ui
-                    .button(t!("cleaning.mask_editor.cancel_processing_button"))
-                    .on_hover_text(t!("cleaning.mask_editor.cancel_processing_tooltip"))
-                    .clicked()
-                {
-                    self.session.cancel_run(editor, self.progress);
-                }
-            }
-        });
-    }
-
-    /// The first reason a run cannot start, or `None` when it can.
-    ///
-    /// The region size is re-derived here from the LOADED editor image rather than
-    /// from the selection: the base clamps a snapped selection to the page edge and
-    /// re-crops by ratio, so neither the multiple of 16 nor the area cap survives the
-    /// trip on its own.
-    fn run_block_reason(&self, region: [usize; 2]) -> Option<String> {
-        flux2_run_block_reason(
-            self.settings,
-            self.session.has_mask(),
-            region,
-            self.prompt_cache_state,
-        )
     }
 }
 
-/// The first reason a run cannot start, or `None` when it can.
+/// The first reason a run cannot start that this ENGINE can see, or `None` when it can.
 ///
-/// `has_mask` reports whether anything is painted. It is only consulted while
-/// `settings.whole_region` is off: with the whole region up for editing there is
-/// nothing to paint, and demanding a mask there would block the mode outright.
+/// It covers the model paths and the prompt, and nothing else. The two checks that used to
+/// live here belong to the host now and must not be duplicated: the region size is
+/// validated by the frame against [`Flux2KleinEngine::constraints`] (and again on the worker
+/// by [`region_block_reason`], which is what protects the wire), and "is anything painted?"
+/// is [`Flux2KleinEngine::allows_empty_mask`], which the frame's own process button honours.
 ///
 /// `prompt_cached` is the three-state `.status` answer for the prompt in the field. **A
 /// cached prompt waives the text encoder**: the denoise and the VAE decode never look at
@@ -3349,16 +3048,14 @@ impl Flux2EditorCtx<'_> {
 /// to explain it before the click, not to duplicate it.
 ///
 /// A free function rather than a method for the same reason [`region_block_reason`] is
-/// one — the gate is the contract worth testing, and a [`Flux2EditorCtx`] cannot be
-/// built outside a live frame.
+/// one — the gate is the contract worth testing, and it must be testable without an engine
+/// instance, which owns channels and worker state.
 fn flux2_run_block_reason(
     settings: &Flux2KleinSettings,
-    has_mask: bool,
-    region: [usize; 2],
     prompt_cached: Option<bool>,
 ) -> Option<String> {
     // Trimmed here rather than through `normalized()`: this runs on every frame of an
-    // open editor, and the only thing `normalized()` would add for these four fields is
+    // open panel, and the only thing `normalized()` would add for these four fields is
     // the trim — at the price of rebuilding the whole settings struct.
     let encoder_waived = prompt_cached == Some(true);
     if settings.transformer_path.trim().is_empty() || settings.vae_path.trim().is_empty() {
@@ -3376,10 +3073,7 @@ fn flux2_run_block_reason(
     if settings.prompt.trim().is_empty() {
         return Some(t!("cleaning.tools.flux2_klein.prompt_required_error").to_string());
     }
-    if !settings.whole_region && !has_mask {
-        return Some(t!("cleaning.tools.flux2_klein.empty_mask_error").to_string());
-    }
-    region_block_reason(region)
+    None
 }
 
 /// Validates a REGION SIZE against the model's hard constraints, naming the first one
@@ -3431,21 +3125,6 @@ fn region_block_reason(region: [usize; 2]) -> Option<String> {
 // ---------------------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------------------
-
-/// Maps a pointer position inside `image_rect` onto integer image pixel coordinates.
-fn pointer_to_image_px(pointer: Pos2, image_rect: Rect, image_size: [usize; 2]) -> (i32, i32) {
-    let image_w = image_size[0].max(1);
-    let image_h = image_size[1].max(1);
-    let rect_w = image_rect.width().max(f32::EPSILON);
-    let rect_h = image_rect.height().max(f32::EPSILON);
-    let x = ((pointer.x - image_rect.left()) / rect_w * image_w as f32)
-        .round()
-        .clamp(0.0, (image_w.saturating_sub(1)) as f32) as i32;
-    let y = ((pointer.y - image_rect.top()) / rect_h * image_h as f32)
-        .round()
-        .clamp(0.0, (image_h.saturating_sub(1)) as f32) as i32;
-    (x, y)
-}
 
 /// Draws one editable model-path row: a label, a text field, and one browse button per
 /// `(glyph, tooltip, purpose)` entry. Returns nothing; `changed` and `picker_requested`
@@ -3710,13 +3389,17 @@ fn draw_status_ui(
     ui: &mut egui::Ui,
     status: Option<&Flux2Status>,
     error: Option<&str>,
-    region: [usize; 2],
+    region: Option<[usize; 2]>,
 ) {
-    ui.small(tf!(
-        "cleaning.tools.flux2_klein.region_size_status",
-        w = region[0],
-        h = region[1]
-    ));
+    // No frame on the canvas yet: there is no region to report, and printing `0x0` would
+    // read as a broken selection rather than as an absent one.
+    if let Some([w, h]) = region {
+        ui.small(tf!(
+            "cleaning.tools.flux2_klein.region_size_status",
+            w = w,
+            h = h
+        ));
+    }
     if let Some(error) = error {
         ui.colored_label(
             FLUX2_STATUS_ERROR_COLOR,
@@ -3786,13 +3469,12 @@ fn draw_status_ui(
 /// handling and mask shaping.
 fn draw_advanced_section(
     ui: &mut egui::Ui,
-    scroll_id: u64,
     settings: &mut Flux2KleinSettings,
     changed: &mut bool,
 ) {
     RegionEditToolBase::draw_region_editor_collapsible_section(
         ui,
-        ("cleaning_flux2_klein_advanced", scroll_id),
+        "cleaning_flux2_klein_advanced",
         t!("cleaning.tools.flux2_klein.advanced_heading"),
         false,
         |ui| {
@@ -4203,7 +3885,7 @@ fn parse_applied_flags(header: &Value) -> Option<Flux2AppliedFlags> {
 /// prompt-cache build, which is why both go through here.
 ///
 /// `on_started` receives the IPC id of the request as soon as it is on the wire; the
-/// editor keeps it so «Отмена» can stop the work backend-side. This is why the call is
+/// progress state keeps it so a cancel can stop the work backend-side. This is why the call is
 /// built from `begin_call` + `wait_streaming` rather than from the `call_streaming`
 /// shorthand, which never exposes the id.
 fn flux2_stream_call<S, F>(
@@ -4792,6 +4474,18 @@ fn settings_from_json(value: &Value) -> Flux2KleinSettings {
 /// # Errors
 /// Returns a user-facing message when the data directory cannot be created, when the
 /// settings cannot be serialized, or when the write fails.
+/// Whether a settings save must be started right now.
+///
+/// `dirty` is raised by every parameter change and by the OOM recovery that rewrites the
+/// economy settings itself. `settings_loaded` gates it because the initial load runs on its own
+/// worker: saving the in-memory DEFAULTS before that load lands would overwrite the user's file
+/// with defaults, which is a silent data loss rather than a visible failure.
+/// `save_in_flight` keeps at most one writer on the file at a time.
+#[must_use]
+fn settings_save_due(dirty: bool, settings_loaded: bool, save_in_flight: bool) -> bool {
+    dirty && settings_loaded && !save_in_flight
+}
+
 fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), String> {
     let path = config::flux2_klein_settings_path();
     if let Some(parent) = path.parent() {
@@ -4807,6 +4501,7 @@ fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tabs::cleaning::tools::region_edit_v2::geometry::check_size;
 
     #[test]
     fn placement_wire_roundtrip() {
@@ -5135,6 +4830,24 @@ mod tests {
         assert!(region_block_reason([1024, 1040]).is_some(), "over 1 MP");
         assert!(region_block_reason([128, 1040]).is_some(), "steeper than 8:1");
         assert!(region_block_reason([128, 1024]).is_none(), "exactly 8:1 is allowed");
+        // The frame validates a rectangle against `constraints()`, the worker against
+        // `region_block_reason`. The two must accept exactly the same regions, or the
+        // frame would offer a size the run then refuses.
+        let constraints = Flux2KleinEngine::frame_constraints();
+        for size in [
+            [512usize, 512],
+            [510, 512],
+            [112, 512],
+            [1024, 1040],
+            [128, 1040],
+            [128, 1024],
+        ] {
+            assert_eq!(
+                check_size(size[0], size[1], &constraints).is_some(),
+                region_block_reason(size).is_some(),
+                "{size:?}"
+            );
+        }
     }
 
     #[test]
@@ -5156,36 +4869,47 @@ mod tests {
         assert!(encode_mask_png_l8(&mask, 32, 15).is_err(), "length mismatch must fail");
     }
 
+    /// The engine owns no brush any more: the host's `MaskStack` paints, and the engine's
+    /// only remaining duty is to put the bytes it is handed on the wire unchanged.
     #[test]
-    fn brush_paints_and_erases_within_the_region() {
-        let mut session = Flux2SessionState::default();
-        assert!(session.sync_session(1, [64, 64]));
-        assert!(!session.has_mask());
-        assert!(session.paint_segment((10, 10), (40, 10), 4, false));
-        assert!(session.has_mask());
-        // The stroke is a band, not the whole region.
-        assert_eq!(session.mask[0], 0);
-        assert_eq!(session.mask[10 * 64 + 10], 255);
-        assert!(session.paint_segment((10, 10), (40, 10), 4, true));
-        assert!(!session.has_mask());
-        session.fill_mask(255);
-        assert!(session.mask.iter().all(|value| *value == 255));
-        session.fill_mask(0);
-        assert!(!session.has_mask());
+    fn the_host_mask_reaches_the_wire_verbatim() {
+        // A band across a 64x64 region — the shape a stroke leaves.
+        let mut painted = vec![0u8; 64 * 64];
+        for x in 6..40 {
+            painted[10 * 64 + x] = 255;
+        }
+        let sent = mask_for_run(&painted, false);
+        assert_eq!(sent, painted, "the painted layer travels byte for byte");
+        // The bytes that actually reach the wire are checked, not the intention.
+        let png = encode_mask_png_l8(&sent, 64, 64).expect("encode the painted mask");
+        let decoded = image::load_from_memory(&png).expect("decode").to_luma8();
+        assert_eq!(decoded.dimensions(), (64, 64));
+        assert_eq!(decoded.get_pixel(0, 0).0[0], 0, "outside the band nothing may change");
+        assert_eq!(decoded.get_pixel(10, 10).0[0], 255, "inside the band the model may paint");
     }
 
+    /// The undo entries describe the rectangle they were captured from, so a frame that
+    /// moves or resizes invalidates them. `same_region` is what decides that, because
+    /// `OverlayRectPx` derives no `PartialEq` to lean on.
     #[test]
-    fn a_new_region_resets_the_session() {
+    fn a_moved_frame_is_a_new_region_and_drops_the_undo_history() {
+        let rect = |x, y, w, h| OverlayRectPx { x, y, w, h };
+        assert!(same_region(None, None));
+        assert!(same_region(Some(&rect(1, 2, 64, 64)), Some(&rect(1, 2, 64, 64))));
+        assert!(
+            !same_region(Some(&rect(1, 2, 64, 64)), Some(&rect(1, 3, 64, 64))),
+            "a move is a new region even at the same size"
+        );
+        assert!(
+            !same_region(Some(&rect(1, 2, 64, 64)), Some(&rect(1, 2, 64, 80))),
+            "a resize is a new region"
+        );
+        assert!(!same_region(Some(&rect(1, 2, 64, 64)), None));
+
         let mut session = Flux2SessionState::default();
-        session.sync_session(1, [64, 64]);
-        session.fill_mask(255);
-        session.undo_stack.push(egui::ColorImage::filled([2, 2], Color32::WHITE));
-        assert!(session.sync_session(2, [32, 48]));
-        assert_eq!(session.mask_size, [32, 48]);
-        assert_eq!(session.mask.len(), 32 * 48);
-        assert!(!session.has_mask());
+        session.push_undo(egui::ColorImage::filled([2, 2], Color32::WHITE));
+        session.clear();
         assert!(session.undo_stack.is_empty());
-        assert!(!session.sync_session(2, [32, 48]), "same session is a no-op");
     }
 
     #[test]
@@ -5282,6 +5006,35 @@ mod tests {
         assert_eq!(guard.step, 0, "a stale worker must not move the live bar");
     }
 
+    /// The debounced settings saver must be ARMED by a settings change and by nothing else.
+    ///
+    /// This is the whole persistence guarantee of the engine: `dirty` is the only signal a
+    /// parameter change leaves behind, and `poll_and_maybe_save` — which runs inside
+    /// `AiEngine::poll`, i.e. once per frame while the tool is active — is the only writer.
+    /// The two guards beside it are equally load-bearing: saving before the initial load
+    /// landed would overwrite the user's file with the in-memory defaults, and a second writer
+    /// would race the first on the same path.
+    #[test]
+    fn the_settings_saver_is_armed_by_a_settings_change_and_only_then() {
+        assert!(settings_save_due(true, true, false), "a changed setting must be written");
+        assert!(!settings_save_due(false, true, false), "nothing changed: no write");
+        assert!(
+            !settings_save_due(true, false, false),
+            "a write before the initial load lands would clobber the file with the defaults"
+        );
+        assert!(!settings_save_due(true, true, true), "at most one writer on the file at a time");
+    }
+
+    /// The engine keeps a change pending rather than dropping it while a save cannot run yet,
+    /// so nothing is lost between the parameter edit and the initial load landing.
+    #[test]
+    fn a_change_made_before_the_initial_load_is_kept_pending() {
+        let mut engine = Flux2KleinEngine { settings_loaded: false, dirty: true, ..Default::default() };
+        engine.poll_and_maybe_save();
+        assert!(engine.dirty, "the change must survive until it can be written");
+        assert!(engine.save_rx.is_none(), "and no writer may have been started");
+    }
+
     #[test]
     fn the_undo_stack_is_bounded() {
         let mut session = Flux2SessionState::default();
@@ -5299,24 +5052,172 @@ mod tests {
         assert_eq!(session.undo_stack[0].size, [4, 1]);
     }
 
+    /// A frame rectangle for the `set_region` rules below.
+    fn region_rect(x: usize, y: usize, w: usize, h: usize) -> Option<OverlayRectPx> {
+        Some(OverlayRectPx { x, y, w, h })
+    }
+
+    /// An engine whose forecast is disarmed and which already knows a 128x128 frame at the
+    /// origin, so each rule below starts from a settled, quiet state.
+    fn engine_with_settled_region() -> Flux2KleinEngine {
+        let mut engine = Flux2KleinEngine::default();
+        engine.set_region(region_rect(0, 0, 128, 128), true);
+        engine.estimate_wanted = false;
+        engine.region_resize_pending = false;
+        engine
+    }
+
+    /// The host pushes the rectangle EVERY frame, and the frame's keep-in-view clamp moves it
+    /// whenever the canvas is scrolled — so a position change must cost nothing. It used to
+    /// arm one `.estimate` round trip per scrolled frame.
     #[test]
-    fn the_painted_pixel_count_tracks_every_write() {
-        let mut session = Flux2SessionState::default();
-        session.sync_session(1, [64, 64]);
-        assert_eq!(session.mask_set_px, 0);
-        session.paint_segment((10, 10), (10, 10), 1, false);
-        let painted = session.mask.iter().filter(|value| **value > 0).count();
-        assert_eq!(session.mask_set_px, painted, "counter must match the buffer");
-        // Painting the same disc again changes nothing and must not double-count.
-        session.paint_segment((10, 10), (10, 10), 1, false);
-        assert_eq!(session.mask_set_px, painted);
-        session.paint_segment((10, 10), (10, 10), 1, true);
-        assert_eq!(session.mask_set_px, 0);
-        assert!(!session.has_mask());
-        session.fill_mask(255);
-        assert_eq!(session.mask_set_px, 64 * 64);
-        session.fill_mask(0);
-        assert_eq!(session.mask_set_px, 0);
+    fn a_position_only_change_does_not_arm_the_forecast() {
+        let mut engine = engine_with_settled_region();
+        engine.set_region(region_rect(64, 32, 128, 128), true);
+        assert!(!engine.estimate_wanted, "the forecast depends on the size alone");
+        assert!(
+            engine.region.is_some_and(|rect| rect.x == 64 && rect.y == 32),
+            "the rectangle itself must still follow the frame, so the status line stays live"
+        );
+    }
+
+    /// A resize drag publishes a new size on every rendered frame; querying the backend on
+    /// each of them would be one IPC round trip per frame.
+    #[test]
+    fn a_size_change_while_the_geometry_is_unsettled_does_not_arm_the_forecast() {
+        let mut engine = engine_with_settled_region();
+        engine.set_region(region_rect(0, 0, 192, 128), false);
+        assert!(!engine.estimate_wanted, "nothing may be queried mid-gesture");
+        assert!(
+            engine.region.is_some_and(|rect| rect.w == 192),
+            "the dragged size must still be displayed"
+        );
+    }
+
+    /// The rule the user asked for: one forecast per finished resize.
+    #[test]
+    fn a_settled_size_change_arms_the_forecast_exactly_once() {
+        let mut engine = engine_with_settled_region();
+        engine.set_region(region_rect(0, 0, 192, 128), true);
+        assert!(engine.estimate_wanted, "a settled resize must re-arm the forecast");
+        engine.estimate_wanted = false;
+        // The host keeps pushing the same rectangle every frame afterwards.
+        engine.set_region(region_rect(0, 0, 192, 128), true);
+        assert!(!engine.estimate_wanted, "the arming must not repeat on the next frames");
+    }
+
+    /// The sizes a drag passes through are one change, not many: the pending flag survives
+    /// the release frame, on which the rectangle usually no longer moves at all.
+    #[test]
+    fn the_sizes_of_one_drag_arm_the_forecast_once_on_release() {
+        let mut engine = engine_with_settled_region();
+        engine.set_region(region_rect(0, 0, 160, 128), false);
+        engine.set_region(region_rect(0, 0, 192, 128), false);
+        assert!(!engine.estimate_wanted, "still mid-drag");
+        // The release frame carries the same rectangle as the last dragged one.
+        engine.set_region(region_rect(0, 0, 192, 128), true);
+        assert!(engine.estimate_wanted, "the finished resize must arm the forecast");
+        engine.estimate_wanted = false;
+        engine.set_region(region_rect(0, 0, 192, 128), true);
+        assert!(!engine.estimate_wanted, "and exactly once");
+    }
+
+    /// The setter runs every frame with an unchanged rectangle for as long as the user does
+    /// nothing at all.
+    #[test]
+    fn an_unchanged_rectangle_arms_nothing() {
+        let mut engine = engine_with_settled_region();
+        for _ in 0..3 {
+            engine.set_region(region_rect(0, 0, 128, 128), true);
+        }
+        assert!(!engine.estimate_wanted, "an idle frame must be silent");
+    }
+
+    /// Regression guard for the fix above: gating the GEOMETRY must not disarm the forecast
+    /// as a whole. Everything that is not the rectangle still arms it — here the settings
+    /// load, which carries the memory preset, the placement and the model paths.
+    #[test]
+    fn a_settings_change_still_arms_the_forecast() {
+        let (tx, rx) = mpsc::channel();
+        assert!(tx.send(runnable_settings()).is_ok(), "the test channel must accept the settings");
+        let mut engine = Flux2KleinEngine {
+            settings_rx: Some(rx),
+            estimate_wanted: false,
+            ..Flux2KleinEngine::default()
+        };
+        engine.poll_settings_load();
+        assert!(engine.settings_loaded, "the load must have landed");
+        assert!(engine.estimate_wanted, "loaded settings describe another forecast");
+    }
+
+    /// The host promises that the region and every mask buffer are exactly `rect_px`.
+    /// The engine CHECKS that promise: a mismatch would otherwise be encoded and refused
+    /// by the backend with a message about the protocol instead of about the region.
+    #[test]
+    fn a_run_request_that_does_not_match_the_frame_is_refused() {
+        let mut engine = Flux2KleinEngine {
+            settings: runnable_settings(),
+            ..Flux2KleinEngine::default()
+        };
+        let rect = OverlayRectPx {
+            x: 0,
+            y: 0,
+            w: 128,
+            h: 128,
+        };
+        let region = || egui::ColorImage::filled([128, 128], Color32::WHITE);
+        let mask = || vec![255u8; 128 * 128];
+        let request = |rect_px, region, masks| EngineRunRequest {
+            page_idx: 3,
+            rect_px,
+            region,
+            masks,
+        };
+
+        assert!(
+            engine
+                .start(request(
+                    rect,
+                    egui::ColorImage::filled([64, 128], Color32::WHITE),
+                    vec![mask()]
+                ))
+                .is_err(),
+            "a region of another size"
+        );
+        assert!(
+            engine.start(request(rect, region(), Vec::new())).is_err(),
+            "no mask layer at all"
+        );
+        assert!(
+            engine
+                .start(request(rect, region(), vec![mask(), mask()]))
+                .is_err(),
+            "more layers than the one this engine declares"
+        );
+        assert!(
+            engine
+                .start(request(rect, region(), vec![vec![255u8; 128 * 64]]))
+                .is_err(),
+            "a mask of the wrong length"
+        );
+        // A rectangle that breaks a model constraint is refused too, even when the region
+        // and the mask agree with it: `region_block_reason` is the wire's last guard.
+        let steep = OverlayRectPx {
+            x: 0,
+            y: 0,
+            w: 120,
+            h: 128,
+        };
+        assert!(
+            engine
+                .start(request(
+                    steep,
+                    egui::ColorImage::filled([120, 128], Color32::WHITE),
+                    vec![vec![255u8; 120 * 128]]
+                ))
+                .is_err(),
+            "120 is not a multiple of 16"
+        );
     }
 
     /// Settings that pass every gate except the one under test, so a block reason a
@@ -5403,44 +5304,42 @@ mod tests {
         );
     }
 
+    /// The empty-mask rule LEFT the engine's gate in the port: the host's frame enforces
+    /// it and asks the engine only whether an empty mask is meaningful at all. Everything
+    /// else the gate used to refuse is refused exactly as before.
     #[test]
     fn an_empty_mask_blocks_a_run_only_while_the_mode_is_off() {
-        let region = [512usize, 512];
-        let painted = runnable_settings();
-        assert!(
-            flux2_run_block_reason(&painted, false, region, None).is_some(),
-            "nothing painted and no whole-region mode: the run must be refused"
-        );
-        assert!(
-            flux2_run_block_reason(&painted, true, region, None).is_none(),
-            "a painted mask is enough"
-        );
-
-        let whole = Flux2KleinSettings {
-            whole_region: true,
-            ..runnable_settings()
+        let mut engine = Flux2KleinEngine {
+            settings: runnable_settings(),
+            ..Flux2KleinEngine::default()
         };
         assert!(
-            flux2_run_block_reason(&whole, false, region, None).is_none(),
+            !engine.allows_empty_mask(),
+            "nothing painted and no whole-region mode: the host must refuse the run"
+        );
+        engine.settings.whole_region = true;
+        assert!(
+            engine.allows_empty_mask(),
             "whole-region mode needs no painted mask"
         );
+        assert!(
+            engine.run_block_reason().is_none(),
+            "with paths and a prompt the engine's own half of the gate is clear"
+        );
+
         // Every other gate still applies in the new mode.
-        assert!(flux2_run_block_reason(&whole, false, [510, 512], None).is_some());
-        let no_prompt = Flux2KleinSettings {
-            prompt: "   ".to_string(),
-            ..whole.clone()
-        };
-        assert!(flux2_run_block_reason(&no_prompt, false, region, None).is_some());
-        let no_paths = Flux2KleinSettings {
+        engine.settings.prompt = "   ".to_string();
+        assert!(engine.run_block_reason().is_some(), "a blank prompt still blocks");
+        engine.settings = Flux2KleinSettings {
+            whole_region: true,
             vae_path: String::new(),
-            ..whole
+            ..runnable_settings()
         };
-        assert!(flux2_run_block_reason(&no_paths, false, region, None).is_some());
+        assert!(engine.run_block_reason().is_some(), "a missing path still blocks");
     }
 
     #[test]
     fn a_cached_prompt_lets_a_run_start_without_a_text_encoder() {
-        let region = [512usize, 512];
         let no_encoder = Flux2KleinSettings {
             text_encoder_path: String::new(),
             ..runnable_settings()
@@ -5448,13 +5347,13 @@ mod tests {
         // The whole point of the prompt-cache library: the denoise and the VAE decode
         // never look at the encoder, so a ready embedding is enough to run.
         assert!(
-            flux2_run_block_reason(&no_encoder, true, region, Some(true)).is_none(),
+            flux2_run_block_reason(&no_encoder, Some(true)).is_none(),
             "a cached prompt must waive the encoder path"
         );
         // Without a cache the encoder is required again, and the message names all three
         // paths because all three are genuinely needed then.
         for state in [None, Some(false)] {
-            let reason = flux2_run_block_reason(&no_encoder, true, region, state)
+            let reason = flux2_run_block_reason(&no_encoder, state)
                 .expect("no encoder and no cache must be refused");
             assert_eq!(
                 reason,
@@ -5479,7 +5378,7 @@ mod tests {
                 ..no_encoder.clone()
             },
         ] {
-            let reason = flux2_run_block_reason(&broken, true, region, Some(true))
+            let reason = flux2_run_block_reason(&broken, Some(true))
                 .expect("a missing transformer or VAE still blocks the run");
             assert_eq!(
                 reason,
@@ -5491,21 +5390,20 @@ mod tests {
             prompt: "   ".to_string(),
             ..no_encoder.clone()
         };
-        assert!(flux2_run_block_reason(&no_prompt, true, region, Some(true)).is_some());
-        assert!(flux2_run_block_reason(&no_encoder, false, region, Some(true)).is_some());
-        assert!(flux2_run_block_reason(&no_encoder, true, [510, 512], Some(true)).is_some());
+        assert!(flux2_run_block_reason(&no_prompt, Some(true)).is_some());
     }
 
     #[test]
     fn whole_region_sends_a_solid_mask_and_keeps_the_painted_one() {
-        let mut session = Flux2SessionState::default();
-        session.sync_session(1, [32, 16]);
-        assert!(session.paint_segment((4, 4), (12, 4), 2, false));
-        let painted = session.mask.clone();
-        let painted_px = session.mask_set_px;
+        // The layer the host paints and hands over: a real stroke, not a full region.
+        let mut painted = vec![0u8; 32 * 16];
+        for x in 2..14 {
+            painted[4 * 32 + x] = 255;
+        }
+        let painted_px = painted.iter().filter(|value| **value > 0).count();
         assert!(painted_px > 0 && painted_px < painted.len(), "a real stroke");
 
-        let sent = session.mask_for_run(true);
+        let sent = mask_for_run(&painted, true);
         // The bytes that actually reach the wire are checked, not the intention: the
         // buffer is encoded and decoded back exactly as `run_flux2_klein_pass` does it.
         let png = encode_mask_png_l8(&sent, 32, 16).expect("encode the solid mask");
@@ -5516,11 +5414,9 @@ mod tests {
             "the backend refuses whole_region unless every mask byte is 255"
         );
 
-        // The user's work is untouched by the mode, so clearing the checkbox brings the
-        // painted mask back exactly as it was.
-        assert_eq!(session.mask, painted);
-        assert_eq!(session.mask_set_px, painted_px);
-        assert_eq!(session.mask_for_run(false), painted);
+        // The solid buffer is built BESIDE the host's layer, never through it, so clearing
+        // the switch brings the user's work back exactly as it was.
+        assert_eq!(mask_for_run(&painted, false), painted);
     }
 
     #[test]
@@ -5552,7 +5448,7 @@ mod tests {
             vae_path: "/models/vae".to_string(),
             ..Flux2KleinSettings::default()
         };
-        assert!(flux2_run_block_reason(&settings, true, [512, 512], None).is_none());
+        assert!(flux2_run_block_reason(&settings, None).is_none());
     }
 
     #[test]

@@ -754,21 +754,34 @@ struct PendingRegionSelection {
     overlay_chunk: Option<egui::ColorImage>,
 }
 
-struct RegionLoadRequest {
-    job_id: u64,
-    page_idx: usize,
-    source_rect: OverlayRectPx,
-    source_size: [usize; 2],
-    page_path: PathBuf,
-    overlay_chunk: Option<egui::ColorImage>,
-    shared_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
+/// One "decode the page and cut this region out of it" job for the region loader thread.
+///
+/// `pub(super)` so the whole `tools` subtree can drive the SAME loader instead of copying the
+/// decode/composite path (D10 / D14 of `dev-docs/region_edit_v2_plan.md`).
+pub(super) struct RegionLoadRequest {
+    /// Identifies the answer. A result whose id is not the one still awaited is dropped, which
+    /// is what makes an abandoned job harmless.
+    pub(super) job_id: u64,
+    pub(super) page_idx: usize,
+    /// The region to cut, in SOURCE page pixels.
+    pub(super) source_rect: OverlayRectPx,
+    /// Size of the page in source pixels, i.e. the space `source_rect` lives in. The crop is
+    /// mapped onto the decoded file proportionally, so this may not be guessed.
+    pub(super) source_size: [usize; 2],
+    pub(super) page_path: PathBuf,
+    /// The clean overlay under `source_rect`, composited over the page crop. `None` for a page
+    /// with no clean overlay allocated, which is that page's true clean state.
+    pub(super) overlay_chunk: Option<egui::ColorImage>,
+    /// The shared decoded-page cache, so a page decoded for one tool is not decoded again.
+    pub(super) shared_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
 }
 
-struct RegionLoadResult {
-    job_id: u64,
-    page_idx: usize,
-    target_rect_px: OverlayRectPx,
-    image: Result<egui::ColorImage, String>,
+/// One finished region load. `image` carries an already-localized message on failure.
+pub(super) struct RegionLoadResult {
+    pub(super) job_id: u64,
+    pub(super) page_idx: usize,
+    pub(super) target_rect_px: OverlayRectPx,
+    pub(super) image: Result<egui::ColorImage, String>,
 }
 
 pub struct RegionEditorSession {
@@ -827,13 +840,10 @@ pub struct RegionEditToolBase {
     window_id: String,
     selection_multiple: Option<usize>,
     /// Smallest accepted side of a selection, in source pixels. `0` = no floor.
-    /// Set through [`RegionEditToolBase::with_min_selection`].
     min_selection_px: usize,
     /// Largest accepted selection AREA, in source pixels squared. `0` = uncapped.
-    /// Set through [`RegionEditToolBase::with_max_selection_area`].
     max_selection_area_px2: usize,
     /// Largest accepted ratio between the long and the short side. `0.0` = uncapped.
-    /// Set through [`RegionEditToolBase::with_max_aspect_ratio`].
     max_selection_aspect: f32,
     selecting_page_idx: Option<usize>,
     selection_start_scene: Option<Pos2>,
@@ -877,42 +887,6 @@ impl RegionEditToolBase {
             editor: None,
             force_center_after_load: false,
         }
-    }
-
-    /// Refuses a finished selection whose shorter side is below `px` source pixels.
-    ///
-    /// Additive builder: the floor is checked in [`RegionEditToolBase::end_selection`],
-    /// NOT while dragging, so the user keeps seeing the rectangle they are drawing and
-    /// gets the reason named in the tool hint instead of a rectangle that silently
-    /// refuses to appear. `0` (the default) disables the check.
-    #[must_use]
-    pub fn with_min_selection(mut self, px: usize) -> Self {
-        self.min_selection_px = px;
-        self
-    }
-
-    /// Refuses a finished selection whose area exceeds `px2` source pixels squared.
-    ///
-    /// Additive builder with the same "checked on release, reported in the hint"
-    /// contract as [`RegionEditToolBase::with_min_selection`]. `0` (the default)
-    /// disables the check. Models with a hard latent budget need this: a selection
-    /// three times the trained area does not fail gracefully backend-side.
-    #[must_use]
-    pub fn with_max_selection_area(mut self, px2: usize) -> Self {
-        self.max_selection_area_px2 = px2;
-        self
-    }
-
-    /// Refuses a finished selection whose long side is more than `ratio` times its
-    /// short side.
-    ///
-    /// Additive builder with the same "checked on release, reported in the hint"
-    /// contract as the two above. A non-finite or non-positive `ratio` (the default
-    /// is `0.0`) disables the check.
-    #[must_use]
-    pub fn with_max_aspect_ratio(mut self, ratio: f32) -> Self {
-        self.max_selection_aspect = ratio;
-        self
     }
 
     /// Checks a finished selection against the optional min-side / max-area /
@@ -3255,7 +3229,16 @@ struct DecodedPageCache {
     image: image::RgbaImage,
 }
 
-fn spawn_region_loader_thread() -> (
+/// Starts the region loader worker: it decodes a page, crops `source_rect` out of it and
+/// composites the clean-overlay chunk on top, one job at a time.
+///
+/// Returns the request sender, the result receiver and the join handle. The owner MUST send
+/// `None` and join the handle on drop, or the thread outlives the tool. `pub(super)` so the
+/// v2 framework's host reuses this loader rather than duplicating the decode (D14); the decode
+/// is deliberately NOT on the GUI thread, and the last decoded page is cached per worker and
+/// shared through `CleanOverlaysModel`.
+#[must_use]
+pub(super) fn spawn_region_loader_thread() -> (
     Sender<Option<RegionLoadRequest>>,
     Receiver<RegionLoadResult>,
     JoinHandle<()>,

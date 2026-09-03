@@ -12,6 +12,7 @@ Main responsibilities:
 - paint the layers, in index order, into a screen rect
 
 Key structures:
+- `MaskLayerSpec`: what a consumer declares about one mask layer — its tint and its name
 - `MaskStack`: geometry, the layers, the active index, the undo history
 - `MaskLayer`: one layer's buffer, counter, preview, dirty box and texture (private)
 - `ResultLayer`: the processed image plus its lazily created texture
@@ -343,6 +344,22 @@ fn axis_window(f: i64, delta: i64, steps: i64, lo: i64, hi: i64) -> Option<(i64,
 // ---------------------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------------------
+
+/// What a consumer declares about one mask layer it wants painted.
+///
+/// It lives in the FRAMEWORK rather than in the consumer that reads it, because the frame owns
+/// both halves: the tint drives `MaskStack`'s preview and the key names the layer in the frame's
+/// own chrome. A consumer-side trait re-exports this type instead of defining a twin, so the two
+/// descriptions of a layer can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskLayerSpec {
+    /// Preview colour of the layer inside the frame. Should be opaque: `MaskStack` scales its
+    /// alpha to `MASK_PREVIEW_ALPHA_FACTOR` itself so the mask stays translucent over the page.
+    pub tint: Color32,
+    /// Catalog key of the layer's name, resolved at DRAW time so it follows a language switch.
+    /// Never a literal user-visible string.
+    pub label_key: &'static str,
+}
 
 /// One undo snapshot: the state of ONE layer before a stroke.
 #[derive(Debug)]

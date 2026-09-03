@@ -16,6 +16,9 @@ Key structures:
 
 Key functions:
 - `RegionFrame::update()`: the whole per-frame pass, run from `CleaningTool::draw_overlay_ui`
+- `RegionFrame::set_constraints()`, `set_mask_layers()`, `set_allows_empty_mask()`: what a host
+  pushes into the frame when the active consumer changes, or when its parameters do (D16)
+- `page_source_size()`: the source-pixel size of a page, i.e. the space `rect_px` lives in
 - `RegionFrame::captures_pointer()`, `drag_active()`: what the tool answers the canvas with
 - `handle_brush_gestures()`, `paint_brush_cursor()`: the brush gestures and ring the frame has
   to own itself, because `tab.rs` delivers no key, wheel or cursor hook over an occluded pointer
@@ -38,7 +41,7 @@ use super::geometry::{
     keep_in_view_delta, nearest_valid_size,
 };
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
-use super::layers::{MaskStack, ResultLayer};
+use super::layers::{MaskLayerSpec, MaskStack, ResultLayer};
 use super::render;
 use crate::canvas::{CanvasView, OverlayRectPx};
 use crate::tools::MaskBrush;
@@ -222,12 +225,19 @@ fn derive_visual(lock: FrameLock, violation: Option<SizeViolation>) -> FrameVisu
 /// «Обработать» needs a lock of `Free` or `MaskPainted`, not merely "not processing": a
 /// second run started while a result is still pending would replace that result without the
 /// user ever seeing it, and the frame offers no way to get the discarded one back.
+///
+/// `allows_empty_mask` relaxes the non-empty-mask requirement, and nothing else (D16): a
+/// consumer whose run regenerates the WHOLE region has nothing for the user to paint, so
+/// demanding a stroke first would make its own mode unreachable. The size check and the lock
+/// still apply unchanged.
 #[must_use]
-fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool) -> FrameButtons {
+fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool, allows_empty_mask: bool) -> FrameButtons {
     let processing = matches!(lock, FrameLock::Processing);
     let has_result = matches!(lock, FrameLock::ResultPending);
     FrameButtons {
-        process: violation.is_none() && matches!(lock, FrameLock::Free | FrameLock::MaskPainted) && !mask_empty,
+        process: violation.is_none()
+            && matches!(lock, FrameLock::Free | FrameLock::MaskPainted)
+            && (!mask_empty || allows_empty_mask),
         apply: has_result,
         cancel: has_result || processing,
         clear_mask: !mask_empty,
@@ -309,6 +319,28 @@ fn px_f32(v: usize) -> f32 {
     u32::try_from(v).unwrap_or(u32::MAX) as f32
 }
 
+/// The preview tints of `layers`, in declaration order — what `MaskStack` is built from.
+#[must_use]
+fn layer_tints(layers: &[MaskLayerSpec]) -> Vec<Color32> {
+    layers.iter().map(|layer| layer.tint).collect()
+}
+
+/// The SOURCE pixel size of page `page_idx`, i.e. the coordinate space of every
+/// `OverlayRectPx` on that page.
+///
+/// The clean overlay is authoritative when one is allocated. Otherwise the size is re-derived
+/// from the page's screen rect and the zoom, because the canvas lays pages out as
+/// `screen = source_px * zoom + translation`. `None` when the canvas has not laid the page out
+/// yet or the zoom is unusable.
+///
+/// Public because a host tool needs exactly this number to describe the frame's rectangle to a
+/// worker that crops the page file (`RegionLoadRequest::source_size`), and re-deriving it there
+/// would be a second copy of a rule that has to agree with the frame's own placement.
+#[must_use]
+pub fn page_source_size(canvas: &CanvasView, page_idx: usize, zoom: f32) -> Option<[usize; 2]> {
+    RegionFrame::page_placement(canvas, page_idx, zoom).map(|page| [page.w, page.h])
+}
+
 /// The chrome heights the frame lays its rows out with. One place, so the hitbox the
 /// geometry clamps and the rows the pass paints can never disagree.
 #[must_use]
@@ -383,8 +415,13 @@ pub struct RegionFrame {
     page_idx: Option<usize>,
     rect_px: Option<OverlayRectPx>,
     masks: MaskStack,
-    /// Preview tints of the mask layers, kept for the layer chips of the top strip.
-    tints: Vec<Color32>,
+    /// What the active consumer declared about each mask layer: the tint the chips of the top
+    /// strip are painted with, and the catalog key their tooltip resolves at draw time.
+    /// Always exactly as long as the mask stack has layers.
+    layers: Vec<MaskLayerSpec>,
+    /// Whether the active consumer accepts a run with every mask layer empty (D16). It only
+    /// relaxes `derive_buttons`' non-empty-mask requirement; the lock rules are untouched.
+    allows_empty_mask: bool,
     result: Option<ResultLayer>,
     processing: bool,
     drag: Option<DragState>,
@@ -414,25 +451,28 @@ impl std::fmt::Debug for RegionFrame {
             .field("rect_px", &self.rect_px)
             .field("lock", &self.lock())
             .field("layers", &self.masks.layer_count())
+            .field("allows_empty_mask", &self.allows_empty_mask)
             .field("has_result", &self.result.is_some())
             .finish()
     }
 }
 
 impl RegionFrame {
-    /// Creates an UNPLACED frame with `tints.len()` mask layers.
+    /// Creates an UNPLACED frame with `layers.len()` mask layers.
     ///
     /// The frame places itself on the current page the first time `update` runs with a laid
-    /// out canvas (D1: there is no rubber band, the frame simply appears).
+    /// out canvas (D1: there is no rubber band, the frame simply appears). A run with an empty
+    /// mask is refused until a consumer says otherwise through `set_allows_empty_mask`.
     #[must_use]
-    pub fn new(constraints: FrameConstraints, tints: &[Color32]) -> Self {
+    pub fn new(constraints: FrameConstraints, layers: &[MaskLayerSpec]) -> Self {
         Self {
             constraints,
             page_idx: None,
             rect_px: None,
             // Zero geometry until the frame is placed; `resize` allocates the real buffers.
-            masks: MaskStack::new(0, 0, tints),
-            tints: tints.to_vec(),
+            masks: MaskStack::new(0, 0, &layer_tints(layers)),
+            layers: layers.to_vec(),
+            allows_empty_mask: false,
             result: None,
             processing: false,
             drag: None,
@@ -447,6 +487,60 @@ impl RegionFrame {
     #[must_use]
     pub fn constraints(&self) -> &FrameConstraints {
         &self.constraints
+    }
+
+    /// Publishes the size requirements of the consumer that is active now (D16).
+    ///
+    /// The rectangle is deliberately NOT snapped to them: a frame whose current size the new
+    /// consumer refuses turns RED and says so, which is exactly the state `FrameVisual::Invalid`
+    /// and `status.invalid_size` exist for. Snapping instead would silently move a rectangle the
+    /// user placed, and would do it at the moment their attention is on the consumer list.
+    pub fn set_constraints(&mut self, constraints: FrameConstraints) {
+        self.constraints = constraints;
+    }
+
+    /// Publishes the mask layers of the consumer that is active now (D16).
+    ///
+    /// Re-creates the mask stack over the CURRENT geometry whenever the declaration differs, so
+    /// every layer ends up empty and the previews take the new tints. That destroys painted work,
+    /// which is why the call is REFUSED (logged, and otherwise a no-op) unless the frame is free:
+    /// a non-empty stack locks the frame, and D15 forbids a consumer switch under that lock for
+    /// this very reason. An identical declaration is a no-op and never disturbs the stack.
+    pub fn set_mask_layers(&mut self, layers: &[MaskLayerSpec]) {
+        if self.layers == layers {
+            return;
+        }
+        if !self.lock().is_free() {
+            crate::runtime_log::log_warn(format!(
+                "[region-edit-v2] refused to replace the {} mask layer(s) with {}: the frame is locked ({:?}), so the switch would discard painted work",
+                self.layers.len(),
+                layers.len(),
+                self.lock()
+            ));
+            return;
+        }
+        let (w, h) = self.masks.size();
+        self.masks = MaskStack::new(w, h, &layer_tints(layers));
+        self.layers = layers.to_vec();
+    }
+
+    /// Publishes whether the active consumer accepts an empty mask (D16).
+    ///
+    /// Re-pushed every frame by the host, because a consumer may derive it from one of its own
+    /// parameters: a copy taken once at the consumer switch would keep blocking «Обработать»
+    /// after that parameter changed, or keep allowing it after it changed back.
+    pub fn set_allows_empty_mask(&mut self, allow: bool) {
+        self.allows_empty_mask = allow;
+    }
+
+    /// Localized name of mask layer `idx`, or its 1-based number when the layer was declared
+    /// without a resolvable key. Resolved on every call so it follows a language switch.
+    #[must_use]
+    pub fn layer_label(&self, idx: usize) -> String {
+        self.layers.get(idx).map_or_else(
+            || idx.saturating_add(1).to_string(),
+            |layer| ms_i18n::lookup(layer.label_key).unwrap_or(layer.label_key).to_string(),
+        )
     }
 
     /// Whether the frame has an anchor and a rectangle, i.e. whether it can be drawn.
@@ -490,7 +584,7 @@ impl RegionFrame {
     /// Which of the four actions are available right now.
     #[must_use]
     pub fn buttons(&self) -> FrameButtons {
-        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty())
+        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty(), self.allows_empty_mask)
     }
 
     #[must_use]
@@ -1139,10 +1233,12 @@ impl RegionFrame {
         let active = self.masks.active();
         for idx in 0..count {
             let rect = render::layer_chip_rect(strip, idx, count);
+            // The tooltip names the layer the ACTIVE consumer declared, so a chip does not stay
+            // an anonymous coloured square when the consumer changes what its layers mean.
             let response = ui
                 .interact(rect, Id::new((FRAME_AREA_ID, "layer", idx)), Sense::click())
-                .on_hover_text(t!("cleaning.region_frame.layer_tooltip"));
-            let tint = self.tints.get(idx).copied().unwrap_or(Color32::GRAY);
+                .on_hover_text(tf!("cleaning.region_frame.layer_tooltip", name = self.layer_label(idx)));
+            let tint = self.layers.get(idx).map_or(Color32::GRAY, |layer| layer.tint);
             render::paint_layer_chip(ui.painter(), rect, idx.saturating_add(1), idx == active, tint);
             if response.clicked() {
                 self.masks.set_active(idx);
@@ -1248,6 +1344,15 @@ mod tests {
         FrameConstraints { multiple: 1, min_side: 1, max_area: None, max_aspect: None }
     }
 
+    /// One layer spec per tint, all naming the same catalog key: the tests care about the
+    /// layer COUNT and the tints, never about the labels.
+    fn test_layers(tints: &[Color32]) -> Vec<MaskLayerSpec> {
+        tints
+            .iter()
+            .map(|tint| MaskLayerSpec { tint: *tint, label_key: "cleaning.region_frame.status.free" })
+            .collect()
+    }
+
     fn rect_px(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }
     }
@@ -1312,19 +1417,19 @@ mod tests {
 
     #[test]
     fn buttons_of_a_free_frame_with_an_empty_mask() {
-        let b = derive_buttons(FrameLock::Free, None, true);
+        let b = derive_buttons(FrameLock::Free, None, true, false);
         assert_eq!(b, FrameButtons { process: false, apply: false, cancel: false, clear_mask: false });
     }
 
     #[test]
     fn buttons_of_a_painted_frame() {
-        let b = derive_buttons(FrameLock::MaskPainted, None, false);
+        let b = derive_buttons(FrameLock::MaskPainted, None, false, false);
         assert_eq!(b, FrameButtons { process: true, apply: false, cancel: false, clear_mask: true });
     }
 
     #[test]
     fn buttons_of_a_painted_frame_with_an_invalid_size() {
-        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false);
+        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, false);
         assert!(!b.process, "an invalid size must block processing");
         assert!(b.clear_mask, "erasing the mask is how the user gets back to a free frame");
     }
@@ -1333,13 +1438,13 @@ mod tests {
     /// recovered, so «Обработать» stays disabled until the user applies or cancels.
     #[test]
     fn buttons_of_a_pending_result() {
-        let b = derive_buttons(FrameLock::ResultPending, None, false);
+        let b = derive_buttons(FrameLock::ResultPending, None, false, false);
         assert_eq!(b, FrameButtons { process: false, apply: true, cancel: true, clear_mask: true });
     }
 
     #[test]
     fn buttons_while_processing() {
-        let b = derive_buttons(FrameLock::Processing, None, false);
+        let b = derive_buttons(FrameLock::Processing, None, false, false);
         assert_eq!(b, FrameButtons { process: false, apply: false, cancel: true, clear_mask: true });
     }
 
@@ -1454,7 +1559,7 @@ mod tests {
     // -----------------------------------------------------------------------------------
 
     fn placed_frame(body: Rect) -> RegionFrame {
-        let mut frame = RegionFrame::new(free_constraints(), &[Color32::RED, Color32::GREEN]);
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED, Color32::GREEN]));
         frame.page_idx = Some(0);
         frame.rect_px = Some(rect_px(0, 0, 100, 100));
         frame.hitbox = Some(hitbox_rect(body, &chrome()));
@@ -1569,7 +1674,7 @@ mod tests {
 
     #[test]
     fn an_undrawn_frame_captures_nothing() {
-        let frame = RegionFrame::new(free_constraints(), &[Color32::RED]);
+        let frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         assert!(!frame.captures_pointer(pos2(0.0, 0.0)));
         assert!(!frame.is_placed());
     }
@@ -1625,7 +1730,7 @@ mod tests {
         let placement = PagePlacement { screen: page, w: 800, h: 4000, zoom: 1.0 };
         let start = rect_px(100, 2000, 200, 200);
 
-        let mut frame = RegionFrame::new(free_constraints(), &[Color32::RED]);
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         frame.page_idx = Some(0);
         frame.rect_px = Some(start);
         frame.masks.resize(start.w, start.h);
@@ -1661,7 +1766,7 @@ mod tests {
 
         // A pending result: apply and cancel are allowed, a second run is not (F4).
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false, false), &mut outcome);
         assert_eq!(
             outcome,
             FrameOutcome { process_requested: false, apply_requested: true, cancel_requested: true, clear_mask_requested: false }
@@ -1669,13 +1774,87 @@ mod tests {
 
         // A free frame with an empty mask allows none of the three.
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::Free, None, true), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::Free, None, true, false), &mut outcome);
         assert_eq!(outcome, FrameOutcome::default());
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The consumer-switch setters (D16)
+    // -----------------------------------------------------------------------------------
+
+    /// A consumer that refuses the frame's current size must leave it RED rather than snap it:
+    /// the switch is the first moment at which a placed, valid frame can become invalid, and
+    /// silently resizing it would move a rectangle the user placed by hand.
+    #[test]
+    fn new_constraints_turn_an_unsatisfying_frame_red_instead_of_resizing_it() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.page_idx = Some(0);
+        frame.rect_px = Some(rect_px(0, 0, 100, 100));
+        assert_eq!(frame.visual(), FrameVisual::Free);
+
+        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 64, max_area: None, max_aspect: None });
+        assert_eq!(frame.size_violation(), Some(SizeViolation::NotMultiple));
+        assert_eq!(frame.visual(), FrameVisual::Invalid);
+        let kept = frame.rect_px().expect("the frame was given a rectangle above");
+        assert_eq!((kept.x, kept.y, kept.w, kept.h), (0, 0, 100, 100), "the rectangle must not be snapped");
+        assert!(!frame.buttons().process, "an invalid size blocks the run");
+    }
+
+    #[test]
+    fn a_new_layer_declaration_rebuilds_the_stack_and_an_identical_one_does_not() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED, Color32::GREEN]));
+        frame.masks.resize(8, 8);
+        assert_eq!(frame.masks().layer_count(), 2);
+
+        // A different declaration: the stack is re-created over the same geometry.
+        frame.set_mask_layers(&test_layers(&[Color32::BLUE]));
+        assert_eq!(frame.masks().layer_count(), 1);
+        assert_eq!(frame.masks().size(), (8, 8));
+        assert_eq!(frame.layer_label(0), t!("cleaning.region_frame.status.free"));
+        assert_eq!(frame.layer_label(9), "10", "a layer nobody declared falls back to its number");
+
+        // An identical declaration must not disturb anything, so a per-frame push is free.
+        frame.masks.paint_segment((1, 1), (2, 2), 1, false);
+        assert!(!frame.masks().is_empty());
+        frame.set_mask_layers(&test_layers(&[Color32::BLUE]));
+        assert!(!frame.masks().is_empty(), "an unchanged declaration must keep the painted mask");
+    }
+
+    /// D15's rule, enforced by the frame itself: a locked frame protects painted work even if a
+    /// caller asks for a layer switch anyway.
+    #[test]
+    fn a_locked_frame_refuses_a_layer_switch() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.masks.resize(8, 8);
+        frame.masks.paint_segment((1, 1), (2, 2), 1, false);
+        assert_eq!(frame.lock(), FrameLock::MaskPainted);
+
+        frame.set_mask_layers(&test_layers(&[Color32::BLUE, Color32::GREEN]));
+        assert_eq!(frame.masks().layer_count(), 1, "the stack must survive the refused switch");
+        assert!(!frame.masks().is_empty(), "and so must the painted mask");
+    }
+
+    /// «Работа без маски»: the run button must come alive with nothing painted, and only
+    /// because of this flag — the size check and the lock stay in force.
+    #[test]
+    fn allowing_an_empty_mask_unblocks_the_run_and_nothing_else() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.page_idx = Some(0);
+        frame.rect_px = Some(rect_px(0, 0, 64, 64));
+        assert!(!frame.buttons().process, "an empty mask blocks the run by default");
+
+        frame.set_allows_empty_mask(true);
+        assert!(frame.buttons().process);
+        assert!(!frame.buttons().clear_mask, "there is still nothing to erase");
+
+        // An invalid size still wins over the relaxation.
+        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 4096, max_area: None, max_aspect: None });
+        assert!(!frame.buttons().process);
     }
 
     #[test]
     fn a_request_queued_by_a_panel_is_kept_until_a_pass_consumes_it() {
-        let mut frame = RegionFrame::new(free_constraints(), &[Color32::RED]);
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         assert_eq!(frame.pending, PendingRequests::default());
         frame.request_apply();
         frame.request_cancel();
@@ -1835,7 +2014,7 @@ mod tests {
 
     #[test]
     fn frame_lock_is_derived_from_the_frames_own_contents() {
-        let mut frame = RegionFrame::new(free_constraints(), &[Color32::RED]);
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         assert_eq!(frame.lock(), FrameLock::Free);
         frame.set_processing(true);
         assert_eq!(frame.lock(), FrameLock::Processing);
