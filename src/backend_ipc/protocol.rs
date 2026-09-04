@@ -157,6 +157,36 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT: &str =
 /// listing and cannot be loaded. One-shot.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
     "inpaint.flux2_klein.prompt_cache.import";
+/// Checks Hugging Face access to the FLUX.2 klein repositories and prices the
+/// download, without transferring anything. One-shot.
+///
+/// Request header: `hf_token` (a string, possibly empty) and `uncensored` (bool —
+/// whether the uncensored text-encoder repository is needed as well). The token is
+/// NEVER logged on either side.
+///
+/// The answer carries `repos`, one entry per repository the toggle actually needs,
+/// each `{ "state": … }` where the state is one of `ok` / `no_token` /
+/// `invalid_token` / `not_accepted` / `not_found` / `network_error`, plus `plan`
+/// with `total_bytes`, `missing_bytes` and `missing_files` computed from the same
+/// listing. The pinned wire contract is `dev-docs/flux2_model_download.md` §3.
+pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux2_klein.download.check";
+/// Downloads the FLUX.2 klein model files into `side_models/FLUX.2-klein-9B/`.
+///
+/// STREAMING, the same envelope as `.prompt_cache.build`, so it claims the same
+/// single progress bar and can never run beside a generation. Request header:
+/// `hf_token` and `uncensored`, as for `.download.check`.
+///
+/// Progress frames keep the usual `phase` / `step` / `total` / `label` — where
+/// `step` and `total` are OVERALL BYTES across the whole plan, which keeps every
+/// existing single-level consumer correct — and ADD three OPTIONAL fields for the
+/// file in flight: `file_step`, `file_total` and `file_label`. A frame that omits
+/// them (a preparation phase) is legal and renders as the overall bar alone.
+///
+/// The answer carries `paths` (`transformer` / `text_encoder` / `vae`),
+/// `downloaded_bytes` and `skipped_files`; the tool writes those three paths into
+/// its settings, so a finished download leaves a configured engine. The pinned wire
+/// contract is `dev-docs/flux2_model_download.md` §4.
+pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START: &str = "inpaint.flux2_klein.download.start";
 
 // --- Visible watermark removal ---
 /// Predicts a watermark mask for the request blob; responds with an L8 mask PNG

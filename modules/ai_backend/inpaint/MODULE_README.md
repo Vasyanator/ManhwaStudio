@@ -47,9 +47,15 @@ Every service follows the same shape and is safe to copy from when adding a seve
 - `flux2_klein.py`: `Flux2KleinInpaintService` — FLUX.2 klein 9B region editing
   (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action` and the
   `.prompt_cache.*` family, streaming). See the FLUX.2 klein sections.
-- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_klein.py`, `test_lease_protocol.py`: pure-Python
+- `flux2_download.py`: acquisition of the klein weights from Hugging Face
+  (`inpaint.flux2_klein.download.check` / `.start`). NOT a service and deliberately so: it holds no
+  resident model, takes no lease and has no `AppState` field — it is a module of functions the
+  handler imports lazily. See the FLUX.2 klein download section.
+- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_klein.py`, `test_flux2_download.py`,
+  `test_lease_protocol.py`: pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
-  modules are injected into `sys.modules`, and `test_lease_protocol.py` stubs each service's load and
+  modules are injected into `sys.modules`, `test_flux2_download.py` fakes the repository listings and
+  the `requests` module, and `test_lease_protocol.py` stubs each service's load and
   inference step instead).
 
 ## Contracts and invariants
@@ -126,7 +132,10 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `<name>.<pid>.part` and published with an atomic `os.replace`. `ensure_model()` deliberately runs
   outside `self._lock` and the IPC layer dispatches onto a thread pool, so two first uses of the
   same quant do reach it at once; the loser of each file's lock re-checks and skips instead of
-  refetching. `flux_fill.py` keeps only the transport (the HF bearer header).
+  refetching. The bearer header itself is NOT duplicated here: `_download_file_streaming` is a thin
+  call into `../engines/model_download.download_bearer_to_path`, which takes the token as an
+  argument, so this module keeps only the DECISION that its token comes from `HF_TOKEN` /
+  `HUGGING_FACE_HUB_TOKEN` in the process environment.
 - `progress_callback(phase, step, total, label)` has two phases: `download` (byte-level) and
   `generate` (step-level). `ipc/handlers/flux_fill.py` streams both as `progress` frames with header
   `phase`/`step`/`total`/`label` and no preview blob.
@@ -214,11 +223,13 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   calls the service and after the service returns; a running diffusion step is not interrupted.
   This is the shared contract of all six inpaint services (`ipc/handlers/sdxl.py`,
   `ipc/handlers/flux_fill.py` do exactly the same) — do not make this one the exception.
-- **Nothing is downloaded.** The user supplies three paths (Qwen3 text encoder, transformer, VAE);
-  the pipeline needs five components, so the tokenizer and the scheduler are DISCOVERED next to
-  those paths (`component_search_roots` / `discover_component_dir`). A component that is not found
-  raises an error naming what to put where — there is deliberately no built-in scheduler config,
-  because an invented one produces plausible-looking garbage.
+- **The service itself downloads nothing.** The user supplies three paths (Qwen3 text encoder,
+  transformer, VAE); the pipeline needs five components, so the tokenizer and the scheduler are
+  DISCOVERED next to those paths (`component_search_roots` / `discover_component_dir`). A component
+  that is not found raises an error naming what to put where — there is deliberately no built-in
+  scheduler config, because an invented one produces plausible-looking garbage. Putting those files
+  on disk in the first place is `flux2_download.py`'s job, and the two never meet: the downloader
+  knows nothing about the pipeline and the service knows nothing about Hugging Face.
 - **A weights FILE may stand in for its component folder** (`component_dir_for_path`). Neither
   `AutoencoderKLFlux2` nor the Qwen3 encoder has a single-file loader in diffusers 0.39, and a user
   picking a model naturally selects `diffusion_pytorch_model.safetensors` rather than the directory
@@ -267,6 +278,25 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     synchronizes. It is a `phase:"load"` step and deliberately never a `generate` one. Skipped
     under the two accelerate offload placements, where the weights are SUPPOSED to stay in host
     memory between forwards.
+  - **The warm-up is owed ONCE PER PLACEMENT of the weights, not once per request.** Everything it
+    establishes is a fact about a placement, so a request that cache-hits a pipeline nothing has
+    moved skips it entirely — `_warmup_pipeline_if_needed_locked` is the guarded form the generation
+    path and the `load` action use, and `self._pipeline_warmed` is the flag. Running it per request
+    cost a parameter walk over the whole 9B transformer, a real VAE decode and an allocator flush on
+    every hot run, and announced «Прогрев модели» to a user whose model had been resident for an
+    hour. The flag is cleared by EVERY path that moves weights, and that list is a correctness
+    obligation — a move that forgets to clear it lets the next run skip a check it needed and fail
+    inside the VAE with the device mismatch `_require_components_materialized` exists to pre-empt:
+    the rebuild branch of `_ensure_pipeline_locked`; `_unload_pipeline_locked` (hence `unload()` and
+    the `_unload_key` eviction) and `_invalidate_pipeline_locked`; the transformer park, both via the
+    `to_ram` action and via `_decode_locked`'s `unload_transformer_before_vae` path; and the restore
+    back onto the device, both via `to_gpu` and via `_decode_locked`'s `finally` — a SUCCESSFUL
+    restore leaves the pipeline cold, because its copy is queued exactly like a placement's. Only a
+    warm-up sets the flag. The consequence is deliberate: `unload_transformer_before_vae` (the
+    default in every placement but `full_gpu`) parks the transformer on every run, so under it every
+    run still owes a warm-up; `full_gpu` is where a hot pipeline stays hot. The user-pressed `warmup`
+    component action deliberately calls the UNGUARDED `_warmup_pipeline_locked`: a button that
+    decided for itself not to act would be a lie about what happened.
   - **phase 2** (`_prompt_embeds_locked` → `_encode_prompts_locked` → `_encode_prompt_phase`) loads
     the encoder, encodes the prompt (and the empty negative prompt when `guidance_scale > 1`) into
     a few MB of embeddings, and by default keeps it.
@@ -518,6 +548,98 @@ client-facing half. What this module owns:
   refusal, both of which fire AFTER the lease is taken, would otherwise leave that key flagged
   `loading` forever and make the next `begin_model_use` for it wait on a load that never finishes.
 
+### FLUX.2 klein: model download (`flux2_download.py`)
+The wire contract is `dev-docs/flux2_model_download.md`; `ipc/PROTOCOL.md` carries the frame shapes.
+Everything lands in `<side_models>/FLUX.2-klein-9B/` — `transformer/`, ONE of `text_encoder/` or
+`text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config.json`,
+`model_index.json`, `LICENSE.md` — which is exactly the layout `component_search_roots` /
+`discover_component_dir` already expect, so a finished download leaves a configured engine.
+
+- **The manifest is PREFIXES resolved against the live listing, never hard-coded shard names**
+  (`SHARED_MANIFEST` + one encoder rule -> `resolve_plan`). A prefix that resolves to no file
+  is a `RuntimeError` naming the prefix and the repository: a repo that was re-sharded must fail
+  loudly, not produce half a model.
+- **The two encoder rules are EXCLUSIVE and the toggle SELECTS between them.** `manifest_entries`
+  returns `SHARED_MANIFEST` plus exactly one of `OFFICIAL_ENCODER_MANIFEST` /
+  `UNCENSORED_ENCODER_MANIFEST`, so a plan is 34.72 GB / 23 files with the toggle off and
+  34.73 GB / 22 files with it on — never the ~51 GB a plan carrying both would cost, for 16 GB of
+  weights the pipeline will not load. Everything else (transformer, tokenizer, VAE, configs) comes
+  from the official repository either way, which is why `required_repos` still access-checks BOTH
+  repositories when the toggle is on.
+  Both encoder directories may nevertheless sit on disk, from two runs with different settings.
+  That is left alone in both directions: the missing-only filter never re-fetches the one already
+  there, and nothing here deletes the unselected one — 16 GB the user paid to download does not
+  vanish because a checkbox moved.
+- **Three files are excluded and each exclusion is load-bearing.** The 18.157 GB root
+  `flux-2-klein-9b.safetensors` is the SAME transformer as `transformer/`, and a single file goes
+  through `from_single_file`, which in diffusers 0.39 accepts `device_map` and silently discards it —
+  the layered offload this engine depends on would be lost. The four `*.gguf` of the uncensored repo
+  are llama.cpp format and the `transformers` loader cannot read them. `*.jpg` / `README.md` /
+  `.gitattributes` are noise.
+- **The tokenizer always comes from the OFFICIAL repo, in both toggle states.** The uncensored repo
+  ships only `tokenizer.json` + `tokenizer_config.json` and would fail `_require_component_dir`'s
+  markers; 17 MB is not worth a second failure mode.
+- **A repository listing is NOT an access check.** `HfApi.model_info()` answers for both of these
+  `gated: auto` repositories with no token at all, so access is probed with `HfApi.auth_check()`.
+  `classify_repo_error` consults the HTTP STATUS before the exception type, deliberately: on a gated
+  repo a wrong token raises `GatedRepoError` with status 401 and the user must be told the token is
+  wrong, not that they failed to accept the conditions — and `GatedRepoError` SUBCLASSES
+  `RepositoryNotFoundError`, so type order alone separates nothing. The six `state` values are a wire
+  contract: the Rust UI gives three of them three different links.
+- **A staged file is published only after its length matches the announced size**
+  (`_size_verifier` -> the `verify` gate `download_to_path` already runs before the rename), and
+  `is_complete_on_disk` treats a file as present only at that same length. Neither `requests` nor
+  `stream_response_to_file` treats a SHORT body that ends cleanly as an error, so without both
+  halves a truncated shard is renamed to its final name and then skipped by every later run —
+  reproduced during review (100 bytes announced, 7 delivered, ended normally) and surfacing much
+  later as corrupt weights. The length check on the planning side is also what REPAIRS a file an
+  earlier run already left behind. A listing that announces no size falls back to the non-empty
+  rule and logs why: a missing size must neither disable the check silently nor force an endless
+  re-download.
+- **An interrupted file RESUMES; it does not restart.** `_fetch_one` asks the shared primitive for
+  resumable staging, so a connection dropped at 8 of 9.8 GB parks those bytes as `<name>.part` and
+  the next run continues from them with `Range: bytes=<n>-`. On a 35 GB plan over a flaky link that
+  is the difference between a feature that finishes and one that never does. Resume is opt-in in
+  `../engines/model_download.py`; `flux_fill.py` keeps its unlink-on-failure semantics untouched.
+- **The size gate keeps the last word over the resume, with exactly ONE recovery.** A resumed file
+  whose final length is wrong raises `IncompleteDownload`, `_fetch_one` discards the staged bytes
+  and fetches that file once more from zero, and a second failure is a `RuntimeError` naming the
+  file. That covers a stale partial whose remote blob changed underneath it. There is deliberately
+  no ETag/`If-Range` sidecar: the size check plus one clean retry is proportionate, and a sidecar
+  would be a second source of truth about what is on disk.
+- **A retry-from-zero is the one place `step` may move backwards**, because the file genuinely
+  restarts. Everything else is monotone: a resumed file's `file_step` and the overall `step` both
+  begin at the resumed offset (`initial_done`), so a consumer deriving speed from consecutive
+  frames never sees a bogus first delta.
+- **The free-space guard subtracts what is already staged** (`staged_bytes`), or it would refuse a
+  download that plainly fits when 8 of 9.8 GB are on the disk already.
+- **`check_access`'s `plan` is NULLABLE and zeros are never synthesised.** Auth and listing are two
+  different network operations; a plan of zeros beside `ok` states reads as "everything is already
+  downloaded" and was observed rendering a complete installation on an empty machine. A listing
+  that fails after a successful probe yields `plan: None` plus a scrubbed `plan_error`, and
+  deliberately no repo state of its own — access really did succeed, and `network_error` would send
+  the user to the wrong link. `no_token` and an inaccessible repo also yield `plan: None`, with an
+  EMPTY `plan_error`, because their `state` already explains it.
+- **The token is a request field.** Never read from the environment here, never persisted, never
+  logged, never interpolated into an error; messages that came back from `huggingface_hub` are
+  scrubbed of it (`_scrub`) before they leave the module. That is also why the bearer fetch lives in
+  `../engines/model_download.download_bearer_to_path` and takes the token as an argument —
+  `flux_fill.py` reads `HF_TOKEN` from the environment and this module must not.
+- **Progress is two-level and throttled.** `step`/`total` stay the OVERALL byte counts (so every
+  existing single-level consumer keeps working) and `file_step`/`file_total`/`file_label` are
+  additive and optional; `ProgressThrottle` requires BOTH ~100 ms and 4 MiB to have passed, and the
+  terminal frame is forced so the last thing a consumer sees is the completed count. `flux_fill`
+  reports on every chunk; at 35 GB that would be 35 000 frames.
+- **Cancellation reaches the socket.** `should_cancel` is polled before each file and at every chunk
+  boundary, where it raises `DownloadCanceled`. That exception travels out of `stream_response_to_file`
+  — which has no cancel hook of its own — and `download_to_path`'s `finally` removes the staging
+  file. Files already published stay: they are complete and were renamed atomically.
+- **Free space is checked before the first byte** (`require_free_space`), and the refusal names both
+  the required and the available number of bytes. A filesystem that cannot be queried is not treated
+  as full.
+- **Nothing here runs under a service lock**, for the same reason `ensure_model` does not: a
+  multi-gigabyte transfer must never block `health()`, `unload()` or an eviction callback.
+
 ### ROCm staging obligation
 On a ROCm Torch build, a host→device copy out of a safetensors file mapping stalls in amdkfd (~1-2 s
 per tensor ≥1 MiB). Any weight move here must route through `runtime/rocm_mmap_transfer.py`:
@@ -580,10 +702,23 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   it exists only there) and `Flux2KleinInpaintService._components_locked` /
   `_components_residency_nowait`. To change what an action DOES, see `component_action` and its
   `_*_action_locked` helpers; each one delegates to the helper the generation path already uses
-  (`_ensure_pipeline_locked`, `_warmup_pipeline_locked`, `_park_transformer_off_device`,
-  `_restore_transformer_to_device`, `_ensure_text_encoder_locked`, `_release_text_encoder_locked`)
-  — do not add a second implementation of a move. Keep the wire literals in step with
+  (`_ensure_pipeline_locked`, `_warmup_pipeline_locked` — the unguarded primitive, because the user
+  pressed the button, `_park_transformer_off_device`, `_restore_transformer_to_device`,
+  `_ensure_text_encoder_locked`, `_release_text_encoder_locked`)
+  — do not add a second implementation of a move. The two that MOVE weights (`to_ram`, `to_gpu`)
+  clear `_pipeline_warmed`; so does the invalidation after a failed restore. Keep the wire literals in step with
   `dev-docs/flux2_component_residency.md` and `ipc/PROTOCOL.md §5.4`.
+- To change WHICH files the FLUX.2 klein download fetches, see `SHARED_MANIFEST` /
+  `OFFICIAL_ENCODER_MANIFEST` / `UNCENSORED_ENCODER_MANIFEST` / `EXCLUDED_SUFFIXES` /
+  `EXCLUDED_NAMES` in `flux2_download.py` — never a hard-coded shard name. An entry added to
+  `SHARED_MANIFEST` is fetched in BOTH toggle states; the two encoder tuples stay mutually
+  exclusive. To change the access states, see `classify_repo_error` (status before
+  type); to change the frame shape or the throttle, `_chunk_reporter` / `ProgressThrottle`; to change
+  where it all lands, `model_root` / `component_paths`; to change resume, the one retry or the
+  integrity gate, `_fetch_one` / `_size_verifier` — the staging, claiming and parking themselves
+  belong to `../engines/model_download.py` and are shared, so do not re-implement them here. Keep every wire literal in step with
+  `dev-docs/flux2_model_download.md` and `ipc/PROTOCOL.md`; the Rust side is written against the same
+  document.
 - To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked` /
   `_encode_prompt_phase`, and `_prompt_cache_key` for what invalidates a cached embedding.
 - To change the prompt-cache LIBRARY, see the `prompt_cache_*` methods of the service
@@ -601,9 +736,18 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
 - To change the load ORDER or the warm-up, see `inpaint_image_bytes` (the sequence and the lease
   boundary — `mark_loaded` runs before the warm-up, because everything after
   `_ensure_pipeline_locked` fails with the pipeline already resident) and
-  `_warmup_pipeline_locked` / `_require_components_materialized` / `_warmup_vae_decode`. The
-  `phase:"load"` step numbers live in the `LOAD_STEP_*` constants and `LOAD_PHASE_STEPS`; they are
-  the order the user sees, so they must stay strictly increasing along that sequence.
+  `_warmup_pipeline_if_needed_locked` (the once-per-placement guard and the exhaustive list of what
+  clears `_pipeline_warmed`) / `_warmup_pipeline_locked` / `_require_components_materialized` /
+  `_warmup_vae_decode`. Adding a path that MOVES weights means clearing `_pipeline_warmed` there.
+  The `phase:"load"` step numbers live in the `LOAD_STEP_*` constants and `LOAD_PHASE_STEPS`; they
+  are the order the user sees, so they must stay strictly increasing along that sequence, and the
+  first `LOAD_STEP_PREPARE` frame is emitted BEFORE the encoder check and the memory guard, both of
+  which touch the filesystem — the progress bar has to appear when the button is pressed.
+- To change how the Qwen tokenizer is obtained, see `_ensure_tokenizer_locked` — the one place
+  `Qwen2TokenizerFast` is constructed. It is cached by the discovered directory, shared between the
+  pipeline component and every prompt encode (encoding is read-only and the pipeline's copy is never
+  called), and dropped by `unload()`. Do not add a second read: it used to happen on every encode,
+  which is real disk I/O on an otherwise hot pipeline.
 - To change the "no mask" mode, see `normalize_flux2_klein_params` / `_whole_region_overrides` (the
   params it settles) and `_require_solid_mask` (the check). `_generate_locked` needs no special
   case and must not grow one — the mode is expressed entirely as normalized parameters.

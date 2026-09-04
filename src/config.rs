@@ -786,6 +786,46 @@ pub fn flux_fill_components_dir() -> PathBuf {
     flux_fill_dir().join("components")
 }
 
+/// FLUX.2 klein: root of the diffusers tree the panel's Hugging Face download fills
+/// (`transformer/`, `text_encoder/`, `text_encoder_uncensored/`, `tokenizer/`, `vae/`,
+/// `scheduler/`).
+///
+/// The backend creates and populates it; this side needs the path because the
+/// «Расцензуренный энкодер» toggle repoints `text_encoder_path` between the two encoder
+/// directories with no download at all when both are already on disk.
+pub fn flux2_klein_dir() -> PathBuf {
+    side_models_dir().join("FLUX.2-klein-9B")
+}
+
+/// Directory of the FLUX.2 klein transformer the download fills.
+///
+/// The subdirectory name mirrors `TRANSFORMER_SUBDIR` in
+/// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
+pub fn flux2_klein_transformer_dir() -> PathBuf {
+    flux2_klein_dir().join("transformer")
+}
+
+/// Directory of the FLUX.2 klein VAE the download fills.
+///
+/// The subdirectory name mirrors `VAE_SUBDIR` in
+/// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
+pub fn flux2_klein_vae_dir() -> PathBuf {
+    flux2_klein_dir().join("vae")
+}
+
+/// Directory of the FLUX.2 klein text encoder the toggle selects.
+///
+/// `uncensored` picks `text_encoder_uncensored/` over the official `text_encoder/`.
+/// Both may sit on disk at once, which is what lets the toggle switch between them
+/// without transferring anything.
+pub fn flux2_klein_text_encoder_dir(uncensored: bool) -> PathBuf {
+    flux2_klein_dir().join(if uncensored {
+        "text_encoder_uncensored"
+    } else {
+        "text_encoder"
+    })
+}
+
 /// Visible-watermark-removal models. Each network gets its own subdirectory
 /// (`slbr/`, `wdnet/`, `splitnet/`) holding its weights and its runtime-fetched
 /// source; mirrors `WATERMARK_DIR` in the Python backend's `config.py`.

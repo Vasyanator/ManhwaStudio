@@ -148,6 +148,15 @@ METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE = "inpaint.flux2_klein.prompt_cache
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD = "inpaint.flux2_klein.prompt_cache.load"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT = "inpaint.flux2_klein.prompt_cache.export"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cache.import"
+# Model acquisition from Hugging Face into `side_models/FLUX.2-klein-9B/`. Both
+# source repositories are GATED, so the token is a REQUEST FIELD of both methods
+# (never an env var of the backend, never inside `params`, never logged).
+# `.check` is non-streaming and answers one `state` per repository plus the plan
+# totals the button labels itself with; `.start` streams the same envelope as
+# `.prompt_cache.build`, so it claims the same single progress bar and can never
+# run beside a generation. The wire contract is `dev-docs/flux2_model_download.md`.
+METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK = "inpaint.flux2_klein.download.check"
+METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START = "inpaint.flux2_klein.download.start"
 
 # --- Visible watermark removal ---
 # Primary flow is `watermark.detect` (mask only, fed to the existing inpainters);
@@ -216,6 +225,8 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
+        METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
+        METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
         METHOD_WATERMARK_DETECT,
         METHOD_WATERMARK_REMOVE,
         METHOD_WATERMARK_STATUS,

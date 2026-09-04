@@ -47,7 +47,6 @@ import logging
 import os
 import threading
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -58,7 +57,7 @@ try:
 except Exception:  # pragma: no cover - config is always importable in-app
     _config = None
 
-from ..engines.model_download import download_to_path, stream_response_to_file
+from ..engines.model_download import download_bearer_to_path
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 from ..runtime.rocm_mmap_transfer import (
@@ -562,29 +561,22 @@ def _build_download_plan(quant: str) -> list[dict[str, Any]]:
 def _download_file_streaming(url: str, dest: str, on_chunk: Callable[[int], None]) -> bool:
     """Download `url` to `dest`, reporting cumulative bytes. Returns whether it ran.
 
-    Serialization, the process-private `.part` staging file and the atomic
-    publish belong to `engines.model_download.download_to_path`: IPC dispatches
-    onto a thread pool, so two first uses of the same quant can otherwise write
-    into one staging file at the same time — a ~22 GB corruption window here.
-    A file another thread already finished is skipped, not refetched.
+    The bearer header, the serialization, the process-private `.part` staging
+    file and the atomic publish all belong to
+    `engines.model_download.download_bearer_to_path`: IPC dispatches onto a
+    thread pool, so two first uses of the same quant can otherwise write into one
+    staging file at the same time — a ~22 GB corruption window here. A file
+    another thread already finished is skipped, not refetched.
+
+    The token stays THIS module's business: FLUX.1-Fill reads it from the process
+    environment (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`), while the FLUX.2 klein
+    downloader receives it as a request field, so the shared helper takes it as an
+    argument and never looks the environment up itself.
     """
-    import requests
-
-    headers = {}
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    def fetch(staging: Path) -> None:
-        with requests.get(
-            url, stream=True, allow_redirects=True, headers=headers, timeout=60
-        ) as response:
-            response.raise_for_status()
-            stream_response_to_file(
-                response, staging, lambda done, _expected: on_chunk(done)
-            )
-
-    return download_to_path(dest, fetch)
+    return download_bearer_to_path(
+        url, dest, lambda done, _expected: on_chunk(done), token=token
+    )
 
 
 def _components_present() -> bool:

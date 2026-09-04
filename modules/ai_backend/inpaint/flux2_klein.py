@@ -59,7 +59,9 @@ what joins the regenerated region to the rest of the page.
 Run order (this is a memory contract, see `inpaint_image_bytes`):
 transformer + VAE are loaded, placed and warmed up FIRST; only then is the 16 GB
 text encoder read, into the host memory the transformer has just vacated, where
-it encodes the prompt and stays for the next one.
+it encodes the prompt and stays for the next one. The warm-up belongs to the
+PLACEMENT, not to the request: a run that cache-hits a pipeline whose weights
+have not moved since skips it (`_warmup_pipeline_if_needed_locked`).
 
 Model layout:
 Nothing is downloaded. The user supplies three paths — a Qwen3 text-encoder
@@ -1585,6 +1587,22 @@ class Flux2KleinInpaintService:
         self._active_key: str | None = None
         self._device: Any = None
         self._last_error: str | None = None
+        # Whether the pipeline in `self._pipe` has been warmed up SINCE its
+        # weights were last placed. The warm-up is a property of a PLACEMENT, not
+        # of a request: everything it proves (nothing left on `meta`, the queued
+        # host->device copies retired, the host pages released before the 16 GB
+        # encoder is read) is established once and stays true until something
+        # moves the weights again. See `_warmup_pipeline_if_needed_locked` for the
+        # exhaustive list of what clears it.
+        self._pipeline_warmed = False
+        # The Qwen tokenizer, with the directory it was read from. It is a few MB
+        # of vocabulary and it is needed on every prompt encode as well as by the
+        # pipeline itself, so it is read ONCE per directory instead of once per
+        # encode — on a model that lives on a spinning disk that read is real I/O
+        # on an otherwise hot pipeline. Invalidated when the discovered directory
+        # changes; dropped by `unload()`.
+        self._tokenizer: Any = None
+        self._tokenizer_dir: str | None = None
         # Paths of the last accepted request, so `status()` can report component
         # state without being handed the params again.
         self._last_paths: dict[str, str] = {}
@@ -1775,11 +1793,16 @@ class Flux2KleinInpaintService:
 
         The prompt cache is deliberately KEPT: it holds a few MB of embeddings,
         not weights, and dropping it would make the next run re-read 16 GB of
-        encoder for a prompt that has not changed.
+        encoder for a prompt that has not changed. The cached tokenizer IS
+        dropped: this method is also the eviction callback's route
+        (`_unload_key`), and an eviction exists to give memory back, so nothing
+        this service allocated should survive it.
         """
         with self._lock:
             had_encoder = self._text_encoder is not None
             self._release_text_encoder_locked()
+            self._tokenizer = None
+            self._tokenizer_dir = None
             return self._unload_pipeline_locked() or had_encoder
 
     def _unload_pipeline_locked(self) -> bool:
@@ -1797,6 +1820,9 @@ class Flux2KleinInpaintService:
         key = self._active_key
         self._pipe = None
         self._active_key = None
+        # The weights are gone, so the warm-up that proved where they sat is
+        # meaningless; the pipeline built next owes a fresh one.
+        self._pipeline_warmed = False
         _clear_torch_cache()
         if key is not None:
             self._model_manager.mark_unloaded(key)
@@ -1829,6 +1855,11 @@ class Flux2KleinInpaintService:
         the transformer's host peak overlap, which is what a run has to avoid on a
         machine whose host memory is smaller than their sum.
 
+        The warm-up is owed once per PLACEMENT, not once per request: a run that
+        cache-hits an already-warm pipeline skips it entirely
+        (`_warmup_pipeline_if_needed_locked`), because nothing it proves can have
+        stopped being true while no weight moved.
+
         # Raises
         `ValueError` for bad params, a bad region size, a mask size mismatch or a
         non-solid mask under `whole_region`; `FileNotFoundError` when a component
@@ -1856,6 +1887,14 @@ class Flux2KleinInpaintService:
                 # at `_ensure_pipeline_locked`, because everything after it runs
                 # with the pipeline already resident — see below.
                 try:
+                    # The FIRST frame of the run, before any guard: both the
+                    # encoder check and the memory guard touch the filesystem, and
+                    # on a cold page cache they take long enough that the user
+                    # sees nothing happen after pressing the button. The frame
+                    # costs nothing and it is the step this scale already calls
+                    # «preparation», so it belongs at the very start of the scope
+                    # it names, not after the guards.
+                    report(LOAD_STEP_PREPARE, "Подготовка запуска FLUX.2 klein")
                     # Before anything is read: a prompt that is not in the cache
                     # needs the encoder, and on a machine that has none the run
                     # cannot succeed. `_encode_prompts_locked` would refuse it
@@ -1864,7 +1903,6 @@ class Flux2KleinInpaintService:
                     if self._prompts_to_encode(normalized):
                         require_text_encoder(normalized, what="генерация с этим промптом")
                     self._require_headroom_locked(normalized, width, height, model_key)
-                    report(LOAD_STEP_PREPARE, "Подготовка запуска FLUX.2 klein")
                     pipe = self._ensure_pipeline_locked(
                         normalized, model_key, report, region_hw=(height, width)
                     )
@@ -1881,7 +1919,7 @@ class Flux2KleinInpaintService:
                 # section of `inpaint/MODULE_README.md`.
                 if lease.needs_load:
                     lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
-                self._warmup_pipeline_locked(pipe, normalized, report)
+                self._warmup_pipeline_if_needed_locked(pipe, normalized, report)
                 embeds = self._prompt_embeds_locked(normalized, report)
                 out_rgb, applied, oom_recovered = self._generate_locked(
                     pipe, region_rgb, mask_u8, normalized, embeds, progress_callback
@@ -2205,10 +2243,17 @@ class Flux2KleinInpaintService:
             return self._unload_pipeline_locked()
         if action == "to_ram":
             report(LOAD_STEP_PLACEMENT, "Выгрузка трансформера в оперативную память")
-            return _park_transformer_off_device(self._pipe, normalized["placement"])
+            moved = _park_transformer_off_device(self._pipe, normalized["placement"])
+            if moved:
+                # Weights left the device, so the placement this pipeline was
+                # warmed for no longer describes it.
+                self._pipeline_warmed = False
+            return moved
         if action == "to_gpu":
             return self._restore_transformer_action_locked(normalized, report)
         # `warmup`: the only remaining action, and the VAE is its only component.
+        # The unconditional primitive on purpose — the user pressed the button, so
+        # the pass must happen even when the pipeline is already marked warm.
         return self._warmup_pipeline_locked(self._pipe, normalized, report)
 
     def _load_text_encoder_action_locked(
@@ -2274,7 +2319,10 @@ class Flux2KleinInpaintService:
             raise
         if lease is not None and lease.needs_load:
             lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
-        self._warmup_pipeline_locked(pipe, normalized, report)
+        # The guarded form even though this action is only offered while nothing
+        # is loaded: it makes the once-per-placement rule hold on every route into
+        # the pipeline rather than on the generation route alone.
+        self._warmup_pipeline_if_needed_locked(pipe, normalized, report)
         return True
 
     def _restore_transformer_action_locked(
@@ -2288,6 +2336,10 @@ class Flux2KleinInpaintService:
         pipeline is invalidated exactly as `_decode_locked` does after a failed
         restore — the next request then rebuilds instead of cache-hitting onto a
         device mismatch. The original error is re-raised.
+
+        A SUCCESSFUL restore is still a weight move, so the pipeline is left
+        marked cold: the copy `nn.Module.to` queues here is exactly the one the
+        warm-up exists to retire and verify.
         """
         self._require_restore_headroom_locked(normalized)
         report(LOAD_STEP_PLACEMENT, "Возврат трансформера на устройство")
@@ -2298,6 +2350,7 @@ class Flux2KleinInpaintService:
                 "трансформер не удалось вернуть на устройство по запросу пользователя", exc
             )
             raise
+        self._pipeline_warmed = False
         return True
 
     def _require_pipeline_headroom_locked(self, normalized: dict[str, Any], model_key: str) -> None:
@@ -2856,13 +2909,12 @@ class Flux2KleinInpaintService:
         )
 
         from diffusers import Flux2KleinInpaintPipeline
-        from transformers import Qwen2TokenizerFast
 
         roots = component_search_roots(normalized)
         tokenizer_dir = _require_component_dir(
             roots, _TOKENIZER_SUBDIR, _TOKENIZER_MARKERS, "токенизатор Qwen"
         )
-        tokenizer = Qwen2TokenizerFast.from_pretrained(str(tokenizer_dir))
+        tokenizer = self._ensure_tokenizer_locked(tokenizer_dir)
 
         report(LOAD_STEP_ENCODE, "Кодирование промпта")
         for text in texts:
@@ -2968,6 +3020,37 @@ class Flux2KleinInpaintService:
         while len(self._prompt_cache) > PROMPT_EMBED_CACHE_ENTRIES:
             self._prompt_cache.popitem(last=False)
 
+    def _ensure_tokenizer_locked(self, tokenizer_dir: Path) -> Any:
+        """Return the Qwen tokenizer for `tokenizer_dir`, reading it once per directory.
+
+        Caller must hold `self._lock`. THE one place `Qwen2TokenizerFast` is
+        constructed: the pipeline build takes its `tokenizer` component from here
+        and so does every prompt encode, so the vocabulary is read from disk once
+        instead of once per encode. On a model that lives on a spinning disk that
+        repeated read is seconds of I/O added to an otherwise hot pipeline.
+
+        The cache key is the discovered directory and nothing else, exactly like
+        the pipeline cache's own path keys: swapping the files under a path
+        without changing the path is not a case this service tracks. The object
+        is shared with the pipeline component, which is safe because encoding is
+        read-only and the pipeline's copy is never even called (the denoise is
+        handed finished `prompt_embeds`).
+
+        # Raises
+        Whatever the loader raises when `tokenizer_dir` does not hold a usable
+        tokenizer.
+        """
+        key = str(tokenizer_dir)
+        if self._tokenizer is not None and self._tokenizer_dir == key:
+            return self._tokenizer
+
+        from transformers import Qwen2TokenizerFast
+
+        tokenizer = Qwen2TokenizerFast.from_pretrained(key)
+        self._tokenizer = tokenizer
+        self._tokenizer_dir = key
+        return tokenizer
+
     def _release_text_encoder_locked(self) -> None:
         """Drop a resident text encoder, if any. Caller must hold `self._lock`."""
         if self._text_encoder is None:
@@ -3016,6 +3099,9 @@ class Flux2KleinInpaintService:
         prev = self._active_key
         self._pipe = None
         self._active_key = None
+        # A pipeline that is about to be built has not been warmed up, and the one
+        # being dropped takes its warm-up with it.
+        self._pipeline_warmed = False
         _clear_torch_cache()
         if prev is not None:
             self._model_manager.mark_unloaded(prev)
@@ -3028,7 +3114,6 @@ class Flux2KleinInpaintService:
             Flux2KleinInpaintPipeline,
             Flux2Transformer2DModel,
         )
-        from transformers import Qwen2TokenizerFast
 
         dtype = torch.bfloat16 if normalized["dtype"] == "bfloat16" else torch.float16
         device = torch.device(_resolve_selected_backend_device("cuda"))
@@ -3097,9 +3182,10 @@ class Flux2KleinInpaintService:
         )
 
         # The tokenizer is a pipeline component even though the denoise never
-        # uses it: `prompt_embeds` are already computed. It costs a few MB.
+        # uses it: `prompt_embeds` are already computed. It costs a few MB, and it
+        # is shared with the prompt-encode path rather than read twice.
         report(LOAD_STEP_TOKENIZER, "Загрузка токенизатора")
-        tokenizer = Qwen2TokenizerFast.from_pretrained(str(tokenizer_dir))
+        tokenizer = self._ensure_tokenizer_locked(tokenizer_dir)
 
         report(LOAD_STEP_VAE, "Загрузка VAE")
         vae = _load_vae(
@@ -3141,12 +3227,63 @@ class Flux2KleinInpaintService:
         return pipe
 
     # ---- warm-up: proof that the weights really left the host ----
+    def _warmup_pipeline_if_needed_locked(
+        self, pipe: Any, normalized: dict[str, Any], report: Callable[[int, str], None]
+    ) -> bool:
+        """Warm up the pipeline unless its current placement is already warm.
+
+        Caller must hold `self._lock`. Returns whether a warm-up actually ran, so
+        `False` means either "already warm" or "this placement owes none".
+
+        **The warm-up is owed once per PLACEMENT of the weights, not once per
+        request.** Everything `_warmup_pipeline_locked` establishes is a fact
+        about a placement — no parameter left on `meta` or on the host, the queued
+        host->device copies retired, the host pages released before the 16 GB
+        encoder is read — and none of it can stop being true while no weight
+        moves. Running it per request cost a full parameter walk over the 9B
+        transformer, a real VAE decode and an allocator flush on every hot run,
+        and announced «Прогрев модели» to a user whose model had been resident
+        for an hour.
+
+        `self._pipeline_warmed` therefore means "the placement currently in
+        `self._pipe` has been warmed since the weights last moved". It is cleared
+        by every path that moves them, and this list is exhaustive by design —
+        a path that moved weights without clearing it would let the next run skip
+        a warm-up it genuinely needed and fail inside the VAE with the device
+        mismatch `_require_components_materialized` exists to pre-empt:
+
+        - `_ensure_pipeline_locked`, on the branch that drops and rebuilds;
+        - `_unload_pipeline_locked` (so also `unload()` and the `_unload_key`
+          eviction callback) and `_invalidate_pipeline_locked`;
+        - the transformer park, both through the `to_ram` action and through
+          `_decode_locked`'s `unload_transformer_before_vae` path;
+        - the restore back onto the device, both through the `to_gpu` action and
+          through `_decode_locked`'s `finally` — a successful restore leaves the
+          pipeline COLD, because its copy is queued exactly like a placement's.
+
+        The consequence for `unload_transformer_before_vae` (the default in every
+        placement but `full_gpu`) is deliberate: that setting parks the
+        transformer on every run, so every run owes a warm-up, exactly as before.
+        `full_gpu` is where a hot pipeline stays hot.
+        """
+        if self._pipeline_warmed:
+            log.debug(
+                "FLUX.2 klein: прогрев не требуется — веса не перемещались с прошлого прогрева."
+            )
+            return False
+        return self._warmup_pipeline_locked(pipe, normalized, report)
+
     def _warmup_pipeline_locked(
         self, pipe: Any, normalized: dict[str, Any], report: Callable[[int, str], None]
     ) -> bool:
         """Force the placed weights to materialize, and prove that they did.
 
         Caller must hold `self._lock`. Returns whether a warm-up actually ran.
+        Unconditional: the "already warm" question belongs to
+        `_warmup_pipeline_if_needed_locked`, and the user-pressed `warmup` action
+        deliberately comes straight here. On every normal return it marks the
+        pipeline warm — including the two skips below, which mean "nothing is
+        owed", not "not done yet". A raise leaves it cold.
 
         This is the hinge of the new load order. The text encoder is read
         immediately afterwards, and the only reason it fits is that the
@@ -3183,9 +3320,11 @@ class Flux2KleinInpaintService:
                 "оперативной памяти между проходами.",
                 placement,
             )
+            self._pipeline_warmed = True
             return False
         vae = getattr(pipe, "vae", None)
         if vae is None or not hasattr(vae, "decode"):
+            self._pipeline_warmed = True
             return False
 
         _require_components_materialized(pipe, self._device)
@@ -3206,6 +3345,7 @@ class Flux2KleinInpaintService:
             after["vram_free"] / (1024**3),
             before["vram_free"] / (1024**3),
         )
+        self._pipeline_warmed = True
         return True
 
     def _unload_key(self, model_key: str) -> bool:
@@ -3341,7 +3481,10 @@ class Flux2KleinInpaintService:
 
         Caller must hold `self._lock`. When the transformer was moved off the
         device it is moved back before returning, so the resident pipeline still
-        matches its model key and the next request is a plain cache hit.
+        matches its model key and the next request is a plain cache hit — a cache
+        hit that is marked COLD, because the park and the restore are two weight
+        moves and a warm-up is owed per placement
+        (`_warmup_pipeline_if_needed_locked`).
 
         The move back can itself run out of memory (it is a full 9B host->device
         copy). That failure never reaches the caller: it must not mask a decode
@@ -3360,6 +3503,11 @@ class Flux2KleinInpaintService:
             if parked:
                 return False
             moved = _park_transformer_off_device(pipe, placement)
+            if moved:
+                # The placement this pipeline was warmed for no longer holds; the
+                # restore in the `finally` below re-queues the copy rather than
+                # re-proving it, so the next request owes a fresh warm-up.
+                self._pipeline_warmed = False
             parked = parked or moved
             return moved
 
@@ -3389,6 +3537,8 @@ class Flux2KleinInpaintService:
         key = self._active_key
         self._pipe = None
         self._active_key = None
+        # The pipeline this warm-up described is gone with it.
+        self._pipeline_warmed = False
         _clear_torch_cache()
         if key is not None:
             self._model_manager.mark_unloaded(key)

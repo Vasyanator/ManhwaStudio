@@ -98,6 +98,27 @@ IPC (`backend_ipc::protocol`):
   never builds a path into it. An imported file of a foreign family is stored under
   that family and reported as such; it does not appear in this family's listing and
   the backend refuses to load it, which is expected and is surfaced as a warning.
+- THE MODEL SOURCE IS A MODE (`source_mode`, persisted, defaulting to `manual`): either
+  the user's own three paths, or the copy this panel downloads. Exactly one body is drawn
+  under the switch at the top of the parameters block.
+  `Flux2KleinSettings::effective_paths` is the ONE answer to "which three paths does a run
+  use" and every consumer goes through it. In download mode the paths are DERIVED from
+  `config::flux2_klein_dir()` and the encoder toggle and the manual fields are never read
+  or written, so a hand-built model tree survives a download and flipping back restores it
+  exactly. That is why a finished download does not write its paths into the settings.
+- `.download.check` / `.download.start` — the model download from Hugging Face. `check` is
+  one-shot and answers a per-repository access verdict (`ok` / `no_token` / `invalid_token` /
+  `not_accepted` / `not_found` / `network_error`, each with the backend's own `message`) plus a
+  NULLABLE `plan` of total/missing bytes with a `plan_error` companion — an absent plan means
+  the size is NOT KNOWN and forbids both a size and a completion state, whatever the states
+  say, because a zero-valued plan reads as "nothing left to download"; `start` is STREAMING and claims the same progress bar as a
+  generation, with `step`/`total` as OVERALL BYTES and three OPTIONAL fields
+  (`file_step`/`file_total`/`file_label`) for the file in flight. Both carry `hf_token` and
+  `uncensored` as their own top-level request fields — never inside `params`. The token is the
+  process-wide `crate::hf_token` global (OS secret store, service `"ManhwaStudio Hugging Face"`),
+  is NOT a setting of this engine, and must never be logged. A finished download writes its
+  answered paths only to LOG a disagreement with the derived ones. The wire contract is
+  `dev-docs/flux2_model_download.md`.
 - `.component_action` — STREAMING, one per-component load / unload / move / warm-up.
   Header: `component`, `action` and the normalized `params`; the answer repeats the
   `.status` `components` block as it stands after the action. It claims the SAME progress
@@ -129,9 +150,17 @@ Contracts:
   terminal "the bar is done" — is dropped. A cancel and a moved frame both retire the
   current generation and cancel the request behind it. The bar lives in this engine's own
   panel: there is no shared progress vocabulary between engines
-  (`dev-docs/region_edit_v2_plan.md` §13.2 D13). THREE operations claim it — a generation,
-  `.prompt_cache.build` and `.component_action` — and every gate that means "wait for the
-  current operation" reads `flux2_pipeline_busy` over all three rather than one receiver.
+  (`dev-docs/region_edit_v2_plan.md` §13.2 D13). FOUR operations claim it — a generation,
+  `.prompt_cache.build`, `.component_action` and `.download.start` — and every gate that means
+  "wait for the current operation" reads `flux2_pipeline_busy` over all four rather than one
+  receiver. The RUN gate reads `non_run_pipeline_busy` instead — the same rule with the
+  generation taken out, so a run cannot report itself as the reason it cannot start while the
+  other three genuinely block one. The bar has a SECOND level, published only by the download:
+  `step`/`total` stay the overall counter and `file_step`/`file_total`/`file_label` are
+  optional, so a frame without them renders the overall bar alone rather than a second bar
+  frozen at zero. The transfer SPEED and the remaining TIME are derived here from those
+  frames — no wire field carries either — by `Flux2RateEstimator`, over the overall counter
+  only, and are absent rather than wrong until the window is wide enough to mean something.
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
   dispatcher (`translate_texts_via_translator`) instead of a second copy of it. It is
@@ -167,9 +196,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
-use web_time::Duration;
+use web_time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------------------
 // Limits
@@ -517,6 +547,87 @@ impl MemoryPreset {
 // Settings
 // ---------------------------------------------------------------------------------------
 
+/// Where the three model components come from: the user's own paths, or the copy this
+/// panel downloads.
+///
+/// The two are MODES and never mix. In [`Flux2SourceMode::Download`] the three effective
+/// paths are DERIVED from the models directory and the encoder toggle, and the manual
+/// fields are never written to — a user who has hand-built a model tree keeps it, and
+/// flipping back restores his configuration exactly. That is why a finished download does
+/// NOT write its answer into the settings: derivation configures the engine continuously
+/// instead of once, and a write-back would silently overwrite paths the user can switch
+/// back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2SourceMode {
+    /// The user points at his own model parts. The three path rows are drawn and their
+    /// values are what a run uses.
+    Manual,
+    /// The program downloads the model. The path rows are not drawn, and the effective
+    /// paths come from [`config::flux2_klein_dir`] and the encoder toggle.
+    Download,
+}
+
+impl Flux2SourceMode {
+    /// Stable token persisted in `flux2_klein_settings.json`.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Download => "download",
+        }
+    }
+
+    /// Reads a persisted token, falling back to [`FLUX2_DEFAULT_SOURCE_MODE`] for anything
+    /// unrecognized — INCLUDING an absent field, which is what every settings file written
+    /// before this switch existed looks like. Those files carry hand-entered paths, so the
+    /// fallback must be `Manual`: loading them as `Download` would replace a working
+    /// configuration with an empty download block and read as a broken update.
+    fn from_wire(value: &str) -> Self {
+        match value.trim() {
+            "download" => Self::Download,
+            "manual" => Self::Manual,
+            _ => FLUX2_DEFAULT_SOURCE_MODE,
+        }
+    }
+
+    /// The localized caption of this mode's toggle button.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => t!("cleaning.tools.flux2_klein.source_mode_manual"),
+            Self::Download => t!("cleaning.tools.flux2_klein.source_mode_download"),
+        }
+    }
+
+    /// The hover explaining what choosing this mode does.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Manual => t!("cleaning.tools.flux2_klein.source_mode_manual_hint"),
+            Self::Download => t!("cleaning.tools.flux2_klein.source_mode_download_hint"),
+        }
+    }
+
+    /// Both modes in picker order.
+    fn all() -> [Self; 2] {
+        [Self::Manual, Self::Download]
+    }
+}
+
+/// The mode a settings file without the field loads as. See
+/// [`Flux2SourceMode::from_wire`] for why it cannot be `Download`.
+const FLUX2_DEFAULT_SOURCE_MODE: Flux2SourceMode = Flux2SourceMode::Manual;
+
+/// The three model paths a run actually uses, after the source mode has been applied.
+///
+/// THE single answer to "which three paths does this engine use". Everything that needs
+/// them — the wire `params`, the run gate, the prompt-cache gates, the paths shown in the
+/// download body — goes through [`Flux2KleinSettings::effective_paths`], because two places
+/// computing it is exactly how the two modes drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2EffectivePaths {
+    text_encoder: String,
+    transformer: String,
+    vae: String,
+}
+
 /// Everything the tool persists to `flux2_klein_settings.json`.
 ///
 /// `#[serde(default)]` so a file written by an older build keeps loading; the wire
@@ -524,8 +635,27 @@ impl MemoryPreset {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Flux2KleinSettings {
-    /// Directory of the Qwen3 text encoder.
+    /// `Flux2SourceMode::wire()` — whether the paths below are used at all.
+    ///
+    /// Defaults to `manual`, and a file written before this field existed loads as manual:
+    /// such a file carries hand-entered paths, and loading it as `download` would replace a
+    /// working configuration with an empty download block.
+    source_mode: String,
+    /// Directory of the Qwen3 text encoder, in MANUAL mode.
+    ///
+    /// Never written to by the download: in download mode the effective encoder is derived
+    /// ([`Flux2KleinSettings::effective_paths`]) and this keeps whatever the user typed, so
+    /// flipping the mode back restores his configuration exactly.
     text_encoder_path: String,
+    /// Use the UNCENSORED text encoder rather than the official one.
+    ///
+    /// A normal persisted setting and not a global: it selects which encoder the model
+    /// download fetches AND which of the two managed directories `text_encoder_path`
+    /// points at. Both encoders may sit on disk at once, so flipping it when the other one
+    /// is already there repoints the path and downloads nothing
+    /// ([`flux2_text_encoder_path_after_toggle`]). It never travels inside `params`: the
+    /// download methods carry it as their own top-level `uncensored` field.
+    uncensored_text_encoder: bool,
     /// Either a `.safetensors` file or a diffusers directory.
     transformer_path: String,
     /// VAE directory or `.safetensors` file.
@@ -598,7 +728,13 @@ struct Flux2KleinSettings {
 impl Default for Flux2KleinSettings {
     fn default() -> Self {
         Self {
+            // Manual: an installation that predates the switch has hand-entered paths, and
+            // so does a user who has never opened the download block.
+            source_mode: FLUX2_DEFAULT_SOURCE_MODE.wire().to_string(),
             text_encoder_path: String::new(),
+            // The official encoder is the default: it is the one the model ships with,
+            // and the uncensored one is a deliberate choice with its own gated repository.
+            uncensored_text_encoder: false,
             transformer_path: String::new(),
             vae_path: String::new(),
             // Not empty: an empty prompt is the one value the run gate refuses outright,
@@ -659,7 +795,11 @@ impl Flux2KleinSettings {
             }
         };
         Self {
+            source_mode: Flux2SourceMode::from_wire(&self.source_mode)
+                .wire()
+                .to_string(),
             text_encoder_path: self.text_encoder_path.trim().to_string(),
+            uncensored_text_encoder: self.uncensored_text_encoder,
             transformer_path: self.transformer_path.trim().to_string(),
             vae_path: self.vae_path.trim().to_string(),
             prompt: self.prompt.trim().to_string(),
@@ -703,6 +843,47 @@ impl Flux2KleinSettings {
         }
     }
 
+    /// The active source mode.
+    fn source_mode(&self) -> Flux2SourceMode {
+        Flux2SourceMode::from_wire(&self.source_mode)
+    }
+
+    /// THE three paths a run uses, after the source mode has been applied.
+    ///
+    /// Every consumer goes through here — the wire `params`, the run gate, the prompt-cache
+    /// gates, the read-only paths the download body shows — so the two modes cannot drift
+    /// apart in one of them.
+    ///
+    /// In `Manual` these are the user's trimmed fields. In `Download` they are DERIVED from
+    /// the models directory and the encoder toggle and the manual fields are not read at
+    /// all, which is what lets a hand-built configuration survive a download untouched.
+    ///
+    /// The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/`
+    /// directories under `FLUX.2-klein-9B/`, which is what the backend's component search
+    /// needs: it probes each supplied path and ITS PARENT (`component_search_roots` /
+    /// `component_probe_order` in `modules/ai_backend/inpaint/flux2_klein.py`), so the repo
+    /// root is reached from any of the three and both encoder directories resolve the
+    /// tokenizer.
+    #[must_use]
+    fn effective_paths(&self) -> Flux2EffectivePaths {
+        match self.source_mode() {
+            Flux2SourceMode::Manual => Flux2EffectivePaths {
+                text_encoder: self.text_encoder_path.trim().to_string(),
+                transformer: self.transformer_path.trim().to_string(),
+                vae: self.vae_path.trim().to_string(),
+            },
+            Flux2SourceMode::Download => Flux2EffectivePaths {
+                text_encoder: config::flux2_klein_text_encoder_dir(self.uncensored_text_encoder)
+                    .to_string_lossy()
+                    .to_string(),
+                transformer: config::flux2_klein_transformer_dir()
+                    .to_string_lossy()
+                    .to_string(),
+                vae: config::flux2_klein_vae_dir().to_string_lossy().to_string(),
+            },
+        }
+    }
+
     /// Builds the `params` object of a generation or estimate request.
     ///
     /// `self` must already be `normalized()`. `seed` is `null` unless the user pinned
@@ -718,10 +899,13 @@ impl Flux2KleinSettings {
     /// the backend apply the mode's parameter overrides — and log them — on a polling path.
     #[must_use]
     fn to_params(&self, whole_region: bool) -> Value {
+        // The EFFECTIVE paths, never the raw fields: in download mode the fields hold the
+        // user's own configuration and must not reach the backend.
+        let paths = self.effective_paths();
         json!({
-            "text_encoder_path": self.text_encoder_path,
-            "transformer_path": self.transformer_path,
-            "vae_path": self.vae_path,
+            "text_encoder_path": paths.text_encoder,
+            "transformer_path": paths.transformer,
+            "vae_path": paths.vae,
             "prompt": self.prompt,
             "steps": self.steps,
             "guidance_scale": self.guidance_scale,
@@ -1143,18 +1327,364 @@ fn flux2_component_block(status: Option<&Flux2Status>) -> Flux2ComponentBlock<'_
 }
 
 /// Whether the backend's ONE pipeline — and with it the single shared progress bar — is
-/// held right now by one of the three long operations that claim it.
+/// held right now by one of the FOUR long operations that claim it.
 ///
-/// A generation, a `.prompt_cache.build` and a `.component_action` all take the service's
-/// lock for minutes and all call [`begin_progress_generation`], so starting a second one
-/// would both queue behind the first and steal its bar. Every gate that means "wait for
-/// the current operation" reads this, and nothing re-derives it field by field.
+/// A generation, a `.prompt_cache.build`, a `.component_action` and a `.download.start`
+/// all take the service for minutes (the download for hours) and all call
+/// [`begin_progress_generation`], so starting a second one would both queue behind the
+/// first and steal its bar. Every gate that means "wait for the current operation" reads
+/// this, and nothing re-derives it field by field.
 fn flux2_pipeline_busy(
     run_in_flight: bool,
     prompt_cache_in_flight: bool,
     component_action_in_flight: bool,
+    download_in_flight: bool,
 ) -> bool {
-    run_in_flight || prompt_cache_in_flight || component_action_in_flight
+    run_in_flight || prompt_cache_in_flight || component_action_in_flight || download_in_flight
+}
+
+// ---------------------------------------------------------------------------------------
+// Model download from Hugging Face (`dev-docs/flux2_model_download.md`)
+// ---------------------------------------------------------------------------------------
+
+/// Where a Hugging Face access token is created. The link the `no_token` and
+/// `invalid_token` verdicts offer.
+const FLUX2_HF_TOKEN_SETTINGS_URL: &str = "https://huggingface.co/settings/tokens";
+
+/// Prefix of a repository's own page, where its gating conditions are accepted. The link
+/// the `not_accepted` verdict offers, completed with the repository id the backend named.
+const FLUX2_HF_REPO_URL_PREFIX: &str = "https://huggingface.co/";
+
+/// One repository's access verdict, as `.download.check` reports it.
+///
+/// The mapping is FIXED by the pinned contract (`dev-docs/flux2_model_download.md` §3) and
+/// each state answers a different question for the user, which is the whole reason the
+/// backend distinguishes them instead of returning one "no access" error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2DownloadState {
+    /// `HfApi.auth_check()` passed for this token on this repository, so it is ready to
+    /// download from. Deliberately NOT "the listing came back": a gated repository's
+    /// METADATA is public, so a listing succeeds for a user holding no token at all.
+    Ok,
+    /// The request carried an empty token and no network call was made.
+    NoToken,
+    /// HTTP 401 — the token is wrong or has been revoked.
+    InvalidToken,
+    /// HTTP 403 (or a `GatedRepoError` carrying no status) — the repository is gated and
+    /// its conditions have not been accepted. The backend decides this by STATUS first and
+    /// exception class second, because `GatedRepoError` is also raised with status 401 for
+    /// a merely bad token.
+    NotAccepted,
+    /// HTTP 404 — the repository id no longer exists.
+    NotFound,
+    /// Anything else; the backend's own message is the only useful detail.
+    NetworkError,
+}
+
+impl Flux2DownloadState {
+    /// The wire literal of this verdict.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoToken => "no_token",
+            Self::InvalidToken => "invalid_token",
+            Self::NotAccepted => "not_accepted",
+            Self::NotFound => "not_found",
+            Self::NetworkError => "network_error",
+        }
+    }
+
+    /// Reads a verdict literal.
+    ///
+    /// `None` for anything this build does not know — a NEWER backend reporting a state
+    /// added after this release. The honest answer there is "not known", shown with the
+    /// literal on hover: silently folding an unknown literal onto one of the six would
+    /// send the user to accept conditions they have already accepted, or tell them a token
+    /// they just created is invalid. Same rule the residency block already follows.
+    fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::Ok,
+            Self::NoToken,
+            Self::InvalidToken,
+            Self::NotAccepted,
+            Self::NotFound,
+            Self::NetworkError,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.wire() == value)
+    }
+
+    /// The localized line this verdict puts on screen.
+    fn message(self) -> &'static str {
+        match self {
+            Self::Ok => t!("cleaning.tools.flux2_klein.download.state_ok"),
+            Self::NoToken => t!("cleaning.tools.flux2_klein.download.state_no_token"),
+            Self::InvalidToken => t!("cleaning.tools.flux2_klein.download.state_invalid_token"),
+            Self::NotAccepted => t!("cleaning.tools.flux2_klein.download.state_not_accepted"),
+            Self::NotFound => t!("cleaning.tools.flux2_klein.download.state_not_found"),
+            Self::NetworkError => t!("cleaning.tools.flux2_klein.download.state_network_error"),
+        }
+    }
+
+    /// The colour the verdict is drawn in; `None` for a neutral line.
+    fn color(self) -> Option<Color32> {
+        match self {
+            Self::Ok => Some(FLUX2_STATUS_OK_COLOR),
+            // Amber, not red: nothing is broken, the user simply has a step left to take.
+            Self::NoToken | Self::NotAccepted => Some(FLUX2_STATUS_WARN_COLOR),
+            Self::InvalidToken | Self::NotFound | Self::NetworkError => {
+                Some(FLUX2_STATUS_ERROR_COLOR)
+            }
+        }
+    }
+
+    /// The link that makes this verdict actionable.
+    ///
+    /// This is the FEATURE: a gated repository fails in three different ways and each one
+    /// has a different page behind it. A verdict with no link is one the user cannot click
+    /// their way out of.
+    fn link(self) -> Flux2DownloadLink {
+        match self {
+            Self::Ok | Self::NotFound | Self::NetworkError => Flux2DownloadLink::None,
+            Self::NoToken | Self::InvalidToken => Flux2DownloadLink::TokenSettings,
+            Self::NotAccepted => Flux2DownloadLink::RepoPage,
+        }
+    }
+}
+
+/// The page one verdict sends the user to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2DownloadLink {
+    /// Nothing to click: the state is not something a page can fix.
+    None,
+    /// `https://huggingface.co/settings/tokens` — where a token is created.
+    TokenSettings,
+    /// The gated repository's own page, where the conditions are accepted.
+    RepoPage,
+}
+
+/// One row of the `repos` block: the repository the backend was asked about and how it
+/// answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Flux2DownloadRepo {
+    /// The repository id, e.g. `black-forest-labs/FLUX.2-klein-9B`. A backend identifier
+    /// and therefore literal — it is also what the repository link is built from.
+    repo: String,
+    /// The parsed verdict; `None` when the backend sent a literal this build does not
+    /// know ([`Flux2DownloadState::from_wire`]).
+    state: Option<Flux2DownloadState>,
+    /// The literal the backend actually sent, kept verbatim so an unrecognised one can
+    /// still be shown on hover instead of vanishing without trace.
+    state_wire: String,
+    /// The backend's own message about this repository, empty for `ok`.
+    ///
+    /// It is the TECHNICAL half: `network_error` has no localizable content — only the
+    /// transport's own wording says what actually went wrong — so the row shows the
+    /// localized state and carries this verbatim on hover and in the log, never in place
+    /// of the sentence the user reads.
+    message: String,
+}
+
+impl Flux2DownloadRepo {
+    /// The link this row offers — its localized caption and its URL — or `None` when the
+    /// verdict offers none.
+    ///
+    /// Caption and URL are decided together so a row can never show "open the model page"
+    /// pointing at the token settings. An unrecognised state offers no link at all.
+    fn link(&self) -> Option<(String, String)> {
+        match self.state?.link() {
+            Flux2DownloadLink::None => None,
+            Flux2DownloadLink::TokenSettings => Some((
+                t!("cleaning.tools.flux2_klein.download.token_settings_link").to_string(),
+                FLUX2_HF_TOKEN_SETTINGS_URL.to_string(),
+            )),
+            Flux2DownloadLink::RepoPage => Some((
+                t!("cleaning.tools.flux2_klein.download.repo_page_link").to_string(),
+                format!("{FLUX2_HF_REPO_URL_PREFIX}{}", self.repo),
+            )),
+        }
+    }
+}
+
+/// What the download would cost, computed by the backend from the same listing the
+/// access check already fetched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Flux2DownloadPlan {
+    /// Size of the complete file set the current toggle needs.
+    total_bytes: u64,
+    /// Of that, what is missing or empty on disk — the number the button carries.
+    missing_bytes: u64,
+    missing_files: u64,
+}
+
+/// The whole `.download.check` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2DownloadCheck {
+    /// One row per repository the toggle actually needs, in the order the backend listed
+    /// them.
+    repos: Vec<Flux2DownloadRepo>,
+    /// `None` when the backend could not price the download — the contract's
+    /// `"plan": null`.
+    ///
+    /// ACCESS AND LISTING ARE TWO DIFFERENT NETWORK OPERATIONS: the token can pass
+    /// `auth_check` for every repository while fetching the file listing still fails. An
+    /// absent plan therefore means the size is NOT KNOWN, exactly like the absent
+    /// `components` of the residency block, and must never collapse into "nothing is
+    /// missing" — a zero-valued plan beside `ok` states renders a complete installation on
+    /// an empty machine, which is the worst failure this block has.
+    plan: Option<Flux2DownloadPlan>,
+    /// Why the plan is missing, verbatim from the backend. Empty whenever `plan` is
+    /// present. The TECHNICAL half, shown on hover beside a localized line, exactly as a
+    /// repository's own `message` is.
+    plan_error: String,
+    /// The encoder toggle this answer describes, stamped by the worker that asked.
+    ///
+    /// The toggle decides WHICH repositories are checked and what the plan counts, so an
+    /// answer is shown only while it still describes the toggle in the panel — the same
+    /// rule `prompt_cached` follows for the prompt it was asked about. Not a wire field:
+    /// it is the question, not the answer.
+    uncensored: bool,
+}
+
+/// Whether an access check still describes the encoder toggle currently selected.
+///
+/// Flipping the toggle changes WHICH repositories are needed and what the plan counts, so
+/// an answer about the other encoder must stop being shown — the same honesty
+/// `prompt_cache_state` applies to the prompt a `.status` answer was asked about.
+fn download_check_matches_toggle(check: Option<&Flux2DownloadCheck>, uncensored: bool) -> bool {
+    check.is_some_and(|check| check.uncensored == uncensored)
+}
+
+impl Flux2DownloadCheck {
+    /// Whether every repository the check covered answered `ok`.
+    ///
+    /// An EMPTY row list is not "ready": it means the backend named no repository, so
+    /// there is nothing to conclude. An unrecognised literal is not "ready" either.
+    fn ready(&self) -> bool {
+        !self.repos.is_empty()
+            && self
+                .repos
+                .iter()
+                .all(|repo| repo.state == Some(Flux2DownloadState::Ok))
+    }
+}
+
+/// What the download controls render for the access check they were given.
+///
+/// A separate type, and pure, because the difference between its two middle variants is a
+/// defect the type system can otherwise not see: an unpriced download and a finished one
+/// both have "no missing bytes" and must render as opposites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2DownloadReadiness {
+    /// Nothing to price and nothing to start: no check yet, or a check with no plan whose
+    /// repository rows already explain why (no token, or a repository the user cannot
+    /// reach). «Скачать» stays closed and no extra line is synthesised — the rows are the
+    /// explanation.
+    Blocked,
+    /// No plan although access was granted everywhere: the FILE LISTING failed. Neither a
+    /// size nor a completion state may be drawn, and «Скачать» stays AVAILABLE — pressing
+    /// it re-lists and either succeeds or reports the same failure honestly. The
+    /// repositories keep rendering as `ok`, because authentication really did succeed and
+    /// inventing a gating state here would send the user to fix something intact.
+    SizeUnknown,
+    /// A plan was computed and something is missing: `missing_bytes` is a real number.
+    Priced { missing_bytes: u64 },
+    /// A plan was computed and every file is already on disk.
+    Complete,
+}
+
+/// Decides what the download controls render from the last access check.
+///
+/// **The ABSENT PLAN decides on its own**, before the repository states are consulted: a
+/// `null` plan means no size and no completion state may be drawn, whatever the states say.
+/// The backend sends it for all three of "no token", "a repository is inaccessible" and "the
+/// listing failed", because a zero-valued plan is the same lie in every one of them — it
+/// reads as "nothing left to download", and was observed reporting a complete installation
+/// on an empty machine. The states are consulted only afterwards, to decide whether
+/// «Скачать» can usefully be pressed.
+fn flux2_download_readiness(check: Option<&Flux2DownloadCheck>) -> Flux2DownloadReadiness {
+    let Some(check) = check else {
+        return Flux2DownloadReadiness::Blocked;
+    };
+    let Some(plan) = check.plan else {
+        // Access granted means the listing is the only thing that failed, so a retry is
+        // worth offering; anything else is already explained by its own row.
+        return if check.ready() {
+            Flux2DownloadReadiness::SizeUnknown
+        } else {
+            Flux2DownloadReadiness::Blocked
+        };
+    };
+    // A plan behind a refusal prices a download that cannot start, so it is not offered.
+    if !check.ready() {
+        return Flux2DownloadReadiness::Blocked;
+    }
+    if plan.missing_bytes == 0 {
+        Flux2DownloadReadiness::Complete
+    } else {
+        Flux2DownloadReadiness::Priced {
+            missing_bytes: plan.missing_bytes,
+        }
+    }
+}
+
+/// The `.download.start` answer: where the files ended up and what it cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2DownloadOutcome {
+    /// Absolute paths of the three components, empty when the backend named none. Only a
+    /// non-empty path is written into the settings, so a partial answer cannot blank a
+    /// path the user had configured.
+    transformer_path: String,
+    text_encoder_path: String,
+    vae_path: String,
+    downloaded_bytes: u64,
+    skipped_files: u64,
+}
+
+/// The one download control the user pressed this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2DownloadAction {
+    /// Run `.download.check` for the current token and toggle.
+    Check,
+    /// Run the streaming `.download.start`.
+    Start,
+    /// Abandon the download in flight and tell the backend to stop.
+    Cancel,
+}
+
+/// The one secret-store control the user pressed this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2HfTokenAction {
+    /// Write the field's contents into the OS secret store.
+    Save,
+    /// Delete the stored token.
+    Delete,
+}
+
+/// The `text_encoder_path` a flip of the «Расцензуренный энкодер» toggle must leave
+/// behind, or `None` when the path must be left exactly as it is.
+///
+/// The toggle owns only the two directories this download block MANAGES. A path that is
+/// empty, or that names the OTHER managed encoder, is repointed — which is what makes
+/// flipping the toggle with both encoders on disk cost nothing. Any other path is a
+/// deliberate choice of the user's (an encoder they downloaded elsewhere, a shared model
+/// tree) and survives the flip untouched; silently rewriting it would lose a value the
+/// tool cannot recover.
+fn flux2_text_encoder_path_after_toggle(current: &str, uncensored: bool) -> Option<String> {
+    let wanted = config::flux2_klein_text_encoder_dir(uncensored)
+        .to_string_lossy()
+        .to_string();
+    let other = config::flux2_klein_text_encoder_dir(!uncensored)
+        .to_string_lossy()
+        .to_string();
+    let current = current.trim();
+    if current == wanted {
+        return None;
+    }
+    if current.is_empty() || current == other {
+        return Some(wanted);
+    }
+    None
 }
 
 /// The `.estimate` answer: the backend's own forecast for the current parameters.
@@ -1192,10 +1722,136 @@ struct Flux2Progress {
     step: u64,
     total: u64,
     label: String,
+    /// The file the model download is transferring right now, `None` for every
+    /// operation and every phase that has no second level. See [`Flux2FileProgress`].
+    file: Option<Flux2FileProgress>,
+    /// Transfer rate over the OVERALL counter, fed only by `download` frames. Reset by
+    /// [`begin_progress_generation`], so a new operation never inherits the previous
+    /// transfer's speed.
+    rate: Flux2RateEstimator,
     /// IPC id of the in-flight request of `generation`, published by the worker as
     /// soon as the request is on the wire and taken by a cancel, which needs it to
     /// stop the backend instead of merely dropping the answer.
     cancel_id: Option<u64>,
+}
+
+/// Wall-clock span the transfer-rate estimator averages over.
+///
+/// A TIME window rather than a fixed number of frames: the backend throttles progress to
+/// roughly ten frames per second AND at least 4 MB apart, so the frame CADENCE varies with
+/// the line speed — a fast link reports every 4 MB, a slow one ten times a second. Averaging
+/// over N frames would therefore average over a different amount of wall time at every
+/// speed, while this averages over a known five seconds whatever the cadence.
+const FLUX2_RATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Shortest span the window must cover before a rate is reported at all.
+///
+/// Two consecutive frames can be 100 ms apart and 4 MB wide, which is a 40 MB/s reading
+/// taken from a single burst; on a transfer measured in hours an estimate built from that
+/// is worse than no estimate. Nothing is shown until the window spans this much real time.
+const FLUX2_RATE_MIN_SPAN: Duration = Duration::from_millis(1500);
+
+/// Rolling transfer-rate estimator over the OVERALL byte counter.
+///
+/// Fed from `step`/`total` and never from the per-file counters: the per-file counter resets
+/// at every file boundary, which on a 35 GB plan would make the rate jump to nonsense
+/// several times per gigabyte.
+///
+/// The rate is the total byte delta across the retained window divided by the wall time it
+/// spans — a moving average over [`FLUX2_RATE_WINDOW`]. An exponential average was the
+/// alternative and was rejected: its smoothing factor only means something relative to a
+/// fixed sample interval, and this stream's interval is set by whichever of the backend's
+/// two throttles binds, which changes with the line speed.
+#[derive(Debug, Clone, Default)]
+struct Flux2RateEstimator {
+    /// `(observed_at, overall step)`, oldest first. Bounded by the window, so at ten frames
+    /// per second it holds about fifty entries.
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl Flux2RateEstimator {
+    /// Records one overall-byte observation.
+    ///
+    /// A BACKWARDS step discards the whole window and starts a new one from this sample.
+    /// That is not defensive coding for an impossible case: a resumed file whose final
+    /// length is wrong is refetched from zero exactly once, so the overall counter really
+    /// does move backwards once per such file (`ipc/PROTOCOL.md`, `download.start`). The
+    /// samples before the restart describe bytes that are being sent again, so averaging
+    /// across the seam would report a rate that never happened; dropping them costs a few
+    /// seconds of "no estimate" and is the only honest answer.
+    fn observe(&mut self, now: Instant, step: u64) {
+        if self.samples.back().is_some_and(|&(_, last)| step < last) {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, step));
+        // Keep one sample older than the window so the span is never shorter than it.
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|&(t, _)| now.duration_since(t) > FLUX2_RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Bytes per second averaged over the retained window, or `None` while there is not
+    /// enough history for the number to mean anything.
+    ///
+    /// `None` covers every degenerate case rather than reporting a number: fewer than two
+    /// samples, a window shorter than [`FLUX2_RATE_MIN_SPAN`], and a window in which the
+    /// byte counter did not move.
+    fn bytes_per_second(&self) -> Option<f64> {
+        let (first_at, first_step) = *self.samples.front()?;
+        let (last_at, last_step) = *self.samples.back()?;
+        let span = last_at.duration_since(first_at);
+        if self.samples.len() < 2 || span < FLUX2_RATE_MIN_SPAN {
+            return None;
+        }
+        // The backwards case is already handled by `observe`, so this cannot underflow; the
+        // checked form keeps that true if the ordering rule is ever changed.
+        let moved = last_step.checked_sub(first_step)?;
+        if moved == 0 {
+            return None;
+        }
+        // Cast justification: a byte delta of at most tens of gigabytes and a span of a few
+        // seconds are both far inside f64's exact-integer range, and the result is a rate
+        // rendered to one decimal.
+        Some(moved as f64 / span.as_secs_f64())
+    }
+
+    /// Remaining wall time at the current rate, or `None` when no rate is known, the total
+    /// is not known, or the transfer is already complete.
+    ///
+    /// Never `0` and never an infinity: both are the "not enough history yet" case wearing a
+    /// number, and on an hours-long transfer a lying estimate is worse than none.
+    fn remaining(&self, step: u64, total: u64) -> Option<Duration> {
+        let rate = self.bytes_per_second()?;
+        let left = total.checked_sub(step).filter(|&left| left > 0)?;
+        if !rate.is_finite() || rate <= 0.0 {
+            return None;
+        }
+        // Cast justification: as above. `try_from_secs_f64` rejects a non-finite or
+        // out-of-range value rather than saturating, so an absurd rate yields no estimate.
+        Duration::try_from_secs_f64(left as f64 / rate).ok()
+    }
+}
+
+/// The SECOND progress level: the single file a model download is transferring, while
+/// `step`/`total` above stay the overall byte count across the whole plan.
+///
+/// Optional on the wire (`dev-docs/flux2_model_download.md` §4) and therefore optional
+/// here: a preparation frame carries no file at all, and rendering it as a bar stuck at
+/// zero would tell the user a transfer had stalled when nothing had started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2FileProgress {
+    /// Bytes of this file already written.
+    step: u64,
+    /// Size of this file, `0` when the backend could not state one — which must render
+    /// as an indeterminate bar rather than divide.
+    total: u64,
+    /// The file's own name, as the backend spelled it.
+    label: String,
 }
 
 /// Memory flags the backend ACTUALLY used for a finished run.
@@ -1391,7 +2047,7 @@ fn flux2_prompt_cache_gates(
     // A configured path the backend cannot find is the same situation as no path at all —
     // that is exactly what a settings file copied from another machine looks like.
     let encoder_present =
-        !settings.text_encoder_path.trim().is_empty() && text_encoder_available != Some(false);
+        !settings.effective_paths().text_encoder.is_empty() && text_encoder_available != Some(false);
     let encodable = !settings.prompt.trim().is_empty() && encoder_present;
     Flux2PromptCacheGates {
         build: ready && encodable,
@@ -1840,6 +2496,24 @@ pub struct Flux2KleinEngine {
     component_action_pending: Option<(Flux2ComponentId, Flux2ComponentAction)>,
     /// User-facing line about the last component action, shown under the residency block.
     component_action_status: Option<String>,
+    /// Buffer of the Hugging Face token field. NEVER persisted and never sent anywhere on
+    /// its own: it is only what «Сохранить» hands to the OS secret store, and it is
+    /// cleared as soon as the store accepts it, so the value does not linger on screen.
+    hf_token_input: String,
+    /// A secret-store save or delete in flight. `Ok` carries the localized outcome line;
+    /// neither branch ever carries the token.
+    hf_token_rx: Option<Receiver<Result<String, String>>>,
+    /// User-facing line about the last token operation, shown beside the badge.
+    hf_token_status: Option<String>,
+    /// The last `.download.check` answer; `None` until one lands.
+    download_check: Option<Flux2DownloadCheck>,
+    download_check_rx: Option<Receiver<Result<Flux2DownloadCheck, String>>>,
+    download_check_error: Option<String>,
+    /// The streaming `.download.start` in flight. It claims the shared progress bar, which
+    /// is why it counts towards [`flux2_pipeline_busy`].
+    download_rx: Option<Receiver<Result<Flux2DownloadOutcome, String>>>,
+    /// User-facing line about the last download, shown under the download controls.
+    download_status: Option<String>,
     translate_rx: Option<Receiver<Result<String, String>>>,
     translate_status: Option<String>,
     picker_rx: Option<Receiver<Option<PathBuf>>>,
@@ -1885,6 +2559,14 @@ impl Default for Flux2KleinEngine {
             component_action_rx: None,
             component_action_pending: None,
             component_action_status: None,
+            hf_token_input: String::new(),
+            hf_token_rx: None,
+            hf_token_status: None,
+            download_check: None,
+            download_check_rx: None,
+            download_check_error: None,
+            download_rx: None,
+            download_status: None,
             translate_rx: None,
             translate_status: None,
             picker_rx: None,
@@ -2095,6 +2777,24 @@ impl Flux2KleinEngine {
             self.session.run_rx.is_some(),
             self.prompt_cache_rx.is_some(),
             self.component_action_rx.is_some(),
+            self.download_rx.is_some(),
+        )
+    }
+
+    /// The same rule with the GENERATION taken out: true while an operation OTHER than a
+    /// run holds the pipeline.
+    ///
+    /// This is what the run gate reads. It cannot read [`Self::pipeline_busy`], which is
+    /// true during a run and would make the run button explain itself away mid-run; and it
+    /// must not read nothing, because a generation started under a `.prompt_cache.build`,
+    /// a `.component_action` or a multi-hour model download would queue behind it and
+    /// steal its progress bar.
+    fn non_run_pipeline_busy(&self) -> bool {
+        flux2_pipeline_busy(
+            false,
+            self.prompt_cache_rx.is_some(),
+            self.component_action_rx.is_some(),
+            self.download_rx.is_some(),
         )
     }
 
@@ -2182,6 +2882,260 @@ impl Flux2KleinEngine {
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    /// Writes the token field into the OS secret store, on a worker thread.
+    ///
+    /// The keyring is an OS round trip, so it never happens on the GUI thread
+    /// (`machine_translation.rs` spawns for the AI API keys for the same reason). The
+    /// buffer is cleared IMMEDIATELY, before the worker even starts: the value is already
+    /// on its way to the store, and leaving it in a widget only keeps a secret on screen.
+    fn start_store_hf_token(&mut self) {
+        if self.hf_token_rx.is_some() {
+            return;
+        }
+        let token = std::mem::take(&mut self.hf_token_input);
+        let (tx, rx) = mpsc::channel();
+        self.hf_token_rx = Some(rx);
+        thread::spawn(move || {
+            let result = crate::hf_token::store_hf_token(&token).map(|()| {
+                t!("cleaning.tools.flux2_klein.download.token_saved_status").to_string()
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Deletes the stored token, on a worker thread. See [`Self::start_store_hf_token`].
+    fn start_clear_hf_token(&mut self) {
+        if self.hf_token_rx.is_some() {
+            return;
+        }
+        self.hf_token_input.clear();
+        let (tx, rx) = mpsc::channel();
+        self.hf_token_rx = Some(rx);
+        thread::spawn(move || {
+            let result = crate::hf_token::clear_hf_token().map(|()| {
+                t!("cleaning.tools.flux2_klein.download.token_deleted_status").to_string()
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Drains the secret-store channel into the token status line.
+    ///
+    /// A finished operation also drops the last access check: it was computed for the
+    /// PREVIOUS token and would otherwise keep claiming access the new one may not have.
+    fn poll_hf_token(&mut self) {
+        let Some(rx) = self.hf_token_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(status)) => {
+                self.hf_token_rx = None;
+                self.hf_token_status = Some(status);
+                self.download_check = None;
+                self.download_check_error = None;
+            }
+            Ok(Err(err)) => {
+                self.hf_token_rx = None;
+                // The error carries the keyring's message, which never contains the token.
+                crate::runtime_log::log_warn(format!(
+                    "[cleaning] FLUX.2 klein Hugging Face token operation failed: {err}"
+                ));
+                self.hf_token_status = Some(err);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.hf_token_rx = None;
+                self.hf_token_status =
+                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Starts the one-shot `.download.check` on a worker thread.
+    ///
+    /// The token is read from the process-wide cache rather than from the field: the field
+    /// holds what the user is TYPING, while the check must ask about what is actually
+    /// stored — otherwise a typo that was never saved would report access the download
+    /// then cannot use.
+    fn start_download_check(&mut self) {
+        if self.download_check_rx.is_some() || self.pipeline_busy() {
+            return;
+        }
+        let uncensored = self.settings.uncensored_text_encoder;
+        let header = flux2_download_header(&crate::hf_token::hf_token(), uncensored);
+        let (tx, rx) = mpsc::channel();
+        self.download_check_rx = Some(rx);
+        self.download_check_error = None;
+        thread::spawn(move || {
+            // Stamped on the worker, from the value that actually travelled: the answer
+            // describes THAT toggle, whatever the user flips while it is in flight.
+            let answer = check_flux2_download(header).map(|mut check| {
+                check.uncensored = uncensored;
+                check
+            });
+            let _ = tx.send(answer);
+        });
+    }
+
+
+    /// Drains the access-check channel.
+    fn poll_download_check(&mut self) {
+        let Some(rx) = self.download_check_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(check)) => {
+                self.download_check_rx = None;
+                self.download_check_error = None;
+                // The technical half goes to the log with the repository it belongs to:
+                // the row on screen carries the localized state, and `network_error` has
+                // no localizable content at all. The request's token is not in scope here
+                // and must never enter this line.
+                for repo in &check.repos {
+                    if repo.state != Some(Flux2DownloadState::Ok) {
+                        crate::runtime_log::log_warn(format!(
+                            "[cleaning] FLUX.2 klein download access check: repo {}, state {}, message: {}",
+                            repo.repo, repo.state_wire, repo.message
+                        ));
+                    }
+                }
+                // A missing plan is its own diagnosis and a different failure from a
+                // refused repository: access succeeded and the LISTING did not.
+                if check.plan.is_none() {
+                    crate::runtime_log::log_warn(format!(
+                        "[cleaning] FLUX.2 klein download access check returned no plan; the download size is unknown. Reason: {}",
+                        check.plan_error
+                    ));
+                }
+                self.download_check = Some(check);
+            }
+            Ok(Err(err)) => {
+                self.download_check_rx = None;
+                self.download_check_error = Some(err);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.download_check_rx = None;
+                self.download_check_error =
+                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Starts the streaming `.download.start` on a worker thread.
+    ///
+    /// Claims the shared progress bar here, on the GUI thread, exactly as a generation and
+    /// a `.prompt_cache.build` do: that is what lets a cancel retire it and what makes the
+    /// four operations mutually exclusive.
+    fn start_download(&mut self) {
+        if self.pipeline_busy() {
+            return;
+        }
+        let header = flux2_download_header(
+            &crate::hf_token::hf_token(),
+            self.settings.uncensored_text_encoder,
+        );
+        let generation = begin_progress_generation(&self.progress);
+        let progress = Arc::clone(&self.progress);
+        let (tx, rx) = mpsc::channel();
+        self.download_rx = Some(rx);
+        self.download_status =
+            Some(t!("cleaning.tools.flux2_klein.download.running_status").to_string());
+        thread::spawn(move || {
+            let _ = tx.send(run_flux2_download(header, &progress, generation));
+        });
+    }
+
+    /// Abandons the download in flight: its answer is discarded, its progress generation is
+    /// retired so it can neither move nor stop the bar of whatever runs next, and the
+    /// backend is told to stop instead of pulling gigabytes nobody will keep.
+    ///
+    /// Files already published on disk stay — they are complete and were renamed
+    /// atomically, so a re-run resumes at file granularity.
+    fn cancel_download(&mut self) {
+        if self.download_rx.is_none() {
+            return;
+        }
+        self.download_rx = None;
+        if let Some(id) = retire_progress_generation(&self.progress) {
+            spawn_flux2_cancel(id);
+        }
+        self.download_status =
+            Some(t!("cleaning.tools.flux2_klein.download.cancelled_status").to_string());
+    }
+
+    /// Drains the download channel and CONFIGURES THE ENGINE from a finished download.
+    ///
+    /// The three answered paths are written into the settings and the file is marked dirty,
+    /// so the user does not then hand-pick paths for files the tool has just placed. Only
+    /// non-empty paths are written: a partial answer must not blank a path the user set by
+    /// hand. `.status`, the forecast and the prompt-cache listing are all re-armed, because
+    /// new model paths change every one of their answers.
+    fn poll_download(&mut self) {
+        let Some(rx) = self.download_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(outcome)) => {
+                self.download_rx = None;
+                self.apply_download_outcome(&outcome);
+            }
+            Ok(Err(err)) => {
+                self.download_rx = None;
+                crate::runtime_log::log_warn(format!(
+                    "[cleaning] FLUX.2 klein model download failed: {err}"
+                ));
+                self.download_status =
+                    Some(tf!("cleaning.tools.flux2_klein.download.error", err = err));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.download_rx = None;
+                self.download_status =
+                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Writes a finished download's paths into the settings and re-arms every query whose
+    /// answer the new files invalidate.
+    fn apply_download_outcome(&mut self, outcome: &Flux2DownloadOutcome) {
+        // The answer's paths are NOT written into the settings. In download mode the three
+        // effective paths are derived from the models directory and the encoder toggle
+        // (`Flux2KleinSettings::effective_paths`), so the engine is already configured and
+        // stays configured; the manual fields belong to the OTHER mode and hold a
+        // configuration the user can switch back to. Writing here would silently destroy a
+        // hand-built model tree, which is exactly what a download must not cost.
+        //
+        // They are still worth comparing: the backend put the files somewhere, and if that
+        // is not where this side derives them from, the two halves have drifted and the
+        // engine would look for a model that is not there. That is a bug report, not a
+        // reason to adopt the backend's answer.
+        let derived = self.settings.effective_paths();
+        for (component, derived, answered) in [
+            ("transformer", &derived.transformer, &outcome.transformer_path),
+            ("text_encoder", &derived.text_encoder, &outcome.text_encoder_path),
+            ("vae", &derived.vae, &outcome.vae_path),
+        ] {
+            if !answered.is_empty() && answered != derived {
+                crate::runtime_log::log_warn(format!(
+                    "[cleaning] FLUX.2 klein download placed {component} at {answered}, but this build derives it from {derived}. The two halves disagree about the model layout."
+                ));
+            }
+        }
+        // The files on disk changed, so what the backend reports about them did too.
+        self.status_wanted = true;
+        self.estimate_wanted = true;
+        self.prompt_cache_list_wanted = true;
+        // The plan is spent: the missing bytes it named are on disk now.
+        self.download_check = None;
+        self.download_status = Some(tf!(
+            "cleaning.tools.flux2_klein.download.done_status",
+            size = format_gib(outcome.downloaded_bytes),
+            skipped = outcome.skipped_files
+        ));
     }
 
     /// Drains the prompt-translation channel into the English prompt field.
@@ -2644,6 +3598,16 @@ impl AiEngine for Flux2KleinEngine {
         let mut prompt_cache_action: Option<Flux2PromptCacheAction> = None;
         let mut component_action: Option<(Flux2ComponentId, Flux2ComponentAction)> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
+        let mut hf_token_action: Option<Flux2HfTokenAction> = None;
+        let mut download_action: Option<Flux2DownloadAction> = None;
+        // Read before the destructure: it is a process-wide global, not a field the
+        // context can borrow.
+        let hf_token_state = crate::hf_token::hf_token_state();
+        // Same reason: it compares a field the destructure hands out with one it does not.
+        let download_check_current = download_check_matches_toggle(
+            self.download_check.as_ref(),
+            self.settings.uncensored_text_encoder,
+        );
         // Read before the destructure below borrows `settings` apart: the cache state is
         // derived from `status` AND `settings`, so it cannot be computed while both are
         // held by the context.
@@ -2671,6 +3635,14 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_list_error,
                 prompt_cache_selected,
                 prompt_cache_name_input,
+                hf_token_input,
+                hf_token_rx,
+                hf_token_status,
+                download_check,
+                download_check_rx,
+                download_check_error,
+                download_rx,
+                download_status,
                 progress,
                 ai_backend_available,
                 run_status,
@@ -2697,6 +3669,15 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_busy: prompt_cache_rx.is_some(),
                 prompt_cache_selected,
                 prompt_cache_name_input,
+                hf_token_state,
+                hf_token_input,
+                hf_token_status: hf_token_status.as_deref(),
+                hf_token_busy: hf_token_rx.is_some(),
+                download_check: download_check.as_ref().filter(|_| download_check_current),
+                download_check_error: download_check_error.as_deref(),
+                download_check_busy: download_check_rx.is_some(),
+                download_busy: download_rx.is_some(),
+                download_status: download_status.as_deref(),
                 progress,
                 run_status: run_status.as_deref(),
                 ai_backend_available: *ai_backend_available,
@@ -2708,6 +3689,8 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_action: &mut prompt_cache_action,
                 component_action: &mut component_action,
                 picker_requested: &mut picker_requested,
+                hf_token_action: &mut hf_token_action,
+                download_action: &mut download_action,
             };
             panel.draw(ui, region);
         }
@@ -2745,6 +3728,17 @@ impl AiEngine for Flux2KleinEngine {
         if let Some((id, action)) = component_action {
             self.start_component_action(id, action);
         }
+        match hf_token_action {
+            Some(Flux2HfTokenAction::Save) => self.start_store_hf_token(),
+            Some(Flux2HfTokenAction::Delete) => self.start_clear_hf_token(),
+            None => {}
+        }
+        match download_action {
+            Some(Flux2DownloadAction::Check) => self.start_download_check(),
+            Some(Flux2DownloadAction::Start) => self.start_download(),
+            Some(Flux2DownloadAction::Cancel) => self.cancel_download(),
+            None => {}
+        }
         if let Some(purpose) = picker_requested {
             self.start_picker(purpose);
         }
@@ -2759,10 +3753,19 @@ impl AiEngine for Flux2KleinEngine {
         }
     }
 
-    /// Only the engine's own half of the gate — the model paths and the prompt. The
-    /// rectangle is already validated against [`Self::constraints`] by the frame, and the
-    /// non-empty-mask rule is [`Self::allows_empty_mask`].
+    /// Only the engine's own half of the gate — the shared pipeline, the model paths and
+    /// the prompt. The rectangle is already validated against [`Self::constraints`] by the
+    /// frame, and the non-empty-mask rule is [`Self::allows_empty_mask`].
+    ///
+    /// The pipeline check comes first and reads [`Self::non_run_pipeline_busy`], not
+    /// [`Self::pipeline_busy`]: a generation must not report itself as the reason it
+    /// cannot start, while a `.prompt_cache.build`, a `.component_action` or a
+    /// multi-hour model download genuinely blocks the next one — it holds the backend's
+    /// one pipeline and the single progress bar a starting run would steal.
     fn run_block_reason(&self) -> Option<String> {
+        if self.non_run_pipeline_busy() {
+            return Some(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());
+        }
         flux2_run_block_reason(&self.settings, self.prompt_cache_state())
     }
 
@@ -2783,6 +3786,12 @@ impl AiEngine for Flux2KleinEngine {
             region,
             masks,
         } = request;
+        // Checked before anything is encoded: the backend has ONE pipeline, so a run
+        // started under a prompt-cache build, a component action or a model download would
+        // queue behind it for as long as it lasts AND steal its progress bar.
+        if self.non_run_pipeline_busy() {
+            return Err(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());
+        }
         let size = [rect_px.w, rect_px.h];
         let expected_bytes = rect_px.w.saturating_mul(rect_px.h);
         let mask_ok = masks.len() == 1 && masks[0].len() == expected_bytes;
@@ -2839,6 +3848,9 @@ impl AiEngine for Flux2KleinEngine {
         self.poll_translate();
         self.poll_prompt_cache();
         self.poll_and_maybe_query_prompt_cache_list();
+        self.poll_hf_token();
+        self.poll_download_check();
+        self.poll_download();
         self.poll_picker();
 
         let mut settings_changed = false;
@@ -2962,6 +3974,20 @@ struct Flux2PanelCtx<'a> {
     prompt_cache_busy: bool,
     prompt_cache_selected: &'a mut Option<String>,
     prompt_cache_name_input: &'a mut String,
+    /// Tri-state of the OS secret store: not read yet / no token / a token is stored.
+    hf_token_state: crate::hf_token::HfTokenState,
+    /// The token field's buffer. Drawn masked and never persisted.
+    hf_token_input: &'a mut String,
+    hf_token_status: Option<&'a str>,
+    /// A secret-store save or delete is in flight; both buttons are closed meanwhile.
+    hf_token_busy: bool,
+    download_check: Option<&'a Flux2DownloadCheck>,
+    download_check_error: Option<&'a str>,
+    download_check_busy: bool,
+    /// A `.download.start` is in flight. Separate from `pipeline_busy` because this is
+    /// what decides whether the block offers «Скачать» or «Отмена».
+    download_busy: bool,
+    download_status: Option<&'a str>,
     progress: &'a Arc<Mutex<Flux2Progress>>,
     /// The engine's own line about the last run, drawn under the progress bar.
     run_status: Option<&'a str>,
@@ -2982,6 +4008,10 @@ struct Flux2PanelCtx<'a> {
     component_action: &'a mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
     /// At most one file dialog request per frame.
     picker_requested: &'a mut Option<Flux2PickerPurpose>,
+    /// The one secret-store control the user pressed this frame, if any.
+    hf_token_action: &'a mut Option<Flux2HfTokenAction>,
+    /// The one download control the user pressed this frame, if any.
+    download_action: &'a mut Option<Flux2DownloadAction>,
 }
 
 impl Flux2PanelCtx<'_> {
@@ -3357,12 +4387,31 @@ impl Flux2PanelCtx<'_> {
         let estimate = self.estimate;
         let estimate_error = self.estimate_error;
         let estimate_busy = self.estimate_busy;
+        let pipeline_busy = self.pipeline_busy;
+        let ai_backend_available = self.ai_backend_available;
+        let hf_token_action = &mut *self.hf_token_action;
+        let download_action = &mut *self.download_action;
+        let hf_token_state = self.hf_token_state;
+        let hf_token_input = &mut *self.hf_token_input;
+        let hf_token_status = self.hf_token_status;
+        let hf_token_busy = self.hf_token_busy;
+        let download_check = self.download_check;
+        let download_check_error = self.download_check_error;
+        let download_check_busy = self.download_check_busy;
+        let download_busy = self.download_busy;
+        let download_status = self.download_status;
         RegionEditToolBase::draw_region_editor_collapsible_section(
             ui,
             "cleaning_flux2_klein_params",
             t!("cleaning.tools.flux2_klein.params_heading"),
             false,
             |ui| {
+                // The switch sits ABOVE everything it governs: exactly one of the two
+                // bodies below is drawn, and the user has to see which one he is in before
+                // he reads it.
+                draw_source_mode_switch(ui, settings, changed);
+                match settings.source_mode() {
+                    Flux2SourceMode::Manual => {
                 draw_path_row(
                     ui,
                     t!("cleaning.tools.flux2_klein.text_encoder_path_label"),
@@ -3416,6 +4465,33 @@ impl Flux2PanelCtx<'_> {
                     changed,
                     picker_requested,
                 );
+
+                    }
+                    // The three manual rows are NOT drawn here: in this mode the paths are
+                    // derived, and an editable field whose value nothing reads is a lie.
+                    // The derived destinations are shown read-only inside the block.
+                    Flux2SourceMode::Download => draw_download_block(
+                        ui,
+                        settings,
+                        Flux2DownloadView {
+                            token_state: hf_token_state,
+                            token_input: hf_token_input,
+                            token_status: hf_token_status,
+                            token_busy: hf_token_busy,
+                            check: download_check,
+                            check_error: download_check_error,
+                            check_busy: download_check_busy,
+                            download_busy,
+                            download_status,
+                            ai_backend_available,
+                            pipeline_busy,
+                            status,
+                        },
+                        changed,
+                        hf_token_action,
+                        download_action,
+                    ),
+                }
 
                 ui.separator();
                 *changed |= ui
@@ -3501,6 +4577,367 @@ impl Flux2PanelCtx<'_> {
     }
 }
 
+/// Draws the source-mode switch: two toggle buttons, exactly one of them selected.
+///
+/// Two mutually exclusive positions with short captions, so this is the toggle-button
+/// idiom the engine picker already uses (`../../mod.rs::draw_engine_picker`) —
+/// `egui::Button::selected` in a `horizontal_wrapped`, with `wrap_mode = Extend` so a long
+/// caption moves its button to the next ROW instead of breaking over two lines
+/// (`egui-docs/04-widgets.md` §5). A `WheelComboBox` would hide one of two choices behind a
+/// popup for no benefit, and `egui::ComboBox` is forbidden outright (§0.2). The buttons take
+/// their `Id` from their localized captions, so each carries a stable `id_salt`
+/// (`egui-docs/05-ids-and-i18n.md` §2) — without it, switching UI language would reset which
+/// button egui thinks was clicked.
+fn draw_source_mode_switch(
+    ui: &mut egui::Ui,
+    settings: &mut Flux2KleinSettings,
+    changed: &mut bool,
+) {
+    let active = settings.source_mode();
+    let mut picked: Option<Flux2SourceMode> = None;
+    ui.label(t!("cleaning.tools.flux2_klein.source_mode_label"));
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        for mode in Flux2SourceMode::all() {
+            // `Button` has no `id_salt` in egui 0.35 (it is not in
+            // `egui-docs/api/symbols.txt`), so the salt is pushed onto a child `Ui` —
+            // the mechanism `05-ids-and-i18n.md` §2 prescribes for exactly this case.
+            // The salt is the MODE's stable token, not its localized caption, so switching
+            // UI language cannot change which button egui thinks it is looking at.
+            let response = ui
+                .push_id(mode.wire(), |ui| {
+                    ui.add(egui::Button::new(mode.label()).selected(mode == active))
+                })
+                .inner;
+            if response.on_hover_text(mode.hint()).clicked() {
+                picked = Some(mode);
+            }
+        }
+    });
+    if let Some(mode) = picked
+        && mode != active
+    {
+        settings.source_mode = mode.wire().to_string();
+        *changed = true;
+    }
+}
+
+/// Draws the three DERIVED destination paths of the download mode, read-only, with what
+/// the backend reports about each one's presence.
+///
+/// Read-only because nothing here is a choice: the paths follow the models directory and
+/// the encoder toggle. They are shown anyway because the user still has to see where his
+/// 35 GB went and whether the install is complete, and making him switch modes to find that
+/// out would be the same as not showing it.
+///
+/// Presence comes from the last `.status` answer, never from a filesystem probe: this runs
+/// on the GUI thread, which must not touch the disk. No answer yet means the mark is
+/// omitted rather than guessed — an absent status is "not known", not "missing".
+fn draw_derived_paths(ui: &mut egui::Ui, settings: &Flux2KleinSettings, status: Option<&Flux2Status>) {
+    let paths = settings.effective_paths();
+    ui.label(t!("cleaning.tools.flux2_klein.download.derived_paths_label"));
+    for (label, path, component) in [
+        (
+            t!("cleaning.tools.flux2_klein.text_encoder_path_label"),
+            &paths.text_encoder,
+            status.map(|status| &status.text_encoder),
+        ),
+        (
+            t!("cleaning.tools.flux2_klein.transformer_path_label"),
+            &paths.transformer,
+            status.map(|status| &status.transformer),
+        ),
+        (
+            t!("cleaning.tools.flux2_klein.vae_path_label"),
+            &paths.vae,
+            status.map(|status| &status.vae),
+        ),
+    ] {
+        ui.horizontal_wrapped(|ui| {
+            // Presence is only claimed when the backend actually answered.
+            if let Some(component) = component {
+                let mark = if component.present { "✓" } else { "✗" };
+                let color = if component.present {
+                    FLUX2_STATUS_OK_COLOR
+                } else {
+                    FLUX2_STATUS_WARN_COLOR
+                };
+                ui.colored_label(color, mark);
+            }
+            ui.small(label);
+        });
+        // Selectable so the user can copy the path out; a path is data, not prose, so it
+        // stays literal.
+        ui.add(egui::Label::new(egui::RichText::new(path).small()).selectable(true));
+    }
+}
+
+/// Everything the model-download block READS, grouped so the block stays one function
+/// with a reviewable signature instead of eleven positional parameters.
+struct Flux2DownloadView<'a> {
+    token_state: crate::hf_token::HfTokenState,
+    /// The masked field's buffer. Never persisted and never logged.
+    token_input: &'a mut String,
+    token_status: Option<&'a str>,
+    token_busy: bool,
+    /// The last access check, ALREADY filtered to the encoder toggle currently selected
+    /// ([`Flux2KleinEngine::download_check_for_toggle`]).
+    check: Option<&'a Flux2DownloadCheck>,
+    check_error: Option<&'a str>,
+    check_busy: bool,
+    download_busy: bool,
+    download_status: Option<&'a str>,
+    ai_backend_available: bool,
+    pipeline_busy: bool,
+    /// The last `.status` answer, for the presence marks beside the derived paths.
+    status: Option<&'a Flux2Status>,
+}
+
+/// Draws the Hugging Face model-download block: the token row, the encoder toggle, the
+/// per-repository access verdicts with the link each one prescribes, and the download
+/// controls.
+///
+/// The token never reaches this function's own state: it lives in the process-wide
+/// `hf_token` module, `token_input` is only the buffer of the entry field, and no branch
+/// here prints, logs or formats a token value.
+fn draw_download_block(
+    ui: &mut egui::Ui,
+    settings: &mut Flux2KleinSettings,
+    view: Flux2DownloadView<'_>,
+    changed: &mut bool,
+    hf_token_action: &mut Option<Flux2HfTokenAction>,
+    download_action: &mut Option<Flux2DownloadAction>,
+) {
+    use crate::hf_token::HfTokenState;
+
+    ui.separator();
+    ui.label(t!("cleaning.tools.flux2_klein.download.heading"));
+    ui.small(t!("cleaning.tools.flux2_klein.download.hint"));
+
+    // --- the token row -------------------------------------------------------------
+    ui.small(match view.token_state {
+        // "Not read yet" is its own line: telling the user no token is saved while the
+        // secret store has not answered would send them to create a second one.
+        HfTokenState::Unknown => t!("cleaning.tools.flux2_klein.download.token_unknown_status"),
+        HfTokenState::Missing => t!("cleaning.tools.flux2_klein.download.token_missing_status"),
+        HfTokenState::Stored => t!("cleaning.tools.flux2_klein.download.token_stored_status"),
+    });
+    ui.add(
+        egui::TextEdit::singleline(view.token_input)
+            .password(true)
+            .id_salt("cleaning_flux2_klein_hf_token")
+            .hint_text(t!("cleaning.tools.flux2_klein.download.token_hint_text")),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if flux2_gated_button(
+            ui,
+            !view.token_busy && !view.token_input.trim().is_empty(),
+            t!("cleaning.tools.flux2_klein.download.token_save_button"),
+            t!("cleaning.tools.flux2_klein.download.token_save_tooltip"),
+            t!("cleaning.tools.flux2_klein.download.token_save_disabled_tooltip"),
+        ) {
+            *hf_token_action = Some(Flux2HfTokenAction::Save);
+        }
+        if flux2_gated_button(
+            ui,
+            !view.token_busy && view.token_state == HfTokenState::Stored,
+            t!("cleaning.tools.flux2_klein.download.token_delete_button"),
+            t!("cleaning.tools.flux2_klein.download.token_delete_tooltip"),
+            t!("cleaning.tools.flux2_klein.download.token_delete_disabled_tooltip"),
+        ) {
+            *hf_token_action = Some(Flux2HfTokenAction::Delete);
+        }
+    });
+    if let Some(status) = view.token_status {
+        ui.small(status);
+    }
+    if view.token_state == HfTokenState::Missing {
+        // Both repositories are gated, so without a token there is nothing to check and
+        // nothing to download: the only useful thing this block can do is say where a
+        // token comes from.
+        ui.small(t!("cleaning.tools.flux2_klein.download.no_token_hint"));
+        ui.hyperlink_to(
+            t!("cleaning.tools.flux2_klein.download.token_settings_link"),
+            FLUX2_HF_TOKEN_SETTINGS_URL,
+        );
+    }
+
+    // --- the encoder toggle --------------------------------------------------------
+    let toggled = ui
+        .checkbox(
+            &mut settings.uncensored_text_encoder,
+            t!("cleaning.tools.flux2_klein.download.uncensored_label"),
+        )
+        .on_hover_text(t!("cleaning.tools.flux2_klein.download.uncensored_hint"))
+        .changed();
+    if toggled {
+        *changed = true;
+        // The toggle selects the encoder AND the directory the tool reads it from. Only a
+        // path this block manages is repointed; a hand-picked one survives the flip.
+        if let Some(path) = flux2_text_encoder_path_after_toggle(
+            &settings.text_encoder_path,
+            settings.uncensored_text_encoder,
+        ) {
+            settings.text_encoder_path = path;
+        }
+    }
+
+    // Where the files go, and whether they are there. Drawn after the toggle because the
+    // encoder path follows it.
+    draw_derived_paths(ui, settings, view.status);
+
+    // --- the access check ----------------------------------------------------------
+    ui.horizontal_wrapped(|ui| {
+        if flux2_gated_button(
+            ui,
+            view.ai_backend_available && !view.check_busy && !view.pipeline_busy,
+            t!("cleaning.tools.flux2_klein.download.check_button"),
+            t!("cleaning.tools.flux2_klein.download.check_tooltip"),
+            t!("cleaning.tools.flux2_klein.download.check_disabled_tooltip"),
+        ) {
+            *download_action = Some(Flux2DownloadAction::Check);
+        }
+        if view.check_busy {
+            ui.small(t!("cleaning.tools.flux2_klein.download.checking_status"));
+        }
+    });
+    if let Some(error) = view.check_error {
+        ui.colored_label(
+            FLUX2_STATUS_ERROR_COLOR,
+            tf!("cleaning.tools.flux2_klein.download.check_error", err = error),
+        );
+    }
+    if let Some(check) = view.check {
+        for repo in &check.repos {
+            draw_download_repo_row(ui, repo);
+        }
+    }
+
+    // --- the download --------------------------------------------------------------
+    let readiness = flux2_download_readiness(view.check);
+    // A size line is drawn ONLY from a plan that was actually computed. Without one there
+    // is no number to show and none to invent: a zero would read as "nothing left to
+    // download" and is the exact lie the nullable plan exists to prevent.
+    if let Some(plan) = view.check.and_then(|check| check.plan) {
+        ui.small(tf!(
+            "cleaning.tools.flux2_klein.download.plan_status",
+            missing = format_gib(plan.missing_bytes),
+            files = plan.missing_files,
+            total = format_gib(plan.total_bytes)
+        ));
+    }
+    // The unpriced case gets a line only when the backend said WHY. A `plan_error` is sent
+    // exactly when access succeeded and the listing failed — the one situation the
+    // repository rows cannot explain, because every one of them reads `ok`. When it is
+    // empty the rows already say what is wrong (no token, an inaccessible repository) and a
+    // second line would only restate them.
+    if let Some(check) = view.check
+        && check.plan.is_none()
+        && !check.plan_error.is_empty()
+    {
+        // The localized sentence carries the meaning and the backend's own wording rides on
+        // the hover, exactly as a repository `message` does.
+        ui.colored_label(
+            FLUX2_STATUS_WARN_COLOR,
+            t!("cleaning.tools.flux2_klein.download.plan_unknown_status"),
+        )
+        .on_hover_text(check.plan_error.clone());
+    }
+    ui.horizontal_wrapped(|ui| {
+        // The size goes on the button only when it is a size the user can act on. An
+        // unpriced download gets the bare caption — never "Download (0.0 GiB)", which is
+        // the same lie as the completion line.
+        let caption = match readiness {
+            Flux2DownloadReadiness::Priced { missing_bytes } => tf!(
+                "cleaning.tools.flux2_klein.download.download_sized_button",
+                size = format_gib(missing_bytes)
+            ),
+            Flux2DownloadReadiness::Blocked
+            | Flux2DownloadReadiness::SizeUnknown
+            | Flux2DownloadReadiness::Complete => {
+                t!("cleaning.tools.flux2_klein.download.download_button").to_string()
+            }
+        };
+        // `SizeUnknown` keeps the button OPEN: pressing it re-lists, and either succeeds or
+        // reports the same failure honestly. Leaving it closed would strand a user whose
+        // listing failed once with no way to retry.
+        let startable = match readiness {
+            Flux2DownloadReadiness::Priced { .. } | Flux2DownloadReadiness::SizeUnknown => true,
+            Flux2DownloadReadiness::Blocked | Flux2DownloadReadiness::Complete => false,
+        };
+        if flux2_gated_button(
+            ui,
+            view.ai_backend_available && !view.pipeline_busy && startable,
+            &caption,
+            t!("cleaning.tools.flux2_klein.download.download_tooltip"),
+            t!("cleaning.tools.flux2_klein.download.download_disabled_tooltip"),
+        ) {
+            *download_action = Some(Flux2DownloadAction::Start);
+        }
+        if flux2_gated_button(
+            ui,
+            view.download_busy,
+            t!("cleaning.tools.flux2_klein.download.cancel_button"),
+            t!("cleaning.tools.flux2_klein.download.cancel_tooltip"),
+            t!("cleaning.tools.flux2_klein.download.cancel_disabled_tooltip"),
+        ) {
+            *download_action = Some(Flux2DownloadAction::Cancel);
+        }
+    });
+    // Everything is already on disk: say so, rather than leaving a disabled button with
+    // no explanation of why it is disabled. Reached ONLY through a plan that was actually
+    // computed — never through a missing one.
+    if readiness == Flux2DownloadReadiness::Complete {
+        ui.colored_label(
+            FLUX2_STATUS_OK_COLOR,
+            t!("cleaning.tools.flux2_klein.download.complete_status"),
+        );
+    }
+    if let Some(status) = view.download_status {
+        ui.small(status);
+    }
+}
+
+/// Draws one repository's verdict row: its id, the localized state, and the link that
+/// makes the state actionable.
+///
+/// A state literal this build does not know degrades to "not known" with the literal on
+/// hover and offers NO link — the same rule the residency block follows, and for the same
+/// reason: guessing which of the six a new literal means would send the user to the wrong
+/// page.
+fn draw_download_repo_row(ui: &mut egui::Ui, repo: &Flux2DownloadRepo) {
+    ui.horizontal_wrapped(|ui| {
+        // The repository id is a backend identifier, so it stays literal.
+        ui.small(repo.repo.clone());
+        match repo.state {
+            Some(state) => {
+                let response = match state.color() {
+                    Some(color) => ui.colored_label(color, state.message()),
+                    None => ui.small(state.message()),
+                };
+                // The backend's own wording is the TECHNICAL half and lives on the hover:
+                // `network_error` has no localizable content, so without it the row would
+                // say only "the repository could not be reached" and nothing about why.
+                if !repo.message.is_empty() {
+                    response.on_hover_text(repo.message.clone());
+                }
+            }
+            None => {
+                let response = ui.small(t!("cleaning.tools.flux2_klein.download.state_unknown"));
+                if !repo.state_wire.is_empty() {
+                    response.on_hover_text(tf!(
+                        "cleaning.tools.flux2_klein.download.state_unrecognized_hint",
+                        value = repo.state_wire
+                    ));
+                }
+            }
+        }
+    });
+    if let Some((caption, url)) = repo.link() {
+        ui.hyperlink_to(caption, url);
+    }
+}
+
 /// Explains what the mask MEANS for this engine, and what an empty one means.
 ///
 /// A free function and not a [`Flux2PanelCtx`] method because it reads no state at all:
@@ -3543,11 +4980,14 @@ fn flux2_run_block_reason(
     settings: &Flux2KleinSettings,
     prompt_cached: Option<bool>,
 ) -> Option<String> {
-    // Trimmed here rather than through `normalized()`: this runs on every frame of an
-    // open panel, and the only thing `normalized()` would add for these four fields is
-    // the trim — at the price of rebuilding the whole settings struct.
+    // The EFFECTIVE paths, so the gate answers about the mode the user is actually in: in
+    // download mode the manual fields may be empty while the derived paths are not, and
+    // reading the fields would refuse a run the backend would have accepted. Built rather
+    // than taken from `normalized()`, which would rebuild the whole struct on every frame
+    // of an open panel.
+    let paths = settings.effective_paths();
     let encoder_waived = prompt_cached == Some(true);
-    if settings.transformer_path.trim().is_empty() || settings.vae_path.trim().is_empty() {
+    if paths.transformer.is_empty() || paths.vae.is_empty() {
         // Two messages, because naming a path the run does not need would send the user
         // looking for a 16 GB download they have already worked around.
         return Some(if encoder_waived {
@@ -3556,7 +4996,7 @@ fn flux2_run_block_reason(
             t!("cleaning.tools.flux2_klein.paths_required_error").to_string()
         });
     }
-    if !encoder_waived && settings.text_encoder_path.trim().is_empty() {
+    if !encoder_waived && paths.text_encoder.is_empty() {
         return Some(t!("cleaning.tools.flux2_klein.paths_required_error").to_string());
     }
     if settings.prompt.trim().is_empty() {
@@ -4189,6 +5629,65 @@ fn format_gib(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
+/// Formats a transfer rate in MiB/s, one decimal.
+///
+/// MiB and not the GiB the sizes use: a 35 GB transfer runs at tens to hundreds of MiB/s, and
+/// in GiB every realistic speed would render as "0.0" or "0.1".
+fn format_mib_per_second(bytes_per_second: f64) -> String {
+    // Cast justification: the divisor is an exact power of two and the input is already f64.
+    format!("{:.1}", bytes_per_second / (1024.0 * 1024.0))
+}
+
+/// Formats a remaining time COARSELY: hours and minutes, minutes, or seconds.
+///
+/// Deliberately never more precise than that. The number is an extrapolation from a
+/// five-second window on a transfer that runs for hours; rendering it to the second would
+/// claim an accuracy it does not have and would flicker on every frame.
+fn format_eta(remaining: Duration) -> String {
+    let seconds = remaining.as_secs();
+    if seconds >= 3600 {
+        return tf!(
+            "cleaning.tools.flux2_klein.download.eta_hours",
+            hours = seconds / 3600,
+            minutes = (seconds % 3600) / 60
+        );
+    }
+    if seconds >= 60 {
+        return tf!(
+            "cleaning.tools.flux2_klein.download.eta_minutes",
+            minutes = seconds / 60
+        );
+    }
+    tf!(
+        "cleaning.tools.flux2_klein.download.eta_seconds",
+        seconds = seconds
+    )
+}
+
+/// The one line under the bars: the current speed, and the remaining time when one can
+/// honestly be given.
+///
+/// `None` when there is no rate yet — the line is then absent entirely rather than showing a
+/// placeholder, because "no estimate" is the honest state at the start of every transfer.
+/// Pure, so the "not enough history" rule can be tested without a `Ui`.
+fn flux2_transfer_status(progress: &Flux2Progress) -> Option<String> {
+    let rate = progress.rate.bytes_per_second()?;
+    let speed = tf!(
+        "cleaning.tools.flux2_klein.download.speed_status",
+        speed = format_mib_per_second(rate)
+    );
+    // The estimate is optional even when the speed is known: a plan whose total is not known
+    // yet, or one already finished, has no remaining time to report.
+    match progress.rate.remaining(progress.step, progress.total) {
+        Some(remaining) => Some(tf!(
+            "cleaning.tools.flux2_klein.download.speed_and_eta_status",
+            speed = speed,
+            eta = format_eta(remaining)
+        )),
+        None => Some(speed),
+    }
+}
+
 fn lock_progress(progress: &Mutex<Flux2Progress>) -> MutexGuard<'_, Flux2Progress> {
     match progress.lock() {
         Ok(guard) => guard,
@@ -4211,6 +5710,10 @@ fn begin_progress_generation(progress: &Mutex<Flux2Progress>) -> u64 {
     guard.step = 0;
     guard.total = 0;
     guard.label = t!("cleaning.tools.flux2_klein.preparing_status").to_string();
+    // The second level belongs to the operation that publishes it: a new claim must not
+    // inherit the file the previous download was transferring, nor its measured speed.
+    guard.file = None;
+    guard.rate = Flux2RateEstimator::default();
     guard.cancel_id = None;
     guard.generation
 }
@@ -4241,6 +5744,32 @@ fn update_progress(
     update(&mut guard);
 }
 
+/// Writes one decoded progress frame into the shared state under `generation`.
+///
+/// Every streaming operation of this engine publishes its frames the same way, second
+/// level included, so a field added to the wire reaches all four bars through one place
+/// instead of four copies that drift. A frame carrying no `file` CLEARS the second level
+/// rather than leaving the previous file on screen.
+fn publish_progress_frame(
+    progress: &Mutex<Flux2Progress>,
+    generation: u64,
+    frame: Flux2ProgressFrame,
+) {
+    let now = Instant::now();
+    update_progress(progress, generation, |state| {
+        // Only a download's counters are BYTES. A generation's `step` is a step index, so
+        // feeding it here would produce a "speed" in bytes per second from step counts.
+        if frame.phase == "download" {
+            state.rate.observe(now, frame.step);
+        }
+        state.phase = frame.phase;
+        state.step = frame.step;
+        state.total = frame.total;
+        state.label = frame.label;
+        state.file = frame.file;
+    });
+}
+
 /// Asks the backend to stop request `id`, on a worker thread.
 ///
 /// The cancel frame is a socket write behind the client's writer lock, which another
@@ -4265,41 +5794,106 @@ fn spawn_flux2_cancel(id: u64) {
     });
 }
 
-/// Draws the single progress bar shared by the load and generate phases.
-fn draw_flux2_progress_ui(ui: &mut egui::Ui, progress: &Mutex<Flux2Progress>) {
-    let (active, phase, step, total, label) = {
-        let guard = lock_progress(progress);
-        (
-            guard.active,
-            guard.phase.clone(),
-            guard.step,
-            guard.total,
-            guard.label.clone(),
-        )
-    };
-    if !active {
-        return;
+/// Fraction of a counter for a progress bar: clamped into `0.0..=1.0`, and `0.0` when
+/// the total is unknown (`0`) rather than a division by zero.
+///
+/// Shared by the overall level and the per-file level so the two can never disagree
+/// about what an unknown total means.
+fn flux2_progress_fraction(step: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
     }
-    // Cast justification: both are small counters (steps, or module counts during a
-    // load), far below the f32 integer-exact range.
-    let fraction = if total > 0 {
-        (step as f32 / total as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
+    // Cast justification: both counters are either small (steps, module counts) or byte
+    // counts of at most tens of gigabytes; f32 loses precision there but the result is a
+    // bar fraction, where a byte of drift is invisible.
+    (step as f32 / total as f32).clamp(0.0, 1.0)
+}
+
+/// The bar fractions the current progress state renders: the OVERALL one, plus the
+/// current-file one when the backend reported a second level.
+///
+/// Pure so the "overall only / both bars" split can be tested without a `Ui`. A frame
+/// that carries no file (a preparation phase) yields `None` for the second bar — never a
+/// bar pinned at zero, which would read as a stalled transfer.
+fn flux2_progress_fractions(progress: &Flux2Progress) -> (f32, Option<f32>) {
+    let overall = flux2_progress_fraction(progress.step, progress.total);
+    let file = progress
+        .file
+        .as_ref()
+        .map(|file| flux2_progress_fraction(file.step, file.total));
+    (overall, file)
+}
+
+/// Draws the progress shared by every long operation of this engine: one bar for the
+/// load and generate phases, and a SECOND bar under it while a model download reports the
+/// file it is transferring.
+fn draw_flux2_progress_ui(ui: &mut egui::Ui, progress: &Mutex<Flux2Progress>) {
+    let state = {
+        let guard = lock_progress(progress);
+        if !guard.active {
+            return;
+        }
+        Flux2Progress {
+            generation: guard.generation,
+            active: guard.active,
+            phase: guard.phase.clone(),
+            step: guard.step,
+            total: guard.total,
+            label: guard.label.clone(),
+            file: guard.file.clone(),
+            rate: guard.rate.clone(),
+            cancel_id: guard.cancel_id,
+        }
     };
-    let text = if phase == "load" {
+    let (overall, file_fraction) = flux2_progress_fractions(&state);
+    let text = if state.phase == "download" {
+        // Bytes, not steps: `step`/`total` are the whole plan's byte counts here.
+        tf!(
+            "cleaning.tools.flux2_klein.download.overall_progress_status",
+            done = format_gib(state.step),
+            total = format_gib(state.total)
+        )
+    } else if state.phase == "load" {
         tf!(
             "cleaning.tools.flux2_klein.load_progress_status",
-            label = label,
-            step = step,
-            total = total
+            label = state.label,
+            step = state.step,
+            total = state.total
         )
-    } else if total > 0 {
-        tf!("cleaning.common.step_progress_status", step = step, total = total)
+    } else if state.total > 0 {
+        tf!("cleaning.common.step_progress_status", step = state.step, total = state.total)
     } else {
-        label.clone()
+        state.label.clone()
     };
-    ui.add(egui::ProgressBar::new(fraction).text(text));
+    ui.add(egui::ProgressBar::new(overall).text(text));
+    match (file_fraction, state.file.as_ref()) {
+        (Some(fraction), Some(file)) => {
+            ui.add(
+                egui::ProgressBar::new(fraction).text(tf!(
+                    "cleaning.tools.flux2_klein.download.file_progress_status",
+                    label = file.label,
+                    done = format_gib(file.step),
+                    total = format_gib(file.total)
+                )),
+            );
+        }
+        // No second level: the frame is a preparation phase, and its `label` is the only
+        // thing that says what the backend is doing. It goes under the bar as plain text
+        // rather than as a second bar frozen at zero.
+        _ if state.phase == "download" && !state.label.trim().is_empty() => {
+            ui.small(state.label.clone());
+        }
+        _ => {}
+    }
+    // Speed and remaining time, under the bars and only while a transfer is actually
+    // running: this whole function returned early when the bar is inactive, so the numbers
+    // cannot be left frozen beside an idle bar. Download frames only — a generation's
+    // counters are steps, not bytes.
+    if state.phase == "download"
+        && let Some(line) = flux2_transfer_status(&state)
+    {
+        ui.small(line);
+    }
     // Nothing else drives repaints while the worker runs, so the bar would freeze.
     ui.ctx().request_repaint();
 }
@@ -4397,14 +5991,7 @@ fn run_flux2_klein_pass(
         header,
         &blob,
         |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |phase, step, total, label| {
-            update_progress(progress, generation, |state| {
-                state.phase = phase;
-                state.step = step;
-                state.total = total;
-                state.label = label;
-            });
-        },
+        |frame| publish_progress_frame(progress, generation, frame),
     );
 
     let (response_header, out_bytes) = stream_result?;
@@ -4467,9 +6054,57 @@ fn parse_applied_flags(header: &Value) -> Option<Flux2AppliedFlags> {
     })
 }
 
+/// One decoded progress frame of a streaming FLUX.2 call.
+///
+/// The four required fields are the shape every streaming method of this engine has
+/// always used. `file` is the SECOND level a model download adds
+/// (`dev-docs/flux2_model_download.md` §4): optional on the wire, `None` here for every
+/// operation that does not publish it, so a consumer that predates it is unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flux2ProgressFrame {
+    phase: String,
+    /// The OVERALL counter — steps for a generation, bytes across the whole plan for a
+    /// download. Deliberately the old field, so every single-level consumer stays right.
+    step: u64,
+    total: u64,
+    label: String,
+    file: Option<Flux2FileProgress>,
+}
+
+/// Reads one progress frame's header.
+///
+/// Every field is optional and degrades rather than failing: an absent `phase` reads as
+/// `generate` (what a generation sends most of the time), absent counters as `0`, and an
+/// absent `file_step`/`file_total` pair as "this frame describes no single file". A frame
+/// that carries EITHER of the two is taken as describing one, because a backend that
+/// reports a byte count without a size still has a file in flight to name.
+fn parse_flux2_progress_frame(header: &Value) -> Flux2ProgressFrame {
+    let u64_field = |name: &str| header.get(name).and_then(Value::as_u64);
+    let str_field = |name: &str| header.get(name).and_then(Value::as_str);
+    let file_step = u64_field("file_step");
+    let file_total = u64_field("file_total");
+    let file = if file_step.is_none() && file_total.is_none() {
+        None
+    } else {
+        Some(Flux2FileProgress {
+            step: file_step.unwrap_or(0),
+            total: file_total.unwrap_or(0),
+            label: str_field("file_label").unwrap_or_default().to_string(),
+        })
+    };
+    Flux2ProgressFrame {
+        phase: str_field("phase").unwrap_or("generate").to_string(),
+        step: u64_field("step").unwrap_or(0),
+        total: u64_field("total").unwrap_or(0),
+        label: str_field("label").unwrap_or_default().to_string(),
+        file,
+    }
+}
+
 /// Streaming call to `method`. Each `progress` frame carries `phase`/`step`/`total`/
-/// `label` in the header and no preview blob — the same shape for a generation and for a
-/// prompt-cache build, which is why both go through here.
+/// `label` in the header and no preview blob — the same shape for a generation, a
+/// prompt-cache build, a component action and a model download, which is why all four go
+/// through here. A download additionally fills [`Flux2ProgressFrame::file`].
 ///
 /// `on_started` receives the IPC id of the request as soon as it is on the wire; the
 /// progress state keeps it so a cancel can stop the work backend-side. This is why the call is
@@ -4484,7 +6119,7 @@ fn flux2_stream_call<S, F>(
 ) -> Result<(Value, Vec<u8>), String>
 where
     S: FnOnce(u64),
-    F: FnMut(String, u64, u64, String),
+    F: FnMut(Flux2ProgressFrame),
 {
     let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let handle = client
@@ -4494,26 +6129,11 @@ where
     handle
         .wait_streaming(
             |progress_header, _preview_blob| {
-                let phase = progress_header
-                    .get("phase")
-                    .and_then(Value::as_str)
-                    .unwrap_or("generate")
-                    .to_string();
-                let step = progress_header
-                    .get("step")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let total = progress_header
-                    .get("total")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let label = progress_header
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                on_progress(phase, step, total, label);
+                on_progress(parse_flux2_progress_frame(progress_header));
             },
+            // Per FRAME, not per call: `wait_streaming` restarts the timer on every
+            // progress frame, which is what lets a multi-hour model download share this
+            // timeout with a generation.
             FLUX2_RUN_TIMEOUT,
         )
         .map_err(map_flux2_call_error)
@@ -4754,14 +6374,7 @@ fn run_flux2_component_action(
         header,
         &[],
         |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |phase, step, total, label| {
-            update_progress(progress, generation, |state| {
-                state.phase = phase;
-                state.step = step;
-                state.total = total;
-                state.label = label;
-            });
-        },
+        |frame| publish_progress_frame(progress, generation, frame),
     )
     .map(|(header, _blob)| parse_flux2_component_snapshot(&header));
     update_progress(progress, generation, |state| {
@@ -4824,14 +6437,7 @@ fn build_flux2_prompt_cache(
         header,
         &[],
         |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |phase, step, total, label| {
-            update_progress(progress, generation, |state| {
-                state.phase = phase;
-                state.step = step;
-                state.total = total;
-                state.label = label;
-            });
-        },
+        |frame| publish_progress_frame(progress, generation, frame),
     )
     .map(|(_header, _blob)| Flux2PromptCacheOutcome::Built);
     update_progress(progress, generation, |state| {
@@ -5036,6 +6642,182 @@ fn flux2_prompt_cache_call(method: &'static str, header: Value) -> Result<Value,
         .call(method, header, &[], FLUX2_QUERY_TIMEOUT)
         .map_err(map_flux2_call_error)?;
     Ok(response)
+}
+
+// ---------------------------------------------------------------------------------------
+// Model download from Hugging Face
+// ---------------------------------------------------------------------------------------
+
+/// Builds the request header of the two download methods.
+///
+/// The token travels as a per-call REQUEST FIELD and never as an environment variable of
+/// the backend process, never inside `params`, and never in a log line — this function is
+/// the only place it is put on the wire, so there is exactly one place to audit.
+/// An empty token is legal and is what makes the backend answer `no_token` without making
+/// a network call.
+#[must_use]
+fn flux2_download_header(hf_token: &str, uncensored: bool) -> Value {
+    json!({
+        "hf_token": hf_token,
+        "uncensored": uncensored,
+    })
+}
+
+/// Runs `.download.check` and returns the per-repository verdicts plus the plan.
+///
+/// BLOCKING: worker threads only.
+///
+/// # Errors
+/// Returns a user-facing message when the backend fails, does not know the method, or is
+/// unreachable. A repository that refused access is NOT an error — it is a verdict, and
+/// the whole point of the call is to tell the six of them apart.
+fn check_flux2_download(header: Value) -> Result<Flux2DownloadCheck, String> {
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
+    let (response, _blob) = client
+        .call(
+            backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
+            header,
+            &[],
+            FLUX2_QUERY_TIMEOUT,
+        )
+        .map_err(map_flux2_call_error)?;
+    Ok(parse_flux2_download_check(&response))
+}
+
+/// Parses a `.download.check` answer.
+///
+/// Every field is optional and degrades rather than failing: an absent `repos` yields no
+/// rows (the block then says nothing was checked), a row whose `state` is missing or
+/// unrecognised keeps its literal for the hover, and an absent `plan` stays `None` — never
+/// a plan of zero bytes, which would put "0.0 GiB" on the download button.
+///
+/// `message` is contractually always present and empty for `ok`, but it is read as
+/// optional all the same: a missing one costs a hover, while treating its absence as an
+/// error would cost the whole verdict.
+fn parse_flux2_download_check(header: &Value) -> Flux2DownloadCheck {
+    let repos = header
+        .get("repos")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(repo, value)| {
+                    let state_wire = value
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Flux2DownloadRepo {
+                        repo: repo.clone(),
+                        state: Flux2DownloadState::from_wire(&state_wire),
+                        state_wire,
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // `plan` is NULLABLE by contract: an explicit `null` is how a failed file listing is
+    // reported, and it must stay `None` here. A plan object carrying neither total counts
+    // as no plan for the same reason — the alternative is a free download of zero bytes,
+    // which renders as "everything is already installed".
+    let plan = header.get("plan").and_then(|plan| {
+        let field = |name: &str| plan.get(name).and_then(Value::as_u64);
+        let total_bytes = field("total_bytes");
+        let missing_bytes = field("missing_bytes");
+        if total_bytes.is_none() && missing_bytes.is_none() {
+            return None;
+        }
+        Some(Flux2DownloadPlan {
+            total_bytes: total_bytes.unwrap_or(0),
+            missing_bytes: missing_bytes.unwrap_or(0),
+            missing_files: field("missing_files").unwrap_or(0),
+        })
+    });
+    // Only meaningful without a plan; the contract leaves it absent or empty otherwise, and
+    // it is dropped here in that case so nothing downstream has to re-check the pairing.
+    let plan_error = if plan.is_some() {
+        String::new()
+    } else {
+        header
+            .get("plan_error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    // `uncensored` is the QUESTION, not part of the answer: the worker that asked stamps
+    // it, because only it knows which toggle actually travelled.
+    Flux2DownloadCheck {
+        repos,
+        plan,
+        plan_error,
+        uncensored: false,
+    }
+}
+
+/// Runs the streaming `.download.start` and returns where the files ended up.
+///
+/// Streaming, and it drives the SAME bar a generation, a `.prompt_cache.build` and a
+/// `.component_action` drive — which is what makes the four mutually exclusive.
+/// `generation` is the progress generation claimed on the GUI thread; every write is
+/// dropped once a newer operation (or a cancel) has retired it, and the bar is cleared on
+/// EVERY exit.
+///
+/// # Errors
+/// Returns a user-facing message when the backend refuses (no access to a gated
+/// repository, not enough free space for the plan), when the transfer fails or is
+/// cancelled, when it does not know the method, or when it is unreachable. No message
+/// carries the token.
+fn run_flux2_download(
+    header: Value,
+    progress: &Arc<Mutex<Flux2Progress>>,
+    generation: u64,
+) -> Result<Flux2DownloadOutcome, String> {
+    let outcome = flux2_stream_call(
+        backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
+        header,
+        &[],
+        |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
+        |frame| publish_progress_frame(progress, generation, frame),
+    )
+    .map(|(header, _blob)| parse_flux2_download_outcome(&header));
+    update_progress(progress, generation, |state| {
+        state.active = false;
+        state.file = None;
+        state.cancel_id = None;
+    });
+    outcome
+}
+
+/// Parses a `.download.start` answer.
+///
+/// A path the backend did not name comes back EMPTY rather than as an error, and the
+/// caller writes only the non-empty ones into the settings: a partial answer must not
+/// blank a path the user had configured by hand.
+fn parse_flux2_download_outcome(header: &Value) -> Flux2DownloadOutcome {
+    let paths = header.get("paths");
+    let path = |name: &str| {
+        paths
+            .and_then(|paths| paths.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let count = |name: &str| header.get(name).and_then(Value::as_u64).unwrap_or(0);
+    Flux2DownloadOutcome {
+        transformer_path: path("transformer"),
+        text_encoder_path: path("text_encoder"),
+        vae_path: path("vae"),
+        downloaded_bytes: count("downloaded_bytes"),
+        skipped_files: count("skipped_files"),
+    }
 }
 
 /// Translates one prompt into English through the translation tab's own dispatcher.
@@ -7023,5 +8805,1347 @@ mod tests {
     fn gib_formatting_is_one_decimal() {
         assert_eq!(format_gib(0), "0.0");
         assert_eq!(format_gib(1024 * 1024 * 1024), "1.0");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Model download from Hugging Face (`dev-docs/flux2_model_download.md`)
+    // -----------------------------------------------------------------------------------
+
+    /// Builds a `.download.check` answer with one repository in the given state.
+    ///
+    /// The byte figures here are ROUND ARBITRARY NUMBERS on purpose. The real manifest sizes
+    /// belong to the backend and reach this side only through the `plan` object at runtime;
+    /// pinning one in a fixture would turn a re-shard or a manifest change into a red test
+    /// about nothing, and invite someone to hard-code it in the UI.
+    fn download_answer(repo: &str, state: &str, message: &str) -> Value {
+        json!({
+            "repos": { repo: { "state": state, "message": message } },
+            "plan": { "total_bytes": 40_000_000_000u64, "missing_bytes": 18_000_000_000u64, "missing_files": 3 }
+        })
+    }
+
+    /// The literal -> verdict mapping is the feature: each of the six states sends the
+    /// user somewhere different, and an unknown one must send them nowhere at all.
+    #[test]
+    fn every_download_state_literal_maps_to_its_own_verdict_and_link() {
+        // Round trip first: the wire spelling is what the contract pins, and a typo here
+        // would silently turn every verdict into "not known".
+        for state in [
+            Flux2DownloadState::Ok,
+            Flux2DownloadState::NoToken,
+            Flux2DownloadState::InvalidToken,
+            Flux2DownloadState::NotAccepted,
+            Flux2DownloadState::NotFound,
+            Flux2DownloadState::NetworkError,
+        ] {
+            assert_eq!(Flux2DownloadState::from_wire(state.wire()), Some(state));
+        }
+        // The exact literals, spelled out, because the Python half matches on these.
+        for (wire, expected) in [
+            ("ok", Flux2DownloadState::Ok),
+            ("no_token", Flux2DownloadState::NoToken),
+            ("invalid_token", Flux2DownloadState::InvalidToken),
+            ("not_accepted", Flux2DownloadState::NotAccepted),
+            ("not_found", Flux2DownloadState::NotFound),
+            ("network_error", Flux2DownloadState::NetworkError),
+        ] {
+            assert_eq!(Flux2DownloadState::from_wire(wire), Some(expected));
+        }
+
+        // The three states that carry a link, and WHICH link. Getting these two round the
+        // wrong way is the failure the states exist to prevent: sending someone whose
+        // token is merely invalid to accept conditions they have already accepted.
+        let repo = |state: Flux2DownloadState| Flux2DownloadRepo {
+            repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            state: Some(state),
+            state_wire: state.wire().to_string(),
+            message: String::new(),
+        };
+        for state in [
+            Flux2DownloadState::NoToken,
+            Flux2DownloadState::InvalidToken,
+        ] {
+            assert_eq!(state.link(), Flux2DownloadLink::TokenSettings);
+            let (_caption, url) = repo(state).link().expect("a token state offers a link");
+            assert_eq!(url, "https://huggingface.co/settings/tokens");
+        }
+        assert_eq!(
+            Flux2DownloadState::NotAccepted.link(),
+            Flux2DownloadLink::RepoPage
+        );
+        let (_caption, url) = repo(Flux2DownloadState::NotAccepted)
+            .link()
+            .expect("a gated repo links to its own page");
+        assert_eq!(url, "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B");
+
+        // The three that carry none: there is no page that fixes them.
+        for state in [
+            Flux2DownloadState::Ok,
+            Flux2DownloadState::NotFound,
+            Flux2DownloadState::NetworkError,
+        ] {
+            assert_eq!(state.link(), Flux2DownloadLink::None);
+            assert!(repo(state).link().is_none());
+        }
+    }
+
+    /// The degradation rule of D7: a literal this build does not know is "not known", it
+    /// keeps the literal for the hover, and it offers no link — never one of the six.
+    #[test]
+    fn an_unrecognised_download_state_claims_no_verdict_and_keeps_the_literal() {
+        assert_eq!(Flux2DownloadState::from_wire("quota_exceeded"), None);
+        assert_eq!(Flux2DownloadState::from_wire(""), None);
+        assert_eq!(Flux2DownloadState::from_wire("OK"), None);
+
+        let check = parse_flux2_download_check(&download_answer(
+            "black-forest-labs/FLUX.2-klein-9B",
+            "quota_exceeded",
+            "monthly quota exhausted",
+        ));
+        let row = check.repos.first().expect("one row");
+        assert_eq!(row.state, None, "an unknown literal must claim no state");
+        assert_eq!(
+            row.state_wire, "quota_exceeded",
+            "the literal survives for the hover"
+        );
+        assert_eq!(row.message, "monthly quota exhausted");
+        assert!(
+            row.link().is_none(),
+            "an unknown state must not send the user to a page guessed from it"
+        );
+        assert!(
+            !check.ready(),
+            "an unrecognised verdict is not permission to download"
+        );
+    }
+
+    /// The `message` field of §3: always present, empty for `ok`, and the ONLY content a
+    /// `network_error` row has — so it has to survive parsing.
+    #[test]
+    fn the_technical_message_survives_for_every_state() {
+        let check = parse_flux2_download_check(&download_answer(
+            "black-forest-labs/FLUX.2-klein-9B",
+            "network_error",
+            "  HTTPSConnectionPool: read timed out  ",
+        ));
+        let row = check.repos.first().expect("one row");
+        assert_eq!(row.state, Some(Flux2DownloadState::NetworkError));
+        assert_eq!(row.message, "HTTPSConnectionPool: read timed out");
+
+        // `ok` carries the empty string, and an answer that omits the field entirely
+        // still parses — it costs a hover, not the verdict.
+        let ok = parse_flux2_download_check(&json!({
+            "repos": { "r": { "state": "ok", "message": "" } }
+        }));
+        assert_eq!(ok.repos[0].message, "");
+        let legacy = parse_flux2_download_check(&json!({ "repos": { "r": { "state": "ok" } } }));
+        assert_eq!(legacy.repos[0].state, Some(Flux2DownloadState::Ok));
+        assert_eq!(legacy.repos[0].message, "");
+    }
+
+    /// `ready` decides whether the download button opens, so its two negative cases are
+    /// pinned as tightly as its positive one.
+    #[test]
+    fn only_an_all_ok_answer_is_permission_to_download() {
+        let mut check = parse_flux2_download_check(&json!({
+            "repos": {
+                "black-forest-labs/FLUX.2-klein-9B": { "state": "ok", "message": "" },
+                "ponpoke/flux2-klein-9b-uncensored-text-encoder": { "state": "ok", "message": "" }
+            }
+        }));
+        assert!(check.ready());
+        // One refusal is enough: the download needs BOTH repositories the toggle asked for.
+        check.repos[1].state = Some(Flux2DownloadState::NotAccepted);
+        assert!(!check.ready());
+        // An empty list is "nothing was checked", never "everything is fine".
+        assert!(!Flux2DownloadCheck::default().ready());
+    }
+
+    /// The defect this variant exists for: access and listing are two different network
+    /// operations, so every repository can answer `ok` while the plan is missing. That must
+    /// render as "size not known" — never as a finished installation.
+    #[test]
+    fn an_all_ok_check_without_a_plan_is_unknown_and_never_complete() {
+        let answer = json!({
+            "repos": { "black-forest-labs/FLUX.2-klein-9B": { "state": "ok", "message": "" } },
+            "plan": null,
+            "plan_error": "ConnectionError: offline"
+        });
+        let check = parse_flux2_download_check(&answer);
+
+        // The repositories keep rendering as `ok`: authentication genuinely succeeded, and
+        // inventing a gating state here would send the user to fix something intact.
+        assert_eq!(check.repos[0].state, Some(Flux2DownloadState::Ok));
+        assert!(check.ready(), "access itself was granted");
+        assert_eq!(check.plan, None, "an explicit null must not become a plan");
+        assert_eq!(check.plan_error, "ConnectionError: offline");
+
+        // Neither a size nor a completion state.
+        assert_eq!(
+            flux2_download_readiness(Some(&check)),
+            Flux2DownloadReadiness::SizeUnknown,
+            "an unpriced download must not be reported as complete on an empty machine"
+        );
+
+        // The line rule: a `plan_error` is sent exactly when the ROWS cannot explain the
+        // missing plan, and it is what the block shows on hover.
+        assert!(
+            check.repos.iter().all(|repo| repo.state == Some(Flux2DownloadState::Ok))
+                && !check.plan_error.is_empty(),
+            "every row reads `ok`, so only `plan_error` can say what happened"
+        );
+
+        // A plan of zeros is the OPPOSITE verdict, and the two must not be confusable —
+        // this is the exact pair the defect collapsed.
+        let complete = parse_flux2_download_check(&json!({
+            "repos": { "black-forest-labs/FLUX.2-klein-9B": { "state": "ok", "message": "" } },
+            "plan": { "total_bytes": 40_000_000_000u64, "missing_bytes": 0, "missing_files": 0 }
+        }));
+        assert_eq!(
+            flux2_download_readiness(Some(&complete)),
+            Flux2DownloadReadiness::Complete
+        );
+        assert!(
+            complete.plan_error.is_empty(),
+            "`plan_error` is empty whenever a plan is present"
+        );
+
+        // An omitted `plan` key behaves like an explicit null, and a `plan_error` that the
+        // backend omitted costs the hover, not the verdict.
+        let bare = parse_flux2_download_check(
+            &json!({ "repos": { "r": { "state": "ok", "message": "" } } }),
+        );
+        assert_eq!(
+            flux2_download_readiness(Some(&bare)),
+            Flux2DownloadReadiness::SizeUnknown
+        );
+        assert!(bare.plan_error.is_empty());
+
+        // And a stray `plan_error` beside a real plan is dropped, so nothing downstream
+        // has to re-check the pairing the contract already guarantees.
+        let priced = parse_flux2_download_check(&json!({
+            "repos": { "r": { "state": "ok", "message": "" } },
+            "plan": { "total_bytes": 40_000_000_000u64, "missing_bytes": 18_000_000_000u64, "missing_files": 3 },
+            "plan_error": "should be ignored"
+        }));
+        assert!(priced.plan_error.is_empty());
+        assert_eq!(
+            flux2_download_readiness(Some(&priced)),
+            Flux2DownloadReadiness::Priced {
+                missing_bytes: 18_000_000_000
+            },
+            "a real plan still prices the download exactly as before"
+        );
+    }
+
+    /// The four readiness verdicts, and which of them opens «Скачать».
+    ///
+    /// `SizeUnknown` is the one that must stay OPEN: the listing failed, pressing the
+    /// button re-lists, and a closed button would strand the user with no way to retry.
+    #[test]
+    fn only_a_priced_or_unpriced_check_opens_the_download_button() {
+        // No check at all, and a refused one, are both blocked.
+        assert_eq!(
+            flux2_download_readiness(None),
+            Flux2DownloadReadiness::Blocked
+        );
+        let refused = parse_flux2_download_check(&json!({
+            "repos": { "r": { "state": "not_accepted", "message": "gated" } },
+            "plan": null,
+            "plan_error": ""
+        }));
+        assert_eq!(
+            flux2_download_readiness(Some(&refused)),
+            Flux2DownloadReadiness::Blocked,
+            "a refusal is explained by its own row, not by a missing size"
+        );
+
+        // THE FIRST-RUN PATH: a user who has never entered a token. The backend sends a
+        // null plan with an EMPTY `plan_error`, and a stray "0.0 GiB" here would be the
+        // most misleading of all — it would tell someone with nothing on disk and no token
+        // that there is nothing to do.
+        let untokened = parse_flux2_download_check(&json!({
+            "repos": {
+                "black-forest-labs/FLUX.2-klein-9B": {
+                    "state": "no_token",
+                    "message": "no token was provided"
+                }
+            },
+            "plan": null,
+            "plan_error": ""
+        }));
+        assert_eq!(untokened.plan, None);
+        assert!(untokened.plan_error.is_empty());
+        assert_eq!(
+            flux2_download_readiness(Some(&untokened)),
+            Flux2DownloadReadiness::Blocked,
+            "no token must never price or complete the download"
+        );
+        assert_ne!(
+            flux2_download_readiness(Some(&untokened)),
+            Flux2DownloadReadiness::Complete
+        );
+        // No plan means no size line at all, so there is no zero to render; and with an
+        // empty `plan_error` no second line is synthesised either — the `no_token` row and
+        // its token link are the explanation.
+        assert!(
+            untokened.plan.is_none() && untokened.plan_error.is_empty(),
+            "the row explains it; the block must add nothing"
+        );
+        assert_eq!(
+            untokened.repos[0].state,
+            Some(Flux2DownloadState::NoToken),
+            "and the row keeps its own actionable verdict"
+        );
+
+        // The startability rule the button reads, kept beside the variants it is derived
+        // from so a new variant cannot be added without deciding this.
+        for (readiness, startable) in [
+            (Flux2DownloadReadiness::Blocked, false),
+            (Flux2DownloadReadiness::SizeUnknown, true),
+            (Flux2DownloadReadiness::Priced { missing_bytes: 1 }, true),
+            (Flux2DownloadReadiness::Complete, false),
+        ] {
+            let actual = match readiness {
+                Flux2DownloadReadiness::Priced { .. } | Flux2DownloadReadiness::SizeUnknown => true,
+                Flux2DownloadReadiness::Blocked | Flux2DownloadReadiness::Complete => false,
+            };
+            assert_eq!(actual, startable, "{readiness:?} must be startable={startable}");
+        }
+    }
+
+    /// A plan is the number on the button, so an answer without one must stay `None`
+    /// rather than becoming a free download of zero bytes.
+    #[test]
+    fn a_missing_plan_is_not_a_plan_of_zero() {
+        let with_plan = parse_flux2_download_check(&download_answer("r", "ok", ""));
+        assert_eq!(
+            with_plan.plan,
+            Some(Flux2DownloadPlan {
+                total_bytes: 40_000_000_000,
+                missing_bytes: 18_000_000_000,
+                missing_files: 3,
+            })
+        );
+        assert!(parse_flux2_download_check(&json!({ "repos": {} })).plan.is_none());
+        assert!(
+            parse_flux2_download_check(&json!({ "plan": {} }))
+                .plan
+                .is_none(),
+            "a plan object with neither total is no plan"
+        );
+        // A complete download is a real answer and must survive as one.
+        let done = parse_flux2_download_check(&json!({
+            "repos": { "r": { "state": "ok", "message": "" } },
+            "plan": { "total_bytes": 40_000_000_000u64, "missing_bytes": 0, "missing_files": 0 }
+        }));
+        assert_eq!(done.plan.map(|plan| plan.missing_bytes), Some(0));
+    }
+
+    /// An answer describes ONE encoder choice. Flipping the toggle must stop it being
+    /// shown, or the panel would keep claiming access to a repository it never asked about.
+    #[test]
+    fn a_check_stops_being_shown_when_the_encoder_toggle_flips() {
+        let check = Flux2DownloadCheck {
+            uncensored: true,
+            ..Flux2DownloadCheck::default()
+        };
+        assert!(download_check_matches_toggle(Some(&check), true));
+        assert!(!download_check_matches_toggle(Some(&check), false));
+        assert!(!download_check_matches_toggle(None, true));
+    }
+
+    /// The progress split of D6, on the exact frame shapes §4 pins.
+    #[test]
+    fn a_frame_without_the_file_fields_renders_the_overall_bar_alone() {
+        // A preparation frame: the four old fields and nothing else.
+        let prepare = parse_flux2_progress_frame(&json!({
+            "phase": "download", "step": 0, "total": 40_000_000_000u64, "label": "resolving the file list"
+        }));
+        assert_eq!(prepare.file, None, "no second level was reported");
+        let mut progress = Flux2Progress::default();
+        publish_frame_into(&mut progress, prepare);
+        let (overall, file) = flux2_progress_fractions(&progress);
+        assert!((overall - 0.0).abs() < f32::EPSILON);
+        assert_eq!(file, None, "a missing second level draws no second bar");
+
+        // A transfer frame: all six counters.
+        let transferring = parse_flux2_progress_frame(&json!({
+            "phase": "download",
+            "step": 12_884_901_888u64, "total": 40_000_000_000u64,
+            "label": "transformer/model-00001-of-00002.safetensors",
+            "file_step": 3_221_225_472u64, "file_total": 9_800_000_000u64,
+            "file_label": "model-00001-of-00002.safetensors"
+        }));
+        assert_eq!(
+            transferring.file,
+            Some(Flux2FileProgress {
+                step: 3_221_225_472,
+                total: 9_800_000_000,
+                label: "model-00001-of-00002.safetensors".to_string(),
+            })
+        );
+        publish_frame_into(&mut progress, transferring);
+        let (overall, file) = flux2_progress_fractions(&progress);
+        assert!((overall - 0.322_1).abs() < 0.001, "overall was {overall}");
+        let file = file.expect("all six counters must draw both bars");
+        assert!((file - 0.328_7).abs() < 0.001, "file was {file}");
+
+        // A file whose size the backend could not state: an indeterminate bar, never a
+        // division by zero.
+        let unsized_file = parse_flux2_progress_frame(&json!({
+            "phase": "download", "step": 1, "total": 2,
+            "file_step": 512u64, "file_label": "config.json"
+        }));
+        publish_frame_into(&mut progress, unsized_file);
+        let (overall, file) = flux2_progress_fractions(&progress);
+        assert!((overall - 0.5).abs() < f32::EPSILON);
+        assert_eq!(file, Some(0.0), "an unknown file size is 0.0, not a panic");
+
+        // And a frame that goes back to having no file clears the second bar rather than
+        // leaving the previous file on screen.
+        publish_frame_into(
+            &mut progress,
+            parse_flux2_progress_frame(&json!({ "phase": "download", "step": 2, "total": 2 })),
+        );
+        assert_eq!(flux2_progress_fractions(&progress).1, None);
+    }
+
+    /// Applies a frame to a progress state the way [`publish_progress_frame`] does, but
+    /// without the generation guard — the guard is already pinned by
+    /// `a_stale_run_cannot_touch_the_progress_of_the_next_one`.
+    fn publish_frame_into(progress: &mut Flux2Progress, frame: Flux2ProgressFrame) {
+        progress.phase = frame.phase;
+        progress.step = frame.step;
+        progress.total = frame.total;
+        progress.label = frame.label;
+        progress.file = frame.file;
+    }
+
+    /// The download claims the shared bar, so it must count towards the same busy rule the
+    /// other three long operations do — and it must ALSO block a generation, which is what
+    /// `non_run_pipeline_busy` exists for.
+    #[test]
+    fn a_download_holds_the_pipeline_exactly_as_the_other_long_operations_do() {
+        // The pure rule first, one flag at a time.
+        assert!(!flux2_pipeline_busy(false, false, false, false));
+        assert!(flux2_pipeline_busy(false, false, false, true));
+
+        let mut engine = Flux2KleinEngine {
+            settings: runnable_settings(),
+            settings_loaded: true,
+            ..Flux2KleinEngine::default()
+        };
+        assert!(!engine.pipeline_busy());
+        assert!(!engine.non_run_pipeline_busy());
+        assert!(
+            engine.run_block_reason().is_none(),
+            "a configured engine with nothing running must be runnable"
+        );
+
+        let (_download_tx, download_rx) = mpsc::channel();
+        engine.download_rx = Some(download_rx);
+        assert!(engine.pipeline_busy(), "a download holds the pipeline");
+        assert!(
+            engine.non_run_pipeline_busy(),
+            "and it is not a generation, so it blocks one"
+        );
+        assert_eq!(
+            engine.run_block_reason(),
+            Some(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string()),
+            "«Обработать» must say the pipeline is busy, not that a path is missing"
+        );
+        // The prompt-cache controls close on the same rule, on a real receiver.
+        let gates = flux2_prompt_cache_gates(
+            &cacheable_settings(),
+            Some(true),
+            Some(true),
+            "entry",
+            true,
+            true,
+            engine.pipeline_busy(),
+        );
+        assert_eq!(
+            gates,
+            Flux2PromptCacheGates {
+                build: false,
+                save: false,
+                load: false,
+                export: false,
+                import: false
+            }
+        );
+        engine.download_rx = None;
+
+        // A GENERATION is the one holder that must not report itself as the reason it
+        // cannot start: the frame owns that state.
+        let (_run_tx, run_rx) = mpsc::channel();
+        engine.session.run_rx = Some(run_rx);
+        assert!(engine.pipeline_busy());
+        assert!(!engine.non_run_pipeline_busy());
+        assert!(engine.run_block_reason().is_none());
+    }
+
+    /// The toggle owns the two directories the download block manages and nothing else.
+    #[test]
+    fn the_encoder_toggle_repoints_only_the_paths_this_block_manages() {
+        let official = config::flux2_klein_text_encoder_dir(false)
+            .to_string_lossy()
+            .to_string();
+        let uncensored = config::flux2_klein_text_encoder_dir(true)
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(official, uncensored, "the two encoders need separate homes");
+        assert!(official.ends_with("text_encoder"));
+        assert!(uncensored.ends_with("text_encoder_uncensored"));
+
+        // An empty path is filled in with the encoder the toggle selects.
+        assert_eq!(
+            flux2_text_encoder_path_after_toggle("", true),
+            Some(uncensored.clone())
+        );
+        assert_eq!(
+            flux2_text_encoder_path_after_toggle("   ", false),
+            Some(official.clone())
+        );
+        // The other managed directory is repointed — this is the "both on disk, flipping
+        // costs nothing" case of §5.
+        assert_eq!(
+            flux2_text_encoder_path_after_toggle(&official, true),
+            Some(uncensored.clone())
+        );
+        assert_eq!(
+            flux2_text_encoder_path_after_toggle(&uncensored, false),
+            Some(official.clone())
+        );
+        // A path that already names the wanted encoder is left alone rather than rewritten.
+        assert_eq!(flux2_text_encoder_path_after_toggle(&uncensored, true), None);
+        // And a hand-picked encoder anywhere else SURVIVES: rewriting it would discard a
+        // value the tool cannot recover.
+        assert_eq!(
+            flux2_text_encoder_path_after_toggle("/mnt/models/qwen3-my-own", true),
+            None
+        );
+    }
+
+    /// The toggle is a persisted setting, and it must NOT leak into `params`: the download
+    /// methods carry it as their own top-level field.
+    #[test]
+    fn the_encoder_toggle_persists_but_never_enters_the_generation_params() {
+        let settings = Flux2KleinSettings {
+            uncensored_text_encoder: true,
+            ..runnable_settings()
+        };
+        let stored = serde_json::to_value(&settings).expect("settings serialize");
+        assert_eq!(stored["uncensored_text_encoder"], json!(true));
+        let reloaded = settings_from_json(&stored);
+        assert!(reloaded.uncensored_text_encoder);
+        assert!(settings.normalized().uncensored_text_encoder);
+
+        let params = settings.normalized().to_params(false);
+        assert!(
+            params.get("uncensored").is_none() && params.get("uncensored_text_encoder").is_none(),
+            "the toggle belongs to the download request, not to `params`"
+        );
+    }
+
+    /// The token is a CREDENTIAL: it travels as a per-call request field and reaches no
+    /// settings file, no `params` and no persisted document at all.
+    #[test]
+    fn the_token_travels_in_the_request_and_never_into_the_settings() {
+        const SECRET: &str = "hf_a_token_that_must_never_be_persisted";
+
+        let header = flux2_download_header(SECRET, true);
+        assert_eq!(header["hf_token"], json!(SECRET));
+        assert_eq!(header["uncensored"], json!(true));
+        assert!(
+            header.get("params").is_none(),
+            "the token must not travel inside `params`"
+        );
+
+        // A fully configured engine, serialized exactly as `save_flux2_settings` writes it.
+        let engine = Flux2KleinEngine {
+            settings: Flux2KleinSettings {
+                uncensored_text_encoder: true,
+                ..runnable_settings()
+            },
+            hf_token_input: SECRET.to_string(),
+            ..Flux2KleinEngine::default()
+        };
+        let document =
+            serde_json::to_string(&engine.settings).expect("the settings document serializes");
+        assert!(
+            !document.contains(SECRET),
+            "the settings document must not contain the token"
+        );
+        assert!(
+            !engine
+                .settings
+                .normalized()
+                .to_params(false)
+                .to_string()
+                .contains(SECRET),
+            "no request `params` may contain the token"
+        );
+    }
+
+    /// What a finished download does NOW: it configures the engine by DERIVATION, not by
+    /// writing paths into the settings.
+    ///
+    /// This replaces the original contract's "a finished download writes its three paths
+    /// into the settings". That rule was safe while the paths block and the download block
+    /// were both always visible; with the two modes it became destructive, because the
+    /// manual fields hold a configuration the user switches back to. Derivation configures
+    /// the engine continuously instead of once, so the write-back is gone — and the
+    /// answered paths are kept only to detect DRIFT between the two halves.
+    #[test]
+    fn a_finished_download_configures_the_engine_by_derivation() {
+        let outcome = parse_flux2_download_outcome(&json!({
+            "paths": {
+                "transformer": " /models/FLUX.2-klein-9B/transformer ",
+                "text_encoder": "/models/FLUX.2-klein-9B/text_encoder_uncensored",
+                "vae": "/models/FLUX.2-klein-9B/vae"
+            },
+            "downloaded_bytes": 40_000_000_000u64,
+            "skipped_files": 4
+        }));
+        assert_eq!(outcome.transformer_path, "/models/FLUX.2-klein-9B/transformer");
+        assert_eq!(outcome.downloaded_bytes, 40_000_000_000);
+        assert_eq!(outcome.skipped_files, 4);
+
+        let mut engine = Flux2KleinEngine {
+            settings: Flux2KleinSettings {
+                source_mode: Flux2SourceMode::Download.wire().to_string(),
+                uncensored_text_encoder: true,
+                ..Flux2KleinSettings::default()
+            },
+            settings_loaded: true,
+            dirty: false,
+            ..Flux2KleinEngine::default()
+        };
+        let before = engine.settings.clone();
+        engine.apply_download_outcome(&outcome);
+
+        // No field of the settings was touched at all — not even a path that happened to
+        // be empty, which the old write-back would have filled in.
+        assert_eq!(
+            serde_json::to_value(&engine.settings).expect("serialize"),
+            serde_json::to_value(&before).expect("serialize"),
+            "a finished download must not write into the settings"
+        );
+        assert!(!engine.dirty);
+
+        // The engine is nevertheless configured: the derived paths point at the files the
+        // download just placed, and they follow the encoder toggle.
+        let paths = engine.settings.effective_paths();
+        assert_eq!(
+            paths.text_encoder,
+            config::flux2_klein_text_encoder_dir(true).to_string_lossy()
+        );
+        assert_eq!(
+            paths.transformer,
+            config::flux2_klein_transformer_dir().to_string_lossy()
+        );
+        assert_eq!(paths.vae, config::flux2_klein_vae_dir().to_string_lossy());
+
+        // Everything the new files invalidate is re-armed, and the spent plan is dropped.
+        assert!(engine.status_wanted && engine.estimate_wanted);
+        assert!(engine.prompt_cache_list_wanted);
+        assert!(engine.download_check.is_none());
+
+        // A partial answer is not a reason to write anything either.
+        let partial = parse_flux2_download_outcome(&json!({
+            "paths": { "transformer": "/models/new-transformer" }
+        }));
+        engine.apply_download_outcome(&partial);
+        assert_eq!(
+            serde_json::to_value(&engine.settings).expect("serialize"),
+            serde_json::to_value(&before).expect("serialize")
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Transfer rate and remaining time
+    // -----------------------------------------------------------------------------------
+
+    /// Feeds a scripted frame sequence into a progress state exactly as
+    /// [`publish_progress_frame`] does, at `origin + offset`.
+    ///
+    /// `Instant` cannot be constructed at an arbitrary value, but the estimator only ever
+    /// looks at DIFFERENCES, so offsets from one origin script it deterministically.
+    fn feed_download(progress: &mut Flux2Progress, origin: Instant, samples: &[(u64, u64)]) {
+        for &(millis, step) in samples {
+            progress.rate.observe(origin + Duration::from_millis(millis), step);
+            progress.step = step;
+        }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A steady transfer must report the rate it is actually running at, and an estimate
+    /// derived from it.
+    #[test]
+    fn a_scripted_transfer_reports_the_expected_speed_and_estimate() {
+        let origin = Instant::now();
+        let mut progress = Flux2Progress {
+            total: 100 * MIB,
+            ..Flux2Progress::default()
+        };
+        // Exactly 20 MiB/s: twenty frames, 100 ms apart, 2 MiB each. The sequence spans
+        // 2 s deliberately — one second of history is BELOW `FLUX2_RATE_MIN_SPAN` and
+        // correctly yields no rate at all, which the "too little history" test pins.
+        let samples: Vec<(u64, u64)> = (0..=20).map(|i| (i * 100, i * 2 * MIB)).collect();
+        feed_download(&mut progress, origin, &samples);
+        assert!(Duration::from_millis(2000) >= FLUX2_RATE_MIN_SPAN);
+
+        let rate = progress
+            .rate
+            .bytes_per_second()
+            .expect("two seconds of history must yield a rate");
+        // Tolerance 1%: the window arithmetic is exact here, and the allowance exists only
+        // so the assertion does not depend on f64's last bits.
+        let expected = 20.0 * MIB as f64;
+        assert!(
+            (rate - expected).abs() < expected * 0.01,
+            "expected ~{expected} B/s, got {rate}"
+        );
+        assert_eq!(format_mib_per_second(rate), "20.0");
+
+        // 40 MiB transferred of 100 MiB, so 60 MiB left at 20 MiB/s is 3 s.
+        assert_eq!(progress.step, 40 * MIB);
+        let remaining = progress
+            .rate
+            .remaining(progress.step, progress.total)
+            .expect("a known rate and a known total give an estimate");
+        assert_eq!(remaining.as_secs(), 3);
+        assert_eq!(
+            format_eta(remaining),
+            tf!("cleaning.tools.flux2_klein.download.eta_seconds", seconds = 3)
+        );
+
+        // The line exists and names both halves.
+        assert!(flux2_transfer_status(&progress).is_some());
+
+        // The coarse formatter's three bands.
+        assert_eq!(
+            format_eta(Duration::from_secs(45)),
+            tf!("cleaning.tools.flux2_klein.download.eta_seconds", seconds = 45)
+        );
+        assert_eq!(
+            format_eta(Duration::from_secs(15 * 60)),
+            tf!("cleaning.tools.flux2_klein.download.eta_minutes", minutes = 15)
+        );
+        assert_eq!(
+            format_eta(Duration::from_secs(2 * 3600 + 15 * 60)),
+            tf!("cleaning.tools.flux2_klein.download.eta_hours", hours = 2, minutes = 15)
+        );
+    }
+
+    /// At the start of a transfer there is not enough history for any number to mean
+    /// something, and the honest answer is silence — not "∞", not "0 с".
+    #[test]
+    fn too_little_history_yields_no_speed_and_no_estimate() {
+        let origin = Instant::now();
+        let mut progress = Flux2Progress {
+            total: 100 * MIB,
+            ..Flux2Progress::default()
+        };
+
+        // Nothing at all.
+        assert_eq!(progress.rate.bytes_per_second(), None);
+        assert_eq!(progress.rate.remaining(0, progress.total), None);
+        assert_eq!(flux2_transfer_status(&progress), None);
+
+        // A single frame is not a rate.
+        feed_download(&mut progress, origin, &[(0, 4 * MIB)]);
+        assert_eq!(progress.rate.bytes_per_second(), None);
+        assert_eq!(flux2_transfer_status(&progress), None);
+
+        // Two frames 100 ms apart are a burst, not a measurement: the window is shorter
+        // than the minimum span, so still nothing.
+        feed_download(&mut progress, origin, &[(100, 8 * MIB)]);
+        assert!(Duration::from_millis(100) < FLUX2_RATE_MIN_SPAN);
+        assert_eq!(progress.rate.bytes_per_second(), None);
+        assert_eq!(flux2_transfer_status(&progress), None);
+
+        // Once the window covers the minimum span, a rate appears.
+        feed_download(&mut progress, origin, &[(2000, 40 * MIB)]);
+        assert!(progress.rate.bytes_per_second().is_some());
+
+        // A counter that does not move is not a rate of zero: it reports nothing, so no
+        // estimate can be computed from it and none is shown.
+        let mut stalled = Flux2Progress {
+            total: 100 * MIB,
+            ..Flux2Progress::default()
+        };
+        feed_download(&mut stalled, origin, &[(0, 8 * MIB), (2000, 8 * MIB), (4000, 8 * MIB)]);
+        assert_eq!(stalled.rate.bytes_per_second(), None);
+        assert_eq!(stalled.rate.remaining(8 * MIB, 100 * MIB), None);
+
+        // A finished transfer has no remaining time either — never "0 с" beside a full bar.
+        let mut done = Flux2Progress {
+            total: 40 * MIB,
+            ..Flux2Progress::default()
+        };
+        feed_download(&mut done, origin, &[(0, 0), (2000, 40 * MIB)]);
+        assert!(done.rate.bytes_per_second().is_some());
+        assert_eq!(done.rate.remaining(40 * MIB, 40 * MIB), None);
+        // An unknown total likewise yields a speed but no estimate.
+        assert_eq!(done.rate.remaining(40 * MIB, 0), None);
+    }
+
+    /// The documented wart: a resumed file whose length check fails is refetched from zero,
+    /// so the OVERALL counter moves backwards exactly once for that file
+    /// (`ipc/PROTOCOL.md`, `download.start`). It must never render as a negative or absurd
+    /// rate, and must never panic.
+    #[test]
+    fn a_backwards_step_discards_the_window_and_never_renders_a_wild_rate() {
+        let origin = Instant::now();
+        let mut progress = Flux2Progress {
+            total: 100 * MIB,
+            ..Flux2Progress::default()
+        };
+        // A steady climb to 60 MiB...
+        feed_download(
+            &mut progress,
+            origin,
+            &[(0, 0), (1000, 20 * MIB), (2000, 40 * MIB), (3000, 60 * MIB)],
+        );
+        let before = progress
+            .rate
+            .bytes_per_second()
+            .expect("the climb established a rate");
+        assert!(before > 0.0);
+
+        // ...then the refetch: the file restarts, so the overall counter drops.
+        feed_download(&mut progress, origin, &[(3100, 45 * MIB)]);
+        // The window was discarded, so nothing is claimed until it refills. Critically, the
+        // answer is None rather than a negative number.
+        assert_eq!(
+            progress.rate.bytes_per_second(),
+            None,
+            "the samples before a restart describe bytes being sent again"
+        );
+        assert_eq!(progress.rate.remaining(45 * MIB, 100 * MIB), None);
+        assert_eq!(flux2_transfer_status(&progress), None);
+
+        // The window refills from the new baseline and reports a SANE rate again — not one
+        // inflated or deflated by the seam.
+        feed_download(
+            &mut progress,
+            origin,
+            &[(4100, 65 * MIB), (5100, 85 * MIB)],
+        );
+        let after = progress
+            .rate
+            .bytes_per_second()
+            .expect("the window refilled after the restart");
+        let expected = 20.0 * MIB as f64;
+        assert!(
+            (after - expected).abs() < expected * 0.01,
+            "expected ~{expected} B/s after the restart, got {after}"
+        );
+        assert!(after.is_finite() && after > 0.0);
+        // And the estimate that follows is a real duration, not a wild number.
+        let remaining = progress
+            .rate
+            .remaining(85 * MIB, 100 * MIB)
+            .expect("a sane rate gives a sane estimate");
+        assert!(remaining.as_secs() <= 2, "got {remaining:?}");
+
+        // A drop to zero is the same case and must be equally survivable.
+        let mut restarted = Flux2Progress::default();
+        feed_download(&mut restarted, origin, &[(0, 60 * MIB), (2000, 80 * MIB), (2100, 0)]);
+        assert_eq!(restarted.rate.bytes_per_second(), None);
+        assert_eq!(restarted.rate.remaining(0, 100 * MIB), None);
+    }
+
+    /// The optional per-file fields are exactly that: a preparation frame carrying only the
+    /// overall level must still drive the speed.
+    #[test]
+    fn a_frame_without_the_file_fields_still_advances_the_speed() {
+        let origin = Instant::now();
+        let progress = Arc::new(Mutex::new(Flux2Progress::default()));
+        let generation = begin_progress_generation(&progress);
+
+        // Frames as the wire sends them, half of them without the per-file trio.
+        for (index, millis) in [(0u64, 0u64), (1, 2000), (2, 4000)] {
+            let mut header = json!({
+                "phase": "download",
+                "step": index * 20 * MIB,
+                "total": 100 * MIB,
+                "label": "transformer/shard.safetensors"
+            });
+            // Only the middle frame describes a file; the others are preparation phases.
+            if index == 1 {
+                let object = header.as_object_mut().expect("object");
+                object.insert("file_step".to_string(), json!(4 * MIB));
+                object.insert("file_total".to_string(), json!(9 * MIB));
+                object.insert("file_label".to_string(), json!("shard.safetensors"));
+            }
+            let frame = parse_flux2_progress_frame(&header);
+            // Fed through the estimator the same way `publish_progress_frame` does, with a
+            // scripted clock instead of the wall clock.
+            let mut guard = lock_progress(&progress);
+            guard.rate.observe(origin + Duration::from_millis(millis), frame.step);
+            guard.step = frame.step;
+            guard.total = frame.total;
+            guard.file = frame.file;
+            drop(guard);
+        }
+        assert_eq!(generation, lock_progress(&progress).generation);
+
+        let guard = lock_progress(&progress);
+        // The last frame carried no file fields, so there is no second bar...
+        assert_eq!(guard.file, None);
+        assert_eq!(flux2_progress_fractions(&guard).1, None);
+        // ...and the speed is nevertheless known, from the overall level alone.
+        let rate = guard
+            .rate
+            .bytes_per_second()
+            .expect("the overall level alone must drive the rate");
+        let expected = 10.0 * MIB as f64;
+        assert!(
+            (rate - expected).abs() < expected * 0.01,
+            "expected ~{expected} B/s, got {rate}"
+        );
+        assert!(flux2_transfer_status(&guard).is_some());
+    }
+
+    /// The numbers belong to ONE transfer and must not outlive it.
+    #[test]
+    fn a_new_operation_does_not_inherit_the_previous_transfer_s_speed() {
+        let origin = Instant::now();
+        let progress = Arc::new(Mutex::new(Flux2Progress::default()));
+        begin_progress_generation(&progress);
+        {
+            let mut guard = lock_progress(&progress);
+            feed_download(&mut guard, origin, &[(0, 0), (2000, 40 * MIB)]);
+            guard.total = 100 * MIB;
+            assert!(guard.rate.bytes_per_second().is_some());
+        }
+
+        // Claiming the bar for the next operation clears the history, so a generation
+        // started after a download cannot show the download's speed.
+        begin_progress_generation(&progress);
+        let guard = lock_progress(&progress);
+        assert_eq!(guard.rate.bytes_per_second(), None);
+        assert_eq!(flux2_transfer_status(&guard), None);
+        drop(guard);
+
+        // A retired bar is inactive, which is what stops the line being drawn at all; the
+        // renderer returns before reaching it.
+        assert!(retire_progress_generation(&progress).is_none());
+        assert!(!lock_progress(&progress).active);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Source mode: manual paths vs. the downloaded copy
+    // -----------------------------------------------------------------------------------
+
+    /// The mode must survive the settings file, and — the case that matters for an update —
+    /// a file that predates the field must load as MANUAL.
+    #[test]
+    fn the_source_mode_round_trips_and_an_absent_field_loads_as_manual() {
+        for mode in Flux2SourceMode::all() {
+            assert_eq!(Flux2SourceMode::from_wire(mode.wire()), mode);
+        }
+        // The exact tokens, spelled out: they are what sits in the user's file.
+        assert_eq!(Flux2SourceMode::from_wire("manual"), Flux2SourceMode::Manual);
+        assert_eq!(
+            Flux2SourceMode::from_wire("download"),
+            Flux2SourceMode::Download
+        );
+
+        let settings = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            ..runnable_settings()
+        };
+        let stored = serde_json::to_value(&settings).expect("settings serialize");
+        assert_eq!(stored["source_mode"], json!("download"));
+        assert_eq!(
+            settings_from_json(&stored).source_mode(),
+            Flux2SourceMode::Download
+        );
+
+        // A settings file written before the switch existed carries hand-entered paths.
+        // Loading it as `download` would hide them behind an empty download block and read
+        // as an update that broke the install, so the fallback is not negotiable.
+        let mut legacy = stored.clone();
+        legacy
+            .as_object_mut()
+            .expect("the document is an object")
+            .remove("source_mode");
+        assert!(legacy.get("source_mode").is_none());
+        assert_eq!(
+            settings_from_json(&legacy).source_mode(),
+            Flux2SourceMode::Manual,
+            "a file without the field must load as manual"
+        );
+        // So must an unrecognised token and the compiled-in default.
+        assert_eq!(Flux2SourceMode::from_wire("auto"), Flux2SourceMode::Manual);
+        assert_eq!(Flux2SourceMode::from_wire(""), Flux2SourceMode::Manual);
+        assert_eq!(FLUX2_DEFAULT_SOURCE_MODE, Flux2SourceMode::Manual);
+        assert_eq!(
+            Flux2KleinSettings::default().source_mode(),
+            Flux2SourceMode::Manual
+        );
+    }
+
+    /// The whole point of the mode: in download mode the paths are DERIVED and the manual
+    /// fields are neither read nor written.
+    #[test]
+    fn download_mode_derives_the_paths_and_never_reads_the_manual_fields() {
+        // The configuration from the user's screenshot: a hand-built tree, including a
+        // hand-picked uncensored encoder somewhere else entirely.
+        let hand_made = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Manual.wire().to_string(),
+            text_encoder_path: "/home/u/sd_models/qwen3-uncensored".to_string(),
+            transformer_path: "/home/u/sd_models/flux2.safetensors".to_string(),
+            vae_path: "/home/u/sd_models/vae".to_string(),
+            ..runnable_settings()
+        };
+        let manual = hand_made.effective_paths();
+        assert_eq!(manual.text_encoder, "/home/u/sd_models/qwen3-uncensored");
+        assert_eq!(manual.transformer, "/home/u/sd_models/flux2.safetensors");
+        assert_eq!(manual.vae, "/home/u/sd_models/vae");
+
+        // Flip to download: the effective paths become the derived ones and NONE of the
+        // three hand-made values survives into them.
+        let downloaded = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            ..hand_made.clone()
+        };
+        let derived = downloaded.effective_paths();
+        assert_eq!(
+            derived.transformer,
+            config::flux2_klein_transformer_dir().to_string_lossy()
+        );
+        assert_eq!(derived.vae, config::flux2_klein_vae_dir().to_string_lossy());
+        assert_eq!(
+            derived.text_encoder,
+            config::flux2_klein_text_encoder_dir(false).to_string_lossy(),
+            "the toggle is off, so the official encoder is derived"
+        );
+        for hand in [&manual.text_encoder, &manual.transformer, &manual.vae] {
+            assert!(
+                ![&derived.text_encoder, &derived.transformer, &derived.vae]
+                    .into_iter()
+                    .any(|d| d == hand),
+                "a manual path leaked into the derived set"
+            );
+        }
+
+        // The encoder toggle selects the derived encoder, and only it.
+        let uncensored = Flux2KleinSettings {
+            uncensored_text_encoder: true,
+            ..downloaded.clone()
+        };
+        let derived_uncensored = uncensored.effective_paths();
+        assert_eq!(
+            derived_uncensored.text_encoder,
+            config::flux2_klein_text_encoder_dir(true).to_string_lossy()
+        );
+        assert_ne!(derived_uncensored.text_encoder, derived.text_encoder);
+        assert_eq!(derived_uncensored.transformer, derived.transformer);
+        assert_eq!(derived_uncensored.vae, derived.vae);
+
+        // The manual fields are untouched throughout, so flipping back restores exactly
+        // what the user had.
+        assert_eq!(
+            uncensored.text_encoder_path,
+            "/home/u/sd_models/qwen3-uncensored"
+        );
+        let back = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Manual.wire().to_string(),
+            ..uncensored
+        };
+        assert_eq!(back.effective_paths(), manual);
+    }
+
+    /// A run must send the paths its MODE prescribes — the single place the two modes could
+    /// drift, so it is pinned on the WIRE rather than on the accessor.
+    #[test]
+    fn a_run_sends_the_paths_its_mode_prescribes() {
+        let hand_made = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Manual.wire().to_string(),
+            text_encoder_path: "/home/u/sd_models/qwen3".to_string(),
+            transformer_path: "/home/u/sd_models/flux2.safetensors".to_string(),
+            vae_path: "/home/u/sd_models/vae".to_string(),
+            ..runnable_settings()
+        };
+        let manual_params = hand_made.normalized().to_params(false);
+        assert_eq!(
+            manual_params["text_encoder_path"],
+            json!("/home/u/sd_models/qwen3")
+        );
+        assert_eq!(
+            manual_params["transformer_path"],
+            json!("/home/u/sd_models/flux2.safetensors")
+        );
+        assert_eq!(manual_params["vae_path"], json!("/home/u/sd_models/vae"));
+
+        let downloaded = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            uncensored_text_encoder: true,
+            ..hand_made.clone()
+        };
+        let derived_params = downloaded.normalized().to_params(false);
+        assert_eq!(
+            derived_params["text_encoder_path"],
+            json!(config::flux2_klein_text_encoder_dir(true).to_string_lossy())
+        );
+        assert_eq!(
+            derived_params["transformer_path"],
+            json!(config::flux2_klein_transformer_dir().to_string_lossy())
+        );
+        assert_eq!(
+            derived_params["vae_path"],
+            json!(config::flux2_klein_vae_dir().to_string_lossy())
+        );
+        // And the user's own paths never reach the backend in that mode.
+        assert!(
+            !derived_params.to_string().contains("/home/u/sd_models/"),
+            "a manual path reached the wire in download mode"
+        );
+
+        // The run gate answers about the EFFECTIVE paths too: blank manual fields must not
+        // block a run in download mode, where the derived ones are non-empty.
+        let empty_fields = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            text_encoder_path: String::new(),
+            transformer_path: String::new(),
+            vae_path: String::new(),
+            ..runnable_settings()
+        };
+        assert!(
+            flux2_run_block_reason(&empty_fields, None).is_none(),
+            "download mode derives its paths, so blank manual fields must not block a run"
+        );
+        // In manual mode the same blank fields do block it.
+        let manual_blank = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Manual.wire().to_string(),
+            ..empty_fields
+        };
+        assert!(flux2_run_block_reason(&manual_blank, None).is_some());
+    }
+
+    /// A finished download must not touch the manual fields. This is the destructive case
+    /// the derivation exists to prevent: a hand-built tree the user switches back to.
+    #[test]
+    fn a_finished_download_leaves_the_manual_paths_untouched() {
+        let outcome = parse_flux2_download_outcome(&json!({
+            "paths": {
+                "transformer": "/models/FLUX.2-klein-9B/transformer",
+                "text_encoder": "/models/FLUX.2-klein-9B/text_encoder_uncensored",
+                "vae": "/models/FLUX.2-klein-9B/vae"
+            },
+            "downloaded_bytes": 40_000_000_000u64,
+            "skipped_files": 4
+        }));
+        let hand_made = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            text_encoder_path: "/home/u/sd_models/qwen3-uncensored".to_string(),
+            transformer_path: "/home/u/sd_models/flux2.safetensors".to_string(),
+            vae_path: "/home/u/sd_models/vae".to_string(),
+            ..runnable_settings()
+        };
+        let mut engine = Flux2KleinEngine {
+            settings: hand_made.clone(),
+            settings_loaded: true,
+            dirty: false,
+            ..Flux2KleinEngine::default()
+        };
+        engine.apply_download_outcome(&outcome);
+
+        assert_eq!(
+            engine.settings.text_encoder_path, hand_made.text_encoder_path,
+            "a download must never overwrite a hand-built encoder path"
+        );
+        assert_eq!(engine.settings.transformer_path, hand_made.transformer_path);
+        assert_eq!(engine.settings.vae_path, hand_made.vae_path);
+        assert!(!engine.dirty, "nothing was written, so nothing needs saving");
+
+        // Switching back to the manual mode restores exactly the user's configuration.
+        engine.settings.source_mode = Flux2SourceMode::Manual.wire().to_string();
+        assert_eq!(
+            engine.settings.effective_paths(),
+            Flux2EffectivePaths {
+                text_encoder: "/home/u/sd_models/qwen3-uncensored".to_string(),
+                transformer: "/home/u/sd_models/flux2.safetensors".to_string(),
+                vae: "/home/u/sd_models/vae".to_string(),
+            }
+        );
+    }
+
+    /// The two method names are the wire, and the Python half matches on these exact
+    /// strings; a rename on either side has to fail here rather than at runtime.
+    #[test]
+    fn the_download_methods_carry_their_pinned_names() {
+        assert_eq!(
+            backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
+            "inpaint.flux2_klein.download.check"
+        );
+        assert_eq!(
+            backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
+            "inpaint.flux2_klein.download.start"
+        );
+    }
+
+    #[test]
+    fn every_catalog_carries_the_download_block_strings() {
+        let interpolated = [
+            (
+                "cleaning.tools.flux2_klein.download.state_unrecognized_hint",
+                vec!["{value}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.check_error",
+                vec!["{err}"],
+            ),
+            ("cleaning.tools.flux2_klein.download.error", vec!["{err}"]),
+            (
+                "cleaning.tools.flux2_klein.download.done_status",
+                vec!["{size}", "{skipped}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.plan_status",
+                vec!["{missing}", "{files}", "{total}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.download_sized_button",
+                vec!["{size}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.overall_progress_status",
+                vec!["{done}", "{total}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.speed_status",
+                vec!["{speed}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.speed_and_eta_status",
+                vec!["{speed}", "{eta}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.eta_hours",
+                vec!["{hours}", "{minutes}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.eta_minutes",
+                vec!["{minutes}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.eta_seconds",
+                vec!["{seconds}"],
+            ),
+            (
+                "cleaning.tools.flux2_klein.download.file_progress_status",
+                vec!["{label}", "{done}", "{total}"],
+            ),
+        ];
+        let plain = [
+            "cleaning.tools.flux2_klein.pipeline_busy_error",
+            "cleaning.tools.flux2_klein.download.heading",
+            "cleaning.tools.flux2_klein.download.hint",
+            "cleaning.tools.flux2_klein.download.no_token_hint",
+            "cleaning.tools.flux2_klein.download.token_settings_link",
+            "cleaning.tools.flux2_klein.download.repo_page_link",
+            "cleaning.tools.flux2_klein.download.uncensored_label",
+            "cleaning.tools.flux2_klein.download.uncensored_hint",
+            "cleaning.tools.flux2_klein.download.check_button",
+            "cleaning.tools.flux2_klein.download.checking_status",
+            "cleaning.tools.flux2_klein.download.download_button",
+            "cleaning.tools.flux2_klein.download.cancel_button",
+            "cleaning.tools.flux2_klein.download.complete_status",
+            "cleaning.tools.flux2_klein.download.running_status",
+            "cleaning.tools.flux2_klein.download.cancelled_status",
+            "cleaning.tools.flux2_klein.download.state_unknown",
+            "cleaning.tools.flux2_klein.download.plan_unknown_status",
+            "cleaning.tools.flux2_klein.download.derived_paths_label",
+            "cleaning.tools.flux2_klein.source_mode_label",
+            "cleaning.tools.flux2_klein.source_mode_manual",
+            "cleaning.tools.flux2_klein.source_mode_download",
+            "cleaning.tools.flux2_klein.source_mode_manual_hint",
+            "cleaning.tools.flux2_klein.source_mode_download_hint",
+            "hf_token.empty_error",
+        ];
+        for (tag, source) in ms_i18n::embedded_locales() {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let entry = |key: &str| -> String {
+                catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"))
+                    .to_owned()
+            };
+            for key in plain {
+                assert!(
+                    !entry(key).trim().is_empty(),
+                    "locale `{tag}`: `{key}` is empty"
+                );
+            }
+            for (key, placeholders) in &interpolated {
+                let text = entry(key);
+                for placeholder in placeholders {
+                    assert!(
+                        text.contains(placeholder),
+                        "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not"
+                    );
+                }
+            }
+            // The two modes are a switch: identical captions would make it unusable.
+            assert_ne!(
+                entry("cleaning.tools.flux2_klein.source_mode_manual"),
+                entry("cleaning.tools.flux2_klein.source_mode_download"),
+                "locale `{tag}`: the two source modes share a caption"
+            );
+            // Six verdicts drawn with the same words would make the block unreadable, and
+            // three of them differ only in what the user is supposed to do next.
+            let mut wordings = Vec::new();
+            for suffix in [
+                "ok",
+                "no_token",
+                "invalid_token",
+                "not_accepted",
+                "not_found",
+                "network_error",
+            ] {
+                let text = entry(&format!("cleaning.tools.flux2_klein.download.state_{suffix}"));
+                assert!(
+                    !wordings.contains(&text),
+                    "locale `{tag}`: two download states share the wording `{text}`"
+                );
+                wordings.push(text);
+            }
+            for key in [
+                "token_save_button",
+                "token_save_tooltip",
+                "token_save_disabled_tooltip",
+                "token_delete_button",
+                "token_delete_tooltip",
+                "token_delete_disabled_tooltip",
+                "token_unknown_status",
+                "token_missing_status",
+                "token_stored_status",
+                "token_hint_text",
+                "token_saved_status",
+                "token_deleted_status",
+                "check_tooltip",
+                "check_disabled_tooltip",
+                "download_tooltip",
+                "download_disabled_tooltip",
+                "cancel_tooltip",
+                "cancel_disabled_tooltip",
+            ] {
+                let key = format!("cleaning.tools.flux2_klein.download.{key}");
+                assert!(
+                    !entry(&key).trim().is_empty(),
+                    "locale `{tag}`: `{key}` is empty"
+                );
+            }
+        }
     }
 }

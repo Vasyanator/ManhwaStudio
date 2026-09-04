@@ -35,7 +35,8 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
                 ├── flux2_klein.py — inpaint.flux2_klein (+ status, estimate, unload,
                 │                    component_action,
-                │                    prompt_cache.build/list/save/load/export/import); streaming
+                │                    prompt_cache.build/list/save/load/export/import,
+                │                    download.check/start); streaming
                 ├── watermark.py   — watermark.detect / .remove / .status / .unload; streaming
                 ├── reline.py      — reline.models / reline.process
                 ├── device.py      — device.get / .set / .cuda_diagnostics
@@ -167,11 +168,17 @@ live in `handlers/MODULE_README.md`.
 - Event fan-out is best-effort. A broken or slow sink is dropped silently; the publisher never
   raises. Slow-client isolation uses a 2 s per-write socket timeout (`_PUBLISH_WRITE_TIMEOUT_S`).
 - Handlers must not import `server.py` directly; they receive `AppState` via `HandlerContext.state`.
-  ONE documented exception: `handlers/sdxl.py` lazily imports `_encode_png_bytes_rgb` from
-  `../../inpaint/sdxl.py` inside the progress callback, because the preview PNG encoder is a pure
-  byte helper with no `AppState` counterpart. The import stays inside the function so the handler
-  module remains torch-free at import time. Do not grow this exception: any NEW service access goes
-  through `HandlerContext.state`.
+  TWO documented exceptions, both stateless function modules with no `AppState` counterpart, both
+  imported INSIDE a function so the handler module remains torch-free at import time:
+  `handlers/sdxl.py` -> `_encode_png_bytes_rgb` from `../../inpaint/sdxl.py` (a pure byte helper),
+  and `handlers/flux2_klein.py` -> `../../inpaint/flux2_download.py` (the FLUX.2 klein model
+  acquisition, which owns no resident state). Do not grow this list: any NEW access to something
+  that HOLDS state goes through `HandlerContext.state`.
+- A `progress{id}` frame's field set is OPEN for additive optional fields, and the download's second
+  level is the precedent: `inpaint.flux2_klein.download.start` adds `file_step` / `file_total` /
+  `file_label` while `phase`/`step`/`total`/`label` keep their meaning, so a consumer that does not
+  know the new names stays correct. An additive field must be OMITTED when absent, never sent as
+  `null`, and must never re-purpose one of the four existing names.
 - Do not add imports directly to `registry.py`. Add one line to `handlers/__init__.py` only.
 
 ## Editing map

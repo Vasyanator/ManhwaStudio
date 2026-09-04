@@ -15,17 +15,30 @@ Main responsibilities:
   present destination is never replaced by a failed attempt;
 - verify calls for different destinations are not serialized against each other;
 - verify `stream_response_to_file` reports cumulative bytes and tolerates a
-  missing `Content-Length`.
+  missing `Content-Length`, and that an appended (resumed) body counts from the
+  offset it was given rather than restarting at zero;
+- verify resume is OPT-IN: the default failure path still unlinks and parks
+  nothing, while `resumable=True` parks the partial under the stable `.part`
+  name, claims it back by an atomic rename that only one owner can win, and never
+  inherits a stale pid-scoped leftover;
+- verify `download_bearer_to_path` builds the `Authorization: Bearer` header from
+  the token it is GIVEN, sends none for an empty token, skips a destination that
+  is already on disk, forwards the caller's `verify` gate so it runs on the
+  STAGED bytes before the publish, and — the cancellation contract both Hugging
+  Face callers rely on — leaves neither destination nor staging file behind when
+  the progress callback or the gate raises.
 
 Notes:
-Neither the network nor `requests` is involved: `download_to_path` takes the
-transport as a callable, and `stream_response_to_file` only needs an object with
-`headers` and `iter_content`.
+The network is never involved. `download_to_path` takes the transport as a
+callable and `stream_response_to_file` only needs an object with `headers` and
+`iter_content`; the `download_bearer_to_path` tests install a fake `requests`
+module in `sys.modules` for their duration, so the real one is never called.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -212,12 +225,253 @@ class StreamResponseToFileTests(unittest.TestCase):
 
         self.assertEqual(self.progress, [(len(self.PAYLOAD), 0)])
 
+    def test_an_appended_body_counts_from_the_offset_it_was_given(self) -> None:
+        # A resumed transfer must report the WHOLE file's progress. Counting from
+        # zero would make an overall bar jump backwards and turn the first delta
+        # a consumer measures into a nonsense transfer rate.
+        self.dest.write_bytes(b"HEAD" * 250)  # 1000 bytes already on disk
+        tail = b"T" * 2000
+        response = _FakeResponse(tail, content_length=str(len(tail)))
+
+        md.stream_response_to_file(
+            response, self.dest, self._on_chunk, chunk_size=1000, mode="ab", initial_done=1000
+        )
+
+        self.assertEqual(self.dest.stat().st_size, 3000)
+        self.assertEqual([done for done, _ in self.progress], [2000, 3000])
+        # `expected` is the whole file, not just this range's length.
+        self.assertEqual({expected for _, expected in self.progress}, {3000})
+
+    def test_an_appended_body_without_a_content_length_reports_unknown(self) -> None:
+        self.dest.write_bytes(b"x" * 10)
+        response = _FakeResponse(b"y" * 20, content_length=None)
+
+        md.stream_response_to_file(
+            response, self.dest, self._on_chunk, mode="ab", initial_done=10
+        )
+
+        # `0` keeps meaning "the server did not say", rather than being mistaken
+        # for a total that happens to equal the offset.
+        self.assertEqual(self.progress, [(30, 0)])
+
     def test_an_unwritable_destination_is_an_explicit_error(self) -> None:
         response = _FakeResponse(self.PAYLOAD, content_length=None)
         with self.assertRaises(RuntimeError) as caught:
             md.stream_response_to_file(response, self.dest.parent / "missing" / "x.bin", self._on_chunk)
 
         self.assertIn("x.bin", str(caught.exception))
+
+
+class _BearerRequestsModule:
+    """`sys.modules['requests']` stand-in recording the headers of each GET."""
+
+    def __init__(self, payload: bytes, *, chunk: int = 1024) -> None:  # noqa: D107
+        self._payload = payload
+        self._chunk = chunk
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append((url, dict(kwargs.get("headers") or {})))
+        return _BearerResponse(self._payload, self._chunk)
+
+
+class _BearerResponse(_FakeResponse):
+    """`_FakeResponse` plus the context-manager and status surface `requests.get` has."""
+
+    def __init__(self, payload: bytes, chunk: int) -> None:
+        super().__init__(payload, content_length=str(len(payload)))
+        self._chunk_hint = chunk
+
+    def __enter__(self) -> "_BearerResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int = 1 << 20):
+        return super().iter_content(chunk_size=self._chunk_hint)
+
+
+class DownloadBearerToPathTests(unittest.TestCase):
+    """The Hugging Face composition: bearer header, staging, cancel-by-raising."""
+
+    PAYLOAD = b"weights" * 512
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dest = Path(tmp.name) / "shard.safetensors"
+
+    def _install(self, module: _BearerRequestsModule) -> None:
+        saved = sys.modules.get("requests")
+
+        def restore() -> None:
+            if saved is None:
+                sys.modules.pop("requests", None)
+            else:
+                sys.modules["requests"] = saved
+
+        self.addCleanup(restore)
+        sys.modules["requests"] = module
+
+    def test_the_token_becomes_a_bearer_header(self) -> None:
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        seen: list[tuple[int, int]] = []
+        self.assertTrue(
+            md.download_bearer_to_path(
+                "https://example/x", self.dest, lambda d, e: seen.append((d, e)), token="tok"
+            )
+        )
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(fake.calls[0][1].get("Authorization"), "Bearer tok")
+        self.assertEqual(seen[-1][0], len(self.PAYLOAD))
+
+    def test_an_empty_token_sends_no_authorization_header(self) -> None:
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        md.download_bearer_to_path("https://example/x", self.dest, lambda d, e: None, token="")
+
+        self.assertNotIn("Authorization", fake.calls[0][1])
+
+    def test_a_present_destination_is_not_refetched(self) -> None:
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        self.dest.write_bytes(b"already here")
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        self.assertFalse(
+            md.download_bearer_to_path("https://example/x", self.dest, lambda d, e: None, token="t")
+        )
+        self.assertEqual(fake.calls, [])
+
+    def test_the_verify_gate_is_forwarded_and_runs_before_the_publish(self) -> None:
+        # Without forwarding, a body that ends cleanly but SHORT is published
+        # under the final name and is then indistinguishable from a complete
+        # file. The gate is the caller's only chance to notice.
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+        staged: list[int] = []
+
+        def verify(path: Path) -> None:
+            staged.append(path.stat().st_size)
+            raise RuntimeError("wrong length")
+
+        with self.assertRaises(RuntimeError):
+            md.download_bearer_to_path(
+                "https://example/x", self.dest, lambda d, e: None, token="t", verify=verify
+            )
+
+        self.assertEqual(staged, [len(self.PAYLOAD)])
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
+
+    def test_a_passing_verify_publishes(self) -> None:
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        def verify(path: Path) -> None:
+            if path.stat().st_size != len(self.PAYLOAD):
+                raise RuntimeError("wrong length")
+
+        self.assertTrue(
+            md.download_bearer_to_path(
+                "https://example/x", self.dest, lambda d, e: None, token="t", verify=verify
+            )
+        )
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    def test_a_failure_unlinks_by_default_and_parks_nothing(self) -> None:
+        # Resume is OPT-IN. The default must keep the semantics `flux_fill.py`
+        # has always had, under BOTH staging names.
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        def on_chunk(done: int, expected: int) -> None:
+            raise RuntimeError("dropped")
+
+        with self.assertRaises(RuntimeError):
+            md.download_bearer_to_path("https://example/x", self.dest, on_chunk, token="t")
+
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
+        self.assertEqual(md.staged_bytes(self.dest), 0)
+
+    def test_a_resumable_failure_parks_the_partial_under_the_stable_name(self) -> None:
+        fake = _BearerRequestsModule(self.PAYLOAD, chunk=64)
+        self._install(fake)
+        seen: list[int] = []
+
+        def on_chunk(done: int, expected: int) -> None:
+            seen.append(done)
+            if len(seen) >= 3:
+                raise RuntimeError("dropped")
+
+        with self.assertRaises(RuntimeError):
+            md.download_bearer_to_path(
+                "https://example/x", self.dest, on_chunk, token="t", resumable=True
+            )
+
+        self.assertFalse(self.dest.exists())
+        parked = md.resumable_staging_path(self.dest)
+        self.assertTrue(parked.is_file())
+        self.assertEqual(parked.stat().st_size, seen[-1])
+        self.assertEqual(md.staged_bytes(self.dest), seen[-1])
+        # The pid-scoped name is free again: a parked partial has one owner.
+        self.assertFalse(md.staging_path(self.dest).exists())
+
+    def test_claiming_a_parked_partial_is_a_rename_so_only_one_owner_wins(self) -> None:
+        staging = md.staging_path(self.dest)
+        parked = md.resumable_staging_path(self.dest)
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        parked.write_bytes(b"partial")
+
+        md._claim_staged_bytes(staging, parked)
+        self.assertEqual(staging.read_bytes(), b"partial")
+        self.assertFalse(parked.exists())
+
+        # A second claimant finds nothing and is left with no staging file at
+        # all, rather than inheriting bytes it has no claim to.
+        other = self.dest.with_name(self.dest.name + ".999999.part")
+        other.write_bytes(b"stale leftover")
+        md._claim_staged_bytes(other, parked)
+        self.assertFalse(other.exists())
+
+    def test_discard_staging_removes_both_names(self) -> None:
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        md.staging_path(self.dest).write_bytes(b"a")
+        md.resumable_staging_path(self.dest).write_bytes(b"b")
+
+        md.discard_staging(self.dest)
+
+        self.assertFalse(md.staging_path(self.dest).exists())
+        self.assertFalse(md.resumable_staging_path(self.dest).exists())
+        self.assertEqual(md.staged_bytes(self.dest), 0)
+
+    def test_a_raising_progress_callback_aborts_and_leaves_nothing_behind(self) -> None:
+        # This is the supported cancellation mechanism: `stream_response_to_file`
+        # has no cancel hook, so the caller raises from `on_chunk` and the
+        # staging file must not survive it.
+        fake = _BearerRequestsModule(self.PAYLOAD)
+        self._install(fake)
+
+        class _Stop(Exception):
+            pass
+
+        def on_chunk(done: int, expected: int) -> None:
+            raise _Stop()
+
+        with self.assertRaises(_Stop):
+            md.download_bearer_to_path("https://example/x", self.dest, on_chunk, token="t")
+
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
 
 
 if __name__ == "__main__":

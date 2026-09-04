@@ -142,6 +142,15 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `python_manager.rs`: the only Rust-side owner of Python environment discovery, Python command
   construction, hidden-window/UTF-8 setup, shell activation snippets, and managed spawning for
   long-lived Python children that should be killed with the Rust parent on Windows.
+- `hf_token.rs`: the process-wide Hugging Face access token. A runtime global in the shape of
+  `tabs/typing/rotation_ctrl_wheel.rs` (cached value + free get/set/clear), backed by the OS secret
+  store under its OWN service name `"ManhwaStudio Hugging Face"` — never the OCR key entry, which
+  belongs to the translation tab and is keyed by service. Seeded once at startup
+  (`main.rs::seed_hf_token_from_secret_store`, on a worker thread) so reads are lock acquisitions,
+  not OS round trips; `store`/`clear`/`read` are BLOCKING and callers spawn for them. Tri-state:
+  `HfTokenState::Unknown` (not read yet) is distinct from `Missing` and must never be rendered as
+  it. The token is never written to `user_config.json`, to any settings JSON, or to a log line, and
+  no message in the tree interpolates its value.
 - `gpu_utils.rs`: shared GPU/accelerator capability probes used by installer and launcher/runtime
   settings. Call it from workers, not from frame drawing. Includes `detect_webgpu_adapters`, which
   enumerates the WebGPU GPU adapters per-OS with Dawn's backend (DXGI/Windows, Vulkan/Linux,
@@ -402,6 +411,9 @@ prompts instead of blocking the GUI thread.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
+- The Hugging Face access token (reading it, adding a second UI surface for it, changing where it is
+  stored): `hf_token.rs`. Its first UI surface is the FLUX.2 klein download block
+  (`tabs/cleaning/tools/ai_editor/engines/flux2_klein.rs`), which is a CONSUMER, not the owner.
 - General settings editor (projects directory, global memory profile, interface scale, primary
   monitor, UI language, and a duplicate surface for the typesetting-language selector owned by
   `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:

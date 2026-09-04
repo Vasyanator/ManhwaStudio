@@ -58,6 +58,10 @@ mod config;
 mod config_saver;
 mod general_settings_panel;
 pub mod gpu_utils;
+// Process-wide Hugging Face access token, backed by the OS secret store. One value for
+// the whole application (the FLUX.2 klein download block is its first UI surface, not
+// its owner); seeded once at startup by `seed_hf_token_from_secret_store`.
+mod hf_token;
 mod i18n_resolve;
 mod input_manager_v2;
 mod input_util;
@@ -287,6 +291,10 @@ fn run_main() -> anyhow::Result<()> {
     seed_text_language_from_config();
     seed_rotation_ctrl_wheel_from_config();
     seed_advanced_form_search_from_config();
+    // Reads the Hugging Face token out of the OS secret store on a worker thread, so the
+    // token badge and every gated download start from the value the user already saved.
+    // Fire-and-forget: until it lands the cache honestly reports "not known".
+    hf_token::seed_hf_token_from_secret_store();
     // Seed the typing tab's per-effect-kind default overrides so newly added effect
     // cards pick up the user's stored defaults from the first frame.
     tabs::typing::seed_effect_defaults_from_config();

@@ -17,7 +17,11 @@ Main responsibilities:
 - verify a failed move degrades to a warning instead of a failed load;
 - verify unloading and swapping quants drop the pipeline and report it;
 - verify two concurrent first uses of the same quant stage the download once,
-  into a process-private file, instead of writing over each other.
+  into a process-private file, instead of writing over each other;
+- verify this path is NOT resumable: a failed transfer unlinks its staging file
+  and parks nothing, and no `Range` header is ever sent. Resume is opt-in in
+  `../engines/model_download.py`, and these two assertions are what keep it that
+  way for a shipped feature.
 
 Notes:
 - Fake `torch` and `diffusers` modules are injected into `sys.modules`, so the
@@ -549,6 +553,48 @@ class WeightDownloadConcurrencyTests(unittest.TestCase):
             svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
         )
         self.assertEqual(self.requests_seen, [])
+
+    def test_a_failed_download_unlinks_and_never_parks_a_partial(self) -> None:
+        """FLUX.1-Fill is NOT resumable, and must not become so by accident.
+
+        Resume is opt-in in the shared primitive precisely so that this path keeps
+        its long-standing semantics: a failure leaves NOTHING behind, under either
+        staging name. A stray `.part` here would be a behaviour change to a
+        shipped feature, which is why it is asserted rather than assumed.
+        """
+
+        class _Failing:
+            headers = {"Content-Length": "40960"}
+
+            def __enter__(self) -> "_Failing":
+                return self
+
+            def __exit__(self, *_exc_info: object) -> bool:
+                return False
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def iter_content(self, chunk_size: int = 1 << 20):
+                yield b"A" * 4096
+                raise OSError("connection reset")
+
+        sys.modules["requests"].get = lambda url, **kwargs: _Failing()
+
+        with self.assertRaises(OSError):
+            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(list(self.root.glob("*.part")), [])
+
+    def test_no_range_header_is_ever_sent(self) -> None:
+        """The non-resumable path must not ask for a range even after a failure."""
+        self.dest.with_name(self.dest.name + ".part").write_bytes(b"B" * 1024)
+
+        self.assertTrue(
+            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
+        )
+        self.assertEqual([headers for headers in self.requests_seen if "Range" in headers], [])
 
     def test_the_hf_token_is_still_sent_as_a_bearer_header(self) -> None:
         with patch.dict("os.environ", {"HF_TOKEN": "hf_secret"}):

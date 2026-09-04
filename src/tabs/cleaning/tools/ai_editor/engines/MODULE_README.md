@@ -25,8 +25,8 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
 ## Files and submodules
 - `mod.rs`: the catalog — `all_engines()` and nothing else.
 - `flux2_klein.rs`: the FLUX.2 klein engine (IPC methods `inpaint.flux2_klein` streaming,
-  `.status`, `.estimate`, `.unload`, `.component_action` streaming, and the six
-  `.prompt_cache.*` methods). The user paints the
+  `.status`, `.estimate`, `.unload`, `.component_action` streaming, the six
+  `.prompt_cache.*` methods, and the two `.download.*` methods). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
   mask layer and puts its bytes on the wire verbatim. Leaving that layer EMPTY is the other
@@ -185,15 +185,108 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   `.prompt_cache.build`; all three are therefore mutually exclusive, and every "wait for the
   current operation" gate reads `flux2_pipeline_busy` across the three rather than one receiver.
   The pinned wire contract is `dev-docs/flux2_component_residency.md`.
-- Every `t!` key of this engine lives under `cleaning.tools.flux2_klein.*`; the run/cancel wording
-  it shares with the older editors stays under `cleaning.mask_editor.*`.
+- **The model source is a MODE, and the two modes never mix.** `source_mode` (`manual` /
+  `download`) is a persisted field beside the paths, switched by two toggle buttons at the TOP
+  of the parameters block, and exactly one body is drawn under it: the three manual path rows,
+  or the download block. It DEFAULTS TO MANUAL and a settings file without the field loads as
+  manual — such a file carries hand-entered paths, and loading it as `download` would hide a
+  working configuration behind an empty download block and read as an update that broke the
+  install.
+  - **`Flux2KleinSettings::effective_paths` is THE answer to "which three paths does a run
+    use"**, and every consumer goes through it — the wire `params`, the run gate, the
+    prompt-cache gates, the read-only paths the download body shows. Two places computing it
+    is how the two modes drift apart.
+  - **In download mode the three paths are DERIVED** from `config::flux2_klein_dir()` and the
+    encoder toggle, and **the manual fields are never read and never written**. A finished
+    download therefore does NOT write its answer into the settings — that write-back existed
+    while both blocks were always visible and became destructive with the switch, because the
+    manual fields hold a configuration the user switches back to. The answered paths are kept
+    only to LOG drift between the two halves. Derivation configures the engine continuously
+    instead of once, which supersedes the original contract's "a finished download configures
+    the engine".
+  - The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/` under
+    `FLUX.2-klein-9B/`, which is what the backend needs: `component_search_roots` probes each
+    supplied path AND ITS PARENT, so the repo root is reached from any of the three and both
+    `text_encoder/` and `text_encoder_uncensored/` resolve the tokenizer (verified against
+    `modules/ai_backend/inpaint/flux2_klein.py`, hit at probe position 2 of 8 for both).
+  - The uncensored toggle belongs to the download body alone. In manual mode it is meaningless
+    — the user simply points at whichever encoder he wants.
+- FLUX.2 klein DOWNLOADS ITS OWN MODEL from Hugging Face, in the download mode of that switch:
+  `.download.check` (one-shot) and `.download.start` (streaming). The pinned wire contract is
+  `dev-docs/flux2_model_download.md`. What this side owns:
+  - **The token is NOT this engine's.** It is the process-wide `crate::hf_token` global, kept in
+    the OS secret store under `"ManhwaStudio Hugging Face"`, seeded at startup. This engine is its
+    first UI surface, not its owner: the token is never a `Flux2KleinSettings` field, never reaches
+    a settings JSON, and never appears in a log line or an error message — it travels as the
+    per-call `hf_token` request field and nowhere else. The badge is TRI-state: "not read yet" is
+    distinct from "not stored" and is never rendered as it.
+  - **Six access verdicts, three of them with a link, and that IS the feature.** `no_token` and
+    `invalid_token` link to the token settings page, `not_accepted` to that repository's own page;
+    `ok`, `not_found` and `network_error` offer none. Every row also carries the backend's own
+    `message`, shown on hover and logged — the technical half, because `network_error` has no
+    localizable content. A literal this build does not know degrades to "not known" with the
+    literal on hover and NO link, exactly as the residency block does.
+  - **The «Расцензуренный энкодер» toggle is a normal persisted setting**
+    (`uncensored_text_encoder`), never a global and never inside `params`: the download methods
+    carry it as their own top-level `uncensored` field. It selects which encoder is fetched AND
+    repoints `text_encoder_path` — but only when that path is empty or names the OTHER managed
+    directory (`config::flux2_klein_text_encoder_dir`), so a hand-picked encoder survives a flip.
+  - **The download claims the shared progress bar**, so `flux2_pipeline_busy` now spans FOUR
+    operations. `run_block_reason` and `start` read `non_run_pipeline_busy` — the same rule with
+    the generation taken out, so a run cannot report itself as the reason it cannot start while a
+    prompt-cache build, a component action or a download genuinely blocks the next one.
+  - **Two progress levels.** `step`/`total` stay the OVERALL counter (bytes across the whole plan),
+    which is what keeps every existing single-level consumer correct; `file_step`/`file_total`/
+    `file_label` are OPTIONAL and describe the file in flight. A frame without them renders the
+    overall bar alone — never a second bar frozen at zero — and a `file_total` of zero renders an
+    indeterminate bar rather than dividing.
+  - **`plan` is NULLABLE, and an absent plan alone decides that NO size and NO completion
+    state may be drawn** — whatever the repository states say. The backend sends `null` for
+    all three of "no token", "a repository is inaccessible" and "the file listing failed",
+    because a zero-valued plan is the same lie in every one of them: it reads as "nothing
+    left to download", and was observed rendering a complete installation on an empty
+    machine. Access and listing are two different network operations, so every row can read
+    `ok` with no plan behind it; the rows then stay `ok` (authentication really did succeed)
+    and `plan_error` carries the reason. `plan_error` is non-empty exactly when the rows
+    cannot explain the gap — it is shown on hover beside a localized line, the way a repo
+    `message` is — and empty otherwise, when no extra line is synthesised at all. That case
+    keeps «Скачать» OPEN, because pressing it re-lists. The four-way decision is the pure
+    `flux2_download_readiness`, and `Complete` is reachable only through a plan that was
+    actually computed.
+  - **Speed and remaining time are DERIVED on this side, with no wire field for either.**
+    `Flux2RateEstimator` averages the OVERALL byte counter over a five-second wall-clock
+    window — a time window and not a frame count, because the backend's two throttles (~10
+    frames/s AND >= 4 MB apart) make the frame cadence depend on the line speed. It is never
+    fed the per-file counter, which resets at every file boundary. Nothing is reported until
+    the window spans `FLUX2_RATE_MIN_SPAN`, so a transfer shows no estimate at its start
+    rather than a wrong one, and a stalled or finished counter reports no rate rather than
+    zero or infinity. A BACKWARDS step discards the window and restarts it: a resumed file
+    whose length check fails is refetched from zero, so the overall counter really does move
+    backwards once per such file (`ipc/PROTOCOL.md`, `download.start`); averaging across that
+    seam would report a rate that never happened. The numbers are cleared by
+    `begin_progress_generation` and drawn only while the bar is active and the phase is
+    `download`, so they never sit frozen beside an idle bar.
+  - **A finished download configures the engine**: the answer's three paths are written into the
+    settings and marked dirty, only non-empty ones, so a partial answer cannot blank a path the
+    user set by hand.
+- Every `t!` key of this engine lives under `cleaning.tools.flux2_klein.*` (the download block under
+  `cleaning.tools.flux2_klein.download.*`); the run/cancel wording it shares with the older editors
+  stays under `cleaning.mask_editor.*`. The `hf_token` module has its own `hf_token.*` namespace,
+  because the token is not a cleaning-tool concept.
 
 ## Editing map
 - To add an engine: a module here plus one line in `mod.rs::all_engines`; the trait it must satisfy
   is `../engine.rs`.
-- To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory presets or
-  RAM/VRAM forecast: `flux2_klein.rs`. The wire names of its methods live in
-  `backend_ipc::protocol`.
+- To change which paths a run uses, or to add a third source mode:
+  `Flux2KleinSettings::effective_paths` and `Flux2SourceMode` — never a second computation at a
+  call site.
+- To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory presets,
+  RAM/VRAM forecast or model-download block: `flux2_klein.rs`. The wire names of its methods live
+  in `backend_ipc::protocol`.
+- To change where the Hugging Face token is stored or to add a SECOND UI surface for it:
+  `src/hf_token.rs`, never here — this engine only reads the global and puts it on the wire.
+- To change where the downloaded model lands: `config::flux2_klein_dir` /
+  `config::flux2_klein_text_encoder_dir`, together with the Python half's own manifest.
 - To change its size contract: `Flux2KleinEngine::frame_constraints` AND `region_block_reason`
   together — the test that compares them will fail otherwise.
 - To change what the host does with an engine (the picker, the panels, the frame): `../mod.rs` and

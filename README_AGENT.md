@@ -913,6 +913,41 @@ egui `Id`, выводимый из текста подписи (`ComboBox::from_
 
 ---
 
+## Credentials: the OS secret store is the only place they live
+
+Written in English per `AGENTS.md`.
+
+**No credential is ever persisted in a config or settings JSON.** Every secret the app holds
+lives in the OS credential store (`keyring`, native-only), and the tree below is the whole set:
+
+| Secret | Service name | Owner | Shape |
+|---|---|---|---|
+| AI API keys (OCR / MT providers) | `"ManhwaStudio AI API OCR"` | `tabs/translation/ocr.rs` | one entry per `AiApiService` |
+| Hugging Face access token | `"ManhwaStudio Hugging Face"` | `src/hf_token.rs` | ONE process-wide value |
+
+The Hugging Face token is the GLOBAL one and therefore has a module of its own rather than
+living inside the feature that first needed it (the FLUX.2 klein model download,
+`tabs/cleaning/tools/ai_editor/engines/flux2_klein.rs`). Its contract:
+
+- A cached value behind free `hf_token()` / `hf_token_state()` / `store_hf_token()` /
+  `clear_hf_token()` / `read_hf_token()` functions, in the shape of
+  `tabs/typing/rotation_ctrl_wheel.rs`. Seeded once at startup
+  (`main.rs::seed_hf_token_from_secret_store`, on a worker thread), so every later read is a
+  lock acquisition rather than an OS round trip.
+- **Keyring I/O never runs on the GUI thread.** Only the seed, a save and a delete touch the
+  store, and all three are BLOCKING — callers spawn (`ms_thread::spawn`).
+- **Tri-state, and the three states are not interchangeable.** `HfTokenState::Unknown` ("the
+  store has not answered yet") must never be rendered as `Missing`: telling a user no token is
+  saved while the read is still in flight sends them to create a second one.
+- **A token value never appears in a log line, an error message, a panic payload or any file.**
+  It travels to the Python backend as a per-call request field only (`hf_token`), never inside
+  `params` and never as an environment variable of the backend process. Messages that must
+  mention it say "the token" and interpolate only the keyring's or the transport's own error.
+- Two UI surfaces may read the same value; neither owns it. A new surface reads the module,
+  it does not copy the value into its own settings.
+
+---
+
 ## Кастомные виджеты (`src/widgets/`)
 
 | Виджет | Назначение |

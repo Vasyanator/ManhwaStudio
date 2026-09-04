@@ -721,6 +721,11 @@ class _PlacementFixture(_TempTreeCase):
         module_cls = self.torch.nn.Module
         self.load_kwargs: dict[str, dict[str, object]] = {}
         load_kwargs = self.load_kwargs
+        #: How often each component loader was entered. `load_kwargs` only keeps
+        #: the LAST call, so a cache that must read a component once per
+        #: directory rather than once per use is not assertable without a count.
+        self.load_calls: dict[str, int] = {}
+        load_calls = self.load_calls
 
         class _Loader:
             """Records the kwargs a component loader was called with.
@@ -738,12 +743,14 @@ class _PlacementFixture(_TempTreeCase):
 
             def from_pretrained(self, path: str, **kwargs: object) -> object:
                 load_kwargs[self.name] = {"path": path, **kwargs}
+                load_calls[self.name] = load_calls.get(self.name, 0) + 1
                 device_map = kwargs.get("device_map")
                 target = device_map.get("") if isinstance(device_map, dict) else None
                 return self.factory(str(target) if target else "cpu")
 
             def from_single_file(self, path: str, **kwargs: object) -> object:
                 load_kwargs[f"{self.name}_single"] = {"path": path, **kwargs}
+                load_calls[self.name] = load_calls.get(self.name, 0) + 1
                 # `device_map` is deliberately NOT consulted here.
                 device = kwargs.get("device")
                 return self.factory(str(device) if device else "cpu")
@@ -856,6 +863,49 @@ class PipelinePlacementTests(_PlacementFixture):
         # loader that silently ignores its placement kwarg must not be able to
         # leave a component on the host (see SingleFileTransformerPlacementTests).
         self.assertEqual([depth for _dev, depth in pipe.moves], [1])
+
+    def test_a_rebuild_marks_the_pipeline_cold(self) -> None:
+        # A build places weights, so whatever a previous warm-up proved is gone
+        # with the pipeline that was dropped.
+        self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self.service._pipeline_warmed = True
+        self._build(model_key="flux2_klein:b", placement="full_gpu")
+        self.assertFalse(self.service._pipeline_warmed)
+
+    def test_a_cache_hit_leaves_the_warm_pipeline_warm(self) -> None:
+        # Nothing moved, so nothing the warm-up proved stopped being true. This
+        # is the whole of the once-per-placement rule on the build side.
+        self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self.service._pipeline_warmed = True
+        self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self.assertTrue(self.service._pipeline_warmed)
+
+    def test_the_tokenizer_is_read_once_per_directory(self) -> None:
+        # It is a few MB of vocabulary on the same disk as the 18 GB checkpoint,
+        # and it used to be re-read on every prompt encode.
+        pipe = self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self._build(model_key="flux2_klein:b", placement="full_gpu")
+        self._encode(placement="full_gpu", prompt="a cat")
+        self.assertEqual(self.load_calls["tokenizer"], 1)
+        # The pipeline component and the encode path are the same object.
+        self.assertIs(pipe.tokenizer, self.service._tokenizer)
+
+    def test_another_tokenizer_directory_is_a_miss(self) -> None:
+        first = self.service._ensure_tokenizer_locked(self.root / "tokenizer")
+        other = self.root / "tokenizer_two"
+        other.mkdir()
+        (other / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        second = self.service._ensure_tokenizer_locked(other)
+        self.assertEqual(self.load_calls["tokenizer"], 2)
+        self.assertIsNot(first, second)
+        self.assertIs(second, self.service._tokenizer)
+
+    def test_unload_drops_the_cached_tokenizer(self) -> None:
+        self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self.service.unload()
+        self.assertIsNone(self.service._tokenizer)
+        self._build(model_key="flux2_klein:a", placement="full_gpu")
+        self.assertEqual(self.load_calls["tokenizer"], 2)
 
     def test_the_pipeline_is_built_without_a_text_encoder(self) -> None:
         # The whole point of the two-phase run: 8B of Qwen3 must never be
@@ -1036,6 +1086,15 @@ class PromptEncodingTests(_PlacementFixture):
         self.encode_calls.clear()
         self._encode(placement="encoder_cpu", prompt="a dog")
         self.assertEqual([call["prompt"] for call in self.encode_calls], ["a dog"])
+
+    def test_a_second_encode_does_not_re_read_the_tokenizer(self) -> None:
+        # Every miss used to call `Qwen2TokenizerFast.from_pretrained` again,
+        # which on a model that lives on a spinning disk is real I/O added to an
+        # otherwise hot pipeline.
+        self._encode(placement="encoder_cpu", prompt="a cat")
+        self._encode(placement="encoder_cpu", prompt="a dog")
+        self.assertEqual([call["prompt"] for call in self.encode_calls], ["a cat", "a dog"])
+        self.assertEqual(self.load_calls["tokenizer"], 1)
 
     def test_guidance_above_one_also_encodes_the_empty_prompt(self) -> None:
         embeds = self._encode(placement="encoder_cpu", prompt="a cat", guidance_scale=2.0)
@@ -2352,16 +2411,27 @@ class InpaintRequestTests(_TempTreeCase):
         self._run(placement="encoder_cpu", prompt="a dog")
         self.assertEqual(self.order, ["pipeline", "encode"])
 
-    def test_the_warmup_runs_once_per_request_and_is_not_a_generation_step(self) -> None:
+    def _frames(self, **overrides: object) -> list[tuple[str, int, int, str]]:
+        """One request, returning every progress frame it emitted."""
         frames: list[tuple[str, int, int, str]] = []
         self.service.inpaint_image_bytes(
             _png_bytes(self.region, "RGB"),
             _png_bytes(self.mask, "L"),
-            params=self.params(placement="encoder_cpu"),
+            params=self.params(**overrides),
             progress_callback=lambda *frame: frames.append(frame),
         )
+        return frames
+
+    @staticmethod
+    def _warmup_frames(
+        frames: list[tuple[str, int, int, str]],
+    ) -> list[tuple[str, int, int, str]]:
+        return [frame for frame in frames if frame[3] == "Прогрев модели"]
+
+    def test_the_building_request_warms_up_and_that_is_not_a_generation_step(self) -> None:
+        frames = self._frames(placement="encoder_cpu")
         self.assertEqual(self.pipe.vae.warmup_calls, 1)
-        warmups = [frame for frame in frames if frame[3] == "Прогрев модели"]
+        warmups = self._warmup_frames(frames)
         self.assertEqual(len(warmups), 1)
         self.assertEqual(warmups[0][0], "load")
         self.assertEqual(warmups[0][1], svc.LOAD_STEP_WARMUP)
@@ -2373,6 +2443,87 @@ class InpaintRequestTests(_TempTreeCase):
         steps = svc.effective_steps(4, 1.0)
         self.assertTrue(all(total == steps for _p, _s, total, _l in generate))
         self.assertTrue(all(label == "Генерация" for _p, _s, _t, label in generate))
+
+    def test_the_first_progress_frame_arrives_before_the_memory_guard(self) -> None:
+        # The encoder check and the memory guard both touch the filesystem, and
+        # on a cold page cache that is seconds during which a user who has just
+        # pressed «Обработать» sees no progress bar at all. The «preparation»
+        # frame therefore opens the scope it names.
+        frames: list[tuple[str, int, int, str]] = []
+        seen_at_guard: list[list[tuple[str, int, int, str]]] = []
+        guard_patch = patch.object(
+            self.service,
+            "_require_headroom_locked",
+            lambda *_args, **_kwargs: seen_at_guard.append(list(frames)),
+        )
+        guard_patch.start()
+        self.addCleanup(guard_patch.stop)
+
+        self.service.inpaint_image_bytes(
+            _png_bytes(self.region, "RGB"),
+            _png_bytes(self.mask, "L"),
+            params=self.params(placement="full_gpu"),
+            progress_callback=lambda *frame: frames.append(frame),
+        )
+        self.assertEqual(
+            seen_at_guard[0],
+            [("load", svc.LOAD_STEP_PREPARE, svc.LOAD_PHASE_STEPS, "Подготовка запуска FLUX.2 klein")],
+        )
+        # And the accounting is unchanged: one scale, non-decreasing steps.
+        load = [frame for frame in frames if frame[0] == "load"]
+        self.assertTrue(all(total == svc.LOAD_PHASE_STEPS for _p, _s, total, _l in load))
+        steps = [step for _p, step, _t, _l in load]
+        self.assertEqual(steps, sorted(steps))
+
+    def test_a_second_request_on_a_hot_pipeline_does_not_warm_up_again(self) -> None:
+        # `full_gpu` leaves the transformer on the card for the decode, so nothing
+        # moves between the two runs: the warm-up proved where the weights are and
+        # that proof is still valid. Re-running it is what made every hot
+        # generation announce «Прогрев модели» before it started.
+        self._frames(placement="full_gpu", prompt="a cat")
+        frames = self._frames(placement="full_gpu", prompt="a dog")
+        self.assertEqual(self.builds, 1)
+        self.assertEqual(self.pipe.vae.warmup_calls, 1)
+        self.assertEqual(self._warmup_frames(frames), [])
+
+    def test_parking_the_transformer_makes_the_next_request_warm_up_again(self) -> None:
+        # `encoder_cpu` turns `unload_transformer_before_vae` on by default, so
+        # every run moves the transformer off the card and back. That is a real
+        # weight move, so the next run owes a real warm-up.
+        self._run(placement="encoder_cpu")
+        frames = self._frames(placement="encoder_cpu")
+        self.assertEqual(self.builds, 1)
+        self.assertEqual(self.pipe.vae.warmup_calls, 2)
+        self.assertEqual(len(self._warmup_frames(frames)), 1)
+
+    def test_an_unload_makes_the_next_request_warm_up_again(self) -> None:
+        self._run(placement="full_gpu")
+        self.assertTrue(self.service.unload())
+        frames = self._frames(placement="full_gpu")
+        self.assertEqual(self.builds, 2)
+        self.assertEqual(self.pipe.vae.warmup_calls, 2)
+        self.assertEqual(len(self._warmup_frames(frames)), 1)
+
+    def test_an_invalidated_pipeline_warms_up_again(self) -> None:
+        # A restore that fails invalidates the pipeline SILENTLY (the run itself
+        # succeeded), so the flag has to be cleared there too or the rebuilt
+        # pipeline would be generated on without a materialization check.
+        failures = [1]
+
+        def explode(pipe: object, device: object) -> None:
+            if failures:
+                failures.pop()
+                raise _FakeOutOfMemoryError("HIP out of memory. Tried to allocate 18.00 GiB")
+            pipe.transformer.to(device)
+
+        restore_patch = patch.object(svc, "_restore_transformer_to_device", explode)
+        restore_patch.start()
+        self.addCleanup(restore_patch.stop)
+
+        self._run(placement="encoder_cpu")
+        frames = self._frames(placement="encoder_cpu")
+        self.assertEqual(self.builds, 2)
+        self.assertEqual(len(self._warmup_frames(frames)), 1)
 
     def test_the_warmup_decode_does_not_consume_the_runs_oom(self) -> None:
         # The warm-up is a 64x64 decode; an OOM belongs to the real one.
@@ -2532,6 +2683,13 @@ class WarmupTests(_TempTreeCase):
             pipe, normalized, lambda step, label: self.frames.append((step, label))
         )
 
+    def _warmup_if_needed(self, pipe: object, **overrides: object) -> bool:
+        """The guarded form the generation path uses."""
+        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
+        return self.service._warmup_pipeline_if_needed_locked(
+            pipe, normalized, lambda step, label: self.frames.append((step, label))
+        )
+
     def test_it_runs_one_tiny_decode_and_reports_a_load_step(self) -> None:
         pipe = self._pipe()
         self.assertTrue(self._warmup(pipe, placement="full_gpu"))
@@ -2586,6 +2744,44 @@ class WarmupTests(_TempTreeCase):
         # The lease-protocol tests install a stand-in with no components at all.
         self.assertFalse(self._warmup(types.SimpleNamespace(), placement="full_gpu"))
         self.assertEqual(self.frames, [])
+
+    # ---- once per placement, not once per request ----
+    def test_the_guarded_form_runs_only_while_the_pipeline_is_cold(self) -> None:
+        pipe = self._pipe()
+        self.assertTrue(self._warmup_if_needed(pipe, placement="full_gpu"))
+        self.assertFalse(self._warmup_if_needed(pipe, placement="full_gpu"))
+        self.assertFalse(self._warmup_if_needed(pipe, placement="full_gpu"))
+        self.assertEqual(pipe.vae.warmup_calls, 1)
+        self.assertEqual(self.frames, [(svc.LOAD_STEP_WARMUP, "Прогрев модели")])
+
+    def test_the_unguarded_form_always_runs_because_the_user_pressed_it(self) -> None:
+        # The `warmup` component action goes straight to the primitive: a button
+        # that decided for itself not to act would be a lie about what happened.
+        pipe = self._pipe()
+        self.assertTrue(self._warmup(pipe, placement="full_gpu"))
+        self.assertTrue(self._warmup(pipe, placement="full_gpu"))
+        self.assertEqual(pipe.vae.warmup_calls, 2)
+
+    def test_a_placement_that_owes_no_warmup_is_still_marked_warm(self) -> None:
+        # «Skipped» here means «nothing is owed», not «not done yet», so the
+        # guarded form must not re-enter it on every request either.
+        for placement in ("model_cpu_offload", "sequential_cpu_offload"):
+            with self.subTest(placement=placement):
+                self.service._pipeline_warmed = False
+                pipe = self._pipe(transformer_device="cpu")
+                self.assertFalse(self._warmup(pipe, placement=placement))
+                self.assertTrue(self.service._pipeline_warmed)
+
+    def test_a_pipeline_that_failed_its_warmup_stays_cold(self) -> None:
+        # The materialization refusal is the whole point of the pass: a run that
+        # never proved its placement must not be treated as if it had.
+        pipe = self._pipe(transformer_device="cpu")
+        with self.assertRaises(RuntimeError):
+            self._warmup_if_needed(pipe, placement="encoder_cpu")
+        self.assertFalse(self.service._pipeline_warmed)
+        # And the next attempt really does try again.
+        with self.assertRaises(RuntimeError):
+            self._warmup_if_needed(pipe, placement="encoder_cpu")
 
 
 class WholeRegionTests(_TempTreeCase):
@@ -3351,6 +3547,36 @@ class ComponentActionTests(_TempTreeCase):
         with self.assertRaises(ValueError):
             self._act("text_encoder", "to_gpu")
 
+    # ---- the moves invalidate the warm-up ----
+    def test_parking_the_transformer_marks_the_pipeline_cold(self) -> None:
+        self._install(placement="full_gpu")
+        self.service._pipeline_warmed = True
+        self.assertTrue(self._act("transformer", "to_ram", placement="full_gpu")["performed"])
+        self.assertFalse(self.service._pipeline_warmed)
+
+    def test_restoring_the_transformer_marks_the_pipeline_cold(self) -> None:
+        # A restore is a queued host->device copy exactly like a placement, so it
+        # leaves a warm-up owed rather than satisfied.
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+        self.service._pipeline_warmed = True
+        self.assertTrue(self._act("transformer", "to_gpu", placement="full_gpu")["performed"])
+        self.assertFalse(self.service._pipeline_warmed)
+
+    def test_the_warmup_button_runs_on_an_already_warm_pipeline(self) -> None:
+        self._install(placement="full_gpu")
+        self.service._pipeline_warmed = True
+        result = self._act("vae", "warmup", placement="full_gpu")
+        self.assertTrue(result["performed"])
+        self.assertEqual(self.pipe.vae.warmup_calls, 1)
+        self.assertTrue(self.service._pipeline_warmed)
+
+    def test_unloading_the_pipeline_marks_it_cold(self) -> None:
+        self._install(placement="full_gpu")
+        self.service._pipeline_warmed = True
+        self._act("vae", "unload", placement="full_gpu")
+        self.assertFalse(self.service._pipeline_warmed)
+
     # ---- busy ----
     def test_a_busy_service_refuses_instead_of_waiting(self) -> None:
         import threading
@@ -3443,6 +3669,21 @@ class ComponentActionTests(_TempTreeCase):
         # next request must rebuild rather than cache-hit onto a mismatch.
         self.assertIsNone(self.service._pipe)
         self.assertIsNone(self.service._active_key)
+
+    def test_a_failed_restore_marks_the_pipeline_cold(self) -> None:
+        self._install(placement="full_gpu")
+        self._act("transformer", "to_ram", placement="full_gpu")
+        # Marked warm again AFTER the park, so the invalidation is the only thing
+        # left that can clear it: the park's own clearing cannot carry this case.
+        self.service._pipeline_warmed = True
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise _FakeOutOfMemoryError("HIP out of memory")
+
+        with patch.object(svc, "_restore_transformer_to_device", _boom):
+            with self.assertRaises(_FakeOutOfMemoryError):
+                self._act("transformer", "to_gpu", placement="full_gpu")
+        self.assertFalse(self.service._pipeline_warmed)
 
     # ---- the text encoder ----
     def test_loading_the_text_encoder_keeps_it_and_reports_it(self) -> None:
