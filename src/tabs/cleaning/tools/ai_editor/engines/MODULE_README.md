@@ -22,6 +22,14 @@ AiEngine::poll(ctx)        -> Idle / Running / Done(ColorImage) / Failed(message
 Adding an engine is a module plus one line in `all_engines`. The picker's two sections come from
 `AiEngine::section`, not from the order of that list.
 
+An engine's panel body owns its own structure, and FLUX.2 klein's is the reference for a big one:
+prompt block (field, the one cache line, the «Перевод» / «Библиотека промптов» toggles) → the one
+creative dial → the ONE readiness line with its «Установить» / «Обновить» buttons → three SIBLING
+collapsible sections («Установка модели», «Память и скорость», «Для экспертов») → the mask note.
+The rule the layout follows: what is touched per edit is never behind a fold, what is set once per
+machine always is, and no section wraps or nests another. The decisions the lines report are pure
+functions with unit tests, not conditionals inside the drawing code.
+
 ## Files and submodules
 - `mod.rs`: the catalog — `all_engines()` and nothing else.
 - `flux2_klein.rs`: the FLUX.2 klein engine (IPC methods `inpaint.flux2_klein` streaming,
@@ -34,15 +42,18 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   contracts below. Size contract:
   multiple of 16, shortest side >= 128 px, area <= 1 MP, aspect not steeper than 8:1, declared
   through `constraints()` AND re-checked against the actual region size on the run path. The prompt
-  field is doubled: an optional user-language field plus a Google/Yandex/DeepL picker and a «↓»
-  button fill in the ENGLISH field that is the only one sent, reusing the translation tab's own
+  field is doubled: an optional user-language field with a «Перевести ↑» button on its row, plus a
+  Google/Yandex/DeepL picker, which together fill in the ENGLISH field that is the only one sent, reusing the translation tab's own
   `translate_texts_via_translator` on a worker thread. That English field is never empty:
   `FLUX2_DEFAULT_PROMPT` is substituted both for a new settings file and for one whose prompt is
-  missing or blank, because an empty prompt blocks the run gate. Under it sits the PROMPT CACHE
-  block: `.status` answers `prompt_cached` for the prompt it was asked about (an optional field —
-  an absent one reads as "not known", never as "not cached"), and the line above the buttons is
-  green/amber/neutral accordingly, shown only while that answer still describes the prompt in the
-  field. «Кэшировать» runs the streaming `.prompt_cache.build` on the SAME progress bar as a
+  missing or blank, because an empty prompt blocks the run gate. Under it sits ONE compact line
+  about the PROMPT CACHE: `.status` answers `prompt_cached` for the prompt it was asked about (an
+  optional field — an absent one reads as "not known", never as "not cached"), and the line is shown
+  only while that answer still describes the prompt in the field. Which of the competing facts takes
+  that single line is the pure `flux2_prompt_cache_line`, and an unknown state draws NOTHING — an
+  outstanding query is not information. The LIBRARY that produces the caches is folded behind the
+  «Библиотека промптов» toggle beside the prompt (session state, never a setting), and folding it
+  away changes no gate. «Кэшировать» runs the streaming `.prompt_cache.build` on the SAME progress bar as a
   generation (so neither can start while the other runs — reading the ~16 GB Qwen3 encoder takes
   ~106 s, against ~6 s for a cached prompt). The saved caches form a LIBRARY that lives
   backend-side (`prompt_cache/`, one folder per encoder family): `.prompt_cache.list` fills a
@@ -61,9 +72,11 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   «Минимум VRAM»); «Пользовательский» is never selectable — it is what the picker reports when the
   SEVEN fields a preset owns match none of them (placement, `low_cpu_mem_usage`, VAE
   tiling/slicing, `unload_transformer_before_vae`, `unload_text_encoder_after_encode`,
-  `text_encoder_fp8`). The last two are the text-encoder memory controls: the Qwen3 encoder is
-  ~16 GB and is needed exactly once per generation, so every economical preset drops it right after
-  the prompt is encoded, while `text_encoder_fp8` is `false` in EVERY preset — quantizing costs
+  `text_encoder_fp8`). The last two are the text-encoder memory controls, and BOTH are `false` in
+  EVERY preset. The Qwen3 encoder is ~16 GB and is needed exactly once per generation, but it is
+  loaded LAST — after the transformer already sits on the card — so it occupies host memory the
+  pipeline has just vacated, and holding it turns a new prompt from ~116 s into ~6 s; that is why
+  no preset unloads it after encoding. `text_encoder_fp8` stays off because quantizing costs
   embedding quality and is the user's decision alone. There is no negative prompt and there must
   not be one: the checkpoint is distilled (4 steps, guidance 1.0). The RAM/VRAM forecast is
   COMPUTED BY THE BACKEND (`.estimate`, peak = max over PHASES: prompt encoding, denoise, VAE
@@ -122,10 +135,15 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
   instead. `mask_feather_px` keeps working either way and softens the join between the region and the
   page.
-- A settings file written before the mode was derived carries a `whole_region` key that maps to no
-  field. `Flux2KleinSettings` does NOT use `deny_unknown_fields`, so serde drops it and the document
-  loads with every other setting intact; no migration exists for it and none may be added. A test
-  pins that such a document loads identically to the same document without the key.
+- A settings file written by an older build carries keys that map to no field any more:
+  `whole_region` (the mode is derived from the mask), `max_sequence_length` (PINNED to
+  `FLUX2_MAX_SEQ` = 512 and no longer a setting — 512 was already the maximum, so every value a
+  user could pick was a reduction, and the length is part of the prompt-cache key, so lowering it
+  invalidated the whole saved `.msprompt` library at once) and `brush_radius` (the brush belongs to
+  the host's `MaskBrush`). `Flux2KleinSettings` does NOT use `deny_unknown_fields`, so serde drops
+  them and the document loads with every other setting intact; no migration exists for any of them
+  and none may be added. A test pins that such a document loads identically to the same document
+  without the keys.
 - FLUX.2 klein RUNS WITHOUT A LOCAL TEXT ENCODER when the prompt is already cached: the denoise and
   the VAE decode never read the encoder, so a `.msprompt` carried to a machine that never downloaded
   the 16 GB Qwen3 is enough. The run gate (`flux2_run_block_reason`) therefore waives the
@@ -139,7 +157,9 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   are the same `false` — the second is what a settings file copied from another machine looks like),
   `.prompt_cache.load.encoder_verified` (whether the encoder fingerprint was compared or the file's
   metadata was taken on trust) and `.prompt_cache.list.text_encoder_available`. The UI consequences:
-  an amber warning line beside the cache status (a warning, not an error — ready caches still work),
+  the one line under the prompt taking an amber warning (a warning, not an error — ready caches
+  still work) unless the prompt is already cached, in which case the affirmative wins because the
+  run works either way,
   «Кэшировать» and «Сохранить кэш» disabled with their own tooltip (they are the only two library
   operations that need the encoder, and the backend refuses both), «Загрузить»/«Экспорт»/«Импорт»
   untouched, and a ONE-OFF notice in the prompt-cache warning slot after a load whose
@@ -164,9 +184,50 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   carries them untouched. Add any further placement-dependent flag there, not in a serde default.
 - The size gate is SPLIT and must stay split: the frame validates a rectangle against
   `constraints()`, the run path re-validates the actual region against `region_block_reason`, and
-  `flux2_run_block_reason` answers only for the model paths and the prompt. A test pins that
-  `constraints()` and `region_block_reason` accept exactly the same regions.
-- FLUX.2 klein reports PER-COMPONENT RESIDENCY and lets the user act on it. `.status`
+  `flux2_run_block_reason` answers only for the model paths, their CONTENTS and the prompt. A test
+  pins that `constraints()` and `region_block_reason` accept exactly the same regions.
+- **Whether the model is installed is ONE answer, `flux2_model_readiness`**, derived from the
+  cached `.status` presence catalog together with `effective_paths` and the source mode. It is
+  three-state and the three states are not interchangeable: `Unknown` (no answer has landed yet)
+  must NEVER block a run — an unanswerable status is not evidence of a missing model, and blocking
+  on it leaves «Обработать» dead on a slow backend; `Missing` is the only blocking verdict and
+  carries the SET of missing components, so one refusal names them all instead of sending the user
+  round the loop once per file; `Ready` passes. An empty required path is decided locally without
+  the backend, everything else waits for the catalog. This function exists because the emptiness
+  check alone CANNOT see a fresh download-mode installation: `effective_paths` derives its three
+  paths under `config::flux2_klein_dir()`, so they are never empty and the user used to receive the
+  backend's untranslated «Путь transformer_path не найден» instead of a local, actionable refusal.
+  The refusal text differs by mode because the fix does — a download is a button, a wrong manual
+  path is a field. The catalog is an answer ABOUT THREE PATHS, so it counts only while it still
+  describes the ones in the settings: `flux2_status_for_paths` drops an answer fetched for others,
+  which turns the verdict back into `Unknown` rather than leaving a refusal standing over a path
+  the user has just corrected, and a path change re-asks (`Flux2KleinEngine::note_settings_changed`
+  — a typed path arms the query, not only the folder picker). This is the same guard
+  `prompt_cache_state_for` applies to the prompt half of that answer, and every consumer reaches the
+  catalog through `Flux2KleinEngine::status_for_current_paths`. The SAME verdict is what the panel's
+  always-visible readiness line reports (`flux2_readiness_line`) and what decides the INITIAL open
+  state of «Установка модели», so the refusal under «Обработать» and the line above the section can
+  never disagree. «Установка модели» starts folded and opens ITSELF once, on the first `Missing`
+  that lands (`flux2_install_seed`) — never from a `default_open`, which on the first drawn frame
+  would only ever see the `Unknown` that precedes the first `.status` answer, and would therefore
+  open the section on every launch. A fold the user has already moved by hand retires that seeding:
+  a section closed while the verdict was still `Unknown` must not be reopened by the answer that
+  arrives afterwards. `Missing` is the
+  only state that offers «Установить», which opens that section; `Unknown` is neutral and offers
+  nothing, because nothing is known to be wrong. The `Ready` line carries the memory forecast and
+  turns amber on `fits: false` — the spelled-out warning lives inside «Память и скорость», which is
+  folded by default.
+- The engine's own `run_status` line carries only what NO OTHER SURFACE says: finished, recovered
+  from an out-of-memory failure, failed, cancelled. "The run has started" is deliberately absent —
+  the progress bar directly above it, the host's panel status line and the frame chrome all report
+  a running job already. A starting run CLEARS the slot instead, so the previous run's outcome
+  cannot linger over a new one.
+- FLUX.2 klein reports PER-COMPONENT RESIDENCY and lets the user act on it, in the SAME list
+  that reports which parts are on disk — one row per component carrying presence, size, residency
+  and the offered buttons together (`flux2_component_rows`), because two adjacent blocks named the
+  same five parts twice. A row the residency answer does not cover (the tokenizer and the scheduler
+  always; every row while the block is busy or unreported) keeps its presence half and claims no
+  state. `.status`
   answers a `components` block — for the text encoder, the transformer and the VAE — carrying
   `residency` (`not_loaded` / `ram` / `gpu` / `offloaded` / `mixed`; five states because
   accelerate's offload leaves the parameters on `meta` with the bytes in a host map, and a load
@@ -187,7 +248,7 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
   The pinned wire contract is `dev-docs/flux2_component_residency.md`.
 - **The model source is a MODE, and the two modes never mix.** `source_mode` (`manual` /
   `download`) is a persisted field beside the paths, switched by two toggle buttons at the TOP
-  of the parameters block, and exactly one body is drawn under it: the three manual path rows,
+  of «Установка модели», and exactly one body is drawn under it: the three manual path rows,
   or the download block. It DEFAULTS TO MANUAL and a settings file without the field loads as
   manual — such a file carries hand-entered paths, and loading it as `download` would hide a
   working configuration behind an empty download block and read as an update that broke the
@@ -283,6 +344,13 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
 - To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory presets,
   RAM/VRAM forecast or model-download block: `flux2_klein.rs`. The wire names of its methods live
   in `backend_ipc::protocol`.
+- To change what one of FLUX.2 klein's lines SAYS, edit its pure function and its test, never the
+  drawing code: `flux2_readiness_line` (the readiness line), `flux2_prompt_cache_line` (the one
+  line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
+  merged component list), `estimate_status_line` (the forecast, printed by two surfaces).
+- To move a control between FLUX.2 klein's sections: `Flux2PanelCtx::draw` is the whole order, and
+  the five bodies under it are `draw_prompt`, `draw_strength`, `draw_readiness`,
+  `draw_install_section`, `draw_memory_section` and `draw_advanced_section`.
 - To change where the Hugging Face token is stored or to add a SECOND UI surface for it:
   `src/hf_token.rs`, never here — this engine only reads the global and puts it on the wire.
 - To change where the downloaded model lands: `config::flux2_klein_dir` /

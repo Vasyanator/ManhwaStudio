@@ -159,7 +159,15 @@ const CLEANING_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(352.0, 360.0);
 const CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 160.0);
 /// Outer size, in points, the «Редактор области» panel starts at: the geometry lines,
 /// the constraint lines, one row per mask layer, the run button and two status lines.
-const CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(320.0, 300.0);
+///
+/// The width is the WIDEST this arrangement admits, not a guess: at 320 the engine
+/// bodies — the model paths, the translator row, the prompt-cache library — wrap every
+/// row, so the panel is opened wider than it starts. It cannot simply be set to the
+/// width a user works at: «Редактор области» hangs under «Лента» on the left chain and
+/// the quick-clean panel sits on the same chain, so anything from 348 pt up lays the
+/// two on top of each other on an ordinary 1600 pt area — which
+/// `the_default_dock_layout_solves_into_disjoint_panels` pins.
+const CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(344.0, 300.0);
 
 /// Extra width, in points, added to every measured tool-button caption before the
 /// «Инструменты клина» minimum is folded out of them.

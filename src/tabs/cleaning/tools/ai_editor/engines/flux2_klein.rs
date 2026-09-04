@@ -35,11 +35,43 @@ Selection contract (checked twice, on purpose):
   well) and refuses with a named reason: a host that hands over a region of another size
   gets an explanation instead of a request the backend would reject.
 
+Panel layout (`Flux2PanelCtx::draw`, and its ORDER is the design):
+progress bar -> run status -> the PROMPT block (the English field, the one compact line
+about its cache state, and two toggles that unfold the translator and the prompt-cache
+library) -> «Сила изменения» -> the READINESS line -> three sibling collapsible sections,
+«Установка модели» / «Память и скорость» / «Для экспертов» -> the mask note.
+Everything a user touches per edit is above the folds; everything set once per machine is
+inside them. There is no wrapper section around the whole body and no section nested in
+another. «Установка модели» is the only one built from `CollapsingState` rather than
+`RegionEditToolBase::draw_region_editor_collapsible_section`, because it has to be opened
+from outside itself: by «Установить» on the readiness line, and once by the first `Missing`
+verdict that lands (never by `default_open`, which on the first frame would only ever see
+the `Unknown` that precedes the first `.status` answer). That one-shot opening yields to
+the user: a fold he has moved by hand is never forced again — see `flux2_install_seed`.
+
 Key items:
 - `Flux2KleinEngine`: the `AiEngine` implementation and its wiring.
+- `flux2_readiness_line` / `flux2_prompt_cache_line` / `flux2_component_rows`: the panel's
+  decisions, kept as PURE functions with unit tests. What a line says, which fact wins the
+  one line the prompt block has for it, and how a component's two halves are joined are
+  contracts; the drawing code only renders their answers.
 - `Flux2KleinSettings`: everything persisted to `flux2_klein_settings.json`
   (`config::flux2_klein_settings_path`), loaded/saved on worker threads.
-  `normalized()` is the ONLY value ever put on the wire.
+  `normalized()` is the ONLY value ever put on the wire. The prompt token budget is
+  NOT among them: `FLUX2_MAX_SEQ` is pinned at 512, which was already the maximum
+  the backend accepts, and the length is part of the prompt-cache key — lowering it
+  invalidated every entry of the saved `.msprompt` library at once.
+- `Flux2ModelReadiness` / `flux2_model_readiness`: THE answer to "is the model
+  installed on this machine", derived from the `.status` presence catalog together
+  with `effective_paths` and the source mode. Three-state on purpose: `Unknown` (no
+  answer yet) never blocks a run, `Missing` blocks and names every missing component,
+  `Ready` passes. It is what keeps the refusal LOCAL in download mode, where the
+  derived paths are never empty and the backend's untranslated «Путь ... не найден»
+  used to be the first thing the user saw. The catalog it reads is an answer ABOUT
+  THREE PATHS and counts only while it still describes them (`flux2_status_for_paths`,
+  the exact counterpart of `prompt_cache_state_for` for the prompt half of the same
+  answer); a path edit both invalidates it — back to `Unknown`, which never blocks —
+  and re-arms the query (`note_settings_changed`).
 - `Flux2SessionState`: the run channel and the per-RUN undo stack. The painted mask is NOT
   here — it belongs to the host's `MaskStack` and arrives in `EngineRunRequest::masks`.
 - `MemoryPreset`: four built-in placement/VAE/text-encoder configurations plus `Custom`,
@@ -77,8 +109,10 @@ IPC (`backend_ipc::protocol`):
   library exists: the denoise and the VAE decode never look at the encoder, so a
   `.msprompt` carried to a machine that never downloaded the 16 GB Qwen3 is enough. The
   run gate therefore waives the encoder path when `.status` says the prompt is cached,
-  and only then. What the absence costs is stated where it happens: a warning line beside
-  the cache status ("only ready caches work"), a disabled «Кэшировать»/«Сохранить кэш»
+  and only then. What the absence costs is stated where it happens: the one line under the
+  prompt takes the warning ("only ready caches work") unless the prompt is already cached,
+  in which case the affirmative wins because the run works either way
+  (`flux2_prompt_cache_line`), a disabled «Кэшировать»/«Сохранить кэш»
   (the two operations that must ENCODE, refused backend-side anyway), the family shown on
   every library row (a machine with no encoder has no ACTIVE family, so the listing spans
   all of them), and a one-off notice after a load whose `encoder_verified` came back
@@ -100,7 +134,7 @@ IPC (`backend_ipc::protocol`):
   the backend refuses to load it, which is expected and is surfaced as a warning.
 - THE MODEL SOURCE IS A MODE (`source_mode`, persisted, defaulting to `manual`): either
   the user's own three paths, or the copy this panel downloads. Exactly one body is drawn
-  under the switch at the top of the parameters block.
+  under the switch at the top of «Установка модели».
   `Flux2KleinSettings::effective_paths` is the ONE answer to "which three paths does a run
   use" and every consumer goes through it. In download mode the paths are DERIVED from
   `config::flux2_klein_dir()` and the encoder toggle and the manual fields are never read
@@ -126,8 +160,9 @@ IPC (`backend_ipc::protocol`):
   The wire contract is `dev-docs/flux2_component_residency.md`.
 
 Contracts:
-- PER-COMPONENT RESIDENCY is reported by `.status` and rendered under the presence
-  catalog: `components[<name>].residency` is one of `not_loaded` / `ram` / `gpu` /
+- PER-COMPONENT RESIDENCY is reported by `.status` and rendered in the SAME list as the
+  presence catalog — one row per component carrying presence, size, residency and the
+  backend's action buttons together: `components[<name>].residency` is one of `not_loaded` / `ram` / `gpu` /
   `offloaded` / `mixed` — five and not three, because accelerate's offload leaves the
   parameters on `meta` with the bytes in a host map, and a load can leave a component
   genuinely split. An ABSENT `components` means NOT KNOWN and never "not loaded"
@@ -224,10 +259,13 @@ const FLUX2_STRENGTH_MIN: f32 = 0.25;
 const FLUX2_STRENGTH_MAX: f32 = 1.0;
 const FLUX2_DILATE_MAX: u32 = 64;
 const FLUX2_FEATHER_MAX: u32 = 32;
-const FLUX2_MAX_SEQ_MIN: u32 = 64;
-const FLUX2_MAX_SEQ_MAX: u32 = 512;
-const FLUX2_BRUSH_MIN: u32 = 1;
-const FLUX2_BRUSH_MAX: u32 = 256;
+/// Prompt token budget put on the wire, PINNED and no longer a setting.
+///
+/// It is also the maximum the backend accepts, so every value a user could have chosen
+/// was a reduction; worse, the length is part of the prompt-cache key, so lowering it
+/// invalidated every `.msprompt` in the saved library at once (the backend refuses a cache
+/// built at another length). The constant stays because the wire field stays.
+const FLUX2_MAX_SEQ: u32 = 512;
 
 /// Generation may load ~20 GB of weights before the first step; allow a wide window.
 const FLUX2_RUN_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
@@ -250,9 +288,6 @@ const FLUX2_BREAKDOWN_PEAK_DECODE: &str = "peak_decode";
 /// peak of its own rather than a term added to the others. A backend that does not
 /// report it simply leaves the line out of the tooltip.
 const FLUX2_BREAKDOWN_PEAK_ENCODE: &str = "peak_encode";
-
-/// Painter opacity of a control that is still live but currently has no effect.
-const FLUX2_FADED_CONTROL_OPACITY: f32 = 0.45;
 
 /// Horizontal room left for the «Сохранить кэш» button beside the name field, points.
 /// The field takes whatever is left, so the button never wraps onto its own line.
@@ -714,15 +749,6 @@ struct Flux2KleinSettings {
     mask_dilate_px: u32,
     mask_feather_px: u32,
     color_match: bool,
-    max_sequence_length: u32,
-    /// Brush radius of the mask painter, in region pixels. UI-only, never sent.
-    ///
-    /// Nothing reads it since the brush became the HOST's: the frame's `MaskBrush` is shared by
-    /// every engine and owns the live radius. The field is kept rather than deleted because the
-    /// file it lives in is the user's and dropping it would silently discard a value they chose;
-    /// remove it, with `FLUX2_BRUSH_MIN`/`FLUX2_BRUSH_MAX` and its clamp, once the host round has
-    /// decided where a shared brush radius is persisted.
-    brush_radius: u32,
 }
 
 impl Default for Flux2KleinSettings {
@@ -773,8 +799,6 @@ impl Default for Flux2KleinSettings {
             // cleaner again (+0.3%) but gives up too much of it.
             mask_feather_px: 12,
             color_match: true,
-            max_sequence_length: FLUX2_MAX_SEQ_MAX,
-            brush_radius: 24,
         }
     }
 }
@@ -836,10 +860,6 @@ impl Flux2KleinSettings {
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
             color_match: self.color_match,
-            max_sequence_length: self
-                .max_sequence_length
-                .clamp(FLUX2_MAX_SEQ_MIN, FLUX2_MAX_SEQ_MAX),
-            brush_radius: self.brush_radius.clamp(FLUX2_BRUSH_MIN, FLUX2_BRUSH_MAX),
         }
     }
 
@@ -923,7 +943,9 @@ impl Flux2KleinSettings {
             "mask_dilate_px": self.mask_dilate_px,
             "mask_feather_px": self.mask_feather_px,
             "color_match": self.color_match,
-            "max_sequence_length": self.max_sequence_length,
+            // Pinned, not a setting: see `FLUX2_MAX_SEQ`. The field stays on the wire
+            // because the backend still reads it.
+            "max_sequence_length": FLUX2_MAX_SEQ,
         })
     }
 }
@@ -1114,15 +1136,6 @@ impl Flux2ComponentId {
         }
     }
 
-    /// The hover that says what the component IS — the block reports where the weights
-    /// are, which means nothing to a user who does not know what each part does.
-    fn hint(self) -> &'static str {
-        match self {
-            Self::TextEncoder => t!("cleaning.tools.flux2_klein.component_text_encoder_hint"),
-            Self::Transformer => t!("cleaning.tools.flux2_klein.component_transformer_hint"),
-            Self::Vae => t!("cleaning.tools.flux2_klein.component_vae_hint"),
-        }
-    }
 }
 
 /// One action the BACKEND offered for a component.
@@ -2429,8 +2442,15 @@ pub struct Flux2KleinEngine {
     /// rectangle usually does not change on the frame the pointer is released, so the size
     /// change would be forgotten and the forecast would never be re-armed.
     region_resize_pending: bool,
-    /// User-facing line about the last run (started, finished, recovered, failed,
-    /// cancelled), shown in this engine's own panel under the progress bar.
+    /// User-facing line about the last run, shown in this engine's own panel under the
+    /// progress bar. `None` while a run is in flight and before the first one.
+    ///
+    /// It carries only what NO OTHER SURFACE says: finished, recovered from an
+    /// out-of-memory failure, failed, cancelled. "The run has started" is deliberately not
+    /// among them — the progress bar directly above, the host's panel status line and the
+    /// frame's chrome all report a running job already, and a fourth copy of that sentence
+    /// only cost vertical space. A starting run therefore CLEARS this slot rather than
+    /// writing to it, so the previous run's outcome cannot linger over a new one.
     run_status: Option<String>,
     settings: Flux2KleinSettings,
     settings_rx: Option<Receiver<Flux2KleinSettings>>,
@@ -2452,6 +2472,16 @@ pub struct Flux2KleinEngine {
     /// still equals the prompt in the field — otherwise the answer is about a prompt
     /// the user has already edited away from, and the honest state is "not known yet".
     status_prompt: Option<String>,
+    /// The effective paths the query currently in flight was asked about, moved into
+    /// `status_paths` when its answer lands. The exact counterpart of
+    /// `status_query_prompt`: the catalog is an answer about THREE PATHS as much as it is
+    /// one about a prompt.
+    status_query_paths: Option<Flux2EffectivePaths>,
+    /// The effective paths `status` describes. The presence half of the catalog counts
+    /// only while they still equal [`Flux2KleinSettings::effective_paths`] — otherwise the
+    /// answer is about files the user has already typed away from, and the honest verdict
+    /// is `Unknown` ([`flux2_status_for_paths`]).
+    status_paths: Option<Flux2EffectivePaths>,
     /// The one prompt-cache operation (build / save / load / export / import) that may
     /// be in flight. All five share the channel because only one can run at a time.
     prompt_cache_rx: Option<Receiver<Result<Flux2PromptCacheOutcome, String>>>,
@@ -2520,6 +2550,34 @@ pub struct Flux2KleinEngine {
     picker: Option<Flux2PickerPurpose>,
     progress: Arc<Mutex<Flux2Progress>>,
     ai_backend_available: bool,
+    /// Whether the prompt-cache LIBRARY is unfolded under the prompt block.
+    ///
+    /// SESSION state and deliberately not a persisted setting: the library is a workbench
+    /// the user opens to save, load or carry a `.msprompt` and closes again, so remembering
+    /// it across launches would re-expand an expert surface on every start. What the library
+    /// EXPLAINS — whether the current prompt is cached — is drawn outside it either way,
+    /// because that one line is what predicts a ~106 s encoder read.
+    prompt_library_open: bool,
+    /// Whether the FIRST definite model verdict has already chosen the initial state of
+    /// «Установка модели».
+    ///
+    /// Session state, and it exists because the verdict is not known on the frame the
+    /// panel first draws: `.status` has not answered yet, so a `default_open` read from
+    /// the verdict would always see `Unknown` and open the section on every launch,
+    /// including on a machine where everything is installed. The section therefore starts
+    /// folded and is opened ONCE, on the first `Missing` that lands; a `Ready` seeds it
+    /// without opening anything. After that the user's own clicks are the only thing that
+    /// moves it — a section forced open per frame cannot be closed.
+    install_section_seeded: bool,
+    /// The open state «Установка модели» was LEFT IN by the previous drawn frame; `None`
+    /// before the first one.
+    ///
+    /// Session state, and it exists to tell the user's clicks apart from this file's own
+    /// `set_open`: a state that differs from what was recorded can only have been moved by
+    /// the header (or Escape), and that retires the one-shot seeding. Without it a user who
+    /// opens and closes the section while the verdict is still `Unknown` — the whole window
+    /// a slow `.status` leaves open — gets it forced open again by the first `Missing`.
+    install_section_open_prev: Option<bool>,
 }
 
 impl Default for Flux2KleinEngine {
@@ -2540,6 +2598,8 @@ impl Default for Flux2KleinEngine {
             status_wanted: true,
             status_query_prompt: None,
             status_prompt: None,
+            status_query_paths: None,
+            status_paths: None,
             prompt_cache_rx: None,
             prompt_cache_status: None,
             prompt_cache_warning: None,
@@ -2573,6 +2633,9 @@ impl Default for Flux2KleinEngine {
             picker: None,
             progress: Arc::new(Mutex::new(Flux2Progress::default())),
             ai_backend_available: false,
+            prompt_library_open: false,
+            install_section_seeded: false,
+            install_section_open_prev: None,
         };
         engine.request_settings_load();
         engine
@@ -2650,18 +2713,22 @@ impl Flux2KleinEngine {
                     self.status = Some(status);
                     self.status_error = None;
                     self.status_rx = None;
-                    // The answer describes the prompt that travelled with the question,
-                    // which may already be several keystrokes behind the field.
+                    // The answer describes the prompt AND the paths that travelled with the
+                    // question, either of which may already be several keystrokes behind
+                    // the fields.
                     self.status_prompt = self.status_query_prompt.take();
+                    self.status_paths = self.status_query_paths.take();
                 }
                 Ok(Err(err)) => {
                     self.status_error = Some(err);
                     self.status_rx = None;
                     self.status_query_prompt = None;
+                    self.status_query_paths = None;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.status_rx = None;
                     self.status_query_prompt = None;
+                    self.status_query_paths = None;
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -2683,8 +2750,13 @@ impl Flux2KleinEngine {
             // specific prompt, not about the tool in general. The mode goes as `false`:
             // there is no mask behind a catalog query, and the backend's own `.status`
             // probe forces the same value for the same reason.
-            let params = self.settings.normalized().to_params(false);
+            let normalized = self.settings.normalized();
+            let params = normalized.to_params(false);
             self.status_query_prompt = Some(self.settings.prompt.trim().to_string());
+            // Taken from the SAME value that built the params, so what is recorded is
+            // literally what went on the wire and the guard below cannot compare the
+            // answer against paths it was never asked about.
+            self.status_query_paths = Some(normalized.effective_paths());
             let (tx, rx) = mpsc::channel();
             self.status_rx = Some(rx);
             thread::spawn(move || {
@@ -2705,6 +2777,53 @@ impl Flux2KleinEngine {
             self.status_prompt.as_deref(),
             &self.settings.prompt,
         )
+    }
+
+    /// The `.status` catalog, but only while it still describes the paths a run would use.
+    ///
+    /// THE accessor every presence judgement goes through, exactly as
+    /// [`Self::prompt_cache_state`] is the one for the cache half of the same answer.
+    /// The raw `status` field stays available for what is genuinely about the machine
+    /// rather than about the paths — the residency block, the device line, the totals.
+    fn status_for_current_paths(&self) -> Option<&Flux2Status> {
+        flux2_status_for_paths(
+            self.status.as_ref(),
+            self.status_paths.as_ref(),
+            &self.settings.effective_paths(),
+        )
+    }
+
+    /// THE verdict on whether the model is installed, guarded against a stale catalog.
+    ///
+    /// Both consumers — the panel's readiness line and the run gate — read this rather
+    /// than calling [`flux2_model_readiness`] with the raw `status`, so an answer about
+    /// paths the user has already edited away from can never refuse a run.
+    fn model_readiness(&self) -> Flux2ModelReadiness {
+        flux2_model_readiness(
+            &self.settings,
+            self.status_for_current_paths(),
+            self.prompt_cache_state(),
+        )
+    }
+
+    /// Records a parameter change and re-arms the background answers it invalidated.
+    ///
+    /// The memory forecast is re-armed as a whole, because any parameter can move it. The
+    /// `.status` catalog is re-asked only when the change moved the EFFECTIVE PATHS: the
+    /// catalog is an answer about exactly those three paths, so a change that leaves them
+    /// alone cannot make it stale — and arming unconditionally would fire an IPC per frame
+    /// of a dragged wheel. A typed or pasted path correction reaches the backend through
+    /// here; only the folder picker arms the query on its own.
+    fn note_settings_changed(&mut self) {
+        self.dirty = true;
+        self.estimate_wanted = true;
+        if flux2_status_paths_stale(
+            &self.settings.effective_paths(),
+            self.status_paths.as_ref(),
+            self.status_query_paths.as_ref(),
+        ) {
+            self.status_wanted = true;
+        }
     }
 
     /// Polls the `.estimate` query and sends a new one when something armed
@@ -3612,6 +3731,9 @@ impl AiEngine for Flux2KleinEngine {
         // derived from `status` AND `settings`, so it cannot be computed while both are
         // held by the context.
         let prompt_cache_state = self.prompt_cache_state();
+        // Same reason, and the staleness guard it applies reads `status_paths`, which the
+        // destructure below does not hand out: the panel gets the finished verdict.
+        let readiness = self.model_readiness();
         // Same reason, and it reads three receivers the destructure hands out separately.
         let pipeline_busy = self.pipeline_busy();
         let region = self.region_size();
@@ -3635,6 +3757,9 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_list_error,
                 prompt_cache_selected,
                 prompt_cache_name_input,
+                prompt_library_open,
+                install_section_seeded,
+                install_section_open_prev,
                 hf_token_input,
                 hf_token_rx,
                 hf_token_status,
@@ -3669,6 +3794,10 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_busy: prompt_cache_rx.is_some(),
                 prompt_cache_selected,
                 prompt_cache_name_input,
+                prompt_library_open,
+                install_section_seeded,
+                install_section_open_prev,
+                readiness,
                 hf_token_state,
                 hf_token_input,
                 hf_token_status: hf_token_status.as_deref(),
@@ -3696,10 +3825,7 @@ impl AiEngine for Flux2KleinEngine {
         }
 
         if settings_changed {
-            self.dirty = true;
-            // Any parameter can move the memory forecast, so it is re-armed as a whole
-            // rather than diffed field by field.
-            self.estimate_wanted = true;
+            self.note_settings_changed();
         }
         if want_status {
             self.status_wanted = true;
@@ -3766,7 +3892,9 @@ impl AiEngine for Flux2KleinEngine {
         if self.non_run_pipeline_busy() {
             return Some(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());
         }
-        flux2_run_block_reason(&self.settings, self.prompt_cache_state())
+        // The GUARDED catalog: an answer about paths the user has already corrected must
+        // not refuse the run its correction just made possible.
+        flux2_run_block_reason(&self.settings, self.status_for_current_paths(), self.prompt_cache_state())
     }
 
     /// Validates the host's request and starts the run.
@@ -3831,8 +3959,12 @@ impl AiEngine for Flux2KleinEngine {
         // stale afterwards.
         self.status_wanted = true;
         self.estimate_wanted = true;
-        self.run_status =
-            Some(t!("cleaning.mask_editor.processing_background_status").to_string());
+        // CLEARED, not set to «идёт обработка»: that sentence is already on screen three
+        // times over — the progress bar this line sits under, the host's panel status line
+        // and the frame's own chrome — and a fourth copy only pushed the panel down. What
+        // the slot must not do is keep showing the PREVIOUS run's outcome while a new one
+        // is in flight, which is what setting it to `None` here prevents.
+        self.run_status = None;
         Ok(())
     }
 
@@ -3860,8 +3992,7 @@ impl AiEngine for Flux2KleinEngine {
             &mut self.run_status,
         );
         if settings_changed {
-            self.dirty = true;
-            self.estimate_wanted = true;
+            self.note_settings_changed();
         }
 
         let region = self.region_size();
@@ -3974,6 +4105,20 @@ struct Flux2PanelCtx<'a> {
     prompt_cache_busy: bool,
     prompt_cache_selected: &'a mut Option<String>,
     prompt_cache_name_input: &'a mut String,
+    /// Session flag of the «Библиотека промптов» toggle — see
+    /// [`Flux2KleinEngine::prompt_library_open`]. The toggle writes it directly, which is
+    /// why it is a `&mut bool` and not one more intent field.
+    prompt_library_open: &'a mut bool,
+    /// Session flag of «Установка модели» — see [`Flux2KleinEngine::install_section_seeded`].
+    install_section_seeded: &'a mut bool,
+    /// The fold state that section was left in last frame — see
+    /// [`Flux2KleinEngine::install_section_open_prev`]. Written back at the end of the
+    /// frame, which is what tells the user's own clicks from this file's `set_open`.
+    install_section_open_prev: &'a mut Option<bool>,
+    /// THE model verdict for this frame, already guarded against a stale catalog
+    /// ([`Flux2KleinEngine::model_readiness`]). Handed in rather than derived here so the
+    /// readiness line and the run gate cannot answer the question differently.
+    readiness: Flux2ModelReadiness,
     /// Tri-state of the OS secret store: not read yet / no token / a token is stored.
     hf_token_state: crate::hf_token::HfTokenState,
     /// The token field's buffer. Drawn masked and never persisted.
@@ -4024,93 +4169,44 @@ impl Flux2PanelCtx<'_> {
     ///
     /// `region` is the frame rectangle's size, `None` while the tool has no frame; the
     /// controls that describe a region are then simply not drawn.
+    ///
+    /// The ORDER is the panel's whole design and is load-bearing: what a user touches on
+    /// every edit comes first and is never behind a fold (the prompt, its cache state, the
+    /// strength dial), the ONE line that says whether the model is installed at all is next,
+    /// and the three one-time-setup surfaces are collapsible siblings under it. The model
+    /// paths used to sit two clicks deep while the expert prompt library was expanded on
+    /// every frame; that is the inversion this order exists to undo.
     fn draw(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
         draw_flux2_progress_ui(ui, self.progress);
         if let Some(status) = self.run_status {
             ui.small(status);
         }
         self.draw_prompt(ui);
-        self.draw_params(ui, region);
+        self.draw_strength(ui);
+        // Handed in, not derived: the readiness line reports it and the setup section
+        // decides its INITIAL open state from it, and the run gate answers the same
+        // question — two derivations could disagree, and only the engine holds the paths
+        // the catalog was asked about.
+        let readiness = self.readiness;
+        // Pressed THIS frame, and the section below is drawn after — so «Установить» opens
+        // it without a session flag and without forcing it open on any later frame.
+        let install_requested = self.draw_readiness(ui, readiness);
+        self.draw_install_section(ui, region, readiness, install_requested);
+        self.draw_memory_section(ui);
+        draw_advanced_section(ui, self.settings, self.settings_changed);
         draw_flux2_mask_hint(ui);
     }
 
-    /// Draws the prompt block: the optional user-language field with its translator
-    /// row above, then the English field that is actually sent.
+    /// Draws the prompt block: the English field that is actually sent, the one compact
+    /// line about its cache state, and the two toggles that unfold the translator and the
+    /// prompt-cache library.
+    ///
+    /// Both toggles are stock `Ui::toggle_value`s in a `horizontal_wrapped`: the panel is a
+    /// dock tab and is often ~300 px wide, so a row of two captions must be allowed to wrap
+    /// rather than clip. «Перевод» is the persisted `translate_prompt` setting; «Библиотека
+    /// промптов» is session-only (see [`Flux2KleinEngine::prompt_library_open`]).
     fn draw_prompt(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        *self.settings_changed |= ui
-            .checkbox(
-                &mut self.settings.translate_prompt,
-                t!("cleaning.tools.flux2_klein.translate_prompt_label"),
-            )
-            .changed();
-
-        if self.settings.translate_prompt {
-            ui.label(t!("cleaning.tools.flux2_klein.source_prompt_label"));
-            *self.settings_changed |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.settings.source_prompt)
-                        .id_salt("cleaning_flux2_klein_source_prompt")
-                        .hint_text(t!("cleaning.tools.flux2_klein.source_prompt_hint"))
-                        .desired_rows(2),
-                )
-                .changed();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(t!("cleaning.tools.flux2_klein.mt_service_label"));
-                let mut service = MtService::from_key(&self.settings.mt_service)
-                    .unwrap_or(MtService::Google);
-                WheelComboBox::from_id_salt("cleaning_flux2_klein_mt_service")
-                    .selected_text(service.title())
-                    .show_ui(ui, |ui| {
-                        for candidate in MtService::all() {
-                            ui.selectable_value(&mut service, *candidate, candidate.title());
-                        }
-                    });
-                if service.key() != self.settings.mt_service {
-                    self.settings.mt_service = service.key().to_string();
-                    *self.settings_changed = true;
-                }
-
-                ui.label(t!("cleaning.tools.flux2_klein.source_lang_label"));
-                let mut lang = normalize_source_lang(&self.settings.source_lang);
-                WheelComboBox::from_id_salt("cleaning_flux2_klein_source_lang")
-                    .selected_text(source_lang_title(&lang))
-                    .show_ui(ui, |ui| {
-                        for candidate in MT_SOURCE_LANGUAGES {
-                            ui.selectable_value(
-                                &mut lang,
-                                candidate.code.to_string(),
-                                candidate.title(),
-                            );
-                        }
-                    });
-                if lang != self.settings.source_lang {
-                    self.settings.source_lang = lang;
-                    *self.settings_changed = true;
-                }
-
-                let can_translate =
-                    !self.translate_busy && !self.settings.source_prompt.trim().is_empty();
-                // A glyph, not prose: the caption is the tooltip.
-                let arrow = ui
-                    .add_enabled(can_translate, egui::Button::new("↓"))
-                    .on_hover_text(t!("cleaning.tools.flux2_klein.translate_button_tooltip"))
-                    .on_disabled_hover_text(t!(
-                        "cleaning.tools.flux2_klein.translate_button_disabled_tooltip"
-                    ));
-                if arrow.clicked() {
-                    *self.translate_requested = true;
-                }
-                if self.translate_busy {
-                    ui.spinner();
-                    ui.ctx().request_repaint();
-                }
-            });
-            if let Some(status) = self.translate_status {
-                ui.small(status);
-            }
-        }
-
         ui.label(t!("cleaning.tools.flux2_klein.prompt_label"));
         let prompt_edited = ui
             .add(
@@ -4130,49 +4226,165 @@ impl Flux2PanelCtx<'_> {
             // forecast uses.
             *self.want_status = true;
         }
-        self.draw_prompt_cache(ui);
+        self.draw_prompt_cache_line(ui);
+
+        ui.horizontal_wrapped(|ui| {
+            *self.settings_changed |= ui
+                .toggle_value(
+                    &mut self.settings.translate_prompt,
+                    t!("cleaning.tools.flux2_klein.translate_prompt_label"),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.translate_prompt_hint"))
+                .changed();
+            ui.toggle_value(
+                self.prompt_library_open,
+                t!("cleaning.tools.flux2_klein.prompt_library_label"),
+            )
+            .on_hover_text(t!("cleaning.tools.flux2_klein.prompt_library_hint"));
+        });
+
+        if self.settings.translate_prompt {
+            self.draw_translator(ui);
+        }
+        if *self.prompt_library_open {
+            self.draw_prompt_cache_library(ui);
+        }
     }
 
-    /// Draws the prompt-cache block directly under the English prompt field: the cache
-    /// line, «Кэшировать», the save-under-a-name row, and the library row (the saved
-    /// entries of the current encoder family plus load / export / import).
+    /// Draws the machine-translation sub-block: the user-language field with the translate
+    /// button at the right edge of its own row, the service and source-language pickers
+    /// under it, and the status line of the last translation.
     ///
-    /// The line is the reason the rest is there: encoding a new prompt costs a ~106 s read
-    /// of the 16 GB Qwen3 encoder, while a cached one costs ~6 s, so whether THIS prompt
-    /// is cached is the single fact that decides how long the next run takes.
-    fn draw_prompt_cache(&mut self, ui: &mut egui::Ui) {
-        match self.prompt_cache_state {
-            Some(true) => {
+    /// The button carries a caption rather than a glyph and points UP, at the English field
+    /// it fills — the direction a bare arrow left the user to guess.
+    ///
+    /// Unfolded by the «Перевод» toggle and unchanged in behaviour — it still writes into
+    /// the ENGLISH field, which stays the only text that reaches the backend.
+    fn draw_translator(&mut self, ui: &mut egui::Ui) {
+        ui.label(t!("cleaning.tools.flux2_klein.source_prompt_label"));
+        // The button belongs beside the field it reads, not below the pickers that only
+        // configure it: right-to-left places it at the row's right edge first, and the
+        // field then takes whatever width is left, so the pair reads as one action.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let can_translate =
+                !self.translate_busy && !self.settings.source_prompt.trim().is_empty();
+            let translate = ui
+                .add_enabled(
+                    can_translate,
+                    egui::Button::new(t!("cleaning.tools.flux2_klein.translate_button_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.translate_button_tooltip"))
+                .on_disabled_hover_text(t!(
+                    "cleaning.tools.flux2_klein.translate_button_disabled_tooltip"
+                ));
+            if translate.clicked() {
+                *self.translate_requested = true;
+            }
+            if self.translate_busy {
+                ui.spinner();
+                ui.ctx().request_repaint();
+            }
+            // Asked for explicitly: a right-to-left layout gives a multiline `TextEdit`
+            // its natural width and packs it against the button, leaving a gap on the
+            // left. `available_width` here is already the row minus the button.
+            let field_width = ui.available_width();
+            *self.settings_changed |= ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.settings.source_prompt)
+                        .id_salt("cleaning_flux2_klein_source_prompt")
+                        .hint_text(t!("cleaning.tools.flux2_klein.source_prompt_hint"))
+                        .desired_width(field_width)
+                        .desired_rows(2),
+                )
+                .changed();
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t!("cleaning.tools.flux2_klein.mt_service_label"));
+            let mut service = MtService::from_key(&self.settings.mt_service)
+                .unwrap_or(MtService::Google);
+            WheelComboBox::from_id_salt("cleaning_flux2_klein_mt_service")
+                .selected_text(service.title())
+                .show_ui(ui, |ui| {
+                    for candidate in MtService::all() {
+                        ui.selectable_value(&mut service, *candidate, candidate.title());
+                    }
+                });
+            if service.key() != self.settings.mt_service {
+                self.settings.mt_service = service.key().to_string();
+                *self.settings_changed = true;
+            }
+
+            ui.label(t!("cleaning.tools.flux2_klein.source_lang_label"));
+            let mut lang = normalize_source_lang(&self.settings.source_lang);
+            WheelComboBox::from_id_salt("cleaning_flux2_klein_source_lang")
+                .selected_text(source_lang_title(&lang))
+                .show_ui(ui, |ui| {
+                    for candidate in MT_SOURCE_LANGUAGES {
+                        ui.selectable_value(
+                            &mut lang,
+                            candidate.code.to_string(),
+                            candidate.title(),
+                        );
+                    }
+                });
+            if lang != self.settings.source_lang {
+                self.settings.source_lang = lang;
+                *self.settings_changed = true;
+            }
+
+        });
+        if let Some(status) = self.translate_status {
+            ui.small(status);
+        }
+    }
+
+    /// Draws the ONE compact line under the prompt field that says what the next run will
+    /// cost: whether these embeddings are already held, or whether this machine has no
+    /// encoder to make them with.
+    ///
+    /// It stays OUTSIDE the collapsible library on purpose. Encoding a new prompt costs a
+    /// ~106 s read of the 16 GB Qwen3 encoder against ~6 s for a cached one, and a cached
+    /// prompt is also what waives the encoder in the run gate — so this is everyday
+    /// information, while the library that produces it is expert tooling.
+    /// [`flux2_prompt_cache_line`] decides which line that is, and an unknown state draws
+    /// nothing at all.
+    fn draw_prompt_cache_line(&mut self, ui: &mut egui::Ui) {
+        match flux2_prompt_cache_line(self.prompt_cache_state, self.text_encoder_available()) {
+            Flux2PromptCacheLine::Silent => {}
+            Flux2PromptCacheLine::Cached => {
                 ui.colored_label(
                     FLUX2_STATUS_OK_COLOR,
                     t!("cleaning.tools.flux2_klein.prompt_cached_status"),
                 );
             }
-            Some(false) => {
+            Flux2PromptCacheLine::NotCached => {
                 ui.colored_label(
                     FLUX2_STATUS_WARN_COLOR,
                     t!("cleaning.tools.flux2_klein.prompt_not_cached_status"),
                 );
             }
-            // Not known yet — see `Flux2KleinEngine::prompt_cache_state`. A neutral line,
-            // never the warning one: the answer is outstanding, not negative.
-            None => {
-                ui.small(t!("cleaning.tools.flux2_klein.prompt_cache_unknown_status"));
+            // A WARNING, not an error: without an encoder the tool still generates from
+            // ready caches, and only encoding a new prompt is closed.
+            Flux2PromptCacheLine::NoEncoder => {
+                ui.colored_label(
+                    FLUX2_STATUS_WARN_COLOR,
+                    t!("cleaning.tools.flux2_klein.text_encoder_missing_warning"),
+                );
             }
         }
+    }
 
+    /// Draws the prompt-cache LIBRARY, unfolded by the «Библиотека промптов» toggle:
+    /// «Кэшировать», the save-under-a-name row, and the library row (the saved entries of
+    /// the current encoder family plus load / export / import), with the outcome lines of
+    /// the last operation under them.
+    ///
+    /// Every gate is unchanged — the state the line above reports is what decides most of
+    /// them, and folding the buttons away neither grants nor withdraws anything.
+    fn draw_prompt_cache_library(&mut self, ui: &mut egui::Ui) {
         let text_encoder_available = self.text_encoder_available();
         // Only a positive `false` counts: "not known" must neither warn nor close a button.
         let encoder_missing = text_encoder_available == Some(false);
-        // A WARNING, not an error: without an encoder the tool still generates from ready
-        // caches, and only encoding a new prompt is closed. The amber of "not cached" says
-        // exactly that — something is limited, nothing is broken.
-        if encoder_missing {
-            ui.colored_label(
-                FLUX2_STATUS_WARN_COLOR,
-                t!("cleaning.tools.flux2_klein.text_encoder_missing_warning"),
-            );
-        }
 
         let gates = flux2_prompt_cache_gates(
             self.settings,
@@ -4366,27 +4578,122 @@ impl Flux2PanelCtx<'_> {
         }
     }
 
-    /// Draws the collapsed-by-default parameter section: model paths, generation
-    /// parameters, the memory preset with its forecast, the nested advanced section,
-    /// and the backend catalog/unload controls.
-    fn draw_params(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
+    /// Draws the panel's one creative dial: how far the model may move away from what is
+    /// already drawn in the region.
+    ///
+    /// It sits outside every fold on purpose — it is the control a user reaches for
+    /// between two runs of the same prompt, and the only generation parameter that is.
+    /// The rest live in «Для экспертов».
+    fn draw_strength(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        *self.settings_changed |= ui
+            .add(
+                WheelSlider::new(
+                    &mut self.settings.strength,
+                    FLUX2_STRENGTH_MIN..=FLUX2_STRENGTH_MAX,
+                )
+                .text(t!("cleaning.tools.flux2_klein.strength_label")),
+            )
+            .on_hover_text(t!("cleaning.tools.flux2_klein.strength_hint"))
+            .changed();
+    }
+
+    /// Draws the always-visible readiness line with its buttons, and reports whether
+    /// «Установить» was pressed this frame.
+    ///
+    /// ONE line, because "is the model installed?" has ONE answer
+    /// ([`flux2_model_readiness`]); the panel used to leave the user to assemble it from a
+    /// five-row presence catalog, a three-row residency block and a refusal under
+    /// «Обработать». What the line says is decided by [`flux2_readiness_line`], never here.
+    ///
+    /// The refresh button re-arms BOTH the component catalog and the memory forecast. Both
+    /// are re-armed automatically by everything that happens inside the app, so the only
+    /// staleness left is the kind caused from outside it — another process taking VRAM, a
+    /// file appearing on disk — and that is one condition, not the two buttons this
+    /// replaces.
+    fn draw_readiness(&mut self, ui: &mut egui::Ui, readiness: Flux2ModelReadiness) -> bool {
+        ui.separator();
+        // Only the READY line carries the forecast: while a component is missing the
+        // figures describe a run that cannot start, and naming what is missing is the
+        // actionable half.
+        let memory = match readiness {
+            Flux2ModelReadiness::Ready => self.estimate.map(|estimate| Flux2MemorySummary {
+                line: estimate_status_line(estimate, self.status),
+                fits: estimate.fits,
+            }),
+            Flux2ModelReadiness::Missing(_) | Flux2ModelReadiness::Unknown => None,
+        };
+        let line = flux2_readiness_line(readiness, memory);
+        let text = line.text();
+        let mut install_requested = false;
+        ui.horizontal_wrapped(|ui| {
+            match line.tone() {
+                Flux2LineTone::Ok => {
+                    ui.colored_label(FLUX2_STATUS_OK_COLOR, text);
+                }
+                Flux2LineTone::Warn => {
+                    ui.colored_label(FLUX2_STATUS_WARN_COLOR, text);
+                }
+                Flux2LineTone::Neutral => {
+                    ui.small(text);
+                }
+            }
+            if line.offers_install()
+                && ui
+                    .small_button(t!("cleaning.tools.flux2_klein.install_button"))
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.install_hint"))
+                    .clicked()
+            {
+                install_requested = true;
+            }
+            if ui
+                .small_button(t!("cleaning.tools.flux2_klein.refresh_state_button"))
+                .on_hover_text(t!("cleaning.tools.flux2_klein.refresh_state_hint"))
+                .clicked()
+            {
+                *self.want_status = true;
+                *self.want_estimate = true;
+            }
+        });
+        install_requested
+    }
+
+    /// Draws «Установка модели»: where the model comes from, what of it is on disk, where
+    /// its weights currently are, and the one button that frees them again.
+    ///
+    /// This is the section without which nothing works, so it starts folded and OPENS
+    /// ITSELF once — on the first `Missing` verdict that lands, and only while the user has
+    /// not already moved the fold himself ([`flux2_install_seed`],
+    /// [`Flux2KleinEngine::install_section_seeded`]). It is deliberately not driven by
+    /// `default_open`: on the frame the panel first draws, `.status` has not answered and
+    /// the verdict is `Unknown`, so a default read from it would open the section on every
+    /// launch. After the one seeding the state is never forced again, because a section
+    /// reopened per frame cannot be closed. `open_requested` is «Установить» of the
+    /// readiness line, pressed in THIS frame above: the button opens the section it points
+    /// at without a session flag of its own.
+    ///
+    /// A raw [`egui::CollapsingHeader`] cannot be opened from elsewhere, which is why this
+    /// one section is built from [`egui::collapsing_header::CollapsingState`] while its two
+    /// siblings use `RegionEditToolBase::draw_region_editor_collapsible_section`.
+    fn draw_install_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        region: Option<[usize; 2]>,
+        readiness: Flux2ModelReadiness,
+        open_requested: bool,
+    ) {
         let settings = &mut *self.settings;
         let changed = &mut *self.settings_changed;
-        let want_status = &mut *self.want_status;
-        let want_estimate = &mut *self.want_estimate;
         let unload_requested = &mut *self.unload_requested;
         let picker_requested = &mut *self.picker_requested;
         let unload_status = &mut *self.unload_status;
         let component_action = &mut *self.component_action;
         let component_action_status = self.component_action_status;
-        // The buttons of the block are the backend's own list; this only says whether the
+        // The buttons of the list are the backend's own; this only says whether the
         // pipeline is free to run one right now.
         let component_actions_enabled = self.ai_backend_available && !self.pipeline_busy;
         let status = self.status;
         let status_error = self.status_error;
-        let estimate = self.estimate;
-        let estimate_error = self.estimate_error;
-        let estimate_busy = self.estimate_busy;
         let pipeline_busy = self.pipeline_busy;
         let ai_backend_available = self.ai_backend_available;
         let hf_token_action = &mut *self.hf_token_action;
@@ -4400,72 +4707,109 @@ impl Flux2PanelCtx<'_> {
         let download_check_busy = self.download_check_busy;
         let download_busy = self.download_busy;
         let download_status = self.download_status;
-        RegionEditToolBase::draw_region_editor_collapsible_section(
-            ui,
-            "cleaning_flux2_klein_params",
-            t!("cleaning.tools.flux2_klein.params_heading"),
+
+        ui.separator();
+        let section_id = ui.make_persistent_id("cleaning_flux2_klein_install_section");
+        let mut section = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            section_id,
             false,
-            |ui| {
+        );
+        // The first DEFINITE verdict decides the initial state, and only it: on the frame
+        // the panel first draws, `.status` has not answered and the verdict is `Unknown`,
+        // so seeding from `default_open` would open the section on every launch even on a
+        // machine where everything is installed. A fold that differs from what the last
+        // frame LEFT it in was moved by the header or by Escape — i.e. by the user — and
+        // that retires the seeding for good.
+        let user_moved = self.install_section_open_prev.is_some_and(|prev| prev != section.is_open());
+        match flux2_install_seed(*self.install_section_seeded, user_moved, readiness) {
+            Flux2InstallSeed::Keep => {}
+            Flux2InstallSeed::Open => {
+                section.set_open(true);
+                *self.install_section_seeded = true;
+            }
+            Flux2InstallSeed::Seal => *self.install_section_seeded = true,
+        }
+        if open_requested {
+            section.set_open(true);
+        }
+        // Recorded BEFORE `show_header` consumes the state, so it holds what THIS file left
+        // behind; a click inside the header changes the stored state afterwards and is what
+        // the next frame reads as `user_moved`.
+        *self.install_section_open_prev = Some(section.is_open());
+        section
+            .show_header(ui, |ui| {
+                ui.label(t!("cleaning.tools.flux2_klein.install_heading"));
+            })
+            .body(|ui| {
                 // The switch sits ABOVE everything it governs: exactly one of the two
                 // bodies below is drawn, and the user has to see which one he is in before
                 // he reads it.
                 draw_source_mode_switch(ui, settings, changed);
                 match settings.source_mode() {
                     Flux2SourceMode::Manual => {
-                draw_path_row(
-                    ui,
-                    t!("cleaning.tools.flux2_klein.text_encoder_path_label"),
-                    "cleaning_flux2_klein_text_encoder_path",
-                    &mut settings.text_encoder_path,
-                    &[(
-                        "📁",
-                        t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
-                        Flux2PickerPurpose::TextEncoderDir,
-                    )],
-                    changed,
-                    picker_requested,
-                );
-                draw_path_row(
-                    ui,
-                    t!("cleaning.tools.flux2_klein.transformer_path_label"),
-                    "cleaning_flux2_klein_transformer_path",
-                    &mut settings.transformer_path,
-                    &[
-                        (
-                            "📄",
-                            t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
-                            Flux2PickerPurpose::TransformerFile,
-                        ),
-                        (
-                            "📁",
-                            t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
-                            Flux2PickerPurpose::TransformerDir,
-                        ),
-                    ],
-                    changed,
-                    picker_requested,
-                );
-                draw_path_row(
-                    ui,
-                    t!("cleaning.tools.flux2_klein.vae_path_label"),
-                    "cleaning_flux2_klein_vae_path",
-                    &mut settings.vae_path,
-                    &[
-                        (
-                            "📄",
-                            t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
-                            Flux2PickerPurpose::VaeFile,
-                        ),
-                        (
-                            "📁",
-                            t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
-                            Flux2PickerPurpose::VaeDir,
-                        ),
-                    ],
-                    changed,
-                    picker_requested,
-                );
-
+                        draw_path_row(
+                            ui,
+                            &Flux2PathRow {
+                                label: t!("cleaning.tools.flux2_klein.text_encoder_path_label"),
+                                hint: t!("cleaning.tools.flux2_klein.text_encoder_path_hint"),
+                                id_salt: "cleaning_flux2_klein_text_encoder_path",
+                                buttons: &[(
+                                    "📁",
+                                    t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
+                                    Flux2PickerPurpose::TextEncoderDir,
+                                )],
+                            },
+                            &mut settings.text_encoder_path,
+                            changed,
+                            picker_requested,
+                        );
+                        draw_path_row(
+                            ui,
+                            &Flux2PathRow {
+                                label: t!("cleaning.tools.flux2_klein.transformer_path_label"),
+                                hint: t!("cleaning.tools.flux2_klein.transformer_path_hint"),
+                                id_salt: "cleaning_flux2_klein_transformer_path",
+                                buttons: &[
+                                    (
+                                        "📄",
+                                        t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
+                                        Flux2PickerPurpose::TransformerFile,
+                                    ),
+                                    (
+                                        "📁",
+                                        t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
+                                        Flux2PickerPurpose::TransformerDir,
+                                    ),
+                                ],
+                            },
+                            &mut settings.transformer_path,
+                            changed,
+                            picker_requested,
+                        );
+                        draw_path_row(
+                            ui,
+                            &Flux2PathRow {
+                                label: t!("cleaning.tools.flux2_klein.vae_path_label"),
+                                hint: t!("cleaning.tools.flux2_klein.vae_path_hint"),
+                                id_salt: "cleaning_flux2_klein_vae_path",
+                                buttons: &[
+                                    (
+                                        "📄",
+                                        t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
+                                        Flux2PickerPurpose::VaeFile,
+                                    ),
+                                    (
+                                        "📁",
+                                        t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
+                                        Flux2PickerPurpose::VaeDir,
+                                    ),
+                                ],
+                            },
+                            &mut settings.vae_path,
+                            changed,
+                            picker_requested,
+                        );
                     }
                     // The three manual rows are NOT drawn here: in this mode the paths are
                     // derived, and an editable field whose value nothing reads is a lie.
@@ -4494,84 +4838,52 @@ impl Flux2PanelCtx<'_> {
                 }
 
                 ui.separator();
-                *changed |= ui
-                    .add(
-                        WheelSlider::new(&mut settings.steps, FLUX2_STEPS_MIN..=FLUX2_STEPS_MAX)
-                            .text(t!("cleaning.common.steps_label")),
-                    )
-                    .on_hover_text(t!("cleaning.tools.flux2_klein.steps_hint"))
-                    .changed();
-                *changed |= ui
-                    .add(
-                        WheelSlider::new(
-                            &mut settings.guidance_scale,
-                            FLUX2_GUIDANCE_MIN..=FLUX2_GUIDANCE_MAX,
-                        )
-                        .text("Guidance"),
-                    )
-                    .on_hover_text(t!("cleaning.tools.flux2_klein.guidance_hint"))
-                    .changed();
-                *changed |= ui
-                    .add(
-                        WheelSlider::new(
-                            &mut settings.strength,
-                            FLUX2_STRENGTH_MIN..=FLUX2_STRENGTH_MAX,
-                        )
-                        .text(t!("cleaning.tools.flux2_klein.strength_label")),
-                    )
-                    .changed();
-                ui.horizontal(|ui| {
-                    *changed |= ui
-                        .checkbox(
-                            &mut settings.use_seed,
-                            t!("cleaning.tools.flux2_klein.fixed_seed_label"),
-                        )
-                        .changed();
-                    if settings.use_seed {
-                        *changed |= SeedSpinBox::new(&mut settings.seed).draw(ui).changed();
-                    }
-                });
-
-                ui.separator();
-                draw_preset_row(ui, settings, changed);
-                draw_estimate_ui(ui, estimate, estimate_error, estimate_busy, status);
-                if ui
-                    .small_button(t!("cleaning.tools.flux2_klein.refresh_estimate_button"))
-                    .clicked()
-                {
-                    *want_estimate = true;
-                }
-
-                draw_advanced_section(ui, settings, changed);
-
-                ui.separator();
-                draw_status_ui(ui, status, status_error, region);
-                draw_component_residency_ui(
+                draw_component_list_ui(
                     ui,
                     status,
+                    status_error,
+                    region,
                     component_actions_enabled,
                     component_action,
                 );
                 if let Some(text) = component_action_status {
                     ui.small(text);
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .small_button(t!("cleaning.tools.flux2_klein.refresh_status_button"))
-                        .clicked()
-                    {
-                        *want_status = true;
-                    }
-                    if ui
-                        .small_button(t!("cleaning.tools.flux2_klein.unload_button"))
-                        .clicked()
-                    {
-                        *unload_requested = true;
-                    }
-                });
+                if ui
+                    .small_button(t!("cleaning.tools.flux2_klein.unload_button"))
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.unload_hint"))
+                    .clicked()
+                {
+                    *unload_requested = true;
+                }
                 if let Some(text) = unload_status.as_ref() {
                     ui.small(text);
                 }
+            });
+    }
+
+    /// Draws «Память и скорость»: the memory preset and the backend's forecast, and
+    /// nothing else.
+    ///
+    /// Closed by default, because a preset is chosen once and the forecast it produces is
+    /// already on the readiness line above — the section exists to CHANGE the preset, not
+    /// to report it. The seven fields a preset owns live in «Для экспертов», where
+    /// overriding one is presented as what it is.
+    fn draw_memory_section(&mut self, ui: &mut egui::Ui) {
+        let settings = &mut *self.settings;
+        let changed = &mut *self.settings_changed;
+        let estimate = self.estimate;
+        let estimate_error = self.estimate_error;
+        let estimate_busy = self.estimate_busy;
+        let status = self.status;
+        RegionEditToolBase::draw_region_editor_collapsible_section(
+            ui,
+            "cleaning_flux2_klein_memory",
+            t!("cleaning.tools.flux2_klein.memory_heading"),
+            false,
+            |ui| {
+                draw_preset_row(ui, settings, changed);
+                draw_estimate_ui(ui, estimate, estimate_error, estimate_busy, status);
             },
         );
     }
@@ -4954,6 +5266,483 @@ fn draw_flux2_mask_hint(ui: &mut egui::Ui) {
     ui.small(t!("cleaning.tools.flux2_klein.mask_hint"));
 }
 
+/// Which of the model components a run needs the machine does not have.
+///
+/// A SET and not a list so the verdict stays `Copy` and a refusal can name every missing
+/// part at once: a user who is told only about the transformer downloads it, presses the
+/// button again and is told about the VAE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Flux2MissingComponents {
+    text_encoder: bool,
+    transformer: bool,
+    vae: bool,
+    tokenizer: bool,
+    scheduler: bool,
+}
+
+impl Flux2MissingComponents {
+    /// Whether anything at all is missing.
+    #[must_use]
+    fn any(self) -> bool {
+        self.text_encoder || self.transformer || self.vae || self.tokenizer || self.scheduler
+    }
+
+    /// The localized component names, in the order of the presence catalog, joined with
+    /// «, ». Empty when nothing is missing.
+    ///
+    /// The names are the SAME keys the catalog above prints, so the refusal and the ✗ rows
+    /// the user is looking at cannot call one component two different things. `t!` takes a
+    /// literal, which is why the pairs are spelled out instead of looked up in a table.
+    #[must_use]
+    fn names(self) -> String {
+        [
+            (self.text_encoder, t!("cleaning.tools.flux2_klein.component_text_encoder")),
+            (self.transformer, t!("cleaning.tools.flux2_klein.component_transformer")),
+            (self.vae, t!("cleaning.tools.flux2_klein.component_vae")),
+            (self.tokenizer, t!("cleaning.tools.flux2_klein.component_tokenizer")),
+            (self.scheduler, t!("cleaning.tools.flux2_klein.component_scheduler")),
+        ]
+        .into_iter()
+        .filter_map(|(missing, name)| missing.then_some(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+/// Whether the model a run would use is actually installed on THIS machine.
+///
+/// The ONE answer to that question: the run gate refuses on it, and the panel's status
+/// line reads the same verdict rather than deriving a second one that could disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2ModelReadiness {
+    /// Nothing has answered yet — no `.status` round trip has landed for the current
+    /// paths. This is NOT evidence of a missing model and **must never block a run**: a
+    /// slow or briefly unreachable backend would otherwise leave the button permanently
+    /// dead with no way for the user to find out why.
+    Unknown,
+    /// The backend answered, or a required path is empty, and at least one component a
+    /// run needs is not there. This is the only verdict that blocks.
+    Missing(Flux2MissingComponents),
+    /// Every component a run needs is present.
+    Ready,
+}
+
+/// The `.status` catalog, kept only while it still describes the paths in the settings.
+///
+/// `asked_about` is the effective-paths triple the answer was fetched for; `current` is
+/// what [`Flux2KleinSettings::effective_paths`] yields now. The presence half of the
+/// catalog is a statement about THOSE files, so once the two disagree the answer describes
+/// files nobody is asking about any more and "not known" is the only honest report —
+/// exactly the rule [`prompt_cache_state_for`] applies to the prompt half of the same
+/// answer. Without it a corrected model path left the previous `Missing` verdict standing
+/// and «Обработать» kept naming components that are now there.
+///
+/// A free function so the rule can be tested without a live engine.
+#[must_use]
+fn flux2_status_for_paths<'a>(
+    status: Option<&'a Flux2Status>,
+    asked_about: Option<&Flux2EffectivePaths>,
+    current: &Flux2EffectivePaths,
+) -> Option<&'a Flux2Status> {
+    let status = status?;
+    (asked_about? == current).then_some(status)
+}
+
+/// Whether a fresh `.status` query is owed because the settings now name other paths than
+/// anything already answered or in flight.
+///
+/// `answered` is what the cached catalog describes, `in_flight` what the query on the wire
+/// was asked about. A query already carrying `current` is enough: arming again would only
+/// send a duplicate the moment the first one lands.
+#[must_use]
+fn flux2_status_paths_stale(
+    current: &Flux2EffectivePaths,
+    answered: Option<&Flux2EffectivePaths>,
+    in_flight: Option<&Flux2EffectivePaths>,
+) -> bool {
+    answered != Some(current) && in_flight != Some(current)
+}
+
+/// Derives [`Flux2ModelReadiness`] from the last `.status` answer and the EFFECTIVE paths.
+///
+/// `status` must be an answer that describes the CURRENT paths — pass
+/// [`Flux2KleinEngine::status_for_current_paths`], never the raw field, or a catalog
+/// fetched for paths the user has since corrected will keep reading as `Missing`.
+///
+/// `status` is the cached component catalog (`None` until the first answer lands);
+/// `prompt_cached` is the same three-state answer [`flux2_run_block_reason`] reads, and
+/// `Some(true)` waives the text encoder exactly as it does there — a cached prompt is
+/// generated without ever reading the 16 GB Qwen3.
+///
+/// An EMPTY required path is decided locally and needs no backend: nothing can be found at
+/// a path that was never given. Everything else waits for the catalog, which is why the
+/// download mode needs this function at all — [`Flux2KleinSettings::effective_paths`]
+/// DERIVES its three paths under `config::flux2_klein_dir()`, so they are never empty and
+/// the emptiness check alone can never notice that nothing has been downloaded yet.
+///
+/// The tokenizer and the scheduler have no path of their own: the backend resolves them
+/// beside the three that do, so they can only ever be judged from the catalog.
+#[must_use]
+fn flux2_model_readiness(
+    settings: &Flux2KleinSettings,
+    status: Option<&Flux2Status>,
+    prompt_cached: Option<bool>,
+) -> Flux2ModelReadiness {
+    let paths = settings.effective_paths();
+    let encoder_needed = prompt_cached != Some(true);
+    let unset = Flux2MissingComponents {
+        text_encoder: encoder_needed && paths.text_encoder.is_empty(),
+        transformer: paths.transformer.is_empty(),
+        vae: paths.vae.is_empty(),
+        ..Flux2MissingComponents::default()
+    };
+    if unset.any() {
+        return Flux2ModelReadiness::Missing(unset);
+    }
+    let Some(status) = status else {
+        return Flux2ModelReadiness::Unknown;
+    };
+    let missing = Flux2MissingComponents {
+        text_encoder: encoder_needed && !status.text_encoder.present,
+        transformer: !status.transformer.present,
+        vae: !status.vae.present,
+        tokenizer: !status.tokenizer.present,
+        scheduler: !status.scheduler.present,
+    };
+    if missing.any() {
+        Flux2ModelReadiness::Missing(missing)
+    } else {
+        Flux2ModelReadiness::Ready
+    }
+}
+
+/// What the one-shot seeding does to «Установка модели» on this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2InstallSeed {
+    /// Touch neither the fold nor the flag: the seeding is spent, or no definite verdict
+    /// has landed yet and guessing is exactly what the flag exists to avoid.
+    Keep,
+    /// Open the section and spend the seeding — the first `Missing`.
+    Open,
+    /// Spend the seeding without touching the fold: everything is installed, or the user
+    /// has already moved the section himself.
+    Seal,
+}
+
+/// Decides the one-shot opening of «Установка модели».
+///
+/// `seeded` is whether the seeding is already spent; `user_moved` says the fold changed
+/// under a hand this file did not move it with; `readiness` is the current verdict.
+///
+/// The rule is "open it once, when we first learn the model is missing" — and a section the
+/// user has closed by hand is his, so a `Missing` landing afterwards must not reopen it.
+/// That window is real rather than theoretical: `.status` can take seconds, and the whole
+/// time the verdict is `Unknown` the user is free to open the section, look and close it.
+/// «Установить» is unaffected — it opens the section explicitly, on any frame.
+///
+/// A free function so the rule is pinned by tests instead of living inside the drawing.
+#[must_use]
+fn flux2_install_seed(
+    seeded: bool,
+    user_moved: bool,
+    readiness: Flux2ModelReadiness,
+) -> Flux2InstallSeed {
+    if seeded {
+        return Flux2InstallSeed::Keep;
+    }
+    if user_moved {
+        return Flux2InstallSeed::Seal;
+    }
+    match readiness {
+        Flux2ModelReadiness::Unknown => Flux2InstallSeed::Keep,
+        Flux2ModelReadiness::Missing(_) => Flux2InstallSeed::Open,
+        Flux2ModelReadiness::Ready => Flux2InstallSeed::Seal,
+    }
+}
+
+/// The at-most-one compact line drawn under the prompt field.
+///
+/// A separate decision from the drawing because it is a PRIORITY rule, not a formatting
+/// one: three facts compete for one line and only the most consequential may take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2PromptCacheLine {
+    /// Nothing is claimed. The answer is outstanding, which is not information — the old
+    /// «Состояние кэша промпта пока неизвестно.» line said only that the panel had asked.
+    Silent,
+    /// The embeddings of this prompt are held: the next run skips the ~106 s encoder read.
+    Cached,
+    /// They are not: the next run pays for them.
+    NotCached,
+    /// This machine has NO text encoder, so nothing can be encoded here and only ready
+    /// caches work. It outranks "not cached", which would read as a delay the user could
+    /// wait out rather than as a run that cannot start.
+    NoEncoder,
+}
+
+/// Decides which single line the prompt block shows about the cache.
+///
+/// Both inputs are the project's three-state `Option<bool>`, where `None` is "not known"
+/// and never `false`. The priority is what the user can DO next:
+/// - a cached prompt wins outright, because with the embeddings held the run works whether
+///   an encoder exists or not — that is the whole point of the library;
+/// - otherwise a missing encoder wins, because it changes what is POSSIBLE rather than
+///   what something costs;
+/// - "not cached" is left, and an outstanding answer says nothing at all.
+#[must_use]
+fn flux2_prompt_cache_line(
+    prompt_cached: Option<bool>,
+    text_encoder_available: Option<bool>,
+) -> Flux2PromptCacheLine {
+    if prompt_cached == Some(true) {
+        return Flux2PromptCacheLine::Cached;
+    }
+    if text_encoder_available == Some(false) {
+        return Flux2PromptCacheLine::NoEncoder;
+    }
+    match prompt_cached {
+        // Handled above; spelled out so the match stays exhaustive over the three states.
+        Some(true) | None => Flux2PromptCacheLine::Silent,
+        Some(false) => Flux2PromptCacheLine::NotCached,
+    }
+}
+
+/// The tone a one-line verdict is drawn in.
+///
+/// The three colours are this file's own ([`FLUX2_STATUS_OK_COLOR`] and friends); naming
+/// the tone rather than the colour keeps the decision testable without a live `Ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2LineTone {
+    Ok,
+    Warn,
+    Neutral,
+}
+
+/// The memory forecast as the readiness line carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Flux2MemorySummary {
+    /// The one-line forecast, already formatted by [`estimate_status_line`].
+    line: String,
+    /// The backend's own verdict. `false` turns the readiness line amber, because the
+    /// spelled-out «не помещается» warning lives inside «Память и скорость» and that
+    /// section may well be folded away.
+    fits: bool,
+}
+
+/// What the always-visible readiness line reports.
+///
+/// A decision separate from the drawing, for the reason every three-state answer in this
+/// file is: the difference between "not installed" and "no answer yet" is exactly what the
+/// line must never blur, and it has to be assertable without a live `Ui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Flux2ReadinessLine {
+    /// Every component a run needs is there. `memory` is the forecast when one has landed.
+    Ready { memory: Option<Flux2MemorySummary> },
+    /// Components are missing; the string is the localized list, and «Установить» is
+    /// offered beside the line because the fix is one click away.
+    Missing { components: String },
+    /// No `.status` answer yet. Neutral and buttonless: nothing is wrong, nothing is known.
+    Unknown,
+}
+
+impl Flux2ReadinessLine {
+    /// The colour the line is drawn in.
+    fn tone(&self) -> Flux2LineTone {
+        match self {
+            // A forecast that does not fit is the one way a READY model still needs
+            // attention, and the tone is the only room this one line has to say so.
+            Self::Ready { memory } => match memory {
+                Some(summary) if !summary.fits => Flux2LineTone::Warn,
+                Some(_) | None => Flux2LineTone::Ok,
+            },
+            Self::Missing { .. } => Flux2LineTone::Warn,
+            Self::Unknown => Flux2LineTone::Neutral,
+        }
+    }
+
+    /// Whether «Установить» is offered beside the line.
+    fn offers_install(&self) -> bool {
+        matches!(self, Self::Missing { .. })
+    }
+
+    /// The localized text of the line.
+    fn text(&self) -> String {
+        match self {
+            Self::Ready { memory: Some(summary) } => tf!(
+                "cleaning.tools.flux2_klein.model_ready_memory_status",
+                memory = summary.line
+            ),
+            Self::Ready { memory: None } => {
+                t!("cleaning.tools.flux2_klein.model_ready_status").to_string()
+            }
+            Self::Missing { components } => tf!(
+                "cleaning.tools.flux2_klein.model_missing_status",
+                components = components
+            ),
+            Self::Unknown => {
+                t!("cleaning.tools.flux2_klein.model_readiness_unknown_status").to_string()
+            }
+        }
+    }
+}
+
+/// Turns the model verdict into the line the panel shows.
+///
+/// `memory` is the forecast summary and is meaningful only for [`Flux2ModelReadiness::Ready`];
+/// it is IGNORED for the other two, because figures about a run that cannot start compete
+/// with the sentence that says why.
+#[must_use]
+fn flux2_readiness_line(
+    readiness: Flux2ModelReadiness,
+    memory: Option<Flux2MemorySummary>,
+) -> Flux2ReadinessLine {
+    match readiness {
+        Flux2ModelReadiness::Ready => Flux2ReadinessLine::Ready { memory },
+        Flux2ModelReadiness::Missing(missing) => Flux2ReadinessLine::Missing {
+            components: missing.names(),
+        },
+        Flux2ModelReadiness::Unknown => Flux2ReadinessLine::Unknown,
+    }
+}
+
+/// The five entries of the `.status` presence catalog, in display order.
+///
+/// Wider than [`Flux2ComponentId`], which names only the three components that carry
+/// WEIGHTS and therefore a residency: the tokenizer and the scheduler are configuration
+/// files, and the merged list still has to show whether they are on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flux2CatalogComponent {
+    TextEncoder,
+    Transformer,
+    Vae,
+    Tokenizer,
+    Scheduler,
+}
+
+impl Flux2CatalogComponent {
+    /// The five components in the order the list draws them.
+    fn all() -> [Self; 5] {
+        [
+            Self::TextEncoder,
+            Self::Transformer,
+            Self::Vae,
+            Self::Tokenizer,
+            Self::Scheduler,
+        ]
+    }
+
+    /// The localized component name — the SAME keys the run-gate refusal names, so a
+    /// refusal and the ✗ row the user is looking at cannot call one component two things.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TextEncoder => t!("cleaning.tools.flux2_klein.component_text_encoder"),
+            Self::Transformer => t!("cleaning.tools.flux2_klein.component_transformer"),
+            Self::Vae => t!("cleaning.tools.flux2_klein.component_vae"),
+            Self::Tokenizer => t!("cleaning.tools.flux2_klein.component_tokenizer"),
+            Self::Scheduler => t!("cleaning.tools.flux2_klein.component_scheduler"),
+        }
+    }
+
+    /// The hover that says what the component IS. A row reports presence, size and
+    /// residency, none of which means anything to a user who does not know what each
+    /// part does.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::TextEncoder => t!("cleaning.tools.flux2_klein.component_text_encoder_hint"),
+            Self::Transformer => t!("cleaning.tools.flux2_klein.component_transformer_hint"),
+            Self::Vae => t!("cleaning.tools.flux2_klein.component_vae_hint"),
+            Self::Tokenizer => t!("cleaning.tools.flux2_klein.component_tokenizer_hint"),
+            Self::Scheduler => t!("cleaning.tools.flux2_klein.component_scheduler_hint"),
+        }
+    }
+
+    /// The residency identity of this component, `None` for the two that have no weights
+    /// and therefore never appear in the backend's `components` block.
+    fn residency_id(self) -> Option<Flux2ComponentId> {
+        match self {
+            Self::TextEncoder => Some(Flux2ComponentId::TextEncoder),
+            Self::Transformer => Some(Flux2ComponentId::Transformer),
+            Self::Vae => Some(Flux2ComponentId::Vae),
+            Self::Tokenizer | Self::Scheduler => None,
+        }
+    }
+
+    /// The presence entry of this component in a `.status` answer.
+    fn presence(self, status: &Flux2Status) -> &Flux2Component {
+        match self {
+            Self::TextEncoder => &status.text_encoder,
+            Self::Transformer => &status.transformer,
+            Self::Vae => &status.vae,
+            Self::Tokenizer => &status.tokenizer,
+            Self::Scheduler => &status.scheduler,
+        }
+    }
+}
+
+/// One row of the merged component list: everything one `.status` answer says about a
+/// single component.
+///
+/// The two blocks this replaces sat next to each other and described the same five things
+/// twice — one by presence and size, the other by residency and the buttons that change
+/// it. A row carries both halves so a component is named once and read once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Flux2ComponentRow<'a> {
+    component: Flux2CatalogComponent,
+    /// Whether the files are on disk (`exists` / `found` in the answer).
+    present: bool,
+    /// Size on disk in bytes, `0` when the backend reported none.
+    size_bytes: u64,
+    /// The path the BACKEND resolved, empty when it reported none. It is the only way to
+    /// tell a typo in the field above from a genuinely missing file, so it goes on hover.
+    path: &'a str,
+    /// The residency half. `None` for a component the backend's `components` block does
+    /// not cover — the tokenizer and the scheduler always, and every row while the block
+    /// is busy or the backend predates it.
+    residency: Option<&'a Flux2ComponentResidency>,
+}
+
+/// Builds the merged component list from a `.status` answer.
+///
+/// `residency` is the block's rows when there are any — `None` covers "busy", "not
+/// reported" and "no answer", which the caller reports once as a line rather than five
+/// times as empty cells. A component the block simply omits keeps its presence half and
+/// shows no state, which is the honest rendering of a partial answer.
+#[must_use]
+fn flux2_component_rows<'a>(
+    status: &'a Flux2Status,
+    residency: Option<&'a [Flux2ComponentResidency]>,
+) -> Vec<Flux2ComponentRow<'a>> {
+    Flux2CatalogComponent::all()
+        .into_iter()
+        .map(|component| {
+            let presence = component.presence(status);
+            Flux2ComponentRow {
+                component,
+                present: presence.present,
+                size_bytes: presence.size_bytes,
+                path: presence.path.as_str(),
+                residency: component.residency_id().and_then(|id| {
+                    residency.and_then(|rows| rows.iter().find(|row| row.id == id))
+                }),
+            }
+        })
+        .collect()
+}
+
+/// The hover of one merged row: what the component IS, then the path the backend
+/// resolved for it.
+///
+/// Merging the two lists merged their hovers too — the presence catalog showed the path
+/// and the residency block explained the component — and a single label has a single
+/// hover, so neither half may be dropped.
+#[must_use]
+fn flux2_component_row_tooltip(component: Flux2CatalogComponent, path: &str) -> String {
+    let hint = component.hint();
+    if path.is_empty() {
+        return hint.to_string();
+    }
+    format!("{hint}\n{path}")
+}
+
 /// The first reason a run cannot start that this ENGINE can see, or `None` when it can.
 ///
 /// It covers the model paths and the prompt, and nothing else. The two checks that used to
@@ -4973,11 +5762,22 @@ fn draw_flux2_mask_hint(ui: &mut egui::Ui) {
 /// makes the final decision either way (`_first_unavailable_reason`) and this gate exists
 /// to explain it before the click, not to duplicate it.
 ///
+/// `status` is the cached `.status` catalog — guarded by
+/// [`Flux2KleinEngine::status_for_current_paths`], so it is never an answer about paths
+/// that have since changed — and it is what makes the refusal LOCAL and
+/// actionable: with the paths filled in, the backend used to be the first thing to notice
+/// that the files behind them do not exist, and answered with its own untranslated
+/// `Путь transformer_path не найден`. In DOWNLOAD mode that was the normal state of a
+/// fresh installation, because the derived paths are never empty. The verdict comes from
+/// [`flux2_model_readiness`], and only `Missing` blocks: `Unknown` means no answer has
+/// landed yet and must leave the button alive.
+///
 /// A free function rather than a method for the same reason [`region_block_reason`] is
 /// one — the gate is the contract worth testing, and it must be testable without an engine
 /// instance, which owns channels and worker state.
 fn flux2_run_block_reason(
     settings: &Flux2KleinSettings,
+    status: Option<&Flux2Status>,
     prompt_cached: Option<bool>,
 ) -> Option<String> {
     // The EFFECTIVE paths, so the gate answers about the mode the user is actually in: in
@@ -4998,6 +5798,17 @@ fn flux2_run_block_reason(
     }
     if !encoder_waived && paths.text_encoder.is_empty() {
         return Some(t!("cleaning.tools.flux2_klein.paths_required_error").to_string());
+    }
+    // The paths are filled in; whether anything is BEHIND them is the next question, and
+    // answering it here is what replaces the backend's raw «Путь ... не найден». The
+    // message differs by mode because the fix does: a download is a button, a wrong manual
+    // path is a field. `Unknown` and `Ready` both fall through — see `flux2_model_readiness`.
+    if let Flux2ModelReadiness::Missing(missing) = flux2_model_readiness(settings, status, prompt_cached) {
+        let components = missing.names();
+        return Some(match settings.source_mode() {
+            Flux2SourceMode::Download => tf!("cleaning.tools.flux2_klein.model_not_downloaded_error", components = components).to_string(),
+            Flux2SourceMode::Manual => tf!("cleaning.tools.flux2_klein.model_components_missing_error", components = components).to_string(),
+        });
     }
     if settings.prompt.trim().is_empty() {
         return Some(t!("cleaning.tools.flux2_klein.prompt_required_error").to_string());
@@ -5055,28 +5866,42 @@ fn region_block_reason(region: [usize; 2]) -> Option<String> {
 // UI helpers
 // ---------------------------------------------------------------------------------------
 
-/// Draws one editable model-path row: a label, a text field, and one browse button per
-/// `(glyph, tooltip, purpose)` entry. Returns nothing; `changed` and `picker_requested`
-/// carry the outcome.
+/// The static description of one model-path row, bundled so the drawing function keeps a
+/// short signature: what the path is called, what belongs in it, the persistent id of its
+/// field, and the browse buttons beside it.
+///
+/// `hint` explains what belongs in THIS path — a folder or a file, and which one. The
+/// per-button `tooltip` describes the PICKER a glyph opens and cannot stand in for it.
+struct Flux2PathRow<'a> {
+    label: &'a str,
+    hint: &'a str,
+    id_salt: &'static str,
+    /// One `(glyph, tooltip, purpose)` entry per browse button.
+    buttons: &'a [(&'static str, &'static str, Flux2PickerPurpose)],
+}
+
+/// Draws one editable model-path row: a label, a text field, and its browse buttons.
+/// Returns nothing; `changed` and `picker_requested` carry the outcome.
 fn draw_path_row(
     ui: &mut egui::Ui,
-    label: &str,
-    id_salt: &'static str,
+    row: &Flux2PathRow<'_>,
     value: &mut String,
-    buttons: &[(&'static str, &str, Flux2PickerPurpose)],
     changed: &mut bool,
     picker_requested: &mut Option<Flux2PickerPurpose>,
 ) {
-    ui.label(label);
+    // The hint sits on the label AND on the field: the label is what a user reads first,
+    // the field is what he hovers while wondering what to paste into it. Only the glyph
+    // buttons used to say anything, and they explain the PICKER, not the path.
+    ui.label(row.label).on_hover_text(row.hint);
     ui.horizontal(|ui| {
-        *changed |= ui
-            .add(
-                egui::TextEdit::singleline(value)
-                    .id_salt(id_salt)
-                    .desired_width(ui.available_width() - 64.0),
-            )
-            .changed();
-        for (glyph, tooltip, purpose) in buttons {
+        let edit = ui.add(
+            egui::TextEdit::singleline(value)
+                .id_salt(row.id_salt)
+                .desired_width(ui.available_width() - 64.0),
+        );
+        *changed |= edit.changed();
+        edit.on_hover_text(row.hint);
+        for (glyph, tooltip, purpose) in row.buttons {
             // Glyph buttons: an icon is not prose, so the caption stays literal and the
             // localized text lives in the tooltip.
             if ui.small_button(*glyph).on_hover_text(*tooltip).clicked() {
@@ -5139,7 +5964,8 @@ fn draw_preset_row(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, changed
     let active = MemoryPreset::detect(settings);
     let mut picked: Option<MemoryPreset> = None;
     ui.horizontal(|ui| {
-        ui.label(t!("cleaning.tools.flux2_klein.preset_label"));
+        ui.label(t!("cleaning.tools.flux2_klein.preset_label"))
+            .on_hover_text(t!("cleaning.tools.flux2_klein.preset_hint"));
         WheelComboBox::from_id_salt("cleaning_flux2_klein_preset")
             .selected_text(active.label())
             .show_ui(ui, |ui| {
@@ -5151,7 +5977,9 @@ fn draw_preset_row(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, changed
                         picked = Some(preset);
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text(t!("cleaning.tools.flux2_klein.preset_hint"));
     });
     if let Some(preset) = picked {
         *changed |= preset.apply(settings);
@@ -5182,13 +6010,39 @@ fn draw_estimate_ui(
         }
         return;
     };
-    // The free figures are what `fits` was actually computed against; the totals come
-    // from `.status` and turn "9.8 free" into a proportion the user can judge. They are
-    // dropped, not printed as "0.0", while `.status` has not answered — that call can
-    // fail on its own, and «из 0,0 ГиБ» would be a lie rather than a missing figure.
+    let line = estimate_status_line(estimate, status);
+    // The line stays one short sentence; the per-phase peaks and the full per-component
+    // breakdown live in its tooltip, because the forecast is max(prompt encoding,
+    // denoise, decode) and which of the phases dominates is the actionable part.
+    let tooltip = estimate_tooltip(estimate);
+    if estimate.fits {
+        ui.small(line).on_hover_text(tooltip);
+    } else {
+        ui.colored_label(FLUX2_STATUS_WARN_COLOR, line)
+            .on_hover_text(tooltip);
+        ui.colored_label(
+            FLUX2_STATUS_WARN_COLOR,
+            t!("cleaning.tools.flux2_klein.estimate_does_not_fit_warning"),
+        );
+    }
+}
+
+/// Formats the memory forecast as ONE line: the predicted peaks against what is free and,
+/// while `.status` has answered, against what the machine has in total.
+///
+/// The free figures are what `fits` was actually computed against; the totals turn "9.8
+/// free" into a proportion the user can judge. They are DROPPED, not printed as "0.0",
+/// while `.status` has not answered — that call fails on its own, and «из 0,0 ГиБ» would be
+/// a lie rather than a missing figure.
+///
+/// A function of its own because two surfaces print this line — the always-visible
+/// readiness line and «Память и скорость» — and a second copy of the formatting would let
+/// the same forecast read differently in the two places.
+#[must_use]
+fn estimate_status_line(estimate: &Flux2Estimate, status: Option<&Flux2Status>) -> String {
     let vram_total = status.map_or(0, |s| s.vram_total);
     let ram_total = status.map_or(0, |s| s.ram_total);
-    let line = if vram_total > 0 && ram_total > 0 {
+    if vram_total > 0 && ram_total > 0 {
         tf!(
             "cleaning.tools.flux2_klein.estimate_status",
             vram = format_gib(estimate.vram_bytes),
@@ -5206,20 +6060,6 @@ fn draw_estimate_ui(
             ram = format_gib(estimate.ram_bytes),
             ram_free = format_gib(estimate.ram_free)
         )
-    };
-    // The line stays one short sentence; the per-phase peaks and the full per-component
-    // breakdown live in its tooltip, because the forecast is max(prompt encoding,
-    // denoise, decode) and which of the phases dominates is the actionable part.
-    let tooltip = estimate_tooltip(estimate);
-    if estimate.fits {
-        ui.small(line).on_hover_text(tooltip);
-    } else {
-        ui.colored_label(FLUX2_STATUS_WARN_COLOR, line)
-            .on_hover_text(tooltip);
-        ui.colored_label(
-            FLUX2_STATUS_WARN_COLOR,
-            t!("cleaning.tools.flux2_klein.estimate_does_not_fit_warning"),
-        );
     }
 }
 
@@ -5314,12 +6154,26 @@ fn split_estimate_peaks(estimate: &Flux2Estimate) -> Flux2EstimatePeaks<'_> {
     }
 }
 
-/// Draws the component catalog from `.status` plus the current region size.
-fn draw_status_ui(
+/// Draws the merged component list of «Установка модели»: the current region size, the
+/// `.status` errors, one row per model component, and the device the backend runs on.
+///
+/// ONE list, and that is the point. `.status` answers two things about the same five
+/// components — whether their files are on disk, and where their weights currently are —
+/// and the panel used to print them as two adjacent blocks that named every component
+/// twice. A row now carries presence, size, residency and the backend's action buttons
+/// together, so a component is read once.
+///
+/// What each row may offer is the BACKEND's `actions` list and is never re-derived here
+/// (see [`Flux2ComponentAction`]); `actions_enabled` is only the local "the pipeline is
+/// free" gate, and a disabled button still explains itself on hover. `action` receives the
+/// one button pressed this frame, in the at-most-one shape the prompt-cache block uses.
+fn draw_component_list_ui(
     ui: &mut egui::Ui,
     status: Option<&Flux2Status>,
     error: Option<&str>,
     region: Option<[usize; 2]>,
+    actions_enabled: bool,
+    action: &mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
 ) {
     // No frame on the canvas yet: there is no region to report, and printing `0x0` would
     // read as a broken selection rather than as an absent one.
@@ -5343,46 +6197,61 @@ fn draw_status_ui(
     if !status.available && !status.reason.is_empty() {
         ui.colored_label(FLUX2_STATUS_WARN_COLOR, status.reason.as_str());
     }
-    for (label, component) in [
-        (
-            t!("cleaning.tools.flux2_klein.component_text_encoder"),
-            &status.text_encoder,
-        ),
-        (
-            t!("cleaning.tools.flux2_klein.component_transformer"),
-            &status.transformer,
-        ),
-        (t!("cleaning.tools.flux2_klein.component_vae"), &status.vae),
-        (
-            t!("cleaning.tools.flux2_klein.component_tokenizer"),
-            &status.tokenizer,
-        ),
-        (
-            t!("cleaning.tools.flux2_klein.component_scheduler"),
-            &status.scheduler,
-        ),
-    ] {
-        let mark = if component.present { "✓" } else { "✗" };
-        let line = if component.size_bytes > 0 {
-            tf!(
-                "cleaning.tools.flux2_klein.component_sized_status",
-                mark = mark,
-                name = label,
-                size = format_gib(component.size_bytes)
-            )
-        } else {
-            tf!(
-                "cleaning.tools.flux2_klein.component_status",
-                mark = mark,
-                name = label
-            )
-        };
-        let response = ui.small(line);
-        // The path the BACKEND resolved, which is the only way to tell a typo in the
-        // field above from a genuinely missing file.
-        if !component.path.is_empty() {
-            response.on_hover_text(component.path.as_str());
+    // The residency half is answered for the whole block at once, so its three
+    // non-row outcomes are reported once above the rows instead of five times inside them.
+    let residency = match flux2_component_block(Some(status)) {
+        // Unreachable: `status` is `Some` here. Spelled out so a new variant cannot slip
+        // through a catch-all.
+        Flux2ComponentBlock::Hidden => None,
+        Flux2ComponentBlock::Busy => {
+            ui.small(t!("cleaning.tools.flux2_klein.component_residency_busy_status"));
+            None
         }
+        Flux2ComponentBlock::Unknown => {
+            ui.small(t!(
+                "cleaning.tools.flux2_klein.component_residency_unknown_status"
+            ));
+            None
+        }
+        Flux2ComponentBlock::Rows(rows) => Some(rows),
+    };
+    for row in flux2_component_rows(status, residency) {
+        // The panel is a dock tab and is often ~300 px wide: a row of a label, a state and
+        // up to three buttons has to be allowed to wrap rather than clip.
+        ui.horizontal_wrapped(|ui| {
+            let mark = if row.present { "✓" } else { "✗" };
+            let line = if row.size_bytes > 0 {
+                tf!(
+                    "cleaning.tools.flux2_klein.component_sized_status",
+                    mark = mark,
+                    name = row.component.label(),
+                    size = format_gib(row.size_bytes)
+                )
+            } else {
+                tf!(
+                    "cleaning.tools.flux2_klein.component_status",
+                    mark = mark,
+                    name = row.component.label()
+                )
+            };
+            ui.small(line)
+                .on_hover_text(flux2_component_row_tooltip(row.component, row.path));
+            let Some(residency) = row.residency else {
+                return;
+            };
+            draw_component_residency_label(ui, residency);
+            for offered in &residency.actions {
+                if flux2_gated_button(
+                    ui,
+                    actions_enabled,
+                    offered.label(),
+                    component_action_tooltip(residency.id, *offered),
+                    t!("cleaning.tools.flux2_klein.component_action_disabled_tooltip"),
+                ) {
+                    *action = Some((residency.id, *offered));
+                }
+            }
+        });
     }
     if !status.device.is_empty() {
         ui.small(tf!(
@@ -5392,60 +6261,6 @@ fn draw_status_ui(
     }
     if status.loaded {
         ui.small(t!("cleaning.tools.flux2_klein.pipeline_loaded_status"));
-    }
-}
-
-/// Draws the per-component residency block under the presence catalog.
-///
-/// One row per component: its localized name (hovering says what the component IS), where
-/// its weights are as a coloured label (hovering explains `offloaded` and `mixed`, which
-/// nobody can be expected to read off the word alone), and the action buttons the BACKEND
-/// listed. Which actions exist is never re-derived here — see [`Flux2ComponentAction`].
-///
-/// `enabled` is the local "the pipeline is free" gate and nothing else; a disabled button
-/// still says on hover why it cannot be pressed. `action` receives the one button pressed
-/// this frame, in the same at-most-one shape the prompt-cache block uses.
-fn draw_component_residency_ui(
-    ui: &mut egui::Ui,
-    status: Option<&Flux2Status>,
-    enabled: bool,
-    action: &mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
-) {
-    let block = flux2_component_block(status);
-    if matches!(block, Flux2ComponentBlock::Hidden) {
-        return;
-    }
-    ui.label(t!("cleaning.tools.flux2_klein.component_residency_heading"));
-    match block {
-        // Handled above; repeated so a new variant cannot slip through a catch-all.
-        Flux2ComponentBlock::Hidden => {}
-        Flux2ComponentBlock::Busy => {
-            ui.small(t!("cleaning.tools.flux2_klein.component_residency_busy_status"));
-        }
-        Flux2ComponentBlock::Unknown => {
-            ui.small(t!(
-                "cleaning.tools.flux2_klein.component_residency_unknown_status"
-            ));
-        }
-        Flux2ComponentBlock::Rows(rows) => {
-            for row in rows {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(row.id.label()).on_hover_text(row.id.hint());
-                    draw_component_residency_label(ui, row);
-                    for offered in &row.actions {
-                        if flux2_gated_button(
-                            ui,
-                            enabled,
-                            offered.label(),
-                            component_action_tooltip(row.id, *offered),
-                            t!("cleaning.tools.flux2_klein.component_action_disabled_tooltip"),
-                        ) {
-                            *action = Some((row.id, *offered));
-                        }
-                    }
-                });
-            }
-        }
     }
 }
 
@@ -5474,8 +6289,18 @@ fn draw_component_residency_label(ui: &mut egui::Ui, row: &Flux2ComponentResiden
     }
 }
 
-/// Draws the nested advanced section: placement, dtype, VAE flags, text-encoder memory
-/// handling and mask shaping.
+/// Draws «Для экспертов», the last of the three collapsible sections: the generation
+/// parameters nobody touches between two runs, the mask shaping, and — behind their own
+/// label — the placement fields the memory preset owns.
+///
+/// Closed by default. It gathers everything that used to be spread over the old
+/// «Параметры» wrapper and a SECOND header nested inside it: a value here is set once for a
+/// machine or for a page, never per edit. «Сила изменения» deliberately does NOT live here
+/// — it is the panel's one creative dial and stays always visible.
+///
+/// The preset-owned group is introduced by a line saying what overriding one costs, because
+/// changing any of the seven silently moves the memory preset to «Пользовательский»
+/// ([`MemoryPreset::detect`]) and the picker that reports it is in another section.
 fn draw_advanced_section(
     ui: &mut egui::Ui,
     settings: &mut Flux2KleinSettings,
@@ -5487,8 +6312,71 @@ fn draw_advanced_section(
         t!("cleaning.tools.flux2_klein.advanced_heading"),
         false,
         |ui| {
+            *changed |= ui
+                .add(
+                    WheelSlider::new(&mut settings.steps, FLUX2_STEPS_MIN..=FLUX2_STEPS_MAX)
+                        .text(t!("cleaning.common.steps_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.steps_hint"))
+                .changed();
+            *changed |= ui
+                .add(
+                    WheelSlider::new(
+                        &mut settings.guidance_scale,
+                        FLUX2_GUIDANCE_MIN..=FLUX2_GUIDANCE_MAX,
+                    )
+                    .text(t!("cleaning.tools.flux2_klein.guidance_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.guidance_hint"))
+                .changed();
             ui.horizontal(|ui| {
-                ui.label(t!("cleaning.tools.flux2_klein.placement_label"));
+                *changed |= ui
+                    .checkbox(
+                        &mut settings.use_seed,
+                        t!("cleaning.tools.flux2_klein.fixed_seed_label"),
+                    )
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.fixed_seed_hint"))
+                    .changed();
+                if settings.use_seed {
+                    *changed |= SeedSpinBox::new(&mut settings.seed).draw(ui).changed();
+                }
+            });
+            // Growing the mask contour has no meaning while nothing is painted: the mask
+            // is then the whole region and the backend IGNORES `mask_dilate_px`. The
+            // slider is NOT faded for that, because the state it depends on is unknowable
+            // here — the working mode is derived from the painted mask at RUN time and the
+            // host pushes an engine the rectangle and the availability flags, never the
+            // mask stack. The condition goes into the hover text instead, where it is true
+            // at every moment rather than only at the drawn one. Feathering is unaffected
+            // either way: it still softens how the regenerated region joins the page.
+            *changed |= ui
+                .add(
+                    WheelSlider::new(&mut settings.mask_dilate_px, 0..=FLUX2_DILATE_MAX)
+                        .text(t!("cleaning.common.mask_expand_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_expand_hint"))
+                .changed();
+            *changed |= ui
+                .add(
+                    WheelSlider::new(&mut settings.mask_feather_px, 0..=FLUX2_FEATHER_MAX)
+                        .text(t!("cleaning.tools.flux2_klein.mask_feather_label")),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_feather_hint"))
+                .changed();
+            *changed |= ui
+                .checkbox(
+                    &mut settings.color_match,
+                    t!("cleaning.tools.flux2_klein.color_match_label"),
+                )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.color_match_hint"))
+                .changed();
+
+            ui.separator();
+            ui.label(t!("cleaning.tools.flux2_klein.preset_fields_label"));
+            ui.small(t!("cleaning.tools.flux2_klein.preset_fields_hint"));
+            ui.horizontal(|ui| {
+                ui.label(t!("cleaning.tools.flux2_klein.placement_label"))
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.placement_hint"));
                 let mut placement = Flux2Placement::from_wire(&settings.placement);
                 WheelComboBox::from_id_salt("cleaning_flux2_klein_placement")
                     .selected_text(placement.label())
@@ -5496,14 +6384,17 @@ fn draw_advanced_section(
                         for candidate in Flux2Placement::all() {
                             ui.selectable_value(&mut placement, candidate, candidate.label());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.placement_hint"));
                 if placement.wire() != settings.placement {
                     settings.placement = placement.wire().to_string();
                     *changed = true;
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(t!("cleaning.tools.flux2_klein.dtype_label"));
+                ui.label(t!("cleaning.tools.flux2_klein.dtype_label"))
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.dtype_hint"));
                 let mut dtype = Flux2Dtype::from_wire(&settings.dtype);
                 WheelComboBox::from_id_salt("cleaning_flux2_klein_dtype")
                     .selected_text(dtype.wire())
@@ -5512,7 +6403,9 @@ fn draw_advanced_section(
                             // The dtype names are technical identifiers, not prose.
                             ui.selectable_value(&mut dtype, candidate, candidate.wire());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.dtype_hint"));
                 if dtype.wire() != settings.dtype {
                     settings.dtype = dtype.wire().to_string();
                     *changed = true;
@@ -5523,6 +6416,7 @@ fn draw_advanced_section(
                     &mut settings.low_cpu_mem_usage,
                     t!("cleaning.tools.flux2_klein.low_cpu_mem_usage_label"),
                 )
+                .on_hover_text(t!("cleaning.tools.flux2_klein.low_cpu_mem_usage_hint"))
                 .changed();
             *changed |= ui
                 .checkbox(
@@ -5554,17 +6448,14 @@ fn draw_advanced_section(
                 .changed();
             // fp8 only moves the peak while the encoder is still resident: once it is
             // unloaded right after the prompt is encoded, the peak belongs to the
-            // transformer and quantizing the encoder buys nothing. The control is FADED
-            // to say so and stays live — the user may be about to turn the unloading off
-            // again, and a disabled checkbox would hide the setting instead of
-            // explaining it (`egui-docs/02-painting.md`: `set_opacity` is a painter
-            // property, so nothing here moves).
+            // transformer and quantizing the encoder buys nothing. The checkbox stays LIVE
+            // and plain anyway: the value is persisted and still goes on the wire, so a
+            // disabled control would trap a `true` the user could only clear by first
+            // turning the unloading off again. The interaction is explained where an
+            // explanation belongs — in the ordinary hover, which says what the combination
+            // means instead of the plain description of the switch.
             let pointless = settings.unload_text_encoder_after_encode;
-            let saved_opacity = ui.opacity();
-            if pointless {
-                ui.set_opacity(saved_opacity * FLUX2_FADED_CONTROL_OPACITY);
-            }
-            let fp8 = ui
+            *changed |= ui
                 .checkbox(
                     &mut settings.text_encoder_fp8,
                     t!("cleaning.tools.flux2_klein.text_encoder_fp8_label"),
@@ -5573,48 +6464,7 @@ fn draw_advanced_section(
                     t!("cleaning.tools.flux2_klein.text_encoder_fp8_hint_pointless")
                 } else {
                     t!("cleaning.tools.flux2_klein.text_encoder_fp8_hint")
-                });
-            if pointless {
-                ui.set_opacity(saved_opacity);
-            }
-            *changed |= fp8.changed();
-            // Growing the mask contour has no meaning while nothing is painted: the mask
-            // is then the whole region and the backend IGNORES `mask_dilate_px`. Unlike
-            // the fp8 checkbox above, this one is NOT faded, because the state it depends
-            // on is unknowable here — the working mode is derived from the painted mask at
-            // RUN time and the host pushes an engine the rectangle and the availability
-            // flags, never the mask stack. The condition goes into the hover text instead,
-            // where it is true at every moment rather than only at the drawn one.
-            // Feathering is unaffected either way: it still softens how the regenerated
-            // region joins the rest of the page.
-            *changed |= ui
-                .add(
-                    WheelSlider::new(&mut settings.mask_dilate_px, 0..=FLUX2_DILATE_MAX)
-                        .text(t!("cleaning.common.mask_expand_label")),
-                )
-                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_expand_hint"))
-                .changed();
-            *changed |= ui
-                .add(
-                    WheelSlider::new(&mut settings.mask_feather_px, 0..=FLUX2_FEATHER_MAX)
-                        .text(t!("cleaning.tools.flux2_klein.mask_feather_label")),
-                )
-                .on_hover_text(t!("cleaning.tools.flux2_klein.mask_feather_hint"))
-                .changed();
-            *changed |= ui
-                .checkbox(
-                    &mut settings.color_match,
-                    t!("cleaning.tools.flux2_klein.color_match_label"),
-                )
-                .changed();
-            *changed |= ui
-                .add(
-                    WheelSlider::new(
-                        &mut settings.max_sequence_length,
-                        FLUX2_MAX_SEQ_MIN..=FLUX2_MAX_SEQ_MAX,
-                    )
-                    .text("Max tokens"),
-                )
+                })
                 .changed();
         },
     );
@@ -6953,12 +7803,13 @@ fn settings_from_json(value: &Value) -> Flux2KleinSettings {
     // which is exactly what serde's `#[serde(default)]` already produces.
     //
     // A file written by a build that still had the «Работа без маски» checkbox carries a
-    // `whole_region` key that no longer maps to a field. No migration is needed for it
-    // either, and none may be added: the struct does NOT use `deny_unknown_fields`, so
-    // serde drops the key silently, the document loads with every other setting intact,
-    // and the next save simply writes it out without that key. The mode it used to hold
-    // is derived from the painted mask now (`mask_for_run`), so there is nothing left for
-    // a stored value to mean.
+    // `whole_region` key that no longer maps to a field; older files likewise carry
+    // `max_sequence_length` (pinned to `FLUX2_MAX_SEQ` now) and `brush_radius` (the brush
+    // belongs to the host's `MaskBrush`). No migration is needed for any of them, and none
+    // may be added: the struct does NOT use `deny_unknown_fields`, so serde drops such keys
+    // silently, the document loads with every other setting intact, and the next save simply
+    // writes it out without them. The mode `whole_region` used to hold is derived from the
+    // painted mask now (`mask_for_run`), so there is nothing left for a stored value to mean.
     settings
 }
 
@@ -7018,7 +7869,6 @@ mod tests {
         assert_eq!(settings.mask_dilate_px, 16);
         assert_eq!(settings.mask_feather_px, 12);
         assert!(settings.color_match);
-        assert_eq!(settings.max_sequence_length, 512);
         // The default placement is `full_gpu`, where the transformer stays put...
         assert!(!settings.unload_transformer_before_vae);
         // ...and the encoder is kept too: loaded LAST, it occupies host memory the
@@ -7236,8 +8086,6 @@ mod tests {
             strength: 0.0,
             mask_dilate_px: 999,
             mask_feather_px: 999,
-            max_sequence_length: 1,
-            brush_radius: 0,
             placement: "nonsense".to_string(),
             dtype: "nonsense".to_string(),
             mt_service: "nonsense".to_string(),
@@ -7251,8 +8099,6 @@ mod tests {
         assert!((norm.strength - FLUX2_STRENGTH_MIN).abs() < f32::EPSILON);
         assert_eq!(norm.mask_dilate_px, FLUX2_DILATE_MAX);
         assert_eq!(norm.mask_feather_px, FLUX2_FEATHER_MAX);
-        assert_eq!(norm.max_sequence_length, FLUX2_MAX_SEQ_MIN);
-        assert_eq!(norm.brush_radius, FLUX2_BRUSH_MIN);
         assert_eq!(norm.placement, "full_gpu");
         assert_eq!(norm.dtype, "bfloat16");
         assert_eq!(norm.mt_service, "google");
@@ -7739,38 +8585,48 @@ mod tests {
         }
     }
 
-    /// A settings file written by a build that still had the «Работа без маски» checkbox
-    /// carries a `whole_region` key nothing maps to any more. The struct does not use
-    /// `deny_unknown_fields`, so the document must load with every other setting intact
-    /// rather than falling back to defaults.
+    /// A settings file written by an older build carries keys nothing maps to any more:
+    /// `whole_region` (the mode is derived from the mask), `max_sequence_length` (pinned to
+    /// [`FLUX2_MAX_SEQ`]) and `brush_radius` (the brush belongs to the host). The struct does
+    /// not use `deny_unknown_fields`, so the document must load with every other setting
+    /// intact rather than falling back to defaults.
     #[test]
-    fn a_settings_file_carrying_the_removed_whole_region_field_still_loads() {
+    fn a_settings_file_carrying_removed_fields_still_loads() {
         let old = json!({
             "text_encoder_path": "/a",
             "transformer_path": "/b",
             "vae_path": "/c",
             "placement": "sequential_cpu_offload",
             "whole_region": true,
+            "max_sequence_length": 128,
+            "brush_radius": 64,
             "mask_dilate_px": 8
         });
         let migrated = settings_from_json(&old);
-        assert_eq!(migrated.text_encoder_path, "/a", "the removed key must not cost the rest");
+        assert_eq!(migrated.text_encoder_path, "/a", "the removed keys must not cost the rest");
         assert_eq!(migrated.transformer_path, "/b");
         assert_eq!(migrated.vae_path, "/c");
         assert_eq!(migrated.mask_dilate_px, 8);
         // The neighbouring placement migration still runs on such a document.
         assert!(migrated.unload_transformer_before_vae);
+        // A stale `max_sequence_length` cannot lower what goes on the wire any more.
+        assert_eq!(
+            migrated.normalized().to_params(false)["max_sequence_length"],
+            json!(FLUX2_MAX_SEQ)
+        );
 
-        // The same document without the key loads identically: the key means nothing now.
+        // The same document without those keys loads identically: they mean nothing now.
         let mut without = old.clone();
         if let Some(map) = without.as_object_mut() {
             map.remove("whole_region");
+            map.remove("max_sequence_length");
+            map.remove("brush_radius");
         }
         let plain = settings_from_json(&without);
         assert_eq!(
             serde_json::to_value(&migrated).expect("serialize"),
             serde_json::to_value(&plain).expect("serialize"),
-            "a stale `whole_region` key may not change a single loaded setting"
+            "a stale removed key may not change a single loaded setting"
         );
     }
 
@@ -7820,13 +8676,13 @@ mod tests {
         // The whole point of the prompt-cache library: the denoise and the VAE decode
         // never look at the encoder, so a ready embedding is enough to run.
         assert!(
-            flux2_run_block_reason(&no_encoder, Some(true)).is_none(),
+            flux2_run_block_reason(&no_encoder, None, Some(true)).is_none(),
             "a cached prompt must waive the encoder path"
         );
         // Without a cache the encoder is required again, and the message names all three
         // paths because all three are genuinely needed then.
         for state in [None, Some(false)] {
-            let reason = flux2_run_block_reason(&no_encoder, state)
+            let reason = flux2_run_block_reason(&no_encoder, None, state)
                 .expect("no encoder and no cache must be refused");
             assert_eq!(
                 reason,
@@ -7851,7 +8707,7 @@ mod tests {
                 ..no_encoder.clone()
             },
         ] {
-            let reason = flux2_run_block_reason(&broken, Some(true))
+            let reason = flux2_run_block_reason(&broken, None, Some(true))
                 .expect("a missing transformer or VAE still blocks the run");
             assert_eq!(
                 reason,
@@ -7863,7 +8719,648 @@ mod tests {
             prompt: "   ".to_string(),
             ..no_encoder.clone()
         };
-        assert!(flux2_run_block_reason(&no_prompt, Some(true)).is_some());
+        assert!(flux2_run_block_reason(&no_prompt, None, Some(true)).is_some());
+    }
+
+    /// A `.status` answer whose presence catalog can be dictated component by component.
+    ///
+    /// `present` lists the components the backend reports as being on disk; everything
+    /// else parses as absent, which is exactly what a fresh machine answers.
+    fn status_with_present(present: &[&str]) -> Flux2Status {
+        let mut components = serde_json::Map::new();
+        for name in ["text_encoder", "transformer", "vae", "tokenizer", "scheduler"] {
+            components.insert(
+                name.to_string(),
+                json!({ "exists": present.contains(&name), "found": present.contains(&name) }),
+            );
+        }
+        parse_flux2_status(&json!({ "available": true, "components": components }))
+    }
+
+    /// Every component the catalog knows, so `Ready` is reachable.
+    const FLUX2_ALL_COMPONENTS: [&str; 5] = [
+        "text_encoder",
+        "transformer",
+        "vae",
+        "tokenizer",
+        "scheduler",
+    ];
+
+    /// The readiness helper is the ONE answer to "is the model installed", and the whole
+    /// point of it is the difference between "not known" and "not there": blocking on the
+    /// first would leave «Обработать» dead on a slow backend, and never blocking on the
+    /// second is what used to leak the backend's untranslated «Путь ... не найден» to the
+    /// user in download mode, where the derived paths are never empty.
+    #[test]
+    fn model_readiness_separates_not_known_from_not_installed() {
+        let manual = runnable_settings();
+
+        // No answer yet: paths are filled in and nothing has contradicted them.
+        assert_eq!(
+            flux2_model_readiness(&manual, None, None),
+            Flux2ModelReadiness::Unknown,
+            "an outstanding `.status` is not evidence of a missing model"
+        );
+
+        // Everything present.
+        assert_eq!(
+            flux2_model_readiness(&manual, Some(&status_with_present(&FLUX2_ALL_COMPONENTS)), None),
+            Flux2ModelReadiness::Ready
+        );
+
+        // One component gone: the verdict names it and nothing else, so the refusal can
+        // send the user after the one file that is actually missing.
+        let without_transformer: Vec<&str> = FLUX2_ALL_COMPONENTS
+            .into_iter()
+            .filter(|name| *name != "transformer")
+            .collect();
+        assert_eq!(
+            flux2_model_readiness(&manual, Some(&status_with_present(&without_transformer)), None),
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                transformer: true,
+                ..Flux2MissingComponents::default()
+            })
+        );
+
+        // An empty required path is decided WITHOUT the backend: nothing can be found at a
+        // path that was never given, so this must not wait for an answer that would only
+        // repeat it.
+        let manual_blank = Flux2KleinSettings {
+            text_encoder_path: String::new(),
+            transformer_path: String::new(),
+            vae_path: String::new(),
+            ..runnable_settings()
+        };
+        assert_eq!(
+            flux2_model_readiness(&manual_blank, None, None),
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                text_encoder: true,
+                transformer: true,
+                vae: true,
+                ..Flux2MissingComponents::default()
+            })
+        );
+        // With the prompt cached the encoder is waived here exactly as it is in the gate.
+        assert_eq!(
+            flux2_model_readiness(&manual_blank, None, Some(true)),
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                transformer: true,
+                vae: true,
+                ..Flux2MissingComponents::default()
+            })
+        );
+
+        // Download mode on a machine where nothing has been downloaded. This is the case
+        // the emptiness check can NEVER see: `effective_paths` derives all three under the
+        // models directory, so they are non-empty from the first frame.
+        let download = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            ..runnable_settings()
+        };
+        assert!(
+            !download.effective_paths().transformer.is_empty(),
+            "the derived paths are never empty — that is why the catalog is consulted"
+        );
+        assert_eq!(
+            flux2_model_readiness(&download, Some(&status_with_present(&[])), None),
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                text_encoder: true,
+                transformer: true,
+                vae: true,
+                tokenizer: true,
+                scheduler: true,
+            })
+        );
+        assert_eq!(
+            flux2_model_readiness(&download, None, None),
+            Flux2ModelReadiness::Unknown,
+            "before the first answer the download mode must not block the button either"
+        );
+    }
+
+    /// A catalog fetched for OTHER paths says nothing about the ones in the settings now.
+    ///
+    /// The regression this pins: the user pastes a corrected model path, the cached answer
+    /// still reports the old file as absent, and «Обработать» keeps refusing with a list of
+    /// components that are in fact there. The guard is the same one the prompt half of the
+    /// answer already had, and it degrades to `Unknown` — which never blocks — rather than
+    /// to a verdict of its own.
+    #[test]
+    fn a_catalog_about_other_paths_is_not_a_verdict_about_these() {
+        let wrong = Flux2KleinSettings {
+            transformer_path: "/models/typo.safetensors".to_string(),
+            ..runnable_settings()
+        };
+        let present: Vec<&str> = FLUX2_ALL_COMPONENTS
+            .into_iter()
+            .filter(|name| *name != "transformer")
+            .collect();
+        let answer = status_with_present(&present);
+        let asked_about = wrong.effective_paths();
+
+        // While the answer still describes the paths in the fields it is a real verdict.
+        assert_eq!(
+            flux2_model_readiness(
+                &wrong,
+                flux2_status_for_paths(Some(&answer), Some(&asked_about), &wrong.effective_paths()),
+                None
+            ),
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                transformer: true,
+                ..Flux2MissingComponents::default()
+            })
+        );
+
+        // The path is corrected by TYPING — no picker, no «Обновить». The catalog in hand
+        // is now about a file nobody asked about, and must stop being evidence.
+        let fixed = runnable_settings();
+        assert_ne!(asked_about, fixed.effective_paths());
+        let guarded =
+            flux2_status_for_paths(Some(&answer), Some(&asked_about), &fixed.effective_paths());
+        assert!(guarded.is_none(), "a stale catalog must not survive the guard");
+        assert_eq!(
+            flux2_model_readiness(&fixed, guarded, None),
+            Flux2ModelReadiness::Unknown,
+            "a corrected path may not keep reading as a missing component"
+        );
+        assert!(
+            flux2_run_block_reason(&fixed, guarded, None).is_none(),
+            "and the run gate must let the corrected configuration through"
+        );
+
+        // No answer at all behaves as before; the guard adds nothing there.
+        assert!(flux2_status_for_paths(None, Some(&asked_about), &fixed.effective_paths()).is_none());
+        // An answer whose paths were never recorded (an older session state) is treated the
+        // same way: unattributed evidence is no evidence.
+        assert!(flux2_status_for_paths(Some(&answer), None, &fixed.effective_paths()).is_none());
+    }
+
+    /// The other half of the same fix: the guard makes a stale answer harmless, and this
+    /// makes a fresh one actually arrive. Only a change of the EFFECTIVE PATHS re-asks —
+    /// the catalog says nothing about the other parameters, and arming on every edit would
+    /// put an IPC on every frame of a dragged wheel.
+    #[test]
+    fn a_path_change_arms_a_fresh_catalog_query() {
+        let asked_about = runnable_settings().effective_paths();
+        let engine_at_rest = || Flux2KleinEngine {
+            settings: runnable_settings(),
+            settings_loaded: true,
+            status: Some(status_with_present(&FLUX2_ALL_COMPONENTS)),
+            status_paths: Some(asked_about.clone()),
+            status_wanted: false,
+            estimate_wanted: false,
+            dirty: false,
+            ..Flux2KleinEngine::default()
+        };
+
+        // A typed path correction: the answer in hand is about the old file.
+        let mut typed = engine_at_rest();
+        typed.settings.transformer_path = "/models/flux2-corrected.safetensors".to_string();
+        typed.note_settings_changed();
+        assert!(typed.dirty && typed.estimate_wanted);
+        assert!(
+            typed.status_wanted,
+            "a typed path must re-ask the catalog — only the picker armed it before"
+        );
+
+        // A parameter the catalog knows nothing about: the forecast moves, the catalog
+        // does not.
+        let mut steps = engine_at_rest();
+        steps.settings.steps += 1;
+        steps.note_settings_changed();
+        assert!(steps.dirty && steps.estimate_wanted);
+        assert!(
+            !steps.status_wanted,
+            "a parameter that leaves the paths alone must not re-ask the catalog"
+        );
+
+        // A query for exactly these paths is already on the wire: arming again would only
+        // send a duplicate behind it.
+        let mut in_flight = engine_at_rest();
+        in_flight.status_paths = None;
+        in_flight.settings.transformer_path = "/models/flux2-corrected.safetensors".to_string();
+        in_flight.status_query_paths = Some(in_flight.settings.effective_paths());
+        in_flight.note_settings_changed();
+        assert!(!in_flight.status_wanted);
+
+        // The switch to download mode changes all three derived paths at once.
+        let mut mode = engine_at_rest();
+        mode.settings.source_mode = Flux2SourceMode::Download.wire().to_string();
+        mode.note_settings_changed();
+        assert!(mode.status_wanted);
+    }
+
+    /// «Установка модели» opens itself once, and never against the user's hand.
+    ///
+    /// The window the last rule closes is real: `.status` can take seconds, and while the
+    /// verdict is `Unknown` the user is free to open the section, look at it and close it
+    /// again — the first `Missing` landing afterwards used to reopen it.
+    #[test]
+    fn the_install_section_seeds_once_and_yields_to_the_user() {
+        let missing = Flux2ModelReadiness::Missing(Flux2MissingComponents {
+            transformer: true,
+            ..Flux2MissingComponents::default()
+        });
+
+        // Nothing has answered: the section keeps waiting rather than guess.
+        assert_eq!(
+            flux2_install_seed(false, false, Flux2ModelReadiness::Unknown),
+            Flux2InstallSeed::Keep
+        );
+        // The first `Missing` opens it, once.
+        assert_eq!(flux2_install_seed(false, false, missing), Flux2InstallSeed::Open);
+        assert_eq!(flux2_install_seed(true, false, missing), Flux2InstallSeed::Keep);
+        // Installed: the seeding is spent without unfolding anything.
+        assert_eq!(
+            flux2_install_seed(false, false, Flux2ModelReadiness::Ready),
+            Flux2InstallSeed::Seal
+        );
+        // The user moved the fold while the verdict was still outstanding. From then on the
+        // section is his, whatever lands next.
+        for readiness in [Flux2ModelReadiness::Unknown, missing, Flux2ModelReadiness::Ready] {
+            assert_eq!(
+                flux2_install_seed(false, true, readiness),
+                Flux2InstallSeed::Seal,
+                "a section the user has moved by hand must never be forced open"
+            );
+        }
+    }
+
+    /// The refusal must be LOCAL and actionable: it names the missing parts and the fix,
+    /// and the fix differs by mode — a download is a button, a wrong manual path is a field.
+    #[test]
+    fn a_missing_model_is_refused_locally_and_says_what_to_do() {
+        let nothing = status_with_present(&[]);
+
+        let download = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            ..runnable_settings()
+        };
+        let reason = flux2_run_block_reason(&download, Some(&nothing), None)
+            .expect("an empty models directory must be refused before the request goes out");
+        assert_eq!(
+            reason,
+            tf!(
+                "cleaning.tools.flux2_klein.model_not_downloaded_error",
+                components = Flux2MissingComponents {
+                    text_encoder: true,
+                    transformer: true,
+                    vae: true,
+                    tokenizer: true,
+                    scheduler: true,
+                }
+                .names()
+            )
+        );
+        // That the message really NAMES the components is a property of the templates and
+        // is pinned per locale by `every_catalog_carries_the_new_panel_keys` — a unit test
+        // runs with no active catalog, where `tf!` answers the key itself.
+
+        // Manual mode: same verdict, a different instruction.
+        let manual = runnable_settings();
+        let manual_reason = flux2_run_block_reason(&manual, Some(&nothing), None)
+            .expect("paths that point at nothing must be refused here, not by the backend");
+        assert_ne!(
+            manual_reason, reason,
+            "the two modes are fixed in different places and must not share one message"
+        );
+
+        // Nothing outstanding may block: an unanswered `.status` leaves the run alive.
+        assert!(
+            flux2_run_block_reason(&manual, None, None).is_none(),
+            "`Unknown` must never block — a slow backend would kill the button"
+        );
+        // And a complete installation is not blocked either.
+        assert!(
+            flux2_run_block_reason(
+                &manual,
+                Some(&status_with_present(&FLUX2_ALL_COMPONENTS)),
+                None
+            )
+            .is_none()
+        );
+    }
+
+    /// The line under the prompt field has room for exactly ONE fact and three compete for
+    /// it, so the priority is a rule and not a formatting accident. A cached prompt wins
+    /// outright — the run works with no encoder at all, which is what the library is for —
+    /// and only after that does a missing encoder outrank «не кэширован», because it says
+    /// the run cannot start rather than that it will be slow.
+    #[test]
+    fn the_prompt_line_reports_the_most_consequential_state_and_stays_silent_when_unsure() {
+        // Nothing has answered: an outstanding query is not information. The old
+        // «Состояние кэша промпта пока неизвестно.» line said only that the panel had asked.
+        assert_eq!(
+            flux2_prompt_cache_line(None, None),
+            Flux2PromptCacheLine::Silent
+        );
+        assert_eq!(
+            flux2_prompt_cache_line(Some(true), None),
+            Flux2PromptCacheLine::Cached
+        );
+        assert_eq!(
+            flux2_prompt_cache_line(Some(false), None),
+            Flux2PromptCacheLine::NotCached
+        );
+        // A cached prompt survives a machine with no encoder — that is the whole point of
+        // a carried `.msprompt`, and the run gate waives the encoder on exactly this.
+        assert_eq!(
+            flux2_prompt_cache_line(Some(true), Some(false)),
+            Flux2PromptCacheLine::Cached
+        );
+        // Without the embeddings AND without an encoder nothing can be produced here, so
+        // that outranks the cache state — including an unanswered one.
+        assert_eq!(
+            flux2_prompt_cache_line(Some(false), Some(false)),
+            Flux2PromptCacheLine::NoEncoder
+        );
+        assert_eq!(
+            flux2_prompt_cache_line(None, Some(false)),
+            Flux2PromptCacheLine::NoEncoder
+        );
+        // "Not known" is never `false`: an encoder that has not been reported on must not
+        // raise the warning that closes the two encode-only library buttons.
+        assert_eq!(
+            flux2_prompt_cache_line(Some(false), None),
+            Flux2PromptCacheLine::NotCached
+        );
+    }
+
+    /// The always-visible readiness line is the panel's ONE report of the model verdict.
+    /// Each of the three states has to read differently — and `Unknown` must never borrow
+    /// the wording or the tone of `Missing`, which is the confusion this whole three-state
+    /// answer exists to prevent.
+    ///
+    /// Every expected text is built from the SAME macro the code uses, because whether a
+    /// catalog is active depends on which other test installed one first; that the
+    /// templates really carry their placeholders is pinned per locale by
+    /// `every_catalog_carries_the_new_panel_keys`.
+    #[test]
+    fn the_readiness_line_says_one_thing_per_verdict() {
+        let forecast = Flux2MemorySummary {
+            line: "VRAM 9.0".to_string(),
+            fits: true,
+        };
+
+        let unknown = flux2_readiness_line(Flux2ModelReadiness::Unknown, Some(forecast.clone()));
+        assert_eq!(unknown, Flux2ReadinessLine::Unknown);
+        assert_eq!(unknown.tone(), Flux2LineTone::Neutral);
+        assert!(
+            !unknown.offers_install(),
+            "nothing is known to be missing, so there is nothing to install"
+        );
+        assert_eq!(
+            unknown.text(),
+            t!("cleaning.tools.flux2_klein.model_readiness_unknown_status")
+        );
+
+        let missing = flux2_readiness_line(
+            Flux2ModelReadiness::Missing(Flux2MissingComponents {
+                transformer: true,
+                vae: true,
+                ..Flux2MissingComponents::default()
+            }),
+            Some(forecast.clone()),
+        );
+        assert_eq!(missing.tone(), Flux2LineTone::Warn);
+        assert!(missing.offers_install());
+        let Flux2ReadinessLine::Missing { components } = &missing else {
+            panic!("a missing model must keep the list of what is missing");
+        };
+        assert_eq!(
+            components,
+            &format!(
+                "{}, {}",
+                t!("cleaning.tools.flux2_klein.component_transformer"),
+                t!("cleaning.tools.flux2_klein.component_vae")
+            ),
+            "one refusal names every missing part, in catalog order"
+        );
+        assert_eq!(
+            missing.text(),
+            tf!(
+                "cleaning.tools.flux2_klein.model_missing_status",
+                components = components
+            )
+        );
+
+        // Ready with no answered forecast yet: the short line, and never a template with an
+        // empty `{memory}` in it.
+        let bare = flux2_readiness_line(Flux2ModelReadiness::Ready, None);
+        assert_eq!(bare.tone(), Flux2LineTone::Ok);
+        assert!(!bare.offers_install());
+        assert_eq!(
+            bare.text(),
+            t!("cleaning.tools.flux2_klein.model_ready_status")
+        );
+
+        let ready = flux2_readiness_line(Flux2ModelReadiness::Ready, Some(forecast));
+        assert_eq!(ready.tone(), Flux2LineTone::Ok);
+        assert_eq!(
+            ready.text(),
+            tf!(
+                "cleaning.tools.flux2_klein.model_ready_memory_status",
+                memory = "VRAM 9.0"
+            ),
+            "a landed forecast takes the other template, so the figures cannot be dropped"
+        );
+
+        // The one way a READY model still needs attention: the spelled-out «не помещается»
+        // warning lives inside «Память и скорость», which may well be folded away, so the
+        // tone of this line has to carry it.
+        let tight = flux2_readiness_line(
+            Flux2ModelReadiness::Ready,
+            Some(Flux2MemorySummary {
+                line: "VRAM 30.0".to_string(),
+                fits: false,
+            }),
+        );
+        assert_eq!(tight.tone(), Flux2LineTone::Warn);
+        assert!(!tight.offers_install(), "the model is installed; it is the memory that is short");
+    }
+
+    /// The two component blocks the panel used to draw described the same five parts twice.
+    /// Merging them may not lose either half, and it may not invent the half the backend
+    /// did not send.
+    #[test]
+    fn the_merged_list_joins_presence_and_residency_without_inventing_either() {
+        let status = parse_flux2_status(&json!({
+            "available": true,
+            "components": {
+                "text_encoder": {
+                    "exists": true,
+                    "size_bytes": 1024,
+                    "path": "/models/te",
+                    "residency": "ram",
+                    "actions": ["unload"],
+                },
+                // On disk, and genuinely SPLIT across devices — one of the two states that
+                // exist precisely because they must not be rounded to another.
+                "vae": { "exists": true, "residency": "mixed", "actions": ["unload", "warmup"] },
+                // Not on disk, and the answer says nothing about where it is.
+                "transformer": { "exists": false, "path": "/models/tr" },
+                "tokenizer": { "found": true, "path": "/models/tok" },
+                "scheduler": { "found": false },
+            },
+        }));
+        let rows = flux2_component_rows(&status, status.components.components.as_deref());
+        assert_eq!(rows.len(), 5, "every catalog component gets a row of its own");
+        assert_eq!(
+            rows.iter().map(|row| row.component).collect::<Vec<_>>(),
+            Flux2CatalogComponent::all().to_vec(),
+            "the display order is the catalog order and does not follow the answer"
+        );
+
+        // Present: presence, size and path from one half, residency and the backend's own
+        // button list from the other — in ONE row.
+        let encoder = &rows[0];
+        assert!(encoder.present);
+        assert_eq!(encoder.size_bytes, 1024);
+        assert_eq!(encoder.path, "/models/te");
+        let residency = encoder.residency.expect("the answer covered the encoder");
+        assert_eq!(residency.residency, Some(Flux2Residency::Ram));
+        assert_eq!(residency.actions, vec![Flux2ComponentAction::Unload]);
+
+        // Split across devices, and the two offered actions survive in the backend's order.
+        let vae = &rows[2];
+        assert_eq!(
+            vae.residency.and_then(|row| row.residency),
+            Some(Flux2Residency::Mixed)
+        );
+        assert_eq!(
+            vae.residency.map(|row| row.actions.as_slice()),
+            Some([Flux2ComponentAction::Unload, Flux2ComponentAction::Warmup].as_slice())
+        );
+
+        // Absent on disk: the row keeps its presence half, and the residency half claims
+        // no state and offers no button rather than guessing at one.
+        let transformer = &rows[1];
+        assert!(!transformer.present);
+        assert_eq!(transformer.path, "/models/tr");
+        let transformer_residency = transformer
+            .residency
+            .expect("the answer listed the transformer, if without a state");
+        assert_eq!(transformer_residency.residency, None);
+        assert!(transformer_residency.actions.is_empty());
+
+        // The two components the residency answer never covers: they carry no weights, so
+        // "no state" is the truth about them and not a gap.
+        for row in &rows[3..] {
+            assert!(
+                row.residency.is_none(),
+                "{:?} has no weights and must never claim a residency",
+                row.component
+            );
+        }
+        assert!(rows[3].present, "the tokenizer's presence still comes through");
+        assert!(!rows[4].present);
+
+        // Busy, or a backend that predates the block: the caller reports that once above
+        // the list, and every row falls back to its presence half.
+        let presence_only = flux2_component_rows(&status, None);
+        assert!(presence_only.iter().all(|row| row.residency.is_none()));
+        assert_eq!(
+            presence_only
+                .iter()
+                .map(|row| row.present)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, true, false],
+            "dropping the residency half must not disturb the presence half"
+        );
+    }
+
+    /// Merging the two lists merged their hovers as well: the presence catalog showed the
+    /// resolved path, the residency block explained what the component IS, and one label
+    /// has one hover. Neither half may be dropped, and an unresolved path may not leave a
+    /// dangling separator behind.
+    #[test]
+    fn a_merged_row_keeps_both_hovers_the_two_lists_had() {
+        let both = flux2_component_row_tooltip(Flux2CatalogComponent::Vae, "/models/vae");
+        assert_eq!(
+            both,
+            format!(
+                "{}\n/models/vae",
+                t!("cleaning.tools.flux2_klein.component_vae_hint")
+            )
+        );
+        assert_eq!(
+            flux2_component_row_tooltip(Flux2CatalogComponent::Scheduler, ""),
+            t!("cleaning.tools.flux2_klein.component_scheduler_hint")
+        );
+    }
+
+    /// The refusal that replaces the backend's untranslated «Путь ... не найден» is only
+    /// actionable if the translation actually names the missing parts, and a hover that is
+    /// missing in one language is a control with no explanation there. Both are properties
+    /// of the CATALOGS, which a unit test cannot see through `t!` — it runs with none.
+    #[test]
+    fn every_catalog_carries_the_new_panel_keys() {
+        const WITH_COMPONENTS: [&str; 3] = [
+            "cleaning.tools.flux2_klein.model_not_downloaded_error",
+            "cleaning.tools.flux2_klein.model_components_missing_error",
+            // The readiness line is the panel's ONE report of the same verdict, and it is
+            // actionable only while it names the parts that are missing.
+            "cleaning.tools.flux2_klein.model_missing_status",
+        ];
+        const PLAIN: [&str; 24] = [
+            "cleaning.tools.flux2_klein.guidance_label",
+            "cleaning.tools.flux2_klein.strength_hint",
+            "cleaning.tools.flux2_klein.fixed_seed_hint",
+            "cleaning.tools.flux2_klein.preset_hint",
+            "cleaning.tools.flux2_klein.placement_hint",
+            "cleaning.tools.flux2_klein.dtype_hint",
+            "cleaning.tools.flux2_klein.low_cpu_mem_usage_hint",
+            "cleaning.tools.flux2_klein.color_match_hint",
+            "cleaning.tools.flux2_klein.refresh_state_hint",
+            "cleaning.tools.flux2_klein.unload_hint",
+            "cleaning.tools.flux2_klein.text_encoder_path_hint",
+            "cleaning.tools.flux2_klein.transformer_path_hint",
+            "cleaning.tools.flux2_klein.vae_path_hint",
+            // The restructured panel: the three section headings, the two prompt toggles
+            // and the readiness line are the whole navigation of this tool, so a language
+            // that lacks one of them loses a section rather than a sentence.
+            "cleaning.tools.flux2_klein.install_heading",
+            "cleaning.tools.flux2_klein.memory_heading",
+            "cleaning.tools.flux2_klein.advanced_heading",
+            "cleaning.tools.flux2_klein.translate_prompt_label",
+            "cleaning.tools.flux2_klein.translate_prompt_hint",
+            "cleaning.tools.flux2_klein.prompt_library_label",
+            "cleaning.tools.flux2_klein.prompt_library_hint",
+            "cleaning.tools.flux2_klein.model_ready_status",
+            "cleaning.tools.flux2_klein.model_readiness_unknown_status",
+            "cleaning.tools.flux2_klein.install_hint",
+            "cleaning.tools.flux2_klein.preset_fields_hint",
+        ];
+        for (tag, source) in ms_i18n::embedded_locales() {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            for key in WITH_COMPONENTS.into_iter().chain(PLAIN) {
+                let value = catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"));
+                assert!(!value.trim().is_empty(), "locale `{tag}`: `{key}` is empty");
+            }
+            for key in WITH_COMPONENTS {
+                let value = catalog.get(key).and_then(Value::as_str).unwrap_or_default();
+                assert!(
+                    value.contains("{components}"),
+                    "locale `{tag}`: `{key}` drops `{{components}}`, so the refusal would not \
+                     say WHICH parts are missing — the one thing that makes it actionable"
+                );
+            }
+            // The other half of the readiness line: a translation that drops `{memory}`
+            // would silently swallow the whole forecast, because that line is the only
+            // place it is shown while «Память и скорость» stays folded.
+            let ready = catalog
+                .get("cleaning.tools.flux2_klein.model_ready_memory_status")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("locale `{tag}` lacks the ready-with-forecast line"));
+            assert!(
+                ready.contains("{memory}"),
+                "locale `{tag}`: the ready line drops `{{memory}}` and would hide the forecast"
+            );
+        }
     }
 
     /// The whole rule, in one place: nothing painted is the whole-region mode and yields
@@ -7943,7 +9440,7 @@ mod tests {
             vae_path: "/models/vae".to_string(),
             ..Flux2KleinSettings::default()
         };
-        assert!(flux2_run_block_reason(&settings, None).is_none());
+        assert!(flux2_run_block_reason(&settings, None, None).is_none());
     }
 
     #[test]
@@ -8734,13 +10231,16 @@ mod tests {
             ),
         ];
         let plain = [
-            "cleaning.tools.flux2_klein.component_residency_heading",
             "cleaning.tools.flux2_klein.component_residency_busy_status",
             "cleaning.tools.flux2_klein.component_residency_unknown_status",
             "cleaning.tools.flux2_klein.component_residency_unknown",
             "cleaning.tools.flux2_klein.component_text_encoder_hint",
             "cleaning.tools.flux2_klein.component_transformer_hint",
             "cleaning.tools.flux2_klein.component_vae_hint",
+            // The merged list shows all five components, so the two that carry no weights
+            // need an explanation of their own — the residency block never had to give one.
+            "cleaning.tools.flux2_klein.component_tokenizer_hint",
+            "cleaning.tools.flux2_klein.component_scheduler_hint",
             "cleaning.tools.flux2_klein.component_action_disabled_tooltip",
             "cleaning.tools.flux2_klein.component_action_done_status",
             "cleaning.tools.flux2_klein.component_action_load_pair_tooltip",
@@ -9919,7 +11419,7 @@ mod tests {
             ..runnable_settings()
         };
         assert!(
-            flux2_run_block_reason(&empty_fields, None).is_none(),
+            flux2_run_block_reason(&empty_fields, None, None).is_none(),
             "download mode derives its paths, so blank manual fields must not block a run"
         );
         // In manual mode the same blank fields do block it.
@@ -9927,7 +11427,7 @@ mod tests {
             source_mode: Flux2SourceMode::Manual.wire().to_string(),
             ..empty_fields
         };
-        assert!(flux2_run_block_reason(&manual_blank, None).is_some());
+        assert!(flux2_run_block_reason(&manual_blank, None, None).is_some());
     }
 
     /// A finished download must not touch the manual fields. This is the destructive case
