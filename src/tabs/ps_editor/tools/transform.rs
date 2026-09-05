@@ -93,6 +93,16 @@ impl PsTool for TransformTool {
         t!("ps_editor.tools.transform_title")
     }
 
+    /// Drops the in-progress drag (and its captured start transform) plus the cached gizmo.
+    ///
+    /// `interact` already clears the drag on the first frame with the button up, so this only
+    /// matters when the tool stops receiving frames at all — a tool or page switch taken mid-drag
+    /// via a hotkey. The layer transform mutated so far is kept: it is a committed edit.
+    fn reset(&mut self) {
+        self.drag = None;
+        self.gizmo = None;
+    }
+
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
         use crate::trace::cat;
         let outcome = ToolOutcome::default();

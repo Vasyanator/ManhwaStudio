@@ -16,6 +16,17 @@ Architecture:
 - `page_loader`: background worker that produces the two base-layer images for the active page.
 - `layer_render`: per-layer tiled texture cache (budgeted upload, dirty tiles).
 - `tools`: `PsTool` trait + selection/brush tools; the tab routes pointer input to the active tool.
+  Tool-gesture lifecycle is the TAB's job: `set_active_tool` (the only writer of `active_tool_idx`)
+  resets the outgoing tool, `request_page` resets the active one, and a frame routed to the pan /
+  text drag instead calls `PsTool::freeze` (or `reset` on Esc) so a multi-frame outline neither
+  outlives its page nor dies on a suppressed frame.
+- selection storage: `set_selection` / `non_empty_selection` keep the page selection `Some` only
+  while it selects at least one pixel — an all-zero mask draws no marquee yet still clips the brush.
+- selection marquee: `draw_selection_marquee` paints the boundary loops of `Selection` as a static
+  black/white dashed border. The loops trace the mask's PIXEL EDGES and can carry many thousands of
+  one-pixel staircase steps, so the screen path is first decimated (`decimate_to_screen`) and then
+  dashed by CUMULATIVE arc length (`walk_dash_runs`) — dashing each segment on its own would restart
+  the pattern every pixel and paint a solid line.
 - raster effects: applying a non-destructive effects chain runs the expensive
   `apply_effects_to_color_image` on a worker thread (`render_ps_raster_effects`), never the GUI
   thread. `apply_effects_to_raster` clones the base pixels and spawns the render (stashing a
@@ -64,13 +75,32 @@ use tools::brush::BrushTool;
 use tools::deform::DeformTool;
 use tools::select::{SelectMode, SelectTool};
 use tools::transform::TransformTool;
-use tools::{PsTool, PsToolContext, PsToolId, ToolOutcome};
+use tools::{PsTool, PsToolContext, PsToolId, PsToolSection, ToolOutcome};
 
 /// Max layer tiles uploaded to the GPU per frame across all layers (spreads big-page uploads).
 const TILE_UPLOAD_BUDGET_PER_FRAME: usize = 8;
 
 /// Max undo steps retained by the PS-editor per-page history (in addition to the byte budget).
 const PS_EDITOR_UNDO_LIMIT: usize = 128;
+
+/// Screen-space length (px) of one dash of the selection marquee. Black and white runs alternate
+/// every `MARQUEE_DASH_PX` of arc length. Fixed in SCREEN space, so the pattern is zoom-invariant.
+const MARQUEE_DASH_PX: f32 = 4.0;
+
+/// Minimum screen-space distance (px) between two consecutive marquee path points. Boundary loops
+/// trace the mask's pixel edges, so at zoom < 1 they carry sub-pixel staircase steps; dropping
+/// those bounds the shape count by the loop's screen length rather than by the mask's complexity.
+/// Below 1.0 so nothing is dropped at zoom >= 1, where the marquee must stay pixel-accurate.
+const MARQUEE_MIN_STEP_PX: f32 = 0.75;
+
+/// Screen-space length (px) below which a dash run (or a leftover dash phase) is treated as zero.
+/// Guards against emitting invisible shapes and against zero-length steps in the arc-length walk.
+const MARQUEE_MIN_RUN_PX: f32 = 1e-3;
+
+/// Hard cap on the dash runs emitted for one selection-marquee frame, across all boundary loops.
+/// Decimation already bounds the count in practice; this is the safety net that keeps a pathological
+/// mask from stalling the GUI thread. Past the cap the remaining loops are simply not drawn.
+const MARQUEE_MAX_RUNS: usize = 20_000;
 
 /// Tile edge (px) used to partition PS-editor undo `RasterDiff`s. Matches the 1024px tiling used by
 /// `layer_render::TiledTexture` and the clean-overlay history.
@@ -1342,6 +1372,10 @@ impl PsEditorTabState {
         self.opacity_gesture = None;
         self.transform_gesture_before = None;
         self.deform_gesture_before = None;
+        // Same reason for the tool's own gesture: an outline traced on the page being left holds
+        // that page's image coordinates (and a combination mode sampled there), so it must never
+        // reach the next page's selection.
+        self.reset_active_tool();
         if self.loader.is_none() {
             return;
         }
@@ -1669,6 +1703,43 @@ impl PsEditorTabState {
         self.tools[self.active_tool_idx].id()
     }
 
+    /// Switches the active tool, abandoning the OUTGOING tool's in-progress gesture first.
+    ///
+    /// Every write to `active_tool_idx` must go through here (toolbar click and B/M/L/V hotkeys):
+    /// a gesture that ends with the button UP — a pending lasso polygon — otherwise survives the
+    /// switch and commits on some later frame, with a combination mode sampled long before. Out
+    /// of range or already-active indices are ignored, so a caller may pass any candidate.
+    fn set_active_tool(&mut self, idx: usize) {
+        if idx >= self.tools.len() || idx == self.active_tool_idx {
+            return;
+        }
+        if let Some(outgoing) = self.tools.get_mut(self.active_tool_idx) {
+            outgoing.reset();
+        }
+        self.active_tool_idx = idx;
+    }
+
+    /// Abandons the active tool's in-progress gesture, keeping the tool selected.
+    ///
+    /// Used on a page switch: the outline's image coordinates belong to the page being left, so
+    /// committing it against the next page would paint a selection nowhere near where it was drawn.
+    fn reset_active_tool(&mut self) {
+        if let Some(tool) = self.tools.get_mut(self.active_tool_idx) {
+            tool.reset();
+        }
+    }
+
+    /// Stores `selection` as the page selection, enforcing "a selection is `Some` only when it
+    /// selects at least one pixel".
+    ///
+    /// An all-zero mask stored as `Some` is invisible (`Selection::any` is false, so the marquee
+    /// draws nothing) yet still clips the brush, which only tests `Option::is_some` — the user
+    /// sees a tool that silently refuses to paint until Ctrl+D. Reachable whenever a footprint
+    /// falls entirely outside the page (a raster moved off-page, an off-page text row).
+    fn set_selection(&mut self, selection: Selection) {
+        self.selection = non_empty_selection(selection);
+    }
+
     /// Main per-frame entry point. Renders the whole tab inside the provided `ui`.
     pub fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
         // Per-frame span. Detailed events inside the editor are gated on real state changes
@@ -1769,18 +1840,36 @@ impl PsEditorTabState {
         });
     }
 
-    /// Left vertical tool selector + active tool options.
+    /// Left vertical tool selector (grouped into `PsToolSection`s) + active tool options.
+    ///
+    /// The grouping is a DRAW-TIME regrouping only: `active_tool_idx` indexes `self.tools`, so the
+    /// registration order of that vector must never be disturbed here. Within a section the tools
+    /// keep their registration order, and a section with no registered tool renders nothing.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("ps_editor_tools")
             .resizable(false)
             .default_size(220.0)
             .show(ui, |ui| {
                 ui.heading(t!("ps_editor.toolbar.tools_heading"));
-                for index in 0..self.tools.len() {
-                    let selected = index == self.active_tool_idx;
-                    let title = self.tools[index].title();
-                    if ui.selectable_label(selected, title).clicked() {
-                        self.active_tool_idx = index;
+                for section in PsToolSection::ORDER {
+                    // The section heading is emitted lazily, on the first tool that belongs to it,
+                    // so an empty section leaves no dangling header.
+                    let mut heading_drawn = false;
+                    for index in 0..self.tools.len() {
+                        if self.tools[index].id().section() != section {
+                            continue;
+                        }
+                        if !heading_drawn {
+                            // Subordinate to the panel heading: a strong label, not a second
+                            // `heading` (the project's section-label idiom).
+                            ui.label(egui::RichText::new(section.title()).strong());
+                            heading_drawn = true;
+                        }
+                        let selected = index == self.active_tool_idx;
+                        let title = self.tools[index].title();
+                        if ui.selectable_label(selected, title).clicked() {
+                            self.set_active_tool(index);
+                        }
                     }
                 }
                 ui.separator();
@@ -1817,7 +1906,9 @@ impl PsEditorTabState {
             if let Some(polygon) = polygon {
                 let mut selection = Selection::empty(page[0], page[1]);
                 selection.set_polygon(&polygon);
-                self.selection = Some(selection);
+                // An overlay dragged fully off the page has an empty footprint: store `None`, never
+                // an invisible all-zero mask that would keep clipping the brush.
+                self.set_selection(selection);
             }
             return;
         }
@@ -1835,7 +1926,8 @@ impl PsEditorTabState {
             let pts: Vec<(f32, f32)> = layer.world_corners().iter().map(|p| (p.x, p.y)).collect();
             selection.set_polygon(&pts);
         }
-        self.selection = Some(selection);
+        // Same invariant as above: a raster moved entirely off-page selects nothing at all.
+        self.set_selection(selection);
     }
 
     /// Right layers panel: the unified, Photoshop-like layer tree. Compact rows (eye + name +
@@ -3495,6 +3587,11 @@ impl PsEditorTabState {
             self.pending_actual_size = false;
         }
 
+        // Keyboard gestures routed to tools (Esc / Backspace / Delete) must not be stolen from a
+        // focused text field — the same discipline `handle_hotkeys` applies to its letter keys.
+        // Resolved BEFORE the `ui.input` closure so the memory and input locks are never nested.
+        let keyboard_free = !ctx.memory(|m| m.focused().is_some());
+
         // Gather pointer / button / wheel input for this frame.
         let input = ui.input(|i| CanvasInput {
             hover_pos: i.pointer.hover_pos(),
@@ -3506,6 +3603,11 @@ impl PsEditorTabState {
             pointer_delta: i.pointer.delta(),
             scroll_y: i.smooth_scroll_delta.y,
             modifiers: i.modifiers,
+            // `key_pressed` only observes the event; it does not consume it, so no other handler
+            // (widgets use `consume_key` while focused) loses its key.
+            cancel_pressed: keyboard_free && i.key_pressed(egui::Key::Escape),
+            remove_point_pressed: keyboard_free
+                && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)),
         });
         let hovered = response.hovered();
         let pointer_in_viewport = hovered && input.hover_pos.is_some_and(|p| rect.contains(p));
@@ -3592,6 +3694,9 @@ impl PsEditorTabState {
                     view,
                     stack,
                     selection: &mut self.selection,
+                    modifiers: input.modifiers,
+                    cancel_pressed: input.cancel_pressed,
+                    remove_point_pressed: input.remove_point_pressed,
                 };
                 self.tools[self.active_tool_idx].interact(&mut tool_ctx)
             } else {
@@ -3738,6 +3843,18 @@ impl PsEditorTabState {
                     });
                 }
                 self.brush_stroke_dirty = None;
+            }
+        } else if input.cancel_pressed {
+            // Esc means "abandon the outline" even while the canvas is panning: the tool never sees
+            // this frame's input, so the tab performs the abandonment on its behalf.
+            self.reset_active_tool();
+        } else {
+            // Input went to the pan / text drag instead of the tool. Freeze the active tool so a
+            // multi-frame gesture survives: without this the release performed during the pan is
+            // never delivered, and the first routed frame afterwards reads "button up, no release"
+            // as an interrupted drag and discards the traced outline.
+            if let Some(tool) = self.tools.get_mut(self.active_tool_idx) {
+                tool.freeze();
             }
         }
 
@@ -4075,8 +4192,18 @@ impl PsEditorTabState {
         true
     }
 
-    /// Draws the selection as a thin dashed black-and-white marquee ("marching ants") along its
-    /// boundary loops, instead of a translucent fill.
+    /// Draws the selection as a thin alternating black/white dashed marquee along its boundary
+    /// loops, instead of a translucent fill. The pattern is static (no animation).
+    ///
+    /// The loops come from `Selection::outline_loops` and follow the mask's PIXEL EDGES, so a
+    /// freehand lasso arrives as a staircase of one-pixel steps. Two consequences shape this code
+    /// and both run on the GUI thread every frame:
+    /// - the dash phase must accumulate along the WHOLE loop (see `walk_dash_runs`), otherwise the
+    ///   pattern restarts on every one-pixel step and the marquee degenerates into a solid line;
+    /// - the point count is unbounded, so the screen-space path is decimated (below) and the total
+    ///   number of emitted runs is capped by `MARQUEE_MAX_RUNS`.
+    ///
+    /// All loops share one shape buffer and a single `Painter::extend`.
     fn draw_selection_marquee(&self, ui: &egui::Ui, view: &viewport::ViewTransform) {
         let Some(selection) = self.selection.as_ref() else {
             return;
@@ -4085,16 +4212,25 @@ impl PsEditorTabState {
             return;
         }
         let painter = ui.painter_at(view.viewport_rect);
+        let mut shapes: Vec<egui::Shape> = Vec::new();
+        let mut screen: Vec<Pos2> = Vec::new();
+        let mut budget = MARQUEE_MAX_RUNS;
         for loop_pts in selection.outline_loops() {
+            if budget == 0 {
+                break;
+            }
             if loop_pts.len() < 2 {
                 continue;
             }
-            let screen: Vec<Pos2> = loop_pts
-                .iter()
-                .map(|&(x, y)| view.world_to_screen(Pos2::new(x, y)))
-                .collect();
-            draw_dashed_marquee(&painter, &screen);
+            screen.clear();
+            decimate_to_screen(loop_pts, view, &mut screen);
+            let emitted = walk_dash_runs(&screen, MARQUEE_DASH_PX, budget, |run| {
+                let color = if run.black { Color32::BLACK } else { Color32::WHITE };
+                shapes.push(egui::Shape::line_segment([run.from, run.to], Stroke::new(1.0, color)));
+            });
+            budget -= emitted;
         }
+        painter.extend(shapes);
     }
 
     /// Right-click menu on the canvas offering copy/cut of the selection from chosen layers.
@@ -4395,16 +4531,16 @@ impl PsEditorTabState {
             )
         });
         if b && let Some(idx) = self.tool_index(PsToolId::Brush) {
-            self.active_tool_idx = idx;
+            self.set_active_tool(idx);
         }
         if m && let Some(idx) = self.tool_index(PsToolId::SelectRect) {
-            self.active_tool_idx = idx;
+            self.set_active_tool(idx);
         }
         if l && let Some(idx) = self.tool_index(PsToolId::SelectLasso) {
-            self.active_tool_idx = idx;
+            self.set_active_tool(idx);
         }
         if v && let Some(idx) = self.tool_index(PsToolId::Transform) {
-            self.active_tool_idx = idx;
+            self.set_active_tool(idx);
         }
         if deselect {
             self.clear_selection();
@@ -4429,6 +4565,10 @@ struct CanvasInput {
     pointer_delta: Vec2,
     scroll_y: f32,
     modifiers: egui::Modifiers,
+    /// Escape pressed this frame, already gated on "no widget holds keyboard focus".
+    cancel_pressed: bool,
+    /// Backspace or Delete pressed this frame, gated the same way as `cancel_pressed`.
+    remove_point_pressed: bool,
 }
 
 /// Source-over composite of premultiplied-alpha colors (`src` painted over `dst`).
@@ -4789,35 +4929,122 @@ fn layer_to_raster_node(layer: &Layer) -> crate::models::layer_model::layer_doc:
     }
 }
 
-/// Draws a thin black-and-white dashed marquee along a screen-space boundary path.
+/// Wraps a freshly built mask in the page-selection invariant: `Some` only when it selects at
+/// least one pixel, `None` otherwise.
 ///
-/// Two offset dash runs (black, then white shifted by one dash) give the classic marching-ants
-/// look that reads on any background; the 1px stroke keeps the border thin.
-fn draw_dashed_marquee(painter: &egui::Painter, path: &[Pos2]) {
-    if path.len() < 2 {
+/// The pure decision behind `PsEditorTabState::set_selection`, and the tab-side twin of
+/// `tools::normalize_selection_slot`. A `Some(all-zero)` selection is the phantom the whole
+/// invariant exists to prevent: invisible (no marquee) but still clipping every brush stroke.
+#[must_use]
+fn non_empty_selection(selection: Selection) -> Option<Selection> {
+    selection.any().then_some(selection)
+}
+
+/// One emitted piece of the selection marquee: a straight screen-space run of a single colour.
+///
+/// Runs tile the path end to end with no gaps; `black` alternates every `dash_len` of ARC LENGTH,
+/// so the black/white contrast is what makes the border read on any background.
+#[derive(Debug, Clone, Copy)]
+struct DashRun {
+    from: Pos2,
+    to: Pos2,
+    /// `true` for a black run, `false` for a white one.
+    black: bool,
+}
+
+/// Maps an image-space boundary loop to screen space, dropping points that land closer than
+/// `MARQUEE_MIN_STEP_PX` to the previously kept one.
+///
+/// `loop_pts` traces the mask's pixel edges, so at zoom < 1 a staircase contributes many sub-pixel
+/// steps that no dash pattern can resolve; decimating them bounds the emitted run count by the
+/// loop's SCREEN length instead of by the mask's complexity. At zoom >= 1 a one-pixel step is at
+/// least one screen pixel, so nothing is dropped and the marquee stays pixel-accurate. The first
+/// and last points are always kept, so a closed loop stays closed.
+///
+/// `out` is cleared by the caller and reused across loops.
+fn decimate_to_screen(loop_pts: &[(f32, f32)], view: &viewport::ViewTransform, out: &mut Vec<Pos2>) {
+    let Some((&first, rest)) = loop_pts.split_first() else {
         return;
+    };
+    let mut last_kept = view.world_to_screen(Pos2::new(first.0, first.1));
+    out.push(last_kept);
+    let last_idx = rest.len().saturating_sub(1);
+    for (i, &(x, y)) in rest.iter().enumerate() {
+        let p = view.world_to_screen(Pos2::new(x, y));
+        // Keep the closing point unconditionally; otherwise keep only points that advance the
+        // path by at least one decimation step.
+        if i == last_idx || (p - last_kept).length() >= MARQUEE_MIN_STEP_PX {
+            out.push(p);
+            last_kept = p;
+        }
     }
-    let dash = 5.0;
-    let gap = 5.0;
-    let mut shapes = Vec::new();
-    for segment in path.windows(2) {
-        egui::Shape::dashed_line_many(
-            segment,
-            Stroke::new(1.0, Color32::BLACK),
-            dash,
-            gap,
-            &mut shapes,
-        );
-        egui::Shape::dashed_line_many_with_offset(
-            segment,
-            Stroke::new(1.0, Color32::WHITE),
-            &[dash],
-            &[gap],
-            dash,
-            &mut shapes,
-        );
+}
+
+/// Walks a screen-space polyline and emits alternating black/white dash runs by CUMULATIVE arc
+/// length, calling `emit` once per run. Returns the number of runs emitted (never above `budget`).
+///
+/// The dash phase is carried across segment boundaries, which is the whole point: a marquee path
+/// traced along mask pixel edges is made of one-pixel segments, far shorter than `dash_len`, so
+/// dashing each segment independently restarts the phase every pixel and paints a solid line. Here
+/// one dash may span many segments and one segment may hold many dashes.
+///
+/// `dash_len` is in SCREEN pixels, so the pattern is zoom-invariant. A path shorter than one dash
+/// emits a single black run. Returns 0 for a path with fewer than two points, a non-positive
+/// `dash_len`, or a zero `budget`. Pure: no painter, no global state.
+fn walk_dash_runs(path: &[Pos2], dash_len: f32, budget: usize, mut emit: impl FnMut(DashRun)) -> usize {
+    if path.len() < 2 || budget == 0 || !(dash_len.is_finite() && dash_len > 0.0) {
+        return 0;
     }
-    painter.extend(shapes);
+    let mut emitted = 0usize;
+    // Phase carried across segments: distance left in the current dash, and its colour.
+    let mut dash_left = dash_len;
+    let mut black = true;
+    for pair in path.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let delta = b - a;
+        let seg_len = delta.length();
+        // A broken `ViewTransform` can map a point to infinity or NaN. An infinite `seg_len` never
+        // shrinks below the loop threshold, so the inner loop would emit `budget` NaN runs from
+        // this one segment; NaN would silently poison the phase. Skip such a segment entirely.
+        if !seg_len.is_finite() || seg_len <= MARQUEE_MIN_RUN_PX {
+            continue;
+        }
+        let dir = delta / seg_len;
+        // Distance from `a` already emitted, and the part of this segment still to emit.
+        let mut cursor = 0.0f32;
+        let mut rest = seg_len;
+        while rest > MARQUEE_MIN_RUN_PX {
+            if emitted == budget {
+                return emitted;
+            }
+            let take = dash_left.min(rest);
+            let next = cursor + take;
+            // Float stall guard: on a very long path `take` can fall below the ulp of `cursor`,
+            // which would leave `cursor` unchanged and spin forever. Abandon the segment instead.
+            if next <= cursor {
+                break;
+            }
+            emit(DashRun { from: a + dir * cursor, to: a + dir * next, black });
+            emitted += 1;
+            dash_left -= take;
+            if dash_left <= MARQUEE_MIN_RUN_PX {
+                dash_left = dash_len;
+                black = !black;
+            }
+            rest -= take;
+            cursor = next;
+        }
+        // Fold the sub-threshold tail into the phase so the pattern does not drift over a
+        // staircase of thousands of tiny segments.
+        if rest > 0.0 && rest <= MARQUEE_MIN_RUN_PX {
+            dash_left -= rest;
+            if dash_left <= MARQUEE_MIN_RUN_PX {
+                dash_left = dash_len;
+                black = !black;
+            }
+        }
+    }
+    emitted
 }
 
 #[cfg(test)]
@@ -4834,6 +5061,95 @@ mod tests {
         let mut sel = Selection::empty(4, 4);
         sel.set_rect(1, 1, 3, 3);
         sel
+    }
+
+    /// Collects every run `walk_dash_runs` emits for `path` at `dash`, with an unrestrictive budget.
+    fn collect_runs(path: &[Pos2], dash: f32) -> Vec<DashRun> {
+        let mut runs = Vec::new();
+        let emitted = walk_dash_runs(path, dash, 10_000, |r| runs.push(r));
+        assert_eq!(emitted, runs.len(), "returned count must match the emitted runs");
+        runs
+    }
+
+    /// Asserts the runs tile `path` end to end without gaps or overlaps.
+    fn assert_contiguous(runs: &[DashRun], start: Pos2, end: Pos2) {
+        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+            panic!("expected at least one run");
+        };
+        assert!((first.from - start).length() < 1e-3, "first run must start at the path start");
+        for pair in runs.windows(2) {
+            assert!(
+                (pair[0].to - pair[1].from).length() < 1e-3,
+                "runs must be contiguous: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!((last.to - end).length() < 1e-3, "last run must end at the path end");
+    }
+
+    #[test]
+    fn dash_phase_carries_across_short_staircase_segments() {
+        // The case the arc-length rewrite exists for: a pixel-traced lasso outline is a staircase of
+        // one-pixel steps, each far shorter than the dash period. Dashing every segment on its own
+        // would restart the phase ten times and paint a solid line; here the phase accumulates, so
+        // the colour flips only where 4px of ARC LENGTH have been walked.
+        let path: Vec<Pos2> = (0u8..=10).map(|i| Pos2::new(f32::from(i), 0.0)).collect();
+        let runs = collect_runs(&path, 4.0);
+        // One run per segment (each segment is shorter than a dash, so none is subdivided).
+        assert_eq!(runs.len(), 10, "expected one run per unit segment, got {runs:?}");
+        assert_contiguous(&runs, Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0));
+        // 4 black, 4 white, then the 2px tail of the next black dash.
+        let expected = [true, true, true, true, false, false, false, false, true, true];
+        let actual: Vec<bool> = runs.iter().map(|r| r.black).collect();
+        assert_eq!(actual, expected, "dash colours must follow cumulative arc length");
+    }
+
+    #[test]
+    fn one_long_segment_holds_several_dashes() {
+        // The mirror case: a single collinear-merged edge (a rectangular selection is ~5 points)
+        // must be subdivided into as many dashes as it is long.
+        let path = [Pos2::new(0.0, 0.0), Pos2::new(20.0, 0.0)];
+        let runs = collect_runs(&path, 4.0);
+        assert_eq!(runs.len(), 5, "20px / 4px dash = 5 runs, got {runs:?}");
+        assert_contiguous(&runs, path[0], path[1]);
+        for (i, run) in runs.iter().enumerate() {
+            let len = (run.to - run.from).length();
+            assert!((len - 4.0).abs() < 1e-3, "run {i} should be one dash long, got {len}");
+            assert_eq!(run.black, i % 2 == 0, "colours must alternate, run {i}");
+        }
+    }
+
+    #[test]
+    fn path_shorter_than_one_dash_emits_a_single_black_run() {
+        let path = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0)];
+        let runs = collect_runs(&path, 4.0);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].black, "the pattern starts black");
+        assert_contiguous(&runs, path[0], path[1]);
+    }
+
+    #[test]
+    fn degenerate_dash_inputs_emit_nothing() {
+        let path = [Pos2::new(0.0, 0.0), Pos2::new(20.0, 0.0)];
+        // Fewer than two points, a non-positive/non-finite dash, or a zero budget: no runs, no panic.
+        assert_eq!(walk_dash_runs(&path[..1], 4.0, 10, |_| {}), 0);
+        assert_eq!(walk_dash_runs(&path, 0.0, 10, |_| {}), 0);
+        assert_eq!(walk_dash_runs(&path, f32::NAN, 10, |_| {}), 0);
+        assert_eq!(walk_dash_runs(&path, 4.0, 0, |_| {}), 0);
+        // A zero-length path (all points coincide) produces nothing either.
+        let collapsed = [Pos2::new(3.0, 3.0), Pos2::new(3.0, 3.0), Pos2::new(3.0, 3.0)];
+        assert_eq!(walk_dash_runs(&collapsed, 4.0, 10, |_| {}), 0);
+    }
+
+    #[test]
+    fn dash_run_budget_is_respected() {
+        // 100px at a 1px dash would be 100 runs; the budget cuts the walk short instead.
+        let path = [Pos2::new(0.0, 0.0), Pos2::new(100.0, 0.0)];
+        let mut count = 0usize;
+        let emitted = walk_dash_runs(&path, 1.0, 7, |_| count += 1);
+        assert_eq!(emitted, 7);
+        assert_eq!(count, 7);
     }
 
     #[test]
@@ -5088,5 +5404,41 @@ mod tests {
         // Equal-Z peers are NOT below each other (strict `z <` only).
         assert_eq!(raster_below_by_band_z(&rasters, "low"), None);
         assert_eq!(raster_below_by_band_z(&rasters, "high"), None);
+    }
+
+    #[test]
+    fn an_empty_footprint_never_becomes_a_phantom_selection() {
+        // "Select layer fully" on a layer whose footprint misses the page entirely: the mask stays
+        // all-zero, and storing it as `Some` would block the brush behind an invisible marquee.
+        let mut off_page = Selection::empty(4, 4);
+        off_page.set_polygon(&[(-30.0, -30.0), (-10.0, -30.0), (-10.0, -10.0), (-30.0, -10.0)]);
+        assert!(!off_page.any(), "the fixture must select nothing");
+        assert!(non_empty_selection(off_page).is_none());
+    }
+
+    #[test]
+    fn a_real_footprint_is_stored_as_is() {
+        let sel = inner_selection();
+        let stored = non_empty_selection(sel).expect("a non-empty mask must be kept");
+        assert!(stored.contains(1, 1));
+        assert!(!stored.contains(0, 0));
+    }
+
+    #[test]
+    fn dash_walker_skips_non_finite_segments() {
+        // A broken `ViewTransform` can hand the walker an infinite point. It must not emit a single
+        // run for that segment (an infinite length would otherwise exhaust the whole budget).
+        let path = [Pos2::new(0.0, 0.0), Pos2::new(f32::INFINITY, 0.0), Pos2::new(10.0, 0.0)];
+        let mut runs = Vec::new();
+        let emitted = walk_dash_runs(&path, 4.0, 10_000, |r| runs.push(r));
+        assert_eq!(emitted, 0, "no run may be emitted from or into a non-finite point");
+        assert!(runs.is_empty());
+
+        let nan_path = [Pos2::new(0.0, 0.0), Pos2::new(f32::NAN, f32::NAN)];
+        assert_eq!(walk_dash_runs(&nan_path, 4.0, 10_000, |_| ()), 0);
+
+        // A finite path around the bad segment still dashes normally.
+        let good = [Pos2::new(0.0, 0.0), Pos2::new(12.0, 0.0)];
+        assert_eq!(walk_dash_runs(&good, 4.0, 10_000, |_| ()), 3);
     }
 }

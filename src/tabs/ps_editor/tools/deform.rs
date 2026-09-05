@@ -80,6 +80,17 @@ impl PsTool for DeformTool {
         t!("ps_editor.tools.deform_title")
     }
 
+    /// Drops the in-progress control-point drag and the per-frame handle cache.
+    ///
+    /// Like the transform tool, `interact` clears the drag once the button is up; this covers the
+    /// case where the tool stops receiving frames mid-drag (tool or page switch by hotkey). The
+    /// grid edited so far stays on the layer — it is a committed edit.
+    fn reset(&mut self) {
+        self.drag = None;
+        self.handles.clear();
+        self.grid_dims = None;
+    }
+
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
         use crate::trace::cat;
         let outcome = ToolOutcome::default();

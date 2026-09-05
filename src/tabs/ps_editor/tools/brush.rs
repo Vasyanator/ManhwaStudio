@@ -68,6 +68,14 @@ impl PsTool for BrushTool {
         t!("ps_editor.tools.brush_title")
     }
 
+    /// Ends any in-progress stroke by forgetting its last point.
+    ///
+    /// `last_world` is the start of the next painted segment, so a stroke that survived a tool or
+    /// page switch would draw a line from a position that belongs to another page.
+    fn reset(&mut self) {
+        self.last_world = None;
+    }
+
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
         use crate::trace::cat;
         let mut outcome = ToolOutcome::default();

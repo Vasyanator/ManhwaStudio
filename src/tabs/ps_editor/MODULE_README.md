@@ -128,10 +128,21 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   group hides its members and its opacity multiplies theirs (`layer_visible` / `layer_opacity`
   resolve this at composite time). Groups are stashed/restored per page alongside raster layers and
   persisted in `layers.json` (`group_uid` per node + a `groups` list).
-- `selection.rs`: `Selection` binary mask plus boundary `outline_loops` for the marquee; rectangle
-  + polygon (lasso) construction; `bounds` accessor.
-- `tools/`: `PsTool` trait + context (carries the frame `ViewTransform`); rectangle/lasso selection,
-  the color brush (paints in layer-local space), and `transform.rs` (move/rotate/scale gizmo).
+- `selection.rs`: `Selection` binary page-sized mask, its tight `bounds`, and the boundary
+  `outline_loops` the marquee is drawn from. Rectangle + polygon (lasso) geometry is combined
+  through `SelectionOp` (`Replace`/`Add`/`Subtract`/`Intersect`, Photoshop's four modes) by
+  `apply_rect` / `apply_polygon`; `set_rect` / `set_polygon` are the `Replace` wrappers. The
+  loops are TRACED FROM THE MASK along pixel edges (a staircase on the integer grid, one closed
+  loop per connected component and one per hole, collinear runs merged), NOT the raw input path —
+  so the marquee states exactly which pixels are selected. Mask writes stay allocation-free: the
+  "mask is zero outside `bounds`" invariant lets every op touch only the affected bbox, and
+  `Intersect` clears the complement by streaming the spans `fill_polygon_spans` emits in
+  increasing `y`/`sx` rather than building a second page-sized buffer.
+- `tools/`: `PsTool` trait + context (carries the frame `ViewTransform`, the frame modifiers, and
+  the Esc / Backspace edges); rectangle + lasso selection, the color brush (paints in layer-local
+  space), and `transform.rs` (move/rotate/scale gizmo). `PsToolSection` groups the tools into the
+  toolbar's Кисти / Выделение / Манипуляция sections at DRAW time — `self.tools` is never
+  reordered, because `active_tool_idx` indexes it.
 - `tree.rs`: pure builder for the unified layers panel. `build_unified_tree(stack, text_layers,
   bands)` joins raster layers + text overlays + groups into one `Vec<TreeItem>` (group headers +
   indented leaves) ordered top-to-bottom by the unified Z, with the same tiebreak as `draw_composite`
@@ -237,13 +248,32 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   transforms (`sample_layer_world`), so partial/rotated/scaled sources contribute correctly. A
   **cut** also clears the selected pixels from every chosen layer **except** `LayerKind::Source`,
   which is immutable and can never be cut from; the `Clean` overlay and raster layers are cuttable.
-- The selection is shown as a thin black-and-white dashed marquee drawn from
-  `Selection::outline_loops` (no translucent fill, never blue), matching the in-progress
-  drag preview in `tools/select.rs`. "Выделить слой полностью" sets the selection to the active
+- The selection is shown as a thin 1px dashed marquee in alternating black and white, drawn from
+  `Selection::outline_loops` (no translucent fill, never blue), matching the in-progress drag
+  preview in `tools/select.rs`. Because a traced loop is a pixel staircase whose segments are far
+  shorter than one dash, the dash phase is carried along the whole loop by CUMULATIVE ARC LENGTH
+  in screen space (`walk_dash_runs`) — dashing each segment on its own restarts the phase every
+  pixel and degenerates into a solid line. Dash length is in screen pixels, so it is
+  zoom-invariant; the marquee does not animate. "Выделить слой полностью" sets the selection to the active
   layer's footprint (page rect for a base/page-sized layer, transformed quad polygon otherwise);
   when the panel's primary row is a TEXT layer (not in `LayerStack`) it uses that overlay's
   `PsTextLayer::footprint_polygon` instead. Clicking any layer row also requests this selection so
   the marquee follows the active/primary layer immediately.
+- **Tool-gesture lifecycle is the TAB's job, not the tool's.** A tool cannot see the frames it is
+  not routed on, so the tab drives two hooks. `set_active_tool` is the ONLY writer of
+  `active_tool_idx` and `reset()`s the outgoing tool; `reset_active_tool` does the same on a page
+  switch (next to the selection/history clear) and on Esc while panning. Without this a pending
+  lasso polygon outlives the switch and later commits over unrelated work, with a combination mode
+  sampled minutes earlier and, across a page switch, in the previous page's coordinates. The other
+  hook is `freeze()`, called on the frames routing is suppressed (space-pan, text drag): it lets the
+  next routed frame treat the swallowed release as a finish instead of an interrupted drag, so
+  panning mid-lasso keeps the outline. It arms only while a gesture is live and is consumed by the
+  single frame that reads it, so a genuine interrupt (focus loss, another widget grabbing the
+  button) still aborts.
+- **A page selection is `Some` only when a pixel is actually set.** `PsToolContext::normalize_selection`
+  (tools) and `set_selection` / `non_empty_selection` (tab) enforce it at every write. An all-zero
+  mask is not a harmless nuisance: the marquee hides itself (`!any()`) while the brush, which only
+  tests `Option::is_some`, silently refuses to paint until Ctrl+D.
 - The transform tool (`tools/transform.rs`) mutates only the active raster layer's `LayerTransform`
   (no pixels), so it needs **no** tile re-upload — `draw` re-evaluates the transform each frame.
   Base layers are not transformable (`Layer::is_transformable`).
@@ -276,8 +306,14 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - To add a tool, implement `PsTool` in `tools/` and register it in `PsEditorTabState::default`.
 - To change brush painting or selection geometry, edit `tools/brush.rs` / `tools/select.rs` and
   `selection.rs`.
-- To change the marquee look, edit `draw_dashed_marquee` (`mod.rs`) and `draw_dashed_preview`
-  (`tools/select.rs`); the boundary loops come from `Selection::outline_loops`.
+- To change the marquee look, edit `walk_dash_runs` / `decimate_to_screen` /
+  `draw_selection_marquee` (`mod.rs`) and `draw_dashed_preview` (`tools/select.rs`); the boundary
+  loops come from `Selection::outline_loops`.
+- To change the selection combination modes or the boundary tracer, edit `selection.rs`
+  (`SelectionOp`, `apply_rect` / `apply_polygon`, the pixel-edge tracer). To change the lasso
+  gesture (Photoshop modes at press, Alt straight segments, Esc / Backspace), edit
+  `SelectTool::step` in `tools/select.rs`. To change the toolbar sections, edit `PsToolSection` /
+  `PsToolId::section` (`tools/mod.rs`) and `draw_toolbar` (`mod.rs`).
 - To change the copy/cut menu or its compositing/cut rules, edit `draw_selection_menu`,
   `clip_op_submenu`, `clip_layer_picker`, and `clip_into_new_layer` in `mod.rs`.
 - To change the raster effects pipeline (off-thread render, recenter, persist), edit
