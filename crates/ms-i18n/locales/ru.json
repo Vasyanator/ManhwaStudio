@@ -3158,7 +3158,7 @@
   "ps_editor.tools.deform_hint_line3": "Сетка появляется при входе в режим.",
   "ps_editor.tools.deform_title": "Деформация (сетка)",
   "ps_editor.tools.lasso_hint": "Обведите область, удерживая ЛКМ.",
-  "ps_editor.tools.lasso_hint_alt": "Alt во время обводки — прямые отрезки.",
+  "ps_editor.tools.lasso_hint_alt": "Alt, нажатый после начала обводки, — прямые отрезки.",
   "ps_editor.tools.lasso_hint_keys": "Esc — отменить контур, Backspace — убрать точку.",
   "ps_editor.tools.lasso_title": "Лассо",
   "ps_editor.tools.rect_select_hint": "Растяните прямоугольник на странице.",

@@ -2980,7 +2980,7 @@
   "ps_editor.tools.deform_hint_line3": "La malla aparece al entrar en el modo.",
   "ps_editor.tools.deform_title": "Deformación (malla)",
   "ps_editor.tools.lasso_hint": "Trace el contorno del área manteniendo el clic izquierdo.",
-  "ps_editor.tools.lasso_hint_alt": "Mantén Alt mientras trazas para obtener segmentos rectos.",
+  "ps_editor.tools.lasso_hint_alt": "Alt pulsado tras iniciar el trazo da segmentos rectos.",
   "ps_editor.tools.lasso_hint_keys": "Esc cancela el contorno, Retroceso elimina el último punto.",
   "ps_editor.tools.lasso_title": "Lazo",
   "ps_editor.tools.rect_select_hint": "Arrastre un rectángulo sobre la página.",

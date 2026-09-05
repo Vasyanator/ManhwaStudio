@@ -25,7 +25,10 @@ Key functions:
 Notes:
 Alt means two different things and the two are told apart by WHEN it is held: Alt down BEFORE the
 press selects the "subtract" combination mode, Alt held AFTER the press draws straight segments.
-That is why the combination mode is sampled exactly once, on the press frame.
+That is why the combination mode is sampled exactly once, on the press frame. The two meanings are
+kept from overlapping by `Gesture::alt_armed`: Alt that was already down at the press stays the
+mode latch until it is RELEASED once inside the gesture, so an Alt-drag subtracts freehand instead
+of subtracting in polyline steps.
 A click with no meaningful drag (a degenerate rect / fewer than three lasso points) reaches
 `apply_rect` / `apply_polygon` anyway: with `Replace` those clear the mask (click to deselect),
 while `Add`/`Subtract`/`Intersect` leave the existing selection alone. The commit always ends in
@@ -141,6 +144,12 @@ struct Gesture {
     /// Entered by releasing the button with Alt held (Photoshop's polygonal lasso); left by
     /// pressing again (places an anchor) or by releasing Alt (closes the path).
     pending_polygon: bool,
+    /// Whether Alt is allowed to mean "straight segment" yet.
+    ///
+    /// False for a gesture begun WITH Alt held, until Alt is released once inside the gesture.
+    /// See the arming comment in [`SelectTool::step`] for why the two meanings of Alt must not
+    /// overlap.
+    alt_armed: bool,
     /// True when the segment from the last anchor to the pointer is a rubber band rather than a
     /// sampled part of the path. Recomputed every frame because `draw_overlay` sees no modifiers.
     rubber_band: bool,
@@ -148,7 +157,10 @@ struct Gesture {
 
 impl Gesture {
     /// Starts an empty gesture with its combination mode already fixed.
-    fn new(op: SelectionOp) -> Self {
+    ///
+    /// `alt_at_press` is the Alt state on the press frame: it selected the combination mode, so
+    /// Alt stays disarmed as the straight-segment modifier until it is released once.
+    fn new(op: SelectionOp, alt_at_press: bool) -> Self {
         Self {
             op,
             anchor: None,
@@ -156,6 +168,7 @@ impl Gesture {
             button_down: true,
             pending_polygon: false,
             rubber_band: false,
+            alt_armed: !alt_at_press,
         }
     }
 }
@@ -251,16 +264,25 @@ impl SelectTool {
             let Some(gesture) = self.gesture.as_mut() else {
                 return GestureAction::None;
             };
-            // Alt AFTER the press means "straight segment", never "subtract": the combination mode
-            // was already fixed at the press.
-            gesture.rubber_band = gesture.pending_polygon || (gesture.button_down && input.modifiers.alt);
+            // Alt means two different things, and which one is decided by what came FIRST. Held
+            // at the press it picked Subtract/Intersect (`gesture_op`), and that latch must not
+            // double as the straight-segment modifier: an Alt-drag would then subtract in polyline
+            // steps instead of freehand, which is the one place Photoshop's own key assignment is
+            // genuinely ambiguous. So Alt only starts meaning "straight segment" once it has been
+            // RELEASED inside the gesture. A gesture begun without Alt is armed from the start, so
+            // pressing Alt mid-stroke still switches to straight segments immediately.
+            if !input.modifiers.alt {
+                gesture.alt_armed = true;
+            }
+            let alt_segments = input.modifiers.alt && gesture.alt_armed;
+            gesture.rubber_band = gesture.pending_polygon || (gesture.button_down && alt_segments);
 
             if input.primary_down {
                 gesture.button_down = true;
                 // With Alt held the pointer is not sampled at all, so the segment from the last
                 // anchor stays straight until the next click commits it.
                 if mode == SelectMode::Lasso
-                    && !input.modifiers.alt
+                    && !alt_segments
                     && let Some(pointer) = input.pointer
                 {
                     push_vertex(&mut gesture.points, pointer, FREEHAND_MIN_STEP);
@@ -274,7 +296,7 @@ impl SelectTool {
                         if let Some(pointer) = input.pointer {
                             push_vertex(&mut gesture.points, pointer, ANCHOR_MIN_STEP);
                         }
-                        if input.modifiers.alt {
+                        if alt_segments {
                             // Photoshop: releasing with Alt held only commits an anchor. The
                             // outline stays alive with the button up until Alt is let go.
                             gesture.pending_polygon = true;
@@ -287,7 +309,7 @@ impl SelectTool {
                 }
             } else if gesture.pending_polygon {
                 // Alt released while the polygon was pending: Photoshop closes the path there.
-                if input.modifiers.alt {
+                if alt_segments {
                     GestureStep::Idle
                 } else {
                     GestureStep::Finish
@@ -330,7 +352,7 @@ impl SelectTool {
             }
             return;
         }
-        let mut gesture = Gesture::new(gesture_op(self.base_op, modifiers));
+        let mut gesture = Gesture::new(gesture_op(self.base_op, modifiers), modifiers.alt);
         match mode {
             SelectMode::Rect => gesture.anchor = Some(pointer),
             SelectMode::Lasso => gesture.points.push((pointer.x, pointer.y)),
@@ -682,6 +704,43 @@ mod tests {
         assert_eq!(tool.step(drag(50.0, 50.0, mods(false, true))), GestureAction::None);
         let gesture = tool.gesture.as_ref().expect("gesture is live between press and release");
         assert_eq!(gesture.points.len(), 1, "Alt draws a straight segment, it does not sample");
+        assert!(gesture.rubber_band, "the aimed segment must be previewed as a rubber band");
+    }
+
+    #[test]
+    fn alt_held_from_the_press_subtracts_freehand_instead_of_drawing_segments() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        // Alt at the press selected Subtract, so it must NOT also mean "straight segment":
+        // the stroke has to stay freehand or the user gets a polyline subtraction.
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, true))), GestureAction::None);
+        assert_eq!(tool.step(drag(50.0, 50.0, mods(false, true))), GestureAction::None);
+        {
+            let gesture = tool.gesture.as_ref().expect("gesture is live between press and release");
+            assert_eq!(gesture.op, SelectionOp::Subtract);
+            assert_eq!(gesture.points.len(), 2, "an Alt-started stroke keeps sampling freehand");
+            assert!(!gesture.rubber_band, "no rubber band while Alt is still the mode latch");
+        }
+        // ... and releasing with Alt still held commits, rather than opening a pending polygon.
+        match tool.step(release(80.0, 80.0, mods(false, true))) {
+            GestureAction::Commit { op, shape } => {
+                assert_eq!(op, SelectionOp::Subtract);
+                assert_eq!(shape, CommitShape::Polygon(vec![(0.0, 0.0), (50.0, 50.0), (80.0, 80.0)]));
+            }
+            other => panic!("expected an immediate subtract commit, got {other:?}"),
+        }
+        assert!(tool.gesture.is_none());
+    }
+
+    #[test]
+    fn releasing_alt_inside_a_subtract_stroke_arms_the_straight_segments() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, true))), GestureAction::None);
+        // Alt let go mid-stroke: the mode stays Subtract, and Alt is now free to mean "segment".
+        assert_eq!(tool.step(drag(50.0, 0.0, mods(false, false))), GestureAction::None);
+        assert_eq!(tool.step(drag(50.0, 50.0, mods(false, true))), GestureAction::None);
+        let gesture = tool.gesture.as_ref().expect("gesture is live between press and release");
+        assert_eq!(gesture.op, SelectionOp::Subtract, "the mode latched at the press never changes");
+        assert_eq!(gesture.points.len(), 2, "the second Alt press stops sampling");
         assert!(gesture.rubber_band, "the aimed segment must be previewed as a rubber band");
     }
 

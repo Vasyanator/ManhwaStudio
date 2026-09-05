@@ -3158,7 +3158,7 @@
   "ps_editor.tools.deform_hint_line3": "The mesh appears when you enter the mode.",
   "ps_editor.tools.deform_title": "Deformation (mesh)",
   "ps_editor.tools.lasso_hint": "Outline the area while holding LMB.",
-  "ps_editor.tools.lasso_hint_alt": "Hold Alt while tracing for straight segments.",
+  "ps_editor.tools.lasso_hint_alt": "Alt pressed after the stroke has started gives straight segments.",
   "ps_editor.tools.lasso_hint_keys": "Esc cancels the outline, Backspace removes the last point.",
   "ps_editor.tools.lasso_title": "Lasso",
   "ps_editor.tools.rect_select_hint": "Drag a rectangle on the page.",

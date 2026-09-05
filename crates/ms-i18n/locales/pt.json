@@ -2980,7 +2980,7 @@
   "ps_editor.tools.deform_hint_line3": "A malha aparece ao entrar no modo.",
   "ps_editor.tools.deform_title": "Deformação (malha)",
   "ps_editor.tools.lasso_hint": "Contorne a área mantendo o clique esq.",
-  "ps_editor.tools.lasso_hint_alt": "Mantenha Alt enquanto traça para obter segmentos retos.",
+  "ps_editor.tools.lasso_hint_alt": "Alt pressionado após iniciar o traço dá segmentos retos.",
   "ps_editor.tools.lasso_hint_keys": "Esc cancela o contorno, Backspace remove o último ponto.",
   "ps_editor.tools.lasso_title": "Laço",
   "ps_editor.tools.rect_select_hint": "Arraste um retângulo sobre a página.",

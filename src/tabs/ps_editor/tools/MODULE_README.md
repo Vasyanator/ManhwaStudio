@@ -59,11 +59,14 @@ another page); `TransformTool` / `DeformTool` drop their control drag and per-fr
   choice; `gesture_op(base, mods)` overrides it per gesture — Shift = add, Alt = subtract,
   Shift+Alt = intersect. It is sampled **once, on the press frame**, and never re-read: Alt held
   BEFORE the press means "subtract", Alt held AFTER it means "straight segment", and only a
-  press-time sample can tell the two apart.
+  press-time sample can tell the two apart. The two meanings must not overlap, so `Gesture::alt_armed`
+  gates the second one: Alt already down at the press stays the mode latch until it is RELEASED once
+  inside the gesture. Without that gate an Alt-drag subtracts in polyline steps instead of freehand —
+  the one place Photoshop's own key assignment is ambiguous.
 - **State machine.** `SelectTool::step(GestureInput) -> GestureAction` is pure (no `PsToolContext`,
   no `Ui`, no `Selection`) and owns the whole lifecycle; `interact` is a thin adapter that performs
   the commit. States: idle → dragging (freehand sampling every `FREEHAND_MIN_STEP` image px, skipped
-  while Alt is held) → either finished, or **pending polygon** (release with Alt: an anchor is
+  while Alt is held AND armed) → either finished, or **pending polygon** (release with Alt: an anchor is
   committed and the outline stays alive with the button UP; a further press adds an anchor, releasing
   Alt closes the path). Esc aborts without touching the selection; Backspace/Delete pops the last
   lasso vertex and aborts at zero. `Gesture::rubber_band` is recomputed every frame because

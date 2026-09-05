@@ -2980,7 +2980,7 @@
   "ps_editor.tools.deform_hint_line3": "La grille apparaît à l'entrée dans le mode.",
   "ps_editor.tools.deform_title": "Déformation (grille)",
   "ps_editor.tools.lasso_hint": "Détourez la zone en maintenant le clic gauche.",
-  "ps_editor.tools.lasso_hint_alt": "Maintenez Alt pendant le tracé pour des segments droits.",
+  "ps_editor.tools.lasso_hint_alt": "Alt enfoncé après le début du tracé donne des segments droits.",
   "ps_editor.tools.lasso_hint_keys": "Échap annule le contour, Retour arrière supprime le dernier point.",
   "ps_editor.tools.lasso_title": "Lasso",
   "ps_editor.tools.rect_select_hint": "Tracez un rectangle sur la page.",
