@@ -965,7 +965,7 @@
   "cleaning.tools.stamp.source_cache_not_ready_status": "Le cache source pour la page actuelle n'est pas encore prêt.",
   "cleaning.tools.stamp.source_option": "Source",
   "cleaning.tools.stamp.source_plus_clean_option": "Source + nettoyage",
-  "cleaning.tools.stamp.source_width_mismatch_error": "La largeur de la source ({width}px) ne correspond pas au calque de superposition ({request})",
+  "cleaning.tools.stamp.source_size_mismatch_error": "La taille de la source ({width}x{height}px) ne correspond pas au calque de superposition ({expected_width}x{expected_height}px)",
   "cleaning.tools.stamp.stamp_point_status": "Point de tampon : {x}, {y}",
   "cleaning.tools.stamp.title": "Tampon",
   "cleaning.tools.texture_synthesis.backtrack_fraction_hint": "Quelle proportion des pixels déjà synthétisés peut être recalculée lors du retour en arrière.",

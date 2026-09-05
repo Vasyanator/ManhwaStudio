@@ -968,7 +968,7 @@
   "cleaning.tools.stamp.source_cache_not_ready_status": "Кэш источника для текущей страницы ещё не готов.",
   "cleaning.tools.stamp.source_option": "Исходник",
   "cleaning.tools.stamp.source_plus_clean_option": "Исходник + клин",
-  "cleaning.tools.stamp.source_width_mismatch_error": "Ширина источника ({width}px) не совпадает с overlay ({request})",
+  "cleaning.tools.stamp.source_size_mismatch_error": "Размер источника ({width}x{height}px) не совпадает с overlay ({expected_width}x{expected_height}px)",
   "cleaning.tools.stamp.stamp_point_status": "Точка штампа: {x}, {y}",
   "cleaning.tools.stamp.title": "Штамп",
   "cleaning.tools.texture_synthesis.backtrack_fraction_hint": "Какую часть уже синтезированных пикселей можно пересчитать во время отката.",

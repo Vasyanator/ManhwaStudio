@@ -8,6 +8,20 @@ FILE HEADER (cleaning/tools/stamp.rs)
   - `CurrentImageStampSource`: какой слой текущей страницы используется как источник штампа.
   - `StampScratch`: временный буфер штриха по видимой области (как у `zamazka`, без спама в модель на каждый move).
   - `SourceLoadRequest/SourceLoadResult`: очередь фоновой загрузки одной текущей alt-страницы.
+- Notes (English, per AGENTS.md §3):
+  - Source pages are validated against BOTH overlay dimensions; a zero expected dimension means the
+    overlay size is not known yet (`CanvasView::overlay_size` returned `None`), never "skip".
+  - The `CurrentImage` commit writes a DENSE overlay: `overlay_pixel_for_final_color` raises the
+    solved alpha to at least the dab coverage, because the page and the overlay are separate
+    LINEAR-sampled quads and a minimum-alpha (stencil-shaped) solution ghosts under resampling.
+  - `Color32` is premultiplied sRGBA; every colour helper here works on `to_srgba_unmultiplied()`
+    and premultiplies exactly once.
+  - `CurrentImage` mode paints TWO canvas markers: the fixed anchor beacon
+    (`draw_source_anchor_marker`) and a MOVING indicator of the point currently being sampled
+    (`draw_sampled_source_marker`, a dashed brush-radius ring plus a centre crosshair). The moving
+    one takes its position from `stamp_sampled_overlay_xy`, which goes through `stamp_source_xy`
+    itself, so it cannot disagree with the pixels being read. With no active stroke the offset is
+    zero, so it rests on the beacon and only travels away from it while the LMB stroke runs.
 - Поведение:
   - ЛКМ: штамп кистью; `Shift+ЛКМ`: временный ластик; `Ctrl+ЛКМ`: прямоугольный штамп;
     `Ctrl+Shift+ЛКМ`: прямоугольное стирание.
@@ -73,26 +87,39 @@ impl CurrentImageStampSource {
     }
 }
 
+/// One background decode job for a source page.
+///
+/// `overlay_size` is the `[width, height]` in overlay pixels the decoded page is expected to
+/// match. A dimension of `0` means the canvas could not report that dimension yet (no overlay
+/// allocated for the page — `CanvasView::overlay_size` returns `None` then), so there is
+/// nothing to compare against and that axis is left unchecked; it never means "skip the check".
+/// That accessor is all-or-nothing, so in practice the pair is either fully known or `[0, 0]`.
 #[derive(Clone)]
 struct SourceLoadRequest {
     job_id: u64,
     page_idx: usize,
-    overlay_width: usize,
+    overlay_size: [usize; 2],
     path: PathBuf,
 }
 
+/// Outcome of one `SourceLoadRequest`: either the decoded page or a user-facing error.
+///
+/// `overlay_size` echoes the request so the GUI thread can cache the expectation the image
+/// was validated against.
 struct SourceLoadResult {
     job_id: u64,
     page_idx: usize,
-    overlay_width: usize,
+    overlay_size: [usize; 2],
     path: PathBuf,
     image: Option<Arc<RgbaImage>>,
     error: Option<String>,
 }
 
+/// A decoded source page kept for one page index, valid for the `overlay_size` it was
+/// validated against (see `SourceLoadRequest` for the meaning of a zero dimension).
 struct CachedSourcePage {
     page_idx: usize,
-    overlay_width: usize,
+    overlay_size: [usize; 2],
     path: PathBuf,
     image: Arc<RgbaImage>,
 }
@@ -162,7 +189,7 @@ impl Default for StampTool {
                 let mut result = SourceLoadResult {
                     job_id: request.job_id,
                     page_idx: request.page_idx,
-                    overlay_width: request.overlay_width,
+                    overlay_size: request.overlay_size,
                     path: request.path.clone(),
                     image: None,
                     error: None,
@@ -171,11 +198,16 @@ impl Default for StampTool {
                 match image::open(&request.path) {
                     Ok(decoded) => {
                         let rgba = decoded.to_rgba8();
-                        let width = rgba.width() as usize;
-                        if request.overlay_width > 0 && width != request.overlay_width {
-                            result.error = Some(tf!("cleaning.tools.stamp.source_width_mismatch_error", width = width, request = request.overlay_width));
-                        } else {
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        // Both axes are validated: a page of the right width but the wrong height
+                        // silently samples the wrong rows. An expected dimension of 0 is "unknown"
+                        // (no overlay allocated yet), so that axis carries no expectation to check.
+                        let width_ok = request.overlay_size[0] == 0 || size[0] == request.overlay_size[0];
+                        let height_ok = request.overlay_size[1] == 0 || size[1] == request.overlay_size[1];
+                        if width_ok && height_ok {
                             result.image = Some(Arc::new(rgba));
+                        } else {
+                            result.error = Some(tf!("cleaning.tools.stamp.source_size_mismatch_error", width = size[0], height = size[1], expected_width = request.overlay_size[0], expected_height = request.overlay_size[1]));
                         }
                     }
                     Err(error) => {
@@ -188,8 +220,8 @@ impl Default for StampTool {
 
         Self {
             brush_base: BrushToolBase::default(),
-            mode: StampMode::AltVersion,
-            current_image_source: CurrentImageStampSource::OriginalOnly,
+            mode: StampMode::CurrentImage,
+            current_image_source: CurrentImageStampSource::OriginalAndOverlay,
             preview_opacity: 160,
             y_offset: 0,
             rotation_degrees: 0.0,
@@ -285,7 +317,7 @@ impl StampTool {
                     if let Some(img) = result.image {
                         self.source_cache = Some(CachedSourcePage {
                             page_idx: result.page_idx,
-                            overlay_width: result.overlay_width,
+                            overlay_size: result.overlay_size,
                             path: result.path,
                             image: img,
                         });
@@ -384,15 +416,26 @@ impl StampTool {
         self.mode == StampMode::AltVersion || self.mode == StampMode::CurrentImage
     }
 
-    fn source_ready_for_page(&self, page_idx: usize, overlay_width: usize) -> bool {
+    /// Whether a decoded source page matching `overlay_size` is already cached for `page_idx`.
+    ///
+    /// `overlay_size` is `[width, height]` in overlay pixels; `[0, 0]` means the overlay size is
+    /// not known yet and no size expectation is enforced. Always `true` for modes that need no
+    /// source image.
+    fn source_ready_for_page(&self, page_idx: usize, overlay_size: [usize; 2]) -> bool {
         if !self.source_required_for_paint() {
             return true;
         }
-        self.source_image_for_page(page_idx, overlay_width)
+        self.source_image_for_page(page_idx, overlay_size)
             .is_some()
     }
 
-    fn queue_source_load_for_page_if_needed(&mut self, page_idx: usize, overlay_width: usize) {
+    /// Dispatches a background decode of the source page for `page_idx` unless the cache or the
+    /// pending job already covers exactly this page, `overlay_size` and path.
+    ///
+    /// `overlay_size` is `[width, height]` in overlay pixels and becomes the size the decoded page
+    /// is validated against; `[0, 0]` means unknown (see `SourceLoadRequest`). Sets
+    /// `source_status_text` when no source file exists or the worker channel is gone.
+    fn queue_source_load_for_page_if_needed(&mut self, page_idx: usize, overlay_size: [usize; 2]) {
         let Some(path) = self.source_path_for_page(page_idx) else {
             self.source_cache = None;
             self.source_load_pending = None;
@@ -407,7 +450,7 @@ impl StampTool {
 
         if self.source_cache.as_ref().is_some_and(|cached| {
             cached.page_idx == page_idx
-                && cached.overlay_width == overlay_width
+                && cached.overlay_size == overlay_size
                 && cached.path == path
         }) {
             return;
@@ -415,7 +458,7 @@ impl StampTool {
 
         if self.source_load_pending.as_ref().is_some_and(|pending| {
             pending.page_idx == page_idx
-                && pending.overlay_width == overlay_width
+                && pending.overlay_size == overlay_size
                 && pending.path == path
         }) {
             return;
@@ -426,7 +469,7 @@ impl StampTool {
         let request = SourceLoadRequest {
             job_id: self.next_source_job_id,
             page_idx,
-            overlay_width,
+            overlay_size,
             path,
         };
         self.next_source_job_id = self.next_source_job_id.saturating_add(1);
@@ -439,16 +482,26 @@ impl StampTool {
         }
     }
 
+    /// Returns the cached source page for `page_idx` when it is usable at `overlay_size`.
+    ///
+    /// `overlay_size` is `[width, height]` in overlay pixels; a dimension of `0` is unknown (the
+    /// canvas has no overlay for the page yet) and carries no expectation. Each known dimension is
+    /// compared against the DECODED page's own size, never against the expectation the page was
+    /// loaded with: a page decoded while the overlay size was still unknown was validated against
+    /// nothing, so trusting that expectation would serve an unvalidated page the moment the real
+    /// size becomes known. Comparing against the decoded size validates it exactly once, here.
     fn source_image_for_page(
         &self,
         page_idx: usize,
-        overlay_width: usize,
+        overlay_size: [usize; 2],
     ) -> Option<Arc<RgbaImage>> {
         let cached = self.source_cache.as_ref()?;
         if cached.page_idx != page_idx {
             return None;
         }
-        if overlay_width > 0 && cached.overlay_width > 0 && cached.overlay_width != overlay_width {
+        let decoded = [usize::try_from(cached.image.width()).ok()?, usize::try_from(cached.image.height()).ok()?];
+        let compatible = |wanted: usize, actual: usize| wanted == 0 || wanted == actual;
+        if !compatible(overlay_size[0], decoded[0]) || !compatible(overlay_size[1], decoded[1]) {
             return None;
         }
         Some(Arc::clone(&cached.image))
@@ -478,11 +531,8 @@ impl StampTool {
         }
         let page_idx = canvas.current_page_idx();
         self.current_page_idx = Some(page_idx);
-        let overlay_width = canvas
-            .overlay_size(page_idx)
-            .map(|size| size[0])
-            .unwrap_or(0);
-        self.queue_source_load_for_page_if_needed(page_idx, overlay_width);
+        let overlay_size = canvas.overlay_size(page_idx).unwrap_or([0, 0]);
+        self.queue_source_load_for_page_if_needed(page_idx, overlay_size);
     }
 
     fn begin_scratch_stroke(
@@ -505,10 +555,7 @@ impl StampTool {
             let _ = canvas.replace_overlay_region_local(point.page_idx, tiny_scene_rect, &tiny);
         }
 
-        let overlay_width = canvas
-            .overlay_size(point.page_idx)
-            .map(|size| size[0])
-            .unwrap_or(0);
+        let overlay_size = canvas.overlay_size(point.page_idx).unwrap_or([0, 0]);
         if self.mode == StampMode::CurrentImage
             && !erase
             && self
@@ -521,10 +568,10 @@ impl StampTool {
         }
         let source = if erase || !self.source_required_for_paint() {
             None
-        } else if let Some(img) = self.source_image_for_page(point.page_idx, overlay_width) {
+        } else if let Some(img) = self.source_image_for_page(point.page_idx, overlay_size) {
             Some(img)
         } else {
-            self.queue_source_load_for_page_if_needed(point.page_idx, overlay_width);
+            self.queue_source_load_for_page_if_needed(point.page_idx, overlay_size);
             self.source_status_text =
                 Some(t!("cleaning.tools.stamp.source_cache_not_ready_status").to_string());
             return false;
@@ -801,12 +848,9 @@ impl StampTool {
         let chunk = if self.rect_erase {
             egui::ColorImage::filled([target.w, target.h], Color32::TRANSPARENT)
         } else if self.mode == StampMode::AltVersion {
-            let overlay_width = canvas
-                .overlay_size(start.page_idx)
-                .map(|size| size[0])
-                .unwrap_or(0);
-            let Some(source) = self.source_image_for_page(start.page_idx, overlay_width) else {
-                self.queue_source_load_for_page_if_needed(start.page_idx, overlay_width);
+            let overlay_size = canvas.overlay_size(start.page_idx).unwrap_or([0, 0]);
+            let Some(source) = self.source_image_for_page(start.page_idx, overlay_size) else {
+                self.queue_source_load_for_page_if_needed(start.page_idx, overlay_size);
                 self.source_status_text = Some(
                     t!("cleaning.tools.stamp.alt_cache_not_ready_status").to_string(),
                 );
@@ -814,12 +858,9 @@ impl StampTool {
             };
             build_rect_chunk_from_source(&source, target, self.y_offset)
         } else {
-            let overlay_width = canvas
-                .overlay_size(start.page_idx)
-                .map(|size| size[0])
-                .unwrap_or(0);
-            if !self.source_ready_for_page(start.page_idx, overlay_width) {
-                self.queue_source_load_for_page_if_needed(start.page_idx, overlay_width);
+            let overlay_size = canvas.overlay_size(start.page_idx).unwrap_or([0, 0]);
+            if !self.source_ready_for_page(start.page_idx, overlay_size) {
+                self.queue_source_load_for_page_if_needed(start.page_idx, overlay_size);
                 self.source_status_text =
                     Some(t!("cleaning.tools.stamp.source_cache_not_ready_status").to_string());
                 return;
@@ -868,7 +909,7 @@ impl StampTool {
             return None;
         }
         let radius = self.brush_base.radius_px().max(1);
-        let source = self.source_image_for_page(page_idx, overlay_w);
+        let source = self.source_image_for_page(page_idx, [overlay_w, overlay_h]);
         if self.source_required_for_paint() && source.is_none() {
             return None;
         }
@@ -990,6 +1031,107 @@ impl StampTool {
             (radius_scene - 1.0).max(0.5),
             egui::Stroke::new(1.0, Color32::BLACK),
         );
+    }
+
+    /// Paints the MOVING indicator of the point the stamp is currently sampling from.
+    ///
+    /// `pointer_scene_pos` is the cursor in scene units. The destination overlay pixel is taken
+    /// on the page under the cursor and mapped through `stamp_sampled_overlay_xy`; the marker is
+    /// painted on the ANCHOR's page, which is where the pixels are read. Paint-only, no hitbox.
+    ///
+    /// Draws nothing outside `StampMode::CurrentImage`, without a stamp anchor, when the cursor
+    /// is not over the anchor's page (no destination pixel exists there, so nothing is sampled
+    /// either), or when the sampled pixel falls outside the overlay.
+    fn draw_sampled_source_marker(&self, ui: &mut egui::Ui, canvas: &CanvasView, pointer_scene_pos: egui::Pos2) {
+        // Number of dashes the ring is split into, kept constant so the per-frame shape count does
+        // not grow with the brush radius or the zoom level.
+        const RING_DASHES: f32 = 16.0;
+        // Segments of the polyline the dashes are cut from; constant for the same reason.
+        const RING_SEGMENTS: usize = 64;
+        const CROSSHAIR_ARM_SCENE: f32 = 5.0;
+        let dark = Color32::from_black_alpha(180);
+
+        let Some(anchor) = self.source_anchor else {
+            return;
+        };
+        let Some(dst_page_idx) = canvas.page_index_at_scene_pos(pointer_scene_pos) else {
+            return;
+        };
+        // A CurrentImage stroke is refused when destination and source pages differ
+        // (`begin_scratch_stroke`), so a cursor on another page gets no marker instead of a guess.
+        if dst_page_idx != anchor.page_idx {
+            return;
+        }
+        let Some((dst_x, dst_y)) = canvas.scene_point_to_overlay_xy(dst_page_idx, pointer_scene_pos)
+        else {
+            return;
+        };
+        let (Ok(dst_x), Ok(dst_y)) = (i32::try_from(dst_x), i32::try_from(dst_y)) else {
+            return;
+        };
+        let Some((src_page_idx, src_overlay)) = stamp_sampled_overlay_xy(self.mode, self.source_anchor, self.rotation_degrees, self.active_stroke_origin_overlay, [dst_x, dst_y])
+        else {
+            return;
+        };
+        let Some(page_rect) = canvas.page_scene_rect(src_page_idx) else {
+            return;
+        };
+        let Some([overlay_w, overlay_h]) = canvas.overlay_size(src_page_idx) else {
+            return;
+        };
+        if overlay_w == 0 || overlay_h == 0 {
+            return;
+        }
+        // `overlay_pos_to_scene_pos` CLAMPS to the page, so an out-of-page source point would be
+        // pinned to the border and claim pixels are read there. Nothing is sampled outside the
+        // overlay, so nothing is drawn either.
+        let inside = usize::try_from(src_overlay[0]).is_ok_and(|x| x < overlay_w)
+            && usize::try_from(src_overlay[1]).is_ok_and(|y| y < overlay_h);
+        if !inside {
+            return;
+        }
+        // Raw pixel index, NOT its centre: the anchor beacon is placed with the same convention,
+        // so at zero offset the two markers coincide exactly instead of sitting half a pixel apart.
+        let Some(center) = overlay_pos_to_scene_pos(canvas, src_page_idx, [src_overlay[0] as f32, src_overlay[1] as f32]) else {
+            return;
+        };
+
+        // Same overlay-pixel -> scene-unit conversion the destination brush cursor uses, so both
+        // rings show the same disc size.
+        let radius_px = self.brush_base.radius_px().max(1) as f32;
+        let radius_x_scene = radius_px * (page_rect.width() / overlay_w as f32);
+        let radius_y_scene = radius_px * (page_rect.height() / overlay_h as f32);
+        let radius_scene = ((radius_x_scene + radius_y_scene) * 0.5).max(2.0);
+
+        let ring: Vec<egui::Pos2> = (0..=RING_SEGMENTS)
+            .map(|step| {
+                let angle = std::f32::consts::TAU * (step as f32) / (RING_SEGMENTS as f32);
+                egui::pos2(center.x + radius_scene * angle.cos(), center.y + radius_scene * angle.sin())
+            })
+            .collect();
+        // Dash and gap scale with the circumference so the dash COUNT stays put at any zoom.
+        let dash = (std::f32::consts::TAU * radius_scene / (RING_DASHES * 2.0)).max(2.0);
+        // Dark under light: the pair survives both black line art and white paper, and the dashed
+        // ring plus the centre crosshair keep it distinct from the solid destination brush ring
+        // and from the filled anchor beacon.
+        ui.painter().extend(egui::Shape::dashed_line(&ring, egui::Stroke::new(3.0, dark), dash, dash));
+        ui.painter().extend(egui::Shape::dashed_line(&ring, egui::Stroke::new(1.0, Color32::WHITE), dash, dash));
+        for (width, color) in [(3.0, dark), (1.0, Color32::WHITE)] {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x - CROSSHAIR_ARM_SCENE, center.y),
+                    egui::pos2(center.x + CROSSHAIR_ARM_SCENE, center.y),
+                ],
+                egui::Stroke::new(width, color),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x, center.y - CROSSHAIR_ARM_SCENE),
+                    egui::pos2(center.x, center.y + CROSSHAIR_ARM_SCENE),
+                ],
+                egui::Stroke::new(width, color),
+            );
+        }
     }
 }
 
@@ -1328,6 +1470,10 @@ impl CleaningTool for StampTool {
             return;
         };
 
+        // Painted above the fixed beacon (so the two stay readable where they overlap at zero
+        // offset) and below the destination brush preview, which owns the cursor position.
+        self.draw_sampled_source_marker(ui, canvas, pointer_scene_pos);
+
         if let Some(snapped_center) = self.draw_cursor_preview(ui, canvas, pointer_scene_pos) {
             self.draw_circle_outline_at(ui, canvas, snapped_center);
         } else {
@@ -1533,6 +1679,41 @@ fn draw_source_anchor_marker(
     );
 }
 
+/// Overlay pixel the stamp CURRENTLY samples for one destination overlay pixel.
+///
+/// `dst_overlay` is a page-overlay pixel (not scene units) of the pixel that would be painted.
+/// `stroke_origin_overlay` is the overlay pixel where the active stroke began, or `None` when no
+/// stroke is running — the prospective origin is then the destination itself, the offset is zero,
+/// and the sampled point collapses onto the anchor, i.e. the indicator rests on the beacon until
+/// the first LMB press and travels away from it afterwards.
+///
+/// Returns the ANCHOR's page index together with the sampled overlay pixel (also not bounds
+/// checked, exactly like `stamp_source_xy`). Returns `None` outside `StampMode::CurrentImage`,
+/// where a different image is sampled and a marker on this page would be meaningless, and `None`
+/// when no stamp anchor is set.
+fn stamp_sampled_overlay_xy(mode: StampMode, anchor: Option<StampAnchor>, rotation_degrees: f32, stroke_origin_overlay: Option<[i32; 2]>, dst_overlay: [i32; 2]) -> Option<(usize, [i32; 2])> {
+    if mode != StampMode::CurrentImage {
+        return None;
+    }
+    let anchor = anchor?;
+    // The position is derived from the sampling mapping itself instead of a second copy of the
+    // offset/rotation maths: an indicator that can disagree with the pixels actually read would
+    // be worse than no indicator at all.
+    let context = StampSourceContext {
+        source: None,
+        overlay: None,
+        mode,
+        // Irrelevant to the coordinate mapping; no layer is sampled here.
+        current_source: CurrentImageStampSource::OriginalOnly,
+        source_anchor: Some(anchor),
+        stroke_origin_overlay: Some(stroke_origin_overlay.unwrap_or(dst_overlay)),
+        rotation_degrees,
+        y_offset: 0,
+    };
+    let (src_x, src_y) = stamp_source_xy(&context, dst_overlay[0], dst_overlay[1])?;
+    Some((anchor.page_idx, [src_x, src_y]))
+}
+
 fn expand_overlay_rect(
     rect: OverlayRectPx,
     max_w: usize,
@@ -1720,9 +1901,11 @@ fn stamp_circle_to_image(
             if strength <= *mask_px {
                 continue;
             }
-            let src_x = center_x + dx;
-            let src_y = center_y + dy;
-            let Some(mut src_px) = sample_stamp_source(source, src_x, src_y) else {
+            // Destination overlay coordinates of this dab pixel; `sample_stamp_source` and
+            // `stamp_source_xy` map them to the source point themselves.
+            let dst_x = center_x + dx;
+            let dst_y = center_y + dy;
+            let Some(mut src_px) = sample_stamp_source(source, dst_x, dst_y) else {
                 continue;
             };
             if src_px.a() == 0 {
@@ -1743,10 +1926,20 @@ fn stamp_circle_to_image(
                     };
                     let current_final = blend_source_over(target_original, base_px);
                     if source.current_source == CurrentImageStampSource::OverlayOnly {
-                        src_px = blend_source_over(target_original, src_px);
+                        // `src_px` is the clean-overlay pixel at the SOURCE point, so the colour
+                        // actually visible there is that pixel over the original page at the
+                        // SOURCE coordinates — not over `target_original`, which belongs to the
+                        // destination. `OriginalAndOverlay` already does exactly this inside
+                        // `sample_stamp_source`; an out-of-bounds source keeps the overlay pixel
+                        // alone, mirroring the `TRANSPARENT` base used there.
+                        let source_base = stamp_source_xy(source, dst_x, dst_y)
+                            .and_then(|(sx, sy)| sample_rgba_image(original, sx, sy))
+                            .unwrap_or(Color32::TRANSPARENT);
+                        src_px = blend_source_over(source_base, src_px);
                     }
                     let desired_final = lerp_color_premultiplied(current_final, src_px, strength);
-                    *dst_px = overlay_pixel_for_final_color(target_original, desired_final);
+                    // The dab strength is the alpha FLOOR: see `overlay_pixel_for_final_color`.
+                    *dst_px = overlay_pixel_for_final_color(target_original, desired_final, strength);
                 } else {
                     let [r, g, b, a] = src_px.to_srgba_unmultiplied();
                     src_px = Color32::from_rgba_unmultiplied(
@@ -2064,9 +2257,18 @@ fn build_stamp_patch_with_opacity(
     out
 }
 
-fn sample_stamp_source(source: &StampSourceContext<'_>, dst_x: i32, dst_y: i32) -> Option<Color32> {
-    let (src_x, src_y) = match source.mode {
-        StampMode::AltVersion => (dst_x, dst_y.saturating_add(source.y_offset)),
+/// Maps a DESTINATION overlay pixel to the overlay pixel the stamp reads its colour from.
+///
+/// `dst_x`/`dst_y` are page-overlay pixel coordinates of the pixel being painted. In
+/// `AltVersion` mode the mapping is the vertical `y_offset` only. In `CurrentImage` mode the
+/// offset from the stroke origin is rotated by `rotation_degrees` (clockwise in image space,
+/// y pointing down) and added to the stamp anchor, i.e. the Photoshop clone-stamp mapping.
+///
+/// Returns `None` in `CurrentImage` mode when no stamp anchor or no stroke origin is set;
+/// the returned coordinates are NOT bounds-checked — the samplers do that.
+fn stamp_source_xy(source: &StampSourceContext<'_>, dst_x: i32, dst_y: i32) -> Option<(i32, i32)> {
+    match source.mode {
+        StampMode::AltVersion => Some((dst_x, dst_y.saturating_add(source.y_offset))),
         StampMode::CurrentImage => {
             let anchor = source.source_anchor?;
             let [origin_x, origin_y] = source.stroke_origin_overlay?;
@@ -2076,12 +2278,21 @@ fn sample_stamp_source(source: &StampSourceContext<'_>, dst_x: i32, dst_y: i32) 
             let (sin, cos) = radians.sin_cos();
             let rx = dx * cos - dy * sin;
             let ry = dx * sin + dy * cos;
-            (
+            Some((
                 (anchor.overlay_xy[0] + rx).round() as i32,
                 (anchor.overlay_xy[1] + ry).round() as i32,
-            )
+            ))
         }
-    };
+    }
+}
+
+/// Samples the colour the stamp copies for the destination overlay pixel `dst_x`/`dst_y`.
+///
+/// The source point is resolved by `stamp_source_xy`; which layer is read there depends on
+/// `source.current_source`. Returns `None` when the source point falls outside the sampled
+/// layer, when a required layer is absent, or when the clone-stamp mapping is not set up.
+fn sample_stamp_source(source: &StampSourceContext<'_>, dst_x: i32, dst_y: i32) -> Option<Color32> {
+    let (src_x, src_y) = stamp_source_xy(source, dst_x, dst_y)?;
 
     match source.mode {
         StampMode::AltVersion => sample_rgba_image(source.source?, src_x, src_y),
@@ -2140,25 +2351,37 @@ fn sample_overlay_image(source: &egui::ColorImage, x: i32, y: i32) -> Option<Col
         .copied()
 }
 
+/// Composites `src` over `dst` (Porter-Duff source-over) in sRGB space.
+///
+/// ALPHA CONVENTION: `Color32` is sRGBA u8 with PREMULTIPLIED alpha
+/// (`ecolor-0.35.0/src/color32.rs:8`), so `r()`/`g()`/`b()` already return colour
+/// bytes scaled by alpha. This function therefore works exclusively on the
+/// UN-premultiplied representation (`to_srgba_unmultiplied()`), premultiplies once
+/// itself, blends, and un-premultiplies again for `from_rgba_unmultiplied` — the same
+/// discipline as `lerp_color_premultiplied`. Reading `r()`/`g()`/`b()` and then
+/// multiplying by alpha again multiplies twice and darkens every translucent input.
+///
+/// Returns the composited colour; `src` with zero alpha is a no-op and a fully
+/// transparent result is normalized to `Color32::TRANSPARENT`.
 fn blend_source_over(dst: Color32, src: Color32) -> Color32 {
-    let sa = src.a() as f32 / 255.0;
+    let [sr, sg, sb, sa] = src.to_srgba_unmultiplied();
+    let sa = sa as f32 / 255.0;
     if sa <= f32::EPSILON {
         return dst;
     }
-    let da = dst.a() as f32 / 255.0;
+    let [dr, dg, db, da] = dst.to_srgba_unmultiplied();
+    let da = da as f32 / 255.0;
     let out_a = sa + da * (1.0 - sa);
     if out_a <= f32::EPSILON {
         return Color32::TRANSPARENT;
     }
-    let sr = src.r() as f32 / 255.0;
-    let sg = src.g() as f32 / 255.0;
-    let sb = src.b() as f32 / 255.0;
-    let dr = dst.r() as f32 / 255.0;
-    let dg = dst.g() as f32 / 255.0;
-    let db = dst.b() as f32 / 255.0;
-    let out_r = (sr * sa + dr * da * (1.0 - sa)) / out_a;
-    let out_g = (sg * sa + dg * da * (1.0 - sa)) / out_a;
-    let out_b = (sb * sa + db * da * (1.0 - sa)) / out_a;
+    // Straight -> premultiplied -> blend -> straight again, once and explicitly.
+    let blend = |s: u8, d: u8| {
+        ((s as f32 / 255.0) * sa + (d as f32 / 255.0) * da * (1.0 - sa)) / out_a
+    };
+    let out_r = blend(sr, dr);
+    let out_g = blend(sg, dg);
+    let out_b = blend(sb, db);
     Color32::from_rgba_unmultiplied(
         (out_r * 255.0).round().clamp(0.0, 255.0) as u8,
         (out_g * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -2200,7 +2423,32 @@ fn lerp_color_premultiplied(from: Color32, to: Color32, t: f32) -> Color32 {
     )
 }
 
-fn overlay_pixel_for_final_color(base: Color32, final_color: Color32) -> Color32 {
+/// Solves for the clean-overlay pixel that shows `final_color` when composited over
+/// the original page pixel `base`, at an alpha of at least `coverage`.
+///
+/// `coverage` is the brush dab strength in `0..=1` (values outside are clamped); it is
+/// the LOWER bound on the returned alpha, not the alpha itself.
+///
+/// # Why not the minimum alpha
+/// For a target colour `f` over an opaque original `o`, every overlay alpha `a` in
+/// `[alpha_min, 1]` reproduces `f` exactly, with `p(a) = o + (f - o) / a`: `p` moves
+/// monotonically from the clamp boundary at `alpha_min` to `p(1) = f`, so it stays inside
+/// `[0, 1]` for the whole range. `alpha_min` — the smallest representable alpha, still
+/// computed below — is exact only under pixel-perfect 1:1 compositing. On the canvas the
+/// page and the clean overlay are two SEPARATE textured quads, both sampled with
+/// `TextureOptions::LINEAR` (`src/canvas/overlay_runtime.rs`), so colour and alpha are
+/// filtered INDEPENDENTLY and their product term is lost: a minimum-alpha solution over
+/// black text on white paper is a text-shaped opaque stencil on a transparent field, and
+/// at glyph coverage `w` the screen shows `w + (1 - w)^2` instead of `1.0` — a ghost of
+/// the letters peaking at 0.25 error. Lifting alpha to the dab coverage keeps the composite
+/// mathematically exact and makes the committed overlay DENSE over the brushed area (like
+/// `zamazka`'s) instead of sparse; at hardness 100 % `coverage == 1.0`, so the patch is
+/// fully opaque and immune to independent resampling.
+///
+/// Returns `Color32::TRANSPARENT` when `final_color` is fully transparent, and when the
+/// solved alpha is below one 8-bit step — which, since the alpha is at least `coverage`,
+/// can only happen where the dab itself contributes nothing.
+fn overlay_pixel_for_final_color(base: Color32, final_color: Color32, coverage: f32) -> Color32 {
     let [br, bg, bb, _] = base.to_srgba_unmultiplied();
     let [fr, fg, fb, fa] = final_color.to_srgba_unmultiplied();
     if fa == 0 {
@@ -2221,6 +2469,8 @@ fn overlay_pixel_for_final_color(base: Color32, final_color: Color32) -> Color32
         };
         alpha = alpha.max(needed.clamp(0.0, 1.0));
     }
+    // `alpha` is the representability floor; the dab coverage raises it, never lowers it.
+    alpha = alpha.max(coverage.clamp(0.0, 1.0));
     if alpha <= (1.0 / 255.0) {
         return Color32::TRANSPARENT;
     }
@@ -2235,4 +2485,199 @@ fn overlay_pixel_for_final_color(base: Color32, final_color: Color32) -> Color32
         (out[2] * 255.0).round().clamp(0.0, 255.0) as u8,
         (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tolerance of one 8-bit step, expressed in the normalized `0..=1` range.
+    const ONE_STEP: f32 = 1.0 / 255.0;
+
+    /// Composites an un-premultiplied overlay pixel over an opaque base and returns the
+    /// three normalized sRGB channels, i.e. what the renderer shows at 1:1 sampling.
+    fn composite_over(overlay: Color32, base: Color32) -> [f32; 3] {
+        let [orr, og, ob, oa] = overlay.to_srgba_unmultiplied();
+        let [br, bg, bb, _] = base.to_srgba_unmultiplied();
+        let a = f32::from(oa) / 255.0;
+        [
+            (f32::from(orr) / 255.0) * a + (f32::from(br) / 255.0) * (1.0 - a),
+            (f32::from(og) / 255.0) * a + (f32::from(bg) / 255.0) * (1.0 - a),
+            (f32::from(ob) / 255.0) * a + (f32::from(bb) / 255.0) * (1.0 - a),
+        ]
+    }
+
+    /// Normalized sRGB channels of a colour, ignoring its alpha.
+    fn channels(color: Color32) -> [f32; 3] {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ]
+    }
+
+    /// A context with no image layers — enough to exercise the coordinate mapping alone.
+    fn coordinate_context(mode: StampMode, rotation_degrees: f32, y_offset: i32) -> StampSourceContext<'static> {
+        StampSourceContext {
+            source: None,
+            overlay: None,
+            mode,
+            current_source: CurrentImageStampSource::OriginalOnly,
+            source_anchor: Some(StampAnchor { page_idx: 0, overlay_xy: [100.0, 100.0] }),
+            stroke_origin_overlay: Some([10, 10]),
+            rotation_degrees,
+            y_offset,
+        }
+    }
+
+    #[test]
+    fn overlay_pixel_at_full_coverage_is_opaque_and_equals_final_color() {
+        // The ghosting regression: over a white page the minimum-alpha solution was
+        // fully transparent, so the page showed through the resampled overlay.
+        let over_white = overlay_pixel_for_final_color(Color32::WHITE, Color32::WHITE, 1.0);
+        assert_eq!(over_white, Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+
+        let over_black = overlay_pixel_for_final_color(Color32::BLACK, Color32::WHITE, 1.0);
+        assert_eq!(over_black, Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+
+        // A non-neutral target must survive full coverage unchanged as well.
+        let target = Color32::from_rgb(37, 180, 90);
+        let solved = overlay_pixel_for_final_color(Color32::from_rgb(200, 40, 10), target, 1.0);
+        assert_eq!(solved.a(), 255);
+        assert_eq!(solved.to_srgba_unmultiplied(), target.to_srgba_unmultiplied());
+    }
+
+    #[test]
+    fn overlay_pixel_at_partial_coverage_still_reproduces_final_color() {
+        let cases = [
+            (Color32::WHITE, Color32::from_rgb(128, 128, 128), 0.5_f32),
+            (Color32::WHITE, Color32::from_rgb(200, 190, 210), 0.25_f32),
+            (Color32::BLACK, Color32::from_rgb(64, 32, 96), 0.35_f32),
+            // Coverage below the representability floor must not weaken the solution.
+            (Color32::WHITE, Color32::BLACK, 0.2_f32),
+        ];
+        for (base, desired_final, coverage) in cases {
+            let overlay = overlay_pixel_for_final_color(base, desired_final, coverage);
+            let alpha = f32::from(overlay.a()) / 255.0;
+            assert!(alpha + ONE_STEP >= coverage, "alpha {alpha} fell below coverage {coverage}");
+            let shown = composite_over(overlay, base);
+            let want = channels(desired_final);
+            for channel in 0..3 {
+                // One step for the alpha quantization plus one for the colour quantization.
+                assert!((shown[channel] - want[channel]).abs() <= 2.0 * ONE_STEP, "channel {channel}: {shown:?} vs {want:?} (coverage {coverage})");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_pixel_for_transparent_final_color_is_transparent() {
+        assert_eq!(overlay_pixel_for_final_color(Color32::WHITE, Color32::TRANSPARENT, 1.0), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn overlay_pixel_without_coverage_or_difference_is_transparent() {
+        // Nothing to paint and nothing to represent: the pixel stays untouched.
+        assert_eq!(overlay_pixel_for_final_color(Color32::WHITE, Color32::WHITE, 0.0), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn blend_source_over_opaque_source_replaces_destination() {
+        let src = Color32::from_rgb(12, 200, 77);
+        assert_eq!(blend_source_over(Color32::from_rgb(240, 10, 10), src), Color32::from_rgba_unmultiplied(12, 200, 77, 255));
+    }
+
+    #[test]
+    fn blend_source_over_transparent_source_is_a_no_op() {
+        let dst = Color32::from_rgba_unmultiplied(30, 60, 90, 200);
+        assert_eq!(blend_source_over(dst, Color32::TRANSPARENT), dst);
+    }
+
+    #[test]
+    fn blend_source_over_half_alpha_white_over_black_is_mid_grey() {
+        // Regression test for the premultiplied/straight double-multiply: with `Color32`
+        // accessors returning PREMULTIPLIED bytes, the old code produced 0.502^2 = 64
+        // instead of 0.502 -> 128.
+        let src = Color32::from_rgba_unmultiplied(255, 255, 255, 128);
+        let out = blend_source_over(Color32::BLACK, src);
+        assert_eq!(out.a(), 255);
+        let [r, g, b, _] = out.to_srgba_unmultiplied();
+        for channel in [r, g, b] {
+            let got = f32::from(channel) / 255.0;
+            assert!((got - 128.0 / 255.0).abs() <= ONE_STEP, "expected mid grey, got {channel}");
+        }
+    }
+
+    #[test]
+    fn stamp_source_xy_without_rotation_offsets_by_the_anchor() {
+        let context = coordinate_context(StampMode::CurrentImage, 0.0, 0);
+        // Destination 10px right of the stroke origin -> 10px right of the anchor.
+        assert_eq!(stamp_source_xy(&context, 20, 10), Some((110, 100)));
+        assert_eq!(stamp_source_xy(&context, 10, 15), Some((100, 105)));
+    }
+
+    #[test]
+    fn stamp_source_xy_rotates_the_offset_around_the_anchor() {
+        let context = coordinate_context(StampMode::CurrentImage, 90.0, 0);
+        // +x at the destination becomes +y at the source (y grows downwards).
+        assert_eq!(stamp_source_xy(&context, 20, 10), Some((100, 110)));
+        assert_eq!(stamp_source_xy(&context, 10, 20), Some((90, 100)));
+    }
+
+    #[test]
+    fn stamp_source_xy_in_alt_version_mode_applies_only_the_y_offset() {
+        let context = coordinate_context(StampMode::AltVersion, 90.0, -7);
+        assert_eq!(stamp_source_xy(&context, 20, 10), Some((20, 3)));
+    }
+
+    #[test]
+    fn stamp_source_xy_without_an_anchor_has_no_source_point() {
+        let mut context = coordinate_context(StampMode::CurrentImage, 0.0, 0);
+        context.source_anchor = None;
+        assert_eq!(stamp_source_xy(&context, 20, 10), None);
+    }
+
+    /// Anchor used by the sampled-marker tests. Its overlay position matches the one
+    /// `coordinate_context` builds, so the two can be compared directly; only the page differs,
+    /// and the page index does not take part in the coordinate mapping.
+    fn marker_anchor() -> StampAnchor {
+        StampAnchor { page_idx: 3, overlay_xy: [100.0, 100.0] }
+    }
+
+    #[test]
+    fn sampled_marker_without_a_stroke_sits_on_the_anchor() {
+        let anchor = marker_anchor();
+        // No active stroke -> zero offset -> the marker rests exactly on the beacon.
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, Some(anchor), 0.0, None, [512, 40]), Some((3, [100, 100])));
+        // A rotation cannot move a zero offset, so it stays there whatever the angle.
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, Some(anchor), 37.0, None, [512, 40]), Some((3, [100, 100])));
+        // A fractional anchor (free placement, snapping off) rounds to the nearest pixel.
+        let fractional = StampAnchor { page_idx: 3, overlay_xy: [100.4, 100.6] };
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, Some(fractional), 0.0, None, [512, 40]), Some((3, [100, 101])));
+    }
+
+    #[test]
+    fn sampled_marker_follows_the_stroke_offset() {
+        let anchor = marker_anchor();
+        // Destination 20px right and 15px below the stroke origin -> the same offset from the anchor.
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, Some(anchor), 0.0, Some([10, 10]), [30, 25]), Some((3, [120, 115])));
+    }
+
+    #[test]
+    fn sampled_marker_matches_the_sampling_mapping_under_rotation() {
+        // The real contract: the indicator must never disagree with the pixels actually read.
+        let context = coordinate_context(StampMode::CurrentImage, 90.0, 0);
+        for dst in [[20, 10], [10, 20], [-5, 40], [300, 275]] {
+            let sampled = stamp_source_xy(&context, dst[0], dst[1]);
+            let marker = stamp_sampled_overlay_xy(StampMode::CurrentImage, Some(marker_anchor()), 90.0, Some([10, 10]), dst);
+            assert_eq!(marker.map(|(_, xy)| (xy[0], xy[1])), sampled, "marker disagreed with the sampling mapping at {dst:?}");
+        }
+    }
+
+    #[test]
+    fn sampled_marker_needs_an_anchor_and_the_current_image_mode() {
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, None, 0.0, None, [10, 10]), None);
+        // Alt-version mode samples a different image; a marker on this page would be a lie.
+        assert_eq!(stamp_sampled_overlay_xy(StampMode::AltVersion, Some(marker_anchor()), 0.0, Some([10, 10]), [30, 25]), None);
+    }
 }

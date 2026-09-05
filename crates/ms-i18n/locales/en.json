@@ -968,7 +968,7 @@
   "cleaning.tools.stamp.source_cache_not_ready_status": "The source cache for the current page is not ready yet.",
   "cleaning.tools.stamp.source_option": "Source",
   "cleaning.tools.stamp.source_plus_clean_option": "Source + cleaning",
-  "cleaning.tools.stamp.source_width_mismatch_error": "Source width ({width}px) does not match the overlay ({request})",
+  "cleaning.tools.stamp.source_size_mismatch_error": "Source size ({width}x{height}px) does not match the overlay ({expected_width}x{expected_height}px)",
   "cleaning.tools.stamp.stamp_point_status": "Stamp point: {x}, {y}",
   "cleaning.tools.stamp.title": "Stamp",
   "cleaning.tools.texture_synthesis.backtrack_fraction_hint": "What fraction of already synthesized pixels can be recomputed during backtracking.",

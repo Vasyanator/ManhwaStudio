@@ -63,7 +63,19 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - `zamazka.rs`: primary paint/erase/eyedropper/rectangle tool for direct clean-overlay edits.
 - `stamp.rs`: copies pixels into clean overlays either from `project/alt_vers/<name>` or from the
   current page image/clean overlay using a Photoshop-like source point, with lazy background
-  source-page loading where file decode is needed.
+  source-page loading where file decode is needed. Defaults to the current-page mode with
+  «Исходник + клин» as the sampled layer. A background-loaded source page must match BOTH overlay
+  dimensions; an expected dimension of `0` means the overlay size is not known yet, not "unchecked".
+  In current-page mode the committed overlay is DENSE, not minimum-alpha: `overlay_pixel_for_final_color`
+  solves the pixel that reproduces the desired final colour over the original page and raises its
+  alpha to at least the brush dab coverage, so a 100 %-hardness dab commits a fully opaque patch.
+  The minimum-alpha solution is exact only at 1:1 sampling — page and overlay are separate
+  `TextureOptions::LINEAR` quads, so colour and alpha are filtered independently and a
+  stencil-shaped overlay ghosts the page's own content back through it.
+  Current-page mode shows two canvas markers: the fixed anchor beacon and a moving indicator of the
+  point currently sampled, whose position is derived from the sampling mapping (`stamp_source_xy`)
+  and therefore cannot disagree with the pixels being copied. The stroke origin is runtime stroke
+  state, so between strokes the offset is zero and the moving marker rests on the beacon.
 - `gradient.rs`: local mask fill using Lab scanline estimation and smoothing.
 - `texture_synthesis.rs`: local inpaint through the `texture-synthesis` crate, with optional
   sample mask limiting the texture source area.

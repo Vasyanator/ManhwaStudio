@@ -965,7 +965,7 @@
   "cleaning.tools.stamp.source_cache_not_ready_status": "O cache de origem da página atual ainda não está pronto.",
   "cleaning.tools.stamp.source_option": "Original",
   "cleaning.tools.stamp.source_plus_clean_option": "Original + limpeza",
-  "cleaning.tools.stamp.source_width_mismatch_error": "A largura da origem ({width}px) não coincide com a sobreposição ({request})",
+  "cleaning.tools.stamp.source_size_mismatch_error": "O tamanho da origem ({width}x{height}px) não coincide com a sobreposição ({expected_width}x{expected_height}px)",
   "cleaning.tools.stamp.stamp_point_status": "Ponto do carimbo: {x}, {y}",
   "cleaning.tools.stamp.title": "Carimbo",
   "cleaning.tools.texture_synthesis.backtrack_fraction_hint": "Que fração dos pixels já sintetizados pode ser recalculada durante o retrocesso.",
