@@ -13,6 +13,10 @@ Main items:
 - `update_user_config_file`: serialized read-modify-write boundary for `user_config.json`.
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
+- `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
+  (9B / 4B). It keys the model directory, the three component directories and the engine's
+  settings file below; its model/UI facts are a second inherent `impl` in
+  `tabs/cleaning/tools/ai_editor/engines/flux2_klein/variant.rs`.
 - `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
 - `OrtLoadGuard` / `OrtLoadDecision` / `ort_load_decision` / `ort_load_scope_key` /
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
@@ -586,13 +590,17 @@ pub fn watermark_removal_settings_path() -> PathBuf {
     data_dir().join("watermark_removal_settings.json")
 }
 
-/// Dedicated settings file for the «FLUX.2 klein» region-edit cleaning tool
-/// (model paths, prompt, generation and memory-placement parameters), kept out of
+/// Dedicated settings file of one «FLUX.2 klein» region-edit engine, kept out of
 /// `user_config.json` for the same reason as the SDXL, FLUX.1-Fill and watermark
 /// ones: its background saves must not race the canvas-settings saver.
+///
+/// ONE FILE PER VARIANT: the two checkpoints have different model paths, different
+/// memory behaviour and their own prompt, so a shared file would make selecting the
+/// other variant rewrite the first one's configuration. [`Flux2Variant::Klein9B`] keeps
+/// the historic name unchanged, because users already have that file on disk.
 #[must_use]
-pub fn flux2_klein_settings_path() -> PathBuf {
-    data_dir().join("flux2_klein_settings.json")
+pub fn flux2_klein_settings_path(variant: Flux2Variant) -> PathBuf {
+    data_dir().join(variant.settings_file_name())
 }
 
 /// Root of the reusable watermark LIBRARY: one self-contained directory per entry
@@ -786,6 +794,89 @@ pub fn flux_fill_components_dir() -> PathBuf {
     flux_fill_dir().join("components")
 }
 
+/// Which FLUX.2 klein checkpoint an «ИИ-редактор области» engine instance works with.
+///
+/// The two variants are separate ENGINES in the picker sharing one implementation, and
+/// this is the key that parameterizes it: it names the model directory under
+/// [`side_models_dir`], the engine's own settings file, and the token the download
+/// methods carry on the wire (`"9b"` / `"4b"`).
+///
+/// It lives here because those are runtime PATH decisions, which belong in this file
+/// (`src/MODULE_README.md`). The MODEL and UI facts of a variant — its engine id, its
+/// picker caption, its Hugging Face repository, whether an uncensored text encoder
+/// exists for it and whether it needs an access token — are a second inherent `impl`
+/// block in `tabs/cleaning/tools/ai_editor/engines/flux2_klein/variant.rs`, so there is
+/// exactly ONE enum and no mapping table that could drift from it.
+///
+/// The backend keeps only one FLUX.2 pipeline and one text encoder resident, keyed by
+/// the three component paths, so selecting the other variant unloads the previous one.
+/// `Default` is [`Flux2Variant::Klein9B`] for the same reason [`Flux2Variant::from_wire`]
+/// falls back to it: a document or a wire frame that names no variant predates the second
+/// one and describes the 9B model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Flux2Variant {
+    /// FLUX.2 klein 9B — the original engine. Gated repository, licence `other`.
+    #[default]
+    Klein9B,
+    /// FLUX.2 klein 4B — the small checkpoint. Ungated, apache-2.0.
+    Klein4B,
+}
+
+impl Flux2Variant {
+    /// The stable token this variant is spelled with on the wire and in the settings
+    /// file. A literal by design (`dev-docs/i18n_exclusions.md` §A5).
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Klein9B => "9b",
+            Self::Klein4B => "4b",
+        }
+    }
+
+    /// Reads a persisted or received token.
+    ///
+    /// Anything unrecognized — INCLUDING an absent field, which is what every settings
+    /// file written before the second variant existed looks like — reads as
+    /// [`Self::Klein9B`]: those files describe the 9B model, and loading them as 4B
+    /// would point a working configuration at a directory that does not exist.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Self {
+        match value.trim() {
+            "4b" => Self::Klein4B,
+            _ => Self::Klein9B,
+        }
+    }
+
+    /// Name of this variant's model directory under [`side_models_dir`]. It mirrors the
+    /// repository name the backend downloads from and must not drift from
+    /// `modules/ai_backend/inpaint/flux2_download.py`.
+    #[must_use]
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Klein9B => "FLUX.2-klein-9B",
+            Self::Klein4B => "FLUX.2-klein-4B",
+        }
+    }
+
+    /// File name of this variant's settings document under [`data_dir`].
+    ///
+    /// The 9B name is FROZEN: users have that file on disk with hand-entered model
+    /// paths in it, and renaming it would silently reset their configuration.
+    #[must_use]
+    pub fn settings_file_name(self) -> &'static str {
+        match self {
+            Self::Klein9B => "flux2_klein_settings.json",
+            Self::Klein4B => "flux2_klein_4b_settings.json",
+        }
+    }
+
+    /// Both variants, in the order the engine picker offers them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Klein9B, Self::Klein4B]
+    }
+}
+
 /// FLUX.2 klein: root of the diffusers tree the panel's Hugging Face download fills
 /// (`transformer/`, `text_encoder/`, `text_encoder_uncensored/`, `tokenizer/`, `vae/`,
 /// `scheduler/`).
@@ -793,33 +884,39 @@ pub fn flux_fill_components_dir() -> PathBuf {
 /// The backend creates and populates it; this side needs the path because the
 /// «Расцензуренный энкодер» toggle repoints `text_encoder_path` between the two encoder
 /// directories with no download at all when both are already on disk.
-pub fn flux2_klein_dir() -> PathBuf {
-    side_models_dir().join("FLUX.2-klein-9B")
+#[must_use]
+pub fn flux2_klein_dir(variant: Flux2Variant) -> PathBuf {
+    side_models_dir().join(variant.dir_name())
 }
 
 /// Directory of the FLUX.2 klein transformer the download fills.
 ///
 /// The subdirectory name mirrors `TRANSFORMER_SUBDIR` in
 /// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
-pub fn flux2_klein_transformer_dir() -> PathBuf {
-    flux2_klein_dir().join("transformer")
+#[must_use]
+pub fn flux2_klein_transformer_dir(variant: Flux2Variant) -> PathBuf {
+    flux2_klein_dir(variant).join("transformer")
 }
 
 /// Directory of the FLUX.2 klein VAE the download fills.
 ///
 /// The subdirectory name mirrors `VAE_SUBDIR` in
 /// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
-pub fn flux2_klein_vae_dir() -> PathBuf {
-    flux2_klein_dir().join("vae")
+#[must_use]
+pub fn flux2_klein_vae_dir(variant: Flux2Variant) -> PathBuf {
+    flux2_klein_dir(variant).join("vae")
 }
 
 /// Directory of the FLUX.2 klein text encoder the toggle selects.
 ///
 /// `uncensored` picks `text_encoder_uncensored/` over the official `text_encoder/`.
 /// Both may sit on disk at once, which is what lets the toggle switch between them
-/// without transferring anything.
-pub fn flux2_klein_text_encoder_dir(uncensored: bool) -> PathBuf {
-    flux2_klein_dir().join(if uncensored {
+/// without transferring anything. Only [`Flux2Variant::Klein9B`] has an uncensored
+/// encoder published for it; the caller is what keeps `uncensored` false for the other
+/// variant (`Flux2Variant::supports_uncensored_encoder`).
+#[must_use]
+pub fn flux2_klein_text_encoder_dir(variant: Flux2Variant, uncensored: bool) -> PathBuf {
+    flux2_klein_dir(variant).join(if uncensored {
         "text_encoder_uncensored"
     } else {
         "text_encoder"

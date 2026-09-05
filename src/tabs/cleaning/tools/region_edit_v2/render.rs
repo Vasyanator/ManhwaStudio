@@ -20,8 +20,8 @@ Key functions:
 
 Notes:
 The colours are named constants with one meaning each, in the style of `FLUX2_STATUS_*` in
-`tools/flux2_klein.rs`; the red and the green are deliberately the same two tones that file
-uses, so a status colour means the same thing across the cleaning tools.
+`tools/ai_editor/engines/flux2_klein/`; the red and the green are deliberately the same two
+tones that engine uses, so a status colour means the same thing across the cleaning tools.
 Design: `dev-docs/region_edit_v2_plan.md` (§1, §2 D6).
 */
 

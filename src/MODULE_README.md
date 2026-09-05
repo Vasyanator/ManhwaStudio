@@ -86,7 +86,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   absolute-coordinate bubble migration (`LegacyRibbonGeometry`), unsaved staging paths, and
   filesystem helpers.
 - `config.rs`: runtime path roots, project/user config defaults, `JsonConfig`, application data
-  directories, model root helpers, and `AiInstallType`. The runtime root is normally the portable
+  directories, model root helpers, `AiInstallType`, and `Flux2Variant` (the FLUX.2 klein
+  checkpoint that keys its model directory, component paths and settings file). The runtime root is normally the portable
   launch/exe directory, except on macOS when the executable runs inside a `*.app` bundle: there the
   read-only bundle forces the writable root to `~/Library/Application Support/ManhwaStudio`
   (`#[cfg(target_os = "macos")]`, no effect on Linux/Windows).
@@ -413,7 +414,8 @@ prompts instead of blocking the GUI thread.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
 - The Hugging Face access token (reading it, adding a second UI surface for it, changing where it is
   stored): `hf_token.rs`. Its first UI surface is the FLUX.2 klein download block
-  (`tabs/cleaning/tools/ai_editor/engines/flux2_klein.rs`), which is a CONSUMER, not the owner.
+  (`tabs/cleaning/tools/ai_editor/engines/flux2_klein/`, drawn by its `ui/install.rs`), which is a
+  CONSUMER, not the owner.
 - General settings editor (projects directory, global memory profile, interface scale, primary
   monitor, UI language, and a duplicate surface for the typesetting-language selector owned by
   `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:

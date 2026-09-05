@@ -44,15 +44,26 @@ Every service follows the same shape and is safe to copy from when adding a seve
 - `sdxl.py`: `SdxlInpaintService` — SDXL (`inpaint.sdxl`, streaming). See the SDXL section.
 - `flux_fill.py`: `FluxFillInpaintService` — FLUX.1-Fill-dev (`inpaint.flux_fill`, `.unload`,
   `.status`, streaming). See the FLUX section.
-- `flux2_klein.py`: `Flux2KleinInpaintService` — FLUX.2 klein 9B region editing
+- `flux2_klein/`: `Flux2KleinInpaintService` — FLUX.2 klein region editing
   (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action` and the
-  `.prompt_cache.*` family, streaming). See the FLUX.2 klein sections.
+  `.prompt_cache.*` family, streaming). Serves BOTH variants (9B and 4B) without knowing which:
+  it is driven by the three user paths and `_model_key` / `_encoder_key` keep exactly one
+  pipeline and one encoder resident, so there is no variant field on the inference path — only
+  `require_encoder_transformer_compatible`, which refuses a MIXED pair.
+  A PACKAGE, not a module: the service was split along its
+  seams (`params`, `progress`, `components`, `prompt_cache`, `imaging`, `hardware`, `memory`,
+  `pipeline`, `service`) once the single file passed the 3000-line ceiling. `__init__.py` re-exports
+  the whole surface the single file had, so `from .inpaint.flux2_klein import
+  Flux2KleinInpaintService` and every `flux2_klein.<name>` reference keep working unchanged. See
+  `flux2_klein/MODULE_README.md` for the layout and the FLUX.2 klein sections below for the
+  contracts.
 - `flux2_download.py`: acquisition of the klein weights from Hugging Face
-  (`inpaint.flux2_klein.download.check` / `.start`). NOT a service and deliberately so: it holds no
+  (`inpaint.flux2_klein.download.check` / `.start`), for either VARIANT (`ModelVariant`: `9b`
+  gated, `4b` public). NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
-- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_klein.py`, `test_flux2_download.py`,
-  `test_lease_protocol.py`: pure-Python
+- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py`, `test_lease_protocol.py` (and the
+  `test_*.py` modules inside `flux2_klein/`): pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
   modules are injected into `sys.modules`, `test_flux2_download.py` fakes the repository listings and
   the `requests` module, and `test_lease_protocol.py` stubs each service's load and
@@ -212,6 +223,20 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `validate_transformer_config_dir` additionally refuses a discovered `config.json` whose
   `_class_name` is not `Flux2Transformer2DModel`, because the search also probes the checkpoint's
   own directory, where a VAE or text-encoder config could otherwise be picked up.
+- **The text encoder and the transformer must be the SAME variant, and that is checked before any
+  weight is read** (`require_encoder_transformer_compatible`, `components.py`). The pipeline
+  concatenates the encoder's hidden states at layers `(9, 18, 27)` and hands the result to
+  `context_embedder = nn.Linear(joint_attention_dim, …)`, so the contract is
+  `TEXT_ENCODER_OUT_LAYERS * hidden_size == joint_attention_dim`: 3·4096 = 12288 for klein 9B,
+  3·2560 = 7680 for klein 4B. Nothing else compares the two — a 4B transformer beside a 9B encoder
+  passes every component check, passes the memory guard, and dies as a bare torch matmul error
+  inside the denoise, ~34 GB into the read. The guard reads the two `config.json` files only and
+  fires from `inpaint_image_bytes` (before `_require_headroom_locked`, hence before
+  `_ensure_pipeline_locked`) and from `_load_pipeline_action_locked` (the other route that reads
+  the 18 GB transformer). It is deliberately SILENT when it cannot PROVE a mismatch — an empty
+  path, a component not on disk, a config without the field — because each of those is a
+  different fault with a better diagnosis further down; adding a "missing config" error here
+  would replace those messages with a worse one.
 - **A failed transformer restore invalidates the pipeline.** Moving the parked 9B transformer
   back onto the device is itself a full host->device copy that can OOM. That failure never
   reaches the caller — it must mask neither a decode that succeeded nor one that failed for a
@@ -550,18 +575,45 @@ client-facing half. What this module owns:
 
 ### FLUX.2 klein: model download (`flux2_download.py`)
 The wire contract is `dev-docs/flux2_model_download.md`; `ipc/PROTOCOL.md` carries the frame shapes.
-Everything lands in `<side_models>/FLUX.2-klein-9B/` — `transformer/`, ONE of `text_encoder/` or
-`text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config.json`,
+Everything lands in `<side_models>/<variant directory>/` — `transformer/`, ONE of `text_encoder/`
+or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config.json`,
 `model_index.json`, `LICENSE.md` — which is exactly the layout `component_search_roots` /
 `discover_component_dir` already expect, so a finished download leaves a configured engine.
 
+- **Two VARIANTS, one manifest.** `ModelVariant` / `VARIANTS` is a frozen data table: wire key,
+  repository id, destination directory, the uncensored repository (or `None`), and whether the
+  repository is gated. `9b` (`FLUX.2-klein-9B`, gated, ~34.7 GB, has an uncensored encoder) is the
+  DEFAULT the wire contract pins for a request with no `variant` field; `4b`
+  (`FLUX.2-klein-4B`, public/apache-2.0, ~15.98 GB) has none. The two repositories share the
+  identical folder layout, so a variant carries NO manifest of its own — `manifest_entries`
+  derives the rules from `variant.repo` and the two cannot drift apart file by file. `variant`
+  is a REQUIRED keyword on `model_root`, `component_paths`, `required_repos`, `manifest_entries`
+  and `resolve_plan`: a caller that forgot it would silently write one variant's weights into the
+  other's directory. Only `check_access` and `download` default it, because that default IS the
+  contract, and they take the RAW wire value (`resolve_variant`) so the vocabulary lives in one
+  place instead of in the IPC layer as well.
+- **Two shapes are refused, never substituted.** An unknown `variant` (`resolve_variant`) and
+  `4b` + `uncensored` (`require_uncensored_supported`), both before any network call. Downgrading
+  either would fetch weights the user did not ask for under the button they pressed.
+- **The token gate follows the REPOSITORY, not the feature** (`token_required`). `no_token` is
+  answered only when the request touches a gated repository — 9B, or any uncensored encoder. A
+  `4b` request with an empty token goes to the hub, passes `auth_check` anonymously and answers
+  `ok` with a real plan; `HfApi` is given `token or None` so an empty string never reaches it.
+- **A token that IS supplied is SENT to gated repositories only** (`repo_token`, `PUBLIC_REPOS`
+  derived from the variant table). The decision is per REPOSITORY and is applied at all three
+  network sites — `probe_repo_access`, `repo_listing` and `_fetch_one`'s two attempts — so a plan
+  mixing a gated and a public repository stays correct file by file. `token_required` answers a
+  different question (may the request short-circuit to `no_token`) and does not gate the wire.
+  Without this, a stale 9B token forwarded to the PUBLIC 4B repository made the hub answer 401,
+  `classify_repo_error` reported `invalid_token`, no plan was built and the download button stayed
+  disabled — with no token editor on the 4B panel to recover from.
 - **The manifest is PREFIXES resolved against the live listing, never hard-coded shard names**
-  (`SHARED_MANIFEST` + one encoder rule -> `resolve_plan`). A prefix that resolves to no file
-  is a `RuntimeError` naming the prefix and the repository: a repo that was re-sharded must fail
-  loudly, not produce half a model.
+  (`shared_manifest(variant)` + one encoder rule -> `resolve_plan`). A prefix that resolves to no
+  file is a `RuntimeError` naming the prefix and the repository: a repo that was re-sharded must
+  fail loudly, not produce half a model.
 - **The two encoder rules are EXCLUSIVE and the toggle SELECTS between them.** `manifest_entries`
-  returns `SHARED_MANIFEST` plus exactly one of `OFFICIAL_ENCODER_MANIFEST` /
-  `UNCENSORED_ENCODER_MANIFEST`, so a plan is 34.72 GB / 23 files with the toggle off and
+  returns `shared_manifest(variant)` plus exactly one of `official_encoder_manifest` /
+  `uncensored_encoder_manifest`, so a 9B plan is 34.72 GB / 23 files with the toggle off and
   34.73 GB / 22 files with it on — never the ~51 GB a plan carrying both would cost, for 16 GB of
   weights the pipeline will not load. Everything else (transformer, tokenizer, VAE, configs) comes
   from the official repository either way, which is why `required_repos` still access-checks BOTH
@@ -570,8 +622,9 @@ Everything lands in `<side_models>/FLUX.2-klein-9B/` — `transformer/`, ONE of 
   That is left alone in both directions: the missing-only filter never re-fetches the one already
   there, and nothing here deletes the unselected one — 16 GB the user paid to download does not
   vanish because a checkbox moved.
-- **Three files are excluded and each exclusion is load-bearing.** The 18.157 GB root
-  `flux-2-klein-9b.safetensors` is the SAME transformer as `transformer/`, and a single file goes
+- **Three files are excluded and each exclusion is load-bearing.** The root single-file
+  transformer — 18.157 GB `flux-2-klein-9b.safetensors`, 7.751 GB `flux-2-klein-4b.safetensors`,
+  whichever variant is selected — is the SAME transformer as `transformer/`, and a single file goes
   through `from_single_file`, which in diffusers 0.39 accepts `device_map` and silently discards it —
   the layered offload this engine depends on would be lost. The four `*.gguf` of the uncensored repo
   are llama.cpp format and the `transformers` loader cannot read them. `*.jpg` / `README.md` /
@@ -579,7 +632,7 @@ Everything lands in `<side_models>/FLUX.2-klein-9B/` — `transformer/`, ONE of 
 - **The tokenizer always comes from the OFFICIAL repo, in both toggle states.** The uncensored repo
   ships only `tokenizer.json` + `tokenizer_config.json` and would fail `_require_component_dir`'s
   markers; 17 MB is not worth a second failure mode.
-- **A repository listing is NOT an access check.** `HfApi.model_info()` answers for both of these
+- **A repository listing is NOT an access check.** `HfApi.model_info()` answers for the
   `gated: auto` repositories with no token at all, so access is probed with `HfApi.auth_check()`.
   `classify_repo_error` consults the HTTP STATUS before the exception type, deliberately: on a gated
   repo a wrong token raises `GatedRepoError` with status 401 and the user must be told the token is
@@ -686,8 +739,9 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
   shared with `watermark/`.
 - To change FLUX.2 klein params, region limits, placement modes, the memory forecast, or the OOM
-  recovery ladder, see `flux2_klein.py` (`normalize_flux2_klein_params`, `validate_region_size`,
-  `_apply_placement`, `forecast_memory`, `_decode_region_latents`); keep the param set in sync with
+  recovery ladder, see `flux2_klein/` (`params.normalize_flux2_klein_params`,
+  `params.validate_region_size`, `pipeline._apply_placement`, `memory.forecast_memory`,
+  `pipeline._decode_region_latents`); keep the param set in sync with
   `ipc/PROTOCOL.md §5.4`. The wire contract carries five `applied` flags —
   `unload_transformer_before_vae`, `vae_tiling`, `vae_slicing`,
   `unload_text_encoder_after_encode`, `text_encoder_fp8` — and the `estimate` breakdown carries
@@ -708,11 +762,18 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   — do not add a second implementation of a move. The two that MOVE weights (`to_ram`, `to_gpu`)
   clear `_pipeline_warmed`; so does the invalidation after a failed restore. Keep the wire literals in step with
   `dev-docs/flux2_component_residency.md` and `ipc/PROTOCOL.md §5.4`.
-- To change WHICH files the FLUX.2 klein download fetches, see `SHARED_MANIFEST` /
-  `OFFICIAL_ENCODER_MANIFEST` / `UNCENSORED_ENCODER_MANIFEST` / `EXCLUDED_SUFFIXES` /
+- To add or change a downloadable MODEL VARIANT, see `ModelVariant` / `VARIANTS` /
+  `DEFAULT_VARIANT` in `flux2_download.py`, and `resolve_variant` /
+  `require_uncensored_supported` / `token_required` / `repo_token` for the wire vocabulary, the two
+  refusals and the two token rules. A new variant is one table row; it gets a manifest for free
+  because `shared_manifest` derives it from `variant.repo`, and `PUBLIC_REPOS` picks its
+  gatedness up from the same row. Keep the wire values in step with
+  `dev-docs/flux2_model_download.md` §1a and `ipc/PROTOCOL.md`.
+- To change WHICH files the FLUX.2 klein download fetches, see `shared_manifest` /
+  `official_encoder_manifest` / `uncensored_encoder_manifest` / `EXCLUDED_SUFFIXES` /
   `EXCLUDED_NAMES` in `flux2_download.py` — never a hard-coded shard name. An entry added to
-  `SHARED_MANIFEST` is fetched in BOTH toggle states; the two encoder tuples stay mutually
-  exclusive. To change the access states, see `classify_repo_error` (status before
+  `shared_manifest` is fetched in BOTH toggle states and by BOTH variants; the two encoder
+  tuples stay mutually exclusive. To change the access states, see `classify_repo_error` (status before
   type); to change the frame shape or the throttle, `_chunk_reporter` / `ProgressThrottle`; to change
   where it all lands, `model_root` / `component_paths`; to change resume, the one retry or the
   integrity gate, `_fetch_one` / `_size_verifier` — the staging, claiming and parking themselves
@@ -753,8 +814,13 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   case and must not grow one — the mode is expressed entirely as normalized parameters.
 - To change where the FLUX.2 klein transformer config is looked for, see
   `transformer_config_roots` / `find_transformer_config_dir` / `validate_transformer_config_dir` in
-  `flux2_klein.py`; the "not found" text is `_missing_transformer_config_message` and lists the
+  `flux2_klein/components.py`; the "not found" text is `_missing_transformer_config_message` and lists the
   probed directories through the same `component_probe_order`, so search and message stay in step.
+- To change the encoder<->transformer compatibility rule, see `TEXT_ENCODER_OUT_LAYERS` /
+  `transformer_config_dir` / `require_encoder_transformer_compatible` in
+  `flux2_klein/components.py`, and its two call sites in `service.py` (`inpaint_image_bytes`,
+  `_load_pipeline_action_locked`). `transformer_config_dir` must keep resolving to the SAME
+  directory `_load_transformer` reads, or the guard and the loader would judge different files.
 - To change how a service reports load vs. inference failures to the model manager, change all six
   at once and extend `test_lease_protocol.py` — the protocol is a cross-service contract.
 - To add a new inpaint backend, copy the service shape above, wire it in `server.py` + `AppState`,

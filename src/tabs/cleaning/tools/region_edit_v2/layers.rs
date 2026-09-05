@@ -23,7 +23,8 @@ Key functions:
 - `ResultLayer::ensure_texture`, `ResultLayer::draw`
 
 Notes:
-Modelled on `Flux2SessionState` (`tools/flux2_klein.rs`), generalised from one mask to N layers.
+Modelled on `Flux2SessionState` (`tools/ai_editor/engines/flux2_klein/session.rs`), with N mask
+layers where that type has one.
 Brush radius policy is deliberately NOT here: the frame owns a `crate::tools::MaskBrush` and hands
 `radius_px()` to `paint_segment`, so this file adds no fourth copy of the radius handling.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md`.

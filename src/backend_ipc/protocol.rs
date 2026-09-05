@@ -160,21 +160,25 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
 /// Checks Hugging Face access to the FLUX.2 klein repositories and prices the
 /// download, without transferring anything. One-shot.
 ///
-/// Request header: `hf_token` (a string, possibly empty) and `uncensored` (bool —
-/// whether the uncensored text-encoder repository is needed as well). The token is
-/// NEVER logged on either side.
+/// Request header: `hf_token` (a string, possibly empty), `uncensored` (bool —
+/// whether the uncensored text-encoder repository is needed as well) and `variant`
+/// (`"9b"`, the default when absent, or `"4b"` — which checkpoint is meant). The
+/// token is NEVER logged on either side. `"4b"` together with `uncensored = true` is
+/// refused: no uncensored encoder is published for that checkpoint.
 ///
 /// The answer carries `repos`, one entry per repository the toggle actually needs,
 /// each `{ "state": … }` where the state is one of `ok` / `no_token` /
 /// `invalid_token` / `not_accepted` / `not_found` / `network_error`, plus `plan`
 /// with `total_bytes`, `missing_bytes` and `missing_files` computed from the same
-/// listing. The pinned wire contract is `dev-docs/flux2_model_download.md` §3.
+/// listing, plus `variant` ECHOED back so a stale answer about the other checkpoint
+/// is detectable. The pinned wire contract is `dev-docs/flux2_model_download.md` §3.
 pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux2_klein.download.check";
-/// Downloads the FLUX.2 klein model files into `side_models/FLUX.2-klein-9B/`.
+/// Downloads the FLUX.2 klein model files into the requested variant's own directory
+/// (`side_models/FLUX.2-klein-9B/` or `side_models/FLUX.2-klein-4B/`).
 ///
 /// STREAMING, the same envelope as `.prompt_cache.build`, so it claims the same
 /// single progress bar and can never run beside a generation. Request header:
-/// `hf_token` and `uncensored`, as for `.download.check`.
+/// `hf_token`, `uncensored` and `variant`, as for `.download.check`.
 ///
 /// Progress frames keep the usual `phase` / `step` / `total` / `label` — where
 /// `step` and `total` are OVERALL BYTES across the whole plan, which keeps every

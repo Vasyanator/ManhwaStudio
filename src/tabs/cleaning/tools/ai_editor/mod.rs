@@ -316,6 +316,18 @@ impl AiEditorTool {
         self.engines.get_mut(self.selected).map(AsMut::as_mut)
     }
 
+    /// Why the selected engine says a switch is unsafe right now; `None` when it is free.
+    ///
+    /// A SECOND gate beside the frame lock, and an independent one: the lock covers a run,
+    /// this covers work an engine owns that no frame state describes — FLUX.2 klein's model
+    /// download, whose free-space budget is its own and would be doubled by starting the
+    /// other checkpoint's download beside it. Both the picker and [`Self::select_engine`]
+    /// read it, so closing the control and refusing the switch cannot drift apart.
+    #[must_use]
+    fn switch_block_reason(&self) -> Option<String> {
+        self.engine().and_then(AiEngine::switch_block_reason)
+    }
+
     /// Whether the mask may still be edited: no result waits and nothing is running.
     ///
     /// Editing the mask under a pending result would make that result describe a mask that no
@@ -355,6 +367,12 @@ impl AiEditorTool {
     /// user to see that this engine wants a different size.
     fn select_engine(&mut self, idx: usize) {
         if idx == self.selected || idx >= self.engines.len() || !self.frame.lock().is_free() {
+            return;
+        }
+        // The engine's own refusal, stated where it is enforceable for the same reason the
+        // frame lock is: the picker is already closed while it stands, but a switch must not
+        // depend on a control having been drawn this frame.
+        if self.switch_block_reason().is_some() {
             return;
         }
         // A run cannot be in flight (the frame would be locked), but a load job might have been
@@ -685,15 +703,32 @@ impl AiEditorTool {
 
     /// Draws the engine picker: toggle buttons in one row per non-empty section (§13.1).
     ///
-    /// Disabled as a whole while the frame is locked (D15): engines declare different mask
-    /// layers, so a switch would have to discard painted work. The disabled tooltip says that,
-    /// because "the button is grey" is not a reason a user can act on.
+    /// Disabled as a whole for TWO independent reasons, each with its own tooltip, because
+    /// "the button is grey" is not a reason a user can act on:
+    /// - the frame is locked (D15): engines declare different mask layers, so a switch would
+    ///   have to discard painted work;
+    /// - the selected engine says a switch is unsafe right now
+    ///   ([`AiEngine::switch_block_reason`]) — a model download in flight, which no frame
+    ///   state describes.
+    ///
+    /// The frame lock is tested FIRST and keeps its own wording: it is the older and more
+    /// specific rule, and an engine that is merely busy must not restate it.
     fn draw_engine_picker(&mut self, ui: &mut egui::Ui) {
         if self.engines.is_empty() {
             ui.colored_label(ui.visuals().error_fg_color, t!("cleaning.tools.area_editor.error_no_engine"));
             return;
         }
         let locked = !self.frame.lock().is_free();
+        // Read once per draw, before the rows borrow `self.engines`: it is `Option<String>`,
+        // not `Copy`, and the rows need it for every button's disabled tooltip.
+        let switch_blocked = if locked { None } else { self.switch_block_reason() };
+        // Borrowed, not cloned: `t!` hands out a `&'static str` and the engine's reason lives
+        // in the local above, so a per-frame allocation buys nothing here.
+        let disabled_hint: &str = match switch_blocked.as_deref() {
+            Some(reason) => reason,
+            None => t!("cleaning.tools.area_editor.engine_locked_hint"),
+        };
+        let enabled = !locked && switch_blocked.is_none();
         let mut requested: Option<usize> = None;
         for section in ENGINE_SECTIONS {
             // Captions are resolved here, before the row closure, so the closure borrows only
@@ -718,11 +753,8 @@ impl AiEditorTool {
                 // next ROW — the same fix `tab.rs::draw_tool_button_rows` makes.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 for (idx, title) in entries {
-                    let response = ui.add_enabled(!locked, egui::Button::new(title).selected(idx == self.selected));
-                    if response
-                        .on_disabled_hover_text(t!("cleaning.tools.area_editor.engine_locked_hint"))
-                        .clicked()
-                    {
+                    let response = ui.add_enabled(enabled, egui::Button::new(title).selected(idx == self.selected));
+                    if response.on_disabled_hover_text(disabled_hint).clicked() {
                         requested = Some(idx);
                     }
                 }
@@ -1359,6 +1391,9 @@ mod tests {
     struct RecordingEngine {
         calls: Rc<RefCell<EngineCalls>>,
         answer: EnginePoll,
+        /// What this engine answers to [`AiEngine::switch_block_reason`]. `None` is the
+        /// trait default and the state every other test wants.
+        switch_block: Option<String>,
     }
 
     impl AiEngine for RecordingEngine {
@@ -1386,6 +1421,9 @@ mod tests {
         fn draw_parameters(&mut self, _ui: &mut egui::Ui) {}
         fn run_block_reason(&self) -> Option<String> {
             None
+        }
+        fn switch_block_reason(&self) -> Option<String> {
+            self.switch_block.clone()
         }
         fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
             self.calls.borrow_mut().started = Some((request.page_idx, request.region.size[0], request.masks.len()));
@@ -1416,9 +1454,54 @@ mod tests {
     fn tool_with_recording_engine(answer: EnginePoll) -> (AiEditorTool, Rc<RefCell<EngineCalls>>) {
         let calls = Rc::new(RefCell::new(EngineCalls::default()));
         let mut tool = AiEditorTool::default();
-        tool.engines = vec![Box::new(RecordingEngine { calls: Rc::clone(&calls), answer })];
+        tool.engines = vec![Box::new(RecordingEngine {
+            calls: Rc::clone(&calls),
+            answer,
+            switch_block: None,
+        })];
         tool.selected = 0;
         (tool, calls)
+    }
+
+    /// Two engines can hold two independent multi-gigabyte downloads, so an engine that owns
+    /// one closes the picker while it runs. The gate lives in `select_engine`, not only in
+    /// the drawing code, because a switch must not depend on a control having been drawn.
+    #[test]
+    fn an_engine_that_calls_a_switch_unsafe_refuses_it() {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let busy = |reason: Option<&str>| RecordingEngine {
+            calls: Rc::clone(&calls),
+            answer: EnginePoll::Idle,
+            switch_block: reason.map(str::to_string),
+        };
+        let mut tool = AiEditorTool::default();
+        tool.engines = vec![Box::new(busy(Some("downloading"))), Box::new(busy(None))];
+        tool.selected = 0;
+
+        // The reason the picker puts on the disabled tooltip — never an empty refusal.
+        assert_eq!(tool.switch_block_reason().as_deref(), Some("downloading"));
+        tool.select_engine(1);
+        assert_eq!(tool.selected, 0, "a switch away from a downloading engine must be refused");
+
+        // And the gate is a state, not a latch: it lifts as soon as the engine says so.
+        tool.engines[0] = Box::new(busy(None));
+        assert!(tool.switch_block_reason().is_none());
+        tool.select_engine(1);
+        assert_eq!(tool.selected, 1);
+    }
+
+    /// The default trait body is `None`: an engine that owns no such work must not have to
+    /// implement the hook, and every real engine in the catalog is switchable at rest.
+    #[test]
+    fn a_resting_catalog_never_blocks_the_picker() {
+        let tool = AiEditorTool::default();
+        for engine in &tool.engines {
+            assert!(
+                engine.switch_block_reason().is_none(),
+                "engine {} refuses a switch while it is doing nothing",
+                engine.id()
+            );
+        }
     }
 
     /// The regression this whole round exists to prevent: an engine that is never polled never

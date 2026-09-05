@@ -1155,7 +1155,8 @@ impl RegionFrame {
     /// Paints a stroke into the active mask layer while the body is being dragged.
     ///
     /// The right mouse button always erases, whatever mode a panel offers — the one gesture
-    /// users expect for undoing a stray stroke (the same rule `flux2_klein.rs` follows).
+    /// users expect for undoing a stray stroke (the same rule the FLUX.2 klein engine follows,
+    /// `tools/ai_editor/engines/flux2_klein/`).
     fn sense_mask_painting(&mut self, ui: &mut egui::Ui, body: &egui::Response, frame_screen: Rect) {
         let Some(rect_px) = self.rect_px else {
             return;

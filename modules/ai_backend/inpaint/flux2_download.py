@@ -2,12 +2,24 @@
 File: modules/ai_backend/inpaint/flux2_download.py
 
 Purpose:
-Acquisition of the FLUX.2 klein 9B weights from Hugging Face into
-`ManhwaStudio_AI_Models/side_models/FLUX.2-klein-9B/`, behind the two IPC
+Acquisition of the FLUX.2 klein weights from Hugging Face into
+`ManhwaStudio_AI_Models/side_models/<variant directory>/`, behind the two IPC
 methods `inpaint.flux2_klein.download.check` and `.start`. The wire contract is
 `dev-docs/flux2_model_download.md`; this module is its Python half.
 
-Model layout produced here (every path relative to `model_root()`):
+Two VARIANTS are downloadable and the request selects one with the `variant`
+field (`"9b"` — the default when the field is absent — or `"4b"`):
+
+    9b  black-forest-labs/FLUX.2-klein-9B  gated, needs a token, ~34.7 GB,
+        has an uncensored text encoder;
+    4b  black-forest-labs/FLUX.2-klein-4B  PUBLIC (apache-2.0), downloads with
+        NO token, ~15.98 GB, no uncensored encoder.
+
+The two repositories have the identical folder layout, so a variant carries no
+manifest of its own: `manifest_entries` derives the rules from `variant.repo`
+and the two cannot drift apart. Everything else in this module is variant-blind.
+
+Model layout produced here (every path relative to `model_root(variant)`):
     transformer/                official `transformer/*`
     text_encoder/               official `text_encoder/*`             — EXACTLY ONE
     text_encoder_uncensored/    uncensored repo minus its GGUF quants — OF THESE TWO
@@ -34,11 +46,17 @@ Main responsibilities:
   and would otherwise be renamed to its final name and skipped forever.
 
 Key structures:
+- `ModelVariant` — one downloadable variant (repo, destination directory,
+  uncensored encoder if any, whether the repository is gated).
 - `ManifestEntry` — one (repo, prefix) -> destination rule.
 - `PlannedFile` — one resolved file of the plan.
 - `DownloadCanceled` — typed cancellation raised at a chunk boundary.
 
 Key functions:
+- `resolve_variant()` — wire string -> `ModelVariant`, a typed refusal otherwise.
+- `require_uncensored_supported()` — the second typed refusal (`4b` + uncensored).
+- `token_required()` / `repo_token()` — whether the REQUEST needs a token, and
+  whether a given REPOSITORY is sent one.
 - `resolve_plan()` — the pure plan builder (a listing in, a plan out).
 - `is_complete_on_disk()` — presence means the ANNOUNCED SIZE, not non-empty.
 - `check_access()` — the `.check` answer (`plan` is NULLABLE; see its docstring).
@@ -52,7 +70,17 @@ error message; a message that must mention it says "токен" and nothing more
 Messages coming back from `huggingface_hub` are additionally scrubbed of the
 token value before they leave this module.
 
-`HfApi.model_info()` succeeds for these repositories WITHOUT a token — the
+A token is REQUIRED only for a gated repository (`token_required`). The 4B
+repository is public, so an empty token there is a normal request that reaches
+the hub and downloads; only the 9B repositories short-circuit to `no_token`.
+
+A token is SENT only to a gated repository (`repo_token`), and that decision is
+made per REPOSITORY at all three network sites — the access probe, the listing
+fetch and the file transfer. A public repository is therefore contacted
+anonymously even when the request carries a token, which is what stops a stale
+9B token from making the public 4B repository answer 401.
+
+`HfApi.model_info()` succeeds for the gated repositories WITHOUT a token — the
 metadata of a `gated: auto` repo is public — so a returned listing proves
 nothing about access. The gate is probed with `HfApi.auth_check()` instead,
 which is the only call that answers "may this token download these files".
@@ -79,14 +107,18 @@ from ..runtime.paths import program_root
 log = logging.getLogger(__name__)
 
 # --- Repositories ---------------------------------------------------------
-#: The official, gated (`gated: auto`) FLUX.2 klein 9B repository.
-OFFICIAL_REPO = "black-forest-labs/FLUX.2-klein-9B"
+#: The official, gated (`gated: auto`, licence `other`) FLUX.2 klein 9B
+#: repository. A token AND accepted conditions are both required.
+OFFICIAL_REPO_9B = "black-forest-labs/FLUX.2-klein-9B"
 
-#: The gated uncensored text encoder. Only fetched while the toggle is on.
-UNCENSORED_REPO = "ponpoke/flux2-klein-9b-uncensored-text-encoder"
+#: The official FLUX.2 klein 4B repository. PUBLIC (apache-2.0, not gated), so
+#: it downloads with no Hugging Face token at all — see `token_required`.
+OFFICIAL_REPO_4B = "black-forest-labs/FLUX.2-klein-4B"
 
-#: Directory under `side_models/` that receives everything.
-MODEL_DIR_NAME = "FLUX.2-klein-9B"
+#: The gated uncensored text encoder of the 9B variant. Only fetched while the
+#: toggle is on. There is no 4B counterpart, which is what `ModelVariant`'s
+#: `uncensored_repo = None` records.
+UNCENSORED_REPO_9B = "ponpoke/flux2-klein-9b-uncensored-text-encoder"
 
 # --- Destination subdirectories -------------------------------------------
 TRANSFORMER_SUBDIR = "transformer"
@@ -172,6 +204,186 @@ class DownloadCanceled(Exception):
     """
 
 
+# =====================================================================
+#  Model variants
+# =====================================================================
+@dataclass(frozen=True)
+class ModelVariant:
+    """One downloadable FLUX.2 klein model variant.
+
+    A frozen data table rather than an enum on purpose: what distinguishes the
+    variants is DATA — a repository id, a destination directory, whether an
+    uncensored encoder exists, whether the repository is gated — and an enum
+    would need exactly this table beside it anyway.
+
+    The two repositories have the IDENTICAL folder layout (`transformer/`,
+    `text_encoder/`, `tokenizer/`, `vae/`, `scheduler/`, `model_index.json`,
+    `LICENSE.md`), so a variant deliberately carries no manifest of its own:
+    `manifest_entries` derives the rules from `repo`, and the two variants
+    therefore cannot drift apart file by file.
+
+    - `key` is the wire value of the `variant` request field.
+    - `dir_name` is the directory under `side_models/` that receives everything.
+    - `uncensored_repo` is `None` when no uncensored encoder exists for this
+      variant; asking for one is then a refusal, never a silent downgrade.
+    - `gated` says whether the repository needs a Hugging Face token at all.
+    """
+
+    key: str
+    repo: str
+    dir_name: str
+    uncensored_repo: str | None
+    gated: bool
+
+    @property
+    def supports_uncensored(self) -> bool:
+        """Whether an uncensored text encoder exists for this variant."""
+        return self.uncensored_repo is not None
+
+
+#: FLUX.2 klein 9B: gated, ~34.7 GB, with an uncensored encoder. The DEFAULT.
+VARIANT_9B = ModelVariant(
+    key="9b",
+    repo=OFFICIAL_REPO_9B,
+    dir_name="FLUX.2-klein-9B",
+    uncensored_repo=UNCENSORED_REPO_9B,
+    gated=True,
+)
+
+#: FLUX.2 klein 4B: public, ~15.98 GB, no uncensored encoder yet.
+VARIANT_4B = ModelVariant(
+    key="4b",
+    repo=OFFICIAL_REPO_4B,
+    dir_name="FLUX.2-klein-4B",
+    uncensored_repo=None,
+    gated=False,
+)
+
+#: Every variant the two `.download.*` methods accept, keyed by wire value.
+VARIANTS: dict[str, ModelVariant] = {VARIANT_9B.key: VARIANT_9B, VARIANT_4B.key: VARIANT_4B}
+
+#: The variant a request that carries no `variant` field means. Pinned by the
+#: wire contract so a client built before the field existed keeps working.
+DEFAULT_VARIANT = VARIANT_9B
+
+#: Repositories the variant table DECLARES public. Derived from the table so a
+#: new variant cannot forget to appear here, and used by `repo_token` to decide
+#: per repository whether a token is sent at all.
+#:
+#: The uncensored encoder repositories are deliberately absent: they are gated,
+#: which is what `token_required` already assumes when the toggle is on.
+PUBLIC_REPOS: frozenset[str] = frozenset(
+    variant.repo for variant in VARIANTS.values() if not variant.gated
+)
+
+
+def resolve_variant(value: Any) -> ModelVariant:
+    """The variant named by the wire field `variant`. Absent or empty means 9B.
+
+    `value` is the raw request field: `None` (absent), `""` (a client that
+    serialises its default as an empty string) or one of the `VARIANTS` keys,
+    matched case-insensitively after stripping.
+
+    # Errors
+    Raises `ValueError` naming the accepted values for a non-string or an
+    unknown name. An unknown variant is NEVER downgraded to the default: that
+    would fetch tens of gigabytes the user did not ask for into a directory
+    they did not name.
+    """
+    if value is None:
+        return DEFAULT_VARIANT
+    if not isinstance(value, str):
+        raise ValueError("Поле «variant» должно быть строкой.")
+    key = value.strip().lower()
+    if not key:
+        return DEFAULT_VARIANT
+    variant = VARIANTS.get(key)
+    if variant is None:
+        offered = ", ".join(f"«{name}»" for name in sorted(VARIANTS))
+        raise ValueError(
+            f"Неизвестный вариант модели FLUX.2 klein: «{value}». Доступны: {offered}."
+        )
+    return variant
+
+
+def require_uncensored_supported(variant: ModelVariant, uncensored: bool) -> None:
+    """Refuse the uncensored encoder for a variant that has none.
+
+    # Errors
+    Raises `ValueError`. There is deliberately no downgrade to the official
+    encoder: the user asked for a different set of weights, and handing them
+    the other ones under the same button is exactly the silent fallback this
+    package forbids.
+    """
+    if not uncensored or variant.supports_uncensored:
+        return
+    raise ValueError(
+        f"Расцензуренный энкодер для {variant.key.upper()} пока не поддерживается — "
+        "такого репозитория не существует. Отключите «Расцензуренный энкодер» или "
+        f"выберите вариант «{VARIANT_9B.key}»."
+    )
+
+
+def token_required(variant: ModelVariant, uncensored: bool) -> bool:
+    """Whether this request needs a Hugging Face token at all.
+
+    True when any repository it touches is gated: the official one for 9B, and
+    the uncensored encoder whenever the toggle selects it. The 4B repository is
+    public, so a 4B request with an empty token is a NORMAL request that reaches
+    the hub — it must not short-circuit to `no_token`, which would tell the user
+    to create a token they do not need.
+
+    Callers must have run `require_uncensored_supported` first; `uncensored` is
+    only meaningful for a variant that has an uncensored repository.
+    """
+    return variant.gated or (uncensored and variant.supports_uncensored)
+
+
+def repo_token(repo: str, token: str) -> str:
+    """The token to send to `repo`: `token` for a gated repository, `""` otherwise.
+
+    **A repository that does not require a token is contacted ANONYMOUSLY.**
+    `token_required` answers for the request as a whole and only gates the
+    no-token short-circuit; this function answers per REPOSITORY and gates
+    whether the token is put on the wire at all. Both the access probe, the
+    listing fetch and the file transfer route their token through here, so a
+    request that touches a public and a gated repository at once stays correct.
+
+    The reason is not hygiene but a dead end observed in the field: a user who
+    configured 9B earlier and whose token has since expired sent that token to
+    the PUBLIC 4B repository, the hub answered 401, `probe_repo_access` mapped
+    it to `invalid_token`, no plan was built and the download button stayed
+    disabled — with no token editor on the 4B panel to recover from.
+
+    Only repositories the variant table declares public (`PUBLIC_REPOS`) are
+    contacted anonymously. Anything else keeps today's behaviour exactly, which
+    is the safe direction for a repository whose status is not known here.
+
+    `repo` is a Hugging Face repository id; `token` is the request's token,
+    possibly empty. The token value is never logged.
+    """
+    if repo in PUBLIC_REPOS:
+        return ""
+    return token
+
+
+def _log_anonymous_repos(repos: Iterable[str], token: str) -> None:
+    """Record that a supplied token is deliberately withheld from public repositories.
+
+    Silent when no token was supplied (nothing is being withheld) or when every
+    repository is gated. Logs repository ids only — never the token.
+    """
+    if not token:
+        return
+    public = [repo for repo in repos if repo in PUBLIC_REPOS]
+    if not public:
+        return
+    log.info(
+        "FLUX.2 klein: репозитории %s публичные — запросы к ним выполняются без токена.",
+        ", ".join(public),
+    )
+
+
 @dataclass(frozen=True)
 class ManifestEntry:
     """One rule mapping repository content to a destination under `model_root()`.
@@ -214,38 +426,55 @@ class ManifestEntry:
         return f"{self.dest}/{relative}" if self.dest else relative
 
 
-#: Taken from the official repository in BOTH toggle states — everything the
-#: pipeline needs except the text encoder. The `transformer/` FOLDER is the one we
-#: take and the 18.157 GB root `flux-2-klein-9b.safetensors` is the same weights
-#: as a single file: diffusers 0.39 loads a single file through
-#: `from_single_file`, which accepts `device_map` and silently discards it, so the
-#: layered offload this engine depends on would be lost.
-SHARED_MANIFEST: tuple[ManifestEntry, ...] = (
-    ManifestEntry(OFFICIAL_REPO, "transformer/", TRANSFORMER_SUBDIR),
-    # The tokenizer ALWAYS comes from the official repo, in both toggle states:
-    # the uncensored repo ships only `tokenizer.json` + `tokenizer_config.json`,
-    # without `merges.txt`, `vocab.json`, `special_tokens_map.json` or
-    # `added_tokens.json`, and `flux2_klein._require_component_dir` refuses a
-    # tokenizer directory that fails its markers. 17 MB is not worth a second
-    # failure mode.
-    ManifestEntry(OFFICIAL_REPO, "tokenizer/", "tokenizer"),
-    ManifestEntry(OFFICIAL_REPO, "vae/", VAE_SUBDIR),
-    ManifestEntry(OFFICIAL_REPO, "scheduler/scheduler_config.json", "scheduler/scheduler_config.json"),
-    ManifestEntry(OFFICIAL_REPO, "model_index.json", "model_index.json"),
-    ManifestEntry(OFFICIAL_REPO, "LICENSE.md", "LICENSE.md"),
-)
+def shared_manifest(variant: ModelVariant) -> tuple[ManifestEntry, ...]:
+    """Everything the pipeline needs except the text encoder, for `variant`.
 
-#: The official text encoder — the plan's encoder while the toggle is OFF.
-OFFICIAL_ENCODER_MANIFEST: tuple[ManifestEntry, ...] = (
-    ManifestEntry(OFFICIAL_REPO, "text_encoder/", TEXT_ENCODER_SUBDIR),
-)
+    Taken from the variant's official repository in BOTH toggle states. The
+    `transformer/` FOLDER is the one we take, never the same weights as the
+    repository-root single file (`flux-2-klein-9b.safetensors` /
+    `flux-2-klein-4b.safetensors`): diffusers 0.39 loads a single file through
+    `from_single_file`, which accepts `device_map` and silently discards it, so
+    the layered offload this engine depends on would be lost — and the file
+    would be a second, duplicate copy of a transformer already on disk.
 
-#: The uncensored text encoder — the plan's encoder while the toggle is ON:
-#: everything that repository holds except the globally excluded files, flattened
-#: into its own directory.
-UNCENSORED_ENCODER_MANIFEST: tuple[ManifestEntry, ...] = (
-    ManifestEntry(UNCENSORED_REPO, "", TEXT_ENCODER_UNCENSORED_SUBDIR),
-)
+    Both repositories share this layout exactly, which is why one function
+    serves both and a variant carries no manifest of its own.
+    """
+    return (
+        ManifestEntry(variant.repo, "transformer/", TRANSFORMER_SUBDIR),
+        # The tokenizer ALWAYS comes from the official repo, in both toggle
+        # states: the uncensored repo ships only `tokenizer.json` +
+        # `tokenizer_config.json`, without `merges.txt`, `vocab.json`,
+        # `special_tokens_map.json` or `added_tokens.json`, and
+        # `flux2_klein._require_component_dir` refuses a tokenizer directory that
+        # fails its markers. 17 MB is not worth a second failure mode.
+        ManifestEntry(variant.repo, "tokenizer/", "tokenizer"),
+        ManifestEntry(variant.repo, "vae/", VAE_SUBDIR),
+        ManifestEntry(
+            variant.repo, "scheduler/scheduler_config.json", "scheduler/scheduler_config.json"
+        ),
+        ManifestEntry(variant.repo, "model_index.json", "model_index.json"),
+        ManifestEntry(variant.repo, "LICENSE.md", "LICENSE.md"),
+    )
+
+
+def official_encoder_manifest(variant: ModelVariant) -> tuple[ManifestEntry, ...]:
+    """The official text encoder — the plan's encoder while the toggle is OFF."""
+    return (ManifestEntry(variant.repo, "text_encoder/", TEXT_ENCODER_SUBDIR),)
+
+
+def uncensored_encoder_manifest(variant: ModelVariant) -> tuple[ManifestEntry, ...]:
+    """The uncensored text encoder — the plan's encoder while the toggle is ON.
+
+    Everything that repository holds except the globally excluded files,
+    flattened into its own directory.
+
+    # Errors
+    Raises `ValueError` through `require_uncensored_supported` for a variant
+    that has no uncensored repository.
+    """
+    require_uncensored_supported(variant, True)
+    return (ManifestEntry(str(variant.uncensored_repo), "", TEXT_ENCODER_UNCENSORED_SUBDIR),)
 
 
 @dataclass(frozen=True)
@@ -264,46 +493,63 @@ class PlannedFile:
     size: int
 
 
-def model_root() -> Path:
-    """Directory that receives the whole model: `<side_models>/FLUX.2-klein-9B`.
+def model_root(variant: ModelVariant) -> Path:
+    """Directory that receives the whole model: `<side_models>/<variant dir>`.
 
     Resolved through root `config.SIDE_MODELS_DIR` when `config` is importable
     and against `runtime.paths.program_root()` otherwise — never by counting
     parent directories here.
+
+    `variant` is REQUIRED and has no default on purpose: a caller that forgot it
+    would silently write one variant's weights into the other's directory.
     """
     if _config is not None and hasattr(_config, "SIDE_MODELS_DIR"):
-        return Path(_config.SIDE_MODELS_DIR) / MODEL_DIR_NAME
-    return Path(program_root()) / "ManhwaStudio_AI_Models" / "side_models" / MODEL_DIR_NAME
+        return Path(_config.SIDE_MODELS_DIR) / variant.dir_name
+    return Path(program_root()) / "ManhwaStudio_AI_Models" / "side_models" / variant.dir_name
 
 
-def required_repos(uncensored: bool) -> tuple[str, ...]:
-    """Repositories the current toggle state actually needs, in report order.
+def required_repos(variant: ModelVariant, uncensored: bool) -> tuple[str, ...]:
+    """Repositories the current variant and toggle state actually need, in report order.
 
-    Only these are checked and reported: the official one always, the uncensored
-    one only while the toggle is on.
+    Only these are checked and reported: the variant's official repository
+    always, its uncensored encoder only while the toggle is on.
+
+    # Errors
+    Raises `ValueError` when the toggle is on for a variant that has no
+    uncensored repository (`require_uncensored_supported`).
     """
-    return (OFFICIAL_REPO, UNCENSORED_REPO) if uncensored else (OFFICIAL_REPO,)
+    require_uncensored_supported(variant, uncensored)
+    if uncensored:
+        return (variant.repo, str(variant.uncensored_repo))
+    return (variant.repo,)
 
 
-def manifest_entries(uncensored: bool) -> tuple[ManifestEntry, ...]:
-    """The manifest rules in force for the current toggle state.
+def manifest_entries(variant: ModelVariant, uncensored: bool) -> tuple[ManifestEntry, ...]:
+    """The manifest rules in force for this variant and toggle state.
 
     **The two encoder rules are EXCLUSIVE: exactly one of them is ever in a
-    plan.** The toggle SELECTS the encoder, it never adds a second one, so a plan
-    is ~34.7 GB in both states rather than ~51 GB with the toggle on. Everything
-    else — the transformer, the tokenizer, the VAE and the configs — comes from
-    the official repository either way, which is why both repositories are still
-    access-checked when the toggle is on (`required_repos`).
+    plan.** The toggle SELECTS the encoder, it never adds a second one, so a 9B
+    plan is ~34.7 GB in both states rather than ~51 GB with the toggle on.
+    Everything else — the transformer, the tokenizer, the VAE and the configs —
+    comes from the official repository either way, which is why both
+    repositories are still access-checked when the toggle is on
+    (`required_repos`).
 
     Both encoder directories may nevertheless end up on disk, from two runs with
     different settings. That is fine and is left alone: the missing-only filter
     never re-fetches the one already there, and nothing here ever deletes it.
+
+    # Errors
+    Raises `ValueError` when the toggle is on for a variant that has no
+    uncensored repository.
     """
-    encoder = UNCENSORED_ENCODER_MANIFEST if uncensored else OFFICIAL_ENCODER_MANIFEST
-    return SHARED_MANIFEST + encoder
+    encoder = (
+        uncensored_encoder_manifest(variant) if uncensored else official_encoder_manifest(variant)
+    )
+    return shared_manifest(variant) + encoder
 
 
-def component_paths(uncensored: bool) -> dict[str, str]:
+def component_paths(variant: ModelVariant, uncensored: bool) -> dict[str, str]:
     """Absolute component directories a finished download leaves behind.
 
     The three keys are the engine settings the Rust side writes back, so a
@@ -311,7 +557,7 @@ def component_paths(uncensored: bool) -> dict[str, str]:
     toggle: it names the uncensored directory while the toggle is on, which is
     the same rule that decides which encoder was downloaded.
     """
-    root = model_root()
+    root = model_root(variant)
     encoder = TEXT_ENCODER_UNCENSORED_SUBDIR if uncensored else TEXT_ENCODER_SUBDIR
     return {
         "transformer": str(root / TRANSFORMER_SUBDIR),
@@ -336,6 +582,7 @@ def is_excluded(path: str) -> bool:
 def resolve_plan(
     listings: Mapping[str, Mapping[str, int]],
     *,
+    variant: ModelVariant,
     uncensored: bool,
     root: Path | str | None = None,
 ) -> list[PlannedFile]:
@@ -353,11 +600,12 @@ def resolve_plan(
     Raises `RuntimeError` when a listing for a needed repository is missing, or
     when a prefix resolves to no file at all — the latter names the prefix and
     the repository, because it means the repository layout changed under us.
+    Raises `ValueError` for an uncensored request on a variant without one.
     """
-    base = Path(root) if root is not None else model_root()
+    base = Path(root) if root is not None else model_root(variant)
     planned: dict[str, PlannedFile] = {}
 
-    for entry in manifest_entries(uncensored):
+    for entry in manifest_entries(variant, uncensored):
         listing = listings.get(entry.repo)
         if listing is None:
             raise RuntimeError(
@@ -499,13 +747,23 @@ def probe_repo_access(repo: str, token: str) -> tuple[str, str]:
     scrubbed of the token first.
 
     A repository listing is NOT a proof of access: `model_info()` answers for
-    these `gated: auto` repositories with no token at all. `auth_check` is the
+    the `gated: auto` repositories with no token at all. `auth_check` is the
     only call that answers the question this function asks.
+
+    The token is filtered through `repo_token` first, so a PUBLIC repository is
+    probed anonymously even when the request carries a token: an expired token
+    forwarded to the public 4B repository answers 401 and would be reported as
+    `invalid_token` for a repository that needs no token at all.
+
+    An EMPTY token is passed to `HfApi` as `None` rather than `""`: that is the
+    public-repository case (the 4B variant), and `huggingface_hub` treats a
+    falsy token as "anonymous" only when it is not an empty string on every
+    code path.
     """
     from huggingface_hub import HfApi
 
     try:
-        HfApi(token=token).auth_check(repo)
+        HfApi(token=repo_token(repo, token) or None).auth_check(repo)
     except Exception as exc:  # noqa: BLE001 - every failure is a reportable state
         state = classify_repo_error(exc)
         log.info("FLUX.2 klein: доступ к %s — %s", repo, state)
@@ -516,9 +774,10 @@ def probe_repo_access(repo: str, token: str) -> tuple[str, str]:
 def repo_listing(repo: str, token: str) -> dict[str, int]:
     """`{path inside the repo: size in bytes}` for every file of `repo`.
 
-    One metadata request, no file bytes. The token is passed through because a
-    private repository would need it; these two do not, which is exactly why the
-    access state is probed separately.
+    One metadata request, no file bytes. The token is filtered through
+    `repo_token`: a gated repository gets it (a private one would need it), a
+    repository the variant table declares public is listed anonymously, so a
+    stale token cannot turn a public listing into a 401.
 
     # Errors
     Propagates `huggingface_hub` errors; `check_access` maps them through
@@ -526,7 +785,7 @@ def repo_listing(repo: str, token: str) -> dict[str, int]:
     """
     from huggingface_hub import HfApi
 
-    info = HfApi(token=token).model_info(repo, files_metadata=True)
+    info = HfApi(token=repo_token(repo, token) or None).model_info(repo, files_metadata=True)
     listing: dict[str, int] = {}
     for sibling in info.siblings or []:
         name = getattr(sibling, "rfilename", None)
@@ -541,12 +800,27 @@ def fetch_listings(repos: Iterable[str], token: str) -> dict[str, dict[str, int]
     return {repo: repo_listing(repo, token) for repo in repos}
 
 
-def check_access(hf_token: str, *, uncensored: bool) -> dict[str, Any]:
+def check_access(hf_token: str, *, uncensored: bool, variant: Any = None) -> dict[str, Any]:
     """The `inpaint.flux2_klein.download.check` answer.
 
-    Reports one `state` per repository the current toggle needs, plus the `plan`
-    the button labels itself with. An EMPTY token short-circuits to `no_token`
-    for every repository and makes NO network call at all.
+    Reports one `state` per repository the current variant and toggle need, plus
+    the `plan` the button labels itself with and the `variant` key it answered
+    for. The echo is what lets a client tell a fresh answer from one computed
+    for the variant it was showing a moment ago.
+
+    `variant` is the RAW wire field (absent/`None`/`""` means `"9b"`); an
+    unknown value and an uncensored request on a variant without an uncensored
+    encoder are both refusals, never a downgrade.
+
+    An empty token short-circuits to `no_token` for every repository and makes
+    NO network call at all — but ONLY when the request actually needs a token
+    (`token_required`). The 4B repository is public, so a token-less 4B check
+    goes to the hub and answers `ok` with a real plan.
+
+    A token that IS supplied is still not sent everywhere: `repo_token` decides
+    per repository, so a public repository is probed and listed anonymously.
+    That is what keeps a stale 9B token from turning the public 4B check into
+    `invalid_token` with no plan and a disabled button.
 
     **`plan` is NULLABLE and a zeroed plan is never synthesised.** Access and
     listing are two different network operations: a token can pass `auth_check`
@@ -563,18 +837,24 @@ def check_access(hf_token: str, *, uncensored: bool) -> dict[str, Any]:
 
     # Errors
     Does not raise for an inaccessible repository or a failed listing — that is
-    what the `state` taxonomy and `plan_error` are for.
+    what the `state` taxonomy and `plan_error` are for. Raises `ValueError` for
+    an unknown `variant` and for `uncensored` on a variant without one: those
+    are malformed requests, not states of the world.
     """
+    selected = resolve_variant(variant)
+    require_uncensored_supported(selected, uncensored)
     token = (hf_token or "").strip()
-    repos = required_repos(uncensored)
+    repos = required_repos(selected, uncensored)
 
-    if not token:
+    if not token and token_required(selected, uncensored):
         return {
+            "variant": selected.key,
             "repos": {repo: {"state": STATE_NO_TOKEN, "message": ""} for repo in repos},
             "plan": None,
             "plan_error": "",
         }
 
+    _log_anonymous_repos(repos, token)
     states: dict[str, dict[str, str]] = {}
     for repo in repos:
         state, message = probe_repo_access(repo, token)
@@ -585,7 +865,9 @@ def check_access(hf_token: str, *, uncensored: bool) -> dict[str, Any]:
     if all(entry["state"] == STATE_OK for entry in states.values()):
         try:
             listings = fetch_listings(repos, token)
-            plan_object = plan_totals(resolve_plan(listings, uncensored=uncensored))
+            plan_object = plan_totals(
+                resolve_plan(listings, variant=selected, uncensored=uncensored)
+            )
         except Exception as exc:  # noqa: BLE001 - reported as plan_error, not as a state
             # Deliberately NOT mapped to a repo state: access genuinely succeeded,
             # and calling this `network_error` would send the user to the wrong
@@ -597,7 +879,12 @@ def check_access(hf_token: str, *, uncensored: bool) -> dict[str, Any]:
                 plan_error,
             )
 
-    return {"repos": states, "plan": plan_object, "plan_error": plan_error}
+    return {
+        "variant": selected.key,
+        "repos": states,
+        "plan": plan_object,
+        "plan_error": plan_error,
+    }
 
 
 # =====================================================================
@@ -711,6 +998,7 @@ def download(
     hf_token: str,
     *,
     uncensored: bool,
+    variant: Any = None,
     progress_callback: ProgressCb | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -719,6 +1007,13 @@ def download(
     The answer is `{"paths": {...}, "downloaded_bytes": N, "skipped_files": N}`;
     `paths` are the three component directories the Rust side writes into the
     engine's settings, so a finished download leaves a configured engine.
+
+    `variant` is the RAW wire field (absent/`None`/`""` means `"9b"`) and selects
+    both the repositories and the destination directory. A token is demanded
+    only when the request actually touches a gated repository, so the public 4B
+    variant downloads with none — and a token that IS supplied is withheld from
+    every public repository (`repo_token`), listing and file transfer alike, so
+    an expired 9B token cannot 401 the public 4B download either.
 
     Runs OUTSIDE every service lock — the download lock of
     `engines.model_download` is per destination path and deliberately not a
@@ -730,29 +1025,33 @@ def download(
     removed by the shared primitive.
 
     # Errors
-    Raises `ValueError` for an empty token, `DownloadCanceled` when the caller
-    canceled, and `RuntimeError` for an inaccessible repository, a manifest
-    prefix that resolved to nothing, insufficient free space, or a transport
-    failure.
+    Raises `ValueError` for an unknown variant, for an uncensored request on a
+    variant that has no uncensored encoder, and for an empty token on a gated
+    request; `DownloadCanceled` when the caller canceled; and `RuntimeError` for
+    an inaccessible repository, a manifest prefix that resolved to nothing,
+    insufficient free space, or a transport failure.
     """
+    selected = resolve_variant(variant)
+    require_uncensored_supported(selected, uncensored)
     token = (hf_token or "").strip()
-    if not token:
+    if not token and token_required(selected, uncensored):
         raise ValueError(
             "Не указан токен Hugging Face. Оба репозитория FLUX.2 klein закрыты "
             "условиями, поэтому загрузка без токена невозможна."
         )
 
-    repos = required_repos(uncensored)
+    repos = required_repos(selected, uncensored)
+    _log_anonymous_repos(repos, token)
     _check_canceled(should_cancel)
     try:
         listings = fetch_listings(repos, token)
     except Exception as exc:  # noqa: BLE001 - reported as a readable refusal
         raise RuntimeError(_listing_failure_message(exc, token)) from exc
 
-    plan = resolve_plan(listings, uncensored=uncensored)
+    plan = resolve_plan(listings, variant=selected, uncensored=uncensored)
     pending = missing_files(plan)
     skipped = len(plan) - len(pending)
-    root = model_root()
+    root = model_root(selected)
 
     total = sum(item.size for item in pending)
     # Bytes an earlier run already parked next to their destinations are on the
@@ -790,7 +1089,7 @@ def download(
         progress_callback(PROGRESS_PHASE, total, total, "")
 
     return {
-        "paths": component_paths(uncensored),
+        "paths": component_paths(selected, uncensored),
         "downloaded_bytes": downloaded,
         "skipped_files": skipped,
     }
@@ -843,6 +1142,11 @@ def _fetch_one(
 ) -> bool:
     """Fetch one planned file, resuming what an earlier run left. Returns whether it ran.
 
+    `token` is the request's token; what actually reaches the wire is
+    `repo_token(item.repo, token)`, so a file of a public repository is fetched
+    with no `Authorization` header even when the request carries a token. The
+    decision is per FILE because the plan may mix repositories.
+
     Resumable: a connection that dropped at 8 of 9.8 GB leaves those bytes parked
     beside the destination, and this run continues from them instead of paying for
     them twice. On a 35 GB plan over a flaky link that is the difference between a
@@ -860,9 +1164,10 @@ def _fetch_one(
     """
     verify = _size_verifier(item)
     url = _file_url(item)
+    sent = repo_token(item.repo, token)
     try:
         return download_bearer_to_path(
-            url, item.dest, on_chunk, token=token, verify=verify, resumable=True
+            url, item.dest, on_chunk, token=sent, verify=verify, resumable=True
         )
     except IncompleteDownload as first:
         log.warning(
@@ -876,7 +1181,7 @@ def _fetch_one(
     discard_staging(item.dest)
     try:
         return download_bearer_to_path(
-            url, item.dest, on_chunk, token=token, verify=verify, resumable=True
+            url, item.dest, on_chunk, token=sent, verify=verify, resumable=True
         )
     except IncompleteDownload as second:
         raise RuntimeError(

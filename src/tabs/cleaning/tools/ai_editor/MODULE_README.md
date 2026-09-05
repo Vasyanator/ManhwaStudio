@@ -106,6 +106,13 @@ frame that scrolled out of view has nothing to look at.
   mask layers, so a switch re-creates the mask stack and would discard painted work. The
   disabled tooltip says exactly that, and `RegionFrame::set_mask_layers` refuses the switch on
   its own side as well.
+- **The picker is also disabled while the SELECTED engine says a switch is unsafe**
+  (`AiEngine::switch_block_reason`, default `None`). The frame lock covers a run; this covers
+  work an engine owns that no frame state describes — FLUX.2 klein's model download, whose
+  free-space budget is its own and would be doubled by starting the other checkpoint's
+  download beside it. The engine's own sentence becomes the disabled tooltip, and
+  `select_engine` refuses on the same answer, so the closed control and the refused switch
+  cannot drift apart. The frame lock is tested first and keeps its own wording.
 - **A switch never resizes the frame.** `set_constraints` publishes the new requirements and
   nothing else: a rectangle the new engine refuses turns the frame RED, blocks «Обработать»
   and gets its requirements spelled out in the left panel. That is the designed behaviour, not

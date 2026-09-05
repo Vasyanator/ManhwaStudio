@@ -36,8 +36,12 @@ Coverage:
   prompt phase and is cancellable, `name`/`path` are required non-empty strings,
   `overwrite` defaults to `false`, an import's `name` is optional and trimmed,
   and the import answer carries `family_matches` for the foreign-family warning;
-- the two `inpaint.flux2_klein.download.*` methods: the token and the toggle
-  travel as request fields, a non-string token is a request error, a NULL `plan`
+- the two `inpaint.flux2_klein.download.*` methods: the token, the toggle and
+  the `variant` travel as request fields — `variant` VERBATIM, because the
+  vocabulary, the absent-field default and the cost of an unknown name are the
+  downloader's single answer — the `.check` reply echoes the variant back, a
+  token-less `4b` request is legal and reaches the downloader, a variant refusal
+  propagates unchanged, a non-string token is a request error, a NULL `plan`
   and its `plan_error` reach the client unchanged (a listing failure must never
   render as a completed installation), `.start`
   streams the two-level progress frame (the three extra fields OMITTED rather
@@ -811,22 +815,26 @@ class _FakeDownloads:
         fail: BaseException | None = None,
         plan_fails: bool = False,
     ) -> None:
-        self.checked: list[tuple[str, bool]] = []
-        self.started: list[tuple[str, bool]] = []
+        self.checked: list[tuple[str, bool, Any]] = []
+        self.started: list[tuple[str, bool, Any]] = []
         self.script = script
         self.fail = fail
         self.plan_fails = plan_fails
         self.cancel_probe: Any = None
 
-    def check_access(self, token: str, *, uncensored: bool) -> dict[str, Any]:
-        self.checked.append((token, uncensored))
+    def check_access(self, token: str, *, uncensored: bool, variant: Any = None) -> dict[str, Any]:
+        self.checked.append((token, uncensored, variant))
+        # The real module echoes the variant it answered for; the fake echoes the
+        # raw field so a handler that dropped it would be visible here.
         if self.plan_fails:
             return {
+                "variant": variant or "9b",
                 "repos": {"black-forest-labs/FLUX.2-klein-9B": {"state": "ok", "message": ""}},
                 "plan": None,
                 "plan_error": "offline",
             }
         return {
+            "variant": variant or "9b",
             "repos": {"black-forest-labs/FLUX.2-klein-9B": {"state": "ok", "message": ""}},
             "plan": {"total_bytes": 100, "missing_bytes": 40, "missing_files": 2},
             "plan_error": "",
@@ -837,10 +845,11 @@ class _FakeDownloads:
         token: str,
         *,
         uncensored: bool,
+        variant: Any = None,
         progress_callback: Any = None,
         should_cancel: Any = None,
     ) -> dict[str, Any]:
-        self.started.append((token, uncensored))
+        self.started.append((token, uncensored, variant))
         self.cancel_probe = should_cancel
         for frame in self.script:
             if progress_callback is not None:
@@ -874,7 +883,7 @@ def test_download_check_forwards_the_token_and_the_toggle(monkeypatch: Any) -> N
         _no_cancel(),
     )
 
-    assert fake.checked == [("secret-token", True)]
+    assert fake.checked == [("secret-token", True, None)]
     assert blob == b""
     assert header["plan"] == {"total_bytes": 100, "missing_bytes": 40, "missing_files": 2}
     assert header["plan_error"] == ""
@@ -903,7 +912,80 @@ def test_download_check_accepts_an_absent_token_as_empty(monkeypatch: Any) -> No
 
     handler(_ctx(_FakeFlux2KleinService()), {}, b"", _no_cancel())
 
-    assert fake.checked == [("", False)]
+    assert fake.checked == [("", False, None)]
+
+
+def test_download_check_forwards_the_variant_verbatim(monkeypatch: Any) -> None:
+    # The handler must NOT re-derive the vocabulary: which variants exist, what
+    # an absent field defaults to and what an unknown name costs are the
+    # downloader's single answer (`resolve_variant`).
+    fake = _with_downloads(monkeypatch, _FakeDownloads())
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
+
+    for sent in ("4b", "9b", "  4B ", "nonsense", None):
+        header, _blob = handler(
+            _ctx(_FakeFlux2KleinService()),
+            {"hf_token": "t", "variant": sent} if sent is not None else {"hf_token": "t"},
+            b"",
+            _no_cancel(),
+        )
+        assert fake.checked[-1] == ("t", False, sent)
+        # The answer ECHOES the variant, so a client can tell a fresh answer
+        # from one computed for the variant it was showing a moment ago.
+        assert "variant" in header
+
+
+def test_download_check_answers_a_tokenless_4b_request(monkeypatch: Any) -> None:
+    # The 4B repository is public: an empty token is a normal request there and
+    # must reach the downloader rather than being refused in this layer.
+    fake = _with_downloads(monkeypatch, _FakeDownloads())
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
+
+    header, _blob = handler(
+        _ctx(_FakeFlux2KleinService()), {"variant": "4b"}, b"", _no_cancel()
+    )
+
+    assert fake.checked == [("", False, "4b")]
+    assert header["variant"] == "4b"
+
+
+def test_download_start_forwards_the_variant(monkeypatch: Any) -> None:
+    fake = _with_downloads(monkeypatch, _FakeDownloads())
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
+
+    handler(_ctx(_FakeFlux2KleinService()), {"variant": "4b"}, b"", _no_cancel())
+    handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel())
+
+    assert fake.started == [("", False, "4b"), ("t", False, None)]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START],
+)
+def test_a_variant_refusal_reaches_the_client_unchanged(monkeypatch: Any, method: str) -> None:
+    # `resolve_variant` / `require_uncensored_supported` raise `ValueError` with
+    # user-facing Russian text; both methods must let it through untouched
+    # rather than turning it into a generic failure.
+    refusal = ValueError("Расцензуренный энкодер для 4B пока не поддерживается")
+    fake = _with_downloads(monkeypatch, _FakeDownloads(fail=refusal))
+
+    def explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise refusal
+
+    # `.check` raises from `check_access`, `.start` from `download` — the fake's
+    # `fail` already covers the second.
+    monkeypatch.setattr(fake, "check_access", explode)
+    handler = get_handler(method)
+
+    with pytest.raises(ValueError) as caught:
+        handler(
+            _ctx(_FakeFlux2KleinService()),
+            {"hf_token": "t", "uncensored": True, "variant": "4b"},
+            b"",
+            _no_cancel(),
+        )
+    assert "не поддерживается" in str(caught.value)
 
 
 def test_download_check_rejects_a_non_string_token(monkeypatch: Any) -> None:

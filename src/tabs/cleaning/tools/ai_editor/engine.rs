@@ -142,6 +142,24 @@ pub trait AiEngine {
     /// `constraints()` by the frame, and the non-empty-mask rule is `allows_empty_mask()`.
     fn run_block_reason(&self) -> Option<String>;
 
+    /// Why switching AWAY from this engine is unsafe right now, localized; `None` when the
+    /// picker may switch freely. Default: `None`.
+    ///
+    /// The host disables the engine picker while a reason stands and puts it on the
+    /// disabled tooltip, so a refusal always says what it is waiting for.
+    ///
+    /// It exists because the frame lock — the picker's other gate — only covers a RUN. An
+    /// engine may own work that no frame state describes: FLUX.2 klein's model download is
+    /// a multi-gigabyte transfer with its own free-space budget, and nothing else would
+    /// stop a user from starting a second one from the other engine and overcommitting the
+    /// disk. An engine that owns no such work leaves the default.
+    ///
+    /// Reported, never enforced silently: this only closes a control, it does not abort
+    /// anything, and it must stay cheap enough to call every frame.
+    fn switch_block_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Starts one run. The engine takes over `request` and reports through `poll`.
     ///
     /// # Errors

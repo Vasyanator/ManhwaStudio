@@ -145,8 +145,8 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   from `draw_overlay_ui` and must not duplicate the helpers `base.rs` already exposes.
 - `ai_editor/`: the «ИИ-редактор области» tool — the framework's only consumer, and the only tool
   with a MAIN dock panel (`wants_main_panel`). It HOSTS the AI engines behind the `AiEngine` trait
-  (`ai_editor/engine.rs`, `ai_editor/engines/`), which is where FLUX.2 klein now lives; a model is
-  no longer a `CleaningTool` of its own. Own `MODULE_README.md`, and a second one under
+  (`ai_editor/engine.rs`, `ai_editor/engines/`), which is where FLUX.2 klein lives; a model is an
+  engine of this tool and not a `CleaningTool` of its own. Own `MODULE_README.md`, and a second one under
   `engines/`.
 
 ## Contracts and invariants
@@ -263,7 +263,7 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
   settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
   bar it reuses live in `base.rs`.
-- To change FLUX.2 klein, edit `ai_editor/engines/flux2_klein.rs` — it is an engine of the
+- To change FLUX.2 klein, edit `ai_editor/engines/flux2_klein/` — it is an engine of the
   «ИИ-редактор области» tool, not a tool; see `ai_editor/engines/MODULE_README.md`. The wire names
   of its methods live in `backend_ipc::protocol`.
 - To change the chapter mode's UI, jobs, reports or overlay patches, edit `watermark_removal.rs`

@@ -469,6 +469,18 @@ def _read_hf_token(header: dict[str, Any]) -> str:
     return value
 
 
+def _read_variant(header: dict[str, Any]) -> Any:
+    """Read the `variant` request field verbatim; absent or `null` means `None`.
+
+    The value is NOT validated here. Which variants exist, what an absent field
+    defaults to (`"9b"`) and what an unknown name costs are the downloader's
+    single answer (`flux2_download.resolve_variant`), exactly as `component` and
+    `action` are the service's — duplicating the vocabulary in this layer is the
+    drift the contract puts it in one place to avoid.
+    """
+    return header.get("variant")
+
+
 def _download_module() -> "Any":
     """The FLUX.2 download module, imported lazily.
 
@@ -491,15 +503,19 @@ def _handle_download_check(
 ) -> tuple[dict[str, Any], bytes]:
     """Report per-repository access and the plan totals; no bytes are fetched.
 
-    Only the repositories the `uncensored` toggle actually needs are checked and
-    reported. Non-streaming: it costs one auth probe per repository plus, when
-    both answered `ok`, one metadata listing each.
+    Only the repositories the `variant` and the `uncensored` toggle actually
+    need are checked and reported, and the answer ECHOES `variant` back so the
+    client can tell a fresh answer from one computed for the variant it was
+    showing a moment ago. Non-streaming: it costs one auth probe per repository
+    plus, when all answered `ok`, one metadata listing each.
     """
     if cancel_event.is_set():
         raise Interrupted("inpaint.flux2_klein.download.check canceled before start.")
     token = _read_hf_token(header)
     uncensored = bool(header.get("uncensored", False))
-    result = _download_module().check_access(token, uncensored=uncensored)
+    result = _download_module().check_access(
+        token, uncensored=uncensored, variant=_read_variant(header)
+    )
     return dict(result), b""
 
 
@@ -513,6 +529,11 @@ def _handle_download_start(
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
     """Download every missing model file, streaming two-level byte progress.
+
+    `variant` selects both the repositories and the destination directory; an
+    unknown name and `variant:"4b"` together with `uncensored:true` are typed
+    refusals from the downloader and reach the user unchanged, like every other
+    readable refusal below.
 
     Unlike every other method of this handler group, cancellation is observed
     INSIDE the work: `cancel_event.is_set` is handed to the downloader, which
@@ -530,6 +551,7 @@ def _handle_download_start(
         result = downloads.download(
             token,
             uncensored=uncensored,
+            variant=_read_variant(header),
             progress_callback=_progress_forwarder(ctx),
             should_cancel=cancel_event.is_set,
         )

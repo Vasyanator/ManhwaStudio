@@ -22,6 +22,12 @@ AiEngine::poll(ctx)        -> Idle / Running / Done(ColorImage) / Failed(message
 Adding an engine is a module plus one line in `all_engines`. The picker's two sections come from
 `AiEngine::section`, not from the order of that list.
 
+ONE MODULE MAY CONTRIBUTE SEVERAL ENTRIES when the difference between them is a parameter and not
+an implementation. `flux2_klein/` contributes one per `config::Flux2Variant` — FLUX.2 klein 9B and
+FLUX.2 klein 4B — and the variant keys the engine id, the picker caption, the settings FILE, the
+model directory and the `variant` field the two `.download.*` methods carry. Duplicating the module
+for a second checkpoint is the wrong answer; parameterizing it is the pattern.
+
 An engine's panel body owns its own structure, and FLUX.2 klein's is the reference for a big one:
 prompt block (field, the one cache line, the «Перевод» / «Библиотека промптов» toggles) → the one
 creative dial → the ONE readiness line with its «Установить» / «Обновить» buttons → three SIBLING
@@ -32,7 +38,10 @@ functions with unit tests, not conditionals inside the drawing code.
 
 ## Files and submodules
 - `mod.rs`: the catalog — `all_engines()` and nothing else.
-- `flux2_klein.rs`: the FLUX.2 klein engine (IPC methods `inpaint.flux2_klein` streaming,
+- `flux2_klein/`: the FLUX.2 klein engine — a DIRECTORY, because it outgrew one file, and the
+  source of TWO picker entries (9B and 4B, one per `config::Flux2Variant`); its own
+  `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods
+  `inpaint.flux2_klein` streaming,
   `.status`, `.estimate`, `.unload`, `.component_action` streaming, the six
   `.prompt_cache.*` methods, and the two `.download.*` methods). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
@@ -66,8 +75,9 @@ functions with unit tests, not conditionals inside the drawing code.
   re-armed through the same one-shot flags as the memory forecast, so editing the prompt cannot
   turn a keystroke into a request. GENERATION WITHOUT A LOCAL TEXT ENCODER is supported — see the
   contracts below. Model paths (Qwen3 text encoder folder, transformer file or diffusers folder,
-  VAE) are entered by hand or through a non-blocking native picker and persist to
-  `flux2_klein_settings.json` (`config::flux2_klein_settings_path`). Memory placement is chosen
+  VAE) are entered by hand or through a non-blocking native picker and persist to the VARIANT's own
+  settings file (`config::flux2_klein_settings_path`; 9B keeps `flux2_klein_settings.json`
+  unchanged, 4B gets `flux2_klein_4b_settings.json`). Memory placement is chosen
   through four BUILT-IN presets («Максимум скорости» / «Сбалансированный» / «Минимум RAM» /
   «Минимум VRAM»); «Пользовательский» is never selectable — it is what the picker reports when the
   SEVEN fields a preset owns match none of them (placement, `low_cpu_mem_usage`, VAE
@@ -114,7 +124,7 @@ functions with unit tests, not conditionals inside the drawing code.
   flight. A pure position change costs nothing — scrolling moves the rectangle through the frame's
   keep-in-view clamp — and a resize drag costs exactly one request, on release, rather than one per
   rendered frame. The size change is held in `region_resize_pending` because the rectangle usually
-  no longer changes on the release frame itself. Everything that is NOT the geometry (a parameter,
+  does not change on the release frame itself. Everything that is NOT the geometry (a parameter,
   the memory preset, a loaded prompt cache, a finished run, the settings load) still arms the
   forecast directly, and a test pins that.
 - FLUX.2 klein's `whole_region` is a WORKING MODE that is DERIVED FROM THE PAINTED MASK and is not a
@@ -131,15 +141,15 @@ functions with unit tests, not conditionals inside the drawing code.
   this engine. `whole_region` also travels as `false` on every path that only ASKS the backend
   something (`.status`, `.estimate`, the prompt-cache calls): no mask exists there, which is why
   `to_params` takes the flag instead of reading it. Backend-side `mask_dilate_px` is ignored when
-  nothing is painted; the slider is no longer faded for that (the engine cannot see the host's mask
+  nothing is painted; the slider is not faded for that (the engine cannot see the host's mask
   stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
   instead. `mask_feather_px` keeps working either way and softens the join between the region and the
   page.
 - A settings file written by an older build carries keys that map to no field any more:
   `whole_region` (the mode is derived from the mask), `max_sequence_length` (PINNED to
-  `FLUX2_MAX_SEQ` = 512 and no longer a setting — 512 was already the maximum, so every value a
-  user could pick was a reduction, and the length is part of the prompt-cache key, so lowering it
-  invalidated the whole saved `.msprompt` library at once) and `brush_radius` (the brush belongs to
+  `FLUX2_MAX_SEQ` = 512 rather than a setting — 512 is the maximum, so every value a user could
+  pick is a reduction, and the length is part of the prompt-cache key, so lowering it invalidates
+  the whole saved `.msprompt` library at once) and `brush_radius` (the brush belongs to
   the host's `MaskBrush`). `Flux2KleinSettings` does NOT use `deny_unknown_fields`, so serde drops
   them and the document loads with every other setting intact; no migration exists for any of them
   and none may be added. A test pins that such a document loads identically to the same document
@@ -195,8 +205,9 @@ functions with unit tests, not conditionals inside the drawing code.
   round the loop once per file; `Ready` passes. An empty required path is decided locally without
   the backend, everything else waits for the catalog. This function exists because the emptiness
   check alone CANNOT see a fresh download-mode installation: `effective_paths` derives its three
-  paths under `config::flux2_klein_dir()`, so they are never empty and the user used to receive the
-  backend's untranslated «Путь transformer_path не найден» instead of a local, actionable refusal.
+  paths under `config::flux2_klein_dir()`, so they are never empty; without the catalog the user
+  gets the backend's untranslated «Путь transformer_path не найден» instead of a local, actionable
+  refusal.
   The refusal text differs by mode because the fix does — a download is a button, a wrong manual
   path is a field. The catalog is an answer ABOUT THREE PATHS, so it counts only while it still
   describes the ones in the settings: `flux2_status_for_paths` drops an answer fetched for others,
@@ -257,21 +268,22 @@ functions with unit tests, not conditionals inside the drawing code.
     use"**, and every consumer goes through it — the wire `params`, the run gate, the
     prompt-cache gates, the read-only paths the download body shows. Two places computing it
     is how the two modes drift apart.
-  - **In download mode the three paths are DERIVED** from `config::flux2_klein_dir()` and the
-    encoder toggle, and **the manual fields are never read and never written**. A finished
-    download therefore does NOT write its answer into the settings — that write-back existed
-    while both blocks were always visible and became destructive with the switch, because the
-    manual fields hold a configuration the user switches back to. The answered paths are kept
-    only to LOG drift between the two halves. Derivation configures the engine continuously
-    instead of once, which supersedes the original contract's "a finished download configures
-    the engine".
-  - The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/` under
-    `FLUX.2-klein-9B/`, which is what the backend needs: `component_search_roots` probes each
+  - **In download mode the three paths are DERIVED** from `config::flux2_klein_dir(variant)` and
+    the encoder toggle, and **the manual fields are never read and never written**. A finished
+    download therefore does NOT write its answer into the settings: the manual fields hold a
+    configuration the user switches back to, so writing over them would destroy it. The answered
+    paths are kept only to LOG drift between the two halves. Derivation is what configures the
+    engine, continuously rather than once at the end of a download.
+  - The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/` under the
+    VARIANT's own root (`FLUX.2-klein-9B/` or `FLUX.2-klein-4B/`), which is what the backend needs: `component_search_roots` probes each
     supplied path AND ITS PARENT, so the repo root is reached from any of the three and both
     `text_encoder/` and `text_encoder_uncensored/` resolve the tokenizer (verified against
     `modules/ai_backend/inpaint/flux2_klein.py`, hit at probe position 2 of 8 for both).
   - The uncensored toggle belongs to the download body alone. In manual mode it is meaningless
-    — the user simply points at whichever encoder he wants.
+    — the user simply points at whichever encoder he wants — and it is drawn only for a variant
+    that HAS an uncensored encoder published for it (`supports_uncensored_encoder`, true for 9B
+    only). `normalized()` forces the flag off for the other one, so the pairing the backend
+    refuses cannot reach a path or the wire even from a hand-edited settings file.
 - FLUX.2 klein DOWNLOADS ITS OWN MODEL from Hugging Face, in the download mode of that switch:
   `.download.check` (one-shot) and `.download.start` (streaming). The pinned wire contract is
   `dev-docs/flux2_model_download.md`. What this side owns:
@@ -291,7 +303,20 @@ functions with unit tests, not conditionals inside the drawing code.
     (`uncensored_text_encoder`), never a global and never inside `params`: the download methods
     carry it as their own top-level `uncensored` field. It selects which encoder is fetched AND
     repoints `text_encoder_path` — but only when that path is empty or names the OTHER managed
-    directory (`config::flux2_klein_text_encoder_dir`), so a hand-picked encoder survives a flip.
+    directory OF THE SAME VARIANT (`config::flux2_klein_text_encoder_dir`), so a hand-picked
+    encoder, and the other engine's directory, both survive a flip.
+  - **The two `.download.*` methods carry a `variant`** (`"9b"`, the default when absent, or
+    `"4b"`), and `check` ECHOES it back — which is why the staleness rule is
+    `download_check_matches_selection` over the toggle AND the variant, so an answer about the
+    other checkpoint stops being shown instead of pricing the wrong download. Every OTHER method
+    is unchanged: they are already keyed by the three component paths, and the prompt-cache
+    family is fingerprinted backend-side from the encoder, so 4B gets its own family for free.
+  - **Only ONE variant is resident at a time.** The backend keeps one pipeline and one text
+    encoder, keyed by the component paths, so selecting the other engine unloads the previous
+    model. This side orchestrates nothing and only says so, in one line at the top of
+    «Установка модели» (`variant_residency_hint`).
+  - **The 4B repository is UNGATED** (apache-2.0), so its download block draws no token row and
+    says so in one line instead; the gating hint above it is drawn only for a gated variant.
   - **The download claims the shared progress bar**, so `flux2_pipeline_busy` now spans FOUR
     operations. `run_block_reason` and `start` read `non_run_pipeline_busy` — the same rule with
     the generation taken out, so a run cannot report itself as the reason it cannot start while a
@@ -342,13 +367,14 @@ functions with unit tests, not conditionals inside the drawing code.
   `Flux2KleinSettings::effective_paths` and `Flux2SourceMode` — never a second computation at a
   call site.
 - To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory presets,
-  RAM/VRAM forecast or model-download block: `flux2_klein.rs`. The wire names of its methods live
-  in `backend_ipc::protocol`.
+  RAM/VRAM forecast or model-download block: `flux2_klein/`, whose `MODULE_README.md` says which
+  file owns which of them. The wire names of its methods live in `backend_ipc::protocol`.
 - To change what one of FLUX.2 klein's lines SAYS, edit its pure function and its test, never the
-  drawing code: `flux2_readiness_line` (the readiness line), `flux2_prompt_cache_line` (the one
-  line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
+  drawing code (`flux2_klein/decisions.rs`): `flux2_readiness_line` (the readiness line),
+  `flux2_prompt_cache_line` (the one line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
   merged component list), `estimate_status_line` (the forecast, printed by two surfaces).
-- To move a control between FLUX.2 klein's sections: `Flux2PanelCtx::draw` is the whole order, and
+- To move a control between FLUX.2 klein's sections: `Flux2PanelCtx::draw` (`flux2_klein/ui/mod.rs`)
+  is the whole order, and
   the five bodies under it are `draw_prompt`, `draw_strength`, `draw_readiness`,
   `draw_install_section`, `draw_memory_section` and `draw_advanced_section`.
 - To change where the Hugging Face token is stored or to add a SECOND UI surface for it:

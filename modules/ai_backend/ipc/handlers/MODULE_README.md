@@ -71,7 +71,12 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   succeeded, and the client renders a `null` plan as "size unknown", never as a finished install.
   The token arrives as the `hf_token` REQUEST FIELD (`_read_hf_token`), never as an environment
   variable and never inside `params`; nothing in this layer logs it, echoes it back or names it in
-  an error. The download's second progress level (`file_step` / `file_total` / `file_label`) is
+  an error. The `variant` field (`_read_variant`) is forwarded VERBATIM for the same reason
+  `component` and `action` are: which variants exist, that an absent field means `"9b"`, that an
+  unknown name is a refusal and that `"4b"` has no uncensored encoder are the downloader's single
+  answer (`resolve_variant` / `require_uncensored_supported`). Re-deriving any of it here is the
+  drift the contract puts it in one place to avoid — and note that an EMPTY `hf_token` is a legal,
+  servable request for `"4b"`, whose repository is public, so this layer must not gate on it. The download's second progress level (`file_step` / `file_total` / `file_label`) is
   ADDITIVE: `_progress_forwarder` takes the three as keyword-only optionals and omits each one it
   was not given, so `step`/`total` keep meaning the overall level and every four-positional-argument
   caller emits exactly the frame it always did. See `PROTOCOL.md` and
