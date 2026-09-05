@@ -11,9 +11,12 @@ FILE HEADER (cleaning/tools/stamp.rs)
 - Notes (English, per AGENTS.md §3):
   - Source pages are validated against BOTH overlay dimensions; a zero expected dimension means the
     overlay size is not known yet (`CanvasView::overlay_size` returned `None`), never "skip".
-  - The `CurrentImage` commit writes a DENSE overlay: `overlay_pixel_for_final_color` raises the
-    solved alpha to at least the dab coverage, because the page and the overlay are separate
+  - The `CurrentImage` commit writes a DENSE overlay: `base::overlay_pixel_for_final_color` raises
+    the solved alpha to at least the dab coverage, because the page and the overlay are separate
     LINEAR-sampled quads and a minimum-alpha (stencil-shaped) solution ghosts under resampling.
+    That solver, the overlay/scene coordinate helpers (`scene_pos_to_overlay_pos`,
+    `overlay_pos_to_scene_pos`, `overlay_rect_to_scene_rect`) and `extract_overlay_chunk` are
+    `pub(super)` items of `base.rs`; this file must not keep copies of them.
   - `Color32` is premultiplied sRGBA; every colour helper here works on `to_srgba_unmultiplied()`
     and premultiplies exactly once.
   - `CurrentImage` mode paints TWO canvas markers: the fixed anchor beacon
@@ -35,7 +38,11 @@ FILE HEADER (cleaning/tools/stamp.rs)
 - Потоки:
   - Отдельный worker декодирует alt-страницу в `RgbaImage` и отправляет результат через channel.
 */
-use super::base::{BrushToolBase, CleaningCursorOccluder, CleaningTool, StrokePoint};
+use super::base::{
+    BrushToolBase, CleaningCursorOccluder, CleaningTool, StrokePoint, extract_overlay_chunk,
+    overlay_pixel_for_final_color, overlay_pos_to_scene_pos, overlay_rect_to_scene_rect,
+    scene_pos_to_overlay_pos,
+};
 use crate::canvas::{CanvasView, OverlayRectPx};
 use crate::project::ProjectData;
 use crate::widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
@@ -1601,39 +1608,6 @@ fn normalize_rotation_degrees(mut degrees: f32) -> f32 {
     degrees
 }
 
-fn scene_pos_to_overlay_pos(
-    canvas: &CanvasView,
-    page_idx: usize,
-    scene_pos: egui::Pos2,
-) -> Option<egui::Pos2> {
-    let page_rect = canvas.page_scene_rect(page_idx)?;
-    let [overlay_w, overlay_h] = canvas.overlay_size(page_idx)?;
-    if overlay_w == 0 || overlay_h == 0 || !page_rect.is_positive() {
-        return None;
-    }
-    let u = ((scene_pos.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0);
-    let v = ((scene_pos.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0);
-    Some(egui::pos2(u * overlay_w as f32, v * overlay_h as f32))
-}
-
-fn overlay_pos_to_scene_pos(
-    canvas: &CanvasView,
-    page_idx: usize,
-    overlay_pos: [f32; 2],
-) -> Option<egui::Pos2> {
-    let page_rect = canvas.page_scene_rect(page_idx)?;
-    let [overlay_w, overlay_h] = canvas.overlay_size(page_idx)?;
-    if overlay_w == 0 || overlay_h == 0 || !page_rect.is_positive() {
-        return None;
-    }
-    let u = (overlay_pos[0] / overlay_w as f32).clamp(0.0, 1.0);
-    let v = (overlay_pos[1] / overlay_h as f32).clamp(0.0, 1.0);
-    Some(egui::pos2(
-        page_rect.left() + page_rect.width() * u,
-        page_rect.top() + page_rect.height() * v,
-    ))
-}
-
 fn draw_source_anchor_marker(
     ui: &mut egui::Ui,
     canvas: &CanvasView,
@@ -1730,59 +1704,6 @@ fn expand_overlay_rect(
         w: x1.saturating_sub(x0),
         h: y1.saturating_sub(y0),
     }
-}
-
-fn overlay_rect_to_scene_rect(
-    page_scene_rect: Rect,
-    overlay_w: usize,
-    overlay_h: usize,
-    rect: OverlayRectPx,
-) -> Option<Rect> {
-    if overlay_w == 0 || overlay_h == 0 || rect.w == 0 || rect.h == 0 {
-        return None;
-    }
-    let u0 = rect.x as f32 / overlay_w as f32;
-    let v0 = rect.y as f32 / overlay_h as f32;
-    let u1 = (rect.x + rect.w) as f32 / overlay_w as f32;
-    let v1 = (rect.y + rect.h) as f32 / overlay_h as f32;
-    let min = egui::pos2(
-        page_scene_rect.left() + page_scene_rect.width() * u0,
-        page_scene_rect.top() + page_scene_rect.height() * v0,
-    );
-    let max = egui::pos2(
-        page_scene_rect.left() + page_scene_rect.width() * u1,
-        page_scene_rect.top() + page_scene_rect.height() * v1,
-    );
-    let rect = Rect::from_min_max(min, max);
-    rect.is_positive().then_some(rect)
-}
-
-fn extract_overlay_chunk(source: &egui::ColorImage, rect: OverlayRectPx) -> egui::ColorImage {
-    let mut out = egui::ColorImage::filled([rect.w, rect.h], Color32::TRANSPARENT);
-    let src_w = source.size[0];
-    let src_h = source.size[1];
-    for y in 0..rect.h {
-        let sy = rect.y + y;
-        if sy >= src_h {
-            continue;
-        }
-        let src_row = sy.saturating_mul(src_w);
-        let dst_row = y.saturating_mul(rect.w);
-        for x in 0..rect.w {
-            let sx = rect.x + x;
-            if sx >= src_w {
-                continue;
-            }
-            let src_idx = src_row.saturating_add(sx);
-            let dst_idx = dst_row.saturating_add(x);
-            if let (Some(src_px), Some(dst_px)) =
-                (source.pixels.get(src_idx), out.pixels.get_mut(dst_idx))
-            {
-                *dst_px = *src_px;
-            }
-        }
-    }
-    out
 }
 
 struct StampSourceContext<'a> {
@@ -2423,99 +2344,12 @@ fn lerp_color_premultiplied(from: Color32, to: Color32, t: f32) -> Color32 {
     )
 }
 
-/// Solves for the clean-overlay pixel that shows `final_color` when composited over
-/// the original page pixel `base`, at an alpha of at least `coverage`.
-///
-/// `coverage` is the brush dab strength in `0..=1` (values outside are clamped); it is
-/// the LOWER bound on the returned alpha, not the alpha itself.
-///
-/// # Why not the minimum alpha
-/// For a target colour `f` over an opaque original `o`, every overlay alpha `a` in
-/// `[alpha_min, 1]` reproduces `f` exactly, with `p(a) = o + (f - o) / a`: `p` moves
-/// monotonically from the clamp boundary at `alpha_min` to `p(1) = f`, so it stays inside
-/// `[0, 1]` for the whole range. `alpha_min` — the smallest representable alpha, still
-/// computed below — is exact only under pixel-perfect 1:1 compositing. On the canvas the
-/// page and the clean overlay are two SEPARATE textured quads, both sampled with
-/// `TextureOptions::LINEAR` (`src/canvas/overlay_runtime.rs`), so colour and alpha are
-/// filtered INDEPENDENTLY and their product term is lost: a minimum-alpha solution over
-/// black text on white paper is a text-shaped opaque stencil on a transparent field, and
-/// at glyph coverage `w` the screen shows `w + (1 - w)^2` instead of `1.0` — a ghost of
-/// the letters peaking at 0.25 error. Lifting alpha to the dab coverage keeps the composite
-/// mathematically exact and makes the committed overlay DENSE over the brushed area (like
-/// `zamazka`'s) instead of sparse; at hardness 100 % `coverage == 1.0`, so the patch is
-/// fully opaque and immune to independent resampling.
-///
-/// Returns `Color32::TRANSPARENT` when `final_color` is fully transparent, and when the
-/// solved alpha is below one 8-bit step — which, since the alpha is at least `coverage`,
-/// can only happen where the dab itself contributes nothing.
-fn overlay_pixel_for_final_color(base: Color32, final_color: Color32, coverage: f32) -> Color32 {
-    let [br, bg, bb, _] = base.to_srgba_unmultiplied();
-    let [fr, fg, fb, fa] = final_color.to_srgba_unmultiplied();
-    if fa == 0 {
-        return Color32::TRANSPARENT;
-    }
-    let b = [br as f32 / 255.0, bg as f32 / 255.0, bb as f32 / 255.0];
-    let f = [fr as f32 / 255.0, fg as f32 / 255.0, fb as f32 / 255.0];
-    let mut alpha: f32 = 0.0;
-    for channel in 0..3 {
-        let diff = (f[channel] - b[channel]).abs();
-        if diff <= (1.0 / 255.0) {
-            continue;
-        }
-        let needed = if f[channel] < b[channel] {
-            diff / b[channel].max(f32::EPSILON)
-        } else {
-            diff / (1.0 - b[channel]).max(f32::EPSILON)
-        };
-        alpha = alpha.max(needed.clamp(0.0, 1.0));
-    }
-    // `alpha` is the representability floor; the dab coverage raises it, never lowers it.
-    alpha = alpha.max(coverage.clamp(0.0, 1.0));
-    if alpha <= (1.0 / 255.0) {
-        return Color32::TRANSPARENT;
-    }
-    let out = [
-        ((f[0] - b[0] * (1.0 - alpha)) / alpha).clamp(0.0, 1.0),
-        ((f[1] - b[1] * (1.0 - alpha)) / alpha).clamp(0.0, 1.0),
-        ((f[2] - b[2] * (1.0 - alpha)) / alpha).clamp(0.0, 1.0),
-    ];
-    Color32::from_rgba_unmultiplied(
-        (out[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (out[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (out[2] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Tolerance of one 8-bit step, expressed in the normalized `0..=1` range.
     const ONE_STEP: f32 = 1.0 / 255.0;
-
-    /// Composites an un-premultiplied overlay pixel over an opaque base and returns the
-    /// three normalized sRGB channels, i.e. what the renderer shows at 1:1 sampling.
-    fn composite_over(overlay: Color32, base: Color32) -> [f32; 3] {
-        let [orr, og, ob, oa] = overlay.to_srgba_unmultiplied();
-        let [br, bg, bb, _] = base.to_srgba_unmultiplied();
-        let a = f32::from(oa) / 255.0;
-        [
-            (f32::from(orr) / 255.0) * a + (f32::from(br) / 255.0) * (1.0 - a),
-            (f32::from(og) / 255.0) * a + (f32::from(bg) / 255.0) * (1.0 - a),
-            (f32::from(ob) / 255.0) * a + (f32::from(bb) / 255.0) * (1.0 - a),
-        ]
-    }
-
-    /// Normalized sRGB channels of a colour, ignoring its alpha.
-    fn channels(color: Color32) -> [f32; 3] {
-        let [r, g, b, _] = color.to_srgba_unmultiplied();
-        [
-            f32::from(r) / 255.0,
-            f32::from(g) / 255.0,
-            f32::from(b) / 255.0,
-        ]
-    }
 
     /// A context with no image layers — enough to exercise the coordinate mapping alone.
     fn coordinate_context(mode: StampMode, rotation_degrees: f32, y_offset: i32) -> StampSourceContext<'static> {
@@ -2529,56 +2363,6 @@ mod tests {
             rotation_degrees,
             y_offset,
         }
-    }
-
-    #[test]
-    fn overlay_pixel_at_full_coverage_is_opaque_and_equals_final_color() {
-        // The ghosting regression: over a white page the minimum-alpha solution was
-        // fully transparent, so the page showed through the resampled overlay.
-        let over_white = overlay_pixel_for_final_color(Color32::WHITE, Color32::WHITE, 1.0);
-        assert_eq!(over_white, Color32::from_rgba_unmultiplied(255, 255, 255, 255));
-
-        let over_black = overlay_pixel_for_final_color(Color32::BLACK, Color32::WHITE, 1.0);
-        assert_eq!(over_black, Color32::from_rgba_unmultiplied(255, 255, 255, 255));
-
-        // A non-neutral target must survive full coverage unchanged as well.
-        let target = Color32::from_rgb(37, 180, 90);
-        let solved = overlay_pixel_for_final_color(Color32::from_rgb(200, 40, 10), target, 1.0);
-        assert_eq!(solved.a(), 255);
-        assert_eq!(solved.to_srgba_unmultiplied(), target.to_srgba_unmultiplied());
-    }
-
-    #[test]
-    fn overlay_pixel_at_partial_coverage_still_reproduces_final_color() {
-        let cases = [
-            (Color32::WHITE, Color32::from_rgb(128, 128, 128), 0.5_f32),
-            (Color32::WHITE, Color32::from_rgb(200, 190, 210), 0.25_f32),
-            (Color32::BLACK, Color32::from_rgb(64, 32, 96), 0.35_f32),
-            // Coverage below the representability floor must not weaken the solution.
-            (Color32::WHITE, Color32::BLACK, 0.2_f32),
-        ];
-        for (base, desired_final, coverage) in cases {
-            let overlay = overlay_pixel_for_final_color(base, desired_final, coverage);
-            let alpha = f32::from(overlay.a()) / 255.0;
-            assert!(alpha + ONE_STEP >= coverage, "alpha {alpha} fell below coverage {coverage}");
-            let shown = composite_over(overlay, base);
-            let want = channels(desired_final);
-            for channel in 0..3 {
-                // One step for the alpha quantization plus one for the colour quantization.
-                assert!((shown[channel] - want[channel]).abs() <= 2.0 * ONE_STEP, "channel {channel}: {shown:?} vs {want:?} (coverage {coverage})");
-            }
-        }
-    }
-
-    #[test]
-    fn overlay_pixel_for_transparent_final_color_is_transparent() {
-        assert_eq!(overlay_pixel_for_final_color(Color32::WHITE, Color32::TRANSPARENT, 1.0), Color32::TRANSPARENT);
-    }
-
-    #[test]
-    fn overlay_pixel_without_coverage_or_difference_is_transparent() {
-        // Nothing to paint and nothing to represent: the pixel stays untouched.
-        assert_eq!(overlay_pixel_for_final_color(Color32::WHITE, Color32::WHITE, 0.0), Color32::TRANSPARENT);
     }
 
     #[test]

@@ -975,6 +975,7 @@ living inside the feature that first needed it (the FLUX.2 klein model download,
 
 - `MaskBrush`: переиспользуемая кисть для рисования бинарной маски в `egui::ColorImage` (радиус, Shift+wheel смена размера, hotkeys, cursor overlay).
 - `paint_line_with_brush`: helper штриха по ColorImage для круглой кисти.
+- `fill_polygon_spans`: развёртка замкнутого многоугольника по правилу even-odd — выдаёт по строкам спаны `x0..=x1`, уже обрезанные по буферу. Общая для лассо-выделения `ps_editor` и заплатки клининга; своей копии растеризатора заводить нельзя.
 
 ---
 

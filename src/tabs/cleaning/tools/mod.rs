@@ -4,9 +4,13 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
 - Экспорт:
   - `CleaningTool`, `StrokePoint`, `StrokeModifiers` из `base.rs`.
   - Конкретные инструменты вкладки cleaning:
-    `ZamazkaTool`, `StampTool`, `GradientFillTool`, `TextureSynthesisInpaintTool`,
-    `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`,
-    `FluxFillInpaintTool`, `WatermarkRemovalTool`, `AiEditorTool`.
+    `ZamazkaTool`, `StampTool`, `PatchTool`, `GradientFillTool`,
+    `TextureSynthesisInpaintTool`, `LamaInpaintTool`, `LamaMpeInpaintTool`,
+    `AotInpaintTool`, `SdxlInpaintTool`, `FluxFillInpaintTool`,
+    `WatermarkRemovalTool`, `AiEditorTool`.
+    `PatchTool` lives in the `patch/` directory together with its GUI-free gradient-domain
+    solver `patch/membrane.rs`, the second consumer of `gradient.rs`'s shared SOR kernel;
+    see `patch/MODULE_README.md`.
 - Внутренние модули без экспорта:
   - `watermark_library` — библиотека измеренных знаков на диске; используется
     режимом «По главе» из `watermark_removal.rs`.
@@ -50,6 +54,9 @@ pub use zamazka::ZamazkaTool;
 
 mod stamp;
 pub use stamp::StampTool;
+
+mod patch;
+pub use patch::PatchTool;
 
 mod watermark_library;
 

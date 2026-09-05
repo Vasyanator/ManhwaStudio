@@ -89,7 +89,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `draw_main_panel`, that tab's body, bound by the same "a body may not mutate the tab" rule as
   `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
   its only consumer `tools/ai_editor/`, which HOSTS the AI engines (FLUX.2 klein is the first) and
-  splits their UI across those two tabs, local fill tools, stamp tool, AI-backed
+  splits their UI across those two tabs, local fill tools, stamp tool, the on-canvas patch tool
+  (`tools/patch/`, gradient-domain seamless cloning), AI-backed
   inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management window and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.

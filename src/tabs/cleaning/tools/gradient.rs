@@ -826,9 +826,22 @@ fn screened_poisson_refine(
 /// `u` is the working buffer (interior updated in place), `u0` the data-fidelity reference,
 /// `lam` the per-cell fidelity weight, `denom` the precomputed `4 + lam[i]`. The two half-sweeps
 /// stay sequential w.r.t. each other; parallelism is only within a half-sweep, across rows.
+///
+/// This is the SHARED Laplacian/SOR kernel of the `tools` subtree (`pub(super)`), not a
+/// gradient-only helper: any tool needing a screened-Poisson or harmonic solve calls this one
+/// instead of copying it. The per-cell update is
+/// `u[i] += omega * ((Σ4 neighbours + lam[i]*u0[i]) / denom[i] - u[i])` with `denom[i] == 4 + lam[i]`,
+/// so `lam[i] == 0` reduces it to the plain harmonic average of the four neighbours (a free,
+/// membrane-like cell), while a large `lam[i]` pins cell `i` to `u0[i]` — a soft Dirichlet
+/// condition, exact in the limit. A harmonic membrane is therefore obtained by setting `lam` to
+/// `0` inside the region and to a large value on the boundary band that holds the known values.
+///
+/// Only the INTERIOR of the `rw`×`rh` grid is updated: the 1-pixel border is never written and
+/// acts as fixed data. A caller must pad its region by at least one pixel (and `rw`/`rh` must be
+/// at least 3, otherwise there is no interior and the call is a no-op).
 // All parameters are distinct solver buffers or ROI dimensions; grouping would obscure the kernel.
 #[allow(clippy::too_many_arguments)]
-fn red_black_sor_sweeps(
+pub(super) fn red_black_sor_sweeps(
     u: &mut [f32],
     u0: &[f32],
     lam: &[f32],

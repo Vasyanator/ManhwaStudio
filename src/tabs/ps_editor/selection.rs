@@ -11,7 +11,11 @@ Key structures:
 Notes:
 The mask uses image pixel coordinates. An empty selection (no pixels set) is represented by
 `None` at the call site, never by an all-zero mask, so "no selection" means "paint everywhere".
+Polygon (lasso) filling is not implemented here: it comes from the shared rasterizer
+`crate::tools::fill_polygon_spans`, so the cleaning tools and this selection agree pixel for pixel.
 */
+
+use crate::tools::fill_polygon_spans;
 
 /// Inclusive integer bounding box in image pixel coordinates.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +119,9 @@ impl Selection {
     /// Replaces the selection with the interior of a closed polygon (even-odd fill).
     ///
     /// `points` are image-space vertices; the polygon is implicitly closed. Fewer than three
-    /// points clears the selection.
+    /// points clears the selection. Rasterization is delegated to
+    /// [`crate::tools::fill_polygon_spans`], which owns the even-odd sampling contract shared
+    /// with the cleaning tools.
     pub fn set_polygon(&mut self, points: &[(f32, f32)]) {
         self.mask.iter_mut().for_each(|v| *v = 0);
         self.bounds = None;
@@ -123,46 +129,17 @@ impl Selection {
         if points.len() < 3 {
             return;
         }
-        let min_y = points
-            .iter()
-            .map(|p| p.1.floor() as i32)
-            .min()
-            .unwrap_or(0)
-            .clamp(0, self.height as i32);
-        let max_y = points
-            .iter()
-            .map(|p| p.1.ceil() as i32)
-            .max()
-            .unwrap_or(0)
-            .clamp(0, self.height as i32);
         let mut bounds: Option<SelectionBounds> = None;
-        let mut crossings: Vec<f32> = Vec::new();
-        for y in min_y..max_y {
-            // Scanline center; test edges crossing this horizontal line (even-odd rule).
-            let yc = y as f32 + 0.5;
-            crossings.clear();
-            for i in 0..points.len() {
-                let (x0, y0) = points[i];
-                let (x1, y1) = points[(i + 1) % points.len()];
-                if (y0 <= yc && y1 > yc) || (y1 <= yc && y0 > yc) {
-                    let t = (yc - y0) / (y1 - y0);
-                    crossings.push(x0 + t * (x1 - x0));
-                }
-            }
-            crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let row = y as usize * self.width;
-            for pair in crossings.chunks_exact(2) {
-                let sx = pair[0].ceil().max(0.0) as i32;
-                let ex = pair[1].floor().min(self.width as f32 - 1.0) as i32;
-                if ex < sx {
-                    continue;
-                }
-                for px in sx..=ex {
-                    self.mask[row + px as usize] = 255;
-                }
-                Self::grow_bounds(&mut bounds, sx as usize, ex as usize, y as usize);
-            }
-        }
+        // Bind the fields the closure needs up front: it borrows `self.mask` mutably, so the
+        // dimensions must be copied out before the borrow starts.
+        let (width, height) = (self.width, self.height);
+        let mask = &mut self.mask;
+        fill_polygon_spans(points, width, height, |y, sx, ex| {
+            // Spans arrive already clamped to the page, so the slice range is always in bounds.
+            let row = y * width;
+            mask[row + sx..=row + ex].iter_mut().for_each(|v| *v = 255);
+            Self::grow_bounds(&mut bounds, sx, ex, y);
+        });
         self.bounds = bounds;
         // Draw the lasso path itself as the marquee when it enclosed any pixels.
         if self.bounds.is_some() {
@@ -227,5 +204,23 @@ mod tests {
         assert!(sel.any());
         assert!(sel.contains(2, 2));
         assert!(!sel.contains(7, 7));
+    }
+
+    #[test]
+    fn concave_polygon_keeps_the_notch_unselected() {
+        // A "U" lasso: the notch between the arms must stay outside the selection, and the
+        // bounding box must still span the whole shape.
+        let mut sel = Selection::empty(9, 9);
+        sel.set_polygon(&[(1.0, 1.0), (3.0, 1.0), (3.0, 6.0), (6.0, 6.0), (6.0, 1.0), (8.0, 1.0), (8.0, 8.0), (1.0, 8.0)]);
+        assert!(sel.any());
+        assert!(sel.contains(2, 3), "left arm");
+        assert!(sel.contains(7, 3), "right arm");
+        assert!(!sel.contains(4, 3), "notch stays unselected");
+        assert!(sel.contains(4, 7), "bottom bar spans the notch columns");
+        let b = sel.bounds().expect("non-empty selection has bounds");
+        assert_eq!((b.min_x, b.min_y, b.max_x, b.max_y), (1, 1, 8, 7));
+        // The lasso path itself becomes the marquee loop, closed back onto its first vertex.
+        assert_eq!(sel.outline_loops().len(), 1);
+        assert_eq!(sel.outline_loops()[0].len(), 9);
     }
 }

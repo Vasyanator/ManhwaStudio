@@ -51,9 +51,9 @@ FILE HEADER (tabs/cleaning/tab.rs)
 use super::autoclean::{autoclean_page, UnevenBackgroundTool};
 use super::tools::{
     AiEditorTool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
-    FluxFillInpaintTool, GradientFillTool, LamaInpaintTool, LamaMpeInpaintTool, SdxlInpaintTool,
-    StampTool, StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool,
-    ZamazkaTool,
+    FluxFillInpaintTool, GradientFillTool, LamaInpaintTool, LamaMpeInpaintTool, PatchTool,
+    SdxlInpaintTool, StampTool, StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool,
+    WatermarkRemovalTool, ZamazkaTool,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
@@ -192,14 +192,14 @@ const CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX: f32 = 4.0;
 /// narrow clips a caption.
 const CLEANING_PANEL_CHROME_WIDTH_PX: f32 = 16.0;
 
-const BRUSH_TOOL_INDICES: [usize; 2] = [0, 1];
-const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
+const BRUSH_TOOL_INDICES: [usize; 3] = [0, 1, 2];
+const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [3, 4, 5, 6, 7];
 // Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков,
 // ИИ-редактор области) — отдельной строкой. FLUX.2 klein больше не является
 // самостоятельным инструментом: это движок ИИ-редактора области
 // (`tools/ai_editor/engines/`). Индекс, отсутствующий в этих массивах,
 // зарегистрирован, но не рисуется ни в одной группе панели инструментов.
-const AREA_EDIT_TOOL_INDICES: [usize; 4] = [7, 8, 9, 10];
+const AREA_EDIT_TOOL_INDICES: [usize; 4] = [8, 9, 10, 11];
 
 /// Every tool index the «Инструменты клина» tab draws a button for, in draw order.
 ///
@@ -747,6 +747,7 @@ impl Default for CleaningTabState {
         let tools: Vec<Box<dyn CleaningTool>> = vec![
             Box::<ZamazkaTool>::default(),
             Box::<StampTool>::default(),
+            Box::<PatchTool>::default(),
             Box::<GradientFillTool>::default(),
             Box::<TextureSynthesisInpaintTool>::default(),
             Box::<LamaInpaintTool>::default(),

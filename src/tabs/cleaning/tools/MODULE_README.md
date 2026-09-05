@@ -59,16 +59,19 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - `mod.rs`: module exports for the cleaning tab.
 - `base.rs`: `CleaningTool`, stroke/cursor types, brush scratch pipeline, region editor pipeline,
   mask-inpaint editor, mask generation (text detectors + watermark detector) with its shared
-  `RegionMaskGenerationState`, and region loader worker.
+  `RegionMaskGenerationState`, and region loader worker. It also owns the overlay<->scene POINT
+  mapping (`scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos`) and the dense-overlay colour
+  solver `overlay_pixel_for_final_color`; both were private to `stamp.rs` and are now shared.
 - `zamazka.rs`: primary paint/erase/eyedropper/rectangle tool for direct clean-overlay edits.
 - `stamp.rs`: copies pixels into clean overlays either from `project/alt_vers/<name>` or from the
   current page image/clean overlay using a Photoshop-like source point, with lazy background
   source-page loading where file decode is needed. Defaults to the current-page mode with
   «Исходник + клин» as the sampled layer. A background-loaded source page must match BOTH overlay
   dimensions; an expected dimension of `0` means the overlay size is not known yet, not "unchecked".
-  In current-page mode the committed overlay is DENSE, not minimum-alpha: `overlay_pixel_for_final_color`
-  solves the pixel that reproduces the desired final colour over the original page and raises its
-  alpha to at least the brush dab coverage, so a 100 %-hardness dab commits a fully opaque patch.
+  In current-page mode the committed overlay is DENSE, not minimum-alpha: the solver is
+  `base::overlay_pixel_for_final_color` (shared, not a stamp-local function), which solves the pixel
+  that reproduces the desired final colour over the original page and raises its alpha to at least
+  the brush dab coverage, so a 100 %-hardness dab commits a fully opaque patch.
   The minimum-alpha solution is exact only at 1:1 sampling — page and overlay are separate
   `TextureOptions::LINEAR` quads, so colour and alpha are filtered independently and a
   stencil-shaped overlay ghosts the page's own content back through it.
@@ -76,7 +79,10 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   point currently sampled, whose position is derived from the sampling mapping (`stamp_source_xy`)
   and therefore cannot disagree with the pixels being copied. The stroke origin is runtime stroke
   state, so between strokes the offset is zero and the moving marker rests on the beacon.
-- `gradient.rs`: local mask fill using Lab scanline estimation and smoothing.
+- `gradient.rs`: local mask fill using Lab scanline estimation and smoothing. It also owns the
+  subtree's SHARED red-black SOR kernel `red_black_sor_sweeps` (`pub(super)`): any tool needing a
+  screened-Poisson or harmonic solve calls that one instead of copying it. Its second consumer is
+  `patch/membrane.rs`.
 - `texture_synthesis.rs`: local inpaint through the `texture-synthesis` crate, with optional
   sample mask limiting the texture source area.
 - `lama.rs`: LaMa V2 backend inpaint, fixed supported model catalog, model scan, model ensure, and
@@ -150,6 +156,13 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   improve-with-another-level. Every one of those runs on a worker; the window polls a channel.
 - `lama_mpe.rs`: LaMa MPE backend inpaint and `inpaint.lama_mpe` IPC calls.
 - `aot.rs`: AOT backend inpaint and `inpaint.aot` IPC calls.
+- `patch/`: the «Заплатка» tool — Photoshop's Patch Tool. A free-form or rectangular selection
+  drawn straight onto the page canvas, dragged onto a clean source area; the copied pixels are
+  colour-adapted to the destination's contour by a gradient-domain (Poisson) membrane and committed
+  as one undo step. Built DIRECTLY on `CleaningTool` (a lasso has no radius, no hardness and no
+  axis-aligned scratch rect, so `BrushToolBase` fits none of it), it rides the tab's ordinary stroke
+  pipeline, and it is the second consumer of `gradient.rs`'s shared SOR kernel. Own
+  `MODULE_README.md`.
 - `region_edit_test.rs`: development-only mask-inpaint pipeline test tool; it is not exported by
   `mod.rs`.
 - `region_edit_v2/`: the on-canvas region-editing FRAMEWORK (frame, mask layers, geometry,
@@ -251,13 +264,38 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   and `draw_main_panel`. `draw_main_panel` runs inside `CanvasView::draw` and therefore may
   mutate only the tool itself — a button there raises a flag consumed by the next
   `draw_overlay_ui`, the `CleaningDockOut` rule at tool scope.
-- `capture_overlay_chunk`, `overlay_rect_to_scene_rect`, `scene_pointer_to_image_px` and
-  `scene_pos_to_source_xy` are `pub(super)` free functions of `base.rs`: the whole `tools`
-  subtree reuses them, and a copy of any of them in a tool is a defect.
+- `capture_overlay_chunk`, `extract_overlay_chunk`, `overlay_rect_to_scene_rect`,
+  `scene_pointer_to_image_px`, `scene_pos_to_source_xy`, `scene_pos_to_overlay_pos`,
+  `overlay_pos_to_scene_pos` and `overlay_pixel_for_final_color` are `pub(super)` free functions of
+  `base.rs`: the whole `tools` subtree reuses them, and a copy of any of them in a tool is a defect.
+  `scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos` are the FRACTIONAL point pair and exact
+  inverses of each other; `scene_pos_to_source_xy` is the rounding, non-`Option` variant that takes
+  an explicit page rect and source size instead of resolving them from the canvas.
 - An on-canvas tool must NOT return `true` from `block_canvas_zoom()`: that flag also disables
   the clean-overlay undo shortcuts (`tab.rs`), which is acceptable for a modal editor window but
   not for a surface that lives on the canvas for a whole session. Block precisely instead
   (`captures_canvas_pointer` over the surface, drag-scroll only while a drag is live).
+- A tool that drives its gesture through the TAB'S STROKE PIPELINE must also leave
+  `captures_canvas_pointer()` `false`: the tab ORs that flag into `canvas_pointer_occluded` and
+  then calls `finish_stroke()` and returns, so a capturing tool receives no stroke, key or cursor
+  callback at all. `region_edit_v2` can capture only because it senses everything through its own
+  `Area` and sets `wants_primary_stroke() = false`; `patch/` does the opposite and therefore pins
+  BOTH flags to `false` with tests.
+- A surface that must stay visible while the pointer is elsewhere is painted from
+  `draw_overlay_ui` through `ctx.layer_painter(LayerId::new(Order::Middle, …))`, never from
+  `draw_cursor`, which is pointer-gated. A bare layer painter registers no interactable `Area`, so
+  it neither occludes canvas input nor trips the tab's z-order check.
+- On-canvas geometry is stored in PAGE pixels and re-projected every frame. A stored screen
+  rectangle drifts the moment the canvas scrolls or zooms — the same rule `region_edit_v2` states
+  for its frame, and the reason `patch/` keeps its polygon in page pixels.
+- Gradient-domain / Laplace maths belongs to ONE kernel: `gradient.rs::red_black_sor_sweeps`.
+  A tool wanting a harmonic or screened-Poisson solve builds `lam`/`denom`/`u0` around it
+  (`lam = 0` inside the region, a large `lam` to pin known values) and pads its region by at least
+  one pixel, because the kernel never writes its border. A second SOR implementation is a defect.
+- Polygon/lasso rasterization belongs to `crate::tools::fill_polygon_spans`, shared with the
+  PS-editor's selection; its sampling rule (scanline centre, even-odd, inclusive clamped span ends)
+  is a contract, so a tool that also tests "is this point inside the selection" must use the same
+  even-odd rule or the two answers disagree at the edges.
 
 ## Editing map
 - To add a new cleaning tool, implement `CleaningTool`, export it from `mod.rs`, and register it in
@@ -271,6 +309,9 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `base.rs`.
 - To change direct paint behavior, edit `zamazka.rs`; to change alt-version or current-page
   stamping, edit `stamp.rs`.
+- To change the patch tool — its selection gesture, its ROI/refusal geometry or its commit — edit
+  `patch/mod.rs`; to change the seamless-cloning maths (pyramid, sweep schedule, Dirichlet weight,
+  blend modes, feather ramp), edit `patch/membrane.rs`. Read `patch/MODULE_README.md` first.
 - To change local fill/inpaint algorithms, edit `gradient.rs` or `texture_synthesis.rs`.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
   settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
