@@ -74,14 +74,15 @@ are never persisted — they mirror
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
 ## Files and submodules
-- `mod.rs`: `PsEditorTabState` orchestration — panels (page switch / toolbar / layers), canvas
+- `mod.rs`: `PsEditorTabState` orchestration — the five dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
   copy/cut menu (`clip_into_new_layer`), layer/group save+load via `models::layer_model`,
   `merge_down` (`composite_to_page` flattens a raster onto the raster directly beneath it by unified
   BAND-Z — `raster_below_by_band_z` / `raster_below_uid`, NOT the layer-stack neighbour, so a manual
   reorder merges the visually-below pair; base layers are never a target), and tab-local hotkeys
-  (`B`/`M`/`L`, `Ctrl+D`).
-  - **Unified layers panel** (`draw_layers_panel` → `layers_panel_body`): a Photoshop-like tree of
+  (`B`/`M`/`L`/`V`, `Ctrl+D`, and undo/redo — the «Горячие клавиши» tab lists the same set,
+  built next to `handle_hotkeys` so the two cannot drift).
+  - **Unified layers panel** (the «Слои» dock tab → `layers_panel_body`): a Photoshop-like tree of
     compact rows (visibility eye + name + group indent), built each frame by `tree::build_unified_tree`
     into an owned snapshot so the render loop can mutate `panel_selection` without borrowing the
     stack. Collapsible/movable groups may mix rasters and texts; text overlays are interleaved by Z in
@@ -89,7 +90,10 @@ layer-model roadmap (groups, text layers, effects, typing-tab sync).
     Shift = range (`select_row`). A right-click menu groups the selection (`GroupOp` → `apply_group_op`
     → `persist::save_page_grouping`): create / move-to-existing / ungroup / delete. Per-row detail
     (opacity, fx, merge, delete, pin, rasterize) lives in the **active-layer controls strip** at the
-    bottom (`draw_active_controls`, keyed on `panel_primary`). Reordering routes through the unified
+    bottom (`draw_active_controls`, keyed on `panel_primary`). The body has NO scroll area and no
+    hand-computed height reserve of its own: the dock already draws every tab body inside a bounded
+    `ScrollArea::both` and sizes the panel from the CONTENT's measured height, so a nested
+    fixed-height scroll area would fight that measurement. Reordering routes through the unified
     band order: `build_unified_order` produces a contiguous order (groups pulled to their lowest
     member Z), `move_band_one` / `move_group_block` swap a band / a whole group block. Group
     collapse/visibility/opacity are stack-only (folded live in `draw_composite`, persisted on
@@ -160,6 +164,72 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   (diff → `Layer.image` + `base_image` mirror), `copy_region_premul` (region-local buffer), and
   `apply_field_patch_to_layer` (drives a `Layer` field to a patch's `after`; also the no-doc fallback).
 
+## Panels: five dock tabs over a full-area canvas
+This tab hosts the app-owned panel dock (`src/widgets/panel_dock/`) and is its first NON-canvas
+consumer. There are no static `egui::Panel`s: the canvas fills the whole program-tab area as the
+BACKGROUND and five floating dock tabs sit over it.
+
+| tab id (stable, non-localized) | caption key | body |
+|---|---|---|
+| `ps_editor.main` | `ps_editor.tab.main` | page switch, «Вписать» / «100%», zoom readout, load / effects spinners, `load_error`, and the «Панели…» menu |
+| `ps_editor.tools` | `ps_editor.tab.tools` | the tool selector grouped by `PsToolSection::ORDER`, plus «Выделить слой полностью» / «Снять выделение» |
+| `ps_editor.active_tool` | `ps_editor.tab.active_tool` | the active tool's `options_ui`, or `ps_editor.active_tool.no_options` when `PsTool::has_options` is false |
+| `ps_editor.hotkeys` | `ps_editor.tab.hotkeys` | the active tool's `hotkey_rows`, then `ps_editor_common_hotkey_rows` |
+| `ps_editor.layers` | `ps_editor.tab.layers` | `layers_panel_body` + `draw_active_controls` |
+
+The tab ids are PERSISTENCE identities (they key the panel inside `user_config.json` and inside
+`PanelDockState`), so they stay non-localized literals — a §A9 i18n exclusion
+(`dev-docs/i18n_exclusions.md`).
+
+**Default arrangement** (`ps_editor_default_dock_layout`, registered in
+`app.rs::panel_dock_default_layout_builders`): two columns. Left — «PS редактор» on the viewport's left
+edge, «Инструменты» below it, «Выбранный инструмент» below that. Right — «Слои» on the viewport's
+right edge, «Горячие клавиши» below it. No size is pinned there; each tab declares its own
+`min_size` / `initial_size` per frame. The builder must name EVERY tab this program tab can
+declare: `panel_dock::persist` resolves stored tab keys against it.
+
+**Visibility.** Four booleans, all defaulting to `true`, live in the MAIN tab's `TabExtras` bag
+under `panels.tools` / `panels.active_tool` / `panels.hotkeys` / `panels.layers`. They are read off
+the dock state BEFORE the tabs are declared (`PsEditorPanelVisibility::read`) — reading them from a
+body would show a hidden panel for one frame — and written back from the main tab's body, which is
+the only one declared with `show_with_extras`. That write is what raises `changed` → `dirty` → the
+persistence write; no other machinery is involved. All five tabs are declared on EVERY frame
+regardless: a hidden tab keeps its slot, a skipped declaration would lose it. «PS редактор» is never in
+the menu — the menu lives in it.
+
+**Frame order** (`PsEditorTabState::draw`, which takes the app's `&mut PanelDockState` as a lent-in
+parameter): resolve ONE `area_rect` (used as both the `DockArea` rect and the canvas rect) →
+`ensure_default_layout` → read the visibility flags → build `PsEditorDockCx` → declare the five
+tabs → `dock.end` → store `PanelDockOutput::drawn_panels` rects into `panel_rects` and apply the
+deferred `PanelActions` → draw the effects-editor window → draw the canvas LAST over `area_rect`.
+The canvas still ends up UNDERNEATH: panels live on `Order::Foreground` areas while the canvas
+paints into the `Ui`'s `Order::Background` layer and egui composites by layer order, not by call
+order (`egui-docs/06-overlays.md`). Drawing it last is what lets the input gate use THIS frame's
+panel rects instead of the previous frame's.
+
+`PsEditorDockCx` lends `&mut PsEditorTabState` as a whole rather than disjoint field borrows: every
+body needs the tab state, and the dock's own frame-long borrow is of the LENT-IN `PanelDockState`,
+so the two are disjoint by construction. The layers body still defers its mutations through the
+tab's existing `PanelActions`, applied after `dock.end`.
+
+**Input gating.** `canvas_pointer_occluded` = an open popup, or `pointer_in_any_panel` over this
+frame's `panel_rects`, or anything above `Order::Background` at the pointer. It gates `hovered`,
+and through it the wheel, the zoom anchor and the routing to the active tool. Panning is
+deliberately NOT gated: the gate answers where the pointer is right now, and a pan begun on bare
+canvas must survive the pointer crossing a panel.
+
+The same gate hides the ACTIVE TOOL'S CURSOR PREVIEW: `overlay_pointer` (pure, unit-tested) drops
+`draw_overlay`'s pointer when it is occluded and `PsTool::gesture_in_flight` is false, on top of the
+`rect.contains` filter it keeps. Gating input alone left the brush circle painted under a panel over
+a canvas that refused the click. The in-flight term is asked of the TOOL and must never be replaced
+by `input.primary_down`: a press that BEGINS on a panel holds the button down too and the tools
+correctly refuse it, so that substitution reintroduces the bug in exactly the reported case.
+
+**The hint grid is a deliberate local duplicate.** `draw_hotkey_rows_grid` re-implements the
+canvas' `CanvasScene::draw_hint_rows_grid` in ~10 lines. That helper is private to the canvas impl,
+this tab is not a canvas tab, and lifting it into a shared widget would be a refactor of another
+subsystem for no gain here. The duplication is recorded here so it stays deliberate.
+
 ## Undo/redo (brush strokes + structural/metadata ops)
 - The tab owns a per-page `ActionHistory<PsEditOp>` (`history`) bounded by `PS_EDITOR_UNDO_LIMIT`
   steps AND a compressed byte budget (`MemoryBudget::ps_editor_undo_bytes`). No live `MemoryProfile`
@@ -228,7 +298,7 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   — `format!("Слой {n}")` (`layers.rs::add_raster_layer`), `format!("Группа {n}")`,
   `format!("Запечён: {name}")`, and the clip names `"Копия"`/`"Вырезка"` — are therefore left as
   stable Russian literals and NOT routed through the `t!`/`tf!` UI catalog (a §A-class i18n exclusion;
-  see `docs/i18n_exclusions.md` §A). Base-layer names (`"Исходник"`/`"Клин"`) are display-only —
+  see `dev-docs/i18n_exclusions.md` §A). Base-layer names (`"Исходник"`/`"Клин"`) are display-only —
   `persist_current_page` filters to `LayerKind::Raster` — so they ARE localized.
 - Non-destructive raster effects render off the GUI thread. `apply_effects_to_raster` parses the
   chain, clones the pre-effects base ColorImage (dropping the stack borrow first), and spawns
@@ -299,6 +369,12 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   `layers.rs` (`LayerTransform`, `local_to_world`/`world_to_local`/`world_corners`).
 - To change move/rotate/scale behavior or the gizmo, edit `tools/transform.rs`.
 - To change "select layer fully", edit `select_active_layer_fully` in `mod.rs`.
+- To change which panels exist, where they start, or what the «Панели…» menu offers, edit
+  `ps_editor_default_dock_layout` / `PsEditorPanelVisibility` / `ps_editor_panels_menu` in `mod.rs`
+  (and register the builder in `app.rs::panel_dock_default_layout_builders`).
+- To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
+  (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
+  / `layers_panel_body`).
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /
   `draw_group_row` / `draw_leaf_row` in `mod.rs`. To change grouping ops, edit `apply_group_op` +
   `persist::save_page_grouping`. To change reorder behavior, edit `build_unified_order` /
@@ -312,8 +388,11 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - To change the selection combination modes or the boundary tracer, edit `selection.rs`
   (`SelectionOp`, `apply_rect` / `apply_polygon`, the pixel-edge tracer). To change the lasso
   gesture (Photoshop modes at press, Alt straight segments, Esc / Backspace), edit
-  `SelectTool::step` in `tools/select.rs`. To change the toolbar sections, edit `PsToolSection` /
-  `PsToolId::section` (`tools/mod.rs`) and `draw_toolbar` (`mod.rs`).
+  `SelectTool::step` in `tools/select.rs`. To change the tool sections, edit `PsToolSection` /
+  `PsToolId::section` (`tools/mod.rs`) and `tools_tab_contents` (`mod.rs`).
+- To change a TAB-LEVEL shortcut, edit `handle_hotkeys` AND `ps_editor_common_hotkey_rows` next to
+  it in `mod.rs` — they are deliberately adjacent so the dispatched keys and the displayed list
+  cannot drift. A TOOL's shortcuts belong to its own `PsTool::hotkey_rows`.
 - To change the copy/cut menu or its compositing/cut rules, edit `draw_selection_menu`,
   `clip_op_submenu`, `clip_layer_picker`, and `clip_into_new_layer` in `mod.rs`.
 - To change the raster effects pipeline (off-thread render, recenter, persist), edit

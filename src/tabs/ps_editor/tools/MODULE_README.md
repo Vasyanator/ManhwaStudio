@@ -15,13 +15,71 @@ tab orchestration beyond registration.
   resolved pointer/button state in image pixel coordinates, the frame's `egui::Modifiers`, and the
   two gesture-control keys (`cancel_pressed` = Esc, `remove_point_pressed` = Backspace/Delete).
 - `ToolOutcome`: what changed (image-space `DirtyRect` for tile invalidation, `selection_changed`).
+- `PsHotkeyRow`: one `(action, keys)` row of the tab's «Горячие клавиши» panel. Both halves are
+  ALREADY LOCALIZED by the tool that built the row, so a language-dependent key name stays owned by
+  the tool; the panel only lays the pair out as a two-column grid.
 - `PsTool`: `interact` (one frame of input), `draw_overlay` (screen-space cursor/preview),
-  `options_ui` (tool panel controls), the two gesture-lifecycle hooks `reset` / `freeze` (both
-  default to a no-op), and the `as_brush_mut` downcast hook used by the tab to forward brush
-  wheel/size gestures without a full `Any` downcast.
+  `has_options` + `options_ui` (the «Выбранный инструмент» panel's pair), `hotkey_rows` (the tool's
+  own shortcut inventory), `gesture_in_flight` (REQUIRED, see below), the two gesture-lifecycle
+  hooks `reset` / `freeze` (both default to a no-op), and the `as_brush_mut` downcast hook used by
+  the tab to forward brush wheel/size gestures without a full `Any` downcast.
 
 Tools never touch GPU textures, files, shared models, or the backend. They mutate the in-memory
 stack/selection only; the tab converts `ToolOutcome::dirty` into `TiledTexture` re-uploads.
+
+**A gesture may not START outside the canvas viewport, but one already in flight may leave it.**
+Since the tab's panels FLOAT over the canvas, `PsToolContext::pointer_in_viewport` is false wherever
+a dock panel covers the pointer, and a tool that only checks the press frame paints under a panel:
+the tab already suppresses `primary_pressed` off-viewport, so such a check is dead code and the
+gesture starts anyway. Gate on the tool's own in-flight marker instead (`BrushTool::last_world`),
+which blocks a start on EVERY frame while letting a stroke crossing a panel continue — the same rule
+the tab applies to panning.
+
+The tool's CURSOR PREVIEW obeys the same rule, and `PsTool::gesture_in_flight` is how it does.
+`draw_overlay`'s pointer is dropped by the tab (`../mod.rs`, `overlay_pointer`) whenever the pointer
+is occluded AND no gesture is running: a brush circle that keeps tracking under a panel advertises a
+stroke the tools already refuse to start there. `gesture_in_flight` is REQUIRED with no default body
+(like `hotkey_rows` and `has_options`) because only the tool knows what an accepted gesture is:
+`BrushTool::last_world`, `SelectTool::gesture`, `TransformTool`/`DeformTool::drag` — never a per-frame
+overlay cache (`gizmo`, `handles`) and never `SelectTool::last_pointer`, which outlives a commit.
+Two answers must not be given: `true` for a press the tool itself REFUSED (the button is held there
+too, which is why the tab must not substitute `primary_down` for this method — that is the exact bug
+it was added to fix), and `false` for the lasso's PENDING POLYGON, which is a live gesture with the
+button up and would otherwise lose its rubber band every time the cursor crossed a panel.
+
+## Shortcut inventory (`hotkey_rows`) — required, never defaulted
+`hotkey_rows` has NO default body on purpose. A tool is the only place that knows which keys and
+mouse gestures it interprets, so a new tool is forced by the compiler to state them; a defaulted
+empty list would silently ship an undocumented tool, and that is exactly the failure this method
+exists to prevent. Returning an empty `Vec` is the explicit way to say "this tool has none".
+
+**Hint text lives in `hotkey_rows`, never in `options_ui`.** `options_ui` is for controls that
+change a parameter (the brush colour/radius/erase, the selection `mode_row`); a `ui.label` that
+merely describes a key or a drag belongs in a row instead, because the panel renders rows as a
+two-column grid and a sentence like "Shift adds, Alt subtracts" cannot be laid out there. Split
+such a sentence into one row per shortcut. Both halves of a row must be non-empty — the unit tests
+in `mod.rs` assert it against the reference (`en`) catalog, so an empty translation there fails
+that test. A missing translation in another catalog falls back to `en` and is not caught here.
+
+Rows are rebuilt on every call, so a runtime language switch is reflected without any invalidation.
+
+## Parameters (`has_options` / `options_ui`) — the pair, and which half is required
+`has_options` is REQUIRED with no default body, for the same reason as `hotkey_rows`: only the tool
+knows whether it owns a parameter, so a new tool is forced by the compiler to answer. It is the
+«Выбранный инструмент» panel's ONLY question — a `false` makes the panel print
+`ps_editor.active_tool.no_options` and never call `options_ui`.
+
+`options_ui` therefore DEFAULTS to a no-op, and a tool answering `false` does not implement it at
+all. `TransformTool` and `DeformTool` are exactly that case: they have no parameters, only
+positional gizmo drags, and those are `hotkey_rows`. `BrushTool` (colour / radius / eraser) and
+`SelectTool` (the persistent combination mode) answer `true`.
+
+Answer `true` only for a control that CHANGES a parameter. A label describing a key or a drag is a
+row, not an option — see the section above.
+
+Scope boundary: a tool lists only keys it handles ITSELF. Tab-level shortcuts (the B/M/L/V tool
+letters, Ctrl+D, undo/redo, pan, zoom) belong to `PsEditorTabState::handle_hotkeys` in `../mod.rs`
+and are appended by the panel, not by a tool.
 
 ## Gesture lifecycle (`reset` / `freeze`)
 A gesture can span many frames and can end with the button UP (the pending lasso polygon), so the
@@ -92,8 +150,15 @@ another page); `TransformTool` / `DeformTool` drop their control drag and per-fr
   needed. `draw_overlay` receives the `ViewTransform` to map image→screen.
 
 ## Editing map
-- To add a tool: implement `PsTool`, add a `PsToolId`, give it a `PsToolSection`, and register it in
-  `PsEditorTabState::default`. Add a hotkey in `PsEditorTabState::handle_hotkeys` if wanted.
+- To change when the tool's cursor preview is hidden, edit `overlay_pointer` in `../mod.rs` (the
+  pure decision, unit-tested there) and the tools' `gesture_in_flight`.
+- To add a tool: implement `PsTool` (including the REQUIRED `hotkey_rows` and `gesture_in_flight`),
+  add a `PsToolId`, give
+  it a `PsToolSection`, register it in `PsEditorTabState::default`, and add it to the
+  `registered_tools` fixture in `mod.rs`'s tests. Add a hotkey in
+  `PsEditorTabState::handle_hotkeys` if wanted.
+- To change what the «Горячие клавиши» panel shows for a tool, edit that tool's `hotkey_rows` —
+  never `options_ui`.
 - To change brush behavior (color, size, erase, clipping), edit `brush.rs`.
 - To change selection shapes or mask combination, edit `select.rs` and `super::selection`.
 - To change how a gesture starts/ends (keys, Alt semantics, pending polygon, the frozen-resume
@@ -102,4 +167,4 @@ another page); `TransformTool` / `DeformTool` drop their control drag and per-fr
 - To change when a gesture is abandoned or frozen, edit `PsEditorTabState::set_active_tool` /
   `reset_active_tool` and the canvas routing gate in `../mod.rs`, plus the tools' `reset`/`freeze`.
 - The selection-mode row is a label plus a WRAPPING button row (`ui.horizontal_wrapped`): the tool
-  panel is a fixed 220 px `Panel::left` that the four localized mode names overflow on one line.
+  panel is narrow and the four localized mode names overflow a single line in several languages.

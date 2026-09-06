@@ -10,10 +10,17 @@ Current state: **phases 0–6**. The pure layer (`model.rs`, `solver.rs`, `drag.
 `cross_window.rs`), the widget
 layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` including the reorganisation
 gestures, the persistence layer (`persist.rs`) and the detached OS windows (`window.rs`). The
-production consumers are the three CANVAS program tabs: «Текст», whose eight tabs plus the canvas'
-own «Лента» live in seven default panels, «Клининг», whose «Клин» / «Инструменты клина» /
-«Выбранный инструмент» / «Быстрый клин найденного текста» join «Лента» in five default panels, and
-«Перевод», whose «Последние персонажи» joins «Лента» in two default panels.
+production consumers are FOUR program tabs. Three of them are CANVAS tabs: «Текст», whose eight
+tabs plus the canvas' own «Лента» live in seven default panels, «Клининг», whose «Клин» /
+«Инструменты клина» / «Выбранный инструмент» / «Быстрый клин найденного текста» join «Лента» in
+five default panels, and «Перевод», whose «Последние персонажи» joins «Лента» in two default
+panels. The fourth, «PS редактор», is the first NON-canvas consumer: it declares no «Лента», its
+five tabs («PS редактор» / «Инструменты» / «Выбранный инструмент» / «Горячие клавиши» / «Слои») live in
+five default panels over its own full-area editing surface, and it therefore supplies its OWN
+`DockArea::rect` — `canvas::dock_area_rect` reserves the shared canvas' scrollbar strip, which that
+tab does not have. It is also the first consumer to drive panel VISIBILITY from `TabExtras`: four
+flags stored on its «PS редактор» tab, read off the state before the declarations and toggled from that
+tab's «Панели…» menu.
 The dedicated canvas-controls anchor those panels used to hang off is gone with the panel it named;
 only its STORED tag survives, decode-only, so an arrangement written by an older build still loads
 (see «A retired stored tag must keep DECODING» below).

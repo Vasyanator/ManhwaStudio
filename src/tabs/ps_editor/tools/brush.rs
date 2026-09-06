@@ -10,11 +10,18 @@ Key structures:
 - `BrushTool`: brush radius (via `MaskBrush`), color, erase flag, and in-stroke state.
 
 Notes:
+The radius shortcuts (Shift+wheel, `-`, `=`/`+`) live in `crate::tools::MaskBrush`; `hotkey_rows`
+publishes them to the tab's shortcut panel and must stay in sync with that implementation.
 Stamping replaces pixels with the brush color (hard round brush). Erasing writes transparent
 pixels. When a selection is active, pixels outside it are left untouched.
+
+A stroke may only START while the pointer is on bare canvas (`PsToolContext::pointer_in_viewport`);
+once in flight it keeps painting even when the pointer crosses a floating dock panel. See the guard
+in `interact`. `PsTool::gesture_in_flight` publishes that same `last_world` marker so the tab can
+apply the identical rule to the brush-size CURSOR CIRCLE.
 */
 
-use super::{DirtyRect, PsTool, PsToolContext, PsToolId, ToolOutcome};
+use super::{DirtyRect, PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome};
 use crate::tabs::ps_editor::layers::Layer;
 use crate::tabs::ps_editor::selection::Selection;
 use crate::tabs::ps_editor::viewport::ViewTransform;
@@ -68,6 +75,15 @@ impl PsTool for BrushTool {
         t!("ps_editor.tools.brush_title")
     }
 
+    /// A stroke is in flight exactly while `last_world` holds a point.
+    ///
+    /// It is the same marker the start gate in `interact` reads, so the two can never disagree: a
+    /// press the gate refused leaves `last_world == None` and is correctly reported as "no gesture",
+    /// even though the button is held.
+    fn gesture_in_flight(&self) -> bool {
+        self.last_world.is_some()
+    }
+
     /// Ends any in-progress stroke by forgetting its last point.
     ///
     /// `last_world` is the start of the next painted segment, so a stroke that survived a tool or
@@ -76,6 +92,12 @@ impl PsTool for BrushTool {
         self.last_world = None;
     }
 
+    /// Paints one frame of the stroke and reports the region it touched.
+    ///
+    /// Two gates decide whether anything is painted: the primary button must be DOWN, and a stroke
+    /// may only be STARTED while the pointer is inside the canvas viewport. A stroke already in
+    /// flight keeps painting wherever the pointer goes — including over a floating dock panel —
+    /// and ends on the first frame the button is up.
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
         use crate::trace::cat;
         let mut outcome = ToolOutcome::default();
@@ -98,7 +120,17 @@ impl PsTool for BrushTool {
         let Some(pointer) = ctx.pointer_image else {
             return outcome;
         };
-        if !ctx.pointer_in_viewport && ctx.primary_pressed {
+        // A stroke may only BEGIN on bare canvas, on EVERY frame — never only on the frame of the
+        // press. `last_world` is the in-flight marker: while it is `None` no stroke exists, so a
+        // pointer outside the viewport must not start one. Gating on `primary_pressed` instead (as
+        // this did) cannot work at all: the tab hands the tool
+        // `primary_pressed && pointer_in_viewport` (`../mod.rs`, `draw_canvas`), so over a floating
+        // panel that flag is already false, the guard never fired, and `last_world == None` made
+        // the frame begin a fresh stroke under the panel — which then committed to undo and to the
+        // shared `LayerDoc` on release.
+        // Once a stroke IS in flight it continues even when the pointer crosses a panel, mirroring
+        // the tab's panning decision (a gesture begun on bare canvas survives the crossing).
+        if self.last_world.is_none() && !ctx.pointer_in_viewport {
             return outcome;
         }
 
@@ -181,6 +213,11 @@ impl PsTool for BrushTool {
         Some(self)
     }
 
+    /// Colour, radius and the eraser toggle are real parameters.
+    fn has_options(&self) -> bool {
+        true
+    }
+
     fn options_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(t!("ps_editor.tools.brush_color_label"));
@@ -197,6 +234,26 @@ impl PsTool for BrushTool {
             self.brush.set_radius_px(radius);
         }
         ui.checkbox(&mut self.erase, t!("ps_editor.tools.brush_eraser_label"));
+    }
+
+    /// The three radius shortcuts the brush actually owns, mirroring `crate::tools::MaskBrush`:
+    /// Shift+wheel steps the radius (`handle_wheel`), `-` scales it by 0.9 and `=`/`+` by 1.1
+    /// (`handle_size_shortcuts`). Painting itself is a plain drag and needs no row.
+    fn hotkey_rows(&self) -> Vec<PsHotkeyRow> {
+        vec![
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.brush.radius_wheel_label"),
+                t!("ps_editor.tools.hotkey.brush.radius_wheel_keys"),
+            ),
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.brush.radius_down_label"),
+                t!("ps_editor.tools.hotkey.brush.radius_down_keys"),
+            ),
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.brush.radius_up_label"),
+                t!("ps_editor.tools.hotkey.brush.radius_up_keys"),
+            ),
+        ]
     }
 }
 
@@ -338,5 +395,188 @@ fn segment_dirty_rect(
         min_y,
         max_x,
         max_y,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::ps_editor::layers::LayerStack;
+    use egui::Rect;
+
+    /// Page size of the fixture, in px. Large enough that a small brush stamp lands well inside it.
+    const PAGE: [usize; 2] = [64, 64];
+
+    /// A page with the two locked base layers plus one blank, directly editable raster on top,
+    /// which `add_raster_layer` also makes active — the layer the brush is allowed to paint.
+    fn stack_with_blank_raster() -> LayerStack {
+        let mut stack = LayerStack::new(
+            0,
+            PAGE,
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+        );
+        stack.add_raster_layer();
+        stack
+    }
+
+    /// A brush with a small radius, so one stamp stays inside the fixture page and two stamps at
+    /// different positions cover measurably different pixel counts.
+    fn small_brush() -> BrushTool {
+        let mut tool = BrushTool::default();
+        tool.brush.set_radius_px(2);
+        tool
+    }
+
+    /// Number of non-transparent pixels of the stack's active raster.
+    fn painted_pixels(stack: &LayerStack) -> usize {
+        stack.layer(stack.active_id()).map_or(0, |layer| {
+            layer.image.pixels.iter().filter(|px| px.a() != 0).count()
+        })
+    }
+
+    /// Runs ONE frame of `interact` with the pointer state the tab would hand the tool.
+    ///
+    /// `primary_pressed` is deliberately masked with `in_viewport`: `draw_canvas` passes
+    /// `input.primary_pressed && pointer_in_viewport` (`../mod.rs`), so a press landing on a
+    /// floating panel reaches the tool with `primary_pressed == false`. Letting a test set that
+    /// combination freely would let it assert a state the tab cannot produce.
+    fn frame(
+        tool: &mut BrushTool,
+        stack: &mut LayerStack,
+        pointer: Pos2,
+        in_viewport: bool,
+        pressed: bool,
+        down: bool,
+    ) -> ToolOutcome {
+        let mut selection = None;
+        let page_size = stack.size();
+        let mut ctx = PsToolContext {
+            page_size,
+            pointer_image: Some(pointer),
+            pointer_in_viewport: in_viewport,
+            primary_pressed: pressed && in_viewport,
+            primary_down: down,
+            primary_released: false,
+            modifiers: egui::Modifiers::default(),
+            cancel_pressed: false,
+            remove_point_pressed: false,
+            // Identity view: screen and world coordinates coincide, so the fixture can name pixels.
+            view: ViewTransform {
+                viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(64.0, 64.0)),
+                zoom: 1.0,
+                center_world: Vec2::new(32.0, 32.0),
+            },
+            stack,
+            selection: &mut selection,
+        };
+        tool.interact(&mut ctx)
+    }
+
+    /// A press that lands on a floating dock panel must not paint — not on the press frame, and
+    /// not on any held-button frame after it.
+    ///
+    /// This is what the old `!pointer_in_viewport && primary_pressed` guard could not do: the tab
+    /// masks `primary_pressed` with `pointer_in_viewport`, so that condition was never true and
+    /// every one of these frames found `last_world == None` and began a stroke under the panel.
+    #[test]
+    fn a_press_outside_the_viewport_never_starts_a_stroke() {
+        let mut tool = small_brush();
+        let mut stack = stack_with_blank_raster();
+        let under_panel = Pos2::new(32.0, 32.0);
+
+        let press = frame(&mut tool, &mut stack, under_panel, false, true, true);
+        assert!(press.dirty.is_none(), "the press frame must not paint under a panel");
+        for held in 0..3 {
+            let outcome = frame(&mut tool, &mut stack, under_panel, false, false, true);
+            assert!(
+                outcome.dirty.is_none(),
+                "held frame {held} must not paint under a panel"
+            );
+        }
+        assert_eq!(
+            painted_pixels(&stack),
+            0,
+            "no pixel of the active layer may change while the stroke was never allowed to start"
+        );
+    }
+
+    /// The other half of the contract: only the START is gated. A stroke begun on bare canvas keeps
+    /// painting when the pointer crosses a floating panel, mirroring the tab's panning decision.
+    #[test]
+    fn a_stroke_begun_inside_the_viewport_survives_the_pointer_crossing_a_panel() {
+        let mut tool = small_brush();
+        let mut stack = stack_with_blank_raster();
+
+        let press = frame(&mut tool, &mut stack, Pos2::new(16.0, 16.0), true, true, true);
+        assert!(press.dirty.is_some(), "a press on bare canvas paints");
+        let after_press = painted_pixels(&stack);
+        assert!(after_press > 0, "the press stamp is on the layer");
+
+        let crossing = frame(&mut tool, &mut stack, Pos2::new(48.0, 16.0), false, false, true);
+        assert!(
+            crossing.dirty.is_some(),
+            "a stroke in flight continues while the pointer is over a panel"
+        );
+        assert!(
+            painted_pixels(&stack) > after_press,
+            "the segment dragged across the panel must be painted"
+        );
+    }
+
+    /// `gesture_in_flight` must track the STROKE, not the button: it is what the tab asks before it
+    /// lets the brush circle keep following a pointer that moved over a floating panel.
+    #[test]
+    fn gesture_in_flight_follows_the_stroke_from_press_to_release() {
+        let mut tool = small_brush();
+        let mut stack = stack_with_blank_raster();
+
+        assert!(!tool.gesture_in_flight(), "a fresh brush holds no stroke");
+        frame(&mut tool, &mut stack, Pos2::new(16.0, 16.0), true, true, true);
+        assert!(tool.gesture_in_flight(), "the accepted press starts a stroke");
+        frame(&mut tool, &mut stack, Pos2::new(48.0, 16.0), false, false, true);
+        assert!(tool.gesture_in_flight(), "the stroke survives crossing a panel");
+        frame(&mut tool, &mut stack, Pos2::new(48.0, 16.0), true, false, false);
+        assert!(!tool.gesture_in_flight(), "the release ends the stroke");
+    }
+
+    /// The case a `primary_down` test at the call site would get wrong: a press that LANDS on a
+    /// floating panel holds the button down too, but the start gate refused it, so no gesture
+    /// exists and the preview must not be kept alive under the panel.
+    #[test]
+    fn a_refused_press_never_reports_a_gesture_in_flight() {
+        let mut tool = small_brush();
+        let mut stack = stack_with_blank_raster();
+        let under_panel = Pos2::new(32.0, 32.0);
+
+        frame(&mut tool, &mut stack, under_panel, false, true, true);
+        assert!(!tool.gesture_in_flight(), "a refused press starts no gesture");
+        for held in 0..3 {
+            frame(&mut tool, &mut stack, under_panel, false, false, true);
+            assert!(!tool.gesture_in_flight(), "held frame {held} must stay gesture-free");
+        }
+    }
+
+    /// Releasing ends the stroke, so the start gate is armed again: a finished stroke must not let
+    /// a later press over a panel paint.
+    #[test]
+    fn a_release_re_arms_the_start_gate() {
+        let mut tool = small_brush();
+        let mut stack = stack_with_blank_raster();
+
+        frame(&mut tool, &mut stack, Pos2::new(16.0, 16.0), true, true, true);
+        // Button up: `interact` clears `last_world`, ending the stroke.
+        frame(&mut tool, &mut stack, Pos2::new(16.0, 16.0), true, false, false);
+        let after_stroke = painted_pixels(&stack);
+
+        let press = frame(&mut tool, &mut stack, Pos2::new(48.0, 48.0), false, true, true);
+        assert!(press.dirty.is_none(), "the next press under a panel must not paint");
+        let held = frame(&mut tool, &mut stack, Pos2::new(48.0, 48.0), false, false, true);
+        assert!(held.dirty.is_none(), "nor may the frame after it");
+        assert_eq!(
+            painted_pixels(&stack),
+            after_stroke,
+            "the layer must still hold exactly the pixels of the finished stroke"
+        );
     }
 }

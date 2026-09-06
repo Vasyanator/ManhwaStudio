@@ -10,15 +10,17 @@ placement is unchanged until the user drags a handle. Base layers are locked and
 
 Key structures:
 - `DeformTool`: the active grid-point drag plus a per-frame cache of handle positions for the
-  overlay.
+  overlay. `drag` is the in-flight marker `PsTool::gesture_in_flight` reports; the cache is not.
 
 Notes:
+The tool has NO options and no keys: a handle is grabbed positionally, and that gesture is listed
+by `PsTool::hotkey_rows` for the shortcut panel rather than printed as hint labels in `options_ui`.
 This is the basic grid-point drag path (Phase 5 scope): each handle moves a single control point.
 The richer perspective / bend / sampled-edge handle modes from the typing tab are not wired here;
 this delivers a usable, model-consistent raster deform that round-trips through the doc and disk.
 */
 
-use super::{PsTool, PsToolContext, PsToolId, ToolOutcome};
+use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome};
 use crate::models::layer_model::manifest::DeformRec;
 use crate::tabs::ps_editor::viewport::ViewTransform;
 use eframe::egui;
@@ -78,6 +80,16 @@ impl PsTool for DeformTool {
 
     fn title(&self) -> &'static str {
         t!("ps_editor.tools.deform_title")
+    }
+
+    /// A gesture is in flight exactly while a control-point drag is held.
+    ///
+    /// `drag` is set only by a press `interact` accepted (`primary_pressed && pointer_in_viewport`
+    /// AND landing on a handle) and is taken on the first frame with the button up, so a press on a
+    /// floating panel never reports `true`. `handles` / `grid_dims` are per-frame overlay caches,
+    /// not gesture state, and are deliberately not consulted.
+    fn gesture_in_flight(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Drops the in-progress control-point drag and the per-frame handle cache.
@@ -217,10 +229,145 @@ impl PsTool for DeformTool {
         }
     }
 
-    fn options_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(t!("ps_editor.tools.deform_hint_line1"));
-        ui.label(t!("ps_editor.tools.deform_hint_line2"));
-        ui.label(t!("ps_editor.tools.deform_hint_line3"));
-        ui.label(t!("ps_editor.tools.applies_to_active_layer_hint"));
+    /// No parameters: the grid resolution is fixed (`DEFAULT_COLS`×`DEFAULT_ROWS`) and every
+    /// gesture is listed by [`PsTool::hotkey_rows`]. So `options_ui` is left at its default no-op
+    /// and the panel prints `ps_editor.active_tool.no_options`.
+    fn has_options(&self) -> bool {
+        false
+    }
+
+    /// The one drag gesture plus the fact that entering the tool materializes the grid. No KEYS:
+    /// a handle is grabbed positionally, within `HANDLE_HIT_PX` of a control point. "Активный
+    /// слой" in the label is the real constraint — base layers are locked.
+    fn hotkey_rows(&self) -> Vec<PsHotkeyRow> {
+        vec![
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.deform.drag_label"),
+                t!("ps_editor.tools.hotkey.deform.drag_keys"),
+            ),
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.deform.grid_label"),
+                t!("ps_editor.tools.hotkey.deform.grid_keys"),
+            ),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::ps_editor::layers::LayerStack;
+    use egui::ColorImage;
+
+    /// Page size of the fixture, in px. The identity view below maps it 1:1 onto screen space.
+    const PAGE: [usize; 2] = [64, 64];
+
+    /// A page with the two locked base layers plus one raster, which `add_raster_layer` also makes
+    /// active — the only layer this tool accepts (base layers are refused).
+    fn stack_with_raster() -> LayerStack {
+        let mut stack = LayerStack::new(
+            0,
+            PAGE,
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+        );
+        stack.add_raster_layer();
+        stack
+    }
+
+    /// Runs ONE frame of `interact` with the pointer state the tab would hand the tool.
+    ///
+    /// `primary_pressed` is masked with `in_viewport` on purpose: `draw_canvas` passes
+    /// `input.primary_pressed && pointer_in_viewport` (`../../mod.rs`), so a press landing on a
+    /// floating panel reaches the tool with `primary_pressed == false`, and a test must not be able
+    /// to assert a combination the tab cannot produce.
+    fn frame(
+        tool: &mut DeformTool,
+        stack: &mut LayerStack,
+        pointer: Pos2,
+        in_viewport: bool,
+        pressed: bool,
+        down: bool,
+    ) {
+        let mut selection = None;
+        let page_size = stack.size();
+        let mut ctx = PsToolContext {
+            page_size,
+            pointer_image: Some(pointer),
+            pointer_in_viewport: in_viewport,
+            primary_pressed: pressed && in_viewport,
+            primary_down: down,
+            primary_released: !down,
+            modifiers: egui::Modifiers::default(),
+            cancel_pressed: false,
+            remove_point_pressed: false,
+            // Identity view: screen and world coordinates coincide, so handle hit-testing in the
+            // fixture works at the control points' page-pixel positions.
+            view: ViewTransform {
+                viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(64.0, 64.0)),
+                zoom: 1.0,
+                center_world: Vec2::new(32.0, 32.0),
+            },
+            stack,
+            selection: &mut selection,
+        };
+        tool.interact(&mut ctx);
+    }
+
+    /// One idle frame materializes the identity grid and caches its control points; returns the
+    /// first handle's page-pixel position, which a press must land on to start a drag.
+    fn first_handle(tool: &mut DeformTool, stack: &mut LayerStack) -> Pos2 {
+        frame(tool, stack, Pos2::new(1.0, 1.0), true, false, false);
+        *tool
+            .handles
+            .first()
+            .expect("entering the tool seeds a 3x3 identity grid")
+    }
+
+    /// `gesture_in_flight` must track the control-point drag from the accepted press to the
+    /// release: it is what lets the tab keep the mesh overlay alive across a floating panel.
+    #[test]
+    fn gesture_in_flight_spans_a_control_point_drag() {
+        let mut tool = DeformTool::default();
+        let mut stack = stack_with_raster();
+
+        let handle = first_handle(&mut tool, &mut stack);
+        assert!(!tool.gesture_in_flight(), "seeding the grid is not a gesture");
+        frame(&mut tool, &mut stack, handle, true, true, true);
+        assert!(tool.gesture_in_flight(), "the accepted press over a handle starts a drag");
+        frame(&mut tool, &mut stack, handle + Vec2::new(20.0, 0.0), false, false, true);
+        assert!(tool.gesture_in_flight(), "the drag survives crossing a panel");
+        frame(&mut tool, &mut stack, handle + Vec2::new(20.0, 0.0), true, false, false);
+        assert!(!tool.gesture_in_flight(), "the release ends the drag");
+    }
+
+    /// A press that lands on a floating panel holds the button down but is refused by the start
+    /// gate, so no gesture exists and the overlay must not be kept alive under the panel.
+    #[test]
+    fn a_press_outside_the_viewport_starts_no_gesture() {
+        let mut tool = DeformTool::default();
+        let mut stack = stack_with_raster();
+        let handle = first_handle(&mut tool, &mut stack);
+
+        frame(&mut tool, &mut stack, handle, false, true, true);
+        assert!(!tool.gesture_in_flight(), "a refused press starts no drag");
+        for held in 0..3 {
+            frame(&mut tool, &mut stack, handle, false, false, true);
+            assert!(!tool.gesture_in_flight(), "held frame {held} must stay gesture-free");
+        }
+    }
+
+    /// `reset` is the tab's abandonment path (tool or page switch taken mid-drag); it must leave no
+    /// phantom gesture that would keep the overlay pinned under a panel.
+    #[test]
+    fn reset_clears_gesture_in_flight() {
+        let mut tool = DeformTool::default();
+        let mut stack = stack_with_raster();
+        let handle = first_handle(&mut tool, &mut stack);
+
+        frame(&mut tool, &mut stack, handle, true, true, true);
+        assert!(tool.gesture_in_flight());
+        tool.reset();
+        assert!(!tool.gesture_in_flight(), "reset must drop the drag");
     }
 }

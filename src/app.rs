@@ -74,7 +74,7 @@ use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
 use crate::tabs::cleaning::{CleaningDrawParams, CleaningTabState, cleaning_default_dock_layout};
 use crate::tabs::notes::NotesTabState;
 use crate::tabs::page_manager::{PageManagerAction, PageManagerTabState};
-use crate::tabs::ps_editor::PsEditorTabState;
+use crate::tabs::ps_editor::{PsEditorTabState, ps_editor_default_dock_layout};
 use crate::tabs::settings::SettingsTabState;
 use crate::tabs::terms::TermsTabState;
 use crate::tabs::translation::backend_health::{
@@ -3208,10 +3208,20 @@ impl eframe::App for MangaApp {
             AppTab::PsEditor => {
                 let project = &self.project;
                 let ps_editor = &mut self.ps_editor_tab;
+                // The dock state is app-owned and lent to the tab for the frame; the borrow is
+                // disjoint from `ps_editor`, which is what lets the tab hand `&mut Self` to its own
+                // dock bodies (`dev-docs/dockable_panels_plan.md` §4.2).
+                let panel_dock = &mut self.panel_dock;
                 ps_editor.handle_hotkeys(ctx, project);
                 egui::CentralPanel::default().show(ui, |ui| {
-                    ps_editor.draw(ctx, ui, project);
+                    ps_editor.draw(ctx, ui, project, panel_dock);
                 });
+                // Panel-layout persistence poll — same contract as under «Клининг» / «Текст»
+                // above: the dock raises `dirty` DURING a gesture, so it must be picked up in the
+                // same frame it was raised.
+                if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
+                    self.panel_layout_writer.store(layouts);
+                }
             }
             AppTab::Characters => {
                 let project = &self.project;
@@ -3620,10 +3630,10 @@ impl PanelDockPass {
 fn tab_hosts_panel_dock(tab: AppTab) -> bool {
     match tab {
         // The three canvas tabs: each declares the canvas' own «Лента» tab and further tabs
-        // of its own — one for «Перевод», four for «Клининг», eight for «Текст».
-        AppTab::Translation | AppTab::Cleaning | AppTab::Typing => true,
+        // of its own — one for «Перевод», four for «Клининг», eight for «Текст». «PS редактор»
+        // is the first NON-canvas host: it declares five tabs of its own and no «Лента».
+        AppTab::Translation | AppTab::Cleaning | AppTab::Typing | AppTab::PsEditor => true,
         AppTab::PageManager
-        | AppTab::PsEditor
         | AppTab::Characters
         | AppTab::Terms
         | AppTab::Notes
@@ -3650,7 +3660,7 @@ fn tab_hosts_panel_dock(tab: AppTab) -> bool {
 /// of the canvas' «Лента», «Клининг» adds four tabs and «Текст» eight — so there is no shared
 /// ribbon-only builder any of them could fall back to.
 #[must_use]
-fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'static>; 3] {
+fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'static>; 4] {
     [
         (
             AppTab::Translation.key(),
@@ -3663,6 +3673,10 @@ fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'s
         (
             AppTab::Typing.key(),
             typing_default_dock_layout as fn() -> DockLayout,
+        ),
+        (
+            AppTab::PsEditor.key(),
+            ps_editor_default_dock_layout as fn() -> DockLayout,
         ),
     ]
 }
@@ -4687,7 +4701,7 @@ mod tests {
         page_op_text_quiesce, panel_dock_default_layout_builders, save_trigger_decision,
         should_seed_page_cache_on_initial_load, DockLayout, PanelDockPass,
         cleaning_default_dock_layout, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
-        translation_default_dock_layout, typing_default_dock_layout,
+        ps_editor_default_dock_layout, translation_default_dock_layout, typing_default_dock_layout,
     };
     use crate::canvas::CANVAS_RIBBON_TAB;
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
@@ -4697,18 +4711,24 @@ mod tests {
 
     /// The dock hosts are the tabs `PanelDock::end` runs for, and the idle sub-window keep-alive
     /// must run on exactly the complementary frames. The hosts are the three CANVAS tabs — each
-    /// declares the canvas' own «Лента» tab — and a tab that starts hosting the dock has to be
-    /// added here together with its default-layout entry in `restore_panel_dock`, while one that
-    /// is added by accident shows up as a double-shown viewport.
+    /// declares the canvas' own «Лента» tab — plus «PS редактор», which declares five tabs of its
+    /// own over a full-area editing surface and no «Лента». A tab that starts hosting the dock has
+    /// to be added here together with its default-layout entry in `restore_panel_dock`, while one
+    /// that is added by accident shows up as a double-shown viewport.
     #[test]
-    fn only_the_canvas_tabs_host_the_panel_dock() {
+    fn exactly_the_registered_tabs_host_the_panel_dock() {
         let hosts: Vec<AppTab> = AppTab::ALL
             .into_iter()
             .filter(|tab| tab_hosts_panel_dock(*tab))
             .collect();
         assert_eq!(
             hosts,
-            vec![AppTab::Translation, AppTab::Cleaning, AppTab::Typing]
+            vec![
+                AppTab::Translation,
+                AppTab::Cleaning,
+                AppTab::Typing,
+                AppTab::PsEditor
+            ]
         );
     }
 
@@ -4784,7 +4804,15 @@ mod tests {
             TabId::new("typing.layout_editor"),
         ];
 
-        let expected: [ExpectedBuilder; 3] = [
+        const PS_EDITOR_TABS: &[TabId] = &[
+            TabId::new("ps_editor.main"),
+            TabId::new("ps_editor.tools"),
+            TabId::new("ps_editor.active_tool"),
+            TabId::new("ps_editor.hotkeys"),
+            TabId::new("ps_editor.layers"),
+        ];
+
+        let expected: [ExpectedBuilder; 4] = [
             (
                 AppTab::Translation,
                 translation_default_dock_layout,
@@ -4792,6 +4820,11 @@ mod tests {
             ),
             (AppTab::Cleaning, cleaning_default_dock_layout, CLEANING_TABS),
             (AppTab::Typing, typing_default_dock_layout, TYPING_TABS),
+            (
+                AppTab::PsEditor,
+                ps_editor_default_dock_layout,
+                PS_EDITOR_TABS,
+            ),
         ];
         let registered = panel_dock_default_layout_builders();
         for (tab, builder, tabs) in expected {

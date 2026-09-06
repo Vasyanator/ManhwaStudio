@@ -8,8 +8,16 @@ set, and tiled GPU cache.
 
 Key structures:
 - `PsEditorTabState`: the tab state held by `MangaApp`.
+- `PsEditorDockCx`: the per-frame context the panel dock lends to one tab body at a time.
+- `PsEditorPanelVisibility`: the four "is this panel shown" flags, stored in the MAIN tab's
+  `TabExtras` bag and toggled from its «Панели…» menu.
 
 Architecture:
+- UI shape: the canvas is the full-area BACKGROUND and every surface over it is a dock tab
+  (`crate::widgets::panel_dock`) — «PS редактор», «Инструменты», «Выбранный инструмент»,
+  «Горячие клавиши», «Слои». `ps_editor_default_dock_layout` is their default arrangement, and
+  the tab supplies its OWN `DockArea` rect (it is not a canvas tab, so `canvas::dock_area_rect`
+  — which reserves the canvas' scrollbar strip — does not apply).
 - `viewport`: own camera (pan/zoom/fit), independent of the shared canvas engine.
 - `layers`: ordered layer stack with two locked base layers (source + clean) and user raster
   layers above them.
@@ -19,7 +27,9 @@ Architecture:
   Tool-gesture lifecycle is the TAB's job: `set_active_tool` (the only writer of `active_tool_idx`)
   resets the outgoing tool, `request_page` resets the active one, and a frame routed to the pan /
   text drag instead calls `PsTool::freeze` (or `reset` on Esc) so a multi-frame outline neither
-  outlives its page nor dies on a suppressed frame.
+  outlives its page nor dies on a suppressed frame. The tool's cursor preview obeys the same
+  occlusion gate as its input: `overlay_pointer` hides it under a floating panel unless
+  `PsTool::gesture_in_flight` says a gesture started on bare canvas is still running.
 - selection storage: `set_selection` / `non_empty_selection` keep the page selection `Some` only
   while it selects at least one pixel — an all-zero mask draws no marquee yet still clips the brush.
 - selection marquee: `draw_selection_marquee` paints the boundary loops of `Selection` as a static
@@ -57,20 +67,25 @@ use crate::models::layer_model::ordering::Band;
 use crate::models::layer_model::persist;
 use crate::models::layer_model::saver;
 use crate::project::ProjectData;
+use crate::tabs::AppTab;
 use crate::trace::cat;
+use crate::widgets::panel_dock::{
+    DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
+    PanelNode, TabExtras, TabId,
+};
 use edit_op::{LayerFieldPatch, LifecycleDir, PsEditOp};
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 use layer_render::TiledTexture;
-use ms_actions::{ActionHistory, ApplyDirection, RasterDiff};
 use layers::{GroupId, Layer, LayerGroup, LayerId, LayerKind, LayerStack, LayerTransform};
+use ms_actions::{ActionHistory, ApplyDirection, RasterDiff};
+use ms_thread as thread;
 use page_loader::{PageLoadRequest, PageLoaderHandles, spawn_page_loader_thread};
 use selection::{Selection, SelectionBounds};
-use text_layers::PsTextLayer;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use ms_thread as thread;
+use text_layers::PsTextLayer;
 use tools::brush::BrushTool;
 use tools::deform::DeformTool;
 use tools::select::{SelectMode, SelectTool};
@@ -109,6 +124,340 @@ const PS_UNDO_TILE_SIDE: u32 = 1024;
 /// Number of text characters shown in a text-layer row preview (`Текст (preview)`) in the layers
 /// panel. Fixed budget (the typing tab makes this width-adaptive; a constant is enough here).
 const PS_TEXT_PREVIEW_CHARS: usize = 16;
+
+// ---------------------------------------------------------------------------------------------
+// Dock tabs
+//
+// The five `TabId` literals below are STABLE, NON-LOCALIZED PERSISTENCE IDENTITIES: they key the
+// tab inside the `PanelLayout` section of `user_config.json` and inside `PanelDockState`'s
+// per-program-tab maps, so renaming one silently drops the user's arrangement for that panel.
+// They are therefore deliberately not routed through the `t!` catalog — a §A9 i18n exclusion
+// (`dev-docs/i18n_exclusions.md`). The visible captions come from `ps_editor.tab.*`.
+// ---------------------------------------------------------------------------------------------
+
+/// «PS редактор»: page switch, zoom, load/effects status, and the «Панели…» visibility menu.
+const PS_EDITOR_MAIN_TAB: TabId = TabId::new("ps_editor.main");
+/// «Инструменты»: the tool selector plus the two whole-layer selection actions.
+const PS_EDITOR_TOOLS_TAB: TabId = TabId::new("ps_editor.tools");
+/// «Выбранный инструмент»: the active tool's `options_ui`, or the "no parameters" line.
+const PS_EDITOR_ACTIVE_TOOL_TAB: TabId = TabId::new("ps_editor.active_tool");
+/// «Горячие клавиши»: the active tool's `hotkey_rows` plus the tab-level shortcuts.
+const PS_EDITOR_HOTKEYS_TAB: TabId = TabId::new("ps_editor.hotkeys");
+/// «Слои»: the unified layer tree and the active-layer controls strip.
+const PS_EDITOR_LAYERS_TAB: TabId = TabId::new("ps_editor.layers");
+
+/// `TabExtras` flag key of the «Инструменты» panel's visibility. Stored on the MAIN tab.
+const PS_EDITOR_FLAG_TOOLS_PANEL: &str = "panels.tools";
+/// `TabExtras` flag key of the «Выбранный инструмент» panel's visibility.
+const PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL: &str = "panels.active_tool";
+/// `TabExtras` flag key of the «Горячие клавиши» panel's visibility.
+const PS_EDITOR_FLAG_HOTKEYS_PANEL: &str = "panels.hotkeys";
+/// `TabExtras` flag key of the «Слои» panel's visibility.
+const PS_EDITOR_FLAG_LAYERS_PANEL: &str = "panels.layers";
+
+/// Every panel starts shown; `TabExtras::set_flag` keeps a flag at its default out of the config.
+const PS_EDITOR_PANEL_VISIBLE_DEFAULT: bool = true;
+
+/// Shrink floor of «PS редактор» (points). Below this its one wrapped row stops being readable.
+const PS_EDITOR_MAIN_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 48.0);
+/// First-frame size of «PS редактор», before its content has ever been measured.
+const PS_EDITOR_MAIN_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(420.0, 72.0);
+/// Shrink floor of «Инструменты».
+const PS_EDITOR_TOOLS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(180.0, 120.0);
+/// First-frame size of «Инструменты».
+const PS_EDITOR_TOOLS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(220.0, 320.0);
+/// Shrink floor of «Выбранный инструмент».
+const PS_EDITOR_ACTIVE_TOOL_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(180.0, 60.0);
+/// First-frame size of «Выбранный инструмент».
+const PS_EDITOR_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(220.0, 140.0);
+/// Shrink floor of «Горячие клавиши».
+const PS_EDITOR_HOTKEYS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(200.0, 80.0);
+/// First-frame size of «Горячие клавиши».
+const PS_EDITOR_HOTKEYS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(300.0, 220.0);
+/// Shrink floor of «Слои».
+const PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(220.0, 140.0);
+/// First-frame size of «Слои».
+const PS_EDITOR_LAYERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(280.0, 380.0);
+
+/// Default panel arrangement of the «PS редактор» program tab.
+///
+/// Two columns over the canvas. On the LEFT, «PS редактор» → «Инструменты» → «Выбранный инструмент»,
+/// which mirrors what the static layout showed as a top strip plus a left toolbar. On the RIGHT,
+/// «Слои» → «Горячие клавиши», mirroring the old right panel and keeping the left chain from
+/// stacking four panels deep on a short window.
+///
+/// It must name EVERY `TabId` this program tab can declare: `panel_dock::persist` resolves a
+/// stored tab key against the default layout's tab set, so a tab missing here would be dropped
+/// from the user's arrangement on every load (`panel_dock/persist.rs::known_tabs`).
+///
+/// No size is pinned: each tab states its own `min_size` / `initial_size` per frame, and the
+/// solver sizes a panel from what its content measured.
+///
+/// Used only when no layout exists yet for this program tab; a restored one always wins. Handed to
+/// the app-owned dock state as a plain `fn` pointer, both when the persisted layouts are restored
+/// before the first frame and by `ensure_default_layout` on every frame this tab draws — the state
+/// keeps that pointer to serve the header's «Сбросить раскладку» item. A model refusal is logged
+/// and skipped, never panicked on: the dock then creates a panel for the orphaned tab on its own,
+/// which is a degraded arrangement rather than a lost tab.
+#[must_use]
+pub(crate) fn ps_editor_default_dock_layout() -> DockLayout {
+    let mut layout = DockLayout::new();
+    let main = PanelId::new(0);
+    let tools = PanelId::new(1);
+    let layers = PanelId::new(3);
+    let panels = [
+        // Insertion order IS anchor order: `insert_panel` rejects an anchor whose target does not
+        // exist yet, so every chain root precedes its dependants.
+        (
+            main,
+            vec![PS_EDITOR_MAIN_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            },
+        ),
+        (
+            tools,
+            vec![PS_EDITOR_TOOLS_TAB],
+            PanelAnchor::Panel {
+                target: main,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+        (
+            PanelId::new(2),
+            vec![PS_EDITOR_ACTIVE_TOOL_TAB],
+            PanelAnchor::Panel {
+                target: tools,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+        (
+            layers,
+            vec![PS_EDITOR_LAYERS_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.0,
+            },
+        ),
+        (
+            PanelId::new(4),
+            vec![PS_EDITOR_HOTKEYS_TAB],
+            PanelAnchor::Panel {
+                target: layers,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+    ];
+    for (id, tabs, anchor) in panels {
+        let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
+            Ok(mut node) => {
+                node.anchor = anchor;
+                node
+            }
+            Err(error) => {
+                crate::runtime_log::log_warn(format!(
+                    "[ps_editor] default dock layout: could not build panel {id} ({error}); \
+                     the dock will create one per orphaned tab on its own"
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = layout.insert_panel(node) {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] default dock layout: could not insert panel {id} ({error}); \
+                 the dock will create one per orphaned tab on its own"
+            ));
+        }
+    }
+    layout
+}
+
+/// Which of the four secondary panels the «Панели…» menu currently shows.
+///
+/// Read straight off the dock state BEFORE the tabs are declared, so the `visible(..)` a tab is
+/// declared with is already the value the user last chose — reading it from a body would show the
+/// panel for one frame before hiding it. The MAIN tab's body writes the values back through its
+/// `TabExtras`, which is what raises `changed` → `dirty` → the persistence write.
+///
+/// «PS редактор» itself is deliberately absent: the menu lives in it, so a flag hiding it could never
+/// be flipped back.
+#[derive(Debug, Clone, Copy)]
+struct PsEditorPanelVisibility {
+    tools: bool,
+    active_tool: bool,
+    hotkeys: bool,
+    layers: bool,
+}
+
+impl PsEditorPanelVisibility {
+    /// Reads the four flags out of the MAIN tab's stored extras, defaulting to "shown".
+    ///
+    /// A tab that never stored anything yields no bag at all, hence the `map_or` over the whole
+    /// lookup rather than per flag.
+    #[must_use]
+    fn read(dock: &PanelDockState, layout_key: &str) -> Self {
+        let Some(extras) = dock.tab_extras(layout_key, PS_EDITOR_MAIN_TAB) else {
+            return Self {
+                tools: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+                active_tool: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+                hotkeys: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+                layers: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+            };
+        };
+        Self {
+            tools: extras.flag(PS_EDITOR_FLAG_TOOLS_PANEL, PS_EDITOR_PANEL_VISIBLE_DEFAULT),
+            active_tool: extras.flag(
+                PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL,
+                PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+            ),
+            hotkeys: extras.flag(
+                PS_EDITOR_FLAG_HOTKEYS_PANEL,
+                PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+            ),
+            layers: extras.flag(PS_EDITOR_FLAG_LAYERS_PANEL, PS_EDITOR_PANEL_VISIBLE_DEFAULT),
+        }
+    }
+
+    /// The four toggles as `(flag key, localized title, value)`, in menu order.
+    ///
+    /// One source for both the menu rows and the write-back below, so a panel can never appear in
+    /// the menu under a key that is not the one persisted for it.
+    fn entries(&mut self) -> [(&'static str, &'static str, &mut bool); 4] {
+        [
+            (
+                PS_EDITOR_FLAG_TOOLS_PANEL,
+                t!("ps_editor.tab.tools"),
+                &mut self.tools,
+            ),
+            (
+                PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL,
+                t!("ps_editor.tab.active_tool"),
+                &mut self.active_tool,
+            ),
+            (
+                PS_EDITOR_FLAG_HOTKEYS_PANEL,
+                t!("ps_editor.tab.hotkeys"),
+                &mut self.hotkeys,
+            ),
+            (
+                PS_EDITOR_FLAG_LAYERS_PANEL,
+                t!("ps_editor.tab.layers"),
+                &mut self.layers,
+            ),
+        ]
+    }
+}
+
+/// Per-frame context the panel dock hands to one «PS редактор» tab body at a time.
+///
+/// Every body of this tab needs the tab state itself — the tool list and `set_active_tool` for
+/// «Инструменты», the layer tree for «Слои», `request_page` and the viewport for «PS редактор» — so the
+/// context lends `&mut PsEditorTabState` as a whole rather than a set of disjoint field borrows.
+/// That is sound by construction here: `PanelDockState` is LENT IN to `PsEditorTabState::draw` by
+/// the application, so the dock's own frame-long borrow is provably disjoint from the tab state
+/// (`panel_dock/MODULE_README.md`, «The dock state must be its own borrow»).
+///
+/// Bodies still defer the expensive layer mutations: `panel_actions` is the tab's existing
+/// [`PanelActions`] request struct, drained and applied by `apply_panel_actions` after
+/// `PanelDock::end` has returned, exactly as the static right panel used to apply it after its
+/// panel closure.
+struct PsEditorDockCx<'a> {
+    /// The tab state every body draws from and (for the cheap, already-per-frame writes) mutates.
+    tab: &'a mut PsEditorTabState,
+    /// The open project: page list for «PS редактор», persistence target for the deferred actions.
+    project: &'a ProjectData,
+    /// Layer-panel actions collected by «Слои», applied after the dock frame.
+    panel_actions: PanelActions,
+    /// Panel visibility as the frame started; «PS редактор» edits it and writes it into its extras.
+    visibility: PsEditorPanelVisibility,
+}
+
+/// Draws the «PS редактор» tab body: the page/zoom strip plus the «Панели…» visibility menu.
+///
+/// The only body declared with `show_with_extras`, because it is the only one that WRITES the
+/// dock's per-tab extra state: the four flags are pushed on every frame with the value the menu
+/// currently shows, which is the usage `TabExtras::set_flag` is designed for — it stores nothing
+/// while a flag equals its default and raises `changed` only when the content really moved.
+fn draw_main_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>, extras: &mut TabExtras) {
+    cx.tab.main_tab_contents(ui, cx.project);
+    ui.separator();
+    ps_editor_panels_menu(ui, &mut cx.visibility);
+    for (key, _title, value) in cx.visibility.entries() {
+        extras.set_flag(key, *value, PS_EDITOR_PANEL_VISIBLE_DEFAULT);
+    }
+}
+
+/// The «Панели…» menu button: one checkbox per SECONDARY panel of this program tab.
+///
+/// «PS редактор» itself is never listed — the menu lives in it, so hiding it could not be undone.
+///
+/// The menu is configured `CloseOnClickOutside` instead of egui's default `CloseOnClick`, so the
+/// user can toggle several panels in one visit; egui closes it on Esc or on a click elsewhere
+/// (`egui-0.35.0/src/containers/popup.rs:77-91`). Ids come from the flag-key literals, never from
+/// the localized captions (`egui-docs/05-ids-and-i18n.md` §2).
+fn ps_editor_panels_menu(ui: &mut egui::Ui, visibility: &mut PsEditorPanelVisibility) {
+    let (response, _inner) = egui::menu::MenuButton::new(t!("ps_editor.panels_menu.button"))
+        .config(
+            egui::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
+            for (key, title, value) in visibility.entries() {
+                ui.push_id(key, |ui| ui.checkbox(value, title));
+            }
+        });
+    response.on_hover_text(t!("ps_editor.panels_menu.tooltip"));
+}
+
+/// Draws the «Инструменты» tab body.
+fn draw_tools_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    cx.tab.tools_tab_contents(ui);
+}
+
+/// Draws the «Выбранный инструмент» tab body.
+fn draw_active_tool_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    cx.tab.active_tool_tab_contents(ui);
+}
+
+/// Draws the «Горячие клавиши» tab body.
+fn draw_hotkeys_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    cx.tab.hotkeys_tab_contents(ui);
+}
+
+/// Draws the «Слои» tab body, parking its deferred actions in the frame context.
+///
+/// The actions are NOT applied here: `apply_panel_actions` rewrites the layer stack, the shared
+/// document and the on-disk manifest, and it must run after the dock frame has finished — the same
+/// place the static right panel applied them from.
+fn draw_layers_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    cx.panel_actions = cx.tab.layers_panel_body(ui);
+}
+
+/// Lays a shortcut inventory out as a two-column grid: the action, then its keys in monospace.
+///
+/// `id_salt` must be a stable literal — two grids in one panel need distinct ids, and a localized
+/// caption must never become one (`egui-docs/05-ids-and-i18n.md` §2).
+///
+/// Deliberately a LOCAL renderer rather than a reuse of the canvas' equivalent
+/// (`CanvasScene::draw_hint_rows_grid`): that one is private to the canvas impl, this tab is not a
+/// canvas tab, and lifting it into a shared widget would be a refactor of another subsystem for no
+/// gain here. The duplication is a few lines and is recorded in this module's `MODULE_README.md`.
+fn draw_hotkey_rows_grid(ui: &mut egui::Ui, id_salt: &'static str, rows: &[tools::PsHotkeyRow]) {
+    egui::Grid::new(id_salt)
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            for row in rows {
+                ui.label(&row.action);
+                ui.monospace(&row.keys);
+                ui.end_row();
+            }
+        });
+}
 
 /// State of the PS-like editor tab.
 pub struct PsEditorTabState {
@@ -177,7 +526,8 @@ pub struct PsEditorTabState {
     trace_last_composite_steps: usize,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
     /// shared with the typing tab. `None` until `set_layer_doc` is called by app.rs.
-    layer_doc: Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
+    layer_doc:
+        Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
     /// Set by the "100%" button; consumed in `draw_canvas` where the real canvas rect is known.
     pending_actual_size: bool,
     /// Camera synced in from `CanvasView`, applied once its target page is loaded so the async
@@ -222,7 +572,15 @@ pub struct PsEditorTabState {
     transform_gesture_before: Option<(String, LayerTransform)>,
     /// Deform-tool gesture start snapshot: `(raster uid, deform BEFORE the gesture)`. Captured on the
     /// press frame and consumed at release to record ONE `FieldPatch::Deform` per gesture.
-    deform_gesture_before: Option<(String, Option<crate::models::layer_model::manifest::DeformRec>)>,
+    deform_gesture_before: Option<(
+        String,
+        Option<crate::models::layer_model::manifest::DeformRec>,
+    )>,
+    /// Screen rects of THIS frame's drawn dock panels (main window only), refilled from
+    /// `PanelDockOutput::drawn_panels` right after `PanelDock::end`. The canvas is drawn afterwards
+    /// and gates its pointer input on them (`canvas_pointer_occluded`), so a click on a floating
+    /// panel never reaches the active tool.
+    panel_rects: Vec<Rect>,
 }
 
 /// Worker result for a non-destructive raster effects render (mirrors the typing tab's
@@ -441,6 +799,7 @@ impl Default for PsEditorTabState {
             opacity_gesture: None,
             transform_gesture_before: None,
             deform_gesture_before: None,
+            panel_rects: Vec::new(),
         }
     }
 }
@@ -594,7 +953,9 @@ impl PsEditorTabState {
         let removed_ids: Vec<LayerId> = stack
             .layers()
             .iter()
-            .filter(|l| l.kind == LayerKind::Raster && !doc_raster_uids.contains(&l.uid.to_string()))
+            .filter(|l| {
+                l.kind == LayerKind::Raster && !doc_raster_uids.contains(&l.uid.to_string())
+            })
             .map(|l| l.id)
             .collect();
         for id in &removed_ids {
@@ -619,7 +980,8 @@ impl PsEditorTabState {
                 continue;
             };
             let cache_key = (page_idx, node.uid.clone());
-            let gen_changed = self.node_generations.get(&cache_key).copied() != Some(node.generation);
+            let gen_changed =
+                self.node_generations.get(&cache_key).copied() != Some(node.generation);
             let group = node
                 .group_uid
                 .as_ref()
@@ -685,7 +1047,10 @@ impl PsEditorTabState {
             .collect();
         let mut new_text: Vec<PsTextLayer> = Vec::new();
         for node in &page.nodes {
-            let NodeBody::Text { image, render_data, .. } = &node.body else {
+            let NodeBody::Text {
+                image, render_data, ..
+            } = &node.body
+            else {
                 continue;
             };
             // Raw overlay text (for the panel row preview); empty when render_data lacks it.
@@ -914,11 +1279,9 @@ impl PsEditorTabState {
                 cache.mark_dirty_rect(tools::DirtyRect {
                     min_x: rect.origin_px[0] as usize,
                     min_y: rect.origin_px[1] as usize,
-                    max_x: rect.origin_px[0]
-                        .saturating_add(rect.size_px[0].saturating_sub(1))
+                    max_x: rect.origin_px[0].saturating_add(rect.size_px[0].saturating_sub(1))
                         as usize,
-                    max_y: rect.origin_px[1]
-                        .saturating_add(rect.size_px[1].saturating_sub(1))
+                    max_y: rect.origin_px[1].saturating_add(rect.size_px[1].saturating_sub(1))
                         as usize,
                 });
             }
@@ -1401,7 +1764,9 @@ impl PsEditorTabState {
         {
             cached_legacy_text_dir.clone()
         } else {
-            let gated = if crate::models::layer_model::migrate::manifest_has_inline_text(&project.paths.layers_dir) {
+            let gated = if crate::models::layer_model::migrate::manifest_has_inline_text(
+                &project.paths.layers_dir,
+            ) {
                 None
             } else {
                 Some(project.paths.text_images_dir.clone())
@@ -1497,15 +1862,14 @@ impl PsEditorTabState {
         let removed_count = removed_uids.len();
 
         // Try the off-thread path: capture the saver handle (clone, no doc lock held during the write).
-        let saver = self
-            .layer_doc
-            .as_ref()
-            .and_then(|doc| doc.lock().ok().and_then(|mut guard| {
+        let saver = self.layer_doc.as_ref().and_then(|doc| {
+            doc.lock().ok().and_then(|mut guard| {
                 guard.saver_handle().map(|handle| {
                     let epoch = guard.next_save_epoch(page_idx, saver::SaveKind::Raster);
                     (handle, epoch)
                 })
-            }));
+            })
+        });
         let persist_result: Result<(), String> = if let Some((handle, raster_epoch)) = saver {
             handle.enqueue(saver::PageSaveJob {
                 page_idx,
@@ -1687,7 +2051,12 @@ impl PsEditorTabState {
                 self.sync_view_from_doc(result.page_idx);
             }
             Err(err) => {
-                crate::trace_log!(cat::PERSIST, "page_load failed page={} err={}", result.page_idx, err);
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "page_load failed page={} err={}",
+                    result.page_idx,
+                    err
+                );
                 crate::runtime_log::log_error(format!("[ps_editor] page load failed: {err}"));
                 self.load_error = Some(err);
             }
@@ -1741,14 +2110,33 @@ impl PsEditorTabState {
     }
 
     /// Main per-frame entry point. Renders the whole tab inside the provided `ui`.
-    pub fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
+    ///
+    /// `panel_dock` is the APPLICATION's single dock state, lent in for this frame: it is
+    /// deliberately not a field of this tab, because `PanelDock::begin` borrows it for the whole
+    /// frame and the tab bodies need `&mut Self` at the same time.
+    ///
+    /// Frame order, and every step of it is load-bearing:
+    /// 1. one `area_rect` is resolved once and serves as BOTH the dock area and the canvas rect;
+    /// 2. the panel-visibility flags are read off the dock state BEFORE the tabs are declared, so
+    ///    a hidden panel never blinks into view for a frame;
+    /// 3. the five tabs are declared and drawn (every one of them on every frame — a hidden tab
+    ///    keeps its slot, a skipped declaration would lose it);
+    /// 4. this frame's panel rects are stored and the deferred layer actions applied;
+    /// 5. the canvas is drawn LAST, over the same rect. It still ends up UNDERNEATH: panels live
+    ///    on `Order::Foreground` areas while the canvas paints into this `Ui`'s `Order::Background`
+    ///    layer, and egui composites by layer order, not by call order
+    ///    (`egui-docs/06-overlays.md` §1). Drawing it last is what lets its input gate use THIS
+    ///    frame's panel rects instead of the previous frame's.
+    pub fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        project: &ProjectData,
+        panel_dock: &mut PanelDockState,
+    ) {
         // Per-frame span. Detailed events inside the editor are gated on real state changes
         // (page load, doc-version change, tool activity) so an idle frame stays quiet.
-        let _frame = crate::trace_scope!(
-            cat::FRAME,
-            "ps_draw page={:?}",
-            self.active_page_idx
-        );
+        let _frame = crate::trace_scope!(cat::FRAME, "ps_draw page={:?}", self.active_page_idx);
         self.ensure_loader();
         self.poll_loader(project);
         // Consume any finished non-destructive raster-effects render (computed off the GUI thread).
@@ -1768,122 +2156,223 @@ impl PsEditorTabState {
             self.request_page(project, first);
         }
 
-        self.draw_top_bar(ctx, ui, project);
-        self.draw_toolbar(ui);
-        self.draw_layers_panel(ui, project);
+        // One rect for the dock and the canvas alike. `canvas::dock_area_rect` is not used here:
+        // it reserves the shared canvas' scrollbar strip, and this tab has no canvas scrollbar.
+        let area_rect = ui.available_rect_before_wrap();
+        let layout_key = AppTab::PsEditor.key();
+        panel_dock.ensure_default_layout(layout_key, ps_editor_default_dock_layout);
+        let visibility = PsEditorPanelVisibility::read(panel_dock, layout_key);
+
+        let mut cx = PsEditorDockCx {
+            tab: self,
+            project,
+            panel_actions: PanelActions::default(),
+            visibility,
+        };
+        let mut dock = PanelDock::begin(
+            ctx,
+            panel_dock,
+            DockArea {
+                rect: area_rect,
+                layout_key,
+            },
+        );
+        // Declared WITH its extras: the «Панели…» menu writes the four visibility flags into the
+        // main tab's bag, and that write is the only thing that persists them.
+        dock.tab(PS_EDITOR_MAIN_TAB)
+            .title(|| t!("ps_editor.tab.main"))
+            .min_size(PS_EDITOR_MAIN_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_MAIN_TAB_INITIAL_SIZE_PX)
+            .show_with_extras(draw_main_tab_body);
+        // The four secondary tabs are declared on EVERY frame regardless of `visible`: a hidden tab
+        // keeps its slot in the layout and only its panel is skipped, so re-enabling it returns it
+        // to wherever the user put it. Skipping the declaration would make the dock treat it as
+        // another program tab's and seed it a fresh panel on the next open.
+        dock.tab(PS_EDITOR_TOOLS_TAB)
+            .title(|| t!("ps_editor.tab.tools"))
+            .visible(visibility.tools)
+            .min_size(PS_EDITOR_TOOLS_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_TOOLS_TAB_INITIAL_SIZE_PX)
+            .show(draw_tools_tab_body);
+        dock.tab(PS_EDITOR_ACTIVE_TOOL_TAB)
+            .title(|| t!("ps_editor.tab.active_tool"))
+            .visible(visibility.active_tool)
+            .min_size(PS_EDITOR_ACTIVE_TOOL_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX)
+            .show(draw_active_tool_tab_body);
+        dock.tab(PS_EDITOR_HOTKEYS_TAB)
+            .title(|| t!("ps_editor.tab.hotkeys"))
+            .visible(visibility.hotkeys)
+            .min_size(PS_EDITOR_HOTKEYS_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_HOTKEYS_TAB_INITIAL_SIZE_PX)
+            .show(draw_hotkeys_tab_body);
+        dock.tab(PS_EDITOR_LAYERS_TAB)
+            .title(|| t!("ps_editor.tab.layers"))
+            .visible(visibility.layers)
+            .min_size(PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_LAYERS_TAB_INITIAL_SIZE_PX)
+            .show(draw_layers_tab_body);
+        // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a panel the user
+        // detached into a sub-window, whose rect lives in that window's own frame and would carve a
+        // dead zone out of this window's top-left corner (`PanelDockOutput`).
+        let out = dock.end(&mut cx);
+        let panel_rects: Vec<Rect> = out.drawn_panels().map(|(_, rect)| rect).collect();
+        let panel_actions = std::mem::take(&mut cx.panel_actions);
+
+        self.panel_rects = panel_rects;
+        self.apply_panel_actions(panel_actions, project);
         self.draw_effects_editor(ctx);
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.draw_canvas(ctx, ui, project);
+        self.draw_canvas(ctx, ui, area_rect, project);
+    }
+
+    /// Everything the «PS редактор» tab shows except its «Панели…» menu: the page switch, the two
+    /// zoom presets, the zoom readout, the load / effects spinners and the last load error.
+    ///
+    /// The row WRAPS: the dock body scrolls both axes, and a panel the user narrows must break the
+    /// row rather than push the buttons behind a horizontal scrollbar.
+    fn main_tab_contents(&mut self, ui: &mut egui::Ui, project: &ProjectData) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t!("ps_editor.top_bar.page_label"));
+            let page_indices: Vec<usize> = project.pages.iter().map(|p| p.idx).collect();
+            let current = self.active_page_idx.or(self.requested_page_idx);
+            let current_pos = current.and_then(|idx| page_indices.iter().position(|&p| p == idx));
+
+            let prev_enabled = current_pos.map(|p| p > 0).unwrap_or(false);
+            if ui
+                .add_enabled(prev_enabled, egui::Button::new("◀"))
+                .clicked()
+                && let Some(pos) = current_pos
+            {
+                self.request_page(project, page_indices[pos - 1]);
+            }
+
+            let label = current
+                .map(|i| (i + 1).to_string())
+                .unwrap_or_else(|| "—".into());
+            ui.label(format!("{label} / {}", page_indices.len().max(1)));
+
+            let next_enabled = current_pos
+                .map(|p| p + 1 < page_indices.len())
+                .unwrap_or(false);
+            if ui
+                .add_enabled(next_enabled, egui::Button::new("▶"))
+                .clicked()
+                && let Some(pos) = current_pos
+            {
+                self.request_page(project, page_indices[pos + 1]);
+            }
+
+            ui.separator();
+            // Both refit using the real canvas rect, resolved in `draw_canvas`.
+            if ui.button(t!("ps_editor.top_bar.fit_button")).clicked() {
+                self.viewport.invalidate();
+            }
+            if ui.button("100%").clicked() {
+                self.pending_actual_size = true;
+            }
+            ui.label(tf!(
+                "ps_editor.top_bar.zoom",
+                percent = format!("{:.0}", self.viewport.zoom() * 100.0)
+            ));
+
+            if self.pending_job_id.is_some() {
+                ui.spinner();
+                ui.label(t!("ps_editor.top_bar.loading_page"));
+            }
+            if self.raster_effects_state.is_some() {
+                ui.spinner();
+                ui.label(t!("ps_editor.top_bar.applying_effects"));
+            }
+            if let Some(err) = &self.load_error {
+                ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+            }
         });
     }
 
-    /// Top page-switch bar plus zoom controls.
-    fn draw_top_bar(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
-        egui::Panel::top("ps_editor_top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(t!("ps_editor.top_bar.page_label"));
-                let page_indices: Vec<usize> = project.pages.iter().map(|p| p.idx).collect();
-                let current = self.active_page_idx.or(self.requested_page_idx);
-                let current_pos =
-                    current.and_then(|idx| page_indices.iter().position(|&p| p == idx));
-
-                let prev_enabled = current_pos.map(|p| p > 0).unwrap_or(false);
-                if ui
-                    .add_enabled(prev_enabled, egui::Button::new("◀"))
-                    .clicked()
-                    && let Some(pos) = current_pos
-                {
-                    self.request_page(project, page_indices[pos - 1]);
-                }
-
-                let label = current
-                    .map(|i| (i + 1).to_string())
-                    .unwrap_or_else(|| "—".into());
-                ui.label(format!("{label} / {}", page_indices.len().max(1)));
-
-                let next_enabled = current_pos
-                    .map(|p| p + 1 < page_indices.len())
-                    .unwrap_or(false);
-                if ui
-                    .add_enabled(next_enabled, egui::Button::new("▶"))
-                    .clicked()
-                    && let Some(pos) = current_pos
-                {
-                    self.request_page(project, page_indices[pos + 1]);
-                }
-
-                ui.separator();
-                // Both refit using the real canvas rect, resolved in `draw_canvas`.
-                if ui.button(t!("ps_editor.top_bar.fit_button")).clicked() {
-                    self.viewport.invalidate();
-                }
-                if ui.button("100%").clicked() {
-                    self.pending_actual_size = true;
-                }
-                ui.label(tf!(
-                    "ps_editor.top_bar.zoom",
-                    percent = format!("{:.0}", self.viewport.zoom() * 100.0)
-                ));
-
-                if self.pending_job_id.is_some() {
-                    ui.spinner();
-                    ui.label(t!("ps_editor.top_bar.loading_page"));
-                }
-                if self.raster_effects_state.is_some() {
-                    ui.spinner();
-                    ui.label(t!("ps_editor.top_bar.applying_effects"));
-                }
-                if let Some(err) = &self.load_error {
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                }
-            });
-        });
-    }
-
-    /// Left vertical tool selector (grouped into `PsToolSection`s) + active tool options.
+    /// «Инструменты» body: the tool selector grouped into `PsToolSection`s, plus the two
+    /// whole-layer selection actions.
     ///
     /// The grouping is a DRAW-TIME regrouping only: `active_tool_idx` indexes `self.tools`, so the
     /// registration order of that vector must never be disturbed here. Within a section the tools
     /// keep their registration order, and a section with no registered tool renders nothing.
-    fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("ps_editor_tools")
-            .resizable(false)
-            .default_size(220.0)
-            .show(ui, |ui| {
-                ui.heading(t!("ps_editor.toolbar.tools_heading"));
-                for section in PsToolSection::ORDER {
-                    // The section heading is emitted lazily, on the first tool that belongs to it,
-                    // so an empty section leaves no dangling header.
-                    let mut heading_drawn = false;
-                    for index in 0..self.tools.len() {
-                        if self.tools[index].id().section() != section {
-                            continue;
-                        }
-                        if !heading_drawn {
-                            // Subordinate to the panel heading: a strong label, not a second
-                            // `heading` (the project's section-label idiom).
-                            ui.label(egui::RichText::new(section.title()).strong());
-                            heading_drawn = true;
-                        }
-                        let selected = index == self.active_tool_idx;
-                        let title = self.tools[index].title();
-                        if ui.selectable_label(selected, title).clicked() {
-                            self.set_active_tool(index);
-                        }
-                    }
+    ///
+    /// The active tool's own parameters live in the separate «Выбранный инструмент» tab.
+    fn tools_tab_contents(&mut self, ui: &mut egui::Ui) {
+        for section in PsToolSection::ORDER {
+            // The section heading is emitted lazily, on the first tool that belongs to it,
+            // so an empty section leaves no dangling header.
+            let mut heading_drawn = false;
+            for index in 0..self.tools.len() {
+                if self.tools[index].id().section() != section {
+                    continue;
                 }
-                ui.separator();
-                ui.heading(t!("ps_editor.toolbar.options_heading"));
-                self.tools[self.active_tool_idx].options_ui(ui);
+                if !heading_drawn {
+                    // Subordinate to the panel caption: a strong label, not a `heading`
+                    // (the project's section-label idiom).
+                    ui.label(egui::RichText::new(section.title()).strong());
+                    heading_drawn = true;
+                }
+                let selected = index == self.active_tool_idx;
+                let title = self.tools[index].title();
+                if ui.selectable_label(selected, title).clicked() {
+                    self.set_active_tool(index);
+                }
+            }
+        }
 
-                ui.separator();
-                if ui.button(t!("ps_editor.toolbar.select_whole_layer")).clicked() {
-                    self.select_active_layer_fully();
-                }
-                if ui.button(t!("ps_editor.toolbar.clear_selection")).clicked() {
-                    self.clear_selection();
-                }
-            });
+        ui.separator();
+        if ui
+            .button(t!("ps_editor.toolbar.select_whole_layer"))
+            .clicked()
+        {
+            self.select_active_layer_fully();
+        }
+        if ui.button(t!("ps_editor.toolbar.clear_selection")).clicked() {
+            self.clear_selection();
+        }
+    }
+
+    /// «Выбранный инструмент» body: the active tool's parameters, or the "none" line.
+    ///
+    /// `PsTool::has_options` is the only question asked — a tool that answers `false` has no
+    /// `options_ui` at all (the trait method defaults to a no-op), so calling it anyway would print
+    /// an empty panel instead of saying why it is empty.
+    fn active_tool_tab_contents(&mut self, ui: &mut egui::Ui) {
+        let Some(tool) = self.tools.get_mut(self.active_tool_idx) else {
+            ui.label(t!("ps_editor.active_tool.no_options"));
+            return;
+        };
+        if tool.has_options() {
+            tool.options_ui(ui);
+        } else {
+            ui.label(t!("ps_editor.active_tool.no_options"));
+        }
+    }
+
+    /// «Горячие клавиши» body: the active tool's own inventory, then the tab-level shortcuts.
+    ///
+    /// The tool section is rebuilt from `PsTool::hotkey_rows` on every frame, so a runtime language
+    /// switch and a tool switch are both reflected without any invalidation path.
+    fn hotkeys_tab_contents(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(t!("ps_editor.hotkeys.tool_section")).strong());
+        let tool_rows = self
+            .tools
+            .get(self.active_tool_idx)
+            .map(|tool| tool.hotkey_rows())
+            .unwrap_or_default();
+        if tool_rows.is_empty() {
+            ui.label(t!("ps_editor.hotkeys.none"));
+        } else {
+            draw_hotkey_rows_grid(ui, "ps_editor_hotkeys_tool", &tool_rows);
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new(t!("ps_editor.hotkeys.common_section")).strong());
+        draw_hotkey_rows_grid(
+            ui,
+            "ps_editor_hotkeys_common",
+            &ps_editor_common_hotkey_rows(),
+        );
     }
 
     /// Sets the selection to the active layer's full footprint. When the panel's primary row is a TEXT
@@ -1930,34 +2419,32 @@ impl PsEditorTabState {
         self.set_selection(selection);
     }
 
-    /// Right layers panel: the unified, Photoshop-like layer tree. Compact rows (eye + name +
-    /// group indent), collapsible/movable groups that may mix rasters and texts, Shift/Ctrl
-    /// multi-select, a right-click menu for grouping, and a controls strip for the active layer.
-    fn draw_layers_panel(&mut self, ui: &mut egui::Ui, project: &ProjectData) {
-        let actions = egui::Panel::right("ps_editor_layers")
-            .resizable(true)
-            .default_size(260.0)
-            .show(ui, |ui| self.layers_panel_body(ui))
-            .inner;
-        self.apply_panel_actions(actions, project);
-    }
-
-    /// Draws the panel and returns the deferred actions. The tree + per-row data are snapshotted into
-    /// owned values first, so the render loop can mutate `self.panel_selection` without holding any
-    /// borrow of `self.stack` / `self.text_layers`.
+    /// «Слои» body: the unified, Photoshop-like layer tree. Compact rows (eye + name + group
+    /// indent), collapsible/movable groups that may mix rasters and texts, Shift/Ctrl multi-select,
+    /// a right-click menu for grouping, and a controls strip for the active layer.
+    ///
+    /// Returns the deferred actions; the caller applies them with `apply_panel_actions` after the
+    /// dock frame. The tree + per-row data are snapshotted into owned values first, so the render
+    /// loop can mutate `self.panel_selection` without holding any borrow of `self.stack` /
+    /// `self.text_layers`.
     fn layers_panel_body(&mut self, ui: &mut egui::Ui) -> PanelActions {
         let mut actions = PanelActions::default();
-        ui.heading(t!("ps_editor.layers_panel.heading"));
         if self.stack.is_none() {
             ui.label(t!("ps_editor.layers_panel.no_page"));
             return actions;
         }
 
         ui.horizontal(|ui| {
-            if ui.button(t!("ps_editor.layers_panel.add_layer_button")).clicked() {
+            if ui
+                .button(t!("ps_editor.layers_panel.add_layer_button"))
+                .clicked()
+            {
                 actions.add_layer = true;
             }
-            if ui.button(t!("ps_editor.layers_panel.add_group_button")).clicked() {
+            if ui
+                .button(t!("ps_editor.layers_panel.add_group_button"))
+                .clicked()
+            {
                 actions.new_empty_group = true;
             }
         });
@@ -1976,34 +2463,32 @@ impl PsEditorTabState {
         let group_list: Vec<(String, String)> = self
             .stack
             .as_ref()
-            .map(|s| s.groups().iter().map(|g| (g.uid.to_string(), g.name.clone())).collect())
+            .map(|s| {
+                s.groups()
+                    .iter()
+                    .map(|g| (g.uid.to_string(), g.name.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let selection = self.panel_selection.clone();
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, true])
-            // Reserve room for the active-layer controls strip below.
-            .max_height((ui.available_height() - 140.0).max(80.0))
-            .show(ui, |ui| {
-                for row in &rows {
-                    match row {
-                        PanelRow::Group(h) => {
-                            self.draw_group_row(ui, h, &selection, &mut actions);
-                        }
-                        PanelRow::Leaf(leaf) => {
-                            self.draw_leaf_row(
-                                ui,
-                                leaf,
-                                &selection,
-                                &row_sels,
-                                &group_list,
-                                &mut actions,
-                            );
-                        }
-                    }
+        // NO nested scroll area and NO hand-computed height reserve here. The dock already draws
+        // every tab body inside a bounded `ScrollArea::both` and derives the panel's size request
+        // from the CONTENT's measured height, so a fixed-height inner scroll area would fight that
+        // measurement and make the panel oscillate or never grow
+        // (`panel_dock/MODULE_README.md`, «The body FILLS its budget…»). The intended height is
+        // expressed by `PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX` / `..._INITIAL_SIZE_PX` instead.
+        for row in &rows {
+            match row {
+                PanelRow::Group(h) => {
+                    self.draw_group_row(ui, h, &selection, &mut actions);
                 }
-            });
+                PanelRow::Leaf(leaf) => {
+                    self.draw_leaf_row(ui, leaf, &selection, &row_sels, &group_list, &mut actions);
+                }
+            }
+        }
 
         ui.separator();
         self.draw_active_controls(ui, &mut actions);
@@ -2025,7 +2510,10 @@ impl PsEditorTabState {
                             let l = stack.layer(*id);
                             (
                                 None,
-                                l.map_or_else(|| t!("ps_editor.layers_panel.leaf_fallback_layer").into(), |l| l.name.clone()),
+                                l.map_or_else(
+                                    || t!("ps_editor.layers_panel.leaf_fallback_layer").into(),
+                                    |l| l.name.clone(),
+                                ),
                                 l.is_some_and(|l| l.visible),
                                 true,
                             )
@@ -2034,7 +2522,10 @@ impl PsEditorTabState {
                             let l = stack.layer(*id);
                             (
                                 Some(RowSel::Raster(*id)),
-                                l.map_or_else(|| t!("ps_editor.layers_panel.leaf_fallback_raster").into(), |l| l.name.clone()),
+                                l.map_or_else(
+                                    || t!("ps_editor.layers_panel.leaf_fallback_raster").into(),
+                                    |l| l.name.clone(),
+                                ),
                                 l.is_some_and(|l| l.visible),
                                 false,
                             )
@@ -2054,7 +2545,10 @@ impl PsEditorTabState {
                                     if preview.is_empty() {
                                         t.name.clone()
                                     } else {
-                                        tf!("ps_editor.layers_panel.text_preview", preview = preview)
+                                        tf!(
+                                            "ps_editor.layers_panel.text_preview",
+                                            preview = preview
+                                        )
                                     }
                                 },
                             );
@@ -2092,7 +2586,10 @@ impl PsEditorTabState {
             .horizontal(|ui| {
                 ui.add_space(header.depth as f32 * tree::INDENT);
                 let arrow = if header.collapsed { "▸" } else { "▾" };
-                if ui.add(egui::Button::new(arrow).small().frame(false)).clicked() {
+                if ui
+                    .add(egui::Button::new(arrow).small().frame(false))
+                    .clicked()
+                {
                     actions.group_op = Some(GroupOp::ToggleCollapse(header.uid.clone()));
                 }
                 let mut vis = header.visible;
@@ -2116,7 +2613,10 @@ impl PsEditorTabState {
         egui::Popup::context_menu(&resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                if ui.button(t!("ps_editor.layers_panel.delete_group_button")).clicked() {
+                if ui
+                    .button(t!("ps_editor.layers_panel.delete_group_button"))
+                    .clicked()
+                {
                     actions.group_op = Some(GroupOp::DeleteGroup(header.uid.clone()));
                     egui::Popup::close_all(ui.ctx());
                 }
@@ -2202,11 +2702,17 @@ impl PsEditorTabState {
                         }
                     });
                 }
-                if ui.button(t!("ps_editor.layers_panel.create_group_from_selection")).clicked() {
+                if ui
+                    .button(t!("ps_editor.layers_panel.create_group_from_selection"))
+                    .clicked()
+                {
                     actions.group_op = Some(GroupOp::NewFromSelection);
                     egui::Popup::close_all(ui.ctx());
                 }
-                if ui.button(t!("ps_editor.layers_panel.remove_from_group")).clicked() {
+                if ui
+                    .button(t!("ps_editor.layers_panel.remove_from_group"))
+                    .clicked()
+                {
                     actions.group_op = Some(GroupOp::Ungroup);
                     egui::Popup::close_all(ui.ctx());
                 }
@@ -2262,7 +2768,10 @@ impl PsEditorTabState {
                 ui.label(format!("▦ {}", layer.name));
                 let mut opacity = layer.opacity;
                 if ui
-                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text(t!("ps_editor.active_controls.opacity_label")))
+                    .add(
+                        crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0)
+                            .text(t!("ps_editor.active_controls.opacity_label")),
+                    )
                     .changed()
                 {
                     actions.opacity_raster = Some((id, opacity));
@@ -2296,7 +2805,10 @@ impl PsEditorTabState {
                     // render into the base pixels and clear the chain so it becomes directly editable.
                     if !layer.effects.is_empty()
                         && ui
-                            .add(egui::Button::new(t!("ps_editor.active_controls.bake_button")).small())
+                            .add(
+                                egui::Button::new(t!("ps_editor.active_controls.bake_button"))
+                                    .small(),
+                            )
                             .on_hover_text(t!("ps_editor.active_controls.bake_tooltip"))
                             .clicked()
                     {
@@ -2305,8 +2817,11 @@ impl PsEditorTabState {
                 });
             }
             RowSel::Text(uid) => {
-                let Some((index, text)) =
-                    self.text_layers.iter().enumerate().find(|(_, t)| t.uid == uid)
+                let Some((index, text)) = self
+                    .text_layers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.uid == uid)
                 else {
                     return;
                 };
@@ -2344,12 +2859,20 @@ impl PsEditorTabState {
                 ui.label(format!("📁 {}", group.name));
                 let mut opacity = group.opacity;
                 if ui
-                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text(t!("ps_editor.active_controls.opacity_label")))
+                    .add(
+                        crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0)
+                            .text(t!("ps_editor.active_controls.opacity_label")),
+                    )
                     .changed()
                 {
                     actions.group_op = Some(GroupOp::GroupOpacity(uid.clone(), opacity));
                 }
-                if ui.add(egui::Button::new(t!("ps_editor.layers_panel.delete_group_button")).small()).clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(t!("ps_editor.layers_panel.delete_group_button")).small(),
+                    )
+                    .clicked()
+                {
                     actions.group_op = Some(GroupOp::DeleteGroup(uid));
                 }
             }
@@ -2403,11 +2926,20 @@ impl PsEditorTabState {
             // Add the local layer first (it is `pixels_dirty`, so a re-projection won't clobber its
             // empty pixels), then mirror it as a doc node so cross-tab reads see it.
             let id = stack.add_raster_layer();
-            crate::trace_log!(cat::PS_EDITOR, "panel add_layer id={} page={:?}", id, page_idx);
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "panel add_layer id={} page={:?}",
+                id,
+                page_idx
+            );
             self.panel_primary = Some(RowSel::Raster(id));
-            if let (Some(page_idx), Some(node)) =
-                (page_idx, self.stack.as_ref().and_then(|s| s.layer(id)).map(layer_to_raster_node))
-            {
+            if let (Some(page_idx), Some(node)) = (
+                page_idx,
+                self.stack
+                    .as_ref()
+                    .and_then(|s| s.layer(id))
+                    .map(layer_to_raster_node),
+            ) {
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.add_node(page_idx, node);
                 });
@@ -2491,11 +3023,20 @@ impl PsEditorTabState {
         }
         if let Some((id, value)) = actions.opacity_raster {
             // Live slider: fires only on actual value change (drag steps), not every idle frame.
-            crate::trace_log!(cat::PS_EDITOR, "panel opacity_raster id={} value={:.3}", id, value);
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "panel opacity_raster id={} value={:.3}",
+                id,
+                value
+            );
             // Snapshot the pre-drag opacity ONCE per gesture (the stack still holds it before this
             // frame's apply), so the whole drag records a single undo step (see `opacity_gesture`).
             if self.opacity_gesture.is_none()
-                && let Some(before) = self.stack.as_ref().and_then(|s| s.layer(id)).map(|l| l.opacity)
+                && let Some(before) = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.layer(id))
+                    .map(|l| l.opacity)
             {
                 self.opacity_gesture = Some((id, before));
             }
@@ -2517,7 +3058,10 @@ impl PsEditorTabState {
             if let (Some(page_idx), Some(uid), Some(after)) = (
                 page_idx,
                 self.raster_uid(id),
-                self.stack.as_ref().and_then(|s| s.layer(id)).map(|l| l.opacity),
+                self.stack
+                    .as_ref()
+                    .and_then(|s| s.layer(id))
+                    .map(|l| l.opacity),
             ) && (after - before).abs() > f32::EPSILON
             {
                 self.history.record(PsEditOp::FieldPatch {
@@ -2528,7 +3072,12 @@ impl PsEditorTabState {
             }
         }
         if let Some(id) = actions.remove_raster {
-            crate::trace_log!(cat::PS_EDITOR, "panel remove_raster id={} page={:?}", id, page_idx);
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "panel remove_raster id={} page={:?}",
+                id,
+                page_idx
+            );
             // Capture the FULL layer (with pixels) + its Z BEFORE removal so an undo can re-add it.
             let captured = self
                 .stack
@@ -2628,7 +3177,13 @@ fn group_mut_by_uid<'a>(stack: &'a mut LayerStack, uid: &str) -> Option<&'a mut 
 
 impl PsEditorTabState {
     /// Band-Z lookup maps from `self.bands`: raster uid→z, text-group layer_idx→z, pinned uid→z.
-    fn band_z_maps(&self) -> (HashMap<String, u32>, HashMap<u32, u32>, HashMap<String, u32>) {
+    fn band_z_maps(
+        &self,
+    ) -> (
+        HashMap<String, u32>,
+        HashMap<u32, u32>,
+        HashMap<String, u32>,
+    ) {
         let mut raster_z = HashMap::new();
         let mut group_z = HashMap::new();
         let mut pinned_z = HashMap::new();
@@ -2667,7 +3222,10 @@ impl PsEditorTabState {
                         .filter(|t| t.layer_idx == *layer_idx && !t.pinned)
                         .collect();
                     members.sort_by(|a, b| {
-                        a.center().y.partial_cmp(&b.center().y).unwrap_or(std::cmp::Ordering::Equal)
+                        a.center()
+                            .y
+                            .partial_cmp(&b.center().y)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     uids.extend(members.iter().map(|t| t.uid.clone()));
                 }
@@ -2725,7 +3283,8 @@ impl PsEditorTabState {
                 });
             }
         }
-        let mut unpinned_groups: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut unpinned_groups: std::collections::BTreeSet<u32> =
+            std::collections::BTreeSet::new();
         for text in &self.text_layers {
             if pinned.contains(&text.uid) {
                 let pz = pinned_z
@@ -2768,10 +3327,15 @@ impl PsEditorTabState {
             }
         }
         items.sort_by(|a, b| {
-            let ka = a.group.as_ref().map_or((a.primary, a.secondary), |g| anchor[g]);
-            let kb = b.group.as_ref().map_or((b.primary, b.secondary), |g| anchor[g]);
-            ka.0
-                .cmp(&kb.0)
+            let ka = a
+                .group
+                .as_ref()
+                .map_or((a.primary, a.secondary), |g| anchor[g]);
+            let kb = b
+                .group
+                .as_ref()
+                .map_or((b.primary, b.secondary), |g| anchor[g]);
+            ka.0.cmp(&kb.0)
                 .then(ka.1.total_cmp(&kb.1))
                 .then(a.primary.cmp(&b.primary))
                 .then(a.secondary.total_cmp(&b.secondary))
@@ -2792,7 +3356,11 @@ impl PsEditorTabState {
         };
         let target = match &sel {
             RowSel::Raster(id) => {
-                let Some(uid) = self.stack.as_ref().and_then(|s| s.layer(*id)).map(|l| l.uid.to_string())
+                let Some(uid) = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.layer(*id))
+                    .map(|l| l.uid.to_string())
                 else {
                     return;
                 };
@@ -2864,7 +3432,11 @@ impl PsEditorTabState {
             bands.insert(insert_at.min(bands.len()), item);
         }
         let order_refs: Vec<persist::BandRef> = bands.into_iter().map(|(b, _)| b).collect();
-        match persist::save_page_band_order(&project.paths.unsaved_layers_dir, page_idx, &order_refs) {
+        match persist::save_page_band_order(
+            &project.paths.unsaved_layers_dir,
+            page_idx,
+            &order_refs,
+        ) {
             Ok(()) => {
                 self.reload_overlays_view(project, page_idx);
                 // Apply the SAME reorder in-memory so the doc (and, via its version bump, the typing
@@ -3022,7 +3594,8 @@ impl PsEditorTabState {
 
         // Apply membership for NewFromSelection / MoveTo / Ungroup.
         for uid in &sel_node_uids {
-            edit.set_membership.push((uid.clone(), target_group.clone()));
+            edit.set_membership
+                .push((uid.clone(), target_group.clone()));
             final_group.insert(uid.clone(), target_group.clone());
         }
         if target_group.is_some() {
@@ -3054,7 +3627,8 @@ impl PsEditorTabState {
         if let Some(stack) = self.stack.as_mut() {
             let target_gid = match (&op, &new_gid, &target_group) {
                 (GroupOp::NewFromSelection, Some((uid, name)), _) => {
-                    let parsed = uuid::Uuid::parse_str(uid).unwrap_or_else(|_| uuid::Uuid::new_v4());
+                    let parsed =
+                        uuid::Uuid::parse_str(uid).unwrap_or_else(|_| uuid::Uuid::new_v4());
                     Some(stack.add_group_with_uid(name.clone(), parsed))
                 }
                 (_, _, Some(uid)) => stack.group_by_uid(uid).map(|g| g.id),
@@ -3114,8 +3688,11 @@ impl PsEditorTabState {
         order_blocks.swap(bi, target);
         let order_refs: Vec<persist::BandRef> =
             order_blocks.into_iter().flatten().map(|(b, _)| b).collect();
-        match persist::save_page_band_order(&project.paths.unsaved_layers_dir, page_idx, &order_refs)
-        {
+        match persist::save_page_band_order(
+            &project.paths.unsaved_layers_dir,
+            page_idx,
+            &order_refs,
+        ) {
             Ok(()) => {
                 self.reload_overlays_view(project, page_idx);
                 // Apply the same group-block move in-memory so the doc (and, via its version bump, the
@@ -3132,7 +3709,12 @@ impl PsEditorTabState {
     /// mirrors the SAME edit onto the shared doc in-memory (so it and the typing tab re-project
     /// without a disk round-trip). Flushes the page's rasters first so freshly-added raster layers
     /// already have manifest nodes for the edit's membership / order to land on.
-    fn persist_grouping(&mut self, edit: persist::GroupingEdit, page_idx: usize, project: &ProjectData) {
+    fn persist_grouping(
+        &mut self,
+        edit: persist::GroupingEdit,
+        page_idx: usize,
+        project: &ProjectData,
+    ) {
         self.persist_current_page(project);
         // Snapshot the in-memory doc effect of `edit` BEFORE it is moved into the disk write. The band
         // order expansion uses the current text-layer page-Y order (unchanged by membership), matching
@@ -3173,7 +3755,8 @@ impl PsEditorTabState {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new(t!("ps_editor.effects_editor.window_title")).id(egui::Id::new("ps_editor.effects_editor.window_title"))
+        egui::Window::new(t!("ps_editor.effects_editor.window_title"))
+            .id(egui::Id::new("ps_editor.effects_editor.window_title"))
             .collapsible(false)
             .resizable(true)
             .open(&mut open)
@@ -3188,16 +3771,20 @@ impl PsEditorTabState {
                     );
                 }
                 ui.horizontal(|ui| {
-                    if ui.button(t!("ps_editor.effects_editor.apply_button")).clicked() {
+                    if ui
+                        .button(t!("ps_editor.effects_editor.apply_button"))
+                        .clicked()
+                    {
                         apply = true;
                     }
-                    if ui.button(t!("ps_editor.effects_editor.cancel_button")).clicked() {
+                    if ui
+                        .button(t!("ps_editor.effects_editor.cancel_button"))
+                        .clicked()
+                    {
                         cancel = true;
                     }
                 });
-                ui.small(
-                    t!("ps_editor.effects_editor.example_hint"),
-                );
+                ui.small(t!("ps_editor.effects_editor.example_hint"));
             });
 
         if apply {
@@ -3349,7 +3936,11 @@ impl PsEditorTabState {
     /// `poll_raster_effects_jobs` body). Performs the recenter anchoring, routes the swap to the
     /// shared doc, persists the chain reversibly (base PNG untouched), and drops the layer's GPU
     /// cache so the new display re-uploads. No long work, no decode, no held lock across a worker.
-    fn apply_ps_raster_effects_result(&mut self, result: PsRasterEffectsResult, project: &ProjectData) {
+    fn apply_ps_raster_effects_result(
+        &mut self,
+        result: PsRasterEffectsResult,
+        project: &ProjectData,
+    ) {
         let PsRasterEffectsResult {
             page_idx,
             uid,
@@ -3415,7 +4006,11 @@ impl PsEditorTabState {
         // off-thread; targeted single-raster RMW, never a whole-page rewrite) — falls back to the sync
         // `update_raster_effects` when no saver is enabled. The save-to-project / app-close barriers
         // guarantee the enqueued effects land. Then the cross-tab bump already happened via the doc edit.
-        let rendered_for_persist = if effects.is_empty() { None } else { display.as_ref() };
+        let rendered_for_persist = if effects.is_empty() {
+            None
+        } else {
+            display.as_ref()
+        };
         let effects_persist = self
             .layer_doc
             .as_ref()
@@ -3493,12 +4088,11 @@ impl PsEditorTabState {
                     return;
                 };
                 let (uid, layer_idx, pinned) = (layer.uid.clone(), layer.layer_idx, layer.pinned);
-                let mut order: Vec<persist::BandRef> = self.bands.iter().map(Band::to_ref).collect();
+                let mut order: Vec<persist::BandRef> =
+                    self.bands.iter().map(Band::to_ref).collect();
                 if pinned {
                     // Drop its pinned band so it rejoins its text group's auto-Y order.
-                    order.retain(
-                        |b| !matches!(b, persist::BandRef::PinnedText(u) if *u == uid),
-                    );
+                    order.retain(|b| !matches!(b, persist::BandRef::PinnedText(u) if *u == uid));
                 } else {
                     // Give it its own band, just above its text group.
                     let after = self
@@ -3525,7 +4119,9 @@ impl PsEditorTabState {
                             doc.set_z_order(page_idx, &node_order);
                         });
                     }
-                    Err(err) => crate::runtime_log::log_warn(format!("[ps_editor] pin text: {err}")),
+                    Err(err) => {
+                        crate::runtime_log::log_warn(format!("[ps_editor] pin text: {err}"))
+                    }
                 }
             }
             TextLayerOp::Rasterize => {
@@ -3546,7 +4142,9 @@ impl PsEditorTabState {
                     .as_mut()
                     // Persisted raster-layer name (round-trips to `layers.json`); stable
                     // literal, not localized. See docs/i18n_exclusions.md §A.
-                    .map(|s| s.add_raster_layer_image(format!("Запечён: {name}"), image, transform));
+                    .map(|s| {
+                        s.add_raster_layer_image(format!("Запечён: {name}"), image, transform)
+                    });
                 // The doc is the sole text writer: removing the Text node and flushing drops it from
                 // `layers.json` (a migrated page ignores the stale `text_info.json` entry, so the
                 // rasterized overlay does not resurrect). No `text_info.json` write here.
@@ -3564,9 +4162,55 @@ impl PsEditorTabState {
         }
     }
 
+    /// Whether `pointer_pos` is inside one of THIS frame's drawn dock panels.
+    ///
+    /// The rects come from `PanelDockOutput::drawn_panels` and are main-window rects by
+    /// construction: a panel the user detached into a sub-window is never reported, so it can never
+    /// blank out a region of this window.
+    fn pointer_in_any_panel(&self, pointer_pos: Pos2) -> bool {
+        self.panel_rects
+            .iter()
+            .any(|panel_rect| panel_rect.contains(pointer_pos))
+    }
+
+    /// Whether canvas pointer input at `pointer_pos` is claimed by UI floating above the canvas.
+    ///
+    /// Three terms, mirroring the cleaning tab's gate (`tabs/cleaning/tab.rs`):
+    /// * an open popup or menu anywhere — its own layer may not cover this point yet on the frame
+    ///   it opens;
+    /// * this frame's dock-panel rects — the tab's uniform statement of "a floating surface of mine
+    ///   is here", independent of the panel widget staying an interactable `Area`;
+    /// * z-order occlusion: anything above `Order::Background` at that point, which covers the
+    ///   effects-editor window, tooltips and context menus. This is the same test
+    ///   `crate::input_util::pointer_over_floating_area` performs, asked at the HOVER position
+    ///   rather than at `interact_pos`, which is the position the canvas gate is about; calling
+    ///   both would only add a second, drag-latched copy of the same answer.
+    fn canvas_pointer_occluded(&self, ctx: &egui::Context, pointer_pos: Pos2) -> bool {
+        ctx.any_popup_open()
+            || self.pointer_in_any_panel(pointer_pos)
+            || ctx.layer_id_at(pointer_pos).is_some_and(|layer| {
+                matches!(
+                    layer.order,
+                    egui::Order::Middle
+                        | egui::Order::Foreground
+                        | egui::Order::Tooltip
+                        | egui::Order::Debug
+                )
+            })
+    }
+
     /// Central pan/zoom canvas: input handling, layer composite, overlays.
-    fn draw_canvas(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    ///
+    /// `rect` is the SAME rect the dock was given this frame, so the canvas fills the whole
+    /// program-tab area and the floating panels sit over it rather than beside it.
+    fn draw_canvas(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        project: &ProjectData,
+    ) {
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, Color32::from_gray(40));
 
@@ -3609,8 +4253,20 @@ impl PsEditorTabState {
             remove_point_pressed: keyboard_free
                 && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)),
         });
-        let hovered = response.hovered();
+        // The canvas now fills the WHOLE program-tab area and the dock panels float over it, so
+        // "the pointer is inside the canvas rect" is no longer the same question as "the pointer is
+        // on bare canvas". Everything derived from the pointer — the wheel, the zoom anchor and the
+        // routing to the active tool — is gated on this instead of on `response.hovered()` alone;
+        // without it a click on a panel would paint underneath it.
+        let pointer_occluded = input
+            .hover_pos
+            .is_some_and(|pos| self.canvas_pointer_occluded(ctx, pos));
+        let hovered = response.hovered() && !pointer_occluded;
         let pointer_in_viewport = hovered && input.hover_pos.is_some_and(|p| rect.contains(p));
+        // Panning is deliberately NOT gated on `pointer_occluded`: the gate answers where the
+        // pointer is RIGHT NOW, and a pan that started on bare canvas must survive the pointer
+        // crossing a panel. What it costs is a middle-drag begun on a panel also panning — the same
+        // behaviour this tab had before the panels floated, and harmless (a pan destroys nothing).
         let pan_active = input.middle_down || (input.space_down && input.primary_down);
 
         // Wheel: Shift+wheel adjusts the brush; plain wheel zooms toward the cursor.
@@ -3867,11 +4523,18 @@ impl PsEditorTabState {
         // Right-click menu on the selection: copy/cut from chosen layers.
         self.draw_selection_menu(&response, project);
 
-        // Tool cursor / preview overlay.
-        let pointer_image = input
-            .hover_pos
-            .filter(|p| rect.contains(*p))
-            .map(|p| view.screen_to_world(p));
+        // Tool cursor / preview overlay. It obeys the SAME occlusion gate as the input path
+        // (`pointer_occluded`, resolved once above): a brush circle that keeps tracking the cursor
+        // under a floating panel advertises a stroke the tools already refuse to start there.
+        // The exception is a gesture the tool has actually accepted — see `overlay_pointer` for why
+        // that question goes to the tool and not to `input.primary_down`.
+        let pointer_image = overlay_pointer(
+            input.hover_pos,
+            rect,
+            pointer_occluded,
+            self.tools[self.active_tool_idx].gesture_in_flight(),
+        )
+        .map(|p| view.screen_to_world(p));
         let painter = ui.painter_at(rect);
         self.tools[self.active_tool_idx].draw_overlay(&painter, &view, pointer_image);
 
@@ -3932,8 +4595,10 @@ impl PsEditorTabState {
                 .get(&layer.id)
                 .is_none_or(|cache| !cache.matches_size(size));
             if needs_new {
-                self.render_cache
-                    .insert(layer.id, TiledTexture::new(size, format!("ps_layer_{}", layer.id)));
+                self.render_cache.insert(
+                    layer.id,
+                    TiledTexture::new(size, format!("ps_layer_{}", layer.id)),
+                );
             }
         }
     }
@@ -4027,7 +4692,14 @@ impl PsEditorTabState {
                     .get(&layer.uid.to_string())
                     .copied()
                     .unwrap_or(top_z);
-                plan.push((z, 0.0, Step::Raster { id: layer.id, opacity }));
+                plan.push((
+                    z,
+                    0.0,
+                    Step::Raster {
+                        id: layer.id,
+                        opacity,
+                    },
+                ));
             }
         }
         for (index, layer) in self.text_layers.iter().enumerate() {
@@ -4055,7 +4727,10 @@ impl PsEditorTabState {
             plan.push((
                 z,
                 layer.center().y,
-                Step::Text { index, opacity: group_opacity },
+                Step::Text {
+                    index,
+                    opacity: group_opacity,
+                },
             ));
         }
         plan.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
@@ -4225,8 +4900,15 @@ impl PsEditorTabState {
             screen.clear();
             decimate_to_screen(loop_pts, view, &mut screen);
             let emitted = walk_dash_runs(&screen, MARQUEE_DASH_PX, budget, |run| {
-                let color = if run.black { Color32::BLACK } else { Color32::WHITE };
-                shapes.push(egui::Shape::line_segment([run.from, run.to], Stroke::new(1.0, color)));
+                let color = if run.black {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                };
+                shapes.push(egui::Shape::line_segment(
+                    [run.from, run.to],
+                    Stroke::new(1.0, color),
+                ));
             });
             budget -= emitted;
         }
@@ -4263,7 +4945,10 @@ impl PsEditorTabState {
     fn clip_op_submenu(&mut self, ui: &mut egui::Ui, mode: ClipMode, project: &ProjectData) {
         let touched = self.clip_touched_layers.clone();
         if ui
-            .add_enabled(!touched.is_empty(), egui::Button::new(t!("ps_editor.selection_menu.clip_from_top_layer")))
+            .add_enabled(
+                !touched.is_empty(),
+                egui::Button::new(t!("ps_editor.selection_menu.clip_from_top_layer")),
+            )
             .clicked()
         {
             if let Some(&top) = touched.last() {
@@ -4274,7 +4959,10 @@ impl PsEditorTabState {
         ui.menu_button(t!("ps_editor.selection_menu.clip_from_layers"), |ui| {
             self.clip_layer_picker(ui, mode, &touched, project);
         });
-        if ui.button(t!("ps_editor.selection_menu.clip_from_all_layers")).clicked() {
+        if ui
+            .button(t!("ps_editor.selection_menu.clip_from_all_layers"))
+            .clicked()
+        {
             let all: Vec<LayerId> = self
                 .stack
                 .as_ref()
@@ -4303,7 +4991,10 @@ impl PsEditorTabState {
                 .stack
                 .as_ref()
                 .and_then(|stack| stack.layer(id))
-                .map_or_else(|| tf!("ps_editor.selection_menu.layer_fallback", id = id), |layer| layer.name.clone());
+                .map_or_else(
+                    || tf!("ps_editor.selection_menu.layer_fallback", id = id),
+                    |layer| layer.name.clone(),
+                );
             let mut checked = self.clip_selected_layers.contains(&id);
             if ui.checkbox(&mut checked, name).changed() {
                 if checked {
@@ -4462,7 +5153,12 @@ impl PsEditorTabState {
             }
             // Bottom-to-top: below then upper, so the upper composites OVER the below.
             let merged = composite_to_page(&[below, upper], size);
-            (below.id, below.uid.to_string(), upper.uid.to_string(), merged)
+            (
+                below.id,
+                below.uid.to_string(),
+                upper.uid.to_string(),
+                merged,
+            )
         };
         // Record the upper raster's deletion (so the manifest save drops it — `save_page_rasters`
         // preserves unowned rasters otherwise). Then edit the doc in memory: the lower raster absorbs
@@ -4552,6 +5248,61 @@ impl PsEditorTabState {
             self.redo(project);
         }
     }
+}
+
+/// The TAB-level shortcuts, already localized, for the «Горячие клавиши» panel.
+///
+/// Deliberately placed immediately next to [`PsEditorTabState::handle_hotkeys`] — which dispatches
+/// the letter keys, Ctrl+D and undo/redo — and next to `draw_canvas`, which reads the pan buttons
+/// and the wheel: the displayed list and the dispatched keys have no other coupling, so keeping
+/// them apart is exactly how the two drift.
+///
+/// A TOOL's own shortcuts are not here: they come from `PsTool::hotkey_rows`, so a tool stays the
+/// single owner of the keys it interprets. `PsToolId::Deform` has no tool letter today, which is
+/// why the list names four tools and not five.
+#[must_use]
+fn ps_editor_common_hotkey_rows() -> Vec<tools::PsHotkeyRow> {
+    use tools::PsHotkeyRow;
+    vec![
+        // Tool letters — `handle_hotkeys`, suppressed while a widget holds keyboard focus.
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.tool_brush_label"),
+            t!("ps_editor.hotkeys.tool_brush_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.tool_rect_select_label"),
+            t!("ps_editor.hotkeys.tool_rect_select_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.tool_lasso_label"),
+            t!("ps_editor.hotkeys.tool_lasso_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.tool_transform_label"),
+            t!("ps_editor.hotkeys.tool_transform_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.clear_selection_label"),
+            t!("ps_editor.hotkeys.clear_selection_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.undo_label"),
+            t!("ps_editor.hotkeys.undo_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.redo_label"),
+            t!("ps_editor.hotkeys.redo_keys"),
+        ),
+        // Canvas gestures — `draw_canvas`: middle button or Space+LMB pans, the wheel zooms.
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.pan_label"),
+            t!("ps_editor.hotkeys.pan_keys"),
+        ),
+        PsHotkeyRow::new(
+            t!("ps_editor.hotkeys.zoom_label"),
+            t!("ps_editor.hotkeys.zoom_keys"),
+        ),
+    ]
 }
 
 /// Snapshot of pointer/keyboard input read once per frame for the canvas.
@@ -4752,8 +5503,8 @@ fn clear_selected_pixels(layer: &mut Layer, selection: &Selection, bounds: Selec
         let row = ly * w;
         for lx in 0..w {
             let local = Vec2::new(lx as f32 + 0.5, ly as f32 + 0.5);
-            let world =
-                transform.center + rotate_vec((local - local_center) * transform.scale, transform.rotation);
+            let world = transform.center
+                + rotate_vec((local - local_center) * transform.scale, transform.rotation);
             if world.x < 0.0 || world.y < 0.0 {
                 continue;
             }
@@ -4855,7 +5606,10 @@ fn effects_recenter_offset(
     let dy = new_size[1] as f32 * 0.5 - origin[1] as f32 - base_size[1] as f32 * 0.5;
     let (sin, cos) = base_t.rotation.sin_cos();
     let scaled = Vec2::new(dx, dy) * base_t.scale;
-    Vec2::new(scaled.x * cos - scaled.y * sin, scaled.x * sin + scaled.y * cos)
+    Vec2::new(
+        scaled.x * cos - scaled.y * sin,
+        scaled.x * sin + scaled.y * cos,
+    )
 }
 
 /// Converts an in-memory layer transform to its on-disk record (center-anchored, page pixels).
@@ -4884,9 +5638,7 @@ fn deform_eq(
 ) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.cols == b.cols && a.rows == b.rows && a.points_px == b.points_px
-        }
+        (Some(a), Some(b)) => a.cols == b.cols && a.rows == b.rows && a.points_px == b.points_px,
         (None, Some(_)) | (Some(_), None) => false,
     }
 }
@@ -4940,6 +5692,32 @@ fn non_empty_selection(selection: Selection) -> Option<Selection> {
     selection.any().then_some(selection)
 }
 
+/// Screen position the active tool's `draw_overlay` may follow this frame, or `None` to hide it.
+///
+/// The pure decision behind the overlay call in `draw_canvas`, split out so it can be exercised
+/// without a GUI. Three terms:
+/// * `hover_pos` outside `rect` — the pointer left the program-tab area entirely;
+/// * `pointer_occluded` — a dock panel, popup or window covers the pointer, the same gate the
+///   input path uses (`PsEditorTabState::canvas_pointer_occluded`);
+/// * `gesture_in_flight` — the escape hatch that keeps a preview alive once its gesture legitimately
+///   started on bare canvas and was then dragged over a panel, mirroring the panning rule.
+///
+/// The in-flight term is asked of the TOOL and must not be replaced by "the primary button is
+/// down": a press that BEGINS on a panel also holds the button down, and the tools correctly refuse
+/// to start a gesture there — so `primary_down` would keep painting the preview under the panel in
+/// exactly the case this function exists to fix.
+#[must_use]
+fn overlay_pointer(
+    hover_pos: Option<Pos2>,
+    rect: Rect,
+    pointer_occluded: bool,
+    gesture_in_flight: bool,
+) -> Option<Pos2> {
+    hover_pos
+        .filter(|p| rect.contains(*p))
+        .filter(|_| !pointer_occluded || gesture_in_flight)
+}
+
 /// One emitted piece of the selection marquee: a straight screen-space run of a single colour.
 ///
 /// Runs tile the path end to end with no gaps; `black` alternates every `dash_len` of ARC LENGTH,
@@ -4962,7 +5740,11 @@ struct DashRun {
 /// and last points are always kept, so a closed loop stays closed.
 ///
 /// `out` is cleared by the caller and reused across loops.
-fn decimate_to_screen(loop_pts: &[(f32, f32)], view: &viewport::ViewTransform, out: &mut Vec<Pos2>) {
+fn decimate_to_screen(
+    loop_pts: &[(f32, f32)],
+    view: &viewport::ViewTransform,
+    out: &mut Vec<Pos2>,
+) {
     let Some((&first, rest)) = loop_pts.split_first() else {
         return;
     };
@@ -4991,7 +5773,12 @@ fn decimate_to_screen(loop_pts: &[(f32, f32)], view: &viewport::ViewTransform, o
 /// `dash_len` is in SCREEN pixels, so the pattern is zoom-invariant. A path shorter than one dash
 /// emits a single black run. Returns 0 for a path with fewer than two points, a non-positive
 /// `dash_len`, or a zero `budget`. Pure: no painter, no global state.
-fn walk_dash_runs(path: &[Pos2], dash_len: f32, budget: usize, mut emit: impl FnMut(DashRun)) -> usize {
+fn walk_dash_runs(
+    path: &[Pos2],
+    dash_len: f32,
+    budget: usize,
+    mut emit: impl FnMut(DashRun),
+) -> usize {
     if path.len() < 2 || budget == 0 || !(dash_len.is_finite() && dash_len > 0.0) {
         return 0;
     }
@@ -5024,7 +5811,11 @@ fn walk_dash_runs(path: &[Pos2], dash_len: f32, budget: usize, mut emit: impl Fn
             if next <= cursor {
                 break;
             }
-            emit(DashRun { from: a + dir * cursor, to: a + dir * next, black });
+            emit(DashRun {
+                from: a + dir * cursor,
+                to: a + dir * next,
+                black,
+            });
             emitted += 1;
             dash_left -= take;
             if dash_left <= MARQUEE_MIN_RUN_PX {
@@ -5051,6 +5842,324 @@ fn walk_dash_runs(path: &[Pos2], dash_len: f32, budget: usize, mut emit: impl Fn
 mod tests {
     use super::*;
     use layers::LayerStack;
+    use std::collections::BTreeSet;
+
+    /// The canvas rect the overlay-gate tests position their pointer inside.
+    const OVERLAY_RECT: Rect = Rect {
+        min: Pos2::new(0.0, 0.0),
+        max: Pos2::new(100.0, 100.0),
+    };
+
+    /// The plain case: bare canvas, no gesture — the preview follows the cursor.
+    #[test]
+    fn the_overlay_follows_the_pointer_on_bare_canvas() {
+        let p = Pos2::new(10.0, 10.0);
+        assert_eq!(
+            overlay_pointer(Some(p), OVERLAY_RECT, false, false),
+            Some(p)
+        );
+    }
+
+    /// The reported bug: hovering a floating dock panel with no gesture running must HIDE the tool
+    /// preview, not merely stop it from acting. `rect.contains` alone cannot do this — the canvas
+    /// is the full-area background, so a panel's pixels are inside the canvas rect.
+    #[test]
+    fn the_overlay_is_dropped_over_a_panel_when_no_gesture_runs() {
+        let p = Pos2::new(10.0, 10.0);
+        assert_eq!(
+            overlay_pointer(Some(p), OVERLAY_RECT, true, false),
+            None,
+            "a preview must not be painted under a floating panel"
+        );
+    }
+
+    /// The other half of the rule, and the reason the in-flight term is asked of the TOOL: a
+    /// gesture that legitimately started on bare canvas keeps its preview while it is dragged over
+    /// a panel, exactly as a pan started on bare canvas survives the crossing.
+    #[test]
+    fn a_gesture_in_flight_keeps_its_overlay_over_a_panel() {
+        let p = Pos2::new(10.0, 10.0);
+        assert_eq!(
+            overlay_pointer(Some(p), OVERLAY_RECT, true, true),
+            Some(p),
+            "a preview dragged over a panel by a running gesture must stay visible"
+        );
+    }
+
+    /// The occlusion gate is added to the rect filter, never substituted for it: a pointer outside
+    /// the program-tab area has nothing to preview, in flight or not.
+    #[test]
+    fn the_overlay_still_requires_the_pointer_inside_the_canvas_rect() {
+        let outside = Pos2::new(200.0, 10.0);
+        assert_eq!(
+            overlay_pointer(Some(outside), OVERLAY_RECT, false, false),
+            None
+        );
+        assert_eq!(
+            overlay_pointer(Some(outside), OVERLAY_RECT, false, true),
+            None
+        );
+        assert_eq!(overlay_pointer(None, OVERLAY_RECT, false, true), None);
+    }
+
+    /// The default arrangement is what the dock is handed on a first run AND the dictionary
+    /// `panel_dock::persist` resolves stored tab keys against, so it must be well-formed and must
+    /// name every tab this program tab can declare — a tab missing here would be dropped from the
+    /// user's stored arrangement on every load.
+    #[test]
+    fn the_default_dock_layout_places_the_five_ps_editor_panels() {
+        let layout = ps_editor_default_dock_layout();
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 5);
+
+        let declared: BTreeSet<TabId> = layout
+            .panels()
+            .iter()
+            .flat_map(|panel| panel.tabs.iter().copied())
+            .collect();
+        let expected: BTreeSet<TabId> = [
+            PS_EDITOR_MAIN_TAB,
+            PS_EDITOR_TOOLS_TAB,
+            PS_EDITOR_ACTIVE_TOOL_TAB,
+            PS_EDITOR_HOTKEYS_TAB,
+            PS_EDITOR_LAYERS_TAB,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            declared, expected,
+            "the default layout must name exactly the five tabs the program tab declares"
+        );
+    }
+
+    /// The two columns the doc comment promises: «PS редактор» roots the left chain at the viewport's
+    /// left edge, «Слои» roots the right one at its right edge, and each dependant hangs below its
+    /// own target. Anchors, not rects: the solver is what turns these into geometry.
+    #[test]
+    fn the_default_dock_layout_builds_two_columns() {
+        let layout = ps_editor_default_dock_layout();
+        let panel_of = |tab: TabId| {
+            let id = layout
+                .panel_of_tab(tab)
+                .unwrap_or_else(|| panic!("{tab} has a panel"));
+            layout
+                .panel(id)
+                .unwrap_or_else(|| panic!("{tab}'s panel exists"))
+        };
+        let main = panel_of(PS_EDITOR_MAIN_TAB);
+        let layers = panel_of(PS_EDITOR_LAYERS_TAB);
+        assert_eq!(
+            main.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0
+            }
+        );
+        assert_eq!(
+            layers.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.0
+            }
+        );
+        assert_eq!(
+            panel_of(PS_EDITOR_TOOLS_TAB).anchor,
+            PanelAnchor::Panel {
+                target: main.id,
+                edge: DockEdge::Bottom,
+                align: 0.0
+            }
+        );
+        assert_eq!(
+            panel_of(PS_EDITOR_ACTIVE_TOOL_TAB).anchor,
+            PanelAnchor::Panel {
+                target: panel_of(PS_EDITOR_TOOLS_TAB).id,
+                edge: DockEdge::Bottom,
+                align: 0.0
+            }
+        );
+        assert_eq!(
+            panel_of(PS_EDITOR_HOTKEYS_TAB).anchor,
+            PanelAnchor::Panel {
+                target: layers.id,
+                edge: DockEdge::Bottom,
+                align: 0.0
+            }
+        );
+    }
+
+    /// The tab-level shortcut list is rendered as a two-column grid, so a blank half is an
+    /// authoring bug (a forgotten key) or a translation bug (an empty catalog value) and must not
+    /// reach the UI.
+    ///
+    /// The reference catalog is installed first on purpose: `t!` falls back to the KEY text on a
+    /// miss, which is never empty, so without a real catalog an empty translation would slip past.
+    #[test]
+    fn the_common_hotkey_rows_are_well_formed() {
+        let _guard = crate::locale_store::GLOBAL_LOCALE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
+        ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
+
+        let rows = ps_editor_common_hotkey_rows();
+        assert!(
+            !rows.is_empty(),
+            "the tab has shortcuts, so the list is never empty"
+        );
+        for row in &rows {
+            assert!(
+                !row.action.trim().is_empty(),
+                "a common hotkey row has an empty action (keys {:?})",
+                row.keys
+            );
+            assert!(
+                !row.keys.trim().is_empty(),
+                "common hotkey row {:?} has empty keys",
+                row.action
+            );
+        }
+    }
+
+    /// One visibility flag key together with the accessor of the field it must be read into.
+    type VisibilityKeyProbe = (&'static str, fn(&PsEditorPanelVisibility) -> bool);
+
+    /// One `entries()` row under test: its flag key, its menu caption, and the mutation that hides
+    /// that panel and no other.
+    type VisibilityRowProbe = (&'static str, &'static str, fn(&mut PsEditorPanelVisibility));
+
+    /// The four visibility flags default to "shown" when the dock has stored nothing, and each one
+    /// is read from its OWN key — a copy-paste slip between the four keys would otherwise show up
+    /// only as two panels that hide together.
+    ///
+    /// The stored case has to go through a real `TabExtras` bag seeded with
+    /// [`PanelDockState::put_tab_extras`]: on a bare `PanelDockState` the MAIN tab has no bag at
+    /// all, so `read` leaves through its `let Some(..) else` branch and the four `extras.flag(..)`
+    /// lines — the thing being tested — never run. One key is turned off at a time, because with
+    /// all four flags equal any permutation of the keys looks identical.
+    #[test]
+    fn panel_visibility_defaults_to_all_shown_and_reads_each_key() {
+        let layout_key = AppTab::PsEditor.key();
+
+        // Nothing stored: no bag for the MAIN tab, so every panel falls back to shown.
+        let state = PanelDockState::new();
+        let visibility = PsEditorPanelVisibility::read(&state, layout_key);
+        assert!(visibility.tools);
+        assert!(visibility.active_tool);
+        assert!(visibility.hotkeys);
+        assert!(visibility.layers);
+
+        // Each flag key, with the field it must land in.
+        let cases: [VisibilityKeyProbe; 4] = [
+            (PS_EDITOR_FLAG_TOOLS_PANEL, |v| v.tools),
+            (PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL, |v| v.active_tool),
+            (PS_EDITOR_FLAG_HOTKEYS_PANEL, |v| v.hotkeys),
+            (PS_EDITOR_FLAG_LAYERS_PANEL, |v| v.layers),
+        ];
+        for (key, field) in cases {
+            let mut state = PanelDockState::new();
+            let mut extras = TabExtras::default();
+            extras.set_flag(
+                key,
+                !PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+                PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+            );
+            state.put_tab_extras(layout_key, PS_EDITOR_MAIN_TAB, extras);
+
+            let visibility = PsEditorPanelVisibility::read(&state, layout_key);
+            assert!(
+                !field(&visibility),
+                "`{key}` must be read by its own field, not by another panel's"
+            );
+            let hidden = cases
+                .iter()
+                .filter(|(_, other)| !other(&visibility))
+                .count();
+            assert_eq!(hidden, 1, "`{key}` must hide exactly one panel — its own");
+        }
+    }
+
+    /// `entries()` is the single owner of the (flag key, menu caption, field) triple: the «Панели…»
+    /// checkbox, the persisted flag and the panel that actually hides all come from ONE row. A
+    /// copy-paste swap between two rows would toggle the wrong panel and persist it under the wrong
+    /// key, so each field is probed on its own — with all four `true` any permutation looks alike.
+    ///
+    /// The `TabId` leg of the pairing is deliberately absent here: `entries()` carries no `TabId`.
+    /// It lives on the `dock.tab(..).title(..).visible(..)` chains in `draw`, where the caption and
+    /// the visibility field sit on the same builder — which is exactly why the caption is asserted
+    /// here: a row whose caption belongs to another panel is the same defect seen from the menu.
+    ///
+    /// The reference catalog is installed first on purpose: `t!` falls back to the KEY text on a
+    /// miss, so without a real catalog every caption would compare equal to its own key text.
+    #[test]
+    fn each_entries_row_pairs_its_own_key_caption_and_field() {
+        let _guard = crate::locale_store::GLOBAL_LOCALE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
+        ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
+
+        let all_shown = PsEditorPanelVisibility {
+            tools: true,
+            active_tool: true,
+            hotkeys: true,
+            layers: true,
+        };
+        let cases: [VisibilityRowProbe; 4] = [
+            (PS_EDITOR_FLAG_TOOLS_PANEL, t!("ps_editor.tab.tools"), |v| {
+                v.tools = false;
+            }),
+            (
+                PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL,
+                t!("ps_editor.tab.active_tool"),
+                |v| v.active_tool = false,
+            ),
+            (
+                PS_EDITOR_FLAG_HOTKEYS_PANEL,
+                t!("ps_editor.tab.hotkeys"),
+                |v| v.hotkeys = false,
+            ),
+            (
+                PS_EDITOR_FLAG_LAYERS_PANEL,
+                t!("ps_editor.tab.layers"),
+                |v| {
+                    v.layers = false;
+                },
+            ),
+        ];
+        for (key, caption, hide) in cases {
+            let mut visibility = all_shown;
+            hide(&mut visibility);
+            let hidden: Vec<(&'static str, &'static str)> = visibility
+                .entries()
+                .into_iter()
+                .filter(|(_, _, value)| !**value)
+                .map(|(row_key, row_caption, _)| (row_key, row_caption))
+                .collect();
+            assert_eq!(
+                hidden,
+                vec![(key, caption)],
+                "hiding the panel of `{key}` must report exactly that key and its own caption"
+            );
+        }
+
+        let mut visibility = all_shown;
+        let keys: Vec<&'static str> = visibility
+            .entries()
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                PS_EDITOR_FLAG_TOOLS_PANEL,
+                PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL,
+                PS_EDITOR_FLAG_HOTKEYS_PANEL,
+                PS_EDITOR_FLAG_LAYERS_PANEL,
+            ],
+            "the menu rows and the persisted keys are one list, in one order"
+        );
+    }
 
     fn filled(size: [usize; 2], color: Color32) -> ColorImage {
         ColorImage::filled(size, color)
@@ -5067,7 +6176,11 @@ mod tests {
     fn collect_runs(path: &[Pos2], dash: f32) -> Vec<DashRun> {
         let mut runs = Vec::new();
         let emitted = walk_dash_runs(path, dash, 10_000, |r| runs.push(r));
-        assert_eq!(emitted, runs.len(), "returned count must match the emitted runs");
+        assert_eq!(
+            emitted,
+            runs.len(),
+            "returned count must match the emitted runs"
+        );
         runs
     }
 
@@ -5076,7 +6189,10 @@ mod tests {
         let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
             panic!("expected at least one run");
         };
-        assert!((first.from - start).length() < 1e-3, "first run must start at the path start");
+        assert!(
+            (first.from - start).length() < 1e-3,
+            "first run must start at the path start"
+        );
         for pair in runs.windows(2) {
             assert!(
                 (pair[0].to - pair[1].from).length() < 1e-3,
@@ -5085,7 +6201,10 @@ mod tests {
                 pair[1]
             );
         }
-        assert!((last.to - end).length() < 1e-3, "last run must end at the path end");
+        assert!(
+            (last.to - end).length() < 1e-3,
+            "last run must end at the path end"
+        );
     }
 
     #[test]
@@ -5097,12 +6216,21 @@ mod tests {
         let path: Vec<Pos2> = (0u8..=10).map(|i| Pos2::new(f32::from(i), 0.0)).collect();
         let runs = collect_runs(&path, 4.0);
         // One run per segment (each segment is shorter than a dash, so none is subdivided).
-        assert_eq!(runs.len(), 10, "expected one run per unit segment, got {runs:?}");
+        assert_eq!(
+            runs.len(),
+            10,
+            "expected one run per unit segment, got {runs:?}"
+        );
         assert_contiguous(&runs, Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0));
         // 4 black, 4 white, then the 2px tail of the next black dash.
-        let expected = [true, true, true, true, false, false, false, false, true, true];
+        let expected = [
+            true, true, true, true, false, false, false, false, true, true,
+        ];
         let actual: Vec<bool> = runs.iter().map(|r| r.black).collect();
-        assert_eq!(actual, expected, "dash colours must follow cumulative arc length");
+        assert_eq!(
+            actual, expected,
+            "dash colours must follow cumulative arc length"
+        );
     }
 
     #[test]
@@ -5115,7 +6243,10 @@ mod tests {
         assert_contiguous(&runs, path[0], path[1]);
         for (i, run) in runs.iter().enumerate() {
             let len = (run.to - run.from).length();
-            assert!((len - 4.0).abs() < 1e-3, "run {i} should be one dash long, got {len}");
+            assert!(
+                (len - 4.0).abs() < 1e-3,
+                "run {i} should be one dash long, got {len}"
+            );
             assert_eq!(run.black, i % 2 == 0, "colours must alternate, run {i}");
         }
     }
@@ -5138,7 +6269,11 @@ mod tests {
         assert_eq!(walk_dash_runs(&path, f32::NAN, 10, |_| {}), 0);
         assert_eq!(walk_dash_runs(&path, 4.0, 0, |_| {}), 0);
         // A zero-length path (all points coincide) produces nothing either.
-        let collapsed = [Pos2::new(3.0, 3.0), Pos2::new(3.0, 3.0), Pos2::new(3.0, 3.0)];
+        let collapsed = [
+            Pos2::new(3.0, 3.0),
+            Pos2::new(3.0, 3.0),
+            Pos2::new(3.0, 3.0),
+        ];
         assert_eq!(walk_dash_runs(&collapsed, 4.0, 10, |_| {}), 0);
     }
 
@@ -5162,7 +6297,10 @@ mod tests {
             scale: 1.0,
         };
         let off = effects_recenter_offset([14, 14], [2, 2], [10, 10], t);
-        assert!(off.length() < 1e-4, "symmetric growth needs no recenter, got {off:?}");
+        assert!(
+            off.length() < 1e-4,
+            "symmetric growth needs no recenter, got {off:?}"
+        );
     }
 
     #[test]
@@ -5190,7 +6328,10 @@ mod tests {
         };
         let off = effects_recenter_offset([16, 10], [0, 0], [10, 10], t);
         assert!(off.x.abs() < 1e-3, "x should be ~0 after 90° rot: {off:?}");
-        assert!((off.y - 6.0).abs() < 1e-3, "y should be ~6 (3*2 scaled, rotated): {off:?}");
+        assert!(
+            (off.y - 6.0).abs() < 1e-3,
+            "y should be ~6 (3*2 scaled, rotated): {off:?}"
+        );
     }
 
     #[test]
@@ -5222,8 +6363,16 @@ mod tests {
             &[stack.layer(bottom).unwrap(), stack.layer(top).unwrap()],
             size,
         );
-        assert_eq!(out.pixels[0], Color32::RED, "top opaque pixel wins over bottom");
-        assert_eq!(out.pixels[1], Color32::BLUE, "bottom shows where top is transparent");
+        assert_eq!(
+            out.pixels[0],
+            Color32::RED,
+            "top opaque pixel wins over bottom"
+        );
+        assert_eq!(
+            out.pixels[1],
+            Color32::BLUE,
+            "bottom shows where top is transparent"
+        );
     }
 
     #[test]
@@ -5267,14 +6416,23 @@ mod tests {
         clip_into_new_layer(&mut stack, &sel, ClipMode::Cut, &[source_id, clean_id]);
 
         // Clean (mutable) is cleared inside the selection; source (immutable) is not.
-        assert_eq!(stack.layer(clean_id).unwrap().image.pixels[4 + 1], Color32::TRANSPARENT);
-        assert_eq!(stack.layer(source_id).unwrap().image.pixels[4 + 1], Color32::RED);
+        assert_eq!(
+            stack.layer(clean_id).unwrap().image.pixels[4 + 1],
+            Color32::TRANSPARENT
+        );
+        assert_eq!(
+            stack.layer(source_id).unwrap().image.pixels[4 + 1],
+            Color32::RED
+        );
         // The new layer (2x2 crop) is the composite (green over red opaque = green).
         let top = stack.layers().last().unwrap();
         assert_eq!(top.image.size, [2, 2]);
         assert!(top.image.pixels.iter().all(|&p| p == Color32::GREEN));
         // Untouched pixels outside the selection stay put.
-        assert_eq!(stack.layer(clean_id).unwrap().image.pixels[0], Color32::GREEN);
+        assert_eq!(
+            stack.layer(clean_id).unwrap().image.pixels[0],
+            Color32::GREEN
+        );
     }
 
     #[test]
@@ -5307,11 +6465,18 @@ mod tests {
             rotation: 0.0,
             scale: 1.0,
         };
-        let id = stack.add_raster_layer_image("blue".into(), filled([2, 2], Color32::BLUE), transform);
+        let id =
+            stack.add_raster_layer_image("blue".into(), filled([2, 2], Color32::BLUE), transform);
 
         // Page pixel (0,0) maps into the layer; (3,3) does not.
-        assert_eq!(sample_layer_world(stack.layer(id).unwrap(), 0, 0), Color32::BLUE);
-        assert_eq!(sample_layer_world(stack.layer(id).unwrap(), 3, 3), Color32::TRANSPARENT);
+        assert_eq!(
+            sample_layer_world(stack.layer(id).unwrap(), 0, 0),
+            Color32::BLUE
+        );
+        assert_eq!(
+            sample_layer_world(stack.layer(id).unwrap(), 3, 3),
+            Color32::TRANSPARENT
+        );
     }
 
     #[test]
@@ -5326,9 +6491,15 @@ mod tests {
         ];
 
         // r_a is the top band (z=2): directly below it is r_c (z=1), NOT its stack neighbor r_b.
-        assert_eq!(raster_below_by_band_z(&rasters, "r_a").as_deref(), Some("r_c"));
+        assert_eq!(
+            raster_below_by_band_z(&rasters, "r_a").as_deref(),
+            Some("r_c")
+        );
         // r_c (z=1): below is r_b (z=0).
-        assert_eq!(raster_below_by_band_z(&rasters, "r_c").as_deref(), Some("r_b"));
+        assert_eq!(
+            raster_below_by_band_z(&rasters, "r_c").as_deref(),
+            Some("r_b")
+        );
         // r_b is the bottom band (z=0): nothing below.
         assert_eq!(raster_below_by_band_z(&rasters, "r_b"), None);
         // Unknown uid → None.
@@ -5356,8 +6527,14 @@ mod tests {
         // Band-Z: `second` is the BOTTOM band (z=0), `first` is the TOP band (z=1) — reverse of stack.
         let ps = PsEditorTabState {
             bands: vec![
-                Band::Raster { uid: second_uid.clone(), z: 0 },
-                Band::Raster { uid: first_uid.clone(), z: 1 },
+                Band::Raster {
+                    uid: second_uid.clone(),
+                    z: 0,
+                },
+                Band::Raster {
+                    uid: first_uid.clone(),
+                    z: 1,
+                },
             ],
             stack: Some(stack),
             ..Default::default()
@@ -5365,12 +6542,18 @@ mod tests {
 
         // `first` is visually on top (band z=1): directly below it is `second` (band z=0), NOT a base
         // layer and NOT its stack neighbour.
-        assert_eq!(ps.raster_below_uid(first).as_deref(), Some(second_uid.as_str()));
+        assert_eq!(
+            ps.raster_below_uid(first).as_deref(),
+            Some(second_uid.as_str())
+        );
         assert!(ps.is_mergeable(first), "top-by-band raster is mergeable");
 
         // `second` is the bottom-most raster by band-Z: nothing below → not mergeable.
         assert_eq!(ps.raster_below_uid(second), None);
-        assert!(!ps.is_mergeable(second), "bottom-by-band raster is not mergeable");
+        assert!(
+            !ps.is_mergeable(second),
+            "bottom-by-band raster is not mergeable"
+        );
 
         // Base layers (source/clean) are never a merge target or source.
         let base_ids: Vec<LayerId> = ps
@@ -5385,7 +6568,11 @@ mod tests {
         assert_eq!(base_ids.len(), 2, "source + clean base layers present");
         for id in base_ids {
             assert!(!ps.is_mergeable(id), "base layer is never mergeable");
-            assert_eq!(ps.raster_below_uid(id), None, "base layer has no band-Z below-raster");
+            assert_eq!(
+                ps.raster_below_uid(id),
+                None,
+                "base layer has no band-Z below-raster"
+            );
         }
     }
 
@@ -5400,7 +6587,10 @@ mod tests {
             ("top".to_string(), 9u32),
         ];
         // `top` (z=9) is above both; the nearest below is the tied pair — the earlier list entry wins.
-        assert_eq!(raster_below_by_band_z(&rasters, "top").as_deref(), Some("low"));
+        assert_eq!(
+            raster_below_by_band_z(&rasters, "top").as_deref(),
+            Some("low")
+        );
         // Equal-Z peers are NOT below each other (strict `z <` only).
         assert_eq!(raster_below_by_band_z(&rasters, "low"), None);
         assert_eq!(raster_below_by_band_z(&rasters, "high"), None);
@@ -5411,7 +6601,12 @@ mod tests {
         // "Select layer fully" on a layer whose footprint misses the page entirely: the mask stays
         // all-zero, and storing it as `Some` would block the brush behind an invisible marquee.
         let mut off_page = Selection::empty(4, 4);
-        off_page.set_polygon(&[(-30.0, -30.0), (-10.0, -30.0), (-10.0, -10.0), (-30.0, -10.0)]);
+        off_page.set_polygon(&[
+            (-30.0, -30.0),
+            (-10.0, -30.0),
+            (-10.0, -10.0),
+            (-30.0, -10.0),
+        ]);
         assert!(!off_page.any(), "the fixture must select nothing");
         assert!(non_empty_selection(off_page).is_none());
     }
@@ -5428,10 +6623,17 @@ mod tests {
     fn dash_walker_skips_non_finite_segments() {
         // A broken `ViewTransform` can hand the walker an infinite point. It must not emit a single
         // run for that segment (an infinite length would otherwise exhaust the whole budget).
-        let path = [Pos2::new(0.0, 0.0), Pos2::new(f32::INFINITY, 0.0), Pos2::new(10.0, 0.0)];
+        let path = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(f32::INFINITY, 0.0),
+            Pos2::new(10.0, 0.0),
+        ];
         let mut runs = Vec::new();
         let emitted = walk_dash_runs(&path, 4.0, 10_000, |r| runs.push(r));
-        assert_eq!(emitted, 0, "no run may be emitted from or into a non-finite point");
+        assert_eq!(
+            emitted, 0,
+            "no run may be emitted from or into a non-finite point"
+        );
         assert!(runs.is_empty());
 
         let nan_path = [Pos2::new(0.0, 0.0), Pos2::new(f32::NAN, f32::NAN)];

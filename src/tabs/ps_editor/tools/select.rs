@@ -18,9 +18,13 @@ Key functions:
 - `SelectTool::step`: the whole press / alt / release / pending-polygon state machine, pure and
   testable without a `PsToolContext`.
 - `SelectTool::apply_commit`: the only place that writes into the page `Selection`.
+- `PsTool::gesture_in_flight`: whether an outline is still live (`gesture.is_some()`), INCLUDING the
+  button-up pending polygon; the tab uses it to keep the preview visible over a floating panel.
 - `PsTool::reset` / `PsTool::freeze`: the two lifecycle hooks. `reset` drops the outline when its
   context is gone (tool switch, page switch, Esc during suppressed input); `freeze` marks a frame
   the tab did not route here, so the release it swallowed commits instead of aborting.
+- `PsTool::hotkey_rows`: the mode-dependent shortcut inventory (the lasso adds Alt straight
+  segments, the Alt-release anchor and Backspace/Delete). `options_ui` holds only `mode_row`.
 
 Notes:
 Alt means two different things and the two are told apart by WHEN it is held: Alt down BEFORE the
@@ -35,7 +39,7 @@ while `Add`/`Subtract`/`Intersect` leave the existing selection alone. The commi
 `PsToolContext::normalize_selection`, so an empty result is `None` and never `Some(all-zero)`.
 */
 
-use super::{PsTool, PsToolContext, PsToolId, ToolOutcome};
+use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome};
 use crate::tabs::ps_editor::selection::SelectionOp;
 use crate::tabs::ps_editor::viewport::ViewTransform;
 use eframe::egui;
@@ -492,6 +496,20 @@ impl PsTool for SelectTool {
         }
     }
 
+    /// An outline is in flight exactly while a `Gesture` is held.
+    ///
+    /// `gesture` is `Some` only after `begin_or_extend` accepted a press inside the viewport, and it
+    /// is taken by the commit or the abort, so it is the tool's whole answer. Crucially it stays
+    /// `Some` through the PENDING POLYGON state, where the button is UP and the outline waits for
+    /// the next anchor: that is still an unfinished gesture, and reporting `false` there would blank
+    /// the rubber band whenever the cursor crossed a floating panel mid-polygon.
+    ///
+    /// `last_pointer` is deliberately not consulted — it survives a commit and would report an idle
+    /// tool as busy forever.
+    fn gesture_in_flight(&self) -> bool {
+        self.gesture.is_some()
+    }
+
     /// Drops the in-progress outline. The committed page selection is never touched: an abandoned
     /// gesture must leave exactly what was selected before it started.
     ///
@@ -554,22 +572,70 @@ impl PsTool for SelectTool {
         }
     }
 
+    /// The persistent combination mode (`base_op`) is a real parameter, so the panel draws it.
+    fn has_options(&self) -> bool {
+        true
+    }
+
+    /// Only the persistent combination-mode row: it is a real parameter (`base_op`). Every hint
+    /// this tool used to print here is now a [`PsTool::hotkey_rows`] entry.
     fn options_ui(&mut self, ui: &mut egui::Ui) {
         self.mode_row(ui);
+    }
+
+    /// The gesture inventory, mode-dependent because the lasso understands three keys the rect
+    /// marquee does not.
+    ///
+    /// The three combination modifiers are listed as "at press" on purpose: `gesture_op` samples
+    /// them once on the press frame and never re-reads them, which is also what makes the lasso's
+    /// straight-segment Alt a DIFFERENT row ("after the outline started" — see `Gesture::alt_armed`).
+    fn hotkey_rows(&self) -> Vec<PsHotkeyRow> {
+        let mut rows = Vec::new();
         match self.mode {
-            SelectMode::Rect => {
-                ui.label(t!("ps_editor.tools.rect_select_hint"));
-            }
-            SelectMode::Lasso => {
-                ui.label(t!("ps_editor.tools.lasso_hint"));
-            }
+            SelectMode::Rect => rows.push(PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.select.rect_drag_label"),
+                t!("ps_editor.tools.hotkey.select.rect_drag_keys"),
+            )),
+            SelectMode::Lasso => rows.push(PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.select.lasso_drag_label"),
+                t!("ps_editor.tools.hotkey.select.lasso_drag_keys"),
+            )),
         }
-        ui.label(t!("ps_editor.tools.select_mods_hint"));
+        rows.push(PsHotkeyRow::new(
+            t!("ps_editor.tools.hotkey.select.add_label"),
+            t!("ps_editor.tools.hotkey.select.add_keys"),
+        ));
+        rows.push(PsHotkeyRow::new(
+            t!("ps_editor.tools.hotkey.select.subtract_label"),
+            t!("ps_editor.tools.hotkey.select.subtract_keys"),
+        ));
+        rows.push(PsHotkeyRow::new(
+            t!("ps_editor.tools.hotkey.select.intersect_label"),
+            t!("ps_editor.tools.hotkey.select.intersect_keys"),
+        ));
         if self.mode == SelectMode::Lasso {
-            ui.label(t!("ps_editor.tools.lasso_hint_alt"));
-            ui.label(t!("ps_editor.tools.lasso_hint_keys"));
+            rows.push(PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.select.straight_label"),
+                t!("ps_editor.tools.hotkey.select.straight_keys"),
+            ));
+            rows.push(PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.select.anchor_label"),
+                t!("ps_editor.tools.hotkey.select.anchor_keys"),
+            ));
+            rows.push(PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.select.remove_point_label"),
+                t!("ps_editor.tools.hotkey.select.remove_point_keys"),
+            ));
         }
-        ui.label(t!("ps_editor.tools.select_clear_hint"));
+        rows.push(PsHotkeyRow::new(
+            t!("ps_editor.tools.hotkey.select.cancel_label"),
+            t!("ps_editor.tools.hotkey.select.cancel_keys"),
+        ));
+        rows.push(PsHotkeyRow::new(
+            t!("ps_editor.tools.hotkey.select.deselect_label"),
+            t!("ps_editor.tools.hotkey.select.deselect_keys"),
+        ));
+        rows
     }
 }
 
@@ -833,6 +899,69 @@ mod tests {
         // Neither down nor released and nothing pending: the drag was interrupted.
         assert_eq!(tool.step(idle(mods(false, false))), GestureAction::Aborted);
         assert!(tool.gesture.is_none());
+    }
+
+    /// The straightforward half: a rect gesture is in flight from the press to the commit, and the
+    /// tool is idle on either side of it.
+    #[test]
+    fn gesture_in_flight_spans_a_rect_gesture_only() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert!(!tool.gesture_in_flight(), "a fresh tool holds no gesture");
+        assert_eq!(tool.step(press(1.0, 1.0, mods(false, false))), GestureAction::None);
+        assert!(tool.gesture_in_flight(), "the press starts the gesture");
+        assert_eq!(tool.step(drag(9.0, 9.0, mods(false, false))), GestureAction::None);
+        assert!(tool.gesture_in_flight(), "the drag keeps it running");
+        assert!(matches!(
+            tool.step(release(9.0, 9.0, mods(false, false))),
+            GestureAction::Commit { .. }
+        ));
+        assert!(!tool.gesture_in_flight(), "the commit consumes the gesture");
+    }
+
+    /// The case a naive implementation gets wrong. Between two anchors of a polygonal lasso the
+    /// BUTTON IS UP while the outline is still alive, so anything derived from `primary_down` would
+    /// report "no gesture" and the tab would blank the rubber band the moment the cursor crossed a
+    /// floating panel — mid-polygon, which is when a user is most likely to cross one.
+    #[test]
+    fn a_pending_polygon_is_still_a_gesture_in_flight_with_the_button_up() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, false))), GestureAction::None);
+        // Release with Alt held: an anchor is placed, the outline survives with the button UP.
+        assert_eq!(tool.step(release(40.0, 0.0, mods(false, true))), GestureAction::None);
+        assert!(
+            tool.gesture.as_ref().is_some_and(|g| g.pending_polygon && !g.button_down),
+            "the fixture must really be in the button-up pending state"
+        );
+        assert!(tool.gesture_in_flight(), "a pending polygon is an unfinished gesture");
+        // Alt let go: Photoshop closes the path, and only then is the tool idle again.
+        assert!(matches!(tool.step(idle(mods(false, false))), GestureAction::Commit { .. }));
+        assert!(!tool.gesture_in_flight(), "closing the path ends the gesture");
+    }
+
+    /// Esc and `reset` are the two abandonment paths; neither may leave a phantom gesture that
+    /// would keep a preview painted under a panel forever.
+    #[test]
+    fn abandoning_a_gesture_clears_gesture_in_flight() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, false))), GestureAction::None);
+        let cancel = GestureInput { cancel_pressed: true, primary_down: true, ..idle(mods(false, false)) };
+        assert_eq!(tool.step(cancel), GestureAction::Aborted);
+        assert!(!tool.gesture_in_flight(), "Esc leaves no gesture");
+
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, false))), GestureAction::None);
+        assert!(tool.gesture_in_flight());
+        tool.reset();
+        assert!(!tool.gesture_in_flight(), "reset leaves no gesture");
+    }
+
+    /// A press the tab never routed here (it landed on a panel, so `pointer_in_viewport` is false)
+    /// must not register as a gesture, even though the button is held.
+    #[test]
+    fn a_press_outside_the_viewport_starts_no_gesture_in_flight() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        let on_panel = GestureInput { pointer_in_viewport: false, ..press(1.0, 1.0, mods(false, false)) };
+        assert_eq!(tool.step(on_panel), GestureAction::None);
+        assert!(!tool.gesture_in_flight(), "a refused press starts no gesture");
     }
 
     #[test]

@@ -7,15 +7,18 @@ Move / rotate / scale tool for the PS-like editor. It manipulates the active ras
 moved, rotated, and uniformly scaled. Base layers (source/clean) are locked and ignored.
 
 Key structures:
-- `TransformTool`: the active drag gesture plus a per-frame gizmo cache for overlay drawing.
+- `TransformTool`: the active drag gesture plus a per-frame gizmo cache for overlay drawing. `drag`
+  is the in-flight marker `PsTool::gesture_in_flight` reports; the gizmo cache is not.
 
 Notes:
+The tool has NO options and no keys: every interaction is a positional gizmo drag, listed by
+`PsTool::hotkey_rows` for the shortcut panel rather than printed as hint labels in `options_ui`.
 Pixels never change here, so no tile re-upload is needed; rendering re-evaluates the transform
 each frame. Handles are hit-tested in screen space (via the frame `ViewTransform`), while the drag
 math runs in page space.
 */
 
-use super::{PsTool, PsToolContext, PsToolId, ToolOutcome};
+use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome};
 use crate::tabs::ps_editor::layers::LayerTransform;
 use crate::tabs::ps_editor::viewport::ViewTransform;
 use eframe::egui;
@@ -91,6 +94,16 @@ impl PsTool for TransformTool {
 
     fn title(&self) -> &'static str {
         t!("ps_editor.tools.transform_title")
+    }
+
+    /// A gesture is in flight exactly while a handle drag is held.
+    ///
+    /// `drag` is set only by a press that `interact` accepted (`primary_pressed &&
+    /// pointer_in_viewport`) and is taken on the first frame with the button up, so a press that
+    /// landed on a floating panel never reports `true`. The cached `gizmo` is NOT consulted: it is
+    /// rebuilt every frame for the overlay and says nothing about a gesture.
+    fn gesture_in_flight(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Drops the in-progress drag (and its captured start transform) plus the cached gizmo.
@@ -247,10 +260,138 @@ impl PsTool for TransformTool {
         }
     }
 
-    fn options_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(t!("ps_editor.tools.transform_hint_line1"));
-        ui.label(t!("ps_editor.tools.transform_hint_line2"));
-        ui.label(t!("ps_editor.tools.transform_hint_line3"));
-        ui.label(t!("ps_editor.tools.applies_to_active_layer_hint"));
+    /// No parameters: the whole tool is the positional gizmo, and every gesture it understands is
+    /// listed by [`PsTool::hotkey_rows`] instead. So `options_ui` is left at its default no-op and
+    /// the panel prints `ps_editor.active_tool.no_options`.
+    fn has_options(&self) -> bool {
+        false
+    }
+
+    /// The gizmo's three drag zones. There are no KEYS here — the mode is chosen positionally by
+    /// `hit_test` (rotate handle, corner square, anything else), so each row names the target it
+    /// is dragged by. "Активный слой" in the labels is the real constraint: base layers are locked
+    /// and `active_transformable_mut` refuses them.
+    fn hotkey_rows(&self) -> Vec<PsHotkeyRow> {
+        vec![
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.transform.move_label"),
+                t!("ps_editor.tools.hotkey.transform.move_keys"),
+            ),
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.transform.rotate_label"),
+                t!("ps_editor.tools.hotkey.transform.rotate_keys"),
+            ),
+            PsHotkeyRow::new(
+                t!("ps_editor.tools.hotkey.transform.scale_label"),
+                t!("ps_editor.tools.hotkey.transform.scale_keys"),
+            ),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::ps_editor::layers::LayerStack;
+    use egui::ColorImage;
+
+    /// Page size of the fixture, in px. The identity view below maps it 1:1 onto screen space.
+    const PAGE: [usize; 2] = [64, 64];
+
+    /// A page with the two locked base layers plus one transformable raster, which
+    /// `add_raster_layer` also makes active — the only layer this tool accepts.
+    fn stack_with_raster() -> LayerStack {
+        let mut stack = LayerStack::new(
+            0,
+            PAGE,
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+            ColorImage::filled(PAGE, Color32::TRANSPARENT),
+        );
+        stack.add_raster_layer();
+        stack
+    }
+
+    /// Runs ONE frame of `interact` with the pointer state the tab would hand the tool.
+    ///
+    /// `primary_pressed` is masked with `in_viewport` on purpose: `draw_canvas` passes
+    /// `input.primary_pressed && pointer_in_viewport` (`../../mod.rs`), so a press landing on a
+    /// floating panel reaches the tool with `primary_pressed == false`, and a test must not be able
+    /// to assert a combination the tab cannot produce.
+    fn frame(
+        tool: &mut TransformTool,
+        stack: &mut LayerStack,
+        pointer: Pos2,
+        in_viewport: bool,
+        pressed: bool,
+        down: bool,
+    ) {
+        let mut selection = None;
+        let page_size = stack.size();
+        let mut ctx = PsToolContext {
+            page_size,
+            pointer_image: Some(pointer),
+            pointer_in_viewport: in_viewport,
+            primary_pressed: pressed && in_viewport,
+            primary_down: down,
+            primary_released: !down,
+            modifiers: egui::Modifiers::default(),
+            cancel_pressed: false,
+            remove_point_pressed: false,
+            // Identity view: screen and world coordinates coincide, so the fixture can name pixels.
+            view: ViewTransform {
+                viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(64.0, 64.0)),
+                zoom: 1.0,
+                center_world: Vec2::new(32.0, 32.0),
+            },
+            stack,
+            selection: &mut selection,
+        };
+        tool.interact(&mut ctx);
+    }
+
+    /// `gesture_in_flight` must track the handle drag from the accepted press to the release: it is
+    /// what lets the tab keep the gizmo overlay alive while the pointer is dragged over a panel.
+    #[test]
+    fn gesture_in_flight_spans_a_handle_drag() {
+        let mut tool = TransformTool::default();
+        let mut stack = stack_with_raster();
+
+        assert!(!tool.gesture_in_flight(), "a fresh tool holds no drag");
+        // Anywhere inside the viewport begins a Move drag (`hit_test`'s fallback).
+        frame(&mut tool, &mut stack, Pos2::new(20.0, 20.0), true, true, true);
+        assert!(tool.gesture_in_flight(), "the accepted press starts a drag");
+        frame(&mut tool, &mut stack, Pos2::new(50.0, 20.0), false, false, true);
+        assert!(tool.gesture_in_flight(), "the drag survives crossing a panel");
+        frame(&mut tool, &mut stack, Pos2::new(50.0, 20.0), true, false, false);
+        assert!(!tool.gesture_in_flight(), "the release ends the drag");
+    }
+
+    /// A press that lands on a floating panel holds the button down but is refused by the start
+    /// gate, so no gesture exists and the overlay must not be kept alive under the panel.
+    #[test]
+    fn a_press_outside_the_viewport_starts_no_gesture() {
+        let mut tool = TransformTool::default();
+        let mut stack = stack_with_raster();
+        let under_panel = Pos2::new(20.0, 20.0);
+
+        frame(&mut tool, &mut stack, under_panel, false, true, true);
+        assert!(!tool.gesture_in_flight(), "a refused press starts no drag");
+        for held in 0..3 {
+            frame(&mut tool, &mut stack, under_panel, false, false, true);
+            assert!(!tool.gesture_in_flight(), "held frame {held} must stay gesture-free");
+        }
+    }
+
+    /// `reset` is the tab's abandonment path (tool or page switch taken mid-drag); it must leave no
+    /// phantom gesture that would keep the overlay pinned under a panel.
+    #[test]
+    fn reset_clears_gesture_in_flight() {
+        let mut tool = TransformTool::default();
+        let mut stack = stack_with_raster();
+
+        frame(&mut tool, &mut stack, Pos2::new(20.0, 20.0), true, true, true);
+        assert!(tool.gesture_in_flight());
+        tool.reset();
+        assert!(!tool.gesture_in_flight(), "reset must drop the drag");
     }
 }
