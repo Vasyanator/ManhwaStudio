@@ -150,11 +150,12 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   "mask is zero outside `bounds`" invariant lets every op touch only the affected bbox, and
   `Intersect` clears the complement by streaming the spans `fill_polygon_spans` emits in
   increasing `y`/`sx` rather than building a second page-sized buffer.
-- `tools/`: `PsTool` trait + context (carries the frame `ViewTransform`, the frame modifiers, and
-  the Esc / Backspace edges); rectangle + lasso selection, the color brush (paints in layer-local
-  space), and `transform.rs` (move/rotate/scale gizmo). `PsToolSection` groups the tools into the
-  toolbar's Кисти / Выделение / Манипуляция sections at DRAW time — `self.tools` is never
-  reordered, because `active_tool_idx` indexes it.
+- `tools/`: `PsTool` trait + context (carries the frame `ViewTransform`, the frame modifiers, the
+  Esc / Backspace edges, and — for the brush's Alt + right-drag HUD — the raw `secondary_down` state
+  and the frame `pointer_delta`); rectangle + lasso selection, the Photoshop-like round brush
+  (paints in layer-local space), and `transform.rs` (move/rotate/scale gizmo). `PsToolSection` groups
+  the tools into the toolbar's Кисти / Выделение / Манипуляция sections at DRAW time — `self.tools`
+  is never reordered, because `active_tool_idx` indexes it.
 - `tree.rs`: pure builder for the unified layers panel. `build_unified_tree(stack, text_layers,
   bands)` joins raster layers + text overlays + groups into one `Vec<TreeItem>` (group headers +
   indented leaves) ordered top-to-bottom by the unified Z, with the same tiebreak as `draw_composite`
@@ -240,6 +241,34 @@ a canvas that refused the click. The in-flight term is asked of the TOOL and mus
 by `input.primary_down`: a press that BEGINS on a panel holds the button down too and the tools
 correctly refuse it, so that substitution reintroduces the bug in exactly the reported case.
 
+**The brush's keys and its eyedropper are the TAB's, not the tool's.** A tool never sees an
+`egui::Context`, so `PsEditorTabState::brush_shortcuts` decodes every brush key once per frame and
+forwards it to `BrushTool`; `BrushTool::hotkey_rows` publishes the same list to the shortcut panel,
+and the two must be edited together. Two rules the dispatch depends on:
+- It is suppressed while a widget holds keyboard focus, exactly like `handle_hotkeys`. Without that
+  guard, typing into the brush panel's own `WheelSlider` also resized the brush.
+- `[` and `Shift+[` must mean different things, so the frame's key EVENTS are scanned and compared
+  with `Modifiers::matches_exact` (`collect_brush_key_actions`, pure and unit-tested).
+  `InputState::key_pressed` ignores modifiers entirely and `consume_key`/`consume_shortcut` match
+  with `matches_logically`, which ignores an extra Shift — neither can separate the two.
+
+Alt + LEFT click/drag is the brush EYEDROPPER and it also lives in the tab
+(`sample_visible_composite`): sampling the visible composite needs the unified band Z order
+(`self.bands`), which `PsToolContext` does not carry. It takes TWO guards for the eyedropper and a
+stroke never to act on the same gesture, because each covers one direction: `BrushTool` stands aside
+for the whole button hold whenever Alt was down at the PRESS, and the tab refuses to sample while
+`PsTool::gesture_in_flight`, which is Alt pressed in the MIDDLE of a live stroke — without it the
+brush colour is resampled every frame while the stroke re-composites with it, and one soft stroke
+comes out multi-coloured.
+
+Alt + RIGHT drag is the brush's size/hardness HUD, and it forces one guard on the canvas:
+`draw_selection_menu` takes a `hud_gesture_possible` flag and returns early. `Popup::context_menu`
+opens itself from `Response::secondary_clicked`, and a short right-drag on this
+`Sense::click_and_drag` canvas still registers as a click, so the only way to keep the copy/cut menu
+out of the gesture is not to call it that frame. The flag is `alt && the brush is active`, scoped to
+the tool that owns the gesture: under the lasso or the transform tool Alt+right-click is an ordinary
+right-click and must still open the menu.
+
 **The hint grid is a deliberate local duplicate.** `draw_hotkey_rows_grid` re-implements the
 canvas' `CanvasScene::draw_hint_rows_grid` in ~10 lines. That helper is private to the canvas impl,
 this tab is not a canvas tab, and lifting it into a shared widget would be a refactor of another
@@ -254,8 +283,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `persist_current_page`). A recorded diff is only valid while its page's layer image buffers are
   resident, and each page rebuilds the stack from scratch, so cross-page undo is intentionally not
   attempted here.
-- **"Before" comes for free from `base_image`**: during a brush stroke `paint_line_color` mutates only
-  `layer.image`; `base_image` keeps the pre-stroke pixels until the release commit. So at the commit
+- **"Before" comes for free from `base_image`**: during a brush stroke the brush mutates only
+  `layer.image`; `base_image` keeps the pre-stroke pixels until the stroke commit. So at the commit
   site `record_brush_stroke` builds the reversible diff from `base_image` (before) vs `image` (after)
   over the stroke's accumulated dirty union (`brush_stroke_dirty`), avoiding any stroke-start snapshot
   of the (up to ~800×19000) ribbon image. `record` is observer-style (the forward edit was already
@@ -405,7 +434,27 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   next routed frame treat the swallowed release as a finish instead of an interrupted drag, so
   panning mid-lasso keeps the outline. It arms only while a gesture is live and is consumed by the
   single frame that reads it, so a genuine interrupt (focus loss, another widget grabbing the
-  button) still aborts.
+  button) still aborts. The brush answers it differently — it ENDS the stroke, because its pixels
+  are already in `layer.image` and there is nothing to resume — which is what makes the stroke
+  commit below reachable on a pan frame.
+- **The brush stroke commit hangs off the STROKE's end, never off `input.primary_released`, and it
+  runs OUTSIDE the `!pan_active && !text_drag_active` routing gate** (`commit_brush_stroke`, driven
+  by `BrushTool::take_stroke_finished`). A release performed while the middle button is held — or
+  during a Space-pan — is delivered on a frame the gate diverts, so a commit written inside it never
+  runs at all: no undo entry is ever recorded, a `Клин` stroke never reaches `CleanOverlaysModel`
+  and vanishes on the next page switch or overlay reload, and a user raster's pixels ride into the
+  NEXT stroke's commit, whose undo diff is bounded by that stroke's union. Do not move the commit
+  back inside the gate, and do not re-key it on a pointer edge.
+- **Abandoning a brush gesture COMMITS its stroke first** (`commit_brush_stroke_before_abandon`,
+  called by `set_active_tool`, `reset_active_tool` and `request_page`). `PsTool::reset` means
+  "abandon", which is right for a lasso outline and wrong for a brush: the brush's pixels are
+  already in `layer.image` and no reset can take them back, so abandoning without committing leaves
+  visible pixels with no undo entry and a `Клин` stroke with no write-back. Every pixel the user can
+  see must stay undoable. The helper is scoped by the tool's own latch, so Esc under any other tool
+  commits nothing, and it goes through the SAME latch as the normal ending, so no stroke commits
+  twice. **On a page switch the order is load-bearing**: `request_page` commits at the top, before
+  `persist_current_page` and before the history/union clear, because the commit reads the resident
+  stack and the current `active_page_idx` — both about to become the next page's.
 - **A page selection is `Some` only when a pixel is actually set.** `PsToolContext::normalize_selection`
   (tools) and `set_selection` / `non_empty_selection` (tab) enforce it at every write. An all-zero
   mask is not a harmless nuisance: the marquee hides itself (`!any()`) while the brush, which only
@@ -444,7 +493,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `is_transformable`.
 - To change how a `Клин` edit reaches the shared model (bounds, revision handling, `base_image`
   mirroring), edit the ONE helper `write_clean_region_to_model` in `mod.rs`. Its callers are the
-  brush release commit, `perform_clip`, `merge_down` and `apply_ps_clean_edit`; do not add a fifth
+  brush stroke commit, `perform_clip`, `merge_down` and `apply_ps_clean_edit`; do not add a fifth
   hand-written copy.
 - To change which layer a merge targets, edit `merge_candidates_by_band_z` (it reserves band-Z 0 for
   `Клин` and shifts the rasters up by one) and `merge_down` in `mod.rs`.
@@ -469,7 +518,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `selection.rs`.
 - To change the marquee look, edit `walk_dash_runs` / `decimate_to_screen` /
   `draw_selection_marquee` (`mod.rs`) and `draw_dashed_preview` (`tools/select.rs`); the boundary
-  loops come from `Selection::outline_loops`.
+  loops come from `Selection::outline_loops`. `walk_dash_runs` is shared with the brush's
+  pixel-exact cursor outline (`tools/brush.rs`), so a change there moves both.
 - To change the selection combination modes or the boundary tracer, edit `selection.rs`
   (`SelectionOp`, `apply_rect` / `apply_polygon`, the pixel-edge tracer). To change the lasso
   gesture (Photoshop modes at press, Alt straight segments, Esc / Backspace), edit

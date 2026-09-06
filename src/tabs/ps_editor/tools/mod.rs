@@ -9,9 +9,11 @@ tools can be added without touching the tab orchestration.
 Key structures:
 - `PsToolId`: stable identity for the active-tool selector and hotkeys.
 - `PsToolSection`: toolbar grouping (brushes / selection / manipulation) for the tool selector.
-- `PsToolContext`: mutable per-frame access to the layer stack, selection, pointer state, and the
-  frame's keyboard modifiers / gesture-control keys (Esc, Backspace).
-- `ToolOutcome`: what changed this frame (dirty image rect, selection change, repaint request).
+- `PsToolContext`: mutable per-frame access to the layer stack, selection, pointer state (both mouse
+  buttons plus the frame's pointer delta), and the frame's keyboard modifiers / gesture-control keys
+  (Esc, Backspace).
+- `ToolOutcome`: what changed this frame (dirty rect in the ACTIVE LAYER's own pixels, selection
+  change).
 - `PsHotkeyRow`: one already-localized (action, keys) row of the tab's shortcut panel.
 - `PsTool`: trait every tool implements (interaction, overlay drawing, options UI, shortcut list).
 
@@ -97,9 +99,12 @@ impl PsToolId {
     }
 }
 
-/// Inclusive dirty rectangle in image pixel coordinates.
+/// Inclusive dirty rectangle in the ACTIVE LAYER's own pixel coordinates.
 ///
-/// Tools report the region they modified so the tab can re-upload only the affected tiles.
+/// Tools report the region they modified so the tab can re-upload only the affected tiles. The
+/// space is layer-local, not page-local: a `TiledTexture` is sized to its layer's image and the
+/// undo diff is cut from that same buffer, so a transformed raster's rect must NOT be mapped into
+/// page pixels on the way here.
 #[derive(Debug, Clone, Copy)]
 pub struct DirtyRect {
     pub min_x: usize,
@@ -111,7 +116,7 @@ pub struct DirtyRect {
 /// Per-frame result of a tool interaction.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolOutcome {
-    /// Image-space region whose pixels changed (active layer), if any.
+    /// Region of the ACTIVE LAYER's own pixel grid whose pixels changed, if any.
     pub dirty: Option<DirtyRect>,
     /// Set when the selection mask changed and its overlay must be refreshed.
     pub selection_changed: bool,
@@ -151,8 +156,19 @@ pub struct PsToolContext<'a> {
     pub primary_pressed: bool,
     pub primary_down: bool,
     pub primary_released: bool,
+    /// Secondary (right) mouse button held this frame.
+    ///
+    /// Present for the brush's Alt + right-drag size/hardness HUD. It is deliberately the raw
+    /// button state and not a `Response::dragged()`: this canvas senses `click_and_drag`, so
+    /// `dragged()` is delayed by the click/drag ambiguity and `drag_delta()` stays zero until it
+    /// resolves — the same reason the tab's own pan gate reads `middle_down`.
+    pub secondary_down: bool,
+    /// Pointer movement this frame in SCREEN px (`PointerState::delta`), for gestures measured in
+    /// drag distance rather than in canvas position.
+    pub pointer_delta: egui::Vec2,
     /// Keyboard modifiers as of this frame. Selection tools sample them at press to pick the
-    /// combination mode, and read `alt` live to switch into straight-segment mode.
+    /// combination mode, and read `alt` live to switch into straight-segment mode; the brush reads
+    /// `shift` for its axis constraint and `alt` to stand aside for the tab's eyedropper.
     pub modifiers: egui::Modifiers,
     /// Escape was pressed this frame: cancel any in-progress gesture without touching the selection.
     pub cancel_pressed: bool,
@@ -275,6 +291,11 @@ pub trait PsTool {
     /// combination mode sampled minutes ago and — across a page switch — the wrong page's
     /// coordinates. Must not touch the page selection: an abandoned gesture leaves the committed
     /// selection exactly as it was.
+    ///
+    /// A gesture that already changed PIXELS cannot be undone by this hook — it receives no layer
+    /// access — so the tab commits such a gesture before abandoning it (`BrushTool`'s
+    /// `end_stroke_for_commit`, run by `PsEditorTabState::commit_brush_stroke_before_abandon`).
+    /// A tool whose gesture only builds an overlay needs nothing of the sort.
     ///
     /// The default is empty, for tools whose state is rebuilt from scratch each frame.
     fn reset(&mut self) {}

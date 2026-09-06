@@ -29,7 +29,12 @@ Architecture:
   text drag instead calls `PsTool::freeze` (or `reset` on Esc) so a multi-frame outline neither
   outlives its page nor dies on a suppressed frame. The tool's cursor preview obeys the same
   occlusion gate as its input: `overlay_pointer` hides it under a floating panel unless
-  `PsTool::gesture_in_flight` says a gesture started on bare canvas is still running.
+  `PsTool::gesture_in_flight` says a gesture started on bare canvas is still running. The brush's
+  cursor is a PIXEL-EXACT outline of the pixels its next stamp would affect, drawn with this
+  module's `walk_dash_runs`; see `tools/MODULE_README.md` for its contract and its fallbacks.
+  A finished brush stroke is committed by `commit_brush_stroke`, driven by the tool's own
+  stroke-end latch and called OUTSIDE the routing gate — a pointer release performed while the
+  canvas pans never reaches the gate, and a commit inside it would silently lose the stroke.
 - selection storage: `set_selection` / `non_empty_selection` keep the page selection `Some` only
   while it selects at least one pixel — an all-zero mask draws no marquee yet still clips the brush.
 - selection marquee: `draw_selection_marquee` paints the boundary loops of `Selection` as a static
@@ -415,7 +420,7 @@ fn ps_editor_panels_menu(ui: &mut egui::Ui, visibility: &mut PsEditorPanelVisibi
 
 /// Draws the «Инструменты» tab body.
 fn draw_tools_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
-    cx.tab.tools_tab_contents(ui);
+    cx.tab.tools_tab_contents(ui, cx.project);
 }
 
 /// Draws the «Выбранный инструмент» tab body.
@@ -1981,6 +1986,12 @@ impl PsEditorTabState {
         let Some(page) = project.pages.iter().find(|p| p.idx == page_idx) else {
             return;
         };
+        // A brush stroke still in flight belongs to the page being LEFT, and its pixels are
+        // already on that page's layer. Commit it FIRST — before the persist below, and long before
+        // `reset_active_tool` at the end of this function — because the commit reads the resident
+        // stack and the current `active_page_idx`, both of which are about to become the next
+        // page's. This is the one abandonment path where the order is load-bearing.
+        self.commit_brush_stroke_before_abandon(project);
         // Persist the page we are leaving (committed edits are already flushed; this catches any
         // model state not yet written). The new page reloads fresh from disk + the shared doc.
         self.persist_current_page(project);
@@ -1997,7 +2008,7 @@ impl PsEditorTabState {
         // Same reason for the tool's own gesture: an outline traced on the page being left holds
         // that page's image coordinates (and a combination mode sampled there), so it must never
         // reach the next page's selection.
-        self.reset_active_tool();
+        self.reset_active_tool(project);
         if self.loader.is_none() {
             return;
         }
@@ -2337,10 +2348,15 @@ impl PsEditorTabState {
     /// a gesture that ends with the button UP — a pending lasso polygon — otherwise survives the
     /// switch and commits on some later frame, with a combination mode sampled long before. Out
     /// of range or already-active indices are ignored, so a caller may pass any candidate.
-    fn set_active_tool(&mut self, idx: usize) {
+    ///
+    /// A brush stroke in flight is COMMITTED before it is abandoned (see
+    /// `commit_brush_stroke_before_abandon`): its pixels are already on the layer, so dropping them
+    /// silently would leave them un-undoable. That is why this needs the project.
+    fn set_active_tool(&mut self, idx: usize, project: &ProjectData) {
         if idx >= self.tools.len() || idx == self.active_tool_idx {
             return;
         }
+        self.commit_brush_stroke_before_abandon(project);
         if let Some(outgoing) = self.tools.get_mut(self.active_tool_idx) {
             outgoing.reset();
         }
@@ -2351,7 +2367,14 @@ impl PsEditorTabState {
     ///
     /// Used on a page switch: the outline's image coordinates belong to the page being left, so
     /// committing it against the next page would paint a selection nowhere near where it was drawn.
-    fn reset_active_tool(&mut self) {
+    /// Also used for Esc pressed on a frame whose input was suppressed by a pan.
+    ///
+    /// A brush stroke that has painted is committed first, exactly as on a tool switch — Esc means
+    /// "abandon the gesture", never "silently keep un-undoable pixels". Callers that change the
+    /// PAGE must run the commit before the change (see `request_page`), because the commit targets
+    /// the resident stack and `active_page_idx`.
+    fn reset_active_tool(&mut self, project: &ProjectData) {
+        self.commit_brush_stroke_before_abandon(project);
         if let Some(tool) = self.tools.get_mut(self.active_tool_idx) {
             tool.reset();
         }
@@ -2556,7 +2579,7 @@ impl PsEditorTabState {
     /// keep their registration order, and a section with no registered tool renders nothing.
     ///
     /// The active tool's own parameters live in the separate «Выбранный инструмент» tab.
-    fn tools_tab_contents(&mut self, ui: &mut egui::Ui) {
+    fn tools_tab_contents(&mut self, ui: &mut egui::Ui, project: &ProjectData) {
         for section in PsToolSection::ORDER {
             // The section heading is emitted lazily, on the first tool that belongs to it,
             // so an empty section leaves no dangling header.
@@ -2574,7 +2597,7 @@ impl PsEditorTabState {
                 let selected = index == self.active_tool_idx;
                 let title = self.tools[index].title();
                 if ui.selectable_label(selected, title).clicked() {
-                    self.set_active_tool(index);
+                    self.set_active_tool(index, project);
                 }
             }
         }
@@ -4541,6 +4564,7 @@ impl PsEditorTabState {
             primary_down: i.pointer.primary_down(),
             primary_pressed: i.pointer.primary_pressed(),
             primary_released: i.pointer.primary_released(),
+            secondary_down: i.pointer.secondary_down(),
             middle_down: i.pointer.middle_down(),
             space_down: i.key_down(egui::Key::Space),
             pointer_delta: i.pointer.delta(),
@@ -4573,7 +4597,7 @@ impl PsEditorTabState {
         if hovered && input.scroll_y.abs() > f32::EPSILON {
             if input.modifiers.shift && self.active_tool_id() == PsToolId::Brush {
                 if let Some(brush) = self.brush_tool_mut() {
-                    brush.handle_wheel(input.scroll_y, input.modifiers);
+                    brush.handle_wheel(input.scroll_y);
                 }
             } else {
                 wheel_for_zoom = input.scroll_y;
@@ -4589,7 +4613,7 @@ impl PsEditorTabState {
             .handle_input(rect, anchor, wheel_for_zoom, pan_delta);
 
         if self.active_tool_id() == PsToolId::Brush {
-            self.brush_size_shortcuts(ctx);
+            self.brush_shortcuts(ctx);
         }
 
         let view = self.viewport.transform(rect);
@@ -4637,6 +4661,34 @@ impl PsEditorTabState {
                     .filter(|l| l.kind == LayerKind::Raster)
                     .map(|l| (l.uid.to_string(), l.deform.clone()));
             }
+            // Alt + left click/drag with the brush is the EYEDROPPER, and it lives here rather than
+            // in the tool: sampling the visible composite needs the unified band Z order
+            // (`self.bands`), which `PsToolContext` does not carry. `BrushTool` stands aside for
+            // the whole button hold while Alt was down at the press, so this never paints.
+            //
+            // The in-flight test is the other half of that agreement, and it is not redundant: the
+            // tool only latches `suppress_stroke` when Alt was down at the PRESS, so pressing Alt
+            // in the middle of a live stroke would otherwise resample the brush colour every frame
+            // while the stroke keeps re-compositing with it — one soft stroke coming out
+            // multi-coloured. The eyedropper and a stroke must never both act on one gesture.
+            if self.active_tool_id() == PsToolId::Brush
+                && input.modifiers.alt
+                && input.primary_down
+                && pointer_in_viewport
+                && !self.tools[self.active_tool_idx].gesture_in_flight()
+            {
+                let sampled = input
+                    .hover_pos
+                    .map(|p| view.screen_to_world(p))
+                    .and_then(|w| Some((page_pixel_index(w.x)?, page_pixel_index(w.y)?)))
+                    .and_then(|(wx, wy)| self.sample_visible_composite(wx, wy));
+                if let Some(color) = sampled
+                    && let Some(brush) = self.brush_tool_mut()
+                {
+                    brush.set_color(color);
+                }
+            }
+
             let outcome = if let Some(stack) = self.stack.as_mut() {
                 let pointer_image = input.hover_pos.map(|p| view.screen_to_world(p));
                 let mut tool_ctx = PsToolContext {
@@ -4646,6 +4698,11 @@ impl PsEditorTabState {
                     primary_pressed: input.primary_pressed && pointer_in_viewport,
                     primary_down: input.primary_down,
                     primary_released: input.primary_released,
+                    // The right button is NOT masked with `pointer_in_viewport`: the brush's HUD
+                    // gesture is a drag whose whole point is that the pointer leaves where it
+                    // started, and it paints nothing, so it cannot damage anything under a panel.
+                    secondary_down: input.secondary_down,
+                    pointer_delta: input.pointer_delta,
                     view,
                     stack,
                     selection: &mut self.selection,
@@ -4764,66 +4821,12 @@ impl PsEditorTabState {
                 }
             }
 
-            // Brush stroke commit: on pointer-up, record the reversible undo diff, then push the
-            // painted pixels onward. During the stroke the local `image` is mutated live
-            // (responsive) while `base_image` still holds the pre-stroke pixels, so
-            // `record_brush_stroke` reads the "before" from `base_image` for free — no stroke-start
-            // snapshot. A paintable raster has no effects, so base == display == painted pixels.
-            //
-            // The destination depends on the painted layer's KIND: a user raster commits to the
-            // shared `LayerDoc` (the model truth, cross-tab visible); the `Клин` base layer is not a
-            // doc node at all, so its stroke goes to the shared `CleanOverlaysModel` instead —
-            // bounded to the stroke's dirty union, because a ribbon page can be ~800x19000 px.
-            if input.primary_released
-                && self.active_tool_id() == PsToolId::Brush
-                && let Some(page_idx) = self.active_page_idx
-            {
-                // Read the stroke union BEFORE `record_brush_stroke`, which does not consume it but
-                // is followed by the reset below.
-                let stroke_union = self.brush_stroke_dirty;
-                // Record BEFORE pushing the pixels onward (the push + next reprojection sync
-                // base_image to the painted pixels, which would erase the "before").
-                self.record_brush_stroke(page_idx);
-                let painted = self
-                    .stack
-                    .as_ref()
-                    .and_then(|s| s.layer(s.active_id()))
-                    .filter(|l| l.pixels_dirty && l.can_edit_pixels())
-                    .map(|l| (l.kind, l.uid.to_string(), l.image.clone()));
-                match painted {
-                    Some((LayerKind::Raster, uid, painted)) => {
-                        let base = painted.clone();
-                        crate::trace_log!(
-                            cat::SYNC,
-                            "commit brush_pixels page={} uid={}",
-                            page_idx,
-                            uid
-                        );
-                        self.route_to_doc(page_idx, project, |doc| {
-                            doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
-                        });
-                    }
-                    Some((LayerKind::Clean, _, _)) => {
-                        if let Some(union) = stroke_union {
-                            self.write_clean_region_to_model(
-                                page_idx,
-                                union.min_x,
-                                union.min_y,
-                                union.max_x.saturating_sub(union.min_x) + 1,
-                                union.max_y.saturating_sub(union.min_y) + 1,
-                            );
-                        }
-                    }
-                    // `Source` is never paintable (`can_edit_pixels`), and `None` means the stroke
-                    // changed nothing.
-                    Some((LayerKind::Source, _, _)) | None => {}
-                }
-                self.brush_stroke_dirty = None;
-            }
         } else if input.cancel_pressed {
             // Esc means "abandon the outline" even while the canvas is panning: the tool never sees
-            // this frame's input, so the tab performs the abandonment on its behalf.
-            self.reset_active_tool();
+            // this frame's input, so the tab performs the abandonment on its behalf. A brush stroke
+            // that has painted is committed by `reset_active_tool` before it is abandoned — its
+            // pixels are already on the layer and Esc must not leave them un-undoable.
+            self.reset_active_tool(project);
         } else {
             // Input went to the pan / text drag instead of the tool. Freeze the active tool so a
             // multi-frame gesture survives: without this the release performed during the pan is
@@ -4834,14 +4837,35 @@ impl PsEditorTabState {
             }
         }
 
+        // The brush stroke commit sits OUTSIDE the routing branch above on purpose, and is driven
+        // by the stroke's own end rather than by `input.primary_released`. A release delivered on a
+        // frame that went to a pan (middle button, or Space+drag) never reaches that branch, and a
+        // commit trapped inside it would then never run: the stroke would get no undo entry, a
+        // `Клин` stroke would never reach `CleanOverlaysModel` and would vanish on the next page
+        // switch, and a raster stroke's pixels would ride into the NEXT stroke's commit. The brush
+        // ends the stroke on exactly those suppressed frames (`BrushTool::freeze`) and latches it
+        // here.
+        if self
+            .brush_tool_mut()
+            .is_some_and(BrushTool::take_stroke_finished)
+        {
+            self.commit_brush_stroke(project);
+        }
+
         // Upload + composite layers bottom-to-top in unified band order (rasters + typing overlays).
         self.sync_render_cache();
         self.upload_layers(ctx);
         self.draw_composite(ctx, ui, &view);
         self.draw_selection_marquee(ui, &view);
 
-        // Right-click menu on the selection: copy/cut from chosen layers.
-        self.draw_selection_menu(&response, project);
+        // Right-click menu on the selection: copy/cut from chosen layers. Suppressed while Alt is
+        // held AND the brush is active, because Alt + right-drag is the brush's size/hardness HUD
+        // and a short one still registers as a secondary CLICK, which would pop the menu open
+        // mid-gesture. The suppression is scoped to the brush because only the brush owns that
+        // gesture: under any other tool Alt+right-click is an ordinary right-click and must still
+        // open the menu.
+        let hud_gesture_possible = input.modifiers.alt && self.active_tool_id() == PsToolId::Brush;
+        self.draw_selection_menu(&response, project, hud_gesture_possible);
 
         // Tool cursor / preview overlay. It obeys the SAME occlusion gate as the input path
         // (`pointer_occluded`, resolved once above): a brush circle that keeps tracking the cursor
@@ -4878,6 +4902,91 @@ impl PsEditorTabState {
             // Keep polling so a finished off-thread effects render is consumed promptly even with no
             // pointer activity.
             ctx.request_repaint();
+        }
+    }
+
+    /// Commits a FINISHED brush stroke: records the reversible undo diff, then pushes the painted
+    /// pixels onward and clears the stroke's dirty union.
+    ///
+    /// Called once per stroke, from the `BrushTool::take_stroke_finished` latch in `draw_canvas` —
+    /// never from the pointer-release edge, which a pan frame can swallow (see the call site).
+    /// During the stroke the local `image` is mutated live (responsive) while `base_image` still
+    /// holds the pre-stroke pixels, so `record_brush_stroke` reads the "before" from `base_image`
+    /// for free — no stroke-start snapshot. A paintable raster has no effects, so
+    /// base == display == painted pixels.
+    ///
+    /// The destination depends on the painted layer's KIND: a user raster commits to the shared
+    /// `LayerDoc` (the model truth, cross-tab visible); the `Клин` base layer is not a doc node at
+    /// all, so its stroke goes to the shared `CleanOverlaysModel` instead — bounded to the stroke's
+    /// dirty union, because a ribbon page can be ~800x19000 px. A stroke that painted nothing (no
+    /// union, or a layer that refuses pixel edits) is a no-op.
+    fn commit_brush_stroke(&mut self, project: &ProjectData) {
+        let Some(page_idx) = self.active_page_idx else {
+            return;
+        };
+        // Read the stroke union BEFORE `record_brush_stroke`, which does not consume it but is
+        // followed by the reset below.
+        let stroke_union = self.brush_stroke_dirty;
+        // Record BEFORE pushing the pixels onward (the push + next reprojection sync base_image to
+        // the painted pixels, which would erase the "before").
+        self.record_brush_stroke(page_idx);
+        let painted = self
+            .stack
+            .as_ref()
+            .and_then(|s| s.layer(s.active_id()))
+            .filter(|l| l.pixels_dirty && l.can_edit_pixels())
+            .map(|l| (l.kind, l.uid.to_string(), l.image.clone()));
+        match painted {
+            Some((LayerKind::Raster, uid, painted)) => {
+                let base = painted.clone();
+                crate::trace_log!(cat::SYNC, "commit brush_pixels page={} uid={}", page_idx, uid);
+                self.route_to_doc(page_idx, project, |doc| {
+                    doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
+                });
+            }
+            Some((LayerKind::Clean, _, _)) => {
+                if let Some(union) = stroke_union {
+                    self.write_clean_region_to_model(
+                        page_idx,
+                        union.min_x,
+                        union.min_y,
+                        union.max_x.saturating_sub(union.min_x) + 1,
+                        union.max_y.saturating_sub(union.min_y) + 1,
+                    );
+                }
+            }
+            // `Source` is never paintable (`can_edit_pixels`), and `None` means the stroke changed
+            // nothing.
+            Some((LayerKind::Source, _, _)) | None => {}
+        }
+        self.brush_stroke_dirty = None;
+    }
+
+    /// Commits an in-flight brush stroke that has already painted, before its gesture is
+    /// ABANDONED (Esc under input suppression, a tool switch, a page switch).
+    ///
+    /// `PsTool::reset` means "abandon", and for every other tool that is exactly right: the lasso's
+    /// Esc drops its pending polygon and must commit nothing. The brush is different — its pixels
+    /// are already in `layer.image` and `reset` cannot take them back — so abandoning without this
+    /// leaves pixels the user can see with no undo entry, and a `Клин` stroke with no write-back to
+    /// `CleanOverlaysModel`. Every pixel the user can see must stay undoable.
+    ///
+    /// Two guards keep it strictly scoped. The stroke is ended through
+    /// `BrushTool::end_stroke_for_commit`, so an idle brush (or any other active tool) latches
+    /// nothing and nothing is committed; and the commit itself runs only when the stroke actually
+    /// painted (`brush_stroke_dirty`), so a stroke that never landed a stamp cannot push a previous
+    /// stroke's pixels a second time. The latch is the SAME one the ordinary ending uses and is
+    /// consumed here, so a stroke can never commit twice.
+    fn commit_brush_stroke_before_abandon(&mut self, project: &ProjectData) {
+        if let Some(brush) = self.brush_tool_mut() {
+            brush.end_stroke_for_commit();
+        }
+        if self
+            .brush_tool_mut()
+            .is_some_and(BrushTool::take_stroke_finished)
+            && self.brush_stroke_dirty.is_some()
+        {
+            self.commit_brush_stroke(project);
         }
     }
 
@@ -5242,7 +5351,22 @@ impl PsEditorTabState {
     ///
     /// The touched-layer list is recomputed once per menu open (on the secondary click) so the
     /// per-frame menu closure stays cheap even for large selections.
-    fn draw_selection_menu(&mut self, response: &egui::Response, project: &ProjectData) {
+    ///
+    /// `hud_gesture_possible` suppresses the menu entirely for the frame: Alt + right-drag is the
+    /// brush's size/hardness HUD, and a short one still produces a secondary CLICK on this
+    /// `Sense::click_and_drag` canvas. `Popup::context_menu` opens itself from that click, so the
+    /// only way to keep the menu out of the gesture is not to call it. The caller must scope the
+    /// flag to the tool that owns the gesture — the brush — so Alt+right-click keeps opening the
+    /// menu under every other tool.
+    fn draw_selection_menu(
+        &mut self,
+        response: &egui::Response,
+        project: &ProjectData,
+        hud_gesture_possible: bool,
+    ) {
+        if hud_gesture_possible {
+            return;
+        }
         if response.secondary_clicked() {
             self.refresh_clip_touched_layers();
             self.clip_selected_layers.clear();
@@ -5585,10 +5709,110 @@ impl PsEditorTabState {
         self.tools.iter_mut().find_map(|tool| tool.as_brush_mut())
     }
 
-    fn brush_size_shortcuts(&mut self, ctx: &egui::Context) {
-        if let Some(brush) = self.brush_tool_mut() {
-            brush.handle_size_shortcuts(ctx);
+    /// Reads every brush key the tab owns this frame and forwards it to the brush tool.
+    ///
+    /// Called once per frame from `draw_canvas` while the brush is active. It is suppressed while
+    /// a widget holds keyboard focus, exactly like [`PsEditorTabState::handle_hotkeys`]: without
+    /// that guard, typing into the brush panel's own `WheelSlider` still resized the brush.
+    ///
+    /// The tool itself never sees an `egui::Context`, so the tab owns the dispatch; the tool's
+    /// `hotkey_rows` publishes the same list to the shortcut panel and the two must be edited
+    /// together.
+    fn brush_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
         }
+        let actions = ctx.input(|i| collect_brush_key_actions(&i.events));
+        if actions.is_empty() {
+            return;
+        }
+        let Some(brush) = self.brush_tool_mut() else {
+            return;
+        };
+        for action in actions {
+            match action {
+                BrushKeyAction::DiameterStep { up } => {
+                    brush.step_diameter(up);
+                }
+                BrushKeyAction::DiameterScale { down } => {
+                    brush.scale_diameter(down);
+                }
+                BrushKeyAction::HardnessStep { up } => brush.step_hardness(up),
+                BrushKeyAction::Opacity(fraction) => brush.set_opacity(fraction),
+                BrushKeyAction::Flow(fraction) => brush.set_flow(fraction),
+            }
+        }
+    }
+
+    /// Nearest-neighbour sample of the VISIBLE raster composite at page pixel `(wx, wy)`.
+    ///
+    /// Layers are composited bottom-to-top in the same order [`PsEditorTabState::draw_composite`]
+    /// uses — the two base layers first (they are not bands), then the user rasters by their
+    /// unified band Z with a stable tiebreak on stack position — honouring per-layer and per-group
+    /// visibility and opacity.
+    ///
+    /// TEXT overlays are deliberately NOT sampled: they are drawn by the typing renderer and have
+    /// no `Layer` buffer to read. That is an accepted limitation of the brush's Alt+click
+    /// eyedropper, recorded in `tools/MODULE_README.md`.
+    ///
+    /// Returns the STRAIGHT (un-premultiplied) colour, or `None` when the composite is fully
+    /// transparent there — sampling a hole would otherwise set the brush colour to black.
+    fn sample_visible_composite(&self, wx: usize, wy: usize) -> Option<Color32> {
+        let stack = self.stack.as_ref()?;
+        let [pw, ph] = stack.size();
+        if wx >= pw || wy >= ph {
+            return None;
+        }
+        let mut raster_z: HashMap<String, u32> = HashMap::new();
+        for band in &self.bands {
+            if let Band::Raster { uid, z } = band {
+                raster_z.insert(uid.clone(), *z);
+            }
+        }
+        // One past the highest band Z, used as the sort key of a raster that is in no band at all.
+        // A band list longer than `u32::MAX` is unreachable, and saturating there still sorts such
+        // a layer on top, which is exactly the intent.
+        let top_z = u32::try_from(self.bands.len()).unwrap_or(u32::MAX);
+        let mut rasters: Vec<(u32, usize)> = Vec::new();
+        for (idx, layer) in stack.layers().iter().enumerate() {
+            if layer.kind.is_base() || !stack.layer_visible(layer) {
+                continue;
+            }
+            if stack.layer_opacity(layer) <= 0.0 {
+                continue;
+            }
+            rasters.push((
+                raster_z.get(&layer.uid.to_string()).copied().unwrap_or(top_z),
+                idx,
+            ));
+        }
+        rasters.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        // `over(src, dst)` is src-over, so walking bottom-to-top and putting each layer over the
+        // accumulator reproduces the composite the user sees.
+        let mut px = Color32::TRANSPARENT;
+        for layer in stack.layers().iter().filter(|l| l.kind.is_base()) {
+            if !stack.layer_visible(layer) {
+                continue;
+            }
+            let opacity = stack.layer_opacity(layer);
+            if opacity <= 0.0 {
+                continue;
+            }
+            px = over(scale_premultiplied(sample_layer_world(layer, wx, wy), opacity), px);
+        }
+        for (_, idx) in rasters {
+            let Some(layer) = stack.layers().get(idx) else {
+                continue;
+            };
+            let opacity = stack.layer_opacity(layer);
+            px = over(scale_premultiplied(sample_layer_world(layer, wx, wy), opacity), px);
+        }
+        if px.a() == 0 {
+            return None;
+        }
+        let [r, g, b, _] = px.to_srgba_unmultiplied();
+        Some(Color32::from_rgb(r, g, b))
     }
 
     /// Handles tab-local tool/selection hotkeys. Called from the root hotkey dispatch.
@@ -5615,16 +5839,16 @@ impl PsEditorTabState {
             )
         });
         if b && let Some(idx) = self.tool_index(PsToolId::Brush) {
-            self.set_active_tool(idx);
+            self.set_active_tool(idx, project);
         }
         if m && let Some(idx) = self.tool_index(PsToolId::SelectRect) {
-            self.set_active_tool(idx);
+            self.set_active_tool(idx, project);
         }
         if l && let Some(idx) = self.tool_index(PsToolId::SelectLasso) {
-            self.set_active_tool(idx);
+            self.set_active_tool(idx, project);
         }
         if v && let Some(idx) = self.tool_index(PsToolId::Transform) {
-            self.set_active_tool(idx);
+            self.set_active_tool(idx, project);
         }
         if deselect {
             self.clear_selection();
@@ -5699,6 +5923,8 @@ struct CanvasInput {
     primary_down: bool,
     primary_pressed: bool,
     primary_released: bool,
+    /// Right button held this frame — the brush's Alt + right-drag HUD gesture.
+    secondary_down: bool,
     middle_down: bool,
     space_down: bool,
     pointer_delta: Vec2,
@@ -5730,6 +5956,101 @@ fn over(src: Color32, dst: Color32) -> Color32 {
         blend(src.b(), dst.b()),
         blend(src.a(), dst.a()),
     )
+}
+
+/// Scales a premultiplied colour by a layer opacity in `0.0..=1.0`.
+///
+/// All four channels scale together, which is exactly what premultiplied alpha means and what
+/// `TiledTexture::draw` does at composite time; doing it before [`over`] reproduces the visible
+/// composite for the eyedropper.
+fn scale_premultiplied(color: Color32, opacity: f32) -> Color32 {
+    let k = opacity.clamp(0.0, 1.0);
+    if k >= 1.0 {
+        return color;
+    }
+    // `k` is clamped to `0.0..=1.0` and the product is clamped to `0.0..=255.0` before the
+    // conversion, so neither cast can truncate or saturate (§17's proven-safe exception).
+    let s = |c: u8| (f32::from(c) * k).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_premultiplied(s(color.r()), s(color.g()), s(color.b()), s(color.a()))
+}
+
+/// One brush parameter change requested by a key press this frame.
+///
+/// Produced by [`collect_brush_key_actions`] and applied by
+/// [`PsEditorTabState::brush_shortcuts`]; splitting the two keeps the key decoding pure and
+/// unit-testable without an `egui::Context`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BrushKeyAction {
+    /// `[` / `]`: one step on Photoshop's non-linear diameter table.
+    DiameterStep { up: bool },
+    /// `-` / `=` / `+`: the legacy multiplicative size change.
+    DiameterScale { down: bool },
+    /// `Shift+[` / `Shift+]`: one 25 % step of hardness.
+    HardnessStep { up: bool },
+    /// A digit: opacity as a fraction of 1.0.
+    Opacity(f32),
+    /// `Shift` + a digit: flow as a fraction of 1.0.
+    Flow(f32),
+}
+
+/// Decodes this frame's key events into brush parameter changes, in event order.
+///
+/// The frame's EVENTS are scanned rather than `InputState::key_pressed`, because the brush needs
+/// `[` and `Shift+[` to mean different things: `key_pressed` ignores modifiers entirely, and
+/// `consume_key`/`consume_shortcut` match with `matches_logically`, which ignores an extra Shift.
+/// Only `Modifiers::matches_exact` separates the two. Key repeats are accepted, so holding `]`
+/// keeps growing the brush.
+fn collect_brush_key_actions(events: &[egui::Event]) -> Vec<BrushKeyAction> {
+    let mut out = Vec::new();
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let plain = modifiers.matches_exact(egui::Modifiers::NONE);
+        let shifted = modifiers.matches_exact(egui::Modifiers::SHIFT);
+        if !plain && !shifted {
+            continue;
+        }
+        let digit = match key {
+            egui::Key::Num1 => Some(0.1),
+            egui::Key::Num2 => Some(0.2),
+            egui::Key::Num3 => Some(0.3),
+            egui::Key::Num4 => Some(0.4),
+            egui::Key::Num5 => Some(0.5),
+            egui::Key::Num6 => Some(0.6),
+            egui::Key::Num7 => Some(0.7),
+            egui::Key::Num8 => Some(0.8),
+            egui::Key::Num9 => Some(0.9),
+            egui::Key::Num0 => Some(1.0),
+            _ => None,
+        };
+        if let Some(fraction) = digit {
+            out.push(if shifted {
+                BrushKeyAction::Flow(fraction)
+            } else {
+                BrushKeyAction::Opacity(fraction)
+            });
+            continue;
+        }
+        match key {
+            egui::Key::OpenBracket if plain => out.push(BrushKeyAction::DiameterStep { up: false }),
+            egui::Key::CloseBracket if plain => out.push(BrushKeyAction::DiameterStep { up: true }),
+            egui::Key::OpenBracket => out.push(BrushKeyAction::HardnessStep { up: false }),
+            egui::Key::CloseBracket => out.push(BrushKeyAction::HardnessStep { up: true }),
+            egui::Key::Minus if plain => out.push(BrushKeyAction::DiameterScale { down: true }),
+            egui::Key::Equals if plain => out.push(BrushKeyAction::DiameterScale { down: false }),
+            // `+` is Shift+`=` on most layouts, so it must be accepted with or without Shift.
+            egui::Key::Plus => out.push(BrushKeyAction::DiameterScale { down: false }),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Nearest-neighbor sample of `layer` at page pixel `(wx, wy)` through its transform, or
@@ -6138,6 +6459,27 @@ fn non_empty_selection(selection: Selection) -> Option<Selection> {
 /// down": a press that BEGINS on a panel also holds the button down, and the tools correctly refuse
 /// to start a gesture there — so `primary_down` would keep painting the preview under the panel in
 /// exactly the case this function exists to fix.
+/// Converts a page/world coordinate in px to a pixel index, or `None` when it addresses no pixel.
+///
+/// Rejects negatives, NaN, infinities and anything past `u32::MAX` instead of letting an `as usize`
+/// truncate or saturate them into a valid-looking index (§17 of `AGENTS.md`): a saturating cast
+/// turns "the pointer is nowhere near the page" into "the pointer is on the last pixel", which
+/// silently samples or clips the wrong pixel. The upper bound is 2^24, the largest integer an `f32`
+/// still represents exactly and far above any page dimension, so everything it excludes is out of
+/// the page anyway.
+///
+/// The caller still has to range-check the result against the actual width or height.
+#[must_use]
+fn page_pixel_index(v: f32) -> Option<usize> {
+    /// Largest coordinate accepted: 2^24, the exact-integer limit of an `f32`.
+    const MAX_EXACT: f32 = 16_777_216.0;
+    if !(0.0..=MAX_EXACT).contains(&v) {
+        return None;
+    }
+    // The range test above proves the truncation is exact and that it fits a `usize`.
+    Some(v as usize)
+}
+
 #[must_use]
 fn overlay_pointer(
     hover_pos: Option<Pos2>,
@@ -6205,6 +6547,12 @@ fn decimate_to_screen(
 /// `dash_len` is in SCREEN pixels, so the pattern is zoom-invariant. A path shorter than one dash
 /// emits a single black run. Returns 0 for a path with fewer than two points, a non-positive
 /// `dash_len`, or a zero `budget`. Pure: no painter, no global state.
+///
+/// Two callers share it: `draw_selection_marquee` here and the brush's pixel-exact cursor outline
+/// (`tools/brush.rs`, `draw_pixel_outline`) — both are staircases traced along pixel edges, and both
+/// need the same black/white contrast to read over arbitrary artwork. A run keeps its input's exact
+/// axis alignment (`a + dir * t` leaves the constant coordinate bit-identical), which is what lets
+/// the tessellator snap an emitted segment to the physical pixel grid; do not change that.
 fn walk_dash_runs(
     path: &[Pos2],
     dash_len: f32,
@@ -6772,6 +7120,111 @@ mod tests {
         assert_eq!(over(Color32::TRANSPARENT, Color32::GREEN), Color32::GREEN);
         // Opaque src fully replaces dst.
         assert_eq!(over(Color32::BLUE, Color32::RED), Color32::BLUE);
+    }
+
+    /// A layer opacity scales all four premultiplied channels, which is what makes
+    /// `scale_premultiplied` + `over` reproduce what the eyedropper's user actually sees.
+    #[test]
+    fn scale_premultiplied_dims_every_channel() {
+        assert_eq!(scale_premultiplied(Color32::RED, 1.0), Color32::RED);
+        assert_eq!(
+            scale_premultiplied(Color32::RED, 0.5),
+            Color32::from_rgba_premultiplied(128, 0, 0, 128)
+        );
+        assert_eq!(scale_premultiplied(Color32::RED, 0.0), Color32::TRANSPARENT);
+    }
+
+    /// One key press event, as the backend delivers it.
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// `[` and `Shift+[` must mean DIFFERENT things — the whole reason the frame's events are
+    /// scanned instead of `key_pressed`, which ignores modifiers entirely.
+    #[test]
+    fn bracket_keys_separate_size_from_hardness_by_shift() {
+        let plain = collect_brush_key_actions(&[
+            key_event(egui::Key::OpenBracket, egui::Modifiers::NONE),
+            key_event(egui::Key::CloseBracket, egui::Modifiers::NONE),
+        ]);
+        assert_eq!(
+            plain,
+            vec![
+                BrushKeyAction::DiameterStep { up: false },
+                BrushKeyAction::DiameterStep { up: true }
+            ]
+        );
+        let shifted = collect_brush_key_actions(&[
+            key_event(egui::Key::OpenBracket, egui::Modifiers::SHIFT),
+            key_event(egui::Key::CloseBracket, egui::Modifiers::SHIFT),
+        ]);
+        assert_eq!(
+            shifted,
+            vec![
+                BrushKeyAction::HardnessStep { up: false },
+                BrushKeyAction::HardnessStep { up: true }
+            ]
+        );
+    }
+
+    /// Digits set opacity, Shift+digits set flow, and `0` means 100 %.
+    #[test]
+    fn digit_keys_set_opacity_and_shifted_digits_set_flow() {
+        let acts = collect_brush_key_actions(&[
+            key_event(egui::Key::Num3, egui::Modifiers::NONE),
+            key_event(egui::Key::Num0, egui::Modifiers::NONE),
+            key_event(egui::Key::Num7, egui::Modifiers::SHIFT),
+        ]);
+        assert_eq!(
+            acts,
+            vec![
+                BrushKeyAction::Opacity(0.3),
+                BrushKeyAction::Opacity(1.0),
+                BrushKeyAction::Flow(0.7),
+            ]
+        );
+    }
+
+    /// A brush key carrying Ctrl/Cmd or Alt belongs to someone else (Ctrl+D deselects, Alt is the
+    /// eyedropper) and must be ignored, and a key RELEASE must never act.
+    #[test]
+    fn brush_keys_ignore_other_modifiers_and_releases() {
+        let ctrl = egui::Modifiers { command: true, ctrl: true, ..Default::default() };
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        assert!(collect_brush_key_actions(&[key_event(egui::Key::Num1, ctrl)]).is_empty());
+        assert!(collect_brush_key_actions(&[key_event(egui::Key::OpenBracket, alt)]).is_empty());
+        let release = egui::Event::Key {
+            key: egui::Key::CloseBracket,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(collect_brush_key_actions(&[release]).is_empty());
+    }
+
+    /// The legacy `-` / `=` / `+` size keys stay wired, `+` with or without Shift.
+    #[test]
+    fn the_legacy_size_keys_still_scale_the_diameter() {
+        let acts = collect_brush_key_actions(&[
+            key_event(egui::Key::Minus, egui::Modifiers::NONE),
+            key_event(egui::Key::Equals, egui::Modifiers::NONE),
+            key_event(egui::Key::Plus, egui::Modifiers::SHIFT),
+        ]);
+        assert_eq!(
+            acts,
+            vec![
+                BrushKeyAction::DiameterScale { down: true },
+                BrushKeyAction::DiameterScale { down: false },
+                BrushKeyAction::DiameterScale { down: false },
+            ]
+        );
     }
 
     #[test]

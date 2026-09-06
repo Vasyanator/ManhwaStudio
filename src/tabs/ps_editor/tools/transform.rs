@@ -334,6 +334,8 @@ mod tests {
             primary_pressed: pressed && in_viewport,
             primary_down: down,
             primary_released: !down,
+            secondary_down: false,
+            pointer_delta: Vec2::ZERO,
             modifiers: egui::Modifiers::default(),
             cancel_pressed: false,
             remove_point_pressed: false,
