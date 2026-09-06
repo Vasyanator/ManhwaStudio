@@ -255,6 +255,10 @@ mod bubble_on_top_ui;
 mod bubble_runtime;
 mod helpers;
 mod overlay_runtime;
+/// Shared per-source-pixel inspection grid. `pub(crate)` because the PS editor
+/// (`tabs::ps_editor`) paints the SAME grid from its own viewport under a manual checkbox — see
+/// the module header for why the painter carries no magnification gate of its own.
+pub(crate) mod pixel_grid;
 mod scene;
 mod settings;
 mod types;

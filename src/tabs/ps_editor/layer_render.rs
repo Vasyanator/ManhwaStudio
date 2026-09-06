@@ -15,6 +15,10 @@ Key functions:
   layer so a transparent hole reads as "no pixels" instead of as dark canvas ground.
 
 Notes:
+Each grid carries the `TextureOptions` its tiles are uploaded with, driven by the «Сглаживание»
+checkbox of the «PS редактор» tab. Flipping it re-uploads (`set_options` -> `mark_all_dirty`)
+instead of keeping a second handle per tile: this cache is not registered with `memory_manager`,
+so dual handles would be untracked, unevictable GPU memory.
 Tiles are uploaded with a per-frame budget so the initial upload of a tall page is spread across
 frames and never stalls the GUI thread. Drawing maps each tile's image-space rect through the
 `ViewTransform` and tints by the layer opacity. The checkerboard is ONE textured quad with a
@@ -71,10 +75,16 @@ pub struct TiledTexture {
     textures: Vec<Option<TextureHandle>>,
     dirty: Vec<bool>,
     name: String,
+    /// Sampling mode every tile of this grid is uploaded with. See [`TiledTexture::set_options`]
+    /// for why the mode lives here instead of at draw time.
+    options: TextureOptions,
 }
 
 impl TiledTexture {
     /// Creates a tile grid for a `size` (image px) layer with all tiles pending upload.
+    ///
+    /// Tiles start in the smoothed (`TextureOptions::LINEAR`) sampling mode, which is what the PS
+    /// editor's «Сглаживание» checkbox defaults to; [`TiledTexture::set_options`] switches it.
     #[must_use]
     pub fn new(size: [usize; 2], name: impl Into<String>) -> Self {
         let cols = size[0].div_ceil(TILE_SIDE).max(1);
@@ -87,7 +97,33 @@ impl TiledTexture {
             textures: (0..count).map(|_| None).collect(),
             dirty: vec![true; count],
             name: name.into(),
+            options: TextureOptions::LINEAR,
         }
+    }
+
+    /// Switches the sampling mode every tile is uploaded with. Returns `true` when the mode
+    /// actually changed, in which case all tiles were marked dirty for re-upload.
+    ///
+    /// # Why a re-upload and not a second `TextureHandle`
+    /// In egui 0.35 filtering is a property of the `TextureId`, not of the mesh
+    /// (`TextureOptions` travels only with an `ImageDelta`), so one handle cannot be drawn both
+    /// smoothed and un-smoothed — a switch costs either a second handle per tile or a re-upload.
+    /// The canvas affords dual handles (`app.rs::TextureTile`) because its source-page cache
+    /// retains the tile bytes AND is registered with `memory_manager` as an evictable
+    /// `CacheResourceKind`. The PS editor's `render_cache` is neither: a dual-handle grid would be
+    /// untracked, unevictable GPU memory — roughly +122 MB for the two base layers of a tall
+    /// webtoon page. Toggling is rare, so the cheap steady state wins over the cheap transition;
+    /// the existing `upload_budgeted` sweep re-uploads over a few frames.
+    ///
+    /// Marking dirty only on a real change is load-bearing: an unconditional `mark_all_dirty` would
+    /// re-upload the whole page every frame, since this is called once per frame per layer.
+    pub fn set_options(&mut self, options: TextureOptions) -> bool {
+        if self.options == options {
+            return false;
+        }
+        self.options = options;
+        self.mark_all_dirty();
+        true
     }
 
     /// True when this tile grid was built for `size` (image px).
@@ -154,12 +190,12 @@ impl TiledTexture {
             let row = index / self.cols;
             let tile = self.crop_tile(image, col, row);
             match &mut self.textures[index] {
-                Some(handle) => handle.set(tile, TextureOptions::LINEAR),
+                Some(handle) => handle.set(tile, self.options),
                 slot @ None => {
                     *slot = Some(ctx.load_texture(
                         format!("{}_{col}_{row}", self.name),
                         tile,
-                        TextureOptions::LINEAR,
+                        self.options,
                     ));
                 }
             }
@@ -426,11 +462,12 @@ pub(super) fn draw_page_checkerboard(
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKER_DARK, CHECKER_LIGHT, CHECKER_SQUARE_PTS, CHECKER_TILE_PTS, ViewTransform,
-        checker_tile_image, checker_uv_rect, draw_page_checkerboard, page_rect_on_screen,
+        CHECKER_DARK, CHECKER_LIGHT, CHECKER_SQUARE_PTS, CHECKER_TILE_PTS, TiledTexture,
+        ViewTransform, checker_tile_image, checker_uv_rect, draw_page_checkerboard,
+        page_rect_on_screen,
     };
     use eframe::egui;
-    use egui::{Pos2, Rect, Vec2};
+    use egui::{ColorImage, Pos2, Rect, TextureOptions, Vec2};
 
     /// A view whose viewport is 400x400 points, with the page origin at its centre offset.
     fn view(zoom: f32) -> ViewTransform {
@@ -522,5 +559,25 @@ mod tests {
         let first = super::checker_texture(&ctx);
         let second = super::checker_texture(&ctx);
         assert_eq!(first.id(), second.id(), "the handle is cached in the context, not re-uploaded");
+    }
+
+    /// `set_options` must mark tiles dirty ONLY on a real change: it is called once per frame per
+    /// layer, so an unconditional invalidation would re-upload the whole page every frame.
+    #[test]
+    fn set_options_marks_dirty_only_on_a_real_change() {
+        let ctx = egui::Context::default();
+        let size = [2048, 2048];
+        let image = ColorImage::filled(size, egui::Color32::WHITE);
+        let mut cache = TiledTexture::new(size, "test_layer");
+        // Four tiles at TILE_SIDE = 1024; the budget is large enough to make the grid fully resident.
+        assert_eq!(cache.upload_budgeted(&ctx, &image, 16), 4);
+        assert_eq!(cache.upload_budgeted(&ctx, &image, 16), 0, "nothing left dirty");
+
+        assert!(!cache.set_options(TextureOptions::LINEAR), "already LINEAR");
+        assert_eq!(cache.upload_budgeted(&ctx, &image, 16), 0, "a no-op must not re-upload");
+
+        assert!(cache.set_options(TextureOptions::NEAREST), "a real change");
+        assert_eq!(cache.upload_budgeted(&ctx, &image, 16), 4, "every tile re-uploads");
+        assert_eq!(cache.upload_budgeted(&ctx, &image, 16), 0, "and then settles again");
     }
 }

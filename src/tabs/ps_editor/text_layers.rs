@@ -12,6 +12,11 @@ These layers are owned by the typing tab; here they are display-only. Keeping th
 `LayerStack` means the raster invariants and tools (paint/cut/merge/reorder/stash) are untouched.
 Moving/transforming them from the PS side (which must write geometry back to `text_info.json` and
 signal the typing tab to reload) is a later step.
+
+Notes:
+An overlay's GPU handle is stored together with the `TextureOptions` it was uploaded with, so the
+tab-wide «Сглаживание» toggle can re-upload it and the recorded mode can never drift from the
+handle that survives a re-projection (`take_texture` / `from_doc_node`).
 */
 
 use super::layers::LayerTransform;
@@ -45,7 +50,13 @@ pub struct PsTextLayer {
     /// rendering instead of the affine `transform`. Canonical `DeformRec` (shared with the layer
     /// model and the typing tab).
     deform: Option<DeformRec>,
-    texture: Option<egui::TextureHandle>,
+    /// Lazily uploaded overlay texture together with the `TextureOptions` it was uploaded with.
+    ///
+    /// The options are stored NEXT TO the handle rather than in a separate field because the handle
+    /// is carried across re-projections by uid (`take_texture`): a mode recorded separately would
+    /// desynchronise from the handle it describes. In egui 0.35 filtering is a property of the
+    /// `TextureId`, so following the «Сглаживание» checkbox means re-uploading, not re-binding.
+    texture: Option<(egui::TextureHandle, egui::TextureOptions)>,
 }
 
 impl PsTextLayer {
@@ -67,7 +78,7 @@ impl PsTextLayer {
         image: ColorImage,
         transform: LayerTransform,
         deform: Option<DeformRec>,
-        texture: Option<egui::TextureHandle>,
+        texture: Option<(egui::TextureHandle, egui::TextureOptions)>,
     ) -> Self {
         Self {
             uid,
@@ -124,8 +135,10 @@ impl PsTextLayer {
         &self.uid
     }
 
-    /// Takes the GPU texture handle out (used to carry it across a re-projection by uid).
-    pub fn take_texture(&mut self) -> Option<egui::TextureHandle> {
+    /// Takes the GPU texture handle and its sampling mode out (used to carry them across a
+    /// re-projection by uid). The pair travels together so the recorded mode always describes the
+    /// handle it is stored with.
+    pub fn take_texture(&mut self) -> Option<(egui::TextureHandle, egui::TextureOptions)> {
         self.texture.take()
     }
 
@@ -241,25 +254,40 @@ impl PsTextLayer {
     /// present (perspective/bend from the typing tab), it renders the textured `cols`×`rows` mesh;
     /// otherwise a simple affine quad. `opacity` (0..=1, from the unified group fold) modulates the
     /// whole overlay via the mesh vertex tint.
+    ///
+    /// `options` is the tab-wide sampling mode («Сглаживание»): text overlays follow the same
+    /// checkbox as the layer tiles so a magnified page reads consistently. A change re-uploads this
+    /// overlay's single texture — filtering belongs to the `TextureId` in egui 0.35, and an overlay
+    /// is small enough that the re-upload is unnoticeable (unlike a page-sized layer, which is why
+    /// `TiledTexture` spreads its own re-upload over a budget).
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
         view: &ViewTransform,
         opacity: f32,
+        options: egui::TextureOptions,
     ) {
         if !self.visible {
             return;
         }
         let tint = Color32::from_white_alpha((opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
-        let image = self.image.clone();
-        let uid = self.uid.clone();
-        let texture_id = self
-            .texture
-            .get_or_insert_with(|| {
-                ctx.load_texture(format!("ps_text_{uid}"), image, egui::TextureOptions::LINEAR)
-            })
-            .id();
+        let texture_id = match &mut self.texture {
+            Some((handle, current)) => {
+                if *current != options {
+                    handle.set(self.image.clone(), options);
+                    *current = options;
+                }
+                handle.id()
+            }
+            slot @ None => {
+                let handle =
+                    ctx.load_texture(format!("ps_text_{}", self.uid), self.image.clone(), options);
+                let id = handle.id();
+                *slot = Some((handle, options));
+                id
+            }
+        };
 
         let mut mesh = egui::Mesh::with_texture(texture_id);
         if let Some(grid) = &self.deform {

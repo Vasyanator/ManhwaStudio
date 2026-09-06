@@ -252,6 +252,12 @@ overlay, and the cleaning text mask, plus the pixel grid, so a magnified source 
 across layers. The grid is drawn in one late overlay pass (`draw_pixel_grid_overlay`), not in base
 layers. Overlay and text-mask tile draws viewport-cull tiles against the visible clip rect.
 
+The grid PAINTER itself lives in `pixel_grid.rs` and carries no threshold of its own: whether a grid
+is wanted is the caller's policy. The canvas applies the threshold above in
+`scene.rs::draw_pixel_grid_on_page` before delegating; the PS editor drives the same painter from a
+manual checkbox (keeping the threshold only as a cost guard). Anything else that magnifies page
+pixels must reuse `pixel_grid::draw_pixel_grid` rather than grow a second grid.
+
 Directed zoom is anchored in content/world space and clamps the requested horizontal
 scroll offset to the current scrollable range.
 
@@ -315,6 +321,10 @@ The centering reads its viewport width from `scene.scroll_inner_rect` (falling b
   `fs::write`: this worker runs off the GUI thread and an unlocked read-modify-write here could drop
   the ORT SIGILL guard marker written concurrently under the same lock.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
+- `pixel_grid.rs`: the ONE per-source-pixel inspection grid, shared with `tabs::ps_editor`
+  (`pub(crate)` for that reason). `pixel_grid_spans` is pure geometry (clip-bounded, unit-tested);
+  `draw_pixel_grid` emits one `Painter::line_segment` per line — never a polyline, which
+  `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
 - `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`). The `ScrollArea` still allocates the page strip and owns scrolling, but each page's authoritative screen `image_rect` and its `page_in_view` visibility are now produced by this transform: `reserve_canvas_page_frame` establishes one per-frame transform from the first laid-out page (`scale == state.zoom`, `translation = old_image_left_top - world_min*scale`) and maps every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the transform-derived rect drifts >0.5px from the old ad-hoc rect. Future increments will remove the `ScrollArea` and make the transform the sole camera.
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
@@ -459,6 +469,10 @@ The centering reads its viewport width from `scene.scroll_inner_rect` (falling b
   `mod.rs::declare_ribbon_tab`, which all three tabs call.
 - To change source page GPU residency or NEAREST inspection behavior, edit `scene.rs`,
   `mod.rs`, and the source-page texture owner in `app.rs`.
+- To change how the pixel grid LOOKS or which lines it emits, edit `pixel_grid.rs` — it is shared
+  with the PS editor, so a change there is visible in both. To change WHEN the canvas shows it,
+  edit `scene.rs::draw_pixel_grid_on_page`; to change the threshold itself, edit
+  `PIXEL_INSPECTION_MIN_DEVICE_PX` in `mod.rs`.
 - To change bubble editing behavior, start in `bubble_runtime.rs` and the relevant
   bubble UI module.
 - To change hint-bubble behavior, edit `bubble_runtime.rs` (`create_hint_bubble_at_pointer_shortcut`,

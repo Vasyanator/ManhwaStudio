@@ -167,7 +167,12 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   forget. A group is a maximal contiguous same-`group_uid` run (the
   contiguity invariant is enforced at write time in `persist::save_page_grouping`).
 - `layer_render.rs`: `TiledTexture` — per-layer tile grid (sized to the layer image), dirty
-  tracking, budgeted upload, and transform-aware mesh draw.
+  tracking, budgeted upload, and transform-aware mesh draw. Each grid also owns the
+  `TextureOptions` its tiles are uploaded with; `set_options` switches it and marks every tile
+  dirty ONLY on a real change, so the existing budgeted uploader re-uploads over a few frames. A
+  second `TextureHandle` per tile (the canvas' `app.rs::TextureTile` pattern) is deliberately NOT
+  used here: `render_cache` is not registered with `memory_manager`, so dual handles would be
+  untracked, unevictable GPU memory (~+122 MB for the two base layers of a tall page).
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
 - `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
   `ReversibleAction<Ctx = PsEditorTabState>` with four variants (real `match`, no `_ =>`, so every
@@ -187,7 +192,7 @@ BACKGROUND and five floating dock tabs sit over it.
 
 | tab id (stable, non-localized) | caption key | body |
 |---|---|---|
-| `ps_editor.main` | `ps_editor.tab.main` | page switch, «Вписать» / «100%», zoom readout, load / effects spinners, `load_error`, and the «Панели…» menu |
+| `ps_editor.main` | `ps_editor.tab.main` | TWO wrapped rows: page switch, «Вписать» / «100%», zoom readout, load / effects spinners, `load_error`; then the «Сглаживание» / «Сетка пикселей» view toggles. Plus the «Панели…» menu |
 | `ps_editor.tools` | `ps_editor.tab.tools` | the tool selector grouped by `PsToolSection::ORDER`, plus «Выделить слой полностью» / «Снять выделение» |
 | `ps_editor.active_tool` | `ps_editor.tab.active_tool` | the active tool's `options_ui`, or `ps_editor.active_tool.no_options` when `PsTool::has_options` is false |
 | `ps_editor.hotkeys` | `ps_editor.tab.hotkeys` | the active tool's `hotkey_rows`, then `ps_editor_common_hotkey_rows` |
@@ -345,6 +350,33 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 ## Contracts and invariants
 - GUI thread never decodes images or holds the model lock across decode: that is `page_loader`'s
   job; the model lock is released before `image::open`.
+- **Pixel inspection is MANUAL here and shares its machinery with the canvas tabs.** Cleaning
+  switches NEAREST sampling and the pixel grid on automatically above
+  `canvas::PIXEL_INSPECTION_MIN_DEVICE_PX`; this tab exposes the same two notions as the
+  «Сглаживание» / «Сетка пикселей» checkboxes of «PS редактор». Both are plain `bool`s on
+  `PsEditorTabState` (`smoothing_enabled` defaults to `true`, `pixel_grid_enabled` to `false`) and
+  are NOT persisted — per-session viewing aids, like everything else in this tab's UI state except
+  the dock arrangement and its panel-visibility flags. Three rules hold:
+  1. **One sampling mode for the whole tab.** `layer_texture_options()` is the single decision;
+     layer tiles (`TiledTexture::set_options`, reconciled for EVERY cache entry before the budgeted
+     upload sweep, never inside it) and typing text overlays (`PsTextLayer::draw`) both follow it,
+     so a magnified page does not SETTLE with smoothed text over un-smoothed art. It is not
+     instantaneous: a text overlay re-uploads in one frame while layer tiles spread over several at
+     `TILE_UPLOAD_BUDGET_PER_FRAME`, so a flip is visible as a brief sweep — which is why
+     `upload_layers` requests the frames that finish it. `PsTextLayer` stores its `TextureOptions`
+     next to its handle, because the handle survives a re-projection by uid.
+  2. **The grid is one late overlay pass**, drawn from `draw_canvas` right after `draw_composite`
+     — never inside a layer. Same contract as `canvas/scene.rs::draw_visible_pixel_grid_overlay`.
+  3. **The grid keeps the zoom gate even under a manual checkbox.** The checkbox states intent;
+     `canvas::pixel_inspection_recommended_for` remains as a cost and legibility guard (below the
+     threshold the grid is a solid grey field costing tens of thousands of segments). The checkbox
+     therefore stays ENABLED at any zoom and simply shows nothing until the zoom suffices.
+- **The pixel grid is a PAGE grid, and that is an accepted limitation.** Page px == source px for
+  the two base layers, which are permanently identity-transformed (`layers.rs::is_transformable`),
+  so the lines coincide with their texels exactly. A user raster layer that is rotated, scaled or
+  deformed has its own texel grid and will NOT align to the page grid. Do not compensate: a
+  per-layer grid would need non-axis-aligned lines, which `tessellate_path` blurs, and thousands of
+  them per layer.
 - **Default layer/group names are persisted, so they must stay non-localized literals.** A raster
   layer's `name` and a group's `name` round-trip through `layers.json` (`persist_current_page` →
   `saver::OwnedRasterLayer`/`GroupMeta`; reloaded by `sync_view_from_doc`). The default-name literals
@@ -534,4 +566,10 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `apply_effects_to_raster`, `render_ps_raster_effects`, `poll_ps_raster_effects_jobs`, and
   `apply_ps_raster_effects_result` in `mod.rs`.
 - To change GPU upload/compositing, edit `layer_render.rs` and `mod.rs::draw_canvas`.
+- To change the sampling mode («Сглаживание»), edit `PsEditorTabState::layer_texture_options` in
+  `mod.rs` — it is the ONE place the mode is decided, consumed by `upload_layers`
+  (`TiledTexture::set_options`) and by `draw_composite` (`PsTextLayer::draw`).
+- To change the pixel grid, edit the SHARED painter `canvas::pixel_grid::draw_pixel_grid`; only
+  the gate (`pixel_grid_enabled` + `canvas::pixel_inspection_recommended_for`) and the page rect
+  live here, in `mod.rs::draw_canvas` right after `draw_composite`.
 - To change how base layers are sourced, edit `page_loader.rs`.

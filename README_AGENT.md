@@ -991,6 +991,7 @@ living inside the feature that first needed it (the FLUX.2 klein model download,
 - `MaskBrush`: переиспользуемая кисть для рисования бинарной маски в `egui::ColorImage` (радиус, Shift+wheel смена размера, hotkeys, cursor overlay).
 - `paint_line_with_brush`: helper штриха по ColorImage для круглой кисти.
 - `fill_polygon_spans`: развёртка замкнутого многоугольника по правилу even-odd — выдаёт по строкам спаны `x0..=x1`, уже обрезанные по буферу. Общая для лассо-выделения `ps_editor` и заплатки клининга; своей копии растеризатора заводить нельзя.
+- Pixel inspection (NEAREST sampling + the pixel grid) has ONE threshold — `canvas::pixel_inspection_recommended_for` — and ONE grid painter — `canvas::pixel_grid::draw_pixel_grid` (gate-free by contract) — shared by the canvas tabs and `ps_editor`; cleaning applies them automatically at high zoom, the PS editor manually via two checkboxes. A second threshold or a second grid implementation is a defect.
 
 ---
 

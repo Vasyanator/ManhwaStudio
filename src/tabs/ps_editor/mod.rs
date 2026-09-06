@@ -163,10 +163,11 @@ const PS_EDITOR_FLAG_LAYERS_PANEL: &str = "panels.layers";
 /// Every panel starts shown; `TabExtras::set_flag` keeps a flag at its default out of the config.
 const PS_EDITOR_PANEL_VISIBLE_DEFAULT: bool = true;
 
-/// Shrink floor of «PS редактор» (points). Below this its one wrapped row stops being readable.
-const PS_EDITOR_MAIN_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 48.0);
-/// First-frame size of «PS редактор», before its content has ever been measured.
-const PS_EDITOR_MAIN_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(420.0, 72.0);
+/// Shrink floor of «PS редактор» (points). Below this its TWO wrapped rows (page/zoom, then the
+/// «Сглаживание» / «Сетка пикселей» toggles) stop being readable.
+const PS_EDITOR_MAIN_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 74.0);
+/// First-frame size of «PS редактор» (two wrapped rows), before its content has ever been measured.
+const PS_EDITOR_MAIN_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(420.0, 98.0);
 /// Shrink floor of «Инструменты».
 const PS_EDITOR_TOOLS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(180.0, 120.0);
 /// First-frame size of «Инструменты».
@@ -535,6 +536,23 @@ pub struct PsEditorTabState {
         Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
     /// Set by the "100%" button; consumed in `draw_canvas` where the real canvas rect is known.
     pending_actual_size: bool,
+    /// «Сглаживание»: bilinear (`true`, the default and the historic behaviour) vs NEAREST sampling
+    /// of EVERY PS-editor texture — layer tiles (`TiledTexture`) and typing text overlays alike, so
+    /// a magnified page reads consistently. A flip re-uploads the affected textures; see
+    /// `TiledTexture::set_options` for why re-upload beats a second handle per tile.
+    ///
+    /// Deliberately NOT persisted: it is a per-session viewing aid, and nothing else in this tab's
+    /// UI state survives a restart except the dock arrangement and its panel-visibility flags.
+    smoothing_enabled: bool,
+    /// «Сетка пикселей»: paint the shared per-source-pixel grid over the page (`false` by default).
+    ///
+    /// The checkbox is the user's INTENT; the grid additionally stays gated on
+    /// `canvas::pixel_inspection_recommended_for`, which is a cost and legibility guard rather than
+    /// a second opinion — below ~4 device pixels per source pixel the grid degenerates into a solid
+    /// grey field and costs tens of thousands of segments per frame. The checkbox therefore stays
+    /// enabled at every zoom and simply shows nothing until the zoom is sufficient (its tooltip says
+    /// so). Not persisted, for the same reason as `smoothing_enabled`.
+    pixel_grid_enabled: bool,
     /// Camera synced in from `CanvasView`, applied once its target page is loaded so the async
     /// page load (which refits the camera) does not clobber it. See `sync_view_from_canvas`.
     pending_camera: Option<CameraSync>,
@@ -787,6 +805,8 @@ impl Default for PsEditorTabState {
             trace_last_composite_steps: usize::MAX,
             layer_doc: None,
             pending_actual_size: false,
+            smoothing_enabled: true,
+            pixel_grid_enabled: false,
             pending_camera: None,
             last_overlay_revision: 0,
             node_generations: HashMap::new(),
@@ -2507,10 +2527,11 @@ impl PsEditorTabState {
         self.draw_canvas(ctx, ui, area_rect, project);
     }
 
-    /// Everything the «PS редактор» tab shows except its «Панели…» menu: the page switch, the two
-    /// zoom presets, the zoom readout, the load / effects spinners and the last load error.
+    /// Everything the «PS редактор» tab shows except its «Панели…» menu, in two wrapped rows: the
+    /// page switch, the two zoom presets, the zoom readout, the load / effects spinners and the last
+    /// load error; then the two view toggles («Сглаживание», «Сетка пикселей»).
     ///
-    /// The row WRAPS: the dock body scrolls both axes, and a panel the user narrows must break the
+    /// Each row WRAPS: the dock body scrolls both axes, and a panel the user narrows must break the
     /// row rather than push the buttons behind a horizontal scrollbar.
     fn main_tab_contents(&mut self, ui: &mut egui::Ui, project: &ProjectData) {
         ui.horizontal_wrapped(|ui| {
@@ -2568,6 +2589,25 @@ impl PsEditorTabState {
             if let Some(err) = &self.load_error {
                 ui.colored_label(Color32::from_rgb(220, 80, 80), err);
             }
+        });
+
+        // Second row: the manual counterparts of what the cleaning tab switches on automatically at
+        // high zoom. No `id_salt` is needed despite the localized labels — `Checkbox` takes its `Id`
+        // from `Ui::next_auto_id`, not from its text (`egui-0.35.0/src/widgets/checkbox.rs:72`), so
+        // the rule of `egui-docs/05-ids-and-i18n.md` §2 does not reach it. The checkboxes are added
+        // straight to the wrapping row: a `push_id` scope lays out as one atomic rect and could not
+        // break onto a second line (`egui-0.35.0/src/placer.rs:165`).
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.smoothing_enabled,
+                t!("ps_editor.top_bar.smoothing_checkbox"),
+            )
+            .on_hover_text(t!("ps_editor.top_bar.smoothing_tooltip"));
+            ui.checkbox(
+                &mut self.pixel_grid_enabled,
+                t!("ps_editor.top_bar.pixel_grid_checkbox"),
+            )
+            .on_hover_text(t!("ps_editor.top_bar.pixel_grid_tooltip"));
         });
     }
 
@@ -4856,6 +4896,29 @@ impl PsEditorTabState {
         self.sync_render_cache();
         self.upload_layers(ctx);
         self.draw_composite(ctx, ui, &view);
+        // The pixel grid is ONE late overlay pass over the whole page, never a per-layer one —
+        // the same contract the canvas keeps (`canvas/scene.rs::draw_visible_pixel_grid_overlay`).
+        // The manual checkbox states the user's intent; the magnification threshold stays as a cost
+        // and legibility guard (see `pixel_grid_enabled`).
+        if self.pixel_grid_enabled
+            && crate::canvas::pixel_inspection_recommended_for(view.zoom, ctx.pixels_per_point())
+        {
+            // A PAGE grid: page px == source px for the two identity-transformed base layers, so
+            // the lines are axis-aligned at `view.zoom` spacing. A rotated/scaled/deformed raster
+            // layer has its own texel grid and will NOT line up with this one — an accepted
+            // limitation (see `MODULE_README.md`), not something to compensate for here.
+            let page_rect = view.world_rect_to_screen(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(page_size[0] as f32, page_size[1] as f32),
+            ));
+            crate::canvas::pixel_grid::draw_pixel_grid(
+                &ui.painter_at(rect),
+                page_rect,
+                view.zoom,
+                rect,
+                ctx.pixels_per_point(),
+            );
+        }
         self.draw_selection_marquee(ui, &view);
 
         // Right-click menu on the selection: copy/cut from chosen layers. Suppressed while Alt is
@@ -5009,6 +5072,19 @@ impl PsEditorTabState {
         // selection needs no extra rebuild here.
     }
 
+    /// Sampling mode every PS-editor texture is uploaded with, from the «Сглаживание» checkbox.
+    ///
+    /// One notion for the whole tab: layer tiles and typing text overlays must not disagree, or a
+    /// magnified page would show smoothed text over un-smoothed art.
+    #[must_use]
+    fn layer_texture_options(&self) -> egui::TextureOptions {
+        if self.smoothing_enabled {
+            egui::TextureOptions::LINEAR
+        } else {
+            egui::TextureOptions::NEAREST
+        }
+    }
+
     /// Ensures a render cache entry exists for every current layer and drops stale ones.
     fn sync_render_cache(&mut self) {
         let Some(stack) = &self.stack else {
@@ -5033,7 +5109,26 @@ impl PsEditorTabState {
     }
 
     /// Uploads dirty layer tiles within the per-frame budget.
+    ///
+    /// Also reconciles every cache with the current «Сглаживание» mode BEFORE the budgeted sweep,
+    /// and does so over the whole cache rather than inside the budgeted loop: the loop stops once
+    /// the budget is spent, so a mode change announced there would silently skip the layers that
+    /// did not fit this frame. `TiledTexture::set_options` is a no-op unless the mode really
+    /// changed, so this costs one comparison per layer per frame.
+    ///
+    /// A fully spent budget means tiles are still waiting, so this REQUESTS the next frame. Without
+    /// that, a «Сглаживание» flip — which re-dirties every tile of every layer at once — would
+    /// convert only `TILE_UPLOAD_BUDGET_PER_FRAME` tiles and stop: the checkbox lives in a dock
+    /// panel away from the canvas, `draw_canvas` repaints only on canvas hover / pan / a pending
+    /// job, and egui's `Checkbox` requests no repaint of its own, so an idle app would keep a page
+    /// split between the two sampling modes until some unrelated repaint arrived. A layer whose
+    /// image no longer matches its cache uploads nothing and therefore spends no budget, so this
+    /// cannot become a self-feeding repaint loop.
     fn upload_layers(&mut self, ctx: &egui::Context) {
+        let options = self.layer_texture_options();
+        for cache in self.render_cache.values_mut() {
+            cache.set_options(options);
+        }
         let Some(stack) = &self.stack else {
             return;
         };
@@ -5046,6 +5141,9 @@ impl PsEditorTabState {
                 let uploaded = cache.upload_budgeted(ctx, &layer.image, budget);
                 budget = budget.saturating_sub(uploaded);
             }
+        }
+        if budget == 0 {
+            ctx.request_repaint();
         }
     }
 
@@ -5063,6 +5161,10 @@ impl PsEditorTabState {
             Raster { id: LayerId, opacity: f32 },
             Text { index: usize, opacity: f32 },
         }
+
+        // Resolved before any field of `self` is borrowed for the draw plan: the text-overlay loop
+        // below holds `&mut self.text_layers`, which would forbid reading the flag there.
+        let text_options = self.layer_texture_options();
 
         // Unified-group visibility/opacity, folded over both rasters (via the stack) and texts.
         let group_meta: HashMap<String, (bool, f32)> = self
@@ -5195,7 +5297,7 @@ impl PsEditorTabState {
                 }
                 Step::Text { index, opacity } => {
                     if let Some(layer) = self.text_layers.get_mut(index) {
-                        layer.draw(ctx, &painter, view, opacity);
+                        layer.draw(ctx, &painter, view, opacity, text_options);
                     }
                 }
             }

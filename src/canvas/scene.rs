@@ -1195,71 +1195,31 @@ impl CanvasView {
         // and mask layers; it is intentionally not drawn here.
     }
 
-    /// Draws the per-pixel inspection grid over `image_rect`. The grid is gated
-    /// on the same DPI-correct magnification notion (`zoom * pixels_per_point`)
-    /// and threshold as NEAREST sampling, so both switch on together.
+    /// Draws the per-pixel inspection grid over `image_rect`.
+    ///
+    /// This is the canvas' POLICY layer over the shared painter
+    /// (`canvas::pixel_grid::draw_pixel_grid`): the canvas gates the grid on the same DPI-correct
+    /// magnification notion (`zoom * pixels_per_point`) and threshold as NEAREST sampling, so both
+    /// switch on together. The painter itself is gate-free, because the PS editor drives it from a
+    /// manual checkbox instead.
     fn draw_pixel_grid_on_page(&self, ui: &mut egui::Ui, image_rect: Rect) {
         // Points-per-source-pixel from the authoritative transform (numerically equal to
         // `self.state.zoom`); keeps grid alignment consistent with the painted tiles.
         let zoom = self.scene.view.scale;
         // Gate on the UNCLAMPED ppp so the grid switches on together with NEAREST sampling
-        // (which also uses the raw `ctx.pixels_per_point()`); clamp only the alignment math
-        // below, where a sub-1 ppp would distort the pixel-snapping arithmetic.
+        // (which also uses the raw `ctx.pixels_per_point()`); the painter clamps only its own
+        // alignment math, where a sub-1 ppp would distort the pixel-snapping arithmetic.
         let real_pixels_per_point = ui.ctx().pixels_per_point();
-        let pixels_per_point = real_pixels_per_point.max(1.0);
-        if !super::pixel_inspection_recommended_for(zoom, real_pixels_per_point)
-            || !image_rect.is_positive()
-        {
+        if !super::pixel_inspection_recommended_for(zoom, real_pixels_per_point) {
             return;
         }
-        let clip_rect = ui.clip_rect().intersect(image_rect);
-        if !clip_rect.is_positive() {
-            return;
-        }
-
-        let stroke_width = 1.0 / pixels_per_point;
-        let align = |value: f32| ((value * pixels_per_point).round() + 0.5) / pixels_per_point;
-        let stroke = egui::Stroke::new(
-            stroke_width,
-            Color32::from_rgba_unmultiplied(16, 16, 16, 52),
+        super::pixel_grid::draw_pixel_grid(
+            ui.painter(),
+            image_rect,
+            zoom,
+            ui.clip_rect(),
+            real_pixels_per_point,
         );
-        let painter = ui.painter().with_clip_rect(clip_rect);
-
-        let first_col = ((clip_rect.left() - image_rect.left()) / zoom)
-            .floor()
-            .max(0.0) as usize;
-        let last_col = ((clip_rect.right() - image_rect.left()) / zoom)
-            .ceil()
-            .min((image_rect.width() / zoom).ceil()) as usize;
-        for col in first_col..=last_col {
-            let x = image_rect.left() + col as f32 * zoom;
-            let x = align(x);
-            painter.line_segment(
-                [
-                    egui::pos2(x, clip_rect.top()),
-                    egui::pos2(x, clip_rect.bottom()),
-                ],
-                stroke,
-            );
-        }
-
-        let first_row = ((clip_rect.top() - image_rect.top()) / zoom)
-            .floor()
-            .max(0.0) as usize;
-        let last_row = ((clip_rect.bottom() - image_rect.top()) / zoom)
-            .ceil()
-            .min((image_rect.height() / zoom).ceil()) as usize;
-        for row in first_row..=last_row {
-            let y = image_rect.top() + row as f32 * zoom;
-            let y = align(y);
-            painter.line_segment(
-                [
-                    egui::pos2(clip_rect.left(), y),
-                    egui::pos2(clip_rect.right(), y),
-                ],
-                stroke,
-            );
-        }
     }
 
     pub(super) fn draw_visible_pixel_grid_overlay(&self, ui: &mut egui::Ui) {
