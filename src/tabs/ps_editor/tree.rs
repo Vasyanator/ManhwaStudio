@@ -16,6 +16,11 @@ group's members are contiguous on the Z axis, so the tree is just a flat sorted 
 group runs bracketed by headers. The bottom-to-top leaf order here mirrors `draw_composite`'s plan
 sort exactly (z, then rasters-below-texts, then text page-Y), so the panel order equals the
 composite order.
+
+The WHOLE emitted list is top-to-bottom, the base tail included: the base layers are appended last
+(they are the bottom of the composite) but in REVERSE stack order, so `Клин` — which `draw_composite`
+paints OVER `Исходник` — is listed above it. The `LayerStack` vector order itself is never changed:
+it is load-bearing for compositing, and only this view is reordered.
 */
 
 use super::layers::{LayerId, LayerStack};
@@ -29,7 +34,10 @@ pub const INDENT: f32 = 16.0;
 /// What a leaf row stands for.
 #[derive(Debug, Clone)]
 pub enum LeafKind {
-    /// A locked base layer (Source / Clean): always at the bottom, never grouped or reordered.
+    /// A base layer (Source / Clean): always the bottom two rows, never grouped or reordered.
+    /// `Клин` is listed above `Исходник`, matching the composite. Structurally locked in the panel
+    /// (a base leaf carries no `RowSel`), so it can never be deleted, moved or grouped — but
+    /// `Клин`'s pixels ARE editable, see `Layer::can_edit_pixels`.
     Base(LayerId),
     /// An editable raster layer.
     Raster(LayerId),
@@ -75,6 +83,10 @@ struct Flat {
 /// Builds the unified tree top-to-bottom (first item renders highest). Group metadata (name /
 /// visibility / opacity / collapse) is read from `stack.groups()`, which holds every group on the
 /// page (including text-only ones, recreated on load from the manifest's `GroupRec`s).
+///
+/// Ordering contract: EVERY row of the returned list is top-to-bottom, including the two base
+/// layers that close it. They are emitted in reverse stack order (`Клин` above `Исходник`) so the
+/// panel matches what `draw_composite` paints; the stack vector is left untouched.
 #[must_use]
 pub fn build_unified_tree(
     stack: &LayerStack,
@@ -188,7 +200,83 @@ pub fn build_unified_tree(
         i = run_bottom; // continue below the run
     }
 
-    // Base layers at the very bottom.
-    out.extend(base.into_iter().map(TreeItem::Leaf));
+    // Base layers close the list (they are the bottom of the composite), but REVERSED: the stack
+    // holds them bottom-to-top (`Исходник`, then `Клин`) while every row above is top-to-bottom, so
+    // emitting them raw would show `Клин` UNDER `Исходник` — the opposite of what is composited.
+    out.extend(base.into_iter().rev().map(TreeItem::Leaf));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::ps_editor::layers::{LayerKind, LayerStack};
+    use eframe::egui::{Color32, ColorImage};
+
+    /// A stack with only the two base layers, both 2x2 and transparent.
+    fn base_stack() -> LayerStack {
+        let size = [2, 2];
+        let img = ColorImage::filled(size, Color32::TRANSPARENT);
+        LayerStack::new(0, size, img.clone(), img)
+    }
+
+    #[test]
+    fn clean_is_listed_above_source() {
+        // Regression: the panel is top-to-bottom, so the base tail must be REVERSED relative to the
+        // stack vector — `draw_composite` paints Clean OVER Source, and the panel must agree.
+        let stack = base_stack();
+        let tree = build_unified_tree(&stack, &[], &[]);
+        let base_kinds: Vec<LayerKind> = tree
+            .iter()
+            .filter_map(|item| match item {
+                TreeItem::Leaf(Leaf {
+                    kind: LeafKind::Base(id),
+                    ..
+                }) => stack.layer(*id).map(|l| l.kind),
+                TreeItem::Leaf(_) | TreeItem::Group(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            base_kinds,
+            vec![LayerKind::Clean, LayerKind::Source],
+            "Клин must be listed above Исходник"
+        );
+    }
+
+    #[test]
+    fn base_layers_stay_at_the_bottom_below_every_raster() {
+        let mut stack = base_stack();
+        let a = stack.add_raster_layer();
+        let b = stack.add_raster_layer();
+        let bands = vec![
+            Band::Raster {
+                uid: stack.layer(a).expect("resident").uid.to_string(),
+                z: 0,
+            },
+            Band::Raster {
+                uid: stack.layer(b).expect("resident").uid.to_string(),
+                z: 1,
+            },
+        ];
+        let tree = build_unified_tree(&stack, &[], &bands);
+        let kinds: Vec<&'static str> = tree
+            .iter()
+            .map(|item| match item {
+                TreeItem::Group(_) => "group",
+                TreeItem::Leaf(Leaf {
+                    kind: LeafKind::Base(_),
+                    ..
+                }) => "base",
+                TreeItem::Leaf(Leaf {
+                    kind: LeafKind::Raster(_),
+                    ..
+                }) => "raster",
+                TreeItem::Leaf(Leaf {
+                    kind: LeafKind::Text(_),
+                    ..
+                }) => "text",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["raster", "raster", "base", "base"]);
+    }
 }

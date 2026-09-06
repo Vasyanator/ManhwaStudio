@@ -17,8 +17,10 @@ Direction convention (both structural and metadata ops):
 
 Key structures:
 - `PsEditOp`: one reversible PS-editor edit — `RasterPixels` (tiled+zstd `RasterDiff`),
-  `LayerLifecycle` (add/delete a whole raster layer, retaining its pixels for re-add),
-  and `FieldPatch` (a single metadata/geometry field's before+after).
+  `CleanPixels` (the same delta against the `Клин` BASE layer, keyed on the layer KIND
+  because base-layer uids are regenerated on every page load), `LayerLifecycle`
+  (add/delete a whole raster layer, retaining its pixels for re-add), and `FieldPatch`
+  (a single metadata/geometry field's before+after).
 - `LifecycleDir`: `Added` / `Removed` — the direction a `LayerLifecycle` realizes.
 - `LayerFieldPatch`: one metadata/geometry field (visibility / opacity / transform /
   deform), each carrying `before` + `after`.
@@ -68,6 +70,25 @@ pub(crate) enum PsEditOp {
         page_idx: usize,
         /// Stable doc uid of the target raster layer.
         layer_uid: String,
+        /// The reversible tiled delta (premultiplied RGBA8).
+        diff: Arc<RasterDiff>,
+        /// Whether `apply` runs the delta Forward (redo/add) or Reverse (undo/subtract).
+        dir: ApplyDirection,
+        /// Human-readable label for history/logging.
+        label: String,
+    },
+    /// A brush stroke on the `Клин` BASE layer, recorded as a tiled+zstd reversible pixel
+    /// delta on `page_idx`.
+    ///
+    /// Deliberately NOT a `RasterPixels` with a nullable uid: base layers are rebuilt on every
+    /// page load and get a FRESH `Layer::uid` each time, so a uid is not a usable identity for
+    /// them. The target is resolved by `LayerKind::Clean` instead — there is exactly one such
+    /// layer per stack. An explicit variant also forces every `match` over `PsEditOp` to be
+    /// revisited (this enum carries no `_ =>` arms).
+    CleanPixels {
+        /// Page the diff was built against; the op is only valid while that page's stack is
+        /// resident (the history is cleared on page switch).
+        page_idx: usize,
         /// The reversible tiled delta (premultiplied RGBA8).
         diff: Arc<RasterDiff>,
         /// Whether `apply` runs the delta Forward (redo/add) or Reverse (undo/subtract).
@@ -178,6 +199,12 @@ impl ReversibleAction for PsEditOp {
                 dir,
                 label: _,
             } => ctx.apply_ps_raster_edit(*page_idx, layer_uid, diff.as_ref(), *dir),
+            PsEditOp::CleanPixels {
+                page_idx,
+                diff,
+                dir,
+                label: _,
+            } => ctx.apply_ps_clean_edit(*page_idx, diff.as_ref(), *dir),
             PsEditOp::LayerLifecycle {
                 page_idx,
                 layer,
@@ -203,6 +230,20 @@ impl ReversibleAction for PsEditOp {
             } => PsEditOp::RasterPixels {
                 page_idx: *page_idx,
                 layer_uid: layer_uid.clone(),
+                diff: Arc::clone(diff),
+                dir: match dir {
+                    ApplyDirection::Forward => ApplyDirection::Reverse,
+                    ApplyDirection::Reverse => ApplyDirection::Forward,
+                },
+                label: label.clone(),
+            },
+            PsEditOp::CleanPixels {
+                page_idx,
+                diff,
+                dir,
+                label,
+            } => PsEditOp::CleanPixels {
+                page_idx: *page_idx,
                 diff: Arc::clone(diff),
                 dir: match dir {
                     ApplyDirection::Forward => ApplyDirection::Reverse,
@@ -236,6 +277,7 @@ impl ReversibleAction for PsEditOp {
     fn label(&self) -> &str {
         match self {
             PsEditOp::RasterPixels { label, .. } => label,
+            PsEditOp::CleanPixels { label, .. } => label,
             PsEditOp::LayerLifecycle { dir, .. } => match dir {
                 LifecycleDir::Added => t!("ps_editor.edit_op.add_layer"),
                 LifecycleDir::Removed => t!("ps_editor.edit_op.delete_layer"),
@@ -255,6 +297,7 @@ impl ReversibleAction for PsEditOp {
             // The retained cost is the compressed tile payload (the `Arc`/String overhead is
             // negligible).
             PsEditOp::RasterPixels { diff, .. } => diff.compressed_len(),
+            PsEditOp::CleanPixels { diff, .. } => diff.compressed_len(),
             // A retained layer's uncompressed display pixels dominate its cost (a deleted large layer
             // must count against the budget). `Color32` is 4 bytes/pixel.
             PsEditOp::LayerLifecycle { layer, .. } => layer.image.pixels.len().saturating_mul(4),
@@ -671,7 +714,9 @@ mod tests {
                 assert_eq!(z, 3);
                 assert_eq!(page_idx, 0);
             }
-            PsEditOp::RasterPixels { .. } | PsEditOp::FieldPatch { .. } => {
+            PsEditOp::RasterPixels { .. }
+            | PsEditOp::CleanPixels { .. }
+            | PsEditOp::FieldPatch { .. } => {
                 panic!("inverse of a lifecycle op must stay a lifecycle op")
             }
         }
@@ -687,5 +732,39 @@ mod tests {
             },
         };
         assert_eq!(fp.weight(), 0);
+    }
+
+    #[test]
+    fn clean_pixels_inverse_flips_direction_and_shares_the_payload() {
+        // The `Клин` op carries no uid (base uids are regenerated per page load), so the only thing
+        // `inverse` may change is the direction; the compressed payload is SHARED, not cloned.
+        let size = [8, 8];
+        let (mut stack, id) = raster_stack(size);
+        let layer = stack.layer_mut(id).expect("raster resident");
+        layer.image.pixels[3] = Color32::GREEN;
+        let diff = Arc::new(diff_from_layer(layer));
+        let op = PsEditOp::CleanPixels {
+            page_idx: 7,
+            diff: Arc::clone(&diff),
+            dir: ApplyDirection::Forward,
+            label: "stroke".to_string(),
+        };
+        assert_eq!(op.weight(), diff.compressed_len());
+        match op.inverse() {
+            PsEditOp::CleanPixels {
+                page_idx,
+                diff: inverted,
+                dir,
+                label,
+            } => {
+                assert_eq!(page_idx, 7);
+                assert!(matches!(dir, ApplyDirection::Reverse), "direction flips");
+                assert_eq!(label, "stroke");
+                assert!(Arc::ptr_eq(&inverted, &diff), "payload is shared, not cloned");
+            }
+            PsEditOp::RasterPixels { .. }
+            | PsEditOp::LayerLifecycle { .. }
+            | PsEditOp::FieldPatch { .. } => panic!("inverse of a clean op must stay a clean op"),
+        }
     }
 }

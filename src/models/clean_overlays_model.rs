@@ -316,6 +316,22 @@ impl CleanOverlaysModel {
         self.overlays.len()
     }
 
+    /// The page size this model will normalize any overlay write for `idx` to, or `None` when no
+    /// size is known yet (a never-written page, which adopts the writer's own size).
+    ///
+    /// This is the size REMEMBERED for the page, which outlives the materialized buffers: it stays
+    /// set across `detach_page_overlay`, so it is the only reliable predictor of what
+    /// `replace`/`replace_region` will scale an incoming chunk into. A caller that must not have its
+    /// pixels rescaled has to compare against this, not against `get(idx).size` — a detached page
+    /// has no `get` yet still normalizes to the remembered size.
+    #[must_use]
+    pub fn overlay_size(&self, idx: usize) -> Option<[usize; 2]> {
+        match self.sizes.get(idx).copied() {
+            Some([w, h]) if w > 0 && h > 0 => Some([w, h]),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, idx: usize) -> Option<&ColorImage> {
         self.overlays.get(idx).and_then(|x| x.as_ref())
     }

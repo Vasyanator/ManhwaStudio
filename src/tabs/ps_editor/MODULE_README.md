@@ -38,13 +38,18 @@ doc by `sync_view_from_doc`). A worker decode failure leaves the page un-inserte
 its two base layers. GPU texture creation / `render_cache` / `node_generations` reset stay on the GUI
 thread (textures cannot be created off-thread).
 
-The two base layers mirror existing shared state **read-only**:
-- `Исходник` (source) comes from `CleanOverlaysModel::cached_page_rgba` (worker-decoded, cached).
-- `Клин` (clean) comes from `CleanOverlaysModel::overlay_rgba`; absent overlay → transparent.
+The two base layers project existing shared state:
+- `Исходник` (source) comes from `CleanOverlaysModel::cached_page_rgba` (worker-decoded, cached) and
+  is **read-only** in every respect.
+- `Клин` (clean) comes from `CleanOverlaysModel::overlay_rgba` (absent overlay → transparent) and is
+  **read-write**: its pixels are editable, and every edit is written straight back to the shared
+  model. See «The `Клин` write-back path» below.
 
-Base layers are locked: they can be hidden but never deleted, reordered, painted on, or
-transformed; they stay page-sized with the identity `LayerTransform`. Any number of user `Raster`
-layers stack above them. Raster layers may be **smaller than the page** ("incomplete") and carry an
+Base layers are STRUCTURALLY locked — never deleted, reordered, grouped or transformed, always
+page-sized with the identity `LayerTransform` — and both can be hidden. Pixel editability is a
+separate axis (`Layer::can_edit_pixels`): `Исходник` is immutable, `Клин` accepts paint, cut and
+merge-into. In the panel `Клин` is listed ABOVE `Исходник`, matching the composite. Any number of
+user `Raster` layers stack above them. Raster layers may be **smaller than the page** ("incomplete") and carry an
 affine `LayerTransform` (center/rotation/uniform scale) so they can be moved, rotated, and scaled.
 User raster layers are preserved per page via `saved_raster` (in-memory, session) and persisted to
 disk via the shared `models::layer_model` (`{chapter}_unsaved/layers/layers.json` + per-layer PNGs,
@@ -69,17 +74,20 @@ saver is enabled. The just-enqueued bytes are guaranteed on disk by the save-to-
 barrier and the app-close drain. `layers_dirty` tracks whether the current page has an edit not yet
 enqueued (set on a deferred `edit_doc_node`, cleared on any enqueue/flush); the tab-switch
 `flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). Base layers
-are never persisted — they mirror
-`src/` and `clean_layers/`. See `models/layer_model/` for the on-disk schema and the unified
+are never part of the LAYER persistence (`persist_current_page` filters to `LayerKind::Raster`);
+they project `src/` and `clean_layers/`, and a `Клин` edit is persisted by the shared clean-overlay
+model's own autosave / save-to-project path instead. See `models/layer_model/` for the on-disk schema and the unified
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
 ## Files and submodules
 - `mod.rs`: `PsEditorTabState` orchestration — the five dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
   copy/cut menu (`clip_into_new_layer`), layer/group save+load via `models::layer_model`,
-  `merge_down` (`composite_to_page` flattens a raster onto the raster directly beneath it by unified
-  BAND-Z — `raster_below_by_band_z` / `raster_below_uid`, NOT the layer-stack neighbour, so a manual
-  reorder merges the visually-below pair; base layers are never a target), and tab-local hotkeys
+  `merge_down` (`composite_to_page` flattens a raster onto the layer directly beneath it by unified
+  BAND-Z — `merge_candidates_by_band_z` / `raster_below_by_band_z` / `raster_below_uid`, NOT the
+  layer-stack neighbour, so a manual reorder merges the visually-below pair; the bottom-most raster
+  merges INTO `Клин`, while `Исходник` is never a target and no base layer is ever the upper
+  participant), and tab-local hotkeys
   (`B`/`M`/`L`/`V`, `Ctrl+D`, and undo/redo — the «Горячие клавиши» tab lists the same set,
   built next to `handle_hotkeys` so the two cannot drift).
   - **Unified layers panel** (the «Слои» dock tab → `layers_panel_body`): a Photoshop-like tree of
@@ -150,14 +158,21 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - `tree.rs`: pure builder for the unified layers panel. `build_unified_tree(stack, text_layers,
   bands)` joins raster layers + text overlays + groups into one `Vec<TreeItem>` (group headers +
   indented leaves) ordered top-to-bottom by the unified Z, with the same tiebreak as `draw_composite`
-  so panel order == composite order. A group is a maximal contiguous same-`group_uid` run (the
+  so panel order == composite order. The two base leaves close the list (they are the composite's
+  bottom) but are emitted in REVERSE stack order, so `Клин` sits above `Исходник` — the `LayerStack`
+  vector itself is never reordered, because its raw order is load-bearing for `draw_composite`.
+  A base leaf deliberately carries no `RowSel`: that is the STRUCTURAL lock that keeps delete /
+  ▲▼ / grouping / the control strip away from base rows, rather than a guard a future edit could
+  forget. A group is a maximal contiguous same-`group_uid` run (the
   contiguity invariant is enforced at write time in `persist::save_page_grouping`).
 - `layer_render.rs`: `TiledTexture` — per-layer tile grid (sized to the layer image), dirty
   tracking, budgeted upload, and transform-aware mesh draw.
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
 - `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
-  `ReversibleAction<Ctx = PsEditorTabState>` with three variants (real `match`, no `_ =>`, so every
+  `ReversibleAction<Ctx = PsEditorTabState>` with four variants (real `match`, no `_ =>`, so every
   variant is handled everywhere): `RasterPixels` (brush stroke as a tiled+zstd `RasterDiff`, Part A),
+  `CleanPixels` (the same delta against the `Клин` base layer, carrying NO uid — base-layer uids are
+  regenerated on every page load, so the target is resolved by `LayerKind::Clean`),
   `LayerLifecycle` (add/delete a whole raster layer, retaining `Box<Layer>` + its `z` for re-add), and
   `FieldPatch` (one metadata/geometry field — `LayerFieldPatch::{Visibility,Opacity,Transform,Deform}`
   — carrying `before` + `after`). Pure, GUI-free cores unit-tested here: `apply_raster_diff_to_layer`
@@ -253,6 +268,14 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `image` + `base_image`, marks only the touched `render_cache` tiles dirty, and routes the reverted
   pixels to the shared doc via `set_raster_pixels` (same path as forward edits) so cross-tab consumers
   and the next `sync_view_from_doc` reprojection agree.
+- **Clean apply path** (`apply_ps_clean_edit`, for `PsEditOp::CleanPixels`): same shape, but the
+  target is resolved by `LayerKind::Clean` and NEVER by uid — base-layer uids are regenerated on
+  every page load — and the reverted pixels go back through `write_clean_region_to_model` instead of
+  the doc, so an undo is as durable and as cross-tab-visible as the forward stroke.
+  **Known asymmetry, accepted deliberately:** `replace_region` records its OWN reversible diff in
+  `CleanOverlaysModel`'s cross-tab history, so a PS-side undo lands there as an additional FORWARD
+  edit. State never diverges; the only oddity is that a later Ctrl+Z on the cleaning tab can re-apply
+  what PS just reverted.
   The `history` field holds ops whose `Ctx` is the whole tab, so `undo`/`redo` use the clean-model
   take-and-restore idiom (`take_history` + unconditional restore) to avoid a self-borrow.
 - **Direction convention** (uniform across variants): `apply` always drives toward the op's RECORDED
@@ -282,7 +305,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   recorded ONCE per pointer gesture via `transform_gesture_before` / `deform_gesture_before` (snapshot
   at press, record at release if the same layer actually changed). All three gesture snapshots are
   cleared on page switch.
-- **Not yet undoable** (deferred): cut/clip, merge-down (need a Batch op — a later part), and z-reorder
+- **Not yet undoable** (deferred): cut/clip (including cut-from-`Клин`), merge-down (need a Batch op
+  — a later part), base-layer visibility (view-only state, deliberately not recorded), and z-reorder
   / grouping (`move_band_one` / `apply_group_op` write the band order to disk synchronously with a
   "band order written LAST" requirement that the unified persist tail cannot reproduce without a
   dedicated per-op persistence hook). Rename has no UI, so no `LayerFieldPatch::Name`.
@@ -310,14 +334,56 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   drop — then re-dispatches any stashed request. This mirrors the typing tab's
   `apply_raster_effects_edit` / `render_raster_effects` / `poll_raster_effects_jobs` trio. The base
   PNG is never rewritten by effects; only the `_fx` rendered PNG is, so the chain stays reversible.
-- Base layers (`LayerKind::Source` / `Clean`) are never written back to `CleanOverlaysModel`. Tools
-  only mutate the active editable raster layer (`LayerStack::active_editable_mut`).
+- **The `Клин` write-back path.** `LayerKind::Clean` is the ONLY base layer whose pixels change, and
+  every such change goes through the single helper `write_clean_region_to_model(page_idx, x, y, w, h)`
+  — used by the brush commit, the selection cut and `merge_down`, and again by undo/redo through
+  `apply_ps_clean_edit`. Its obligations:
+  1. Push only the given rect via `CleanOverlaysModel::replace_region`. A ribbon page can be
+     ~800×19000 px, so the full buffer is never sent; the brush passes the stroke's accumulated
+     `brush_stroke_dirty` union, the cut passes the selection bounds, and a merge passes the upper
+     layer's page footprint (`page_footprint_rect`) — the only region a merge can change, because
+     `composite_to_page` reproduces `Клин` unchanged wherever the upper layer samples transparent.
+     That bound matters: the whole-page write it replaces meant two full-page RGBA copies plus a
+     tiled zstd diff of both, on the GUI thread and under the model lock the autosave worker shares.
+     An upper layer that genuinely covers the page still costs a whole page — inherent to the merge.
+  2. The `chunk` is a raw crop of the premultiplied `Layer::image`; the model converts to straight
+     RGBA itself.
+  3. Write to the model FIRST; commit local state (`base_image` mirror, `pixels_dirty`) only after
+     the model accepted. A rejected write must not leave the edit alive only in this tab's stack,
+     where the next reload kills it unnoticed. Every failure path logs with page and rect.
+  4. Re-establish `base_image == image` over the same rect — the undo "before" is read from
+     `base_image`.
+  5. Refuse the write when `CleanOverlaysModel::overlay_size(page_idx)` differs from the stack's
+     page size: `replace_region` normalizes to the model's size and SCALES the chunk into it,
+     landing a stroke misaligned. That legacy mismatch is the state `page_loader` answers with a
+     transparent page-sized `Клин`, so it is reachable. `overlay_size` reports the REMEMBERED size
+     rather than a materialized buffer's, so a detached page (no buffer, size still remembered and
+     still driving the rescale) is covered too.
+  6. Adopt `last_overlay_revision` from the model IN THE SAME LOCK SCOPE, but ONLY when it still
+     equals the revision read immediately before our own `replace_region`. `sync_view_from_canvas`
+     reloads the page whenever the model revision differs from ours, so adopting our own bump keeps
+     a stroke from costing a redundant full-page reload — but adopting UNCONDITIONALLY also swallows
+     any foreign bump that landed while this tab was away (the page manager's clean-attach worker
+     writes from a thread), permanently suppressing the reload that would surface it. The tab
+     resyncs only on tab entry, so that window is the whole session, not one frame — which is why
+     `canvas::overlay_runtime::replace_overlay_region` can adopt unconditionally and this cannot.
+     Declining to adopt never costs the user's work: the model already holds the write and the
+     reload restores it from `overlay_rgba`.
+  Disk persistence is NOT this tab's job: the app-level autosave worker and save-to-project own it.
+  `Исходник` is never written back under any circumstance.
+- Base-layer VISIBILITY is view-only session state: neither base layer is a doc node and neither is
+  persisted (`persist_current_page` filters to `LayerKind::Raster`), so `apply_panel_actions` writes
+  `Layer::visible` straight onto the stack — no doc route, no `FieldPatch` history entry.
+  `draw_composite` honours the flag for base layers, which makes that sufficient.
 - Selection copy/cut (`clip_into_new_layer`) composites the chosen layers bottom-to-top within the
   mask into a new raster layer **cropped to the selection bounds** and placed at the matching page
   position (so clip results are "incomplete", movable layers). Layers are sampled through their
   transforms (`sample_layer_world`), so partial/rotated/scaled sources contribute correctly. A
   **cut** also clears the selected pixels from every chosen layer **except** `LayerKind::Source`,
   which is immutable and can never be cut from; the `Clean` overlay and raster layers are cuttable.
+  Cut-from-`Клин` routes its cleared region through `write_clean_region_to_model`, so it survives a
+  page switch and reaches the other tabs — like the merge and unlike the raster path, it is not
+  undoable.
 - The selection is shown as a thin 1px dashed marquee in alternating black and white, drawn from
   `Selection::outline_loops` (no translucent fill, never blue), matching the in-progress drag
   preview in `tools/select.rs`. Because a traced loop is a pixel staircase whose segments are far
@@ -346,7 +412,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   tests `Option::is_some`, silently refuses to paint until Ctrl+D.
 - The transform tool (`tools/transform.rs`) mutates only the active raster layer's `LayerTransform`
   (no pixels), so it needs **no** tile re-upload — `draw` re-evaluates the transform each frame.
-  Base layers are not transformable (`Layer::is_transformable`).
+  Base layers are not transformable (`Layer::is_transformable`) — `Клин` included, even though it is
+  paintable: the shared overlay model is page-aligned, so the layer keeps the identity transform.
 - Tools mutate the in-memory stack/selection only — no GPU, file, model, or backend access. The tab
   translates `ToolOutcome::dirty` into `TiledTexture::mark_dirty_rect` (in layer-local pixels).
 - `TiledTexture` is sized to each layer's own image; `sync_render_cache` rebuilds a layer's cache
@@ -359,14 +426,30 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   to each side's own limits, so the freer PS editor honors a canvas zoom as far as it can.
   - The synced camera is parked in `pending_camera` and applied only once its target page finishes
     its async load, because the load refits the camera (`viewport.invalidate`).
-  - Clean-overlay sync is one-way (model → tab): `sync_view_from_canvas` compares
+  - Clean-overlay sync is TWO-way. Model → tab: `sync_view_from_canvas` compares
     `CleanOverlaysModel::revision` against `last_overlay_revision` and reloads the page (preserving
     raster layers) when it changed, so the `Клин` base layer reflects edits made on other tabs.
+    Tab → model: `write_clean_region_to_model` (see the contracts section) pushes this tab's own
+    `Клин` edits. That helper adopts the model's fresh revision in the same lock scope ONLY when no
+    foreign bump happened in between (contract 6 above) — adopting it always would hide a background
+    writer's edit from the reload for the rest of the session; adopting it never would reload the
+    whole page after every stroke.
 
 ## Editing map
 - To change the camera (pan/zoom/fit), edit `viewport.rs`.
 - To change layer rules (base locking, ordering, add/remove) or the per-layer transform math, edit
-  `layers.rs` (`LayerTransform`, `local_to_world`/`world_to_local`/`world_corners`).
+  `layers.rs` (`LayerTransform`, `local_to_world`/`world_to_local`/`world_corners`). Which layers
+  accept pixel edits is `Layer::can_edit_pixels`; which are structurally locked is
+  `LayerKind::is_base` plus `remove_layer` / `reorder_rasters` / `set_layer_group` /
+  `is_transformable`.
+- To change how a `Клин` edit reaches the shared model (bounds, revision handling, `base_image`
+  mirroring), edit the ONE helper `write_clean_region_to_model` in `mod.rs`. Its callers are the
+  brush release commit, `perform_clip`, `merge_down` and `apply_ps_clean_edit`; do not add a fifth
+  hand-written copy.
+- To change which layer a merge targets, edit `merge_candidates_by_band_z` (it reserves band-Z 0 for
+  `Клин` and shifts the rasters up by one) and `merge_down` in `mod.rs`.
+- To change base-layer visibility handling, edit the `toggle_visible_raster` block in
+  `apply_panel_actions`.
 - To change move/rotate/scale behavior or the gizmo, edit `tools/transform.rs`.
 - To change "select layer fully", edit `select_active_layer_fully` in `mod.rs`.
 - To change which panels exist, where they start, or what the «Панели…» menu offers, edit
@@ -375,6 +458,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
   (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
   / `layers_panel_body`).
+- To change the panel's row ORDER (including the `Клин`-above-`Исходник` base tail), edit
+  `build_unified_tree` in `tree.rs` — never the `LayerStack` vector order.
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /
   `draw_group_row` / `draw_leaf_row` in `mod.rs`. To change grouping ops, edit `apply_group_op` +
   `persist::save_page_grouping`. To change reorder behavior, edit `build_unified_order` /

@@ -1300,6 +1300,238 @@ impl PsEditorTabState {
         Ok(())
     }
 
+    /// Writes the `Клин` base layer's CURRENT pixels over the page-space rect `(x, y, w, h)` back
+    /// into the shared `CleanOverlaysModel`, and re-establishes `base_image == image` over the same
+    /// rect.
+    ///
+    /// This is the ONE write-back path for every Clean-layer pixel edit (brush commit, cut,
+    /// merge-into, undo/redo), so the rules below hold exactly once:
+    /// - only the given rect is pushed — a ribbon page can be ~800x19000 px, so the whole buffer is
+    ///   never sent;
+    /// - `chunk` is a raw crop of the premultiplied `Layer::image`; the model converts it to
+    ///   straight RGBA itself;
+    /// - the model write happens FIRST and the local commit (`base_image` mirror, `pixels_dirty`)
+    ///   only after the model accepted it — otherwise a rejected write would leave the edit alive
+    ///   solely in this tab's stack, to die unnoticed at the next reload;
+    /// - the write is REFUSED when the model's materialized overlay for this page has a different
+    ///   size than the stack's page: `replace_region` would clamp to the MODEL's size and scale the
+    ///   chunk into it, landing a brush stroke scaled and misaligned. That legacy mismatch is the
+    ///   case `page_loader` answers with a transparent page-sized `Клин`, so it is a real state, and
+    ///   a silent rescale is exactly the incorrect fallback the project forbids. NOT covered: an
+    ///   overlay the model remembers a size for but has not materialized (only reachable through
+    ///   `detach_page_overlay`) — the model exposes no size accessor for that state;
+    /// - `last_overlay_revision` is adopted IN THE SAME LOCK SCOPE, but ONLY when it still equals
+    ///   the revision read just before our own write — i.e. when nothing foreign changed the model
+    ///   while this tab was away. Adopting it unconditionally would swallow a background writer's
+    ///   bump (the page manager's clean-attach worker is one) and permanently suppress the reload
+    ///   that reconciles it, leaving the tab painting on stale pixels for the rest of the session.
+    ///   Declining to adopt costs one redundant full-page reload at the next
+    ///   `sync_view_from_canvas`; it never costs the user's work, which the model already holds and
+    ///   the reload restores from `overlay_rgba`.
+    /// - `pixels_dirty` is cleared: the shared model (and its autosave worker) owns Clean
+    ///   persistence, and `persist_current_page` deliberately never writes base layers.
+    ///
+    /// Returns `true` when the model accepted the region. `false` means the stack is absent or on
+    /// another page, the rect is empty after clamping, there is no Clean layer, no model is bound,
+    /// the model's lock is poisoned, or the overlay size mismatched — the first three are ordinary
+    /// no-ops, the rest are logged with context.
+    fn write_clean_region_to_model(
+        &mut self,
+        page_idx: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> bool {
+        // Phase 1 — crop the chunk out of the stack, mutating nothing. The local commit is phase 3,
+        // after the model has actually taken the pixels.
+        let Some(stack) = self.stack.as_ref() else {
+            return false;
+        };
+        if stack.page_idx() != page_idx {
+            return false;
+        }
+        let page_size = stack.size();
+        let Some(clean) = stack.layers().iter().find(|l| l.kind == LayerKind::Clean) else {
+            return false;
+        };
+        let clean_id = clean.id;
+        // Clamp the requested rect into the layer image; an empty result is a no-op.
+        let [iw, ih] = clean.image.size;
+        let x0 = x.min(iw);
+        let y0 = y.min(ih);
+        let x1 = x.saturating_add(w).min(iw);
+        let y1 = y.saturating_add(h).min(ih);
+        if x0 >= x1 || y0 >= y1 {
+            return false;
+        }
+        let (cw, ch) = (x1 - x0, y1 - y0);
+        let mut pixels: Vec<Color32> = Vec::with_capacity(cw.saturating_mul(ch));
+        for row in y0..y1 {
+            let start = row * iw + x0;
+            let Some(span) = clean.image.pixels.get(start..start + cw) else {
+                // Clamped above, so this cannot happen; bail out instead of panicking.
+                return false;
+            };
+            pixels.extend_from_slice(span);
+        }
+        let chunk = ColorImage::new([cw, ch], pixels);
+
+        // Phase 2 — push to the shared model.
+        let Some(model) = self.overlays_model.as_ref() else {
+            crate::runtime_log::log_error(format!(
+                "[ps_editor] no clean overlay model is bound; the Клин edit on page {page_idx} \
+                 rect ({x0},{y0},{cw},{ch}) was not shared"
+            ));
+            return false;
+        };
+        let Ok(mut locked) = model.lock() else {
+            crate::runtime_log::log_error(format!(
+                "[ps_editor] clean overlay model lock poisoned; the Клин edit on page {page_idx} \
+                 rect ({x0},{y0},{cw},{ch}) was not shared"
+            ));
+            return false;
+        };
+        // Refuse rather than let `replace_region` scale our chunk into a differently-sized overlay.
+        // `overlay_size` is the REMEMBERED page size, which is what the model normalizes a write to;
+        // a materialized-buffer check (`get`) would miss a detached page, where no buffer exists yet
+        // the remembered size still drives the rescale.
+        if let Some(model_size) = locked.overlay_size(page_idx)
+            && model_size != page_size
+        {
+            drop(locked);
+            crate::runtime_log::log_error(format!(
+                "[ps_editor] clean overlay size mismatch on page {page_idx}: model has \
+                 {}x{} px, the editor page is {}x{} px; the Клин edit was refused instead of \
+                 being rescaled",
+                model_size[0], model_size[1], page_size[0], page_size[1]
+            ));
+            return false;
+        }
+        // Read the revision BEFORE our write so the adoption below can tell our own bump apart from
+        // a foreign one that landed while this tab was not syncing.
+        let revision_before = locked.revision();
+        let accepted = locked.replace_region(page_idx, page_size, x0, y0, cw, ch, &chunk);
+        // Same lock scope as the write: adopt the revision our own write just produced, so the next
+        // `sync_view_from_canvas` does not mistake it for another tab's edit and reload the page.
+        // Conditional on purpose — see the doc comment: if a foreign writer bumped the revision
+        // while we were away, adopting now would hide that edit from the reload forever.
+        if accepted && self.last_overlay_revision == revision_before {
+            self.last_overlay_revision = locked.revision();
+        }
+        drop(locked);
+        crate::trace_log!(
+            cat::SYNC,
+            "clean_write page={} rect=({},{},{},{}) accepted={} rev_before={} rev_known={}",
+            page_idx,
+            x0,
+            y0,
+            cw,
+            ch,
+            accepted,
+            revision_before,
+            self.last_overlay_revision
+        );
+        if !accepted {
+            crate::runtime_log::log_error(format!(
+                "[ps_editor] the clean overlay model rejected the Клин edit on page {page_idx} \
+                 rect ({x0},{y0},{cw},{ch}); the local pixels were left uncommitted"
+            ));
+            return false;
+        }
+
+        // Phase 3 — the model holds the write, so commit the local bookkeeping.
+        let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(clean_id)) else {
+            return false;
+        };
+        // The undo "before" is read from `base_image`, so it must track `image` once an edit is
+        // committed — the same invariant `edit_op::apply_raster_diff_to_layer` keeps for rasters.
+        if layer.base_image.size == layer.image.size {
+            for row in y0..y1 {
+                let start = row * iw + x0;
+                let (Some(src), Some(dst)) = (
+                    layer.image.pixels.get(start..start + cw),
+                    layer.base_image.pixels.get_mut(start..start + cw),
+                ) else {
+                    continue;
+                };
+                dst.copy_from_slice(src);
+            }
+        }
+        layer.pixels_dirty = false;
+        true
+    }
+
+    /// Applies a reversible pixel delta to the `Клин` base layer on `page_idx`, in `dir`, and pushes
+    /// the result back to the shared `CleanOverlaysModel` (see [`PsEditOp::CleanPixels`]).
+    ///
+    /// The target is resolved by KIND, never by uid: base-layer uids are regenerated on every page
+    /// load, so a uid recorded at stroke time would not match after a reload. Mutates the layer's
+    /// `image` + `base_image`, marks the affected `render_cache` tiles dirty, and routes each
+    /// changed rect through `write_clean_region_to_model` so an undo is as durable and as
+    /// cross-tab-visible as the forward edit.
+    ///
+    /// # Errors
+    /// - [`edit_op::PsEditOpError::NotResident`] if the stack is absent, on a different page, or has
+    ///   no Clean layer.
+    /// - [`edit_op::PsEditOpError::Raster`] if the delta cannot be applied (size mismatch / corrupt).
+    fn apply_ps_clean_edit(
+        &mut self,
+        page_idx: usize,
+        diff: &RasterDiff,
+        dir: ApplyDirection,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        let (id, dirty) = {
+            let stack = self
+                .stack
+                .as_mut()
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            if stack.page_idx() != page_idx {
+                return Err(edit_op::PsEditOpError::NotResident { page_idx });
+            }
+            let id = stack
+                .layers()
+                .iter()
+                .find(|l| l.kind == LayerKind::Clean)
+                .map(|l| l.id)
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            let layer = stack
+                .layer_mut(id)
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            let dirty = edit_op::apply_raster_diff_to_layer(layer, diff, dir)?;
+            (id, dirty)
+        };
+
+        // Invalidate only the touched tiles so the next upload re-sends the reverted pixels.
+        if let Some(cache) = self.render_cache.get_mut(&id) {
+            for rect in &dirty {
+                cache.mark_dirty_rect(tools::DirtyRect {
+                    min_x: rect.origin_px[0] as usize,
+                    min_y: rect.origin_px[1] as usize,
+                    max_x: rect.origin_px[0].saturating_add(rect.size_px[0].saturating_sub(1))
+                        as usize,
+                    max_y: rect.origin_px[1].saturating_add(rect.size_px[1].saturating_sub(1))
+                        as usize,
+                });
+            }
+        }
+
+        // Share the reverted pixels. NOTE: `replace_region` records its OWN reversible diff in the
+        // clean model's cross-tab history, so this undo also lands there as a further FORWARD edit.
+        // State never diverges; the only oddity is that a later Ctrl+Z on the cleaning tab can
+        // re-apply what PS just reverted. Documented in `MODULE_README.md`.
+        for rect in &dirty {
+            self.write_clean_region_to_model(
+                page_idx,
+                rect.origin_px[0] as usize,
+                rect.origin_px[1] as usize,
+                rect.size_px[0] as usize,
+                rect.size_px[1] as usize,
+            );
+        }
+        Ok(())
+    }
+
     /// Realizes a whole-raster-layer add/delete for undo/redo (see [`PsEditOp::LayerLifecycle`]).
     /// `dir == Added` re-inserts `layer` (with its retained pixels) into the shared doc at Z `z` and
     /// re-projects, so the stack + `render_cache` are rebuilt by `sync_view_from_doc`; `dir == Removed`
@@ -1450,6 +1682,12 @@ impl PsEditorTabState {
     /// forward edit was already applied live). Builds a region-bounded `RasterDiff` from the
     /// pre-stroke `base_image` ("before") and the painted `image` ("after") over the stroke's dirty
     /// union, so no full-image scan is needed. A no-op stroke (empty diff) is not recorded.
+    ///
+    /// Handles BOTH paintable kinds. A user raster records a `PsEditOp::RasterPixels` keyed on its
+    /// stable doc uid; the `Клин` base layer records a `PsEditOp::CleanPixels`, which carries NO uid
+    /// — base-layer uids are regenerated on every page load, so only the layer KIND identifies it.
+    /// Must be called BEFORE the pixels are pushed onward, while `base_image` still holds the
+    /// pre-stroke state.
     fn record_brush_stroke(&mut self, page_idx: usize) {
         let Some(union) = self.brush_stroke_dirty else {
             return;
@@ -1465,10 +1703,12 @@ impl PsEditorTabState {
             let Some(layer) = stack.layer(stack.active_id()) else {
                 return;
             };
-            // Only an editable raster (no effects) has base_image == pre-stroke pixels.
-            if layer.kind != LayerKind::Raster || !layer.effects.is_empty() {
+            // Only a directly-editable layer (raster without effects, or Клин) has
+            // base_image == pre-stroke pixels.
+            if !layer.can_edit_pixels() {
                 return;
             }
+            let kind = layer.kind;
             let size = layer.image.size;
             let max_x = size[0].saturating_sub(1);
             let max_y = size[1].saturating_sub(1);
@@ -1483,9 +1723,17 @@ impl PsEditorTabState {
             let h = y1 - y0 + 1;
             let before = edit_op::copy_region_premul(&layer.base_image, x0, y0, w, h);
             let after = edit_op::copy_region_premul(&layer.image, x0, y0, w, h);
-            (layer.uid.to_string(), size, [x0, y0], [w, h], before, after)
+            (
+                kind,
+                layer.uid.to_string(),
+                size,
+                [x0, y0],
+                [w, h],
+                before,
+                after,
+            )
         };
-        let (uid, size, origin, region, before, after) = captured;
+        let (kind, uid, size, origin, region, before, after) = captured;
         let (Some(origin), Some(region), Some(image_size)) = (
             usize_pair_to_u32(origin),
             usize_pair_to_u32(region),
@@ -1502,13 +1750,24 @@ impl PsEditorTabState {
             PS_UNDO_TILE_SIDE,
         ) {
             Ok(diff) if diff.is_empty() => {}
-            Ok(diff) => self.history.record(PsEditOp::RasterPixels {
-                page_idx,
-                layer_uid: uid,
-                diff: Arc::new(diff),
-                dir: ApplyDirection::Forward,
-                label: t!("ps_editor.edit_op.brush_stroke").to_string(),
-            }),
+            // A real `match` over the kind (no `_ =>`): `Source` is never paintable, so it is
+            // unreachable here, but a new paintable kind must force this site to be revisited.
+            Ok(diff) => match kind {
+                LayerKind::Raster => self.history.record(PsEditOp::RasterPixels {
+                    page_idx,
+                    layer_uid: uid,
+                    diff: Arc::new(diff),
+                    dir: ApplyDirection::Forward,
+                    label: t!("ps_editor.edit_op.brush_stroke").to_string(),
+                }),
+                LayerKind::Clean => self.history.record(PsEditOp::CleanPixels {
+                    page_idx,
+                    diff: Arc::new(diff),
+                    dir: ApplyDirection::Forward,
+                    label: t!("ps_editor.edit_op.brush_stroke").to_string(),
+                }),
+                LayerKind::Source => {}
+            },
             Err(err) => {
                 crate::runtime_log::log_warn(format!(
                     "[ps_editor] failed to build brush undo diff (page {page_idx}): {err}"
@@ -2879,11 +3138,16 @@ impl PsEditorTabState {
         }
     }
 
-    /// Every non-base raster as `(uid, band_z)` in stack order, where `band_z` is the raster's
-    /// `Band::Raster` Z from `self.bands` (or the past-the-top fallback for a raster without a band,
-    /// mirroring `draw_composite`). Base layers (source/clean) are excluded so they can never be a
-    /// merge target. The order within the Vec is the stack order, used only as the stable tiebreak.
-    fn non_base_rasters_by_band_z(&self) -> Vec<(String, u32)> {
+    /// Every legal merge-down TARGET as `(uid, band_z)` in stack order: the user rasters plus the
+    /// `Клин` base layer, which sits below all of them.
+    ///
+    /// A raster's `band_z` is its `Band::Raster` Z from `self.bands` (or the past-the-top fallback
+    /// for a raster without a band, mirroring `draw_composite`), SHIFTED UP BY ONE so that `Клин`
+    /// can occupy the synthetic Z 0 strictly beneath every raster — the shift preserves the rasters'
+    /// relative order exactly, and keeps the whole axis in `u32`. `Исходник` is excluded: it is
+    /// immutable and must never become a merge target. The order within the Vec is the stack order,
+    /// used only as the stable tiebreak.
+    fn merge_candidates_by_band_z(&self) -> Vec<(String, u32)> {
         let Some(stack) = self.stack.as_ref() else {
             return Vec::new();
         };
@@ -2892,27 +3156,42 @@ impl PsEditorTabState {
         stack
             .layers()
             .iter()
-            .filter(|l| !l.kind.is_base())
+            .filter(|l| l.kind != LayerKind::Source)
             .map(|l| {
                 let uid = l.uid.to_string();
-                let z = raster_z.get(&uid).copied().unwrap_or(top_z);
+                let z = match l.kind {
+                    // Reserved bottom slot: Клин is composited under every raster.
+                    LayerKind::Clean => 0,
+                    LayerKind::Raster => raster_z
+                        .get(&uid)
+                        .copied()
+                        .unwrap_or(top_z)
+                        .saturating_add(1),
+                    // Filtered out above.
+                    LayerKind::Source => u32::MAX,
+                };
                 (uid, z)
             })
             .collect()
     }
 
-    /// The raster directly beneath `id` on the unified band-Z axis (the visually-below raster the user
-    /// sees in the composite), or `None` if `id` is the bottom-most raster / not a non-base raster.
+    /// The layer directly beneath `id` on the unified band-Z axis (the visually-below layer the user
+    /// sees in the composite), or `None` if `id` has nothing below it or is itself a base layer.
+    ///
+    /// The result may be the `Клин` base layer (the bottom-most raster merges INTO it); it is never
+    /// `Исходник`. `id` itself must be a non-base layer: base layers are never the UPPER participant
+    /// of a merge, which is also why the panel gives them no control strip.
     /// Band-Z based, so a manual reorder picks the correct pair (not the stack neighbor).
     fn raster_below_uid(&self, id: LayerId) -> Option<String> {
         let stack = self.stack.as_ref()?;
         let target = stack.layer(id).filter(|l| !l.kind.is_base())?;
         let target_uid = target.uid.to_string();
-        raster_below_by_band_z(&self.non_base_rasters_by_band_z(), &target_uid)
+        raster_below_by_band_z(&self.merge_candidates_by_band_z(), &target_uid)
     }
 
-    /// A raster can be merged down when there is another raster directly beneath it on the unified
-    /// band-Z axis (the bottom-most raster cannot; base layers are never a target).
+    /// A raster can be merged down when there is another merge target directly beneath it on the
+    /// unified band-Z axis — another raster, or `Клин` for the bottom-most one. Base layers are
+    /// never mergeable themselves, and `Исходник` is never a target.
     fn is_mergeable(&self, id: LayerId) -> bool {
         self.raster_below_uid(id).is_some()
     }
@@ -2980,35 +3259,55 @@ impl PsEditorTabState {
         if actions.request_select_active {
             self.select_active_layer_fully();
         }
-        if let Some(id) = actions.toggle_visible_raster
-            && let (Some(page_idx), Some(uid)) = (page_idx, self.raster_uid(id))
-        {
-            let new_visible = self
+        if let Some(id) = actions.toggle_visible_raster {
+            let is_base = self
                 .stack
                 .as_ref()
                 .and_then(|s| s.layer(id))
-                .is_some_and(|l| !l.visible);
-            crate::trace_log!(
-                cat::PS_EDITOR,
-                "panel toggle_visible_raster id={} visible={}",
-                id,
-                new_visible
-            );
-            if !self.route_to_doc(page_idx, project, |doc| {
-                doc.set_visibility(page_idx, &uid, new_visible);
-            }) && let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(id))
-            {
-                layer.visible = new_visible;
+                .is_some_and(|l| l.kind.is_base());
+            if is_base {
+                // Base-layer visibility is VIEW-ONLY session state: `Исходник`/`Клин` have no doc
+                // node to patch and are deliberately never persisted (`persist_current_page`
+                // filters to `LayerKind::Raster`), so there is nothing to route and nothing to
+                // record in the history. `draw_composite` already honours `Layer::visible` for base
+                // layers, which makes a plain stack write sufficient.
+                if let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(id)) {
+                    layer.visible = !layer.visible;
+                    crate::trace_log!(
+                        cat::PS_EDITOR,
+                        "panel toggle_visible_base id={} visible={}",
+                        id,
+                        layer.visible
+                    );
+                }
+            } else if let (Some(page_idx), Some(uid)) = (page_idx, self.raster_uid(id)) {
+                let new_visible = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.layer(id))
+                    .is_some_and(|l| !l.visible);
+                crate::trace_log!(
+                    cat::PS_EDITOR,
+                    "panel toggle_visible_raster id={} visible={}",
+                    id,
+                    new_visible
+                );
+                if !self.route_to_doc(page_idx, project, |doc| {
+                    doc.set_visibility(page_idx, &uid, new_visible);
+                }) && let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(id))
+                {
+                    layer.visible = new_visible;
+                }
+                // Record the toggle (a toggle always changes value → always record).
+                self.history.record(PsEditOp::FieldPatch {
+                    page_idx,
+                    layer_uid: uid,
+                    field: LayerFieldPatch::Visibility {
+                        before: !new_visible,
+                        after: new_visible,
+                    },
+                });
             }
-            // Record the toggle (a toggle always changes value → always record).
-            self.history.record(PsEditOp::FieldPatch {
-                page_idx,
-                layer_uid: uid,
-                field: LayerFieldPatch::Visibility {
-                    before: !new_visible,
-                    after: new_visible,
-                },
-            });
         }
         if let Some(i) = actions.toggle_visible_text
             && let Some(layer) = self.text_layers.get_mut(i)
@@ -4466,37 +4765,58 @@ impl PsEditorTabState {
             }
 
             // Brush stroke commit: on pointer-up, record the reversible undo diff, then push the
-            // active raster's painted base pixels to the doc. During the stroke the local `image` is
-            // mutated live (responsive) while `base_image` still holds the pre-stroke pixels, so
+            // painted pixels onward. During the stroke the local `image` is mutated live
+            // (responsive) while `base_image` still holds the pre-stroke pixels, so
             // `record_brush_stroke` reads the "before" from `base_image` for free — no stroke-start
-            // snapshot. The commit makes the doc the model truth (and cross-tab visible). A paintable
-            // raster has no effects, so base == display == painted pixels.
+            // snapshot. A paintable raster has no effects, so base == display == painted pixels.
+            //
+            // The destination depends on the painted layer's KIND: a user raster commits to the
+            // shared `LayerDoc` (the model truth, cross-tab visible); the `Клин` base layer is not a
+            // doc node at all, so its stroke goes to the shared `CleanOverlaysModel` instead —
+            // bounded to the stroke's dirty union, because a ribbon page can be ~800x19000 px.
             if input.primary_released
                 && self.active_tool_id() == PsToolId::Brush
                 && let Some(page_idx) = self.active_page_idx
             {
-                // Record BEFORE routing to the doc (the doc push + next reprojection sync base_image to
-                // the painted pixels, which would erase the "before").
+                // Read the stroke union BEFORE `record_brush_stroke`, which does not consume it but
+                // is followed by the reset below.
+                let stroke_union = self.brush_stroke_dirty;
+                // Record BEFORE pushing the pixels onward (the push + next reprojection sync
+                // base_image to the painted pixels, which would erase the "before").
                 self.record_brush_stroke(page_idx);
-                if let Some((uid, painted)) = self
+                let painted = self
                     .stack
                     .as_ref()
                     .and_then(|s| s.layer(s.active_id()))
-                    .filter(|l| {
-                        l.kind == LayerKind::Raster && l.pixels_dirty && l.effects.is_empty()
-                    })
-                    .map(|l| (l.uid.to_string(), l.image.clone()))
-                {
-                    let base = painted.clone();
-                    crate::trace_log!(
-                        cat::SYNC,
-                        "commit brush_pixels page={} uid={}",
-                        page_idx,
-                        uid
-                    );
-                    self.route_to_doc(page_idx, project, |doc| {
-                        doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
-                    });
+                    .filter(|l| l.pixels_dirty && l.can_edit_pixels())
+                    .map(|l| (l.kind, l.uid.to_string(), l.image.clone()));
+                match painted {
+                    Some((LayerKind::Raster, uid, painted)) => {
+                        let base = painted.clone();
+                        crate::trace_log!(
+                            cat::SYNC,
+                            "commit brush_pixels page={} uid={}",
+                            page_idx,
+                            uid
+                        );
+                        self.route_to_doc(page_idx, project, |doc| {
+                            doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
+                        });
+                    }
+                    Some((LayerKind::Clean, _, _)) => {
+                        if let Some(union) = stroke_union {
+                            self.write_clean_region_to_model(
+                                page_idx,
+                                union.min_x,
+                                union.min_y,
+                                union.max_x.saturating_sub(union.min_x) + 1,
+                                union.max_y.saturating_sub(union.min_y) + 1,
+                            );
+                        }
+                    }
+                    // `Source` is never paintable (`can_edit_pixels`), and `None` means the stroke
+                    // changed nothing.
+                    Some((LayerKind::Source, _, _)) | None => {}
                 }
                 self.brush_stroke_dirty = None;
             }
@@ -4674,6 +4994,9 @@ impl PsEditorTabState {
             let Some(stack) = self.stack.as_ref() else {
                 return;
             };
+            // Transparency checkerboard under the page: a transparent hole must read as a hole,
+            // not as the viewport void. Drawn before every layer so it stays the bottom-most mark.
+            layer_render::draw_page_checkerboard(&painter, ctx, view, stack.size());
             for layer in stack.layers() {
                 if !stack.layer_visible(layer) {
                     continue;
@@ -5042,20 +5365,25 @@ impl PsEditorTabState {
     ///
     /// For a cut, the selected pixels are cleared from every chosen layer **except** the locked
     /// source layer, which is immutable and can never be cut from; the clean overlay and raster
-    /// layers are cleared normally.
+    /// layers are cleared normally. Cleared `Клин` pixels are written back to the shared
+    /// `CleanOverlaysModel` (it is not a doc node), so a cut from it survives a page switch — the
+    /// same write-back path the brush commit and merge-into use.
     fn perform_clip(&mut self, mode: ClipMode, layer_ids: &[LayerId], project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
-        {
+        // The selection bounds bound the Clean write-back below (a ribbon page is far too large to
+        // push whole).
+        let bounds = {
             let (stack, selection) = match (self.stack.as_mut(), self.selection.as_ref()) {
                 (Some(stack), Some(selection)) if selection.any() => (stack, selection),
                 _ => return,
             };
-            if clip_into_new_layer(stack, selection, mode, layer_ids).is_none() {
-                return;
+            match clip_into_new_layer(stack, selection, mode, layer_ids) {
+                Some(bounds) => bounds,
+                None => return,
             }
-        }
+        };
 
         // The new clip layer is now the active raster on the stack; mirror it as a doc node. For a
         // cut, also push the cleared base pixels of every source RASTER back to the doc (dirty). The
@@ -5107,6 +5435,24 @@ impl PsEditorTabState {
                     cache.mark_all_dirty();
                 }
             }
+            // `Клин` was cut from but has no doc node, so the routing above skipped it. Without this
+            // the cleared pixels lived only in the tab's stack and died on the next page switch or
+            // overlay-revision reload.
+            let cut_clean = self.stack.as_ref().is_some_and(|s| {
+                layer_ids
+                    .iter()
+                    .filter_map(|id| s.layer(*id))
+                    .any(|l| l.kind == LayerKind::Clean)
+            });
+            if cut_clean {
+                self.write_clean_region_to_model(
+                    page_idx,
+                    bounds.min_x,
+                    bounds.min_y,
+                    bounds.max_x.saturating_sub(bounds.min_x) + 1,
+                    bounds.max_y.saturating_sub(bounds.min_y) + 1,
+                );
+            }
         }
     }
 
@@ -5114,9 +5460,18 @@ impl PsEditorTabState {
         self.selection = None;
     }
 
-    /// Merges the raster layer `id` down onto the raster layer directly beneath it. The lower layer
-    /// becomes a page-sized identity raster holding both composited (src-over); the upper layer is
-    /// removed. No-op when `id` is a base layer or has no raster layer beneath it.
+    /// Merges the raster layer `id` down onto the layer directly beneath it on the unified band-Z
+    /// axis. The lower layer becomes a page-sized identity layer holding both composited (src-over);
+    /// the upper layer is removed. No-op when `id` is a base layer or has nothing beneath it.
+    ///
+    /// The lower participant may be the `Клин` base layer (the bottom-most raster merges into it),
+    /// in which case the merged pixels go to the shared `CleanOverlaysModel` instead of the doc —
+    /// `Клин` is not a doc node — bounded to the upper layer's page footprint
+    /// ([`page_footprint_rect`]), which is the only region a merge can change. `Исходник` is never a
+    /// target. The UPPER participant is always a user raster.
+    ///
+    /// NOT undoable (by design, like the cut): it removes a layer AND rewrites another's pixels,
+    /// which needs a batch op the history does not have yet.
     fn merge_down(&mut self, id: LayerId, project: &ProjectData) -> bool {
         let Some(page_idx) = self.active_page_idx else {
             return false;
@@ -5132,7 +5487,7 @@ impl PsEditorTabState {
         };
         let size = stack.size();
         // Build the merged pixels and resolve both participants' ids/uids (the borrow ends here).
-        let (below_id, below_uid, upper_uid, merged) = {
+        let (below_id, below_kind, upper_uid, upper_footprint, merged) = {
             let layers = stack.layers();
             let Some(upper) = layers.iter().find(|l| l.id == id) else {
                 return false;
@@ -5140,9 +5495,11 @@ impl PsEditorTabState {
             let Some(below) = layers.iter().find(|l| l.uid.to_string() == below_uid) else {
                 return false;
             };
-            // The target itself must be a non-base raster; the below-raster is guaranteed non-base by
-            // `raster_below_uid` (base layers are excluded from the band-Z candidate set).
-            if upper.kind.is_base() || below.kind.is_base() {
+            // The UPPER participant must be a user raster (base layers are never merged away). The
+            // lower one may be `Клин`, but never `Исходник` — which `merge_candidates_by_band_z`
+            // already excludes; the check is repeated here so the invariant is enforced at the
+            // mutation site and not only by the candidate query.
+            if upper.kind.is_base() || below.kind == LayerKind::Source {
                 return false;
             }
             // A merge rewrites the lower layer's base pixels, so refuse while either participant
@@ -5155,31 +5512,62 @@ impl PsEditorTabState {
             let merged = composite_to_page(&[below, upper], size);
             (
                 below.id,
-                below.uid.to_string(),
+                below.kind,
                 upper.uid.to_string(),
+                page_footprint_rect(upper, size),
                 merged,
             )
         };
         // Record the upper raster's deletion (so the manifest save drops it — `save_page_rasters`
-        // preserves unowned rasters otherwise). Then edit the doc in memory: the lower raster absorbs
-        // the composited pixels as a page-sized identity raster (pixels_dirty), and the upper raster
-        // node is removed. `persist_current_page` (below) writes the manifest with the removed uid.
+        // preserves unowned rasters otherwise), then absorb the composited pixels into the lower
+        // participant. Which store that is depends on its kind: a raster becomes a page-sized
+        // identity doc node (pixels_dirty), while `Клин` — not a doc node — takes the pixels on the
+        // stack and pushes them to the shared clean model. Either way the upper raster's doc node is
+        // removed and `persist_current_page` (below) writes the manifest with the removed uid.
         self.record_raster_deletion(id);
-        let merged_for_doc = merged.clone();
-        let identity = transform_to_rec(LayerTransform::identity_for(size));
-        let below_uid_for_doc = below_uid.clone();
-        self.edit_doc_node(page_idx, |doc| {
-            doc.set_raster_pixels(
-                page_idx,
-                &below_uid_for_doc,
-                merged_for_doc.clone(),
-                merged_for_doc,
-                Vec::new(),
-                true,
-            );
-            doc.set_transform(page_idx, &below_uid_for_doc, identity);
-            doc.remove_node(page_idx, &upper_uid);
-        });
+        match below_kind {
+            LayerKind::Raster => {
+                let merged_for_doc = merged;
+                let identity = transform_to_rec(LayerTransform::identity_for(size));
+                let below_uid_for_doc = below_uid.clone();
+                self.edit_doc_node(page_idx, |doc| {
+                    doc.set_raster_pixels(
+                        page_idx,
+                        &below_uid_for_doc,
+                        merged_for_doc.clone(),
+                        merged_for_doc,
+                        Vec::new(),
+                        true,
+                    );
+                    doc.set_transform(page_idx, &below_uid_for_doc, identity);
+                    doc.remove_node(page_idx, &upper_uid);
+                });
+            }
+            LayerKind::Clean => {
+                // `Клин` is not a doc node, so only the upper raster is removed there; the merged
+                // pixels are absorbed by the base layer and pushed to the shared overlay model.
+                self.edit_doc_node(page_idx, |doc| {
+                    doc.remove_node(page_idx, &upper_uid);
+                });
+                if let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(below_id)) {
+                    layer.transform = LayerTransform::identity_for(size);
+                    layer.base_image = merged.clone();
+                    layer.image = merged;
+                }
+                // Push ONLY the upper layer's page footprint, not the whole page. Everywhere else
+                // `composite_to_page` reproduces the `Клин` pixels unchanged (the upper sample is
+                // transparent there and `Клин` is a page-sized identity layer), so a bounded write
+                // is complete — and a whole-page write on a ~800x19000 ribbon means two full RGBA
+                // copies plus a tiled zstd diff of both, on the GUI thread and under the model lock
+                // (the autosave worker shares it). An upper layer that really does cover the page
+                // still costs the whole page; that is inherent to the merge it asked for.
+                if let Some((fx, fy, fw, fh)) = upper_footprint {
+                    self.write_clean_region_to_model(page_idx, fx, fy, fw, fh);
+                }
+            }
+            // `raster_below_uid` never yields the immutable source layer.
+            LayerKind::Source => return false,
+        }
         self.persist_current_page(project);
         // Refresh caches and selection locally (the projection rebuilt the stack).
         self.render_cache.remove(&id);
@@ -5365,12 +5753,12 @@ fn sample_layer_world(layer: &Layer, wx: usize, wy: usize) -> Color32 {
 /// sees beneath it in the composite), for "merge down". This is the band-Z order — NOT the layer
 /// stack index — so after a manual reorder the correct visually-below raster is chosen.
 ///
-/// `rasters` lists every non-base raster as `(uid, band_z)` where `band_z` is its `Band::Raster` Z
-/// (or the past-the-top fallback for a raster without a band, mirroring `draw_composite`). Base layers
-/// are excluded by the caller so they can never be a merge target. Among the rasters strictly below
+/// `rasters` lists every merge candidate as `(uid, band_z)` — see `merge_candidates_by_band_z`,
+/// which supplies each raster's shifted `Band::Raster` Z and reserves Z 0 for `Клин`. `Исходник` is
+/// excluded by the caller so it can never be a merge target. Among the candidates strictly below
 /// the target's Z, the nearest one (greatest Z) wins; ties break toward the earlier list position
 /// (stable, matching `draw_composite`'s constant raster tiebreak). Returns `None` when the target is
-/// not found or is already the bottom-most raster.
+/// not found or is already the bottom-most candidate.
 fn raster_below_by_band_z(rasters: &[(String, u32)], target_uid: &str) -> Option<String> {
     let target_z = rasters
         .iter()
@@ -5383,6 +5771,50 @@ fn raster_below_by_band_z(rasters: &[(String, u32)], target_uid: &str) -> Option
         // Nearest below = greatest Z; on a Z tie keep the earlier list position (lower stack index).
         .max_by(|(ia, (_, za)), (ib, (_, zb))| za.cmp(zb).then(ib.cmp(ia)))
         .map(|(_, (uid, _))| uid.clone())
+}
+
+/// Page-space pixel rect `(x, y, w, h)` bounding every pixel [`composite_to_page`] can take from
+/// `layer`, clamped to a `size` page. `None` when the layer's footprint misses the page entirely.
+///
+/// This is a strict SUPERSET of the pixels the layer can alter, which is what makes it safe to
+/// bound a merge write-back with: `composite_to_page` samples through [`sample_layer_world`], which
+/// maps a page point back with the AFFINE `LayerTransform` only — `Layer::deform` is not consulted
+/// there — so the four affine `world_corners()` bound every sample that can return a non-transparent
+/// pixel, deformed layer or not. Should `sample_layer_world` ever become deform-aware, this bound
+/// must grow with it or a merge will silently lose pixels.
+///
+/// The box is rounded OUTWARD by a whole pixel on each side: a page pixel contributes when its
+/// CENTRE falls inside the quad, and the margin also absorbs the `f32` rounding of the corner math.
+/// A non-finite corner (a degenerate transform) yields the whole page rather than a guess.
+fn page_footprint_rect(layer: &Layer, size: [usize; 2]) -> Option<(usize, usize, usize, usize)> {
+    let [pw, ph] = size;
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let whole_page = Some((0, 0, pw, ph));
+    let corners = layer.world_corners();
+    if corners.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+        return whole_page;
+    }
+    let (page_w, page_h) = (pw as f32, ph as f32);
+    let mut min = Vec2::new(f32::INFINITY, f32::INFINITY);
+    let mut max = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for c in corners {
+        min.x = min.x.min(c.x);
+        min.y = min.y.min(c.y);
+        max.x = max.x.max(c.x);
+        max.y = max.y.max(c.y);
+    }
+    // Clamp into the page in float space first, so the casts below are on finite, non-negative
+    // values no larger than the page dimensions — no truncation or sign loss is possible.
+    let x0 = (min.x - 1.0).floor().clamp(0.0, page_w) as usize;
+    let y0 = (min.y - 1.0).floor().clamp(0.0, page_h) as usize;
+    let x1 = (max.x + 1.0).ceil().clamp(0.0, page_w) as usize;
+    let y1 = (max.y + 1.0).ceil().clamp(0.0, page_h) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some((x0, y0, x1 - x0, y1 - y0))
 }
 
 /// Composites `layers` (bottom-to-top, src-over) into a fresh page-sized image, sampling each
@@ -6510,7 +6942,8 @@ mod tests {
     fn merge_selection_uses_band_z_after_reorder_and_protects_base_layers() {
         // Integration: a stack with two rasters whose BAND-Z order is the REVERSE of their stack
         // insertion order. `raster_below_uid` / `is_mergeable` must follow band-Z (the visually-below
-        // raster), and base (source/clean) layers must never be a target.
+        // raster). `Клин` is the target below the bottom-most raster; `Исходник` never is, and
+        // neither base layer is ever the UPPER participant.
         let size = [2, 2];
         let mut stack = LayerStack::new(
             0,
@@ -6548,14 +6981,52 @@ mod tests {
         );
         assert!(ps.is_mergeable(first), "top-by-band raster is mergeable");
 
-        // `second` is the bottom-most raster by band-Z: nothing below → not mergeable.
-        assert_eq!(ps.raster_below_uid(second), None);
+        // `second` is the bottom-most raster by band-Z: below it is the `Клин` base layer, so it IS
+        // mergeable — merging flattens it into the clean overlay.
+        let stack_ref = ps.stack.as_ref().expect("stack resident");
+        let clean_uid = stack_ref
+            .layers()
+            .iter()
+            .find(|l| l.kind == LayerKind::Clean)
+            .map(|l| l.uid.to_string())
+            .expect("clean base layer present");
+        let source_uid = stack_ref
+            .layers()
+            .iter()
+            .find(|l| l.kind == LayerKind::Source)
+            .map(|l| l.uid.to_string())
+            .expect("source base layer present");
+        assert_eq!(
+            ps.raster_below_uid(second).as_deref(),
+            Some(clean_uid.as_str()),
+            "the bottom-most raster merges into Клин"
+        );
         assert!(
-            !ps.is_mergeable(second),
-            "bottom-by-band raster is not mergeable"
+            ps.is_mergeable(second),
+            "bottom-by-band raster is mergeable into Клин"
         );
 
-        // Base layers (source/clean) are never a merge target or source.
+        // `Исходник` is never a merge candidate at all.
+        let candidates = ps.merge_candidates_by_band_z();
+        assert!(
+            !candidates.iter().any(|(uid, _)| *uid == source_uid),
+            "Исходник must never be a merge target"
+        );
+        let clean_z = candidates
+            .iter()
+            .find(|(uid, _)| *uid == clean_uid)
+            .map(|(_, z)| *z)
+            .expect("Клин is a merge candidate");
+        assert!(
+            candidates
+                .iter()
+                .filter(|(uid, _)| *uid != clean_uid)
+                .all(|(_, z)| *z > clean_z),
+            "Клин sits strictly below every raster on the band-Z axis"
+        );
+
+        // Neither base layer is ever the UPPER participant of a merge (they have no control strip,
+        // and the query refuses them by construction).
         let base_ids: Vec<LayerId> = ps
             .stack
             .as_ref()
@@ -6567,13 +7038,56 @@ mod tests {
             .collect();
         assert_eq!(base_ids.len(), 2, "source + clean base layers present");
         for id in base_ids {
-            assert!(!ps.is_mergeable(id), "base layer is never mergeable");
+            assert!(!ps.is_mergeable(id), "a base layer is never merged away");
             assert_eq!(
                 ps.raster_below_uid(id),
                 None,
-                "base layer has no band-Z below-raster"
+                "a base layer is never the upper participant"
             );
         }
+    }
+
+    #[test]
+    fn merge_candidates_keep_raster_order_and_reserve_the_bottom_slot_for_clean() {
+        // The +1 shift that makes room for Клин at Z 0 must not disturb the rasters' relative order.
+        let size = [2, 2];
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let a = stack.add_raster_layer();
+        let b = stack.add_raster_layer();
+        let a_uid = stack.layer(a).expect("resident").uid.to_string();
+        let b_uid = stack.layer(b).expect("resident").uid.to_string();
+        let ps = PsEditorTabState {
+            bands: vec![
+                Band::Raster {
+                    uid: a_uid.clone(),
+                    z: 0,
+                },
+                Band::Raster {
+                    uid: b_uid.clone(),
+                    z: 1,
+                },
+            ],
+            stack: Some(stack),
+            ..Default::default()
+        };
+        let candidates = ps.merge_candidates_by_band_z();
+        let z_of = |uid: &str| {
+            candidates
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map(|(_, z)| *z)
+                .expect("candidate present")
+        };
+        assert_eq!(z_of(&a_uid), 1, "band z 0 shifts to 1");
+        assert_eq!(z_of(&b_uid), 2, "band z 1 shifts to 2");
+        // `a` (the lower raster) is what `b` merges into; `a` in turn merges into Клин.
+        assert_eq!(ps.raster_below_uid(b).as_deref(), Some(a_uid.as_str()));
+        assert!(ps.raster_below_uid(a).is_some(), "Клин is below the bottom raster");
     }
 
     #[test]
@@ -6642,5 +7156,361 @@ mod tests {
         // A finite path around the bad segment still dashes normally.
         let good = [Pos2::new(0.0, 0.0), Pos2::new(12.0, 0.0)];
         assert_eq!(walk_dash_runs(&good, 4.0, 10_000, |_| ()), 3);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `write_clean_region_to_model` — the ONE `Клин` write-back path (see its doc comment).
+    // ---------------------------------------------------------------------------------------
+
+    /// A 1-page clean-overlay model whose page 0 overlay is materialized at `size`.
+    ///
+    /// `replace` adopts the size of the image it is given on a model that has none yet, which is
+    /// how these tests give the model a size that either matches or deliberately mismatches the
+    /// editor's page.
+    fn overlays_model_with_overlay(size: [usize; 2]) -> Arc<Mutex<CleanOverlaysModel>> {
+        let mut model = CleanOverlaysModel::new_from_pages(&[std::path::PathBuf::from("p0.png")]);
+        model.replace(0, &filled(size, Color32::TRANSPARENT));
+        Arc::new(Mutex::new(model))
+    }
+
+    /// A tab state on page 0 with a `size` page and the given model bound, its `Клин` layer painted
+    /// `paint` over the whole page while `base_image` still holds transparent (the state a live
+    /// stroke leaves behind: `image` mutated, `base_image` pre-stroke, `pixels_dirty` set).
+    fn ps_with_painted_clean(
+        size: [usize; 2],
+        paint: Color32,
+        model: Arc<Mutex<CleanOverlaysModel>>,
+    ) -> (PsEditorTabState, LayerId) {
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let clean_id = stack
+            .layers()
+            .iter()
+            .find(|l| l.kind == LayerKind::Clean)
+            .map(|l| l.id)
+            .expect("clean base layer present");
+        let clean = stack.layer_mut(clean_id).expect("clean layer resident");
+        clean.image = filled(size, paint);
+        clean.pixels_dirty = true;
+        let ps = PsEditorTabState {
+            stack: Some(stack),
+            overlays_model: Some(model),
+            active_page_idx: Some(0),
+            ..Default::default()
+        };
+        (ps, clean_id)
+    }
+
+    /// The straight-RGBA pixel the model holds for page 0 at `(x, y)`.
+    fn model_pixel(model: &Arc<Mutex<CleanOverlaysModel>>, x: u32, y: u32) -> [u8; 4] {
+        let locked = model.lock().expect("model lock");
+        let rgba = locked.overlay_rgba(0).expect("overlay materialized");
+        rgba.get_pixel(x, y).0
+    }
+
+    /// The happy path: the requested rect (and ONLY it) reaches the model, `base_image` is
+    /// re-established over that rect so the next undo reads the committed pixels, and
+    /// `pixels_dirty` is cleared because the shared model owns Clean persistence.
+    #[test]
+    fn clean_write_back_pushes_only_the_requested_rect_and_commits_local_state() {
+        let size = [4, 4];
+        let model = overlays_model_with_overlay(size);
+        let (mut ps, clean_id) = ps_with_painted_clean(size, Color32::RED, Arc::clone(&model));
+
+        assert!(ps.write_clean_region_to_model(0, 1, 1, 2, 2));
+
+        // Inside the rect the model took the painted pixel; outside it is untouched.
+        assert_eq!(model_pixel(&model, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(model_pixel(&model, 2, 2), [255, 0, 0, 255]);
+        assert_eq!(model_pixel(&model, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(model_pixel(&model, 3, 3), [0, 0, 0, 0]);
+
+        let clean = ps
+            .stack
+            .as_ref()
+            .and_then(|s| s.layer(clean_id))
+            .expect("clean layer resident");
+        assert_eq!(
+            clean.base_image.pixels[5], // (x=1, y=1) on a 4-wide page
+            Color32::RED,
+            "base_image must mirror image inside the committed rect"
+        );
+        assert_eq!(
+            clean.base_image.pixels[0],
+            Color32::TRANSPARENT,
+            "base_image outside the rect is not touched"
+        );
+        assert!(!clean.pixels_dirty);
+    }
+
+    /// The rect is clamped into the page, and a rect entirely outside it is a no-op that commits
+    /// nothing — neither to the model nor to the layer's bookkeeping.
+    #[test]
+    fn clean_write_back_clamps_the_rect_and_refuses_one_outside_the_page() {
+        let size = [4, 4];
+        let model = overlays_model_with_overlay(size);
+        let (mut ps, clean_id) = ps_with_painted_clean(size, Color32::RED, Arc::clone(&model));
+
+        // Overhanging rect: clamped to (3,3)-(4,4), so exactly the corner pixel is written.
+        assert!(ps.write_clean_region_to_model(0, 3, 3, 100, 100));
+        assert_eq!(model_pixel(&model, 3, 3), [255, 0, 0, 255]);
+        assert_eq!(model_pixel(&model, 2, 3), [0, 0, 0, 0]);
+
+        // Wholly outside: nothing written, nothing committed.
+        let (mut ps_out, clean_out) =
+            ps_with_painted_clean(size, Color32::GREEN, overlays_model_with_overlay(size));
+        assert!(!ps_out.write_clean_region_to_model(0, 4, 4, 2, 2));
+        let clean = ps_out
+            .stack
+            .as_ref()
+            .and_then(|s| s.layer(clean_out))
+            .expect("clean layer resident");
+        assert!(
+            clean.pixels_dirty,
+            "a refused write must not clear the dirty flag"
+        );
+
+        // The first tab's clamped write left its own layer committed.
+        assert!(
+            !ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean_id))
+                .expect("clean layer resident")
+                .pixels_dirty
+        );
+    }
+
+    /// A write for a page the resident stack is not on is refused outright — the crop would come
+    /// from the wrong page's pixels.
+    #[test]
+    fn clean_write_back_refuses_a_foreign_page_index() {
+        let size = [4, 4];
+        let model = overlays_model_with_overlay(size);
+        let (mut ps, _) = ps_with_painted_clean(size, Color32::RED, Arc::clone(&model));
+        assert!(!ps.write_clean_region_to_model(1, 0, 0, 4, 4));
+        assert_eq!(model_pixel(&model, 0, 0), [0, 0, 0, 0]);
+    }
+
+    /// Revision adoption, half one: with no foreign edit in between, the tab adopts the revision its
+    /// own write produced, so `sync_view_from_canvas` does not reload the whole page after a stroke.
+    #[test]
+    fn clean_write_back_adopts_its_own_revision_when_nothing_foreign_happened() {
+        let size = [4, 4];
+        let model = overlays_model_with_overlay(size);
+        let (mut ps, _) = ps_with_painted_clean(size, Color32::RED, Arc::clone(&model));
+        // In sync with the model, as the last page load left us.
+        let before = model.lock().expect("model lock").revision();
+        ps.last_overlay_revision = before;
+
+        assert!(ps.write_clean_region_to_model(0, 0, 0, 4, 4));
+
+        let after = model.lock().expect("model lock").revision();
+        assert!(after > before, "replace_region must bump the revision");
+        assert_eq!(
+            ps.last_overlay_revision, after,
+            "our own bump must be adopted, or every stroke triggers a full page reload"
+        );
+    }
+
+    /// Revision adoption, half two — the bug this guards: a background writer (the page manager's
+    /// clean-attach worker) bumped the revision while the tab was elsewhere. Adopting now would make
+    /// the tab equal to the model forever and the foreign edit would NEVER be loaded. The tab must
+    /// keep its stale revision so the next `sync_view_from_canvas` reloads and reconciles; its own
+    /// write is not lost by that, the model holds it.
+    #[test]
+    fn clean_write_back_keeps_a_stale_revision_when_a_foreign_edit_intervened() {
+        let size = [4, 4];
+        let model = overlays_model_with_overlay(size);
+        let (mut ps, _) = ps_with_painted_clean(size, Color32::RED, Arc::clone(&model));
+        // Last sync saw this revision...
+        let synced = model.lock().expect("model lock").revision();
+        ps.last_overlay_revision = synced;
+        // ...then somebody else wrote to the model while the tab was not looking.
+        model
+            .lock()
+            .expect("model lock")
+            .replace(0, &filled(size, Color32::BLUE));
+        let foreign = model.lock().expect("model lock").revision();
+        assert!(foreign > synced);
+
+        assert!(ps.write_clean_region_to_model(0, 0, 0, 4, 4));
+
+        assert_eq!(
+            ps.last_overlay_revision, synced,
+            "a foreign bump must stay visible as a difference, so the page still reloads"
+        );
+        assert_ne!(
+            ps.last_overlay_revision,
+            model.lock().expect("model lock").revision()
+        );
+        // The write itself still reached the model — the reload restores it from there.
+        assert_eq!(model_pixel(&model, 0, 0), [255, 0, 0, 255]);
+    }
+
+    /// A legacy overlay whose size disagrees with the editor's page must be REFUSED, not rescaled:
+    /// `replace_region` clamps to the model's size and scales the chunk into it, which would land a
+    /// brush stroke misaligned. `page_loader` answers the same mismatch with a transparent
+    /// page-sized `Клин`, so this state is reachable.
+    #[test]
+    fn clean_write_back_refuses_a_size_mismatched_overlay_instead_of_rescaling() {
+        // The model remembers an 8x8 overlay; the editor page is 4x4.
+        let model = overlays_model_with_overlay([8, 8]);
+        let (mut ps, clean_id) =
+            ps_with_painted_clean([4, 4], Color32::RED, Arc::clone(&model));
+        ps.last_overlay_revision = model.lock().expect("model lock").revision();
+
+        assert!(!ps.write_clean_region_to_model(0, 0, 0, 4, 4));
+
+        // Nothing scaled into the model, and no local state was committed.
+        assert_eq!(model_pixel(&model, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(model_pixel(&model, 7, 7), [0, 0, 0, 0]);
+        assert!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean_id))
+                .expect("clean layer resident")
+                .pixels_dirty,
+            "a refused write leaves the layer uncommitted"
+        );
+    }
+
+    /// Without a bound model there is nowhere to push to: the write fails and, crucially, leaves the
+    /// local bookkeeping uncommitted so the edit is not silently declared durable.
+    #[test]
+    fn clean_write_back_without_a_model_commits_nothing() {
+        let size = [4, 4];
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let clean_id = stack
+            .layers()
+            .iter()
+            .find(|l| l.kind == LayerKind::Clean)
+            .map(|l| l.id)
+            .expect("clean base layer present");
+        stack
+            .layer_mut(clean_id)
+            .expect("clean layer resident")
+            .pixels_dirty = true;
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            active_page_idx: Some(0),
+            ..Default::default()
+        };
+
+        assert!(!ps.write_clean_region_to_model(0, 0, 0, 4, 4));
+        assert!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean_id))
+                .expect("clean layer resident")
+                .pixels_dirty
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `page_footprint_rect` — the bound a merge-into-`Клин` write-back uses.
+    // ---------------------------------------------------------------------------------------
+
+    /// The contract that makes the bound safe: outside the upper layer's footprint the composite
+    /// reproduces the lower layer's pixels EXACTLY, so a write-back limited to that rect loses
+    /// nothing. Asserted against `composite_to_page` itself, not against the rect math alone.
+    #[test]
+    fn a_merge_changes_no_pixel_outside_the_upper_layers_footprint() {
+        let size = [8, 8];
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::from_rgb(10, 20, 30)),
+        );
+        let upper_id = stack.add_raster_layer();
+        {
+            let upper = stack.layer_mut(upper_id).expect("raster resident");
+            upper.image = filled([2, 2], Color32::RED);
+            upper.base_image = upper.image.clone();
+            // Placed over page pixels (1,1)..=(2,2).
+            upper.transform = LayerTransform {
+                center: Vec2::new(2.0, 2.0),
+                rotation: 0.0,
+                scale: 1.0,
+            };
+        }
+        let layers = stack.layers();
+        let below = layers
+            .iter()
+            .find(|l| l.kind == LayerKind::Clean)
+            .expect("clean base layer present");
+        let upper = layers
+            .iter()
+            .find(|l| l.id == upper_id)
+            .expect("raster resident");
+        let merged = composite_to_page(&[below, upper], size);
+        let (fx, fy, fw, fh) = page_footprint_rect(upper, size).expect("footprint on the page");
+
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let inside = x >= fx && x < fx + fw && y >= fy && y < fy + fh;
+                if !inside {
+                    assert_eq!(
+                        merged.pixels[y * size[0] + x],
+                        below.image.pixels[y * size[0] + x],
+                        "pixel ({x},{y}) lies outside the footprint and must be unchanged"
+                    );
+                }
+            }
+        }
+        // And the bound is actually a bound, not the whole page.
+        assert!(fw < size[0] && fh < size[1], "the footprint must be tight");
+    }
+
+    /// A layer dragged entirely off the page contributes nothing, so there is no rect to write.
+    #[test]
+    fn a_footprint_entirely_off_the_page_is_none() {
+        let size = [8, 8];
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let id = stack.add_raster_layer();
+        let layer = stack.layer_mut(id).expect("raster resident");
+        layer.image = filled([2, 2], Color32::RED);
+        layer.transform = LayerTransform {
+            center: Vec2::new(-50.0, -50.0),
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        assert_eq!(page_footprint_rect(layer, size), None);
+    }
+
+    /// A degenerate transform must widen the bound to the whole page, never guess a smaller one:
+    /// losing merged pixels is worse than one expensive write.
+    #[test]
+    fn a_non_finite_footprint_falls_back_to_the_whole_page() {
+        let size = [8, 8];
+        let mut stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let id = stack.add_raster_layer();
+        let layer = stack.layer_mut(id).expect("raster resident");
+        layer.image = filled([2, 2], Color32::RED);
+        layer.transform = LayerTransform {
+            center: Vec2::new(f32::NAN, 0.0),
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        assert_eq!(page_footprint_rect(layer, size), Some((0, 0, 8, 8)));
     }
 }

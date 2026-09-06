@@ -191,12 +191,23 @@ main.rs → ProjectData → MangaApp
 8. **`src/tabs/*`** — логика конкретных вкладок; canvas расширяется через `CanvasHooks`.
    Исключение — `src/tabs/ps_editor/` (вкладка «PS-подобный редактор»): самостоятельный
    одностраничный слоёвый редактор, который **не** является `CanvasView`. У него собственная
-   камера pan/zoom (`viewport.rs`), стек слоёв с двумя заблокированными базовыми слоями (Исходник —
-   из `CleanOverlaysModel::cached_page_rgba`, Клин — из `overlay_rgba`, оба read-only, можно скрыть,
-   нельзя удалить), пользовательские raster-слои поверх них (session-scoped в памяти, per-page; без
+   камера pan/zoom (`viewport.rs`), стек слоёв с двумя базовыми слоями (Исходник —
+   из `CleanOverlaysModel::cached_page_rgba`, Клин — из `overlay_rgba`), пользовательские
+   raster-слои поверх них (session-scoped в памяти, per-page; без
    дискового сохранения в этой фазе), набор инструментов через trait `PsTool` (прямоугольное/лассо
-   выделение, цветная кисть), фоновый `page_loader` и потайловый GPU-кэш `TiledTexture`. Базовые
-   слои никогда не пишутся обратно в `CleanOverlaysModel`. Вкладка исключена из shared-canvas
+   выделение, цветная кисть), фоновый `page_loader` и потайловый GPU-кэш `TiledTexture`.
+   Both base layers are structurally locked (never deleted, reordered, grouped or transformed) and
+   both are hideable, but they differ on the pixel axis: `Исходник` is read-only, while `Клин` is
+   PAINTABLE — so the PS editor both reads AND WRITES `CleanOverlaysModel`. Every `Клин` pixel edit
+   (brush, cut, merge-into, undo) goes through one helper, `write_clean_region_to_model`, which
+   pushes a bounded region via `replace_region` BEFORE committing any local state, refuses a write
+   whose page size disagrees with the model's overlay (no silent rescale), and in the same lock
+   scope adopts the model's new `revision()` ONLY when no foreign bump landed since its last sync —
+   the tab reloads the page whenever that revision differs from its own, and this tab resyncs on tab
+   entry rather than per frame, so an unconditional adoption would mask a background writer's edit
+   for the whole session. Disk persistence stays with the clean model's autosave
+   / save-to-project path; PS layer persistence never touches base layers.
+   Вкладка исключена из shared-canvas
    viewport sync и source-page window в `app.rs` (`active_tab_is_canvas` для неё false).
    UI вкладки — панельный док (`src/widgets/panel_dock/`), а не статические `egui::Panel`: холст
    занимает всю область вкладки фоном, а поверх него плавают пять вкладок дока («PS редактор» — главная,

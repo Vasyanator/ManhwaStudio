@@ -13,10 +13,13 @@ Key structures:
 - `LayerStack`: ordered layers (index 0 = bottom) plus the active layer and id allocator.
 
 Notes:
-The stack always begins with `Source` (bottom) and `Clean`, both locked: they can be hidden but
-never deleted, reordered, painted on, or transformed. Any number of `Raster` layers stack above
-them. Base layers are page-sized with the identity transform; raster layers may be smaller than
-the page ("incomplete") and carry an arbitrary transform so they can be moved/rotated/scaled.
+The stack always begins with `Source` (bottom) and `Clean`. Neither can be deleted, reordered,
+grouped or transformed, and both can be hidden. They differ in one respect: `Source` is fully
+immutable, while `Clean`'s PIXELS are editable (paint / cut / merge-into) — it is the shared clean
+overlay, and the tab writes those edits back to `CleanOverlaysModel`. Any number of `Raster` layers
+stack above them. Base layers are page-sized with the identity transform; raster layers may be
+smaller than the page ("incomplete") and carry an arbitrary transform so they can be
+moved/rotated/scaled.
 */
 
 use eframe::egui;
@@ -82,12 +85,13 @@ impl LayerTransform {
     }
 }
 
-/// Distinguishes the read-only base layers from editable raster layers.
+/// Distinguishes the structurally locked base layers from user raster layers.
 ///
-/// `Source` mirrors the page source image; `Clean` mirrors the shared clean overlay. Both are
-/// locked. `Raster` layers are user-owned, editable, and removable. Text overlays are NOT
-/// `LayerStack` layers — they live as the doc's Text nodes and the tab's `text_layers` projection,
-/// and become rasters only when baked.
+/// `Source` mirrors the page source image and is fully read-only; `Clean` mirrors the shared clean
+/// overlay and is PIXEL-editable (its edits are written back to `CleanOverlaysModel`). Both are
+/// structurally locked: never deleted, reordered, grouped or transformed. `Raster` layers are
+/// user-owned, editable, and removable. Text overlays are NOT `LayerStack` layers — they live as
+/// the doc's Text nodes and the tab's `text_layers` projection, and become rasters only when baked.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LayerKind {
     Source,
@@ -96,7 +100,8 @@ pub enum LayerKind {
 }
 
 impl LayerKind {
-    /// Base layers are locked: hideable but not editable, movable, or deletable.
+    /// Base layers are STRUCTURALLY locked: hideable, but never movable, groupable or deletable.
+    /// This says nothing about pixels — `Clean` is paintable, see [`Layer::can_edit_pixels`].
     #[must_use]
     pub fn is_base(self) -> bool {
         matches!(self, LayerKind::Source | LayerKind::Clean)
@@ -141,16 +146,25 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// True when the layer accepts direct base-pixel edits (paint / cut / merge) *right now*. A
-    /// raster showing a non-destructive effects chain must be baked first (flatten the rendered
-    /// display into the base and clear the chain), so it is not directly editable until then.
+    /// True when the layer accepts direct base-pixel edits (paint / cut / merge) *right now*.
+    ///
+    /// Holds for user `Raster` layers and for the `Clean` base layer — the shared clean overlay is
+    /// paintable, and the tab writes those pixels back to `CleanOverlaysModel`. `Source` is never
+    /// editable. A raster showing a non-destructive effects chain must be baked first (flatten the
+    /// rendered display into the base and clear the chain), so it is not directly editable until
+    /// then; `Clean` never carries effects, so the second term is trivially true for it.
+    ///
+    /// Pixel-editable is NOT the same as unlocked: `Clean` remains non-deletable, non-movable and
+    /// non-groupable (see [`Self::is_transformable`], `LayerStack::remove_layer`,
+    /// `LayerStack::reorder_rasters`, `LayerStack::set_layer_group`).
     #[must_use]
     pub fn can_edit_pixels(&self) -> bool {
-        matches!(self.kind, LayerKind::Raster) && self.effects.is_empty()
+        matches!(self.kind, LayerKind::Raster | LayerKind::Clean) && self.effects.is_empty()
     }
 
     /// True when the layer can be freely moved/rotated/scaled (raster and text layers — the shared
-    /// transform mechanism; base layers are locked).
+    /// transform mechanism). Both base layers are locked here, `Clean` included: it stays page-sized
+    /// with the identity transform because the shared overlay model is page-aligned.
     #[must_use]
     pub fn is_transformable(&self) -> bool {
         !self.kind.is_base()
@@ -332,9 +346,11 @@ impl LayerStack {
 
     /// Mutable access to the active layer when its base pixels are directly editable right now.
     ///
-    /// Returns `None` for a locked base layer (so painting tools cannot mutate the source/clean
-    /// buffers) *and* for a raster still showing a non-destructive effects chain (it must be baked
-    /// first). Uses `can_edit_pixels` so the brush refuses to paint into an effected raster.
+    /// Returns `None` for the immutable `Source` layer (so painting tools can never mutate the page
+    /// source) *and* for a raster still showing a non-destructive effects chain (it must be baked
+    /// first). The `Clean` base layer IS returned: it is paintable, and the tab is responsible for
+    /// writing the resulting pixels back to `CleanOverlaysModel`. Uses `can_edit_pixels`, so the
+    /// brush refuses to paint into an effected raster.
     pub fn active_editable_mut(&mut self) -> Option<&mut Layer> {
         let active = self.active;
         self.layers
@@ -583,15 +599,72 @@ mod tests {
     }
 
     #[test]
-    fn base_layers_are_locked_and_undeletable() {
+    fn base_layers_are_structurally_locked_and_undeletable() {
         let mut s = stack();
         assert_eq!(s.layers().len(), 2);
         assert!(!s.remove_layer(0), "source must not be removable");
         assert!(!s.remove_layer(1), "clean must not be removable");
         assert_eq!(s.layers().len(), 2);
-        // Base layers report not editable so brush tools skip them.
-        assert!(!s.layers()[0].can_edit_pixels());
-        assert!(!s.layers()[1].can_edit_pixels());
+        // Neither base layer can be moved/rotated/scaled.
+        assert!(!s.layers()[0].is_transformable(), "source not transformable");
+        assert!(!s.layers()[1].is_transformable(), "clean not transformable");
+        // Pixel editability is a SEPARATE axis: source is immutable, clean is paintable.
+        assert!(!s.layers()[0].can_edit_pixels(), "source pixels are immutable");
+        assert!(s.layers()[1].can_edit_pixels(), "clean pixels are editable");
+    }
+
+    #[test]
+    fn clean_is_paintable_but_never_moved_deleted_or_grouped() {
+        // The user-facing contract: `Клин` accepts paint / cut / merge-into, yet stays structurally
+        // locked. Each refusal below is enforced by construction, not by a caller-side guard.
+        let mut s = stack();
+        let clean_id = s.layers()[1].id;
+        assert_eq!(s.layers()[1].kind, LayerKind::Clean);
+
+        // Paintable: `active_editable_mut` hands the brush the clean buffer.
+        s.set_active(clean_id);
+        assert!(
+            s.active_editable_mut().is_some(),
+            "clean is the active editable layer"
+        );
+        // ...but not transformable, so the transform gizmo refuses it.
+        assert!(s.active_transformable_mut().is_none(), "clean is not transformable");
+
+        // Not deletable.
+        assert!(!s.remove_layer(clean_id));
+        assert_eq!(s.layers().len(), 2);
+
+        // Not groupable.
+        let g = s.add_group("G".to_string());
+        s.set_layer_group(clean_id, Some(g));
+        assert_eq!(s.layer(clean_id).expect("resident").group, None);
+
+        // Not reorderable: `reorder_rasters` only ever permutes `LayerKind::Raster`.
+        let r = s.add_raster_layer();
+        s.reorder_rasters(&[clean_id, r]);
+        let kinds: Vec<LayerKind> = s.layers().iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![LayerKind::Source, LayerKind::Clean, LayerKind::Raster],
+            "base layers keep their positions whatever order is projected"
+        );
+    }
+
+    #[test]
+    fn both_base_layers_can_be_hidden() {
+        // Base visibility is view-only session state (no doc node, never persisted). Compositing
+        // reads `Layer::visible` for base layers exactly as it does for rasters, so a plain stack
+        // write is the whole feature — this pins that the field is writable on both of them.
+        let mut s = stack();
+        for id in [0, 1] {
+            let layer = s.layer_mut(id).expect("base layer resident");
+            assert!(layer.visible, "base layers start visible");
+            layer.visible = false;
+        }
+        for id in [0, 1] {
+            let layer = s.layer(id).expect("base layer resident");
+            assert!(!s.layer_visible(layer), "a hidden base layer is not composited");
+        }
     }
 
     #[test]
@@ -634,8 +707,11 @@ mod tests {
         assert!(s.active_editable_mut().is_some());
         assert!(s.remove_layer(id));
         assert_eq!(s.layers().len(), 2);
-        // After deleting the only raster layer, active is a locked base layer again.
-        assert!(s.active_editable_mut().is_none());
+        // After deleting the only raster layer the active fallback is the topmost remaining layer —
+        // `Клин`, which is paintable — but it is still not transformable.
+        assert_eq!(s.active_id(), 1);
+        assert!(s.active_editable_mut().is_some());
+        assert!(s.active_transformable_mut().is_none());
     }
 
     #[test]
@@ -655,11 +731,11 @@ mod tests {
     }
 
     #[test]
-    fn can_edit_pixels_requires_a_raster_with_no_effects() {
+    fn can_edit_pixels_requires_a_raster_or_clean_with_no_effects() {
         let mut s = stack();
-        // Base layers are never directly editable.
+        // `Source` is immutable; `Clean` is paintable (it is the shared clean overlay).
         assert!(!s.layers()[0].can_edit_pixels(), "source");
-        assert!(!s.layers()[1].can_edit_pixels(), "clean");
+        assert!(s.layers()[1].can_edit_pixels(), "clean");
 
         let id = s.add_raster_layer();
         // A fresh raster has an empty effects chain → directly editable.
