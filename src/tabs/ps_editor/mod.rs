@@ -9,15 +9,15 @@ set, and tiled GPU cache.
 Key structures:
 - `PsEditorTabState`: the tab state held by `MangaApp`.
 - `PsEditorDockCx`: the per-frame context the panel dock lends to one tab body at a time.
-- `PsEditorPanelVisibility`: the four "is this panel shown" flags, stored in the MAIN tab's
+- `PsEditorPanelVisibility`: the five "is this panel shown" flags, stored in the MAIN tab's
   `TabExtras` bag and toggled from its «Панели…» menu.
 
 Architecture:
 - UI shape: the canvas is the full-area BACKGROUND and every surface over it is a dock tab
   (`crate::widgets::panel_dock`) — «PS редактор», «Инструменты», «Выбранный инструмент»,
-  «Горячие клавиши», «Слои». `ps_editor_default_dock_layout` is their default arrangement, and
-  the tab supplies its OWN `DockArea` rect (it is not a canvas tab, so `canvas::dock_area_rect`
-  — which reserves the canvas' scrollbar strip — does not apply).
+  «Горячие клавиши», «Слои», «Коррекция». `ps_editor_default_dock_layout` is their default
+  arrangement, and the tab supplies its OWN `DockArea` rect (it is not a canvas tab, so
+  `canvas::dock_area_rect` — which reserves the canvas' scrollbar strip — does not apply).
 - `viewport`: own camera (pan/zoom/fit), independent of the shared canvas engine.
 - `layers`: ordered layer stack with two locked base layers (source + clean) and user raster
   layers above them.
@@ -48,12 +48,17 @@ Architecture:
   latest-wins request via `pending_raster_effects` if one is already in flight);
   `poll_ps_raster_effects_jobs` (once per frame) does the cheap GUI-side apply (recenter, doc
   routing, reversible persist). Mirrors the typing tab's `apply_raster_effects_edit` pipeline.
+- «Коррекция»: a VIEW-ONLY colour correction of the composited canvas (`correction/`). It is the
+  project's first GPU shader pass — an `egui_glow` paint callback inserted between `draw_composite`
+  and the pixel-grid pass — and it never touches layer pixels, the doc or the saved project. Its GL
+  objects are built lazily inside the callback and freed from `MangaApp::on_exit`.
 
 Notes:
 Base layers mirror existing models read-only and are never written back. User raster layers are
 session-scoped in memory (kept per page); on-disk persistence is a future phase.
 */
 
+pub mod correction;
 pub mod edit_op;
 pub mod layer_render;
 pub mod layers;
@@ -78,6 +83,7 @@ use crate::widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabExtras, TabId,
 };
+use correction::{ColorFilter, CorrectionState};
 use edit_op::{LayerFieldPatch, LifecycleDir, PsEditOp};
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
@@ -133,7 +139,7 @@ const PS_TEXT_PREVIEW_CHARS: usize = 16;
 // ---------------------------------------------------------------------------------------------
 // Dock tabs
 //
-// The five `TabId` literals below are STABLE, NON-LOCALIZED PERSISTENCE IDENTITIES: they key the
+// The six `TabId` literals below are STABLE, NON-LOCALIZED PERSISTENCE IDENTITIES: they key the
 // tab inside the `PanelLayout` section of `user_config.json` and inside `PanelDockState`'s
 // per-program-tab maps, so renaming one silently drops the user's arrangement for that panel.
 // They are therefore deliberately not routed through the `t!` catalog — a §A9 i18n exclusion
@@ -150,6 +156,8 @@ const PS_EDITOR_ACTIVE_TOOL_TAB: TabId = TabId::new("ps_editor.active_tool");
 const PS_EDITOR_HOTKEYS_TAB: TabId = TabId::new("ps_editor.hotkeys");
 /// «Слои»: the unified layer tree and the active-layer controls strip.
 const PS_EDITOR_LAYERS_TAB: TabId = TabId::new("ps_editor.layers");
+/// «Коррекция»: the view-only colour correction of the canvas (`correction/`).
+const PS_EDITOR_CORRECTION_TAB: TabId = TabId::new("ps_editor.correction");
 
 /// `TabExtras` flag key of the «Инструменты» panel's visibility. Stored on the MAIN tab.
 const PS_EDITOR_FLAG_TOOLS_PANEL: &str = "panels.tools";
@@ -159,6 +167,8 @@ const PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL: &str = "panels.active_tool";
 const PS_EDITOR_FLAG_HOTKEYS_PANEL: &str = "panels.hotkeys";
 /// `TabExtras` flag key of the «Слои» panel's visibility.
 const PS_EDITOR_FLAG_LAYERS_PANEL: &str = "panels.layers";
+/// `TabExtras` flag key of the «Коррекция» panel's visibility.
+const PS_EDITOR_FLAG_CORRECTION_PANEL: &str = "panels.correction";
 
 /// Every panel starts shown; `TabExtras::set_flag` keeps a flag at its default out of the config.
 const PS_EDITOR_PANEL_VISIBLE_DEFAULT: bool = true;
@@ -184,13 +194,17 @@ const PS_EDITOR_HOTKEYS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(300.0, 220.0);
 const PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(220.0, 140.0);
 /// First-frame size of «Слои».
 const PS_EDITOR_LAYERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(280.0, 380.0);
+/// Shrink floor of «Коррекция»: the combo plus the widest of its parameter cards.
+const PS_EDITOR_CORRECTION_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(200.0, 80.0);
+/// First-frame size of «Коррекция» (the combo and the two-slider card).
+const PS_EDITOR_CORRECTION_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(280.0, 140.0);
 
 /// Default panel arrangement of the «PS редактор» program tab.
 ///
 /// Two columns over the canvas. On the LEFT, «PS редактор» → «Инструменты» → «Выбранный инструмент»,
 /// which mirrors what the static layout showed as a top strip plus a left toolbar. On the RIGHT,
-/// «Слои» → «Горячие клавиши», mirroring the old right panel and keeping the left chain from
-/// stacking four panels deep on a short window.
+/// «Слои» → «Горячие клавиши» and «Слои» → «Коррекция», mirroring the old right panel and keeping
+/// the left chain from stacking four panels deep on a short window.
 ///
 /// It must name EVERY `TabId` this program tab can declare: `panel_dock::persist` resolves a
 /// stored tab key against the default layout's tab set, so a tab missing here would be dropped
@@ -257,6 +271,21 @@ pub(crate) fn ps_editor_default_dock_layout() -> DockLayout {
                 align: 0.0,
             },
         ),
+        (
+            PanelId::new(5),
+            vec![PS_EDITOR_CORRECTION_TAB],
+            // Anchored to «Горячие клавиши», NOT to «Слои». Two panels sharing one target, edge and
+            // align solve to the SAME rect — `solver::place_outside` is a pure function of the
+            // target rect and does no occupancy check — and the second one is then buried and
+            // unreachable. That is the failure the solver's own «THE SIBLING CONTRACT» test
+            // (`panel_dock/solver.rs`) exists to pin. Chaining continues the right-hand column
+            // «Слои» -> «Горячие клавиши» -> «Коррекция».
+            PanelAnchor::Panel {
+                target: PanelId::new(4),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
     ];
     for (id, tabs, anchor) in panels {
         let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
@@ -282,7 +311,7 @@ pub(crate) fn ps_editor_default_dock_layout() -> DockLayout {
     layout
 }
 
-/// Which of the four secondary panels the «Панели…» menu currently shows.
+/// Which of the five secondary panels the «Панели…» menu currently shows.
 ///
 /// Read straight off the dock state BEFORE the tabs are declared, so the `visible(..)` a tab is
 /// declared with is already the value the user last chose — reading it from a body would show the
@@ -297,10 +326,11 @@ struct PsEditorPanelVisibility {
     active_tool: bool,
     hotkeys: bool,
     layers: bool,
+    correction: bool,
 }
 
 impl PsEditorPanelVisibility {
-    /// Reads the four flags out of the MAIN tab's stored extras, defaulting to "shown".
+    /// Reads the five flags out of the MAIN tab's stored extras, defaulting to "shown".
     ///
     /// A tab that never stored anything yields no bag at all, hence the `map_or` over the whole
     /// lookup rather than per flag.
@@ -312,6 +342,7 @@ impl PsEditorPanelVisibility {
                 active_tool: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
                 hotkeys: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
                 layers: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+                correction: PS_EDITOR_PANEL_VISIBLE_DEFAULT,
             };
         };
         Self {
@@ -325,14 +356,18 @@ impl PsEditorPanelVisibility {
                 PS_EDITOR_PANEL_VISIBLE_DEFAULT,
             ),
             layers: extras.flag(PS_EDITOR_FLAG_LAYERS_PANEL, PS_EDITOR_PANEL_VISIBLE_DEFAULT),
+            correction: extras.flag(
+                PS_EDITOR_FLAG_CORRECTION_PANEL,
+                PS_EDITOR_PANEL_VISIBLE_DEFAULT,
+            ),
         }
     }
 
-    /// The four toggles as `(flag key, localized title, value)`, in menu order.
+    /// The five toggles as `(flag key, localized title, value)`, in menu order.
     ///
     /// One source for both the menu rows and the write-back below, so a panel can never appear in
     /// the menu under a key that is not the one persisted for it.
-    fn entries(&mut self) -> [(&'static str, &'static str, &mut bool); 4] {
+    fn entries(&mut self) -> [(&'static str, &'static str, &mut bool); 5] {
         [
             (
                 PS_EDITOR_FLAG_TOOLS_PANEL,
@@ -353,6 +388,11 @@ impl PsEditorPanelVisibility {
                 PS_EDITOR_FLAG_LAYERS_PANEL,
                 t!("ps_editor.tab.layers"),
                 &mut self.layers,
+            ),
+            (
+                PS_EDITOR_FLAG_CORRECTION_PANEL,
+                t!("ps_editor.tab.correction"),
+                &mut self.correction,
             ),
         ]
     }
@@ -385,7 +425,7 @@ struct PsEditorDockCx<'a> {
 /// Draws the «PS редактор» tab body: the page/zoom strip plus the «Панели…» visibility menu.
 ///
 /// The only body declared with `show_with_extras`, because it is the only one that WRITES the
-/// dock's per-tab extra state: the four flags are pushed on every frame with the value the menu
+/// dock's per-tab extra state: the five flags are pushed on every frame with the value the menu
 /// currently shows, which is the usage `TabExtras::set_flag` is designed for — it stores nothing
 /// while a flag equals its default and raises `changed` only when the content really moved.
 fn draw_main_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>, extras: &mut TabExtras) {
@@ -432,6 +472,21 @@ fn draw_active_tool_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
 /// Draws the «Горячие клавиши» tab body.
 fn draw_hotkeys_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
     cx.tab.hotkeys_tab_contents(ui);
+}
+
+/// Draws the «Коррекция» tab body: the view-only colour correction of the canvas.
+///
+/// Mutating `cx.tab` here is sound and deliberate — a PS-editor body is lent the whole tab state
+/// (`PsEditorDockCx`), and the correction is per-session view state exactly like `smoothing_enabled`.
+/// The canvas reads it fresh every frame, so nothing has to be invalidated from here.
+fn draw_correction_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    let failed = cx
+        .tab
+        .correction_filter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .has_failed();
+    correction::correction_panel_body(ui, &mut cx.tab.correction, failed);
 }
 
 /// Draws the «Слои» tab body, parking its deferred actions in the frame context.
@@ -553,6 +608,19 @@ pub struct PsEditorTabState {
     /// enabled at every zoom and simply shows nothing until the zoom is sufficient (its tooltip says
     /// so). Not persisted, for the same reason as `smoothing_enabled`.
     pixel_grid_enabled: bool,
+    /// «Коррекция»: the VIEW-ONLY colour correction the canvas is drawn through (`correction/`).
+    ///
+    /// Purely a property of the picture on screen — it never reaches layer pixels, the shared doc,
+    /// `layers.json` or `CleanOverlaysModel`. Deliberately NOT persisted, for the same reason as
+    /// `smoothing_enabled` and `pixel_grid_enabled`: it is a per-session viewing aid.
+    correction: CorrectionState,
+    /// GL objects of the correction's shader pass, shared with the paint callback.
+    ///
+    /// Behind an `Arc<Mutex<..>>` because `egui_glow::CallbackFn` demands a `Send + Sync` closure;
+    /// in practice the lock is uncontended, since the panel body and the callback both run on the
+    /// GUI thread. Built lazily inside the first callback and freed by `release_gpu_resources`,
+    /// which `MangaApp::on_exit` calls with the context eframe hands it.
+    correction_filter: Arc<Mutex<ColorFilter>>,
     /// Camera synced in from `CanvasView`, applied once its target page is loaded so the async
     /// page load (which refits the camera) does not clobber it. See `sync_view_from_canvas`.
     pending_camera: Option<CameraSync>,
@@ -807,6 +875,8 @@ impl Default for PsEditorTabState {
             pending_actual_size: false,
             smoothing_enabled: true,
             pixel_grid_enabled: false,
+            correction: CorrectionState::default(),
+            correction_filter: Arc::new(Mutex::new(ColorFilter::default())),
             pending_camera: None,
             last_overlay_revision: 0,
             node_generations: HashMap::new(),
@@ -2486,7 +2556,7 @@ impl PsEditorTabState {
             .min_size(PS_EDITOR_MAIN_TAB_MIN_SIZE_PX)
             .initial_size(PS_EDITOR_MAIN_TAB_INITIAL_SIZE_PX)
             .show_with_extras(draw_main_tab_body);
-        // The four secondary tabs are declared on EVERY frame regardless of `visible`: a hidden tab
+        // The five secondary tabs are declared on EVERY frame regardless of `visible`: a hidden tab
         // keeps its slot in the layout and only its panel is skipped, so re-enabling it returns it
         // to wherever the user put it. Skipping the declaration would make the dock treat it as
         // another program tab's and seed it a fresh panel on the next open.
@@ -2514,6 +2584,12 @@ impl PsEditorTabState {
             .min_size(PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX)
             .initial_size(PS_EDITOR_LAYERS_TAB_INITIAL_SIZE_PX)
             .show(draw_layers_tab_body);
+        dock.tab(PS_EDITOR_CORRECTION_TAB)
+            .title(|| t!("ps_editor.tab.correction"))
+            .visible(visibility.correction)
+            .min_size(PS_EDITOR_CORRECTION_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_CORRECTION_TAB_INITIAL_SIZE_PX)
+            .show(draw_correction_tab_body);
         // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a panel the user
         // detached into a sub-window, whose rect lives in that window's own frame and would carve a
         // dead zone out of this window's top-left corner (`PanelDockOutput`).
@@ -4561,6 +4637,71 @@ impl PsEditorTabState {
             })
     }
 
+    /// Runs the view-only «Коррекция» pass over the composited page, if one is active.
+    ///
+    /// Emits an `egui_glow` paint callback that copies the already-drawn canvas out of the
+    /// framebuffer and re-draws it through `out = clamp(gain * c + bias, 0, 1)`. It is the project's
+    /// only GPU shader pass; the contract and the reason egui alone cannot express it are in
+    /// `correction/MODULE_README.md`.
+    ///
+    /// Clipped to `page_rect ∩ canvas_rect`, so the viewport ground outside the page keeps its own
+    /// colour. Draws nothing when the correction is neutral, when «Нет» is selected, or when the
+    /// filter has already failed — so the default path costs one comparison and no GL work at all.
+    ///
+    /// VIEW-ONLY: it changes what is on screen this frame and nothing else. No layer buffer, no
+    /// document node and no on-disk file is touched.
+    fn draw_correction_pass(&self, ui: &egui::Ui, canvas_rect: Rect, page_rect: Rect) {
+        let Some(uniforms) = self.correction.active_uniforms() else {
+            return;
+        };
+        if self
+            .correction_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_failed()
+        {
+            return;
+        }
+        let target = page_rect.intersect(canvas_rect);
+        if !target.is_positive() {
+            return;
+        }
+        // The closure owns its own handle: `CallbackFn` requires `Send + Sync + 'static`, so nothing
+        // borrowed from `self` may cross into it.
+        let filter = Arc::clone(&self.correction_filter);
+        let callback = egui::PaintCallback {
+            rect: target,
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(
+                move |info: egui::PaintCallbackInfo, painter: &eframe::egui_glow::Painter| {
+                    filter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .paint(painter.gl(), &info, uniforms);
+                },
+            )),
+        };
+        ui.painter_at(target).add(egui::Shape::Callback(callback));
+    }
+
+    /// Frees the GL objects of the correction filter.
+    ///
+    /// Called from `MangaApp::on_exit`, the one shutdown hook eframe hands a `&glow::Context`.
+    /// A `None` context means eframe had no live context to give (an already-lost renderer), in
+    /// which case the names die with it; that is logged rather than passed over in silence.
+    pub fn release_gpu_resources(&mut self, gl: Option<&eframe::glow::Context>) {
+        let mut filter = self
+            .correction_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match gl {
+            Some(gl) => filter.destroy(gl),
+            None => crate::runtime_log::log_warn(
+                "[ps_editor] correction: no GL context at shutdown; the colour-filter objects are \
+                 released with the context itself",
+            ),
+        }
+    }
+
     /// Central pan/zoom canvas: input handling, layer composite, overlays.
     ///
     /// `rect` is the SAME rect the dock was given this frame, so the canvas fills the whole
@@ -4896,6 +5037,15 @@ impl PsEditorTabState {
         self.sync_render_cache();
         self.upload_layers(ctx);
         self.draw_composite(ctx, ui, &view);
+        // The page rect in SCREEN space: the correction pass and the pixel grid both need it.
+        let page_screen_rect = view.world_rect_to_screen(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(page_size[0] as f32, page_size[1] as f32),
+        ));
+        // «Коррекция» runs HERE: after the composite (so it corrects the page and the checkerboard
+        // under it) and before every legibility overlay below (so the grid, the marquee, the menu
+        // and the tool cursor stay exactly as drawn).
+        self.draw_correction_pass(ui, rect, page_screen_rect);
         // The pixel grid is ONE late overlay pass over the whole page, never a per-layer one —
         // the same contract the canvas keeps (`canvas/scene.rs::draw_visible_pixel_grid_overlay`).
         // The manual checkbox states the user's intent; the magnification threshold stays as a cost
@@ -4907,13 +5057,9 @@ impl PsEditorTabState {
             // the lines are axis-aligned at `view.zoom` spacing. A rotated/scaled/deformed raster
             // layer has its own texel grid and will NOT line up with this one — an accepted
             // limitation (see `MODULE_README.md`), not something to compensate for here.
-            let page_rect = view.world_rect_to_screen(Rect::from_min_size(
-                Pos2::ZERO,
-                Vec2::new(page_size[0] as f32, page_size[1] as f32),
-            ));
             crate::canvas::pixel_grid::draw_pixel_grid(
                 &ui.painter_at(rect),
-                page_rect,
+                page_screen_rect,
                 view.zoom,
                 rect,
                 ctx.pixels_per_point(),
@@ -6789,10 +6935,10 @@ mod tests {
     /// name every tab this program tab can declare — a tab missing here would be dropped from the
     /// user's stored arrangement on every load.
     #[test]
-    fn the_default_dock_layout_places_the_five_ps_editor_panels() {
+    fn the_default_dock_layout_places_the_six_ps_editor_panels() {
         let layout = ps_editor_default_dock_layout();
         assert_eq!(layout.validate(), Ok(()));
-        assert_eq!(layout.panels().len(), 5);
+        assert_eq!(layout.panels().len(), 6);
 
         let declared: BTreeSet<TabId> = layout
             .panels()
@@ -6805,12 +6951,13 @@ mod tests {
             PS_EDITOR_ACTIVE_TOOL_TAB,
             PS_EDITOR_HOTKEYS_TAB,
             PS_EDITOR_LAYERS_TAB,
+            PS_EDITOR_CORRECTION_TAB,
         ]
         .into_iter()
         .collect();
         assert_eq!(
             declared, expected,
-            "the default layout must name exactly the five tabs the program tab declares"
+            "the default layout must name exactly the six tabs the program tab declares"
         );
     }
 
@@ -6868,6 +7015,16 @@ mod tests {
                 align: 0.0
             }
         );
+        // «Коррекция» hangs under «Горячие клавиши», not under «Слои»: sharing «Слои» + Bottom
+        // with the hotkeys panel would solve both to one rect and bury this one.
+        assert_eq!(
+            panel_of(PS_EDITOR_CORRECTION_TAB).anchor,
+            PanelAnchor::Panel {
+                target: panel_of(PS_EDITOR_HOTKEYS_TAB).id,
+                edge: DockEdge::Bottom,
+                align: 0.0
+            }
+        );
     }
 
     /// The tab-level shortcut list is rendered as a two-column grid, so a blank half is an
@@ -6910,15 +7067,15 @@ mod tests {
     /// that panel and no other.
     type VisibilityRowProbe = (&'static str, &'static str, fn(&mut PsEditorPanelVisibility));
 
-    /// The four visibility flags default to "shown" when the dock has stored nothing, and each one
-    /// is read from its OWN key — a copy-paste slip between the four keys would otherwise show up
+    /// The five visibility flags default to "shown" when the dock has stored nothing, and each one
+    /// is read from its OWN key — a copy-paste slip between the five keys would otherwise show up
     /// only as two panels that hide together.
     ///
     /// The stored case has to go through a real `TabExtras` bag seeded with
     /// [`PanelDockState::put_tab_extras`]: on a bare `PanelDockState` the MAIN tab has no bag at
-    /// all, so `read` leaves through its `let Some(..) else` branch and the four `extras.flag(..)`
+    /// all, so `read` leaves through its `let Some(..) else` branch and the five `extras.flag(..)`
     /// lines — the thing being tested — never run. One key is turned off at a time, because with
-    /// all four flags equal any permutation of the keys looks identical.
+    /// all five flags equal any permutation of the keys looks identical.
     #[test]
     fn panel_visibility_defaults_to_all_shown_and_reads_each_key() {
         let layout_key = AppTab::PsEditor.key();
@@ -6930,13 +7087,15 @@ mod tests {
         assert!(visibility.active_tool);
         assert!(visibility.hotkeys);
         assert!(visibility.layers);
+        assert!(visibility.correction);
 
         // Each flag key, with the field it must land in.
-        let cases: [VisibilityKeyProbe; 4] = [
+        let cases: [VisibilityKeyProbe; 5] = [
             (PS_EDITOR_FLAG_TOOLS_PANEL, |v| v.tools),
             (PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL, |v| v.active_tool),
             (PS_EDITOR_FLAG_HOTKEYS_PANEL, |v| v.hotkeys),
             (PS_EDITOR_FLAG_LAYERS_PANEL, |v| v.layers),
+            (PS_EDITOR_FLAG_CORRECTION_PANEL, |v| v.correction),
         ];
         for (key, field) in cases {
             let mut state = PanelDockState::new();
@@ -6986,8 +7145,9 @@ mod tests {
             active_tool: true,
             hotkeys: true,
             layers: true,
+            correction: true,
         };
-        let cases: [VisibilityRowProbe; 4] = [
+        let cases: [VisibilityRowProbe; 5] = [
             (PS_EDITOR_FLAG_TOOLS_PANEL, t!("ps_editor.tab.tools"), |v| {
                 v.tools = false;
             }),
@@ -7006,6 +7166,13 @@ mod tests {
                 t!("ps_editor.tab.layers"),
                 |v| {
                     v.layers = false;
+                },
+            ),
+            (
+                PS_EDITOR_FLAG_CORRECTION_PANEL,
+                t!("ps_editor.tab.correction"),
+                |v| {
+                    v.correction = false;
                 },
             ),
         ];
@@ -7038,6 +7205,7 @@ mod tests {
                 PS_EDITOR_FLAG_ACTIVE_TOOL_PANEL,
                 PS_EDITOR_FLAG_HOTKEYS_PANEL,
                 PS_EDITOR_FLAG_LAYERS_PANEL,
+                PS_EDITOR_FLAG_CORRECTION_PANEL,
             ],
             "the menu rows and the persisted keys are one list, in one order"
         );

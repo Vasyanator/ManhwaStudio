@@ -80,7 +80,7 @@ model's own autosave / save-to-project path instead. See `models/layer_model/` f
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
 ## Files and submodules
-- `mod.rs`: `PsEditorTabState` orchestration — the five dock tabs (see «Panels» below), canvas
+- `mod.rs`: `PsEditorTabState` orchestration — the six dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
   copy/cut menu (`clip_into_new_layer`), layer/group save+load via `models::layer_model`,
   `merge_down` (`composite_to_page` flattens a raster onto the layer directly beneath it by unified
@@ -174,6 +174,10 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   used here: `render_cache` is not registered with `memory_manager`, so dual handles would be
   untracked, unevictable GPU memory (~+122 MB for the two base layers of a tall page).
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
+- `correction/`: the VIEW-ONLY «Коррекция» panel — its model and maths (`model.rs`, GUI-free and
+  GL-free), the `egui_glow` shader pass that renders it (`gpu.rs`, the project's ONLY GL code) and
+  the panel body plus its reusable parameter card (`ui.rs`). Own `MODULE_README.md`; it never writes
+  pixels, the doc or the saved project.
 - `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
   `ReversibleAction<Ctx = PsEditorTabState>` with four variants (real `match`, no `_ =>`, so every
   variant is handled everywhere): `RasterPixels` (brush stroke as a tiled+zstd `RasterDiff`, Part A),
@@ -185,10 +189,10 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   (diff → `Layer.image` + `base_image` mirror), `copy_region_premul` (region-local buffer), and
   `apply_field_patch_to_layer` (drives a `Layer` field to a patch's `after`; also the no-doc fallback).
 
-## Panels: five dock tabs over a full-area canvas
+## Panels: six dock tabs over a full-area canvas
 This tab hosts the app-owned panel dock (`src/widgets/panel_dock/`) and is its first NON-canvas
 consumer. There are no static `egui::Panel`s: the canvas fills the whole program-tab area as the
-BACKGROUND and five floating dock tabs sit over it.
+BACKGROUND and six floating dock tabs sit over it.
 
 | tab id (stable, non-localized) | caption key | body |
 |---|---|---|
@@ -197,6 +201,7 @@ BACKGROUND and five floating dock tabs sit over it.
 | `ps_editor.active_tool` | `ps_editor.tab.active_tool` | the active tool's `options_ui`, or `ps_editor.active_tool.no_options` when `PsTool::has_options` is false |
 | `ps_editor.hotkeys` | `ps_editor.tab.hotkeys` | the active tool's `hotkey_rows`, then `ps_editor_common_hotkey_rows` |
 | `ps_editor.layers` | `ps_editor.tab.layers` | `layers_panel_body` + `draw_active_controls` |
+| `ps_editor.correction` | `ps_editor.tab.correction` | «Коррекция»: the VIEW-ONLY colour correction, `correction::correction_panel_body` (see `correction/MODULE_README.md`) |
 
 The tab ids are PERSISTENCE identities (they key the panel inside `user_config.json` and inside
 `PanelDockState`), so they stay non-localized literals — a §A9 i18n exclusion
@@ -205,22 +210,27 @@ The tab ids are PERSISTENCE identities (they key the panel inside `user_config.j
 **Default arrangement** (`ps_editor_default_dock_layout`, registered in
 `app.rs::panel_dock_default_layout_builders`): two columns. Left — «PS редактор» on the viewport's left
 edge, «Инструменты» below it, «Выбранный инструмент» below that. Right — «Слои» on the viewport's
-right edge, «Горячие клавиши» below it. No size is pinned there; each tab declares its own
+right edge, then «Горячие клавиши» under it and «Коррекция» under THAT — a chain, not two panels on
+one target: `solver::place_outside` is a pure function of the target rect and does no occupancy
+check, so two panels sharing a target, edge and align solve to the SAME rect and the second is
+buried unreachable (the solver's own «THE SIBLING CONTRACT» test pins that failure).
+No size is pinned there; each tab declares its own
 `min_size` / `initial_size` per frame. The builder must name EVERY tab this program tab can
 declare: `panel_dock::persist` resolves stored tab keys against it.
 
-**Visibility.** Four booleans, all defaulting to `true`, live in the MAIN tab's `TabExtras` bag
-under `panels.tools` / `panels.active_tool` / `panels.hotkeys` / `panels.layers`. They are read off
+**Visibility.** Five booleans, all defaulting to `true`, live in the MAIN tab's `TabExtras` bag
+under `panels.tools` / `panels.active_tool` / `panels.hotkeys` / `panels.layers` /
+`panels.correction`. They are read off
 the dock state BEFORE the tabs are declared (`PsEditorPanelVisibility::read`) — reading them from a
 body would show a hidden panel for one frame — and written back from the main tab's body, which is
 the only one declared with `show_with_extras`. That write is what raises `changed` → `dirty` → the
-persistence write; no other machinery is involved. All five tabs are declared on EVERY frame
+persistence write; no other machinery is involved. All six tabs are declared on EVERY frame
 regardless: a hidden tab keeps its slot, a skipped declaration would lose it. «PS редактор» is never in
 the menu — the menu lives in it.
 
 **Frame order** (`PsEditorTabState::draw`, which takes the app's `&mut PanelDockState` as a lent-in
 parameter): resolve ONE `area_rect` (used as both the `DockArea` rect and the canvas rect) →
-`ensure_default_layout` → read the visibility flags → build `PsEditorDockCx` → declare the five
+`ensure_default_layout` → read the visibility flags → build `PsEditorDockCx` → declare the six
 tabs → `dock.end` → store `PanelDockOutput::drawn_panels` rects into `panel_rects` and apply the
 deferred `PanelActions` → draw the effects-editor window → draw the canvas LAST over `area_rect`.
 The canvas still ends up UNDERNEATH: panels live on `Order::Foreground` areas while the canvas
@@ -365,12 +375,31 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
      `TILE_UPLOAD_BUDGET_PER_FRAME`, so a flip is visible as a brief sweep — which is why
      `upload_layers` requests the frames that finish it. `PsTextLayer` stores its `TextureOptions`
      next to its handle, because the handle survives a re-projection by uid.
-  2. **The grid is one late overlay pass**, drawn from `draw_canvas` right after `draw_composite`
-     — never inside a layer. Same contract as `canvas/scene.rs::draw_visible_pixel_grid_overlay`.
+  2. **The grid is one late overlay pass**, drawn from `draw_canvas` right after the «Коррекция»
+     pass — never inside a layer. Same contract as `canvas/scene.rs::draw_visible_pixel_grid_overlay`.
   3. **The grid keeps the zoom gate even under a manual checkbox.** The checkbox states intent;
      `canvas::pixel_inspection_recommended_for` remains as a cost and legibility guard (below the
      threshold the grid is a solid grey field costing tens of thousands of segments). The checkbox
      therefore stays ENABLED at any zoom and simply shows nothing until the zoom suffices.
+- **«Коррекция» is VIEW-ONLY and is the project's only GPU shader pass** (`correction/`, own
+  `MODULE_README.md`). `CorrectionState` on `PsEditorTabState` is a per-session viewing aid beside
+  `smoothing_enabled` / `pixel_grid_enabled` and is likewise NOT persisted; no code path in it
+  writes a layer buffer, the shared `LayerDoc`, `layers.json` or `CleanOverlaysModel`.
+  - **Draw order.** `draw_correction_pass` runs in `draw_canvas` BETWEEN `draw_composite` and the
+    pixel-grid pass, clipped to `page_rect ∩ canvas rect`. So it corrects the page composite and
+    the checkerboard under it, and never the pixel grid, the selection marquee, the selection menu
+    or the tool cursor — those are deliberate legibility devices.
+  - **Why a shader.** egui's fragment stage is a multiply and its blend stage is fixed
+    `(ONE, ONE_MINUS_SRC_ALPHA)`, so every egui-reachable composition is `out = M*c + B` with
+    `M >= 0, B >= 0`; contrast pivoted on mid-grey needs a NEGATIVE offset. An `egui_glow` paint
+    callback is the only mechanism that can express it.
+  - **GL resource lifetime.** The program, VAO/VBO and scratch texture are created LAZILY inside the
+    first paint callback (the only place a `&glow::Context` exists) and held behind
+    `Arc<Mutex<ColorFilter>>` because `CallbackFn` demands a `Send + Sync` closure. They are freed by
+    `PsEditorTabState::release_gpu_resources`, which `MangaApp::on_exit` calls with the context
+    eframe hands it — the ONE shutdown hook that has one. A build failure disables the pass for the
+    session, logs the driver's message and makes the panel say the correction is unavailable; it
+    never silently draws nothing.
 - **The pixel grid is a PAGE grid, and that is an accepted limitation.** Page px == source px for
   the two base layers, which are permanently identity-transformed (`layers.rs::is_transformable`),
   so the lines coincide with their texels exactly. A user raster layer that is rotated, scaled or
@@ -538,7 +567,10 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   (and register the builder in `app.rs::panel_dock_default_layout_builders`).
 - To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
   (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
-  / `layers_panel_body`).
+  / `layers_panel_body`); the «Коррекция» body lives in `correction/ui.rs`.
+- To change the view-only colour correction — its maths, its shader, its panel, or which part of the
+  canvas it covers — edit `correction/` (see that directory's `MODULE_README.md`) and
+  `draw_correction_pass` in `mod.rs`.
 - To change the panel's row ORDER (including the `Клин`-above-`Исходник` base tail), edit
   `build_unified_tree` in `tree.rs` — never the `LayerStack` vector order.
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /
