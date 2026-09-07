@@ -248,6 +248,35 @@ main.rs → ProjectData → MangaApp
 
 ---
 
+## Application version (`build.rs` + `src/version_format.rs`)
+
+The version has TWO forms, and the split is a safety contract, not a style choice:
+- `MS_APP_VERSION` — extended, human-facing. `build.rs` composes it at compile time from
+  `CARGO_PKG_VERSION` plus git state: on a tag `3.6.0`, ahead of a tag `3.6.0+<hash7>-<N>`, plus a
+  dirty marker (`3.6.0+dirty` / `3.6.0+1cd9638-83-dirty`). Dirty means uncommitted changes anywhere
+  under `src/` or `crates/`, documentation in those trees included. No git, no repository (checked
+  on `<manifest>/.git` itself, so an enclosing repository can never be adopted), no tag, or any
+  failing git command → exactly the `Cargo.toml` version, silently and without `cargo:warning=`
+  (that is the normal state of a GitHub source ZIP).
+- `CARGO_PKG_VERSION` — plain, machine-facing. **Never overridden** — `winresource` also reads it
+  for the numeric Windows `FILEVERSION`.
+
+The rule: everything DISPLAYED to a human (window title, version labels, `--version`, diagnostic
+logs) uses the extended form; everything COMPARED or parsed by another process uses the plain one.
+That covers the backend `/health` equality, the Python downloader equality and all three release
+comparators. Where the extended string does cross a process boundary (probing an installed copy
+with `--version`), both sides are reduced with `version_format::version_core` (build metadata cut
+from the first `+`) before comparing. Composition and stripping live in `src/version_format.rs`,
+which `build.rs` pulls in with `include!` so the build script's code is covered by `cargo test`.
+
+`build.rs` must keep its `cargo:rerun-if-changed` watches (`.git/HEAD`, `.git/index`,
+`.git/packed-refs`, `.git/refs`, `src`, `crates`) and emit them ONLY for existing paths: a watch on
+a missing path makes cargo re-run the script on every build. Consequence to know: those watches
+re-run the script on every source change, so a Windows-target build or check without
+`MS_DISABLE_BUILD_CODESIGN=1` re-spawns the detached codesign worker each time.
+
+---
+
 ## Шрифты UI (`src/ui_fonts.rs`)
 
 Единственный владелец шрифтового стека интерфейса. **Каждое** замыкание-конструктор
@@ -1118,6 +1147,9 @@ because a screenshot looked plausible.
   вызова `ui_fonts::install*` — это баг. Байты бандла берутся у `ms-fonts` и ставятся
   `FontData::from_static`; собственное `fs::read` + `from_owned` для `fonts/ui` — регресс
   на ≈99 МБ памяти.
+- **Версия** — сравнивать и парсить только `CARGO_PKG_VERSION`; `MS_APP_VERSION` (git-суффикс) —
+  исключительно для показа человеку. Суффикс в сравнении = ложный модал рассинхрона на каждой
+  dev-сборке и сборка, которая «новее» собственного релизного тега.
 - **Shared state** — только через `Arc<Mutex<…>>` модели с `revision`; не копировать состояние вручную между вкладками.
 - **CanvasView** — общий движок; логика вкладки добавляется через `CanvasHooks` и отдельные runtime-слои, не форком canvas-кода.
 - **CleanOverlaysModel** — держать двойное представление (ColorImage + RgbaImage); одностороннее разрушает export и инструменты.

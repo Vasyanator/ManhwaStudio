@@ -123,7 +123,11 @@ enum UpdateMode {
 }
 
 struct UpdateApp {
+    /// Plain `CARGO_PKG_VERSION`: the value fed to the release comparison, so that a
+    /// git-suffixed development build never outranks the tag it was built from.
     local_version: String,
+    /// Extended `MS_APP_VERSION`: shown to the user, never compared or parsed.
+    local_version_display: String,
     page: UpdatePage,
     state: UpdateState,
     pending_check: Option<mpsc::Receiver<Result<UpdateCheckResult, String>>>,
@@ -143,6 +147,7 @@ impl UpdateApp {
     fn new(mode: UpdateMode, output: Arc<Mutex<UpdateWindowOutcome>>) -> Self {
         let mut app = Self {
             local_version: env!("CARGO_PKG_VERSION").to_string(),
+            local_version_display: env!("MS_APP_VERSION").to_string(),
             page: UpdatePage::Check,
             state: UpdateState::Checking,
             pending_check: None,
@@ -373,7 +378,7 @@ impl UpdateApp {
             ui.add_space(44.0);
             ui.heading(t!("installer.update.window_title"));
             ui.add_space(8.0);
-            ui.label(tf!("installer.update.current_version_label", arg = self.local_version));
+            ui.label(tf!("installer.update.current_version_label", arg = self.local_version_display));
             ui.add_space(18.0);
 
             match &self.state {

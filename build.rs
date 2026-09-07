@@ -1,8 +1,40 @@
 /*
 FILE OVERVIEW: build.rs
-Build script for platform-specific executable metadata.
+Build script for platform-specific executable metadata and the compile-time version.
 
 Main responsibilities:
+- Emits `cargo:rustc-env=MS_APP_VERSION=<composed version>` — the human-facing
+  application version, derived from `CARGO_PKG_VERSION` plus the git state of the
+  source tree. `CARGO_PKG_VERSION` itself is NEVER overridden: it stays the
+  machine-facing value used by every comparison and cross-process parse, and it is
+  also what `winresource` reads from this script's own environment for the numeric
+  Windows `FILEVERSION` (which has no encoding for a hash suffix anyway).
+  The composition itself lives in `src/version_format.rs` and is pulled in with
+  `include!` so that the exact code this script runs is covered by `cargo test`.
+  Every git failure — no `git` on PATH, no repository, no tags, a shallow clone,
+  a non-zero exit — degrades silently to the plain `Cargo.toml` version. That is the
+  normal state of a GitHub source ZIP, so it must never produce a `cargo:warning=`.
+- Emits the `cargo:rerun-if-changed` watches that keep that version fresh. This is
+  NOT optional bookkeeping: this script already emitted `rerun-if-changed`, which
+  REPLACES cargo's default "re-run when any package file changed", so without the
+  watches below a git-derived value would go stale on the very next build. Watched:
+  `.git/HEAD`, `.git/index`, `.git/packed-refs`, `.git/refs` (commits, staging,
+  branch switches, tag changes) and the `src` / `crates` directories (which is what
+  makes the dirty marker track reality — editing a file without staging it does not
+  touch `.git/index`). A watch is emitted ONLY for a path that actually exists: a
+  `rerun-if-changed` naming a missing path makes cargo re-run this script on every
+  single build, and a source ZIP has no `.git` at all — exactly the case that must
+  stay cheap. When `.git` is a FILE (linked worktree or submodule checkout) the ref
+  watches are skipped rather than guessed at.
+  KNOWN CONSEQUENCE, awaiting a decision by the project owner: watching `src`/`crates`
+  makes this script re-run on every source change, so EVERY Windows-target build or
+  check that does not set `MS_DISABLE_BUILD_CODESIGN=1` re-spawns the detached
+  `osslsigncode` worker below. `cargo check-all` is exactly such an invocation — it
+  cross-checks the windows-gnu target and sets nothing — so the routine post-change
+  check now leaves a signer waiting up to `SIGN_WAIT_SECONDS` (300 s) per executable
+  for `.exe` files that a `cargo check` never produces. Set
+  `MS_DISABLE_BUILD_CODESIGN=1` for checks to avoid it. Do NOT change the signing
+  behaviour here to work around this: the release workflow is the owner's call.
 - On Windows, embeds `app_icon.ico` into the PE resources so the produced `.exe`
   has the correct file icon in Explorer and shell surfaces.
 - On Windows, starts a detached post-build `osslsigncode` worker that waits for
@@ -22,6 +54,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+// The version composition is shared verbatim with the crate (`mod version_format;` in
+// `src/main.rs`). `include!` rather than a copy, so that the code this script runs is the
+// code `cargo test` covers; the file's `#[cfg(test)] mod tests` is inert here.
+include!("src/version_format.rs");
+
 const SIGN_WAIT_SECONDS: u64 = 300;
 const SIGN_TS_URL: &str = "http://timestamp.sectigo.com";
 const DISABLE_BUILD_CODESIGN_ENV: &str = "MS_DISABLE_BUILD_CODESIGN";
@@ -40,6 +77,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MS_CODESIGN_P12");
     println!("cargo:rerun-if-env-changed=MS_CODESIGN_PASSWORD");
     println!("cargo:rerun-if-env-changed={DISABLE_BUILD_CODESIGN_ENV}");
+
+    emit_app_version();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" {
@@ -62,6 +101,125 @@ fn manifest_dir() -> PathBuf {
 
 fn secret_config_path() -> PathBuf {
     manifest_dir().join(SECRET_CONFIG_REL)
+}
+
+/// Emits `cargo:rustc-env=MS_APP_VERSION` together with the `rerun-if-changed` watches
+/// that keep it fresh. See this file's header for the rerun policy and its accepted
+/// side effect on the Windows codesign worker.
+///
+/// Never fails: any git problem degrades to the plain `CARGO_PKG_VERSION`, silently and
+/// without a `cargo:warning=` (a source ZIP has no repository, and that is normal).
+fn emit_app_version() {
+    let manifest = manifest_dir();
+    emit_version_rerun_watches(&manifest);
+
+    let base_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    // The probes run with `current_dir(manifest)` and git searches UPWARD for a
+    // repository. Without this gate a `.git`-less source tree unpacked inside some other
+    // repository — the GitHub-ZIP case this feature exists to degrade gracefully on —
+    // would silently adopt the ENCLOSING repository's tag, distance and hash. That is a
+    // wrong version rather than a missing one, and a permanently stale one, since no
+    // `.git/*` watch was emitted for a directory that is not there. `.exists()`, not
+    // `.is_dir()`: a linked worktree stores `.git` as a file and is still a repository.
+    let git_info = if manifest.join(".git").exists() { git_describe_info(&manifest) } else { None };
+    // The dirty flag is meaningless without a commit to attach it to, so the probe is
+    // skipped entirely when `git describe` produced nothing (see `compose_app_version`).
+    let dirty = git_info.is_some() && git_source_tree_is_dirty(&manifest);
+    let version = compose_app_version(
+        &base_version,
+        git_info.as_ref().map(|(hash, distance)| (hash.as_str(), *distance)),
+        dirty,
+    );
+    println!("cargo:rustc-env=MS_APP_VERSION={version}");
+}
+
+/// Emits one `cargo:rerun-if-changed` per EXISTING path that can change the composed
+/// version. Missing paths are skipped on purpose: cargo treats a watch on a missing path
+/// as "always changed" and would re-run this script on every build, which is precisely
+/// the wrong outcome in a `.git`-less source ZIP.
+fn emit_version_rerun_watches(manifest: &Path) {
+    // Source directories: cargo walks a watched directory recursively. These are what the
+    // dirty marker depends on — an unstaged edit never touches anything under `.git/`.
+    for source_dir in ["src", "crates"] {
+        if manifest.join(source_dir).is_dir() {
+            println!("cargo:rerun-if-changed={source_dir}");
+        }
+    }
+
+    // A linked worktree or a submodule checkout stores `.git` as a FILE pointing at the
+    // real git directory. Resolving that indirection is out of scope; skip the ref
+    // watches rather than watch paths that do not exist.
+    let git_dir = manifest.join(".git");
+    if !git_dir.is_dir() {
+        return;
+    }
+    // `HEAD` catches branch switches and detached-HEAD moves, `index` catches staging,
+    // `packed-refs` and `refs/` catch commits and tag creation/packing.
+    for git_rel in [".git/HEAD", ".git/index", ".git/packed-refs", ".git/refs"] {
+        if manifest.join(git_rel).exists() {
+            println!("cargo:rerun-if-changed={git_rel}");
+        }
+    }
+}
+
+/// Runs `git` in `manifest` and returns its trimmed stdout, or `None` on any failure.
+///
+/// stderr is discarded so that it can never end up in parsed data, and
+/// `GIT_OPTIONAL_LOCKS=0` forbids git from taking the index lock: without it a plain
+/// `git status` may rewrite `.git/index` while refreshing it, and `.git/index` is one of
+/// the paths this script watches — the build would then re-run the script forever.
+///
+/// `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` are removed from the child environment:
+/// inherited, any of them would point the probe at a repository other than the one being
+/// built (a git hook or a wrapper script is enough to set them), which is the same wrong
+/// answer the `.git` gate in `emit_app_version` exists to prevent.
+fn run_git(manifest: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(manifest)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// Returns `(short_hash, commits_since_tag)` from `git describe --tags --long`, or `None`
+/// when there is no git, no repository, no reachable tag, or the output does not parse.
+///
+/// `git describe --long` prints `<tag>-<distance>-g<hash>`, and a tag name may itself
+/// contain `-`, so the two trailing fields are split off from the RIGHT. Anything that
+/// does not parse into a numeric distance and a hex hash is rejected instead of guessed.
+fn git_describe_info(manifest: &Path) -> Option<(String, u32)> {
+    let described = run_git(manifest, &["describe", "--tags", "--long", "--abbrev=7"])?;
+    let (head, hash_field) = described.rsplit_once('-')?;
+    let (_tag, distance_field) = head.rsplit_once('-')?;
+
+    let short_hash = hash_field.strip_prefix('g')?;
+    if short_hash.is_empty() || !short_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let distance = distance_field.parse::<u32>().ok()?;
+    Some((short_hash.to_string(), distance))
+}
+
+/// Reports whether `src/` or `crates/` carry uncommitted changes (modified, staged or
+/// untracked). The scope is those two directory trees ENTIRELY, documentation included:
+/// `src/MODULE_README.md` and the per-module readmes live inside `src/`, so editing one
+/// marks the build dirty. Everything outside the two trees — `wiki/`, `dev-docs/`,
+/// `user_config.json`, logs, `README_AGENT.md` — does not. Any git failure reads as
+/// "clean".
+fn git_source_tree_is_dirty(manifest: &Path) -> bool {
+    run_git(manifest, &["status", "--porcelain", "--", "src", "crates"])
+        .is_some_and(|status| !status.is_empty())
 }
 
 /// Reads `key_path` and `password` from `.secret/build_config.json`. Either may

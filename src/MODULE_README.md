@@ -55,6 +55,12 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `args.rs`: `clap` CLI contract, including visible startup/update flags, the update-check test
   override, the environment-check and run-from-sources flags, and hidden installer/update
   continuation flags.
+- `version_format.rs`: the pure composition and stripping of the application version string.
+  Compiled twice — as a crate module and, through `include!("src/version_format.rs")`, as part
+  of `build.rs` — so that the code the build script runs is the code `cargo test` covers. It
+  must stay std-only: no `t!`, no logging, no other crate item. Edit it when the shape of the
+  extended version or the "strip build metadata" rule changes; edit `build.rs` when the git
+  probing or the rerun watches change.
 - `venv_check.rs`: native-only, GUI-free readiness check of the managed Python environment
   behind `--check-venv`. Reads `General.ai_install_type` from the root's `user_config.json`
   (never writing it), resolves the interpreter through `python_manager`, and compares the
@@ -331,6 +337,16 @@ prompts instead of blocking the GUI thread.
   downloads, model probes, rendering, export, AI calls, and command execution to workers.
 - Runtime path decisions belong in `config.rs`. Do not hard-code writable data, model, config, log,
   or project paths in feature modules.
+- The application version has TWO forms and the split is a safety rule, not a preference.
+  `MS_APP_VERSION` (composed at build time by `build.rs`, e.g. `3.6.0+1cd9638-83-dirty`) is the
+  HUMAN form: window title, version labels, `--version`, diagnostic logs. `CARGO_PKG_VERSION` is
+  the MACHINE form: every comparison and every value parsed by another process — the backend
+  `/health` equality (`app.rs`), the Python downloader equality
+  (`launcher/new_project/advanced_download.rs`) and all three release comparators (`main.rs`,
+  `installer/update.rs`, `installer/utils.rs`). A suffix on a compared value opens a spurious
+  mismatch modal on every development build, or makes a build outrank its own release tag.
+  Where an extended string unavoidably crosses a process boundary (an installed copy probed with
+  `--version`), reduce BOTH sides with `version_format::version_core` before comparing.
 - Image cache retention decisions should use `memory_manager.rs` policy objects. Cache owners keep
   pixels and texture handles local and must not move them into the manager.
 - Floating panels are declared as tabs of the panel dock (`widgets/panel_dock/`, widgets
@@ -394,6 +410,9 @@ prompts instead of blocking the GUI thread.
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
   `main.rs` and `args.rs`.
+- What the application reports as its version, or which sites may see the git suffix:
+  `version_format.rs` (the pure rules) + `build.rs` (git probing and rerun watches); then the
+  human/machine split in "Contracts and invariants" above before touching any call site.
 - What counts as a complete Python environment, or the `--check-venv` exit contract:
   `venv_check.rs` (decision) + `main.rs::run_check_venv_flow` (window + exit code) +
   `installer/utils.rs::required_dependency_specs` (the required set).

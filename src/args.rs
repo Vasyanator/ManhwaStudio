@@ -23,15 +23,24 @@ Main items:
 - `Cli.uninstall_signal_file`: скрытый служебный файл-сигнал для сценария "удалить и затем переустановить".
 - `Cli.continue_update`: hidden service flag that resumes update work after executable replacement.
 - `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `src/trace.rs`).
+
+Notes:
+`--version` reports the extended, git-derived `MS_APP_VERSION` (see `src/version_format.rs`
+and `build.rs`), not the plain `CARGO_PKG_VERSION`.
 */
 
 use clap::Parser;
 use std::path::PathBuf;
 
+// `--version` prints the EXTENDED, git-derived version (`MS_APP_VERSION`), not clap's
+// default `CARGO_PKG_VERSION`: a developer typing it is exactly the reader this string
+// serves. The installer also probes an installed copy with `--version`
+// (`installer::utils::query_executable_version`), and that consumer compares only the
+// semver core through `version_format::version_core`, so the suffix is invisible to it.
 #[derive(Debug, Parser)]
 #[command(
     author,
-    version,
+    version = env!("MS_APP_VERSION"),
     about = "Minimal Rust project viewer for MangaFucker projects"
 )]
 pub struct Cli {

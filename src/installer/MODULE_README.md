@@ -91,7 +91,11 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   run on background workers; the GUI thread only polls worker results, asks for PyTorch choice when
   needed, and draws state. Existing-install and custom-folder update entry points first query the
   target executable with `--version`, compare against GitHub releases, replace that executable, and
-  launch the target copy with `--continue-update`.
+  launch the target copy with `--continue-update`. `--version` prints the EXTENDED version
+  (`MS_APP_VERSION`, possibly `3.6.0+1cd9638-83-dirty`), so `run_update_binary_stage_inner` reduces
+  both sides with `version_format::version_core` before `compare_version_strings`; the release
+  comparators themselves are always fed the plain `CARGO_PKG_VERSION`. The extended string may be
+  displayed (`UpdateApp::local_version_display`) but never compared.
 - Update flow is two-stage: first replace the platform executable from the latest GitHub release,
   then resume with `--continue-update` to repair/create uv-managed `installer_files/venv`, refresh
   PyTorch only for Full installs when the embedded torch version is newer, install missing embedded

@@ -44,6 +44,7 @@ use crate::gpu_utils::{
     detect_nvidia_compute_capability, detect_nvidia_gpu, detect_rocm_runtime_version,
 };
 use crate::python_manager;
+use crate::version_format::version_core;
 use eframe::egui;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -913,7 +914,11 @@ fn run_update_binary_stage_inner(
     send_update_progress(tx, 0.0, t!("installer.common.preparation"), 0.0, t!("installer.utils.stage_update_binary"));
     let remote_version =
         fetch_latest_app_release_tag_with_required_asset(platform_binary_asset_name())?;
-    if compare_version_strings(&remote_version, &local_version).is_le() {
+    // The probed binary prints the EXTENDED version (`--version` -> `MS_APP_VERSION`), so
+    // both sides are reduced to their semver core before comparing: build metadata such as
+    // `+1cd9638-83-dirty` carries no ordering meaning, and leaving it in would make a
+    // development build compare as strictly newer than its own release tag forever.
+    if compare_version_strings(version_core(&remote_version), version_core(&local_version)).is_le() {
         return Ok(UpdateBinaryStageOutcome::NoUpdate {
             local_version,
             remote_version,

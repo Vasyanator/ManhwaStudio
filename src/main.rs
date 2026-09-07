@@ -111,6 +111,10 @@ mod tabs;
 // of which are compiled out on wasm.
 #[cfg(not(target_arch = "wasm32"))]
 mod venv_check;
+// Pure version-string composition/stripping, shared verbatim with `build.rs` through
+// `include!`. Defines the human/machine split: `MS_APP_VERSION` (composed here at build
+// time) is for display, `CARGO_PKG_VERSION` is for every comparison and cross-process parse.
+mod version_format;
 // Single owner of the UI font stack (`fonts/ui`): every `run_native` context installs the
 // same chain through it, so no window is left on the bare egui defaults.
 mod ui_fonts;
@@ -891,28 +895,33 @@ fn spawn_startup_update_check(
     force_update_available: bool,
 ) -> mpsc::Receiver<Option<UpdateNotification>> {
     let (tx, rx) = mpsc::channel();
+    // Two values, on purpose. The comparison against a GitHub release tag runs on the
+    // plain `CARGO_PKG_VERSION`, so a development build is never mistaken for a newer
+    // release than the tag it was built from; the notification is shown to a person and
+    // therefore carries the extended, git-derived string.
     let local_version = env!("CARGO_PKG_VERSION").to_string();
+    let display_version = env!("MS_APP_VERSION").to_string();
 
     let spawn_result = thread::Builder::new()
         .name("startup-version-check".to_string())
         .spawn(move || {
             let notification = if force_update_available {
                 Some(UpdateNotification {
-                    local_version,
+                    local_version: display_version,
                     remote_version: "test-update".to_string(),
                 })
             } else {
                 match fetch_latest_release_tag() {
                     Ok(remote_version) if is_remote_newer(&local_version, &remote_version) => {
                         Some(UpdateNotification {
-                            local_version,
+                            local_version: display_version,
                             remote_version,
                         })
                     }
                     Ok(remote_version) => {
                         runtime_log::log_info(format!(
                             "[startup-version-check] no update: local={}, remote={}",
-                            local_version, remote_version
+                            display_version, remote_version
                         ));
                         None
                     }
@@ -1646,9 +1655,11 @@ fn run_main_window(
     user_settings: &serde_json::Value,
     ai_backend: ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<RunResult> {
+    // Human-facing surface: the extended, git-derived version (`3.6.0+1cd9638-83-dirty`),
+    // never the plain one — a title is read by a person, not parsed by a process.
     let title = format!(
         "ManhwaStudio v{} - {}",
-        env!("CARGO_PKG_VERSION"),
+        env!("MS_APP_VERSION"),
         project_dir.display()
     );
 
