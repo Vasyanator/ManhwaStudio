@@ -357,13 +357,22 @@ impl BackendClient {
             let hello = read_frame(&mut read_half)
                 .map_err(|err| tf!("backend_ipc.client.hello_read_error", err = err))?;
             verify_hello(&hello.header)?;
-            if let Some(ver) = hello
+            let reported_backend_version = hello
                 .header
                 .get(protocol::HEADER_BACKEND_VERSION)
-                .and_then(Value::as_str)
-            {
+                .and_then(Value::as_str);
+            if let Some(ver) = reported_backend_version {
                 *self.shared.backend_version.lock().unwrap() = Some(ver.to_string());
             }
+            // Diagnostic only: the program version is NEVER compared with the backend's.
+            // Compatibility is decided solely by `PROTOCOL_VERSION` in `verify_hello` above.
+            // Logging both halves keeps a mixed installation identifiable from `last.log`.
+            crate::runtime_log::log_info(format!(
+                "[backend_ipc] handshake ok: protocol={} studio_version={} backend_version={}",
+                protocol::PROTOCOL_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                reported_backend_version.unwrap_or("<not reported>")
+            ));
 
             *self.shared.write_half.lock().unwrap() = Some(wh);
             *self.shared.shutdown_handle.lock().unwrap() = Some(shutdown_handle);

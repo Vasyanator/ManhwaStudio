@@ -26,7 +26,21 @@ use serde_json::{Map, Value, json};
 // ============================================================================
 
 /// Protocol version compared during the `hello` handshake. Mirrors
-/// `protocol.PROTOCOL_VERSION`.
+/// `PROTOCOL_VERSION` in `modules/ai_backend/ipc/protocol.py`.
+///
+/// This constant is the ONLY compatibility gate between the Rust application and the
+/// Python backend: `client::verify_hello` rejects a connection whose `hello` reply
+/// carries a different value. The program version (`CARGO_PKG_VERSION` /
+/// `config.VERSION`) is never compared — it is diagnostic information only.
+///
+/// It MUST be bumped in BOTH files together on ANY change to that contract, not only on
+/// one judged breaking: a new method, a new header or payload field, a new topic, a
+/// changed meaning of an existing field, a changed blob format. Deciding whether a change
+/// "really" breaks anything is exactly the judgement that gets made wrong, and bumping
+/// costs nothing because both halves ship and update together.
+/// `python_protocol_version_matches_rust` below guards the mirror — but nothing can detect
+/// a bump that was never made: a client and a backend from different builds then agree on
+/// a contract that does not exist and fail at runtime instead of being refused in `hello`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 // ============================================================================
@@ -281,6 +295,72 @@ pub fn cancel_header(id: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Path of the Python mirror of this file, relative to the crate manifest directory.
+    const PYTHON_PROTOCOL_REL_PATH: &str = "modules/ai_backend/ipc/protocol.py";
+
+    /// Extracts the `PROTOCOL_VERSION = <int>` assignment from Python source.
+    ///
+    /// Matches only a top-level assignment (no leading indentation), so the surrounding
+    /// banner comments that also mention the name cannot be picked up. Returns `None`
+    /// when no such assignment exists or its value is not a plain decimal integer.
+    fn parse_python_protocol_version(source: &str) -> Option<u32> {
+        source
+            .lines()
+            .filter_map(|line| line.strip_prefix("PROTOCOL_VERSION"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|rest| {
+                // Trim the value and drop a trailing `# …` comment before parsing.
+                let value = rest.trim();
+                value.split('#').next().unwrap_or(value).trim()
+            })
+            .find_map(|value| value.parse::<u32>().ok())
+    }
+
+    /// `PROTOCOL_VERSION` is the SINGLE point of coupling between the Rust application and
+    /// the Python backend: it is the only value the `hello` handshake compares, and a silent
+    /// divergence between the two mirrored constants would make every backend call fail at
+    /// connect. Nothing else in the build checks that the mirror holds, so this test does.
+    #[test]
+    fn python_protocol_version_matches_rust() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PYTHON_PROTOCOL_REL_PATH);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(err) => panic!(
+                "cannot read the Python protocol mirror at {}: {err}. \
+                 This file defines the Python side of PROTOCOL_VERSION; if it moved, update \
+                 PYTHON_PROTOCOL_REL_PATH in src/backend_ipc/protocol.rs together with it.",
+                path.display()
+            ),
+        };
+        let Some(python_version) = parse_python_protocol_version(&source) else {
+            panic!(
+                "no top-level `PROTOCOL_VERSION = <int>` assignment found in {}. \
+                 The Rust side declares {PROTOCOL_VERSION}; the mirror cannot be verified.",
+                path.display()
+            );
+        };
+        assert_eq!(
+            python_version,
+            PROTOCOL_VERSION,
+            "PROTOCOL_VERSION diverged: src/backend_ipc/protocol.rs declares {PROTOCOL_VERSION}, \
+             {} declares {python_version}. These two constants are the only compatibility gate \
+             between the application and the Python backend and must be bumped together.",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn python_protocol_version_parser_ignores_comments_and_indentation() {
+        // The real file surrounds the assignment with banner comments naming the constant,
+        // and an indented occurrence would belong to some unrelated scope.
+        let source = "# PROTOCOL_VERSION is bumped on breaking changes\n\
+                      PROTOCOL_VERSION = 7  # bumped for the blob rework\n\
+                      \x20   PROTOCOL_VERSION = 99\n";
+        assert_eq!(parse_python_protocol_version(source), Some(7));
+        assert_eq!(parse_python_protocol_version("PROTOCOL_VERSION = later\n"), None);
+        assert_eq!(parse_python_protocol_version("nothing here\n"), None);
+    }
 
     #[test]
     fn request_header_sets_reserved_fields() {

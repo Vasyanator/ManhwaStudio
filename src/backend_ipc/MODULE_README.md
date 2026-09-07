@@ -65,7 +65,9 @@ is ephemeral and published per process.
   `set_ws_endpoint`, `current_backend_endpoint`).
 - `protocol.rs`: constants mirroring `modules/ai_backend/ipc/protocol.py` (version,
   kinds, statuses, topics, method names, header keys) + header builders. Values must
-  match Python byte-for-byte. Edit here when the shared contract changes.
+  match Python byte-for-byte. Edit here when the shared contract changes. Its
+  `python_protocol_version_matches_rust` test reads the Python file and asserts the
+  two `PROTOCOL_VERSION` constants agree.
 - `frame.rs`: the frame codec (`Frame`, `read_frame`, `write_frame`). Edit here for
   wire-format / size-guard changes.
 - `transport.rs`: connection primitives — `BackendStream` (Read/Write/clone/shutdown),
@@ -77,6 +79,16 @@ is ephemeral and published per process.
   and returns clear errors (no backend on web). Edit here for routing/lifecycle logic.
 
 ## Contracts and invariants
+- `PROTOCOL_VERSION` is the ONLY compatibility gate between the application and the
+  Python backend. `verify_hello` hard-compares the `v` header of the server `hello`
+  against `protocol::PROTOCOL_VERSION` and refuses the connection on any difference
+  (`backend_ipc.client.protocol_version_mismatch`). Bump the constant in BOTH
+  `src/backend_ipc/protocol.rs` and `modules/ai_backend/ipc/protocol.py` whenever the
+  Rust <-> Python contract changes; the parity test in `protocol.rs` guards the mirror.
+- The PROGRAM version is never compared. `backend_version` from the `hello` header
+  (`BackendClient::backend_version()`) and from the health snapshot is DIAGNOSTIC only:
+  it is logged once per handshake so a mixed installation is visible in `last.log`, and
+  it must never gate a feature or raise UI.
 - Wire bytes are identical on both transports; the receiver treats all payloads as one
   ordered byte stream and delimits frames by the length prefixes (WS: do NOT assume one
   WS message == one frame).
@@ -124,7 +136,9 @@ symptom: read the backend log the test prints before blaming the environment.
 ## Editing map
 - To change the wire format or size guards, see `frame.rs` (+ `protocol.rs` guards) and
   keep `modules/ai_backend/ipc` in sync.
-- To add/adjust a method, topic, or header key, see `protocol.rs` (mirror Python).
+- To add/adjust a method, topic, or header key, see `protocol.rs` (mirror Python), and
+  bump `PROTOCOL_VERSION` on both sides — on ANY such change, not only one judged breaking.
+  That judgement is the thing that gets made wrong, and bumping costs nothing here.
 - To change how a connection is opened, timed out, or shut down, see `transport.rs`.
 - To change the socket path (including the per-root isolation), see `transport.rs` — it is the
   single source both the IPC client and the supervisor's `--socket` argument read from. The

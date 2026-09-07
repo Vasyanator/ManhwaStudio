@@ -23,8 +23,14 @@ from __future__ import annotations
 # ============================================================================
 # PROTOCOL VERSION
 # ----------------------------------------------------------------------------
-# Bumped on any breaking change to the frame layout, header fields, kinds,
-# topics, or method contracts. The hello handshake compares this value; a
+# MUST be bumped on ANY change to the contract, not only on one judged breaking:
+# a new method, a new header or payload field, a new topic, a changed meaning of
+# an existing field, a changed blob format. Deciding whether a change "really"
+# breaks anything is exactly the judgement that gets made wrong, and bumping
+# costs nothing because both halves ship and update together.
+# Bump it here AND in src/backend_ipc/protocol.rs together — the Rust test
+# python_protocol_version_matches_rust guards the mirror, but nothing can detect
+# a bump that was never made. The hello handshake compares this value; a
 # mismatch is a clean error (see PROTOCOL.md "Error model").
 # ============================================================================
 PROTOCOL_VERSION = 1

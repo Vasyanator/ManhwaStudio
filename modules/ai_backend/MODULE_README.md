@@ -110,7 +110,10 @@ the convention `browser/` already used.
   explicit user choice. Which default is picked, and when the user is asked to confirm one, is
   `runtime/MODULE_README.md`'s contract.
 - The `health` IPC method and the `TOPIC_HEALTH` event push must include `backend_version` from root
-  `config.VERSION`; Rust compares it with its own version and warns on a mismatch.
+  `config.VERSION`, but it is DIAGNOSTIC information only: Rust never compares it with its own
+  version. Compatibility is governed by `PROTOCOL_VERSION` alone (`ipc/protocol.py`, mirrored by
+  `src/backend_ipc/protocol.rs`), compared during the `hello` handshake; bump it in BOTH files
+  whenever the Rust <-> Python contract changes.
 - Long-running inference never runs on the Rust GUI thread — it is always a backend request.
 - On ROCm Torch builds, MIOpen tuning is configured once at startup by
   `runtime.rocm_runtime.configure_rocm_runtime()`, and any service moving checkpoint weights to the

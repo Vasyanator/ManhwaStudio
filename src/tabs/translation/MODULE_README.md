@@ -171,8 +171,10 @@ is an author note addressed to the translator, not a replica.
 - `adv_rec.rs`: floating advanced-recognition crop preview/editor with async crop preparation,
   brush overlay, rotation, zoom, and local quick-selection OCR actions.
 - `backend_health.rs`: push-driven backend health via `TOPIC_HEALTH` v2 events (with a one-shot
-  `health` pull as the startup/liveness fallback), backend version snapshot, plus `device`
-  get/set, ONNX provider, max-loaded-models, and CUDA diagnostics helpers.
+  `health` pull as the startup/liveness fallback), plus `device` get/set, ONNX provider,
+  max-loaded-models, and CUDA diagnostics helpers. The snapshot's `backend_version` is DIAGNOSTIC
+  only — it is never compared with the program version and never gates a feature; compatibility is
+  decided by `PROTOCOL_VERSION` in the `hello` handshake (`src/backend_ipc/`).
 
 ## Contracts and invariants
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block

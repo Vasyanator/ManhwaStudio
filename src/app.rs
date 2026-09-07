@@ -217,8 +217,8 @@ pub struct MangaApp {
     prev_view_tab: Option<AppTab>,
     ai_backend_health: Arc<Mutex<AiBackendHealthSnapshot>>,
     /// Per-frame cached copy of `ai_backend_health`, refreshed once per frame in `update`.
-    /// The AI prompt/version-warning helpers read this snapshot instead of locking and
-    /// cloning the shared health state up to three times per frame.
+    /// The AI prompt helpers read this snapshot instead of locking and cloning the shared
+    /// health state several times per frame.
     ai_backend_health_cached: AiBackendHealthSnapshot,
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
     translation_tab: TranslationTabState,
@@ -270,8 +270,6 @@ pub struct MangaApp {
     ai_device_prompt_directml_device_id: String,
     ai_device_prompt_applying: bool,
     ai_device_prompt_error: Option<String>,
-    ai_backend_version_warning_open: bool,
-    ai_backend_version_warning_dismissed: bool,
     /// Background thread that autosaves dirty overlays every 30 s.
     overlay_autosave_thread: Option<JoinHandle<()>>,
     /// Signals the overlay autosave worker before it is joined for a page operation or teardown.
@@ -830,8 +828,6 @@ impl MangaApp {
             ai_device_prompt_directml_device_id: String::new(),
             ai_device_prompt_applying: false,
             ai_device_prompt_error: None,
-            ai_backend_version_warning_open: false,
-            ai_backend_version_warning_dismissed: false,
             overlay_autosave_thread,
             overlay_autosave_shutdown,
             save_to_project_rx: None,
@@ -2037,69 +2033,6 @@ impl MangaApp {
             });
     }
 
-    fn current_ai_backend_version_mismatch(&self) -> Option<(String, String)> {
-        let snapshot = &self.ai_backend_health_cached;
-        if !snapshot.connected {
-            return None;
-        }
-
-        let studio_version = env!("CARGO_PKG_VERSION").trim().to_string();
-        let backend_version = snapshot
-            .backend_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(t!("app.version.unknown"))
-            .to_string();
-        if backend_version == studio_version {
-            return None;
-        }
-
-        Some((studio_version, backend_version))
-    }
-
-    fn refresh_ai_backend_version_warning(&mut self) {
-        if self.ai_backend_version_warning_open || self.ai_backend_version_warning_dismissed {
-            return;
-        }
-        let Some((studio_version, backend_version)) = self.current_ai_backend_version_mismatch()
-        else {
-            return;
-        };
-
-        runtime_log::log_warn(format!(
-            "[app] AI backend version mismatch: studio={studio_version} backend={backend_version}"
-        ));
-        self.ai_backend_version_warning_open = true;
-    }
-
-    fn draw_ai_backend_version_warning(&mut self, ctx: &egui::Context) {
-        if !self.ai_backend_version_warning_open {
-            return;
-        }
-
-        let Some((studio_version, backend_version)) = self.current_ai_backend_version_mismatch()
-        else {
-            self.ai_backend_version_warning_open = false;
-            return;
-        };
-        let message = ai_backend_version_warning_message(&studio_version, &backend_version);
-
-        egui::Window::new(t!("app.version_warning.window_title")).id(egui::Id::new("app.version_warning.window_title"))
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .movable(false)
-            .show(ctx, |ui| {
-                ui.label(message);
-                ui.add_space(10.0);
-                if ui.button("OK").clicked() {
-                    self.ai_backend_version_warning_dismissed = true;
-                    self.ai_backend_version_warning_open = false;
-                }
-            });
-    }
-
     /// Switches to a page-capable tab and applies the selected page without letting viewport
     /// snapshot synchronization overwrite the explicit focus: setting
     /// `active_viewport_owner_tab` to the destination makes the next
@@ -3291,14 +3224,9 @@ impl eframe::App for MangaApp {
 
         self.refresh_ai_backend_health_cache();
         self.refresh_ai_device_selection_prompt();
-        self.refresh_ai_backend_version_warning();
         self.draw_comic_type_prompt(ctx);
         self.draw_ai_device_selection_prompt(ctx);
-        self.draw_ai_backend_version_warning(ctx);
-        if !self.comic_type_prompt_open
-            && !self.ai_device_prompt_open
-            && !self.ai_backend_version_warning_open
-        {
+        if !self.comic_type_prompt_open && !self.ai_device_prompt_open {
             self.dispatch_hotkeys(ctx);
         } else {
             ctx.request_repaint();
@@ -3567,10 +3495,6 @@ fn page_op_text_quiesce(
             }
         }
     }
-}
-
-fn ai_backend_version_warning_message(studio_version: &str, backend_version: &str) -> String {
-    tf!("app.version_warning.mismatch_message", studio_version = studio_version, backend_version = backend_version)
 }
 
 fn append_eviction_report(target: &mut CacheEvictionReport, source: CacheEvictionReport) {
@@ -4699,7 +4623,7 @@ mod tests {
         CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
         CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, PageOpTextQuiesce, SaveGateDecision,
         TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
-        TEXT_TAB_CONFIG_SECTION, TypingTextFlushError, ai_backend_version_warning_message,
+        TEXT_TAB_CONFIG_SECTION, TypingTextFlushError,
         apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
         decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
         page_op_text_quiesce, panel_dock_default_layout_builders, save_trigger_decision,
@@ -5196,20 +5120,6 @@ mod tests {
         assert!(
             !all_pages_loaded_after_giveup,
             "precondition: not every page is resident after giving up on a decode failure"
-        );
-    }
-
-    #[test]
-    fn formats_ai_backend_version_warning() {
-        // Pins the exact catalog key + args (in tests the empty default catalog makes
-        // both sides render the key verbatim, so this compares key + interpolation).
-        assert_eq!(
-            ai_backend_version_warning_message("3.4.0", "3.3.0"),
-            tf!(
-                "app.version_warning.mismatch_message",
-                studio_version = "3.4.0",
-                backend_version = "3.3.0"
-            )
         );
     }
 

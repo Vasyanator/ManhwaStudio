@@ -33,8 +33,7 @@ use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config;
 use crate::launcher::new_project::advanced_download::{
     AdvancedAutoCandidateSet, AdvancedBrowserBackend, AdvancedDownloadController,
-    AdvancedDownloadEvent, InterceptCounts, advanced_downloader_version_warning_message,
-    build_pages_from_auto_candidates,
+    AdvancedDownloadEvent, InterceptCounts, build_pages_from_auto_candidates,
 };
 use crate::launcher::new_project::open_source::{
     OpenSourceKind, SourceImportController, SourceImportOptions, SourceLoadEvent,
@@ -496,9 +495,6 @@ pub struct NewProjectWindowState {
     advanced_intercept_active: bool,
     advanced_intercept_counts: InterceptCounts,
     advanced_intercept_last_poll_at: Instant,
-    advanced_downloader_version_warning_open: bool,
-    advanced_downloader_version_warning_dismissed: bool,
-    advanced_downloader_version_warning_message: String,
     site_name: String,
     image_prefix: String,
     advanced_fetch_parallelism: usize,
@@ -665,9 +661,6 @@ impl NewProjectWindowState {
             advanced_intercept_active: false,
             advanced_intercept_counts: InterceptCounts::default(),
             advanced_intercept_last_poll_at: Instant::now(),
-            advanced_downloader_version_warning_open: false,
-            advanced_downloader_version_warning_dismissed: false,
-            advanced_downloader_version_warning_message: String::new(),
             site_name: String::new(),
             image_prefix: default_prefix,
             advanced_fetch_parallelism: 4,
@@ -882,7 +875,6 @@ impl NewProjectWindowState {
             _ => self.show_native(ui),
         };
         self.show_crop_editor_window(ctx);
-        self.show_advanced_downloader_version_warning(ctx);
         self.show_advanced_auto_review_window(ctx);
         self.show_screen_capture_overlay(ctx);
         self.show_batch_processing_window(ctx);
@@ -5405,15 +5397,6 @@ impl NewProjectWindowState {
     fn poll_advanced_download(&mut self, ctx: &egui::Context) {
         if let Some(event) = self.advanced_download.poll(ctx) {
             match event {
-                AdvancedDownloadEvent::VersionMismatch {
-                    studio_version,
-                    downloader_version,
-                } => {
-                    self.open_advanced_downloader_version_warning(
-                        &studio_version,
-                        &downloader_version,
-                    );
-                }
                 AdvancedDownloadEvent::Progress {
                     stage,
                     current,
@@ -5559,41 +5542,6 @@ impl NewProjectWindowState {
         self.advanced_download
             .begin_query_link_collect_count(browser);
         ctx.request_repaint_after(Duration::from_millis(100));
-    }
-
-    fn open_advanced_downloader_version_warning(
-        &mut self,
-        studio_version: &str,
-        downloader_version: &str,
-    ) {
-        if self.advanced_downloader_version_warning_open
-            || self.advanced_downloader_version_warning_dismissed
-        {
-            return;
-        }
-        self.advanced_downloader_version_warning_message =
-            advanced_downloader_version_warning_message(studio_version, downloader_version);
-        self.advanced_downloader_version_warning_open = true;
-    }
-
-    fn show_advanced_downloader_version_warning(&mut self, ctx: &egui::Context) {
-        if !self.advanced_downloader_version_warning_open {
-            return;
-        }
-
-        Window::new(t!("launcher.new_project.warning_dialog_title")).id(egui::Id::new("launcher.new_project.warning_dialog_title"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .movable(false)
-            .show(ctx, |ui| {
-                ui.label(&self.advanced_downloader_version_warning_message);
-                ui.add_space(10.0);
-                if ui.button("OK").clicked() {
-                    self.advanced_downloader_version_warning_dismissed = true;
-                    self.advanced_downloader_version_warning_open = false;
-                }
-            });
     }
 
     fn poll_advanced_intercept_status(&mut self, ctx: &egui::Context) {

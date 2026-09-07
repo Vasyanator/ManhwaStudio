@@ -340,11 +340,11 @@ prompts instead of blocking the GUI thread.
 - The application version has TWO forms and the split is a safety rule, not a preference.
   `MS_APP_VERSION` (composed at build time by `build.rs`, e.g. `3.6.0+1cd9638-83-dirty`) is the
   HUMAN form: window title, version labels, `--version`, diagnostic logs. `CARGO_PKG_VERSION` is
-  the MACHINE form: every comparison and every value parsed by another process — the backend
-  `/health` equality (`app.rs`), the Python downloader equality
-  (`launcher/new_project/advanced_download.rs`) and all three release comparators (`main.rs`,
-  `installer/update.rs`, `installer/utils.rs`). A suffix on a compared value opens a spurious
-  mismatch modal on every development build, or makes a build outrank its own release tag.
+  the MACHINE form: every comparison and every value parsed by another process — all three
+  release comparators (`main.rs`, `installer/update.rs`, `installer/utils.rs`). A suffix on a
+  compared value makes a build outrank its own release tag. Neither form is compared with the
+  Python backend: compatibility there is `PROTOCOL_VERSION` in the `hello` handshake
+  (`backend_ipc/`), and the backend's own version is diagnostic only.
   Where an extended string unavoidably crosses a process boundary (an installed copy probed with
   `--version`), reduce BOTH sides with `version_format::version_core` before comparing.
 - Image cache retention decisions should use `memory_manager.rs` policy objects. Cache owners keep

@@ -136,10 +136,6 @@ pub struct InterceptCounts {
 }
 
 pub enum AdvancedDownloadEvent {
-    VersionMismatch {
-        studio_version: String,
-        downloader_version: String,
-    },
     Progress {
         stage: String,
         current: usize,
@@ -170,10 +166,6 @@ pub enum AdvancedDownloadEvent {
 }
 
 enum AdvancedDownloadWorkerEvent {
-    VersionMismatch {
-        studio_version: String,
-        downloader_version: String,
-    },
     Progress {
         stage: &'static str,
         current: usize,
@@ -584,17 +576,6 @@ impl AdvancedDownloadController {
         let mut last_progress = None;
         loop {
             match pending.rx.try_recv() {
-                Ok(AdvancedDownloadWorkerEvent::VersionMismatch {
-                    studio_version,
-                    downloader_version,
-                }) => {
-                    self.pending = Some(pending);
-                    ctx.request_repaint();
-                    return Some(AdvancedDownloadEvent::VersionMismatch {
-                        studio_version,
-                        downloader_version,
-                    });
-                }
                 Ok(AdvancedDownloadWorkerEvent::Progress {
                     stage,
                     current,
@@ -730,7 +711,7 @@ fn run_advanced_command(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let daemon = ensure_python_daemon(&mut guard, backend, progress_tx)?;
+    let daemon = ensure_python_daemon(&mut guard, backend)?;
 
     match command {
         AdvancedCommand::OpenUrl { browser, url } => {
@@ -1674,11 +1655,12 @@ fn send_link_count(tx: &Sender<AdvancedDownloadWorkerEvent>, found_links: usize)
     }
 }
 
-fn ensure_python_daemon<'daemon>(
-    slot: &'daemon mut Option<PythonDaemon>,
+/// Returns the live daemon in `slot`, (re)starting it when it is absent, dead, or bound to a
+/// different browser backend. The borrow of `slot` extends into the returned reference.
+fn ensure_python_daemon(
+    slot: &mut Option<PythonDaemon>,
     backend: AdvancedBrowserBackend,
-    progress_tx: &Sender<AdvancedDownloadWorkerEvent>,
-) -> Result<&'daemon mut PythonDaemon, AdvancedDownloadError> {
+) -> Result<&mut PythonDaemon, AdvancedDownloadError> {
     let needs_restart = match slot.as_ref() {
         Some(daemon) if daemon.backend != backend => {
             crate::runtime_log::log_info(format!(
@@ -1697,7 +1679,7 @@ fn ensure_python_daemon<'daemon>(
         if let Some(mut daemon) = slot.take() {
             let _ = daemon.write_command(&json!({ "command": "close" }));
         }
-        *slot = Some(start_python_daemon(backend, progress_tx)?);
+        *slot = Some(start_python_daemon(backend)?);
     }
 
     slot.as_mut().ok_or_else(|| AdvancedDownloadError {
@@ -1760,7 +1742,6 @@ fn backend_is_ready(client: &backend_ipc::BackendClient) -> bool {
 
 fn start_python_daemon(
     backend: AdvancedBrowserBackend,
-    progress_tx: &Sender<AdvancedDownloadWorkerEvent>,
 ) -> Result<PythonDaemon, AdvancedDownloadError> {
     let client = ensure_backend_client()?;
     crate::runtime_log::log_info(format!(
@@ -1784,7 +1765,6 @@ fn start_python_daemon(
     } else {
         let _ = daemon.read_payload(); // consume the `backend_set` terminal
     }
-    fetch_and_warn_downloader_version(&mut daemon, progress_tx);
     Ok(daemon)
 }
 
@@ -2085,62 +2065,6 @@ fn parse_auto_downloaded_items(
         });
     }
     Ok(parsed)
-}
-
-/// Asks the backend for the downloader version (`browser.version`) and warns the
-/// UI if it differs from the studio build. Best-effort: a failure is logged and
-/// skipped (the real commands still work).
-fn fetch_and_warn_downloader_version(
-    daemon: &mut PythonDaemon,
-    progress_tx: &Sender<AdvancedDownloadWorkerEvent>,
-) {
-    if daemon.write_command(&json!({ "command": "version" })).is_err() {
-        return;
-    }
-    let Ok(payload) = daemon.read_payload() else {
-        return;
-    };
-    let downloader_version = payload
-        .get("downloader_version")
-        .or_else(|| payload.get("version"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(downloader_version) = downloader_version {
-        emit_downloader_version_warning_if_needed(progress_tx, downloader_version);
-    }
-}
-
-fn emit_downloader_version_warning_if_needed(
-    progress_tx: &Sender<AdvancedDownloadWorkerEvent>,
-    downloader_version: &str,
-) {
-    let studio_version = env!("CARGO_PKG_VERSION").trim().to_string();
-    if downloader_version == studio_version {
-        return;
-    }
-
-    crate::runtime_log::log_warn(format!(
-        "[new-project] Python downloader version mismatch: studio={studio_version} downloader={downloader_version}"
-    ));
-    if progress_tx
-        .send(AdvancedDownloadWorkerEvent::VersionMismatch {
-            studio_version,
-            downloader_version: downloader_version.to_string(),
-        })
-        .is_err()
-    {
-        crate::runtime_log::log_warn(
-            "[new-project] UI dropped advanced downloader version mismatch event",
-        );
-    }
-}
-
-pub fn advanced_downloader_version_warning_message(
-    studio_version: &str,
-    downloader_version: &str,
-) -> String {
-    tf!("launcher.adv_dl.version_mismatch_warning", studio_version = studio_version, downloader_version = downloader_version)
 }
 
 fn stage_name_to_static(stage: &str) -> &'static str {
@@ -2640,8 +2564,7 @@ fn looks_like_domain(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvancedBrowserBackend, AdvancedDownloadController,
-        advanced_downloader_version_warning_message, auto_url_group_signature,
+        AdvancedBrowserBackend, AdvancedDownloadController, auto_url_group_signature,
     };
 
     #[test]
@@ -2657,18 +2580,6 @@ mod tests {
         let mut controller = AdvancedDownloadController::new();
         controller.set_backend(AdvancedBrowserBackend::Cloak);
         assert_eq!(controller.backend(), AdvancedBrowserBackend::Cloak);
-    }
-
-    #[test]
-    fn formats_advanced_downloader_version_warning() {
-        assert_eq!(
-            advanced_downloader_version_warning_message("3.4.0", "3.3.0"),
-            tf!(
-                "launcher.adv_dl.version_mismatch_warning",
-                studio_version = "3.4.0",
-                downloader_version = "3.3.0"
-            )
-        );
     }
 
     #[test]

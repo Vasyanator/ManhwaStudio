@@ -89,8 +89,6 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   download state (`advanced_page_url`, `advanced_intercept_*`) and reuses the advanced wrappers, but
   first calls `prepare_simple_deep_capture` to force Cloak + `DeepCapture` since it has no
   backend/mode selectors.
-- The advanced downloader version is read via the `version` command (`downloader_version`); Rust
-  compares it with `CARGO_PKG_VERSION` and shows a session-only warning on mismatch.
 - Waifu2x must keep the application usable when the shared library is absent; the worker either
   downloads/extracts the real runtime or returns a clear error.
 - Reline processing depends on an externally running AI backend reached through `crate::backend_ipc`
