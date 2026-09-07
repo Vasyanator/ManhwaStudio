@@ -21,11 +21,21 @@ Main responsibilities:
   `.git/HEAD`, `.git/index`, `.git/packed-refs`, `.git/refs` (commits, staging,
   branch switches, tag changes) and the `src` / `crates` directories (which is what
   makes the dirty marker track reality — editing a file without staging it does not
-  touch `.git/index`). A watch is emitted ONLY for a path that actually exists: a
-  `rerun-if-changed` naming a missing path makes cargo re-run this script on every
-  single build, and a source ZIP has no `.git` at all — exactly the case that must
-  stay cheap. When `.git` is a FILE (linked worktree or submodule checkout) the ref
-  watches are skipped rather than guessed at.
+  touch `.git/index`). When `.git` is a FILE (linked worktree or submodule checkout)
+  the ref watches are skipped rather than guessed at.
+- **EVERY watch this script emits — the codesign ones at the top of `main` included —
+  is emitted ONLY for a path that actually exists, and that rule is load bearing.**
+  Cargo treats a `rerun-if-changed` naming a MISSING path as permanently stale, so it
+  re-runs the script on every single cargo invocation; and a build-script re-run
+  recompiles the dependent crate EVEN WHEN the script's output is byte-identical. The
+  second half is the non-obvious one, and together they turn one missing watch into a
+  full recompile of this crate on every build, forever. That is not hypothetical: this
+  script watched `.secret/build_config.json` unconditionally, that file is git-ignored
+  and thus absent from every fresh clone, and a user paid a three-minute relink on each
+  and every `run-dev` launch until it was found. A source ZIP has no `.git` either —
+  the same trap, which is why the version watches were written this way from the start.
+  Verify with `CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build`: cargo
+  names the missing file outright ("Dirty …: the file … is missing").
   KNOWN CONSEQUENCE, awaiting a decision by the project owner: watching `src`/`crates`
   makes this script re-run on every source change, so EVERY Windows-target build or
   check that does not set `MS_DISABLE_BUILD_CODESIGN=1` re-spawns the detached
@@ -72,8 +82,21 @@ struct CodesignCredentials {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=app_icon.ico");
-    println!("cargo:rerun-if-changed={SECRET_CONFIG_REL}");
+    // Both of these are watched ONLY when they exist, for the reason spelled out in this
+    // file's header: cargo treats a `rerun-if-changed` on a missing path as permanently
+    // stale. `.secret/build_config.json` is git-ignored and therefore absent from every
+    // fresh clone, so watching it unconditionally re-ran this script on every single
+    // cargo invocation and recompiled the crate each time — three minutes per launch on a
+    // real user's machine. Losing the watch when the file is absent is the right trade:
+    // the file can only start mattering once it exists, and the `src`/`crates` watches
+    // below re-run this script on the next source change anyway; the env-var route is
+    // covered by the `rerun-if-env-changed` lines.
+    let manifest = manifest_dir();
+    for watched in ["app_icon.ico", SECRET_CONFIG_REL] {
+        if manifest.join(watched).exists() {
+            println!("cargo:rerun-if-changed={watched}");
+        }
+    }
     println!("cargo:rerun-if-env-changed=MS_CODESIGN_P12");
     println!("cargo:rerun-if-env-changed=MS_CODESIGN_PASSWORD");
     println!("cargo:rerun-if-env-changed={DISABLE_BUILD_CODESIGN_ENV}");
@@ -249,6 +272,13 @@ fn load_secret_config() -> (Option<String>, Option<String>) {
 }
 
 /// Persists entered credentials so subsequent builds don't re-prompt.
+///
+/// Unix-only, matching its sole caller: the interactive prompt reads `/dev/tty` and is
+/// itself `#[cfg(unix)]`, while the non-unix `prompt_for_credentials` is a stub that never
+/// prompts and so never has anything to persist. Without this gate the function is dead
+/// code on a Windows host and the build script warns there — a warning nobody saw while
+/// `build.rs` almost never re-ran.
+#[cfg(unix)]
 fn save_secret_config(key_path: &str, password: &str) {
     let path = secret_config_path();
     if let Some(dir) = path.parent()
