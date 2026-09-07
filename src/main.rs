@@ -640,6 +640,41 @@ fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>
     }
 }
 
+/// Relaunches this executable with `--ignore-installed` and returns once the child is spawned.
+///
+/// This is the only way to enter standalone mode from the existing-install window: the flag is
+/// consumed during startup routing (`StartupRoutingFlags`) and seeded into a process-global
+/// `OnceLock` for the backend socket path long before the window opens, so it cannot be turned
+/// on in place. The caller must let this process exit right afterwards, otherwise two copies
+/// compete for the same runtime root.
+///
+/// `working_dir` is the program directory the child should start in — the same root this copy
+/// was resolved against.
+///
+/// # Errors
+/// Returns an error when the current executable cannot be located or the child cannot be
+/// spawned; the message is localized because it is shown to the user.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn spawn_self_in_standalone_mode(working_dir: &Path) -> anyhow::Result<()> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| anyhow::Error::msg(tf!("startup.standalone.current_exe_error", e = e)))?;
+    let original_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let relaunch_args = args::standalone_relaunch_args(&original_args);
+    runtime_log::log_info(format!(
+        "[startup] relaunching '{}' in standalone mode from '{}'",
+        current_exe.display(),
+        working_dir.display()
+    ));
+    std::process::Command::new(&current_exe)
+        .current_dir(working_dir)
+        .args(&relaunch_args)
+        .spawn()
+        .map_err(|e| {
+            anyhow::Error::msg(tf!("startup.standalone.relaunch_error", current_exe = current_exe.display(), e = e))
+        })?;
+    Ok(())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_project_dir_without_cli_arg(
     user_settings: &serde_json::Value,
@@ -680,6 +715,12 @@ fn resolve_project_dir_without_cli_arg(
             launcher_install::ExistingInstallAction::UpdateInstalled(target) => {
                 let _ = installer::update::run_external_install_update_window(target)
                     .map_err(anyhow::Error::msg)?;
+                return Ok(None);
+            }
+            // Its own arm on purpose: it must NOT fall through to the missing-Python prompt
+            // below the way `NoInstallFound` does — the user asked to run THIS copy as it is.
+            launcher_install::ExistingInstallAction::RunStandalone => {
+                spawn_self_in_standalone_mode(&program_dir)?;
                 return Ok(None);
             }
         }

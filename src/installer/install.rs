@@ -10,7 +10,8 @@ Main responsibilities:
 - host the two installer purposes (`InstallerPurpose`): a full application install and the
   environment-repair mode that only provisions the Python environment of an existing root;
 - surface actions for a detected existing install, including launching, shortcut creation,
-  reinstall, and updating that installed executable;
+  reinstall, updating that installed executable, replacing the installed executable with the
+  running one (executable ONLY), and running this copy standalone;
 - start background installer workers and consume their progress events;
 - persist the selected AI dependency level into the installed `user_config.json`;
 - expose startup service entry points used by `main.rs`.
@@ -81,6 +82,11 @@ pub enum ExistingInstallAction {
     ExitCurrentCopy,
     StartInstaller(PathBuf),
     UpdateInstalled(ExternalUpdateTarget),
+    /// Run THIS copy without touching the installed one. The flag that expresses this
+    /// (`--ignore-installed`) is consumed during startup routing long before this window
+    /// opens and is seeded into a `OnceLock`, so it cannot be turned on in process:
+    /// `main.rs` must relaunch this executable with the flag prepended and then exit.
+    RunStandalone,
 }
 
 #[cfg(target_os = "windows")]
@@ -95,12 +101,48 @@ struct ExistingWindowsInstall {
 enum ExistingInstallUiState {
     Choice,
     WaitingForReinstall,
+    WaitingForReplace,
     Error,
 }
 
 #[cfg(target_os = "windows")]
 enum ExistingInstallEvent {
     ReinstallFinished(Result<PathBuf, String>),
+    /// Result of the background `--version` probe of the installed executable.
+    InstalledVersionProbed(Result<String, String>),
+    /// Result of replacing the installed executable with the running one.
+    ReplaceFinished(Result<(), String>),
+}
+
+/// State of the background `--version` probe of the installed copy.
+///
+/// The `test` arm of the `cfg` exists so [`installed_version_display`] is compiled and
+/// exercised by `cargo test` on non-Windows development hosts; the window itself is
+/// Windows-only.
+#[cfg(any(target_os = "windows", test))]
+enum InstalledVersionProbe {
+    /// The worker thread has not answered yet.
+    Pending,
+    /// The installed copy printed this EXTENDED version string (`MS_APP_VERSION` form).
+    /// It is only ever displayed, never compared.
+    Known(String),
+    /// The probe failed; the reason is logged, and the UI must say "unknown" rather than
+    /// invent a version.
+    Unknown,
+}
+
+/// Text shown for the installed copy's version in the replace hint line.
+///
+/// Returns the probed string verbatim when known, and a localized placeholder otherwise —
+/// distinct ones for "still probing" and "could not be determined", so a slow probe is never
+/// mistaken for a failed one.
+#[cfg(any(target_os = "windows", test))]
+fn installed_version_display(probe: &InstalledVersionProbe) -> String {
+    match probe {
+        InstalledVersionProbe::Pending => t!("installer.install.version_probing_placeholder").to_string(),
+        InstalledVersionProbe::Known(version) => version.clone(),
+        InstalledVersionProbe::Unknown => t!("installer.install.version_unknown_placeholder").to_string(),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -109,7 +151,11 @@ struct ExistingInstallApp {
     state: ExistingInstallUiState,
     status_text: String,
     error_text: Option<String>,
-    rx: Option<mpsc::Receiver<ExistingInstallEvent>>,
+    /// Kept so every background job of this window (version probe, reinstall, replace)
+    /// reports through the SAME channel instead of replacing the receiver.
+    tx: mpsc::Sender<ExistingInstallEvent>,
+    rx: mpsc::Receiver<ExistingInstallEvent>,
+    installed_version: InstalledVersionProbe,
     result_sink: Arc<Mutex<Option<ExistingInstallAction>>>,
 }
 
@@ -210,10 +256,13 @@ fn run_existing_windows_install_window(
 ) -> Result<ExistingInstallAction, String> {
     let result_sink = Arc::new(Mutex::new(None::<ExistingInstallAction>));
     let result_sink_for_app = Arc::clone(&result_sink);
+    // Taller than the other startup windows on purpose: the window is not resizable and a
+    // CentralPanel clips rather than scrolls, so the seven choices plus the wrapped
+    // replace hint and Python-payload warning must fit without a scrollbar.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([430.0, 520.0])
-        .with_min_inner_size([400.0, 520.0])
-        .with_max_inner_size([520.0, 620.0])
+        .with_inner_size([430.0, 580.0])
+        .with_min_inner_size([400.0, 560.0])
+        .with_max_inner_size([520.0, 660.0])
         .with_resizable(false);
     if let Some(icon) = load_embedded_icon_data() {
         viewport = viewport.with_icon(icon);
@@ -243,6 +292,36 @@ fn run_existing_windows_install_window(
     Ok(guard
         .take()
         .unwrap_or(ExistingInstallAction::ExitCurrentCopy))
+}
+
+/// Copies the RUNNING executable over the installed copy's executable.
+///
+/// Runs on a worker thread. Order matters: the install directory's writability is probed
+/// FIRST, so an inaccessible target is refused before anything is created, and only then is
+/// the staged copy made and renamed into place (`utils::replace_executable_with_local_file`).
+///
+/// Deliberately out of scope: `ManhwaStudio.zip`, the installed `installer_files/venv`, the
+/// registry entries, and elevation. Only one file changes.
+///
+/// # Errors
+/// Returns a localized message when the running executable cannot be located, when the
+/// install directory refuses a write probe, or when the copy or the rename fails.
+#[cfg(target_os = "windows")]
+fn run_existing_install_replace_worker(install: &ExistingWindowsInstall) -> Result<(), String> {
+    let source = env::current_exe().map_err(|e| tf!("installer.utils.determine_current_exe_error", e = e))?;
+    match classify_replace_target_access(
+        has_write_access_for_install(&install.install_dir),
+        is_running_elevated(),
+    ) {
+        ReplaceTargetAccess::Writable => {}
+        ReplaceTargetAccess::Blocked => {
+            return Err(tf!("installer.install.replace_target_not_writable_error", install = install.install_dir.display()));
+        }
+        ReplaceTargetAccess::BlockedWhileElevated => {
+            return Err(tf!("installer.install.replace_target_not_writable_elevated_error", install = install.install_dir.display()));
+        }
+    }
+    replace_executable_with_local_file(&source, &install.launcher_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -465,14 +544,52 @@ impl ExistingInstallApp {
         result_sink: Arc<Mutex<Option<ExistingInstallAction>>>,
     ) -> Self {
         let status_text = tf!("installer.install.installed_copy_found_status", install = install.install_dir.display(), install_2 = install.source_label);
+        let (tx, rx) = mpsc::channel();
+        // The installed copy's version is only knowable by RUNNING it with `--version`, which
+        // blocks; the GUI thread may only poll this channel (see `MODULE_README.md`).
+        let probe_install = install.clone();
+        let probe_tx = tx.clone();
+        let _ = ms_thread::Builder::new()
+            .name("existing-install-version-probe".to_string())
+            .spawn(move || {
+                let result =
+                    query_executable_version(&probe_install.launcher_path, &probe_install.install_dir);
+                let _ = probe_tx.send(ExistingInstallEvent::InstalledVersionProbed(result));
+            });
         Self {
             install,
             state: ExistingInstallUiState::Choice,
             status_text,
             error_text: None,
-            rx: None,
+            tx,
+            rx,
+            installed_version: InstalledVersionProbe::Pending,
             result_sink,
         }
+    }
+
+    /// Starts the background replacement of the installed executable with the running one.
+    ///
+    /// Switches the window to [`ExistingInstallUiState::WaitingForReplace`]; the outcome
+    /// arrives as [`ExistingInstallEvent::ReplaceFinished`]. Only the executable is copied —
+    /// the installed Python payload and virtual environment are left untouched on purpose.
+    fn start_replace_installed(&mut self) {
+        let install = self.install.clone();
+        let tx = self.tx.clone();
+        self.state = ExistingInstallUiState::WaitingForReplace;
+        self.error_text = None;
+        self.status_text = tf!("installer.install.replacing_installed_copy_status", install = install.install_dir.display());
+        let _ = ms_thread::Builder::new()
+            .name("existing-install-replace".to_string())
+            .spawn(move || {
+                let result = run_existing_install_replace_worker(&install);
+                let _ = tx.send(ExistingInstallEvent::ReplaceFinished(result));
+            });
+    }
+
+    /// Records the "run this copy standalone" choice; `main.rs` performs the relaunch.
+    fn choose_run_standalone(&mut self) {
+        self.set_result(ExistingInstallAction::RunStandalone);
     }
 
     fn set_result(&self, result: ExistingInstallAction) {
@@ -501,8 +618,7 @@ impl ExistingInstallApp {
 
     fn start_reinstall(&mut self) {
         let install = self.install.clone();
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
+        let tx = self.tx.clone();
         self.state = ExistingInstallUiState::WaitingForReinstall;
         self.error_text = None;
         self.status_text = tf!("installer.install.removing_installed_copy_status", install = install.install_dir.display());
@@ -523,10 +639,8 @@ impl eframe::App for ExistingInstallApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         let mut queued_events = Vec::new();
-        if let Some(rx) = &self.rx {
-            while let Ok(event) = rx.try_recv() {
-                queued_events.push(event);
-            }
+        while let Ok(event) = self.rx.try_recv() {
+            queued_events.push(event);
         }
 
         for event in queued_events {
@@ -539,6 +653,29 @@ impl eframe::App for ExistingInstallApp {
                     self.state = ExistingInstallUiState::Error;
                     self.error_text = Some(err.clone());
                     self.status_text = t!("installer.install.reinstall_not_prepared_error").to_string();
+                }
+                ExistingInstallEvent::InstalledVersionProbed(Ok(version)) => {
+                    self.installed_version = InstalledVersionProbe::Known(version);
+                }
+                ExistingInstallEvent::InstalledVersionProbed(Err(err)) => {
+                    // A failed probe is not an error of the user's action: the version line
+                    // says "unknown" and every button stays available (the user may be
+                    // repairing exactly this broken install).
+                    crate::runtime_log::log_warn(format!(
+                        "could not query the version of the installed copy '{}': {err}",
+                        self.install.launcher_path.display()
+                    ));
+                    self.installed_version = InstalledVersionProbe::Unknown;
+                }
+                ExistingInstallEvent::ReplaceFinished(Ok(())) => {
+                    self.state = ExistingInstallUiState::Choice;
+                    self.error_text = None;
+                    self.status_text = tf!("installer.install.replace_succeeded_status", install = self.install.install_dir.display());
+                }
+                ExistingInstallEvent::ReplaceFinished(Err(err)) => {
+                    self.state = ExistingInstallUiState::Error;
+                    self.error_text = Some(err);
+                    self.status_text = t!("installer.install.replace_failed_status").to_string();
                 }
             }
         }
@@ -572,6 +709,16 @@ impl eframe::App for ExistingInstallApp {
                                 self.error_text = Some(err);
                             }
                         }
+                    }
+                    ui.add_space(6.0);
+                    // Next to "launch the installed copy" because it is the other way to just
+                    // START something, and the only choice that changes nothing on disk.
+                    if ui
+                        .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.run_standalone_button")))
+                        .clicked()
+                    {
+                        self.choose_run_standalone();
+                        close_window = true;
                     }
                     ui.add_space(6.0);
                     if ui
@@ -619,6 +766,23 @@ impl eframe::App for ExistingInstallApp {
                         close_window = true;
                     }
                     ui.add_space(6.0);
+                    // Placed next to "update the installed copy": both rewrite the installed
+                    // executable, and this one is the manual, offline variant of that. It stays
+                    // above "reinstall", which is still the more drastic of the two.
+                    if ui
+                        .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.replace_installed_button")))
+                        .clicked()
+                    {
+                        self.start_replace_installed();
+                    }
+                    ui.add_space(4.0);
+                    ui.small(tf!(
+                        "installer.install.replace_versions_label",
+                        current = env!("MS_APP_VERSION"),
+                        installed = installed_version_display(&self.installed_version)
+                    ));
+                    ui.small(t!("installer.install.replace_python_warning_label"));
+                    ui.add_space(6.0);
                     if ui
                         .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.reinstall_button")))
                         .clicked()
@@ -630,6 +794,12 @@ impl eframe::App for ExistingInstallApp {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(t!("installer.install.waiting_uninstall_status"));
+                    });
+                }
+                ExistingInstallUiState::WaitingForReplace => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t!("installer.install.waiting_replace_status"));
                     });
                 }
             }
@@ -1629,6 +1799,28 @@ pub(super) fn run_windows_uninstall_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_version_display_never_invents_a_version() {
+        assert_eq!(
+            installed_version_display(&InstalledVersionProbe::Known("3.6.0+1cd9638".to_string())),
+            "3.6.0+1cd9638",
+            "a known version must be shown verbatim, extended suffix included"
+        );
+        let probing = installed_version_display(&InstalledVersionProbe::Pending);
+        let unknown = installed_version_display(&InstalledVersionProbe::Unknown);
+        assert!(!probing.is_empty() && !unknown.is_empty(), "both placeholders must say something");
+        assert_ne!(
+            probing, unknown,
+            "a slow probe and a failed probe must not read the same"
+        );
+        for placeholder in [&probing, &unknown] {
+            assert!(
+                !placeholder.chars().any(|ch| ch.is_ascii_digit()),
+                "a placeholder must not look like a version number: {placeholder}"
+            );
+        }
+    }
 
     #[test]
     fn persist_ai_install_type_writes_installed_user_config() {

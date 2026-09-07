@@ -14,6 +14,8 @@ Main items:
   (no existing-install discovery, no Linux desktop entry, isolated backend socket, self-update off).
 - `conflicting_installed_copy_flags`: the single validation of flag combinations that contradict
   `--ignore-installed`; startup must reject them before any service action runs.
+- `standalone_relaunch_args`: builds the command line for relaunching this executable with
+  `--ignore-installed`, used by the Windows existing-install window's "run standalone" choice.
 - `Cli.continue_install`: скрытый служебный флаг продолжения установки после elevation.
 - `Cli.continue_install_target`: скрытый служебный путь установки для continuation.
 - `Cli.uninstall`: скрытый Windows-флаг удаления установленной копии приложения.
@@ -30,6 +32,8 @@ and `build.rs`), not the plain `CARGO_PKG_VERSION`.
 */
 
 use clap::Parser;
+#[cfg(any(target_os = "windows", test))]
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 // `--version` prints the EXTENDED, git-derived version (`MS_APP_VERSION`), not clap's
@@ -151,6 +155,39 @@ pub fn conflicting_installed_copy_flags(cli: &Cli) -> Vec<&'static str> {
         .collect()
 }
 
+/// Spelling of the standalone-mode flag, kept next to the `Cli` field it fills so the two
+/// cannot drift apart.
+///
+/// The `test` arm of the `cfg` exists so the relaunch logic below stays compiled and tested on
+/// non-Windows hosts; its only caller is the Windows existing-install window.
+#[cfg(any(target_os = "windows", test))]
+pub const IGNORE_INSTALLED_FLAG: &str = "--ignore-installed";
+
+/// Builds the argument list for relaunching this executable in standalone mode.
+///
+/// `original` must be the current process's arguments WITHOUT `argv[0]`. The result is the
+/// same list with [`IGNORE_INSTALLED_FLAG`] in FRONT and any pre-existing occurrence of that
+/// flag removed, so the relaunched process can never receive it twice — the flag is a plain
+/// boolean, and a duplicate would be a usage error rather than a stronger request.
+///
+/// Nothing else is filtered: dropping a flag the user typed would be as surprising as
+/// honoring one they did not. Flags that contradict standalone mode cannot reach here anyway,
+/// because startup rejects those combinations before any window opens
+/// (see [`conflicting_installed_copy_flags`]) and acts on them long before this one.
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub fn standalone_relaunch_args(original: &[OsString]) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(original.len() + 1);
+    args.push(OsString::from(IGNORE_INSTALLED_FLAG));
+    args.extend(
+        original
+            .iter()
+            .filter(|arg| arg.as_os_str() != OsStr::new(IGNORE_INSTALLED_FLAG))
+            .cloned(),
+    );
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +259,51 @@ mod tests {
         assert_eq!(
             conflicting_installed_copy_flags(&cli),
             vec!["--update", "--continue-update"]
+        );
+    }
+
+    /// Turns a borrowed command line into the owned form `standalone_relaunch_args` takes.
+    fn owned(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn standalone_relaunch_prepends_the_flag_and_keeps_the_rest() {
+        let relaunch = standalone_relaunch_args(&owned(&["--project", "/tmp/chapter", "--no-ai"]));
+        assert_eq!(
+            relaunch,
+            owned(&[IGNORE_INSTALLED_FLAG, "--project", "/tmp/chapter", "--no-ai"]),
+            "the flag must come first and no other argument may be dropped or reordered"
+        );
+    }
+
+    #[test]
+    fn standalone_relaunch_never_repeats_the_flag() {
+        let relaunch = standalone_relaunch_args(&owned(&["--trace", IGNORE_INSTALLED_FLAG, "--no-ai"]));
+        assert_eq!(relaunch, owned(&[IGNORE_INSTALLED_FLAG, "--trace", "--no-ai"]));
+        assert_eq!(
+            relaunch.iter().filter(|arg| *arg == IGNORE_INSTALLED_FLAG).count(),
+            1,
+            "a boolean flag passed twice is a usage error, not a stronger request"
+        );
+    }
+
+    #[test]
+    fn standalone_relaunch_of_an_empty_command_line_is_just_the_flag() {
+        assert_eq!(standalone_relaunch_args(&[]), owned(&[IGNORE_INSTALLED_FLAG]));
+    }
+
+    #[test]
+    fn standalone_relaunch_args_parse_back_into_standalone_mode() {
+        let relaunch = standalone_relaunch_args(&owned(&["--no-ai"]));
+        let mut argv = vec![OsString::from("manhwastudio_rs")];
+        argv.extend(relaunch);
+        let cli = Cli::try_parse_from(argv).expect("the relaunch command line must parse");
+        assert!(cli.ignore_installed, "the relaunched process must be in standalone mode");
+        assert!(cli.no_ai, "the original arguments must survive the relaunch");
+        assert!(
+            conflicting_installed_copy_flags(&cli).is_empty(),
+            "the relaunch must not produce a command line startup rejects"
         );
     }
 }

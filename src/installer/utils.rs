@@ -1097,7 +1097,18 @@ fn platform_executable_file_name() -> &'static str {
     }
 }
 
-fn query_executable_version(executable: &Path, root_dir: &Path) -> Result<String, String> {
+/// Runs `executable --version` in `root_dir` and returns the version string it printed.
+///
+/// The returned string is the EXTENDED, git-derived version (`MS_APP_VERSION`, e.g.
+/// `3.6.0+1cd9638-83-dirty`): it may be DISPLAYED as-is, but any comparison must first
+/// reduce both sides with [`version_core`] (see `src/MODULE_README.md`, version contract).
+///
+/// Blocking: it spawns a process and waits for it, so callers must be on a worker thread.
+///
+/// # Errors
+/// Returns a localized message when the process cannot be started, exits non-zero, or
+/// prints nothing that parses as a version.
+pub(super) fn query_executable_version(executable: &Path, root_dir: &Path) -> Result<String, String> {
     let (status, output) = run_command_streaming(executable, root_dir, &["--version"], None, &[])?;
     if !status.success() {
         return Err(tf!("installer.utils.get_version_error", executable = executable.display(), output = output.trim()));
@@ -2017,6 +2028,145 @@ pub(super) fn has_write_access_for_install(target_dir: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Whether an existing copy's install directory can be written to, and if not, whether
+/// administrator rights are still a plausible remedy.
+///
+/// Program Files installs are normally writable WITHOUT elevation: the installer grants the
+/// built-in Users group inheritable Modify rights once, at install time
+/// (`grant_windows_users_modify_acl_with_inheritance`, run from `prepare_install_root_dir`),
+/// which is why ordinary updates need no UAC prompt. A negative probe is therefore the
+/// exception — an install made before that ACL behavior existed, an ACL changed afterwards, a
+/// per-user install owned by another Windows account, or a folder held by policy or antivirus.
+///
+/// The `test` arm of the `cfg` exists so this platform-independent decision is compiled and
+/// exercised by `cargo test` on non-Windows development hosts; the feature itself is reachable
+/// only from the Windows existing-install window.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum ReplaceTargetAccess {
+    /// A write probe inside the install directory succeeded; the replacement may proceed.
+    Writable,
+    /// The probe failed while this process runs unelevated, so relaunching as administrator
+    /// is one of the remedies worth offering the user.
+    Blocked,
+    /// The probe failed even though this process is ALREADY elevated: administrator rights
+    /// are not the missing piece, so the message must not suggest them.
+    BlockedWhileElevated,
+}
+
+/// Classifies write access to an install directory from the two facts the caller probed.
+///
+/// Pure decision function, deliberately separated from the probes (`has_write_access_for_install`
+/// and `is_running_elevated`) so it can be tested on any host.
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub(super) fn classify_replace_target_access(directory_is_writable: bool, running_elevated: bool) -> ReplaceTargetAccess {
+    if directory_is_writable {
+        ReplaceTargetAccess::Writable
+    } else if running_elevated {
+        ReplaceTargetAccess::BlockedWhileElevated
+    } else {
+        ReplaceTargetAccess::Blocked
+    }
+}
+
+/// Builds the name of the staging file used to replace `target_file_name` in place.
+///
+/// The name introduces no path separator, so the staging file lands in the target's OWN
+/// directory and the final rename cannot cross a volume boundary. It is unique per process
+/// and per attempt so two replacements never collide, and carries the `.part` suffix this
+/// module already uses for staged downloads.
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub(super) fn staged_replacement_file_name(target_file_name: &str, process_id: u32, unique_suffix: u128) -> String {
+    format!("{target_file_name}.replace-{process_id}-{unique_suffix}.part")
+}
+
+/// Replaces the executable at `target` with a copy of `source`, atomically.
+///
+/// `source` is copied to a staging file NEXT TO `target` and then renamed over it, so a failed
+/// or interrupted copy can never leave `target` missing or truncated; the staging file is
+/// removed on every failure path. `source` is normally `env::current_exe()`.
+///
+/// This replaces the EXECUTABLE ONLY: the target's Python payload (`ai_backend.py`, `modules/`)
+/// and its virtual environment are deliberately left untouched — see the existing-install
+/// window contract in `MODULE_README.md`.
+///
+/// Blocking filesystem work: call it from a worker thread, never from the GUI thread.
+///
+/// # Errors
+/// Returns a localized message when `target` has no parent directory or file name, when it
+/// resolves to the same file as `source`, when the copy fails, or when the rename fails. A
+/// rename refused because the destination is in use (Windows keeps a running image locked)
+/// gets its own message naming that cause instead of a bare OS error.
+#[cfg(any(target_os = "windows", test))]
+pub(super) fn replace_executable_with_local_file(source: &Path, target: &Path) -> Result<(), String> {
+    if paths_point_to_same_file(source, target) {
+        return Err(tf!("installer.utils.replace_same_file_error", target = target.display()));
+    }
+    let target_dir = target
+        .parent()
+        .ok_or_else(|| tf!("installer.utils.replace_target_path_error", target = target.display()))?;
+    let target_file_name = target
+        .file_name()
+        .ok_or_else(|| tf!("installer.utils.replace_target_path_error", target = target.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let unique_suffix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let staged = target_dir.join(staged_replacement_file_name(
+        &target_file_name,
+        std::process::id(),
+        unique_suffix,
+    ));
+
+    if let Err(e) = fs::copy(source, &staged) {
+        // Cleanup of our own staging file: a partial copy must never be left behind, and
+        // there is nothing useful to report if the removal of an already-failed write fails.
+        let _ = fs::remove_file(&staged);
+        return Err(tf!("installer.utils.replace_stage_copy_error", source = source.display(), staged = staged.display(), e = e));
+    }
+    // Carry the source's mode over so a Unix copy stays executable. On Windows permissions
+    // come from the directory ACL, so a failure here changes nothing and is not worth an abort.
+    if let Ok(metadata) = fs::metadata(source) {
+        let _ = fs::set_permissions(&staged, metadata.permissions());
+    }
+
+    if let Err(e) = fs::rename(&staged, target) {
+        // Same reasoning as above: drop the staging file, keep the rename error.
+        let _ = fs::remove_file(&staged);
+        return Err(if error_means_destination_in_use(&e) {
+            tf!("installer.utils.replace_target_in_use_error", target = target.display(), e = e)
+        } else {
+            tf!("installer.utils.replace_rename_error", target = target.display(), staged = staged.display(), e = e)
+        });
+    }
+    Ok(())
+}
+
+/// Whether a failed rename onto an existing executable means the destination is currently in
+/// use rather than genuinely inaccessible.
+///
+/// Windows keeps a running image locked and reports `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32) for a `MoveFileEx` over it. Because the install directory's
+/// writability is probed BEFORE the copy, those two codes at the rename step point at the file
+/// being open, not at missing rights.
+#[cfg(target_os = "windows")]
+fn error_means_destination_in_use(error: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    matches!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION))
+}
+
+/// Non-Windows counterpart used only by the host test build: other platforms replace a running
+/// binary without complaint, so no error code maps to "destination in use".
+#[cfg(all(test, not(target_os = "windows")))]
+fn error_means_destination_in_use(_error: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -4701,6 +4851,10 @@ mod tests {
         platform_executable_file_name, required_dependency_specs,
         sanitize_windows_archive_path_component,
     };
+    use super::{
+        ReplaceTargetAccess, classify_replace_target_access, replace_executable_with_local_file,
+        staged_replacement_file_name,
+    };
     use crate::config::AiInstallType;
     use std::cmp::Ordering;
     use std::collections::HashMap;
@@ -5124,5 +5278,120 @@ mod tests {
             "bad_name___"
         );
         assert_eq!(sanitize_windows_archive_path_component("CON"), "CON_");
+    }
+
+    #[test]
+    fn replace_target_access_treats_elevation_as_a_remedy_only_when_it_can_help() {
+        // The expected case: the installer already granted the Users group inheritable
+        // Modify rights, so the probe succeeds and no elevation talk belongs in the UI.
+        assert_eq!(classify_replace_target_access(true, false), ReplaceTargetAccess::Writable);
+        assert_eq!(
+            classify_replace_target_access(true, true),
+            ReplaceTargetAccess::Writable,
+            "already being elevated must not change a successful probe"
+        );
+        assert_eq!(
+            classify_replace_target_access(false, false),
+            ReplaceTargetAccess::Blocked,
+            "unelevated and blocked: administrator rights are worth offering as one remedy"
+        );
+        assert_eq!(
+            classify_replace_target_access(false, true),
+            ReplaceTargetAccess::BlockedWhileElevated,
+            "already elevated and still blocked: rights are not the missing piece"
+        );
+    }
+
+    #[test]
+    fn staged_replacement_file_name_stays_in_the_target_directory_and_is_unique() {
+        let name = staged_replacement_file_name("manhwastudio_rs.exe", 4242, 99);
+        assert!(name.starts_with("manhwastudio_rs.exe"), "{name} must be recognizable as the target");
+        assert!(name.ends_with(".part"), "{name} must carry the staging suffix");
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "{name} must not introduce a path separator: the rename must not cross a volume"
+        );
+        assert_ne!(
+            name,
+            staged_replacement_file_name("manhwastudio_rs.exe", 4242, 100),
+            "two attempts of one process must not collide"
+        );
+        assert_ne!(
+            name,
+            staged_replacement_file_name("manhwastudio_rs.exe", 4243, 99),
+            "two processes must not collide"
+        );
+    }
+
+    #[test]
+    fn replacing_an_executable_overwrites_the_target_and_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source_binary");
+        let target = dir.path().join("installed_binary");
+        std::fs::write(&source, b"new build").expect("source must be writable");
+        std::fs::write(&target, b"old build").expect("target must be writable");
+
+        replace_executable_with_local_file(&source, &target).expect("replacement must succeed");
+
+        assert_eq!(std::fs::read(&target).expect("target must be readable"), b"new build");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("temp dir must be listable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files must not survive: {leftovers:?}");
+    }
+
+    #[test]
+    fn replacing_a_missing_target_still_produces_the_file() {
+        // The user may be repairing an install whose executable is already gone; the
+        // staged copy plus rename must create it rather than fail on the missing file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source_binary");
+        let target = dir.path().join("installed_binary");
+        std::fs::write(&source, b"new build").expect("source must be writable");
+
+        replace_executable_with_local_file(&source, &target).expect("replacement must succeed");
+
+        assert_eq!(std::fs::read(&target).expect("target must be readable"), b"new build");
+    }
+
+    #[test]
+    fn replacing_a_file_with_itself_is_refused_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("installed_binary");
+        std::fs::write(&target, b"old build").expect("target must be writable");
+
+        let error = replace_executable_with_local_file(&target, &target)
+            .expect_err("replacing a file with itself must be refused");
+        assert!(!error.is_empty(), "the refusal must carry a message");
+        assert_eq!(
+            std::fs::read(&target).expect("target must be readable"),
+            b"old build",
+            "a refused replacement must not touch the target"
+        );
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_target_intact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("installed_binary");
+        std::fs::write(&target, b"old build").expect("target must be writable");
+        let missing_source = dir.path().join("does_not_exist");
+
+        let error = replace_executable_with_local_file(&missing_source, &target)
+            .expect_err("copying a missing source must fail");
+        assert!(!error.is_empty(), "the failure must carry a message");
+        assert_eq!(
+            std::fs::read(&target).expect("target must still exist"),
+            b"old build",
+            "the installed copy must survive a failed replacement"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("temp dir must be listable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files must not survive a failure: {leftovers:?}");
     }
 }

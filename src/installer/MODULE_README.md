@@ -110,12 +110,41 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   source used by both the release availability check (`update.rs`) and the download stage. On-disk
   executable names stay arch-agnostic (`platform_executable_file_name()`), so `_macos`/`_arm64`
   suffixes never leak into install-path or archive-strip logic.
+- The Windows existing-install window (`install.rs`, `ExistingInstallApp`) offers seven choices and
+  reports them as `ExistingInstallAction`. Two of them are deliberately narrow:
+  - "replace the installed copy with this one" copies the RUNNING executable over the installed one
+    and does NOTHING else: no `ManhwaStudio.zip`, no `installer_files/venv`, no registry or
+    `DisplayVersion` refresh, no `--continue-update`. The installed Python payload therefore stays
+    at its old version, which is safe only while the IPC `PROTOCOL_VERSION` still matches; the
+    window states this in a warning that is always visible, not only on a version mismatch. The
+    copy goes through `utils::replace_executable_with_local_file`: a staging file NEXT TO the
+    target (so the final rename cannot cross a volume), then an atomic rename, with the staging
+    file removed on every failure path — the target is never left missing or truncated. Write
+    access is classified BEFORE anything is created (`classify_replace_target_access` over
+    `has_write_access_for_install` + `is_running_elevated`). A Program Files install is normally
+    writable WITHOUT elevation, because `prepare_install_root_dir` granted the built-in Users group
+    inheritable Modify rights at install time, so a refusal is the exception and is worded as one:
+    administrator rights are offered as one possible remedy, never as the headline. Elevation is
+    out of scope — this action never requests UAC — and a rename refused because the destination is
+    in use gets its own "the installed copy is running" message.
+  - "run this copy standalone" only records `ExistingInstallAction::RunStandalone`; `main.rs`
+    relaunches this executable with `--ignore-installed` prepended
+    (`args::standalone_relaunch_args`) and exits. The flag cannot be turned on in process: startup
+    routing consumes it and seeds the backend-socket `OnceLock` long before this window opens.
+- Every background job of that window (the installed copy's `--version` probe, the reinstall, the
+  replacement) reports through ONE `mpsc` channel owned by `ExistingInstallApp`; the GUI thread only
+  drains it and draws. The probed version is the EXTENDED `MS_APP_VERSION` string: it is displayed
+  as-is next to `env!("MS_APP_VERSION")` of the running copy and never compared. A failed probe is
+  logged and shown as "unknown"; it never blocks any of the window's actions, because the user may
+  be repairing exactly that broken install.
 - Known limitation: external-target updates (existing-install / custom-folder entry points) pick the
   asset by the RUNNING process's os/arch and assume the target executable matches it; the target is
   only version-queried (`--version`), never arch-probed.
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.
+- To change what "replace the installed copy" does on disk, edit
+  `utils.rs::replace_executable_with_local_file` and keep the exe-only contract above in sync.
 - To change what environment repair does (or must not do), edit
   `utils.rs::run_environment_repair_worker` and keep the invariants above in sync.
 - To change the update window shell, edit `update.rs`.
