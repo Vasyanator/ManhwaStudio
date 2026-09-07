@@ -16,7 +16,8 @@ Main structs:
 - `WikiTabState`: tab state, selected file, async receivers, and image cache.
 - `WikiFileEntry`: one markdown file from `wiki/`.
 - `WikiDocument`: loaded markdown file plus parsed render blocks.
-- `WikiBlock`: simplified markdown blocks (headings, paragraphs, lists, image rows, code).
+- `WikiBlock`: simplified markdown blocks (headings, paragraphs, lists, blockquotes,
+  image rows, code).
 - `WikiImageSpec`: one image inside a row (resolved source + optional `w=NN%`).
 - `WikiImageEntry`: image cache record (pending/ready/failed).
 - `InlineSegment`: inline markdown fragment for plain/code/bold text.
@@ -36,6 +37,21 @@ Inline rendering notes:
   which are stripped before local path resolution.
 - relative local image paths are normalized through `PathBuf` on Windows and
   use the same invalid-character replacement as installer ZIP extraction.
+
+List rendering notes:
+- unordered items accept both Markdown markers, `- text` and `* text`; a marker
+  must be followed by a space, so `**bold**` at line start and an asterisk
+  thematic break (`***`, `* * *`) stay plain text.
+- ordered items keep the ordinal written in the Markdown source (`1. 2. 3.`),
+  they are not renumbered and not collapsed to a single `1.`.
+- both list kinds draw the marker in the strong text color and align the item
+  text past a measured marker column, so wrapped lines hang under the text.
+
+Blockquote rendering notes:
+- a line starting with `>` becomes a `Quote` block; consecutive `>` lines of the
+  same nesting depth are merged into one block, and a depth change starts a new one.
+- the block is highlighted: faint background across the full content width, an
+  indent per nesting level, and one vertical accent bar per level in the margin.
 
 Image rendering notes:
 - a Markdown line made only of `![alt](src)` tags becomes one `ImageRow`; two
@@ -75,8 +91,14 @@ enum WikiBlock {
     Heading { level: usize, text: String },
     Paragraph(String),
     Bullet(String),
-    Numbered(String),
+    /// Ordered list item. `number` is the number written in the Markdown source,
+    /// so `1. 2. 3.` renders as written instead of repeating the first marker.
+    Numbered { number: u32, text: String },
     Code(String),
+    /// Markdown blockquote (`> text`). `level` is the nesting depth already
+    /// clamped to `WIKI_QUOTE_MAX_LEVEL`; `text` holds the consecutive quote
+    /// lines joined by `\n` with their `>` markers removed.
+    Quote { level: u8, text: String },
     /// One or more images sharing a single horizontal row. A one-spec row is a
     /// normal standalone image; a two-spec row renders the images side by side.
     ImageRow(Vec<WikiImageSpec>),
@@ -118,6 +140,28 @@ const WIKI_FALLBACK_LANGUAGE_DIR: &str = "en";
 /// Default display width of a wiki image as a fraction of the available content
 /// width when no `w=NN%` directive is present. Two default images fill one row.
 const WIKI_DEFAULT_IMAGE_WIDTH_FRACTION: f32 = 0.5;
+
+/// Left indent of a list item marker inside the wiki content, in points.
+const WIKI_LIST_INDENT: f32 = 6.0;
+
+/// Minimum width of the list marker column, in points. Wider markers (`10.`)
+/// grow the column, so the text of one list stays aligned.
+const WIKI_LIST_MARKER_MIN_WIDTH: f32 = 20.0;
+
+/// Deepest blockquote nesting that still gets its own accent bar and indent
+/// step. Deeper quotes render as this level, which keeps the computed inner
+/// margin inside the `i8` range egui uses for margins.
+const WIKI_QUOTE_MAX_LEVEL: u8 = 4;
+
+/// Horizontal indent added per blockquote nesting level, in points. Also the
+/// spacing between the accent bars of nested levels.
+const WIKI_QUOTE_LEVEL_INDENT: i8 = 8;
+
+/// Gap between the innermost blockquote accent bar and the quote text, in points.
+const WIKI_QUOTE_TEXT_PADDING: i8 = 6;
+
+/// Width of one blockquote accent bar, in points.
+const WIKI_QUOTE_BAR_WIDTH: f32 = 3.0;
 
 /// Owned render instruction for one slot of an image row, decoupled from the
 /// image cache so the egui layout closure does not need to borrow the tab state.
@@ -284,16 +328,16 @@ impl WikiTabState {
                     _ => 18.0,
                 };
                 ui.add_space(6.0);
-                self.draw_inline_text(ui, text, None, Some(size), true);
+                self.draw_inline_text(ui, text, Some(size), true);
             }
             WikiBlock::Paragraph(text) => {
-                self.draw_inline_text(ui, text, None, None, false);
+                self.draw_inline_text(ui, text, None, false);
             }
             WikiBlock::Bullet(text) => {
-                self.draw_inline_text(ui, text, Some("•"), None, false);
+                self.draw_list_item(ui, "•", text);
             }
-            WikiBlock::Numbered(text) => {
-                self.draw_inline_text(ui, text, Some("1."), None, false);
+            WikiBlock::Numbered { number, text } => {
+                self.draw_list_item(ui, &format!("{number}."), text);
             }
             WikiBlock::Code(text) => {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -303,6 +347,9 @@ impl WikiTabState {
                     );
                 });
             }
+            WikiBlock::Quote { level, text } => {
+                self.draw_quote(ui, *level, text);
+            }
             WikiBlock::ImageRow(specs) => {
                 self.draw_image_row(ui, specs);
             }
@@ -310,48 +357,79 @@ impl WikiTabState {
         ui.add_space(4.0);
     }
 
-    fn draw_inline_text(
-        &self,
-        ui: &mut egui::Ui,
-        text: &str,
-        prefix: Option<&str>,
-        base_size: Option<f32>,
-        base_strong: bool,
-    ) {
+    /// Draws a block of body text, one Markdown source line per UI line.
+    ///
+    /// `base_size` overrides the font size (headings) and `base_strong` renders
+    /// every segment bold; inline `**bold**` and `` `code` `` markers are applied
+    /// on top of both.
+    fn draw_inline_text(&self, ui: &mut egui::Ui, text: &str, base_size: Option<f32>, base_strong: bool) {
+        for line in text.lines() {
+            ui.horizontal_wrapped(|ui| {
+                draw_inline_segments(ui, line, base_size, base_strong);
+            });
+        }
+    }
+
+    /// Draws one list item as a highlighted marker column followed by the text.
+    ///
+    /// `marker` is the already formatted bullet or ordinal (`•`, `3.`). It is
+    /// drawn in the strong text color so lists stand out from body text, and the
+    /// text of every line starts past a marker column at least
+    /// [`WIKI_LIST_MARKER_MIN_WIDTH`] wide, so wrapped lines and longer ordinals
+    /// keep the same left edge.
+    fn draw_list_item(&self, ui: &mut egui::Ui, marker: &str, text: &str) {
+        let marker_color = ui.visuals().strong_text_color();
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        // The column is measured, not guessed, so `10.` does not push its own text
+        // out of line with the shorter markers of the same list.
+        let marker_width = ui.painter().layout_no_wrap(marker.to_owned(), font_id, marker_color).size().x;
+        let column = marker_width.max(WIKI_LIST_MARKER_MIN_WIDTH);
+
         for (line_idx, line) in text.lines().enumerate() {
             ui.horizontal_wrapped(|ui| {
+                ui.add_space(WIKI_LIST_INDENT);
                 if line_idx == 0 {
-                    if let Some(mark) = prefix {
-                        ui.label(mark);
-                    }
-                } else if prefix.is_some() {
-                    ui.label(" ");
+                    ui.label(egui::RichText::new(marker).strong().color(marker_color));
+                    ui.add_space((column - marker_width).max(0.0));
+                } else {
+                    // Continuation lines are indented to the text column, giving the
+                    // item a hanging indent instead of restarting at the margin.
+                    ui.add_space(column);
                 }
-
-                for seg in parse_inline_segments(line) {
-                    if seg.is_code {
-                        let mut rich = egui::RichText::new(format!(" {} ", seg.text))
-                            .monospace()
-                            .background_color(ui.visuals().code_bg_color);
-                        if let Some(size) = base_size {
-                            rich = rich.size(size);
-                        }
-                        ui.label(rich);
-                    } else {
-                        let mut rich = egui::RichText::new(seg.text);
-                        if let Some(size) = base_size {
-                            rich = rich.size(size);
-                        }
-                        if base_strong || seg.is_bold {
-                            rich = rich.strong();
-                        }
-                        if seg.is_bold {
-                            rich = rich.color(ui.visuals().strong_text_color());
-                        }
-                        ui.label(rich);
-                    }
-                }
+                draw_inline_segments(ui, line, None, false);
             });
+        }
+    }
+
+    /// Draws a Markdown blockquote as a highlighted, indented block.
+    ///
+    /// `level` is the nesting depth (clamped to [`WIKI_QUOTE_MAX_LEVEL`]); the
+    /// block is filled with the faint background color, spans the full content
+    /// width, and carries one vertical accent bar per nesting level inside its
+    /// left margin. `text` may contain `\n`, which renders as separate lines.
+    fn draw_quote(&self, ui: &mut egui::Ui, level: u8, text: &str) {
+        let level = level.clamp(1, WIKI_QUOTE_MAX_LEVEL);
+        let bar_color = ui.visuals().weak_text_color();
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(egui::CornerRadius::same(2))
+            .inner_margin(egui::Margin { left: quote_left_margin(level), right: 6, top: 4, bottom: 4 });
+        let response = frame
+            .show(ui, |ui| {
+                // Stretch the frame across the content width so the highlight covers
+                // the whole quoted line, not just the width of its text.
+                ui.set_min_width(ui.available_width());
+                self.draw_inline_text(ui, text, None, false);
+            })
+            .response;
+
+        // The accent bars live inside the frame's left margin, so they are painted
+        // after the frame body and never overlap the quoted text.
+        let rect = response.rect;
+        for index in 0..level {
+            let x = rect.left() + f32::from(WIKI_QUOTE_TEXT_PADDING) / 2.0 + f32::from(index) * f32::from(WIKI_QUOTE_LEVEL_INDENT);
+            let bar = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(WIKI_QUOTE_BAR_WIDTH, rect.height()));
+            ui.painter().rect_filled(bar, egui::CornerRadius::same(1), bar_color);
         }
     }
 
@@ -803,12 +881,35 @@ fn parse_markdown_to_blocks(markdown: &str, base_dir: &Path) -> Vec<WikiBlock> {
             blocks.push(WikiBlock::ImageRow(specs));
             continue;
         }
+        if let Some((level, first_line)) = parse_quote(trimmed) {
+            let mut quote = first_line;
+            // Consecutive `>` lines of the same depth belong to one blockquote; a
+            // depth change starts a new block so nesting stays visible.
+            while let Some(next) = lines.peek() {
+                let Some((next_level, next_text)) = parse_quote(next.trim()) else {
+                    break;
+                };
+                if next_level != level {
+                    break;
+                }
+                quote.push('\n');
+                quote.push_str(&next_text);
+                lines.next();
+            }
+            // Marker-only lines at the edges (`>`) carry no text and would render as
+            // blank rows inside the highlight, so they are dropped here.
+            let text = quote.trim().to_owned();
+            if !text.is_empty() {
+                blocks.push(WikiBlock::Quote { level, text });
+            }
+            continue;
+        }
         if let Some(text) = parse_bullet(trimmed) {
             blocks.push(WikiBlock::Bullet(text.to_owned()));
             continue;
         }
-        if let Some(text) = parse_numbered(trimmed) {
-            blocks.push(WikiBlock::Numbered(text));
+        if let Some((number, text)) = parse_numbered(trimmed) {
+            blocks.push(WikiBlock::Numbered { number, text });
             continue;
         }
 
@@ -817,7 +918,8 @@ fn parse_markdown_to_blocks(markdown: &str, base_dir: &Path) -> Vec<WikiBlock> {
             let n = next.trim();
             if n.is_empty()
                 || n.starts_with('#')
-                || n.starts_with("- ")
+                || parse_bullet(n).is_some()
+                || n.starts_with('>')
                 || n.starts_with("```")
                 || parse_numbered(n).is_some()
                 || parse_image_row(n).is_some()
@@ -921,24 +1023,106 @@ fn normalize_markdown_image_source(source: &str) -> String {
         .to_owned()
 }
 
-fn parse_bullet(line: &str) -> Option<&str> {
-    line.strip_prefix("- ").map(str::trim)
+/// Parses a Markdown blockquote line (`> text`, `>> text`, `> > text`).
+///
+/// Returns the nesting depth (number of leading `>` markers, clamped to
+/// [`WIKI_QUOTE_MAX_LEVEL`]) and the remaining text with the markers stripped
+/// and trimmed. A marker-only line yields an empty string, which the caller
+/// treats as a blank line inside the quote. Returns `None` when `line` does not
+/// start with `>`.
+fn parse_quote(line: &str) -> Option<(u8, String)> {
+    let mut rest = line.strip_prefix('>')?;
+    let mut level: u8 = 1;
+    // `>>`, `> >` and any mix of both mark the same nesting depth.
+    while let Some(next) = rest.trim_start_matches(' ').strip_prefix('>') {
+        level = level.saturating_add(1);
+        rest = next;
+    }
+    Some((level.min(WIKI_QUOTE_MAX_LEVEL), rest.trim().to_owned()))
 }
 
-fn parse_numbered(line: &str) -> Option<String> {
-    let mut chars = line.chars().peekable();
-    while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
-        chars.next();
-    }
-    if chars.next() != Some('.') {
+/// Left inner margin of a blockquote frame, in points, for nesting depth `level`.
+///
+/// `level` is clamped to [`WIKI_QUOTE_MAX_LEVEL`] first, so the product always
+/// fits `i8` and the fallback in the conversion is unreachable in practice.
+fn quote_left_margin(level: u8) -> i8 {
+    let level = i8::try_from(level.clamp(1, WIKI_QUOTE_MAX_LEVEL)).unwrap_or(1);
+    WIKI_QUOTE_TEXT_PADDING + WIKI_QUOTE_LEVEL_INDENT * level
+}
+
+/// Parses an unordered list line (`- text`, `* text`).
+///
+/// Both Markdown bullet markers are accepted and the marker must be followed by
+/// a space, so emphasis at line start (`**bold** …`, `*italic*`) is not a list
+/// item. A thematic break of asterisks (`***`, `* * *`) is rejected as well.
+/// Returns the item text with the surrounding whitespace removed.
+fn parse_bullet(line: &str) -> Option<&str> {
+    if is_asterisk_thematic_break(line) {
         return None;
     }
-    let rest: String = chars.collect();
-    let rest = rest.trim();
+    let rest = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))?.trim();
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// Reports whether `line` is a Markdown thematic break written with asterisks
+/// (`***`, `* * *`): three or more `*` with nothing but spaces around them.
+///
+/// Such a line starts with `* ` but is not a list item, so bullet parsing has to
+/// reject it explicitly.
+fn is_asterisk_thematic_break(line: &str) -> bool {
+    let stars = line.chars().filter(|&ch| ch == '*').count();
+    stars >= 3 && line.chars().all(|ch| ch == '*' || ch == ' ' || ch == '\t')
+}
+
+/// Parses an ordered list line (`3. text`).
+///
+/// Returns the ordinal written in the source and the item text, so the wiki
+/// renders `1. 2. 3.` as written. Returns `None` when the line has no leading
+/// `<digits>.` marker, when the ordinal does not fit `u32`, or when the text
+/// after the marker is empty.
+fn parse_numbered(line: &str) -> Option<(u32, String)> {
+    let digits: String = line.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = line.get(digits.len()..)?.strip_prefix('.')?.trim();
     if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_owned())
+        return None;
+    }
+    // An ordinal too large for `u32` is not a list marker worth rendering; the
+    // line falls back to a paragraph instead of being silently truncated.
+    let number = digits.parse::<u32>().ok()?;
+    Some((number, rest.to_owned()))
+}
+
+/// Renders one Markdown source line into the current horizontal layout.
+///
+/// Splits the line with [`parse_inline_segments`] and paints each fragment as
+/// plain, bold, or inline-code text. `base_size` overrides the font size and
+/// `base_strong` makes every fragment bold.
+fn draw_inline_segments(ui: &mut egui::Ui, line: &str, base_size: Option<f32>, base_strong: bool) {
+    for seg in parse_inline_segments(line) {
+        if seg.is_code {
+            let mut rich = egui::RichText::new(format!(" {} ", seg.text))
+                .monospace()
+                .background_color(ui.visuals().code_bg_color);
+            if let Some(size) = base_size {
+                rich = rich.size(size);
+            }
+            ui.label(rich);
+        } else {
+            let mut rich = egui::RichText::new(seg.text);
+            if let Some(size) = base_size {
+                rich = rich.size(size);
+            }
+            if base_strong || seg.is_bold {
+                rich = rich.strong();
+            }
+            if seg.is_bold {
+                rich = rich.color(ui.visuals().strong_text_color());
+            }
+            ui.label(rich);
+        }
     }
 }
 
@@ -1174,7 +1358,8 @@ fn load_remote_image_rgba(_url: &str) -> Result<(usize, usize, Vec<u8>), String>
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_image_alt_width, parse_image_row, resolve_image_source, resolve_locale_wiki_dir,
+        WikiBlock, parse_bullet, parse_image_alt_width, parse_image_row, parse_markdown_to_blocks,
+        parse_numbered, parse_quote, resolve_image_source, resolve_locale_wiki_dir,
     };
     use std::path::{Path, PathBuf};
 
@@ -1239,6 +1424,122 @@ mod tests {
     fn parse_image_row_rejects_mixed_text_or_no_image() {
         assert_eq!(parse_image_row("![a](images/1.png) trailing text"), None);
         assert_eq!(parse_image_row("plain paragraph"), None);
+    }
+
+    #[test]
+    fn parse_bullet_accepts_both_markers_and_rejects_emphasis() {
+        assert_eq!(parse_bullet("- dash"), Some("dash"));
+        assert_eq!(parse_bullet("* star"), Some("star"));
+        assert_eq!(parse_bullet("*   spaced  "), Some("spaced"));
+        assert_eq!(parse_bullet("**bold** text"), None);
+        assert_eq!(parse_bullet("*italic*"), None);
+        assert_eq!(parse_bullet("*nospace"), None);
+        assert_eq!(parse_bullet("* "), None);
+        assert_eq!(parse_bullet("***"), None);
+        assert_eq!(parse_bullet("* * *"), None);
+    }
+
+    #[test]
+    fn parse_markdown_treats_star_lines_as_bullets_but_keeps_emphasis_text() {
+        let blocks = parse_markdown_to_blocks("**note** here\n* one\n* two\n", Path::new("."));
+        match blocks.as_slice() {
+            [
+                WikiBlock::Paragraph(note),
+                WikiBlock::Bullet(first),
+                WikiBlock::Bullet(second),
+            ] => {
+                assert_eq!(note, "**note** here");
+                assert_eq!(first, "one");
+                assert_eq!(second, "two");
+            }
+            other => panic!("unexpected blocks: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_numbered_keeps_the_source_ordinal() {
+        assert_eq!(parse_numbered("1. first"), Some((1, "first".to_owned())));
+        assert_eq!(parse_numbered("10.  tenth"), Some((10, "tenth".to_owned())));
+        assert_eq!(parse_numbered("0. zero"), Some((0, "zero".to_owned())));
+        assert_eq!(parse_numbered("1."), None);
+        assert_eq!(parse_numbered("1 no dot"), None);
+        assert_eq!(parse_numbered("- bullet"), None);
+        // Out of `u32` range: rendered as a paragraph rather than a wrong ordinal.
+        assert_eq!(parse_numbered("99999999999. huge"), None);
+    }
+
+    #[test]
+    fn parse_markdown_numbers_list_items_from_the_source() {
+        let blocks = parse_markdown_to_blocks("1. one\n2. two\n3. three\n", Path::new("."));
+        let numbers: Vec<u32> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                WikiBlock::Numbered { number, .. } => Some(*number),
+                WikiBlock::Heading { .. }
+                | WikiBlock::Paragraph(_)
+                | WikiBlock::Bullet(_)
+                | WikiBlock::Code(_)
+                | WikiBlock::Quote { .. }
+                | WikiBlock::ImageRow(_) => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_quote_strips_marker_and_reports_depth() {
+        assert_eq!(parse_quote("> note"), Some((1, "note".to_owned())));
+        assert_eq!(parse_quote(">note"), Some((1, "note".to_owned())));
+        assert_eq!(parse_quote(">> deep"), Some((2, "deep".to_owned())));
+        assert_eq!(parse_quote("> > deep"), Some((2, "deep".to_owned())));
+        assert_eq!(parse_quote(">"), Some((1, String::new())));
+        assert_eq!(parse_quote("plain"), None);
+        assert_eq!(parse_quote("a > b"), None);
+    }
+
+    #[test]
+    fn parse_quote_clamps_excessive_nesting() {
+        let (level, text) = parse_quote(">>>>>>> deep").expect("quote line");
+        assert_eq!(level, super::WIKI_QUOTE_MAX_LEVEL);
+        assert_eq!(text, "deep");
+    }
+
+    #[test]
+    fn parse_markdown_merges_consecutive_quote_lines_of_one_depth() {
+        let blocks = parse_markdown_to_blocks("> first\n> second\n>> nested\n", Path::new("."));
+        match blocks.as_slice() {
+            [
+                WikiBlock::Quote { level: 1, text: outer },
+                WikiBlock::Quote { level: 2, text: inner },
+            ] => {
+                assert_eq!(outer, "first\nsecond");
+                assert_eq!(inner, "nested");
+            }
+            other => panic!("unexpected blocks: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_markdown_does_not_swallow_a_quote_into_the_previous_paragraph() {
+        let blocks = parse_markdown_to_blocks("body text\n> quoted\ntail\n", Path::new("."));
+        match blocks.as_slice() {
+            [
+                WikiBlock::Paragraph(body),
+                WikiBlock::Quote { level: 1, text: quoted },
+                WikiBlock::Paragraph(tail),
+            ] => {
+                assert_eq!(body, "body text");
+                assert_eq!(quoted, "quoted");
+                assert_eq!(tail, "tail");
+            }
+            other => panic!("unexpected blocks: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_markdown_drops_a_marker_only_quote() {
+        let blocks = parse_markdown_to_blocks(">\n>   \n", Path::new("."));
+        assert!(blocks.is_empty(), "unexpected blocks: {blocks:?}");
     }
 
     #[test]
