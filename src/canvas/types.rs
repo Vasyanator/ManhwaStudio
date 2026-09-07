@@ -876,7 +876,7 @@ impl Default for CanvasState {
             bubble_max_width: 550.0,
             aside_compact_mode: AsideBubbleCompactMode::None,
             aside_side_mode: AsideBubbleSideMode::Auto,
-            aside_second_column: false,
+            aside_second_column: true,
             on_top_focus_mode: OnTopFocusMode::Around,
             scale_bubbles: true,
             aside_scale_pct: 100,
@@ -885,7 +885,10 @@ impl Default for CanvasState {
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
-            translation_status_display: TranslationStatusDisplay::UntilNext,
+            // Same value as `CanvasSettings::default` and `SharedCanvasSettings::default`;
+            // `canvas_defaults_agree_across_the_three_mirrors` in `src/project.rs` keeps the
+            // three in step.
+            translation_status_display: TranslationStatusDisplay::Marks,
             hint_show_outside_default: false,
         }
     }

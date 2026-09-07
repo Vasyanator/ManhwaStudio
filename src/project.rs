@@ -163,14 +163,26 @@ impl ComicType {
         }
     }
 
+    /// Canvas fields a preset writes: `(aside_compact_mode, separate_pages)`.
+    ///
+    /// `Custom` returns `None` — it is not a set of values but the absence of a match.
+    ///
+    /// This function and [`Self::from_canvas_preset_fields`] are a PAIR and must stay
+    /// exact inverses: the settings UI applies these values and then re-derives the
+    /// active preset from them on the very next frame, so any disagreement makes the
+    /// combo box jump to "Custom" the instant the user picks a preset. `preset_round_trip`
+    /// in the tests below locks that down.
     pub fn canvas_preset(self) -> Option<(&'static str, bool)> {
         match self {
-            Self::Pages => Some(("strong", true)),
+            Self::Pages => Some(("moderate", true)),
             Self::Ribbon => Some(("none", false)),
             Self::Custom => None,
         }
     }
 
+    /// Derives the active preset from the canvas fields, or `Custom` when they match none.
+    ///
+    /// The inverse of [`Self::canvas_preset`]; see the contract stated there.
     pub fn from_canvas_preset_fields(aside_compact_mode: &str, separate_pages: bool) -> Self {
         match (
             aside_compact_mode.trim().to_ascii_lowercase().as_str(),
@@ -197,7 +209,7 @@ impl Default for CanvasSettings {
             aside_max_width_px: 550,
             aside_compact_mode: "none".to_string(),
             aside_side_mode: "auto".to_string(),
-            aside_second_column: false,
+            aside_second_column: true,
             on_top_focus_mode: "around".to_string(),
             scale_bubbles: true,
             page_spacing_px: 200,
@@ -210,7 +222,11 @@ impl Default for CanvasSettings {
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
-            translation_status_display: "until_next".to_string(),
+            // Marks by default, and deliberately independent of the canvas preset: the
+            // preset only owns `aside_compact_mode` / `separate_pages` (see
+            // `ComicType::canvas_preset`), so this value survives switching between the
+            // page and ribbon presets.
+            translation_status_display: "marks".to_string(),
             hint_show_outside_default: false,
         }
     }
@@ -2115,8 +2131,105 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LegacyEntry, LegacyRibbonGeometry, overlay_name_match_key, value_is_legacy_xy};
+    use super::{
+        ComicType, LegacyEntry, LegacyRibbonGeometry, overlay_name_match_key, value_is_legacy_xy,
+    };
     use serde_json::json;
+
+    /// `canvas_preset` and `from_canvas_preset_fields` must be exact inverses.
+    ///
+    /// The settings UI writes the values of the chosen preset and re-derives the active
+    /// preset from them on the next frame. When the two disagreed — `Pages` was applied as
+    /// `strong` while only `moderate` was recognised as `Pages` — picking "Pages" wrote the
+    /// wrong compact mode AND made the combo box flip straight back to "Custom".
+    #[test]
+    fn preset_round_trip() {
+        for preset in [ComicType::Pages, ComicType::Ribbon] {
+            let (mode, separate_pages) = preset
+                .canvas_preset()
+                .unwrap_or_else(|| panic!("{preset:?} must define canvas fields"));
+            assert_eq!(
+                ComicType::from_canvas_preset_fields(mode, separate_pages),
+                preset,
+                "preset {preset:?} applies ({mode}, {separate_pages}) but is not recognised back"
+            );
+        }
+        assert_eq!(ComicType::Custom.canvas_preset(), None);
+    }
+
+    /// The page preset uses the MODERATE compact mode, not the strong one: the strong mode
+    /// hides too much of a side bubble for page-based comics. Stated as its own test because
+    /// the round trip above would stay green if both halves were changed to `strong`.
+    #[test]
+    fn pages_preset_uses_moderate_compact_mode() {
+        assert_eq!(ComicType::Pages.canvas_preset(), Some(("moderate", true)));
+    }
+
+    /// The same canvas defaults are declared in THREE places and must agree.
+    ///
+    /// `CanvasSettings::default` (project file), `SharedCanvasSettings::default`
+    /// (`src/models/bubbles_model.rs`) and `CanvasState::default` (`src/canvas/types.rs`)
+    /// each spell out the same user-facing values in a different representation, so a
+    /// change to one silently drifts from the others and shows up only as a wrong value
+    /// on a fresh install or a flicker before the project loads. The JSON copies in
+    /// `config::user_config_defaults` / `project_config_defaults` are covered too.
+    /// Only the fields this test names are guarded; extend it when you touch another one.
+    #[test]
+    fn canvas_defaults_agree_across_the_three_mirrors() {
+        use crate::canvas::CanvasState;
+        use crate::models::bubbles_model::SharedCanvasSettings;
+
+        let project = super::CanvasSettings::default();
+        let shared = SharedCanvasSettings::default();
+        let state = CanvasState::default();
+
+        assert_eq!(project.translation_status_display, "marks");
+        assert_eq!(shared.translation_status_display, project.translation_status_display);
+        assert_eq!(state.translation_status_display.as_str(), project.translation_status_display);
+
+        assert!(project.aside_second_column);
+        assert_eq!(shared.aside_second_column, project.aside_second_column);
+        assert_eq!(state.aside_second_column, project.aside_second_column);
+
+        for defaults in [
+            crate::config::user_config_defaults(),
+            crate::config::project_config_defaults(),
+        ] {
+            // The two documents spell the section differently — `user_config_defaults`
+            // uses TitleCase sections, `project_config_defaults` a lowercase `canvas`
+            // object — so accept either rather than hard-coding one.
+            let canvas = defaults
+                .get("Canvas")
+                .or_else(|| defaults.get("canvas"))
+                .unwrap_or_else(|| panic!("defaults must carry a canvas section"));
+            assert_eq!(
+                canvas.get("translation_status_display").and_then(|v| v.as_str()),
+                Some(project.translation_status_display.as_str())
+            );
+            assert_eq!(
+                canvas.get("aside_second_column").and_then(|v| v.as_bool()),
+                Some(project.aside_second_column)
+            );
+        }
+    }
+
+    /// Values matching no preset are `Custom`, including a mode that is merely mis-cased or
+    /// padded — the deriver normalises before matching.
+    #[test]
+    fn unmatched_fields_are_custom() {
+        assert_eq!(
+            ComicType::from_canvas_preset_fields("strong", true),
+            ComicType::Custom
+        );
+        assert_eq!(
+            ComicType::from_canvas_preset_fields("moderate", false),
+            ComicType::Custom
+        );
+        assert_eq!(
+            ComicType::from_canvas_preset_fields("  MODERATE ", true),
+            ComicType::Pages
+        );
+    }
 
     /// Forward map used only by tests: place a normalized (u, v) point on page `idx`
     /// back into absolute legacy canvas coordinates for a known scale/offset.

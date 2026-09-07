@@ -135,7 +135,7 @@ impl Default for SharedCanvasSettings {
             bubble_max_width: 550.0,
             aside_compact_mode: "none".to_string(),
             aside_side_mode: "auto".to_string(),
-            aside_second_column: false,
+            aside_second_column: true,
             on_top_focus_mode: "around".to_string(),
             scale_bubbles: true,
             aside_scale_pct: 100,
@@ -144,7 +144,10 @@ impl Default for SharedCanvasSettings {
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
-            translation_status_display: "until_next".to_string(),
+            // Kept in step with `CanvasSettings::default` in `src/project.rs`: these two
+            // Default impls describe the same user-facing settings, and a disagreement
+            // shows up only as a one-frame flicker before the project's values load.
+            translation_status_display: "marks".to_string(),
             hint_show_outside_default: false,
         }
     }
