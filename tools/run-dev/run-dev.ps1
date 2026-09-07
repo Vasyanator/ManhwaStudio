@@ -4,7 +4,7 @@ File: tools/run-dev/run-dev.ps1
 Purpose:
 Windows core of `run-dev`: bring the working copy up to date with origin,
 provision Git / a Rust toolchain / a C toolchain when the machine has none, then
-run the app with `cargo run --bin manhwastudio_rs --release`.
+build the app, put the built binary in the project root and run it from there.
 
 Main responsibilities:
 - Stage 1 (git): provision portable MinGit when git is absent, adopt a working
@@ -13,8 +13,11 @@ Main responsibilities:
   itself and request a restart instead of continuing.
 - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
   toolchain, provision an isolated one plus MinGW-w64 under installer_files/.
-- Stage 3: two sequential cargo runs — an environment check that only shows a
-  GUI when something is missing, then the application itself.
+- Stage 3, strictly sequential: an environment check (`cargo run --check-venv`)
+  that only shows a GUI when something is missing and is also what builds the
+  project; publishing the built binary into the project root; then running that
+  root binary. Publishing is a convenience — any failure falls back to the
+  `cargo run` launch and never stops the run.
 
 Key functions:
 - Invoke-GitStage, Install-MinGit, Invoke-RepositoryAdoption, Update-WithLocalChanges
@@ -23,6 +26,9 @@ Key functions:
 - Get-StashTop, Get-StashRefFor, Invoke-StashPop, Restore-StashEntry
 - Invoke-RustStage, Install-ManagedRust, Install-Mingw, Assert-CToolchain
 - Invoke-CargoRun, Assert-AppEnvironment, Invoke-RunStage
+- Get-BuiltBinaryFromJson, Resolve-BuiltBinary, Test-RootBinaryNeedsCopy,
+  Install-RootBinary, Clear-RootBinaryLeftovers, Publish-RootBinary,
+  Invoke-RootBinary
 
 Notes:
 The algorithm, its rationale, and every failure path are specified in
@@ -112,6 +118,11 @@ $script:PreHead     = ''
 # Exit code of the most recent Invoke-CargoRun; see that function for why the
 # code is passed through state instead of being returned.
 $script:LastRunCode = 0
+# Full path of the binary published into the project root, or '' when publishing
+# did not happen. Carried through state for the same reason as $script:LastRunCode:
+# Publish-RootBinary's output stream belongs to cargo, so a returned path would
+# arrive glued to the build log. Empty means "phase 2 goes through cargo run".
+$script:RootExe     = ''
 
 # --- Output helpers ----------------------------------------------------------
 
@@ -1525,8 +1536,8 @@ function Invoke-CargoRun {
 Phase 1 of Stage 3: let the binary itself decide whether the Python environment
 is usable. `--check-venv` opens the installer *only* when something is missing
 and exits 0 without any GUI when everything is in place, so this is also what
-compiles the project — phase 2 then starts instantly. Never returns when the
-environment could not be prepared.
+compiles the project — Publish-RootBinary then only has to ask cargo where the
+result is. Never returns when the environment could not be prepared.
 #>
 function Assert-AppEnvironment {
     if ($Offline) {
@@ -1561,6 +1572,352 @@ function Assert-AppEnvironment {
     Ok 'Окружение готово.'
 }
 
+# --- Publishing the built binary into the project root ------------------------
+#
+# The point is that the user can start the application afterwards WITHOUT this
+# script and without any git update: `manhwastudio_rs.exe` in the project root is
+# a complete launch. Running it from there is safe — config::resolve_runtime_root
+# finds the project root both from the current directory and from the
+# executable's own directory, and no DLL is loaded from beside the executable.
+# The whole step is a convenience: every failure degrades to the old `cargo run`
+# launch and no new exit code exists for it.
+
+<#
+.SYNOPSIS
+Returns the path of the executable that cargo built for bin target $TargetName,
+taken from a `--message-format=json` stream, or '' when the stream names none.
+
+.DESCRIPTION
+$Json is cargo's stdout, one JSON object per line. The LAST `compiler-artifact`
+message whose `target.name` equals $TargetName and whose `executable` is non-null
+wins: a stream can carry several artifacts for one target, and the final one
+describes what is on disk now. Filtering by target name is not optional — the
+package declares several bin targets besides this one, and `src/bin/` adds more
+automatically — and the non-null test is what skips library artifacts, which
+report `"executable":null`.
+
+Pure: reads nothing, writes nothing, and is safe to call on arbitrary text. Lines
+that are not JSON objects are skipped rather than throwing, because cargo is free
+to put plain text on stdout, and every field is probed before it is read: under
+Set-StrictMode -Version Latest reading an absent property is a terminating error,
+and most cargo messages (build-script-executed, build-finished, compiler-message)
+carry no `target` or `executable` at all.
+#>
+function Get-BuiltBinaryFromJson {
+    param([string] $Json, [string] $TargetName)
+    if ([string]::IsNullOrWhiteSpace($Json)) { return '' }
+    $found = ''
+    foreach ($line in ($Json -split "`r?`n")) {
+        $text = $line.Trim()
+        if (-not $text.StartsWith('{')) { continue }
+        $msg = $null
+        try { $msg = ConvertFrom-Json -InputObject $text } catch { continue }
+        if ($null -eq $msg) { continue }
+
+        $fields = @($msg.PSObject.Properties.Name)
+        if ($fields -notcontains 'reason') { continue }
+        # -cne: the project compares machine-readable tokens case-sensitively.
+        if ("$($msg.reason)" -cne 'compiler-artifact') { continue }
+        if ($fields -notcontains 'executable' -or $fields -notcontains 'target') { continue }
+
+        # A lib artifact reports "executable":null; only a bin has a path here.
+        $exe = "$($msg.executable)"
+        if ([string]::IsNullOrWhiteSpace($exe)) { continue }
+
+        $target = $msg.target
+        if ($null -eq $target) { continue }
+        if (@($target.PSObject.Properties.Name) -notcontains 'name') { continue }
+        if ("$($target.name)" -cne $TargetName) { continue }
+
+        $found = $exe
+    }
+    return $found
+}
+
+<#
+.SYNOPSIS
+Asks cargo where the binary of $AppBin is, by building it and reading the path
+out of the JSON message stream. Returns '' when cargo failed or named no
+executable; never throws for that reason and never guesses a `target\...` path.
+
+.DESCRIPTION
+Normally free: phase 1 has already built the project, so this call is cache-warm
+and only prints the JSON. Under -Offline phase 1 is skipped and THIS call performs
+the real build.
+
+`json-render-diagnostics` rather than plain `json`: it keeps the human-readable
+compiler errors going to stderr, which plain `json` would swallow into the
+machine-readable stream and hide from the user. stderr is deliberately NOT merged
+into the captured output — cargo's progress and diagnostics must stay on the
+terminal, and merging streams into parsed data is the exact bug class the
+Invoke-Git contract exists to prevent.
+#>
+function Resolve-BuiltBinary {
+    $cargoArgs = @('build', '--bin', $AppBin)
+    if (-not $DebugBuild) { $cargoArgs += '--release' }
+    $cargoArgs += '--message-format=json-render-diagnostics'
+
+    $prev = $ErrorActionPreference
+    # A native command that is allowed to fail: under 'Stop' anything cargo writes
+    # to stderr becomes a terminating error. Same treatment as Invoke-CargoRun.
+    $ErrorActionPreference = 'Continue'
+    $captured = & $script:Cargo @cargoArgs
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+
+    if ($code -ne 0) {
+        Warn "cargo build завершился с кодом $code."
+        return ''
+    }
+    $text = ((@($captured) | ForEach-Object { [string]$_ }) -join "`n")
+    return (Get-BuiltBinaryFromJson -Json $text -TargetName $AppBin)
+}
+
+<#
+.SYNOPSIS
+True when $Destination has to be (re)written from $Source: it is missing, or its
+size or last-write time differ. $Source must exist.
+
+.DESCRIPTION
+Exact timestamp equality is the right test, not "older than": Copy-Item preserves
+LastWriteTime, so a destination produced by Install-RootBinary from this very
+source carries the source's stamp byte for byte. Comparing UTC avoids the DST
+shifts a local-time comparison would invent twice a year.
+#>
+function Test-RootBinaryNeedsCopy {
+    param([string] $Source, [string] $Destination)
+    if (-not (Test-Path -LiteralPath $Destination)) { return $true }
+    $src = Get-Item -LiteralPath $Source
+    $dst = Get-Item -LiteralPath $Destination
+    if ($src.Length -ne $dst.Length) { return $true }
+    return ($src.LastWriteTimeUtc -ne $dst.LastWriteTimeUtc)
+}
+
+<#
+.SYNOPSIS
+Copies $Source onto $Destination atomically. Throws with a Russian message when
+the destination could not be replaced; the caller treats that as non-fatal.
+
+.DESCRIPTION
+Same `.part` principle as Get-RemoteFile: the bytes go to `<Destination>.part`
+and are renamed into place only once they are all there, so $Destination never
+holds a half-written executable.
+
+The real hazard is Windows-specific: $Destination may be a *running* executable
+left over from a previous session, and Windows refuses to overwrite or delete
+one. Renaming it, however, is allowed even while it runs — that is the standard
+updater trick — so the move is retried after the old file is renamed aside.
+
+The aside name carries a random suffix instead of being a fixed `<Destination>.old`:
+an aside that is still locked by a live process cannot be deleted, and a fixed name
+would then block every future publish and make the error message blame that
+leftover rather than the file actually in the way. Deleting the aside is
+best-effort; Clear-RootBinaryLeftovers sweeps whatever survived on a later run.
+#>
+function Install-RootBinary {
+    param([string] $Source, [string] $Destination)
+    $part = "$Destination.part"
+    $old  = "$Destination.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8)
+
+    Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $Source -Destination $part -Force
+
+    $firstError = ''
+    try {
+        Move-Item -LiteralPath $part -Destination $Destination -Force
+        return
+    } catch {
+        $firstError = $_.Exception.Message
+    }
+
+    # The destination is locked — almost always a copy of the app still running.
+    try {
+        Move-Item -LiteralPath $Destination -Destination $old -Force
+    } catch {
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        throw "файл занят и не переименовывается: $firstError"
+    }
+
+    try {
+        Move-Item -LiteralPath $part -Destination $Destination -Force
+    } catch {
+        $moveError = $_.Exception.Message
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        # Put the previous binary back, so a failure leaves the root as it was.
+        # When even that fails the root holds NO binary at all — the one outcome
+        # that must never hide behind the original error message.
+        $restored = $false
+        try {
+            Move-Item -LiteralPath $old -Destination $Destination -Force
+            $restored = $true
+        } catch { }
+        if (-not $restored) {
+            throw "$moveError. Вернуть прежний файл не удалось: в корне проекта сейчас нет программы, она лежит рядом под именем $old"
+        }
+        throw $moveError
+    }
+    Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+}
+
+<#
+.SYNOPSIS
+Removes what a previous publish may have left next to $Destination:
+`<Destination>.part` and every `<Destination>.old-*` aside. Best-effort and
+silent — an aside still locked by a running copy of the application is normal,
+and the next run tries again.
+
+.DESCRIPTION
+Called unconditionally, not only when a copy happens: Install-RootBinary is
+skipped whenever the root binary is already identical, so a leftover from an
+interrupted or blocked run would otherwise survive forever.
+#>
+function Clear-RootBinaryLeftovers {
+    param([string] $Destination)
+    Remove-Item -LiteralPath "$Destination.part" -Force -ErrorAction SilentlyContinue
+    $dir  = Split-Path -Parent $Destination
+    $leaf = Split-Path -Leaf   $Destination
+    if (-not $dir -or -not $leaf) { return }
+    # -LiteralPath: a project path containing [ ] would be read as a wildcard by -Path.
+    $asides = @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.old-*" -File -ErrorAction SilentlyContinue)
+    foreach ($aside in $asides) {
+        Remove-Item -LiteralPath $aside.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+<#
+.SYNOPSIS
+Puts the freshly built binary into the project root and records its path in
+$script:RootExe, so phase 2 can launch it directly. Sets $script:RootExe to ''
+and warns — never dies — when anything about that fails.
+
+.DESCRIPTION
+Deliberately non-fatal and without an exit code of its own: publishing the binary
+is a convenience, running the application is the point of the script. Everything
+this step can fail at (cargo not naming the path, a locked destination, a full
+disk) leaves phase 2 working exactly as it did before, through Invoke-CargoRun.
+#>
+function Publish-RootBinary {
+    $script:RootExe = ''
+
+    Step 'Готовлю запускаемый файл в корне проекта'
+    if ($Offline) {
+        Info 'Режим -Offline: проверка окружения пропущена, поэтому проект собирается сейчас.'
+        Info 'На чистой машине это самая долгая часть, окно не зависло.'
+    } else {
+        Info 'Проект уже собран на предыдущем шаге — это займёт мгновение.'
+    }
+    Say ''
+
+    $built = ''
+    try {
+        $built = Resolve-BuiltBinary
+    } catch {
+        Warn "Не удалось узнать путь к собранному файлу: $($_.Exception.Message)"
+        Info 'Запуск продолжится обычным способом, через cargo run.'
+        return
+    }
+    if (-not $built) {
+        Warn 'Cargo не сообщил путь к собранному файлу, копирование в корень пропущено.'
+        Info 'Запуск продолжится обычным способом, через cargo run.'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $built)) {
+        Warn "Собранный файл не найден: $built"
+        Info 'Запуск продолжится обычным способом, через cargo run.'
+        return
+    }
+
+    # The name is taken from the built file, not hard-coded: it carries the .exe
+    # suffix on Windows and would not on any other host.
+    $dest = Join-Path $script:RepoRoot (Split-Path -Leaf $built)
+    # Unconditional, before the copy is even decided: the copy below is skipped
+    # whenever the root binary is already current, and its own cleanup with it.
+    Clear-RootBinaryLeftovers -Destination $dest
+
+    try {
+        if (Test-RootBinaryNeedsCopy -Source $built -Destination $dest) {
+            Install-RootBinary -Source $built -Destination $dest
+            Ok "Программа скопирована в корень проекта: $dest"
+            Info 'Дальше её можно запускать напрямую — без run-dev и без обновления.'
+        } else {
+            Ok "В корне проекта уже лежит эта же сборка: $dest"
+        }
+    } catch {
+        Warn "Не удалось скопировать файл в корень проекта: $($_.Exception.Message)"
+        Info 'Запуск продолжится обычным способом, через cargo run.'
+        return
+    }
+
+    $script:RootExe = $dest
+}
+
+<#
+.SYNOPSIS
+Runs the published root binary with $ApplicationArgs, WAITS for it, and records
+its exit code in $script:LastRunCode. Requires $script:RootExe to be set. Records
+126 — the POSIX "found but could not be executed" code, which run-dev.sh yields on
+this path — when the file cannot be started at all.
+
+.DESCRIPTION
+The counterpart of Invoke-CargoRun for the published binary, and it keeps that
+function's two contracts: the exit code travels through script state because this
+function's output stream belongs to the application, and the call is synchronous.
+The working directory is the project root — Invoke-Main sets it and nothing moves
+it afterwards — which is what the application's own root resolution expects.
+#>
+function Invoke-RootBinary {
+    param([string[]] $ApplicationArgs)
+    $prev = $ErrorActionPreference
+    # A native command that is allowed to fail; same treatment as Invoke-CargoRun.
+    $ErrorActionPreference = 'Continue'
+    try {
+        # `| Out-Host` is load-bearing. Do not "simplify" it away.
+        #
+        # On Windows the application is a GUI-subsystem binary: src/main.rs applies
+        # windows_subsystem = "windows" unless the active-logs feature is on, and
+        # run-dev passes no --features. PowerShell's call operator does NOT wait for
+        # a GUI-subsystem process — it starts it and returns immediately. Without a
+        # pipeline this function would therefore return at once, $LASTEXITCODE would
+        # still hold the code of the PREVIOUS command (cargo build's 0), the launcher
+        # window would close while the application was still starting, and a startup
+        # crash would show the user nothing at all. `cargo run` never had this
+        # problem: cargo.exe is a console application, so PowerShell waited for it.
+        #
+        # A pipeline forces PowerShell to redirect the process's stdout and read it
+        # to EOF, which cannot happen before the process exits. That makes the call
+        # synchronous again, and $LASTEXITCODE — read on the next line, with no other
+        # command in between — is then the application's own exit code.
+        #
+        # Start-Process -Wait -PassThru would also wait and is this file's idiom
+        # elsewhere (Install-ManagedRust), but Windows PowerShell 5.1 joins its
+        # -ArgumentList into one string WITHOUT quoting, so every argument containing
+        # a space would arrive split. dev-docs/run_dev_plan.md documents argument
+        # fidelity as a property of the Windows side, so the array is splatted through
+        # the call operator instead, exactly as Invoke-CargoRun does.
+        #
+        # Out-Host rather than Out-Null: the application's own output stays visible.
+        & $script:RootExe @ApplicationArgs | Out-Host
+        $script:LastRunCode = $LASTEXITCODE
+    } catch {
+        # A file that cannot be started at all (missing, quarantined by antivirus,
+        # not an executable) throws instead of returning a code. Untreated it would
+        # end the run with a raw PowerShell stack trace, outside the exit codes in
+        # dev-docs/run_dev_plan.md.
+        Warn "Не удалось запустить программу из корня проекта: $($_.Exception.Message)"
+        Info "Файл: $script:RootExe"
+        Info 'Удалите его и запустите run-dev снова — он соберёт и положит новый.'
+        $script:LastRunCode = 126
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+<#
+.SYNOPSIS
+Stage 3: check the environment (which also builds), publish the built binary into
+the project root, then run the application. Never returns — it exits with the
+application's own exit code.
+#>
 function Invoke-RunStage {
     Step 'Сборка и запуск'
     if ($DebugBuild) {
@@ -1578,13 +1935,24 @@ function Invoke-RunStage {
 
     Assert-AppEnvironment
 
+    # Between the check and the run: put the built binary in the project root, so
+    # the user can start the application later without this script. Sets
+    # $script:RootExe on success and only warns on failure.
+    Publish-RootBinary
+
     # Phase 2. `--ignore-installed` goes first: the environment was just checked,
-    # so the application must not repeat that check at startup.
+    # so the application must not repeat that check at startup. It is also what
+    # keeps the self-updater from overwriting the root binary in place, so it is
+    # passed on both launch paths.
     $appArguments = @('--ignore-installed')
     if ($AppArgs -and $AppArgs.Count -gt 0) { $appArguments += $AppArgs }
 
     Say ''
-    Invoke-CargoRun -ApplicationArgs $appArguments
+    if ($script:RootExe) {
+        Invoke-RootBinary -ApplicationArgs $appArguments
+    } else {
+        Invoke-CargoRun -ApplicationArgs $appArguments
+    }
     $code = $script:LastRunCode
 
     if ($code -ne 0) {

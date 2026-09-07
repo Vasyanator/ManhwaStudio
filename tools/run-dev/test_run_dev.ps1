@@ -22,6 +22,10 @@ What is covered:
 - self-update detection                 -> git names the run-dev paths an update
                                            touched; exit 8 only when it did
 - stash guard                           -> a pop never restores somebody else's entry
+- root binary: cargo JSON parsing       -> the right bin target, unescaped path
+- root binary: copy predicate and copy  -> skipped when identical, .part never left
+- root binary: leftovers                -> .part and every .old-* aside swept
+- root binary: launch                   -> arguments survive spaces, real exit code
 
 Run:  pwsh -NoProfile -File tools/run-dev/test_run_dev.ps1
 
@@ -477,6 +481,190 @@ try {
     if ($curlApp.Count -gt 0) {
         Check 'curl.exe разрешается в приложение' $curlApp[0].CommandType 'Application'
     }
+
+    # ---------------------------------------------------------------------
+    Note 'Готовый файл в корне: путь берётся у cargo, а не угадывается'
+    # ---------------------------------------------------------------------
+
+    # Поток --message-format=json как его отдаёт cargo: строка не-JSON перед ним,
+    # артефакт библиотеки с "executable":null, артефакт ДРУГОГО bin-таргета,
+    # сообщение без полей target/executable вовсе (под StrictMode обращение к
+    # отсутствующему полю — ошибка) и завершающий build-finished.
+    $cargoJson = @(
+        'Compiling manhwastudio_rs v3.6.0 (C:\proj)',
+        '{"reason":"compiler-artifact","target":{"name":"egui","kind":["lib"]},"executable":null}',
+        '{"reason":"build-script-executed","package_id":"aws-lc-sys 0.1.0"}',
+        '{"reason":"compiler-artifact","target":{"name":"render_gallery","kind":["bin"]},"executable":"C:\\proj\\target\\x86_64-pc-windows-gnu\\release\\render_gallery.exe"}',
+        '{"reason":"compiler-artifact","target":{"name":"manhwastudio_rs","kind":["bin"]},"executable":"C:\\proj\\target\\x86_64-pc-windows-gnu\\release\\manhwastudio_rs.exe"}',
+        '{"reason":"build-finished","success":true}'
+    ) -join "`n"
+
+    $wantExe = 'C:\proj\target\x86_64-pc-windows-gnu\release\manhwastudio_rs.exe'
+    Check 'взят путь нужного bin-таргета' `
+          (Get-BuiltBinaryFromJson -Json $cargoJson -TargetName 'manhwastudio_rs') $wantExe
+    Check 'обратные слэши развёрнуты из JSON-экранирования' `
+          ((Get-BuiltBinaryFromJson -Json $cargoJson -TargetName 'manhwastudio_rs') -like '*\release\*') $true
+    Check 'соседний bin-таргет не перепутан' `
+          (Get-BuiltBinaryFromJson -Json $cargoJson -TargetName 'render_gallery') `
+          'C:\proj\target\x86_64-pc-windows-gnu\release\render_gallery.exe'
+    Check 'нужного таргета нет -> пусто' `
+          (Get-BuiltBinaryFromJson -Json $cargoJson -TargetName 'tutorial_test') ''
+    Check 'пустой ввод -> пусто'  (Get-BuiltBinaryFromJson -Json '' -TargetName 'manhwastudio_rs') ''
+    Check 'мусор вместо JSON -> пусто' `
+          (Get-BuiltBinaryFromJson -Json "error: could not compile`nfatal" -TargetName 'manhwastudio_rs') ''
+
+    # Побеждает ПОСЛЕДНИЙ артефакт — пересборка может выдать несколько.
+    $twice = @(
+        '{"reason":"compiler-artifact","target":{"name":"manhwastudio_rs","kind":["bin"]},"executable":"C:\\old.exe"}',
+        '{"reason":"compiler-artifact","target":{"name":"manhwastudio_rs","kind":["bin"]},"executable":"C:\\new.exe"}'
+    ) -join "`n"
+    Check 'из нескольких артефактов берётся последний' `
+          (Get-BuiltBinaryFromJson -Json $twice -TargetName 'manhwastudio_rs') 'C:\new.exe'
+
+    # ...но "последний" не отменяет требования непустого executable: артефакт
+    # библиотеки с тем же именем не должен затирать найденный путь.
+    $libLast = @(
+        '{"reason":"compiler-artifact","target":{"name":"manhwastudio_rs","kind":["bin"]},"executable":"C:\\app.exe"}',
+        '{"reason":"compiler-artifact","target":{"name":"manhwastudio_rs","kind":["lib"]},"executable":null}'
+    ) -join "`n"
+    Check 'артефакт с executable:null не затирает найденный путь' `
+          (Get-BuiltBinaryFromJson -Json $libLast -TargetName 'manhwastudio_rs') 'C:\app.exe'
+
+    # ---------------------------------------------------------------------
+    Note 'Готовый файл в корне: когда копировать и как'
+    # ---------------------------------------------------------------------
+
+    $rb = Join-Path $Sandbox 'rootbin'
+    [void](New-Item -ItemType Directory -Path $rb -Force)
+    $srcExe = Join-Path $rb 'built.bin'
+    $dstExe = Join-Path $rb 'root.bin'
+    Set-Content -LiteralPath $srcExe -Value 'built payload' -NoNewline -Encoding Ascii
+
+    # Продакшн работает под 'Stop', а этот файл — под 'Continue'. Копирование
+    # проверяем в боевом режиме: иначе непойманная ошибка Copy-Item/Move-Item
+    # молча превратилась бы в «успех».
+    $eapPrev = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+    try {
+
+    Check 'в корне ничего нет -> копировать' `
+          (Test-RootBinaryNeedsCopy -Source $srcExe -Destination $dstExe) $true
+
+    Install-RootBinary -Source $srcExe -Destination $dstExe
+    Check 'файл появился в корне'      (Test-Path -LiteralPath $dstExe) $true
+    Check 'временный .part не остался' (Test-Path -LiteralPath "$dstExe.part") $false
+    Check 'копия .old-* не осталась'   (@(Get-ChildItem -LiteralPath $rb -Filter 'root.bin.old-*' -File)).Count 0
+    Check 'содержимое совпадает'       (Get-Content -LiteralPath $dstExe -Raw) 'built payload'
+    # Ровно на этом держится предикат: Copy-Item сохраняет время изменения, иначе
+    # каждый запуск копировал бы файл заново. Сравниваем сами DateTime, а не их
+    # строковый вид: строка округляется до секунд и скрыла бы расхождение в
+    # миллисекундах — то самое, из-за которого предикат начал бы копировать всегда.
+    Check 'время изменения сохранено копированием' `
+          ((Get-Item -LiteralPath $dstExe).LastWriteTimeUtc -eq (Get-Item -LiteralPath $srcExe).LastWriteTimeUtc) $true
+    Check 'та же сборка -> копировать не нужно' `
+          (Test-RootBinaryNeedsCopy -Source $srcExe -Destination $dstExe) $false
+
+    # Другой размер при том же времени изменения.
+    $stamp = (Get-Item -LiteralPath $srcExe).LastWriteTimeUtc
+    Set-Content -LiteralPath $dstExe -Value 'built payload + tail' -NoNewline -Encoding Ascii
+    $dstItem = Get-Item -LiteralPath $dstExe
+    $dstItem.LastWriteTimeUtc = $stamp
+    Check 'другой размер -> копировать' `
+          (Test-RootBinaryNeedsCopy -Source $srcExe -Destination $dstExe) $true
+
+    # Тот же размер, но другое время изменения.
+    Install-RootBinary -Source $srcExe -Destination $dstExe
+    Check 'повторная установка перезаписывает файл' `
+          (Test-RootBinaryNeedsCopy -Source $srcExe -Destination $dstExe) $false
+    $dstItem = Get-Item -LiteralPath $dstExe
+    $dstItem.LastWriteTimeUtc = $stamp.AddMinutes(-5)
+    Check 'другое время изменения -> копировать' `
+          (Test-RootBinaryNeedsCopy -Source $srcExe -Destination $dstExe) $true
+
+    # Подметание хвостов: они остаются и тогда, когда копировать ничего не нужно,
+    # поэтому чистка живёт в Publish-RootBinary, а не внутри Install-RootBinary.
+    Install-RootBinary -Source $srcExe -Destination $dstExe
+    Set-Content -LiteralPath "$dstExe.part"          -Value 'обрывок' -NoNewline
+    Set-Content -LiteralPath "$dstExe.old-deadbeef"  -Value 'старое'  -NoNewline
+    Set-Content -LiteralPath "$dstExe.old-cafebabe"  -Value 'старое'  -NoNewline
+    Clear-RootBinaryLeftovers -Destination $dstExe
+    Check 'хвост .part подметён'   (Test-Path -LiteralPath "$dstExe.part") $false
+    Check 'все .old-* подметены'   (@(Get-ChildItem -LiteralPath $rb -Filter 'root.bin.old-*' -File)).Count 0
+    Check 'сама программа не тронута' (Test-Path -LiteralPath $dstExe) $true
+    Check 'исходник не тронут'         (Test-Path -LiteralPath $srcExe) $true
+
+    } finally { $ErrorActionPreference = $eapPrev }
+
+    # ---------------------------------------------------------------------
+    Note 'Запуск файла из корня: аргументы и код возврата'
+    # ---------------------------------------------------------------------
+
+    # Заглушка вместо приложения: пишет каждый полученный аргумент отдельной
+    # строкой в MS_ARGS_FILE и возвращает код из MS_FAKE_RC. Пути передаются
+    # через переменные среды, чтобы тело заглушки осталось чистым ASCII и не
+    # зависело от кодовой страницы.
+    #
+    # ЧЕГО ЭТОТ ТЕСТ НЕ ПРОВЕРЯЕТ: заглушка — консольная программа, а настоящее
+    # приложение на Windows собрано для GUI-подсистемы, и оператор вызова таких
+    # процессов НЕ ждёт. Ожидание обеспечивает конвейер `| Out-Host` в
+    # Invoke-RootBinary; проверить это можно только настоящим GUI-бинарником.
+    $argsFile = Join-Path $rb 'appargs.txt'
+    if ($env:OS -eq 'Windows_NT') {
+        $fakeApp = Join-Path $rb 'fakeapp.cmd'
+        Set-Content -LiteralPath $fakeApp -Encoding Ascii -Value @(
+            '@echo off',
+            'if exist "%MS_ARGS_FILE%" del "%MS_ARGS_FILE%"',
+            ':loop',
+            'if "%~1"=="" goto done',
+            '>>"%MS_ARGS_FILE%" echo %~1',
+            'shift',
+            'goto loop',
+            ':done',
+            'exit /b %MS_FAKE_RC%')
+    } else {
+        $fakeApp = Join-Path $rb 'fakeapp.sh'
+        Set-Content -LiteralPath $fakeApp -Encoding Ascii -Value @(
+            '#!/bin/sh',
+            ': > "$MS_ARGS_FILE"',
+            'for a in "$@"; do printf ''%s\n'' "$a" >> "$MS_ARGS_FILE"; done',
+            'exit "${MS_FAKE_RC:-0}"')
+        $chmod = Get-Command chmod -ErrorAction SilentlyContinue
+        if ($chmod) { & $chmod.Source '+x' $fakeApp }
+    }
+
+    $env:MS_ARGS_FILE = $argsFile
+    $env:MS_FAKE_RC   = '0'
+    $script:RootExe     = $fakeApp
+    $script:LastRunCode = -1
+
+    # Аргумент с пробелом — главный риск регрессии: Start-Process -ArgumentList
+    # склеил бы массив без кавычек и разорвал бы его на два аргумента.
+    Invoke-RootBinary -ApplicationArgs @('--ignore-installed', '--project', 'C:\my projects\ch 01')
+    $passed = @(Get-Content -LiteralPath $argsFile)
+    Check 'аргументов ровно столько, сколько передали' $passed.Count 3
+    Check 'первый аргумент дошёл'   $passed[0] '--ignore-installed'
+    Check 'второй аргумент дошёл'   $passed[1] '--project'
+    Check 'аргумент с пробелом не распался на два' $passed[2] 'C:\my projects\ch 01'
+    Check 'нулевой код возврата'    $script:LastRunCode 0
+
+    $env:MS_FAKE_RC = '42'
+    Invoke-RootBinary -ApplicationArgs @('--ignore-installed')
+    Check 'код возврата приложения пробрасывается' $script:LastRunCode 42
+    Check 'а не остаётся от прошлой команды' `
+          (@(Get-Content -LiteralPath $argsFile))[0] '--ignore-installed'
+
+    $env:MS_FAKE_RC = '0'
+    Invoke-RootBinary -ApplicationArgs @()
+    Check 'пустой список аргументов не ломает запуск' $script:LastRunCode 0
+
+    # Незапускаемый файл: код 126, как на POSIX-стороне, а не стек-трейс.
+    $script:RootExe     = Join-Path $rb 'no-such-file.bin'
+    $script:LastRunCode = -1
+    Invoke-RootBinary -ApplicationArgs @('--ignore-installed')
+    Check 'незапускаемый файл -> код 126' $script:LastRunCode 126
+
+    Remove-Item Env:MS_ARGS_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:MS_FAKE_RC   -ErrorAction SilentlyContinue
 
 } finally {
     Set-Location ([System.IO.Path]::GetTempPath())

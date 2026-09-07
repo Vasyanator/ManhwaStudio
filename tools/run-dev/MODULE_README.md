@@ -3,14 +3,19 @@
 ## Purpose
 
 The `run-dev` entry point: take a machine that may have nothing installed, bring the working copy
-up to date with `origin`, provision a Rust toolchain that satisfies the crate's MSRV, and start the
-application binary from source.
+up to date with `origin`, provision a Rust toolchain that satisfies the crate's MSRV, build the
+application, publish the built binary into the project root, and start it from there.
 
 This is a **developer/source-user** tool, not the shipped installer. Python, AI models, and the
 ONNX runtime are provisioned by `src/installer/`; nothing here does that work. Stage 3 does *start*
 the binary with `--check-venv` so the application can provision its own environment before the real
 launch, but the script only reads that process's exit code — its responsibility still ends the
 moment the Rust binary starts.
+
+Publishing the binary into the project root is what makes the script optional afterwards: once a
+build has succeeded, `manhwastudio_rs` (`.exe` on Windows) in the root is a complete launch, with
+no git update and no cargo involved. That is the point of the step, and it is why a failure to
+publish is only a warning.
 
 The algorithm, every branch of it, and the rationale for each decision are specified in
 `dev-docs/run_dev_plan.md`. That document is the contract; these scripts implement it.
@@ -27,7 +32,11 @@ Stage 1 (git)   locate git -> remember HEAD -> adopt a non-repo ZIP copy -> fetc
 Stage 2 (rust)  read MSRV from Cargo.toml -> pick/provision toolchain -> check C compiler
 Stage 3 (run)   phase 1: cargo run ... -- --check-venv --ignore-installed   (builds; GUI only
                          when the environment is incomplete; non-zero -> exit 7)
-                phase 2: cargo run ... -- --ignore-installed [user args]
+                publish: cargo build --message-format=json -> read the `executable` path ->
+                         copy it into the project root, atomically, skipping an identical
+                         copy. Any failure here is a warning, not an exit
+                phase 2: <project root>/manhwastudio_rs -- --ignore-installed [user args]
+                         (falls back to `cargo run …` when publishing failed)
 ```
 
 Two implementations, not three: Linux and macOS share `run-dev.sh` and differ only in three leaf
@@ -83,9 +92,12 @@ committed and never shows up as a local change during Stage 1:
 - **The MSRV lives in `Cargo.toml` (`rust-version`), nowhere else.** Both scripts parse it and
   **fail** when it is absent — no fallback constant, which would silently drift and turn into a
   confusing mid-build type error.
-- **Nothing outside `installer_files/` is written.** No shell profile, no `PATH`, no registry, no
-  system packages. `rustup-init` always runs with `--no-modify-path`; `PATH` changes are
-  process-local.
+- **Nothing outside `installer_files/` is written — with exactly one deliberate exception.** No
+  shell profile, no `PATH`, no registry, no system packages. `rustup-init` always runs with
+  `--no-modify-path`; `PATH` changes are process-local. The exception is the published binary
+  `<project root>/manhwastudio_rs[.exe]`, which is the whole point of the publishing step; both
+  names are already ignored by the root `.gitignore` (line 4 is `*` — the file is a publication
+  allowlist), so it can never be committed and never appears as a local change during Stage 1.
 - **`MS_DISABLE_BUILD_CODESIGN=1` is set before cargo** unless the caller already exported it.
   `build.rs` otherwise starts a codesign worker for Windows targets that *prompts on the terminal*
   for a `.p12` password when `.secret/build_config.json` is missing — in a double-clicked window
@@ -168,10 +180,44 @@ committed and never shows up as a local change during Stage 1:
   gets the same treatment as a clone. `.gitattributes` is allowlisted in the root `.gitignore` —
   that file is a publication allowlist, so a new dotfile without an explicit `!` rule would never
   be published.
-- **Stage 3's two phases are strictly sequential.** Phase 1 (`--check-venv`) has fully exited
-  before phase 2 starts. On Windows a running `.exe` cannot be relinked, so overlapping them would
-  break the rebuild. Both are plain `cargo run`; there is no separate `cargo build` and no guessed
-  `target/…` path.
+- **Stage 3's phases are strictly sequential.** Phase 1 (`--check-venv`) has fully exited before
+  the publishing step runs, and that step has finished before phase 2 starts. On Windows a running
+  `.exe` can neither be relinked nor overwritten, so overlapping any two of them would break either
+  the rebuild or the copy into the root.
+- **The binary's path is asked of cargo, never guessed.** The publishing step runs
+  `cargo build --bin <APP_BIN> [--release] --message-format=json-render-diagnostics` and reads the
+  `executable` field of the last `compiler-artifact` message whose `target.name` matches. The
+  profile directory, a `--target` triple and `CARGO_TARGET_DIR` all move the output, so a hand-built
+  `target/release/…` path would be wrong on somebody's machine — and `--message-format=json` alone
+  would swallow the compiler errors, hence the `-render-diagnostics` variant. Filtering on the
+  target name is required: the package has several bin targets, `src/bin/` autodiscovery included.
+  Normally the call is cache-warm and free, because phase 1 already built; under
+  `--offline`/`-Offline`, where phase 1 is skipped, it is the call that really builds.
+- **Publishing the root binary is a convenience and never fatal.** Every failure of it — cargo not
+  naming a path, a locked destination, a full disk — is a `warn`, and phase 2 falls back to
+  `cargo run` exactly as it worked before the step existed. It has no exit code of its own; adding
+  one would turn a lost convenience into a refusal to run the application.
+- **The root copy is written the same way a download is: `.part`, then rename.** The bytes go to
+  `<dest>.part` and are renamed into place only when complete, so the destination never holds a
+  truncated executable — and the user may be running the previous root binary at that very moment.
+  On POSIX renaming over a running executable is safe while writing into it is not; on Windows the
+  rename is refused outright, so `Install-RootBinary` renames the locked file aside to a unique
+  `<dest>.old-<8 hex>` and retries, restoring it if the retry fails. The name is unique on purpose:
+  a fixed one left behind and still locked by that same process would block every future publish
+  and blame the wrong file. `Clear-RootBinaryLeftovers` sweeps stale `.part`/`.old-*` files on
+  every run, before the copy decision, so the "already identical, skip the copy" path cleans up
+  too. `cp -p` / `Copy-Item` carry the modification time over, which is what makes that
+  identical-skip test work.
+- **On Windows phase 2 must be a PIPELINE, and that is not cosmetic.** `src/main.rs` applies
+  `windows_subsystem = "windows"` unless the `active-logs` feature is on, and `run-dev` passes no
+  `--features`, so the application is a GUI-subsystem binary — and PowerShell's call operator does
+  not wait for one. `Invoke-RootBinary` therefore pipes it (`& $exe @args | Out-Host`): a pipeline
+  makes PowerShell read the child's stdout to EOF, which cannot happen before it exits. Without
+  that, the script would return instantly, report `cargo build`'s stale exit code, and close the
+  window while the application was still starting. `cargo run` never had the problem because
+  `cargo.exe` is a console application. `Start-Process -Wait` would also wait, but Windows
+  PowerShell 5.1 joins its `-ArgumentList` without quoting and would split every argument
+  containing a space.
 - **Phase 1 is skipped under `--offline`/`-Offline`.** The flag means "no network at all", and the
   check may download uv, Python or Torch wheels. The application reports a broken environment on
   its own later.
@@ -189,10 +235,19 @@ committed and never shows up as a local change during Stage 1:
   notation, same order in both) — the detection itself, `self_changed_paths` /
   `Get-ChangedSelfPaths`, needs no changes. A file added there whose line endings matter needs a rule
   in the root `.gitattributes` as well.
-- To change what is passed to the application, see `run_stage` + `cargo_run_app` (sh) /
-  `Invoke-RunStage` + `Invoke-CargoRun` (ps1). The environment check is `check_environment` /
-  `Assert-AppEnvironment`; the flags it relies on (`--check-venv`, `--ignore-installed`) are
-  defined in `src/args.rs`.
+- To change what is passed to the application, see `run_stage` + `cargo_run_app` + `run_root_binary`
+  (sh) / `Invoke-RunStage` + `Invoke-CargoRun` + `Invoke-RootBinary` (ps1) — the arguments are
+  composed once in the stage function and used by both launch paths. The environment check is
+  `check_environment` / `Assert-AppEnvironment`; the flags it relies on (`--check-venv`,
+  `--ignore-installed`) are defined in `src/args.rs`. `--ignore-installed` is load-bearing on the
+  root-binary path specifically: without it the application's self-updater is allowed to overwrite
+  the very file it is running from.
+- To change how the built binary reaches the project root, see `resolve_built_binary`,
+  `root_binary_needs_copy`, `install_root_binary`, `publish_root_binary` (sh) /
+  `Resolve-BuiltBinary`, `Test-RootBinaryNeedsCopy`, `Install-RootBinary`, `Publish-RootBinary`
+  (ps1). The two parsers of cargo's JSON (`built_binary_from_json` / `Get-BuiltBinaryFromJson`) and
+  the two copy predicates are pure functions on purpose, so both test suites can drive them under
+  `MS_RUN_DEV_SOURCE_ONLY=1` without cargo.
 - To change anything about downloading — retries, resume, verification, progress — edit
   `Get-RemoteFile` and its two primitives (`Invoke-CurlDownload`, `Invoke-DotNetDownload`) in
   `run-dev.ps1` and `download` in `run-dev.sh`; the contract itself is `dev-docs/run_dev_plan.md`
@@ -211,8 +266,25 @@ to `check_self_update` returning exit 8. `test_run_dev.ps1` asserts the same con
 Windows PowerShell or pwsh, which is not available in every development environment here, so a
 change that only runs the sh suite is a change whose Windows half is unverified — say so rather than
 implying both were run. Two bugs reached users because that half went unrun, so run it on a real
-machine when one is reachable. Neither suite covers Stage 2 or 3: provisioning asserts against real
-downloads and Stage 3 means a full cargo build plus a GUI. Those paths are verified by hand.
+machine when one is reachable. Both suites also cover the pure halves of the publishing step — the
+cargo-JSON parser and the "does the root copy need refreshing?" predicate — plus one real copy into
+a temp directory asserting the atomic rename, the preserved modification time and that no `.part`
+is left behind.
+
+Both also cover the launch of the published binary against a stub program: the arguments reach it
+intact (one of them containing a space), its exit code is propagated, and an unlaunchable file
+yields 126 rather than a stack trace.
+
+What stays uncovered: the cargo invocation itself, because it means a real build; on Windows, the
+locked-`.exe` rename-aside path, which needs a running executable to exercise; and — the important
+one — the GUI-subsystem wait described in the invariants, because the stub is a console program and
+the suite would pass even with that bug present. Those are verified by hand from the checklist
+below. This gap is
+recorded rather than closed on purpose: a test that drives cargo would take tens of minutes and
+would assert cargo's behaviour, not ours.
+
+Neither suite covers Stage 2: provisioning asserts against real downloads. That path is verified by
+hand too.
 
 Before trusting a change, on each platform: fresh ZIP without git, clean repo behind origin, dirty
 repo with non-overlapping edits, dirty repo with overlapping edits that merge, dirty repo with
@@ -220,3 +292,13 @@ edits that genuinely conflict (verify the tree is restored), `--offline` with no
 whose commits touch `tools/run-dev/*` (expect exit 8, no build, and a correct restart command), a
 run with a complete venv (expect no installer window between the build and the app), and a run with
 the venv removed (expect the installer, then the application).
+
+For the publishing step specifically: a first run (expect the binary to appear in the project root
+and the application to start from it), an immediate second run with no source change (expect
+"already the same build" and no copying), a run after an edit (expect the root copy to be
+refreshed), a run started while an older root binary is still running (POSIX: expect a clean
+replacement; Windows: expect the `.old-*` rename-aside path and, once that process exits and one
+more run has happened, no leftover `.old-*`), and a run with the project root made read-only
+(expect a warning and a normal launch
+through `cargo run`). Finally, launch the root binary by hand from a different working directory —
+a double click from a file manager — and confirm it finds the project root.

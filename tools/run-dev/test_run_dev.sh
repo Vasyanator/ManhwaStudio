@@ -20,6 +20,11 @@
 #                                            touched; exit 8 only when it did
 # - object id / count parsing             -> only well-formed values are accepted
 # - stash guard                           -> a pop never restores somebody else's entry
+# - cargo JSON parsing                    -> the bin target's executable, never the
+#                                            library artifact or another bin
+# - root-binary publishing                -> when a copy is needed, and that the copy
+#                                            is atomic and keeps mtime and the +x bit
+# - running the root binary               -> arguments reach it, its code is propagated
 #
 # Run: bash tools/run-dev/test_run_dev.sh
 #
@@ -426,6 +431,116 @@ check "аргумент с пробелом цитируется" \
       "$(quote_args -- --project "/tmp/a b/x")" "-- --project '/tmp/a b/x'"
 check "аргументы без пробелов не цитируются" "$(quote_args --debug --yes)" "--debug --yes"
 check "пустой аргумент не теряется"          "$(quote_args --name "")" "--name ''"
+
+# ---------------------------------------------------------------------------
+note "Путь к собранному файлу берётся из JSON-потока cargo"
+# ---------------------------------------------------------------------------
+
+# Предыдущий блок оставил MS_OS="macos" — вернём настоящее значение, иначе
+# file_size_mtime() вызовет stat не с теми флагами.
+detect_os
+
+# Реалистичный поток: артефакт библиотеки ("executable":null, без кавычек),
+# артефакт ДРУГОГО bin-таргета (их в пакете несколько), нужный bin и итоговая
+# строка build-finished.
+CARGO_JSON=$(cat <<'JSON'
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0","target":{"kind":["lib"],"crate_types":["lib"],"name":"serde","src_path":"/home/u/.cargo/registry/serde/src/lib.rs","edition":"2021"},"profile":{"opt_level":"3","debuginfo":0,"test":false},"features":[],"filenames":["/proj/target/release/deps/libserde.rlib"],"executable":null,"fresh":true}
+{"reason":"compiler-artifact","package_id":"path+file:///proj#manhwastudio_rs@0.1.0","target":{"kind":["lib"],"crate_types":["lib"],"name":"manhwastudio_rs","src_path":"/proj/src/lib.rs","edition":"2024"},"profile":{"opt_level":"3","debuginfo":0,"test":false},"features":[],"filenames":["/proj/target/release/deps/libmanhwastudio_rs.rlib"],"executable":null,"fresh":true}
+{"reason":"compiler-artifact","package_id":"path+file:///proj#manhwastudio_rs@0.1.0","target":{"kind":["bin"],"crate_types":["bin"],"name":"render_gallery","src_path":"/proj/src/bin/render_gallery.rs","edition":"2024"},"profile":{"opt_level":"3","debuginfo":0,"test":false},"features":[],"filenames":["/proj/target/release/render_gallery"],"executable":"/proj/target/release/render_gallery","fresh":true}
+{"reason":"compiler-artifact","package_id":"path+file:///proj#manhwastudio_rs@0.1.0","target":{"kind":["bin"],"crate_types":["bin"],"name":"manhwastudio_rs","src_path":"/proj/src/main.rs","edition":"2024"},"profile":{"opt_level":"3","debuginfo":0,"test":false},"features":[],"filenames":["/proj/target/release/manhwastudio_rs"],"executable":"/proj/target/release/manhwastudio_rs","fresh":false}
+{"reason":"build-finished","success":true}
+JSON
+)
+
+check "выбран исполняемый файл нужного bin-таргета" \
+      "$(built_binary_from_json "$CARGO_JSON" "manhwastudio_rs")" \
+      "/proj/target/release/manhwastudio_rs"
+check "другой bin-таргет тоже находится по имени" \
+      "$(built_binary_from_json "$CARGO_JSON" "render_gallery")" \
+      "/proj/target/release/render_gallery"
+check "пустой поток — пустой результат" \
+      "$(built_binary_from_json "" "manhwastudio_rs")" ""
+check "нет подходящего артефакта — пустой результат" \
+      "$(built_binary_from_json "$CARGO_JSON" "tutorial_test")" ""
+
+# Библиотека того же пакета носит то же имя, но её executable — null без кавычек,
+# поэтому она не может перебить bin, даже если идёт в потоке последней.
+LIB_ONLY=$(printf '%s\n' "$CARGO_JSON" | grep -v '"kind":\["bin"\]')
+check "только библиотечные артефакты — пустой результат" \
+      "$(built_binary_from_json "$LIB_ONLY" "manhwastudio_rs")" ""
+
+# ---------------------------------------------------------------------------
+note "Нужно ли обновлять файл в корне проекта"
+# ---------------------------------------------------------------------------
+
+BINDIR="$SANDBOX/rootbin"
+mkdir -p "$BINDIR"
+SRC_BIN="$BINDIR/built"
+DEST_BIN="$BINDIR/root/manhwastudio_rs"
+mkdir -p "$BINDIR/root"
+printf 'ELF-подобное содержимое\n' > "$SRC_BIN"
+chmod +x "$SRC_BIN"
+
+root_binary_needs_copy "$SRC_BIN" "$DEST_BIN"
+check "в корне ничего нет -> копировать" "$?" "0"
+
+cp -p "$SRC_BIN" "$DEST_BIN"
+root_binary_needs_copy "$SRC_BIN" "$DEST_BIN"
+check "точная копия -> не копировать" "$?" "1"
+
+printf 'хвост\n' >> "$DEST_BIN"
+touch -r "$SRC_BIN" "$DEST_BIN"      # время то же, размер другой
+root_binary_needs_copy "$SRC_BIN" "$DEST_BIN"
+check "другой размер -> копировать" "$?" "0"
+
+cp -p "$SRC_BIN" "$DEST_BIN"
+touch -t 202001010000 "$DEST_BIN"    # размер тот же, время другое
+root_binary_needs_copy "$SRC_BIN" "$DEST_BIN"
+check "другое время -> копировать" "$?" "0"
+
+# ---------------------------------------------------------------------------
+note "Копирование в корень: атомарно, с правами и временем"
+# ---------------------------------------------------------------------------
+
+rm -f "$DEST_BIN"
+install_root_binary "$SRC_BIN" "$DEST_BIN"
+check "код возврата"              "$?" "0"
+check "файл появился"             "$(test -f "$DEST_BIN" && echo yes || echo no)" "yes"
+check "файл исполняемый"          "$(test -x "$DEST_BIN" && echo yes || echo no)" "yes"
+check "содержимое совпадает"      "$(cat "$DEST_BIN")" "$(cat "$SRC_BIN")"
+check "размер и время сохранены"  "$(file_size_mtime "$DEST_BIN")" "$(file_size_mtime "$SRC_BIN")"
+check ".part не остался"          "$(test -e "$DEST_BIN.part" && echo yes || echo no)" "no"
+root_binary_needs_copy "$SRC_BIN" "$DEST_BIN"
+check "повторный запуск копировать не станет" "$?" "1"
+
+# Перезапись поверх существующего файла — то же самое, без остатков.
+printf 'новая сборка\n' > "$SRC_BIN"
+chmod +x "$SRC_BIN"
+install_root_binary "$SRC_BIN" "$DEST_BIN"
+check "перезапись: код возврата"  "$?" "0"
+check "перезапись: содержимое обновилось" "$(cat "$DEST_BIN")" "новая сборка"
+check "перезапись: .part не остался" "$(test -e "$DEST_BIN.part" && echo yes || echo no)" "no"
+
+# ---------------------------------------------------------------------------
+note "Запуск файла из корня: аргументы и код возврата"
+# ---------------------------------------------------------------------------
+
+# Вместо приложения — заглушка, которая печатает свои аргументы и возвращает
+# код из первого аргумента после флагов.
+cat > "$DEST_BIN" <<'FAKEAPP'
+#!/usr/bin/env bash
+printf '%s\n' "$*"
+exit "${MS_FAKE_RC:-0}"
+FAKEAPP
+chmod +x "$DEST_BIN"
+ROOT_EXE="$DEST_BIN"
+
+check "аргументы передаются приложению" \
+      "$(run_root_binary "--ignore-installed --project /tmp/x")" \
+      "--ignore-installed --project /tmp/x"
+check "без аргументов запуск тоже работает" "$(run_root_binary "")" ""
+MS_FAKE_RC=42 run_root_binary "--ignore-installed" >/dev/null
+check "код возврата приложения пробрасывается" "$?" "42"
 
 # ---------------------------------------------------------------------------
 

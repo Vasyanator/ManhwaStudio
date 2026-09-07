@@ -721,8 +721,9 @@ fn resolve_project_dir_without_cli_arg(
 /// Reports that self-update is unavailable when the program runs from a source checkout.
 ///
 /// The updater replaces the running executable in place; under `--ignore-installed` that
-/// executable lives in `target/`, so replacing it would overwrite a build artifact with a
-/// release binary. Both the log and a modal dialog say what to do instead.
+/// executable is a build product — either the one in `target/` or the copy `run-dev` publishes
+/// into the project root — so replacing it would overwrite a local build with a release binary.
+/// Both the log and a modal dialog say what to do instead.
 #[cfg(not(target_arch = "wasm32"))]
 fn refuse_self_update_from_sources() {
     runtime_log::log_warn(

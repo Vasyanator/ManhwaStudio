@@ -4,8 +4,8 @@
 #
 # Purpose:
 # POSIX core of `run-dev` (Linux + macOS): bring the working copy up to date with
-# origin, provision a Rust toolchain satisfying the crate MSRV, then run the app
-# with `cargo run --bin manhwastudio_rs --release`.
+# origin, provision a Rust toolchain satisfying the crate MSRV, build the app,
+# put the built binary in the project root and run it from there.
 #
 # Main responsibilities:
 # - Stage 1 (git): locate git, adopt a non-repository ZIP copy, fetch, and merge
@@ -13,8 +13,11 @@
 #   the update changed run-dev itself and request a restart instead of continuing.
 # - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
 #   toolchain, provision an isolated one under installer_files/ when needed.
-# - Stage 3: two sequential cargo runs — an environment check that only shows a
-#   GUI when something is missing, then the application itself.
+# - Stage 3: an environment check that also builds and only shows a GUI when
+#   something is missing; then the built binary is copied into the project root
+#   (cargo is asked where it is, the copy is atomic) so the user can launch the
+#   application later without this script; then that binary is run. A failure to
+#   publish it is only a warning — the run falls back to `cargo run`.
 #
 # Key functions:
 # - git_stage(), adopt_repository(), update_with_local_changes()
@@ -22,6 +25,8 @@
 # - is_object_id(), to_count(), stash_top(), quote_args(), restart_command()
 # - rust_stage(), required_msrv(), ensure_c_toolchain()
 # - cargo_run_app(), check_environment(), run_stage()
+# - built_binary_from_json(), resolve_built_binary(), root_binary_needs_copy(),
+#   install_root_binary(), publish_root_binary(), run_root_binary()
 #
 # Notes:
 # The algorithm, its rationale, and every failure path are specified in
@@ -94,6 +99,16 @@ MANAGED_RUST=0
 PRE_HEAD=""
 # The command line this run was started with, echoed back in the restart hint.
 RUN_DEV_ARGV=""
+# Absolute path cargo reported for the freshly built APP_BIN binary, or empty
+# when it could not be determined. Set by `resolve_built_binary`.
+BUILT_EXE=""
+# Path of the binary published into the project root, or empty when publishing
+# did not happen. Set by `publish_root_binary`; when it is non-empty phase 2
+# executes that file directly instead of going through `cargo run`. These two
+# are script-level variables rather than function output because `say`/`info`/
+# `ok`/`step` all print to stdout, so a helper cannot both talk to the user and
+# return a path there.
+ROOT_EXE=""
 
 # --- Output helpers ----------------------------------------------------------
 
@@ -997,6 +1012,172 @@ check_environment() {
     ok "Окружение готово."
 }
 
+# Prints "<size> <mtime-in-seconds>" for the file `$1`, or nothing when it cannot
+# be read. `stat` is not portable: GNU takes `-c`, the BSD one macOS ships takes
+# `-f`, hence the same `$MS_OS` branch the rest of this file uses.
+file_size_mtime() {
+    if [ "$MS_OS" = "macos" ]; then
+        stat -f '%z %m' "$1" 2>/dev/null
+    else
+        stat -c '%s %Y' "$1" 2>/dev/null
+    fi
+}
+
+# Extracts the path of the executable cargo built for bin target `$2` from the
+# `--message-format=json` stream `$1`. Prints the path, or nothing when the
+# stream contains no such artifact.
+#
+# Three filters, all literal: the artifact reason, the target name (the package
+# declares several bin targets, so the name is what distinguishes them), and a
+# *quoted* `executable` value — a library artifact carries `"executable":null`
+# without quotes and therefore cannot match. Only then is the last remaining
+# line taken, so a trailing lib artifact can never shadow the binary.
+built_binary_from_json() {
+    local json="$1" target="$2"
+    printf '%s\n' "$json" \
+        | grep -F '"reason":"compiler-artifact"' \
+        | grep -F "\"name\":\"$target\"" \
+        | grep -F '"executable":"' \
+        | tail -n 1 \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p'
+}
+
+# Asks cargo where the built APP_BIN binary is and stores the answer in
+# BUILT_EXE (emptied first). Returns 0 when a path was found and the file
+# exists, non-zero otherwise — with a `warn` naming what failed.
+#
+# The path is never guessed from `target/…`: the profile directory, the target
+# triple and `CARGO_TARGET_DIR` all move it. Normally this build is cache-warm
+# because phase 1 already compiled everything; under `--offline` phase 1 is
+# skipped and this is the call that really builds. `json-render-diagnostics`
+# keeps the human-readable compiler output on stderr, which stays attached to
+# the terminal.
+resolve_built_binary() {
+    BUILT_EXE=""
+    local out rc
+    set -- build --bin "$APP_BIN"
+    [ "$RELEASE" = 1 ] && set -- "$@" --release
+    set -- "$@" --message-format=json-render-diagnostics
+    # A single assignment, so `$?` on the next line is cargo's own status:
+    # `pipefail` is active, and after a pipeline `$?` would be the rightmost one.
+    out=$("$CARGO" "$@")
+    rc=$?
+    if [ "$rc" != "0" ]; then
+        warn "cargo build завершился с кодом $rc — путь к собранному файлу не определён."
+        return 1
+    fi
+
+    BUILT_EXE=$(built_binary_from_json "$out" "$APP_BIN")
+    if [ -z "$BUILT_EXE" ] || [ ! -f "$BUILT_EXE" ]; then
+        warn "cargo не сообщил путь к собранному файлу $APP_BIN."
+        BUILT_EXE=""
+        return 1
+    fi
+    return 0
+}
+
+# True (returns 0) when `$2` must be refreshed from `$1`: it is missing, or its
+# size or modification time differs. Exact mtime equality is the right test
+# because the copy preserves the source's mtime (`cp -p`), so an identical pair
+# is exactly a copy this script made from this very build. Unreadable metadata
+# on either side counts as "copy needed" — re-copying is cheap, running a stale
+# binary is not. Pure: reads nothing but the two paths.
+root_binary_needs_copy() {
+    local src="$1" dest="$2" s d
+    [ -f "$dest" ] || return 0
+    s=$(file_size_mtime "$src")
+    d=$(file_size_mtime "$dest")
+    [ -n "$s" ] || return 0
+    [ -n "$d" ] || return 0
+    [ "$s" = "$d" ] && return 1
+    return 0
+}
+
+# Copies `$1` onto `$2` atomically and returns non-zero on failure.
+#
+# Same principle as `download`: the bytes go to `<dest>.part` and are renamed
+# into place only once the copy finished, so `$2` never holds a truncated file.
+# Here it also protects the user: they may be running the previous root binary
+# at this very moment, and on POSIX renaming over a running executable is safe
+# while writing into it corrupts the running process. `cp -p` carries the
+# modification time and the executable bit over, which is what
+# `root_binary_needs_copy` compares on the next run.
+install_root_binary() {
+    local src="$1" dest="$2" part="$2.part"
+    if ! cp -p "$src" "$part"; then
+        rm -f "$part"
+        return 1
+    fi
+    if ! mv -f "$part" "$dest"; then
+        rm -f "$part"
+        return 1
+    fi
+    return 0
+}
+
+# Publishes the freshly built binary into the project root and records the
+# result in ROOT_EXE (emptied first). Returns 0 when ROOT_EXE is usable.
+#
+# Convenience, not a prerequisite: every failure is a `warn` and a non-zero
+# return, never a `die` and never a new exit code — the caller then falls back
+# to `cargo run`, which is what the script did before this step existed.
+publish_root_binary() {
+    ROOT_EXE=""
+    step "Готовый файл в корне проекта"
+    if [ "$OFFLINE" = 1 ]; then
+        info "Режим --offline: проверка окружения пропущена, поэтому проект собирается сейчас."
+    else
+        info "Проект уже собран на предыдущем шаге — cargo только сообщит путь к файлу."
+    fi
+
+    if ! resolve_built_binary; then
+        warn "Запуск пойдёт обычным способом, через cargo run."
+        return 1
+    fi
+
+    local dest; dest="$REPO_ROOT/$(basename "$BUILT_EXE")"
+    if ! root_binary_needs_copy "$BUILT_EXE" "$dest"; then
+        ROOT_EXE="$dest"
+        ok "В корне проекта уже лежит ровно этот же файл: $dest"
+        info "Его можно запускать напрямую — без run-dev и без обновления."
+        return 0
+    fi
+
+    if ! install_root_binary "$BUILT_EXE" "$dest"; then
+        warn "Не удалось скопировать файл в $dest — запуск пойдёт через cargo run."
+        return 1
+    fi
+
+    ROOT_EXE="$dest"
+    ok "Готовый файл скопирован в корень проекта: $dest"
+    info "Дальше его можно запускать напрямую — без run-dev и без обновления."
+    return 0
+}
+
+# Runs the published root binary (ROOT_EXE) synchronously and returns its exit
+# code. `$1` is the same flat argument string `cargo_run_app` takes and is
+# word-split on purpose; see the known limitation of `--` in
+# `dev-docs/run_dev_plan.md`. The caller composes it so that
+# `--ignore-installed` comes first.
+#
+# The empty case is spelled out rather than folded into `"$@"`: bash 3.2 —
+# the version macOS ships — errors on `"$@"` under `set -u` when there are no
+# positional parameters at all.
+run_root_binary() {
+    local extra="$1"
+    if [ -z "$extra" ]; then
+        "$ROOT_EXE"
+        return $?
+    fi
+    # shellcheck disable=SC2086
+    "$ROOT_EXE" $extra
+}
+
+# Stage 3: check the application environment (phase 1, which also builds),
+# publish the built binary into the project root, then run the application
+# (phase 2) and exit with its code. Phase 2 executes the root binary when
+# publishing succeeded and falls back to `cargo run` when it did not; either way
+# the two phases stay strictly sequential and never overlap. Does not return.
 run_stage() {
     step "Сборка и запуск"
     if [ "$RELEASE" = 1 ]; then
@@ -1022,9 +1203,23 @@ run_stage() {
     local extra="--ignore-installed"
     if [ -n "$APP_ARGS" ]; then extra="$extra $APP_ARGS"; fi
 
+    # Publishing the built binary to the project root is what lets the user
+    # start the application later without this script; failing at it only costs
+    # that convenience, so the run continues through cargo in that case.
+    publish_root_binary
+
     say ""
-    cargo_run_app "$extra"
-    local rc=$?
+    local rc
+    if [ -n "$ROOT_EXE" ]; then
+        # `--ignore-installed` matters even more here than under cargo: without
+        # it the application's self-updater is allowed to overwrite the very
+        # file it is running from.
+        run_root_binary "$extra"
+        rc=$?
+    else
+        cargo_run_app "$extra"
+        rc=$?
+    fi
     if [ "$rc" != "0" ]; then
         warn "Приложение завершилось с кодом $rc."
         if [ -r /dev/tty ] && [ "$ASSUME_YES" != 1 ]; then
