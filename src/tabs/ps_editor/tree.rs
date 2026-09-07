@@ -35,9 +35,16 @@ pub const INDENT: f32 = 16.0;
 #[derive(Debug, Clone)]
 pub enum LeafKind {
     /// A base layer (Source / Clean): always the bottom two rows, never grouped or reordered.
-    /// `Клин` is listed above `Исходник`, matching the composite. Structurally locked in the panel
-    /// (a base leaf carries no `RowSel`), so it can never be deleted, moved or grouped — but
-    /// `Клин`'s pixels ARE editable, see `Layer::can_edit_pixels`.
+    /// `Клин` is listed above `Исходник`, matching the composite.
+    ///
+    /// A base leaf IS selectable as the panel's primary row (`RowSel::Base`) — the editor always
+    /// has an active layer and it defaults to `Клин`, so the row has to be able to show it. The
+    /// structural lock is therefore stated per consumer, never by withholding the key: every
+    /// structural consumer refuses `RowSel::Base` explicitly (`select_row` keeps it a solo
+    /// primary and out of `panel_selection`, `selectable_row_order` keeps it out of the Shift range,
+    /// `move_band_one` and `apply_group_op` return on it, and `draw_active_controls` gives it an arm
+    /// with no destructive or reordering buttons). `Клин`'s pixels ARE editable, see
+    /// `Layer::can_edit_pixels`.
     Base(LayerId),
     /// An editable raster layer.
     Raster(LayerId),

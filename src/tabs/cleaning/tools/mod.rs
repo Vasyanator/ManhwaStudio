@@ -8,9 +8,10 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
     `TextureSynthesisInpaintTool`, `LamaInpaintTool`, `LamaMpeInpaintTool`,
     `AotInpaintTool`, `SdxlInpaintTool`, `FluxFillInpaintTool`,
     `WatermarkRemovalTool`, `AiEditorTool`.
-    `PatchTool` lives in the `patch/` directory together with its GUI-free gradient-domain
-    solver `patch/membrane.rs`, the second consumer of `gradient.rs`'s shared SOR kernel;
-    see `patch/MODULE_README.md`.
+    `PatchTool` in `patch/` is only this tab's HOST for the «Заплатка» tool: the tool itself —
+    selection, gesture, ROI/refusal geometry and the gradient-domain solver — lives in
+    `crate::tools::patch`, and `patch/` implements its `PatchHost` (canvas geometry, the two
+    region loads, the store into the clean overlay). See `patch/MODULE_README.md`.
 - Внутренние модули без экспорта:
   - `watermark_library` — библиотека измеренных знаков на диске; используется
     режимом «По главе» из `watermark_removal.rs`.

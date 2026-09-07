@@ -1,5 +1,5 @@
 /*
-File: tabs/cleaning/tools/patch/membrane.rs
+File: tools/patch/membrane.rs
 
 Purpose:
 The gradient-domain (Poisson) maths behind the «Заплатка» tool. GUI-free and I/O-free: buffers
@@ -29,12 +29,12 @@ turns that into `Δu = 0` inside `Ω` with `u|∂Ω = (f* − g)|∂Ω`: the cor
 source's texture (its gradients) survives intact while its colour and luminance are pulled onto
 the destination's.
 
-The Laplace solve reuses `gradient.rs`'s shared red-black SOR kernel; this module only builds its
-`lam`/`denom`/`u0` buffers and the multigrid schedule around it. Plain SOR needs iterations on the
-order of the region's DIAMETER, so a 1500-px selection would stall a worker for many seconds — the
+The Laplace solve reuses the project's shared red-black SOR kernel (`crate::tools::sor`); this
+module only builds its `lam`/`denom`/`u0` buffers and the multigrid schedule around it. Plain SOR
+needs iterations on the order of the region's DIAMETER, so a 1500-px selection would stall a worker for many seconds — the
 cascadic pyramid below is what keeps the tool interactive.
 */
-use super::super::gradient::red_black_sor_sweeps;
+use crate::tools::red_black_sor_sweeps;
 use rayon::prelude::*;
 
 /// Colour channels solved independently. RGB only; alpha is not part of the membrane.

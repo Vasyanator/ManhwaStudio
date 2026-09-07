@@ -23,7 +23,8 @@ Architecture:
   layers above them.
 - `page_loader`: background worker that produces the two base-layer images for the active page.
 - `layer_render`: per-layer tiled texture cache (budgeted upload, dirty tiles).
-- `tools`: `PsTool` trait + selection/brush tools; the tab routes pointer input to the active tool.
+- `tools`: `PsTool` trait + the selection / brush / transform / deform / patch tools; the tab routes
+  pointer input to the active tool.
   Tool-gesture lifecycle is the TAB's job: `set_active_tool` (the only writer of `active_tool_idx`)
   resets the outgoing tool, `request_page` resets the active one, and a frame routed to the pan /
   text drag instead calls `PsTool::freeze` (or `reset` on Esc) so a multi-frame outline neither
@@ -35,6 +36,11 @@ Architecture:
   A finished brush stroke is committed by `commit_brush_stroke`, driven by the tool's own
   stroke-end latch and called OUTSIDE the routing gate — a pointer release performed while the
   canvas pans never reaches the gate, and a commit inside it would silently lose the stroke.
+- layers panel active row: `panel_primary` is the row the panel highlights and the row whose
+  controls the strip shows. While a page is loaded it is ALWAYS `Some` and always names an existing
+  row — `normalize_panel_primary` re-establishes that after every projection and page load, seeding
+  it from `LayerStack::active_id()` (`Клин` on a fresh page). Base rows are selectable but
+  structurally locked; `RowSel::is_base` is the predicate every structural consumer asks.
 - selection storage: `set_selection` / `non_empty_selection` keep the page selection `Some` only
   while it selects at least one pixel — an all-zero mask draws no marquee yet still clips the brush.
 - selection marquee: `draw_selection_marquee` paints the boundary loops of `Selection` as a static
@@ -48,6 +54,10 @@ Architecture:
   latest-wins request via `pending_raster_effects` if one is already in flight);
   `poll_ps_raster_effects_jobs` (once per frame) does the cheap GUI-side apply (recenter, doc
   routing, reversible persist). Mirrors the typing tab's `apply_raster_effects_edit` pipeline.
+- page-rectangle compositing: `visible_layers_bottom_to_top` resolves the composite ORDER and the
+  per-layer opacity once, `composite_rect` walks the rectangle. Both ROI consumers go through them —
+  selection copy/cut and the patch tool's destination composite and storage backdrop — so the two
+  can never disagree about what a page rectangle looks like.
 - «Коррекция»: a VIEW-ONLY colour correction of the composited canvas (`correction/`). It is the
   project's first GPU shader pass — an `egui_glow` paint callback inserted between `draw_composite`
   and the pixel-grid pass — and it never touches layer pixels, the doc or the saved project. Its GL
@@ -69,6 +79,7 @@ pub mod tools;
 pub mod tree;
 pub mod viewport;
 
+use crate::canvas::OverlayRectPx;
 use crate::memory_manager::{MemoryBudget, MemoryProfile};
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::models::layer_model::effects;
@@ -99,6 +110,7 @@ use std::sync::{Arc, Mutex};
 use text_layers::PsTextLayer;
 use tools::brush::BrushTool;
 use tools::deform::DeformTool;
+use tools::patch::PatchTool;
 use tools::select::{SelectMode, SelectTool};
 use tools::transform::TransformTool;
 use tools::{PsTool, PsToolContext, PsToolId, PsToolSection, ToolOutcome};
@@ -139,7 +151,7 @@ const PS_TEXT_PREVIEW_CHARS: usize = 16;
 // ---------------------------------------------------------------------------------------------
 // Dock tabs
 //
-// The six `TabId` literals below are STABLE, NON-LOCALIZED PERSISTENCE IDENTITIES: they key the
+// The seven `TabId` literals below are STABLE, NON-LOCALIZED PERSISTENCE IDENTITIES: they key the
 // tab inside the `PanelLayout` section of `user_config.json` and inside `PanelDockState`'s
 // per-program-tab maps, so renaming one silently drops the user's arrangement for that panel.
 // They are therefore deliberately not routed through the `t!` catalog — a §A9 i18n exclusion
@@ -158,6 +170,14 @@ const PS_EDITOR_HOTKEYS_TAB: TabId = TabId::new("ps_editor.hotkeys");
 const PS_EDITOR_LAYERS_TAB: TabId = TabId::new("ps_editor.layers");
 /// «Коррекция»: the view-only colour correction of the canvas (`correction/`).
 const PS_EDITOR_CORRECTION_TAB: TabId = TabId::new("ps_editor.correction");
+/// The ACTIVE TOOL's own dock panel (`PsTool::draw_main_panel`), shown only while that tool asks
+/// for it (`PsTool::wants_main_panel`).
+///
+/// Unlike the five secondary panels it carries NO user visibility flag and is absent from the
+/// «Панели…» menu: it belongs to a tool, not to the tab, so the tool alone decides whether it
+/// exists this frame. Its caption is the tool's own `PsTool::title`, which is why no
+/// `ps_editor.tab.*` key backs it.
+const PS_EDITOR_TOOL_PANEL_TAB: TabId = TabId::new("ps_editor.tool_panel");
 
 /// `TabExtras` flag key of the «Инструменты» panel's visibility. Stored on the MAIN tab.
 const PS_EDITOR_FLAG_TOOLS_PANEL: &str = "panels.tools";
@@ -198,13 +218,20 @@ const PS_EDITOR_LAYERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(280.0, 380.0);
 const PS_EDITOR_CORRECTION_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(200.0, 80.0);
 /// First-frame size of «Коррекция» (the combo and the two-slider card).
 const PS_EDITOR_CORRECTION_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(280.0, 140.0);
+/// Shrink floor of the active tool's own panel. The tool sizes its content; this only keeps a
+/// button row readable.
+const PS_EDITOR_TOOL_PANEL_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(200.0, 80.0);
+/// First-frame size of the active tool's own panel, before its content has ever been measured.
+const PS_EDITOR_TOOL_PANEL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(300.0, 200.0);
 
 /// Default panel arrangement of the «PS редактор» program tab.
 ///
-/// Two columns over the canvas. On the LEFT, «PS редактор» → «Инструменты» → «Выбранный инструмент»,
-/// which mirrors what the static layout showed as a top strip plus a left toolbar. On the RIGHT,
-/// «Слои» → «Горячие клавиши» and «Слои» → «Коррекция», mirroring the old right panel and keeping
-/// the left chain from stacking four panels deep on a short window.
+/// Two columns over the canvas. On the LEFT, «PS редактор» → «Инструменты» → «Выбранный инструмент»
+/// → the active tool's own panel, which mirrors what the static layout showed as a top strip plus a
+/// left toolbar. On the RIGHT, «Слои» → «Горячие клавиши» and «Слои» → «Коррекция», mirroring the
+/// old right panel and keeping the left chain from stacking four VISIBLE panels deep on a short
+/// window — the tool panel is drawn only while the active tool asks for it, which no shipped tool
+/// does.
 ///
 /// It must name EVERY `TabId` this program tab can declare: `panel_dock::persist` resolves a
 /// stored tab key against the default layout's tab set, so a tab missing here would be dropped
@@ -282,6 +309,20 @@ pub(crate) fn ps_editor_default_dock_layout() -> DockLayout {
             // «Слои» -> «Горячие клавиши» -> «Коррекция».
             PanelAnchor::Panel {
                 target: PanelId::new(4),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+        (
+            PanelId::new(6),
+            vec![PS_EDITOR_TOOL_PANEL_TAB],
+            // Continues the LEFT chain under «Выбранный инструмент», the panel it is closest kin
+            // to — both belong to whichever tool is active. It costs the default arrangement
+            // nothing: no shipped tool answers `wants_main_panel`, so the panel is not drawn at
+            // all until a region tool is added. Anchored to `active_tool`, not shared with it —
+            // see the «Коррекция» comment above for why two panels may not share one target.
+            PanelAnchor::Panel {
+                target: PanelId::new(2),
                 edge: DockEdge::Bottom,
                 align: 0.0,
             },
@@ -474,6 +515,18 @@ fn draw_hotkeys_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
     cx.tab.hotkeys_tab_contents(ui);
 }
 
+/// Draws the ACTIVE TOOL's own dock panel body ([`PsTool::draw_main_panel`]).
+///
+/// Declared every frame and made visible only while the active tool answers
+/// [`PsTool::wants_main_panel`], so a tool that owns no panel costs one declaration. The body may
+/// mutate the TOOL and nothing else — it runs inside the dock frame, before the canvas exists this
+/// frame, so a button here raises a flag the tool acts on in its next `draw_overlay_ui`.
+fn draw_tool_panel_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
+    if let Some(tool) = cx.tab.tools.get_mut(cx.tab.active_tool_idx) {
+        tool.draw_main_panel(ui);
+    }
+}
+
 /// Draws the «Коррекция» tab body: the view-only colour correction of the canvas.
 ///
 /// Mutating `cx.tab` here is sound and deliberate — a PS-editor body is lent the whole tab state
@@ -563,10 +616,19 @@ pub struct PsEditorTabState {
     /// and the unified layer panel. Rebuilt on each page load / reload.
     bands: Vec<Band>,
     /// Multi-selected rows in the unified layers panel (for batch group ops). Cleared on page change.
+    /// NEVER contains a `RowSel::Base`: base layers are structurally locked and take no part in
+    /// group ops (`select_row` / `selectable_row_order` keep them out).
     panel_selection: HashSet<RowSel>,
     /// Anchor row for Shift-range selection in the panel.
     panel_anchor: Option<RowSel>,
-    /// The row whose controls the "active layer" strip shows (last plain/ctrl click).
+    /// The row whose controls the "active layer" strip shows and which the panel draws highlighted
+    /// (last plain/ctrl click, or the seeded active layer).
+    ///
+    /// INVARIANT: while a page is loaded (`stack.is_some()`) this is always `Some` and always names
+    /// a row that exists in the current tree. [`PsEditorTabState::normalize_panel_primary`] is the
+    /// single enforcer — it runs after every projection that can remove a row and after a page load,
+    /// re-pointing a `None`/dangling primary at `LayerStack::active_id()` (which is `Клин` on a
+    /// fresh page). It is `None` only before the first page finishes loading.
     panel_primary: Option<RowSel>,
     /// Open destructive effects editor: the target raster layer and its effects-JSON text.
     effects_editor: Option<(LayerId, String)>,
@@ -725,12 +787,82 @@ enum TextDragMode {
 }
 
 /// A selectable row in the unified layers panel. Texts and groups key on their stable uid (survives
-/// reloads); rasters key on the session `LayerId` (matches `LayerStack::active`).
+/// reloads); rasters and base layers key on the session `LayerId` (matches `LayerStack::active`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RowSel {
+    /// One of the two STRUCTURALLY LOCKED base layers (`Исходник` / `Клин`). It exists only so the
+    /// panel can show the active layer — the editor always has one and it defaults to `Клин`. It is
+    /// never allowed into `panel_selection`, a Shift range, a group op or a band move; see
+    /// [`RowSel::is_base`] for the list of guards that enforce that.
+    Base(LayerId),
     Raster(LayerId),
     Text(String),
     Group(String),
+}
+
+impl RowSel {
+    /// Whether this row is a structurally locked base layer.
+    ///
+    /// A base row may be the panel's PRIMARY row (it is what makes the active layer visible), but it
+    /// must never take part in anything structural: multi-selection, Shift ranges, grouping,
+    /// deletion, merging, baking or reordering. Every such consumer asks this instead of relying on
+    /// the older "a base leaf carries no `RowSel`" lock.
+    fn is_base(&self) -> bool {
+        matches!(self, RowSel::Base(_))
+    }
+}
+
+/// The order the panel's Shift-range multi-selection walks, top-to-bottom.
+///
+/// BASE ROWS ARE EXCLUDED. They are structurally locked, so they must never end up in
+/// `panel_selection` — and a Shift range that swept the bottom of the list would put them there.
+/// Together with `select_row`'s own base guard this is the replacement for the older lock, where a
+/// base leaf simply had no `RowSel` at all.
+fn selectable_row_order(rows: &[PanelRow]) -> Vec<RowSel> {
+    rows.iter()
+        .filter_map(|r| match r {
+            PanelRow::Group(h) => Some(RowSel::Group(h.uid.clone())),
+            PanelRow::Leaf(l) => l.sel.clone().filter(|s| !s.is_base()),
+        })
+        .collect()
+}
+
+/// Whether a leaf row is drawn as selected.
+///
+/// A row is highlighted when it is in the multi-selection OR when it is the primary row. The
+/// primary term is what makes the ALWAYS-PRESENT active layer visible: a freshly loaded page seeds
+/// `panel_primary` (to `Клин`) while deliberately leaving `panel_selection` empty, so a
+/// selection-only rule would leave the active layer unmarked.
+///
+/// `sel` is `None` only for a row that has no selection key at all (a text leaf whose runtime
+/// vanished between the tree build and the snapshot); such a row is never highlighted.
+fn row_is_selected(
+    sel: Option<&RowSel>,
+    selection: &HashSet<RowSel>,
+    primary: Option<&RowSel>,
+) -> bool {
+    sel.is_some_and(|s| selection.contains(s) || primary == Some(s))
+}
+
+/// Whether a group-header row is drawn as selected.
+///
+/// Beyond the leaf rule it carries one extra case: a COLLAPSED group emits no rows for its members
+/// (`tree::build_unified_tree`), so a primary row inside it would be invisible. The header borrows
+/// the highlight in that case. `primary_group_uid` is the group uid the primary row belongs to, or
+/// `None` when the primary is ungrouped, is a group header itself, or is a base layer (base layers
+/// are never grouped).
+fn group_row_is_selected(
+    uid: &str,
+    selection: &HashSet<RowSel>,
+    primary: Option<&RowSel>,
+    collapsed: bool,
+    primary_group_uid: Option<&str>,
+) -> bool {
+    let own = RowSel::Group(uid.to_owned());
+    if selection.contains(&own) || primary == Some(&own) {
+        return true;
+    }
+    collapsed && primary_group_uid == Some(uid)
 }
 
 /// A batch grouping operation requested from the panel's right-click menu, resolved into a
@@ -786,13 +918,33 @@ enum PanelRow {
 }
 
 struct PanelLeaf {
-    /// Selection key (`None` for the locked base layers, which take no part in group ops).
+    /// Selection key. `None` only when the row has no identity to key on — a text leaf whose
+    /// `PsTextLayer` runtime is missing. Base layers DO carry one (`RowSel::Base`) so they can be
+    /// the primary row; their structural lock is enforced by [`RowSel::is_base`] at every consumer,
+    /// not by the absence of a key.
     sel: Option<RowSel>,
     kind: tree::LeafKind,
     depth: u8,
     name: String,
     visible: bool,
     is_base: bool,
+}
+
+/// The read-only, per-frame context every layers-panel ROW draw needs, snapshotted before the
+/// render loop (which mutates `self.panel_selection` / `self.panel_primary`) so no borrow of `self`
+/// is held across it.
+struct PanelRowCx<'a> {
+    /// The current multi-selection (batch group ops).
+    selection: &'a HashSet<RowSel>,
+    /// The primary row: highlighted, and the subject of the controls strip.
+    primary: Option<&'a RowSel>,
+    /// The group uid the primary row belongs to, so a COLLAPSED header can borrow its highlight.
+    /// `None` when the primary is ungrouped, is a group header itself, or is a base layer.
+    primary_group_uid: Option<&'a str>,
+    /// The displayed rows a Shift range may span (base rows excluded, see `selectable_row_order`).
+    row_sels: &'a [RowSel],
+    /// Existing groups as `(uid, name)`, for the "move to group" submenu.
+    group_list: &'a [(String, String)],
 }
 
 /// One band with the keys needed to build a contiguous unified order (`build_unified_order`).
@@ -839,6 +991,9 @@ impl Default for PsEditorTabState {
             Box::new(BrushTool::default()),
             Box::new(TransformTool::default()),
             Box::new(DeformTool::default()),
+            // Appended LAST on purpose: `active_tool_idx` below is a position in this vector, and
+            // inserting anywhere earlier would silently change which tool starts selected.
+            Box::new(PatchTool::default()),
         ];
         Self {
             overlays_model: None,
@@ -1224,6 +1379,11 @@ impl PsEditorTabState {
         for id in drop_caches {
             self.render_cache.remove(&id);
         }
+        // This projection may have removed the very row `panel_primary` names (a raster deleted or
+        // merged away here or in the other tab, a rasterized text, a deleted group). Re-establish
+        // the "always a valid primary row" invariant before the panel next draws — otherwise the
+        // controls strip renders nothing at all, not even its hint.
+        self.normalize_panel_primary();
     }
 
     /// Routes a raster/group MODEL edit to the shared `LayerDoc`: locks it, runs `edit` against the
@@ -1773,20 +1933,22 @@ impl PsEditorTabState {
         Ok(())
     }
 
-    /// Records the just-committed brush stroke as a reversible undo entry (observer style — the
-    /// forward edit was already applied live). Builds a region-bounded `RasterDiff` from the
-    /// pre-stroke `base_image` ("before") and the painted `image` ("after") over the stroke's dirty
-    /// union, so no full-image scan is needed. A no-op stroke (empty diff) is not recorded.
+    /// Records a just-performed pixel edit of the ACTIVE layer as one reversible undo entry
+    /// (observer style — the forward edit was already applied live).
     ///
-    /// Handles BOTH paintable kinds. A user raster records a `PsEditOp::RasterPixels` keyed on its
-    /// stable doc uid; the `Клин` base layer records a `PsEditOp::CleanPixels`, which carries NO uid
-    /// — base-layer uids are regenerated on every page load, so only the layer KIND identifies it.
+    /// Builds a region-bounded `RasterDiff` from the pre-edit `base_image` ("before") and the
+    /// edited `image` ("after") over `region` — the ACTIVE LAYER's own pixel grid, like every
+    /// [`tools::DirtyRect`] — so no full-image scan is needed. A no-op edit (empty diff) is not
+    /// recorded. `label` is the already-localized history caption.
+    ///
+    /// Handles BOTH paintable kinds through the pure [`pixel_region_edit_op`]: a user raster
+    /// records a `PsEditOp::RasterPixels` keyed on its stable doc uid; the `Клин` base layer
+    /// records a `PsEditOp::CleanPixels`, which carries NO uid — base-layer uids are regenerated on
+    /// every page load, so only the layer KIND identifies it.
+    ///
     /// Must be called BEFORE the pixels are pushed onward, while `base_image` still holds the
-    /// pre-stroke state.
-    fn record_brush_stroke(&mut self, page_idx: usize) {
-        let Some(union) = self.brush_stroke_dirty else {
-            return;
-        };
+    /// pre-edit state. Both callers are in `commit_pixel_region`, whose contract states that.
+    fn record_pixel_region(&mut self, page_idx: usize, union: tools::DirtyRect, label: &str) {
         // Capture the region-local before/after buffers + uid while borrowing the stack immutably.
         let captured = {
             let Some(stack) = self.stack.as_ref() else {
@@ -1845,27 +2007,20 @@ impl PsEditorTabState {
             PS_UNDO_TILE_SIDE,
         ) {
             Ok(diff) if diff.is_empty() => {}
-            // A real `match` over the kind (no `_ =>`): `Source` is never paintable, so it is
-            // unreachable here, but a new paintable kind must force this site to be revisited.
-            Ok(diff) => match kind {
-                LayerKind::Raster => self.history.record(PsEditOp::RasterPixels {
+            Ok(diff) => {
+                if let Some(op) = pixel_region_edit_op(
+                    kind,
                     page_idx,
-                    layer_uid: uid,
-                    diff: Arc::new(diff),
-                    dir: ApplyDirection::Forward,
-                    label: t!("ps_editor.edit_op.brush_stroke").to_string(),
-                }),
-                LayerKind::Clean => self.history.record(PsEditOp::CleanPixels {
-                    page_idx,
-                    diff: Arc::new(diff),
-                    dir: ApplyDirection::Forward,
-                    label: t!("ps_editor.edit_op.brush_stroke").to_string(),
-                }),
-                LayerKind::Source => {}
-            },
+                    uid,
+                    Arc::new(diff),
+                    label.to_string(),
+                ) {
+                    self.history.record(op);
+                }
+            }
             Err(err) => {
                 crate::runtime_log::log_warn(format!(
-                    "[ps_editor] failed to build brush undo diff (page {page_idx}): {err}"
+                    "[ps_editor] failed to build the {label} undo diff (page {page_idx}): {err}"
                 ));
             }
         }
@@ -2397,6 +2552,8 @@ impl PsEditorTabState {
                 self.active_page_idx = Some(result.page_idx);
                 self.selection = None;
                 // Panel selection keys on session ids that the new page's stack reuses; reset it.
+                // `panel_primary` is only cleared here — `normalize_panel_primary` below re-seeds it
+                // from the fresh stack's active layer, which is `Клин`.
                 self.panel_selection.clear();
                 self.panel_anchor = None;
                 self.panel_primary = None;
@@ -2409,6 +2566,12 @@ impl PsEditorTabState {
                 self.load_error = None;
                 // Project the shared doc over the freshly-loaded stack / text / bands.
                 self.sync_view_from_doc(result.page_idx);
+                // Seed the panel's primary row from the projected stack's active layer, so the page
+                // opens with `Клин` selected. Called explicitly rather than left to
+                // `sync_view_from_doc`'s own tail: that call returns early when the doc has no page
+                // (a worker decode failure leaves the page un-inserted), and the page still opens
+                // with its two base layers, which must still show an active one.
+                self.normalize_panel_primary();
             }
             Err(err) => {
                 crate::trace_log!(
@@ -2511,6 +2674,13 @@ impl PsEditorTabState {
         let _frame = crate::trace_scope!(cat::FRAME, "ps_draw page={:?}", self.active_page_idx);
         self.ensure_loader();
         self.poll_loader(project);
+        // Consume every TOOL-owned worker channel, next to the loader poll and for the same reason:
+        // a tool that computes anything expensive must never block `interact` (`AGENTS.md` §5), so
+        // its results arrive on a channel and are drained here. The pixel writes such a result asks
+        // for are queued as `PsToolAction`s and applied by `apply_tool_actions` below.
+        if self.poll_tools() {
+            ctx.request_repaint();
+        }
         // Consume any finished non-destructive raster-effects render (computed off the GUI thread).
         if self.poll_ps_raster_effects_jobs(project) {
             ctx.request_repaint();
@@ -2534,6 +2704,12 @@ impl PsEditorTabState {
         let layout_key = AppTab::PsEditor.key();
         panel_dock.ensure_default_layout(layout_key, ps_editor_default_dock_layout);
         let visibility = PsEditorPanelVisibility::read(panel_dock, layout_key);
+        // The active tool's panel is resolved BEFORE `cx` takes `&mut self`, for the same reason
+        // the visibility flags are read before the tabs are declared: the `visible` flag and the
+        // caption must both be this frame's answer, and neither can be asked for once the tool list
+        // is inside the borrow the dock frame holds.
+        let tool_panel_visible = tool_panel_visible(&self.tools, self.active_tool_idx);
+        let tool_panel_title = self.active_tool_title();
 
         let mut cx = PsEditorDockCx {
             tab: self,
@@ -2590,6 +2766,16 @@ impl PsEditorTabState {
             .min_size(PS_EDITOR_CORRECTION_TAB_MIN_SIZE_PX)
             .initial_size(PS_EDITOR_CORRECTION_TAB_INITIAL_SIZE_PX)
             .show(draw_correction_tab_body);
+        // The ACTIVE TOOL's own panel. Declared on every frame like the five above, but its
+        // `visible` comes from the TOOL (`wants_main_panel`) rather than from a stored user flag,
+        // and its caption is the tool's own title — the panel belongs to a tool, so its name must
+        // say which one.
+        dock.tab(PS_EDITOR_TOOL_PANEL_TAB)
+            .title(move || tool_panel_title)
+            .visible(tool_panel_visible)
+            .min_size(PS_EDITOR_TOOL_PANEL_TAB_MIN_SIZE_PX)
+            .initial_size(PS_EDITOR_TOOL_PANEL_TAB_INITIAL_SIZE_PX)
+            .show(draw_tool_panel_tab_body);
         // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a panel the user
         // detached into a sub-window, whose rect lives in that window's own frame and would carve a
         // dead zone out of this window's top-left corner (`PanelDockOutput`).
@@ -2597,10 +2783,50 @@ impl PsEditorTabState {
         let panel_rects: Vec<Rect> = out.drawn_panels().map(|(_, rect)| rect).collect();
         let panel_actions = std::mem::take(&mut cx.panel_actions);
 
+        // Hand this frame's panel rects to the active tool BEFORE they are stored, so a tool that
+        // places a surface on the canvas can cut the floating panels out of the viewport. Read from
+        // the local `panel_rects` rather than from `self.panel_rects`, which the `self.tools`
+        // borrow below would conflict with.
+        if let Some(tool) = self.tools.get_mut(self.active_tool_idx) {
+            tool.set_panel_rects(&panel_rects);
+        }
         self.panel_rects = panel_rects;
         self.apply_panel_actions(panel_actions, project);
         self.draw_effects_editor(ctx);
         self.draw_canvas(ctx, ui, area_rect, project);
+        // The ONE drain point for tool-queued pixel writes, and deliberately AFTER `draw_canvas`:
+        // that is the only site reached on every frame, because `draw_canvas` returns early while
+        // no page is resident and a queue drained only there would grow without bound. The cost is
+        // one frame of latency on a commit that is asynchronous to begin with (a worker result, or
+        // a gesture that has already ended), so nothing the user is currently dragging is delayed.
+        if self.apply_tool_actions(project) {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Polls every tool's own worker channels, whether or not it is the active tool.
+    ///
+    /// Called once per frame from [`PsEditorTabState::draw`], next to `poll_loader`. Inactive tools
+    /// are polled too: a job dispatched before a tool switch still finishes, and its result must be
+    /// consumed rather than stranded — the same reason the loader poll is unconditional.
+    ///
+    /// Returns `true` when at least one tool wants the next frame (a job in flight, or a poll that
+    /// changed something visible); the caller turns that into a repaint request, which is what
+    /// makes an off-thread result appear without any pointer movement.
+    fn poll_tools(&mut self) -> bool {
+        let mut repaint = false;
+        for tool in &mut self.tools {
+            repaint |= tool.poll_workers();
+        }
+        repaint
+    }
+
+    /// Localized title of the active tool, used as the caption of its own dock panel.
+    #[must_use]
+    fn active_tool_title(&self) -> &'static str {
+        self.tools
+            .get(self.active_tool_idx)
+            .map_or("", |tool| tool.title())
     }
 
     /// Everything the «PS редактор» tab shows except its «Панели…» menu, in two wrapped rows: the
@@ -2851,13 +3077,7 @@ impl PsEditorTabState {
         // Owned snapshot: rows (top-to-bottom), the selectable-row order (for Shift range), and the
         // existing-group list (for the "move to group" submenu).
         let rows = self.build_panel_rows();
-        let row_sels: Vec<RowSel> = rows
-            .iter()
-            .filter_map(|r| match r {
-                PanelRow::Group(h) => Some(RowSel::Group(h.uid.clone())),
-                PanelRow::Leaf(l) => l.sel.clone(),
-            })
-            .collect();
+        let row_sels = selectable_row_order(&rows);
         let group_list: Vec<(String, String)> = self
             .stack
             .as_ref()
@@ -2870,6 +3090,19 @@ impl PsEditorTabState {
             .unwrap_or_default();
 
         let selection = self.panel_selection.clone();
+        let primary = self.panel_primary.clone();
+        // The group a COLLAPSED header must borrow the primary highlight from: a collapsed group
+        // emits no member rows, so without this the primary row inside it would be invisible.
+        // A base primary contributes nothing — base layers are never grouped.
+        let primary_group_uid: Option<String> = match &primary {
+            Some(RowSel::Raster(id)) => self.stack.as_ref().and_then(|s| s.layer_group_uid(*id)),
+            Some(RowSel::Text(uid)) => self
+                .text_layers
+                .iter()
+                .find(|t| t.uid() == uid)
+                .and_then(|t| t.group_uid.clone()),
+            Some(RowSel::Base(_) | RowSel::Group(_)) | None => None,
+        };
 
         // NO nested scroll area and NO hand-computed height reserve here. The dock already draws
         // every tab body inside a bounded `ScrollArea::both` and derives the panel's size request
@@ -2877,13 +3110,20 @@ impl PsEditorTabState {
         // measurement and make the panel oscillate or never grow
         // (`panel_dock/MODULE_README.md`, «The body FILLS its budget…»). The intended height is
         // expressed by `PS_EDITOR_LAYERS_TAB_MIN_SIZE_PX` / `..._INITIAL_SIZE_PX` instead.
+        let cx = PanelRowCx {
+            selection: &selection,
+            primary: primary.as_ref(),
+            primary_group_uid: primary_group_uid.as_deref(),
+            row_sels: &row_sels,
+            group_list: &group_list,
+        };
         for row in &rows {
             match row {
                 PanelRow::Group(h) => {
-                    self.draw_group_row(ui, h, &selection, &mut actions);
+                    self.draw_group_row(ui, h, &cx, &mut actions);
                 }
                 PanelRow::Leaf(leaf) => {
-                    self.draw_leaf_row(ui, leaf, &selection, &row_sels, &group_list, &mut actions);
+                    self.draw_leaf_row(ui, leaf, &cx, &mut actions);
                 }
             }
         }
@@ -2894,6 +3134,10 @@ impl PsEditorTabState {
     }
 
     /// Builds the owned per-row snapshot from the unified tree + stack + text layers.
+    ///
+    /// Every leaf that has an identity gets a `RowSel`, base layers included (`RowSel::Base`) — a
+    /// base row must be able to be the primary row, because the editor always has an active layer
+    /// and it defaults to `Клин`. `sel` is `None` only for a text leaf whose runtime is missing.
     fn build_panel_rows(&self) -> Vec<PanelRow> {
         let Some(stack) = self.stack.as_ref() else {
             return Vec::new();
@@ -2907,7 +3151,10 @@ impl PsEditorTabState {
                         tree::LeafKind::Base(id) => {
                             let l = stack.layer(*id);
                             (
-                                None,
+                                // A base row IS keyed: it must be able to become the primary row so
+                                // the always-present active layer is visible. Its structural lock is
+                                // re-expressed at every consumer via `RowSel::is_base`.
+                                Some(RowSel::Base(*id)),
                                 l.map_or_else(
                                     || t!("ps_editor.layers_panel.leaf_fallback_layer").into(),
                                     |l| l.name.clone(),
@@ -2972,14 +3219,23 @@ impl PsEditorTabState {
     }
 
     /// One group-header row: collapse arrow, visibility eye, name, block move arrows, context menu.
+    ///
+    /// A COLLAPSED header also carries the highlight of a primary row hidden inside it
+    /// (`group_row_is_selected`), because a collapsed group emits no member rows.
     fn draw_group_row(
         &mut self,
         ui: &mut egui::Ui,
         header: &tree::GroupHeader,
-        selection: &HashSet<RowSel>,
+        cx: &PanelRowCx<'_>,
         actions: &mut PanelActions,
     ) {
-        let selected = selection.contains(&RowSel::Group(header.uid.clone()));
+        let selected = group_row_is_selected(
+            &header.uid,
+            cx.selection,
+            cx.primary,
+            header.collapsed,
+            cx.primary_group_uid,
+        );
         let resp = ui
             .horizontal(|ui| {
                 ui.add_space(header.depth as f32 * tree::INDENT);
@@ -3023,19 +3279,21 @@ impl PsEditorTabState {
 
     /// One leaf row (raster / text / locked base): visibility eye + indented name + selection +
     /// right-click grouping menu.
+    ///
+    /// A base row is clickable and CAN become the primary row (that is how the always-present active
+    /// layer is shown), but it returns before the grouping context menu: it is structurally locked.
     fn draw_leaf_row(
         &mut self,
         ui: &mut egui::Ui,
         leaf: &PanelLeaf,
-        selection: &HashSet<RowSel>,
-        row_sels: &[RowSel],
-        group_list: &[(String, String)],
+        cx: &PanelRowCx<'_>,
         actions: &mut PanelActions,
     ) {
-        let selected = leaf.sel.as_ref().is_some_and(|s| selection.contains(s));
+        let selected = row_is_selected(leaf.sel.as_ref(), cx.selection, cx.primary);
+        // Exhaustive on purpose (no `_ =>`): a new `LeafKind` must be given an icon deliberately.
         let icon = match leaf.kind {
             tree::LeafKind::Text(_) => "🅣",
-            _ => "▦",
+            tree::LeafKind::Raster(_) | tree::LeafKind::Base(_) => "▦",
         };
         let resp = ui
             .horizontal(|ui| {
@@ -3059,40 +3317,42 @@ impl PsEditorTabState {
             .inner;
 
         let Some(sel) = leaf.sel.clone() else {
-            // Base layer: clicking just makes it active (no group ops).
-            if resp.clicked()
-                && let tree::LeafKind::Base(id) = leaf.kind
-            {
-                actions.set_active_raster = Some(id);
-                // Base rows are not in `RowSel`, so they don't call `select_row` and would leave a
-                // STALE `panel_primary`. If it still held a `RowSel::Text`, `select_active_layer_fully`
-                // would draw that text overlay's marquee instead of the base layer's footprint. Clear
-                // it so the selection falls through to the stack/`active_id()` (base) path.
-                self.panel_primary = None;
-                actions.request_select_active = true;
-            }
+            // No selection key at all: a text leaf whose runtime vanished between the tree build and
+            // this snapshot. Nothing to select and nothing to act on.
             return;
         };
 
         if resp.clicked() {
             let mods = ui.input(|i| i.modifiers);
-            self.select_row(sel.clone(), mods, row_sels);
-            if let tree::LeafKind::Raster(id) = leaf.kind {
-                actions.set_active_raster = Some(id);
+            // `select_row` keeps a base row a SOLO primary (never in `panel_selection`), so the
+            // modifiers are safe to forward for every kind.
+            self.select_row(sel.clone(), mods, cx.row_sels);
+            match leaf.kind {
+                // A base row makes its layer active exactly like a raster row does — `Клин` is
+                // paintable, and `Исходник` is the read-only layer the user may still want selected.
+                tree::LeafKind::Raster(id) | tree::LeafKind::Base(id) => {
+                    actions.set_active_raster = Some(id);
+                }
+                tree::LeafKind::Text(_) => {}
             }
-            // Cover raster AND text rows: show the clicked (primary) layer's marquee immediately.
+            // Cover raster, base AND text rows: show the clicked (primary) layer's marquee immediately.
             actions.request_select_active = true;
+        }
+        if sel.is_base() {
+            // One site of the structural lock: no right-click selection, no grouping menu — a base
+            // layer can never be grouped, ungrouped or moved into a group.
+            return;
         }
         // Right-click acts on the current multi-selection; if this row is not selected, select it.
         if resp.secondary_clicked() && !self.panel_selection.contains(&sel) {
-            self.select_row(sel.clone(), egui::Modifiers::default(), row_sels);
+            self.select_row(sel.clone(), egui::Modifiers::default(), cx.row_sels);
         }
         egui::Popup::context_menu(&resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                if !group_list.is_empty() {
+                if !cx.group_list.is_empty() {
                     ui.menu_button(t!("ps_editor.layers_panel.move_to_group"), |ui| {
-                        for (uid, name) in group_list {
+                        for (uid, name) in cx.group_list {
                             if ui.button(format!("📁 {name}")).clicked() {
                                 actions.group_op = Some(GroupOp::MoveTo(uid.clone()));
                                 egui::Popup::close_all(ui.ctx());
@@ -3119,7 +3379,19 @@ impl PsEditorTabState {
 
     /// Applies a row click to the panel selection: plain = replace, Ctrl/Cmd = toggle, Shift = range
     /// over the displayed selectable rows (`row_sels`) from the anchor.
+    ///
+    /// A BASE row is the one exception: whatever the modifiers, it becomes a SOLO primary and the
+    /// multi-selection is cleared. Base layers are structurally locked, so letting one join a
+    /// Ctrl/Shift selection would hand it to `apply_group_op` (which reads `panel_selection`).
+    /// `selectable_row_order` also keeps base rows out of `row_sels`, so a Shift range can never
+    /// sweep one up; this guard is the second half of the same lock, at the mutation site.
     fn select_row(&mut self, sel: RowSel, mods: egui::Modifiers, row_sels: &[RowSel]) {
+        if sel.is_base() {
+            self.panel_selection.clear();
+            self.panel_anchor = None;
+            self.panel_primary = Some(sel);
+            return;
+        }
         if mods.shift
             && !row_sels.is_empty()
             && let Some(anchor) = self.panel_anchor.clone()
@@ -3148,8 +3420,100 @@ impl PsEditorTabState {
         self.panel_primary = Some(sel);
     }
 
+    /// The panel row naming the stack's current active layer (`LayerStack::active_id`), or `None`
+    /// when no page is loaded. The variant follows the layer's kind, so a base layer yields
+    /// `RowSel::Base` and a user raster yields `RowSel::Raster`.
+    fn active_row_sel(&self) -> Option<RowSel> {
+        let stack = self.stack.as_ref()?;
+        let active = stack.active_id();
+        let layer = stack.layer(active)?;
+        Some(if layer.kind.is_base() {
+            RowSel::Base(active)
+        } else {
+            RowSel::Raster(active)
+        })
+    }
+
+    /// Whether `sel` still names a row the current tree would render.
+    ///
+    /// The kind must match too, not just the id: a `RowSel::Raster` that now resolves to a base
+    /// layer (or the reverse) would drive `draw_active_controls` into the wrong arm.
+    fn row_exists(&self, sel: &RowSel) -> bool {
+        let Some(stack) = self.stack.as_ref() else {
+            return false;
+        };
+        match sel {
+            RowSel::Base(id) => stack.layer(*id).is_some_and(|l| l.kind.is_base()),
+            RowSel::Raster(id) => stack.layer(*id).is_some_and(|l| !l.kind.is_base()),
+            RowSel::Text(uid) => self.text_layers.iter().any(|t| t.uid() == uid),
+            // A group needs BOTH halves: `LayerStack` may still hold a group whose last member was
+            // deleted, and `tree::build_unified_tree` brackets a header around a run of member
+            // leaves — so an emptied group renders no row at all.
+            RowSel::Group(uid) => {
+                stack.group_by_uid(uid).is_some() && self.group_has_members(stack, uid)
+            }
+        }
+    }
+
+    /// Whether group `uid` still owns at least one leaf — a non-base raster or a text overlay.
+    ///
+    /// Mirrors the membership `tree::build_unified_tree` walks, so `row_exists` and the rendered
+    /// tree cannot disagree about whether a group has a row.
+    fn group_has_members(&self, stack: &layers::LayerStack, uid: &str) -> bool {
+        stack
+            .layers()
+            .iter()
+            .any(|l| !l.kind.is_base() && stack.layer_group_uid(l.id).as_deref() == Some(uid))
+            || self.text_layers.iter().any(|t| t.group_uid.as_deref() == Some(uid))
+    }
+
+    /// Re-establishes the panel invariant: **while a page is loaded, `panel_primary` is always
+    /// `Some` and always names a row that exists in the current tree.**
+    ///
+    /// A `None` or dangling primary is re-pointed at `LayerStack::active_id()`, which the stack
+    /// itself keeps valid (`LayerStack::new` starts at `Клин`, `remove_layer` falls back to the
+    /// topmost survivor and finally to `Клин`). So a freshly loaded page shows `Клин` as the active
+    /// layer, and deleting/merging away the active raster moves the highlight to the stack's
+    /// fallback instead of leaving a strip that renders nothing at all. Stale rows are dropped from
+    /// `panel_selection` at the same time so the multi-selection cannot outlive its rows either.
+    ///
+    /// No-op when no page is loaded (`stack == None`): there is no row to point at.
+    ///
+    /// This is view state, so nothing here is recorded in the undo history.
+    fn normalize_panel_primary(&mut self) {
+        if self.stack.is_none() {
+            return;
+        }
+        let fallback = self.active_row_sel();
+        // Drop rows that no longer exist from the multi-selection (cheap: the panel is small).
+        let stale: Vec<RowSel> = self
+            .panel_selection
+            .iter()
+            .filter(|s| !self.row_exists(s))
+            .cloned()
+            .collect();
+        for sel in stale {
+            self.panel_selection.remove(&sel);
+        }
+        if self.panel_anchor.as_ref().is_some_and(|s| !self.row_exists(s)) {
+            self.panel_anchor = None;
+        }
+        if self
+            .panel_primary
+            .as_ref()
+            .is_some_and(|s| self.row_exists(s))
+        {
+            return;
+        }
+        self.panel_primary = fallback;
+    }
+
     /// Controls strip for the active row (`panel_primary`): opacity / merge / delete / fx for a
-    /// raster, pin / rasterize for a text, opacity / delete for a group.
+    /// raster, pin / rasterize for a text, opacity / delete for a group, and — for a structurally
+    /// locked base layer — only its name plus the view-only opacity.
+    ///
+    /// The "select a layer" hint is a defensive fallback: while a page is loaded `panel_primary` is
+    /// always `Some` (see the field's invariant), so it is reachable only before the first load.
     fn draw_active_controls(&self, ui: &mut egui::Ui, actions: &mut PanelActions) {
         let Some(primary) = self.panel_primary.clone() else {
             ui.label(t!("ps_editor.active_controls.select_layer_hint"));
@@ -3159,8 +3523,37 @@ impl PsEditorTabState {
             return;
         };
         match primary {
+            RowSel::Base(id) => {
+                // Structurally locked: NO delete / merge / bake / fx / ▲▼ here. `Исходник` and
+                // `Клин` are never removed, reordered, grouped or transformed.
+                let Some(layer) = stack.layer(id).filter(|l| l.kind.is_base()) else {
+                    return;
+                };
+                ui.label(format!("▦ {} 🔒", layer.name))
+                    .on_hover_text(t!("ps_editor.active_controls.base_locked_tooltip"));
+                // Opacity is genuinely honoured for base layers by the composite
+                // (`draw_composite` → `LayerStack::layer_opacity`), and — like base-layer
+                // visibility — it is VIEW-ONLY session state: base layers are not doc nodes and are
+                // not persisted, so nothing is routed and nothing is recorded in the history
+                // (`raster_uid` filters to `LayerKind::Raster`, so the opacity gesture records
+                // nothing for a base id).
+                let mut opacity = layer.opacity;
+                if ui
+                    .add(
+                        crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0)
+                            .text(t!("ps_editor.active_controls.opacity_label")),
+                    )
+                    .changed()
+                {
+                    actions.opacity_raster = Some((id, opacity));
+                }
+            }
             RowSel::Raster(id) => {
-                let Some(layer) = stack.layer(id) else {
+                // The base filter is repeated at this mutation site on purpose (same habit as
+                // `merge_down`): this arm exposes delete / merge / bake / fx / ▲▼, none of which a
+                // base layer may ever reach, and that must not depend only on `build_panel_rows`
+                // and `normalize_panel_primary` agreeing on which variant to construct.
+                let Some(layer) = stack.layer(id).filter(|l| !l.kind.is_base()) else {
                     return;
                 };
                 ui.label(format!("▦ {}", layer.name));
@@ -3539,6 +3932,12 @@ impl PsEditorTabState {
                 stack.remove_layer(id);
             }
             self.persist_current_page(project);
+            // The deleted layer may have been the primary row. Re-point it at the stack's own
+            // fallback (`LayerStack::remove_layer` already moved `active` to the topmost survivor,
+            // finally `Клин`) so the controls strip keeps showing a layer. Needed here as well as in
+            // `sync_view_from_doc`, because the no-doc fallback path above removes the layer from
+            // the stack directly and never reaches a projection.
+            self.normalize_panel_primary();
             // Record the DELETE (observer style). Undo → inverse (Added) re-adds it at its prior Z.
             if let (Some(page_idx), Some(layer), Some(z)) = (page_idx, captured, captured_z) {
                 self.history.record(PsEditOp::LayerLifecycle {
@@ -3805,7 +4204,9 @@ impl PsEditorTabState {
                 persist::BandRef::Raster(uid)
             }
             RowSel::Text(uid) => persist::BandRef::PinnedText(uid.clone()),
-            RowSel::Group(_) => return,
+            // A base layer has no band and is never reordered (it IS the bottom of the composite);
+            // a group moves as a block through `move_group_block`, not here.
+            RowSel::Base(_) | RowSel::Group(_) => return,
         };
         // Ensure the page's rasters are on disk BEFORE the synchronous band-order write below:
         // `persist_current_page` now ENQUEUES (async) so it cannot guarantee the raster nodes are
@@ -3919,7 +4320,10 @@ impl PsEditorTabState {
                         }
                     }
                     RowSel::Text(uid) => sel_node_uids.push(uid.clone()),
-                    RowSel::Group(_) => {}
+                    // A base layer can never be grouped, ungrouped or deleted with a group. It
+                    // cannot reach `panel_selection` in the first place (`select_row` /
+                    // `selectable_row_order`); this arm keeps the lock explicit at the read site.
+                    RowSel::Base(_) | RowSel::Group(_) => {}
                 }
             }
         }
@@ -4762,9 +5166,18 @@ impl PsEditorTabState {
         // on bare canvas". Everything derived from the pointer — the wheel, the zoom anchor and the
         // routing to the active tool — is gated on this instead of on `response.hovered()` alone;
         // without it a click on a panel would paint underneath it.
-        let pointer_occluded = input
-            .hover_pos
-            .is_some_and(|pos| self.canvas_pointer_occluded(ctx, pos));
+        // The active tool's own on-canvas surface is the fourth term of the gate, asked of the TOOL
+        // because only it knows where its surface is this frame (`PsTool::captures_canvas_pointer`;
+        // a region tool re-projects the answer from PAGE pixels, so it does not drift on a pan).
+        // It is deliberately narrow: it withholds the wheel, the zoom anchor, the routing to
+        // `interact` and the tool's own cursor preview, and NOTHING else — the undo/redo shortcuts
+        // live in `handle_hotkeys`, which never consults this gate, so an on-canvas surface can
+        // never disable them (the mistake the cleaning tab's whole-canvas `block_canvas_zoom` flag
+        // makes, `tabs/cleaning/tools/MODULE_README.md`).
+        let pointer_occluded = input.hover_pos.is_some_and(|pos| {
+            self.canvas_pointer_occluded(ctx, pos)
+                || self.tools[self.active_tool_idx].captures_canvas_pointer(pos)
+        });
         let hovered = response.hovered() && !pointer_occluded;
         let pointer_in_viewport = hovered && input.hover_pos.is_some_and(|p| rect.contains(p));
         // Panning is deliberately NOT gated on `pointer_occluded`: the gate answers where the
@@ -4872,7 +5285,12 @@ impl PsEditorTabState {
 
             let outcome = if let Some(stack) = self.stack.as_mut() {
                 let pointer_image = input.hover_pos.map(|p| view.screen_to_world(p));
+                // Taken from the STACK, not from `active_page_idx`: the stack is the buffer the
+                // tool is about to edit, so its own page index is the one a queued action or a
+                // worker job must be stamped with.
+                let tool_page_idx = stack.page_idx();
                 let mut tool_ctx = PsToolContext {
+                    page_idx: tool_page_idx,
                     page_size,
                     pointer_image,
                     pointer_in_viewport,
@@ -5103,6 +5521,28 @@ impl PsEditorTabState {
             egui::StrokeKind::Outside,
         );
 
+        // Resolved in its own statement so the immutable stack borrow ends before `self.tools` is
+        // borrowed mutably below. The stack is present here — `page_size` above returns otherwise.
+        let overlay_page_idx = self.stack.as_ref().map_or(0, layers::LayerStack::page_idx);
+        // The active tool's on-canvas pass, LAST in the canvas frame and for the ACTIVE tool only.
+        // Unlike `draw_overlay` above it owns the `Context`, so it may open its own `Area` and
+        // sense input there; being last costs nothing for those (an `Area` is its own layer and is
+        // composited by layer order, not by call order — `egui-docs/06-overlays.md`) and keeps the
+        // painter-based decorations above from being reordered.
+        //
+        // It runs only while a page is resident, because `PsToolOverlayCx` is page geometry — which
+        // is exactly why a tool's WORKER results are consumed in `poll_tools` instead, and why the
+        // pixel writes it asks for are queued rather than performed here.
+        self.tools[self.active_tool_idx].draw_overlay_ui(
+            ctx,
+            tools::PsToolOverlayCx {
+                viewport: rect,
+                view,
+                page_size,
+                page_idx: overlay_page_idx,
+            },
+        );
+
         if response.hovered()
             || pan_active
             || self.pending_job_id.is_some()
@@ -5120,25 +5560,62 @@ impl PsEditorTabState {
     /// Called once per stroke, from the `BrushTool::take_stroke_finished` latch in `draw_canvas` —
     /// never from the pointer-release edge, which a pan frame can swallow (see the call site).
     /// During the stroke the local `image` is mutated live (responsive) while `base_image` still
-    /// holds the pre-stroke pixels, so `record_brush_stroke` reads the "before" from `base_image`
+    /// holds the pre-stroke pixels, so `record_pixel_region` reads the "before" from `base_image`
     /// for free — no stroke-start snapshot. A paintable raster has no effects, so
     /// base == display == painted pixels.
     ///
-    /// The destination depends on the painted layer's KIND: a user raster commits to the shared
-    /// `LayerDoc` (the model truth, cross-tab visible); the `Клин` base layer is not a doc node at
-    /// all, so its stroke goes to the shared `CleanOverlaysModel` instead — bounded to the stroke's
-    /// dirty union, because a ribbon page can be ~800x19000 px. A stroke that painted nothing (no
-    /// union, or a layer that refuses pixel edits) is a no-op.
+    /// The destination depends on the painted layer's KIND; see
+    /// [`PsEditorTabState::commit_pixel_region`], which this shares with every other tool-driven
+    /// pixel commit. A stroke that painted nothing (no union, or a layer that refuses pixel edits)
+    /// is a no-op.
     fn commit_brush_stroke(&mut self, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
-        // Read the stroke union BEFORE `record_brush_stroke`, which does not consume it but is
-        // followed by the reset below.
+        // Read the stroke union BEFORE the commit, which does not consume it but is followed by the
+        // reset below.
         let stroke_union = self.brush_stroke_dirty;
+        self.commit_pixel_region(
+            page_idx,
+            stroke_union,
+            t!("ps_editor.edit_op.brush_stroke"),
+            project,
+        );
+        self.brush_stroke_dirty = None;
+    }
+
+    /// Commits an ALREADY-APPLIED pixel edit of the active layer: one reversible undo entry, then
+    /// the push onward that makes it durable and cross-tab visible.
+    ///
+    /// The single commit path for every tool-driven pixel edit — the brush stroke and the
+    /// [`tools::PsToolAction::WriteRegion`] a region tool queues both end here, so the rules below
+    /// hold exactly once.
+    ///
+    /// `region` is the edit's bounding rect in the ACTIVE LAYER's own pixel grid, or `None` when
+    /// the edit had no measured region. `label` is the already-localized undo caption.
+    ///
+    /// Order is load-bearing: the undo entry is recorded FIRST, because the push and the next
+    /// reprojection sync `base_image` to the edited pixels and would erase the "before" the diff is
+    /// built from.
+    ///
+    /// The destination depends on the edited layer's KIND, the same split
+    /// [`pixel_region_edit_op`] makes for the undo variant: a user raster commits to the shared
+    /// `LayerDoc` (the model truth, cross-tab visible); the `Клин` base layer is not a doc node at
+    /// all, so it goes to the shared `CleanOverlaysModel` through the one
+    /// `write_clean_region_to_model` helper — bounded to `region`, because a ribbon page can be
+    /// ~800x19000 px. `Исходник` is never editable and is a no-op here.
+    fn commit_pixel_region(
+        &mut self,
+        page_idx: usize,
+        region: Option<tools::DirtyRect>,
+        label: &str,
+        project: &ProjectData,
+    ) {
         // Record BEFORE pushing the pixels onward (the push + next reprojection sync base_image to
-        // the painted pixels, which would erase the "before").
-        self.record_brush_stroke(page_idx);
+        // the edited pixels, which would erase the "before").
+        if let Some(region) = region {
+            self.record_pixel_region(page_idx, region, label);
+        }
         let painted = self
             .stack
             .as_ref()
@@ -5148,13 +5625,19 @@ impl PsEditorTabState {
         match painted {
             Some((LayerKind::Raster, uid, painted)) => {
                 let base = painted.clone();
-                crate::trace_log!(cat::SYNC, "commit brush_pixels page={} uid={}", page_idx, uid);
+                crate::trace_log!(
+                    cat::SYNC,
+                    "commit pixels page={} uid={} label={}",
+                    page_idx,
+                    uid,
+                    label
+                );
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
                 });
             }
             Some((LayerKind::Clean, _, _)) => {
-                if let Some(union) = stroke_union {
+                if let Some(union) = region {
                     self.write_clean_region_to_model(
                         page_idx,
                         union.min_x,
@@ -5164,11 +5647,113 @@ impl PsEditorTabState {
                     );
                 }
             }
-            // `Source` is never paintable (`can_edit_pixels`), and `None` means the stroke changed
+            // `Source` is never paintable (`can_edit_pixels`), and `None` means the edit changed
             // nothing.
             Some((LayerKind::Source, _, _)) | None => {}
         }
-        self.brush_stroke_dirty = None;
+    }
+
+    /// Drains every tool's deferred action queue and performs the requests.
+    ///
+    /// The tab-side half of [`tools::PsTool::take_actions`]: a tool may not record history, may not
+    /// write the shared `LayerDoc` and may not reach `CleanOverlaysModel`, so it describes the
+    /// commit and this performs it. Drained from EVERY tool, not only the active one — a worker
+    /// result that landed after a tool switch still represents work the user did.
+    ///
+    /// Called once per frame from [`PsEditorTabState::draw`], after `draw_canvas`; that is the only
+    /// site reached on every frame, since `draw_canvas` returns early while no page is resident.
+    ///
+    /// A request for a page that is NOT resident is dropped and logged: a worker result that
+    /// outlived a page switch would otherwise land on the new page's pixels.
+    ///
+    /// Returns `true` when at least one request changed pixels, so the caller can request the
+    /// repaint that shows them.
+    fn apply_tool_actions(&mut self, project: &ProjectData) -> bool {
+        let mut actions: Vec<tools::PsToolAction> = Vec::new();
+        for tool in &mut self.tools {
+            actions.extend(tool.take_actions());
+        }
+        let mut changed = false;
+        for action in actions {
+            match action {
+                tools::PsToolAction::WriteRegion(write) => {
+                    changed |= self.apply_tool_region_write(write, project);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Performs one [`tools::ToolRegionWrite`]: blend into the active editable layer, invalidate the
+    /// affected tiles, then commit it as ONE undo step through
+    /// [`PsEditorTabState::commit_pixel_region`].
+    ///
+    /// Refuses — logging why, never silently degrading — when the page is not resident, when the
+    /// active layer accepts no pixel edit (`Исходник`, or a raster still showing an effects chain),
+    /// when the rect falls entirely outside the layer, or when the coverage buffer's length does
+    /// not match the source rect.
+    ///
+    /// Returns `true` when pixels actually changed.
+    fn apply_tool_region_write(
+        &mut self,
+        write: tools::ToolRegionWrite,
+        project: &ProjectData,
+    ) -> bool {
+        let tools::ToolRegionWrite {
+            page_idx,
+            origin,
+            pixels,
+            coverage,
+            label,
+        } = write;
+        if self.active_page_idx != Some(page_idx)
+            || self
+                .stack
+                .as_ref()
+                .is_none_or(|stack| stack.page_idx() != page_idx)
+        {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] a tool asked to write {}x{} px into page {page_idx}, which is no \
+                 longer the resident page; the request was dropped",
+                pixels.size[0], pixels.size[1]
+            ));
+            return false;
+        }
+        // `active_editable_mut` is the same gate the brush paints through: it refuses `Исходник`
+        // and a raster whose effects chain is not baked, so a tool cannot write where the brush
+        // cannot.
+        let Some(layer) = self
+            .stack
+            .as_mut()
+            .and_then(layers::LayerStack::active_editable_mut)
+        else {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] a tool asked to write into page {page_idx}, but the active layer \
+                 accepts no pixel edit; the request was dropped"
+            ));
+            return false;
+        };
+        let layer_id = layer.id;
+        let Some(dirty) =
+            blend_premul_region(&mut layer.image, origin, &pixels, coverage.as_deref())
+        else {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] a tool's {}x{} px write at ({},{}) on page {page_idx} was refused: it \
+                 falls outside the active layer, or its coverage buffer is not {} bytes long",
+                pixels.size[0],
+                pixels.size[1],
+                origin[0],
+                origin[1],
+                pixels.size[0].saturating_mul(pixels.size[1])
+            ));
+            return false;
+        };
+        layer.pixels_dirty = true;
+        if let Some(cache) = self.render_cache.get_mut(&layer_id) {
+            cache.mark_dirty_rect(dirty);
+        }
+        self.commit_pixel_region(page_idx, Some(dirty), &label, project);
+        true
     }
 
     /// Commits an in-flight brush stroke that has already painted, before its gesture is
@@ -5949,6 +6534,13 @@ impl PsEditorTabState {
         if let Some(stack) = self.stack.as_mut() {
             stack.set_active(below_id);
         }
+        // The upper participant's row is gone and the active layer just moved to the merge target,
+        // so the panel's primary row follows it. Set explicitly (not via `normalize_panel_primary`):
+        // the projection inside `edit_doc_node` already re-pointed the primary at the then-active
+        // layer, so it is "valid" by now and normalization alone would leave it on the wrong row.
+        self.panel_primary = self.active_row_sel();
+        self.panel_selection.clear();
+        self.panel_anchor = None;
         true
     }
 
@@ -6386,6 +6978,118 @@ fn page_footprint_rect(layer: &Layer, size: [usize; 2]) -> Option<(usize, usize,
     Some((x0, y0, x1 - x0, y1 - y0))
 }
 
+/// One layer of an ordered composite: the layer itself and the opacity it contributes at.
+///
+/// The opacity travels WITH the layer because it is not a property of the layer alone — group
+/// opacity multiplies into it (`LayerStack::layer_opacity`) — and a caller that resolved the
+/// order already resolved the opacity in the same walk.
+type CompositeLayer<'a> = (&'a Layer, f32);
+
+/// Which part of a stack one composite covers, relative to a stack index.
+///
+/// The two forms are ONE index apart and mean opposite things, so they are named rather than
+/// written as an off-by-one at the call site: a patch is solved in the plane its target layer is
+/// PART of ([`CompositeBound::UpTo`]) and stored over the plane BELOW it
+/// ([`CompositeBound::Below`]), and confusing the two applies every layer above the target twice —
+/// once because the solver copied it into the target, once because the render paints it again.
+///
+/// The whole visible stack is [`CompositeBound::UpTo`] the topmost index; no production caller
+/// composites a page rectangle that way, so it has no variant of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompositeBound {
+    /// Visible layers STRICTLY BELOW the index — the backdrop a pixel written into the layer at
+    /// that index is composited over.
+    Below(usize),
+    /// Visible layers up to and INCLUDING the index — the plane the layer at that index is part
+    /// of, i.e. what the page shows when everything above it is stripped away.
+    UpTo(usize),
+}
+
+impl CompositeBound {
+    /// Whether the layer at stack index `idx` is inside this bound.
+    ///
+    /// Monotone in `idx` — once it answers `false` it answers `false` for every deeper index — which
+    /// is what makes the `take_while` in [`visible_layers_bottom_to_top`] an exact filter rather
+    /// than a truncation.
+    fn includes(self, idx: usize) -> bool {
+        match self {
+            Self::Below(limit) => idx < limit,
+            Self::UpTo(limit) => idx <= limit,
+        }
+    }
+}
+
+/// The layers of `stack` in COMPOSITE order (bottom to top), with the opacity each contributes at.
+///
+/// `bound` selects the part of the stack the composite covers; see [`CompositeBound`] for why the
+/// inclusive and the exclusive form are named types.
+///
+/// Hidden layers and layers at zero opacity are skipped, exactly as
+/// [`PsEditorTabState::sample_visible_composite`] skips them. TEXT overlays are absent by
+/// construction: they are not `LayerStack` layers at all.
+///
+/// **Why the plain stack order is the composite order.** `sample_visible_composite` sorts the user
+/// rasters by their unified band Z because it holds the tab's `bands`. It does not have to: the tab
+/// projects the shared `LayerDoc`'s node list — which the doc keeps sorted by `z` — onto the stack
+/// through `LayerStack::reorder_rasters`, which preserves that order and keeps the two base layers
+/// first. A bottom-to-top walk of `stack.layers()` therefore yields the same sequence the band-Z
+/// sort produces, and it is available to code that holds only a `LayerStack` (a tool's
+/// `PsToolContext`), where `bands` is not.
+fn visible_layers_bottom_to_top(
+    stack: &LayerStack,
+    bound: CompositeBound,
+) -> Vec<CompositeLayer<'_>> {
+    stack
+        .layers()
+        .iter()
+        .enumerate()
+        .take_while(|(idx, _)| bound.includes(*idx))
+        .filter(|(_, layer)| stack.layer_visible(layer))
+        .map(|(_, layer)| (layer, stack.layer_opacity(layer)))
+        .filter(|(_, opacity)| *opacity > 0.0)
+        .collect()
+}
+
+/// Composites `layers` (bottom-to-top, src-over) over `rect` of the page into a `rect`-sized image.
+///
+/// The ROI counterpart of [`composite_to_page`], and the one place the project composites a page
+/// RECTANGLE: a whole-page composite is unusable on a ribbon page (~800x19000 px), and sampling a
+/// per-pixel helper instead re-resolves the layer order for every pixel. The order and the
+/// opacities are resolved ONCE by the caller (`visible_layers_bottom_to_top`), so this function is
+/// a pure buffer walk.
+///
+/// Each layer is sampled through its transform ([`sample_layer_world`]), so rotated, scaled and
+/// "incomplete" layers contribute correctly, and its `opacity` is applied before the src-over —
+/// which is what `TiledTexture::draw` does at composite time.
+///
+/// `mask` restricts the composite to the page pixels the selection contains; masked-out pixels stay
+/// transparent. `None` composites the whole rectangle.
+///
+/// Pixels are PREMULTIPLIED, the `Layer::image` convention. A rectangle reaching past the page or
+/// past a layer simply samples transparent there, so no clamping is performed or needed.
+fn composite_rect(
+    layers: &[CompositeLayer<'_>],
+    rect: OverlayRectPx,
+    mask: Option<&Selection>,
+) -> ColorImage {
+    let mut out = ColorImage::filled([rect.w, rect.h], Color32::TRANSPARENT);
+    for row in 0..rect.h {
+        let y = rect.y + row;
+        for col in 0..rect.w {
+            let x = rect.x + col;
+            if mask.is_some_and(|mask| !mask.contains(x, y)) {
+                continue;
+            }
+            let mut px = Color32::TRANSPARENT;
+            for (layer, opacity) in layers {
+                px = over(scale_premultiplied(sample_layer_world(layer, x, y), *opacity), px);
+            }
+            out.pixels[row * rect.w + col] = px;
+        }
+    }
+    out
+}
+
 /// Composites `layers` (bottom-to-top, src-over) into a fresh page-sized image, sampling each
 /// through its transform so rotated/scaled/incomplete layers contribute correctly.
 fn composite_to_page(layers: &[&Layer], size: [usize; 2]) -> ColorImage {
@@ -6418,25 +7122,24 @@ fn clip_into_new_layer(
     if layer_ids.is_empty() {
         return None;
     }
-    let crop_w = bounds.max_x - bounds.min_x + 1;
-    let crop_h = bounds.max_y - bounds.min_y + 1;
+    let crop_rect = OverlayRectPx {
+        x: bounds.min_x,
+        y: bounds.min_y,
+        w: bounds.max_x - bounds.min_x + 1,
+        h: bounds.max_y - bounds.min_y + 1,
+    };
 
-    // Composite into a buffer cropped to the selection bounds (an "incomplete" layer).
-    let mut pixels = vec![Color32::TRANSPARENT; crop_w * crop_h];
-    for &id in layer_ids {
-        let Some(layer) = stack.layer(id) else {
-            continue;
-        };
-        for y in bounds.min_y..=bounds.max_y {
-            for x in bounds.min_x..=bounds.max_x {
-                if selection.contains(x, y) {
-                    let idx = (y - bounds.min_y) * crop_w + (x - bounds.min_x);
-                    pixels[idx] = over(sample_layer_world(layer, x, y), pixels[idx]);
-                }
-            }
-        }
-    }
-    let clip_image = ColorImage::new([crop_w, crop_h], pixels);
+    // Composite into a buffer cropped to the selection bounds (an "incomplete" layer), through the
+    // shared ROI composite so the clip and the patch tool cannot drift apart. A clip takes the
+    // layers the USER picked at their own pixels — visibility and opacity are deliberately not
+    // applied here, which is why the opacities are all 1.0 rather than `layer_opacity`.
+    let clip_layers: Vec<CompositeLayer<'_>> = layer_ids
+        .iter()
+        .filter_map(|&id| stack.layer(id))
+        .map(|layer| (layer, 1.0))
+        .collect();
+    let clip_image = composite_rect(&clip_layers, crop_rect, Some(selection));
+    drop(clip_layers);
 
     if mode == ClipMode::Cut {
         for &id in layer_ids {
@@ -6693,6 +7396,147 @@ fn non_empty_selection(selection: Selection) -> Option<Selection> {
     selection.any().then_some(selection)
 }
 
+/// The undo op that records a pixel-region edit of a layer of `kind`, or `None` when that kind
+/// accepts no pixel edit at all.
+///
+/// The pure decision behind `PsEditorTabState::record_pixel_region`, split out so the variant
+/// choice — which also NAMES the write-back route the commit takes — can be exercised without a
+/// tab state, a stack or a history. The two are one decision and must not drift:
+/// * [`LayerKind::Raster`] ⇒ [`PsEditOp::RasterPixels`], keyed on the layer's stable doc uid,
+///   because a user raster is a doc node and its commit goes to the shared `LayerDoc`;
+/// * [`LayerKind::Clean`] ⇒ [`PsEditOp::CleanPixels`], carrying NO uid, because base-layer uids are
+///   regenerated on every page load and the commit goes to `CleanOverlaysModel` instead;
+/// * [`LayerKind::Source`] ⇒ `None`: it is immutable (`Layer::can_edit_pixels`), so it is
+///   unreachable here, but a real `match` (no `_ =>`) forces a new paintable kind to be handled.
+///
+/// `dir` is always `Forward`: recording is observer-style, the forward edit having already been
+/// applied live.
+#[must_use]
+fn pixel_region_edit_op(
+    kind: LayerKind,
+    page_idx: usize,
+    layer_uid: String,
+    diff: Arc<RasterDiff>,
+    label: String,
+) -> Option<PsEditOp> {
+    match kind {
+        LayerKind::Raster => Some(PsEditOp::RasterPixels {
+            page_idx,
+            layer_uid,
+            diff,
+            dir: ApplyDirection::Forward,
+            label,
+        }),
+        LayerKind::Clean => Some(PsEditOp::CleanPixels {
+            page_idx,
+            diff,
+            dir: ApplyDirection::Forward,
+            label,
+        }),
+        LayerKind::Source => None,
+    }
+}
+
+/// Whether the ACTIVE TOOL's own dock tab is drawn this frame.
+///
+/// The pure decision behind the seventh tab's `visible` flag, split out so it can be exercised
+/// without a dock. It is asked of the tool and of nothing else: the panel belongs to whichever tool
+/// is active, so it appears and disappears with the tool selection rather than with a stored user
+/// flag. An out-of-range index answers `false` instead of panicking.
+#[must_use]
+fn tool_panel_visible(tools: &[Box<dyn PsTool>], active_tool_idx: usize) -> bool {
+    tools
+        .get(active_tool_idx)
+        .is_some_and(|tool| tool.wants_main_panel())
+}
+
+/// Blends a premultiplied RGBA source rect into a premultiplied destination image at `origin`,
+/// returning the rect actually written in the destination's own pixels.
+///
+/// The pure core of the [`tools::PsToolAction::WriteRegion`] apply path, split out so the geometry
+/// and the blend can be exercised without a tab state. Contract:
+/// * `origin` is in DESTINATION pixels; the source rect is clipped to the destination and an empty
+///   result yields `None`, so a rect that hangs off the page is a no-op rather than a panic;
+/// * `coverage`, when present, must be exactly `src.size[0] * src.size[1]` bytes — a wrongly-sized
+///   buffer is REFUSED (`None`), never padded, because a silent fallback would land a half-written
+///   patch (`AGENTS.md` §11);
+/// * the blend is `dst += (src - dst) * coverage / 255` per premultiplied channel. Linear
+///   interpolation of PREMULTIPLIED RGBA is exactly the premultiplied form of the interpolated
+///   image, so this is a correct cross-fade and not an approximation of one. `None` coverage means
+///   "fully opaque" and copies the source outright, which is what a coverage of 255 also does.
+#[must_use]
+fn blend_premul_region(
+    dst: &mut ColorImage,
+    origin: [usize; 2],
+    src: &ColorImage,
+    coverage: Option<&[u8]>,
+) -> Option<tools::DirtyRect> {
+    let [dw, dh] = dst.size;
+    let [sw, sh] = src.size;
+    if let Some(cov) = coverage
+        && cov.len() != sw.saturating_mul(sh)
+    {
+        return None;
+    }
+    let x0 = origin[0].min(dw);
+    let y0 = origin[1].min(dh);
+    let x1 = origin[0].saturating_add(sw).min(dw);
+    let y1 = origin[1].saturating_add(sh).min(dh);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    for y in y0..y1 {
+        let sy = y - origin[1];
+        for x in x0..x1 {
+            let sx = x - origin[0];
+            let s_idx = sy * sw + sx;
+            let d_idx = y * dw + x;
+            let (Some(&src_px), Some(dst_px)) =
+                (src.pixels.get(s_idx), dst.pixels.get_mut(d_idx))
+            else {
+                // Both indices are inside their buffers by the clamps above; bail out rather than
+                // panic if that ever stops holding.
+                continue;
+            };
+            let weight = coverage.map_or(255, |cov| cov.get(s_idx).copied().unwrap_or(0));
+            *dst_px = match weight {
+                0 => *dst_px,
+                255 => src_px,
+                w => lerp_premul(*dst_px, src_px, w),
+            };
+        }
+    }
+    Some(tools::DirtyRect {
+        min_x: x0,
+        min_y: y0,
+        max_x: x1 - 1,
+        max_y: y1 - 1,
+    })
+}
+
+/// Linear interpolation between two PREMULTIPLIED colours by `weight / 255`.
+///
+/// Rounds to nearest so a weight of 255 reproduces `to` exactly and a weight of 0 reproduces
+/// `from`; both are short-circuited by the caller, which is what keeps a full-coverage write
+/// bit-exact.
+#[must_use]
+fn lerp_premul(from: Color32, to: Color32, weight: u8) -> Color32 {
+    let mix = |a: u8, b: u8| -> u8 {
+        let a = u32::from(a);
+        let b = u32::from(b);
+        let w = u32::from(weight);
+        // (a * (255 - w) + b * w + 127) / 255, all terms below 255*255 + 127, so no overflow.
+        let v = (a * (255 - w) + b * w + 127) / 255;
+        u8::try_from(v).unwrap_or(255)
+    };
+    Color32::from_rgba_premultiplied(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+        mix(from.a(), to.a()),
+    )
+}
+
 /// Screen position the active tool's `draw_overlay` may follow this frame, or `None` to hide it.
 ///
 /// The pure decision behind the overlay call in `draw_canvas`, split out so it can be exercised
@@ -6935,10 +7779,10 @@ mod tests {
     /// name every tab this program tab can declare — a tab missing here would be dropped from the
     /// user's stored arrangement on every load.
     #[test]
-    fn the_default_dock_layout_places_the_six_ps_editor_panels() {
+    fn the_default_dock_layout_places_the_seven_ps_editor_panels() {
         let layout = ps_editor_default_dock_layout();
         assert_eq!(layout.validate(), Ok(()));
-        assert_eq!(layout.panels().len(), 6);
+        assert_eq!(layout.panels().len(), 7);
 
         let declared: BTreeSet<TabId> = layout
             .panels()
@@ -6952,12 +7796,16 @@ mod tests {
             PS_EDITOR_HOTKEYS_TAB,
             PS_EDITOR_LAYERS_TAB,
             PS_EDITOR_CORRECTION_TAB,
+            // The active tool's own panel is normally hidden, but it is still DECLARED every frame,
+            // so it must be named here: `panel_dock::persist` resolves stored tab keys against this
+            // layout and would drop it from the user's arrangement on every load.
+            PS_EDITOR_TOOL_PANEL_TAB,
         ]
         .into_iter()
         .collect();
         assert_eq!(
             declared, expected,
-            "the default layout must name exactly the six tabs the program tab declares"
+            "the default layout must name exactly the seven tabs the program tab declares"
         );
     }
 
@@ -7017,6 +7865,16 @@ mod tests {
         );
         // «Коррекция» hangs under «Горячие клавиши», not under «Слои»: sharing «Слои» + Bottom
         // with the hotkeys panel would solve both to one rect and bury this one.
+        // The tool panel continues the LEFT chain under «Выбранный инструмент». Same sibling rule
+        // as «Коррекция»: it must not share «Выбранный инструмент»'s own target and edge.
+        assert_eq!(
+            panel_of(PS_EDITOR_TOOL_PANEL_TAB).anchor,
+            PanelAnchor::Panel {
+                target: panel_of(PS_EDITOR_ACTIVE_TOOL_TAB).id,
+                edge: DockEdge::Bottom,
+                align: 0.0
+            }
+        );
         assert_eq!(
             panel_of(PS_EDITOR_CORRECTION_TAB).anchor,
             PanelAnchor::Panel {
@@ -8235,5 +9093,735 @@ mod tests {
             scale: 1.0,
         };
         assert_eq!(page_footprint_rect(layer, size), Some((0, 0, 8, 8)));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The panel's ALWAYS-PRESENT active layer (`panel_primary`).
+    // ---------------------------------------------------------------------------------------
+
+    /// A stack with only the two base layers, plus the `Клин` layer's id.
+    fn base_stack_with_clean() -> (LayerStack, LayerId) {
+        let size = [2, 2];
+        let stack = LayerStack::new(
+            0,
+            size,
+            filled(size, Color32::TRANSPARENT),
+            filled(size, Color32::TRANSPARENT),
+        );
+        let clean = stack
+            .layers()
+            .iter()
+            .find(|l| l.kind == LayerKind::Clean)
+            .map(|l| l.id)
+            .expect("the clean base layer is always present");
+        (stack, clean)
+    }
+
+    /// (a) A base row must be representable as the primary row AND must read as selected from that
+    /// alone: a freshly loaded page seeds `panel_primary` while deliberately leaving
+    /// `panel_selection` empty, so a selection-only highlight rule would show nothing at all — which
+    /// is the reported bug.
+    #[test]
+    fn a_base_row_is_keyed_and_is_highlighted_by_being_the_primary_row() {
+        let (stack, clean) = base_stack_with_clean();
+        let ps = PsEditorTabState {
+            stack: Some(stack),
+            panel_primary: Some(RowSel::Base(clean)),
+            ..Default::default()
+        };
+
+        let rows = ps.build_panel_rows();
+        let base_sels: Vec<Option<RowSel>> = rows
+            .iter()
+            .filter_map(|r| match r {
+                PanelRow::Leaf(l) if l.is_base => Some(l.sel.clone()),
+                PanelRow::Leaf(_) | PanelRow::Group(_) => None,
+            })
+            .collect();
+        assert!(
+            base_sels.iter().all(Option::is_some),
+            "a base leaf must carry a RowSel so it can become the primary row: {base_sels:?}"
+        );
+        assert!(
+            base_sels.contains(&Some(RowSel::Base(clean))),
+            "the Клин row must be keyed as RowSel::Base"
+        );
+
+        let empty = HashSet::new();
+        assert!(
+            row_is_selected(Some(&RowSel::Base(clean)), &empty, ps.panel_primary.as_ref()),
+            "the primary row is highlighted even with an empty multi-selection"
+        );
+    }
+
+    /// (b) The user-visible default: a page opens with `Клин` as the active row, not with the
+    /// «Выберите слой» hint. `poll_loader` clears `panel_primary` and then calls exactly this.
+    #[test]
+    fn a_loaded_page_makes_the_clean_base_layer_the_primary_row() {
+        let (stack, clean) = base_stack_with_clean();
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            // Exactly the state `poll_loader` leaves behind before it normalizes.
+            panel_primary: None,
+            ..Default::default()
+        };
+
+        ps.normalize_panel_primary();
+
+        assert_eq!(ps.panel_primary, Some(RowSel::Base(clean)));
+        assert_eq!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean))
+                .map(|l| l.kind),
+            Some(LayerKind::Clean),
+            "the seeded primary must be the Клин base layer, not Исходник"
+        );
+    }
+
+    /// No page loaded ⇒ nothing to point at. The invariant is scoped to a resident page, and
+    /// asserting `Some` unconditionally would be wrong before the first load finishes.
+    #[test]
+    fn the_primary_row_stays_none_while_no_page_is_loaded() {
+        let mut ps = PsEditorTabState::default();
+        ps.normalize_panel_primary();
+        assert_eq!(ps.panel_primary, None);
+    }
+
+    /// (c) Deleting the primary raster must re-point the primary at the stack's own fallback. Before
+    /// this, `panel_primary` kept naming the dead layer and the controls strip rendered NOTHING —
+    /// not even its hint — because `draw_active_controls` bails on an unresolvable id.
+    #[test]
+    fn deleting_the_primary_raster_repoints_the_primary_at_the_stack_fallback() {
+        let (mut stack, clean) = base_stack_with_clean();
+        let raster = stack.add_raster_layer();
+        stack.set_active(raster);
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            panel_primary: Some(RowSel::Raster(raster)),
+            panel_selection: [RowSel::Raster(raster)].into_iter().collect(),
+            panel_anchor: Some(RowSel::Raster(raster)),
+            ..Default::default()
+        };
+
+        // The no-doc removal path (`apply_panel_actions`' fallback), which never reaches a projection.
+        assert!(
+            ps.stack
+                .as_mut()
+                .expect("page resident")
+                .remove_layer(raster)
+        );
+        ps.normalize_panel_primary();
+
+        assert_eq!(
+            ps.panel_primary,
+            Some(RowSel::Base(clean)),
+            "the primary must fall back to Клин, never dangle on the deleted raster"
+        );
+        assert!(
+            ps.panel_selection.is_empty(),
+            "a row that no longer exists must leave the multi-selection too"
+        );
+        assert_eq!(ps.panel_anchor, None);
+    }
+
+    /// A still-valid primary is left exactly where it is: normalization repairs, it does not reset
+    /// the user's choice on every projection.
+    #[test]
+    fn a_valid_primary_row_survives_normalization() {
+        let (mut stack, _clean) = base_stack_with_clean();
+        let raster = stack.add_raster_layer();
+        // The active layer is deliberately NOT the primary row, so a blind "follow active" would fail.
+        stack.set_active(raster);
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            panel_primary: Some(RowSel::Raster(raster)),
+            ..Default::default()
+        };
+        ps.normalize_panel_primary();
+        assert_eq!(ps.panel_primary, Some(RowSel::Raster(raster)));
+    }
+
+    /// A group the stack still holds but whose last member is gone renders NO row
+    /// (`tree::build_unified_tree` brackets a header around a run of member leaves), so a primary
+    /// left on it is dangling even though `group_by_uid` still resolves.
+    #[test]
+    fn a_group_emptied_of_its_last_member_is_treated_as_dangling() {
+        let (mut stack, clean) = base_stack_with_clean();
+        let raster = stack.add_raster_layer();
+        let group = stack.add_group("g".to_string());
+        stack.set_layer_group(raster, Some(group));
+        let uid = stack
+            .group(group)
+            .expect("group just added")
+            .uid
+            .to_string();
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            panel_primary: Some(RowSel::Group(uid.clone())),
+            ..Default::default()
+        };
+
+        // While the group still owns the raster it is a real row and must be left alone.
+        ps.normalize_panel_primary();
+        assert_eq!(ps.panel_primary, Some(RowSel::Group(uid.clone())));
+
+        // Deleting the last member leaves the group in the stack but removes its row.
+        assert!(
+            ps.stack
+                .as_mut()
+                .expect("page resident")
+                .remove_layer(raster)
+        );
+        ps.normalize_panel_primary();
+        assert_eq!(
+            ps.panel_primary,
+            Some(RowSel::Base(clean)),
+            "an emptied group has no row, so the primary must fall back to the active layer"
+        );
+    }
+
+    /// A `RowSel` whose id resolves to a layer of the WRONG kind is dangling too: it would drive
+    /// `draw_active_controls` into the raster arm — delete / merge / bake — for a base layer.
+    #[test]
+    fn a_base_id_wearing_the_raster_variant_is_treated_as_dangling() {
+        let (stack, clean) = base_stack_with_clean();
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            panel_primary: Some(RowSel::Raster(clean)),
+            ..Default::default()
+        };
+        ps.normalize_panel_primary();
+        assert_eq!(ps.panel_primary, Some(RowSel::Base(clean)));
+    }
+
+    /// (d) The structural lock, re-expressed after base rows became selectable: whatever the
+    /// modifiers, a base row is a SOLO primary and never enters `panel_selection` — which is the
+    /// only thing `apply_group_op` reads, so a base layer can never be grouped, ungrouped or
+    /// deleted with a group.
+    #[test]
+    fn a_base_row_can_never_join_a_multi_selection() {
+        let (mut stack, clean) = base_stack_with_clean();
+        let raster = stack.add_raster_layer();
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            ..Default::default()
+        };
+        let order = vec![RowSel::Raster(raster)];
+
+        for mods in [
+            egui::Modifiers::default(),
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::SHIFT,
+        ] {
+            // Seed a real multi-selection first, so "cleared" is an observable effect.
+            ps.select_row(RowSel::Raster(raster), egui::Modifiers::default(), &order);
+            assert!(!ps.panel_selection.is_empty());
+
+            ps.select_row(RowSel::Base(clean), mods, &order);
+            assert_eq!(ps.panel_primary, Some(RowSel::Base(clean)));
+            assert!(
+                ps.panel_selection.is_empty(),
+                "a base row must not join the multi-selection (mods {mods:?})"
+            );
+            assert_eq!(ps.panel_anchor, None);
+        }
+    }
+
+    /// The other half of that lock: base rows are absent from the Shift-range order, so a range
+    /// dragged over the bottom of the panel cannot sweep `Исходник`/`Клин` into the selection.
+    #[test]
+    fn the_shift_range_order_excludes_base_rows() {
+        let (mut stack, _clean) = base_stack_with_clean();
+        let raster = stack.add_raster_layer();
+        let ps = PsEditorTabState {
+            stack: Some(stack),
+            ..Default::default()
+        };
+        let rows = ps.build_panel_rows();
+        let order = selectable_row_order(&rows);
+        assert_eq!(
+            order,
+            vec![RowSel::Raster(raster)],
+            "only the user raster is range-selectable; the two base rows are locked out"
+        );
+    }
+
+    /// A collapsed group emits no member rows, so the header borrows the primary highlight —
+    /// otherwise the active layer would be invisible whenever its group is folded.
+    #[test]
+    fn a_collapsed_group_header_carries_the_hidden_primary_highlight() {
+        let empty = HashSet::new();
+        let primary = RowSel::Raster(7);
+        assert!(
+            group_row_is_selected("g1", &empty, Some(&primary), true, Some("g1")),
+            "a collapsed group holding the primary row is highlighted"
+        );
+        assert!(
+            !group_row_is_selected("g1", &empty, Some(&primary), false, Some("g1")),
+            "an EXPANDED group must not steal its member's highlight — the member row shows it"
+        );
+        assert!(
+            !group_row_is_selected("g2", &empty, Some(&primary), true, Some("g1")),
+            "an unrelated collapsed group is not highlighted"
+        );
+        assert!(
+            group_row_is_selected("g1", &empty, Some(&RowSel::Group("g1".to_owned())), false, None),
+            "a group that IS the primary row is highlighted regardless of collapse"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Region-tool host hooks: the deferred action queue, the write-region apply path, and the
+    // seventh dock tab's visibility.
+    // ---------------------------------------------------------------------------------------
+
+    /// A project with no pages and no real paths. Nothing this file's tool-action tests reach
+    /// touches the disk: with no `LayerDoc` bound, `route_to_doc` returns before it ever looks at
+    /// `project.paths`.
+    fn empty_project() -> ProjectData {
+        use crate::project::{CanvasSettings, ProjectPaths};
+        let empty = std::path::PathBuf::new;
+        ProjectData {
+            project_dir: empty(),
+            image_dir: empty(),
+            pages: Vec::new(),
+            bubbles: Arc::new(Vec::new()),
+            paths: ProjectPaths {
+                project_dir: empty(),
+                title_dir: empty(),
+                notes_file: empty(),
+                char_favorites_file: empty(),
+                color_presets_file: empty(),
+                bubbles_file: empty(),
+                src_dir: empty(),
+                clean_layers_dir: empty(),
+                cleaned_dir: empty(),
+                alt_vers_dir: empty(),
+                saved_dir: empty(),
+                image_bubbles_dir: empty(),
+                text_images_dir: empty(),
+                layers_dir: empty(),
+                text_detection_dir: empty(),
+                characters_dir: empty(),
+                terms_file: empty(),
+                settings_file: empty(),
+                unsaved_dir: empty(),
+                unsaved_bubbles_file: empty(),
+                unsaved_clean_layers_dir: empty(),
+                unsaved_image_bubbles_dir: empty(),
+                unsaved_text_images_dir: empty(),
+                unsaved_layers_dir: empty(),
+            },
+            comic_type: None,
+            canvas_settings: CanvasSettings::default(),
+            settings_data: serde_json::Value::Null,
+        }
+    }
+
+    /// A tool that queues exactly the writes it is handed, so the TAB half of the out-channel can
+    /// be exercised without inventing a real region tool.
+    #[derive(Default)]
+    struct QueueingTool {
+        queued: Vec<tools::PsToolAction>,
+        wants_panel: bool,
+    }
+
+    impl PsTool for QueueingTool {
+        fn id(&self) -> PsToolId {
+            PsToolId::Brush
+        }
+        fn title(&self) -> &'static str {
+            "queueing"
+        }
+        fn interact(&mut self, _ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+            ToolOutcome::default()
+        }
+        fn draw_overlay(
+            &self,
+            _painter: &egui::Painter,
+            _view: &viewport::ViewTransform,
+            _pointer_image: Option<Pos2>,
+        ) {
+        }
+        fn has_options(&self) -> bool {
+            false
+        }
+        fn hotkey_rows(&self) -> Vec<tools::PsHotkeyRow> {
+            Vec::new()
+        }
+        fn gesture_in_flight(&self) -> bool {
+            false
+        }
+        fn wants_main_panel(&self) -> bool {
+            self.wants_panel
+        }
+        fn take_actions(&mut self) -> Vec<tools::PsToolAction> {
+            std::mem::take(&mut self.queued)
+        }
+    }
+
+    /// A solid `w`x`h` premultiplied source rect.
+    fn solid(w: usize, h: usize, color: Color32) -> ColorImage {
+        ColorImage::new([w, h], vec![color; w * h])
+    }
+
+    /// A write request for page 0 with the given label.
+    fn write_action(origin: [usize; 2], pixels: ColorImage, label: &str) -> tools::PsToolAction {
+        tools::PsToolAction::WriteRegion(tools::ToolRegionWrite {
+            page_idx: 0,
+            origin,
+            pixels,
+            coverage: None,
+            label: label.to_string(),
+        })
+    }
+
+    /// A tab state whose only tool queues `actions`, on a two-base-layer page 0.
+    fn tab_with_queued(actions: Vec<tools::PsToolAction>) -> (PsEditorTabState, LayerId) {
+        let (stack, clean) = base_stack_with_clean();
+        let tool = QueueingTool {
+            queued: actions,
+            wants_panel: false,
+        };
+        let ps = PsEditorTabState {
+            stack: Some(stack),
+            active_page_idx: Some(0),
+            tools: vec![Box::new(tool)],
+            active_tool_idx: 0,
+            ..Default::default()
+        };
+        (ps, clean)
+    }
+
+    /// A `Клин`-targeted write must produce EXACTLY ONE undo entry, and it must be the
+    /// `CleanPixels` variant — the base layer is not a doc node, so a `RasterPixels` entry would
+    /// try to resolve a uid that is regenerated on every page load.
+    #[test]
+    fn a_queued_write_onto_klin_records_one_clean_undo_entry() {
+        let project = empty_project();
+        let (mut ps, clean) = tab_with_queued(vec![write_action(
+            [0, 0],
+            solid(2, 2, Color32::RED),
+            "region write",
+        )]);
+        // `Клин` is the active layer of a freshly built stack.
+        assert_eq!(
+            ps.stack.as_ref().and_then(|s| s.layer(s.active_id())).map(|l| l.kind),
+            Some(LayerKind::Clean)
+        );
+
+        assert!(ps.apply_tool_actions(&project), "the write changed pixels");
+
+        assert_eq!(ps.history.undo_len(), 1, "exactly one undo step per queued write");
+        assert_eq!(ps.history.peek_undo_label(), Some("region write"));
+        assert_eq!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean))
+                .map(|l| l.image.pixels[0]),
+            Some(Color32::RED),
+            "the source pixels must actually land on the layer"
+        );
+        // The variant, asserted through the pure decision the recording site uses.
+        assert!(matches!(
+            pixel_region_edit_op(
+                LayerKind::Clean,
+                0,
+                "uid".to_string(),
+                Arc::new(
+                    RasterDiff::from_region_pixels(
+                        &[0u8; 4],
+                        &[255u8; 4],
+                        [0, 0],
+                        [1, 1],
+                        [1, 1],
+                        PS_UNDO_TILE_SIDE,
+                    )
+                    .expect("a 1x1 diff builds")
+                ),
+                "l".to_string(),
+            ),
+            Some(PsEditOp::CleanPixels { .. })
+        ));
+    }
+
+    /// The `Клин` half of the route, asserted against the REAL shared model rather than inferred:
+    /// a write onto the base layer must reach `CleanOverlaysModel`, because that layer is not
+    /// persisted by the layer document at all and the pixels would otherwise die at the next page
+    /// switch.
+    #[test]
+    fn a_queued_write_onto_klin_reaches_the_clean_overlay_model() {
+        let project = empty_project();
+        let model = Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(&[
+            std::path::PathBuf::from("0.png"),
+        ])));
+        assert!(
+            model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ensure_overlay(0, [2, 2]),
+            "the overlay is materialized at the page size"
+        );
+        let (mut ps, _clean) = tab_with_queued(vec![write_action(
+            [0, 0],
+            solid(2, 2, Color32::RED),
+            "region write",
+        )]);
+        ps.set_overlays_model(Arc::clone(&model));
+
+        assert!(ps.apply_tool_actions(&project));
+
+        let locked = model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rgba = locked.overlay_rgba(0).expect("the overlay is materialized");
+        assert_eq!(
+            rgba.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "the Клин write must be pushed into the shared model, straight-alpha"
+        );
+    }
+
+    /// A RASTER-targeted write takes the other arm: it records `RasterPixels` (keyed on the
+    /// layer's doc uid) and must NOT touch the clean-overlay model, whose revision therefore stays
+    /// where it was.
+    #[test]
+    fn a_queued_write_onto_a_raster_records_raster_pixels_and_spares_the_clean_model() {
+        let project = empty_project();
+        let model = Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(&[
+            std::path::PathBuf::from("0.png"),
+        ])));
+        assert!(
+            model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ensure_overlay(0, [2, 2]),
+            "the overlay is materialized at the page size"
+        );
+        let revision_before = model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision();
+
+        let (mut ps, _clean) = tab_with_queued(vec![write_action(
+            [0, 0],
+            solid(2, 2, Color32::RED),
+            "region write",
+        )]);
+        ps.set_overlays_model(Arc::clone(&model));
+        let raster = {
+            let stack = ps.stack.as_mut().expect("page resident");
+            let raster = stack.add_raster_layer();
+            let layer = stack.layer_mut(raster).expect("raster resident");
+            layer.image = solid(2, 2, Color32::TRANSPARENT);
+            layer.base_image = solid(2, 2, Color32::TRANSPARENT);
+            stack.set_active(raster);
+            raster
+        };
+
+        assert!(ps.apply_tool_actions(&project));
+
+        assert_eq!(ps.history.undo_len(), 1);
+        assert_eq!(ps.history.peek_undo_label(), Some("region write"));
+        assert_eq!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(raster))
+                .map(|l| l.image.pixels[0]),
+            Some(Color32::RED)
+        );
+        assert_eq!(
+            model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .revision(),
+            revision_before,
+            "a raster write must never reach the clean-overlay model"
+        );
+        assert!(matches!(
+            pixel_region_edit_op(
+                LayerKind::Raster,
+                0,
+                "uid".to_string(),
+                Arc::new(
+                    RasterDiff::from_region_pixels(
+                        &[0u8; 4],
+                        &[255u8; 4],
+                        [0, 0],
+                        [1, 1],
+                        [1, 1],
+                        PS_UNDO_TILE_SIDE,
+                    )
+                    .expect("a 1x1 diff builds")
+                ),
+                "l".to_string(),
+            ),
+            Some(PsEditOp::RasterPixels { .. })
+        ));
+    }
+
+    /// `Исходник` is immutable, so no undo variant exists for it. The `match` in
+    /// `pixel_region_edit_op` is exhaustive on purpose: a new paintable kind must be given a route
+    /// here rather than falling into a catch-all.
+    #[test]
+    fn the_source_layer_has_no_pixel_undo_variant() {
+        let diff = Arc::new(
+            RasterDiff::from_region_pixels(
+                &[0u8; 4],
+                &[255u8; 4],
+                [0, 0],
+                [1, 1],
+                [1, 1],
+                PS_UNDO_TILE_SIDE,
+            )
+            .expect("a 1x1 diff builds"),
+        );
+        assert!(
+            pixel_region_edit_op(LayerKind::Source, 0, "uid".to_string(), diff, "l".to_string())
+                .is_none()
+        );
+    }
+
+    /// A request naming a page that is no longer resident is DROPPED, not applied to whatever page
+    /// happens to be open: a worker result can easily outlive a page switch, and landing it would
+    /// paint one page's patch onto another.
+    #[test]
+    fn a_write_for_another_page_is_dropped() {
+        let project = empty_project();
+        let (mut ps, clean) = tab_with_queued(vec![tools::PsToolAction::WriteRegion(
+            tools::ToolRegionWrite {
+                page_idx: 4,
+                origin: [0, 0],
+                pixels: solid(2, 2, Color32::RED),
+                coverage: None,
+                label: "stale".to_string(),
+            },
+        )]);
+
+        assert!(!ps.apply_tool_actions(&project));
+
+        assert_eq!(ps.history.undo_len(), 0);
+        assert_eq!(
+            ps.stack
+                .as_ref()
+                .and_then(|s| s.layer(clean))
+                .map(|l| l.image.pixels[0]),
+            Some(Color32::TRANSPARENT),
+            "a stale request must leave the resident page untouched"
+        );
+    }
+
+    /// The queue is DRAINED once per frame: a second pass must find nothing, or a commit would be
+    /// recorded twice and undo would need two steps to take back one edit.
+    #[test]
+    fn the_action_queue_is_drained_by_one_pass() {
+        let project = empty_project();
+        let (mut ps, _clean) = tab_with_queued(vec![write_action(
+            [0, 0],
+            solid(2, 2, Color32::RED),
+            "region write",
+        )]);
+        assert!(ps.apply_tool_actions(&project));
+        assert!(!ps.apply_tool_actions(&project), "the queue is empty now");
+        assert_eq!(ps.history.undo_len(), 1);
+    }
+
+    /// Full coverage is a plain replace, and the returned rect is the written region in the
+    /// destination's own pixels.
+    #[test]
+    fn a_full_coverage_write_replaces_the_destination() {
+        let mut dst = solid(4, 4, Color32::TRANSPARENT);
+        let src = solid(2, 2, Color32::RED);
+        let dirty = blend_premul_region(&mut dst, [1, 1], &src, None).expect("the rect is inside");
+        assert_eq!((dirty.min_x, dirty.min_y, dirty.max_x, dirty.max_y), (1, 1, 2, 2));
+        assert_eq!(dst.pixels[5], Color32::RED, "(1,1) of a 4-wide destination");
+        assert_eq!(dst.pixels[0], Color32::TRANSPARENT, "outside the rect is untouched");
+    }
+
+    /// Coverage 255 must be bit-identical to no coverage at all — that is what lets a feathered
+    /// patch's opaque interior stay exact — and coverage 0 must leave the destination alone.
+    #[test]
+    fn coverage_extremes_match_replace_and_no_op() {
+        let src = solid(2, 2, Color32::from_rgba_premultiplied(10, 20, 30, 200));
+        let mut opaque = solid(2, 2, Color32::TRANSPARENT);
+        blend_premul_region(&mut opaque, [0, 0], &src, Some(&[255u8; 4][..])).expect("inside");
+        assert_eq!(opaque.pixels, src.pixels);
+
+        let mut untouched = solid(2, 2, Color32::BLUE);
+        blend_premul_region(&mut untouched, [0, 0], &src, Some(&[0u8; 4][..])).expect("inside");
+        assert_eq!(untouched.pixels, vec![Color32::BLUE; 4]);
+    }
+
+    /// A mid-range coverage interpolates every premultiplied channel toward the source.
+    #[test]
+    fn a_partial_coverage_lerps_toward_the_source() {
+        let mut dst = solid(1, 1, Color32::from_rgba_premultiplied(0, 0, 0, 0));
+        let src = solid(1, 1, Color32::from_rgba_premultiplied(200, 100, 50, 255));
+        blend_premul_region(&mut dst, [0, 0], &src, Some(&[128u8][..])).expect("inside");
+        let px = dst.pixels[0];
+        // round(200 * 128 / 255) = 100, round(100 * 128/255) = 50, round(50*128/255) = 25.
+        assert_eq!((px.r(), px.g(), px.b(), px.a()), (100, 50, 25, 128));
+    }
+
+    /// A rect hanging off the destination is CLIPPED, never refused and never a panic: a region
+    /// tool works in page pixels and its ROI legitimately reaches the page edge.
+    #[test]
+    fn a_write_overhanging_the_layer_is_clipped() {
+        let mut dst = solid(2, 2, Color32::TRANSPARENT);
+        let src = solid(4, 4, Color32::RED);
+        let dirty = blend_premul_region(&mut dst, [1, 1], &src, None).expect("part of it is inside");
+        assert_eq!((dirty.min_x, dirty.min_y, dirty.max_x, dirty.max_y), (1, 1, 1, 1));
+        assert_eq!(dst.pixels[3], Color32::RED);
+        assert_eq!(dst.pixels[0], Color32::TRANSPARENT);
+
+        // Entirely outside is a no-op, reported as such.
+        assert!(blend_premul_region(&mut dst, [9, 9], &src, None).is_none());
+    }
+
+    /// A coverage buffer whose length does not match the source rect is REFUSED, not padded:
+    /// silently filling the difference would land a half-written patch (`AGENTS.md` §11).
+    #[test]
+    fn a_wrongly_sized_coverage_buffer_is_refused() {
+        let mut dst = solid(4, 4, Color32::TRANSPARENT);
+        let src = solid(2, 2, Color32::RED);
+        assert!(blend_premul_region(&mut dst, [0, 0], &src, Some(&[255u8; 3][..])).is_none());
+        assert!(blend_premul_region(&mut dst, [0, 0], &src, Some(&[255u8; 5][..])).is_none());
+        assert_eq!(dst.pixels, vec![Color32::TRANSPARENT; 16], "nothing was written");
+    }
+
+    /// The seventh dock tab follows the ACTIVE tool, not a stored user flag: switching to a tool
+    /// that owns a panel shows it, switching away hides it again.
+    #[test]
+    fn the_tool_panel_tab_follows_the_active_tool() {
+        let tools: Vec<Box<dyn PsTool>> = vec![
+            Box::new(QueueingTool {
+                queued: Vec::new(),
+                wants_panel: false,
+            }),
+            Box::new(QueueingTool {
+                queued: Vec::new(),
+                wants_panel: true,
+            }),
+        ];
+        assert!(!tool_panel_visible(&tools, 0));
+        assert!(tool_panel_visible(&tools, 1));
+        // An out-of-range index answers `false` rather than panicking: the dock declaration runs
+        // every frame, including before the tool list is ever indexed.
+        assert!(!tool_panel_visible(&tools, 9));
+        assert!(!tool_panel_visible(&[], 0));
+    }
+
+    /// None of the SHIPPED tools asks for the panel, so the default arrangement is unchanged by
+    /// the tab's existence — the seventh panel is declared but never drawn today.
+    #[test]
+    fn no_shipped_tool_opens_the_tool_panel() {
+        let ps = PsEditorTabState::default();
+        for idx in 0..ps.tools.len() {
+            assert!(
+                !tool_panel_visible(&ps.tools, idx),
+                "tool {idx} unexpectedly asks for a dock panel"
+            );
+        }
     }
 }

@@ -292,6 +292,8 @@ mod tests {
         let mut selection = None;
         let page_size = stack.size();
         let mut ctx = PsToolContext {
+            // Taken from the stack, like the real call site in `../mod.rs`.
+            page_idx: stack.page_idx(),
             page_size,
             pointer_image: Some(pointer),
             pointer_in_viewport: in_viewport,

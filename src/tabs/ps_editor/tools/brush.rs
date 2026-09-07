@@ -1859,6 +1859,8 @@ mod tests {
         let mut selection = None;
         let page_size = stack.size();
         let mut ctx = PsToolContext {
+            // Taken from the stack, like the real call site in `../mod.rs`.
+            page_idx: stack.page_idx(),
             page_size,
             pointer_image: Some(pointer),
             pointer_in_viewport: in_viewport,
@@ -1894,6 +1896,8 @@ mod tests {
     ) -> ToolOutcome {
         let page_size = stack.size();
         let mut ctx = PsToolContext {
+            // Taken from the stack, like the real call site in `../mod.rs`.
+            page_idx: stack.page_idx(),
             page_size,
             pointer_image: Some(pointer),
             pointer_in_viewport: true,
@@ -2440,6 +2444,8 @@ mod tests {
         let page_size = stack.size();
         let mut selection = None;
         let mut ctx = PsToolContext {
+            // Taken from the stack, like the real call site in `../mod.rs`.
+            page_idx: stack.page_idx(),
             page_size,
             pointer_image: Some(Pos2::new(20.0, 20.0)),
             pointer_in_viewport: true,
@@ -2891,6 +2897,8 @@ mod tests {
         let hud_frame = |delta: Vec2, tool: &mut BrushTool, stack: &mut LayerStack| {
             let mut selection = None;
             let mut ctx = PsToolContext {
+                // Taken from the stack, like the real call site in `../mod.rs`.
+                page_idx: stack.page_idx(),
                 page_size,
                 pointer_image: Some(Pos2::new(20.0, 20.0)),
                 pointer_in_viewport: true,

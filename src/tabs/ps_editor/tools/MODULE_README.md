@@ -12,7 +12,8 @@ tab orchestration beyond registration.
   is the toolbar's top-to-bottom order and `PsToolId::section` the assignment, so the toolbar renders
   headings without a hard-coded tool list; a new tool only picks a section.
 - `PsToolContext`: per-frame mutable access to the active `LayerStack` and page `Selection`, plus
-  resolved pointer/button state in image pixel coordinates, the frame's `egui::Modifiers`, the two
+  the `page_idx` that stack is on, resolved pointer/button state in image pixel coordinates, the
+  frame's `egui::Modifiers`, the two
   gesture-control keys (`cancel_pressed` = Esc, `remove_point_pressed` = Backspace/Delete), and —
   for gestures measured in DRAG DISTANCE rather than canvas position — the raw `secondary_down`
   button state and the screen-space `pointer_delta`. Those two are raw on purpose: the canvas senses
@@ -24,14 +25,20 @@ tab orchestration beyond registration.
 - `PsHotkeyRow`: one `(action, keys)` row of the tab's «Горячие клавиши» panel. Both halves are
   ALREADY LOCALIZED by the tool that built the row, so a language-dependent key name stays owned by
   the tool; the panel only lays the pair out as a two-column grid.
+- `PsToolAction` / `ToolRegionWrite`: the tool → tab OUT-CHANNEL (see «Deferred tool actions»).
+- `PsToolOverlayCx`: the page/view geometry `draw_overlay_ui` is handed (see «Region-tool hooks»).
 - `PsTool`: `interact` (one frame of input), `draw_overlay` (screen-space cursor/preview),
   `has_options` + `options_ui` (the «Выбранный инструмент» panel's pair), `hotkey_rows` (the tool's
   own shortcut inventory), `gesture_in_flight` (REQUIRED, see below), the two gesture-lifecycle
-  hooks `reset` / `freeze` (both default to a no-op), and the `as_brush_mut` downcast hook used by
-  the tab to forward the brush's wheel and key gestures without a full `Any` downcast.
+  hooks `reset` / `freeze` (both default to a no-op), the `as_brush_mut` downcast hook used by
+  the tab to forward the brush's wheel and key gestures without a full `Any` downcast, and the
+  REGION-TOOL block — `poll_workers`, `take_actions`, `set_panel_rects`, `wants_main_panel`,
+  `draw_main_panel`, `draw_overlay_ui`, `captures_canvas_pointer` — all defaulted to inert.
 
 Tools never touch GPU textures, files, shared models, or the backend. They mutate the in-memory
-stack/selection only; the tab converts `ToolOutcome::dirty` into `TiledTexture` re-uploads.
+stack/selection only; the tab converts `ToolOutcome::dirty` into `TiledTexture` re-uploads. A tool
+that needs a pixel edit RECORDED and PUSHED (an undo entry, the shared `LayerDoc`, the `Клин`
+write-back) asks for it through `PsToolAction` instead — see «Deferred tool actions» below.
 
 The brush's own keys and its Alt+click eyedropper are dispatched by the TAB, not here — a tool never
 sees an `egui::Context`, and the eyedropper needs the band Z order. See `../MODULE_README.md`; the
@@ -60,6 +67,161 @@ Two answers must not be given: `true` for a press the tool itself REFUSED (the b
 too, which is why the tab must not substitute `primary_down` for this method — that is the exact bug
 it was added to fix), and `false` for the lasso's PENDING POLYGON, which is a live gesture with the
 button up and would otherwise lose its rubber band every time the cursor crossed a panel.
+
+## Deferred tool actions (`take_actions`) — the tool's only durable write path
+A tool mutates the in-memory stack and selection and NOTHING else. Everything that makes a pixel
+edit survive is tab-side and a tool can reach none of it: the undo entry (`PsEditOp`), the push to
+the shared `LayerDoc`, and the `Клин` write-back to `CleanOverlaysModel`. A tool that must commit
+pixels therefore DESCRIBES the commit and hands it over.
+
+`PsTool::take_actions(&mut self) -> Vec<PsToolAction>` is that out-channel: the tool owns the queue,
+pushes into it from wherever the decision is made (`interact`, `poll_workers`, `draw_overlay_ui` —
+the last two see no `PsToolContext`, which is why the queue is on the TOOL rather than a `&mut` slot
+in the context), and the tab drains it once per frame in `PsEditorTabState::apply_tool_actions`
+(`../mod.rs`). It is the same pattern as the layers panel's own `PanelActions` one level up: a body
+that may not perform a contract-bearing mutation in place parks it for the owner.
+
+Rules:
+- **Drained from EVERY tool, not only the active one.** A worker result that landed after a tool
+  switch still represents work the user did, and stranding it in the queue would silently lose it.
+- **`take_actions` DRAINS.** Handing the tab the same request twice would apply it twice and cost
+  two undo steps to take back one edit; the unit tests pin this.
+- **Exactly ONE variant today**: `PsToolAction::WriteRegion(ToolRegionWrite)` — "write this pixel
+  rect into the ACTIVE EDITABLE layer as ONE undo step, with this label". Add a variant only
+  together with the tool that raises it and the tab arm that performs it (`AGENTS.md` §14).
+- **`ToolRegionWrite` geometry is in the ACTIVE LAYER's own pixels**, the same space as `DirtyRect`
+  and as the undo diff — never in page pixels. `pixels` are PREMULTIPLIED RGBA (the `Layer::image`
+  convention); `coverage`, when present, is one byte per source pixel and blends
+  `dst += (src - dst) * coverage / 255` per premultiplied channel, so `None` and an all-255 buffer
+  are bit-identical. A wrongly-sized coverage buffer is REFUSED and logged, never padded.
+- **`page_idx` is mandatory and is checked.** The tab drops a request naming a page that is no
+  longer resident: a worker result easily outlives a page switch, and landing it would paint one
+  page's patch onto another. Stamp it from `PsToolContext::page_idx`.
+- The tab's apply path clips the rect to the layer, marks the affected tiles dirty, and routes the
+  commit through the one `commit_pixel_region` helper the brush stroke also uses — so a queued write
+  is as undoable, as durable and as cross-tab-visible as a brush stroke, with no second copy of
+  those rules.
+
+## Region-tool hooks (`poll_workers`, panels, `draw_overlay_ui`, `captures_canvas_pointer`)
+A REGION tool — one that owns a worker thread, an on-canvas surface and its own dock panel — needs
+more than one frame of pointer input can express. The block at the end of the trait is what it uses.
+Every hook is DEFAULTED to inert, so the four shipped tools implement none of them and are
+unaffected.
+
+- **`poll_workers(&mut self) -> bool`** — the tool's own channels, drained once per frame for EVERY
+  tool from `PsEditorTabState::poll_tools`, next to `poll_loader`. The GUI thread never blocks
+  (`AGENTS.md` §5), so anything expensive runs on a worker and its result arrives here, never inside
+  `interact` (which is skipped on a pan frame and on a frame the pointer sits over a panel).
+  Returning `true` asks for the next frame — that is what makes an off-thread result appear without
+  any pointer movement. It runs for INACTIVE tools on purpose: a job dispatched before a tool switch
+  still finishes.
+- **`set_panel_rects(&[Rect])`** — this frame's dock-panel rects in screen points, pushed by the tab
+  right after `PanelDock::end` and before the canvas is drawn, so a tool that PLACES something on
+  the canvas can cut the floating panels out of the viewport. Main-window rects only, by
+  construction. Pushed to the ACTIVE tool, which is the only one that draws.
+- **`wants_main_panel` / `draw_main_panel`** — the tool's own dock tab (`ps_editor.tool_panel`,
+  declared every frame by the tab, `visible` driven by this answer, captioned with the tool's own
+  `title()`). The body may mutate the TOOL and nothing else: it runs inside the dock frame, before
+  the canvas exists this frame, so a button there raises a flag the tool acts on in its next
+  `draw_overlay_ui`. Ordinary parameters still belong in `options_ui`, shortcuts in `hotkey_rows`.
+- **`draw_overlay_ui(&mut self, &egui::Context, PsToolOverlayCx)`** — the on-canvas pass, run LAST
+  in `draw_canvas` for the ACTIVE tool only. Unlike `draw_overlay` (a painter-only decoration on the
+  canvas' background layer) it owns the `Context`, so it may open its own `egui::Area`, sense
+  pointer input there and paint through `Context::layer_painter`. `PsToolOverlayCx` carries exactly
+  what an on-canvas surface needs to place itself and nothing else: `viewport` (the canvas rect,
+  the outer bound an `Area` must stay inside), `view` (this frame's image↔screen transform),
+  `page_size` and `page_idx`. The layer stack is deliberately absent — pixel work is QUEUED. It runs
+  only while a page is resident, which is exactly why worker results are consumed in `poll_workers`
+  instead.
+- **`captures_canvas_pointer(Pos2) -> bool`** — the tab ORs this into `canvas_pointer_occluded`
+  (`../mod.rs`), so a `true` withholds the wheel, the zoom anchor and the routing to `interact`, and
+  hides the tool's own cursor preview (the same gate). Two rules:
+  - **On-canvas geometry is stored in PAGE pixels and re-projected every frame.** A stored screen
+    rect drifts the moment the canvas pans or zooms — the same rule the cleaning tab states for its
+    own on-canvas surfaces.
+  - **It must stay NARROW, and must never grow a whole-canvas sibling.** The cleaning tab paid for
+    that: its `block_canvas_zoom` flag also disables the clean-overlay undo shortcuts, which is
+    tolerable for a modal window and not for a surface that lives on the canvas for a whole session.
+    Here undo/redo runs in `PsEditorTabState::handle_hotkeys`, which never consults the canvas gate,
+    so this hook cannot disable them — and nothing that can may be added beside it. Panning is
+    likewise ungated, for the reason the tab already states: a pan begun on bare canvas must survive
+    the pointer crossing anything.
+
+## The patch tool (`patch.rs`) — the editor's first REGION tool
+`PatchTool` implements `PatchHost` for `crate::tools::patch::PatchToolCore`. The core owns everything
+about the patch itself and stops at `(page_idx, roi, rgb, coverage)`; this file decides where those
+pixels are stored, and nothing else. It is the SECOND host of that core — `tabs/cleaning/tools/patch`
+is the first — so a change to the gesture, the geometry or the solve belongs in the core and affects
+both, while a change to storage belongs here and affects only this editor.
+
+**The host is split in two, across a frame boundary.** `PsTool::draw_overlay_ui` — the hook the
+core's whole frame pass runs from — is handed no `PsToolContext` and therefore no `LayerStack`,
+deliberately (see «Region-tool hooks»). So:
+- the GEOMETRY hooks (`page_source_size`, `page_projection`, `usable_viewport`,
+  `scene_pos_to_page_pos`, `ensure_page_pixels`) answer from a `PageGeometry` cached on every frame
+  that has one — the same per-frame overlay-cache pattern `BrushTool` uses for its cursor;
+- the PIXEL hooks (`start_region_load`, `commit_patch`) PARK their request in `HostState` and the
+  next `interact` services it against `&mut LayerStack`. One frame of latency on an operation that
+  is already asynchronous — the same trade the tab makes for `apply_tool_actions`.
+- `discard_region_load` drops only the LOAD's buffers. It must NOT drop a parked COMMIT: the core
+  calls it immediately after every `commit_patch` it accepted, so sweeping the commit up there
+  would silently lose every patch. `pending_commit` is cleared by `start_region_load` and by
+  `reset` only, and `reset` REPORTS what it drops — the one-frame window in which a tool or page
+  switch can still lose a solved patch.
+
+**The region load has no worker thread, on purpose.** The cleaning host needs one because it decodes
+a PNG from disk; here the pixels are already in memory, so `service_pending_region` composites the
+ROI synchronously with `composite_rect` (`../mod.rs`). The heavy step — the membrane solve — is the
+core's own worker, so `AGENTS.md` §5 holds. The ROI is the selection box plus the drag offset, padded:
+bounded, and small relative to the solve it feeds.
+
+**THE SOLVE PLANE, and why it must agree with the backdrop.** A patch is solved in the plane its
+TARGET LAYER is part of — the visible layers from the bottom up to and INCLUDING the active one
+(`CompositeBound::UpTo`, `../mod.rs`) — and stored over the plane strictly BELOW it
+(`CompositeBound::Below`, `backdrop_rect`). The two are complementary by construction: the store
+step solves each pixel so that "the active layer over the backdrop" shows the colour the membrane
+asked for, and the tab then composites everything ABOVE the active layer on top, exactly as it does
+for any other pixel of that layer. Handing the solver the WHOLE visible stack instead would copy
+the layers above the target into the target, and the render would paint them a second time over
+their own copy — a layer applied twice on screen, reachable in the default state because every user
+raster sits above `Клин`. Working in the active layer's own plane is also what Photoshop's Patch
+Tool does: it patches the active layer, not a flattened view. The two bounds are named variants
+rather than an index arithmetic at the call site precisely because they are one index apart and
+mean opposite things.
+
+**The store step uses the shared `crate::tools::overlay_pixel_for_final_color`**, the same solver the
+cleaning host's store step uses, whose `base` is the BACKDROP — the composite of everything strictly
+BELOW the write target (`backdrop_rect`):
+- active layer `Клин`: the backdrop is `Исходник` and nothing else, read straight out of
+  `stack.layers()[0]`. Its VISIBILITY is ignored — hiding `Исходник` in this editor is a view toggle,
+  while the clean overlay's storage contract ("these pixels sit over the page source") is not.
+- active layer a user raster: the ordered composite of the layers visible below it.
+The solved pixel is premultiplied (egui's `Color32::from_rgba_unmultiplied` premultiplies), which is
+`ToolRegionWrite::pixels`' convention. The returned coverage is BINARY — 255 where the patch claims
+the pixel, 0 where it does not: the feather is already inside `rgb` and inside the solved alpha, so
+a second blend would attenuate it twice, and the zero bytes are what leave the surrounding work
+untouched.
+
+**Six refusals, each with its own message, none of them silent** (`AGENTS.md` §6). `ToolRegionWrite`
+geometry is LAYER-local while the patch works in PAGE pixels, so the two grids must coincide up to a
+whole-pixel translation. `patch_target_for` (pure, one case per variant in the tests) refuses: no
+active layer; `Исходник`; an INVISIBLE active layer (hidden, in a hidden group, or at zero effective
+opacity — the same predicate the composite filters on, so the solve plane always contains the layer
+being written); a raster with an unbaked effects chain; a `deform` mesh (following `transform.rs`,
+which refuses for the same reason); and a rotated, scaled or fractionally-placed layer.
+`PatchTarget::local_origin_for` is the sixth — an ROI that leaves the layer's own footprint — kept
+separate because it needs an ROI, which does not exist while the options pane renders the verdict.
+The reason is shown in the tool's own options pane, so a drag that does nothing can always be
+explained. The DEFAULT active layer of a freshly loaded page is `Клин`, which passes all six.
+
+**What it does NOT implement, and why.** `wants_main_panel` / `draw_main_panel`: its controls are
+ordinary parameters and belong in `options_ui` (which delegates to the core's `draw_ui`).
+`set_panel_rects`: the dock panels float on `Order::Foreground` while the core paints its outline on
+`Order::Middle`, so a panel already covers the outline by z-order and `usable_viewport` returns the
+plain canvas rect. `captures_canvas_pointer`: it stays `false` because the whole gesture rides
+`interact`, which a `true` would withhold — the same reason the cleaning host keeps its equivalent
+`false`. `freeze`: the gesture END is detected as a LEVEL (`!primary_down`) on every routed frame,
+like `BrushTool`'s Shift anchor, so a release swallowed by a canvas pan is still seen.
 
 ## Shortcut inventory (`hotkey_rows`) — required, never defaulted
 `hotkey_rows` has NO default body on purpose. A tool is the only place that knows which keys and
@@ -133,6 +295,9 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   `LayerTransform` (no pixels, so no tile re-upload); base and deformed layers are refused.
 - `deform.rs`: `DeformTool` — grid-point drag over the active raster's `deform` mesh (page px),
   initializing an identity grid on first use.
+- `patch.rs`: `PatchTool` — the «Заплатка» region tool. A HOST for the shared, host-neutral core in
+  `crate::tools::patch`; the gesture, the selection, the ROI geometry, the membrane solve and the
+  outline painting all live there. See «The patch tool» below.
 
 ## Selection gesture model (`select.rs`)
 - **Combination mode.** `SelectionOp` (`super::selection`) decides how a finished shape meets the
@@ -304,6 +469,14 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   it a `PsToolSection`, register it in `PsEditorTabState::default`, and add it to the
   `registered_tools` fixture in `mod.rs`'s tests. Add a hotkey in
   `PsEditorTabState::handle_hotkeys` if wanted.
+- To add a REGION tool (worker thread + on-canvas surface + own dock panel), implement the block
+  above on top of that: `poll_workers` for its channels, `take_actions` for its pixel commits,
+  `draw_overlay_ui` + `set_panel_rects` + `captures_canvas_pointer` for its surface, and
+  `wants_main_panel` + `draw_main_panel` for its panel. Nothing in `../mod.rs` needs a new call
+  site — every hook is already wired.
+- To change what a tool may ask the tab to commit, edit `PsToolAction` / `ToolRegionWrite` here AND
+  the matching arm of `PsEditorTabState::apply_tool_actions` in `../mod.rs`; the write itself must
+  keep going through `commit_pixel_region`, never through a second copy of the undo/route rules.
 - To change what the «Горячие клавиши» panel shows for a tool, edit that tool's `hotkey_rows` —
   never `options_ui`.
 - To change brush behavior (colour, diameter, hardness, opacity, flow, erase, clipping), edit
@@ -314,6 +487,10 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   `PIXEL_OUTLINE_MIN_SCALE`. Changing what the outline encloses means changing `stamp_coverage`,
   not the cursor.
 - To change selection shapes or mask combination, edit `select.rs` and `super::selection`.
+- To change the patch GESTURE, its ROI geometry or the membrane solve, edit `crate::tools::patch` —
+  never `patch.rs`, which would only change this editor and leave the cleaning tab behind. To change
+  where a patch is STORED, which layers may receive one, or what the backdrop is, edit `patch.rs`.
+  To change how a page rectangle is composited for it, edit `composite_rect` in `../mod.rs`.
 - To change how a gesture starts/ends (keys, Alt semantics, pending polygon, the frozen-resume
   branch), edit `SelectTool::step` — it is the single decision point, and its unit tests live
   beside it.

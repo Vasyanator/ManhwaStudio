@@ -20,6 +20,9 @@ project page -> page_loader (worker) -> LoadedPage (source + clean ColorImage
                 via its LayerTransform + ViewTransform (rotated/scaled tile meshes)
 tool input  -> active PsTool::interact -> ToolOutcome (dirty rect / selection change)
             -> tile invalidation; marquee drawn from Selection::outline_loops
+tool worker -> PsTool::poll_workers (poll_tools, every tool, next to poll_loader)
+            -> PsTool::take_actions -> apply_tool_actions -> commit_pixel_region
+               (one undo entry + the doc / CleanOverlaysModel push)
 ```
 
 PAGE-SWITCH DECODE IS OFF-THREAD. On a page switch the worker now decodes BOTH base layers AND the
@@ -80,7 +83,7 @@ model's own autosave / save-to-project path instead. See `models/layer_model/` f
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
 ## Files and submodules
-- `mod.rs`: `PsEditorTabState` orchestration — the six dock tabs (see «Panels» below), canvas
+- `mod.rs`: `PsEditorTabState` orchestration — the seven dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
   copy/cut menu (`clip_into_new_layer`), layer/group save+load via `models::layer_model`,
   `merge_down` (`composite_to_page` flattens a raster onto the layer directly beneath it by unified
@@ -153,7 +156,8 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - `tools/`: `PsTool` trait + context (carries the frame `ViewTransform`, the frame modifiers, the
   Esc / Backspace edges, and — for the brush's Alt + right-drag HUD — the raw `secondary_down` state
   and the frame `pointer_delta`); rectangle + lasso selection, the Photoshop-like round brush
-  (paints in layer-local space), and `transform.rs` (move/rotate/scale gizmo). `PsToolSection` groups
+  (paints in layer-local space), `transform.rs` (move/rotate/scale gizmo) and `patch.rs` (the
+  «Заплатка» region tool, hosting the shared `crate::tools::patch` core). `PsToolSection` groups
   the tools into the toolbar's Кисти / Выделение / Манипуляция sections at DRAW time — `self.tools`
   is never reordered, because `active_tool_idx` indexes it.
 - `tree.rs`: pure builder for the unified layers panel. `build_unified_tree(stack, text_layers,
@@ -162,9 +166,10 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   so panel order == composite order. The two base leaves close the list (they are the composite's
   bottom) but are emitted in REVERSE stack order, so `Клин` sits above `Исходник` — the `LayerStack`
   vector itself is never reordered, because its raw order is load-bearing for `draw_composite`.
-  A base leaf deliberately carries no `RowSel`: that is the STRUCTURAL lock that keeps delete /
-  ▲▼ / grouping / the control strip away from base rows, rather than a guard a future edit could
-  forget. A group is a maximal contiguous same-`group_uid` run (the
+  A base leaf IS keyed (`RowSel::Base`) so it can be the panel's primary row; the structural lock
+  that keeps it out of grouping, reordering and deletion is stated per consumer — see «The panel's
+  active row» below.
+  A group is a maximal contiguous same-`group_uid` run (the
   contiguity invariant is enforced at write time in `persist::save_page_grouping`).
 - `layer_render.rs`: `TiledTexture` — per-layer tile grid (sized to the layer image), dirty
   tracking, budgeted upload, and transform-aware mesh draw. Each grid also owns the
@@ -189,10 +194,10 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   (diff → `Layer.image` + `base_image` mirror), `copy_region_premul` (region-local buffer), and
   `apply_field_patch_to_layer` (drives a `Layer` field to a patch's `after`; also the no-doc fallback).
 
-## Panels: six dock tabs over a full-area canvas
+## Panels: seven dock tabs over a full-area canvas
 This tab hosts the app-owned panel dock (`src/widgets/panel_dock/`) and is its first NON-canvas
 consumer. There are no static `egui::Panel`s: the canvas fills the whole program-tab area as the
-BACKGROUND and six floating dock tabs sit over it.
+BACKGROUND and seven floating dock tabs sit over it.
 
 | tab id (stable, non-localized) | caption key | body |
 |---|---|---|
@@ -202,6 +207,7 @@ BACKGROUND and six floating dock tabs sit over it.
 | `ps_editor.hotkeys` | `ps_editor.tab.hotkeys` | the active tool's `hotkey_rows`, then `ps_editor_common_hotkey_rows` |
 | `ps_editor.layers` | `ps_editor.tab.layers` | `layers_panel_body` + `draw_active_controls` |
 | `ps_editor.correction` | `ps_editor.tab.correction` | «Коррекция»: the VIEW-ONLY colour correction, `correction::correction_panel_body` (see `correction/MODULE_README.md`) |
+| `ps_editor.tool_panel` | the ACTIVE TOOL's own `PsTool::title` | the active tool's `PsTool::draw_main_panel`, shown only while it answers `wants_main_panel` |
 
 The tab ids are PERSISTENCE identities (they key the panel inside `user_config.json` and inside
 `PanelDockState`), so they stay non-localized literals — a §A9 i18n exclusion
@@ -224,15 +230,22 @@ under `panels.tools` / `panels.active_tool` / `panels.hotkeys` / `panels.layers`
 the dock state BEFORE the tabs are declared (`PsEditorPanelVisibility::read`) — reading them from a
 body would show a hidden panel for one frame — and written back from the main tab's body, which is
 the only one declared with `show_with_extras`. That write is what raises `changed` → `dirty` → the
-persistence write; no other machinery is involved. All six tabs are declared on EVERY frame
+persistence write; no other machinery is involved. All seven tabs are declared on EVERY frame
 regardless: a hidden tab keeps its slot, a skipped declaration would lose it. «PS редактор» is never in
-the menu — the menu lives in it.
+the menu — the menu lives in it, and neither is the TOOL panel: it belongs to whichever tool is
+active, so its visibility comes from `PsTool::wants_main_panel` rather than from a stored flag, and
+its caption is that tool's own `PsTool::title` (which is why no `ps_editor.tab.*` key backs it). No
+shipped tool asks for it, so it is declared but never drawn today.
 
 **Frame order** (`PsEditorTabState::draw`, which takes the app's `&mut PanelDockState` as a lent-in
-parameter): resolve ONE `area_rect` (used as both the `DockArea` rect and the canvas rect) →
-`ensure_default_layout` → read the visibility flags → build `PsEditorDockCx` → declare the six
-tabs → `dock.end` → store `PanelDockOutput::drawn_panels` rects into `panel_rects` and apply the
-deferred `PanelActions` → draw the effects-editor window → draw the canvas LAST over `area_rect`.
+parameter): `poll_loader` → `poll_tools` (every tool's own worker channels) → resolve ONE
+`area_rect` (used as both the `DockArea` rect and the canvas rect) →
+`ensure_default_layout` → read the visibility flags and the active tool's `wants_main_panel` →
+build `PsEditorDockCx` → declare the seven
+tabs → `dock.end` → hand `PanelDockOutput::drawn_panels` rects to the active tool
+(`PsTool::set_panel_rects`), store them in `panel_rects` and apply the
+deferred `PanelActions` → draw the effects-editor window → draw the canvas LAST over `area_rect` →
+`apply_tool_actions`.
 The canvas still ends up UNDERNEATH: panels live on `Order::Foreground` areas while the canvas
 paints into the `Ui`'s `Order::Background` layer and egui composites by layer order, not by call
 order (`egui-docs/06-overlays.md`). Drawing it last is what lets the input gate use THIS frame's
@@ -244,10 +257,15 @@ so the two are disjoint by construction. The layers body still defers its mutati
 tab's existing `PanelActions`, applied after `dock.end`.
 
 **Input gating.** `canvas_pointer_occluded` = an open popup, or `pointer_in_any_panel` over this
-frame's `panel_rects`, or anything above `Order::Background` at the pointer. It gates `hovered`,
+frame's `panel_rects`, or anything above `Order::Background` at the pointer; `draw_canvas` ORs in a
+fourth term, the ACTIVE TOOL's own `PsTool::captures_canvas_pointer`, for a tool that puts an
+interactive surface on the canvas. It gates `hovered`,
 and through it the wheel, the zoom anchor and the routing to the active tool. Panning is
 deliberately NOT gated: the gate answers where the pointer is right now, and a pan begun on bare
-canvas must survive the pointer crossing a panel.
+canvas must survive the pointer crossing a panel. Neither is `handle_hotkeys`, which never consults
+the gate — so an on-canvas tool surface can never disable undo/redo, and nothing that could may be
+added beside it (the cleaning tab's whole-canvas `block_canvas_zoom` is exactly that mistake,
+`tabs/cleaning/tools/MODULE_README.md`).
 
 The same gate hides the ACTIVE TOOL'S CURSOR PREVIEW: `overlay_pointer` (pure, unit-tested) drops
 `draw_overlay`'s pointer when it is occluded and `PsTool::gesture_in_flight` is false, on top of the
@@ -300,7 +318,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   attempted here.
 - **"Before" comes for free from `base_image`**: during a brush stroke the brush mutates only
   `layer.image`; `base_image` keeps the pre-stroke pixels until the stroke commit. So at the commit
-  site `record_brush_stroke` builds the reversible diff from `base_image` (before) vs `image` (after)
+  site `record_pixel_region` builds the reversible diff from `base_image` (before) vs `image` (after)
   over the stroke's accumulated dirty union (`brush_stroke_dirty`), avoiding any stroke-start snapshot
   of the (up to ~800×19000) ribbon image. `record` is observer-style (the forward edit was already
   applied live) — it never re-applies the paint.
@@ -351,13 +369,42 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   cleared on page switch.
 - **Not yet undoable** (deferred): cut/clip (including cut-from-`Клин`), merge-down (need a Batch op
   — a later part), base-layer visibility (view-only state, deliberately not recorded), and z-reorder
-  / grouping (`move_band_one` / `apply_group_op` write the band order to disk synchronously with a
+  / grouping, and the active row / `panel_primary` (view-only state, like base-layer visibility)
+  (`move_band_one` / `apply_group_op` write the band order to disk synchronously with a
   "band order written LAST" requirement that the unified persist tail cannot reproduce without a
   dedicated per-op persistence hook). Rename has no UI, so no `LayerFieldPatch::Name`.
 - Hotkeys (`handle_hotkeys`): Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y = redo (respecting the
   existing focus early-return). `handle_hotkeys` takes `&ProjectData` so undo/redo can persist.
 
 ## Contracts and invariants
+- **The panel's active row: `panel_primary` is always `Some` while a page is loaded, and always
+  names a row that exists in the current tree.** The editor's model already guarantees an active
+  layer (`LayerStack::active` is a plain `LayerId`, `Клин` on a fresh page); this is the PANEL half
+  of it, so the active layer is visibly selected and the controls strip always has a subject.
+  - `normalize_panel_primary` is the single enforcer. It re-points a `None`/dangling primary at
+    `LayerStack::active_id()` and prunes stale rows out of `panel_selection` / `panel_anchor`. It
+    runs at the tail of `sync_view_from_doc` (the choke point every doc-driven row removal passes
+    through: raster delete, text rasterize, group delete, undo/redo lifecycle), after the page-load
+    projection in `poll_loader` (also correct when a failed worker decode makes that projection
+    return early), and after the no-doc removal fallback in `apply_panel_actions`. `merge_down`
+    instead assigns `active_row_sel()` directly, because its `set_active` runs AFTER the projection
+    that already normalized.
+  - The highlight rule is "in the multi-selection OR the primary row" (`row_is_selected`). The
+    primary term is load-bearing: a page load seeds `panel_primary` while deliberately leaving
+    `panel_selection` empty. A COLLAPSED group header borrows the highlight of a primary row hidden
+    inside it (`group_row_is_selected`), since a collapsed group emits no member rows.
+  - Base rows are SELECTABLE but STRUCTURALLY LOCKED, and the lock is now explicit at each consumer
+    rather than implied by the absence of a `RowSel`: `select_row` makes a base row a solo primary
+    and clears the multi-selection whatever the modifiers; `selectable_row_order` keeps base rows
+    out of the Shift range; `draw_leaf_row` returns before the grouping context menu; `move_band_one`
+    and `apply_group_op` refuse `RowSel::Base`; `draw_active_controls` gives it an arm with no
+    delete / merge / bake / fx / ▲▼. `RowSel::is_base` is the one predicate they all ask.
+  - The base arm exposes only the name and OPACITY. Opacity is genuinely honoured for base layers by
+    `draw_composite` (via `LayerStack::layer_opacity`) and is VIEW-ONLY session state exactly like
+    base-layer visibility — base layers are not doc nodes and are not persisted, so nothing routes
+    to the doc and nothing is recorded in the history.
+  - The primary row is view state: an active-layer change is NOT a `PsEditOp` and is not undoable,
+    the same class as base-layer visibility.
 - GUI thread never decodes images or holds the model lock across decode: that is `page_loader`'s
   job; the model lock is released before `image::open`.
 - **Pixel inspection is MANUAL here and shares its machinery with the canvas tabs.** Cleaning
@@ -465,10 +512,26 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   persisted (`persist_current_page` filters to `LayerKind::Raster`), so `apply_panel_actions` writes
   `Layer::visible` straight onto the stack — no doc route, no `FieldPatch` history entry.
   `draw_composite` honours the flag for base layers, which makes that sufficient.
+- **Compositing a page RECTANGLE is `composite_rect`, and there is one copy of it.** The order and
+  the per-layer opacity are resolved ONCE by `visible_layers_bottom_to_top`, then the rectangle is a
+  pure buffer walk sampling each layer through its transform (`sample_layer_world`); an optional
+  `Selection` masks it. Both ROI consumers use it — selection copy/cut and the patch tool's ROI
+  composite and backdrop — so neither can drift from the other. Which PART of the stack a composite
+  covers is a named `CompositeBound`, never an index computed at the call site: `Below(idx)` is the
+  backdrop a pixel written into that layer sits over, `UpTo(idx)` the plane that layer is part of.
+  The patch tool needs both, one index apart, and confusing them applies every layer above its
+  target twice (`tools/MODULE_README.md`, «The solve plane»). Do NOT reach for `composite_to_page`
+  (whole page: unusable on a ~800x19000 ribbon) or for `sample_visible_composite` per pixel (it
+  rebuilds a `HashMap` and re-sorts every raster on each call).
+  `visible_layers_bottom_to_top` deliberately does NOT consult `self.bands`: the tab projects the
+  doc's z-sorted node list onto the stack through `LayerStack::reorder_rasters`, so the plain
+  bottom-to-top stack walk already IS the band-Z order `sample_visible_composite` sorts into — and
+  unlike `bands`, a `LayerStack` is reachable from a tool's `PsToolContext`.
 - Selection copy/cut (`clip_into_new_layer`) composites the chosen layers bottom-to-top within the
   mask into a new raster layer **cropped to the selection bounds** and placed at the matching page
-  position (so clip results are "incomplete", movable layers). Layers are sampled through their
-  transforms (`sample_layer_world`), so partial/rotated/scaled sources contribute correctly. A
+  position (so clip results are "incomplete", movable layers). It goes through `composite_rect` with
+  the selection as the mask, at opacity 1.0 per layer: a clip takes the layers the USER picked at
+  their own pixels, so visibility and opacity are deliberately not applied. A
   **cut** also clears the selected pixels from every chosen layer **except** `LayerKind::Source`,
   which is immutable and can never be cut from; the `Clean` overlay and raster layers are cuttable.
   Cut-from-`Клин` routes its cleared region through `write_clean_region_to_model`, so it survives a
@@ -526,6 +589,28 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   paintable: the shared overlay model is page-aligned, so the layer keeps the identity transform.
 - Tools mutate the in-memory stack/selection only — no GPU, file, model, or backend access. The tab
   translates `ToolOutcome::dirty` into `TiledTexture::mark_dirty_rect` (in layer-local pixels).
+- **A tool ASKS for a durable pixel commit; it never performs one.** The undo entry, the push to the
+  shared `LayerDoc` and the `Клин` write-back are all tab-side and a tool reaches none of them, so a
+  tool that must commit pixels queues a `tools::PsToolAction::WriteRegion` and the tab performs it
+  in `apply_tool_actions` (drained from EVERY tool once per frame, at the end of `draw` — the one
+  site reached on every frame, since `draw_canvas` returns early while no page is resident). Three
+  rules hold there: a request naming a page that is no longer resident is DROPPED and logged (a
+  worker result easily outlives a page switch); the rect is CLIPPED to the active layer, never
+  refused, while a coverage buffer of the wrong length IS refused rather than padded; and the write
+  itself goes through the SAME `commit_pixel_region` the brush stroke uses, so there is exactly one
+  copy of the undo + routing rules. See `tools/MODULE_README.md`, «Deferred tool actions».
+- **Both pixel commits share one path.** `commit_pixel_region(page_idx, region, label, project)`
+  records the undo entry FIRST (the push and the next reprojection sync `base_image` to the edited
+  pixels and would erase the "before") through `record_pixel_region`, whose variant choice is the
+  pure `pixel_region_edit_op`: `Raster` ⇒ `RasterPixels` + the doc push, `Clean` ⇒ `CleanPixels` +
+  `write_clean_region_to_model`, `Source` ⇒ nothing. `commit_brush_stroke` is now a thin caller of
+  it that supplies `brush_stroke_dirty` and the brush's own label.
+- **A tool's WORKER results are consumed in `poll_tools`**, called once per frame next to
+  `poll_loader` and run for EVERY tool, active or not: a job dispatched before a tool switch still
+  finishes, and `PsTool::draw_overlay_ui` — which runs for the active tool only, and only while a
+  page is resident — cannot be relied on to drain it. `poll_tools` returning `true` raises the
+  frame's repaint request, which is what makes an off-thread result appear with no pointer
+  movement.
 - `TiledTexture` is sized to each layer's own image; `sync_render_cache` rebuilds a layer's cache
   when its image is resized (e.g. a freshly cropped clip). Base layers stay page-sized.
 - This tab is excluded from the canvas source-page residency window in `app.rs`; it manages its own
@@ -577,7 +662,23 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `draw_group_row` / `draw_leaf_row` in `mod.rs`. To change grouping ops, edit `apply_group_op` +
   `persist::save_page_grouping`. To change reorder behavior, edit `build_unified_order` /
   `move_band_one` / `move_group_block`. To change multi-select, edit `select_row`.
+- To change which row is the active one, or how it is highlighted, edit `normalize_panel_primary` /
+  `active_row_sel` / `row_exists` and the pure `row_is_selected` / `group_row_is_selected` /
+  `selectable_row_order` helpers in `mod.rs`. To change what the strip offers a base layer, edit the
+  `RowSel::Base` arm of `draw_active_controls`.
 - To add a tool, implement `PsTool` in `tools/` and register it in `PsEditorTabState::default`.
+  A REGION tool (worker thread, on-canvas surface, own dock panel) implements the defaulted hook
+  block on top of that — see `tools/MODULE_README.md`, «Region-tool hooks»; every call site already
+  exists here. `PatchTool` is the worked example.
+- To change how a page RECTANGLE is composited, edit `composite_rect` / `visible_layers_bottom_to_top`
+  in `mod.rs`; both the clip and the patch tool read them, so a change moves both.
+- To change how a tool-requested pixel write is performed, edit `apply_tool_actions` /
+  `apply_tool_region_write` and the pure `blend_premul_region` in `mod.rs`. To change what such a
+  write records or where it is pushed, edit `commit_pixel_region` / `record_pixel_region` and the
+  pure `pixel_region_edit_op` — the brush stroke goes through the same three, so a change moves
+  both.
+- To change when the active tool's own dock panel appears, edit the pure `tool_panel_visible` and
+  `PsTool::wants_main_panel`; its body is `draw_tool_panel_tab_body` → `PsTool::draw_main_panel`.
 - To change brush painting or selection geometry, edit `tools/brush.rs` / `tools/select.rs` and
   `selection.rs`.
 - To change the marquee look, edit `walk_dash_runs` / `decimate_to_screen` /

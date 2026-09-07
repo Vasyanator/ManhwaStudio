@@ -60,8 +60,9 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - `base.rs`: `CleaningTool`, stroke/cursor types, brush scratch pipeline, region editor pipeline,
   mask-inpaint editor, mask generation (text detectors + watermark detector) with its shared
   `RegionMaskGenerationState`, and region loader worker. It also owns the overlay<->scene POINT
-  mapping (`scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos`) and the dense-overlay colour
-  solver `overlay_pixel_for_final_color`; both were private to `stamp.rs` and are now shared.
+  mapping (`scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos`) and re-exports the dense-overlay
+  colour solver `overlay_pixel_for_final_color` from `crate::tools::overlay_pixel`, so the whole
+  subtree keeps reaching it as `base::overlay_pixel_for_final_color`.
 - `zamazka.rs`: primary paint/erase/eyedropper/rectangle tool for direct clean-overlay edits.
 - `stamp.rs`: copies pixels into clean overlays either from `project/alt_vers/<name>` or from the
   current page image/clean overlay using a Photoshop-like source point, with lazy background
@@ -79,10 +80,9 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   point currently sampled, whose position is derived from the sampling mapping (`stamp_source_xy`)
   and therefore cannot disagree with the pixels being copied. The stroke origin is runtime stroke
   state, so between strokes the offset is zero and the moving marker rests on the beacon.
-- `gradient.rs`: local mask fill using Lab scanline estimation and smoothing. It also owns the
-  subtree's SHARED red-black SOR kernel `red_black_sor_sweeps` (`pub(super)`): any tool needing a
-  screened-Poisson or harmonic solve calls that one instead of copying it. Its second consumer is
-  `patch/membrane.rs`.
+- `gradient.rs`: local mask fill using Lab scanline estimation and smoothing. Its screened-Poisson
+  L-channel consolidation calls the project's SHARED red-black SOR kernel
+  `crate::tools::red_black_sor_sweeps`; the other consumer is `crate::tools::patch::membrane`.
 - `texture_synthesis.rs`: local inpaint through the `texture-synthesis` crate, with optional
   sample mask limiting the texture source area.
 - `lama.rs`: LaMa V2 backend inpaint, fixed supported model catalog, model scan, model ensure, and
@@ -156,12 +156,15 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   improve-with-another-level. Every one of those runs on a worker; the window polls a channel.
 - `lama_mpe.rs`: LaMa MPE backend inpaint and `inpaint.lama_mpe` IPC calls.
 - `aot.rs`: AOT backend inpaint and `inpaint.aot` IPC calls.
-- `patch/`: the «Заплатка» tool — Photoshop's Patch Tool. A free-form or rectangular selection
-  drawn straight onto the page canvas, dragged onto a clean source area; the copied pixels are
-  colour-adapted to the destination's contour by a gradient-domain (Poisson) membrane and committed
-  as one undo step. Built DIRECTLY on `CleaningTool` (a lasso has no radius, no hardness and no
-  axis-aligned scratch rect, so `BrushToolBase` fits none of it), it rides the tab's ordinary stroke
-  pipeline, and it is the second consumer of `gradient.rs`'s shared SOR kernel. Own
+- `patch/`: this tab's HOST for the «Заплатка» tool — Photoshop's Patch Tool. A free-form or
+  rectangular selection drawn straight onto the page canvas, dragged onto a clean source area; the
+  copied pixels are colour-adapted to the destination's contour by a gradient-domain (Poisson)
+  membrane and committed into the clean overlay as one undo step. The tool ITSELF — selection,
+  gesture, ROI/refusal geometry, the membrane solve and the outline painting — lives in
+  `crate::tools::patch`; what is here is the `CleaningTool` impl, the `PatchHost` impl (canvas
+  geometry, the two region loads, the store step) and the tab registration. Built DIRECTLY on
+  `CleaningTool` (a lasso has no radius, no hardness and no axis-aligned scratch rect, so
+  `BrushToolBase` fits none of it), it rides the tab's ordinary stroke pipeline. Own
   `MODULE_README.md`.
 - `region_edit_test.rs`: development-only mask-inpaint pipeline test tool; it is not exported by
   `mod.rs`.
@@ -266,8 +269,9 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `draw_overlay_ui`, the `CleaningDockOut` rule at tool scope.
 - `capture_overlay_chunk`, `extract_overlay_chunk`, `overlay_rect_to_scene_rect`,
   `scene_pointer_to_image_px`, `scene_pos_to_source_xy`, `scene_pos_to_overlay_pos`,
-  `overlay_pos_to_scene_pos` and `overlay_pixel_for_final_color` are `pub(super)` free functions of
-  `base.rs`: the whole `tools` subtree reuses them, and a copy of any of them in a tool is a defect.
+  `overlay_pos_to_scene_pos` and `overlay_pixel_for_final_color` are reachable as `pub(super)` items
+  of `base.rs` (the last one re-exported from `crate::tools::overlay_pixel`): the whole `tools`
+  subtree reuses them, and a copy of any of them in a tool is a defect.
   `scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos` are the FRACTIONAL point pair and exact
   inverses of each other; `scene_pos_to_source_xy` is the rounding, non-`Option` variant that takes
   an explicit page rect and source size instead of resolving them from the canvas.
@@ -288,7 +292,7 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - On-canvas geometry is stored in PAGE pixels and re-projected every frame. A stored screen
   rectangle drifts the moment the canvas scrolls or zooms — the same rule `region_edit_v2` states
   for its frame, and the reason `patch/` keeps its polygon in page pixels.
-- Gradient-domain / Laplace maths belongs to ONE kernel: `gradient.rs::red_black_sor_sweeps`.
+- Gradient-domain / Laplace maths belongs to ONE kernel: `crate::tools::red_black_sor_sweeps`.
   A tool wanting a harmonic or screened-Poisson solve builds `lam`/`denom`/`u0` around it
   (`lam = 0` inside the region, a large `lam` to pin known values) and pads its region by at least
   one pixel, because the kernel never writes its border. A second SOR implementation is a defect.
@@ -309,9 +313,11 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `base.rs`.
 - To change direct paint behavior, edit `zamazka.rs`; to change alt-version or current-page
   stamping, edit `stamp.rs`.
-- To change the patch tool — its selection gesture, its ROI/refusal geometry or its commit — edit
-  `patch/mod.rs`; to change the seamless-cloning maths (pyramid, sweep schedule, Dirichlet weight,
-  blend modes, feather ramp), edit `patch/membrane.rs`. Read `patch/MODULE_README.md` first.
+- To change the patch tool's selection gesture or its ROI/refusal geometry, edit
+  `crate::tools::patch`; to change the seamless-cloning maths (pyramid, sweep schedule, Dirichlet
+  weight, blend modes, feather ramp), edit `crate::tools::patch::membrane`. To change how a patch is
+  STORED in the clean overlay, or how its region is loaded, edit `patch/mod.rs` here. Read
+  `patch/MODULE_README.md` and `crate::tools::patch`'s `MODULE_README.md` first.
 - To change local fill/inpaint algorithms, edit `gradient.rs` or `texture_synthesis.rs`.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
   settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
