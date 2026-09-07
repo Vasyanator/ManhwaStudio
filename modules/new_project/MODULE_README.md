@@ -25,7 +25,8 @@ This package is now headless-only: the legacy PyQt6 "New project" UI (`window.py
 `batch_nodes_window/` node editor, and the UI-level `test_adv_fetch*` tests of that era)
 was rewritten in Rust under `src/launcher/new_project/` and archived in `old_or_test/2.X/`.
 Only the browser-fetch daemons hosted in-process by the AI backend remain here, together
-with the browser-free `test_adv_fetch_cloak_cli.py` unit tests listed below.
+with the browser-free `test_adv_fetch_cloak_cli.py` / `test_adv_fetch_cli.py` unit tests
+listed below (new files, unrelated to the archived UI-level tests of the same names).
 
 - `__init__.py`: import-light package init. It must NOT import any PyQt6/UI module, because the
   AI backend imports `modules.new_project.adv_fetch_cli` and initializes this package first.
@@ -38,9 +39,17 @@ with the browser-free `test_adv_fetch_cloak_cli.py` unit tests listed below.
   `_deep_capture_sort_key` tiers, and the stop-time call order around the screenshot pass), plus
   the pure deep-capture diagnostics helpers (`DeepCaptureStallTracker` episode/recovery edges,
   `DeepCapturePageShape` parsing and change signature, `_deep_capture_source_breakdown`,
-  `_format_deep_capture_summary`, `_format_deep_call_stats`, `_format_deep_drain_stages`). It
-  exposes a `__main__` runner as well, because the project venv has no pytest; run it with
-  `PYTHONPATH=<repo> ./venv/bin/python modules/new_project/test_adv_fetch_cloak_cli.py`.
+  `_format_deep_capture_summary`, `_format_deep_call_stats`, `_format_deep_drain_stages`), plus
+  the browser-session liveness/reopen contract (round-trip probe, teardown-and-relaunch,
+  `open_url`'s single retry). It exposes a `__main__` runner as well as running under pytest;
+  run it either way:
+  `PYTHONPATH=<repo> ./venv/bin/python modules/new_project/test_adv_fetch_cloak_cli.py` or
+  `PYTHONPATH=<repo> ./venv/bin/python -m pytest modules/new_project/`.
+- `test_adv_fetch_cli.py`: browser-free unit tests for the Selenium daemon's session
+  lifecycle only — `_is_dead_session` classification (including through a `raise ... from`
+  chain) and `open_url`'s relaunch-and-retry-once behaviour. Same style and `__main__`
+  runner; `build_browser` / `cleanup_browser_runtime` are swapped for fakes, so no browser
+  and no chromedriver are needed.
 
 ## Contracts and invariants
 
@@ -63,7 +72,9 @@ with the browser-free `test_adv_fetch_cloak_cli.py` unit tests listed below.
 - The cumulative deep-capture DOM order (`_accumulate_deep_dom_order`) is refreshed on every drain by plain first-seen append (`_append_first_seen_keys`): each poll's window of image-URL/canvas-WeakMap-id keys is appended in encounter order, along with any page index and the owning DOM element seen for a key (first reading wins). Anchor-based insertion must not be used for accumulation — consecutive polls often catch non-overlapping windows during a fast scroll, and inserting a non-overlapping group relative to absent anchors scrambles the sequence into small correctly-ordered fragments.
 - At stop, `_combine_dom_order` **merges** the accumulated first-seen order into the live stop-time DOM order: every key that has left the DOM is anchored to the next key that follows it in first-seen order and is still present at stop, and is emitted immediately before that anchor. Both inputs must already be de-duplicated. Invariants: keys present at stop keep their stop-time relative order unchanged (that order is the reliable one, since fast scrolling can scramble pure first-seen accumulation); vanished keys stay interleaved between their first-seen neighbours; nothing vanished degenerates to exactly `stop_keys`; nothing present degenerates to exactly the first-seen order. Vanished keys must **not** be concatenated as a leading block — on a reader where `<img>` pages persist in the DOM but `<canvas>` pages are torn down when scrolled away, a leading block splits one chapter into two internally-ordered halves.
 - `stop_deep_intercept` must accumulate the DOM order **on both sides of the canvas screenshot pass**: `ElementHandle.screenshot()` scrolls each element into view, which is exactly what recycles elements on a virtual-scroll reader, so the pre-screenshot reading is the only surviving evidence for the keys that pass tears down. Do not reorder these calls.
-- Browser sessions are cached and reused across commands, but `_ensure_browser` must verify the cached session is still live and relaunch when it is not: any failure probing the Selenium driver (closed window, dead chromedriver, invalid session) drops it, and a CloakBrowser context with no live page (the user closed the browser) is torn down and recreated. A command like `open_url` must always end up with a live browser instead of erroring on a stale one.
+- Browser sessions are cached and reused across commands, but `_ensure_browser` must verify the cached session is still live and relaunch when it is not: any failure probing the Selenium driver (closed window, dead chromedriver, invalid session) drops it, and a CloakBrowser context that fails its liveness probe (the user closed the browser) is torn down and recreated. A command like `open_url` must always end up with a live browser instead of erroring on a stale one.
+- **A liveness probe MUST make a real round-trip to the browser.** This is the whole lesson of the "closed the browser, could not reopen it" bug. In Playwright's **sync** API `context.pages` and `page.is_closed()` are plain reads of locally cached state (`Page.is_closed` is literally `return self._is_closed`), and that state is refreshed only while a sync call pumps the dispatcher greenlet. Between two IPC commands the browser-owner thread is parked, so the `close` events of a browser the user shut down by hand are never dispatched and those reads still claim the session is open — the check passes, and the first real call (`page.goto`) raises `TargetClosedError` instead. `_browser_session_alive` therefore starts with `context.cookies()`, which both fails outright on a dead browser and pumps the loop so the local reads after it are finally truthful. Selenium has no such trap: `driver.current_url` is already a round-trip.
+- **Liveness and use cannot be made atomic, so navigation retries once.** The browser can die between a passing probe and the call that uses it, and a live context whose active tab was closed reads the same way. `CloakFetchDaemon.open_url` and `AdvancedFetchDaemon.open_url` therefore catch a session-death error from the navigation (`_is_target_closed` / `_is_dead_session`), tear the session down through the single existing `close()` path, relaunch, and retry the navigation **exactly once**; a second failure and every non-session error (bad URL, load timeout) propagate unchanged, so a mistyped link never costs the user their browser. Each relaunch is reported once through `_warn_log`, so `last.log` shows plainly that the browser was found closed and reopened; no user-facing notice is raised, because the operation self-heals.
 - Errors returned to Rust must distinguish user-facing messages from technical log messages.
 
 ## Editing map

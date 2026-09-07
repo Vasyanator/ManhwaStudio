@@ -4,7 +4,11 @@ Python daemon for the advanced Selenium-based downloader used by the Rust launch
 
 Main items:
 - `AdvancedFetchDaemon`: owns the Selenium driver lifecycle and persistent browser profiles.
-- `open_url` command: opens a page in the selected browser/profile.
+- `open_url` command: opens a page in the selected browser/profile. Its liveness probe
+  (`_ensure_browser`) is a real WebDriver round-trip, and the navigation itself retries
+  exactly once — after dropping and relaunching the driver — when `_is_dead_session`
+  recognises the failure, so a browser closed between check and navigation reopens instead
+  of erroring.
 - `fetch` command: collects image candidates from the active page, transfers cookies to
   the active browser tab, downloads images, and stores them in a temporary folder for Rust.
 - `fetch_canvas` / `start_intercept` / `stop_intercept`: collect current canvas snapshots or
@@ -43,7 +47,11 @@ from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import requests
 from PIL import Image
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchWindowException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.support.ui import WebDriverWait
@@ -76,6 +84,47 @@ NEW_TAB_OPEN_POLL_SECONDS = 1.0
 NEW_TAB_OPEN_POLL_INTERVAL_SECONDS = 0.05
 NEW_TAB_IMAGE_WAIT_SECONDS = 5.0
 BROWSER_FETCH_TIMEOUT_MS = 8000
+
+
+# Substrings of a WebDriver error message that mean the SESSION died (the user closed
+# the browser, chromedriver went away, the target window vanished) rather than the page
+# failing to load. Matched case-insensitively against the whole message.
+_DEAD_SESSION_MARKERS = (
+    "invalid session id",
+    "session deleted",
+    "no such window",
+    "target window already closed",
+    "web view not found",
+    "not connected to devtools",
+    "chrome not reachable",
+    "browser has closed",
+    "max retries exceeded",
+    "connection refused",
+    "failed to establish a new connection",
+)
+
+
+def _is_dead_session(exc: BaseException) -> bool:
+    """True if ``exc`` means the Selenium session itself is gone.
+
+    Only session-level deaths qualify: closed browser, dead chromedriver, vanished target
+    window. A plain navigation failure (DNS, TLS, load timeout) must NOT qualify, or a
+    mistyped link would cost the user their whole browser session. The `__cause__` /
+    `__context__` chain is walked (bounded) because `_wait_for_page_ready` re-raises a
+    dead driver as a friendly `RuntimeError`.
+    """
+    seen = 0
+    current: Optional[BaseException] = exc
+    while current is not None and seen < 5:
+        if isinstance(current, (InvalidSessionIdException, NoSuchWindowException)):
+            return True
+        if isinstance(current, WebDriverException):
+            message = str(getattr(current, "msg", "") or current).lower()
+            if any(marker in message for marker in _DEAD_SESSION_MARKERS):
+                return True
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
 
 
 class SelfClosingNewTabError(RuntimeError):
@@ -330,8 +379,36 @@ class AdvancedFetchDaemon:
                 time.sleep(0.2)
 
     def open_url(self, browser: str, url: str) -> str:
+        """Navigate the active browser tab to ``url`` and return its resulting URL.
+
+        Ensures a live driver first, then navigates. The liveness check and the navigation
+        cannot be made atomic — the user may close the browser in between — so a failure
+        that `_is_dead_session` recognises drops the driver and retries the navigation
+        **exactly once** on a freshly launched browser. A second failure, and every error
+        that is not a dead session (bad URL, load timeout), propagates unchanged.
+        """
         self._ensure_browser(browser)
         self._emit_progress("browser", 0, 0)
+        try:
+            return self._navigate_active_tab(url)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless the session itself died
+            if not _is_dead_session(exc):
+                raise
+            _warn_log(
+                "selenium session: browser session died during navigation to %s;"
+                " relaunching and retrying once",
+                _short_link(url),
+            )
+        self.close()
+        self._ensure_browser(browser)
+        return self._navigate_active_tab(url)
+
+    def _navigate_active_tab(self, url: str) -> str:
+        """Run one `driver.get` on the active tab and return the page URL afterwards.
+
+        Assumes nothing about session liveness: a dead browser surfaces as the WebDriver
+        error `open_url` turns into a single relaunch-and-retry.
+        """
         assert self._driver is not None
         self._sync_active_browser_tab()
         self._driver.get(url)
@@ -858,6 +935,14 @@ class AdvancedFetchDaemon:
             return len(capture.entries)
 
     def _ensure_browser(self, browser: str) -> None:
+        """Guarantee a live Selenium driver for ``browser``, relaunching if needed.
+
+        The cached driver is kept only when a real round-trip to it succeeds
+        (`driver.current_url`); unlike Playwright's sync API there is no locally cached
+        liveness flag to be fooled by, so this probe is truthful by construction. Any
+        failure drops the driver through the single `close` path and a fresh browser is
+        launched, reported once as a lifecycle warning.
+        """
         if not browser:
             raise RuntimeError("Не найден ни один поддерживаемый браузер.")
 
@@ -871,7 +956,8 @@ class AdvancedFetchDaemon:
                 # Any failure to talk to the cached driver (closed window, dead
                 # chromedriver connection, invalid session) means there is no live
                 # browser; drop it so we relaunch below instead of erroring out.
-                LOG.warning("Existing Selenium driver became invalid, recreating it")
+                LOG.debug("Selenium driver liveness probe failed", exc_info=True)
+                _warn_log("selenium session: cached browser session is closed; relaunching the browser")
                 self.close()
         elif self._driver is not None:
             self.close()
@@ -2303,6 +2389,22 @@ def _debug_log(message: str, *args: object) -> None:
     except Exception:  # noqa: BLE001
         formatted = f"{message} | args={args!r}"
     _emit_daemon_log("info", formatted)
+
+
+def _warn_log(message: str, *args: object) -> None:
+    """Emit a warning-level diagnostic to both the Python log and the Rust runtime log.
+
+    Same transport as `_debug_log` (a JSON ``log`` event on stdout, which the Rust side
+    forwards into the runtime log) but at ``warn`` level and **not** gated by
+    `VERBOSE_DOWNLOAD_LOG`: it carries lifecycle conditions the user must be able to see
+    in `last.log`, such as the browser session being found dead and relaunched.
+    """
+    LOG.warning(message, *args)
+    try:
+        formatted = message % args if args else message
+    except Exception:  # noqa: BLE001 - never lose a warning to a bad format string
+        formatted = f"{message} | args={args!r}"
+    _emit_daemon_log("warn", formatted)
 
 
 def _emit_daemon_log(level: str, message: str) -> None:

@@ -4,6 +4,11 @@ CloakBrowser/Playwright daemon for the advanced downloader used by the Rust laun
 
 Main items:
 - `CloakFetchDaemon`: owns a persistent CloakBrowser context and active Playwright page.
+- Session liveness (`_browser_session_alive` / `_ensure_browser`) must make a REAL round-trip
+  to the browser: in Playwright's sync API `context.pages` / `page.is_closed()` are local
+  reads refreshed only while a sync call pumps the dispatcher greenlet, so a browser the
+  user closed by hand still reads as open between commands. `open_url` additionally retries
+  a target-closed navigation exactly once after relaunching, closing the check-then-act gap.
 - Browser commands keep the same line-oriented JSON protocol as `adv_fetch_cli.py`.
 - Image fetching prioritizes bytes already seen by the page, then page-context `fetch()`,
   DOM image readback, a temporary page, and finally an HTTP requests fallback with browser cookies.
@@ -602,8 +607,38 @@ class CloakFetchDaemon:
         raise RuntimeError(f"Unknown command: {command_name}")
 
     def open_url(self, url: str) -> str:
+        """Navigate the active CloakBrowser tab to ``url`` and return its resulting URL.
+
+        Ensures a live session first, then navigates. The liveness check and the
+        navigation cannot be made atomic — the user may close the browser in between, and
+        a page that is merely a closed tab of a live context reads the same way — so a
+        target-closed failure of the navigation drops the whole session through `close`,
+        relaunches it and retries the navigation **exactly once**. A second failure, and
+        every error that is not a closed target (bad URL, navigation timeout, TLS),
+        propagates unchanged.
+        """
         self._ensure_browser()
         self._emit_progress("browser", 0, 0)
+        try:
+            return self._navigate_active_page(url)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is a closed target
+            if not _is_target_closed(exc):
+                raise
+            _warn_log(
+                "cloak session: CloakBrowser closed during navigation to %s; relaunching and retrying once",
+                _short_link(url),
+            )
+        self.close()
+        self._ensure_browser()
+        return self._navigate_active_page(url)
+
+    def _navigate_active_page(self, url: str) -> str:
+        """Run one `page.goto` on the active tab and return the page URL afterwards.
+
+        Assumes nothing about session liveness: raises Playwright's target-closed error
+        when the browser or tab died, which is what `open_url` turns into a single
+        relaunch-and-retry. `networkidle` is best effort, as before.
+        """
         with self._page_lock:
             page = self._require_page()
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
@@ -1115,11 +1150,20 @@ class CloakFetchDaemon:
         )
 
     def _ensure_browser(self) -> None:
+        """Guarantee a live CloakBrowser context and active page, relaunching if needed.
+
+        Reuses the cached session only when `_browser_session_alive` proves it live with
+        a real round-trip; a dead one is torn down through the single `close` path and a
+        fresh persistent context is launched. The relaunch is reported once as a
+        lifecycle warning so the runtime log shows plainly that the user's browser was
+        found closed.
+        """
         if self._context is not None and self._browser_session_alive():
             return
         if self._context is not None:
             # The cached context is dead (the user closed CloakBrowser); tear it down
             # so a fresh one launches below instead of reusing a disconnected session.
+            _warn_log("cloak session: cached CloakBrowser session is closed; relaunching the browser")
             self.close()
         self._emit_progress("browser", 0, 0)
         try:
@@ -1151,15 +1195,38 @@ class CloakFetchDaemon:
         self._deep_capture_active = False
 
     def _browser_session_alive(self) -> bool:
-        """Report whether the cached CloakBrowser context still has a usable page.
+        """Report whether the cached CloakBrowser context is still usable.
 
-        When the user closes CloakBrowser (or the process dies) Playwright marks every
-        page of the context closed, so the absence of any live page is a reliable
-        "session is dead" signal. If only the active tab was closed but the context is
-        still alive, adopt the most recently opened live page so commands keep working.
+        Starts with ONE real round-trip to the browser (``context.cookies()``), and that
+        round-trip is the load-bearing part of the check, not a defensive extra. In
+        Playwright's **sync** API ``BrowserContext.pages`` and ``Page.is_closed()`` are
+        plain reads of locally cached state (``Page.is_closed`` is literally
+        ``return self._is_closed``); that state is only refreshed while a sync call pumps
+        the dispatcher greenlet. Between two IPC commands the browser-owner thread is
+        parked, so the ``close`` events of a browser the user shut down by hand are never
+        dispatched and the cached flags still claim the session is open — the first real
+        call (``page.goto``) is then what raises ``TargetClosedError``. The round-trip
+        fixes both halves: it fails outright on a dead browser, and on a live one it
+        pumps the loop so the local reads below are finally truthful.
+
+        Returns False when the session is gone, so `_ensure_browser` tears it down and
+        relaunches. Any probe failure counts as "gone" — a context we cannot talk to is
+        not a context we can serve a command from. If only the active tab was closed but
+        the context is still alive, the most recently opened live page is adopted so
+        commands keep working.
         """
         context = self._context
         if context is None:
+            return False
+        try:
+            # Real round-trip: `BrowserContext.cookies` is sent over the Playwright
+            # channel, so it raises on a dead browser instead of reading a stale flag.
+            context.cookies()
+        except Exception as exc:  # noqa: BLE001 - any probe failure means "no usable session"
+            if _is_target_closed(exc):
+                LOG.debug("CloakBrowser session probe hit a closed target", exc_info=True)
+            else:
+                LOG.debug("CloakBrowser session probe failed", exc_info=True)
             return False
         try:
             live_pages = [page for page in context.pages if not page.is_closed()]

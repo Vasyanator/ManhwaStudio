@@ -9,7 +9,7 @@ Main responsibilities:
 - Implement exec/data routing: cycle loop, join-node wait, data propagation
 - Execute all 13 node handlers (start_number, start_string, string_template,
   variable_read/write, quick_downloader, save_folder, stitch_split, waifu2x,
-  end; browser nodes via Selenium JSON-RPC to the Python daemon)
+  end; browser nodes via the backend's Selenium session over IPC)
 - Stream progress events back via an mpsc channel
 
 Key structures:
@@ -27,11 +27,13 @@ The algorithm is a direct port of Python BatchPipelineExecutor:
      d. process exec queue: wait for required_exec_inputs, then execute node
   3. return stats summary string
 
-Browser nodes (open_url, scroll_page, fetch_from_browser) communicate with the
-adv_fetch_cli.py Python daemon via JSON-RPC over stdio, reusing the pattern from
-advanced_download.rs.  The daemon is started lazily on first browser node use and
-kept alive for the duration of the pipeline run.  The startup `ready` event is
-consumed before browser node commands are sent.
+Browser nodes (open_url, scroll_page, fetch_from_browser) drive the browser session
+that lives INSIDE the app-global AI backend, over framed IPC (method
+`browser.command`), reusing the pattern from advanced_download.rs.  No Python child
+process is spawned here and there is no stdio `ready` handshake: `BrowserDaemon` is
+only a cloneable backend client, connected lazily on first browser node use, which
+selects the Selenium backend on connect and sends `close` on Drop.  That session is
+app-global and shared with the advanced downloader.
 
 Image downloads (quick_downloader) use ureq with browser-like headers.
 Image saves (save_folder) write PNG files with sequential numbering.

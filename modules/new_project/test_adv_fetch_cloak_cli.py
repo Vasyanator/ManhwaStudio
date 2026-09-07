@@ -13,6 +13,13 @@ Main responsibilities:
 - a single live real-URL tab is used as-is (no monitor read needed);
 - a chosen tab that is already closed triggers a live re-resolve;
 - `_active_page_url` raises the standard error when the active tab is blank;
+- browser-session liveness: `_browser_session_alive` decides from a REAL round-trip
+  (`context.cookies()`), so a browser the user closed by hand is detected even while the
+  cached Playwright flags still read "open", and `_ensure_browser` then tears the dead
+  context down and relaunches; only a closed *tab* adopts a live page instead;
+- `open_url` relaunches and retries the navigation exactly once on a target-closed error
+  (the check-then-act race), and propagates every other error with no retry and no
+  teardown;
 - `_combine_dom_order` splices keys that left the DOM back between their first-seen
   neighbours instead of hoisting them into a leading block (the mixed canvas/`<img>`
   virtual-scroll reader case), while keys still present keep their stop-time order;
@@ -42,9 +49,14 @@ plain `python3` invocation.
 
 from __future__ import annotations
 
+import shutil
+import sys
+import tempfile
 import threading
+import types
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from PIL import Image
 
@@ -167,6 +179,216 @@ def test_active_page_url_rejects_blank() -> None:
 
     assert raised is not None
     assert "CloakBrowser" in str(raised)
+
+
+# --------------------------------------------------------------------------------------
+# Browser-session liveness and reopen
+#
+# Regression cover for the bug where closing CloakBrowser by hand and pressing "open in
+# browser" again failed with `Page.goto: Target page, context or browser has been closed`
+# instead of reopening. Playwright's sync `page.is_closed()` / `context.pages` are LOCAL
+# reads that only become truthful once a call pumps the dispatcher greenlet, so the old
+# liveness check happily reported a dead browser as alive. The fakes below reproduce that
+# exactly: a "dead" context still lists an open-looking page, and only the round-trip
+# (`cookies()`) tells the truth.
+# --------------------------------------------------------------------------------------
+
+
+class _FakeNavPage(_FakePage):
+    """`_FakePage` that also records `goto`, failing the first calls if asked to."""
+
+    def __init__(self, url: str, *, goto_errors: Optional[list[Exception]] = None) -> None:
+        super().__init__(url, active_ts=0.0)
+        self._goto_errors = list(goto_errors or [])
+        self.goto_calls: list[str] = []
+
+    def goto(self, url: str, **_kwargs: Any) -> None:
+        self.goto_calls.append(url)
+        if self._goto_errors:
+            raise self._goto_errors.pop(0)
+        self.url = url
+
+    def wait_for_load_state(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
+class _FakeContext:
+    """Minimal Playwright-context stand-in for the session-liveness tests.
+
+    `cookies()` models the real round-trip: it raises `cookies_error` when the browser is
+    gone. `pages` stays deliberately populated with open-looking pages on a dead context,
+    which is precisely the stale local state the old check trusted.
+    """
+
+    def __init__(
+        self,
+        pages: Optional[list[_FakePage]] = None,
+        cookies_error: Optional[Exception] = None,
+    ) -> None:
+        self.pages: list[Any] = list(pages or [])
+        self._cookies_error = cookies_error
+        self.cookie_calls = 0
+        self.closed = 0
+
+    def cookies(self) -> list[dict[str, Any]]:
+        self.cookie_calls += 1
+        if self._cookies_error is not None:
+            raise self._cookies_error
+        return []
+
+    def close(self) -> None:
+        self.closed += 1
+        for page in self.pages:
+            page._closed = True
+        self.pages = []
+
+    def new_page(self) -> _FakeNavPage:
+        page = _FakeNavPage(f"about:blank#{len(self.pages)}")
+        self.pages.append(page)
+        return page
+
+    def on(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def add_init_script(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
+def _target_closed_error() -> RuntimeError:
+    """Playwright's real target-closed message, which `_is_target_closed` matches by text.
+
+    A plain `RuntimeError` is used on purpose: it exercises the message fallback rather
+    than the `isinstance` fast path, so the test does not depend on Playwright's private
+    error class being importable.
+    """
+    return RuntimeError("Page.goto: Target page, context or browser has been closed")
+
+
+@contextmanager
+def _stub_cloakbrowser(factory: Callable[[], _FakeContext]) -> Iterator[None]:
+    """Make `_ensure_browser`'s lazy `from cloakbrowser import ...` yield a fake launcher.
+
+    The real package must never be imported here: importing it starts browser machinery
+    and queries pypi. The previous `sys.modules` entry is restored on exit.
+    """
+    module = types.ModuleType("cloakbrowser")
+    module.launch_persistent_context = lambda *_args, **_kwargs: factory()  # type: ignore[attr-defined]
+    previous = sys.modules.get("cloakbrowser")
+    sys.modules["cloakbrowser"] = module
+    try:
+        yield
+    finally:
+        if previous is None:
+            sys.modules.pop("cloakbrowser", None)
+        else:
+            sys.modules["cloakbrowser"] = previous
+
+
+def _daemon_with_context(context: _FakeContext) -> CloakFetchDaemon:
+    """Daemon holding `context` as its cached session, with a throwaway profile dir."""
+    daemon = CloakFetchDaemon()
+    daemon._context = context
+    daemon._page = context.pages[0] if context.pages else None
+    daemon._profile_dir = Path(tempfile.mkdtemp(prefix="ms_test_cloak_profile_"))
+    return daemon
+
+
+def test_dead_session_is_detected_and_torn_down() -> None:
+    # The page still reads as open locally — exactly the stale state that fooled the old
+    # check — while the round-trip reports the browser is gone.
+    stale_page = _FakeNavPage("https://site/chapter")
+    dead = _FakeContext(pages=[stale_page], cookies_error=_target_closed_error())
+    fresh = _FakeContext()
+    daemon = _daemon_with_context(dead)
+    assert [page for page in dead.pages if not page.is_closed()], "fake must look alive locally"
+
+    try:
+        assert daemon._browser_session_alive() is False
+        assert dead.cookie_calls == 1  # exactly one round-trip, not a local read
+
+        with _stub_cloakbrowser(lambda: fresh):
+            daemon._ensure_browser()
+
+        assert dead.closed == 1  # the dead context was really torn down, not just flagged
+        assert daemon._context is fresh
+        assert daemon._page is not stale_page
+        assert daemon._page in fresh.pages
+    finally:
+        shutil.rmtree(daemon._profile_dir, ignore_errors=True)
+
+
+def test_probe_failure_of_any_kind_counts_as_dead() -> None:
+    # A context we cannot talk to at all is not a context we can serve a command from.
+    unreachable = _FakeContext(pages=[_FakeNavPage("https://site/chapter")], cookies_error=OSError("pipe"))
+    daemon = _daemon_with_context(unreachable)
+
+    try:
+        assert daemon._browser_session_alive() is False
+    finally:
+        shutil.rmtree(daemon._profile_dir, ignore_errors=True)
+
+
+def test_only_a_closed_tab_adopts_a_live_page_without_relaunch() -> None:
+    closed_tab = _FakePage("https://site/gone", active_ts=5.0, closed=True)
+    live_tab = _FakePage("https://site/live", active_ts=1.0)
+    context = _FakeContext(pages=[closed_tab, live_tab])
+    daemon = _daemon_with_context(context)
+    daemon._page = closed_tab
+
+    try:
+        assert daemon._browser_session_alive() is True
+        assert daemon._page is live_tab
+        assert context.cookie_calls == 1
+        assert context.closed == 0  # a live context is never torn down
+    finally:
+        shutil.rmtree(daemon._profile_dir, ignore_errors=True)
+
+
+def test_open_url_relaunches_and_retries_once_on_target_closed() -> None:
+    # The browser dies between the liveness probe and the navigation: `cookies()` still
+    # answers, `goto` does not. This is the check-then-act race the retry closes.
+    doomed = _FakeNavPage("https://site/old", goto_errors=[_target_closed_error()])
+    dying = _FakeContext(pages=[doomed])
+    fresh = _FakeContext()
+    daemon = _daemon_with_context(dying)
+
+    try:
+        with _stub_cloakbrowser(lambda: fresh):
+            result = daemon.open_url("https://site/new")
+
+        assert result == "https://site/new"
+        assert doomed.goto_calls == ["https://site/new"]  # one failed attempt
+        assert dying.closed == 1  # session dropped through the single teardown path
+        assert daemon._context is fresh
+        assert len(fresh.pages) == 1
+        assert fresh.pages[0].goto_calls == ["https://site/new"]  # exactly ONE retry
+    finally:
+        shutil.rmtree(daemon._profile_dir, ignore_errors=True)
+
+
+def test_open_url_propagates_other_errors_without_retry() -> None:
+    boom = RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+    page = _FakeNavPage("https://site/old", goto_errors=[boom])
+    context = _FakeContext(pages=[page])
+    daemon = _daemon_with_context(context)
+
+    def _must_not_relaunch() -> _FakeContext:
+        raise AssertionError("a non-target-closed error must not relaunch the browser")
+
+    raised: Optional[Exception] = None
+    try:
+        with _stub_cloakbrowser(_must_not_relaunch):
+            try:
+                daemon.open_url("https://bad/link")
+            except RuntimeError as exc:
+                raised = exc
+
+        assert raised is boom
+        assert page.goto_calls == ["https://bad/link"]  # no retry
+        assert context.closed == 0  # no teardown
+        assert daemon._context is context
+    finally:
+        shutil.rmtree(daemon._profile_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -921,6 +1143,11 @@ if __name__ == "__main__":
     test_single_tab_used_as_is()
     test_closed_chosen_tab_triggers_reresolve()
     test_active_page_url_rejects_blank()
+    test_dead_session_is_detected_and_torn_down()
+    test_probe_failure_of_any_kind_counts_as_dead()
+    test_only_a_closed_tab_adopts_a_live_page_without_relaunch()
+    test_open_url_relaunches_and_retries_once_on_target_closed()
+    test_open_url_propagates_other_errors_without_retry()
     test_combine_dom_order_interleaves_vanished_canvases()
     test_combine_dom_order_no_vanished_keys_is_stop_order()
     test_combine_dom_order_everything_vanished_is_first_seen_order()
