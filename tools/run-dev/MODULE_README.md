@@ -120,6 +120,18 @@ committed and never shows up as a local change during Stage 1:
   GitHub CDN (exit 52) while `HttpWebRequest` downloads the same URL fine. The .NET path therefore
   implements `Range` resume and progress reporting for real. Look up `curl.exe` with
   `-CommandType Application`: in Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`.
+- **GCC must be reached through a path with no space in it.** It builds the paths of its own
+  internals from where `gcc.exe` lives and hands them to `ld.exe` in unquoted spec strings, so
+  `C:\Program Files\ManhwaStudio\installer_files\mingw64` reaches the linker split in two and
+  every link fails (`ld.exe: cannot find C:/Program`). That path is the *installer's* location, not
+  a mistake, and the paths rustc passes are quoted and fine — so the fix is never "move the
+  project". `Resolve-SpaceFreePath` tries the path as given, its 8.3 short form, then a `subst`
+  drive; `Set-MingwEnvironment` puts the winner on `PATH` and additionally pins the linker, `CC` and
+  `AR` by absolute path, because rustc calls the linker by bare name and gcc would otherwise recover
+  its own location from the PATH lookup. A drive created here is released by `Invoke-Main`; one that
+  already existed is reused and left alone. When nothing works the run stops with exit code 5
+  **before** the download — `Assert-SpaceFreeToolchainPath`, called at the top of `Install-Mingw`.
+  Rationale and the rejected alternatives are in `dev-docs/run_dev_plan.md` §2.5a.
 - **The C toolchain is probed before cargo runs.** `aws-lc-sys` (`translators`/`genai` → `reqwest`
   → `rustls` → `aws-lc-rs`) compiles C and assembly on every native target, so it is a real
   prerequisite; probing converts a wall of linker errors 200 crates deep into one clear message.
@@ -253,6 +265,10 @@ committed and never shows up as a local change during Stage 1:
   `run-dev.ps1` and `download` in `run-dev.sh`; the contract itself is `dev-docs/run_dev_plan.md`
   §2.3a. `Resolve-GithubAsset` is what supplies the expected size and the checksum sidecar.
 - To change the Windows host triple or why GNU is used, see `dev-docs/run_dev_plan.md` §2.4 first.
+- To change how the C toolchain is located or handed to cargo, see `Set-MingwEnvironment` and
+  `Resolve-SpaceFreePath` (plus `Get-ShortPathName`, `Get-SubstMap`, `Get-FreeDriveLetters`,
+  `Get-ExistingSubstDrive`, `New-SubstDrive`, `Remove-SubstDrive`). Windows-only: `run-dev.sh` has
+  no counterpart, because Linux and macOS take their compiler from a package manager.
 - To raise the required Rust version, edit `rust-version` in the root `Cargo.toml`. Do not touch
   the scripts.
 - To retarget a fork, set `MS_RUN_DEV_ORIGIN` / `MS_RUN_DEV_BRANCH` rather than editing constants.
@@ -270,6 +286,13 @@ machine when one is reachable. Both suites also cover the pure halves of the pub
 cargo-JSON parser and the "does the root copy need refreshing?" predicate — plus one real copy into
 a temp directory asserting the atomic rename, the preserved modification time and that no `.part`
 is left behind.
+
+`test_run_dev.ps1` additionally covers the space-free toolchain path: the `subst` output parser, a
+path without a space being left alone, and `Set-MingwEnvironment` pinning `PATH`/linker/`CC`/`AR`
+without duplicating the `PATH` entry. Only the Windows branch of that suite exercises the
+interesting half — an actual path *with* a space resolving to one without, and the created drive
+being released — and it has no `test_run_dev.sh` counterpart because the toolchain provisioning it
+guards is Windows-only.
 
 Both also cover the launch of the published binary against a stub program: the arguments reach it
 intact (one of them containing a space), its exit code is propagated, and an unlaunchable file

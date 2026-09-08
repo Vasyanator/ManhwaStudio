@@ -26,6 +26,12 @@ What is covered:
 - root binary: copy predicate and copy  -> skipped when identical, .part never left
 - root binary: leftovers                -> .part and every .old-* aside swept
 - root binary: launch                   -> arguments survive spaces, real exit code
+- subst output parsing                  -> only well-formed mappings become data
+- space-free toolchain path             -> a path without a space is left alone;
+                                           PATH, linker, CC and AR are pinned to
+                                           it and never duplicated; on Windows a
+                                           path WITH a space resolves to one
+                                           without, and a created drive is freed
 
 Run:  pwsh -NoProfile -File tools/run-dev/test_run_dev.ps1
 
@@ -665,6 +671,102 @@ try {
 
     Remove-Item Env:MS_ARGS_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:MS_FAKE_RC   -ErrorAction SilentlyContinue
+
+    # ---------------------------------------------------------------------
+    # Путь к тулчейну без пробела
+    # ---------------------------------------------------------------------
+    Note 'Путь к C-тулчейну без пробела'
+
+    # Разбор вывода `subst` — чистая функция, поэтому проверяется на любой ОС.
+    $map = Get-SubstMap -Lines @(
+        'Z:\: => C:\Program Files\ManhwaStudio\installer_files\mingw64',
+        'мусор, который не является отображением',
+        '',
+        'Y:\: => D:\tools')
+    Check 'subst: буква Z разобрана' $map['Z'] 'C:\Program Files\ManhwaStudio\installer_files\mingw64'
+    Check 'subst: буква Y разобрана' $map['Y'] 'D:\tools'
+    Check 'subst: мусорные строки отброшены' $map.Count 2
+    Check 'subst: пустой ввод -> пустая карта' (Get-SubstMap -Lines @()).Count 0
+
+    # Конвенция возврата массива: обёртка @() должна давать нормальный счётчик.
+    $letters = @(Get-FreeDriveLetters)
+    Check 'свободные буквы: возвращён массив' ($letters -is [array]) $true
+    if ($letters.Count -gt 0) {
+        Check 'свободные буквы: формат «X:»' ($letters[0] -match '^[A-Z]:$') $true
+    }
+
+    Check 'короткое имя: несуществующий путь -> $null' `
+          (Get-ShortPathName -Path (Join-Path $Sandbox 'nope')) $null
+    Check 'короткое имя: пустая строка -> $null' (Get-ShortPathName -Path '') $null
+
+    # Дальше проверяется поведение на пути БЕЗ пробела, поэтому песочница обязана
+    # быть без пробела: временный каталог машины может лежать в C:\Users\Имя
+    # Фамилия\..., и тогда эти проверки говорили бы не о том, что заявлено.
+    $plain = Join-Path $Sandbox 'mingw64'
+    if ($plain -match ' ') {
+        Write-Host '  SKIP временный каталог машины содержит пробел' -ForegroundColor Yellow
+    } else {
+
+        # Путь без пробела не трогается ни одной из стратегий.
+        Check 'путь без пробела возвращается как есть' (Resolve-SpaceFreePath -Dir $plain) $plain
+
+        # Применение окружения: PATH и переменные компоновщика.
+        $mgBin = Join-Path $plain 'bin'
+        [void](New-Item -ItemType Directory -Path $mgBin -Force)
+        $fakeGcc = Join-Path $mgBin 'x86_64-w64-mingw32-gcc.exe'
+        $fakeAr  = Join-Path $mgBin 'x86_64-w64-mingw32-ar.exe'
+        Set-Content -LiteralPath $fakeGcc -Encoding Ascii -Value 'stub'
+        Set-Content -LiteralPath $fakeAr  -Encoding Ascii -Value 'stub'
+
+        $pathBefore = $env:PATH
+        $script:SubstDrive = ''
+        Set-MingwEnvironment -Dir $plain
+        Check 'PATH начинается с bin тулчейна' (@($env:PATH -split ';')[0]) $mgBin
+        Check 'компоновщик закреплён абсолютным путём' `
+              $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER $fakeGcc
+        Check 'CC для gnu-таргета закреплён' $env:CC_x86_64_pc_windows_gnu $fakeGcc
+        Check 'AR для gnu-таргета закреплён'  $env:AR_x86_64_pc_windows_gnu $fakeAr
+        Check 'без пробела в пути subst не создавался' $script:SubstDrive ''
+
+        # Повторный вызов не должен наращивать PATH: скрипт вызывает его и из
+        # Assert-CToolchain, и из Install-Mingw.
+        $lenOnce = $env:PATH.Length
+        Set-MingwEnvironment -Dir $plain
+        Check 'повторный вызов не дублирует запись в PATH' $env:PATH.Length $lenOnce
+        $env:PATH = $pathBefore
+        Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER -ErrorAction SilentlyContinue
+        Remove-Item Env:CC_x86_64_pc_windows_gnu -ErrorAction SilentlyContinue
+        Remove-Item Env:AR_x86_64_pc_windows_gnu -ErrorAction SilentlyContinue
+    }
+
+    # Ранняя проверка: корень без пробела -> вопрос не стоит, Die не вызывается.
+    $rootBefore = $script:RepoRoot
+    $script:RepoRoot = $Sandbox
+    $script:LastDieCode = 0
+    try { Assert-SpaceFreeToolchainPath } catch { }
+    Check 'корень без пробела: ранняя проверка молчит' $script:LastDieCode 0
+
+    # На Windows путь С пробелом должен разрешаться в путь БЕЗ пробела: либо
+    # короткое имя 8.3, либо подстановка диска. Здесь же проверяется, что
+    # созданная нами буква снимается.
+    if ($env:OS -eq 'Windows_NT') {
+        $spaced = Join-Path $Sandbox 'dir with space\mingw64'
+        [void](New-Item -ItemType Directory -Path $spaced -Force)
+        $script:SubstDrive = ''
+        $resolved = Resolve-SpaceFreePath -Dir $spaced
+        Check 'путь с пробелом разрешён' ($null -ne $resolved) $true
+        if ($resolved) {
+            Check 'в разрешённом пути нет пробела' ($resolved -match ' ') $false
+            Check 'разрешённый путь существует' (Test-Path -LiteralPath $resolved) $true
+        }
+        if ($script:SubstDrive) {
+            $drive = $script:SubstDrive
+            Remove-SubstDrive -Drive $drive
+            $script:SubstDrive = ''
+            Check 'созданная буква снимается' (Test-Path -LiteralPath "$drive\") $false
+        }
+    }
+    $script:RepoRoot = $rootBefore
 
 } finally {
     Set-Location ([System.IO.Path]::GetTempPath())

@@ -12,7 +12,10 @@ Main responsibilities:
   when they do not truly conflict; ask git whether the update changed run-dev
   itself and request a restart instead of continuing.
 - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
-  toolchain, provision an isolated one plus MinGW-w64 under installer_files/.
+  toolchain, provision an isolated one plus MinGW-w64 under installer_files/,
+  and make sure gcc is reached through a path with no space in it — the project
+  is normally installed under `C:\Program Files\ManhwaStudio`, and gcc splits
+  its own unquoted spec paths on that space.
 - Stage 3, strictly sequential: an environment check (`cargo run --check-venv`)
   that only shows a GUI when something is missing and is also what builds the
   project; publishing the built binary into the project root; then running that
@@ -25,6 +28,9 @@ Key functions:
 - Invoke-Git (stdout and stderr are never mixed)
 - Get-StashTop, Get-StashRefFor, Invoke-StashPop, Restore-StashEntry
 - Invoke-RustStage, Install-ManagedRust, Install-Mingw, Assert-CToolchain
+- Get-ShortPathName, Get-SubstMap, Get-FreeDriveLetters, Get-ExistingSubstDrive,
+  New-SubstDrive, Remove-SubstDrive, Resolve-SpaceFreePath,
+  Assert-SpaceFreeToolchainPath, Set-MingwEnvironment
 - Invoke-CargoRun, Assert-AppEnvironment, Invoke-RunStage
 - Get-BuiltBinaryFromJson, Resolve-BuiltBinary, Test-RootBinaryNeedsCopy,
   Install-RootBinary, Clear-RootBinaryLeftovers, Publish-RootBinary,
@@ -123,6 +129,12 @@ $script:LastRunCode = 0
 # Publish-RootBinary's output stream belongs to cargo, so a returned path would
 # arrive glued to the build log. Empty means "phase 2 goes through cargo run".
 $script:RootExe     = ''
+# Drive letter created by this run with `subst` so gcc can be reached through a
+# path without a space (see "A space-free path to the C toolchain"), or '' when
+# none was created. Released by Invoke-Main; a mapping that already existed is
+# reused and never recorded here, because removing somebody else's is not ours
+# to do.
+$script:SubstDrive  = ''
 
 # --- Output helpers ----------------------------------------------------------
 
@@ -1335,6 +1347,246 @@ function Install-ManagedRust {
     Ok "Rust установлен: $(Get-RustcVersion $script:Cargo)"
 }
 
+# --- A space-free path to the C toolchain ------------------------------------
+#
+# GCC computes the location of its own internals — `default-manifest.o`, its
+# library search directories — from where `gcc.exe` itself lives, and hands them
+# to `ld.exe` through spec strings that are concatenated WITHOUT quoting. A space
+# anywhere in that path therefore reaches ld split in two, and every link fails:
+#     ld.exe: cannot find C:/Program: No such file or directory
+# The paths rustc passes are quoted and survive intact; only the toolchain's own
+# location matters. So the project may sit under `C:\Program Files\ManhwaStudio`
+# — where the Windows installer puts it — as long as gcc is *reached* through a
+# path with no space in it. That is what the helpers below arrange, in order of
+# preference: the path as it is, its DOS 8.3 short form, a `subst` drive.
+
+<#
+.SYNOPSIS
+Returns the DOS 8.3 short form of an existing directory, or $null.
+
+`$Path` must name a directory that exists. Returns $null when it does not, when
+8.3 name generation is disabled on the volume, or when the COM object is
+unavailable (any non-Windows host) — never throws, because every caller treats
+"no short form" as one more strategy that did not work.
+#>
+function Get-ShortPathName {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $fso   = New-Object -ComObject Scripting.FileSystemObject
+        $short = $fso.GetFolder($Path).ShortPath
+    } catch {
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($short)) { return $null }
+    return $short
+}
+
+<#
+.SYNOPSIS
+Parses the output of `subst` into a hashtable of drive letter -> target path.
+
+Pure on purpose — the caller supplies the lines — so the parser is testable off
+Windows. `subst` prints one mapping per line as `Z:\: => C:\some\dir`; anything
+that does not match that shape is ignored rather than becoming data. Letters are
+keyed upper-case without the colon.
+#>
+function Get-SubstMap {
+    param([string[]] $Lines)
+    $map = @{}
+    foreach ($line in @($Lines)) {
+        if ($line -match '^\s*([A-Za-z]):\\?:\s*=>\s*(.+?)\s*$') {
+            $map[$matches[1].ToUpperInvariant()] = $matches[2]
+        }
+    }
+    return $map
+}
+
+<#
+.SYNOPSIS
+Returns every drive letter from Z down to E that is currently unused, as `X:`.
+
+A-D are skipped: they are conventionally floppy/removable/system and a `subst`
+there confuses more than it helps. Returns a plain array — wrap the call in
+`@(...)`, per the module's array-return convention.
+#>
+function Get-FreeDriveLetters {
+    $free = @()
+    foreach ($code in 90..69) {          # Z .. E
+        $letter = [char] $code
+        if (-not (Test-Path -LiteralPath "${letter}:\")) { $free += "${letter}:" }
+    }
+    return $free
+}
+
+<#
+.SYNOPSIS
+Returns the existing `subst` drive already mapped to `$Path` (as `X:`), or $null.
+
+Reusing a mapping matters because a run killed mid-flight leaves its drive
+behind: without this the letters would accumulate one per crashed run. A mapping
+found this way was not created by us, so it is left in place on exit.
+#>
+function Get-ExistingSubstDrive {
+    param([string] $Path)
+    try {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $out  = @(& subst 2>$null)
+        $ErrorActionPreference = $prev
+    } catch {
+        return $null
+    }
+    $map = Get-SubstMap -Lines $out
+    foreach ($letter in $map.Keys) {
+        if ($map[$letter].TrimEnd('\') -eq $Path.TrimEnd('\')) { return "${letter}:" }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+Maps `$Path` to a free drive letter with `subst` and returns it as `X:`, or $null.
+
+Needs no privileges, copies nothing, and lasts until the mapping is removed or
+the machine reboots. Letters are tried in turn because a free one can be taken
+between the check and the call.
+#>
+function New-SubstDrive {
+    param([string] $Path)
+    foreach ($drive in @(Get-FreeDriveLetters)) {
+        try {
+            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            & subst $drive $Path 2>$null | Out-Null
+            $rc = $LASTEXITCODE
+            $ErrorActionPreference = $prev
+        } catch {
+            return $null   # subst.exe itself is missing; trying more letters is pointless
+        }
+        if ($rc -eq 0 -and (Test-Path -LiteralPath "$drive\")) { return $drive }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+Removes a `subst` mapping created by this run. Failures are deliberately ignored:
+the mapping is a convenience and disappears on reboot regardless.
+#>
+function Remove-SubstDrive {
+    param([string] $Drive)
+    if ([string]::IsNullOrWhiteSpace($Drive)) { return }
+    try { & subst $Drive /D 2>$null | Out-Null } catch { }
+}
+
+<#
+.SYNOPSIS
+Returns a path that reaches `$Dir` without a space in it, or $null when none can
+be arranged.
+
+Strategies in order: the path as given, its 8.3 short form, an existing `subst`
+drive, a new one. A drive created here is recorded in `$script:SubstDrive` so
+`Invoke-Main` can release it; one that already existed is reused and left alone.
+#>
+function Resolve-SpaceFreePath {
+    param([string] $Dir)
+    if ($Dir -notmatch ' ') { return $Dir }
+
+    $short = Get-ShortPathName -Path $Dir
+    if ($short -and $short -notmatch ' ') { return $short }
+
+    $existing = Get-ExistingSubstDrive -Path $Dir
+    if ($existing) { return "$existing\" }
+
+    $created = New-SubstDrive -Path $Dir
+    if ($created) {
+        $script:SubstDrive = $created
+        return "$created\"
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+Returns the lines explaining that no space-free path to the toolchain exists and
+what the user can do about it. One text, two call sites (the early check and the
+apply step), so the two can never drift apart.
+#>
+function Get-SpaceFreePathHelp {
+    return @(
+        'Проект лежит по пути с пробелом, и обойти это не удалось.',
+        "Каталог проекта: $script:RepoRoot",
+        '',
+        'Компилятор MinGW-w64 подставляет пути к своим внутренним файлам',
+        'в командную строку компоновщика без кавычек. Пробел разрывает такой',
+        'путь надвое, и сборка падает на первом же связывании:',
+        '    ld.exe: cannot find C:/Program: No such file or directory',
+        '',
+        'Обычно это обходится короткими именами 8.3 или подстановкой диска,',
+        'но на этой машине недоступно ни то, ни другое.',
+        '',
+        'Что можно сделать:',
+        '  1) включить короткие имена и перезагрузиться (нужны права',
+        '     администратора):  fsutil 8dot3name set 0',
+        '  2) либо перенести проект в путь без пробелов, например',
+        '     C:\ManhwaStudio. Перед переносом удалите папки target и',
+        '     installer_files\mingw64 — в них записаны абсолютные пути.')
+}
+
+<#
+.SYNOPSIS
+Fails with exit code 5 when the toolchain could not be reached without a space,
+BEFORE the 261 MB download rather than after it plus a build that cannot link.
+
+The MinGW directory does not exist yet at this point, so the question is asked of
+the repository root, which does: 8.3 applies per path component, so a space-free
+root can only produce a space-free child. Returns normally when a space is not a
+problem at all.
+#>
+function Assert-SpaceFreeToolchainPath {
+    $dir = Get-MingwDir
+    if ($dir -notmatch ' ') { return }
+
+    $short = Get-ShortPathName -Path $script:RepoRoot
+    if ($short -and $short -notmatch ' ') { return }
+    if (Get-ExistingSubstDrive -Path $dir) { return }
+    if (@(Get-FreeDriveLetters).Count -gt 0) { return }
+
+    Die $ExitNoCc @(Get-SpaceFreePathHelp)
+}
+
+<#
+.SYNOPSIS
+Points the build at the MinGW toolchain in `$Dir` through a space-free path.
+
+Prepends its `bin\` to the process PATH and pins the linker, C compiler and
+archiver by absolute path. Pinning is the load-bearing half: rustc invokes the
+linker by bare name, leaving gcc to recover its own location from however the
+PATH lookup resolved — an absolute path removes that dependency. The compiler
+variables are read by the `cc` crate, which is what builds `aws-lc-sys`. All of
+it is process-local; nothing is written to the user's environment.
+
+Terminates with exit code 5 when no space-free path can be arranged.
+#>
+function Set-MingwEnvironment {
+    param([string] $Dir)
+
+    $base = Resolve-SpaceFreePath -Dir $Dir
+    if (-not $base) { Die $ExitNoCc @(Get-SpaceFreePathHelp) }
+
+    $bin = Join-Path $base 'bin'
+    # Split rather than -like: a path is a literal here, and -like would read
+    # any [ ] in it as a wildcard set.
+    if (@($env:PATH -split ';') -notcontains $bin) { $env:PATH = "$bin;$($env:PATH)" }
+
+    $gcc = Join-Path $bin 'x86_64-w64-mingw32-gcc.exe'
+    $ar  = Join-Path $bin 'x86_64-w64-mingw32-ar.exe'
+    if (Test-Path -LiteralPath $gcc) {
+        $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $gcc
+        $env:CC_x86_64_pc_windows_gnu                  = $gcc
+    }
+    if (Test-Path -LiteralPath $ar) { $env:AR_x86_64_pc_windows_gnu = $ar }
+}
+
 <#
 .SYNOPSIS
 Provisions portable MinGW-w64 (WinLibs) into installer_files\mingw64 and prepends
@@ -1348,6 +1600,11 @@ function Install-Mingw {
             'Не найден компилятор C, а режим -Offline запрещает скачивание.',
             'Установите MinGW-w64 вручную: https://winlibs.com/')
     }
+
+    # Before the 261 MB download, not after it: a toolchain that cannot be reached
+    # without a space in its path links nothing, and the user would find that out
+    # only at the end of the first build.
+    Assert-SpaceFreeToolchainPath
 
     Step 'Компилятор C не найден — скачиваю портативный MinGW-w64'
     Info 'Он нужен зависимости aws-lc-sys (шифрование в сетевых запросах),'
@@ -1409,7 +1666,7 @@ function Install-Mingw {
     Move-Item -Path $root -Destination $dest
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
-    $env:PATH = "$dest\bin;$($env:PATH)"
+    Set-MingwEnvironment -Dir $dest
     Ok 'MinGW-w64 установлен.'
 }
 
@@ -1420,9 +1677,9 @@ compiles C and assembly on every native target, so this turns a wall of linker
 errors 200 crates into the build into one clear message before it.
 #>
 function Assert-CToolchain {
-    $mingwBin = Join-Path (Get-MingwDir) 'bin'
-    if (Test-Path (Join-Path $mingwBin 'gcc.exe')) {
-        if ($env:PATH -notlike "*$mingwBin*") { $env:PATH = "$mingwBin;$($env:PATH)" }
+    $mingwDir = Get-MingwDir
+    if (Test-Path (Join-Path $mingwDir 'bin\gcc.exe')) {
+        Set-MingwEnvironment -Dir $mingwDir
         return
     }
     if (Get-Command gcc -ErrorAction SilentlyContinue) { return }
@@ -1994,8 +2251,17 @@ function Invoke-Main {
         # what this check exists to prevent.
         Assert-NoSelfUpdate
     }
-    Invoke-RustStage
-    Invoke-RunStage
+    try {
+        Invoke-RustStage
+        Invoke-RunStage
+    } finally {
+        # `exit` inside the stages is a terminating condition, so this still runs:
+        # a subst drive left mapped would hold its letter until the next reboot.
+        if ($script:SubstDrive) {
+            Remove-SubstDrive -Drive $script:SubstDrive
+            $script:SubstDrive = ''
+        }
+    }
 }
 
 # `test_run_dev.ps1` dot-sources this file to exercise the git stage in isolation
