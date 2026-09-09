@@ -46,7 +46,12 @@ Main responsibilities:
   `MS_DISABLE_BUILD_CODESIGN=1` for checks to avoid it. Do NOT change the signing
   behaviour here to work around this: the release workflow is the owner's call.
 - On Windows, embeds `app_icon.ico` into the PE resources so the produced `.exe`
-  has the correct file icon in Explorer and shell surfaces.
+  has the correct file icon in Explorer and shell surfaces. When the manifest path
+  contains a space — the normal case for a source checkout of an installed copy in
+  `C:\Program Files\ManhwaStudio` — `CARGO_MANIFEST_DIR` is swapped for its 8.3 short
+  form across that one call: `winresource` hands it to `windres` as `-I<dir>` and
+  windres forwards it to the preprocessor unquoted, which otherwise fails the build
+  with `cc1.exe: fatal error: Files\ManhwaStudio`.
 - On Windows, starts a detached post-build `osslsigncode` worker that waits for
   known bin `.exe` files and signs them with a PKCS#12 certificate, unless
   `MS_DISABLE_BUILD_CODESIGN=1` disables the background signer.
@@ -107,13 +112,101 @@ fn main() {
     if target_os == "windows" {
         let mut resource = winresource::WindowsResource::new();
         resource.set_icon("app_icon.ico");
-        if let Err(err) = resource.compile() {
+        let restore = shorten_manifest_dir_for_windres();
+        let compiled = resource.compile();
+        restore_manifest_dir(restore.as_deref());
+        if let Err(err) = compiled {
             panic!("failed to embed Windows executable icon: {err}");
         }
         if env::var_os(DISABLE_BUILD_CODESIGN_ENV).as_deref() != Some("1".as_ref()) {
             spawn_windows_signer();
         }
     }
+}
+
+/// Replaces `CARGO_MANIFEST_DIR` with its DOS 8.3 short form for the duration of the
+/// `winresource` call, returning the original value when it was changed.
+///
+/// `winresource` passes the manifest directory to `windres` as `-I<dir>`, and windres
+/// forwards that to the C preprocessor as part of an UNQUOTED command string — so a
+/// space in the path arrives split and the build fails at the very end with
+/// `cc1.exe: fatal error: Files\ManhwaStudio: No such file or directory`. This is the
+/// default situation for a source checkout of an installed copy, which lives in
+/// `C:\Program Files\ManhwaStudio`. Measured there: the same build script exits 101
+/// with the long path and 0 with the short one. Cargo itself cannot be steered around
+/// it — it canonicalises the manifest path, so invoking it from the short directory
+/// changes nothing.
+///
+/// Returns `None` (and changes nothing) when the host is not Windows, when the path
+/// holds no space, or when no short form exists — a caller must treat that as "the
+/// variable was left alone", not as failure.
+#[must_use]
+fn shorten_manifest_dir_for_windres() -> Option<String> {
+    let current = env::var("CARGO_MANIFEST_DIR").ok()?;
+    if !current.contains(' ') {
+        return None;
+    }
+    let short = short_path(&current)?;
+    if short.contains(' ') {
+        return None;
+    }
+    // SAFETY: build scripts are single-threaded at this point — the only thread this
+    // script ever spawns is the detached signer, started after the resource step below.
+    unsafe { env::set_var("CARGO_MANIFEST_DIR", &short) };
+    Some(current)
+}
+
+/// Puts back the `CARGO_MANIFEST_DIR` that `shorten_manifest_dir_for_windres` replaced.
+///
+/// A `None` means it was never changed, so nothing is done. Restoring matters because
+/// the codesign step below resolves `.secret/build_config.json` through the same
+/// variable, and a build script's environment should not outlive the one call that
+/// needed it changed.
+fn restore_manifest_dir(original: Option<&str>) {
+    if let Some(value) = original {
+        // SAFETY: as above — still single-threaded here.
+        unsafe { env::set_var("CARGO_MANIFEST_DIR", value) };
+    }
+}
+
+/// Returns the DOS 8.3 short form of an existing Windows path, or `None`.
+///
+/// Asks `cmd` for the `%~s` expansion rather than calling `GetShortPathNameW`: this
+/// script is compiled for the HOST, and the project is routinely cross-built for
+/// Windows from Linux, where a Windows-only crate would have to be gated in
+/// `Cargo.toml` for this single call. Returns `None` on any failure, including 8.3 name
+/// generation being disabled on the volume — every caller treats that as "no short form
+/// available".
+#[cfg(windows)]
+fn short_path(path: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // `raw_arg`, not `arg`: building a command line the normal way escapes an inner `"`
+    // as `\"`, and cmd.exe does not understand that escaping — measured on Windows 11,
+    // it echoes back `C:\"C:\Program Files\ManhwaStudio\"` instead of the short form.
+    // The quotes around the path are required in turn, or `for` would split the set on
+    // the space. The command deliberately does not start with a quote, so cmd takes the
+    // whole remainder as the command to run instead of stripping the outer pair.
+    let output = Command::new("cmd")
+        .arg("/C")
+        .raw_arg(format!("for %I in (\"{path}\") do @echo %~sI"))
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let short = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if short.is_empty() || !Path::new(&short).exists() {
+        return None;
+    }
+    Some(short)
+}
+
+/// Non-Windows hosts have no 8.3 names, and no `windres` path problem to solve.
+#[cfg(not(windows))]
+fn short_path(_path: &str) -> Option<String> {
+    None
 }
 
 fn manifest_dir() -> PathBuf {

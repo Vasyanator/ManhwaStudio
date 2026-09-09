@@ -26,12 +26,12 @@ What is covered:
 - root binary: copy predicate and copy  -> skipped when identical, .part never left
 - root binary: leftovers                -> .part and every .old-* aside swept
 - root binary: launch                   -> arguments survive spaces, real exit code
-- subst output parsing                  -> only well-formed mappings become data
-- space-free toolchain path             -> a path without a space is left alone;
-                                           PATH, linker, CC and AR are pinned to
-                                           it and never duplicated; on Windows a
-                                           path WITH a space resolves to one
-                                           without, and a created drive is freed
+- gcc version directory                 -> discovered, ambiguity yields nothing
+- a space in the toolchain path         -> without one, only PATH is touched and
+                                           never duplicated; on Windows a path
+                                           WITH one yields GCC_EXEC_PREFIX and
+                                           LIBRARY_PATH in 8.3 form, pointing at
+                                           directories that exist
 
 Run:  pwsh -NoProfile -File tools/run-dev/test_run_dev.ps1
 
@@ -673,98 +673,85 @@ try {
     Remove-Item Env:MS_FAKE_RC   -ErrorAction SilentlyContinue
 
     # ---------------------------------------------------------------------
-    # Путь к тулчейну без пробела
+    # Пробел в пути к C-тулчейну
     # ---------------------------------------------------------------------
-    Note 'Путь к C-тулчейну без пробела'
-
-    # Разбор вывода `subst` — чистая функция, поэтому проверяется на любой ОС.
-    $map = Get-SubstMap -Lines @(
-        'Z:\: => C:\Program Files\ManhwaStudio\installer_files\mingw64',
-        'мусор, который не является отображением',
-        '',
-        'Y:\: => D:\tools')
-    Check 'subst: буква Z разобрана' $map['Z'] 'C:\Program Files\ManhwaStudio\installer_files\mingw64'
-    Check 'subst: буква Y разобрана' $map['Y'] 'D:\tools'
-    Check 'subst: мусорные строки отброшены' $map.Count 2
-    Check 'subst: пустой ввод -> пустая карта' (Get-SubstMap -Lines @()).Count 0
-
-    # Конвенция возврата массива: обёртка @() должна давать нормальный счётчик.
-    $letters = @(Get-FreeDriveLetters)
-    Check 'свободные буквы: возвращён массив' ($letters -is [array]) $true
-    if ($letters.Count -gt 0) {
-        Check 'свободные буквы: формат «X:»' ($letters[0] -match '^[A-Z]:$') $true
-    }
+    Note 'Пробел в пути к C-тулчейну'
 
     Check 'короткое имя: несуществующий путь -> $null' `
           (Get-ShortPathName -Path (Join-Path $Sandbox 'nope')) $null
     Check 'короткое имя: пустая строка -> $null' (Get-ShortPathName -Path '') $null
 
-    # Дальше проверяется поведение на пути БЕЗ пробела, поэтому песочница обязана
-    # быть без пробела: временный каталог машины может лежать в C:\Users\Имя
-    # Фамилия\..., и тогда эти проверки говорили бы не о том, что заявлено.
+    # Версия GCC определяется по дереву тулчейна, а не константой: winlibs
+    # обновляется, и зашитый номер молча указывал бы в никуда.
+    $mg = Join-Path $Sandbox 'mg'
+    $verParent = Join-Path $mg 'lib\gcc\x86_64-w64-mingw32'
+    Check 'версия GCC: дерева нет -> $null' (Get-MingwGccVersionDir -Dir $mg) $null
+    [void](New-Item -ItemType Directory -Path (Join-Path $verParent '16.2.0') -Force)
+    Check 'версия GCC: одна папка -> её имя' (Get-MingwGccVersionDir -Dir $mg) '16.2.0'
+    [void](New-Item -ItemType Directory -Path (Join-Path $verParent '15.1.0') -Force)
+    Check 'версия GCC: неоднозначно -> $null' (Get-MingwGccVersionDir -Dir $mg) $null
+    Remove-Item -LiteralPath (Join-Path $verParent '15.1.0') -Recurse -Force
+
+    # Путь БЕЗ пробела: трогается только PATH, переменные gcc не выставляются.
     $plain = Join-Path $Sandbox 'mingw64'
     if ($plain -match ' ') {
         Write-Host '  SKIP временный каталог машины содержит пробел' -ForegroundColor Yellow
     } else {
-
-        # Путь без пробела не трогается ни одной из стратегий.
-        Check 'путь без пробела возвращается как есть' (Resolve-SpaceFreePath -Dir $plain) $plain
-
-        # Применение окружения: PATH и переменные компоновщика.
         $mgBin = Join-Path $plain 'bin'
         [void](New-Item -ItemType Directory -Path $mgBin -Force)
-        $fakeGcc = Join-Path $mgBin 'x86_64-w64-mingw32-gcc.exe'
-        $fakeAr  = Join-Path $mgBin 'x86_64-w64-mingw32-ar.exe'
-        Set-Content -LiteralPath $fakeGcc -Encoding Ascii -Value 'stub'
-        Set-Content -LiteralPath $fakeAr  -Encoding Ascii -Value 'stub'
 
         $pathBefore = $env:PATH
-        $script:SubstDrive = ''
+        Remove-Item Env:GCC_EXEC_PREFIX, Env:LIBRARY_PATH -ErrorAction SilentlyContinue
         Set-MingwEnvironment -Dir $plain
         Check 'PATH начинается с bin тулчейна' (@($env:PATH -split ';')[0]) $mgBin
-        Check 'компоновщик закреплён абсолютным путём' `
-              $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER $fakeGcc
-        Check 'CC для gnu-таргета закреплён' $env:CC_x86_64_pc_windows_gnu $fakeGcc
-        Check 'AR для gnu-таргета закреплён'  $env:AR_x86_64_pc_windows_gnu $fakeAr
-        Check 'без пробела в пути subst не создавался' $script:SubstDrive ''
+        Check 'без пробела GCC_EXEC_PREFIX не нужен' $env:GCC_EXEC_PREFIX $null
+        Check 'без пробела LIBRARY_PATH не нужен'    $env:LIBRARY_PATH    $null
 
-        # Повторный вызов не должен наращивать PATH: скрипт вызывает его и из
-        # Assert-CToolchain, и из Install-Mingw.
+        # Повторный вызов: скрипт зовёт функцию и из Assert-CToolchain, и из
+        # Install-Mingw.
         $lenOnce = $env:PATH.Length
         Set-MingwEnvironment -Dir $plain
         Check 'повторный вызов не дублирует запись в PATH' $env:PATH.Length $lenOnce
         $env:PATH = $pathBefore
-        Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER -ErrorAction SilentlyContinue
-        Remove-Item Env:CC_x86_64_pc_windows_gnu -ErrorAction SilentlyContinue
-        Remove-Item Env:AR_x86_64_pc_windows_gnu -ErrorAction SilentlyContinue
     }
 
     # Ранняя проверка: корень без пробела -> вопрос не стоит, Die не вызывается.
     $rootBefore = $script:RepoRoot
     $script:RepoRoot = $Sandbox
     $script:LastDieCode = 0
-    try { Assert-SpaceFreeToolchainPath } catch { }
+    try { Assert-ToolchainPathUsable } catch { }
     Check 'корень без пробела: ранняя проверка молчит' $script:LastDieCode 0
 
-    # На Windows путь С пробелом должен разрешаться в путь БЕЗ пробела: либо
-    # короткое имя 8.3, либо подстановка диска. Здесь же проверяется, что
-    # созданная нами буква снимается.
+    # Путь С пробелом: на Windows должны появиться пути поиска в форме 8.3.
+    # Именно они, а не способ вызова gcc, лечат разрыв spec-путей — проверено на
+    # winlibs GCC 16.2.0: короткий путь запуска, subst и junction не помогают.
     if ($env:OS -eq 'Windows_NT') {
-        $spaced = Join-Path $Sandbox 'dir with space\mingw64'
-        [void](New-Item -ItemType Directory -Path $spaced -Force)
-        $script:SubstDrive = ''
-        $resolved = Resolve-SpaceFreePath -Dir $spaced
-        Check 'путь с пробелом разрешён' ($null -ne $resolved) $true
-        if ($resolved) {
-            Check 'в разрешённом пути нет пробела' ($resolved -match ' ') $false
-            Check 'разрешённый путь существует' (Test-Path -LiteralPath $resolved) $true
-        }
-        if ($script:SubstDrive) {
-            $drive = $script:SubstDrive
-            Remove-SubstDrive -Drive $drive
-            $script:SubstDrive = ''
-            Check 'созданная буква снимается' (Test-Path -LiteralPath "$drive\") $false
-        }
+        $spacedRoot = Join-Path $Sandbox 'dir with space'
+        $spaced     = Join-Path $spacedRoot 'mingw64'
+        [void](New-Item -ItemType Directory -Path (Join-Path $spaced 'bin') -Force)
+        [void](New-Item -ItemType Directory -Path (Join-Path $spaced 'x86_64-w64-mingw32\lib') -Force)
+        [void](New-Item -ItemType Directory -Path (Join-Path $spaced 'lib\gcc\x86_64-w64-mingw32\16.2.0') -Force)
+
+        $pathBefore = $env:PATH
+        Remove-Item Env:GCC_EXEC_PREFIX, Env:LIBRARY_PATH -ErrorAction SilentlyContinue
+        $script:LastDieCode = 0
+        try { Set-MingwEnvironment -Dir $spaced } catch { }
+        Check 'путь с пробелом не завершает работу' $script:LastDieCode 0
+        Check 'GCC_EXEC_PREFIX выставлен' ($null -ne $env:GCC_EXEC_PREFIX) $true
+        Check 'в GCC_EXEC_PREFIX нет пробела' ($env:GCC_EXEC_PREFIX -match ' ') $false
+        Check 'GCC_EXEC_PREFIX кончается разделителем' ($env:GCC_EXEC_PREFIX -match '\\$') $true
+        Check 'GCC_EXEC_PREFIX указывает на существующий каталог' `
+              (Test-Path -LiteralPath $env:GCC_EXEC_PREFIX) $true
+        Check 'LIBRARY_PATH выставлен' ($null -ne $env:LIBRARY_PATH) $true
+        Check 'в LIBRARY_PATH нет пробела' ($env:LIBRARY_PATH -match ' ') $false
+        $libDirs = @($env:LIBRARY_PATH -split ';')
+        Check 'LIBRARY_PATH: обе ветки поиска' $libDirs.Count 2
+        Check 'LIBRARY_PATH: каталоги существуют' `
+              (@($libDirs | Where-Object { -not (Test-Path -LiteralPath $_) }).Count) 0
+        Check 'версия попала в LIBRARY_PATH' ($env:LIBRARY_PATH -match '16\.2\.0') $true
+
+        $env:PATH = $pathBefore
+        Remove-Item Env:GCC_EXEC_PREFIX, Env:LIBRARY_PATH -ErrorAction SilentlyContinue
     }
     $script:RepoRoot = $rootBefore
 

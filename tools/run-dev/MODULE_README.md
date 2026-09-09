@@ -120,18 +120,27 @@ committed and never shows up as a local change during Stage 1:
   GitHub CDN (exit 52) while `HttpWebRequest` downloads the same URL fine. The .NET path therefore
   implements `Range` resume and progress reporting for real. Look up `curl.exe` with
   `-CommandType Application`: in Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`.
-- **GCC must be reached through a path with no space in it.** It builds the paths of its own
-  internals from where `gcc.exe` lives and hands them to `ld.exe` in unquoted spec strings, so
-  `C:\Program Files\ManhwaStudio\installer_files\mingw64` reaches the linker split in two and
-  every link fails (`ld.exe: cannot find C:/Program`). That path is the *installer's* location, not
-  a mistake, and the paths rustc passes are quoted and fine — so the fix is never "move the
-  project". `Resolve-SpaceFreePath` tries the path as given, its 8.3 short form, then a `subst`
-  drive; `Set-MingwEnvironment` puts the winner on `PATH` and additionally pins the linker, `CC` and
-  `AR` by absolute path, because rustc calls the linker by bare name and gcc would otherwise recover
-  its own location from the PATH lookup. A drive created here is released by `Invoke-Main`; one that
-  already existed is reused and left alone. When nothing works the run stops with exit code 5
-  **before** the download — `Assert-SpaceFreeToolchainPath`, called at the top of `Install-Mingw`.
-  Rationale and the rejected alternatives are in `dev-docs/run_dev_plan.md` §2.5a.
+- **A space in the path to gcc breaks every link, and the fix is not the way gcc is called.** GCC
+  builds the paths of its own internals from where `gcc.exe` lives and hands them to `ld.exe` in
+  unquoted spec strings, so `C:\Program Files\ManhwaStudio\installer_files\mingw64` reaches the
+  linker split in two (`ld.exe: cannot find C:/Program`). That path is the *installer's* location,
+  not a mistake, and the paths rustc passes are quoted and fine — so the fix is never "move the
+  project". Measured on winlibs GCC 16.2.0: calling gcc through its 8.3 short path, a `subst` drive
+  or a junction all fail identically, because gcc resolves its own location back to the canonical
+  long form (`gcc -print-search-dirs`). What works is handing gcc space-free search paths —
+  `Set-MingwEnvironment` sets `GCC_EXEC_PREFIX` and `LIBRARY_PATH` in 8.3 form (each verified to fix
+  the link on its own; `COMPILER_PATH` does not), with the GCC version directory discovered by
+  `Get-MingwGccVersionDir` rather than hard-coded. A volume with 8.3 disabled has no space-free
+  spelling at all: that stops with exit code 5 **before** the download —
+  `Assert-ToolchainPathUsable`, called at the top of `Install-Mingw`. Rationale and the rejected
+  alternatives are in `dev-docs/run_dev_plan.md` §2.5a.
+- **The linker is not the only thing a space breaks, and the other half is NOT fixed here.** Cargo
+  passes the manifest path to every build script as `CARGO_MANIFEST_DIR`, `winresource` hands it to
+  `windres` as `-I<dir>`, and windres forwards it unquoted — the icon step then fails with
+  `cc1.exe: fatal error: Files\ManhwaStudio` at the very end of an otherwise complete build.
+  Starting cargo from the short root does **not** help: cargo canonicalises the manifest path
+  (measured — the switch happened and cargo still reported the long path). That fix lives in the
+  root `build.rs`; do not reintroduce a working-directory workaround here.
 - **The C toolchain is probed before cargo runs.** `aws-lc-sys` (`translators`/`genai` → `reqwest`
   → `rustls` → `aws-lc-rs`) compiles C and assembly on every native target, so it is a real
   prerequisite; probing converts a wall of linker errors 200 crates deep into one clear message.
@@ -265,10 +274,10 @@ committed and never shows up as a local change during Stage 1:
   `run-dev.ps1` and `download` in `run-dev.sh`; the contract itself is `dev-docs/run_dev_plan.md`
   §2.3a. `Resolve-GithubAsset` is what supplies the expected size and the checksum sidecar.
 - To change the Windows host triple or why GNU is used, see `dev-docs/run_dev_plan.md` §2.4 first.
-- To change how the C toolchain is located or handed to cargo, see `Set-MingwEnvironment` and
-  `Resolve-SpaceFreePath` (plus `Get-ShortPathName`, `Get-SubstMap`, `Get-FreeDriveLetters`,
-  `Get-ExistingSubstDrive`, `New-SubstDrive`, `Remove-SubstDrive`). Windows-only: `run-dev.sh` has
-  no counterpart, because Linux and macOS take their compiler from a package manager.
+- To change how the C toolchain is handed to cargo, see `Set-MingwEnvironment` (plus
+  `Get-ShortPathName`, `Get-MingwGccVersionDir`, `Assert-ToolchainPathUsable`). Windows-only:
+  `run-dev.sh` has no counterpart, because Linux and macOS take their compiler from a package
+  manager.
 - To raise the required Rust version, edit `rust-version` in the root `Cargo.toml`. Do not touch
   the scripts.
 - To retarget a fork, set `MS_RUN_DEV_ORIGIN` / `MS_RUN_DEV_BRANCH` rather than editing constants.
@@ -287,12 +296,13 @@ cargo-JSON parser and the "does the root copy need refreshing?" predicate — pl
 a temp directory asserting the atomic rename, the preserved modification time and that no `.part`
 is left behind.
 
-`test_run_dev.ps1` additionally covers the space-free toolchain path: the `subst` output parser, a
-path without a space being left alone, and `Set-MingwEnvironment` pinning `PATH`/linker/`CC`/`AR`
-without duplicating the `PATH` entry. Only the Windows branch of that suite exercises the
-interesting half — an actual path *with* a space resolving to one without, and the created drive
-being released — and it has no `test_run_dev.sh` counterpart because the toolchain provisioning it
-guards is Windows-only.
+`test_run_dev.ps1` additionally covers the spaced-path handling: version-directory discovery, a path
+without a space touching only `PATH` and not duplicating it, and — on the Windows branch — a path
+*with* a space producing `GCC_EXEC_PREFIX`/`LIBRARY_PATH` in 8.3 form that point at directories which
+exist. It has no `test_run_dev.sh` counterpart because the toolchain provisioning it guards is
+Windows-only. What the suite cannot assert is the part that made the design: that those variables
+actually fix the link. That was measured by hand against a real winlibs toolchain unpacked under a
+path with a space, and the result is recorded in `dev-docs/run_dev_plan.md` §2.5a.
 
 Both also cover the launch of the published binary against a stub program: the arguments reach it
 intact (one of them containing a space), its exit code is propagated, and an unlaunchable file
