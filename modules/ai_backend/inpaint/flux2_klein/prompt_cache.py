@@ -46,7 +46,7 @@ from .components import (
     read_safetensors_header,
     text_encoder_available,
 )
-from .params import _to_bool, _to_int
+from .params import _to_bool, _to_int, text_encoder_dtype_name
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +59,8 @@ PROMPT_EMBED_CACHE_ENTRIES = 8
 # The `.msprompt` prompt-cache file
 # ---------------------------------------------------------------------------
 # A prompt embedding is worth persisting for exactly one reason: producing it
-# costs a 16 GB read of the Qwen3 encoder (~106 s measured on this project's
-# reference host), while the embedding itself is ~4 MiB. A user who always edits
+# costs reading the Qwen3 encoder off disk - tens of seconds, and the bulk of
+# what a fresh prompt costs - while the embedding itself is ~4 MiB. A user who always edits
 # with the same prompt should never have to hold that encoder at all.
 #
 # The container is safetensors — already a dependency, readable by third-party
@@ -157,9 +157,12 @@ def text_encoder_fingerprint(path: str) -> str:
     sorted `(file name, size in bytes)` list of its weight files.
 
     What that catches: another model (a different architecture, hidden size,
-    vocabulary or layer count — all of it lives in `config.json`), another
-    precision or another shard layout of the same model, a partially downloaded
-    checkout, and a file swapped for one of a different length.
+    vocabulary or layer count AS DECLARED ON DISK — all of it lives in
+    `config.json`; the truncation this service applies at LOAD time
+    (`ENCODER_KEEP_LAYERS`) is invisible here, and deliberately so, since it
+    provably does not change the hidden states the embedding is built from),
+    another precision or another shard layout of the same model, a partially
+    downloaded checkout, and a file swapped for one of a different length.
 
     What it does NOT catch: a fine-tune saved with the identical config and
     byte-for-byte identical file SIZES, and corruption inside a weight file that
@@ -220,13 +223,17 @@ def prompt_file_metadata(
     the file so that IMPORTING one on a machine (or at a moment) where another
     encoder is selected still files it under its own family instead of losing it
     among another encoder's entries.
+
+    `dtype` is the ENCODER's (`text_encoder_dtype_name`), not the request's: the
+    field describes the embedding stored in this file, and the request's `dtype`
+    governs the transformer and the VAE, neither of which touched it.
     """
     return {
         "format": PROMPT_CACHE_FORMAT,
         "format_version": str(PROMPT_CACHE_VERSION),
         "prompt": str(text),
         "max_sequence_length": str(int(normalized["max_sequence_length"])),
-        "dtype": str(normalized["dtype"]),
+        "dtype": text_encoder_dtype_name(),
         "text_encoder_fp8": "true" if normalized["text_encoder_fp8"] else "false",
         "text_encoder_id": str(encoder_id),
         "text_encoder_family": str(family),
@@ -293,6 +300,14 @@ def validate_prompt_file_metadata(
     tensor's own dtype is compared against the declared one, so an edited
     `__metadata__` cannot smuggle float16 embeddings into a bfloat16 run.
 
+    **The dtype compared is the ENCODER's** (`text_encoder_dtype_name`), which is
+    now always bfloat16, and NOT the request's `dtype` — that one governs the
+    transformer and the VAE and cannot have changed a value in this tensor. The
+    consequence is deliberate: a `.msprompt` written while the service still ran
+    the encoder at float16 is refused from here on, because its embedding really
+    did come from a different encoder precision. The refusal says so and says to
+    rebuild the entry.
+
     **`encoder_id=None` means there is no encoder on this machine to compare
     against** (`local_encoder_identity`), which is the whole point of carrying a
     `.msprompt` to a machine that never downloaded the 16 GB Qwen3. Only the
@@ -315,12 +330,15 @@ def validate_prompt_file_metadata(
             "несовместимы — постройте кэш заново или верните прежнее значение."
         )
 
-    wanted_dtype = str(normalized["dtype"])
+    wanted_dtype = text_encoder_dtype_name()
     file_dtype = metadata.get("dtype", "")
     if file_dtype != wanted_dtype:
         raise ValueError(
-            f"Файл кэша промпта {path} построен для типа данных «{file_dtype}», "
-            f"а сейчас выбран «{wanted_dtype}»."
+            f"Файл кэша промпта {path} построен для типа данных «{file_dtype}», а текстовый "
+            f"энкодер FLUX.2 klein теперь всегда работает в «{wanted_dtype}»: он выполняется "
+            "на CPU, где float16 приходится считать программно, и это в десятки раз медленнее. "
+            "Эмбеддинги другой точности получены другим энкодером, поэтому запись нужно "
+            "построить заново («Кэшировать») и сохранить под тем же именем."
         )
     expected_token = _PROMPT_CACHE_DTYPE_TOKENS.get(wanted_dtype)
     actual_token = str(tensor.get("dtype", ""))

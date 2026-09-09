@@ -32,6 +32,10 @@ from modules.ai_backend.ipc.events import EventBus
 from modules.ai_backend.ipc.framing import read_frame, write_frame
 from modules.ai_backend.ipc.registry import HandlerContext, Interrupted
 from modules.ai_backend.ipc.protocol import PROTOCOL_VERSION
+from modules.ai_backend.runtime.error_text import (
+    configure_error_text,
+    rocm_advice_rewrite_enabled,
+)
 
 BACKEND_VERSION = "9.9.9-test"
 
@@ -462,6 +466,67 @@ def test_handler_raising_yields_response_error(ctx, pool, events) -> None:
         assert "handler blew up" in header["error"]
     finally:
         conn.close()
+
+
+_TORCH_OOM_TEXT = (
+    "HIP out of memory. Tried to allocate 9.00 GiB. If reserved but unallocated "
+    "memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+    "to avoid fragmentation.  See documentation for Memory Management"
+)
+
+
+def _error_for_failing_handler(ctx, pool, events, method: str, text: str) -> str:
+    """Register a handler that raises `text` and return the outbound `error` field."""
+
+    def boom(ctx_, header, blob, cancel_event):
+        raise RuntimeError(text)
+
+    registry.register(method, boom)
+    conn = _Conn(ctx, pool, events)
+    try:
+        _hello(conn)
+        conn.send({"v": 1, "id": 4, "kind": "request", "method": method})
+        header, _ = conn.recv()
+        assert header["status"] == "error"
+        return header["error"]
+    finally:
+        conn.close()
+
+
+def test_handler_error_text_is_sanitized_outbound(ctx, pool, events) -> None:
+    # A handler failing with Torch's own OOM text must not hand the user Torch's
+    # advice to enable `expandable_segments:True`: on this project's ROCm build
+    # that allocator mode corrupts computation and yields black images
+    # (`runtime/error_text.py`). Everything else Torch said must survive, because
+    # it is the diagnostic the user forwards. The untouched text stays in the
+    # process log via the dispatcher's `traceback.print_exc()`.
+    # The rewrite is ROCm-gated, so this test turns it on the way
+    # `rocm_runtime.configure_rocm_runtime()` does on a real ROCm backend.
+    previous = rocm_advice_rewrite_enabled()
+    configure_error_text(rocm_runtime=True)
+    try:
+        error = _error_for_failing_handler(ctx, pool, events, "test.oom", _TORCH_OOM_TEXT)
+    finally:
+        configure_error_text(rocm_runtime=previous)
+    assert "expandable_segments:True" not in error
+    # The rest of the message is untouched: the numbers and the pointer to
+    # the upstream documentation are what makes the error actionable.
+    assert "Tried to allocate 9.00 GiB" in error
+    assert "See documentation for Memory Management" in error
+
+
+def test_handler_error_text_is_untouched_off_rocm(ctx, pool, events) -> None:
+    # The dispatcher sanitizes unconditionally, but the rewrite itself is
+    # ROCm-gated and defaults to OFF, so a process that never called
+    # `configure_rocm_runtime()` — a unit test, a CUDA or CPU install — forwards
+    # Torch's text byte for byte. On NVIDIA that advice is correct and useful.
+    previous = rocm_advice_rewrite_enabled()
+    configure_error_text(rocm_runtime=False)
+    try:
+        error = _error_for_failing_handler(ctx, pool, events, "test.oom_cuda", _TORCH_OOM_TEXT)
+    finally:
+        configure_error_text(rocm_runtime=previous)
+    assert error == _TORCH_OOM_TEXT
 
 
 def test_cancel_for_unknown_id_is_noop(ctx, pool, events) -> None:

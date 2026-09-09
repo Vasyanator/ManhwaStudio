@@ -63,8 +63,8 @@ functions with unit tests, not conditionals inside the drawing code.
   outstanding query is not information. The LIBRARY that produces the caches is folded behind the
   «Библиотека промптов» toggle beside the prompt (session state, never a setting), and folding it
   away changes no gate. «Кэшировать» runs the streaming `.prompt_cache.build` on the SAME progress bar as a
-  generation (so neither can start while the other runs — reading the ~16 GB Qwen3 encoder takes
-  ~106 s, against ~6 s for a cached prompt). The saved caches form a LIBRARY that lives
+  generation (so neither can start while the other runs — reading the Qwen3 encoder off disk
+  costs tens of seconds, which a cached prompt skips entirely). The saved caches form a LIBRARY that lives
   backend-side (`prompt_cache/`, one folder per encoder family): `.prompt_cache.list` fills a
   `WheelComboBox` of named entries, `.save`/`.load` take a NAME (typed in an inline field beside
   the button, following the watermark library and the typing presets rather than a modal of its
@@ -85,10 +85,17 @@ functions with unit tests, not conditionals inside the drawing code.
   `text_encoder_fp8`). The last two are the text-encoder memory controls, and BOTH are `false` in
   EVERY preset. The Qwen3 encoder is ~16 GB and is needed exactly once per generation, but it is
   loaded LAST — after the transformer already sits on the card — so it occupies host memory the
-  pipeline has just vacated, and holding it turns a new prompt from ~116 s into ~6 s; that is why
-  no preset unloads it after encoding. `text_encoder_fp8` stays off because quantizing costs
-  embedding quality and is the user's decision alone. There is no negative prompt and there must
-  not be one: the checkpoint is distilled (4 steps, guidance 1.0). The RAM/VRAM forecast is
+  pipeline has just vacated, and holding it turns a new prompt from a fresh read of the weights
+  into a single encode pass; that is why no preset unloads it after encoding. What reaches memory is
+  LESS than what sits on disk: the encoder is loaded as a `Qwen3Model` truncated to the decoder
+  layers the pipeline actually reads, which on the shipped 4B encoder leaves about a fifth of its
+  tensors unread, so `status.components[*].size_bytes` (disk) and the memory forecast (RAM)
+  deliberately disagree for this one component. `text_encoder_fp8` stays off because quantizing
+  costs embedding quality and is the user's decision alone. Whether a negative prompt exists is
+  decided by the CHECKPOINT, not assumed: the backend reads `is_distilled` from `model_index.json`
+  and reports `guidance_supported` in `.status` (absent means supported). Both shipped klein
+  checkpoints are distilled, so guidance is inert there, the negative prompt is never encoded, and
+  the UI greys the control out (4 steps, guidance 1.0). The RAM/VRAM forecast is
   COMPUTED BY THE BACKEND (`.estimate`, peak = max over PHASES: prompt encoding, denoise, VAE
   decode); this side only formats it and warns when `fits` is false. The `breakdown` peaks are
   looked up by name and each one is optional, so a backend that does not report a phase simply

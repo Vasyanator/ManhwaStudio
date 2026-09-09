@@ -501,10 +501,14 @@ impl Default for Flux2KleinSettings {
             vae_tiling: false,
             vae_slicing: false,
             // Nothing is unloaded by default. The encoder is loaded LAST, after the
-            // transformer already sits on the card, so it lands in host memory the
-            // pipeline has just vacated: measured 17.2 GiB RSS while the card holds
-            // 18.4 GiB. Keeping it turns a NEW prompt from ~116 s into 6.0 s, so paying
-            // 16.4 GiB of otherwise idle host memory for that is the right default.
+            // transformer already sits on the card, so it lands in host memory the pipeline
+            // has just vacated. Keeping it there is what turns a NEW prompt from a full
+            // re-read of the encoder into a single encode pass, and the host memory it
+            // costs is memory nothing else wants at that moment. The backend now loads a
+            // TRUNCATED encoder (28 of 36 decoder layers, no `lm_head`), so both the
+            // residency and the read are about a fifth smaller than they were; the exact
+            // figures that used to stand here were measured on the full model and no
+            // replacement has been measured on real hardware yet.
             unload_transformer_before_vae: false,
             unload_text_encoder_after_encode: false,
             // Never defaulted on: quantizing the encoder is a quality trade the user
@@ -856,7 +860,8 @@ mod tests {
         // The default placement is `full_gpu`, where the transformer stays put...
         assert!(!settings.unload_transformer_before_vae);
         // ...and the encoder is kept too: loaded LAST, it occupies host memory the
-        // pipeline has already vacated, and keeping it turns a new prompt into ~6 s.
+        // pipeline has already vacated, and keeping it spares every new prompt a full
+        // re-read of the encoder.
         assert!(!settings.unload_text_encoder_after_encode);
         // Quantizing the text encoder is never defaulted on.
         assert!(!settings.text_encoder_fp8);
@@ -867,8 +872,8 @@ mod tests {
         let mut settings = Flux2KleinSettings::default();
         MemoryPreset::MaxSpeed.apply(&mut settings);
         assert!(!settings.unload_transformer_before_vae);
-        // No preset releases the encoder: measured, keeping it costs host memory the
-        // pipeline no longer needs and saves ~110 s on every new prompt.
+        // No preset releases the encoder: keeping it costs host memory the pipeline no
+        // longer needs and saves a full encoder re-read on every new prompt.
         assert!(!settings.unload_text_encoder_after_encode);
         for preset in [
             MemoryPreset::Balanced,
@@ -979,6 +984,27 @@ mod tests {
         assert!(norm.to_params(false)["unload_transformer_before_vae"].is_boolean());
         assert!(norm.to_params(false)["unload_text_encoder_after_encode"].is_boolean());
         assert!(norm.to_params(false)["text_encoder_fp8"].is_boolean());
+    }
+
+    #[test]
+    fn normalization_never_rewrites_a_guidance_the_checkpoint_ignores() {
+        // A distilled checkpoint makes `guidance_scale` inert, and the panel closes the
+        // control for it — but the VALUE is the user's and the backend owns the run's
+        // semantics, so nothing here may clamp it to 1.0, drop it from `params` or reset
+        // it. A user who switches to a checkpoint that is not distilled has to find his
+        // setting where he left it; `normalized()` deliberately knows nothing about the
+        // flag and only enforces the range.
+        let settings = Flux2KleinSettings {
+            guidance_scale: 3.5,
+            ..Flux2KleinSettings::default()
+        };
+        let norm = settings.normalized();
+        assert!((norm.guidance_scale - 3.5).abs() < f32::EPSILON);
+        assert_eq!(
+            norm.to_params(false)["guidance_scale"],
+            Value::from(3.5_f32),
+            "the value travels on the wire unchanged; the backend decides what it means"
+        );
     }
 
     #[test]

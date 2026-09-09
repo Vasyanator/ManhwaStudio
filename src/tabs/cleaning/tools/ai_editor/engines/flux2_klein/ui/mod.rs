@@ -179,7 +179,11 @@ impl Flux2PanelCtx<'_> {
         let install_requested = self.draw_readiness(ui, readiness);
         self.draw_install_section(ui, region, readiness, install_requested);
         self.draw_memory_section(ui);
-        draw_advanced_section(ui, self.settings, self.settings_changed);
+        // Read before the `&mut` borrow of the settings, and derived by the same pure
+        // decision the tests assert: only a positive `guidance_supported: false` closes the
+        // dial, so a backend that never reports the field leaves it exactly as it was.
+        let guidance_supported = flux2_guidance_supported(self.status);
+        draw_advanced_section(ui, self.settings, guidance_supported, self.settings_changed);
         draw_flux2_mask_hint(ui);
     }
 
@@ -329,7 +333,7 @@ impl Flux2PanelCtx<'_> {
     /// encoder to make them with.
     ///
     /// It stays OUTSIDE the collapsible library on purpose. Encoding a new prompt costs a
-    /// ~106 s read of the 16 GB Qwen3 encoder against ~6 s for a cached one, and a cached
+    /// read of the Qwen3 encoder, where a cached one costs almost nothing, and a cached
     /// prompt is also what waives the encoder in the run gate — so this is everyday
     /// information, while the library that produces it is expert tooling.
     /// [`flux2_prompt_cache_line`] decides which line that is, and an unknown state draws
@@ -901,8 +905,13 @@ mod tests {
             // actionable only while it names the parts that are missing.
             "cleaning.tools.flux2_klein.model_missing_status",
         ];
-        const PLAIN: [&str; 24] = [
+        const PLAIN: [&str; 26] = [
             "cleaning.tools.flux2_klein.guidance_label",
+            // The two halves of the ONE disabled control in this panel. A language that
+            // lacks either leaves the user with a grey dial and no reason for it, which is
+            // the exact bug report the explanation exists to prevent.
+            "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip",
+            "cleaning.tools.flux2_klein.guidance_unsupported_note",
             "cleaning.tools.flux2_klein.strength_hint",
             "cleaning.tools.flux2_klein.fixed_seed_hint",
             "cleaning.tools.flux2_klein.preset_hint",

@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `1` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `2` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `src/backend_ipc/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -344,7 +344,7 @@ streams `phase:"download"`.
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
 | `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `params: object` (see below)                            | region PNG ++ mask PNG | `image_len: int`, `oom_recovered: bool`, `applied: object`                 | result PNG | **yes** | yes    |
-| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool` | none | no | no |
+| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
 | `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
 | `inpaint.flux2_klein.component_action` | `params: object`, `component: string`, `action: string`                             | none                   | `component`, `action`, `performed: bool`, `components: object`, `components_busy: false`, `device: string` | none | **yes** | yes |
@@ -485,7 +485,9 @@ out-of-range numbers are clamped, an unknown enum or a missing/absent
 transformer or VAE path is a request error — `text_encoder_path` is optional,
 see "generating without a text encoder" below):
 `text_encoder_path`, `transformer_path`, `vae_path`, `prompt`,
-`steps` (1..50, default 4), `guidance_scale` (1.0..10.0, default 1.0),
+`steps` (1..50, default 4), `guidance_scale` (1.0..10.0, default 1.0 — see
+"guidance and distilled checkpoints" below; on a distilled checkpoint it is
+accepted and then ignored),
 `strength` (0.25..1.0, default 1.0), `seed: int|null`,
 `placement` (`full_gpu` | `encoder_cpu` | `model_cpu_offload` |
 `sequential_cpu_offload`), `dtype` (`bfloat16` | `float16`),
@@ -522,9 +524,20 @@ Response detail — `applied` is the set of memory settings ACTUALLY in force wh
 the run finished, `{unload_transformer_before_vae: bool, vae_tiling: bool,
 vae_slicing: bool}`. The backend splits denoising from the VAE decode, so an
 out-of-memory failure in the decode is recovered from without repeating the
-denoise: it parks the transformer, then enables tiling/slicing, and only then
-gives up. When a retry was needed `oom_recovered` is `true` and `applied` names
-the settings the client should persist so the next run takes the cheap path
+denoise — every retry starts from the same host copy of the latents. Three rungs,
+in order: it parks the transformer on the host; it enables VAE tiling, but only
+when tiling would ACTUALLY engage for this region (diffusers takes the tiled
+branch only above the VAE's own threshold — 1024 output px on the shipped klein
+VAE — so below it the flag changes nothing and `applied.vae_tiling` must not
+claim a saving that never happened); and finally it shrinks the VAE's tile itself
+for ONE decode, lowering the latent and the sample threshold together, so that
+tiling engages on a region the shipped threshold ignores. That last rung is an
+emergency, not a setting: both thresholds are restored before the answer is sent
+and neither appears in `applied`, and its output is not bit-identical to an
+untiled decode because the tiles are blended. `vae_slicing` is NOT a rung at all:
+`decode` slices only a batch larger than one and this service always decodes a
+batch of one. When a retry was needed `oom_recovered` is `true` and `applied`
+names the settings the client should persist so the next run takes the cheap path
 immediately.
 
 **FLUX.2 klein per-component residency.** The three WEIGHT-BEARING entries of
@@ -559,7 +572,7 @@ of `status` is answered regardless; nothing else in it takes the lock.
 
 `inpaint.flux2_klein.component_action` performs ONE of those actions. It is
 STREAMING (`phase:"load"`, the same 0..9 scale) because reading the encoder takes
-~100 s and the transformer 18 GB, and it claims the same single progress bar a
+tens of seconds and the transformer 18 GB, and it claims the same single progress bar a
 generation does — so an action and a generation can never run at once. `params`
 is the same normalized object every other FLUX.2 call takes. Refusals are
 `status:"error"` with an actionable message, never a silent no-op: the action is
@@ -584,7 +597,7 @@ to the card goes through the SAME guard, with the same reserves and the same
   accounts for the steps `strength` drops).
 
 **FLUX.2 klein prompt cache.** Encoding a prompt costs a ~16 GB read of the Qwen3
-encoder (~106 s on this project's reference host) and yields ~4 MiB of
+encoder (tens of seconds) and yields ~4 MiB of
 embeddings, so embeddings are cached in memory and can be kept on disk. The
 in-memory cache, `prompt_cache.build`, `prompt_cache.load` and `status`'s
 `prompt_cached` all use ONE key: prompt text + encoder path +
@@ -672,6 +685,23 @@ generates.
 - `.estimate` is lower on such a machine: the encode phase cannot run there, so
   it contributes nothing to `peak_encode` or to the totals. The same single
   forecast still gates the load.
+
+**FLUX.2 klein: guidance and distilled checkpoints.** `.status` answers
+`guidance_supported: bool` — whether `guidance_scale` can do anything at all on
+the configured checkpoint. It is `false` exactly when the checkpoint's own
+`model_index.json` declares `"is_distilled": true`, which the shipped klein
+builds do: guidance was distilled into such a model, so diffusers computes
+`do_classifier_free_guidance = guidance_scale > 1 and not is_distilled` as
+`false` and a raised slider buys nothing while costing twice the compute per
+denoise step. The backend therefore pins the scale to `1.0` and encodes no
+negative prompt on such a checkpoint, however the request was filled in; the
+request is NOT refused, and `guidance_scale` stays a valid param. A checkpoint
+that declares nothing — a hand-assembled folder of components, which carries no
+`model_index.json` — reports `guidance_supported: true` and behaves exactly as
+before: the slider is live and classifier-free guidance really runs. The field is
+a plain boolean, never a third "unknown" value: it says what the run will do, and
+the run treats an undeclared checkpoint as guided. Clients should use it to
+disable the control, not to decide whether to send the param.
 
 All inpaint engines require Torch.
 

@@ -13,13 +13,17 @@ Main responsibilities:
 - `validate_region_size` - the region contract (multiple, minimum side, pixel
   budget, aspect ratio); nothing is silently resized;
 - `_model_key` / `_lenient_paths` - the resident-model key and the tolerant path
-  view `status` uses before a run has ever happened.
+  view `status` uses before a run has ever happened;
+- `text_encoder_dtype_name` - the ONE place that answers what dtype the
+  host-resident text encoder runs in; it is deliberately NOT the request's
+  `dtype`, which governs the transformer and the VAE alone.
 
 Key functions:
 - normalize_flux2_klein_params()
 - _whole_region_overrides()
 - validate_region_size()
 - _model_key(), effective_steps(), _lenient_paths()
+- text_encoder_dtype_name()
 
 Notes:
 Pure Python: no torch, no filesystem access beyond `Path.exists` in
@@ -46,8 +50,14 @@ log = logging.getLogger(__name__)
 #: already on the card by the time it is read (`_encode_prompts_locked`).
 VALID_PLACEMENTS = ("full_gpu", "encoder_cpu", "model_cpu_offload", "sequential_cpu_offload")
 
-#: Compute dtypes offered to the user. Both are 2 bytes per parameter.
+#: Compute dtypes offered to the user. Both are 2 bytes per parameter. Since the
+#: encoder dtype was fixed (`text_encoder_dtype_name`) this governs the
+#: TRANSFORMER AND THE VAE only.
 VALID_DTYPES = ("bfloat16", "float16")
+
+#: The dtype the text encoder always runs in, whatever `dtype` the request asks
+#: for. See `text_encoder_dtype_name` for why it is not a choice.
+TEXT_ENCODER_DTYPE = "bfloat16"
 
 #: Placements that are meaningless without an accelerator.
 _GPU_ONLY_PLACEMENTS = ("encoder_cpu", "model_cpu_offload", "sequential_cpu_offload")
@@ -67,6 +77,45 @@ MAX_REGION_PIXELS = 1024 * 1024
 
 #: Extreme aspect ratios collapse one latent axis to a handful of tokens.
 MAX_REGION_ASPECT_RATIO = 8.0
+
+
+# =====================================================================
+#  The text encoder's dtype
+# =====================================================================
+def text_encoder_dtype_name() -> str:
+    """THE single answer to "what dtype does the host-resident text encoder use".
+
+    Always `bfloat16`, whatever `normalized["dtype"]` says, because the encoder
+    always runs on the HOST (`_ensure_text_encoder_locked` pins
+    `torch.device("cpu")`) and x86 has no native float16 arithmetic: a fp16
+    forward is emulated element by element, while bfloat16 lowers onto the same
+    fp32 paths as everything else. A sibling project measured 59 s against 2.4 s
+    per encode on a Zen host for exactly this pair. bfloat16 is also the dtype
+    the shipped klein checkpoints declare for their encoder, so this is the
+    cheapest AND the most faithful choice at once.
+
+    **The scope of that argument is x86**, which is what this project targets
+    (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`), and it is a statement
+    about the HOST's CPU, not about the GPU vendor: it holds identically on a
+    CUDA machine and on a ROCm one, because the encoder never reaches either
+    accelerator. On an ARM host the premise would be the other way round — NEON
+    has native fp16 while bf16 needs FEAT_BF16 — so if this service is ever
+    supported there, re-measure before assuming this constant still points the
+    right way. It is deliberately NOT branched on the architecture today:
+    nobody has measured that case, and a speculative branch would be a guess
+    wearing the clothes of a measurement.
+
+    `normalized["dtype"]` keeps governing the transformer and the VAE, which run
+    on the accelerator where float16 is a real format — that is why `float16`
+    stays in `VALID_DTYPES`.
+
+    Everything that describes an EMBEDDING rather than a run reports this value:
+    `_encoder_key`, `_prompt_cache_key` and the `.msprompt` metadata. A
+    `.msprompt` written earlier under `float16` therefore no longer validates —
+    correctly, because its embedding really did come from a different encoder
+    precision — and `validate_prompt_file_metadata` says so by name.
+    """
+    return TEXT_ENCODER_DTYPE
 
 
 # =====================================================================

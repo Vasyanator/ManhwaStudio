@@ -326,8 +326,9 @@ pub(super) fn flux2_prompt_cache_header(settings: &Flux2KleinSettings, extra: &[
 
 /// Encodes the prompt in `params` and leaves the embeddings in the backend's live cache.
 ///
-/// Streaming, because reading the ~16 GB Qwen3 encoder takes ~106 s: the progress frames
-/// have the same shape as a generation's and drive the same bar. `generation` is the
+/// Streaming, because reading the Qwen3 encoder takes far longer than a call may block for:
+/// the progress frames have the same shape as a generation's and drive the same bar.
+/// `generation` is the
 /// progress generation claimed on the GUI thread; every write is dropped once a newer run
 /// — or a cancel — has retired it, and the bar is cleared on EVERY exit.
 ///

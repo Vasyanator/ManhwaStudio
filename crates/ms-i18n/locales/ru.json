@@ -748,6 +748,8 @@
   "cleaning.tools.flux2_klein.fixed_seed_label": "Фиксированный seed",
   "cleaning.tools.flux2_klein.guidance_hint": "Дистиллированная модель ожидает guidance 1.0.",
   "cleaning.tools.flux2_klein.guidance_label": "Guidance",
+  "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip": "Бэкенд сообщил, что этот чекпоинт дистиллированный, поэтому classifier-free guidance выключён при любом значении: величина выше 1.0 только удвоит вычисления на шаг и ничего не изменит. Сохранённое значение не трогается и снова заработает на недистиллированном чекпоинте.",
+  "cleaning.tools.flux2_klein.guidance_unsupported_note": "Чекпоинт дистиллированный — guidance ни на что не влияет, поэтому параметр отключён.",
   "cleaning.tools.flux2_klein.install_button": "Установить",
   "cleaning.tools.flux2_klein.install_heading": "Установка модели",
   "cleaning.tools.flux2_klein.install_hint": "Раскрывает раздел «Установка модели», где выбирается источник — свои пути или скачивание.",

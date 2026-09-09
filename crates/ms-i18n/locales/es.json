@@ -745,6 +745,8 @@
   "cleaning.tools.flux2_klein.fixed_seed_label": "Seed fija",
   "cleaning.tools.flux2_klein.guidance_hint": "El modelo destilado espera un guidance de 1.0.",
   "cleaning.tools.flux2_klein.guidance_label": "Guidance",
+  "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip": "El backend informa de que este checkpoint está destilado, así que la guía sin clasificador queda desactivada con cualquier valor: por encima de 1.0 solo duplicaría el cálculo por paso sin cambiar nada. El valor guardado se conserva y vuelve a actuar en un checkpoint no destilado.",
+  "cleaning.tools.flux2_klein.guidance_unsupported_note": "El checkpoint está destilado: el guidance no influye, por eso el control está desactivado.",
   "cleaning.tools.flux2_klein.install_button": "Instalar",
   "cleaning.tools.flux2_klein.install_heading": "Instalación del modelo",
   "cleaning.tools.flux2_klein.install_hint": "Despliega la sección «Instalación del modelo», donde se elige la fuente: tus propias rutas o una descarga.",

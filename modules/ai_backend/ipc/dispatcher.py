@@ -16,7 +16,12 @@ Main responsibilities:
 - `cancel{id}`: set that id's cancel event so the running handler stops and
   finishes with `status:"interrupted"`; unknown/finished ids are a no-op;
 - robust to client disconnect: BrokenPipe/ConnectionReset/clean EOF drop the
-  connection quietly (quiet disconnect handling).
+  connection quietly (quiet disconnect handling);
+- sanitize the outbound error text of a failed handler
+  (`runtime.error_text.sanitize_torch_error`) while the untouched text stays in
+  the process log via `traceback.print_exc()`. The call is unconditional; what
+  it actually rewrites is decided inside `error_text`, which is ROCm-gated and
+  a pass-through by default.
 
 Notes:
 One `Dispatcher` instance serves one connection. It is constructed with the
@@ -33,6 +38,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from ..runtime.error_text import sanitize_torch_error
 from .events import EventBus, EventSink
 from .framing import FrameError, FrameWriteLock, StreamClosed, read_frame, write_frame
 from .protocol import (
@@ -312,9 +318,25 @@ class Dispatcher:
                 if cancel_event.is_set():
                     self._send_response(request_id, STATUS_INTERRUPTED, {})
                 else:
+                    # `print_exc` puts the UNTOUCHED exception text and traceback
+                    # in the process log, which is the detailed technical half of
+                    # the error contract. Only the OUTBOUND copy below is
+                    # sanitized, and only to drop Torch's
+                    # `expandable_segments:True` OOM advice, which silently
+                    # corrupts computation on this project's ROCm build. Do not
+                    # "restore" the raw text here - the raw text is already
+                    # logged one line above.
+                    # The call stays UNCONDITIONAL: whether anything is rewritten
+                    # is `error_text`'s decision (it is ROCm-gated, and off ROCm
+                    # - including in a process that never ran
+                    # `configure_rocm_runtime()` - it returns the text
+                    # byte-identical). Adding a platform test here would put the
+                    # same rule in two places.
                     traceback.print_exc()
                     self._send_response(
-                        request_id, STATUS_ERROR, {HEADER_ERROR: str(exc)}
+                        request_id,
+                        STATUS_ERROR,
+                        {HEADER_ERROR: sanitize_torch_error(str(exc))},
                     )
                 return
 

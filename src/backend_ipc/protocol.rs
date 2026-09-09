@@ -41,7 +41,7 @@ use serde_json::{Map, Value, json};
 /// `python_protocol_version_matches_rust` below guards the mirror — but nothing can detect
 /// a bump that was never made: a client and a backend from different builds then agree on
 /// a contract that does not exist and fail at runtime instead of being refused in `hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -126,7 +126,7 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE: &str = "inpaint.flux2_klein.estim
 pub const METHOD_INPAINT_FLUX2_KLEIN_UNLOAD: &str = "inpaint.flux2_klein.unload";
 /// Loads, unloads or moves ONE FLUX.2 klein component (text encoder, transformer,
 /// VAE). Streaming, like `.prompt_cache.build`, because reading the ~16 GB text
-/// encoder takes ~100 s; it therefore claims the same single progress bar and can
+/// encoder takes tens of seconds; it therefore claims the same single progress bar and can
 /// never run beside a generation.
 ///
 /// Request header: `component` (`text_encoder` / `transformer` / `vae`), `action`
@@ -141,7 +141,7 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION: &str =
     "inpaint.flux2_klein.component_action";
 /// Encodes the `params.prompt` with the Qwen3 text encoder and keeps the
 /// embeddings in the backend's prompt cache (streaming: reading the ~16 GB encoder
-/// takes ~106 s, and the progress frames carry `phase`/`step`/`total`/`label` just
+/// takes tens of seconds, and the progress frames carry `phase`/`step`/`total`/`label` just
 /// like a generation). Afterwards `.status` reports `prompt_cached = true` for that
 /// prompt and a generation skips the encoder entirely.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD: &str =

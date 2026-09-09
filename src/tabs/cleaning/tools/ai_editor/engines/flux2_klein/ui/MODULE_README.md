@@ -36,7 +36,8 @@ never work started from inside a widget closure.
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
 - `advanced.rs`: «Для экспертов» — the generation parameters, the mask shaping and the
-  placement fields the memory preset owns.
+  placement fields the memory preset owns. It holds the panel's only gated non-button
+  control: `guidance_scale`, closed on a distilled checkpoint.
 - `progress.rs`: the progress bars and the mask hint the body opens with.
 
 ## Contracts and invariants
@@ -51,7 +52,16 @@ never work started from inside a widget closure.
 - **A disabled control explains itself.** Every gated button here is disabled for a reason
   the user cannot read off the button, so the disabled tooltip is the only place that
   reason is stated — hence `flux2_gated_button` rather than a hand-threaded
-  `add_enabled(..)`.
+  `add_enabled(..)`. The one non-button gate is `guidance_scale` in `advanced.rs`, closed
+  when `.status` reports the checkpoint as distilled (`flux2_guidance_supported`): it
+  carries the disabled tooltip AND a line under it, because a section the user opened
+  deliberately should not need a hover to explain a grey control. Its stored value is
+  untouched while it is closed.
+- **A disabled `WheelSlider` still sees the mouse wheel.** `add_enabled` clears
+  `Response::hovered()` but not `contains_pointer()` — a disabled widget stays in egui's
+  hit test so `on_disabled_hover_text` can work — and the widget's wheel path keys on
+  `hovered() || contains_pointer()` (`src/widgets/wheel_slider.rs`). A closed `Wheel*`
+  control must therefore be handed a value the frame throws away, never the persisted one.
 - **A backend literal this build does not know degrades to "not known"**, with the literal
   on hover, and offers no action. It is never guessed into one of the known states.
 - **The two FLUX.2 klein engines draw the SAME body**, differing only where

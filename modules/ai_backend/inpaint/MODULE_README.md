@@ -223,12 +223,44 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `validate_transformer_config_dir` additionally refuses a discovered `config.json` whose
   `_class_name` is not `Flux2Transformer2DModel`, because the search also probes the checkpoint's
   own directory, where a VAE or text-encoder config could otherwise be picked up.
+- **A single-file transformer is read ONE TENSOR AT A TIME when it can be, and that decision is
+  made and LOGGED by the caller.** `from_single_file` materializes the WHOLE checkpoint in host
+  memory before anything reaches the accelerator (`load_single_file_checkpoint` calls
+  `load_state_dict()` on the entire file), so a ~17 GiB klein checkpoint costs ~17 GiB of host RAM
+  it does not need. `flux2_klein/streaming.py` builds the model skeleton on `meta` and fills it
+  tensor by tensor instead, leaving one tensor live at a time; a sibling project measured the peak
+  dropping from 17.7 GiB to 1.55 GiB on a 16.9 GiB checkpoint. Four preconditions, all four checked
+  by `streaming_load_eligible` and none of them assumed: one `.safetensors` FILE (not a directory,
+  not one shard of a set), `low_cpu_mem_usage=True`, a whole-model `device_map` (i.e. a non-offload
+  placement), and a CUDA/ROCm target — the last being about WORTH, since streaming a CPU-resident
+  model from a CPU-read file buys nothing.
+  - **The module contains no fallback on purpose.** `pipeline._load_transformer` asks the predicate
+    first, and on `False` logs the Russian reason it returned before calling `from_single_file`.
+    A silent fallback would make the difference between a 1.5 GiB and a 17 GiB host peak invisible
+    in the log of a machine that was just OOM-killed.
+  - **It weakens neither placement guarantee.** `_apply_placement` still moves the components
+    unconditionally and `_require_components_materialized` still runs afterwards; a streamed model
+    is verified like any other (see "Placement never trusts the loader kwargs"). It also runs
+    OUTSIDE `patched_module_to()`: measured on this host a `torch.frombuffer` tensor reports
+    `tensor_needs_staging() == False`, the patch hooks `nn.Module.to` which this path never calls,
+    and that patch's contract forbids file I/O inside the block.
+  - **The read drives a SECOND progress level, not a new step.** `LOAD_STEP_TRANSFORMER` /
+    `LOAD_PHASE_STEPS` are unchanged — they are a wire contract shared with the Rust client — and
+    the bytes travel in the already-existing optional `file_step` / `file_total` / `file_label`
+    fields of the same frame, which the client parses phase-agnostically and draws as a second bar.
+    `file_label` is the CHECKPOINT FILE's name; the loader's per-tensor key is dropped, because the
+    client renders that label beside a GiB figure. Reports are rate-limited to 2 s inside
+    `streaming.py` and always fire on the last tensor.
 - **The text encoder and the transformer must be the SAME variant, and that is checked before any
   weight is read** (`require_encoder_transformer_compatible`, `components.py`). The pipeline
-  concatenates the encoder's hidden states at layers `(9, 18, 27)` and hands the result to
+  concatenates the encoder's hidden states at layers `(9, 18, 27)`
+  (`TEXT_ENCODER_OUT_LAYER_INDICES`) and hands the result to
   `context_embedder = nn.Linear(joint_attention_dim, …)`, so the contract is
   `TEXT_ENCODER_OUT_LAYERS * hidden_size == joint_attention_dim`: 3·4096 = 12288 for klein 9B,
-  3·2560 = 7680 for klein 4B. Nothing else compares the two — a 4B transformer beside a 9B encoder
+  3·2560 = 7680 for klein 4B. Those indices are a **diffusers default we do not own** — the sibling
+  `Flux2Pipeline` uses `(10, 20, 30)` — so `_encode_prompt_phase` passes them EXPLICITLY as
+  `text_encoder_out_layers` instead of inheriting the default, and `TEXT_ENCODER_OUT_LAYERS` is
+  derived from the tuple rather than written out a second time. Nothing else compares the two — a 4B transformer beside a 9B encoder
   passes every component check, passes the memory guard, and dies as a bare torch matmul error
   inside the denoise, ~34 GB into the read. The guard reads the two `config.json` files only and
   fires from `inpaint_image_bytes` (before `_require_headroom_locked`, hence before
@@ -285,8 +317,36 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   already returns unpacked, batch-norm-denormalized latents) and the VAE decode runs separately, so
   the transformer can be parked on the host first — its residency plus the decode peak is the most
   common OOM here. An OOM in the decode is recovered from without repeating the denoise: a host copy
-  of the latents is kept, the transformer is parked, then tiling/slicing is enabled. The settings
-  actually in force come back to Rust as `applied` so the next run starts on the cheap path.
+  of the latents is kept and each rung retries from it. The settings actually in force come back to
+  Rust as `applied` so the next run starts on the cheap path.
+  - **The ladder has three rungs, and two of them used to be one lie.** (1) park the transformer;
+    (2) enable VAE tiling — but ONLY when tiling can actually engage for these latents; (3) shrink
+    the VAE's tile so that it can. `enable_tiling()` moves no threshold: `AutoencoderKLFlux2._decode`
+    takes the tiled branch only when a LATENT side exceeds `tile_latent_min_size`, which on the
+    shipped klein VAE (`sample_size: 1024`, four `block_out_channels`) means **above 1024 output
+    px** — and since `MAX_REGION_PIXELS` caps the area at 1 MP, NO SQUARE REGION can ever reach it.
+    Tiling is therefore genuinely useful for an elongated region (1200x800 is legal, the extreme is
+    ~368x2848) and genuinely inert for the near-square majority. Rung 2 asks
+    `pipeline._vae_tiling_engages` before it claims anything, because `applied` is written into the
+    user's settings file and read back by the memory guard.
+  - **Rung 3 changes TWO thresholds or none.** `tiled_decode` slices the latents by
+    `tile_latent_min_size` and blends/crops the decoded tiles by `tile_sample_min_size`, and its
+    arithmetic assumes `tile_sample_min_size == tile_latent_min_size * 2 ** (len(block_out_channels)
+    - 1)`. A sibling project lowered only the latent one and got a 1024x1024 image rebuilt as a
+    mosaic of nine shifted copies with visible seams. `pipeline._lowered_vae_tile_thresholds` moves
+    both, and a VAE whose config cannot give the scale factor is left alone instead.
+  - **Rung 3 is a per-decode emergency, not a setting.** Both thresholds are restored in a `finally`
+    so nothing leaks into the next request, the warm-up or a cached pipeline, and no threshold ever
+    appears in `applied`, which carries the five persisted memory flags and nothing else. A tiled
+    decode is a BLENDED reconstruction, so the image is not bit-identical to an untiled one; that is
+    acceptable here only because `oom_recovered` already tells the caller a retry happened.
+  - **`vae_slicing` is not a rung and never was one that worked.** `decode` slices only when
+    `z.shape[0] > 1` and this service always decodes a batch of one, so enabling it cannot save a
+    byte. It stays on the wire because the Rust `MemoryPreset` values and `Flux2KleinSettings`
+    mirror it; see `dev-docs/known_gaps.md`, KG-008, for the removal condition.
+  - When every rung is exhausted the refusal names what was actually tried and, when tiling could
+    not engage, says so with the numbers — a message telling the user to enable a tiling flag that
+    is already on and cannot help is worse than none.
 - **A run is TWO PHASES, and their ORDER is a memory contract, not an optimization.** The text
   encoder is needed for exactly one forward pass per prompt: the four denoising steps and the VAE
   decode never look at it. Holding 8B of Qwen3 resident next to the 9B transformer is what made
@@ -323,8 +383,37 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     component action deliberately calls the UNGUARDED `_warmup_pipeline_locked`: a button that
     decided for itself not to act would be a lie about what happened.
   - **phase 2** (`_prompt_embeds_locked` → `_encode_prompts_locked` → `_encode_prompt_phase`) loads
-    the encoder, encodes the prompt (and the empty negative prompt when `guidance_scale > 1`) into
-    a few MB of embeddings, and by default keeps it.
+    the encoder, encodes the prompt (and the empty negative prompt when the EFFECTIVE guidance
+    scale exceeds 1 — `_effective_guidance_scale`, never the raw request) into a few MB of
+    embeddings, and by default keeps it.
+  - **The encoder is loaded as a TRUNCATED `Qwen3Model`, never as `Qwen3ForCausalLM`.** The
+    pipeline reads `output.hidden_states` and nothing else, so the causal head would compute a
+    `[1, 512, 151936]` logits tensor per prompt — ~400 GFLOP and ~155 MiB — on the HOST CPU, where
+    the user waits for it, and throw it away. For the same reason every decoder layer above the
+    last one the pipeline asks for is never built: `components.ENCODER_KEEP_LAYERS` is
+    `max(TEXT_ENCODER_OUT_LAYER_INDICES) + 1` and `text_encoder_truncation_kwargs` reads the
+    encoder's own `config.json` to decide what to pass. Three things about that are contracts:
+    - **The `+ 1` is exact.** `hidden_states[n]` for `n == num_hidden_layers` is the `model.norm`-ed
+      output, not a raw layer output, so one layer fewer silently corrupts the last requested state.
+      Measured, and defended by a real-torch test in `test_components.py`.
+    - **Truncation does not invalidate a saved embedding.** The states at `(9, 18, 27)` are
+      bit-identical between the full and the truncated model, which is why the `.msprompt` library
+      and the fingerprint say nothing about it.
+    - **The count and `layer_types` travel together.** transformers 4.57 validates
+      `num_hidden_layers` against `len(config.layer_types)`, so overriding only the count raises;
+      the shipped list is sliced, never invented. An encoder with FEWER layers than the pipeline
+      reads is REFUSED naming the file, the count and the minimum — it is never clamped — and a
+      config with no `num_hidden_layers` at all is loaded whole, with the reason logged.
+  - **The encoder's dtype is always bfloat16** (`params.text_encoder_dtype_name`), whatever `dtype`
+    the request carries. It runs on the host, where x86 has no native float16 arithmetic — a
+    sibling project measured 59 s against 2.4 s per encode on a Zen host for exactly this pair —
+    and bfloat16 is what the shipped checkpoints declare anyway. `dtype` keeps governing the
+    transformer and the VAE, which run on the accelerator, so `float16` stays a valid request value.
+    Everything that describes the EMBEDDING rather than the run records the encoder's dtype:
+    `_encoder_key`, `_prompt_cache_key` and the `.msprompt` metadata. The consequence is deliberate
+    and visible: a `.msprompt` saved while the service still ran the encoder at float16 is refused
+    on load, because its embedding really did come from a different encoder precision, and the
+    refusal says to rebuild the entry.
   - **Why the encoder comes SECOND.** In the reverse order — the one this replaced — the encoder's
     16 GB host peak and the transformer's 18 GB host peak were both host peaks, so keeping the
     encoder meant `max` became a sum (~34.7 GiB) and only `unload_text_encoder_after_encode=True`
@@ -337,7 +426,8 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     card. Anything that puts the encoder back onto the device, or back into the resident pipeline,
     undoes this.
 - **The prompt-embedding cache is always on** (`_prompt_cache`, LRU, `PROMPT_EMBED_CACHE_ENTRIES`).
-  It is keyed by encoder path + text + `max_sequence_length` + dtype + fp8 — not by placement, since
+  It is keyed by encoder path + text + `max_sequence_length` + the ENCODER's dtype (always
+  bfloat16, `text_encoder_dtype_name`, never the request's `dtype`) + fp8 — not by placement, since
   the same encoder produces the same embedding wherever it ran. A mask edit, a new seed or a
   repeated prompt therefore skips the prompt phase entirely; a miss costs a full 16 GB read from
   disk, which is why that phase reports its own `phase:"load"` progress steps (7-9). Entries
@@ -433,7 +523,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   in the run wants back, while dropping it costs a full 16 GB re-read on the next cache miss. When
   it is off, the encoder IS resident, so it joins `_model_key` — the key must never claim less than
   what the service holds. **The default is duplicated on the Rust side** (`MemoryPreset::values` and
-  `Flux2KleinSettings` in `src/tabs/cleaning/tools/flux2_klein.rs`); changing one side alone makes
+  `Flux2KleinSettings` in `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs`); changing one side alone makes
   the UI and the backend disagree about what a preset means.
   - The one combination the reorder does NOT make cheaper is a resident encoder together with
     `unload_transformer_before_vae`: parking the 9B transformer for the decode copies it back into
@@ -447,7 +537,11 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   / torch 2.12.0+rocm7.2. **It does not lower the load peak** — the bf16 weights must exist before
   they can be quantized — so it only pays off together with
   `unload_text_encoder_after_encode=False`. A torch build without `float8_e4m3fn` raises; the flag
-  is never silently ignored.
+  is never silently ignored. The "bytes saved" it reports is now TRUE: the walk used to include the
+  TIED `lm_head`, whose bf16 storage stayed alive through `embed_tokens`, so quantizing it freed
+  nothing, ADDED the fp8 copy plus its scales and counted the whole tensor as saved. `Qwen3Model`
+  has no such layer, which is why there is no tied-weight special case here and must not become
+  one.
 - **`placement` is an enum, not a boolean**: `full_gpu`, `encoder_cpu`, `model_cpu_offload`,
   `sequential_cpu_offload`. Since the load reorder it governs ONE thing: how the transformer + VAE
   are placed. It no longer decides where the prompt is encoded — that is always host memory now,
@@ -475,6 +569,40 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   512 MiB) exist because occupying the last byte is what makes the OOM killer fire before our own
   exception can. A free-memory figure of `0` means UNKNOWN (no psutil, no accelerator) and never
   refuses a run.
+  - **The forecast's encoder figure is a RESIDENT size, and it deliberately disagrees with the one
+    on screen.** `status.components[*].size_bytes` is a DISK size (`components._weight_bytes`) — the
+    client renders it as a file size and it must keep matching what the filesystem says. The
+    forecast needs what will exist in RAM, and the encoder is loaded truncated, so it asks
+    `components.text_encoder_resident_bytes`, which walks the safetensors headers and skips
+    `lm_head.*` and every `model.layers.<i>` at or above `ENCODER_KEEP_LAYERS` (20.1% of the
+    shipped 4B encoder's 7.492 GiB of tensors). The two figures are therefore different numbers for
+    the same component, on purpose; neither may be expressed in terms of the other, and a shard
+    whose header cannot be parsed counts in FULL, because rounding a memory need DOWN is the one
+    error that ends in an OOM kill.
+  - **A `low_cpu_mem_usage` the loader ignores is not a saving either.** The pipeline's transient
+    HOST term used to be `0 if low_cpu_mem_usage else transformer + vae`, which is FALSE for a
+    single-file transformer: `from_single_file` reads the whole checkpoint into host memory
+    whatever the flag says, so the guard under-forecast ~17 GiB on exactly the path most likely to
+    get the user's editor OOM-killed. `memory._transformer_avoids_the_host` now answers the real
+    question — a diffusers FOLDER goes through accelerate's `device_map` path and really is
+    host-free, a single FILE is host-free only when the streaming loader takes it — and the term is
+    `0`, `transformer_bytes` or `transformer + vae` accordingly. It is still ONE forecast:
+    `estimate` and the guard read the same function. The forecast runs before any device exists, so
+    the one precondition it cannot read from the request (the accelerator target) is ASSUMED, which
+    is the same assumption the surrounding branch already makes — that the weights end up on the
+    card. Everything else it cannot prove yields the EXPENSIVE answer, for the reason stated just
+    below: over-reserving refuses a run that might have fitted, under-reserving invites the OOM
+    killer, and only the second is unrecoverable.
+  - **A saving that cannot happen is not forecast.** The decode's per-pixel constant is the cheap
+    (tiled) one only when `vae_tiling` is set AND the region reaches
+    `components.vae_tile_threshold_pixels` — the threshold read from the VAE's own `config.json`,
+    never a literal here. `vae_tiling` DEFAULTS to `True`, so the old flag-only predicate
+    (`vae_tiling or vae_slicing`) under-forecast the decode of every region up to 1024 px by a
+    factor of four, in a guard whose whole purpose is to fire before the OOM killer does. A config
+    that cannot be read yields a threshold no region can reach — i.e. the EXPENSIVE answer — for the
+    same reason `text_encoder_resident_bytes` rounds up: over-reserving refuses a run that might
+    have fitted, under-reserving invites the OOM killer, and only the second is unrecoverable.
+    `vae_slicing` is not part of the predicate at all (KG-008).
   - **What the service already HOLDS is discounted, and that is not optional.** `forecast_memory`
     answers for a run starting from nothing, which is what `estimate` must show; the guard runs
     against a machine where the placed pipeline and the kept encoder are already allocated and
@@ -486,11 +614,35 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     17.6 GiB of VRAM that the very pipeline it was about to reuse was occupying, and refused a run
     whose memory was already in place. The refusal message names the short resource, the phase, the numbers, and the
   settings that DO fit right now — computed from `_MEMORY_PRESETS`, which must stay in sync with
-  `MemoryPreset::values` in `src/tabs/cleaning/tools/flux2_klein.rs`.
-- **`is_distilled` is left at `False`** and `guidance_scale` (default 1.0) decides: the pipeline uses
-  the flag for nothing but `do_classifier_free_guidance`, so at 1.0 the run is identical to a
-  distilled configuration while the slider stays meaningful. Nothing is assumed about the user's
-  checkpoint.
+  `MemoryPreset::values` in `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs`.
+- **`is_distilled` is READ FROM THE CHECKPOINT, and it decides whether guidance can happen at all.**
+  `components.checkpoint_is_distilled` answers a TRI-STATE from the `model_index.json` beside the
+  weights — `True` / `False` as declared, `None` when there is no manifest, it cannot be read, or it
+  carries no boolean `is_distilled`. The pipeline uses the flag for nothing but
+  `do_classifier_free_guidance` (`guidance_scale > 1 and not is_distilled`), so getting it wrong on
+  a distilled checkpoint — which every shipped klein build is — costs TWICE the compute per denoise
+  step for a guidance that was distilled away, plus a whole wasted pass over the 16 GB text encoder
+  for a negative prompt the denoise never reads.
+  - **Unknown means today's behaviour, logged.** `None` builds the pipeline with `is_distilled=False`
+    and leaves `guidance_scale` in force, and `_ensure_pipeline_locked` says so at INFO. This is a
+    documented choice, not a silent fallback: a hand-assembled folder of components carries no
+    manifest, and refusing it would be worse than running it the way this service ran every
+    checkpoint before the flag was read.
+  - **A distilled checkpoint skips the negative encode entirely.** Every decision that depends on
+    the scale asks `service._effective_guidance_scale`, which returns 1.0 there and announces the
+    ignored slider once per `(checkpoint, requested scale)`. So `_prompts_to_encode` never asks for
+    the empty prompt, `_prompt_embeds_locked` returns `negative=None`, and `_generate_locked` sends
+    `guidance_scale=1.0` down to diffusers. The filesystem is consulted only when the user actually
+    raised the slider, so the default costs nothing.
+  - **The flag needs no field in `_model_key`.** `components.model_index_search_roots` reads only
+    the transformer's and the VAE's roots — the two paths that key ALWAYS carries — so a checkpoint
+    that would answer differently is already a different key and therefore a different pipeline.
+    The text-encoder path is in the key only when the encoder is kept resident, which is why it is
+    deliberately NOT a search root here.
+  - **`status.guidance_supported`** is the same answer told to the client: `False` exactly when the
+    checkpoint declares `is_distilled: true`, `True` otherwise — the undeclared case included,
+    because that is what its run really does. A plain boolean, not the tri-state (`ipc/PROTOCOL.md`
+    §5.4).
 - Unlike `flux_fill.py`, this service honours the user's `General.ai_device` choice through the
   module-local `_resolve_selected_backend_device()`.
 - **The reported device is never a placeholder.** `status`, `health` and the generation answer take
@@ -738,6 +890,11 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
   shared with `watermark/`.
+- To change how the single-file transformer is READ — tensor by tensor or in one piece — see
+  `flux2_klein/streaming.py` for the loader and `pipeline._load_transformer` for the choice between
+  the two (the refusal must stay logged there; `streaming.py` carries no fallback). The byte-level
+  progress that read publishes is `progress._file_progress_reporter`, wired in
+  `service._ensure_pipeline_locked`; it must never move `LOAD_STEP_*` / `LOAD_PHASE_STEPS`.
 - To change FLUX.2 klein params, region limits, placement modes, the memory forecast, or the OOM
   recovery ladder, see `flux2_klein/` (`params.normalize_flux2_klein_params`,
   `params.validate_region_size`, `pipeline._apply_placement`, `memory.forecast_memory`,
@@ -747,10 +904,16 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   `unload_text_encoder_after_encode`, `text_encoder_fp8` — and the `estimate` breakdown carries
   three peaks, `peak_encode` / `peak_denoise` / `peak_decode`, in pipeline order. The Rust side
   matches those names exactly; do not rename one side alone.
+- To change what "tiling" means — the threshold, the forecast predicate or the decode's last rung —
+  see `flux2_klein/components.py::vae_tile_threshold_pixels` (the threshold, read from the VAE
+  config), `memory.forecast_memory` (the predicate) and
+  `pipeline._vae_tiling_engages` / `_lowered_vae_tile_thresholds` (the decode). Never hard-code the
+  1024/128 numbers in any of the three, and never move one of the two tile thresholds alone.
 - To change the memory gate or its advice, see `forecast_memory`, `_require_memory_headroom` and
   `_preset_advice`. Never add a second forecast: `estimate` and the gate must be the same
   arithmetic. Its three per-action entry points are `_require_pipeline_headroom_locked`,
-  `_require_restore_headroom_locked` and `_require_encode_headroom_locked`.
+  `_require_restore_headroom_locked` and `_require_encode_headroom_locked`. The pipeline's transient
+  host term is `_transformer_avoids_the_host`, which follows the LOADER and not the flag.
 - To change what `status` reports per component, or which buttons the FLUX.2 panel offers, see
   `_module_residency` (where the weights are), `_component_actions` (the authoritative matrix —
   it exists only there) and `Flux2KleinInpaintService._components_locked` /

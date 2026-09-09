@@ -24,6 +24,7 @@ everything else about the file is covered from its safetensors HEADER alone.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import struct
@@ -60,6 +61,22 @@ def _prompt_cache_bytes(metadata: dict[str, str], *, dtype_token: str = "BF16") 
     }
     blob = json.dumps(header).encode("utf-8")
     return struct.pack("<Q", len(blob)) + blob + payload
+
+
+@contextlib.contextmanager
+def _patched_sizes(sizes: dict[str, int]):
+    """Patch BOTH component sizers with the same figures, for one `with` block.
+
+    `forecast_memory` asks `text_encoder_resident_bytes` for the encoder and
+    `_weight_bytes` for the transformer and the VAE, so a test that patches only
+    one leaves the encoder at the fixture tree's real (tiny) size and stops
+    measuring what it says it measures.
+    """
+    with patch.object(components, "_weight_bytes", lambda path: sizes.get(path, 0)):
+        with patch.object(
+            components, "text_encoder_resident_bytes", lambda path, *_a, **_k: sizes.get(path, 0)
+        ):
+            yield
 
 
 def _write_prompt_cache_file(path: Path, metadata: dict[str, str], **kwargs: object) -> None:
@@ -419,17 +436,40 @@ class PromptCacheLibraryTests(_TempTreeCase):
             self.service.prompt_cache_load(self.params(max_sequence_length=512), "short")
         self.assertIn("max_sequence_length", str(caught.exception))
 
-    def test_another_dtype_is_refused(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(self.params(dtype="float16"))
-        metadata = svc.prompt_file_metadata(normalized, "p", self.encoder_id, self.family)
+    def test_an_entry_written_under_float16_is_refused_and_says_to_rebuild(self) -> None:
+        # The state a user is left in by the encoder-dtype change: an entry saved
+        # while the service still encoded at float16. Its embedding really did
+        # come from a different encoder precision, so the refusal is correct —
+        # but it has to name float16, name bfloat16, and say what to do.
+        normalized = svc.normalize_flux2_klein_params(self.params())
+        metadata = dict(
+            svc.prompt_file_metadata(normalized, "p", self.encoder_id, self.family)
+        )
+        metadata["dtype"] = "float16"
         _write_prompt_cache_file(
             self.library / "prompt_cache" / self.family / "half.msprompt",
             metadata,
             dtype_token="F16",
         )
         with self.assertRaises(ValueError) as caught:
-            self.service.prompt_cache_load(self.params(dtype="bfloat16"), "half")
-        self.assertIn("типа данных", str(caught.exception))
+            self.service.prompt_cache_load(self.params(), "half")
+        message = str(caught.exception)
+        self.assertIn("float16", message)
+        self.assertIn("bfloat16", message)
+        self.assertIn("заново", message)
+
+    def test_the_request_dtype_no_longer_decides_what_an_entry_must_be(self) -> None:
+        # `dtype` governs the transformer and the VAE; the encoder is bfloat16 in
+        # every case, so an entry written under one request dtype loads under the
+        # other.
+        normalized = svc.normalize_flux2_klein_params(self.params(dtype="bfloat16"))
+        metadata = svc.prompt_file_metadata(normalized, "p", self.encoder_id, self.family)
+        self.assertEqual(metadata["dtype"], "bfloat16")
+        _write_prompt_cache_file(
+            self.library / "prompt_cache" / self.family / "either.msprompt", metadata
+        )
+        out = self.service.prompt_cache_load(self.params(dtype="float16"), "either")
+        self.assertEqual(out["dtype"], "bfloat16")
 
     def test_metadata_that_lies_about_the_tensor_dtype_is_refused(self) -> None:
         normalized = svc.normalize_flux2_klein_params(self.params(dtype="bfloat16"))
@@ -780,7 +820,7 @@ class PromptCacheBuildTests(_PlacementFixture):
             self.paths["text_encoder_path"]: 16_381_516_808,
             self.paths["vae_path"]: 168_120_878,
         }
-        with patch.object(components, "_weight_bytes", lambda path: sizes.get(path, 0)):
+        with _patched_sizes(sizes):
             forecast = svc.forecast_memory(
                 svc.normalize_flux2_klein_params(self.params()), 384, 384
             )
@@ -805,7 +845,7 @@ class PromptCacheBuildTests(_PlacementFixture):
             "vram_free": 32 * 1024**3,
             "vram_total": 32 * 1024**3,
         }
-        with patch.object(components, "_weight_bytes", lambda path: sizes.get(path, 0)):
+        with _patched_sizes(sizes):
             with patch.object(hardware, "memory_snapshot", lambda _device=None: snapshot):
                 with self.assertRaises(RuntimeError) as caught:
                     self.service.prompt_cache_build(self.params(prompt="a cat"))

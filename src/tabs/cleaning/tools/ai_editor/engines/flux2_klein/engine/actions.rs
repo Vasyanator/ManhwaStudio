@@ -35,7 +35,7 @@ impl Flux2KleinEngine {
     ///
     /// Streaming and claiming the shared progress bar exactly as
     /// [`Self::start_prompt_cache_build`] does — loading the ~16 GB text encoder takes
-    /// ~100 s — which is also what makes it mutually exclusive with a generation.
+    /// tens of seconds — which is also what makes it mutually exclusive with a generation.
     ///
     /// Whether the action is POSSIBLE is not decided here: the service listed it, and
     /// re-deriving that rule on this side would duplicate a matrix that depends on the
@@ -503,7 +503,7 @@ impl Flux2KleinEngine {
     /// Starts the prompt-cache build on a worker thread.
     ///
     /// Streaming, and it claims the shared progress bar exactly as a generation does —
-    /// reading the ~16 GB Qwen3 encoder takes ~106 s and the user needs to see it move.
+    /// reading the Qwen3 encoder takes long enough that the user needs to see it move.
     /// Claiming the generation here, on the GUI thread, is what makes a cancel and a moved
     /// frame able to retire and stop it, just like a run.
     pub(super) fn start_prompt_cache_build(&mut self) {

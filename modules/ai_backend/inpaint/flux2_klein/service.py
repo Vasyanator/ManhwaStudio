@@ -10,12 +10,18 @@ work itself is delegated to the sibling modules of this package.
 Main responsibilities:
 - `status` / `estimate` / `health` / `unload` - what the client polls;
 - `inpaint_image_bytes` - one region edit, in the documented order: transformer +
-  VAE are loaded, placed and warmed up FIRST, then the 16 GB text encoder is read
-  into the host memory the transformer has just vacated;
+  VAE are loaded, placed and warmed up FIRST, then the text encoder is read into
+  the host memory the transformer has just vacated - as a `Qwen3Model` truncated
+  to `ENCODER_KEEP_LAYERS` layers and always in bfloat16
+  (`text_encoder_dtype_name`), because it runs on the host CPU;
 - `component_action` - one per-component residency action under the same memory
   guard and lease protocol a generation uses;
 - the `prompt_cache_*` methods - the library surface, keyed identically to the
-  in-memory cache through `_prompt_cache_key`.
+  in-memory cache through `_prompt_cache_key`;
+- `_effective_guidance_scale` - the ONE place a run learns whether classifier-free
+  guidance can happen at all, from the checkpoint's own `is_distilled`
+  (`components.checkpoint_is_distilled`); `status.guidance_supported` is the same
+  answer told to the client.
 
 Notes:
 - Load and inference are two separate `try` scopes: see the lease-protocol
@@ -50,7 +56,9 @@ from .components import (
     _component_states,
     _first_unavailable_reason,
     _require_component_dir,
+    checkpoint_is_distilled,
     component_search_roots,
+    ENCODER_KEEP_LAYERS,
     require_encoder_transformer_compatible,
     require_text_encoder,
     text_encoder_available,
@@ -73,6 +81,7 @@ from .params import (
     effective_steps,
     MIN_REGION_SIDE,
     normalize_flux2_klein_params,
+    text_encoder_dtype_name,
     validate_region_size,
 )
 from .pipeline import (
@@ -96,6 +105,7 @@ from .pipeline import (
     ACTIONABLE_COMPONENTS,
 )
 from .progress import (
+    _file_progress_reporter,
     _progress_reporter,
     LOAD_PHASE_STEPS,
     LOAD_STEP_ENCODE,
@@ -182,6 +192,11 @@ class Flux2KleinInpaintService:
         # see `_model_key`.
         self._text_encoder: Any = None
         self._text_encoder_key: tuple[Any, ...] | None = None
+        # Last `(transformer_path, vae_path, requested guidance_scale)` for which
+        # `_effective_guidance_scale` already told the user that the slider is
+        # being ignored. A run reads the scale from three places, and the same
+        # sentence three times per generation is noise, not information.
+        self._guidance_ignored_note: tuple[Any, ...] | None = None
 
     # ---- status / health ----
     def status(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -202,6 +217,14 @@ class Flux2KleinInpaintService:
         and the client is expected to warn that only ready caches will work —
         `prompt_cache.build` and any new prompt are refused until an encoder is
         configured.
+
+        `guidance_supported` says whether the `guidance_scale` slider can do
+        anything on THIS checkpoint: `False` exactly when its `model_index.json`
+        declares `is_distilled: true`, in which case classifier-free guidance is
+        never run and the service pins the scale to 1.0. A checkpoint that
+        declares nothing reports `True`, which is what its run really does — the
+        flag is a plain boolean, not the tri-state behind it, because the client
+        only ever needs to know whether to offer the control.
 
         **Per-component residency.** The three weight-bearing entries of
         `components` also carry `residency` (a `RESIDENCY_*` literal) and
@@ -238,6 +261,9 @@ class Flux2KleinInpaintService:
             "device": device,
             "prompt_cached": prompt_cached,
             "text_encoder_available": text_encoder_available(paths),
+            # `is not True` on purpose: an undeclared checkpoint (`None`) is run
+            # with guidance live, so it must report the slider as supported.
+            "guidance_supported": checkpoint_is_distilled(paths) is not True,
         }
 
     def _components_residency_nowait(self) -> tuple[dict[str, dict[str, Any]] | None, bool]:
@@ -475,7 +501,11 @@ class Flux2KleinInpaintService:
                     require_encoder_transformer_compatible(normalized)
                     self._require_headroom_locked(normalized, width, height, model_key)
                     pipe = self._ensure_pipeline_locked(
-                        normalized, model_key, report, region_hw=(height, width)
+                        normalized,
+                        model_key,
+                        report,
+                        region_hw=(height, width),
+                        progress_callback=progress_callback,
                     )
                 except Exception:
                     if lease.needs_load:
@@ -658,8 +688,8 @@ class Flux2KleinInpaintService:
         `actions` list (`_component_actions`), which is re-checked here under the
         lock rather than trusted from whatever snapshot the client last saw.
 
-        Streaming, like `prompt_cache.build`: reading the encoder takes ~106 s
-        and the transformer 18 GB, so progress is reported on the shared
+        Streaming, like `prompt_cache.build`: reading the encoder takes tens of
+        seconds and the transformer 18 GB, so progress is reported on the shared
         `phase:"load"` scale and this call claims the same single progress bar a
         generation does.
 
@@ -713,7 +743,13 @@ class Flux2KleinInpaintService:
                 try:
                     self._require_action_available_locked(component, action)
                     performed = self._component_action_locked(
-                        normalized, model_key, component, action, report, lease
+                        normalized,
+                        model_key,
+                        component,
+                        action,
+                        report,
+                        lease,
+                        progress_callback=progress_callback,
                     )
                 except Exception as exc:
                     self._last_error = str(exc)
@@ -794,6 +830,8 @@ class Flux2KleinInpaintService:
         action: str,
         report: Callable[[int, str], None],
         lease: Any,
+        *,
+        progress_callback: ProgressCb | None = None,
     ) -> bool:
         """Dispatch one already-validated action; `True` when something changed.
 
@@ -801,11 +839,17 @@ class Flux2KleinInpaintService:
         the actions that take one (`None` otherwise). Every branch reuses the
         helper the generation path already uses — nothing here is a second
         implementation of a move, a load or a warm-up.
+
+        `progress_callback` is the RAW callback beside the `(step, label)`
+        reporter, carried only so that the pipeline load can report the
+        transformer read at BYTE level; see `_ensure_pipeline_locked`.
         """
         if action == "load":
             if component == "text_encoder":
                 return self._load_text_encoder_action_locked(normalized, report)
-            return self._load_pipeline_action_locked(normalized, model_key, report, lease)
+            return self._load_pipeline_action_locked(
+                normalized, model_key, report, lease, progress_callback=progress_callback
+            )
         if action == "unload":
             if component == "text_encoder":
                 released = self._text_encoder is not None
@@ -863,6 +907,8 @@ class Flux2KleinInpaintService:
         model_key: str,
         report: Callable[[int, str], None],
         lease: Any,
+        *,
+        progress_callback: ProgressCb | None = None,
     ) -> bool:
         """Build and warm up the transformer + VAE. Caller must hold `self._lock`.
 
@@ -872,6 +918,10 @@ class Flux2KleinInpaintService:
         reporting a failed warm-up as a failed LOAD would clear the manager's
         `resident` flag and drop its unload callback while 18 GB still occupy
         VRAM.
+
+        `progress_callback` is forwarded so that this button's progress bar gets
+        the same byte-level second level a generation's load does — it reads the
+        very same checkpoint.
 
         # Raises
         `ValueError` when the configured encoder cannot be used with this
@@ -892,6 +942,7 @@ class Flux2KleinInpaintService:
                 # No image is produced here; the smallest valid region is what the
                 # log line names, exactly as in `_require_encode_headroom_locked`.
                 region_hw=(MIN_REGION_SIDE, MIN_REGION_SIDE),
+                progress_callback=progress_callback,
             )
         except Exception:
             if lease is not None and lease.needs_load:
@@ -1210,7 +1261,10 @@ class Flux2KleinInpaintService:
             "prompt": text,
             "prompt_cached": True,
             "max_sequence_length": int(normalized["max_sequence_length"]),
-            "dtype": str(normalized["dtype"]),
+            # The EMBEDDING's dtype, which is the encoder's and not the request's
+            # (`text_encoder_dtype_name`) — it is what the entry was validated
+            # against just above.
+            "dtype": text_encoder_dtype_name(),
             "created_at": metadata.get("created_at", ""),
             "encoder_verified": encoder_id is not None,
         }
@@ -1370,21 +1424,62 @@ class Flux2KleinInpaintService:
         The placement is deliberately absent — the same encoder computes the same
         embedding whether it ran on the host or the accelerator, and including it
         would evict the cache on a profile change for nothing.
+
+        The dtype is the ENCODER's (`text_encoder_dtype_name`) because that is
+        what the embedding is made of; the request's `dtype` describes the
+        transformer and the VAE and cannot change a single value in this tensor.
         """
         return (
             normalized["text_encoder_path"],
             text,
             int(normalized["max_sequence_length"]),
-            normalized["dtype"],
+            text_encoder_dtype_name(),
             bool(normalized["text_encoder_fp8"]),
         )
+
+    def _effective_guidance_scale(self, normalized: dict[str, Any]) -> float:
+        """The `guidance_scale` this run will really use — 1.0 on a distilled checkpoint.
+
+        Every decision that depends on the scale must ask THIS, never
+        `normalized["guidance_scale"]`, because the two differ exactly when the
+        checkpoint declares `is_distilled: true`: diffusers then computes
+        `do_classifier_free_guidance = guidance_scale > 1 and not is_distilled`
+        as `False`, so a higher scale buys nothing while the code around it would
+        still pay for it — a whole extra pass over the 16 GB text encoder for a
+        negative prompt the denoise never reads, and a `denoise` step that thinks
+        it runs two branches.
+
+        The checkpoint is consulted only when the user actually raised the slider,
+        so the default (1.0) never touches the filesystem; when it did, the read
+        is one small JSON beside weights measured in gigabytes. The override is
+        announced once per `(checkpoint, requested scale)`, because a run asks
+        three times.
+        """
+        requested = float(normalized["guidance_scale"])
+        if requested <= 1.0:
+            return requested
+        if checkpoint_is_distilled(normalized) is not True:
+            return requested
+        note = (normalized["transformer_path"], normalized["vae_path"], requested)
+        if self._guidance_ignored_note != note:
+            self._guidance_ignored_note = note
+            log.info(
+                "FLUX.2 klein: model_index.json чекпоинта объявляет is_distilled: true — "
+                "guidance из него дистиллирован, поэтому запрошенный guidance_scale %.3g "
+                "игнорируется (используется 1.0), а негативный промпт не кодируется.",
+                requested,
+            )
+        return 1.0
 
     def _prompts_to_encode(self, normalized: dict[str, Any]) -> list[str]:
         """Prompt texts the phase still has to run; empty when the cache covers the run."""
         wanted = [normalized["prompt"]]
-        if float(normalized["guidance_scale"]) > 1.0:
+        if self._effective_guidance_scale(normalized) > 1.0:
             # Classifier-free guidance needs the empty prompt too; encoding it now
             # is what keeps the pipeline from reaching for an encoder that is gone.
+            # A distilled checkpoint never gets here: `_effective_guidance_scale`
+            # has already pinned the scale to 1.0, so the encoder is not read for
+            # an embedding the denoise would then ignore.
             wanted.append("")
         return [
             text
@@ -1445,7 +1540,9 @@ class Flux2KleinInpaintService:
         `unload_text_encoder_after_encode` is on) released again; the freed
         memory is measured, not assumed.
 
-        `negative` is `None` unless classifier-free guidance is active.
+        `negative` is `None` unless classifier-free guidance is active — which it
+        never is on a checkpoint declaring `is_distilled: true`, whatever the
+        request asked for (`_effective_guidance_scale`).
         """
         missing = self._prompts_to_encode(normalized)
         if missing:
@@ -1455,7 +1552,7 @@ class Flux2KleinInpaintService:
 
         embeds: dict[str, Any] = {"prompt": None, "negative": None}
         embeds["prompt"] = self._cached_embeds(normalized, normalized["prompt"])
-        if float(normalized["guidance_scale"]) > 1.0:
+        if self._effective_guidance_scale(normalized) > 1.0:
             embeds["negative"] = self._cached_embeds(normalized, "")
         return embeds
 
@@ -1549,15 +1646,28 @@ class Flux2KleinInpaintService:
         (see `_encode_prompts_locked` and the load-order contract). `what` names
         the operation in the refusal raised when no encoder is installed.
 
+        The dtype is `text_encoder_dtype_name()` — always bfloat16 — and NOT the
+        request's `dtype`, which governs the transformer and the VAE. The encoder
+        runs on the host, where float16 has no native x86 arithmetic; see that
+        function for the measurement.
+
+        The model class is `Qwen3Model`, not `Qwen3ForCausalLM`, and it is loaded
+        truncated to `ENCODER_KEEP_LAYERS` decoder layers: the pipeline reads
+        `output.hidden_states` alone, so both the `lm_head` projection over a
+        151936-token vocabulary and every layer above the last one it asks for
+        are pure cost.
+
         # Raises
         `FileNotFoundError` / `ValueError` from `require_text_encoder` when no
-        encoder is configured on this machine, and whatever the loader raises.
+        encoder is configured on this machine, `ValueError` from
+        `text_encoder_truncation_kwargs` when the encoder has too few layers, and
+        whatever the loader raises.
         """
         require_text_encoder(normalized, what=what)
 
         import torch
 
-        dtype = torch.bfloat16 if normalized["dtype"] == "bfloat16" else torch.float16
+        dtype = getattr(torch, text_encoder_dtype_name())
         device = torch.device("cpu")
         encoder_key = self._encoder_key(normalized, str(device))
 
@@ -1565,7 +1675,11 @@ class Flux2KleinInpaintService:
         if self._text_encoder is not None and self._text_encoder_key == encoder_key:
             return self._text_encoder, encoder_key, device
 
-        from transformers import Qwen3ForCausalLM
+        # `Qwen3Model`, not `Qwen3ForCausalLM`: the pipeline consumes
+        # `output.hidden_states` only, so the causal head would compute a
+        # [1, 512, 151936] logits tensor (~400 GFLOP, ~155 MiB) per prompt and
+        # throw it away — on the HOST CPU, where the user waits for it.
+        from transformers import Qwen3Model
 
         self._release_text_encoder_locked()
         # No `device_map`: it exists to load straight into VRAM, and this phase
@@ -1574,21 +1688,28 @@ class Flux2KleinInpaintService:
         # `nn.Module.to` even between host allocations.
         with pipeline.patched_module_to():
             encoder = _load_text_encoder(
-                Qwen3ForCausalLM,
+                Qwen3Model,
                 normalized["text_encoder_path"],
                 dtype=dtype,
                 device_map=None,
                 low_cpu_mem_usage=normalized["low_cpu_mem_usage"],
+                keep_layers=ENCODER_KEEP_LAYERS,
             )
         if normalized["text_encoder_fp8"]:
             pipeline._quantize_text_encoder_fp8(encoder)
         return encoder, encoder_key, device
 
     def _encoder_key(self, normalized: dict[str, Any], device: str) -> tuple[Any, ...]:
-        """Identity of a resident text encoder: path, dtype, fp8 and where it sits."""
+        """Identity of a resident text encoder: path, dtype, fp8 and where it sits.
+
+        The dtype is the ENCODER's (`text_encoder_dtype_name`), not the request's:
+        the encoder is loaded in bfloat16 whatever `dtype` was asked for, so
+        keying on the request's value would evict a perfectly good encoder every
+        time the user switched the transformer's precision.
+        """
         return (
             normalized["text_encoder_path"],
-            normalized["dtype"],
+            text_encoder_dtype_name(),
             bool(normalized["text_encoder_fp8"]),
             device,
         )
@@ -1647,6 +1768,7 @@ class Flux2KleinInpaintService:
         report: Callable[[int, str], None],
         *,
         region_hw: tuple[int, int],
+        progress_callback: ProgressCb | None = None,
     ) -> Any:
         """Phase 1: return the cached pipeline for `model_key`, building it if needed.
 
@@ -1666,6 +1788,12 @@ class Flux2KleinInpaintService:
         every host->device weight move through `rocm_mmap_transfer` (a no-op off
         ROCm). `region_hw` is the `(height, width)` this pipeline is built for,
         kept for the log line that names what the residency is being spent on.
+
+        `progress_callback` is the RAW callback, not the `(step, label)` reporter:
+        the transformer read is the one step of this phase that can also report
+        BYTES, and only the raw callback can carry the wire's second level
+        (`_file_progress_reporter`). It is optional — with none, the load simply
+        reports steps as it always did.
 
         # Raises
         `FileNotFoundError` when a component cannot be found, `ValueError` for an
@@ -1752,13 +1880,29 @@ class Flux2KleinInpaintService:
                 placement,
             )
 
-        report(LOAD_STEP_TRANSFORMER, "Загрузка трансформера")
+        transformer_label = "Загрузка трансформера"
+        report(LOAD_STEP_TRANSFORMER, transformer_label)
+        # The SECOND progress level, inside this one step: the transformer is
+        # ~17 GiB and its read is by far the longest thing the load does, so the
+        # step bar would otherwise sit still for minutes. `step`/`total` are
+        # unchanged — only the optional file fields are added — and the loader
+        # drives it only where it reads the checkpoint itself (see
+        # `pipeline._load_transformer`).
+        byte_progress = _file_progress_reporter(
+            progress_callback,
+            "load",
+            LOAD_PHASE_STEPS,
+            LOAD_STEP_TRANSFORMER,
+            transformer_label,
+            Path(normalized["transformer_path"]).name,
+        )
         transformer = _load_transformer(
             Flux2Transformer2DModel,
             normalized["transformer_path"],
             dtype=dtype,
             device_map=device_map,
             low_cpu_mem_usage=normalized["low_cpu_mem_usage"],
+            progress=byte_progress,
         )
 
         # The tokenizer is a pipeline component even though the denoise never
@@ -1779,16 +1923,32 @@ class Flux2KleinInpaintService:
         report(LOAD_STEP_SCHEDULER, "Загрузка планировщика")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(scheduler_dir))
 
-        # `is_distilled` is deliberately left at False: the pipeline uses it for
-        # nothing but `do_classifier_free_guidance`
-        # (`guidance_scale > 1 and not is_distilled`), and the transformer always
-        # receives `guidance=None`. With the default `guidance_scale` of 1.0 the
-        # run is therefore identical to a distilled configuration, while a user
-        # who raises the scale gets real classifier-free guidance instead of a
-        # silently ignored slider. Nothing about the user's checkpoint is assumed.
+        # `is_distilled` comes from the checkpoint's own `model_index.json`, never
+        # from a hardcoded guess: the pipeline uses it for nothing but
+        # `do_classifier_free_guidance` (`guidance_scale > 1 and not
+        # is_distilled`), and getting it wrong on a distilled checkpoint costs
+        # TWICE the compute per denoise step for a guidance that was distilled
+        # away. The flag is a function of the same paths `_model_key` carries
+        # (`components.model_index_search_roots` reads only the transformer's and
+        # the VAE's roots for exactly that reason), so it needs no field of its
+        # own in the key: a checkpoint that would answer differently is already a
+        # different key and therefore a different pipeline.
+        distilled = checkpoint_is_distilled(normalized)
+        if distilled is None:
+            # A DOCUMENTED choice, not a silent fallback: a hand-assembled folder
+            # of components carries no manifest, and refusing it would be worse
+            # than running it exactly the way this service ran every checkpoint
+            # before the flag was read at all.
+            log.info(
+                "FLUX.2 klein: чекпоинт не объявляет is_distilled (нет model_index.json рядом с "
+                "трансформером и VAE или в нём нет этого поля) — пайплайн строится с "
+                "is_distilled=False, guidance_scale продолжает действовать.",
+            )
+            distilled = False
         pipe = Flux2KleinInpaintPipeline(
             scheduler=scheduler,
             vae=vae,
+            is_distilled=distilled,
             # The prompt phase runs AFTER this build and hands its embeddings to
             # `__call__`; see this method's docstring for why the `None` is safe.
             text_encoder=None,
@@ -2007,7 +2167,10 @@ class Flux2KleinInpaintService:
             "width": width,
             "strength": float(normalized["strength"]),
             "num_inference_steps": requested_steps,
-            "guidance_scale": float(normalized["guidance_scale"]),
+            # Not the raw request: a distilled checkpoint runs no classifier-free
+            # guidance, so passing a higher scale down would only make diffusers
+            # branch on a value it has already decided to ignore.
+            "guidance_scale": self._effective_guidance_scale(normalized),
             "max_sequence_length": int(normalized["max_sequence_length"]),
             "generator": generator,
             # Latents only: the VAE decode is a separate step so the transformer

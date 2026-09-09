@@ -10,6 +10,7 @@ frame, which is what the tests at the end of this file do.
 
 Main responsibilities:
 - decide the at-most-one line under the prompt field (`flux2_prompt_cache_line`);
+- decide whether the `guidance_scale` control is live at all (`flux2_guidance_supported`);
 - decide what the always-visible readiness line reports (`flux2_readiness_line`), with the
   memory forecast folded in as `Flux2MemorySummary`;
 - name the first reason a run cannot start (`flux2_run_block_reason`);
@@ -20,7 +21,7 @@ Key structures:
 - `Flux2PromptCacheLine`, `Flux2ReadinessLine`, `Flux2LineTone`, `Flux2MemorySummary`
 
 Key functions:
-- `flux2_prompt_cache_line()`, `flux2_readiness_line()`
+- `flux2_prompt_cache_line()`, `flux2_guidance_supported()`, `flux2_readiness_line()`
 - `flux2_run_block_reason()`, `region_block_reason()`
 
 Notes:
@@ -41,7 +42,7 @@ pub(super) enum Flux2PromptCacheLine {
     /// Nothing is claimed. The answer is outstanding, which is not information — the old
     /// «Состояние кэша промпта пока неизвестно.» line said only that the panel had asked.
     Silent,
-    /// The embeddings of this prompt are held: the next run skips the ~106 s encoder read.
+    /// The embeddings of this prompt are held: the next run skips the encoder read entirely.
     Cached,
     /// They are not: the next run pays for them.
     NotCached,
@@ -76,6 +77,20 @@ pub(super) fn flux2_prompt_cache_line(
         Some(true) | None => Flux2PromptCacheLine::Silent,
         Some(false) => Flux2PromptCacheLine::NotCached,
     }
+}
+
+/// Whether the `guidance_scale` control may be touched, from the last `.status` answer.
+///
+/// `false` ONLY when the backend positively answered `guidance_supported: false`, i.e. the
+/// loaded checkpoint declares itself distilled and diffusers switches classifier-free
+/// guidance off regardless of the value. Everything else — no answer yet, a backend that
+/// predates the field, a field of the wrong type — is `true`, which is what the control did
+/// before the field existed. Reading silence as "unsupported" would take a working
+/// parameter away from a user whose backend is simply older, so the asymmetry is the whole
+/// point of this function and is why it is not spelled inline at the call site.
+#[must_use]
+pub(super) fn flux2_guidance_supported(status: Option<&Flux2Status>) -> bool {
+    status.and_then(|status| status.guidance_supported) != Some(false)
 }
 
 /// The tone a one-line verdict is drawn in.
@@ -327,6 +342,23 @@ mod tests {
                 "{size:?}"
             );
         }
+    }
+
+    #[test]
+    fn guidance_stays_live_until_the_backend_says_otherwise() {
+        // No `.status` answer at all — the first frames of every session. The panel is not
+        // allowed to close a control on a question nobody has answered yet.
+        assert!(flux2_guidance_supported(None));
+        // An answer that predates the field: the same "not known", and it must read the
+        // same way. This is the case a future edit is most likely to invert.
+        assert!(flux2_guidance_supported(Some(&status_with_present(
+            &FLUX2_ALL_COMPONENTS
+        ))));
+        let mut distilled = status_with_present(&FLUX2_ALL_COMPONENTS);
+        distilled.guidance_supported = Some(false);
+        assert!(!flux2_guidance_supported(Some(&distilled)));
+        distilled.guidance_supported = Some(true);
+        assert!(flux2_guidance_supported(Some(&distilled)));
     }
 
     #[test]

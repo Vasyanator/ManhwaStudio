@@ -748,6 +748,8 @@
   "cleaning.tools.flux2_klein.fixed_seed_label": "Fixed seed",
   "cleaning.tools.flux2_klein.guidance_hint": "The distilled checkpoint expects a guidance of 1.0.",
   "cleaning.tools.flux2_klein.guidance_label": "Guidance",
+  "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip": "The backend reports this checkpoint as distilled, so classifier-free guidance is off whatever is set here: a value above 1.0 would only double the compute per step and change nothing. The saved value is kept and becomes active again on a checkpoint that is not distilled.",
+  "cleaning.tools.flux2_klein.guidance_unsupported_note": "The checkpoint is distilled — guidance has no effect, so the control is off.",
   "cleaning.tools.flux2_klein.install_button": "Install",
   "cleaning.tools.flux2_klein.install_heading": "Model setup",
   "cleaning.tools.flux2_klein.install_hint": "Unfolds the «Model setup» section, where the source is chosen: your own paths or a download.",

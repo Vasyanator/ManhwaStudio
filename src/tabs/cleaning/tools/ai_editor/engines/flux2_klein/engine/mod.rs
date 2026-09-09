@@ -178,7 +178,7 @@ pub struct Flux2KleinEngine {
     /// the user opens to save, load or carry a `.msprompt` and closes again, so remembering
     /// it across launches would re-expand an expert surface on every start. What the library
     /// EXPLAINS — whether the current prompt is cached — is drawn outside it either way,
-    /// because that one line is what predicts a ~106 s encoder read.
+    /// because that one line is what predicts a full encoder read.
     pub(super) prompt_library_open: bool,
     /// Whether the FIRST definite model verdict has already chosen the initial state of
     /// «Установка модели».
@@ -392,8 +392,9 @@ impl Flux2KleinEngine {
         if self.status_wanted
             && self.ai_backend_available
             && self.status_rx.is_none()
-            // A prompt-cache build holds the backend for ~106 s and a component action for
-            // as long; asking about the catalog meanwhile only queues a call behind it.
+            // A prompt-cache build holds the backend for as long as an encoder read takes,
+            // and a component action for as long; asking about the catalog meanwhile only
+            // queues a call behind it.
             // `.status` itself takes the lock a generation holds for its whole run, which
             // is also why the residency block reports `components_busy` instead of waiting.
             && !self.pipeline_busy()

@@ -8,6 +8,9 @@ reports both to the client.
 
 Main responsibilities:
 - verify the forecast treats denoise and decode as two separate peaks;
+- verify the pipeline's transient host copy follows the LOADER rather than the
+  `low_cpu_mem_usage` flag, so a single-file transformer `from_single_file` will
+  materialize in full is forecast in full;
 - verify each of the guard's refusals fires on the right shortfall and names a
   placement preset that would fit;
 - verify `estimate` answers without loading anything.
@@ -53,9 +56,18 @@ class MemoryGuardTests(_PlacementFixture):
             self.paths["text_encoder_path"]: self.TEXT_ENCODER_BYTES,
             self.paths["vae_path"]: self.VAE_BYTES,
         }
-        weights_patch = patch.object(components, "_weight_bytes", lambda path: sizes.get(path, 0))
-        weights_patch.start()
-        self.addCleanup(weights_patch.stop)
+        # Both sizers are patched: the forecast asks `text_encoder_resident_bytes`
+        # for the encoder and `_weight_bytes` for the other two, so patching only
+        # one would leave the encoder at the fixture tree's real (tiny) size and
+        # silently stop covering it. They return the same figure here — the
+        # divergence between disk and resident bytes is covered by
+        # `TextEncoderResidentBytesTests` in `test_components.py`.
+        for name in ("_weight_bytes", "text_encoder_resident_bytes"):
+            weights_patch = patch.object(
+                components, name, lambda path, *_a, **_k: sizes.get(path, 0)
+            )
+            weights_patch.start()
+            self.addCleanup(weights_patch.stop)
 
     def _with_memory(self, *, ram_free: float, vram_free: float) -> None:
         snapshot = {
@@ -516,6 +528,203 @@ class EstimateTests(_TempTreeCase):
                 params=self.params(), region_width=512, region_height=512
             )
         self.assertFalse(out["fits"])
+
+class VaeTilingForecastTests(_TempTreeCase):
+    """The decode is forecast by what the VAE will DO, not by what was asked.
+
+    `vae_tiling` only flips `use_tiling`; `AutoencoderKLFlux2._decode` enters the
+    tiled path only when a latent side exceeds `tile_latent_min_size`, i.e. above
+    1024 output px on the shipped klein VAE. Since the flag DEFAULTS to `True`,
+    crediting it unconditionally under-forecast the decode of every region up to
+    that side by a factor of four — in the one calculation that also gates the
+    load, and whose failure mode is the kernel OOM killer.
+    """
+
+    #: No side reaches the fixture VAE's 1024 px threshold, which is true of every
+    #: SQUARE region this service accepts (`MAX_REGION_PIXELS` is 1 MP).
+    SMALL = (512, 512)
+    #: An elongated region that does reach it: inside the 1 MP budget and the 8:1
+    #: aspect limit, a multiple of 16, and 1152 > 1024.
+    LARGE = (1152, 896)
+
+    def _decode_vram(self, size: tuple[int, int], **overrides: object) -> int:
+        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
+        forecast = svc.forecast_memory(normalized, size[0], size[1])
+        return forecast["phases"]["decode"]["vram_bytes"]
+
+    def test_the_threshold_is_read_from_the_vae_config(self) -> None:
+        self.assertEqual(svc.vae_tile_threshold_pixels(self.paths["vae_path"]), 1024)
+
+    def test_an_unreadable_vae_config_forecasts_the_expensive_decode(self) -> None:
+        # Rounding a memory need DOWN is the one error that ends in an OOM kill,
+        # so an unknown threshold means "tiling will not help".
+        (self.root / "vae" / "config.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            svc.vae_tile_threshold_pixels(self.paths["vae_path"]),
+            svc.VAE_TILE_THRESHOLD_FALLBACK_PIXELS,
+        )
+        self.assertEqual(
+            self._decode_vram(self.LARGE, vae_tiling=True),
+            self._decode_vram(self.LARGE, vae_tiling=False),
+        )
+
+    def test_a_region_below_the_threshold_is_forecast_untiled(self) -> None:
+        width, height = self.SMALL
+        with_tiling = self._decode_vram(self.SMALL, vae_tiling=True, vae_slicing=False)
+        without = self._decode_vram(self.SMALL, vae_tiling=False, vae_slicing=False)
+        self.assertEqual(with_tiling, without)
+        # And it is genuinely the untiled constant, not merely a matching pair:
+        # halving the area must move the forecast by the untiled per-pixel cost.
+        half = self._decode_vram((width, height // 2), vae_tiling=True, vae_slicing=False)
+        self.assertEqual(
+            with_tiling - half,
+            width * (height - height // 2) * svc.VAE_DECODE_BYTES_PER_PIXEL,
+        )
+
+    def test_a_region_past_the_threshold_is_forecast_tiled(self) -> None:
+        width, height = self.LARGE
+        with_tiling = self._decode_vram(self.LARGE, vae_tiling=True, vae_slicing=False)
+        without = self._decode_vram(self.LARGE, vae_tiling=False, vae_slicing=False)
+        self.assertEqual(
+            without - with_tiling,
+            width
+            * height
+            * (svc.VAE_DECODE_BYTES_PER_PIXEL - svc.VAE_DECODE_TILED_BYTES_PER_PIXEL),
+        )
+
+    def test_slicing_alone_never_changes_the_forecast(self) -> None:
+        # `decode` slices only when `z.shape[0] > 1`; this service decodes one
+        # image, so slicing is inert here in every case (KG-008).
+        for size in (self.SMALL, self.LARGE):
+            with self.subTest(size=size):
+                self.assertEqual(
+                    self._decode_vram(size, vae_tiling=False, vae_slicing=True),
+                    self._decode_vram(size, vae_tiling=False, vae_slicing=False),
+                )
+
+
+class SingleFileHostTransientTests(_TempTreeCase):
+    """The pipeline's transient host copy follows the LOADER, not the flag.
+
+    `low_cpu_mem_usage` is a REQUEST. accelerate honours it (a diffusers folder,
+    and the VAE in every case); diffusers' `from_single_file` does not — it reads
+    the whole checkpoint into host memory first. Forecasting zero there
+    under-charged ~17 GiB on the one path most likely to end in an OOM kill, so
+    the term is now credited only when `streaming.load_transformer_streaming`
+    will really take the file.
+    """
+
+    single_file_transformer = True
+
+    TRANSFORMER_BYTES = 18_157_185_168
+    TEXT_ENCODER_BYTES = 16_381_516_808
+    VAE_BYTES = 168_120_878
+
+    def setUp(self) -> None:
+        super().setUp()
+        sizes = {
+            self.paths["transformer_path"]: self.TRANSFORMER_BYTES,
+            self.paths["text_encoder_path"]: self.TEXT_ENCODER_BYTES,
+            self.paths["vae_path"]: self.VAE_BYTES,
+        }
+        # Both sizers, together: `forecast_memory` asks `text_encoder_resident_bytes`
+        # for the encoder and `_weight_bytes` for the other two, so patching one
+        # alone would drop the encoder out of the forecast under test.
+        for name in ("_weight_bytes", "text_encoder_resident_bytes"):
+            size_patch = patch.object(
+                components, name, lambda path, _sizes=sizes: _sizes.get(str(path), 0)
+            )
+            size_patch.start()
+            self.addCleanup(size_patch.stop)
+
+    def _denoise_ram(self, **overrides: object) -> int:
+        """The `denoise` host figure with the resident encoder taken out of the way.
+
+        `run_ram` is the MAXIMUM of the transient pipeline copy and the resident
+        encoder, so dropping the encoder after the encode is what leaves the
+        transient term alone in the answer.
+        """
+        settings: dict[str, object] = {
+            "placement": "encoder_cpu",
+            "unload_text_encoder_after_encode": True,
+        }
+        settings.update(overrides)
+        normalized = svc.normalize_flux2_klein_params(self.params(**settings))
+        return svc.forecast_memory(normalized, 128, 128)["phases"]["denoise"]["ram_bytes"]
+
+    def test_a_streamable_checkpoint_costs_no_transient_host_memory(self) -> None:
+        # The tree's transformer is one plain `.safetensors` file, which is
+        # exactly what `streaming_load_eligible` accepts.
+        self.assertEqual(self._denoise_ram(low_cpu_mem_usage=True), 0)
+
+    def test_a_checkpoint_streaming_cannot_take_is_charged_in_full(self) -> None:
+        # One part of a sharded checkout: refused by name, so `from_single_file`
+        # runs and the whole file lands in host memory.
+        shard = self.root / "flux2-klein-00001-of-00002.safetensors"
+        shard.write_bytes((self.root / "flux2-klein.safetensors").read_bytes())
+        with patch.object(
+            components,
+            "_weight_bytes",
+            lambda path, _size=self.TRANSFORMER_BYTES: _size if "flux2-klein" in str(path) else 0,
+        ):
+            charged = self._denoise_ram(low_cpu_mem_usage=True, transformer_path=str(shard))
+        self.assertEqual(charged, self.TRANSFORMER_BYTES)
+
+    def test_a_diffusers_folder_still_costs_nothing(self) -> None:
+        # It goes through `from_pretrained` with a whole-model `device_map`, i.e.
+        # accelerate's shard-by-shard path, which really does honour the flag.
+        folder = self.root / "transformer"
+        with patch.object(components, "_weight_bytes", lambda _path: 0):
+            self.assertEqual(
+                self._denoise_ram(low_cpu_mem_usage=True, transformer_path=str(folder)), 0
+            )
+
+    def test_without_low_cpu_mem_usage_the_whole_pipeline_is_charged(self) -> None:
+        # Nothing changed on this path: no flag, no direct-to-VRAM loader, so the
+        # transformer AND the VAE pass through host memory.
+        self.assertEqual(
+            self._denoise_ram(low_cpu_mem_usage=False),
+            self.TRANSFORMER_BYTES + self.VAE_BYTES,
+        )
+
+    def test_the_corrected_term_reaches_the_pre_load_guard(self) -> None:
+        # Not only the number on screen: `_require_memory_headroom` reads the very
+        # same forecast, so a host that cannot hold the checkpoint is refused
+        # BEFORE the first byte. Under the old flag-only term this figure was
+        # zero and the phase was not even checked.
+        shard = self.root / "flux2-klein-00001-of-00002.safetensors"
+        shard.write_bytes((self.root / "flux2-klein.safetensors").read_bytes())
+        normalized = svc.normalize_flux2_klein_params(
+            self.params(
+                placement="encoder_cpu",
+                low_cpu_mem_usage=True,
+                unload_text_encoder_after_encode=True,
+                transformer_path=str(shard),
+            )
+        )
+        with patch.object(
+            components,
+            "_weight_bytes",
+            lambda path, _size=self.TRANSFORMER_BYTES: _size if "flux2-klein" in str(path) else 0,
+        ):
+            needed = svc.forecast_memory(normalized, 128, 128)["phases"]["denoise"]["ram_bytes"]
+            self.assertEqual(needed, self.TRANSFORMER_BYTES)
+            with patch.object(
+                hardware,
+                "memory_snapshot",
+                lambda *_args, **_kwargs: {
+                    "vram_total": 64 << 30,
+                    "vram_free": 64 << 30,
+                    "ram_total": 64 << 30,
+                    "ram_free": needed,  # short by exactly the host reserve
+                },
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    svc._require_memory_headroom(
+                        normalized, 128, 128, "cuda:0", phases=("denoise",)
+                    )
+        self.assertIn("оперативной памяти", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

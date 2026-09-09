@@ -22,6 +22,7 @@ Main responsibilities:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
 
-from ._test_fixtures import _TempTreeCase, _write_safetensors
+from ._test_fixtures import _make_model_tree, _TempTreeCase, _write_safetensors
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,67 @@ class ComponentDiscoveryTests(_TempTreeCase):
         message = str(caught.exception)
         self.assertIn("scheduler_config.json", message)
         self.assertIn(str(self.root), message)
+
+
+class CheckpointIsDistilledTests(_TempTreeCase):
+    """`model_index.json` as a TRI-STATE: declared true, declared false, unknown."""
+
+    def test_the_shipped_manifest_declares_the_checkpoint_distilled(self) -> None:
+        self.assertIs(svc.checkpoint_is_distilled(self.paths), True)
+
+    def test_a_manifest_declaring_false_is_reported_as_false(self) -> None:
+        self.declare_distilled(False)
+        self.assertIs(svc.checkpoint_is_distilled(self.paths), False)
+
+    def test_no_manifest_at_all_is_unknown(self) -> None:
+        self.declare_distilled(None)
+        self.assertIsNone(svc.checkpoint_is_distilled(self.paths))
+
+    def test_a_manifest_without_the_field_is_unknown(self) -> None:
+        (self.root / "model_index.json").write_text(
+            json.dumps({"_class_name": "Flux2KleinPipeline"}), encoding="utf-8"
+        )
+        self.assertIsNone(svc.checkpoint_is_distilled(self.paths))
+
+    def test_a_non_boolean_declaration_is_unknown_and_logged(self) -> None:
+        # `bool` is a subclass of `int`, and a hand-edited `"true"` is a string:
+        # neither may be coerced into an answer about compute.
+        for value in ("true", 1, [True]):
+            with self.subTest(value=value):
+                self.declare_distilled(value)
+                with self.assertLogs(svc.log, level="INFO"):
+                    self.assertIsNone(svc.checkpoint_is_distilled(self.paths))
+
+    def test_a_malformed_manifest_is_unknown_and_never_raises(self) -> None:
+        # The flag can only make a run cheaper, so a broken metadata file must
+        # not be able to kill a generation.
+        (self.root / "model_index.json").write_text("{ not json", encoding="utf-8")
+        with self.assertLogs(svc.log, level="INFO"):
+            self.assertIsNone(svc.checkpoint_is_distilled(self.paths))
+
+    def test_only_the_transformer_and_vae_roots_are_searched(self) -> None:
+        # The answer becomes part of what the resident pipeline IS, so it must be
+        # a function of the paths `_model_key` ALWAYS carries. The text-encoder
+        # path is in that key only when the encoder is kept resident, so a
+        # manifest reachable through it alone must not decide.
+        self.declare_distilled(None)
+        encoder_only = self.root / "elsewhere"
+        (encoder_only / "text_encoder").mkdir(parents=True)
+        (encoder_only / "model_index.json").write_text(
+            json.dumps({"is_distilled": True}), encoding="utf-8"
+        )
+        paths = dict(self.paths)
+        paths["text_encoder_path"] = str(encoder_only / "text_encoder")
+        self.assertIsNone(svc.checkpoint_is_distilled(paths))
+        self.assertNotIn(encoder_only, svc.model_index_search_roots(paths))
+
+    def test_a_single_file_transformer_finds_the_manifest_beside_it(self) -> None:
+        # The layout a standalone klein release ships: the checkpoint in the
+        # repository root, `model_index.json` next to it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _make_model_tree(root, single_file_transformer=True)
+            self.assertIs(svc.checkpoint_is_distilled(paths), True)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +187,12 @@ class ComponentDirNormalizationTests(_TempTreeCase):
                 return "encoder"
 
         loaded = svc._load_text_encoder(
-            _Encoder, str(weights), dtype=None, device_map=None, low_cpu_mem_usage=True
+            _Encoder,
+            str(weights),
+            dtype=None,
+            device_map=None,
+            low_cpu_mem_usage=True,
+            keep_layers=None,
         )
         self.assertEqual(loaded, "encoder")
         self.assertEqual(seen, [str(encoder_dir)])
@@ -192,7 +259,7 @@ class EncoderTransformerCompatibilityTests(unittest.TestCase):
         """A text-encoder directory carrying `hidden_size`; `None` omits the field."""
         folder = self.root / name
         folder.mkdir(parents=True, exist_ok=True)
-        config: dict[str, object] = {"architectures": ["Qwen3ForCausalLM"]}
+        config: dict[str, object] = {"architectures": ["Qwen3Model"]}
         if hidden_size is not None:
             config["hidden_size"] = hidden_size
         (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -339,6 +406,226 @@ class EncoderTransformerCompatibilityTests(unittest.TestCase):
                 }
             )
         self.assertNotIn("нужен энкодер с hidden_size", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Text-encoder truncation and its resident size
+# ---------------------------------------------------------------------------
+class EncoderTruncationKwargsTests(unittest.TestCase):
+    """`text_encoder_truncation_kwargs` decides per config, and never clamps."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _encoder(self, config: dict[str, object]) -> Path:
+        folder = self.root / "text_encoder"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return folder
+
+    def test_a_deeper_encoder_is_cut_and_its_layer_types_are_cut_with_it(self) -> None:
+        # Passing `num_hidden_layers` alone raises in transformers 4.57:
+        # `layer_type_validation` compares it against `len(config.layer_types)`.
+        keep = svc.ENCODER_KEEP_LAYERS
+        folder = self._encoder(
+            {"num_hidden_layers": 36, "layer_types": ["full_attention"] * 36}
+        )
+        kwargs = svc.text_encoder_truncation_kwargs(folder)
+        self.assertEqual(kwargs["num_hidden_layers"], keep)
+        self.assertEqual(len(kwargs["layer_types"]), keep)
+        self.assertEqual(kwargs["layer_types"], ["full_attention"] * keep)
+
+    def test_a_config_without_layer_types_gets_only_the_count(self) -> None:
+        folder = self._encoder({"num_hidden_layers": 36})
+        kwargs = svc.text_encoder_truncation_kwargs(folder)
+        self.assertEqual(kwargs, {"num_hidden_layers": svc.ENCODER_KEEP_LAYERS})
+
+    def test_an_encoder_of_exactly_the_needed_depth_is_not_touched(self) -> None:
+        folder = self._encoder({"num_hidden_layers": svc.ENCODER_KEEP_LAYERS})
+        self.assertEqual(svc.text_encoder_truncation_kwargs(folder), {})
+
+    def test_too_few_layers_is_refused_and_never_clamped(self) -> None:
+        # Clamping would feed the pipeline `model.norm`-ed states where raw layer
+        # outputs belong — a silently wrong embedding.
+        folder = self._encoder({"num_hidden_layers": svc.ENCODER_KEEP_LAYERS - 1})
+        with self.assertRaises(ValueError) as caught:
+            svc.text_encoder_truncation_kwargs(folder)
+        message = str(caught.exception)
+        self.assertIn(str(svc.ENCODER_KEEP_LAYERS - 1), message)
+        self.assertIn(str(svc.ENCODER_KEEP_LAYERS), message)
+        self.assertIn("config.json", message)
+
+    def test_a_config_without_the_field_loads_the_encoder_whole(self) -> None:
+        # The `{}` config every fixture tree writes, and a real one whose field
+        # we cannot read: nothing is truncated and the reason is logged.
+        folder = self._encoder({})
+        with self.assertLogs(svc.log, level="INFO"):
+            self.assertEqual(svc.text_encoder_truncation_kwargs(folder), {})
+
+    def test_the_kept_depth_is_exactly_one_above_the_last_layer_read(self) -> None:
+        # `hidden_states[n]` for `n == num_hidden_layers` is the `model.norm`-ed
+        # output, so the `+ 1` is the exact minimum and not a safety margin.
+        self.assertEqual(
+            svc.ENCODER_KEEP_LAYERS, max(svc.TEXT_ENCODER_OUT_LAYER_INDICES) + 1
+        )
+        self.assertEqual(svc.TEXT_ENCODER_OUT_LAYERS, len(svc.TEXT_ENCODER_OUT_LAYER_INDICES))
+
+
+class TextEncoderResidentBytesTests(unittest.TestCase):
+    """The RAM figure the forecast uses, next to the DISK figure `status` shows."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.folder = self.root / "text_encoder"
+        self.folder.mkdir(parents=True)
+
+    @staticmethod
+    def _entry(begin: int, end: int) -> dict[str, object]:
+        return {"dtype": "BF16", "shape": [end - begin], "data_offsets": [begin, end]}
+
+    def test_trimmed_layers_and_the_tied_head_do_not_count(self) -> None:
+        keep = svc.ENCODER_KEEP_LAYERS
+        _write_safetensors(
+            self.folder / "model.safetensors",
+            {
+                "model.embed_tokens.weight": self._entry(0, 1000),
+                f"model.layers.{keep - 1}.self_attn.q_proj.weight": self._entry(1000, 1100),
+                f"model.layers.{keep}.self_attn.q_proj.weight": self._entry(1100, 1300),
+                "model.norm.weight": self._entry(1300, 1310),
+                "lm_head.weight": self._entry(1310, 3310),
+            },
+        )
+        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 1000 + 100 + 10)
+
+    def test_it_never_exceeds_the_disk_figure_status_reports(self) -> None:
+        keep = svc.ENCODER_KEEP_LAYERS
+        shard = self.folder / "model.safetensors"
+        _write_safetensors(
+            shard,
+            {
+                "model.embed_tokens.weight": self._entry(0, 1000),
+                f"model.layers.{keep}.mlp.up_proj.weight": self._entry(1000, 9000),
+            },
+        )
+        # `_write_safetensors` writes the header alone; the tensor bytes have to
+        # exist for the DISK figure to be the one a real checkout would show.
+        shard.write_bytes(shard.read_bytes() + b"\x00" * 9000)
+        self.assertLess(
+            svc.text_encoder_resident_bytes(str(self.folder)),
+            svc._weight_bytes(str(self.folder)),
+        )
+
+    def test_a_shard_whose_header_cannot_be_read_counts_in_full(self) -> None:
+        # Rounding DOWN here would invite the OOM killer; rounding up only
+        # refuses a run that might have fitted. The fixture trees ship exactly
+        # such a file (2 KiB of zeros).
+        blob = self.folder / "model.safetensors"
+        blob.write_bytes(b"\x00" * 2048)
+        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 2048)
+
+    def test_a_non_safetensors_weight_file_counts_in_full(self) -> None:
+        (self.folder / "pytorch_model.bin").write_bytes(b"\x01" * 512)
+        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 512)
+
+    def test_a_path_that_is_not_there_costs_nothing(self) -> None:
+        self.assertEqual(svc.text_encoder_resident_bytes(str(self.root / "nope")), 0)
+
+
+@unittest.skipIf(
+    importlib.util.find_spec("torch") is None, "torch is not installed in this environment"
+)
+class TruncatedEncoderEquivalenceTests(unittest.TestCase):
+    """The invariant the whole truncation rests on, checked against real torch.
+
+    A truncated Qwen3 must produce BIT-IDENTICAL hidden states at
+    `TEXT_ENCODER_OUT_LAYER_INDICES`, or every `.msprompt` ever saved becomes
+    subtly wrong. A comment cannot defend that; this can. The model is random and
+    tiny (hidden 32, vocab 128), so the test costs a fraction of a second.
+    """
+
+    def test_the_requested_hidden_states_survive_the_truncation(self) -> None:
+        import torch
+        from transformers import Qwen3Config, Qwen3Model
+
+        keep = svc.ENCODER_KEEP_LAYERS
+        full_layers = keep + 8
+
+        def _config(layers: int) -> "Qwen3Config":
+            return Qwen3Config(
+                vocab_size=128,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=layers,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                max_position_embeddings=64,
+                layer_types=["full_attention"] * layers,
+            )
+
+        torch.manual_seed(0)
+        full = Qwen3Model(_config(full_layers)).eval()
+        state = full.state_dict()
+
+        truncated = Qwen3Model(_config(keep)).eval()
+        missing, unexpected = truncated.load_state_dict(state, strict=False)
+        self.assertEqual(missing, [])
+        # Exactly the layers we cut away are unused, and nothing else: every
+        # unexpected key names a decoder layer at or above `keep`.
+        self.assertTrue(unexpected)
+        for name in unexpected:
+            with self.subTest(tensor=name):
+                self.assertTrue(name.startswith("layers."), name)
+                self.assertGreaterEqual(int(name.split(".")[1]), keep)
+
+        ids = torch.randint(0, 128, (1, 16))
+        with torch.no_grad():
+            wide = full(input_ids=ids, output_hidden_states=True, use_cache=False)
+            narrow = truncated(input_ids=ids, output_hidden_states=True, use_cache=False)
+        for index in svc.TEXT_ENCODER_OUT_LAYER_INDICES:
+            with self.subTest(layer=index):
+                self.assertTrue(
+                    torch.equal(wide.hidden_states[index], narrow.hidden_states[index])
+                )
+
+    def test_one_layer_fewer_would_corrupt_the_last_requested_state(self) -> None:
+        # Why `ENCODER_KEEP_LAYERS` is `max(indices) + 1` and not `max(indices)`:
+        # `hidden_states[num_hidden_layers]` is the `model.norm`-ed output, not a
+        # raw layer output, so cutting one layer more silently changes it.
+        import torch
+        from transformers import Qwen3Config, Qwen3Model
+
+        keep = svc.ENCODER_KEEP_LAYERS
+        last = max(svc.TEXT_ENCODER_OUT_LAYER_INDICES)
+
+        def _config(layers: int) -> "Qwen3Config":
+            return Qwen3Config(
+                vocab_size=128,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=layers,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                max_position_embeddings=64,
+                layer_types=["full_attention"] * layers,
+            )
+
+        torch.manual_seed(0)
+        correct = Qwen3Model(_config(keep)).eval()
+        state = correct.state_dict()
+        short = Qwen3Model(_config(last)).eval()
+        short.load_state_dict(state, strict=False)
+
+        ids = torch.randint(0, 128, (1, 16))
+        with torch.no_grad():
+            good = correct(input_ids=ids, output_hidden_states=True, use_cache=False)
+            bad = short(input_ids=ids, output_hidden_states=True, use_cache=False)
+        self.assertFalse(torch.equal(good.hidden_states[last], bad.hidden_states[last]))
 
 
 if __name__ == "__main__":

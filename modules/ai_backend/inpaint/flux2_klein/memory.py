@@ -19,26 +19,43 @@ Main responsibilities:
   reserves, `_MEMORY_PRESETS`).
 
 Notes:
-`components._weight_bytes` and `hardware.memory_snapshot` are reached through
-their modules on purpose: both are replaced by the test suite, and a
-`from ... import` here would leave this module holding a stale reference.
+`components.text_encoder_resident_bytes` and `hardware.memory_snapshot` are
+reached through their modules on purpose: both are replaced by the test suite,
+and a `from ... import` here would leave this module holding a stale reference.
+
+The decode phase asks `components.vae_tile_threshold_pixels` whether the VAE's
+tiled path can engage for this region at all: `vae_tiling` is a REQUEST, and a
+request that cannot be honoured must not be forecast as a saving. The pipeline's
+transient host copy follows the same rule through
+`_transformer_avoids_the_host`: `low_cpu_mem_usage` is a request too, and
+diffusers' `from_single_file` ignores it.
+
+This module asks `components.text_encoder_resident_bytes` for the encoder and
+`components._weight_bytes` for the transformer and the VAE, and that split is
+deliberate: the encoder is loaded truncated, so what it occupies in RAM is
+smaller than what it occupies on disk, while `status.components[*].size_bytes`
+must keep showing the disk figure. Do not collapse the two.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
-from . import components, hardware
+from . import components, hardware, streaming
 from .components import text_encoder_available
 from .params import REGION_SIZE_MULTIPLE
 
 log = logging.getLogger(__name__)
 
 #: Peak activation bytes of ONE text-encoder forward pass at 512 tokens: the
-#: `[1, 512, vocab]` logits Qwen3ForCausalLM produces (~150 MiB at bf16 for a
-#: 151k vocabulary), the three requested hidden-state layers, and the attention
-#: working set. Coarse and deliberately generous, like the other constants here.
+#: hidden states of every kept layer (`output_hidden_states=True` retains all of
+#: them, not just the three that are stacked), the stacked
+#: `(1, 512, 3 * hidden)` embedding, and the attention working set. The encoder
+#: is loaded as `Qwen3Model`, so there is no `[1, 512, vocab]` logits tensor to
+#: budget for any more — the value is kept at 512 MiB anyway, as a coarse upper
+#: bound in the spirit of the other constants here, not as a measurement.
 ENCODE_ACTIVATION_BYTES = 512 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
@@ -90,14 +107,69 @@ DEVICE_MEMORY_RESERVE_BYTES = 512 * 1024**2
 
 #: The four memory profiles the UI offers, as (label, placement,
 #: low_cpu_mem_usage). MUST stay in sync with `MemoryPreset::values` in
-#: `src/tabs/cleaning/tools/flux2_klein.rs` — the guard names the ones that fit,
+#: `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs` — the guard names the ones that fit,
 #: so a stale entry here is advice the user cannot follow.
 _MEMORY_PRESETS = (
-    ("Максимальная скорость", "full_gpu", False),
+    # The labels are shown to the USER by `_preset_advice`, so they must be the
+    # strings the picker shows, not paraphrases of them: advice naming a preset
+    # the user cannot find in the UI is advice they cannot follow. Mirror of
+    # `cleaning.tools.flux2_klein.preset_*` in `crates/ms-i18n/locales/*.json`.
+    ("Максимум скорости", "full_gpu", False),
     ("Сбалансированный", "encoder_cpu", False),
     ("Минимум RAM", "encoder_cpu", True),
     ("Минимум VRAM", "sequential_cpu_offload", True),
 )
+
+
+#: The accelerator target the forecast ASSUMES when it asks
+#: `streaming.streaming_load_eligible` whether the single-file transformer will
+#: really be streamed. The forecast answers before any device is resolved, so
+#: this one precondition — the only one of the four that is about the MACHINE
+#: rather than the request — cannot be read from `normalized` and is assumed
+#: instead. The assumption is the same one the whole non-offload branch below
+#: already makes (`pipeline_device = pipeline_bytes`, `pipeline_host_resident =
+#: 0`: the weights end up on the card), so it adds no new optimism. Every other
+#: precondition is answered from the request, and each one that cannot be proved
+#: yields the EXPENSIVE answer — "streaming will not run", i.e. the whole
+#: checkpoint on the host.
+_FORECAST_STREAMING_TARGET = "cuda"
+
+
+def _transformer_avoids_the_host(normalized: dict[str, Any], *, low_cpu: bool) -> bool:
+    """Whether the transformer load really keeps the checkpoint out of host memory.
+
+    Only meaningful for the two non-offload placements, whose caller is the one
+    branch of `forecast_memory` that may ask; the offload placements keep the
+    weights in host memory by design.
+
+    `low_cpu_mem_usage` alone does NOT answer this, and the difference is the
+    largest single term in the host forecast:
+
+    - a diffusers FOLDER goes through `from_pretrained` with a whole-model
+      `device_map`, i.e. accelerate's shard-by-shard path, which really does
+      write straight to the device;
+    - a single FILE goes through diffusers' `from_single_file`, which reads the
+      ENTIRE checkpoint into host memory first (`load_single_file_checkpoint`)
+      whatever `low_cpu_mem_usage` says — unless
+      `streaming.load_transformer_streaming` takes it instead, which is exactly
+      what `streaming.streaming_load_eligible` decides.
+
+    Under-forecasting here is the unrecoverable direction: a host shortfall is
+    the kernel's OOM killer, not a catchable exception. So an unreadable, sharded
+    or otherwise unclassifiable checkpoint answers `False` — the expensive
+    answer — rather than being credited with a saving it may not get.
+    """
+    if not low_cpu:
+        return False
+    source = Path(normalized["transformer_path"])
+    if source.is_dir():
+        return True
+    eligible, _reason = streaming.streaming_load_eligible(
+        source,
+        low_cpu_mem_usage=low_cpu,
+        device_map={"": _FORECAST_STREAMING_TARGET},
+    )
+    return eligible
 
 
 # =====================================================================
@@ -129,10 +201,28 @@ def forecast_memory(
     Under the two offload placements the pipeline stays in host memory for the
     whole run, and that same maximum degenerates into the sum it should be.
 
+    **How big that transient copy is follows the LOADER, not the flag.**
+    `low_cpu_mem_usage` is a request, and `from_single_file` ignores it: a
+    single-file transformer is materialized in full in host memory unless the
+    streaming loader takes it. `_transformer_avoids_the_host` answers that
+    question, and answers it EXPENSIVELY whenever it cannot prove the saving.
+
     The weight terms are read from the files on disk (a bf16/fp16 checkpoint
     stores 2 bytes per parameter, which is also what it occupies once loaded);
     the activation terms use the coarse per-token / per-pixel constants
-    documented at the top of this module.
+    documented at the top of this module. The TEXT ENCODER is the one component
+    whose forecast is not its file size: it is loaded truncated, so
+    `components.text_encoder_resident_bytes` answers for it, and every encoder
+    figure this function returns — the `encode` phases, `resident.text_encoder_host`
+    and `breakdown.text_encoder` — is a RESIDENT figure. `status` keeps reporting
+    the DISK size for the same component, and the two legitimately disagree.
+
+    **The decode's per-pixel constant follows what the VAE will DO, not what the
+    request asked for.** `vae_tiling` only flips `use_tiling`; diffusers enters
+    the tiled decode only when a side exceeds the VAE's own threshold, so the
+    cheap constant is used only when `components.vae_tile_threshold_pixels` says
+    this region reaches it. `vae_slicing` never enters the predicate: slicing
+    splits a BATCH and this service decodes one image.
 
     **With no text encoder installed both encode phases are zero**, because
     neither can run there: a prompt that is not cached is refused before the load
@@ -157,16 +247,35 @@ def forecast_memory(
     # which is the same number `_weight_bytes` would return for a path that
     # exists but holds no weights, and those two must not be confused.
     encoder_installed = text_encoder_available(normalized)
-    text_encoder_bytes = components._weight_bytes(normalized["text_encoder_path"]) if encoder_installed else 0
+    # RESIDENT bytes, not the disk size: the encoder is loaded as a truncated
+    # `Qwen3Model`, so its `lm_head` and every decoder layer at or above
+    # `ENCODER_KEEP_LAYERS` never exist in memory (~20% of the shipped 4B
+    # encoder's tensors). `_weight_bytes` deliberately still answers the DISK
+    # question for `status.components[*].size_bytes`; the two figures differ for
+    # this one component and must not be unified.
+    text_encoder_bytes = (
+        components.text_encoder_resident_bytes(normalized["text_encoder_path"])
+        if encoder_installed
+        else 0
+    )
     vae_bytes = components._weight_bytes(normalized["vae_path"])
 
     latent_tokens = (int(region_width) // REGION_SIZE_MULTIPLE) * (
         int(region_height) // REGION_SIZE_MULTIPLE
     )
+    # Tiling is credited only when it can ACTUALLY engage for this region.
+    # `enable_tiling()` flips a flag; the tiled decode path is entered only when a
+    # side exceeds the VAE's own threshold (`components.vae_tile_threshold_pixels`,
+    # 1024 px on the shipped klein VAE), so with `vae_tiling` defaulting to `True`
+    # the old flag-only predicate under-forecast the decode of EVERY region up to
+    # that side by a factor of four — in a guard whose failure mode is the OOM
+    # killer. `vae_slicing` is not part of the predicate at all: `decode` slices
+    # only when `z.shape[0] > 1` and this service always decodes a batch of one.
+    tiling_engages = bool(normalized["vae_tiling"]) and max(
+        int(region_width), int(region_height)
+    ) > components.vae_tile_threshold_pixels(normalized["vae_path"])
     vae_per_pixel = (
-        VAE_DECODE_TILED_BYTES_PER_PIXEL
-        if normalized["vae_tiling"] or normalized["vae_slicing"]
-        else VAE_DECODE_BYTES_PER_PIXEL
+        VAE_DECODE_TILED_BYTES_PER_PIXEL if tiling_engages else VAE_DECODE_BYTES_PER_PIXEL
     )
     denoise_activations = latent_tokens * ACTIVATION_BYTES_PER_LATENT_TOKEN
     decode_activations = int(region_width) * int(region_height) * vae_per_pixel
@@ -185,11 +294,21 @@ def forecast_memory(
 
     if placement in ("full_gpu", "encoder_cpu"):
         # The pipeline ends up on the accelerator, so its host copy is transient:
-        # it exists between the safetensors read and the placement move, and
-        # `low_cpu_mem_usage` removes even that by loading straight into VRAM.
+        # it exists between the safetensors read and the placement move.
+        # `low_cpu_mem_usage` removes it only where the loader honours it — the
+        # VAE always does (accelerate's `device_map` path), the transformer only
+        # as a diffusers folder or through the streaming loader. Asking the flag
+        # alone used to report ZERO host bytes for a single-file transformer that
+        # `from_single_file` materializes in full, i.e. it under-forecast ~17 GiB
+        # on the very path most likely to get the user's editor OOM-killed.
         pipeline_device = pipeline_bytes
         pipeline_host_resident = 0
-        pipeline_host_transient = 0 if low_cpu else pipeline_bytes
+        if not low_cpu:
+            pipeline_host_transient = pipeline_bytes
+        elif _transformer_avoids_the_host(normalized, low_cpu=low_cpu):
+            pipeline_host_transient = 0
+        else:
+            pipeline_host_transient = transformer_bytes
         decode_weights_parked = vae_bytes
         # Parking the transformer before the VAE decode copies all 9B of it back
         # into anonymous host memory. That peak is what the OOM killer sees, so

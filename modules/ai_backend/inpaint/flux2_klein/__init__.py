@@ -119,6 +119,8 @@ Module layout (this file re-exports the package's whole public surface, so
 - `progress.py`     - `phase:"load"` step numbering and the progress callback type.
 - `components.py`   - the five components as files on disk: discovery, validation,
                       sizes, and the `components` map `status` returns.
+- `streaming.py`    - the streaming single-file transformer loader: one tensor at a
+                      time, so the host peak is one tensor and not the checkpoint.
 - `prompt_cache.py` - encoder fingerprint, the `.msprompt` container, the library.
 - `imaging.py`      - mask/region decoding, color match, feathered composite.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
@@ -142,8 +144,9 @@ log = logging.getLogger(__name__)
 # complete so that `server.py`, `test_lease_protocol.py` and the FLUX.2 test
 # modules keep resolving. WARNING: a few of them (`memory_snapshot`,
 # `_clear_torch_cache`, `_resolve_selected_backend_device`, `_weight_bytes`,
-# `_quantize_text_encoder_fp8`, `_restore_transformer_to_device`,
-# `write_prompt_file`) are monkeypatched by the test suite. Patch them on their
+# `text_encoder_resident_bytes`, `_quantize_text_encoder_fp8`,
+# `_restore_transformer_to_device`, `write_prompt_file`) are monkeypatched by the
+# test suite. Patch them on their
 # DEFINING module (`hardware`, `components`, `pipeline`, `prompt_cache`), never on
 # this package: the re-export here is a separate binding, so patching it would be
 # a silent no-op for every real caller.
@@ -154,10 +157,12 @@ from .params import (  # noqa: F401  - re-exported public surface
     MIN_REGION_SIDE,
     PIPELINE_MIN_REGION_SIDE,
     REGION_SIZE_MULTIPLE,
+    TEXT_ENCODER_DTYPE,
     VALID_DTYPES,
     VALID_PLACEMENTS,
     effective_steps,
     normalize_flux2_klein_params,
+    text_encoder_dtype_name,
     validate_region_size,
     _GPU_ONLY_PLACEMENTS,
     _PATH_KEYS,
@@ -184,10 +189,13 @@ from .progress import (  # noqa: F401  - re-exported public surface
     LOAD_STEP_TRANSFORMER,
     LOAD_STEP_VAE,
     LOAD_STEP_WARMUP,
+    FileProgressCb,
     ProgressCb,
+    _file_progress_reporter,
     _progress_reporter,
 )
 from .components import (  # noqa: F401  - re-exported public surface
+    checkpoint_is_distilled,
     component_dir_for_path,
     component_probe_order,
     component_safetensors_shards,
@@ -195,18 +203,26 @@ from .components import (  # noqa: F401  - re-exported public surface
     discover_component_dir,
     find_transformer_config_dir,
     is_fp8_scaled_checkpoint,
+    model_index_search_roots,
     read_safetensors_header,
     require_encoder_transformer_compatible,
     require_text_encoder,
     text_encoder_available,
+    text_encoder_resident_bytes,
+    text_encoder_truncation_kwargs,
     transformer_config_dir,
     transformer_config_roots,
+    vae_tile_threshold_pixels,
     validate_transformer_config_dir,
+    ENCODER_KEEP_LAYERS,
+    TEXT_ENCODER_OUT_LAYER_INDICES,
     TEXT_ENCODER_OUT_LAYERS,
+    VAE_TILE_THRESHOLD_FALLBACK_PIXELS,
     _FP8_DTYPES,
     _FP8_SCALE_SUFFIXES,
     _MAX_SAFETENSORS_HEADER_BYTES,
     _MODEL_CONFIG_MARKER,
+    _MODEL_INDEX_MARKER,
     _SCHEDULER_MARKER,
     _SCHEDULER_SUBDIR,
     _TOKENIZER_MARKERS,
@@ -221,6 +237,32 @@ from .components import (  # noqa: F401  - re-exported public surface
     _reject_fp8_scaled_directory,
     _require_component_dir,
     _weight_bytes,
+    read_safetensors_header_and_data_start,
+)
+from .streaming import (  # noqa: F401  - re-exported public surface
+    CHECKPOINT_LAYOUT_BFL,
+    CHECKPOINT_LAYOUT_DIFFUSERS,
+    FLUX2_BFL_MARKER_KEY,
+    PROGRESS_MIN_INTERVAL_SECONDS,
+    SAFETENSORS_DTYPES,
+    StreamingProgressCb,
+    StreamingSafetensorsReader,
+    TensorSpan,
+    checkpoint_layout,
+    convert_tensor_to_diffusers,
+    iter_converted_transformer_tensors,
+    load_transformer_streaming,
+    parse_tensor_spans,
+    streaming_load_eligible,
+    _ByteProgress,
+    _LDM_UNET_PREFIX,
+    _SAFETENSORS_SUFFIX,
+    _SHARD_NAME_RE,
+    _require_accelerator_target,
+    _require_plain_loading_contract,
+    _require_single_file_checkpoint,
+    _require_streaming_fill_contract,
+    _set_buffer,
 )
 from .prompt_cache import (  # noqa: F401  - re-exported public surface
     PROMPT_CACHE_DIRNAME,
@@ -305,6 +347,7 @@ from .pipeline import (  # noqa: F401  - re-exported public surface
     RESIDENCY_MIXED,
     RESIDENCY_NOT_LOADED,
     RESIDENCY_OFFLOADED,
+    EMERGENCY_TILE_LATENT_MIN_SIZE,
     RESIDENCY_RAM,
     WARMUP_LATENT_CELLS,
     _LEASED_ACTIONS,
@@ -317,9 +360,12 @@ from .pipeline import (  # noqa: F401  - re-exported public surface
     _component_is_file_backed,
     _decode_once,
     _decode_region_latents,
+    _emergency_tile_latent_size,
     _encode_prompt_phase,
     _is_out_of_memory,
     _largest_cpu_tensor,
+    _latent_spatial_sides,
+    _lowered_vae_tile_thresholds,
     _load_text_encoder,
     _load_transformer,
     _load_vae,
@@ -334,7 +380,11 @@ from .pipeline import (  # noqa: F401  - re-exported public surface
     _restore_transformer_to_device,
     _single_file_device,
     _synchronize_device,
+    _tiling_gate_note,
     _vae_input_device,
+    _vae_latent_scale_factor,
+    _vae_tile_latent_min_size,
+    _vae_tiling_engages,
     _warmup_vae_decode,
 )
 from .service import (  # noqa: F401  - re-exported public surface

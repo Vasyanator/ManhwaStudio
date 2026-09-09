@@ -8,7 +8,17 @@ lets the placement and generation tests run without those packages, the klein
 weights or a GPU, and `_PlacementFixture`, the base case that installs all of it.
 
 Key declarations:
-- `_make_model_tree` / `_write_safetensors` / `_png_bytes` - on-disk inputs.
+- `_make_model_tree` / `_write_safetensors` / `_write_safetensors_with_data` /
+  `_png_bytes` - on-disk inputs. The first safetensors helper writes a header-only
+  container, the second a real one with tensor bytes at chosen offsets.
+- `VAE_SAMPLE_SIZE` / `VAE_BLOCK_OUT_CHANNELS` and the thresholds derived from them -
+  the fixture VAE's tiling geometry, written both into its `config.json` and into
+  `_make_fake_vae`, so "tiling requested" and "tiling engaged" are different states
+  a test can actually assert. They are DERIVED exactly as diffusers derives them and
+  must never be set independently of each other.
+- `DEFAULT_MODEL_INDEX` - the `model_index.json` the tree carries by default, kept
+  faithful to the shipped klein 4B one (`is_distilled: true`). Pass another dict,
+  or `None` for no manifest at all, to build an undeclared checkpoint.
 - `_TempTreeCase` - a `TestCase` with a complete model tree in a temp directory.
 - `_install_fake_torch` and the `_Fake*` doubles - the injected torch stack.
 - `_PlacementFixture` - `_TempTreeCase` plus the fake modules and the three
@@ -45,13 +55,59 @@ from modules.ai_backend.runtime.model_manager import LoadedModelManager
 # ---------------------------------------------------------------------------
 # Fixtures shared by several test classes
 # ---------------------------------------------------------------------------
-def _make_model_tree(root: Path, *, single_file_transformer: bool = False) -> dict[str, str]:
-    """Lay out a klein-like checkout and return the three user-supplied paths."""
+#: `sample_size` and `block_out_channels` written into the fixture VAE config and
+#: mirrored by `_make_fake_vae`. They are NOT two independent knobs: diffusers
+#: derives `tile_sample_min_size = sample_size` and
+#: `tile_latent_min_size = int(sample_size / 2 ** (len(block_out_channels) - 1))`
+#: in `AutoencoderKLFlux2.__init__`, so a fixture that sets them separately would
+#: model a VAE that cannot exist. These are the shipped klein VAE's values.
+VAE_SAMPLE_SIZE = 1024
+VAE_BLOCK_OUT_CHANNELS = (128, 256, 512, 512)
+
+#: Pixels per latent cell for that VAE, and the two thresholds it implies.
+VAE_LATENT_SCALE = 2 ** (len(VAE_BLOCK_OUT_CHANNELS) - 1)
+VAE_TILE_LATENT_MIN_SIZE = int(VAE_SAMPLE_SIZE / VAE_LATENT_SCALE)
+
+
+#: `model_index.json` written into the fixture tree by default, trimmed from the
+#: shipped `side_models/FLUX.2-klein-4B/model_index.json` to the fields this
+#: backend reads. The real checkpoint declares `is_distilled: true`, so the
+#: default fixture must too — a fixture that quietly declared `false` would let a
+#: regression in the guidance skip pass every test.
+DEFAULT_MODEL_INDEX: dict[str, object] = {
+    "_class_name": "Flux2KleinPipeline",
+    "is_distilled": True,
+}
+
+
+def _make_model_tree(
+    root: Path,
+    *,
+    single_file_transformer: bool = False,
+    model_index: dict[str, object] | None = DEFAULT_MODEL_INDEX,
+) -> dict[str, str]:
+    """Lay out a klein-like checkout and return the three user-supplied paths.
+
+    `model_index` is the manifest written at the checkout root; pass `None` to
+    build a tree with no `model_index.json` at all, which is what a
+    hand-assembled folder of components looks like.
+    """
+    if model_index is not None:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "model_index.json").write_text(json.dumps(model_index), encoding="utf-8")
     (root / "text_encoder").mkdir(parents=True)
     (root / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
     (root / "text_encoder" / "model.safetensors").write_bytes(b"\x00" * 2048)
     (root / "vae").mkdir()
-    (root / "vae" / "config.json").write_text("{}", encoding="utf-8")
+    # The two fields the tiling threshold is derived from, at the shipped klein
+    # VAE's values: `sample_size` 1024 over four `block_out_channels` gives a
+    # latent threshold of 128 and therefore a 1024 px side threshold, which is
+    # what `components.vae_tile_threshold_pixels` must answer. A `{}` config
+    # would send every test down the unreadable-config fallback instead.
+    (root / "vae" / "config.json").write_text(
+        json.dumps({"sample_size": VAE_SAMPLE_SIZE, "block_out_channels": list(VAE_BLOCK_OUT_CHANNELS)}),
+        encoding="utf-8",
+    )
     (root / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(b"\x00" * 1024)
     (root / "tokenizer").mkdir()
     (root / "tokenizer" / "tokenizer_config.json").write_text("{}", encoding="utf-8")
@@ -87,6 +143,42 @@ def _write_safetensors(path: Path, header: dict[str, object]) -> None:
     path.write_bytes(struct.pack("<Q", len(payload)) + payload)
 
 
+def _write_safetensors_with_data(
+    path: Path,
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]],
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """Write a REAL safetensors container: header plus the tensor bytes themselves.
+
+    `tensors` maps a tensor name to `(safetensors dtype token, shape, payload)`.
+    Data offsets are assigned in INSERTION order, and the JSON header preserves
+    that order too, so a caller that inserts anti-alphabetically produces a file
+    whose key order and whose byte order genuinely disagree — which is what the
+    file-order tests need. No consistency between `shape`, the dtype and
+    `len(payload)` is enforced here: a test that wants a corrupt container asks
+    for one explicitly.
+
+    The sibling `_write_safetensors` stays the right tool whenever only the
+    header matters (dtype refusals, fp8 detection, size accounting).
+    """
+    header: dict[str, object] = {}
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    offset = 0
+    blobs: list[bytes] = []
+    for name, (dtype_token, shape, payload) in tensors.items():
+        header[name] = {
+            "dtype": dtype_token,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(payload)],
+        }
+        blobs.append(payload)
+        offset += len(payload)
+    encoded = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
+
+
 def _png_bytes(array: np.ndarray, mode: str) -> bytes:
     import io
 
@@ -99,19 +191,41 @@ class _TempTreeCase(unittest.TestCase):
     """Base class giving every test a throwaway klein-like model tree."""
 
     single_file_transformer = False
+    #: Manifest written at the tree's root; `None` builds a tree without one.
+    #: Override it in a subclass to exercise a checkpoint that declares
+    #: `is_distilled: false` or declares nothing.
+    model_index: dict[str, object] | None = DEFAULT_MODEL_INDEX
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.paths = _make_model_tree(
-            self.root, single_file_transformer=self.single_file_transformer
+            self.root,
+            single_file_transformer=self.single_file_transformer,
+            model_index=self.model_index,
         )
 
     def params(self, **overrides: object) -> dict[str, object]:
         merged: dict[str, object] = dict(self.paths)
         merged.update(overrides)
         return merged
+
+    def declare_distilled(self, value: object) -> None:
+        """Rewrite the tree's `model_index.json` in place; `None` removes the file.
+
+        `value` is written verbatim as `is_distilled`, so a test can also declare
+        a non-boolean and prove it is refused. The manifest is read at call time,
+        never cached, so this takes effect for the next request.
+        """
+        manifest = self.root / "model_index.json"
+        if value is None:
+            manifest.unlink(missing_ok=True)
+            return
+        manifest.write_text(
+            json.dumps({"_class_name": "Flux2KleinPipeline", "is_distilled": value}),
+            encoding="utf-8",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +410,18 @@ class _FakeWarmupLatents:
 
 
 class _FakeLatents:
-    """Stand-in for the latent tensor handed back by `output_type="latent"`."""
+    """Stand-in for the latent tensor handed back by `output_type="latent"`.
 
-    def __init__(self) -> None:
+    `shape` is real, because the decode's tiling gate reads it: diffusers enters
+    the tiled path only when a LATENT side exceeds `tile_latent_min_size`, so a
+    shapeless stand-in cannot express "tiling engages" at all. The default is a
+    64x64 latent — a 512 px region on the fixture VAE, below its 128-cell
+    threshold — which is the common case the ladder must stop crediting tiling
+    for.
+    """
+
+    def __init__(self, shape: tuple[int, ...] = (1, 16, 64, 64)) -> None:
+        self.shape = tuple(shape)
         self.moves: list[dict[str, object]] = []
         self.detached = 0
 
@@ -318,15 +441,24 @@ def _make_fake_vae(
     oom_times: int = 0,
     device_type: str = "cpu",
     latent_channels: int | None = 16,
+    sample_size: int | None = VAE_SAMPLE_SIZE,
 ) -> object:
     """VAE stand-in: a real subclass of the fake `nn.Module` that also decodes.
 
     It must genuinely be an `nn.Module` subclass, because
     `_materialize_components_for_offload` skips anything that is not one.
     `device_type` is where the loader is pretending to have put it, and
-    `latent_channels` is the one `config` field `_warmup_vae_decode` reads —
+    `latent_channels` is one of the `config` fields `_warmup_vae_decode` reads —
     `None` models a VAE that does not carry it, which is the degraded warm-up
     path.
+
+    **The two tile thresholds are DERIVED, exactly as `AutoencoderKLFlux2.__init__`
+    derives them**, from `sample_size` and `block_out_channels`; they are not
+    independent knobs and must not be set apart from each other, because
+    `tiled_decode` slices by the latent one and blends by the sample one.
+    `sample_size=None` models a VAE that declares neither threshold, which is the
+    case where the decode ladder must refuse to lower them rather than corrupt
+    the image.
 
     Warm-up decodes are counted separately from real ones and never consume
     `oom_times`: an OOM armed for the run's decode must not be spent on the
@@ -342,14 +474,33 @@ def _make_fake_vae(
             self.warmup_calls = 0
             self.tiling = False
             self.slicing = False
+            self.thresholds_at_decode: list[tuple[object, object]] = []
+            config: dict[str, object] = {}
             if latent_channels is not None:
-                self.config = types.SimpleNamespace(latent_channels=latent_channels)
+                config["latent_channels"] = latent_channels
+            if sample_size is not None:
+                config["sample_size"] = sample_size
+                config["block_out_channels"] = list(VAE_BLOCK_OUT_CHANNELS)
+                scale = 2 ** (len(VAE_BLOCK_OUT_CHANNELS) - 1)
+                self.tile_sample_min_size = sample_size
+                self.tile_latent_min_size = int(sample_size / scale)
+            if config:
+                self.config = types.SimpleNamespace(**config)
 
         def decode(self, latents: object, return_dict: bool = True) -> list[object]:
             if getattr(latents, "is_warmup", False):
                 self.warmup_calls += 1
                 return [self.decoded]
             self.decode_calls += 1
+            # The thresholds IN FORCE for this attempt. The last rung of the OOM
+            # ladder lowers them for one decode and restores them afterwards, so
+            # the values a test reads after the call cannot show what ran.
+            self.thresholds_at_decode.append(
+                (
+                    getattr(self, "tile_latent_min_size", None),
+                    getattr(self, "tile_sample_min_size", None),
+                )
+            )
             if self.oom_left > 0:
                 self.oom_left -= 1
                 raise _FakeOutOfMemoryError("HIP out of memory. Tried to allocate 2.00 GiB")
@@ -376,10 +527,16 @@ class _FakeImageProcessor:
         return [image]
 
 
-def _fake_pipe(module_cls: type, decoded: object, *, oom_times: int = 0) -> types.SimpleNamespace:
+def _fake_pipe(
+    module_cls: type,
+    decoded: object,
+    *,
+    oom_times: int = 0,
+    sample_size: int | None = VAE_SAMPLE_SIZE,
+) -> types.SimpleNamespace:
     """A pipeline stand-in with just the surface the decode step touches."""
     return types.SimpleNamespace(
-        vae=_make_fake_vae(module_cls, decoded, oom_times=oom_times),
+        vae=_make_fake_vae(module_cls, decoded, oom_times=oom_times, sample_size=sample_size),
         transformer=module_cls("transformer", ptr=0x4000, device_type="cuda"),
         text_encoder=module_cls("text_encoder", ptr=0x2000),
         image_processor=_FakeImageProcessor(),
@@ -485,8 +642,15 @@ class _PlacementFixture(_TempTreeCase):
         diffusers.Flux2KleinInpaintPipeline = FakePipeline
 
         transformers = types.ModuleType("transformers")
-        transformers.Qwen3ForCausalLM = _Loader(
+        # `Qwen3Model` is what the service loads (the pipeline reads hidden states
+        # only). `Qwen3ForCausalLM` stays on the double because the real module
+        # still exports it and a test may want to prove we do NOT ask for it.
+        transformers.Qwen3Model = _Loader(
             "text_encoder",
+            lambda device: module_cls("text_encoder", ptr=0x2000, device_type=device),
+        )
+        transformers.Qwen3ForCausalLM = _Loader(
+            "text_encoder_causal_lm",
             lambda device: module_cls("text_encoder", ptr=0x2000, device_type=device),
         )
         transformers.Qwen2TokenizerFast = _Loader("tokenizer", lambda _device: object())

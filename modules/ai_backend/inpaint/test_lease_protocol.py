@@ -195,7 +195,12 @@ def _case_flux2_klein(
     service = flux2_klein.Flux2KleinInpaintService(manager)
 
     def ensure(
-        _normalized: dict[str, Any], model_key: str, _report: Any, *, region_hw: tuple[int, int]
+        _normalized: dict[str, Any],
+        model_key: str,
+        _report: Any,
+        *,
+        region_hw: tuple[int, int],
+        progress_callback: Any = None,
     ) -> _StubModel:
         service._pipe = _StubModel()
         service._active_key = model_key
@@ -241,7 +246,12 @@ def _case_flux2_klein_component_action(
     service = flux2_klein.Flux2KleinInpaintService(manager)
 
     def ensure(
-        _normalized: dict[str, Any], model_key: str, _report: Any, *, region_hw: tuple[int, int]
+        _normalized: dict[str, Any],
+        model_key: str,
+        _report: Any,
+        *,
+        region_hw: tuple[int, int],
+        progress_callback: Any = None,
     ) -> _StubModel:
         service._pipe = _StubModel()
         service._active_key = model_key

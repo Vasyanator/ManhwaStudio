@@ -1007,7 +1007,7 @@ mod tests {
                     Some("hello")
                 );
                 let reply = json!({
-                    "v": 1, "id": 0, "kind": "hello", "backend_version": "9.9.9"
+                    "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": 0, "kind": "hello", "backend_version": "9.9.9"
                 });
                 write_frame(&mut write, &reply, &[]).expect("write server hello");
 
@@ -1035,7 +1035,7 @@ mod tests {
                                 Some("cancel")
                             );
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response",
                                 "status": "interrupted", "error": "cancelled by client"
                             });
                             write_frame(&mut write, &resp, &[]).expect("write interrupted");
@@ -1044,13 +1044,13 @@ mod tests {
                             // Emit two progress frames then the terminal response.
                             for step in 1..=2 {
                                 let prog = json!({
-                                    "v": 1, "id": id, "kind": "progress",
+                                    "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "progress",
                                     "step": step, "total": 2
                                 });
                                 write_frame(&mut write, &prog, &[]).expect("write progress");
                             }
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response",
                                 "status": "ok", "echo": method
                             });
                             write_frame(&mut write, &resp, b"stream-blob")
@@ -1060,13 +1060,13 @@ mod tests {
                             // FIX-4: emit a progress frame WITH a preview blob, then
                             // the terminal response.
                             let prog = json!({
-                                "v": 1, "id": id, "kind": "progress",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "progress",
                                 "step": 1, "total": 1
                             });
                             write_frame(&mut write, &prog, b"preview-png")
                                 .expect("write progress with blob");
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response",
                                 "status": "ok", "echo": method
                             });
                             write_frame(&mut write, &resp, b"final-blob")
@@ -1084,7 +1084,7 @@ mod tests {
                             );
                             thread::sleep(Duration::from_millis(30));
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response",
                                 "status": "interrupted", "error": "interrupted after timeout"
                             });
                             write_frame(&mut write, &resp, &[])
@@ -1093,7 +1093,7 @@ mod tests {
                         "request" => {
                             // Echo: result carries the method + the request blob back.
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response",
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response",
                                 "status": "ok", "echo": method
                             });
                             write_frame(&mut write, &resp, &frame.blob)
@@ -1432,7 +1432,7 @@ mod tests {
                             return;
                         }
                         let reply = json!({
-                            "v": 1, "id": 0, "kind": "hello", "backend_version": "9.9.9"
+                            "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": 0, "kind": "hello", "backend_version": "9.9.9"
                         });
                         if write_frame(&mut write, &reply, &[]).is_err() {
                             return;
@@ -1443,7 +1443,7 @@ mod tests {
                             }
                             let id = frame.header.get("id").and_then(Value::as_u64).unwrap_or(0);
                             let resp = json!({
-                                "v": 1, "id": id, "kind": "response", "status": "ok", "echo": "ok"
+                                "v": crate::backend_ipc::protocol::PROTOCOL_VERSION, "id": id, "kind": "response", "status": "ok", "echo": "ok"
                             });
                             if write_frame(&mut write, &resp, &frame.blob).is_err() {
                                 break;

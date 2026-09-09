@@ -363,6 +363,21 @@ pub(super) struct Flux2Status {
     /// `None` is "not known": a backend that predates the field, or no answer yet. It must
     /// not read as `Some(false)`, which is what the warning line and the encode gates act on.
     pub(super) text_encoder_available: Option<bool>,
+    /// Whether `guidance_scale` can change anything on the checkpoint the backend loaded.
+    ///
+    /// A DISTILLED checkpoint declares `"is_distilled": true` in its `model_index.json`,
+    /// and diffusers then computes `do_classifier_free_guidance = guidance_scale > 1 and
+    /// not is_distilled`. On such a checkpoint a guidance above 1.0 doubles the per-step
+    /// compute and leaves the result identical, so the parameter is not a trade-off the
+    /// user can make — it is inert, and the panel closes the control rather than let it
+    /// move a number with no effect.
+    ///
+    /// `None` is "not known" and MUST read as SUPPORTED — today's behaviour. The field is
+    /// new, so an older backend and any answer produced before it existed report nothing;
+    /// treating that silence as `Some(false)` would take a working control away from a
+    /// user whose backend is merely older. Only a positive `false` gates anything, which is
+    /// the single place that rule is applied ([`flux2_guidance_supported`]).
+    pub(super) guidance_supported: Option<bool>,
     /// Where each component's weights are, and what may be done to them. Three-state:
     /// see [`Flux2ComponentSnapshot::components`].
     pub(super) components: Flux2ComponentSnapshot,

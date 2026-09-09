@@ -160,7 +160,9 @@ IPC (`backend_ipc::protocol`):
   held — and the field is optional: a backend that omits it reads as "not known",
   never as "not cached". It also answers `text_encoder_available`, which is a DIFFERENT
   question from `available`: a run whose prompt is cached needs no encoder, so
-  `available` stays true while this is false.
+  `available` stays true while this is false. And it answers `guidance_supported`, whose
+  ABSENCE means SUPPORTED — the inverse default of the two above, because that is what
+  every backend older than the field reports and what the control did before it existed.
 - GENERATING WITHOUT A TEXT ENCODER is supported and is the reason the prompt-cache
   library exists: the denoise and the VAE decode never look at the encoder, so a
   `.msprompt` carried to a machine that never downloaded the 16 GB Qwen3 is enough. The
@@ -175,8 +177,8 @@ IPC (`backend_ipc::protocol`):
   false — the file's own metadata was taken on trust because nothing local could compare
   the fingerprint. Загрузить/Экспорт/Импорт keep working throughout.
 - `.prompt_cache.*` — the prompt-cache LIBRARY, six methods carrying the normalized
-  `params` plus their own fields. `build` is STREAMING (the ~16 GB Qwen3 encoder takes
-  ~106 s to read) and drives the same progress bar as a generation, which is why the
+  `params` plus their own fields. `build` is STREAMING (reading the Qwen3 encoder takes
+  far longer than a call may block for) and drives the same progress bar as a generation, which is why the
   two can never run at once. `list` answers the ACTIVE encoder family (empty when no
   encoder is installed, and the listing then spans every family) and the saved entries
   (`name`, its own `family`, `prompt`, `created_at`); `save`/`load` take a `name`; `export` takes a
@@ -270,7 +272,13 @@ Contracts:
   HOST's job; this file never writes `CleanOverlaysModel` storage and never touches
   `CanvasView`.
 - The model is distilled: 4 steps and `guidance_scale = 1.0` are the defaults and
-  there is no negative prompt — do not add a field for one.
+  there is no negative prompt — do not add a field for one. Whether guidance can do
+  anything at all is the BACKEND's answer, not an assumption of this side: a checkpoint
+  that declares `"is_distilled": true` makes diffusers switch classifier-free guidance off,
+  and `.status` reports that as `guidance_supported: false`, on which the panel closes the
+  control (`flux2_guidance_supported`). The field is OPTIONAL and an absent one means
+  SUPPORTED — the shipped klein checkpoints are distilled, but the paths are the user's and
+  may point at one that is not.
 */
 use super::super::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
 use crate::backend_ipc::{self, CallError};

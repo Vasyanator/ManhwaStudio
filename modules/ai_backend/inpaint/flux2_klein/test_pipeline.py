@@ -12,6 +12,9 @@ Main responsibilities:
 - verify a single-file transformer is loaded with the local
   `transformer/config.json` and refused with instructions when there is none, so
   the gated `flux-2-dev` config is never fetched;
+- verify the choice between the streaming loader and `from_single_file`: the
+  streaming one whenever `streaming.streaming_load_eligible` says so, the
+  ordinary one otherwise WITH the refusal logged at the call site;
 - verify the transformer is parked off the GPU before the VAE decode and moved
   back afterwards, and that an OOM in the decode is recovered from without
   repeating the denoise;
@@ -34,7 +37,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import hardware, pipeline
+from modules.ai_backend.inpaint.flux2_klein import hardware, pipeline, streaming
 from modules.ai_backend.runtime.model_manager import LoadedModelManager
 
 from ._test_fixtures import (
@@ -50,6 +53,10 @@ from ._test_fixtures import (
     _make_fake_vae,
     _write_safetensors,
 )
+
+#: Checkpoint size the streaming double reports through its byte-progress
+#: callback. Any number does; it only has to be stable so a test can assert on it.
+STREAM_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 class PipelinePlacementTests(_PlacementFixture):
@@ -72,6 +79,31 @@ class PipelinePlacementTests(_PlacementFixture):
         # loader that silently ignores its placement kwarg must not be able to
         # leave a component on the host (see SingleFileTransformerPlacementTests).
         self.assertEqual([depth for _dev, depth in pipe.moves], [1])
+
+    def test_the_checkpoints_own_is_distilled_reaches_the_constructor(self) -> None:
+        # The shipped klein 4B declares it, and the flag is the difference
+        # between one and two transformer passes per denoise step.
+        self.assertIs(self._build(placement="full_gpu").is_distilled, True)
+
+    def test_a_checkpoint_declaring_false_builds_a_guided_pipeline(self) -> None:
+        self.declare_distilled(False)
+        self.assertIs(self._build(placement="full_gpu").is_distilled, False)
+
+    def test_an_undeclared_checkpoint_builds_as_not_distilled_and_says_so(self) -> None:
+        # The documented policy for the unknown case: today's behaviour, kept,
+        # and logged — never a refusal, because a hand-assembled folder of
+        # components has no manifest at all.
+        self.declare_distilled(None)
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            pipe = self._build(placement="full_gpu")
+        self.assertIs(pipe.is_distilled, False)
+        self.assertTrue(any("is_distilled" in line for line in captured.output))
+
+    def test_a_non_boolean_declaration_is_treated_as_undeclared(self) -> None:
+        # A hand-edited manifest saying `"true"` must not read as True, the same
+        # rule `_config_int` applies to dimensions.
+        self.declare_distilled("true")
+        self.assertIs(self._build(placement="full_gpu").is_distilled, False)
 
     def test_a_rebuild_marks_the_pipeline_cold(self) -> None:
         # A build places weights, so whatever a previous warm-up proved is gone
@@ -282,6 +314,74 @@ class PromptEncodingTests(_PlacementFixture):
                 self.assertEqual(str(self.encode_calls[-1]["device"]), "cpu")
                 self.assertNotIn("device_map", self.load_kwargs["text_encoder"])
 
+    def _deep_encoder_config(self, layers: int = 36, *, layer_types: bool = True) -> None:
+        """Give the fixture's encoder a config as a real klein checkout ships it."""
+        config: dict[str, object] = {"num_hidden_layers": layers}
+        if layer_types:
+            config["layer_types"] = ["full_attention"] * layers
+        (self.root / "text_encoder" / "config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+
+    def test_the_encoder_is_loaded_as_qwen3model_not_the_causal_lm(self) -> None:
+        # The pipeline reads `output.hidden_states` only; the causal head would
+        # compute a [1, 512, 151936] logits tensor per prompt on the host CPU.
+        self._encode(placement="encoder_cpu", prompt="a cat")
+        self.assertIn("text_encoder", self.load_kwargs)
+        self.assertNotIn("text_encoder_causal_lm", self.load_kwargs)
+
+    def test_a_deep_encoder_is_loaded_truncated_with_matching_layer_types(self) -> None:
+        # transformers 4.57 validates `num_hidden_layers` against
+        # `len(layer_types)`, so the two kwargs must travel together.
+        self._deep_encoder_config()
+        self._encode(placement="encoder_cpu", prompt="a cat")
+        kwargs = self.load_kwargs["text_encoder"]
+        self.assertEqual(kwargs["num_hidden_layers"], svc.ENCODER_KEEP_LAYERS)
+        self.assertEqual(len(kwargs["layer_types"]), svc.ENCODER_KEEP_LAYERS)
+
+    def test_a_config_without_a_layer_count_is_loaded_whole(self) -> None:
+        # The fixture tree's own `{}` config, and the branch a hand-made checkout
+        # lands in: nothing is truncated and nothing raises.
+        self._encode(placement="encoder_cpu", prompt="a cat")
+        kwargs = self.load_kwargs["text_encoder"]
+        self.assertNotIn("num_hidden_layers", kwargs)
+        self.assertNotIn("layer_types", kwargs)
+
+    def test_an_encoder_with_too_few_layers_is_refused(self) -> None:
+        self._deep_encoder_config(svc.ENCODER_KEEP_LAYERS - 1)
+        with self.assertRaises(ValueError) as caught:
+            self._encode(placement="encoder_cpu", prompt="a cat")
+        self.assertIn(str(svc.ENCODER_KEEP_LAYERS), str(caught.exception))
+        self.assertNotIn("text_encoder", self.load_kwargs)
+
+    def test_the_pipeline_is_told_which_hidden_states_to_stack(self) -> None:
+        # Inherited defaults are what `ENCODER_KEEP_LAYERS` cannot survive: the
+        # sibling `Flux2Pipeline` already uses (10, 20, 30).
+        self._encode(placement="encoder_cpu", prompt="a cat")
+        self.assertEqual(
+            self.encode_calls[-1]["text_encoder_out_layers"],
+            svc.TEXT_ENCODER_OUT_LAYER_INDICES,
+        )
+
+    def test_the_encoder_is_bfloat16_whatever_dtype_the_request_asked_for(self) -> None:
+        # It runs on the host CPU, where float16 has no native arithmetic; the
+        # request's dtype governs the transformer and the VAE alone.
+        for dtype in svc.VALID_DTYPES:
+            with self.subTest(dtype=dtype):
+                self.setUp()
+                self._encode(placement="encoder_cpu", prompt="a cat", dtype=dtype)
+                self.assertEqual(self.load_kwargs["text_encoder"]["dtype"], self.torch.bfloat16)
+
+    def test_the_encoder_survives_a_change_of_the_request_dtype(self) -> None:
+        # `_encoder_key` records the ENCODER's dtype, so switching the
+        # transformer's precision must not evict a resident encoder.
+        self._encode(placement="encoder_cpu", prompt="a cat", dtype="bfloat16")
+        resident = self.service._text_encoder
+        self.load_kwargs.clear()
+        self._encode(placement="encoder_cpu", prompt="a dog", dtype="float16")
+        self.assertIs(self.service._text_encoder, resident)
+        self.assertEqual(self.load_kwargs, {})
+
     def test_a_cached_prompt_does_not_load_the_encoder(self) -> None:
         self._encode(placement="encoder_cpu", prompt="a cat")
         self.load_kwargs.clear()
@@ -306,9 +406,29 @@ class PromptEncodingTests(_PlacementFixture):
         self.assertEqual(self.load_calls["tokenizer"], 1)
 
     def test_guidance_above_one_also_encodes_the_empty_prompt(self) -> None:
+        # Only on a checkpoint that does NOT declare itself distilled: there
+        # classifier-free guidance really runs and the negative embedding is read.
+        self.declare_distilled(False)
         embeds = self._encode(placement="encoder_cpu", prompt="a cat", guidance_scale=2.0)
         self.assertEqual([call["prompt"] for call in self.encode_calls], ["a cat", ""])
         self.assertIsNotNone(embeds["negative"])
+
+    def test_an_undeclared_checkpoint_still_honours_the_guidance_slider(self) -> None:
+        # A hand-assembled folder of components carries no `model_index.json`.
+        # The documented policy is "keep today's behaviour": the slider is live.
+        self.declare_distilled(None)
+        embeds = self._encode(placement="encoder_cpu", prompt="a cat", guidance_scale=2.0)
+        self.assertEqual([call["prompt"] for call in self.encode_calls], ["a cat", ""])
+        self.assertIsNotNone(embeds["negative"])
+
+    def test_a_distilled_checkpoint_never_encodes_a_negative_prompt(self) -> None:
+        # The shipped klein 4B declares `is_distilled: true`, so
+        # `do_classifier_free_guidance` is False whatever the slider says — and a
+        # negative encode there is a full, wasted pass over the 16 GB encoder.
+        with self.assertLogs(svc.log, level="INFO"):
+            embeds = self._encode(placement="encoder_cpu", prompt="a cat", guidance_scale=7.0)
+        self.assertEqual([call["prompt"] for call in self.encode_calls], ["a cat"])
+        self.assertIsNone(embeds["negative"])
 
     def test_the_cache_evicts_the_least_recently_used_entry(self) -> None:
         prompts = [f"prompt {index}" for index in range(svc.PROMPT_EMBED_CACHE_ENTRIES + 1)]
@@ -394,14 +514,81 @@ class SingleFileTransformerPlacementTests(_PlacementFixture):
 
     single_file_transformer = True
 
-    def test_the_single_file_loader_is_given_device_not_device_map(self) -> None:
+    def setUp(self) -> None:
+        super().setUp()
+        #: Where the fake streaming loader leaves the transformer. Overridden by
+        #: the test that reproduces a loader ignoring its placement.
+        self.streamed_device = "cuda:0"
+        #: One entry per `load_transformer_streaming` call, with its kwargs.
+        self.streamed: list[dict[str, object]] = []
+        module_cls = self.torch.nn.Module
+        case = self
+
+        def _stream(model_cls: object, source: object, **kwargs: object) -> object:
+            case.streamed.append({"model_cls": model_cls, "source": str(source), **kwargs})
+            progress = kwargs.get("progress")
+            if callable(progress):
+                progress(STREAM_TOTAL_BYTES // 2, STREAM_TOTAL_BYTES, "blocks.0.weight")
+                progress(STREAM_TOTAL_BYTES, STREAM_TOTAL_BYTES, "blocks.1.weight")
+            return module_cls("transformer", ptr=0x4000, device_type=case.streamed_device)
+
+        # Patched on the module that DEFINES it, so `pipeline`'s
+        # `streaming.load_transformer_streaming(...)` lookup sees the double.
+        stream_patch = patch.object(streaming, "load_transformer_streaming", _stream)
+        stream_patch.start()
+        self.addCleanup(stream_patch.stop)
+
+    def _shard_path(self) -> str:
+        """A checkpoint the streaming loader must refuse: one part of a shard set."""
+        shard = self.root / "flux2-klein-00001-of-00002.safetensors"
+        _write_safetensors(shard, {"single_stream_modulation.lin.weight": {"dtype": "BF16"}})
+        return str(shard)
+
+    def test_a_streamable_checkpoint_goes_to_the_streaming_loader(self) -> None:
+        # `low_cpu_mem_usage` + a whole-model `device_map` onto CUDA + one
+        # `.safetensors` FILE is exactly the request the streaming loader serves,
+        # and it keeps the host peak at one tensor instead of the whole 17 GiB.
         pipe = self._build(placement="encoder_cpu", low_cpu_mem_usage=True)
+        self.assertEqual(len(self.streamed), 1)
+        call = self.streamed[0]
+        self.assertEqual(call["source"], self.paths["transformer_path"])
+        self.assertEqual(call["device_map"], {"": "cuda:0"})
+        self.assertIs(call["low_cpu_mem_usage"], True)
+        # The ordinary loader was not even asked.
+        self.assertNotIn("transformer_single", self.load_kwargs)
+        self.assertEqual(str(pipe.transformer.device), "cuda:0")
+        # The encoder is not part of this pipeline at all any more.
+        self.assertIsNone(pipe.text_encoder)
+
+    def test_a_streamed_transformer_is_still_placed_and_still_checked(self) -> None:
+        # The invariant does not weaken for the new loader: `_apply_placement`
+        # moves unconditionally (inside the staging patch) and
+        # `_require_components_materialized` still has to pass afterwards. The
+        # double deliberately leaves the transformer on the host to prove it.
+        self.streamed_device = "cpu"
+        pipe = self._build(placement="encoder_cpu", low_cpu_mem_usage=True)
+        self.assertEqual(str(pipe.transformer.device), "cuda:0")
+        self.assertEqual([depth for _dev, depth in pipe.transformer.moves], [1])
+        svc._require_components_materialized(pipe, _FakeDevice("cuda:0"))
+
+    def test_a_refused_checkpoint_falls_back_and_the_reason_is_logged(self) -> None:
+        # `streaming.py` carries no fallback on purpose: the ordinary loader is
+        # chosen HERE, and the reason has to be in the log or the choice is
+        # invisible.
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            pipe = self._build(
+                placement="encoder_cpu",
+                low_cpu_mem_usage=True,
+                transformer_path=self._shard_path(),
+            )
+        self.assertEqual(self.streamed, [])
         kwargs = self.load_kwargs["transformer_single"]
         self.assertEqual(kwargs["device"], "cuda:0")
         self.assertNotIn("device_map", kwargs)
         self.assertEqual(str(pipe.transformer.device), "cuda:0")
-        # The encoder is not part of this pipeline at all any more.
-        self.assertIsNone(pipe.text_encoder)
+        reasons = [line for line in captured.output if "потоковая загрузка" in line.lower()]
+        self.assertTrue(reasons, captured.output)
+        self.assertIn("шардированного", reasons[0])
 
     def test_a_single_file_load_without_a_device_map_asks_for_no_device(self) -> None:
         self._build(placement="encoder_cpu")
@@ -619,6 +806,92 @@ class SingleFileTransformerTests(_TempTreeCase):
         self.assertIn("fp8_scaled", str(caught.exception))
         self.assertEqual(self.calls, [])
 
+    def test_an_eligible_request_never_reaches_the_ordinary_loader(self) -> None:
+        # The whole point of the branch: `from_single_file` reads the ENTIRE
+        # checkpoint into host memory first, so an eligible request must not
+        # touch it at all.
+        streamed: list[dict[str, object]] = []
+
+        def _stream(model_cls: object, source: object, **kwargs: object) -> str:
+            streamed.append({"source": str(source), **kwargs})
+            return "streamed"
+
+        with patch.object(streaming, "load_transformer_streaming", _stream):
+            result = svc._load_transformer(
+                self.model_cls,
+                self.paths["transformer_path"],
+                dtype="bfloat16",
+                device_map={"": "cuda:0"},
+                low_cpu_mem_usage=True,
+            )
+
+        self.assertEqual(result, "streamed")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(streamed[0]["source"], self.paths["transformer_path"])
+        self.assertEqual(streamed[0]["device_map"], {"": "cuda:0"})
+
+    def test_the_byte_callback_is_forwarded_without_the_tensor_name(self) -> None:
+        # The wire's second level names the FILE, which the reporter already
+        # bound; the loader's per-tensor key is dropped here rather than
+        # flickering through the user's progress bar.
+        seen: list[tuple[int, int]] = []
+
+        def _stream(_model_cls: object, _source: object, **kwargs: object) -> str:
+            progress = kwargs["progress"]
+            assert callable(progress)
+            progress(4, 8, "blocks.0.weight")
+            return "streamed"
+
+        with patch.object(streaming, "load_transformer_streaming", _stream):
+            svc._load_transformer(
+                self.model_cls,
+                self.paths["transformer_path"],
+                dtype="bfloat16",
+                device_map={"": "cuda:0"},
+                low_cpu_mem_usage=True,
+                progress=lambda done, total: seen.append((done, total)),
+            )
+        self.assertEqual(seen, [(4, 8)])
+
+    def test_no_callback_means_no_callback_is_handed_down(self) -> None:
+        # `_ByteProgress` already tolerates `None`; handing it a lambda that
+        # calls nothing would only hide a wiring mistake.
+        handed: list[object] = []
+
+        def _stream(_model_cls: object, _source: object, **kwargs: object) -> str:
+            handed.append(kwargs["progress"])
+            return "streamed"
+
+        with patch.object(streaming, "load_transformer_streaming", _stream):
+            svc._load_transformer(
+                self.model_cls,
+                self.paths["transformer_path"],
+                dtype="bfloat16",
+                device_map={"": "cuda:0"},
+                low_cpu_mem_usage=True,
+            )
+        self.assertEqual(handed, [None])
+
+    def test_an_ineligible_request_logs_the_reason_and_uses_the_ordinary_loader(self) -> None:
+        # `low_cpu_mem_usage=False` is the plainest refusal there is, and the
+        # sentence the predicate returns is the one that must reach the log.
+        def _stream(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("an ineligible request must not be streamed")
+
+        with patch.object(streaming, "load_transformer_streaming", _stream):
+            with self.assertLogs(svc.log, level="INFO") as captured:
+                svc._load_transformer(
+                    self.model_cls,
+                    self.paths["transformer_path"],
+                    dtype="bfloat16",
+                    device_map=None,
+                    low_cpu_mem_usage=False,
+                )
+        self.assertEqual(len(self.calls), 1)
+        reasons = [line for line in captured.output if "потоковая загрузка" in line.lower()]
+        self.assertTrue(reasons, captured.output)
+        self.assertIn("low_cpu_mem_usage", reasons[0])
+
     def test_a_loader_failure_is_propagated_unchanged(self) -> None:
         # With a local config in hand there is no remedy left to suggest, so the
         # loader's own error must not be rewrapped into a different type.
@@ -778,8 +1051,10 @@ class DecodeRecoveryTests(_TempTreeCase):
         self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
         self.service._device = _FakeDevice("cuda:0")
 
-    def _pipe(self, *, oom_times: int = 0) -> types.SimpleNamespace:
-        return _fake_pipe(self.torch.nn.Module, self.decoded, oom_times=oom_times)
+    def _pipe(self, *, oom_times: int = 0, **vae_kwargs: object) -> types.SimpleNamespace:
+        return _fake_pipe(
+            self.torch.nn.Module, self.decoded, oom_times=oom_times, **vae_kwargs
+        )
 
     def _normalized(self, **overrides: object) -> dict[str, object]:
         return svc.normalize_flux2_klein_params(self.params(**overrides))
@@ -866,20 +1141,119 @@ class DecodeRecoveryTests(_TempTreeCase):
         self.assertEqual(str(pipe.transformer.moves[0][0]), "cpu")
         self.assertEqual(str(pipe.transformer.moves[-1][0]), "cuda:0")
 
-    def test_a_second_oom_escalates_to_tiling_and_slicing(self) -> None:
+    def test_a_second_oom_escalates_to_tiling_when_tiling_can_engage(self) -> None:
+        # 192 latent cells a side is 1536 px, past the fixture VAE's 128-cell
+        # threshold, so `enable_tiling()` here really does change what happens.
         pipe = self._pipe(oom_times=2)
+        latents = _FakeLatents((1, 16, 192, 192))
         normalized = self._normalized(
             placement="full_gpu", vae_tiling=False, vae_slicing=False
         )
-        image, applied, recovered = self.service._decode_locked(pipe, self.latents, normalized)
+        image, applied, recovered = self.service._decode_locked(pipe, latents, normalized)
 
         self.assertIs(image, self.decoded)
         self.assertTrue(recovered)
         self.assertTrue(applied["vae_tiling"])
-        self.assertTrue(applied["vae_slicing"])
         self.assertTrue(pipe.vae.tiling)
-        self.assertTrue(pipe.vae.slicing)
+        # Slicing left the ladder: `decode` slices only when `z.shape[0] > 1` and
+        # this service decodes a batch of one, so enabling it saves nothing and
+        # claiming it would be written into the user's settings (KG-008).
+        self.assertFalse(applied["vae_slicing"])
+        self.assertFalse(pipe.vae.slicing)
         self.assertEqual(pipe.vae.decode_calls, 3)
+        # The tiled attempt ran at the VAE's own thresholds; the last rung was
+        # never needed.
+        self.assertEqual(pipe.vae.thresholds_at_decode[-1], (128, 1024))
+
+    def test_tiling_is_not_claimed_on_a_region_it_cannot_engage_for(self) -> None:
+        # The common case: a 64x64 latent is a 512 px region, and diffusers enters
+        # the tiled path only ABOVE 128 latent cells. Retrying with the flag on
+        # would repeat the decode for nothing and persist a saving that never
+        # happened — which is what the memory guard then plans against.
+        pipe = self._pipe(oom_times=2)
+        normalized = self._normalized(
+            placement="full_gpu", vae_tiling=False, vae_slicing=False
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            self.service._decode_locked(pipe, self.latents, normalized)
+
+        self.assertEqual(pipe.vae.decode_calls, 2)
+        self.assertFalse(pipe.vae.tiling)
+        message = str(caught.exception)
+        # The refusal says WHY tiling is not an answer here, with the numbers.
+        self.assertIn("1024", message)
+        self.assertIn("512x512", message)
+
+    def test_the_last_rung_lowers_both_thresholds_in_the_documented_ratio(self) -> None:
+        # 96 latent cells (768 px) is below the VAE's 128-cell threshold, so the
+        # only thing left to try is making the tile itself smaller.
+        pipe = self._pipe(oom_times=2)
+        latents = _FakeLatents((1, 16, 96, 96))
+        normalized = self._normalized(
+            placement="full_gpu", vae_tiling=False, vae_slicing=False
+        )
+        image, applied, recovered = self.service._decode_locked(pipe, latents, normalized)
+
+        self.assertIs(image, self.decoded)
+        self.assertTrue(recovered)
+        self.assertEqual(pipe.vae.decode_calls, 3)
+        # BOTH thresholds moved, and in the ratio `tiled_decode` assumes:
+        # it slices by the latent one and blends/crops by the sample one, so
+        # lowering the latent side alone rebuilds the image as a mosaic of
+        # shifted copies.
+        self.assertEqual(
+            pipe.vae.thresholds_at_decode[-1],
+            (svc.EMERGENCY_TILE_LATENT_MIN_SIZE, svc.EMERGENCY_TILE_LATENT_MIN_SIZE * 8),
+        )
+        # And they are the VAE's own again afterwards: the change is per decode,
+        # never a setting.
+        self.assertEqual(
+            (pipe.vae.tile_latent_min_size, pipe.vae.tile_sample_min_size), (128, 1024)
+        )
+        # `applied` carries the five persisted flags and no threshold.
+        self.assertEqual(
+            sorted(applied),
+            [
+                "text_encoder_fp8",
+                "unload_text_encoder_after_encode",
+                "unload_transformer_before_vae",
+                "vae_slicing",
+                "vae_tiling",
+            ],
+        )
+
+    def test_the_last_rung_restores_the_thresholds_when_it_fails_too(self) -> None:
+        pipe = self._pipe(oom_times=9)
+        latents = _FakeLatents((1, 16, 96, 96))
+        normalized = self._normalized(
+            placement="full_gpu", vae_tiling=False, vae_slicing=False
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            self.service._decode_locked(pipe, latents, normalized)
+
+        self.assertEqual(
+            pipe.vae.thresholds_at_decode[-1],
+            (svc.EMERGENCY_TILE_LATENT_MIN_SIZE, svc.EMERGENCY_TILE_LATENT_MIN_SIZE * 8),
+        )
+        self.assertEqual(
+            (pipe.vae.tile_latent_min_size, pipe.vae.tile_sample_min_size), (128, 1024)
+        )
+        # The refusal names what was actually tried, not a generic "memory".
+        self.assertIn("уменьшение тайла VAE", str(caught.exception))
+
+    def test_a_vae_that_declares_no_thresholds_is_never_lowered(self) -> None:
+        # Without `block_out_channels` the paired sample threshold cannot be
+        # computed, and moving one of the two alone corrupts the image. Refusing
+        # the rung is the only safe answer.
+        pipe = self._pipe(oom_times=9, sample_size=None)
+        normalized = self._normalized(
+            placement="full_gpu", vae_tiling=False, vae_slicing=False
+        )
+        with self.assertRaises(RuntimeError):
+            self.service._decode_locked(pipe, _FakeLatents((1, 16, 96, 96)), normalized)
+
+        self.assertEqual(pipe.vae.decode_calls, 2)
+        self.assertFalse(hasattr(pipe.vae, "tile_latent_min_size"))
 
     def test_an_unrecoverable_oom_reports_the_free_memory(self) -> None:
         pipe = self._pipe(oom_times=9)

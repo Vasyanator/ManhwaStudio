@@ -16,7 +16,9 @@ Main responsibilities:
   `components_busy: true` rather than waiting for the service lock;
 - verify every refusal of `component_action`: unknown component or action, an
   action outside the component's current list, a busy service, and each of the
-  three memory-guard refusals.
+  three memory-guard refusals;
+- verify the transformer read publishes the wire's SECOND progress level
+  (`file_step`/`file_total`/`file_label`) without moving `step`/`total`.
 
 Notes:
 Module attributes are patched on the module that defines them (`pipeline`,
@@ -35,7 +37,12 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware, pipeline
+from modules.ai_backend.inpaint.flux2_klein import components, hardware, pipeline, streaming
+# Imported at module scope ON PURPOSE: pulling the IPC handler in from inside a
+# test would import the backend's own stack while `sys.modules` still holds this
+# suite's fake `torch`/`diffusers`, and the half-initialized modules that leaves
+# behind break every later test in the file.
+from modules.ai_backend.ipc.handlers.flux2_klein import _progress_forwarder
 from modules.ai_backend.runtime.model_manager import LoadedModelManager
 
 from ._test_fixtures import (
@@ -45,6 +52,7 @@ from ._test_fixtures import (
     _FakeLatents,
     _FakeOutOfMemoryError,
     _PatchRecorder,
+    _PlacementFixture,
     _ResidencyModule,
     _TempTreeCase,
     _install_fake_torch,
@@ -111,7 +119,9 @@ class InpaintRequestTests(_TempTreeCase):
         ensure_patch = patch.object(
             self.service,
             "_ensure_pipeline_locked",
-            lambda normalized, model_key, report, region_hw: self._install(model_key),
+            lambda normalized, model_key, report, region_hw, progress_callback=None: (
+                self._install(model_key)
+            ),
         )
         ensure_patch.start()
         self.addCleanup(ensure_patch.stop)
@@ -121,8 +131,12 @@ class InpaintRequestTests(_TempTreeCase):
         def _embeds(normalized: dict[str, object], _report: object) -> dict[str, object]:
             self.encodes += 1
             self.order.append("encode")
+            # The EFFECTIVE scale, exactly as the real phase asks: a distilled
+            # checkpoint pins it to 1.0, so no negative embedding is produced.
             negative = (
-                _FakeEmbeds("") if float(normalized["guidance_scale"]) > 1.0 else None
+                _FakeEmbeds("")
+                if self.service._effective_guidance_scale(normalized) > 1.0
+                else None
             )
             return {"prompt": _FakeEmbeds(str(normalized["prompt"])), "negative": negative}
 
@@ -163,6 +177,30 @@ class InpaintRequestTests(_TempTreeCase):
             _png_bytes(self.mask, "L"),
             params=self.params(**overrides),
         )
+
+    def test_a_distilled_checkpoint_gets_no_raised_guidance_and_no_negative(self) -> None:
+        # `do_classifier_free_guidance` is `guidance_scale > 1 and not
+        # is_distilled`, so on the shipped checkpoint a raised slider buys
+        # nothing — but sending it down anyway invites diffusers to branch on a
+        # value it has already decided to ignore, and the negative embedding it
+        # implies costs a full pass over the 16 GB text encoder.
+        self._run(placement="full_gpu", guidance_scale=7.0)
+        self.assertAlmostEqual(float(self.pipe_calls[-1]["guidance_scale"]), 1.0)
+        self.assertIsNone(self.pipe_calls[-1]["negative_prompt_embeds"])
+
+    def test_an_undeclared_checkpoint_still_gets_the_requested_guidance(self) -> None:
+        self.declare_distilled(None)
+        self._run(placement="full_gpu", guidance_scale=7.0)
+        self.assertAlmostEqual(float(self.pipe_calls[-1]["guidance_scale"]), 7.0)
+        self.assertIsNotNone(self.pipe_calls[-1]["negative_prompt_embeds"])
+
+    def test_the_ignored_slider_is_announced_once_per_run(self) -> None:
+        # Three places read the scale during one request; the user needs the
+        # sentence, not three copies of it.
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            self._run(placement="full_gpu", guidance_scale=7.0)
+        ignored = [line for line in captured.output if "is_distilled" in line]
+        self.assertEqual(len(ignored), 1, ignored)
 
     def test_the_result_is_the_region_size_and_untouched_outside_the_mask(self) -> None:
         import io
@@ -471,7 +509,7 @@ class InpaintRequestTests(_TempTreeCase):
     def _write_dimensions(self, hidden_size: int, joint_attention_dim: int) -> None:
         """Give the fixture's two configs real widths, as a checkout carries them."""
         (self.root / "text_encoder" / "config.json").write_text(
-            json.dumps({"architectures": ["Qwen3ForCausalLM"], "hidden_size": hidden_size}),
+            json.dumps({"architectures": ["Qwen3Model"], "hidden_size": hidden_size}),
             encoding="utf-8",
         )
         (self.root / "transformer" / "config.json").write_text(
@@ -722,6 +760,15 @@ class StatusTests(_TempTreeCase):
         self.assertTrue(out["components"]["scheduler"]["found"])
         self.assertFalse(out["loaded"])
 
+    def test_guidance_supported_follows_the_checkpoints_own_declaration(self) -> None:
+        # A plain boolean on the wire, not the tri-state behind it: the client
+        # only needs to know whether to offer the slider, and the unknown case
+        # reports `True` because that is what its run really does.
+        for declared, expected in ((True, False), (False, True), (None, True)):
+            with self.subTest(is_distilled=declared):
+                self.declare_distilled(declared)
+                self.assertIs(self.service.status(self.params())["guidance_supported"], expected)
+
     def test_an_unconfigured_service_reports_the_missing_component(self) -> None:
         out = self.service.status(None)
         self.assertFalse(out["available"])
@@ -950,6 +997,14 @@ class ComponentActionTests(_TempTreeCase):
             (hardware, "_clear_torch_cache", lambda: None),
             (hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:0"),
             (components, "_weight_bytes", lambda path: sizes.get(path, 0)),
+            # The forecast sizes the encoder through the RESIDENT helper, so it
+            # has to be patched too or the encoder drops out of every guard
+            # assertion below (see `test_memory.py` for the same pair).
+            (
+                components,
+                "text_encoder_resident_bytes",
+                lambda path, *_a, **_k: sizes.get(path, 0),
+            ),
             (hardware, "memory_snapshot", lambda *_a, **_k: dict(self.memory)),
         ):
             attr_patch = patch.object(module, name, replacement)
@@ -968,7 +1023,7 @@ class ComponentActionTests(_TempTreeCase):
         )
         self.builds = 0
 
-        def _ensure(normalized, model_key, report, *, region_hw):
+        def _ensure(normalized, model_key, report, *, region_hw, progress_callback=None):
             self.builds += 1
             self.region_hw = region_hw
             self.pipe.transformer.to(self.service._device)
@@ -1254,6 +1309,125 @@ class ComponentActionTests(_TempTreeCase):
         self.assertTrue(result["performed"])
         self.assertEqual(self.pipe.vae.warmup_calls, 1)
         self.assertEqual(self.pipe.vae.decode_calls, 0)
+
+# ---------------------------------------------------------------------------
+# Byte-level load progress
+# ---------------------------------------------------------------------------
+class _RecordingEmitter:
+    """The one method `_progress_forwarder` calls on a request's progress emitter."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, object]] = []
+
+    def emit(self, header: dict[str, object], blob: bytes) -> None:
+        assert blob == b""
+        self.frames.append(dict(header))
+
+
+class TransformerByteProgressTests(_PlacementFixture):
+    """The transformer read drives the wire's SECOND progress level.
+
+    The step bar cannot move for the minutes a ~17 GiB checkpoint takes, so the
+    streaming loader's byte counters are published as the optional
+    `file_step`/`file_total`/`file_label` fields of the SAME frame. The real IPC
+    forwarder is used here rather than a stand-in, because "does it reach the
+    handler" is precisely the question.
+    """
+
+    single_file_transformer = True
+    TOTAL_BYTES = 17 * 1024**3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.emitter = _RecordingEmitter()
+        self.forward = _progress_forwarder(types.SimpleNamespace(progress_emitter=self.emitter))
+        module_cls = self.torch.nn.Module
+        total = self.TOTAL_BYTES
+
+        def _stream(model_cls: object, _source: object, **kwargs: object) -> object:
+            progress = kwargs.get("progress")
+            if callable(progress):
+                progress(total // 4, total, "blocks.0.weight")
+                progress(total, total, "blocks.9.weight")
+            return module_cls("transformer", ptr=0x4000, device_type="cuda:0")
+
+        stream_patch = patch.object(streaming, "load_transformer_streaming", _stream)
+        stream_patch.start()
+        self.addCleanup(stream_patch.stop)
+
+    def _load(self) -> list[dict[str, object]]:
+        normalized = svc.normalize_flux2_klein_params(
+            self.params(placement="encoder_cpu", low_cpu_mem_usage=True)
+        )
+        report = svc._progress_reporter(self.forward, "load", svc.LOAD_PHASE_STEPS)
+        self.service._ensure_pipeline_locked(
+            normalized,
+            "flux2_klein:test",
+            report,
+            region_hw=(128, 128),
+            progress_callback=self.forward,
+        )
+        return self.emitter.frames
+
+    def test_the_bytes_arrive_as_file_step_and_file_total(self) -> None:
+        byte_frames = [frame for frame in self._load() if "file_step" in frame]
+        self.assertEqual(
+            [(frame["file_step"], frame["file_total"]) for frame in byte_frames],
+            [(self.TOTAL_BYTES // 4, self.TOTAL_BYTES), (self.TOTAL_BYTES, self.TOTAL_BYTES)],
+        )
+        # The FILE is named, not the tensor: the client renders this label beside
+        # a GiB figure, and a per-tensor key would flicker on every frame.
+        for frame in byte_frames:
+            self.assertEqual(frame["file_label"], "flux2-klein.safetensors")
+
+    def test_the_step_level_is_not_disturbed(self) -> None:
+        byte_frames = [frame for frame in self._load() if "file_step" in frame]
+        for frame in byte_frames:
+            with self.subTest(file_step=frame["file_step"]):
+                self.assertEqual(frame["phase"], "load")
+                self.assertEqual(frame["step"], svc.LOAD_STEP_TRANSFORMER)
+                self.assertEqual(frame["total"], svc.LOAD_PHASE_STEPS)
+                self.assertEqual(frame["label"], "Загрузка трансформера")
+
+    def test_the_later_step_frames_carry_no_file_level_and_so_clear_the_bar(self) -> None:
+        # The Rust client clears its second bar on the first frame without the
+        # fields, which is what makes the tokenizer/VAE steps look right.
+        frames = self._load()
+        later = [
+            frame
+            for frame in frames
+            if isinstance(frame["step"], int) and frame["step"] > svc.LOAD_STEP_TRANSFORMER
+        ]
+        self.assertTrue(later)
+        for frame in later:
+            with self.subTest(step=frame["step"]):
+                self.assertNotIn("file_step", frame)
+                self.assertNotIn("file_total", frame)
+                self.assertNotIn("file_label", frame)
+
+    def test_a_callback_that_predates_the_second_level_is_not_broken_by_it(self) -> None:
+        # Every service callback older than the download's three fields takes
+        # four positional arguments only. Handing it keywords raises `TypeError`,
+        # which must cost the byte frames and nothing else.
+        seen: list[tuple[str, int]] = []
+        report = svc._progress_reporter(
+            lambda phase, step, _total, _label: seen.append((phase, step)),
+            "load",
+            svc.LOAD_PHASE_STEPS,
+        )
+        normalized = svc.normalize_flux2_klein_params(
+            self.params(placement="encoder_cpu", low_cpu_mem_usage=True)
+        )
+        self.service._ensure_pipeline_locked(
+            normalized,
+            "flux2_klein:test",
+            report,
+            region_hw=(128, 128),
+            progress_callback=lambda phase, step, _total, _label: seen.append((phase, step)),
+        )
+        self.assertIn(("load", svc.LOAD_STEP_TRANSFORMER), seen)
+        self.assertIn(("load", svc.LOAD_STEP_PLACEMENT), seen)
+
 
 if __name__ == "__main__":
     unittest.main()

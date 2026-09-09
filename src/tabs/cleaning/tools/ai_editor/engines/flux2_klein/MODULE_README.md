@@ -92,8 +92,9 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   `components.rs`, `advanced.rs` and `progress.rs` draw the blocks it calls into. See
   `ui/MODULE_README.md`.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
-  `flux2_prompt_cache_line`, `flux2_run_block_reason`, `region_block_reason` — with the
-  line/tone types they answer in. Edit it to change what a line or a refusal SAYS.
+  `flux2_prompt_cache_line`, `flux2_guidance_supported`, `flux2_run_block_reason`,
+  `region_block_reason` — with the line/tone types they answer in. Edit it to change what a
+  line or a refusal SAYS, or which control the backend's answer closes.
 - `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()`, the
   placement/dtype/preset vocabulary, `Flux2SourceMode`, the persisted `variant` and
   `effective_paths`, and the settings-file load/save pair. Edit it to add or change a
@@ -145,6 +146,16 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   read `flux2_pipeline_busy` over all four.
 - **`Flux2ModelReadiness` is three-state on purpose** (`status.rs`): `Unknown` never
   blocks a run, and a catalog counts only while it still describes the configured paths.
+- **An ABSENT `guidance_supported` means SUPPORTED** (`status.rs`, `wire.rs`,
+  `decisions.rs`). `.status` reports whether the loaded checkpoint can use guidance at all:
+  a checkpoint declaring `"is_distilled": true` makes diffusers switch classifier-free
+  guidance off, so a `guidance_scale` above 1.0 only doubles the per-step compute. The
+  field is `Option<bool>` like `prompt_cached` and `text_encoder_available`, but its safe
+  default is INVERTED — only a positive `false` closes the control, because an older
+  backend reports nothing and must not lose a working parameter. The one place that rule
+  lives is `flux2_guidance_supported`. The stored `guidance_scale` is never clamped,
+  rewritten or hidden by this: the backend owns the run's semantics and the setting has to
+  come back on a checkpoint that is not distilled.
 - **`FLUX2_MAX_SEQ` (wire.rs) is part of the prompt-cache key.** Lowering it invalidates
   every saved `.msprompt` entry at once.
 - **The HF token never enters the settings file** and must never be logged

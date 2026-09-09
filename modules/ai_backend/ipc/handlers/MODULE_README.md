@@ -42,7 +42,8 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   answer — it throws the whole OOM-recovery report away.
   `prompt_cache.build` is the second streaming method of the group (same
   `{phase, step, total, label}` frames through the shared `_progress_forwarder`, no blob): it
-  encodes a prompt without generating anything, and reading the text encoder takes ~106 s, so a
+  encodes a prompt without generating anything, and reading the text encoder takes tens of seconds,
+  so a
   silent wait is not acceptable. `prompt_cache.list`/`.save`/`.load`/`.export`/`.import` are plain
   request/response. Names and paths are forwarded VERBATIM — `_require_non_empty_str` only checks
   that the field arrived as a non-empty string; what makes a path or a name acceptable is the

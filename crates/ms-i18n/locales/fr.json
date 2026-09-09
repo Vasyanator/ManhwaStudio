@@ -745,6 +745,8 @@
   "cleaning.tools.flux2_klein.fixed_seed_label": "Seed fixe",
   "cleaning.tools.flux2_klein.guidance_hint": "Le modèle distillé attend un guidance de 1.0.",
   "cleaning.tools.flux2_klein.guidance_label": "Guidance",
+  "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip": "Le backend signale ce checkpoint comme distillé : le guidage sans classifieur est donc désactivé quelle que soit la valeur, et au-delà de 1.0 elle ne ferait que doubler le calcul par étape sans rien changer. La valeur enregistrée est conservée et redevient active sur un checkpoint non distillé.",
+  "cleaning.tools.flux2_klein.guidance_unsupported_note": "Le checkpoint est distillé : le guidance n'a aucun effet, le paramètre est donc désactivé.",
   "cleaning.tools.flux2_klein.install_button": "Installer",
   "cleaning.tools.flux2_klein.install_heading": "Installation du modèle",
   "cleaning.tools.flux2_klein.install_hint": "Déplie la section « Installation du modèle », où la source se choisit : vos propres chemins ou un téléchargement.",

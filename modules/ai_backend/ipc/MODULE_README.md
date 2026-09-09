@@ -165,6 +165,23 @@ live in `handlers/MODULE_README.md`.
   same convention to its RESPONSE (`clean_png ++ mask_png`); it is the only method that does.
 - A `cancel{id}` sets that id's `threading.Event`; the handler observes it and raises `Interrupted`
   to emit `response{status:"interrupted"}`.
+- **Outbound error text is sanitized; the log keeps the original.** `_run_handler` calls
+  `traceback.print_exc()` first — that puts the UNTOUCHED exception text and traceback in the process
+  log, which is the detailed technical half of the error contract — and only then passes `str(exc)`
+  through `runtime.error_text.sanitize_torch_error` for the `HEADER_ERROR` field. The one thing it
+  currently removes is Torch's out-of-memory advice to set
+  `PYTORCH_{CUDA,HIP}_ALLOC_CONF=expandable_segments:True`, which corrupts computation on this
+  project's ROCm build and yields black images (`runtime/MODULE_README.md`). Do not "restore" the raw
+  text on the wire, and do not widen the sanitizer into a general error-message filter here: it is a
+  targeted rewrite that leaves everything else byte-identical, because the user may have to forward
+  the message as a diagnostic. The import is deliberate and cheap — `runtime/error_text.py` is
+  stdlib-only, so `ipc/` stays torch-free at import time.
+  - **The call is unconditional; WHEN it rewrites anything is not this layer's decision.**
+    `error_text` is ROCm-gated and defaults to a pass-through, so a dispatcher in a process that
+    never ran `configure_rocm_runtime()` — a unit test, a CPU or CUDA install — forwards Torch's
+    text byte for byte, and on NVIDIA Torch's advice reaches the user intact because it is correct
+    there. Do not add a platform test here: that would put the same rule in two places, and this
+    layer is torch-free and cannot ask the question anyway.
 - Event fan-out is best-effort. A broken or slow sink is dropped silently; the publisher never
   raises. Slow-client isolation uses a 2 s per-write socket timeout (`_PUBLISH_WRITE_TIMEOUT_S`).
 - Handlers must not import `server.py` directly; they receive `AppState` via `HandlerContext.state`.
@@ -184,7 +201,8 @@ live in `handlers/MODULE_README.md`.
 ## Editing map
 - Wire format or protocol constants: `framing.py` and `protocol.py`; update `PROTOCOL.md` first.
 - Event bus fan-out behavior or slow-client isolation: `events.py`.
-- Handshake, cancel registry, in-flight cap, or progress emitter wiring: `dispatcher.py`.
+- Handshake, cancel registry, in-flight cap, progress emitter wiring, or outbound error-text
+  sanitizing: `dispatcher.py` (the rewrite itself lives in `../runtime/error_text.py`).
 - AF_UNIX listener, single-instance safety, or worker pool: `frame_server.py`.
 - WebSocket transport, handshake token check, or WS byte-stream adapter: `frame_ws_server.py`.
 - Handler for an existing feature group: the matching `handlers/<group>.py`.

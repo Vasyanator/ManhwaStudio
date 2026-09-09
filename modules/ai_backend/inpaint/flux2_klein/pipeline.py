@@ -8,21 +8,30 @@ operates on a pipeline or a component module; nothing here owns the service lock
 or the model lease - that is `service.py`.
 
 Main responsibilities:
-- component loaders (`_load_transformer`, `_load_text_encoder`, `_load_vae`) and
-  the single-file transformer's config contract;
+- component loaders (`_load_transformer`, `_load_text_encoder`, `_load_vae`),
+  the single-file transformer's config contract, the choice between the
+  tensor-at-a-time loader of `streaming.py` and diffusers' own
+  `from_single_file`, and the text encoder's
+  truncation to `components.ENCODER_KEEP_LAYERS` decoder layers (with
+  `_quiet_transformers_load_warnings` around that one load);
 - placement (`_apply_placement`, `_require_components_materialized`,
   `_materialize_components_for_offload`) and the ROCm staging patch it runs under;
 - per-component residency and the action matrix the client renders
   (`_module_residency`, `_component_actions`, plus the name validators);
 - the warm-up decode, the prompt-encode phase and the fp8 quantization;
 - the VAE decode with its out-of-memory recovery (`_decode_region_latents`,
-  `_park_transformer_off_device`, `_restore_transformer_to_device`).
+  `_park_transformer_off_device`, `_restore_transformer_to_device`), including
+  the tiling gate that says whether tiling can engage at all
+  (`_vae_tiling_engages`) and the last-resort tile shrink
+  (`_lowered_vae_tile_thresholds`, whose two thresholds must move together).
 
 Notes:
 - `patched_module_to`, `mmap_staging_required`, `tensor_needs_staging`,
   `_quantize_text_encoder_fp8` and `_restore_transformer_to_device` are replaced
   by the test suite through this module object; `service.py` therefore calls them
   as `pipeline.<name>(...)`.
+- `streaming.load_transformer_streaming` / `streaming.streaming_load_eligible`
+  are reached through the `streaming` module for the same reason.
 - `hardware._clear_torch_cache` / `hardware.memory_snapshot` are reached through
   their module for the same reason.
 - torch / diffusers / transformers are imported lazily inside the functions that
@@ -31,17 +40,18 @@ Notes:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ...runtime.rocm_mmap_transfer import (
     mmap_staging_required,
     patched_module_to,
     tensor_needs_staging,
 )
-from . import hardware
+from . import hardware, streaming
 from .components import (
     _fp8_scaled_message,
     _missing_transformer_config_message,
@@ -50,8 +60,11 @@ from .components import (
     find_transformer_config_dir,
     is_fp8_scaled_checkpoint,
     read_safetensors_header,
+    text_encoder_truncation_kwargs,
+    TEXT_ENCODER_OUT_LAYER_INDICES,
     validate_transformer_config_dir,
 )
+from .progress import FileProgressCb
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +74,14 @@ log = logging.getLogger(__name__)
 #: forward — but it costs `WARMUP_LATENT_CELLS * vae_scale_factor` pixels, i.e. a
 #: 64x64 image, which is nothing next to the region itself.
 WARMUP_LATENT_CELLS = 8
+
+#: Latent tile side the LAST rung of the decode's OOM ladder falls back to
+#: (`_decode_region_latents`, step 3). It is diffusers' own working assumption —
+#: `tiled_decode` documents itself as splitting `z` into "overlapping 64x64 tiles"
+#: — and on a four-block VAE it means a 512 px tile, a quarter of the shipped
+#: 1024 px threshold's area. It is used only as an emergency, per decode, and is
+#: restored afterwards; see `_lowered_vae_tile_thresholds`.
+EMERGENCY_TILE_LATENT_MIN_SIZE = 64
 
 #: Components loaded from safetensors, i.e. the ones diffusers hands out backed
 #: by a writable private file mapping and which therefore hit the ROCm amdkfd
@@ -124,6 +145,7 @@ def _load_transformer(
     dtype: Any,
     device_map: dict[str, str] | None,
     low_cpu_mem_usage: bool,
+    progress: FileProgressCb | None = None,
 ) -> Any:
     """Load `Flux2Transformer2DModel` from a diffusers folder or a single file.
 
@@ -146,6 +168,24 @@ def _load_transformer(
     The two loaders also take the target device through DIFFERENT kwargs, which
     is why `device_map` is only forwarded to the directory branch; see
     `_single_file_device`.
+
+    **A single file is read TENSOR BY TENSOR when it can be**
+    (`streaming.load_transformer_streaming`): `from_single_file` materializes the
+    WHOLE checkpoint in host memory before anything reaches the accelerator, so
+    on a ~17 GiB klein checkpoint the host peak is the checkpoint itself. The
+    decision is `streaming.streaming_load_eligible` — that module carries no
+    fallback on purpose — and a refusal is LOGGED here, at the site that makes
+    the choice, before the ordinary loader runs. `progress` is the byte-level
+    channel the streaming loader drives; it is ignored on every other path,
+    because nothing else can report bytes.
+
+    `streaming.load_transformer_streaming` runs OUTSIDE `patched_module_to()`
+    deliberately: its tensors come from `torch.frombuffer` over anonymous memory,
+    which reports `tensor_needs_staging() == False`, it never calls
+    `nn.Module.to`, and that patch's contract forbids file I/O inside the block.
+    Placement is not weakened by any of this — `_apply_placement` still moves the
+    components unconditionally afterwards, and `_require_components_materialized`
+    still checks the result.
 
     # Raises
     `ValueError` for an fp8_scaled checkpoint (unsupported by diffusers 0.39) or
@@ -173,6 +213,31 @@ def _load_transformer(
     if config_dir is None:
         raise FileNotFoundError(_missing_transformer_config_message(source))
     validate_transformer_config_dir(config_dir)
+
+    # The streaming loader keeps the host peak at ONE TENSOR instead of the whole
+    # checkpoint. It refuses by name rather than falling back, so the choice —
+    # and the reason for not taking it — is made and logged here.
+    eligible, reason = streaming.streaming_load_eligible(
+        source, low_cpu_mem_usage=low_cpu_mem_usage, device_map=device_map
+    )
+    if eligible:
+        return streaming.load_transformer_streaming(
+            model_cls,
+            source,
+            dtype=dtype,
+            device_map=device_map,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+            # The loader names the TENSOR it just read; the wire's second level
+            # names the FILE, which `progress` already has bound, so the key is
+            # dropped here rather than flickering through the user's progress bar.
+            progress=None if progress is None else lambda done, total, _key: progress(done, total),
+        )
+    log.info(
+        "FLUX.2 klein: потоковая загрузка трансформера не применяется (%s) — "
+        "используется обычный загрузчик diffusers.",
+        reason,
+    )
+
     # `config` as a local directory is what keeps the loader off the Hub: with it
     # set, diffusers never calls `fetch_diffusers_config`, which is where the
     # flux-2-dev repo id comes from. `local_files_only` closes the door a second
@@ -205,6 +270,36 @@ def _single_file_device(device_map: dict[str, str] | None) -> str | None:
     return str(device_map[""])
 
 
+#: Loggers a truncated encoder load must not shout through. transformers reports
+#: every checkpoint key it did not consume, and a truncated load leaves a whole
+#: block of decoder layers unconsumed by design, so the warning is a wall of
+#: noise about the exact thing we asked for.
+_TRANSFORMERS_LOAD_LOGGERS = ("transformers.modeling_utils",)
+
+
+@contextlib.contextmanager
+def _quiet_transformers_load_warnings() -> Iterator[None]:
+    """Silence transformers' UNEXPECTED-key warnings for the duration of ONE load.
+
+    Used only around a load that was DELIBERATELY truncated
+    (`text_encoder_truncation_kwargs`), where "some weights of the checkpoint
+    were not used" is the intended outcome and printing several hundred tensor
+    names would bury the load steps the user is actually watching. Levels are
+    restored in `finally`, so an exception inside the load cannot leave the
+    process with transformers muted.
+    """
+    restore: list[tuple[logging.Logger, int]] = []
+    for name in _TRANSFORMERS_LOAD_LOGGERS:
+        logger = logging.getLogger(name)
+        restore.append((logger, logger.level))
+        logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        for logger, level in restore:
+            logger.setLevel(level)
+
+
 def _load_text_encoder(
     model_cls: Any,
     path: str,
@@ -212,6 +307,7 @@ def _load_text_encoder(
     dtype: Any,
     device_map: dict[str, str] | None,
     low_cpu_mem_usage: bool,
+    keep_layers: int | None,
 ) -> Any:
     """Load the Qwen3 text encoder from a transformers/diffusers folder.
 
@@ -223,6 +319,18 @@ def _load_text_encoder(
     (`modeling_utils.py`, "`torch_dtype` is deprecated! Use `dtype` instead!").
     The diffusers loaders in this module keep `torch_dtype` — diffusers 0.39
     recognizes nothing else.
+
+    `keep_layers` is how many decoder layers the loaded model must have, i.e.
+    `components.ENCODER_KEEP_LAYERS` for a run; `None` loads the checkpoint whole
+    and exists for a caller that is not encoding a klein prompt. It is applied
+    through `text_encoder_truncation_kwargs`, which decides per config what to
+    pass and refuses an encoder with too few layers, and the load it produces is
+    the only one whose "unused checkpoint keys" warnings are suppressed — those
+    keys are the layers we asked not to build.
+
+    # Raises
+    `ValueError` when `path` is not a transformers folder, or when the encoder
+    has fewer layers than the pipeline reads.
     """
     source = component_dir_for_path(Path(path))
     if not source.is_dir():
@@ -232,7 +340,14 @@ def _load_text_encoder(
     kwargs: dict[str, Any] = {"dtype": dtype, "low_cpu_mem_usage": low_cpu_mem_usage}
     if device_map is not None:
         kwargs["device_map"] = device_map
-    return model_cls.from_pretrained(str(source), **kwargs)
+    truncation = (
+        text_encoder_truncation_kwargs(source, keep_layers) if keep_layers is not None else {}
+    )
+    kwargs.update(truncation)
+    if not truncation:
+        return model_cls.from_pretrained(str(source), **kwargs)
+    with _quiet_transformers_load_warnings():
+        return model_cls.from_pretrained(str(source), **kwargs)
 
 
 def _load_vae(
@@ -274,6 +389,16 @@ def _apply_vae_memory_options(pipe: Any, options: dict[str, Any]) -> None:
     normalized params, or the `applied` dict during OOM recovery. Applied on
     every request, including a cache hit, so toggling the option in the UI takes
     effect without rebuilding the pipeline.
+
+    **Both flags are REQUESTS, and neither changes a threshold.** `enable_tiling`
+    only sets `use_tiling`; `AutoencoderKLFlux2._decode` still enters the tiled
+    path only when a latent side exceeds `tile_latent_min_size` (1024 output px
+    on the shipped klein VAE), so on a smaller region this call saves nothing.
+    `enable_slicing` is inert here in EVERY case: `decode` slices only when
+    `z.shape[0] > 1` and this service always decodes a batch of one. It stays on
+    the wire because the Rust `MemoryPreset` values mirror it — see
+    `dev-docs/known_gaps.md`. Whoever needs to know whether tiling will really
+    engage asks `_vae_tiling_engages`, never this function.
     """
     vae = getattr(pipe, "vae", None)
     if vae is None:
@@ -614,8 +739,15 @@ def _encode_prompt_phase(
 
     Going through the pipeline's own `encode_prompt` rather than reimplementing
     it is deliberate: the Qwen3 chat template, the attention mask and the
-    `text_encoder_out_layers` default all live there, and a second copy of them
-    would drift from the version diffusers actually denoises with.
+    stacking of the requested hidden states all live there, and a second copy of
+    them would drift from the version diffusers actually denoises with.
+
+    **`text_encoder_out_layers` is passed explicitly, not inherited.** The
+    default happens to be `(9, 18, 27)` today, but it is a diffusers default we
+    do not own — the sibling `Flux2Pipeline` already uses `(10, 20, 30)` — and
+    `components.ENCODER_KEEP_LAYERS` truncates the encoder to exactly the layers
+    named here. Inheriting the default would let an upstream edit ask for a layer
+    the loaded encoder no longer has.
 
     The result is moved to the HOST before it is returned, so the prompt cache
     never pins device memory; the caller moves it to the run device.
@@ -632,7 +764,10 @@ def _encode_prompt_phase(
     )
     with torch.no_grad():
         prompt_embeds, _text_ids = holder.encode_prompt(
-            prompt=prompt or "", device=device, max_sequence_length=max_sequence_length
+            prompt=prompt or "",
+            device=device,
+            max_sequence_length=max_sequence_length,
+            text_encoder_out_layers=TEXT_ENCODER_OUT_LAYER_INDICES,
         )
     return prompt_embeds.detach().to("cpu")
 
@@ -647,9 +782,18 @@ def _quantize_text_encoder_fp8(text_encoder: Any) -> int:
     on this project's ROCm host (gfx1201, torch 2.12.0+rocm7.2) the quantize /
     dequantize round trip costs a relative max error of ~3.4% per weight tensor.
 
-    Returns the number of bytes saved. **It does not lower the load peak**: the
-    bf16 weights must exist before they can be quantized, so it pays off only
-    while the encoder stays resident (`unload_text_encoder_after_encode=False`).
+    Returns the number of bytes saved, and that figure is now TRUE. The encoder
+    is loaded as `Qwen3Model`, which has no `lm_head` at all; under the previous
+    `Qwen3ForCausalLM` the walk also hit that layer, whose weight is TIED to
+    `model.embed_tokens` (verified: identical `data_ptr()`). Quantizing it freed
+    nothing — the bf16 storage stayed alive through the embedding — while ADDING
+    the fp8 copy and its scales, and counted the whole tied tensor as saved. The
+    class change removes the case; do not add tied-weight special-casing to
+    bring it back.
+
+    **It does not lower the load peak**: the bf16 weights must exist before they
+    can be quantized, so it pays off only while the encoder stays resident
+    (`unload_text_encoder_after_encode=False`).
 
     # Raises
     `RuntimeError` when the running torch build has no `float8_e4m3fn`. The flag
@@ -854,6 +998,160 @@ def _vae_input_device(pipe: Any) -> Any:
     return pipe._execution_device
 
 
+def _latent_spatial_sides(latents: Any) -> tuple[int, int] | None:
+    """`(height, width)` of a latent tensor in latent cells, or `None`.
+
+    The two trailing dimensions are exactly the ones `AutoencoderKLFlux2._decode`
+    compares against `tile_latent_min_size`, so reading them here keeps the two
+    gates talking about the same numbers. `None` whenever the object does not
+    expose a usable 2-D-or-deeper `shape` — a stand-in, or a future tensor type —
+    and every caller then declines to CLAIM anything rather than guessing.
+    """
+    shape = getattr(latents, "shape", None)
+    if shape is None:
+        return None
+    try:
+        dims = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError):
+        return None
+    if len(dims) < 2 or dims[-1] <= 0 or dims[-2] <= 0:
+        return None
+    return dims[-2], dims[-1]
+
+
+def _vae_tile_latent_min_size(vae: Any) -> int | None:
+    """The VAE's own latent tiling threshold, or `None` when it has none.
+
+    Read from the instance rather than recomputed from the config: the
+    thresholds are mutable attributes and the last rung of the OOM ladder lowers
+    them, so the instance is the only place that knows the current value.
+    """
+    value = getattr(vae, "tile_latent_min_size", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _vae_latent_scale_factor(vae: Any) -> int | None:
+    """Pixels per latent cell for this VAE, or `None` when its config is unusable.
+
+    `2 ** (len(block_out_channels) - 1)`, which is the very factor
+    `AutoencoderKLFlux2.__init__` uses to derive `tile_latent_min_size` from
+    `tile_sample_min_size`. `None` means the paired thresholds cannot be computed
+    and the last rung of the OOM ladder must not run: changing one of the two
+    alone is a corrupt image, not a saving (see `_lowered_vae_tile_thresholds`).
+    """
+    blocks = getattr(getattr(vae, "config", None), "block_out_channels", None)
+    if not isinstance(blocks, (list, tuple)) or not blocks:
+        return None
+    return 2 ** (len(blocks) - 1)
+
+
+def _vae_tiling_engages(pipe: Any, latents_cpu: Any) -> bool:
+    """Whether a tiled decode would ACTUALLY happen for these latents.
+
+    Mirrors diffusers' own gate (`AutoencoderKLFlux2._decode`: the tiled branch is
+    taken when a latent side exceeds `tile_latent_min_size`) instead of repeating
+    the 1024/128 numbers, so an upstream or per-VAE change of the threshold moves
+    both together. `False` whenever the answer cannot be established — a VAE
+    without the attribute, latents without a shape — because every caller uses
+    this to decide whether to CLAIM a saving, and an unprovable claim is a lie
+    written into the user's settings file.
+    """
+    sides = _latent_spatial_sides(latents_cpu)
+    threshold = _vae_tile_latent_min_size(getattr(pipe, "vae", None))
+    if sides is None or threshold is None:
+        return False
+    return max(sides) > threshold
+
+
+@contextlib.contextmanager
+def _lowered_vae_tile_thresholds(vae: Any, latent_min_size: int, scale: int) -> Iterator[None]:
+    """Temporarily shrink the VAE's tile, restoring both thresholds afterwards.
+
+    **The two thresholds are ONE setting and must move together.**
+    `tiled_decode` slices the latents by `tile_latent_min_size` but blends and
+    crops the decoded tiles by `tile_sample_min_size`
+    (`overlap_size`/`blend_extent`/`row_limit` in
+    `diffusers/models/autoencoders/autoencoder_kl_flux2.py`), and its arithmetic
+    assumes `tile_sample_min_size == tile_latent_min_size * scale`. A sibling
+    project lowered only the latent side and got a 1024x1024 image rebuilt as a
+    mosaic of nine shifted copies of the scene with visible seams. `scale` is
+    therefore required, and `_vae_latent_scale_factor` refuses the whole rung
+    when it cannot be computed.
+
+    The change is PER DECODE: the thresholds are restored in a `finally` so that
+    nothing leaks into the next request, the warm-up, or a cached pipeline
+    another request will hit.
+    """
+    missing = object()
+    previous_latent = vae.tile_latent_min_size
+    # A VAE that never declared the sample-side threshold must not come back
+    # carrying one: restoring an absent attribute as `None` would leave
+    # `tiled_decode` reading it as a number on the next request.
+    previous_sample = getattr(vae, "tile_sample_min_size", missing)
+    vae.tile_latent_min_size = latent_min_size
+    vae.tile_sample_min_size = latent_min_size * scale
+    try:
+        yield
+    finally:
+        vae.tile_latent_min_size = previous_latent
+        if previous_sample is missing:
+            delattr(vae, "tile_sample_min_size")
+        else:
+            vae.tile_sample_min_size = previous_sample
+
+
+def _emergency_tile_latent_size(pipe: Any, latents_cpu: Any) -> tuple[int, int] | None:
+    """`(latent tile size, scale)` for the last rung, or `None` when it cannot run.
+
+    The rung is worth running only when every part of it holds: the VAE exposes
+    a threshold and a usable config, the threshold is genuinely ABOVE
+    `EMERGENCY_TILE_LATENT_MIN_SIZE` (otherwise there is nothing to lower), and
+    the latents are larger than the emergency tile (otherwise the gate still will
+    not open and the decode would be repeated for nothing). A region smaller than
+    one emergency tile is refused rather than tiled finer: its decode is already
+    the cheapest this VAE can do, and the shortfall is elsewhere.
+    """
+    vae = getattr(pipe, "vae", None)
+    threshold = _vae_tile_latent_min_size(vae)
+    scale = _vae_latent_scale_factor(vae)
+    sides = _latent_spatial_sides(latents_cpu)
+    if threshold is None or scale is None or sides is None:
+        return None
+    target = EMERGENCY_TILE_LATENT_MIN_SIZE
+    if threshold <= target or max(sides) <= target:
+        return None
+    return target, scale
+
+
+def _tiling_gate_note(pipe: Any, latents_cpu: Any) -> str:
+    """Sentence for the final refusal when tiling could not engage, else `""`.
+
+    §7 wants a refusal that says what to do next, and "включите тайлинг" is not
+    it when the flag is already on and the region is simply below the threshold.
+    """
+    if _vae_tiling_engages(pipe, latents_cpu):
+        return ""
+    vae = getattr(pipe, "vae", None)
+    threshold = _vae_tile_latent_min_size(vae)
+    sides = _latent_spatial_sides(latents_cpu)
+    if threshold is None or sides is None:
+        return ""
+    scale = _vae_latent_scale_factor(vae)
+    if scale is None:
+        return (
+            f"Тайлинг VAE на этой области не включается: он начинает действовать только когда "
+            f"сторона латентов превышает {threshold} ячеек, а здесь это "
+            f"{sides[1]}x{sides[0]}. "
+        )
+    return (
+        f"Тайлинг VAE на этой области не включается: он начинает действовать только когда "
+        f"сторона области превышает {threshold * scale} px, а здесь это "
+        f"{sides[1] * scale}x{sides[0] * scale} px. "
+    )
+
+
 def _decode_region_latents(
     pipe: Any,
     latents_cpu: Any,
@@ -863,12 +1161,35 @@ def _decode_region_latents(
     """Decode the latents, escalating memory savings on an out-of-memory failure.
 
     The denoise is never repeated: every attempt starts from the same host copy
-    of the latents. Escalation order — park the transformer, then enable VAE
-    tiling and slicing. Returns `(image, applied, oom_recovered)`.
+    of the latents. Escalation order:
+
+    1. park the transformer on the host;
+    2. enable VAE tiling — but ONLY when it can actually engage for these
+       latents (`_vae_tiling_engages`). Below the VAE's threshold the flag
+       changes nothing, so setting `applied["vae_tiling"]` there would write a
+       saving that never happened into the user's settings file;
+    3. shrink the VAE's tile (`_lowered_vae_tile_thresholds`) so that tiling
+       engages on a region the shipped threshold ignores. This is the only rung
+       that helps the common case, since no square region this service accepts
+       reaches 1024 px.
+
+    `vae_slicing` is NOT a rung: `decode` slices only when `z.shape[0] > 1` and
+    this service always decodes a batch of one, so enabling it can never save a
+    byte here (`dev-docs/known_gaps.md`, KG-008).
+
+    Rung 3 is an emergency, not a setting: the thresholds are restored before
+    returning and never appear in `applied`, which carries the five persisted
+    memory flags and nothing else. Its result is also not bit-identical to an
+    untiled decode — `tiled_decode` blends overlapping tiles — which is
+    acceptable precisely because the answer carries `oom_recovered`, telling the
+    caller a retry happened.
+
+    Returns `(image, applied, oom_recovered)`.
 
     # Raises
-    `RuntimeError` with the free-memory figures when even the last attempt runs
-    out of memory, and re-raises unchanged anything that is not an OOM.
+    `RuntimeError` naming what was tried and the free-memory figures when even
+    the last attempt runs out of memory, and re-raises unchanged anything that is
+    not an OOM.
     """
     applied = {
         "unload_transformer_before_vae": bool(normalized["unload_transformer_before_vae"]),
@@ -898,6 +1219,12 @@ def _decode_region_latents(
             applied["vae_slicing"],
         )
 
+    #: Whether a rung actually decoded with tiling in force. Not the same as
+    #: `applied["vae_tiling"]`, which can be `True` from the user's settings on a
+    #: region where tiling never engages — and the final refusal must not claim
+    #: to have tried something that could not happen.
+    tiling_attempted = _vae_tiling_engages(pipe, latents_cpu) and applied["vae_tiling"]
+
     # Step 1: get the transformer out of the way and retry.
     if not applied["unload_transformer_before_vae"]:
         park_transformer()
@@ -915,15 +1242,17 @@ def _decode_region_latents(
                 raise
             last_error = exc
 
-    # Step 2: cut the decode's own peak with tiling and slicing.
-    if not (applied["vae_tiling"] and applied["vae_slicing"]):
+    # Step 2: cut the decode's own peak with tiling — but only where the tiled
+    # path would really be entered. Claiming it on a region below the VAE's
+    # threshold costs a repeated decode and writes a false saving back into the
+    # user's settings, which is what the memory guard then plans against.
+    if not applied["vae_tiling"] and _vae_tiling_engages(pipe, latents_cpu):
         applied["vae_tiling"] = True
-        applied["vae_slicing"] = True
+        tiling_attempted = True
         _apply_vae_memory_options(pipe, applied)
         after = hardware.memory_snapshot()
         log.warning(
-            "FLUX.2 klein: retrying the VAE decode with tiling and slicing enabled "
-            "(free VRAM %d B).",
+            "FLUX.2 klein: retrying the VAE decode with tiling enabled (free VRAM %d B).",
             after["vram_free"],
         )
         try:
@@ -933,11 +1262,45 @@ def _decode_region_latents(
                 raise
             last_error = exc
 
+    # Step 3: make tiling possible at all by shrinking the tile itself. The
+    # thresholds belong to the VAE object, so the change is scoped to this decode
+    # and undone before the next request can see it.
+    emergency = _emergency_tile_latent_size(pipe, latents_cpu)
+    if emergency is not None:
+        target, scale = emergency
+        with _lowered_vae_tile_thresholds(pipe.vae, target, scale):
+            # Tiling has to be ON for the lowered threshold to be consulted at
+            # all; it genuinely runs tiled here, so `applied` may say so.
+            applied["vae_tiling"] = True
+            tiling_attempted = True
+            _apply_vae_memory_options(pipe, applied)
+            after = hardware.memory_snapshot()
+            log.warning(
+                "FLUX.2 klein: retrying the VAE decode with the VAE tile lowered to %d latent "
+                "cells / %d px (free VRAM %d B). The tiles are blended, so the image is not "
+                "bit-identical to an untiled decode.",
+                target,
+                target * scale,
+                after["vram_free"],
+            )
+            try:
+                return _decode_once(pipe, latents_cpu), applied, True
+            except Exception as exc:  # noqa: BLE001 - checked immediately below
+                if not _is_out_of_memory(exc):
+                    raise
+                last_error = exc
+
     final = hardware.memory_snapshot()
+    tried = ["выгрузка трансформера"]
+    if tiling_attempted:
+        tried.append("тайлинг VAE")
+    if emergency is not None:
+        tried.append(f"уменьшение тайла VAE до {emergency[0] * emergency[1]} px")
     raise RuntimeError(
-        "Не хватило видеопамяти на декодирование VAE даже после выгрузки трансформера и "
-        f"включения тайлинга. Свободно {final['vram_free']} байт из {final['vram_total']}; "
-        f"уменьшите выделенную область или выберите режим размещения с меньшим расходом "
+        f"Не хватило видеопамяти на декодирование VAE. Испробовано: {', '.join(tried)}. "
+        f"Свободно {final['vram_free']} байт из {final['vram_total']}. "
+        f"{_tiling_gate_note(pipe, latents_cpu)}"
+        "Уменьшите выделенную область или выберите режим размещения с меньшим расходом "
         f"видеопамяти. Исходная ошибка: {last_error}"
     ) from last_error
 

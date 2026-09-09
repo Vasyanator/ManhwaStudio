@@ -298,6 +298,11 @@ pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
         // raises a warning, so a backend that never reports the field must not be read as
         // "you have no encoder".
         text_encoder_available: header.get("text_encoder_available").and_then(Value::as_bool),
+        // Three-state again, but the SAFE reading is inverted here: an ABSENT field means
+        // supported, because that is what every backend older than the field reports and
+        // what the control did before it existed. `Some(false)` is the only value that
+        // closes the control — see `flux2_guidance_supported`.
+        guidance_supported: header.get("guidance_supported").and_then(Value::as_bool),
         components: parse_flux2_component_snapshot(header),
     }
 }
@@ -394,7 +399,7 @@ pub(super) fn flux2_component_action_header(
 /// Runs one per-component action and returns the residency snapshot that follows it.
 ///
 /// Streaming, and it drives the SAME bar a generation and a `.prompt_cache.build` drive:
-/// loading the ~16 GB text encoder takes ~100 s. `generation` is the progress generation
+/// loading the text encoder takes tens of seconds. `generation` is the progress generation
 /// claimed on the GUI thread; every write is dropped once a newer operation — or a cancel
 /// — has retired it, and the bar is cleared on EVERY exit.
 ///
@@ -574,6 +579,30 @@ mod tests {
             parse_flux2_status(&json!({ "text_encoder_available": "yes" })).text_encoder_available,
             None
         );
+    }
+
+    #[test]
+    fn an_absent_guidance_flag_is_read_as_supported() {
+        // The one three-state field whose SAFE default is `true`. Every backend older than
+        // the field omits it, and reading that silence as "unsupported" would grey out a
+        // working control for a user who only has an older backend — the failure this
+        // assertion exists to catch, because it is invisible until someone runs the app.
+        let silent = parse_flux2_status(&json!({ "available": true }));
+        assert_eq!(silent.guidance_supported, None);
+        assert!(flux2_guidance_supported(Some(&silent)));
+
+        let distilled = parse_flux2_status(&json!({ "guidance_supported": false }));
+        assert_eq!(distilled.guidance_supported, Some(false));
+        assert!(!flux2_guidance_supported(Some(&distilled)));
+
+        let regular = parse_flux2_status(&json!({ "guidance_supported": true }));
+        assert_eq!(regular.guidance_supported, Some(true));
+        assert!(flux2_guidance_supported(Some(&regular)));
+
+        // A field of the wrong type is not an answer either, and must not close the control.
+        let malformed = parse_flux2_status(&json!({ "guidance_supported": "no" }));
+        assert_eq!(malformed.guidance_supported, None);
+        assert!(flux2_guidance_supported(Some(&malformed)));
     }
 
     #[test]

@@ -210,7 +210,7 @@ def _handle_inpaint_flux2_klein(
         "oom_recovered": bool(result.get("oom_recovered", False)),
         # ALL FIVE flags, always. The Rust side parses `applied` as one struct and
         # ignores a partial object outright (`Flux2AppliedFlags` in
-        # `src/tabs/cleaning/tools/flux2_klein.rs`), so dropping a key here does
+        # `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/progress.rs`), so dropping a key here does
         # not degrade the answer — it discards the whole thing, and with it the
         # OOM-recovery settings the next run was supposed to start from.
         "applied": {name: bool(applied.get(name, False)) for name in _APPLIED_FLAGS},
@@ -328,7 +328,7 @@ def _handle_prompt_cache_build(
     """Encode the prompt into the in-memory cache; no image is produced.
 
     Streams the same `phase:"load"` frames as a generation — reading the text
-    encoder takes ~106 s and a silent wait is not acceptable — but only the
+    encoder takes tens of seconds and a silent wait is not acceptable — but only the
     prompt phase's steps occur, because no pipeline is built.
 
     Cancellation follows the shared inpaint contract: checked before the call and
