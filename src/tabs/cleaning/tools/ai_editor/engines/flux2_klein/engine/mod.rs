@@ -74,9 +74,17 @@ pub struct Flux2KleinEngine {
     /// only cost vertical space. A starting run therefore CLEARS this slot rather than
     /// writing to it, so the previous run's outcome cannot linger over a new one.
     pub(super) run_status: Option<String>,
+    /// Every model path, prompt and parameter. Replaced wholesale by the initial load, and
+    /// only while `dirty` is clear — an edit the user has already made outranks the file.
     pub(super) settings: Flux2KleinSettings,
+    /// Channel of the initial settings load, `None` once it has landed.
     pub(super) settings_rx: Option<Receiver<Flux2KleinSettings>>,
+    /// Whether the initial load has landed. Gates saving: writing before it would overwrite
+    /// the user's file with the in-memory defaults.
     pub(super) settings_loaded: bool,
+    /// Raised by every parameter change, cleared when a save is started. It is also what
+    /// makes a user edit outrank a settings load that lands afterwards
+    /// ([`Self::poll_settings_load`]).
     pub(super) dirty: bool,
     pub(super) save_rx: Option<Receiver<()>>,
     /// Component catalog; `None` until the first `.status` answer.
@@ -308,18 +316,41 @@ impl Flux2KleinEngine {
         });
     }
 
-    /// Applies a finished settings load. A disconnected channel keeps the in-memory
-    /// defaults and unblocks saving.
+    /// Applies a finished settings load — UNLESS the user has already edited something, in
+    /// which case the edit wins and the load is discarded.
+    ///
+    /// THE USER ALWAYS WINS, and this is the one place that decides it. The host draws an
+    /// engine's panel body earlier in the frame than it polls that engine, so a value changed
+    /// in the frames between construction and the load landing would otherwise be replaced by
+    /// the file, silently. `dirty` is an exact witness of that case: nothing can clear it
+    /// before the load lands, because [`Self::poll_and_maybe_save`] refuses to write until
+    /// `settings_loaded` is set.
+    ///
+    /// The cost of choosing the edit is that the DISCARDED file is discarded whole — the
+    /// fields the user did not touch keep their defaults and the save that follows writes
+    /// them back. That is the accepted price of never losing a visible edit; per-field
+    /// merging would need per-field dirt, which nothing else here has a use for. The load is
+    /// still marked complete either way, so persistence unblocks and the surviving edit is
+    /// what reaches the file.
+    ///
+    /// The memory forecast is re-armed only when the load actually replaced the settings: a
+    /// discarded document changes nothing, and the edit that outranked it armed the forecast
+    /// through [`Self::note_settings_changed`] already.
+    ///
+    /// A disconnected channel keeps the in-memory settings and unblocks saving, so a crashed
+    /// loader cannot freeze persistence forever.
     pub(super) fn poll_settings_load(&mut self) {
         let Some(rx) = self.settings_rx.as_ref() else {
             return;
         };
         match rx.try_recv() {
             Ok(settings) => {
-                self.settings = settings;
+                if !self.dirty {
+                    self.settings = settings;
+                    self.estimate_wanted = true;
+                }
                 self.settings_loaded = true;
                 self.settings_rx = None;
-                self.estimate_wanted = true;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -1186,6 +1217,60 @@ mod tests {
         engine.poll_and_maybe_save();
         assert!(engine.dirty, "the change must survive until it can be written");
         assert!(engine.save_rx.is_none(), "and no writer may have been started");
+    }
+
+    /// An edit made before the load lands survives it: the file is discarded, the edit stays,
+    /// and persistence is unblocked so the edit is what gets written.
+    #[test]
+    fn an_edit_made_before_the_load_lands_survives_it() {
+        // A load that has NOT landed yet, whose payload differs from what the user picks.
+        let (tx, rx) = mpsc::channel();
+        let mut engine = Flux2KleinEngine {
+            settings_rx: Some(rx),
+            settings_loaded: false,
+            dirty: false,
+            ..Flux2KleinEngine::default()
+        };
+        let from_file = Flux2KleinSettings { steps: FLUX2_STEPS_MAX, ..runnable_settings() };
+
+        // The user edits in the same frame, BEFORE the poll that drains the channel.
+        engine.settings.steps = FLUX2_STEPS_MIN;
+        engine.note_settings_changed();
+
+        assert!(tx.send(from_file).is_ok(), "the test channel must accept the settings");
+        engine.poll_settings_load();
+
+        assert_eq!(
+            engine.settings.steps, FLUX2_STEPS_MIN,
+            "the load must not overwrite an edit the user already made"
+        );
+        assert!(engine.settings_loaded, "the load is complete either way: saving is unblocked");
+        assert!(engine.dirty, "the edit is still pending a write");
+        // The save GATE is asserted rather than driven: `poll_and_maybe_save` would write
+        // the real settings file of whoever runs the test suite.
+        assert!(
+            settings_save_due(engine.dirty, engine.settings_loaded, engine.save_rx.is_some()),
+            "the surviving edit is what gets written next"
+        );
+    }
+
+    /// With nothing edited, the load applies as it always did.
+    #[test]
+    fn a_load_applies_when_the_user_has_changed_nothing() {
+        let (tx, rx) = mpsc::channel();
+        let mut engine = Flux2KleinEngine {
+            settings_rx: Some(rx),
+            settings_loaded: false,
+            dirty: false,
+            ..Flux2KleinEngine::default()
+        };
+
+        let from_file = Flux2KleinSettings { steps: FLUX2_STEPS_MAX, ..runnable_settings() };
+        assert!(tx.send(from_file).is_ok(), "the test channel must accept the settings");
+        engine.poll_settings_load();
+
+        assert_eq!(engine.settings.steps, FLUX2_STEPS_MAX);
+        assert!(engine.settings_loaded);
     }
 
     /// The host pushes the rectangle EVERY frame, and the frame's keep-in-view clamp moves it

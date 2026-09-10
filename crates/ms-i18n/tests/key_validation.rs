@@ -377,7 +377,7 @@ fn meta_holds_only_name() {
 /// The match is intentionally PERMISSIVE — "does the quoted key text occur anywhere
 /// in a source file", NOT "is it a `t!` argument". Some keys are stored in runtime
 /// key-tables and passed to `t!` indirectly (e.g. `translation/ocr_langs.rs`,
-/// `cleaning/tools/lama.rs` `display_name`, `onnx_runtime/builds.rs` `display_label`,
+/// `cleaning/tools/ai_editor/engines/lama/catalog.rs` `display_name`, `onnx_runtime/builds.rs` `display_label`,
 /// `launcher/new_project/reline_models.rs` `CURATED`); as long as the key text is a
 /// literal somewhere, it counts as referenced, so those tables never false-positive.
 /// The surrounding quotes in the `"key"` needle prevent a shorter key from matching

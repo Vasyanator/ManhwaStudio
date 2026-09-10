@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!(before.vae_slicing, settings.vae_slicing);
     }
 
-    /// The debounced settings saver must be ARMED by a settings change and by nothing else.
+    /// The settings saver must be ARMED by a settings change and by nothing else.
     ///
     /// This is the whole persistence guarantee of the engine: `dirty` is the only signal a
     /// parameter change leaves behind, and `poll_and_maybe_save` — which runs inside

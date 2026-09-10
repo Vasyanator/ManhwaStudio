@@ -54,6 +54,7 @@ use super::base::{
     CleaningTool, RegionLoadRequest, RegionLoadResult, StrokePoint, capture_overlay_chunk, overlay_rect_to_scene_rect,
     spawn_region_loader_thread,
 };
+use super::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationState, MaskSource};
 use super::region_edit_v2::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::region_edit_v2::geometry::{FrameConstraints, SizeViolation};
 use super::region_edit_v2::layers::ResultLayer;
@@ -63,6 +64,7 @@ use crate::widgets::WheelSlider;
 use eframe::egui;
 use egui::Pos2;
 use engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
@@ -84,6 +86,15 @@ const NO_ENGINE_CONSTRAINTS: FrameConstraints = FrameConstraints {
 /// are kept equal to that range so the slider cannot present a value the brush would refuse.
 const BRUSH_RADIUS_MIN_PX: usize = 1;
 const BRUSH_RADIUS_MAX_PX: usize = 200;
+
+/// `id_salt` of the mask-generation parameter section and of its source picker.
+///
+/// Both captions are localized, so egui would otherwise derive their persistent ids from the
+/// translated text and lose the folded state and the open popup on a language switch
+/// (`egui-docs/05-ids-and-i18n.md` §2). One tool instance draws each control once, so a
+/// constant salt is enough.
+const MASK_GENERATION_SECTION_ID: &str = "cleaning_ai_editor_mask_generation_section";
+const MASK_SOURCE_PICKER_ID: &str = "cleaning_ai_editor_mask_source_picker";
 
 /// The picker sections, in the order they are drawn. A section with no engine is skipped.
 const ENGINE_SECTIONS: [EngineSection; 2] = [EngineSection::WithoutPrompt, EngineSection::WithPrompt];
@@ -209,6 +220,19 @@ struct ToolMessage {
     error: bool,
 }
 
+/// What a finished region load is FOR.
+///
+/// Both consumers need exactly the same pixels — the page crop composited with the clean
+/// overlay — and the loader is single-slot, so the purpose travels with the job instead of
+/// being guessed from the tool's state when the answer lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadPurpose {
+    /// The region goes to the selected engine (`hand_region_to_engine`).
+    Run,
+    /// The region goes to a backend mask detector (`start_mask_detection`).
+    MaskGeneration,
+}
+
 /// The region-load job in flight, and what it was started for.
 ///
 /// The rectangle is captured HERE rather than re-read from the frame when the load lands: the
@@ -219,6 +243,7 @@ struct PendingLoad {
     job_id: u64,
     page_idx: usize,
     rect: OverlayRectPx,
+    purpose: LoadPurpose,
 }
 
 /// The «ИИ-редактор области» tool: an on-canvas `RegionFrame` in front of a catalog of engines.
@@ -246,6 +271,17 @@ pub struct AiEditorTool {
     /// `Some` between «Обработать» and the moment the region reaches the engine. Clearing it
     /// abandons the job: the answer is then dropped on its job id.
     pending_load: Option<PendingLoad>,
+    /// Mask-generation parameters and the watermark catalog state, shared with the classic
+    /// mask-inpaint editors through `super::mask_generation` — the sources, their requirement
+    /// rules and the detection call have exactly one implementation.
+    mask_generation: MaskGenerationState,
+    /// `Some` while a detector is running on a worker. The frame is `Processing` for as long,
+    /// so its rectangle and its mask cannot move under the job.
+    mask_generation_rx: Option<Receiver<Result<GeneratedMask, String>>>,
+    /// Raised by «Сгенерировать маску» in the compact panel and consumed by the next
+    /// `draw_overlay_ui`. A panel body may mutate only the tool, and starting the job needs
+    /// the canvas and the project — the same reason «Обработать» goes through the frame.
+    generate_mask_requested: bool,
 }
 
 impl std::fmt::Debug for AiEditorTool {
@@ -257,6 +293,7 @@ impl std::fmt::Debug for AiEditorTool {
             .field("engines", &self.engines.iter().map(|engine| engine.id()).collect::<Vec<_>>())
             .field("selected", &self.selected)
             .field("pending_load", &self.pending_load)
+            .field("generating_mask", &self.mask_generation_rx.is_some())
             .finish()
     }
 }
@@ -287,6 +324,9 @@ impl Default for AiEditorTool {
             load_thread: Some(load_thread),
             next_job_id: 1,
             pending_load: None,
+            mask_generation: MaskGenerationState::default(),
+            mask_generation_rx: None,
+            generate_mask_requested: false,
         }
     }
 }
@@ -436,19 +476,10 @@ impl AiEditorTool {
         Ok(Some(chunk))
     }
 
-    /// Step 1 of a run: asks the loader worker for the source region under the frame (D14).
-    ///
-    /// The frame is marked as processing immediately, so it is locked for the whole load — the
-    /// rectangle the answer is validated against cannot move under it. Nothing is decoded here:
-    /// the GUI thread only captures the clean-overlay chunk it already has in memory.
+    /// Step 1 of a run: refuses what the selected engine refuses, then queues the region load
+    /// (D14). The load mechanics themselves are [`Self::request_region`], shared with mask
+    /// generation.
     fn start_run(&mut self, canvas: &CanvasView, project: &ProjectData) {
-        let (Some(page_idx), Some(rect)) = (self.frame.page_idx(), self.frame.rect_px()) else {
-            self.report_error(
-                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
-                &"the frame has no page anchor or no rectangle",
-            );
-            return;
-        };
         let Some(engine) = self.engine() else {
             self.report_error(
                 t!("cleaning.tools.area_editor.error_no_engine").to_string(),
@@ -461,6 +492,74 @@ impl AiEditorTool {
             self.report_error(reason, &detail);
             return;
         }
+        self.request_region(canvas, project, LoadPurpose::Run);
+    }
+
+    /// Step 1 of a mask generation: asks the loader worker for the same source region a run
+    /// would get, so the detector sees the page WITH the user's clean edits (D14).
+    ///
+    /// Every refusal the button already encodes is restated here, where it is enforceable: a
+    /// panel must not be able to start a job by having been drawn one frame late. Nothing is
+    /// decoded or encoded on the GUI thread — the load is a worker and so is the detection.
+    fn start_mask_generation(&mut self, canvas: &CanvasView, project: &ProjectData) {
+        if let Some((text, detail)) = self.mask_generation_block_reason() {
+            self.report_error(text, &detail);
+            return;
+        }
+        self.request_region(canvas, project, LoadPurpose::MaskGeneration);
+    }
+
+    /// Why «Сгенерировать маску» must refuse right now: `(the sentence the user reads, the
+    /// technical detail for the log)`, or `None` while a generation may start.
+    ///
+    /// ONE rule, read by both the control and the action, so a greyed-out button and a refused
+    /// click can never disagree — the same pairing `switch_block_reason` gives the engine
+    /// picker. The order runs most-specific first: an unplaced frame, then a job already in
+    /// flight, then a frame holding work, then the source's own unavailability.
+    #[must_use]
+    fn mask_generation_block_reason(&self) -> Option<(String, String)> {
+        if !self.frame.is_placed() {
+            return Some((
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                "the frame has no page anchor or no rectangle".to_string(),
+            ));
+        }
+        if self.mask_generation_rx.is_some() || self.pending_load.is_some() {
+            return Some((
+                t!("cleaning.mask_editor.background_op_running_status").to_string(),
+                "a region load or a detection is already in flight".to_string(),
+            ));
+        }
+        if !self.mask_editable() {
+            return Some((
+                t!("cleaning.tools.area_editor.generate_mask_locked_hint").to_string(),
+                "a result waits or the engine is running".to_string(),
+            ));
+        }
+        let source = self.mask_generation.params.source;
+        if !source.is_available(self.backend_available, self.torch_available) {
+            return Some((
+                mask_generation::generate_button_hover_text(source, self.backend_available, self.torch_available),
+                format!("mask source {source:?} is unavailable (backend: {}, torch: {})", self.backend_available, self.torch_available),
+            ));
+        }
+        None
+    }
+
+    /// Queues one region load for `purpose` and locks the frame for its duration.
+    ///
+    /// Shared by the run and by mask generation because both need the identical pixels and the
+    /// identical guarantees: the frame is marked as processing immediately, so the rectangle the
+    /// answer is validated against cannot move under the job. Nothing is decoded here — the GUI
+    /// thread only captures the clean-overlay chunk it already has in memory.
+    fn request_region(&mut self, canvas: &CanvasView, project: &ProjectData, purpose: LoadPurpose) {
+        let (Some(page_idx), Some(rect)) = (self.frame.page_idx(), self.frame.rect_px()) else {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                &"the frame has no page anchor or no rectangle",
+            );
+            return;
+        };
         let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) else {
             self.report_error(
                 tf!("cleaning.tools.area_editor.error_page_missing", page = page_idx + 1),
@@ -502,7 +601,7 @@ impl AiEditorTool {
             );
             return;
         }
-        self.pending_load = Some(PendingLoad { job_id, page_idx, rect });
+        self.pending_load = Some(PendingLoad { job_id, page_idx, rect, purpose });
         self.frame.set_processing(true);
         self.report_info(t!("cleaning.tools.area_editor.loading_region_status").to_string());
     }
@@ -523,7 +622,10 @@ impl AiEditorTool {
                         continue;
                     };
                     match result.image {
-                        Ok(region) => self.hand_region_to_engine(pending, region),
+                        Ok(region) => match pending.purpose {
+                            LoadPurpose::Run => self.hand_region_to_engine(pending, region),
+                            LoadPurpose::MaskGeneration => self.start_mask_detection(pending, region),
+                        },
                         Err(error) => {
                             self.frame.set_processing(false);
                             self.report_error(t!("cleaning.tools.area_editor.error_region_load").to_string(), &error);
@@ -605,11 +707,97 @@ impl AiEditorTool {
         }
     }
 
+    /// Step 2 of a mask generation: hands the loaded region to the detector worker.
+    ///
+    /// The frame stays `Processing` across the handover, so the mask cannot be painted and no
+    /// run can start while a detector is about to overwrite the active layer.
+    fn start_mask_detection(&mut self, pending: PendingLoad, region: egui::ColorImage) {
+        let rect = pending.rect;
+        if region.size != [rect.w, rect.h] {
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_region_size").to_string(),
+                &format!(
+                    "the loaded region is {}x{}, the frame region is {}x{}",
+                    region.size[0], region.size[1], rect.w, rect.h
+                ),
+            );
+            return;
+        }
+        let params = self.mask_generation.params;
+        if params.source == MaskSource::Watermark {
+            // The detection may download network code and weights; re-query the catalog once
+            // it ends, so the ✓/«скачать» marks stop lying.
+            self.mask_generation.rearm_watermark_catalog();
+        }
+        self.mask_generation_rx = Some(mask_generation::spawn_mask_generation(
+            region,
+            params,
+            Arc::clone(&self.mask_generation.watermark_progress),
+        ));
+        self.report_info(t!("cleaning.mask_editor.generating_mask_status").to_string());
+    }
+
+    /// Step 3 of a mask generation: drains the detector and writes its answer into the frame.
+    ///
+    /// Runs every frame, panel visible or not — the same rule the engine poll follows: a panel
+    /// the user closed mid-detection must not strand the job. A running detector repaints, so
+    /// the streaming watermark progress bar advances without any input.
+    fn poll_mask_generation(&mut self, ctx: &egui::Context) {
+        match mask_generation::poll_mask_generation(&mut self.mask_generation_rx) {
+            MaskGenerationPoll::Idle => {}
+            MaskGenerationPoll::Running => ctx.request_repaint(),
+            MaskGenerationPoll::Done(mask) => self.accept_generated_mask(mask),
+            MaskGenerationPoll::Failed(text) => {
+                self.frame.set_processing(false);
+                self.report_error(text, &"the mask-generation worker reported a failure");
+            }
+        }
+    }
+
+    /// Writes a finished detection into the SELECTED mask layer of the frame's stack.
+    ///
+    /// It goes through `MaskStack::set_active_from_alpha`, which snapshots the layer first, so
+    /// the whole generated mask is one undo step and erases exactly like a brush stroke — the
+    /// host never touches a layer's pixels itself. Which layer receives it is the user's
+    /// choice in the layer picker, and what the mask MEANS there is the engine's business: the
+    /// detector only marks the text or the watermark it found.
+    ///
+    /// A mask whose size is not exactly the frame rectangle is REFUSED rather than rescaled,
+    /// for the same reason a result is (D7): the stack and the region share one stride.
+    fn accept_generated_mask(&mut self, mask: GeneratedMask) {
+        self.frame.set_processing(false);
+        let Some(rect) = self.frame.rect_px() else {
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                &"a generated mask arrived for a frame that has no rectangle",
+            );
+            return;
+        };
+        let size = mask.size();
+        if size != [rect.w, rect.h] {
+            self.report_error(
+                tf!("cleaning.mask_editor.mask_gen_size_error", mask_w = size[0], mask_h = size[1], expected_w = rect.w, expected_h = rect.h),
+                &"the detector answered about a region of a different size",
+            );
+            return;
+        }
+        let (stack_w, stack_h) = self.frame.masks().size();
+        if !self.frame.masks_mut().set_active_from_alpha(mask.alpha()) {
+            self.report_error(
+                tf!("cleaning.mask_editor.mask_gen_size_error", mask_w = size[0], mask_h = size[1], expected_w = stack_w, expected_h = stack_h),
+                &format!("the mask stack is {stack_w}x{stack_h} and refused a {}x{} mask", size[0], size[1]),
+            );
+            return;
+        }
+        self.report_info(t!("cleaning.mask_editor.mask_generated_status").to_string());
+    }
+
     /// Step 3: polls the selected engine and turns a terminal answer into frame state.
     ///
     /// Runs EVERY frame, panel visible or not: an engine drains its channels here, so skipping
-    /// it would strand a finished run — and, for FLUX.2 klein, would also stop the debounced
-    /// settings saver that runs inside `poll`, silently losing model paths and prompts.
+    /// it would strand a finished run — and, for FLUX.2 klein, would also stop the settings
+    /// saver that runs inside `poll`, silently losing model paths and prompts.
     fn poll_engine(&mut self, ctx: &egui::Context) {
         let Some(engine) = self.engine_mut() else {
             return;
@@ -654,9 +842,16 @@ impl AiEditorTool {
         self.report_info(t!("cleaning.tools.area_editor.result_ready_status").to_string());
     }
 
-    /// Abandons whatever is in flight: the engine's run, and the region load that precedes it.
+    /// Abandons everything in flight: the engine's run, a mask detection, the region load that
+    /// precedes either, and a queued generation request.
+    ///
+    /// Dropping `mask_generation_rx` is what cancels a detection: the worker cannot be stopped
+    /// mid-call, so its answer is discarded on arrival instead of reaching a mask the user has
+    /// meanwhile taken back.
     fn cancel_run(&mut self) {
         self.pending_load = None;
+        self.mask_generation_rx = None;
+        self.generate_mask_requested = false;
         if let Some(engine) = self.engine_mut() {
             engine.cancel();
         }
@@ -842,6 +1037,62 @@ impl AiEditorTool {
         }
     }
 
+    /// Draws the mask-generation block of the compact panel: the source picker, the selected
+    /// source's parameters in a collapsed section, the live progress of a streaming source, and
+    /// «Сгенерировать маску».
+    ///
+    /// It sits among the mask actions because that is what it is — filling the selected layer
+    /// from a backend detector instead of by hand — and it is the HOST's, not an engine's: every
+    /// engine gets it, including the ones whose mask means "you may change here" rather than
+    /// "remove this". The block therefore says nothing about what the mask means; the engines
+    /// state that in their own panel bodies.
+    ///
+    /// The button only QUEUES the job ([`Self::generate_mask_requested`]): a dock panel body
+    /// may mutate the tool alone, and the load needs the canvas and the project.
+    fn draw_mask_generation(&mut self, ui: &mut egui::Ui) {
+        let busy = self.mask_generation_rx.is_some() || self.pending_load.is_some();
+        // The ✓/«скачать» marks of the watermark catalog come from the backend and are fetched
+        // lazily: at most one query in flight, and never while a detection is running.
+        self.mask_generation.refresh_watermark_catalog(self.backend_available, busy);
+
+        let torch_available = self.torch_available;
+        let section_id = ui.make_persistent_id(MASK_GENERATION_SECTION_ID);
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), section_id, false)
+            .show_header(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t!("cleaning.mask_editor.mask_gen_params_heading"));
+                    ui.add_space(8.0);
+                    self.mask_generation.draw_source_picker(ui, MASK_SOURCE_PICKER_ID, torch_available);
+                });
+            })
+            .body(|ui| self.mask_generation.draw_source_params(ui));
+        // Outside the collapsible, so a running detection stays visible while the parameters
+        // are folded away.
+        self.mask_generation.draw_progress(ui);
+
+        // The button's enablement and its tooltip come from the SAME rule the click is checked
+        // against, so a greyed-out button and a refused click can never give different reasons.
+        let block_reason = self.mask_generation_block_reason();
+        let hint = match block_reason {
+            Some((ref text, _)) => text.clone(),
+            None => mask_generation::generate_button_hover_text(
+                self.mask_generation.params.source,
+                self.backend_available,
+                self.torch_available,
+            ),
+        };
+        if ui
+            .add_enabled(block_reason.is_none(), egui::Button::new(t!("cleaning.mask_editor.generate_mask_button")))
+            .on_hover_text(hint.clone())
+            // `on_hover_text` is enabled-only (`Tooltip::for_enabled`), so the reason the button
+            // is greyed out needs the disabled variant too.
+            .on_disabled_hover_text(hint)
+            .clicked()
+        {
+            self.generate_mask_requested = true;
+        }
+    }
+
     /// One line per mask layer with its painted-pixel count, while anything is painted.
     ///
     /// It answers the one question neither the frame's chrome nor its status line can: the
@@ -1017,6 +1268,7 @@ impl CleaningTool for AiEditorTool {
         ui.separator();
         self.draw_brush_controls(ui);
         self.draw_layer_picker(ui);
+        self.draw_mask_generation(ui);
         self.draw_mask_actions(ui);
         self.draw_mask_summary(ui);
         ui.separator();
@@ -1110,8 +1362,15 @@ impl CleaningTool for AiEditorTool {
         if outcome.apply_requested {
             self.apply_result(canvas);
         }
+        // Last of the queued actions: `cancel_run` clears the flag, so a cancel and a generate
+        // clicked in the same frame resolve as the cancel.
+        if self.generate_mask_requested {
+            self.generate_mask_requested = false;
+            self.start_mask_generation(canvas, project);
+        }
 
         self.poll_region_load();
+        self.poll_mask_generation(ctx);
         self.poll_engine(ctx);
     }
 
@@ -1347,7 +1606,7 @@ mod tests {
     #[test]
     fn cancelling_abandons_the_pending_region_load() {
         let mut tool = AiEditorTool::default();
-        tool.pending_load = Some(PendingLoad { job_id: 7, page_idx: 0, rect: rect(0, 0, 64, 64) });
+        tool.pending_load = Some(PendingLoad { job_id: 7, page_idx: 0, rect: rect(0, 0, 64, 64), purpose: LoadPurpose::Run });
         tool.frame.set_processing(true);
         tool.cancel_run();
         assert!(tool.pending_load.is_none());
@@ -1359,10 +1618,10 @@ mod tests {
     #[test]
     fn a_region_from_an_abandoned_job_is_ignored() {
         let mut tool = AiEditorTool::default();
-        tool.pending_load = Some(PendingLoad { job_id: 2, page_idx: 0, rect: rect(0, 0, 64, 64) });
+        tool.pending_load = Some(PendingLoad { job_id: 2, page_idx: 0, rect: rect(0, 0, 64, 64), purpose: LoadPurpose::Run });
         // The loader is a real worker here; feed the tool the answer of job 1 directly.
         tool.hand_region_to_engine(
-            PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4) },
+            PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run },
             egui::ColorImage::filled([8, 8], Color32::WHITE),
         );
         assert!(
@@ -1370,6 +1629,143 @@ mod tests {
             "a region of the wrong size must be refused, never rescaled"
         );
         assert!(tool.frame.result().is_none());
+    }
+
+    /// A generated mask lands in the layer the user SELECTED, not in layer 0, and only there:
+    /// which layer the detection fills is the layer picker's answer, and the engines that
+    /// declare two layers give the two different meanings.
+    #[test]
+    fn a_generated_mask_fills_the_selected_layer_only() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.place_for_test(0, rect(0, 0, 5, 3));
+        let layers = tool.frame.masks().layer_count();
+        assert!(layers >= 1, "every engine declares at least one mask layer");
+        let target = layers - 1;
+        tool.frame.masks_mut().set_active(target);
+
+        let mut alpha = vec![0u8; 15];
+        // Row 2, column 1: a transposed write would land somewhere else.
+        alpha[2 * 5 + 1] = 255;
+        tool.accept_generated_mask(GeneratedMask::from_parts_for_test([5, 3], alpha));
+
+        assert_eq!(tool.frame.masks().layer_set_px(target), 1);
+        assert_eq!(tool.frame.masks().bytes(target)[2 * 5 + 1], 255);
+        for idx in 0..layers {
+            if idx != target {
+                assert_eq!(tool.frame.masks().layer_set_px(idx), 0, "layer {idx} must be untouched");
+            }
+        }
+        assert!(tool.message.as_ref().is_some_and(|message| !message.error), "success is reported");
+        assert_eq!(tool.frame.lock(), FrameLock::MaskPainted, "the frame is released into its painted state");
+    }
+
+    /// The fill is undoable exactly like a stroke: one `undo` restores what the brush had left.
+    #[test]
+    fn a_generated_mask_is_undoable_like_a_stroke() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        tool.accept_generated_mask(GeneratedMask::from_parts_for_test([4, 4], vec![255u8; 16]));
+        let active = tool.frame.masks().active();
+        assert_eq!(tool.frame.masks().layer_set_px(active), 16);
+        assert!(tool.frame.masks_mut().undo());
+        assert!(tool.frame.masks().is_empty(), "undo takes the whole generated mask back");
+    }
+
+    /// A detection answer of the wrong size is REFUSED, never rescaled: the stack and the
+    /// region share one stride (D7's rule, applied to the mask).
+    #[test]
+    fn a_generated_mask_of_the_wrong_size_is_refused() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.place_for_test(0, rect(0, 0, 5, 3));
+        tool.accept_generated_mask(GeneratedMask::from_parts_for_test([3, 5], vec![255u8; 15]));
+        assert!(tool.message.as_ref().is_some_and(|message| message.error));
+        assert!(tool.frame.masks().is_empty(), "nothing may be written from a mask of the wrong shape");
+    }
+
+    /// Every state that must refuse a generation does, with its own reason, in the documented
+    /// order. This is the rule «Сгенерировать маску» is drawn from AND the one a click is
+    /// checked against, so the button and the action cannot disagree.
+    #[test]
+    fn generation_is_refused_in_every_blocked_state() {
+        let mut tool = AiEditorTool::default();
+        // Backend and Torch present, so nothing but the frame's own state can block.
+        tool.backend_available = true;
+        tool.torch_available = true;
+
+        // 1. No frame yet.
+        assert_eq!(
+            tool.mask_generation_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.error_no_frame").to_string())
+        );
+
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        assert!(tool.mask_generation_block_reason().is_none(), "a placed, free frame may generate");
+
+        // 2. A job already in flight.
+        tool.pending_load = Some(PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 8, 8), purpose: LoadPurpose::MaskGeneration });
+        assert_eq!(
+            tool.mask_generation_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.mask_editor.background_op_running_status").to_string())
+        );
+        tool.pending_load = None;
+
+        // 3. A result waiting: the mask then describes work already handed over, and
+        //    overwriting it would make the pending result describe a mask that is gone.
+        tool.frame
+            .set_result(Some(ResultLayer::new(egui::ColorImage::filled([8, 8], Color32::WHITE))));
+        assert!(!tool.mask_editable());
+        assert_eq!(
+            tool.mask_generation_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.generate_mask_locked_hint").to_string())
+        );
+        tool.frame.set_result(None);
+
+        // 4. The source itself unavailable — reported with the source's own reason, never a
+        //    silent fallback to another detector.
+        tool.backend_available = false;
+        assert_eq!(
+            tool.mask_generation_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.mask_editor.backend_unavailable_status").to_string())
+        );
+    }
+
+    /// Cancelling abandons a detection in flight: the worker cannot be stopped mid-call, so
+    /// dropping the receiver is what keeps its answer from reaching a mask the user took back.
+    #[test]
+    fn cancelling_abandons_a_running_detection() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        let (tx, rx) = std::sync::mpsc::channel::<Result<GeneratedMask, String>>();
+        tool.mask_generation_rx = Some(rx);
+        tool.generate_mask_requested = true;
+        tool.frame.set_processing(true);
+
+        tool.cancel_run();
+
+        assert!(tool.mask_generation_rx.is_none());
+        assert!(!tool.generate_mask_requested, "a queued request must not survive a cancel");
+        assert_eq!(tool.frame.lock(), FrameLock::Free);
+        // The worker's answer now has nowhere to go, which is the point.
+        assert!(tx.send(Ok(GeneratedMask::from_parts_for_test([8, 8], vec![255u8; 64]))).is_err());
+    }
+
+    /// A region loaded for a detection must NOT reach the engine, and vice versa: the purpose
+    /// travels with the job because the loader has one slot for both consumers.
+    #[test]
+    fn a_load_carries_what_it_was_started_for() {
+        let mut tool = AiEditorTool::default();
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        tool.backend_available = true;
+        tool.torch_available = true;
+        let pending = PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::MaskGeneration };
+        tool.frame.set_processing(true);
+        tool.start_mask_detection(pending, egui::ColorImage::filled([4, 4], Color32::WHITE));
+
+        assert!(tool.mask_generation_rx.is_some(), "the detector worker was started");
+        assert!(tool.frame.result().is_none(), "a detection never produces a result layer");
+        assert_eq!(tool.frame.lock(), FrameLock::Processing, "the frame stays locked for the detection");
+        // Drop the receiver so the worker's send fails instead of blocking on teardown.
+        tool.mask_generation_rx = None;
     }
 
     /// What one `RecordingEngine` was asked to do, shared with the test that installed it.
@@ -1505,9 +1901,9 @@ mod tests {
     }
 
     /// The regression this whole round exists to prevent: an engine that is never polled never
-    /// drains its channels — a finished run is stranded, and FLUX.2 klein's debounced settings
-    /// saver, which lives inside `poll`, never writes, silently losing model paths and prompts
-    /// on exit. The host polls once per frame, panel visible or not.
+    /// drains its channels — a finished run is stranded, and FLUX.2 klein's settings saver,
+    /// which lives inside `poll`, never writes, silently losing model paths and prompts on
+    /// exit. The host polls once per frame, panel visible or not.
     #[test]
     fn the_selected_engine_is_polled_on_every_frame() {
         let ctx = egui::Context::default();

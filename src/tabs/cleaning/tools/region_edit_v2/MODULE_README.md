@@ -143,6 +143,15 @@ that owns the context, the canvas and the project at once:
   size differs from `rect_px` — `replace_overlay_region_px` silently rescales.
 - **Reuse, never copy.** Pointer-to-pixel and overlay-chunk conversions come from `tools/base.rs`
   (`pub(super)`); brush radius policy comes from `crate::tools::MaskBrush`.
+- **A mask that did not come from the brush enters through `MaskStack::set_active_from_alpha`,
+  and through the same door a stroke uses.** It writes the ACTIVE layer only, binarizes its
+  input to `0`/`255` (the layer's own invariant, and what keeps the set-pixel counter exact),
+  and SNAPSHOTS the layer first, so a whole generated mask is one undo step and erases exactly
+  like painted work. A buffer that is not exactly `width * height` bytes is refused, having
+  written nothing and taken no snapshot: every consumer indexes the mask and the region with
+  the same stride, so a mask of the wrong shape must never be stretched over a layer. The
+  consumer checks the SHAPE (a transposed buffer has the right length); this checks the length.
+  The area editor's «Сгенерировать маску» is the only caller today.
 - **Painting is refused while a result is pending or work is running**: the mask then describes
   work already handed over. It is also refused while a canvas zoom modifier (Ctrl/Cmd/`Z`) is
   held, because Ctrl+drag over the frame zooms the page and must not leave a stroke behind.
@@ -168,6 +177,10 @@ that owns the context, the canvas and the project at once:
 - To change the lock rules, the button enablement, the status line or the pass order:
   `frame.rs`.
 - To change how a mask layer stores, previews or uploads its pixels: `layers.rs`.
+- To change how a mask arrives from somewhere other than the brush: `set_active_from_alpha` in
+  `layers.rs`. `place_for_test` in `frame.rs` is how a CONSUMER's own tests reach a placed
+  frame — the rectangle stays unsettable from production code, which is what keeps every
+  placement inside the pass with its constraints and its clamp.
 - To change what a consumer may declare about a layer, or how a consumer switch re-shapes the
   frame: `MaskLayerSpec` in `layers.rs` and the three setters in `frame.rs`.
 - To add a consumer, build the tool beside this directory and drive `RegionFrame` from its

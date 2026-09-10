@@ -51,9 +51,9 @@ FILE HEADER (tabs/cleaning/tab.rs)
 use super::autoclean::{autoclean_page, UnevenBackgroundTool};
 use super::tools::{
     AiEditorTool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
-    FluxFillInpaintTool, GradientFillTool, LamaInpaintTool, LamaMpeInpaintTool, PatchTool,
-    SdxlInpaintTool, StampTool, StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool,
-    WatermarkRemovalTool, ZamazkaTool,
+    FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
+    StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool,
+    ZamazkaTool,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
@@ -193,13 +193,13 @@ const CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX: f32 = 4.0;
 const CLEANING_PANEL_CHROME_WIDTH_PX: f32 = 16.0;
 
 const BRUSH_TOOL_INDICES: [usize; 3] = [0, 1, 2];
-const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [3, 4, 5, 6, 7];
-// Инструменты редактирования области (SDXL, FLUX.1 Fill, удаление водяных знаков,
-// ИИ-редактор области) — отдельной строкой. FLUX.2 klein больше не является
-// самостоятельным инструментом: это движок ИИ-редактора области
+const MASK_REMOVAL_TOOL_INDICES: [usize; 3] = [3, 4, 5];
+// Инструменты редактирования области (FLUX.1 Fill, удаление водяных знаков,
+// ИИ-редактор области) — отдельной строкой. FLUX.2 klein, Lama и SDXL Inpaint больше
+// не являются самостоятельными инструментами: это движки ИИ-редактора области
 // (`tools/ai_editor/engines/`). Индекс, отсутствующий в этих массивах,
 // зарегистрирован, но не рисуется ни в одной группе панели инструментов.
-const AREA_EDIT_TOOL_INDICES: [usize; 4] = [8, 9, 10, 11];
+const AREA_EDIT_TOOL_INDICES: [usize; 3] = [6, 7, 8];
 
 /// Every tool index the «Инструменты клина» tab draws a button for, in draw order.
 ///
@@ -750,10 +750,7 @@ impl Default for CleaningTabState {
             Box::<PatchTool>::default(),
             Box::<GradientFillTool>::default(),
             Box::<TextureSynthesisInpaintTool>::default(),
-            Box::<LamaInpaintTool>::default(),
-            Box::<LamaMpeInpaintTool>::default(),
             Box::<AotInpaintTool>::default(),
-            Box::<SdxlInpaintTool>::default(),
             Box::<FluxFillInpaintTool>::default(),
             Box::<WatermarkRemovalTool>::default(),
             Box::<AiEditorTool>::default(),
@@ -2067,8 +2064,9 @@ fn draw_tools_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
         &MASK_REMOVAL_TOOL_INDICES,
         &mut activate_tool_idx,
     );
-    // The area-edit tools (SDXL, FLUX.1 Fill, watermark removal) deliberately carry
-    // no category label of their own — they read as a continuation of the list.
+    // The area-edit tools (FLUX.1 Fill, watermark removal, the AI area editor)
+    // deliberately carry no category label of their own — they read as a continuation
+    // of the list.
     draw_tool_button_rows(ui, cx.tools, &AREA_EDIT_TOOL_INDICES, &mut activate_tool_idx);
     cx.out.activate_tool_idx = Some(activate_tool_idx);
 }
@@ -3529,8 +3527,8 @@ mod tests {
 
     /// Every registered tool must appear in exactly one button group, or it is
     /// unreachable: the picker draws the three index groups and nothing else, so a
-    /// 13th tool pushed onto `CleaningTabState::default`'s list without touching a
-    /// group constant would simply never be shown.
+    /// tool pushed onto `CleaningTabState::default`'s list without touching a group
+    /// constant would simply never be shown.
     #[test]
     fn every_registered_tool_is_drawn_by_exactly_one_button_group() {
         let state = CleaningTabState::default();

@@ -14,11 +14,17 @@ for large images and are committed to `CanvasView` only at stroke boundaries. Re
 `RegionEditToolBase` to select an overlay rectangle, load the composited source page plus current
 clean overlay on a worker thread, show a detached region editor, and insert the accepted result
 back into the page overlay. Mask-inpaint tools use `RegionMaskInpaintToolBase` to add editable
-binary masks, optional sample masks, mask generation from a backend source, and worker-thread run
-closures. The mask editor offers four generation sources — the text detectors ComicTextDetector,
-PaddleOCR and Surya (through the translation module's typed helpers) and the watermark detector
-(`watermark.detect`, streamed) — so every mask-inpaint tool gains watermark removal with a
-user-editable mask without a tool of its own.
+binary masks, optional sample masks, «Сгенерировать маску», and worker-thread run closures.
+
+Mask generation itself is HOST-NEUTRAL and lives in `mask_generation.rs`, not in any host: it owns
+the four sources — the text detectors ComicTextDetector, PaddleOCR and Surya (through the
+translation module's typed helpers) and the watermark detector (`watermark.detect`, streamed) —
+their availability rules, the detection worker, and the two shared controls. A host owns only the
+`MaskGenerationState` it hands that module and the mask it writes the answer into. Both hosts read
+it and neither may fork it: `RegionMaskInpaintToolBase` writes into its single editor mask, and
+`ai_editor/` writes into the selected layer of its `RegionFrame` mask stack. Every mask-carrying
+tool therefore gains watermark removal with a user-editable mask without a tool of its own, and a
+new source or requirement rule reaches both hosts at once.
 
 A tool whose mask is not the mask-inpaint one builds on `RegionEditToolBase` ALONE. That base
 gives the selection, the loader, the editor window, zoom/scroll and Apply; everything the mask base
@@ -47,22 +53,39 @@ and so far only consumer is `ai_editor/`, which also carries the UI split the fr
 a compact part in «Выбранный инструмент» (`draw_ui`) and a main part in its own dock panel
 (`draw_main_panel`).
 
-AI-backed tools (`lama.rs`, `lama_mpe.rs`, `aot.rs`, `sdxl.rs`) send region and mask as raw PNG
+AI-backed tools (`aot.rs`, `flux_fill.rs`, and the engines under `ai_editor/engines/`) send region
+and mask as raw PNG
 bytes in the IPC request blob (no base64), ensure required app-managed models through `ai_models.rs`,
 verify backend health, call the Python AI backend via `backend_ipc::shared_client()`, validate the
 returned PNG size (from the response blob), and surface backend errors in the region editor status.
-All backend transport goes through `crate::backend_ipc` (framed IPC over the AF_UNIX socket);
-`sdxl.rs` uses `call_streaming` with a progress callback for native streaming progress/preview
-frames, while the one-shot tools use `shared_client().call(...)`.
+All backend transport goes through `crate::backend_ipc` (framed IPC over the AF_UNIX socket), in
+three shapes. A method that answers once uses `shared_client().call(...)` — `aot`, the two
+`inpaint.lama_*` methods, and every query/unload method of the other tools and engines. A method
+that streams progress or preview frames uses `call_streaming` with a progress callback —
+`inpaint.sdxl`, `inpaint.flux_fill`, the `watermark.*` run and the streaming detector behind mask
+generation. A method that must also be STOPPABLE backend-side uses `begin_call` + `wait_streaming`
+instead — `flux2_klein` only: `call_streaming` never exposes the request id `Client::cancel` needs,
+so the id is what buys a real cancel rather than a detached answer (`flux2_klein/wire.rs`).
 
 ## Files and submodules
 - `mod.rs`: module exports for the cleaning tab.
 - `base.rs`: `CleaningTool`, stroke/cursor types, brush scratch pipeline, region editor pipeline,
-  mask-inpaint editor, mask generation (text detectors + watermark detector) with its shared
-  `RegionMaskGenerationState`, and region loader worker. It also owns the overlay<->scene POINT
-  mapping (`scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos`) and re-exports the dense-overlay
-  colour solver `overlay_pixel_for_final_color` from `crate::tools::overlay_pixel`, so the whole
-  subtree keeps reaching it as `base::overlay_pixel_for_final_color`.
+  mask-inpaint editor and region loader worker. Of mask generation it owns only the host side —
+  the `MaskGenerationState` it hands `mask_generation.rs` and the editor mask the answer lands in;
+  the sources, the worker and the watermark plumbing are NOT here. It also owns the
+  overlay<->scene POINT mapping (`scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos`) and
+  re-exports the dense-overlay colour solver `overlay_pixel_for_final_color` from
+  `crate::tools::overlay_pixel`, so the whole subtree keeps reaching it as
+  `base::overlay_pixel_for_final_color`.
+- `mask_generation.rs`: the host-neutral core of «Сгенерировать маску», shared by `base.rs` and
+  `ai_editor/`. Owns the source catalog (`MaskSource`, `MASK_SOURCES`), the availability rule
+  (`MaskSource::is_available` / `requires_torch`), the per-host parameters and progress
+  (`MaskGenerationParams`, `MaskGenerationState`), the worker lifecycle
+  (`spawn_mask_generation` / `poll_mask_generation`, answering with a validated 0/255
+  `GeneratedMask` in REGION pixels), the streaming `watermark.detect` call with its model catalog
+  and `watermark.status` query, and the two reusable controls (`draw_source_picker`,
+  `draw_source_params`). GUI-free apart from the `draw_*`, `poll_*` and `spawn_*` helpers —
+  everything else does a blocking IPC round trip and may only run on the worker.
 - `zamazka.rs`: primary paint/erase/eyedropper/rectangle tool for direct clean-overlay edits.
 - `stamp.rs`: copies pixels into clean overlays either from `project/alt_vers/<name>` or from the
   current page image/clean overlay using a Photoshop-like source point, with lazy background
@@ -85,25 +108,6 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `crate::tools::red_black_sor_sweeps`; the other consumer is `crate::tools::patch::membrane`.
 - `texture_synthesis.rs`: local inpaint through the `texture-synthesis` crate, with optional
   sample mask limiting the texture source area.
-- `lama.rs`: LaMa V2 backend inpaint, fixed supported model catalog, model scan, model ensure, and
-  `inpaint.lama_v2` IPC calls (image+mask as concatenated request blob, result PNG in response
-  blob). Exposes `lama_model_catalog`, `default_lama_model_filename`, and
-  `ensure_lama_model_for_external` so other tools (SDXL 4-channel prefill) can reuse the catalog.
-  `LamaModelSpec.file_name` is the persisted selection identity; `display_key` is an i18n catalog
-  key resolved to a localized label via `LamaModelSpec::display_name()` at render time (the model
-  name is display-only and is free to localize, `dev-docs/i18n_exclusions.md` §A5).
-- `sdxl.rs`: SDXL inpaint backend tool (IPC method `inpaint.sdxl`) with two channel modes.
-  `nine_channel` uses a dedicated 9-channel inpaint model at full denoise; `four_channel` uses an
-  ordinary SDXL checkpoint with a LaMa prefill (model chosen from `lama.rs`) and a moderate
-  denoise. Region selection is forced to multiples of 8 (SDXL VAE). The `inpaint.sdxl` call is
-  streamed via `call_streaming`: the tool receives `progress` frames (each carrying `step`/`total`
-  plus an optional latent preview PNG blob), updates a shared `SdxlSharedProgress`, and the editor
-  renders a step progress bar plus a live latent preview while it repaints during processing. All
-  generation controls live in a collapsible "Параметры генерации (SDXL)" section (collapsed by
-  default). Per-mode generation parameters (prompts, steps, cfg, denoise, seed, sampler, mask
-  blur/dilation, weights path) persist to a dedicated `sdxl_inpaint_settings.json` (see
-  `config::sdxl_inpaint_settings_path`); loads/saves run on background threads, never
-  `user_config.json`.
 - `flux_fill.rs`: FLUX.1-Fill-dev tool (IPC methods `inpaint.flux_fill` streaming, `.unload`,
   `.status`) with two modes — `object_removal` (default) and `inpaint`. The GGUF quant (catalog from
   `.status`, with a ✓/«скачать» hint) and diffusers components are downloaded on demand by the
@@ -154,7 +158,6 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   every entry with its preview, its verbatim name, its quality verdict, its calibration levels
   and its sources, and offers rename / delete / export / import / build-from-reference-crops /
   improve-with-another-level. Every one of those runs on a worker; the window polls a channel.
-- `lama_mpe.rs`: LaMa MPE backend inpaint and `inpaint.lama_mpe` IPC calls.
 - `aot.rs`: AOT backend inpaint and `inpaint.aot` IPC calls.
 - `patch/`: this tab's HOST for the «Заплатка» tool — Photoshop's Patch Tool. A free-form or
   rectangular selection drawn straight onto the page canvas, dragged onto a clean source area; the
@@ -256,9 +259,11 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `CleaningTabState::default` vector, and the matching index group array (`BRUSH_*`,
   `MASK_REMOVAL_*`, `AREA_EDIT_TOOL_INDICES`). An index missing from the group arrays is registered
   but never drawn.
-- Mask generation is gated by the availability flags the tab pushes into the base: every source
-  except PaddleOCR requires Torch (`RegionMaskGenerationMethod::requires_torch`), and the whole
-  section requires a reachable backend.
+- Mask generation is gated by the availability flags the tab pushes into the host: every source
+  except PaddleOCR requires Torch (`MaskSource::requires_torch`), and the whole section requires a
+  reachable backend. `MaskSource::is_available` in `mask_generation.rs` is the ONLY place that rule
+  lives; a host that also blocks for a reason of its own (a busy worker, a locked frame) adds that
+  reason beside it, never instead of it.
 - Tool pointer capture and zoom/scroll blocking are part of the canvas contract. An open region
   editor must block canvas zoom and capture pointer input inside its window.
 - `CleaningTool` carries three additive, defaulted methods for tools that place something on the
@@ -308,9 +313,14 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `BrushToolBase` in `base.rs`.
 - To change region selection, composited-region loading, editor zoom/scroll, or apply behavior,
   edit `RegionEditToolBase` in `base.rs`.
-- To change mask editor controls, mask generation (sources, watermark model catalog, streaming
-  progress), sample-mask handling, or worker-run lifecycle, edit `RegionMaskInpaintToolBase` in
-  `base.rs`.
+- To change mask editor controls, sample-mask handling, or worker-run lifecycle, edit
+  `RegionMaskInpaintToolBase` in `base.rs`.
+- To change mask generation — a source, its parameters or availability rule, the watermark model
+  catalog, the streaming progress, the detection call or the source picker — edit
+  `mask_generation.rs`. It is shared, so the change reaches both the mask-inpaint editor and
+  `ai_editor/`; edit a host only for where the answer is written (`base.rs` for the single editor
+  mask, `ai_editor/mod.rs` for the selected `RegionFrame` layer) or for a block reason of that
+  host's own.
 - To change direct paint behavior, edit `zamazka.rs`; to change alt-version or current-page
   stamping, edit `stamp.rs`.
 - To change the patch tool's selection gesture or its ROI/refusal geometry, edit
@@ -322,9 +332,14 @@ frames, while the one-shot tools use `shared_client().call(...)`.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
   settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
   bar it reuses live in `base.rs`.
-- To change FLUX.2 klein, edit `ai_editor/engines/flux2_klein/` — it is an engine of the
-  «ИИ-редактор области» tool, not a tool; see `ai_editor/engines/MODULE_README.md`. The wire names
-  of its methods live in `backend_ipc::protocol`.
+- To change FLUX.2 klein, Lama or SDXL Inpaint, edit `ai_editor/engines/flux2_klein/`,
+  `ai_editor/engines/lama/` or `ai_editor/engines/sdxl/` — they are engines of the «ИИ-редактор
+  области» tool, not tools; see `ai_editor/engines/MODULE_README.md`. The wire names of their
+  methods live in `backend_ipc::protocol`.
+- To change the LaMa model catalog — the offered checkpoints, which backend method each one runs,
+  or whether it supports the refine pass — edit `ai_editor/engines/lama/catalog.rs`. It is the ONE
+  place both that engine and the SDXL engine's 4-channel prefill picker read; the SDXL side takes
+  the `lama_v2_model_catalog()` view and must never be handed the LaMa-MPE entry.
 - To change the chapter mode's UI, jobs, reports or overlay patches, edit `watermark_removal.rs`
   (`ChapterState` and the `run_chapter_*` workers); to change the maths behind them, edit
   `../watermark_chapter.rs`; to change what a stored watermark holds on disk, or how it is

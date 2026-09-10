@@ -603,6 +603,19 @@ pub fn flux2_klein_settings_path(variant: Flux2Variant) -> PathBuf {
     data_dir().join(variant.settings_file_name())
 }
 
+/// Dedicated settings file of the «Lama» region-edit engine (the selected model and
+/// the parameters of both backend methods), kept out of `user_config.json` for the
+/// same reason as the SDXL, FLUX.1-Fill and watermark ones: its background saves must
+/// not race the canvas-settings saver.
+///
+/// ONE file for all catalog entries, unlike `flux2_klein_settings_path`: the selected
+/// model IS one of the persisted fields here, so a per-model file could not record
+/// which model to restore.
+#[must_use]
+pub fn lama_engine_settings_path() -> PathBuf {
+    data_dir().join("lama_engine_settings.json")
+}
+
 /// Root of the reusable watermark LIBRARY: one self-contained directory per entry
 /// (metadata JSON, the `c`/`s` planes, the correlation template and the calibration
 /// crops that produced it).

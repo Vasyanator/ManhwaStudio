@@ -18,7 +18,7 @@ Key structures:
 - `ResultLayer`: the processed image plus its lazily created texture
 
 Key functions:
-- `MaskStack::paint_segment`, `clear_all`, `push_undo`, `undo`
+- `MaskStack::paint_segment`, `set_active_from_alpha`, `clear_all`, `push_undo`, `undo`
 - `MaskStack::ensure_textures`, `MaskStack::draw`
 - `ResultLayer::ensure_texture`, `ResultLayer::draw`
 
@@ -526,6 +526,54 @@ impl MaskStack {
         }
     }
 
+    /// Replaces the ACTIVE layer with `alpha` — one byte per pixel, row-major, non-zero meaning
+    /// "set" — and returns whether it was written.
+    ///
+    /// This is how a mask that came from somewhere other than the brush (a backend detector, for
+    /// instance) enters the stack, and it deliberately goes through the same door a stroke does:
+    /// the previous contents are SNAPSHOTTED first, so the whole fill is one undo step and erases
+    /// like anything painted by hand. Nothing else changes — the other layers, the active index
+    /// and the geometry are untouched.
+    ///
+    /// `alpha` is binarized to `0`/`255` on the way in, which is the layer's own invariant and
+    /// what keeps the set-pixel counter (the frame's lock signal) exact.
+    ///
+    /// Returns `false`, having changed nothing and taken no snapshot, when `alpha` does not hold
+    /// exactly `width * height` bytes or the active index is out of range: a mask of the wrong
+    /// shape must be refused rather than stretched over the layer, because every consumer indexes
+    /// both with the same stride.
+    pub fn set_active_from_alpha(&mut self, alpha: &[u8]) -> bool {
+        let (w, h) = (self.w, self.h);
+        if alpha.len() != w.saturating_mul(h) {
+            return false;
+        }
+        let Some(layer) = self.layers.get(self.active) else {
+            return false;
+        };
+        if layer.bytes.len() != alpha.len() {
+            // The stack's own invariant, restated where writing past it would corrupt the counter.
+            runtime_log::log_error(format!(
+                "[region-edit-v2] layer {} holds {} bytes but the stack is {w}x{h}; the generated mask is refused",
+                self.active,
+                layer.bytes.len()
+            ));
+            return false;
+        }
+        self.push_undo();
+        let Some(layer) = self.layers.get_mut(self.active) else {
+            return false;
+        };
+        let mut set_px = 0usize;
+        for (dst, src) in layer.bytes.iter_mut().zip(alpha) {
+            let value = if *src == 0 { 0u8 } else { 255u8 };
+            *dst = value;
+            set_px += usize::from(value != 0);
+        }
+        layer.set_px = set_px;
+        layer.rebuild_preview(w, h);
+        true
+    }
+
     /// Clears EVERY layer and drops the undo history.
     ///
     /// The history goes because a snapshot covers one layer only (`push_undo`) and could not
@@ -708,6 +756,55 @@ mod tests {
     /// Brute-force set-pixel count, the reference the O(1) counter is checked against.
     fn count_set(bytes: &[u8]) -> usize {
         bytes.iter().filter(|byte| **byte != 0).count()
+    }
+
+    /// A generated mask lands in the ACTIVE layer only, keeps its non-square stride, is
+    /// binarized on the way in, and leaves the counter exact.
+    #[test]
+    fn a_generated_mask_fills_the_active_layer_at_the_right_stride() {
+        let (w, h) = (5usize, 3usize);
+        let mut stack = stack(w, h);
+        stack.set_active(1);
+        let mut alpha = vec![0u8; w * h];
+        // Row 2, column 1: the two indices differ, so a transposed write lands elsewhere.
+        alpha[2 * w + 1] = 17;
+        assert!(stack.set_active_from_alpha(&alpha));
+
+        assert_eq!(stack.bytes(1)[2 * w + 1], 255, "a non-zero byte becomes a set pixel");
+        assert_eq!(count_set(stack.bytes(1)), 1);
+        assert_eq!(stack.layer_set_px(1), 1, "the O(1) counter must agree");
+        assert_eq!(stack.layer_set_px(0), 0, "the other layer is untouched");
+        assert!(!stack.is_empty(), "the frame must see the stack as painted");
+    }
+
+    /// The fill is ONE undo step: undoing it restores the layer the brush left behind, counter
+    /// included, so a generated mask erases exactly like a stroke.
+    #[test]
+    fn a_generated_mask_is_undone_in_one_step() {
+        let mut stack = stack(4, 4);
+        fill_layer(&mut stack, 0);
+        let painted = stack.layer_set_px(0);
+        assert!(painted > 0);
+
+        assert!(stack.set_active_from_alpha(&[255u8; 16]));
+        assert_eq!(stack.layer_set_px(0), 16);
+        assert!(stack.undo());
+        assert_eq!(stack.layer_set_px(0), painted);
+        assert_eq!(count_set(stack.bytes(0)), painted);
+    }
+
+    /// A buffer of the wrong length is refused outright: nothing is written and no undo step is
+    /// taken, so the refusal cannot be mistaken for an empty fill afterwards.
+    #[test]
+    fn a_generated_mask_of_the_wrong_length_is_refused() {
+        let mut stack = stack(5, 3);
+        assert!(!stack.set_active_from_alpha(&[255u8; 8]));
+        assert_eq!(stack.layer_set_px(0), 0);
+        assert!(stack.is_empty());
+        assert!(!stack.undo(), "a refused fill must leave no undo step behind");
+        // A transposed buffer has the right LENGTH, so it is accepted — the caller checks the
+        // shape. This pins that the length check is the only guard here.
+        assert!(stack.set_active_from_alpha(&[255u8; 15]));
     }
 
     /// Every counter agrees with a brute-force scan of its own buffer.

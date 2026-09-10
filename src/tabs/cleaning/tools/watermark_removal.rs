@@ -63,8 +63,10 @@ Contracts:
   gain and t-statistic instead.
 */
 use super::base::{
-    CleaningTool, DEFAULT_WATERMARK_MODEL, RegionEditToolBase, RegionEditorSession, StrokePoint,
-    WATERMARK_DETECT_DOWNSCALE_TO, WatermarkProgress, WatermarkStatus, build_tinted_mask_preview,
+    CleaningTool, RegionEditToolBase, RegionEditorSession, StrokePoint, build_tinted_mask_preview,
+};
+use super::mask_generation::{
+    DEFAULT_WATERMARK_MODEL, WATERMARK_DETECT_DOWNSCALE_TO, WatermarkProgress, WatermarkStatus,
     draw_watermark_model_picker_ui, draw_watermark_progress_ui, lock_watermark_progress,
     map_watermark_call_error, poll_watermark_status, spawn_watermark_status_query,
     watermark_model_spec,

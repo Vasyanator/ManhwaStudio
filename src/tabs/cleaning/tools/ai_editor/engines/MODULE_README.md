@@ -28,6 +28,14 @@ FLUX.2 klein 4B — and the variant keys the engine id, the picker caption, the 
 model directory and the `variant` field the two `.download.*` methods carry. Duplicating the module
 for a second checkpoint is the wrong answer; parameterizing it is the pattern.
 
+THE OPPOSITE SHAPE IS ALSO CORRECT, and `lama/` and `sdxl/` are it: ONE picker entry offering four
+checkpoints behind TWO backend methods (`lama/`), and ONE picker entry offering two channel modes
+behind ONE backend method (`sdxl/`), chosen inside the engine's own panel. The line between the two
+shapes is what the user is choosing. A FLUX.2 klein variant changes what the engine IS — its model
+directory, its settings file, its download — so it is a picker entry. A LaMa checkpoint or an SDXL
+channel mode changes only how one engine runs, so it is a parameter, and folding them into one entry
+each is what keeps the sections from being lists of near-identical buttons.
+
 An engine's panel body owns its own structure, and FLUX.2 klein's is the reference for a big one:
 prompt block (field, the one cache line, the «Перевод» / «Библиотека промптов» toggles) → the one
 creative dial → the ONE readiness line with its «Установить» / «Обновить» buttons → three SIBLING
@@ -37,7 +45,12 @@ machine always is, and no section wraps or nests another. The decisions the line
 functions with unit tests, not conditionals inside the drawing code.
 
 ## Files and submodules
-- `mod.rs`: the catalog — `all_engines()` and nothing else.
+- `mod.rs`: the catalog — `all_engines()`, plus the one helper every engine's run path shares
+  (`region_size_refusal`, the `FrameConstraints` re-check described below). It also decides ONE
+  thing beyond the list: the engine at index 0 is the one selected when the tool is created, which
+  is why FLUX.2 klein 9B stays at the head and `lama` then `sdxl` are appended after it. Screen
+  order is unaffected — the picker draws «Без промпта» before «С промптом», so «Lama» appears first
+  regardless.
 - `flux2_klein/`: the FLUX.2 klein engine — a DIRECTORY, because it outgrew one file, and the
   source of TWO picker entries (9B and 4B, one per `config::Flux2Variant`); its own
   `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods
@@ -107,6 +120,31 @@ functions with unit tests, not conditionals inside the drawing code.
   replaced it; cancelling also stops the backend through `CallHandle::cancel` instead of only
   dropping the answer.
 
+- `lama/`: the «Lama» engine — a DIRECTORY for the same reason `flux2_klein/` is one, and the source
+  of exactly ONE picker entry offering FOUR checkpoints. Its own `MODULE_README.md` is the map. The
+  user paints what must be REMOVED and gets the background restored under it; there is no prompt and
+  no creative dial, so it sits in the «Без промпта» section. IPC methods `inpaint.lama_v2` /
+  `.unload` and `inpaint.lama_mpe` / `.unload`, both plain request/response (no streaming, therefore
+  no progress bar and no backend-side cancel). Size contract: multiple of 8, shortest side >= 8 px,
+  no area and no aspect limit. Its three engine-specific contracts are in the section below: the
+  mandatory mask, the per-entry method dispatch and the refine rule.
+
+- `sdxl/`: the «SDXL Inpaint» engine — a DIRECTORY for the same reason, and the source of exactly
+  ONE picker entry offering TWO channel modes. Its own `MODULE_README.md` is the map. The user
+  paints what must be REGENERATED, writes a positive and a negative prompt and gets that area
+  redrawn, so it sits in the «С промптом» section beside FLUX.2 klein. IPC methods `inpaint.sdxl`
+  (STREAMING — one `progress` frame per diffusion step, carrying `step` / `total` and an optional
+  latent preview PNG in the frame blob) and `inpaint.sdxl.unload`. Size contract: multiple of 8
+  (the SDXL VAE's downscale factor), shortest side >= 8 px, no area and no aspect limit. The two
+  modes are
+  `nine_channel` (a dedicated 9-channel inpainting UNet, full denoise, no prefill) and
+  `four_channel` (an ordinary SDXL checkpoint over a LaMa prefill, moderate denoise); each owns a
+  COMPLETE parameter set, both are persisted, and only the 4-channel one puts `lama_model` on the
+  wire. There is no model catalog and no presence scan: the checkpoint is a path or a Hugging Face
+  repo id the user types, which is why the run gate closes on an empty one. Its engine-specific
+  contracts are in the section below: the mandatory mask, the per-mode parameter sets and the
+  progress generation.
+
 ## Contracts and invariants
 - **An engine never touches the canvas.** No `CanvasView`, no `ProjectData`, no frame, and no
   `egui::Context` outside `poll`. Its whole UI surface is a plain `&mut Ui`, and its answer is a
@@ -119,11 +157,24 @@ functions with unit tests, not conditionals inside the drawing code.
   only drains channels. `poll` is called every frame whether the parameter panel is drawn or not,
   so a finished run lands with the panel closed.
 - **`poll` is also the only writer of the settings file, and losing it loses data silently.**
-  FLUX.2 klein's debounced saver runs inside `poll`; a host that stops polling keeps the tool
-  working and quietly discards every model path, memory preset and prompt on exit. The arming rule
-  is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)`: a write before the
-  initial load lands would overwrite the user's file with the in-memory defaults, so `dirty` is
-  kept pending instead of dropped, and at most one writer touches the path at a time.
+  Every engine's saver runs inside `poll`; a host that stops polling keeps the tool working and
+  quietly discards every model path, memory preset, prompt and parameter on exit. The arming rule
+  is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)` — a plain gate with no
+  time debounce, so a save starts on the first poll it is due on: a write before the initial load
+  lands would overwrite the user's file with the in-memory defaults, so `dirty` is kept pending
+  instead of dropped, and at most one writer touches the path at a time.
+- **A user edit outranks a settings load that lands after it** (`lama/`, `sdxl/`). The host draws an
+  engine's panel body earlier in a frame than it polls that engine, so a value changed before the
+  load landed would be replaced silently; `poll_settings_load` therefore applies the file only while
+  `dirty` is clear, and drops the whole loaded document otherwise.
+- **The run path re-checks the size against `constraints()`, it does not trust the host.** The frame
+  snaps and validates a rectangle against the same constraints, but the rectangle and the region an
+  engine is handed can disagree, so `AiEngine::start` refuses a violating size instead of encoding
+  it onto the wire. `lama/` and `sdxl/` do it through the shared `region_size_refusal` in `mod.rs`,
+  which reads `region_edit_v2::geometry::check_size` — the one authority on what a valid size is —
+  and answers in the host's own violation wording; `flux2_klein/` does it through its own
+  `region_block_reason`, whose message set is engine-specific and whose agreement with `check_size`
+  is pinned by a unit test.
 - **The RAM/VRAM forecast is armed by a SETTLED SIZE change and by nothing else geometric.**
   `set_region` is pushed every frame and carries `geometry_settled`; the rectangle is stored
   unconditionally, so the status line keeps printing the size the user is dragging, but the
@@ -152,6 +203,59 @@ functions with unit tests, not conditionals inside the drawing code.
   stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
   instead. `mask_feather_px` keeps working either way and softens the join between the region and the
   page.
+- **Lama's mask is MANDATORY and means the OPPOSITE of FLUX.2 klein's.** `allows_empty_mask()` is
+  unconditionally `false`: the mask says WHAT TO REMOVE, so an empty one describes no work at all,
+  and the host disables «Обработать» rather than sending a request whose only possible answer is the
+  region it was given. Nothing in the panel can change that answer, so the host's per-frame re-read
+  simply keeps agreeing with it, and `draw_empty_mask_hint` draws nothing. The single layer carries
+  the inpaint yellow the mask-inpaint editor uses (`../../base.rs`), because the engines share one
+  frame and one brush and the colour is what tells the user which meaning is in force.
+- **A Lama catalog entry carries its METHOD and its refine support as constants; nothing re-derives
+  them.** `inpaint.lama_v2` and `inpaint.lama_mpe` are different architectures — different
+  generator, different forward arity, different weight layout, different model directory — so the
+  backend keeps both methods and `LamaModelSpec::method` dispatches. The user still sees one run
+  button and one unload button; which method they reach is the selected entry's business. The
+  parameter panel follows the same field: a v2 entry draws refine plus `n_iters` / `max_scales` /
+  `px_budget`, the MPE entry draws `inpaint_size`, and neither shows a parameter its method ignores.
+  Both methods are the backend's contract and travel under `PROTOCOL_VERSION`: changing either
+  request shape is a protocol change, not an engine-local one.
+- **`refine: true` can only ever reach the wire for an entry that declares `supports_refine`.** The
+  backend refuses its refine pass on a TorchScript `.pt` outright and LaMa-MPE has no refine pass at
+  all, so a leftover checkbox would turn into a failed run. The flag is decided in exactly one
+  place, `effective_refine(spec, settings)`, which the header builder itself calls — no call site can
+  bypass it — and the UI closes the control with a tooltip that says why instead of leaving it
+  merely grey. It is a CONSTANT of the catalog entry, never re-guessed from the file extension: a
+  second copy of that rule at a call site is a copy that drifts.
+- **The Lama model catalog is the only cross-engine dependency in this subtree, and it is
+  one-directional.** `sdxl/` reads its LaMa-v2 VIEW (`lama_v2_model_catalog`) for the 4-channel
+  prefill picker, which is why those items are `pub(in crate::tabs::cleaning::tools::ai_editor::engines)`
+  rather than private to `lama/`. Nothing outside `engines` sees them, and `lama/` knows nothing
+  about `sdxl/`. That view exists so the MPE entry can never be offered there: the SDXL request
+  sends a checkpoint FILE NAME the backend resolves inside `Torch/LaMa/models`, a directory the MPE
+  checkpoint is not in, and `ensure_lama_model_for_external` refuses any name outside the v2 subset
+  for the same reason. Duplicating the catalog on the SDXL side is the wrong answer — a second copy
+  is a copy that drifts.
+- **SDXL's mask is MANDATORY too, and means REGENERATE.** `allows_empty_mask()` is unconditionally
+  `false`: SDXL inpainting has no whole-region mode the way FLUX.2 klein does, so an empty mask
+  describes no work at all. The single layer carries the same inpaint yellow `lama/` uses, because
+  the meaning is the inpainting hole in both and the colour is what tells the user which meaning is
+  in force.
+- **An SDXL channel mode owns a COMPLETE parameter set, and both are persisted.** Switching mode
+  switches the whole set; it never merges the two, and the mode that is not selected keeps its
+  prompts, its weights path and its denoise. That is why the persisted document holds both sets
+  plus the selected mode, in ONE file — a file per mode could not record which mode to restore.
+  `lama_model` is read only by `four_channel` and reaches the wire only there
+  (`lama_model_for_run`): the 9-channel pipeline has no prefill step and would not know the field.
+- **SDXL's progress bar is claimed by GENERATION.** `inpaint.sdxl` streams a frame per diffusion
+  step, and a cancelled run is DETACHED — `call_streaming` never hands out the request id
+  `Client::cancel` would need, so the backend finishes the pass. Every publication into the shared
+  progress is therefore stamped with the generation that
+  claimed the bar, so an abandoned worker can neither move nor clear the bar of the run that
+  replaced it. The engine has no other cancellation, and the run cannot be stopped backend-side.
+- **The SDXL settings are NOT clamped on load, unlike Lama's.** Persisted values travel to the wire
+  verbatim and two of the fields are free-form text (a weights path and two prompts); a clamp on
+  load would silently rewrite a value a user put in the file by hand. The panel's own ranges bound
+  everything entered through the UI, which is the only path that matters in practice.
 - A settings file written by an older build carries keys that map to no field any more:
   `whole_region` (the mode is derived from the mask), `max_sequence_length` (PINNED to
   `FLUX2_MAX_SEQ` = 512 rather than a setting — 512 is the maximum, so every value a user could
@@ -390,5 +494,15 @@ functions with unit tests, not conditionals inside the drawing code.
   `config::flux2_klein_text_encoder_dir`, together with the Python half's own manifest.
 - To change its size contract: `Flux2KleinEngine::frame_constraints` AND `region_block_reason`
   together — the test that compares them will fail otherwise.
+- To change which LaMa checkpoints are offered, which backend method one runs, or whether it can
+  refine: `lama/catalog.rs` and nothing else — `sdxl/` reads the same table through
+  `lama_v2_model_catalog`.
+- To change a LaMa parameter, its range or where it is drawn: `lama/engine.rs`
+  (`draw_method_parameters`) plus the range constants in `lama/mod.rs`; to change what travels on
+  the wire: `lama/wire.rs` (`lama_run_header`), which is also where `effective_refine` lives.
+- To change an SDXL parameter, its range or where it is drawn: `sdxl/engine.rs`
+  (`draw_mode_parameters`) plus the range constants in `sdxl/mod.rs`; to change what travels on the
+  wire: `sdxl/wire.rs` (`sdxl_run_header`), which is also where `lama_model_for_run` lives. To
+  change what is persisted, or the on-disk document: `sdxl/settings.rs`.
 - To change what the host does with an engine (the picker, the panels, the frame): `../mod.rs` and
   `../../region_edit_v2/`, never here.

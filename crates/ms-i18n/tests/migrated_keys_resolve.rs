@@ -38,7 +38,7 @@ const SAMPLE: &[(&str, &str)] = &[
     ("tutorial.title.ps_editor", "PS-редактор"),
     ("ps_editor.tools.brush_title", "Кисть"),
     // Keys migrated in the cleaning / translation tab batch.
-    ("cleaning.tools.lama.title", "AI удаление (Lama)"),
+    ("cleaning.tools.lama.params_heading", "Параметры Lama"),
     ("cleaning.mask_editor.process_button", "Обработать"),
     ("cleaning.common.cancel_button", "Отмена"),
     // Model display name resolved via a runtime accessor (was a `const` literal).

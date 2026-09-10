@@ -523,6 +523,20 @@ impl RegionFrame {
         }
     }
 
+    /// Places the frame at `rect` on page `page_idx` and sizes the mask stack to match — the
+    /// state the placement step of `update` reaches.
+    ///
+    /// TEST ONLY. Real placement needs a laid-out `CanvasView` and happens inside the pass; a
+    /// consumer's own tests would otherwise have no way to reach a placed frame at all, and the
+    /// alternative — making the rectangle publicly settable — would let production code park a
+    /// frame anywhere without the constraints or the clamp.
+    #[cfg(test)]
+    pub fn place_for_test(&mut self, page_idx: usize, rect: OverlayRectPx) {
+        self.page_idx = Some(page_idx);
+        self.rect_px = Some(rect);
+        self.masks.resize(rect.w, rect.h);
+    }
+
     #[must_use]
     pub fn constraints(&self) -> &FrameConstraints {
         &self.constraints

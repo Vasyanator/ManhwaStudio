@@ -111,7 +111,8 @@ class ResolveSchedulerConfigTests(unittest.TestCase):
             svc.resolve_scheduler_config("Unknown")
 
     def test_all_rust_samplers_are_supported(self) -> None:
-        # Mirror of SDXL_SAMPLERS in src/tabs/cleaning/tools/sdxl.rs.
+        # Mirror of SDXL_SAMPLERS in
+        # src/tabs/cleaning/tools/ai_editor/engines/sdxl/mod.rs.
         rust_samplers = [
             "Euler",
             "Euler a",

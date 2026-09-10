@@ -885,7 +885,7 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   the class, not by reading the code.
 - To change SDXL param validation, sampler mapping, or the latent preview, see `sdxl.py`
   (`normalize_sdxl_params`, `SAMPLER_CONFIGS`, `_latent_preview_rgb`); keep `SAMPLER_CONFIGS` in sync
-  with `SDXL_SAMPLERS` in `src/tabs/cleaning/tools/sdxl.rs`.
+  with `SDXL_SAMPLERS` in `src/tabs/cleaning/tools/ai_editor/engines/sdxl/mod.rs`.
 - To change the FLUX quant catalog, download layout, or device pinning, see `flux_fill.py`
   (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
