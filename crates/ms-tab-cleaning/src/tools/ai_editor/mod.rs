@@ -54,7 +54,7 @@ use super::base::{
     CleaningTool, RegionLoadRequest, RegionLoadResult, StrokePoint, capture_overlay_chunk, overlay_rect_to_scene_rect,
     spawn_region_loader_thread,
 };
-use super::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationState, MaskSource};
+use super::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationSpawner, MaskGenerationState, MaskSource};
 use super::region_edit_v2::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::region_edit_v2::geometry::{FrameConstraints, SizeViolation};
 use super::region_edit_v2::layers::ResultLayer;
@@ -275,6 +275,18 @@ pub struct AiEditorTool {
     /// mask-inpaint editors through `super::mask_generation` — the sources, their requirement
     /// rules and the detection call have exactly one implementation.
     mask_generation: MaskGenerationState,
+    /// How a detection is started. Always `mask_generation::spawn_mask_generation` in the
+    /// product; the field exists so this host's unit tests can drive `start_mask_detection`
+    /// itself without the real detector, which performs a backend round trip and, for the
+    /// Torch sources, a model download into the runtime data root — neither belongs in a unit
+    /// test. A test must opt OUT explicitly; the default is always the real spawner.
+    ///
+    /// Injection rather than a `#[cfg(test)]` override inside `mask_generation.rs`: an override
+    /// there would have to be reconfigurable, i.e. mutable process- or thread-global state,
+    /// which this project forbids (`AGENTS.md` §5), and it would be invisible at the call site.
+    /// This field is per-instance, needs no crate feature — `ms-tab-cleaning` has none — and
+    /// leaves `start_mask_detection` with ONE code path, so the test drives exactly what ships.
+    spawn_detection: MaskGenerationSpawner,
     /// `Some` while a detector is running on a worker. The frame is `Processing` for as long,
     /// so its rectangle and its mask cannot move under the job.
     mask_generation_rx: Option<Receiver<Result<GeneratedMask, String>>>,
@@ -325,6 +337,7 @@ impl Default for AiEditorTool {
             next_job_id: 1,
             pending_load: None,
             mask_generation: MaskGenerationState::default(),
+            spawn_detection: mask_generation::spawn_mask_generation,
             mask_generation_rx: None,
             generate_mask_requested: false,
         }
@@ -710,7 +723,9 @@ impl AiEditorTool {
     /// Step 2 of a mask generation: hands the loaded region to the detector worker.
     ///
     /// The frame stays `Processing` across the handover, so the mask cannot be painted and no
-    /// run can start while a detector is about to overwrite the active layer.
+    /// run can start while a detector is about to overwrite the active layer. The worker is
+    /// started through `self.spawn_detection`, which is the real spawner everywhere except in
+    /// this module's own tests.
     fn start_mask_detection(&mut self, pending: PendingLoad, region: egui::ColorImage) {
         let rect = pending.rect;
         if region.size != [rect.w, rect.h] {
@@ -730,7 +745,9 @@ impl AiEditorTool {
             // it ends, so the ✓/«скачать» marks stop lying.
             self.mask_generation.rearm_watermark_catalog();
         }
-        self.mask_generation_rx = Some(mask_generation::spawn_mask_generation(
+        // Through the stored spawner, never `mask_generation::spawn_mask_generation` by name:
+        // the indirection is this host's only test seam for the detection (see the field).
+        self.mask_generation_rx = Some((self.spawn_detection)(
             region,
             params,
             Arc::clone(&self.mask_generation.watermark_progress),
@@ -1414,12 +1431,35 @@ impl CleaningTool for AiEditorTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::mask_generation::{MaskGenerationParams, WatermarkProgress};
     use egui::Color32;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Mutex;
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }
+    }
+
+    /// The detector a test installs into [`AiEditorTool::spawn_detection`] in place of the real
+    /// one: it starts no worker, so no backend round trip and no model download happens — the
+    /// default source is `ComicTextDetector`, whose first real call downloads weights into the
+    /// runtime data root, which for a test binary is whatever directory it was launched from.
+    ///
+    /// It answers a full mask of exactly the size of the region it was handed, so a test can
+    /// prove that the region reached the spawner rather than only that some receiver was
+    /// stored. `params` and `progress` are named by the [`MaskGenerationSpawner`] signature and
+    /// have no stub behaviour to drive.
+    fn stub_detection_spawner(
+        image: egui::ColorImage,
+        _params: MaskGenerationParams,
+        _progress: Arc<Mutex<WatermarkProgress>>,
+    ) -> Receiver<Result<GeneratedMask, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let alpha = vec![255u8; image.size[0] * image.size[1]];
+        // The receiver is alive in this scope, so the send cannot fail.
+        tx.send(Ok(GeneratedMask::from_parts_for_test(image.size, alpha))).expect("the stub answer is queued");
+        rx
     }
 
     #[test]
@@ -1761,6 +1801,8 @@ mod tests {
     #[test]
     fn a_load_carries_what_it_was_started_for() {
         let mut tool = AiEditorTool::default();
+        // Opt out of the real detector; everything else is the production path.
+        tool.spawn_detection = stub_detection_spawner;
         tool.frame.place_for_test(0, rect(0, 0, 4, 4));
         tool.backend_available = true;
         tool.torch_available = true;
@@ -1771,8 +1813,10 @@ mod tests {
         assert!(tool.mask_generation_rx.is_some(), "the detector worker was started");
         assert!(tool.frame.result().is_none(), "a detection never produces a result layer");
         assert_eq!(tool.frame.lock(), FrameLock::Processing, "the frame stays locked for the detection");
-        // Drop the receiver so the worker's send fails instead of blocking on teardown.
-        tool.mask_generation_rx = None;
+        // The stored receiver is the spawner's own, and it carries a mask of exactly the region
+        // that was handed over: the loaded region travelled THROUGH the detection path.
+        let answer = tool.mask_generation_rx.as_ref().expect("the receiver is stored").recv().expect("the stub answered");
+        assert_eq!(answer.expect("the stub answers a mask").size(), [4, 4]);
     }
 
     /// What one `RecordingEngine` was asked to do, shared with the test that installed it.

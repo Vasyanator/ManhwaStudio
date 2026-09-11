@@ -219,6 +219,12 @@ frame that scrolled out of view has nothing to look at.
 - **The mask may not be edited while a result waits or work runs** (`mask_editable`): the mask
   then describes work already handed over. The compact panel's undo and clear are disabled in
   those states, which mirrors the frame's own painting rule.
+- **The detection is started through `spawn_detection`, not by naming the spawner.** That field
+  is `mask_generation::spawn_mask_generation` in the product and exists so this module's tests
+  can exercise `start_mask_detection` without the real detector, which performs a backend round
+  trip and downloads model weights into the runtime data root — in a test binary, into whatever
+  directory it was launched from. A test opts OUT explicitly; the default is always the real
+  spawner and `start_mask_detection` has ONE code path, so what a test drives is what ships.
 - **Nothing here blocks the GUI thread.** No decode, no file read and no network call happens
   on it; the only per-frame work is capturing an in-memory overlay chunk when a job starts. The
   detection is a worker like the run, polled every frame with the same Running / Done / Failed

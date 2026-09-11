@@ -264,6 +264,12 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   reachable backend. `MaskSource::is_available` in `mask_generation.rs` is the ONLY place that rule
   lives; a host that also blocks for a reason of its own (a busy worker, a locked frame) adds that
   reason beside it, never instead of it.
+- **A unit test never starts a real detection.** `spawn_mask_generation` reaches the backend and,
+  for the Torch sources, downloads model weights into `config::models_dir()` — which for a test
+  binary is whatever directory it was launched from. A host that starts detections therefore holds
+  the spawner in a field of type `MaskGenerationSpawner`, defaulted to `spawn_mask_generation`, and
+  its tests install a stub instead of calling the host method that would spawn the real one. The
+  default is always the real spawner: a test opts OUT, and no product code path changes.
 - Tool pointer capture and zoom/scroll blocking are part of the canvas contract. An open region
   editor must block canvas zoom and capture pointer input inside its window.
 - `CleaningTool` carries three additive, defaulted methods for tools that place something on the

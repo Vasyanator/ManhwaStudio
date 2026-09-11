@@ -27,6 +27,8 @@ Key structures:
 - `MaskGenerationState`: the params plus the watermark catalog state and the live progress
 - `GeneratedMask`: a validated 0/255 alpha buffer with its size
 - `MaskGenerationPoll`: what a host learns from one poll of a running job
+- `MaskGenerationSpawner`: the type of `spawn_mask_generation`, so a host can hold the spawner
+  in a field and its unit tests can install a stub instead of starting the real detector
 - `WatermarkProgress`, `WatermarkModelSpec`, `WatermarkStatus`: the watermark source's extras,
   shared with the standalone `watermark_removal.rs` tool
 
@@ -352,6 +354,16 @@ pub(super) enum MaskGenerationPoll {
     Done(GeneratedMask),
     Failed(String),
 }
+
+/// Signature of [`spawn_mask_generation`], so a host can hold the spawner instead of naming it
+/// at the call site.
+///
+/// It exists for ONE reason: a host's unit tests must be able to exercise their own
+/// mask-generation path without starting the real detector, which performs a backend round
+/// trip and, for the Torch sources, a model download into the runtime data root. A host stores
+/// this pointer, defaults it to `spawn_mask_generation` and lets its tests install a stub — see
+/// `ai_editor::AiEditorTool::spawn_detection`.
+pub(super) type MaskGenerationSpawner = fn(egui::ColorImage, MaskGenerationParams, Arc<Mutex<WatermarkProgress>>) -> Receiver<Result<GeneratedMask, String>>;
 
 /// Starts a detection on a worker thread and returns its result channel.
 ///
