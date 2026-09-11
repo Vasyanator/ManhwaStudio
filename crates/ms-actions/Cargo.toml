@@ -11,7 +11,7 @@ edition = "2024"
 [dependencies]
 # Only pulled in when the `raster` feature is enabled; keeps the default build
 # std-only. Version matches the workspace root (0.13).
-zstd = { version = "0.13", optional = true }
+zstd = { workspace = true, optional = true }
 
 [features]
 # Enables the `raster_diff` module: a tiled, zstd-compressed, reversible RGBA

@@ -142,7 +142,7 @@ max 0/255 for both the RGBA and alpha paths).
   `should_replace_gradient*` / `color_tolerance_threshold_sq` / `bounds_where` in
   `gradients.rs` and `parse_gradient_color_tolerance` / `parse_gradient_area_mode` +
   `GradientAreaMode` in `parse.rs`. The panel mirrors both fields in
-  `src/tabs/typing/panel/{effect_parse,effect_cards}.rs`, so the JSON keys must stay in sync.
+  `crates/ms-tab-typing/src/panel/{effect_parse,effect_cards}.rs`, so the JSON keys must stay in sync.
 - To change the shared noise (grain/static) math, edit the noise helpers in `image_ops.rs`;
   both `dry_media` and `interference` depend on them.
 - To change legacy JSON compatibility, edit `parse.rs` and update parent typing

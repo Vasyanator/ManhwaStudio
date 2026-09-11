@@ -1,0 +1,606 @@
+/*
+File: panel/create_render_data.rs
+
+Purpose:
+Part of `impl TypingCreatePanelState`, extracted verbatim from `panel.rs`.
+Holds render-data / effects / font-profile / shape-layout JSON building for the
+create panel plus the font-profile memory sync used on font selection changes.
+
+Main responsibilities:
+- build image-effect and full render-data JSON (per-font and per-index profiles);
+- serialize and apply shape / formula / drawn-lines layout parameters;
+- store the current font profile in per-font memory and react to a font selection
+  change (which is a no-op for the per-font memory in local-preset mode, where the
+  font is an ordinary parameter — see `local_presets.rs`).
+
+Notes:
+`use super::*;` pulls in the parent module's types and imports. Methods are
+`pub(super)` because `TypingCreatePanelState` is used only inside `panel.rs`.
+*/
+
+use super::*;
+use crate::psd_export::FontPostScriptNames;
+
+impl TypingCreatePanelState {
+    /// render-data для image-оверлея: только список эффектов (без text_params).
+    pub(super) fn build_image_effects_render_data(&self) -> Value {
+        json!({ "effects": self.effects_value_array() })
+    }
+
+    /// Загружает только эффекты из render-data (для image-оверлеев без text_params).
+    pub(super) fn load_effects_only_from_render_data(&mut self, render_data: &Value) {
+        self.effects = render_data
+            .as_object()
+            .and_then(|obj| obj.get("effects"))
+            .and_then(Value::as_array)
+            .map(|effects| parse_effect_cards(effects, self.text_color))
+            .unwrap_or_default();
+    }
+
+    /// Serializes the panel's effect cards to the stored JSON array. Each element is
+    /// produced by the shared single-card serializer `effect_card_to_value`, so the
+    /// per-card shape is defined in exactly one place.
+    pub(super) fn effects_value_array(&self) -> Vec<Value> {
+        self.effects.iter().map(effect_card_to_value).collect()
+    }
+
+    /// Profile JSON of the font at `font_idx` in the CURRENT schema, carrying that font's
+    /// IDENTITY (`FontEntry::render_identity_name`) under `font`. An out-of-range index
+    /// yields a payload with no font key — the profile is still usable for parameters.
+    pub(super) fn build_font_profile_json_for_idx(&self, font_idx: usize) -> Value {
+        // Schema 2 stores ONE font key: the identity (the representative face's
+        // PostScript name, `%hash`-suffixed only on a same-name/different-bytes
+        // contest). Path, label, family name are neither written nor read here any
+        // more; they survive only as the codec's legacy READ chain for schema-1
+        // documents (`dev-docs/font_identity_postscript_plan.md` phase 3).
+        let font_identity = self.fonts.get(font_idx).map(FontEntry::render_identity_name);
+        self.build_render_data_json_with_font(self.text.clone(), self.width_px.max(1), font_identity)
+    }
+
+    /// Full render-data JSON for the CURRENTLY selected font, or `None` when the panel
+    /// has no font selected (an empty font list).
+    pub(super) fn build_render_data_json_for(&self, text: String, width_px: u32) -> Option<Value> {
+        let font = self.fonts.get(self.selected_font_idx)?;
+        Some(self.build_render_data_json_with_font(
+            text,
+            width_px.max(1),
+            Some(font.render_identity_name()),
+        ))
+    }
+
+    /// Builds the overlay's `render_data` in the CURRENT `text_params` schema.
+    ///
+    /// `font_identity` is the font's render identity (`FontEntry::render_identity_name`)
+    /// or `None` when no font is selected. The parameter object is assembled in full and
+    /// then handed to [`text_params_schema::write_text_params`], which stamps the schema
+    /// version and drops every value equal to its frozen default — so this function must
+    /// keep listing EVERY key, defaults included. An empty effect list is omitted.
+    pub(super) fn build_render_data_json_with_font(
+        &self,
+        text: String,
+        width_px: u32,
+        font_identity: Option<String>,
+    ) -> Value {
+        let mut text_params = json!({
+                "text": text,
+                "text_color": [self.text_color.r(), self.text_color.g(), self.text_color.b(), self.text_color.a()],
+                "font_size_px": self.font_size_px,
+                "line_spacing": self.line_spacing.to_token(),
+                "kerning_mode": match self.kerning_mode {
+                    KerningMode::Fixed => "fixed",
+                    KerningMode::Auto => "auto",
+                    KerningMode::Optical => "optical",
+                },
+                "kerning": self.kerning.to_token(),
+                "glyph_height": self.glyph_height.to_token(),
+                "glyph_width": self.glyph_width.to_token(),
+                "width_px": width_px.max(1),
+                // `align` — легаси-совместимая строка (PSD-экспорт, старые ридеры),
+                // `align_bias` — точное непрерывное смещение слайдера лево↔право.
+                "align": self.align.legacy_str(),
+                "align_bias": self.align.bias,
+                "global_rotation_deg": self.global_rotation_deg,
+                "line_placement_percent": self.line_placement_percent,
+                "line_placement_reference": self.line_placement_reference.as_json_str(),
+                "text_line_mode": match self.text_line_mode {
+                    TextLineMode::Horizontal => "horizontal",
+                    TextLineMode::Vertical => "vertical",
+                },
+                "vertical_line_direction": match self.vertical_line_direction {
+                    VerticalLineDirection::LeftToRight => "left_to_right",
+                    VerticalLineDirection::RightToLeft => "right_to_left",
+                },
+                "text_layout_mode": match self.text_layout_mode {
+                    TextLayoutMode::Normal => "normal",
+                    TextLayoutMode::Formula => "formula",
+                    TextLayoutMode::Shape => "shape",
+                    TextLayoutMode::CustomRasterLines => "custom_raster_lines",
+                    TextLayoutMode::CustomVectorLines => "custom_vector_lines",
+                },
+                "formula_layout": text_formula_layout_to_value(&self.formula_layout),
+                "shape_layout": self.shape_layout_to_value(),
+                "drawn_lines_layout": text_drawn_lines_layout_to_value(&self.drawn_lines_layout_for_render()),
+                "vector_lines_layout": text_vector_lines_layout_to_value(&self.vector_lines_layout),
+                "selected_face_index": self.selected_face_idx,
+                "force_bold": self.force_bold,
+                "force_italic": self.force_italic,
+                "uppercase_text": self.uppercase_text,
+                "trim_extra_spaces": self.trim_extra_spaces,
+                "replace_ellipsis_with_dots": self.replace_ellipsis_with_dots,
+                "force_remove_ellipsis_glyph": self.force_remove_ellipsis_glyph,
+                "hanging_punctuation": self.hanging_punctuation,
+                "new_line_after_sentence": self.new_line_after_sentence,
+                "enable_inline_style_tags": self.enable_inline_style_tags,
+                "text_wrap_mode": match self.text_wrap_mode {
+                    TextWrapMode::None => "none",
+                    TextWrapMode::WholeWords => "whole_words",
+                    TextWrapMode::Minimal => "minimal",
+                    TextWrapMode::Moderate => "moderate",
+                    TextWrapMode::Aggressive => "aggressive",
+                },
+                "anti_aliasing": match self.anti_aliasing {
+                    AntiAliasingMode::None => "none",
+                    AntiAliasingMode::Sharp => "sharp",
+                    AntiAliasingMode::Crisp => "crisp",
+                    AntiAliasingMode::Strong => "strong",
+                    AntiAliasingMode::Smooth => "smooth",
+                },
+                "allow_moderate_trees": self.allow_moderate_trees,
+                "text_shape": match self.text_shape {
+                    TextShape::Free => "free",
+                    TextShape::Rectangle => "rectangle",
+                    TextShape::Oval => "oval",
+                    TextShape::Hexagon => "hexagon",
+                    TextShape::SoftPeak => "soft_peak",
+                },
+                "shape_min_width_percent": self.shape_min_width_percent,
+                "shape_variant": self.shape_variant,
+                // Сформированный (разбитый на строки) текст «продвинутой формы».
+                // Если не пуст — именно он идёт в рендер; `text` остаётся исходным.
+                // Переживает перезапуск.
+                "formed_text": self.formed_text,
+        });
+        let Some(text_params_obj) = text_params.as_object_mut() else {
+            // Unreachable: the literal above IS an object. Returning an empty payload
+            // instead of panicking keeps the GUI thread alive on an impossible edit.
+            return json!({});
+        };
+        // The ONLY font key of schema 2. Absent when the panel has no font selected.
+        if let Some(identity) = font_identity {
+            text_params_obj.insert("font".to_string(), Value::String(identity));
+        }
+        text_params_obj.insert("faux_bold".to_string(), json!(self.faux_bold));
+        text_params_obj.insert("faux_bold_thicken_percent".to_string(), json!(self.faux_bold_thicken_percent));
+        text_params_obj.insert("faux_bold_expand_percent".to_string(), json!(self.faux_bold_expand_percent));
+        text_params_obj.insert("faux_bold_sharp_corners".to_string(), json!(self.faux_bold_sharp_corners));
+        text_params_obj.insert("faux_bold_outward_only".to_string(), json!(self.faux_bold_outward_only));
+        text_params_obj.insert("faux_italic".to_string(), json!(self.faux_italic));
+        text_params_obj.insert("faux_italic_slant_deg".to_string(), json!(self.faux_italic_slant_deg));
+        // Carry the canvas-authored vector mesh warp verbatim (Phase 3). Only
+        // emit the key when present so old overlays stay byte-stable/clean.
+        if let Some(raster_transform) = self.pending_raster_transform.clone() {
+            text_params_obj.insert("raster_transform".to_string(), raster_transform);
+        }
+        let text_params = text_params_schema::write_text_params(std::mem::take(text_params_obj));
+
+        let mut render_data = serde_json::Map::new();
+        render_data.insert("text_params".to_string(), text_params);
+        // An empty effect list carries no information: every reader treats an absent
+        // `effects` exactly like `[]` (`effects_json_from_render_data`, the panel's own
+        // `parse_effect_cards` call, and the renderer's `parse_effects_json`).
+        let effects = self.effects_value_array();
+        if !effects.is_empty() {
+            render_data.insert("effects".to_string(), Value::Array(effects));
+        }
+        Value::Object(render_data)
+    }
+
+    /// Snapshot of `identity -> per-face PostScript names` for the panel's CURRENT font
+    /// list, for consumers that need a real PostScript name but hold no font list — today
+    /// the PSD export, whose job carries neither the fonts nor the provider.
+    ///
+    /// Faces are indexed by their POSITION in the font's face list, which is what
+    /// `text_params.selected_face_index` stores. Cheap (one small string per face) and
+    /// built off any font file access.
+    pub(crate) fn font_post_script_names(&self) -> FontPostScriptNames {
+        let mut index = FontPostScriptNames::default();
+        for font in &self.fonts {
+            index.insert_font(
+                &font.render_identity_name(),
+                font.faces
+                    .iter()
+                    .map(|face| face.post_script_name.clone())
+                    .collect(),
+                font.post_script_name(),
+            );
+        }
+        index
+    }
+
+    /// Resolves a font reference written by an OLDER build (a `font_path` and/or a name
+    /// in any historical form) to the current render IDENTITY, or `None` when no
+    /// installed font matches.
+    ///
+    /// The single entry point of the legacy READ path for callers outside the panel (the
+    /// tab's schema-1 -> schema-2 conversion). It delegates to the same
+    /// `find_font_idx_by_legacy_reference` the panel's own overlay-selection path uses,
+    /// so a converted document selects exactly the font the panel would have selected.
+    pub(crate) fn resolve_legacy_font_identity(
+        &self,
+        font_path: Option<&str>,
+        font_name: Option<&str>,
+    ) -> Option<String> {
+        self.find_font_idx_by_legacy_reference(font_path, font_name)
+            .and_then(|idx| self.fonts.get(idx))
+            .map(FontEntry::render_identity_name)
+    }
+
+    pub(super) fn shape_layout_to_value(&self) -> Value {
+        match self.shape_layout_kind {
+            TypingShapeLayoutKind::Arc => json!({
+                "kind": "arc",
+                "length_px": self.arc_shape_layout.length_px,
+                "amplitude_px": self.arc_shape_layout.amplitude_px,
+                "width_px": self.arc_shape_layout.length_px,
+                "height_px": self.arc_shape_layout.amplitude_px,
+                "frequency": self.arc_shape_layout.frequency,
+                "orientation": self.arc_shape_layout.orientation.as_config_str(),
+            }),
+            TypingShapeLayoutKind::Circle => json!({
+                "kind": "circle",
+                "width_px": self.circle_shape_layout.width_px,
+                "height_px": self.circle_shape_layout.height_px,
+            }),
+            TypingShapeLayoutKind::Spiral => json!({
+                "kind": "spiral",
+                "width_px": self.spiral_shape_layout.width_px,
+                "height_px": self.spiral_shape_layout.height_px,
+                "turns": self.spiral_shape_layout.turns,
+                "inner_ratio": self.spiral_shape_layout.inner_ratio,
+            }),
+            TypingShapeLayoutKind::Polygon => json!({
+                "kind": "polygon",
+                "width_px": self.polygon_shape_layout.width_px,
+                "height_px": self.polygon_shape_layout.height_px,
+                "sides": self.polygon_shape_layout.sides,
+            }),
+            TypingShapeLayoutKind::Zigzag => json!({
+                "kind": "zigzag",
+                "width_px": self.zigzag_shape_layout.width_px,
+                "height_px": self.zigzag_shape_layout.height_px,
+                "segments": self.zigzag_shape_layout.segments,
+            }),
+            TypingShapeLayoutKind::SCurve => json!({
+                "kind": "s_curve",
+                "width_px": self.s_curve_shape_layout.width_px,
+                "height_px": self.s_curve_shape_layout.height_px,
+                "bends": self.s_curve_shape_layout.bends,
+            }),
+        }
+    }
+
+    pub(super) fn apply_shape_layout_json(&mut self, obj: &Map<String, Value>) {
+        let kind = obj
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "arc".to_string());
+        self.shape_layout_kind = match kind.as_str() {
+            "arc" => TypingShapeLayoutKind::Arc,
+            "circle" | "ellipse" | "oval" => TypingShapeLayoutKind::Circle,
+            "spiral" => TypingShapeLayoutKind::Spiral,
+            "polygon" => TypingShapeLayoutKind::Polygon,
+            "zigzag" => TypingShapeLayoutKind::Zigzag,
+            "s_curve" | "s-curve" | "scurve" => TypingShapeLayoutKind::SCurve,
+            _ => TypingShapeLayoutKind::Arc,
+        };
+        self.arc_shape_layout.length_px = obj
+            .get("length_px")
+            .and_then(value_as_f32)
+            .or_else(|| obj.get("width_px").and_then(value_as_f32))
+            .unwrap_or(self.arc_shape_layout.length_px)
+            .clamp(1.0, 10_000.0);
+        self.arc_shape_layout.amplitude_px = obj
+            .get("amplitude_px")
+            .and_then(value_as_f32)
+            .or_else(|| obj.get("height_px").and_then(value_as_f32))
+            .unwrap_or(self.arc_shape_layout.amplitude_px)
+            .clamp(-10_000.0, 10_000.0);
+        self.arc_shape_layout.frequency = obj
+            .get("frequency")
+            .and_then(value_as_f32)
+            .unwrap_or(self.arc_shape_layout.frequency)
+            .clamp(0.1, 32.0);
+        self.arc_shape_layout.orientation = obj
+            .get("orientation")
+            .and_then(Value::as_str)
+            .and_then(TypingArcOrientation::from_config_str)
+            .unwrap_or(self.arc_shape_layout.orientation);
+        self.circle_shape_layout.width_px = obj
+            .get("width_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.circle_shape_layout.width_px)
+            .clamp(1.0, 10_000.0);
+        self.circle_shape_layout.height_px = obj
+            .get("height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.circle_shape_layout.height_px)
+            .clamp(1.0, 10_000.0);
+        self.spiral_shape_layout.width_px = obj
+            .get("width_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.spiral_shape_layout.width_px)
+            .clamp(1.0, 10_000.0);
+        self.spiral_shape_layout.height_px = obj
+            .get("height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.spiral_shape_layout.height_px)
+            .clamp(1.0, 10_000.0);
+        self.spiral_shape_layout.turns = obj
+            .get("turns")
+            .and_then(value_as_f32)
+            .unwrap_or(self.spiral_shape_layout.turns)
+            .clamp(0.25, 16.0);
+        self.spiral_shape_layout.inner_ratio = obj
+            .get("inner_ratio")
+            .and_then(value_as_f32)
+            .unwrap_or(self.spiral_shape_layout.inner_ratio)
+            .clamp(0.0, 0.98);
+        self.polygon_shape_layout.width_px = obj
+            .get("width_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.polygon_shape_layout.width_px)
+            .clamp(1.0, 10_000.0);
+        self.polygon_shape_layout.height_px = obj
+            .get("height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.polygon_shape_layout.height_px)
+            .clamp(1.0, 10_000.0);
+        self.polygon_shape_layout.sides = obj
+            .get("sides")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(self.polygon_shape_layout.sides)
+            .clamp(3, 12);
+        self.zigzag_shape_layout.width_px = obj
+            .get("width_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.zigzag_shape_layout.width_px)
+            .clamp(1.0, 10_000.0);
+        self.zigzag_shape_layout.height_px = obj
+            .get("height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.zigzag_shape_layout.height_px)
+            .clamp(-10_000.0, 10_000.0);
+        self.zigzag_shape_layout.segments = obj
+            .get("segments")
+            .and_then(value_as_f32)
+            .unwrap_or(self.zigzag_shape_layout.segments)
+            .clamp(0.5, 32.0);
+        self.s_curve_shape_layout.width_px = obj
+            .get("width_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.s_curve_shape_layout.width_px)
+            .clamp(1.0, 10_000.0);
+        self.s_curve_shape_layout.height_px = obj
+            .get("height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(self.s_curve_shape_layout.height_px)
+            .clamp(-10_000.0, 10_000.0);
+        self.s_curve_shape_layout.bends = obj
+            .get("bends")
+            .and_then(value_as_f32)
+            .unwrap_or(self.s_curve_shape_layout.bends)
+            .clamp(0.25, 8.0);
+    }
+
+    pub(super) fn formula_layout_for_render(&self) -> TextFormulaLayoutParams {
+        match self.text_layout_mode {
+            TextLayoutMode::Shape => self.shape_formula_layout(),
+            _ => self.formula_layout.clone(),
+        }
+    }
+
+    pub(super) fn drawn_lines_layout_for_render(&self) -> TextDrawnLinesLayoutParams {
+        self.drawn_lines_layout.clone()
+    }
+
+    pub(super) fn shape_formula_layout(&self) -> TextFormulaLayoutParams {
+        let mut layout = self.formula_layout.clone();
+        match self.shape_layout_kind {
+            TypingShapeLayoutKind::Arc => {
+                match self.arc_shape_layout.orientation {
+                    TypingArcOrientation::Horizontal => {
+                        layout.x_expr = "a * (t - 0.5)".to_string();
+                        layout.y_expr = "b * sin(pi * c * t)".to_string();
+                    }
+                    TypingArcOrientation::Vertical => {
+                        layout.x_expr = "b * sin(pi * c * t)".to_string();
+                        layout.y_expr = "a * (t - 0.5)".to_string();
+                    }
+                }
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = self.arc_shape_layout.length_px.clamp(1.0, 10_000.0);
+                layout.vars[1] = self
+                    .arc_shape_layout
+                    .amplitude_px
+                    .clamp(-10_000.0, 10_000.0);
+                layout.vars[2] = self.arc_shape_layout.frequency.clamp(0.1, 32.0);
+            }
+            TypingShapeLayoutKind::Circle => {
+                layout.x_expr = "a * cos(tau * t)".to_string();
+                layout.y_expr = "b * sin(tau * t)".to_string();
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = (self.circle_shape_layout.width_px * 0.5).clamp(1.0, 10_000.0);
+                layout.vars[1] = (self.circle_shape_layout.height_px * 0.5).clamp(1.0, 10_000.0);
+            }
+            TypingShapeLayoutKind::Spiral => {
+                layout.x_expr = "(a * (d + (1 - d) * t)) * cos(tau * c * t)".to_string();
+                layout.y_expr = "(b * (d + (1 - d) * t)) * sin(tau * c * t)".to_string();
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = (self.spiral_shape_layout.width_px * 0.5).clamp(1.0, 10_000.0);
+                layout.vars[1] = (self.spiral_shape_layout.height_px * 0.5).clamp(1.0, 10_000.0);
+                layout.vars[2] = self.spiral_shape_layout.turns.clamp(0.25, 16.0);
+                layout.vars[3] = self.spiral_shape_layout.inner_ratio.clamp(0.0, 0.98);
+            }
+            TypingShapeLayoutKind::Polygon => {
+                layout.x_expr = "a * cos(tau * t) * cos(pi / c) / cos(atan2(sin(c * tau * t), cos(c * tau * t)) / c)".to_string();
+                layout.y_expr = "b * sin(tau * t) * cos(pi / c) / cos(atan2(sin(c * tau * t), cos(c * tau * t)) / c)".to_string();
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = (self.polygon_shape_layout.width_px * 0.5).clamp(1.0, 10_000.0);
+                layout.vars[1] = (self.polygon_shape_layout.height_px * 0.5).clamp(1.0, 10_000.0);
+                layout.vars[2] = self.polygon_shape_layout.sides.clamp(3, 12) as f32;
+            }
+            TypingShapeLayoutKind::Zigzag => {
+                layout.x_expr = "a * (t - 0.5)".to_string();
+                layout.y_expr = "b * (2 / pi) * asin(sin(pi * c * t))".to_string();
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = self.zigzag_shape_layout.width_px.clamp(1.0, 10_000.0);
+                layout.vars[1] = self
+                    .zigzag_shape_layout
+                    .height_px
+                    .clamp(-10_000.0, 10_000.0);
+                layout.vars[2] = self.zigzag_shape_layout.segments.clamp(0.5, 32.0);
+            }
+            TypingShapeLayoutKind::SCurve => {
+                layout.x_expr = "a * (t - 0.5)".to_string();
+                layout.y_expr = "b * sin(pi * c * (t - 0.5))".to_string();
+                layout.rotation_expr = "0".to_string();
+                layout.t_start = 0.0;
+                layout.t_end = 1.0;
+                layout.offset_x_px = 0.0;
+                layout.offset_y_px = 0.0;
+                layout.scale_x = 1.0;
+                layout.scale_y = 1.0;
+                layout.vars[0] = self.s_curve_shape_layout.width_px.clamp(1.0, 10_000.0);
+                layout.vars[1] = self
+                    .s_curve_shape_layout
+                    .height_px
+                    .clamp(-10_000.0, 10_000.0);
+                layout.vars[2] = self.s_curve_shape_layout.bends.clamp(0.25, 8.0);
+            }
+        }
+        layout
+    }
+
+    /// Stores the panel's current parameters as the profile of the font at `idx`, keyed by
+    /// that font's IDENTITY, and makes it the active profile anchor. No-op without the
+    /// per-font memory (edit panel) or for an out-of-range index.
+    ///
+    /// WHICH LAYER IS WRITTEN follows the ownership split of "variant A"
+    /// (`dev-docs/font_identity_postscript_plan.md`): with a preset applied the edit belongs
+    /// to that preset's working set and the font's PERSISTED DEFAULT is left alone; without
+    /// one, the parameters on screen are what this font should remember by itself. See
+    /// [`DefaultProfileWrite`].
+    pub(super) fn store_current_font_profile_by_idx(&mut self, idx: usize) {
+        if !self.preview_enabled {
+            return;
+        }
+        let Some(identity) = self.font_identity_name_by_idx(idx) else {
+            return;
+        };
+        let write = if self.selected_preset_name.is_some() {
+            DefaultProfileWrite::PresetOnly
+        } else {
+            DefaultProfileWrite::UpdateFontDefault
+        };
+        self.font_profiles_by_identity.insert(
+            identity.clone(),
+            self.build_font_profile_json_for_idx(idx),
+            write,
+        );
+        self.active_font_identity = Some(identity);
+    }
+
+    /// Stores the parameters on screen with whoever owns them — the LEGACY NAME of
+    /// [`Self::store_current_params_snapshot`], which is the real dispatch
+    /// (`local_presets.rs`, `dev-docs/local_presets_plan.md` §5).
+    ///
+    /// Kept only because two of its call sites live in `create_sections.rs`, a file this
+    /// change is not allowed to touch. REMOVAL CONDITION: rename those two calls (and the
+    /// one in `create_apply::adjust_font_size_by_wheel_steps`, plus the three in this file
+    /// and `create_state.rs`) to `store_current_params_snapshot` and delete this method. New
+    /// code must call the dispatch directly — in local-preset mode this name is a lie, since
+    /// nothing goes into the per-font memory then.
+    pub(super) fn sync_current_font_profile_memory(&mut self) {
+        self.store_current_params_snapshot();
+    }
+
+    /// Reacts to the user picking a DIFFERENT font in the create panel. Returns whether any
+    /// panel parameter changed as a result.
+    ///
+    /// In [`ParamIdentityMode::Font`] mode the font is the parameter KEY: the outgoing
+    /// font's snapshot is stored and the incoming font's snapshot (session memory, else its
+    /// persisted default) is restored over the panel.
+    ///
+    /// In [`ParamIdentityMode::LocalPreset`] mode the font is an ORDINARY PARAMETER of the
+    /// selected local preset: nothing is stored per font and nothing is restored, the
+    /// selection simply stands and the new font becomes part of the preset's snapshot.
+    pub(super) fn handle_create_font_selection_change(&mut self, prev_font_idx: usize) -> bool {
+        if !self.preview_enabled {
+            return false;
+        }
+        if self.identity_mode == ParamIdentityMode::LocalPreset {
+            // No per-font store, no per-font restore: only the face index has to follow the
+            // new font, and the snapshot the local preset owns has to record the change.
+            // `active_font_identity` still follows the SELECTION — it is also the anchor a
+            // background font reload restores the selection by (`poll_font_reload_results`),
+            // and leaving it on the previous font would hand the user that font back.
+            self.active_font_identity = self.current_font_identity();
+            self.clamp_face_index();
+            self.store_current_params_snapshot();
+            return true;
+        }
+        self.store_current_font_profile_by_idx(prev_font_idx);
+        let Some(new_identity) = self.current_font_identity() else {
+            return false;
+        };
+        self.active_font_identity = Some(new_identity.clone());
+        // A FONT-mode preset stores the font itself (`capture_current_preset`), so the switch
+        // alone already makes the applied global preset differ from disk — before any
+        // parameter is touched. Marked HERE, once, so both branches below are symmetric: the
+        // fresh-font branch would reach the ordinary dispatch (which marks) while the branch
+        // that finds a session profile returns early and would mark nothing at all, leaving
+        // the user with no unsaved-changes warning for a change the save really writes.
+        self.mark_selected_global_preset_dirty();
+        if let Some(profile) = self.font_profiles_by_identity.get(&new_identity).cloned() {
+            self.apply_render_data_json_with_options(&profile, false);
+            self.clamp_face_index();
+            return true;
+        }
+        self.selected_face_idx = 0;
+        self.sync_current_font_profile_memory();
+        true
+    }
+
+}

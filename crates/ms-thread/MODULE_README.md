@@ -40,7 +40,7 @@ works because both backends offer the same shape:
 - **A thread on a path that also runs on the web must be created through this crate.** A
   direct `std::thread::spawn` there compiles and then panics in the browser. Direct
   `std::thread` stays legitimate in code excluded from the wasm build
-  (`#[cfg(not(target_arch = "wasm32"))]`, e.g. `src/ui_fonts.rs::install_with_roots`) and in
+  (`#[cfg(not(target_arch = "wasm32"))]`, e.g. `crates/ms-widgets/src/ui_fonts.rs::install_with_roots`) and in
   tests.
 - **`scope` is native-oriented.** It is re-exported from `std` on both targets, so it
   compiles everywhere, but a scoped `spawn` would hit std's unsupported path in the browser.

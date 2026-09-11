@@ -58,7 +58,7 @@ const META_KEY: &str = "_meta";
 /// `(tag, json_source)` for every locale whose catalog is compiled in today.
 ///
 /// All five shipped locales are present. A custom user-authored tag (e.g. `de`) has no
-/// embedded source and must be loaded from disk. `src/locale_store.rs` uses this to
+/// embedded source and must be loaded from disk. `crates/ms-config/src/locale_store.rs` uses this to
 /// materialize the bundled sources into the editable `locale/` folder.
 static EMBEDDED: [(&str, &str); 5] = [
     ("en", EN_JSON),
@@ -71,7 +71,7 @@ static EMBEDDED: [(&str, &str); 5] = [
 /// Returns the embedded locale sources as `(tag, json_source)` pairs.
 ///
 /// The slice contains every locale that ships a catalog (`en`, `ru`, `es`, `fr`, `pt`).
-/// `src/locale_store.rs` materializes the bundled JSON onto disk; the catalog runtime
+/// `crates/ms-config/src/locale_store.rs` materializes the bundled JSON onto disk; the catalog runtime
 /// itself parses these directly.
 #[must_use]
 pub fn embedded_locales() -> &'static [(&'static str, &'static str)] {

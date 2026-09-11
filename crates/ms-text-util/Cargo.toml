@@ -6,4 +6,4 @@ edition = "2024"
 # Config-free text utilities shared by the app and the text renderer:
 # the hanging-punctuation set and language-aware line segmentation.
 [dependencies]
-hyphenation = { version = "0.8", features = ["embed_all"] }
+hyphenation.workspace = true

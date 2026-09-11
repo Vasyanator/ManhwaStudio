@@ -22,7 +22,7 @@ Notes:
 The renderer's fallback chain is deterministic (`font_base.rs`), so a character it
 serves IS rendered correctly — just not in the selected typeface. That is why the
 result is INFORMATION, and only `missing` (`.notdef`, a tofu box) is a real loss.
-This is a different question from `src/tabs/typing/panel/font_coverage.rs`, which
+This is a different question from `crates/ms-tab-typing/src/panel/font_coverage.rs`, which
 statically ranks a FONT against the typesetting LANGUAGE before any text exists.
 */
 

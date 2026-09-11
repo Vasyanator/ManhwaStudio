@@ -40,7 +40,7 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   is located by name and comes back as a normal row (the localized reason still describes what
   happened at the recorded path, which is the half the user can act on). The picker's
   system-font catalog load doubles as the refresh of that by-name index — see
-  `src/tabs/typing/panel/MODULE_README.md`. The remove button
+  `crates/ms-tab-typing/src/panel/MODULE_README.md`. The remove button
   passes `row.stored_identity` (the document key), NOT the loaded font's render identity, which
   may carry a collision suffix. Draws
   each font's name in its own typeface (`crate::widgets::request_font_family`, keyed by the
@@ -328,7 +328,7 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   internal. egui font-preview registration uses `crate::widgets::font_preview`.
 - Own-typeface rule: wherever a font's name is displayed and/or the font is selectable, render
   the name in that font itself when available (see the contract in
-  `src/tabs/typing/panel/MODULE_README.md`, "Font model exposure").
+  `crates/ms-tab-typing/src/panel/MODULE_README.md`, "Font model exposure").
 - Do not block the GUI thread: font enumeration, font-file analysis, native file pickers,
   by-name system-font lookups and font-card PSD reading run on worker threads, results polled
   over `mpsc`. `rfd` is a NON-wasm dependency, so every picker call site needs a

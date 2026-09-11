@@ -1,0 +1,75 @@
+[package]
+name = "ms-settings-ui"
+version = "0.1.0"
+edition = "2024"
+
+# The settings surface ManhwaStudio's two shells share: the launcher's settings page and
+# the studio's Settings tab both render the SAME General / AI-backend / Tutorials panes
+# through the double-interface pattern, and both drive the SAME AI-backend supervisor.
+# Neither shell may own them, so they live here.
+#
+# Layer position: above the primitives (`ms-widgets`, `ms-config`, `ms-sysprobe`,
+# `ms-backend-ipc`) and above exactly one tab crate (`ms-tab-translation`, for the
+# backend-health model). Nothing in the tabs depends back on this crate.
+[features]
+# In-app onboarding tutorial. Off by default and forwarded from the ROOT crate's feature
+# of the same name (`tutorial = ["ms-settings-ui/tutorial"]`) — features are NOT inherited,
+# so without that forward the tours would compile out of this half of the app while the
+# binary still thought they were on.
+tutorial = []
+
+[dependencies]
+# `user_config.json` (every pane writes a section of it), `program_dir()`/`data_dir()`,
+# the section writers of these panes (`save_ai_runtime`, `save_text_language`, …) and the
+# ORT load guard. Also `locale_store`, the editable on-disk UI locale catalog.
+ms-config = { path = "../ms-config" }
+# Diagnostics of the panes and of the backend supervisor (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# Every widget these panes are built from (`WheelComboBox`, `WheelSlider`, `AiButton`, …).
+ms-widgets = { path = "../ms-widgets" }
+# `MemoryProfile` / `MemoryManager`: the memory-profile selector of the General pane.
+ms-memory = { path = "../ms-memory" }
+# `t!` / `tf!` / `tp!` plus `resolve_key` for runtime-chosen catalog keys; the macros are
+# mounted crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# The framed IPC the supervisor speaks to the Python AI backend over.
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# Host probes: `python_manager` (interpreter discovery for the backend process),
+# `gpu_utils` (accelerator list of the AI pane) and `ai_backend_capabilities`.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# `backend_health` — the health snapshot / probe-command model of the AI pane and the
+# supervisor. The ONLY tab crate this one depends on; the dependency never points back.
+ms-tab-translation = { path = "../ms-tab-translation" }
+# The typesetting-language model behind the General pane's language selector.
+ms-text-util = { path = "../ms-text-util" }
+# Named worker threads: no pane may probe, spawn or write on the GUI thread.
+ms-thread = { path = "../ms-thread" }
+# `ExecutionProvider` — the ONNX provider tokens the AI pane offers.
+ms-onnx = { path = "../ms-onnx" }
+# The panes are egui widgets; `eframe::egui` is re-exported through eframe in some files,
+# so both are named. Same feature set the binary selects, so no second backend is built.
+egui.workspace = true
+eframe.workspace = true
+# Targeted read-modify-write of `user_config.json` sections.
+serde_json.workspace = true
+# Aggregated context on the supervisor's config-write failures (`anyhow::anyhow!`).
+anyhow.workspace = true
+# Monotonic time in the health-probe cadence; works on wasm too, unlike `Instant`.
+web-time.workspace = true
+# The per-launch WebSocket handshake token the supervisor mints for the backend child on
+# Windows (AF_UNIX is unreliable there, so the same framed protocol runs over loopback).
+# Same feature set as the binary, so no second copy is built.
+uuid.workspace = true
+
+# Native-only halves. The panes keep their `cfg(not(target_arch = "wasm32"))` gates
+# internally (there is no ONNX Runtime dylib, no OS monitor list and no subprocess AI
+# backend on the web), so these three crates are only linked on native.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The ORT dylib resolver behind the AI pane's runtime/build selectors.
+ms-onnx-runtime = { path = "../ms-onnx-runtime" }
+# The native OCR runtime whose loaded-engine state the AI pane reports.
+ms-native-runtime = { path = "../ms-native-runtime" }
+# The startup-monitor selector of the General pane.
+ms-window-geometry = { path = "../ms-window-geometry" }
+# The native folder picker behind the General pane's "projects root" button.
+rfd.workspace = true

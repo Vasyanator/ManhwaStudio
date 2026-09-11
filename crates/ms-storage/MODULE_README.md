@@ -26,8 +26,15 @@ Paths are **virtual**: root-relative, '/'-separated (backslashes accepted),
 
 ## Files and submodules
 - `lib.rs`: `Storage` trait, `StorageError`, `Metadata`, `DirEntry`; re-exports.
+- `global.rs`: the process-wide backend. Owns the write-once `OnceLock<Arc<dyn Storage>>`,
+  lazily defaulting to `PassthroughStorage` on native and `MemStorage` on wasm, and
+  `install()` (wasm-only) for the web layer's pre-hydrated store. The binary re-exports
+  this module as `crate::storage`, so every `crate::storage::storage()` call site in
+  `src/` reaches it unchanged. `ms-config` reads and writes `user_config.json` through it.
 - `native.rs`: `NativeStorage` + `real_path()` migration helper (virtual → real
   `PathBuf`, for call sites still handing a `&Path` to e.g. `image::open`).
+- `passthrough.rs`: `PassthroughStorage` — `std::fs` with no virtual root and no
+  normalization (absolute paths verbatim); the desktop default behind `global`.
 - `mem.rs`: `MemStorage` in-memory tree backend.
 - `path.rs`: `normalize()` virtual-path parser + unit tests.
 - `tests/backends.rs`: identical-behavior contract tests across both backends.
@@ -49,3 +56,5 @@ Paths are **virtual**: root-relative, '/'-separated (backslashes accepted),
   add a `mod`, implement `Storage`, and include it in the `backends()` fixture.
 - Path rules live only in `path.rs` — do not re-implement normalization in a
   backend.
+- To change which backend the application runs on, or to install one before first
+  use: `global.rs`. Nothing else in the tree may build a backend of its own.

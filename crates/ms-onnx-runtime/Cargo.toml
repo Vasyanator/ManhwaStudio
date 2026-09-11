@@ -1,0 +1,34 @@
+[package]
+name = "ms-onnx-runtime"
+version = "0.1.0"
+edition = "2024"
+
+# Loader that resolves (and, if absent, downloads + verifies + extracts) the official
+# ONNX Runtime dynamic library for the current platform/provider, so `ms-onnx` can
+# dlopen it. GUI-free and native-only by nature: onnxruntime is a native shared
+# library and every path here is blocking I/O meant for a worker thread. It owns
+# dylib RESOLUTION only — it never links, initializes or runs onnxruntime.
+[dependencies]
+# The cache directory lives under `config::data_dir()`.
+ms-config = { path = "../ms-config" }
+# Diagnostics for probe/download/verify/extract (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# Every user-facing failure string is localized (`t!` / `tf!`); the macros are mounted
+# crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# `OrtRuntimeError` carries `ms_onnx` failures and the resolved path is handed to it.
+ms-onnx = { path = "../ms-onnx" }
+# The pinned release manifest (`ort_manifest.json`) is embedded and parsed into typed
+# entries.
+serde.workspace = true
+serde_json.workspace = true
+# SHA256 verification of every downloaded archive.
+sha2.workspace = true
+# Blocking HTTP download of the official release archives.
+ureq.workspace = true
+# The archive shapes the official releases ship in: .zip, .tgz (gzip + tar) and
+# .tar.zst (zstd + tar).
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zstd.workspace = true

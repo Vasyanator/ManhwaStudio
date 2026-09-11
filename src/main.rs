@@ -44,99 +44,218 @@ Main flow:
 #[macro_use]
 extern crate ms_i18n;
 
-mod ai_backend_capabilities;
-mod ai_backend_panel;
-mod ai_backend_supervisor;
-mod ai_install_probe;
-mod ai_models;
 mod app;
 mod args;
-mod backend_ipc;
-mod bubble_status;
-mod canvas;
-mod config;
-mod config_saver;
-mod general_settings_panel;
-pub mod gpu_utils;
-// Process-wide Hugging Face access token, backed by the OS secret store. One value for
-// the whole application (the FLUX.2 klein download block is its first UI surface, not
-// its owner); seeded once at startup by `seed_hf_token_from_secret_store`.
-mod hf_token;
 mod i18n_resolve;
-mod input_manager_v2;
-mod input_util;
-mod installer;
-mod launcher;
-// On-disk editable UI locale catalog layer (unpack + reconcile embedded catalogs
-// into `data_dir()/locale`). Native-only: there is no folder next to an executable
-// on wasm, where the embedded catalog is installed directly (see `web_entry.rs`).
-#[cfg(not(target_arch = "wasm32"))]
-mod locale_store;
-mod memory_manager;
-mod models;
-// Phase 1 native ONNX Runtime OCR manager: lazily loads the ONNX Runtime + native
-// MangaOCR engine (via `ms-onnx`) behind the SIGILL crash-guard and serves the
-// `General.ai_runtime = "native"` OCR path. Native-only (depends on `ms-onnx`/
-// `ort`), so gated off wasm like its dependencies.
-#[cfg(not(target_arch = "wasm32"))]
-mod native_runtime;
-// Native ONNX Runtime loader (resolves/downloads the onnxruntime dylib for
-// `ms-onnx`). Its public API is consumed by `native_runtime` + the OCR router.
-// Native-only (ureq/sha2/ms-onnx are not part of the wasm build), so gated off
-// wasm like its deps. `allow(dead_code)`: a few items are kept for completeness
-// and are not yet consumed (the `OrtDownloadProgress` byte counters, the
-// `sha256_hex` helper, the manifest version field).
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-mod onnx_runtime;
-mod page_ops;
-mod paste_image;
-mod project;
-mod python_manager;
-mod screen_capture;
-// Menu-level shared layer for the two settings surfaces (launcher settings page +
-// studio settings tab): the section registry (`SettingsSectionId`/`sections_for`/
-// `title_key`) and the `SharedSettingsPanels` container that owns the three shared
-// double-interface panels (General/AiBackend/Tutorials).
-mod settings_shared;
-mod storage;
 // Studio window startup shell: opens the window immediately and runs the project load on
 // a background thread behind a loading screen, then swaps in `MangaApp`. Native-only: it
 // wraps the native windowed startup flow (`run_main_window`), which does not exist on wasm.
 #[cfg(not(target_arch = "wasm32"))]
 mod studio_bootstrap;
 mod tabs;
-// Non-interactive readiness check of the managed Python environment behind
-// `--check-venv`. Native-only: it drives the installer/python-manager layers, both
-// of which are compiled out on wasm.
-#[cfg(not(target_arch = "wasm32"))]
-mod venv_check;
-// Pure version-string composition/stripping, shared verbatim with `build.rs` through
-// `include!`. Defines the human/machine split: `MS_APP_VERSION` (composed here at build
-// time) is for display, `CARGO_PKG_VERSION` is for every comparison and cross-process parse.
-mod version_format;
-// Single owner of the UI font stack (`fonts/ui`): every `run_native` context installs the
-// same chain through it, so no window is left on the bare egui defaults.
-mod ui_fonts;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
-mod tools;
-// Onboarding tutorial subsystem; gated behind the `tutorial` feature (off by
-// default). The demo bin `src/bin/tutorial_test` mounts `engine.rs` directly via
-// `#[path]`, so it stays buildable regardless of this feature.
+// The reusable tooling primitives (mask brush, polygon rasterizer, the shared red-black
+// SOR kernel, the dense overlay-pixel solve, and the host-neutral patch core) now live in
+// the standalone `ms-tools` crate. The re-export keeps every `crate::tools::…` path valid
+// without touching call sites. It sits above `ms-canvas`/`ms-widgets` and below the tabs,
+// which drive its patch core through the `PatchHost` trait it declares.
+pub use ms_tools as tools;
+
+// The settings surface both shells share — the menu-level `settings_shared` layer, the
+// three double-interface panes (`general_settings_panel`, `ai_backend_panel`, plus the
+// `ai_backend_supervisor` they drive) and the onboarding `tutorial` subsystem — now lives
+// in the standalone `ms-settings-ui` crate. The launcher's settings page and the studio's
+// Settings tab render the SAME panes, so neither could own them. The re-exports keep every
+// `crate::settings_shared::…` / `crate::general_settings_panel::…` / `crate::ai_backend_panel::…`
+// / `crate::ai_backend_supervisor::…` / `crate::tutorial::…` path valid without touching a
+// call site.
+pub use ms_settings_ui::{
+    ai_backend_panel, ai_backend_supervisor, general_settings_panel, settings_shared,
+};
+
+// The launcher shell — project catalogue, the detached "New Project" window with every
+// download/stitch/reline/batch flow, PSD import, the import/export pages, the first-run
+// language modal and the launcher settings page — now lives in the standalone
+// `ms-launcher` crate. It is effectively a second application: the studio never names it,
+// only `main.rs` and `web_entry.rs` do. The re-export keeps every `crate::launcher::…`
+// path valid without touching a call site.
+pub use ms_launcher as launcher;
+// Gated exactly as the module was. The root `tutorial` feature FORWARDS to
+// `ms-settings-ui/tutorial` (see `Cargo.toml`): features are not inherited, so without the
+// forward this re-export would not exist while the binary's own `mark` sites compiled in.
+// The demo bin `src/bin/tutorial_test` mounts `engine.rs` directly via `#[path]`, so it
+// stays buildable regardless of this feature.
 #[cfg(feature = "tutorial")]
-mod tutorial;
-pub mod widgets;
-// Startup monitor + window geometry contract (`Window` section of `user_config.json`).
-// Native-only: it talks to winit monitors and OS windows, neither of which exists on web.
+pub use ms_settings_ui::tutorial;
+// Startup monitor + window geometry contract (`Window` section of `user_config.json`) now
+// lives in the standalone `ms-window-geometry` crate — it is also the only direct user of
+// `winit`, which left the binary's manifest with it. The re-export keeps every
+// `crate::window_geometry::…` path valid without touching call sites. Native-only: it talks
+// to winit monitors and OS windows, neither of which exists on web.
 #[cfg(not(target_arch = "wasm32"))]
-mod window_geometry;
+pub use ms_window_geometry as window_geometry;
 
 // `runtime_log` and `trace` now live in the standalone `ms-log` crate. These
 // re-exports keep the existing `crate::runtime_log::…` / `crate::trace::…` module
 // paths and the `crate::trace_log!` / `crate::trace_scope!` macro paths valid
 // across the whole binary without touching call sites.
 pub use ms_log::{runtime_log, trace, trace_log, trace_scope};
+
+// `backend_ipc` now lives in the standalone `ms-backend-ipc` crate. The re-export keeps
+// every existing `crate::backend_ipc::…` path valid across the binary without touching
+// call sites, exactly like the `ms-log` shim above.
+pub use ms_backend_ipc as backend_ipc;
+
+// `ai_install_probe`, `gpu_utils`, `python_manager` and `screen_capture` now live in the
+// standalone `ms-sysprobe` crate. The re-exports keep `crate::ai_install_probe::…`,
+// `crate::gpu_utils::…`, `crate::python_manager::…` and `crate::screen_capture::…` valid
+// across the binary without touching call sites. `gpu_utils` was `pub mod`, so it stays
+// `pub` here.
+pub use ms_sysprobe::{ai_install_probe, gpu_utils, paste_image, python_manager, screen_capture};
+
+// Three more GUI-free host-facing modules moved into the same crate: `ai_models` (lazy
+// download of the app-managed model tree from the `Vasyanator2/ManhwaStudio_AI_Models`
+// repository), `hf_token` (the process-wide Hugging Face access token backed by the OS
+// secret store, seeded at startup by `seed_hf_token_from_secret_store`) and
+// `ai_backend_capabilities` (the process-global Torch-availability slot the health
+// snapshot mirrors into). The re-exports keep `crate::ai_models::…`,
+// `crate::hf_token::…` and `crate::ai_backend_capabilities::…` valid unchanged.
+pub use ms_sysprobe::{ai_backend_capabilities, ai_models, hf_token};
+
+// `memory_manager` now lives in the standalone `ms-memory` crate. It sits BELOW `config`
+// (which reads `MemoryProfile` from it), so it had to leave the binary before `config` can.
+// The re-export keeps every `crate::memory_manager::…` path valid without touching call sites.
+pub use ms_memory as memory_manager;
+
+// The process-wide storage backend selection now lives in the `ms-storage` crate
+// (`ms_storage::global`). The re-export keeps every `crate::storage::…` path valid
+// across the binary without touching call sites. It sits BELOW `config` (which reads
+// and writes `user_config.json` through it), so it had to leave the binary first.
+pub use ms_storage::global as storage;
+
+// `config` — the project's global config / runtime-path hub — now lives in the
+// standalone `ms-config` crate, together with the two crate-root modules its default
+// trees name: `app_tab` (`General.enabled_tabs` keys) and `rotation_ctrl_wheel`
+// (`TextTab.rotation_ctrl_wheel_mode`). The three re-exports keep every existing
+// `crate::config::…`, `crate::app_tab::…` and `crate::rotation_ctrl_wheel::…` path
+// valid across the binary without touching call sites, and with them the
+// `tabs::AppTab` / `tabs::typing::rotation_ctrl_wheel` re-exports layered on top.
+// `rotation_ctrl_wheel` was `pub mod`, so it stays `pub` here.
+pub use ms_config as config;
+pub use ms_config::{app_tab, rotation_ctrl_wheel};
+
+// Two more modules moved down into the same crate, both of which sit directly on the
+// `user_config.json` border it owns: `config_saver` (the debouncing, retrying writer
+// thread every self-owned config section writes through — its write step IS
+// `config::update_user_config_file`) and `locale_store` (the editable on-disk `locale/`
+// catalog, whose active tag comes out of `General.ui_language`). The re-exports keep
+// `crate::config_saver::…` and `crate::locale_store::…` valid without touching call sites.
+// `locale_store` keeps its native-only gate: on wasm there is no folder next to an
+// executable, and `web_entry.rs` installs the embedded catalog directly.
+pub use ms_config::config_saver;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ms_config::locale_store;
+
+// The desktop installer/updater subsystem now lives in the standalone `ms-installer`
+// crate. The re-export keeps every `crate::installer::…` path valid across the binary and
+// the launcher without touching call sites. Native-only, exactly as the module was: it
+// installs the managed Python environment and replaces the shipped executable, and its
+// modules are compiled out on wasm inside the crate itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub use ms_installer as installer;
+// The `--check-venv` readiness check moved into the same crate: it reads the installer's
+// own package requirements and shares two predicates with its repair worker, so a copy
+// outside would be free to drift. The re-export keeps `crate::venv_check::…` valid.
+#[cfg(not(target_arch = "wasm32"))]
+pub use ms_installer::venv_check;
+
+/// The application's own version pair, handed to `ms-installer` at its entry points.
+///
+/// It cannot be read inside that crate: `env!("CARGO_PKG_VERSION")` compiled there would
+/// yield the LIBRARY's version, and `MS_APP_VERSION` is a `rustc-env` that `build.rs`
+/// emits for this crate only. The two halves are not interchangeable — `core` is the
+/// machine-facing value every release comparison reduces with `version_format::version_core`,
+/// `display` is the git-derived string shown to the user and never parsed.
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_VERSION: ms_installer::HostVersion = ms_installer::HostVersion {
+    core: env!("CARGO_PKG_VERSION"),
+    display: env!("MS_APP_VERSION"),
+};
+
+// Pure version-string composition/stripping, shared verbatim with `build.rs` through
+// `include!("crates/ms-config/src/version_format.rs")`. It moved into `ms-config` so the
+// installer and launcher crates can reach it without going through the binary. Defines
+// the human/machine split: `MS_APP_VERSION` (composed at build time) is for display,
+// `CARGO_PKG_VERSION` is for every comparison and cross-process parse.
+pub use ms_config::version_format;
+
+// The reusable UI-primitive layer — `crates/ms-widgets/src/` plus three neighbouring leaves of the
+// same layer: `input_util` (shared egui input helpers), `ui_fonts` (the single owner of
+// the bundled `fonts/ui` stack), and `bubble_status` (the egui half of the bubble-status
+// feature: it paints a rule's border and re-exports the GUI-free model from `ms-config`) —
+// now lives in the standalone `ms-widgets` crate. The re-exports keep every
+// `crate::widgets::…`, `crate::input_util::…`, `crate::ui_fonts::…` and
+// `crate::bubble_status::…` path valid without touching call sites. `widgets` was `pub mod`, so the
+// alias stays `pub` here. The crate knows nothing about the project domain: `canvas` and the
+// tabs depend on IT, never the other way round.
+pub use ms_widgets as widgets;
+pub use ms_widgets::{bubble_status, input_util, ui_fonts};
+// The configurable-hotkey registry moved into `ms-widgets` (it is an egui-input
+// primitive over `AppTab`, and the `translation` tab crate registers specs with it).
+// This re-export keeps every `crate::input_manager_v2::…` path valid in `app.rs` and the
+// settings hotkeys pane.
+pub use ms_widgets::input_manager_v2;
+
+// The shared runtime models — the bubble model, the layer document, the clean-overlay
+// model and the text-mask model — now live in the standalone `ms-models` crate, together
+// with `page_view` (the source-page view model, a crate-root module of the same layer).
+// The two re-exports keep every `crate::models::…` and `crate::page_view::…` path valid
+// without touching call sites. The crate sits ABOVE `ms-project` (it loads and saves the
+// chapter domain model) and BELOW the canvas and the tabs.
+pub use ms_models as models;
+pub use ms_models::page_view;
+
+// The canvas facade — page rendering, bubble editing and clean-overlay painting — now lives
+// in the standalone `ms-canvas` crate. The re-export keeps every `crate::canvas::…` path
+// valid without touching call sites. It DECLARES the `CanvasHooks` trait that the tabs
+// IMPLEMENT, so the dependency points down only and no cycle appears.
+pub use ms_canvas as canvas;
+
+// `page_ops` — the journalled structural page transaction — now lives in the standalone
+// `ms-page-ops` crate, and `project` — the chapter domain model — in `ms-project`. The two
+// re-exports keep every `crate::page_ops::…` and `crate::project::…` path valid across the
+// binary without touching call sites.
+//
+// `Page` and `ProjectPaths` were DECLARED in `project.rs` and are now declared in
+// `ms-page-ops` and re-exported by `ms-project`, so `crate::project::{Page, ProjectPaths}`
+// still resolves. They had to move: `ProjectData::load` resolves a pending page-op journal
+// before any reconcile pass runs (a contract that cannot be hoisted into callers without
+// turning a crash-safety invariant into a convention), so `ms-project` depends on
+// `ms-page-ops` and not the other way round.
+pub use ms_page_ops as page_ops;
+pub use ms_project as project;
+// The projects-root catalogue scan (`list_titles`/`list_chapters`/
+// `validate_project_dir_for_startup`) moved into `ms-project` as well: it is the same
+// domain one level up from the chapter load, and `ms_config`'s path constants were its
+// only dependency. The re-export keeps every `crate::project_scan::…` path valid.
+pub use ms_project::project_scan;
+
+// The native ONNX Runtime loader (resolves/downloads the onnxruntime dylib for
+// `ms-onnx`) now lives in the standalone `ms-onnx-runtime` crate; its public API is
+// consumed by `native_runtime` and the AI backend panel. The re-export keeps every
+// `crate::onnx_runtime::…` path valid without touching call sites. Native-only
+// (ureq/sha2/ms-onnx are not part of the wasm build), like the module it replaced.
+#[cfg(not(target_arch = "wasm32"))]
+pub use ms_onnx_runtime as onnx_runtime;
+
+// The native ONNX Runtime OCR manager (lazily loads the ORT dylib + native MangaOCR /
+// Paddle engines behind the SIGILL crash guard and serves the
+// `General.ai_runtime = "native"` path) now lives in the standalone `ms-native-runtime`
+// crate. The re-export keeps every `crate::native_runtime::…` path valid without touching
+// call sites. Native-only (it depends on `ms-onnx`/`ort`), exactly as the module was.
+#[cfg(not(target_arch = "wasm32"))]
+pub use ms_native_runtime as native_runtime;
 
 // `text_punctuation` now lives in the config-free `ms-text-util` crate. Re-export
 // keeps `crate::text_punctuation::…` valid across the binary. The crate no longer
@@ -151,11 +270,10 @@ pub use ms_text_util::language;
 // Native-only startup imports. All of these feed the native launcher/installer/
 // update-check flow (`eframe::run_native`, `rfd`, `ureq`, `clap` CLI, native
 // windows) which does not exist on `wasm32`. They are gated so the wasm build
-// does not fail on missing deps or unused imports. `std::ffi::OsStr` and
-// `std::path::{Path, PathBuf}` stay unconditional because the shared filesystem
-// helpers (`list_titles`, `list_chapters`, `validate_project_dir_for_startup`,
-// `count_images_in_dir`, `find_unsaved_chapter`) used by other modules need them
-// on both targets.
+// does not fail on missing deps or unused imports. `std::path::{Path, PathBuf}`
+// stays unconditional because path types appear in items that both targets compile;
+// the shared filesystem helpers that used to keep `std::ffi::OsStr` unconditional
+// here now live in `project_scan.rs`.
 #[cfg(not(target_arch = "wasm32"))]
 use crate::widgets::WheelComboBox;
 #[cfg(not(target_arch = "wasm32"))]
@@ -178,6 +296,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 #[cfg(target_os = "linux")]
 use std::env;
+#[cfg(not(target_arch = "wasm32"))]
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -242,6 +361,12 @@ fn run_main() -> anyhow::Result<()> {
     if !cli.ignore_installed {
         install_linux_desktop_integration_async();
     }
+    // Hand the IPC crate this binary's own version. It cannot read it itself — compiled
+    // inside a library, `env!("CARGO_PKG_VERSION")` yields that library's `0.1.0` — and the
+    // handshake log line exists precisely to make a mixed installation visible in
+    // `last.log`, so a wrong number there defeats its only purpose. Diagnostic only: it
+    // never reaches the wire. Seeded before any backend client exists; read-only afterwards.
+    backend_ipc::set_studio_version(HOST_VERSION.core);
     // Give this copy its own backend socket so a dev build and an installed copy can run
     // side by side without adopting each other's Python backend. Seeded before any
     // backend client or supervisor exists; read-only afterwards.
@@ -331,7 +456,7 @@ fn run_main() -> anyhow::Result<()> {
 
     if cli.continue_update {
         init_runtime_logging();
-        if installer::update::run_continue_update_window().map_err(anyhow::Error::msg)?
+        if installer::update::run_continue_update_window(HOST_VERSION).map_err(anyhow::Error::msg)?
             == UpdateWindowOutcome::Exit
         {
             return Ok(());
@@ -342,7 +467,7 @@ fn run_main() -> anyhow::Result<()> {
     // `--ignore-installed`: `reject_conflicting_startup_flags` ended the process already.
     if cli.update {
         init_runtime_logging();
-        if installer::update::run_update_window(cli.test_ver_check).map_err(anyhow::Error::msg)?
+        if installer::update::run_update_window(cli.test_ver_check, HOST_VERSION).map_err(anyhow::Error::msg)?
             == UpdateWindowOutcome::Exit
         {
             return Ok(());
@@ -415,24 +540,6 @@ fn detect_unsaved_for_project(project_dir: &Path) -> bool {
         return false;
     };
     title_dir.join(format!("{chapter_name}_unsaved")).is_dir()
-}
-
-/// Returns Some(chapter_name) when the given title folder contains a `{chapter}_unsaved` dir
-/// that has a corresponding base chapter dir.
-pub(crate) fn find_unsaved_chapter(projects_root: &Path, title: &str) -> Option<String> {
-    let title_dir = projects_root.join(title);
-    let entries = std::fs::read_dir(&title_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if let Some(base) = name_str.strip_suffix("_unsaved")
-            && !base.is_empty()
-            && title_dir.join(base).is_dir()
-        {
-            return Some(base.to_string());
-        }
-    }
-    None
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -630,9 +737,9 @@ struct StartupRoutingFlags {
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     let path = project_dir.to_path_buf();
-    match validate_project_dir_for_startup(&path) {
-        ProjectValidationState::Valid { .. } => Ok(Some(path)),
-        ProjectValidationState::Invalid { message } => {
+    match crate::project_scan::validate_project_dir_for_startup(&path) {
+        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(path)),
+        crate::project_scan::ProjectValidationState::Invalid { message } => {
             let full_message = format!("--project path is invalid: {message}");
             show_startup_error_dialog(&full_message);
             anyhow::bail!("{full_message}")
@@ -696,7 +803,7 @@ fn resolve_project_dir_without_cli_arg(
     #[cfg(target_os = "windows")]
     if !has_python_env {
         let existing_install_action =
-            match launcher_install::handle_existing_windows_install(&program_dir) {
+            match launcher_install::handle_existing_windows_install(&program_dir, HOST_VERSION) {
                 Ok(action) => action,
                 Err(err) => {
                     runtime_log::log_warn(format!(
@@ -713,7 +820,7 @@ fn resolve_project_dir_without_cli_arg(
                 return run_startup_installer(program_dir, Some(target_dir));
             }
             launcher_install::ExistingInstallAction::UpdateInstalled(target) => {
-                let _ = installer::update::run_external_install_update_window(target)
+                let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
                     .map_err(anyhow::Error::msg)?;
                 return Ok(None);
             }
@@ -732,7 +839,7 @@ fn resolve_project_dir_without_cli_arg(
                 return run_startup_installer(config::program_dir(), None);
             }
             MissingPythonEnvAction::UpdateCustom(target) => {
-                let _ = installer::update::run_external_install_update_window(target)
+                let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
                     .map_err(anyhow::Error::msg)?;
                 return Ok(None);
             }
@@ -755,7 +862,7 @@ fn resolve_project_dir_without_cli_arg(
                 refuse_self_update_from_sources();
                 return Ok(None);
             }
-            let _ = installer::update::run_update_window(flags.force_update_available)
+            let _ = installer::update::run_update_window(flags.force_update_available, HOST_VERSION)
                 .map_err(anyhow::Error::msg)?;
             Ok(None)
         }
@@ -1264,9 +1371,9 @@ fn run_python_launcher_and_wait_for_project(
         project_dir.display()
     ));
 
-    match validate_project_dir_for_startup(&project_dir) {
-        ProjectValidationState::Valid { .. } => Ok(Some(project_dir)),
-        ProjectValidationState::Invalid { message } => {
+    match crate::project_scan::validate_project_dir_for_startup(&project_dir) {
+        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(project_dir)),
+        crate::project_scan::ProjectValidationState::Invalid { message } => {
             anyhow::bail!("launcher returned invalid project path: {message}")
         }
     }
@@ -1788,13 +1895,7 @@ fn run_main_window(
 #[allow(dead_code)]
 struct ProjectValidationResult {
     project_dir: PathBuf,
-    state: ProjectValidationState,
-}
-
-#[derive(Debug)]
-pub(crate) enum ProjectValidationState {
-    Valid { image_count: usize },
-    Invalid { message: String },
+    state: crate::project_scan::ProjectValidationState,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1845,7 +1946,7 @@ impl BasicLauncherApp {
     }
 
     fn reload_lists(&mut self) {
-        self.titles = list_titles(&self.projects_root).unwrap_or_default();
+        self.titles = crate::project_scan::list_titles(&self.projects_root).unwrap_or_default();
         self.selected_title = self.titles.first().cloned();
         self.reload_chapters_for_selected_title();
     }
@@ -1860,7 +1961,7 @@ impl BasicLauncherApp {
             return;
         };
 
-        self.chapters = list_chapters(&self.projects_root, &title).unwrap_or_default();
+        self.chapters = crate::project_scan::list_chapters(&self.projects_root, &title).unwrap_or_default();
         self.selected_chapter = self.chapters.first().cloned();
         if let Some(project_dir) = self.selected_project_dir() {
             self.start_validation(project_dir);
@@ -1877,7 +1978,7 @@ impl BasicLauncherApp {
         self.pending_validation = Some(rx);
 
         thread::spawn(move || {
-            let state = validate_project_dir_for_startup(&project_dir);
+            let state = crate::project_scan::validate_project_dir_for_startup(&project_dir);
             let _ = tx.send(ProjectValidationResult { project_dir, state });
         });
     }
@@ -1890,10 +1991,10 @@ impl BasicLauncherApp {
                     should_clear_receiver = true;
                     if self.selected_project_dir().as_ref() == Some(&result.project_dir) {
                         self.state = match result.state {
-                            ProjectValidationState::Valid { image_count } => {
+                            crate::project_scan::ProjectValidationState::Valid { image_count } => {
                                 ChooserUiState::Ready { image_count }
                             }
-                            ProjectValidationState::Invalid { message } => {
+                            crate::project_scan::ProjectValidationState::Invalid { message } => {
                                 ChooserUiState::Invalid { message }
                             }
                         };
@@ -2074,91 +2175,6 @@ fn pick_project_dir_from_basic_launcher_gui(
         .map_err(|_| anyhow::anyhow!("failed to read selected project directory"))?
         .clone();
     Ok(selected)
-}
-
-pub(crate) fn validate_project_dir_for_startup(project_dir: &Path) -> ProjectValidationState {
-    let src_dir = project_dir.join(config::SRC_DIR);
-    if !src_dir.is_dir() {
-        let scr_dir = project_dir.join("scr");
-        if scr_dir.is_dir() {
-            if let Err(err) = std::fs::rename(&scr_dir, &src_dir) {
-                return ProjectValidationState::Invalid {
-                    message: tf!("startup.validate.scr_rename_failed", project_dir = project_dir.display(), err = err),
-                };
-            }
-        } else {
-            return ProjectValidationState::Invalid {
-                message: tf!("startup.validate.no_src_dir", project_dir = project_dir.display()),
-            };
-        }
-    }
-
-    match count_images_in_dir(&src_dir) {
-        Ok(0) => ProjectValidationState::Invalid {
-            message: tf!("startup.validate.no_images_in_src", project_dir = project_dir.display()),
-        },
-        Ok(image_count) => ProjectValidationState::Valid { image_count },
-        Err(err) => ProjectValidationState::Invalid {
-            message: tf!("startup.validate.check_failed", src_dir = src_dir.display(), err = err),
-        },
-    }
-}
-
-pub(crate) fn count_images_in_dir(dir: &Path) -> std::io::Result<usize> {
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-pub(crate) fn list_titles(projects_root: &Path) -> std::io::Result<Vec<String>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(projects_root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        out.push(name.to_string());
-    }
-    out.sort();
-    Ok(out)
-}
-
-pub(crate) fn list_chapters(projects_root: &Path, title: &str) -> std::io::Result<Vec<String>> {
-    let mut out = Vec::new();
-    let title_dir = projects_root.join(title);
-    for entry in std::fs::read_dir(title_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        if name == "characters" {
-            continue;
-        }
-        out.push(name.to_string());
-    }
-    out.sort();
-    Ok(out)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

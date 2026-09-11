@@ -9,4 +9,4 @@ edition = "2024"
 # per-frame decoding still belongs off the GUI thread. No egui / image dependency.
 [dependencies]
 image-webp = "0.2"
-thiserror = "2"
+thiserror.workspace = true

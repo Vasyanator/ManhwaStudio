@@ -539,7 +539,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   or an identity mesh stays byte-identical on all paths (the pre-box capture is
   gated on `raster_transform.is_some()` and `MeshWarpContext::new` returns `None`
   for identity/invalid/degenerate). Production overlays wire it through the on-canvas
-  VECTOR transform mode (`src/tabs/typing/tab/vector_transform.rs`).
+  VECTOR transform mode (`crates/ms-tab-typing/src/tab/vector_transform.rs`).
 - `TextRenderParams.line_placement_percent` (`[-100, 100]`, default 0) places
   each glyph PERPENDICULAR to the line/path at the vector level: `0` centers the
   glyph ink on the line, `+100` rests it ABOVE (сверху, ink bottom on the line),
@@ -795,7 +795,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `fallback_diag.rs`. To change WHERE it is collected, edit the single call in
   `pipeline::render_text_to_image` right after `shape_until_scroll` — not the
   per-mode draw passes. To change how it is SHOWN, edit
-  `src/tabs/typing/panel/create_presets.rs` (`font_fallback_status_lines`).
+  `crates/ms-tab-typing/src/panel/create_presets.rs` (`font_fallback_status_lines`).
 - To change WHICH attrs modifications are legal, edit the predicates
   `font_registry::family_has_matching_face` (style/stretch) and
   `font_registry::family_has_face_of_requested_weight` (weight). To change how an

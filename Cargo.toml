@@ -13,7 +13,74 @@ edition = "2024"
 rust-version = "1.92"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+
+# Single pin for every third-party crate used by MORE THAN ONE manifest in this workspace.
+# Members write `<dep>.workspace = true` instead of repeating a version, so a version can no
+# longer drift between two crates — a drifted requirement puts a SECOND copy of the crate in
+# the graph and makes the build slower, which is exactly what the crate split exists to
+# avoid. Cargo now enforces mechanically what used to be a written convention.
+#
+# Rules for editing this table:
+# * A dependency used by exactly ONE manifest stays local to it (nothing can drift), and
+#   moves here the moment a second crate needs it.
+# * FEATURES ARE ADDITIVE: a member may add `features = [...]` on top of an inherited entry,
+#   never remove one. So the entry here carries only the features EVERY user needs, and each
+#   member adds its own on top (`windows-sys` is the clearest case: no features here at all).
+# * `default-features = false` can only be set HERE — a member cannot turn defaults off on an
+#   inherited dependency. It can turn them back ON with `default-features = true`.
+# * `crates/puffin_egui` is a vendored upstream copy kept close to its upstream manifest for
+#   re-sync, and `crates/ag-psd` is a standalone gitignored package that opts out of this
+#   workspace entirely; neither inherits from this table.
+[workspace.dependencies]
+ag-psd = "0.2.0"
+anyhow = "1"
+arboard = "3"
+chrono = "0.4"
+cosmic-text = "0.14"
+# egui 0.35 changed the eframe default renderer to wgpu; ManhwaStudio uses the glow renderer
+# (`App::on_exit` takes an `Option<&glow::Context>`), so glow is pinned explicitly with
+# default features (incl. wgpu) turned off. Every eframe user in the workspace shares this
+# exact feature set, so no second copy of the backend is ever built.
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
+egui = "0.35"
+flate2 = "1"
+genai = "0.6"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+hyphenation = { version = "0.8", features = ["embed_all"] }
+image = { version = "0.25", default-features = true }
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
+libc = "0.2"
+libloading = "0.8"
+minijinja = "2"
+rayon = "1"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+swash = "0.2"
+sys-locale = "0.3"
+tar = "0.4"
+tempfile = "3"
+texture-synthesis = "0.8.2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+translators = { version = "0.1.5", default-features = false, features = ["google"] }
+# Inverted on purpose: `ms-fonts` needs only the `std` feature, and defaults can be turned
+# off ONLY here. The two users that do want the full parser (the binary and `ms-widgets`,
+# for the font-properties window) opt back in with `default-features = true`.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+unicode-script = "0.5"
+ureq = { version = "2", features = ["json", "cookies"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+web-time = "1"
+# No features here: the four users need four different, partly disjoint Win32 subsets and
+# add them locally. Listing a union here would compile Win32 headers nobody asked for.
+windows-sys = { version = "0.59" }
+zeno = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+zspell = "0.5"
+zstd = "0.13"
 
 [features]
 active-logs = []
@@ -21,8 +88,11 @@ active-logs = []
 # settings pane). Off by default: the tutorial controller and its `mark` sites
 # stay compiled but inert, and all autoplay/overlay rendering plus the settings
 # pane are gated out. Enable with `--features tutorial` to restore the tours.
-# The `src/tutorial/` engine itself always compiles (the demo bin depends on it).
-tutorial = []
+# The engine itself always compiles (the demo bin mounts it through `#[path]`).
+# Features are NOT inherited: this MUST forward to `ms-settings-ui/tutorial`, where the
+# subsystem now lives, or the tours would compile out while the binary still gated its
+# own `mark` sites in.
+tutorial = ["ms-settings-ui/tutorial", "ms-launcher/tutorial"]
 # Web (wasm) build switch. Enabled by the wcheck/wbuild aliases and build-wasm.sh.
 # Selects the browser storage/network backends and compiles out native-only
 # subsystems (subprocess AI backend, sockets, dynamic libs). See docs/WEB_PORT.md.
@@ -54,7 +124,97 @@ path = "src/bin/tutorial_test/main.rs"
 # subprocess/dylib, OS keyring, clipboard, file dialogs) live in the
 # cfg(not(wasm32)) block below and their call sites are cfg-gated per WEB_PORT.md.
 [dependencies]
+# Framed IPC with the Python AI backend (`crate::backend_ipc` re-export shim in
+# `src/main.rs`). Cross-target: the crate itself compiles a wasm stub, matching the
+# unconditional module declaration it replaced.
+ms-backend-ipc = { path = "crates/ms-backend-ipc" }
 ms-log = { path = "crates/ms-log" }
+# Global config / runtime-path hub (`program_dir`/`data_dir`, `user_config.json`,
+# default trees), re-exported as `crate::config` from `src/main.rs` together with its
+# two companion modules `crate::app_tab` and `crate::rotation_ctrl_wheel`. It is the
+# crate every upper layer reads, so it sits ABOVE ms-log/ms-memory/ms-storage/
+# ms-text-util/ms-i18n and below everything in `src/`.
+ms-config = { path = "crates/ms-config" }
+# Image-cache memory policy (profile, pressure, budgets, eviction ordering),
+# re-exported as `crate::memory_manager` from `src/main.rs`. `config.rs` reads
+# `MemoryProfile` from it, so it must stay BELOW config in the dependency order.
+ms-memory = { path = "crates/ms-memory" }
+# The journalled structural page transaction (insert/delete/reorder/rotate/stitch/
+# split of a chapter tree), re-exported as `crate::page_ops` from `src/main.rs`. It
+# also owns the `Page` / `ProjectPaths` data types that `ms-project` re-exports, so it
+# sits BELOW `ms-project` — the only direction that breaks the old module cycle.
+ms-page-ops = { path = "crates/ms-page-ops" }
+# The project/chapter domain model (`ProjectData`, `Bubble`, `CanvasSettings`,
+# `ComicType`) and its load-time reconcile passes, re-exported as `crate::project`
+# from `src/main.rs`. Everything above it in `src/` reads the loaded project.
+ms-project = { path = "crates/ms-project" }
+# Host-environment probes (GPU/accelerator detection, app-local Python runtime,
+# desktop region capture), re-exported as `crate::{gpu_utils, python_manager,
+# screen_capture}` from `src/main.rs`. Cross-target like the module declarations it
+# replaced: `python_manager` carries its own `#![cfg(not(wasm32))]`.
+ms-sysprobe = { path = "crates/ms-sysprobe" }
+# The reusable UI-primitive layer (`src/widgets/` + `input_util` + `ui_fonts`),
+# re-exported as `crate::widgets` / `crate::input_util` / `crate::ui_fonts` from
+# `src/main.rs`. It knows nothing about the project domain, so it sits below
+# `canvas`/`tabs`/`launcher` and may never depend on them.
+ms-widgets = { path = "crates/ms-widgets" }
+# The shared runtime models (bubbles, layer document, clean overlays, text masks) plus
+# the source-page view model, re-exported as `crate::models` / `crate::page_view` from
+# `src/main.rs`. Sits ABOVE `ms-project` and BELOW the canvas and the tabs; egui is a
+# pixel format there, never a drawing surface.
+ms-models = { path = "crates/ms-models" }
+# The canvas facade (page rendering, bubble editing, clean-overlay painting), re-exported
+# as `crate::canvas` from `src/main.rs`. It declares `CanvasHooks`, which the tabs
+# IMPLEMENT, so it sits below them and never names a tab.
+ms-canvas = { path = "crates/ms-canvas" }
+# The reusable tooling primitives (`src/tools/`): mask brush, polygon rasterizer, the shared
+# red-black SOR kernel, the dense overlay-pixel solve and the host-neutral patch core,
+# re-exported as `crate::tools` from `src/main.rs`. Sits ABOVE `ms-canvas`/`ms-widgets` and
+# BELOW the tabs, which implement its `PatchHost` trait.
+ms-tools = { path = "crates/ms-tools" }
+# The settings surface both shells share (`src/settings_shared.rs`,
+# `src/general_settings_panel.rs`, `src/ai_backend_panel.rs`, `src/ai_backend_supervisor.rs`
+# and `src/tutorial/`), re-exported under those same names from `src/main.rs`. The
+# launcher's settings page and the studio's Settings tab render the SAME panes and drive the
+# SAME AI-backend supervisor, so neither shell could own them. Its `tutorial` feature is
+# forwarded from this crate's own — see the `[features]` note.
+ms-settings-ui = { path = "crates/ms-settings-ui" }
+# The launcher shell (`src/launcher/`), re-exported as `crate::launcher` from
+# `src/main.rs`. Effectively a SECOND application next to the studio: the editor never
+# references it — only `main.rs` (native startup) and `web_entry.rs` (the wasm entry) do.
+# It sits at the very top of the stack; nothing may depend on it.
+ms-launcher = { path = "crates/ms-launcher" }
+# The «Текст» (typing) tab (`src/tabs/typing/`), re-exported as `crate::tabs::typing`
+# from `src/tabs/mod.rs`. The top of the library stack: only `app.rs` calls into it
+# (`TypingTabState::draw`), and nothing below it may name it back.
+ms-tab-typing = { path = "crates/ms-tab-typing" }
+# The four small project-editor tabs («Персонажи», «Термины», «Заметки», «Вики»),
+# re-exported as `crate::tabs::{characters, terms, notes, wiki}` from `src/tabs/mod.rs`.
+# Same layer as `ms-tab-typing`: only `app.rs`, `launcher/app.rs` and the translation tab
+# call into it, and nothing below it may name it back.
+ms-tabs-simple = { path = "crates/ms-tabs-simple" }
+# The «Перевод» (translation) tab (`src/tabs/translation/`), re-exported as
+# `crate::tabs::translation` from `src/tabs/mod.rs`. Sits above `ms-tabs-simple` (it reads
+# character/term note entries) and below `app.rs`, the AI backend panel/supervisor, the
+# launcher's reline flow and the `cleaning` tab.
+ms-tab-translation = { path = "crates/ms-tab-translation" }
+# The «PS-подобный редактор» tab (`src/tabs/ps_editor/`), re-exported as
+# `crate::tabs::ps_editor` from `src/tabs/mod.rs`. Sits above `ms-tab-typing` (its layers
+# panel renders typing's text preview label) and below `app.rs` and the `page_manager`
+# tab. Its GL objects are freed from `MangaApp::on_exit`, which is why
+# `PsEditorTabState::release_gpu_resources` is public.
+ms-tab-ps-editor = { path = "crates/ms-tab-ps-editor" }
+# The «Менеджер страниц» tab (`src/tabs/page_manager/`), re-exported as
+# `crate::tabs::page_manager` from `src/tabs/mod.rs`. Sits above `ms-tab-ps-editor` (the
+# crop/split/stitch previews reuse its viewport camera) and below only `app.rs`, which
+# executes the structural page ops the tab requests.
+ms-tab-page-manager = { path = "crates/ms-tab-page-manager" }
+# The «Клининг» tab (`src/tabs/cleaning/`), re-exported as `crate::tabs::cleaning` from
+# `src/tabs/mod.rs`. The TOP of the library stack: it sits above `ms-tab-translation`
+# (backend health, the text detector, the MT service) and only `app.rs` calls into it
+# (`CleaningTabState::draw`). It deliberately does NOT depend on `ms-tab-typing` — an edge
+# between the two largest crates would serialize the build for nothing.
+ms-tab-cleaning = { path = "crates/ms-tab-cleaning" }
 ms-text-util = { path = "crates/ms-text-util" }
 ms-text-render = { path = "crates/ms-text-render" }
 ms-actions = { path = "crates/ms-actions", features = ["raster"] }
@@ -62,60 +222,57 @@ ms-storage = { path = "crates/ms-storage" }
 ms-thread = { path = "crates/ms-thread" }
 ms-i18n = { path = "crates/ms-i18n" }
 ms-gifs = { path = "crates/ms-gifs" }
-web-time = "1"
-anyhow = "1"
-chrono = "0.4"
+web-time.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
-# egui 0.35 changed the eframe default renderer to wgpu; ManhwaStudio uses the
-# glow renderer (App::on_exit takes an Option<&glow::Context>), so glow is pinned
-# explicitly with default features (incl. wgpu) turned off.
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
-egui = "0.35"
-cosmic-text = "0.14"
-swash = "0.2"
-zeno = "0.3"
-hyphenation = { version = "0.8", features = ["embed_all"] }
-image = { version = "0.25", default-features = true }
-minijinja = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-flate2 = "1"
-tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-zstd = "0.13"
-libc = "0.2"
+eframe.workspace = true
+egui.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+zeno.workspace = true
+hyphenation.workspace = true
+image.workspace = true
+minijinja.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+zstd.workspace = true
+libc.workspace = true
 # System UI-locale probe (Windows + Linux). Used by the launcher's first-run
 # language modal to preselect the interface/typesetting language; already present
 # transitively (cosmic-text / zspell), pinned here as a direct dependency.
-sys-locale = "0.3"
+sys-locale.workspace = true
 # Font table parser used by the font-properties window (glyph inventory + kerning
 # extraction). Already present transitively (owned_ttf_parser -> epaint) and pinned
 # to the same 0.25 line here as a direct dependency (precedent: sys-locale above).
-ttf-parser = "0.25"
+ttf-parser = { workspace = true, default-features = true }
 # Writing-system classification for the post-OCR ALL-CAPS fix
 # (`tabs::translation::ocr_case_fix`), which must touch Latin/Cyrillic letters only.
 # Already in the tree at this version through cosmic-text / ms-text-render, so it
 # adds no build cost and pins nothing new (precedent: ttf-parser above).
-unicode-script = "0.5"
-texture-synthesis = "0.8.2"
-rayon = "1"
-ag-psd = "0.2.0"
-zspell = "0.5"
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
+unicode-script.workspace = true
+texture-synthesis.workspace = true
+rayon.workspace = true
+ag-psd.workspace = true
+zspell.workspace = true
+uuid.workspace = true
 # Two users, both needing a hash whose algorithm is fixed forever: the app-managed
 # onnxruntime dylib downloader verifies archive checksums (native-only), and the typing
 # font loader derives a font file's content hash from it — that hash is spelled into a
 # PERSISTED font identity (`fonts::suffixed_font_identity_name`), so it may never change
 # with a toolchain upgrade the way `DefaultHasher` may. Kept in the SHARED dependency
 # section for the second user: the typing panel is compiled for wasm32 too.
-sha2 = "0.10"
+sha2.workspace = true
 # Typed public errors (`#[derive(thiserror::Error)]`) across the whole crate — the
 # native onnxruntime loader, but also plenty of cross-target code: `page_ops`,
 # `models::clean_assign`, `locale_store`, the typing tab and the dockable-panel
 # subsystem (`widgets::panel_dock`). It therefore belongs in the SHARED section:
 # thiserror is a proc macro plus a `core`-only runtime shim, so it costs the wasm
 # build nothing beyond the derive it already needs.
-thiserror = "2"
+thiserror.workspace = true
 puffin = { version = "0.20.0", optional = true }
 # Vendored & ported to egui 0.35 (crates/puffin_egui); upstream has no 0.34/0.35
 # release. See crates/puffin_egui/Cargo.toml.
@@ -132,35 +289,48 @@ puffin_egui = { path = "crates/puffin_egui", optional = true }
 # disk, neither of which exists in a web build — `src/ui_fonts.rs` compiles to a no-op
 # there and the web entry point installs its own fonts.
 ms-fonts = { path = "crates/ms-fonts" }
-arboard = "3"
-libloading = "0.8"
-rfd = "0.15"
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
-ureq = { version = "2", features = ["json", "cookies"] }
-translators = { version = "0.1.5", default-features = false, features = ["google"] }
-genai = "0.6"
-keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+arboard.workspace = true
+libloading.workspace = true
+rfd.workspace = true
+hf-hub.workspace = true
+ureq.workspace = true
+translators.workspace = true
+genai.workspace = true
+keyring.workspace = true
+tokio.workspace = true
 # Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
 # dylib). Native-only: onnxruntime is a native shared library.
 ms-onnx = { path = "crates/ms-onnx" }
-# Monitor enumeration for the startup-monitor / window-geometry contract
-# (`src/window_geometry.rs`). egui/eframe expose no monitor list at all — only the
-# raw window (`CreationContext::winit_window` / `Frame::winit_window`), whose type
-# comes from this exact crate — so winit has to be a direct dependency to call
-# `available_monitors()` / `current_monitor()`. Same version eframe already pulls in
-# (0.30.x in `Cargo.lock`), so the types unify and no second copy is built;
-# `default-features = false` adds nothing to the feature union eframe already
-# selects (notably it must not switch Wayland decorations on by itself).
-winit = { version = "0.30", default-features = false }
+# The loader that resolves/downloads that dylib, re-exported as `crate::onnx_runtime`
+# from `src/main.rs`. Native-only for the same reason as `ms-onnx`, and because every
+# path in it is blocking download/extract I/O.
+ms-onnx-runtime = { path = "crates/ms-onnx-runtime" }
+# The native ONNX Runtime OCR manager (`src/native_runtime.rs`), re-exported as
+# `crate::native_runtime` from `src/main.rs`. Native-only for the same reason as
+# `ms-onnx`: it owns the process-global `OrtRuntime` and the engine LRU.
+ms-native-runtime = { path = "crates/ms-native-runtime" }
+# Startup monitor + main-window geometry (`src/window_geometry.rs`), re-exported as
+# `crate::window_geometry` from `src/main.rs`. It owns the self-versioned `Window`
+# section of `user_config.json` and is the only place that talks to winit: egui/eframe
+# expose no monitor list at all, only the raw window (`CreationContext::winit_window` /
+# `Frame::winit_window`), whose type comes from that exact crate — which is why `winit`
+# is a direct dependency THERE and no longer here. Native-only: winit windows and OS
+# monitors do not exist on wasm.
+ms-window-geometry = { path = "crates/ms-window-geometry" }
+# The desktop installer/updater subsystem (`src/installer/`), re-exported as
+# `crate::installer` from `src/main.rs`. Desktop-only: it installs the managed Python
+# environment and replaces the shipped executable, neither of which exists on the web
+# build. It is an application surface of its own (two standalone `eframe` windows), so
+# nothing above it depends on it — startup and the launcher's settings page only start
+# it and read its outcome.
+ms-installer = { path = "crates/ms-installer" }
 
 # Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
 # (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /
 # web-sys / futures stack drives the eframe `WebRunner` entry in `web_entry.rs`;
 # `console_error_panic_hook` surfaces Rust panics in the browser console.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { version = "1", features = ["js"] }
+uuid = { workspace = true, features = ["js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -168,13 +338,26 @@ console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "console"] }
 
 [target.'cfg(windows)'.dependencies]
-uds_windows = "1"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
 
 [build-dependencies]
 winresource = "0.1"
-serde_json = "1"
+serde_json.workspace = true
 
 [dev-dependencies]
 # Isolated on-disk chapter fixtures for the `page_ops` transaction tests.
-tempfile = "3"
+tempfile.workspace = true
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support`
+# for test builds: it exposes `config_saver::test_harness` (used by the window
+# geometry saver tests) and `locale_store::GLOBAL_LOCALE_LOCK` (held by every test
+# that installs a UI locale). Declaring it here and not above is what keeps those
+# test-only items out of the shipped binary.
+ms-config = { path = "crates/ms-config", features = ["test-support"] }
+# Same again for `ms-tab-typing`: `test-support` exposes `font_admin::{test_lock,
+# test_reset}`, the process-global font-settings store helpers the binary's settings-UI
+# tests share with the tab's own tests. Test builds only, for the same reason.
+ms-tab-typing = { path = "crates/ms-tab-typing", features = ["test-support"] }
+# Same again for `ms-models`: `test-support` exposes the layer document's test-only
+# accessors (`ensure_page_loaded`, `node`, `is_text`, `display_image`) that the typing
+# tab's tests drive. Test builds only, for the same reason.
+ms-models = { path = "crates/ms-models", features = ["test-support"] }

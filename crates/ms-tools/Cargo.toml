@@ -1,0 +1,31 @@
+[package]
+name = "ms-tools"
+version = "0.1.0"
+edition = "2024"
+
+# The host-neutral tooling primitives extracted from `src/tools/`: the reusable mask
+# brush, the polygon scanline rasterizer, the shared red-black SOR kernel, the dense
+# overlay-pixel solve, and the «Заплатка» (patch) tool core. Re-exported by the binary
+# as `crate::tools`, so every existing `crate::tools::...` call site keeps its path.
+#
+# Layer: ABOVE `ms-canvas` / `ms-widgets` (it borrows `OverlayRectPx` and a slider),
+# BELOW the tabs. It must never name `tabs`, `app` or `launcher`; hosts drive it
+# through the `PatchHost` trait declared here.
+[dependencies]
+# Every primitive here paints into or reads from egui surfaces.
+egui.workspace = true
+eframe.workspace = true
+# `OverlayRectPx`, the pixel-space overlay rectangle the patch core reports back to its host.
+ms-canvas = { path = "../ms-canvas" }
+# `WheelSlider` for the patch tool's inline parameter controls.
+ms-widgets = { path = "../ms-widgets" }
+# Localized patch-tool labels (`t!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics on the patch core's failure paths (`runtime_log`).
+ms-log = { path = "../ms-log" }
+# The project thread wrapper for the patch tool's background membrane solve.
+ms-thread = { path = "../ms-thread" }
+# Parallel span/solve passes in the SOR kernel and the membrane solve.
+rayon.workspace = true
+# Typed public errors for the patch core (`PatchInputError`, `PatchError`, `DragRefusal`).
+thiserror.workspace = true

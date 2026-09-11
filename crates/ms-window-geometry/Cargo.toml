@@ -1,0 +1,61 @@
+[package]
+name = "ms-window-geometry"
+version = "0.1.0"
+edition = "2024"
+
+# Startup monitor + OS window geometry of ManhwaStudio, extracted from
+# `src/window_geometry.rs`. Owns the self-versioned `Window` section of
+# `user_config.json` end to end: it plans where the window opens before any window
+# exists, resolves the stored monitor key against the live winit monitor list, and
+# persists the observed geometry through the shared config writer thread.
+#
+# Native-only: winit windows and OS monitors do not exist in the web build, so the
+# binary depends on this crate from its `cfg(not(target_arch = "wasm32"))` block —
+# exactly the gate the module it replaced carried.
+[dependencies]
+# The `user_config.json` border itself (`update_user_config_file`, `load_user_settings`)
+# plus `config_saver`, the debouncing writer thread every persisted sample goes through.
+ms-config = { path = "../ms-config" }
+# Diagnostics for the monitor-resolution and persistence paths (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# The named/observable worker-thread helper the geometry saver is spawned with.
+ms-thread = { path = "../ms-thread" }
+# `plan_startup_placement` fills an `egui::ViewportBuilder` and the tracker samples
+# `egui::Context`/`ViewportInfo` each frame. Same version as the binary and `ms-widgets`.
+egui.workspace = true
+# Monitor enumeration (`available_monitors()` / `current_monitor()`), which egui/eframe
+# expose nowhere. The version MUST stay the one eframe pulls in (0.30.x in `Cargo.lock`)
+# so `Window` unifies with what `CreationContext::winit_window` hands back; a second copy
+# would make the two types distinct. `default-features = false` deliberately leaves the
+# Wayland client-side decorations (`wayland-csd-adwaita`) off — this crate must not switch
+# them on behind eframe's back. The free-unix backends are selected in the target table
+# below rather than here.
+winit = { version = "0.30", default-features = false }
+# The `Window` section is a serde mirror over a `serde_json` object.
+serde.workspace = true
+serde_json.workspace = true
+# `WindowGeometryError`, the typed failure of the section writers, is a
+# `#[derive(thiserror::Error)]` enum — same major as the rest of the workspace.
+thiserror.workspace = true
+
+# On the free-unix platforms winit refuses to compile without at least one windowing
+# backend (`compile_error!("The platform you're compiling for is not supported by winit")`,
+# `winit-0.30.13/src/platform_impl/mod.rs`). In the workspace build eframe's `x11`/`wayland`
+# features already select both through `egui-winit`, but cargo does NOT unify features for a
+# standalone `cargo check -p ms-window-geometry`, so the crate has to name them itself. The
+# pair is exactly what `egui-winit` selects, so the workspace feature union is unchanged.
+# `wayland-dlopen` is on for the same reason: it makes `wayland-sys` load libwayland at
+# runtime instead of link-time, which is what keeps the build working on a machine with no
+# `wayland-client.pc`. In the workspace it is already on (`egui-winit`'s `clipboard`
+# feature -> `smithay-clipboard/dlopen` -> `wayland-backend/dlopen`), so naming it here is
+# likewise a no-op for the union. `wayland-csd-adwaita` stays OFF deliberately: this crate
+# must not turn client-side decorations on behind eframe's back.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
+
+[dev-dependencies]
+# Same crate as above, re-declared only to switch on `test-support` for test builds:
+# it exposes `config_saver::test_harness` (`LoopHarness`, the timing constants), which
+# the saver-loop tests below drive. A `#[cfg(test)]` item is invisible across a crate
+# boundary, which is why the feature exists at all.
+ms-config = { path = "../ms-config", features = ["test-support"] }

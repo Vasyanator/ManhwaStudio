@@ -1,0 +1,38 @@
+[package]
+name = "ms-project"
+version = "0.1.0"
+edition = "2024"
+
+# The project/chapter domain model of ManhwaStudio, extracted from `src/project.rs`:
+# `ProjectData` (pages, bubbles, paths, canvas settings), `Bubble`, `CanvasSettings`,
+# `ComicType`, and the load-time reconcile/normalize passes over a chapter tree.
+# GUI-free: it produces data for the editor, never widgets.
+#
+# `Page` and `ProjectPaths` are re-exported from `ms-page-ops` rather than declared
+# here — see the cycle note in `lib.rs`.
+[dependencies]
+# The journalled page transaction. `ProjectData::load` resolves a pending journal
+# before any reconcile pass runs, and the two path/page data types come from there.
+ms-page-ops = { path = "../ms-page-ops" }
+# Path constants of the chapter tree, `JsonConfig`, and the project-config defaults.
+ms-config = { path = "../ms-config" }
+# Load diagnostics (`ms_log::runtime_log`): reconcile decisions and skipped files.
+ms-log = { path = "../ms-log" }
+# Every project file is read/written through the process-wide storage backend
+# (`ms_storage::global::storage()`), never `std::fs`.
+ms-storage = { path = "../ms-storage" }
+# User-visible messages of the load path (`t!` / `tf!`); the macros are mounted
+# crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# `Bubble` / `CanvasSettings` / `ComicType` are persisted in the chapter documents.
+serde.workspace = true
+serde_json.workspace = true
+# Aggregated context on load failures (`anyhow::Context`).
+anyhow.workspace = true
+# Legacy raster conversions performed during load re-encode pages as PNG.
+image.workspace = true
+# Independent files are converted in parallel over the global rayon pool: the load
+# runs on a background thread, never the GUI thread.
+rayon.workspace = true
+# Wall-clock timestamps that also work on wasm32 (`SystemTime` is unusable there).
+web-time.workspace = true

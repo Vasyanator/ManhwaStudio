@@ -42,10 +42,12 @@ commit message, or a code comment.** Re-derive it with grep.
 **`get_symbols_overview` emits no line numbers at all.** It maps a file; it does not locate
 anything in it.
 
-**Rust default depth is useless.** `src/backend_ipc/client.rs` (1759 lines) at default depth
-returns about 130 characters — the names `wasm_stub` and `inner` and nothing else, because the
-whole file lives inside two modules. It reads as "this file is nearly empty". At `depth=2` the
-same call returns the full map for about 1.6 KB. **Always pass `depth` explicitly, 2 or more.**
+**Rust default depth is useless.** `crates/ms-backend-ipc/src/client.rs` — a file well past a
+thousand lines, all of it nested inside two modules — returns about 130 characters at the
+default depth: the names `wasm_stub` and `inner` and nothing else. It reads as "this file is
+nearly empty". At `depth=2` the same call returns the full map for about 1.6 KB. **Always pass
+`depth` explicitly, 2 or more.** (The exact line count is deliberately not quoted here: it
+drifts with every edit, and the failure mode does not depend on it.)
 
 **Method paths include the impl block.** `CallError/is_interrupted` fails; the correct path is
 `impl CallError/is_interrupted`. Nested in a module it becomes `inner/impl BackendClient/call`.
@@ -70,10 +72,10 @@ by **where the `cfg` attribute sits**:
 
 Verified in both directions:
 
-- `src/storage.rs:70` declares `pub fn install` under `#[cfg(target_arch = "wasm32")]`. It has one
-  real caller, `src/web_entry.rs:38`. `find_referencing_symbols` returns `{}` — because
-  `src/main.rs:113` gates `mod web_entry` at the module declaration, so that file does not exist
-  for the linux target.
+- `crates/ms-storage/src/global.rs:72` declares `pub fn install` under
+  `#[cfg(target_arch = "wasm32")]`. It has one real caller, `src/web_entry.rs:38`.
+  `find_referencing_symbols` returns `{}` — because `src/main.rs:56-57` gates `mod web_entry` at
+  the module declaration, so that file does not exist for the linux target.
 - That same `install` function *was* returned as a referencing symbol when searching for
   references to `Storage`, proving a cfg-gated item inside a loaded file is indexed normally.
 

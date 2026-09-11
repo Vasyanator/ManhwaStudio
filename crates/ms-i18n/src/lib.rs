@@ -10,7 +10,11 @@ Main responsibilities:
 - expose `LocaleTag` (open catalog identity), `PluralRules` (closed rule set) and
   the `plural_rules_for_tag` bridge, `Catalog`, `install`/`set_locale`,
   `lookup`/`lookup_plural`, `plural_category`, `interpolate`, and `embedded_locales`;
-- export the `t!` / `tf!` / `tp!` translation macros at the crate root.
+- export the `t!` / `tf!` / `tp!` translation macros at the crate root, plus
+  `resolve_key` — their counterpart for keys chosen at RUNTIME rather than written
+  as string literals (a GUI-free crate returns a `&'static str` catalog key it
+  computed from an enum variant, and the UI resolves it). See
+  `docs/i18n_exclusions.md` §F.
 
 Type split — identity vs. plural rules:
 - `LocaleTag` is an OPEN validated string: any `<tag>.json` a user drops into the
@@ -96,6 +100,20 @@ impl PluralCount for isize {
         // Signed-wide: saturate toward the end the value overflowed past.
         i64::try_from(*self).unwrap_or(if *self < 0 { i64::MIN } else { i64::MAX })
     }
+}
+
+/// Resolves a catalog `key` chosen at RUNTIME to its active-locale text, falling back
+/// to the key itself on a catalog miss (never panics, never allocates).
+///
+/// The counterpart of [`t!`] for keys that are NOT string literals: a GUI-free crate
+/// hands the UI a `&'static str` catalog key it computed from an enum variant
+/// (`ScriptGroup::name_key`, `TextLanguage::name_key`, `Conservatism::label_key`, …) and
+/// the caller resolves it here. The key/label split contract lives in
+/// `docs/i18n_exclusions.md` §F. The returned `&'static str` points into the leaked
+/// active catalog, so it is safe to paint every frame.
+#[must_use]
+pub fn resolve_key(key: &'static str) -> &'static str {
+    lookup(key).unwrap_or(key)
 }
 
 /// Translates a static key to a `&'static str`, or returns the key itself on a miss.

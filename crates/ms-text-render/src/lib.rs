@@ -19,6 +19,8 @@ Public surface:
   остаются внутренними деталями нового рендера.
 */
 
+#![warn(clippy::all)]
+
 pub mod drawn_lines;
 mod effects;
 mod extra_info;

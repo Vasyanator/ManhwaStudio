@@ -1,0 +1,36 @@
+[package]
+name = "ms-native-runtime"
+version = "0.1.0"
+edition = "2024"
+
+# The process-global lazy manager for the in-process native ONNX Runtime OCR path,
+# extracted from `src/native_runtime.rs`. Re-exported by the binary as
+# `crate::native_runtime`, so every existing `crate::native_runtime::...` call site keeps
+# its path.
+#
+# Layer: ABOVE `ms-onnx` / `ms-onnx-runtime` / `ms-sysprobe` / `ms-config`, BELOW the tabs
+# and the AI backend panel, which route OCR/detection requests into it. It must never name
+# `tabs`, `app` or `launcher`; the SIGILL crash guard it writes lives in
+# `ms_config::ort_load_guard`.
+#
+# Native-only by construction: `ms-onnx`/`ort` load a native shared library, so the binary
+# gates the re-export off wasm exactly as it gated the module.
+[dependencies]
+# The ONNX session layer: runtime handle, MangaOCR engine, Paddle detector/recognizer.
+ms-onnx = { path = "../ms-onnx" }
+# Resolves/downloads the onnxruntime dylib this manager loads, and owns the build catalog.
+ms-onnx-runtime = { path = "../ms-onnx-runtime" }
+# `ai_models` (the app-managed model enum this manager keys its LRU by) and `gpu_utils`
+# (the accelerator probes behind the availability fallback).
+ms-sysprobe = { path = "../ms-sysprobe" }
+# The unified ONNX selection keys in `user_config.json` plus `ort_load_guard`, the
+# crash-safe `General.ort_load_state` markers written around every dylib load.
+ms-config = { path = "../ms-config" }
+# Diagnostics on every load/fallback/failure path.
+ms-log = { path = "../ms-log" }
+# Localized failure messages (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# The RGBA crop/page buffers handed to the OCR and detection entry points.
+image.workspace = true
+# The unified ONNX selection is read straight off the merged `user_config.json` tree.
+serde_json.workspace = true

@@ -25,9 +25,9 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 ms-log = { path = "../ms-log" }
 # Matches the root crate's image version; used by the Phase 1 inference
 # pre/post-processing that this foundation crate is being set up for.
-image = { version = "0.25", default-features = true }
+image.workspace = true
 # Pure-Rust image geometry/morphology used by the native PaddleOCR path
 # (contours, minimum-area rectangle, perspective warp). Pairs with the workspace
 # `image` 0.25.x and cross-compiles to windows-gnu/macos/linux. No OpenCV/Clipper.
 imageproc = "0.27"
-thiserror = "2"
+thiserror.workspace = true

@@ -7,22 +7,22 @@ edition = "2024"
 # src/tabs/typing/render_next. GUI-free: shaping/layout via cosmic-text, vector
 # glyph rasterization via zeno, RGBA output via the image crate.
 [dependencies]
-web-time = "1"
+web-time.workspace = true
 ms-log = { path = "../ms-log" }
 ms-text-util = { path = "../ms-text-util" }
 # The bundled `fonts/ui` stack: the renderer builds its own deterministic fontdb
 # base out of it instead of loading the operating system's fonts
 # (see src/font_base.rs and dev-docs/unicode_base_font_plan.md, decision 1).
 ms-fonts = { path = "../ms-fonts" }
-cosmic-text = "0.14"
+cosmic-text.workspace = true
 # `cosmic_text::Fallback` names writing systems with `unicode_script::Script` and
 # cosmic-text does not re-export the type, so it has to be a direct dependency.
 # Already in the tree at this version as cosmic-text's own dependency, so it adds
 # no build cost and pins nothing new.
-unicode-script = "0.5"
-swash = "0.2"
-zeno = "0.3"
-hyphenation = { version = "0.8", features = ["embed_all"] }
-image = { version = "0.25", default-features = true }
-rayon = "1"
-serde_json = "1"
+unicode-script.workspace = true
+swash.workspace = true
+zeno.workspace = true
+hyphenation.workspace = true
+image.workspace = true
+rayon.workspace = true
+serde_json.workspace = true

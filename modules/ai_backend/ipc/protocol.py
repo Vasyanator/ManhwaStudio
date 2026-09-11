@@ -28,7 +28,7 @@ from __future__ import annotations
 # an existing field, a changed blob format. Deciding whether a change "really"
 # breaks anything is exactly the judgement that gets made wrong, and bumping
 # costs nothing because both halves ship and update together.
-# Bump it here AND in src/backend_ipc/protocol.rs together — the Rust test
+# Bump it here AND in crates/ms-backend-ipc/src/protocol.rs together — the Rust test
 # python_protocol_version_matches_rust guards the mirror, but nothing can detect
 # a bump that was never made. The hello handshake compares this value; a
 # mismatch is a clean error (see PROTOCOL.md "Error model").

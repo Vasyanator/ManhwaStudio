@@ -1,0 +1,59 @@
+[package]
+name = "ms-canvas"
+version = "0.1.0"
+edition = "2024"
+
+# The canvas facade extracted from `src/canvas/`: page rendering, bubble editing and
+# clean-overlay painting. Re-exported by the binary as `crate::canvas`, so every
+# existing `crate::canvas::...` call site keeps its path.
+#
+# Layer: ABOVE `ms-models` / `ms-project` / `ms-widgets`, BELOW the tabs. The
+# `CanvasHooks` trait is DECLARED here and IMPLEMENTED by the tabs, so the dependency
+# points down only — this crate must never name `tabs`, `app` or `launcher`.
+[dependencies]
+# The whole crate draws: scene passes, bubble widgets, overlay uploads.
+egui.workspace = true
+eframe.workspace = true
+# The chapter domain model the canvas renders and edits (`Bubble`, `CanvasSettings`,
+# `ProjectData`).
+ms-project = { path = "../ms-project" }
+# The runtime models the canvas reads and mutates (bubble model, clean overlays, layer
+# document) plus `page_view`, the source-page geometry/texture view model it draws from.
+ms-models = { path = "../ms-models" }
+# Every reusable widget the canvas puts on screen (spellchecked fields, hangul keyboard,
+# marked scroll bars), plus `ui_fonts` (the bubble text family), `input_util` (raw wheel
+# delta for Ctrl+zoom) and `bubble_status` (the status-border painter).
+ms-widgets = { path = "../ms-widgets" }
+# Localized canvas labels (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics for the canvas' own failure paths plus the `trace_log!` / `trace_scope!`
+# frame instrumentation.
+ms-log = { path = "../ms-log" }
+# Canvas settings are read from and written to `user_config.json` / the project config.
+ms-config = { path = "../ms-config" }
+# Image-cache budgets consulted before a source page or overlay is uploaded.
+ms-memory = { path = "../ms-memory" }
+# Undo/redo of bubble and overlay edits (`ActionHistory`, `RasterDiff`).
+ms-actions = { path = "../ms-actions", features = ["raster"] }
+# Every background worker the canvas spawns (overlay tiling, overlay autosave, settings
+# persistence) goes through the project's thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Canvas settings snapshots and bubble `extra` payloads are JSON trees.
+serde_json.workspace = true
+# Aggregated context on the settings-persistence and overlay-autosave paths.
+anyhow.workspace = true
+# Hangul syllable classification behind the on-screen jamo keyboard's caret handling.
+ms-text-util = { path = "../ms-text-util" }
+# Animated WebP hints carried by the canvas' bottom hint rows (`CanvasHintHelp`).
+ms-gifs = { path = "../ms-gifs" }
+# Monotonic time that also works in a web build (debounce and animation timers).
+web-time.workspace = true
+# Parallel overlay tile preparation.
+rayon.workspace = true
+# Overlay raster decode/scale on the CPU side of the upload pipeline.
+image.workspace = true
+
+# Clipboard-backed bubble copy/paste. Native-only: there is no synchronous clipboard
+# on wasm, where the call sites are compiled out.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard.workspace = true

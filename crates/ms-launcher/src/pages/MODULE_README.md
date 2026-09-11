@@ -1,0 +1,62 @@
+# Module: crates/ms-launcher/src/pages
+
+## Purpose
+Fullscreen page workflows used inside the Rust launcher shell before a project is opened. These
+pages cover opening existing chapters, importing/exporting `.mschapter` archives, and editing
+launcher-wide settings.
+
+## Architecture
+`LauncherApp` owns page instances, routing, transitions, detached window lifecycle, and final
+launcher outcomes. Page modules render focused workflows and return `PageNavAction` values through
+`base.rs`; they do not start the editor, updater, or installer directly.
+
+Each state type follows the same pattern: store input/status fields, start a worker by keeping an
+`mpsc::Receiver`, poll that receiver from `show`, and return a typed navigation action when the
+root launcher needs to react. Filesystem scans, archive work, project validation, Python probes,
+installer preflights, shell I/O, and system probes run on workers and request repaint when new
+state arrives.
+
+## Files and submodules
+- `mod.rs`: module declarations for the launcher page stack.
+- `base.rs`: shared slide/fade transition runtime, clipped page layer creation, common page shell,
+  back button, and `PageNavAction`.
+- `open_page.rs`: projects-root title/chapter scanning, `_unsaved` chapter detection, project
+  validation through `ProjectValidationState`, open selection creation, last opened title
+  persistence, and per-title last opened chapter persistence in `user_config.json`.
+- `import_page.rs`: `.mschapter` metadata read, editable target title/chapter form, archive
+  extraction into the projects root, safe path validation, and optional open-after-import action.
+- `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and
+  `tar + zstd` archive creation for `.mschapter` export.
+- `settings_page.rs`: launcher settings tabs, system CPU/RAM/GPU probes,
+  AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
+  flow, and a background-driven Python environment console. The tab set, ordering, tab labels, and
+  the shared General/AiBackend/Tutorials sections come from the shared section registry
+  (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab bar iterates
+  `sections_for(SettingsSurface::Launcher)`, and the three shared "double-interface" panels are owned
+  as one `SharedSettingsPanels`. The dynamic TorchUpgrade hide/relabel logic is applied inline in the
+  tab bar. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
+  keep their local renderers here. The `ProjectsRootChanged` invariant is unchanged — a saved
+  projects root is still emitted as `PageNavAction::ProjectsRootChanged` (mapped from the shared
+  General section's outcome).
+
+## Contracts and invariants
+- Page UI must stay responsive. Do not perform project scans, archive traversal, compression,
+  Python probing, command execution, or installer work inside frame drawing.
+- Page actions are routed by `LauncherApp`; pages must not launch the editor, updater, installer,
+  or detached new-project window directly.
+- Project root changes must be returned as `PageNavAction::ProjectsRootChanged` so `LauncherApp`
+  can refresh every page and detached window that caches the root.
+- `PageNavAction::OpenProject` must carry an `OpenProjectSelection` that has passed launcher-side
+  validation.
+- Import must reject unsafe archive paths and preserve explicit user-facing errors plus diagnostic
+  log messages.
+- Settings probes and consoles must use shared runtime helpers such as `python_manager` and
+  `gpu_utils`; do not duplicate Python or GPU discovery in page UI code.
+
+## Editing map
+- To add a launcher-level navigation action, edit `base.rs`, update affected page states, and handle
+  the action in `crates/ms-launcher/src/app.rs`.
+- To change project opening, edit `open_page.rs`.
+- To change archive import/export, edit `import_page.rs` or `export_page.rs`.
+- To change global launcher settings, environment probes, AI install-type reconciliation, Torch
+  upgrade UI, or the Python console, edit `settings_page.rs`.

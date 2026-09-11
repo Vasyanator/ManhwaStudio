@@ -8,9 +8,10 @@ argument must be a string literal; a GUI-free logic crate (e.g. `ms-text-util`,
 `ms-text-render`) hands the binary a `&'static str` catalog key it computed from
 an enum variant, and the binary resolves it here.
 
-Key functions:
-- `resolve_key` — `ms_i18n::lookup(key).unwrap_or(key)`, a wait-free,
-  allocation-free catalog read safe on the egui paint path.
+Key items:
+- none. `resolve_key` is declared in `ms_i18n` (a wait-free, allocation-free catalog read,
+  safe on the egui paint path) and called there directly. This module exists only to host
+  the cross-crate tests that guard it — see the note below.
 
 Notes:
 This mirrors the `SocketSpec::display_label` / `reline_models::resolve_key`
@@ -19,22 +20,19 @@ GUI-free crate never carries localized text, but any label it hands the UI is a
 catalog key resolved here.
 */
 
-/// Resolves a catalog `key` to its active-locale text, falling back to the key
-/// itself on a catalog miss (never panics, never allocates).
-///
-/// Use for keys chosen at runtime — e.g. returned by `ScriptGroup::name_key`,
-/// `TextLanguage::name_key`, or `Conservatism::label_key` — where `t!` (which
-/// requires a literal) does not apply. The returned `&'static str` is a pointer
-/// into the leaked active catalog, so it is safe to paint every frame.
-#[must_use]
-pub fn resolve_key(key: &'static str) -> &'static str {
-    ms_i18n::lookup(key).unwrap_or(key)
-}
+// `resolve_key` is DECLARED in `ms_i18n`; every caller now names it there directly (the
+// launcher and the settings panes became crates of their own, and both sit above `ms-i18n`).
+// This module is therefore no longer a re-export — it exists ONLY to host the tests below.
+//
+// They stay HERE, not in `ms-i18n`: they assert against the key sets of `ms-text-util` and
+// against `ms_config::locale_store::GLOBAL_LOCALE_LOCK`, and `ms-i18n` sits BELOW both —
+// importing them there would invert the dependency. The binary is the lowest place that
+// can see all three at once.
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_key;
     use crate::locale_store::GLOBAL_LOCALE_LOCK;
+    use ms_i18n::resolve_key;
     use ms_i18n::LocaleTag;
     use ms_text_util::language::{ScriptGroup, TextLanguage};
     use ms_text_util::segmentation::Conservatism;

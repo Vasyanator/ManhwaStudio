@@ -7,5 +7,5 @@ edition = "2024"
 # Depends only on the thread shim (for a wasm-compatible writer thread) — no
 # dependency on the application crate.
 [dependencies]
-web-time = "1"
+web-time.workspace = true
 ms-thread = { path = "../ms-thread" }

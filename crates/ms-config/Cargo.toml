@@ -1,0 +1,58 @@
+[package]
+name = "ms-config"
+version = "0.1.0"
+edition = "2024"
+
+# Global config / runtime-path layer of ManhwaStudio, extracted from `src/config.rs`.
+# Owns `program_dir()` / `data_dir()`, the `user_config.json` + project-config
+# read-modify-write boundary and the default trees for both documents. GUI-free:
+# it is the hub every upper layer reads, so it must depend on nothing above it.
+#
+# Two small crate-root modules moved down with it because the default trees name
+# them: `app_tab` (the `General.enabled_tabs` key contract) and
+# `rotation_ctrl_wheel` (the `TextTab.rotation_ctrl_wheel_mode` default).
+[dependencies]
+# Diagnostics for config load/save failures (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# `General.memory_profile` is persisted as `MemoryProfile::as_config_str()`.
+ms-memory = { path = "../ms-memory" }
+# The storage seam for the WHOLE-DOCUMENT config paths: `Config::load` / `Config::save`
+# and `update_user_config_file` go through the process-wide backend
+# (`ms_storage::global::storage()`) so the web build can serve `user_config.json` from its
+# in-memory/IndexedDB store. That seam is the only reason for this dependency — the
+# single-setting savers (`save_text_language`, `save_ai_runtime`, `save_onnx_build`, …),
+# `load_raw_user_settings_for_startup` and the directory creation in `ensure_model_dirs`
+# still call `std::fs` directly and are desktop-only paths.
+ms-storage = { path = "../ms-storage" }
+# `TextTab` defaults name `text_punctuation::DEFAULT_HANGING_PUNCTUATION` and
+# `language::TextLanguage::Ru.tag()`.
+ms-text-util = { path = "../ms-text-util" }
+# Localized labels of the bubble-status rule model (`t!` / `tf!`); the macros are
+# mounted crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# The bubble-status rule model is persisted inside `user_config.json`, so it
+# derives Serialize/Deserialize.
+serde.workspace = true
+# Every config document is a `serde_json::Value` tree.
+serde_json.workspace = true
+# Aggregated context on config load/save errors (`anyhow::Context`).
+anyhow.workspace = true
+# `config_saver` runs its writer thread through the project's thread wrapper, which
+# is the only way a background thread is spawned in this workspace.
+ms-thread = { path = "../ms-thread" }
+# `locale_store::LocaleStoreError` is a typed public error.
+thiserror.workspace = true
+
+[features]
+# Exposes the two test-only helpers this crate owns — `config_saver::test_harness`
+# and `locale_store::GLOBAL_LOCALE_LOCK` — to DEPENDENT crates' tests. A
+# `#[cfg(test)]` item is invisible outside its own crate, so the sections that live
+# above this one (`ms-widgets`' panel-dock layout, the binary's window geometry and
+# every test that installs a UI locale) can only reach them through a feature.
+# Enable it from `[dev-dependencies]` only: that keeps it out of every non-test build.
+test-support = []
+
+[dev-dependencies]
+# Isolated on-disk fixtures for the `JsonConfig` / `update_user_config_file` tests,
+# which write real files through the storage backend.
+tempfile.workspace = true

@@ -854,7 +854,7 @@ fn parse_faux_italic_tag(raw_tag: &str) -> Option<f32> {
 /// `true`. A saved TEXT is not: a hand-typed `<b=8>` or `<b=default>` written
 /// before the flip now renders uniform instead of counter-preserving. The
 /// exposure is limited to hand-typed tags — the typing panel always emits the
-/// token explicitly (`src/tabs/typing/panel/inline_tags.rs`). No compatibility
+/// token explicitly (`crates/ms-tab-typing/src/panel/inline_tags.rs`). No compatibility
 /// shim exists, deliberately: a tag has no version to key one off, and guessing
 /// per tag would make two identical tags in one document mean different things.
 pub(crate) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {

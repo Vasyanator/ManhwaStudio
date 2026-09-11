@@ -1,0 +1,1995 @@
+/*
+File: tab/draw_page.rs
+
+Purpose:
+Per-page overlay drawing and interaction for the typing tab. Hosts the large
+`draw_page_overlays` method that renders and drives egui interaction for the
+text/image overlays and interleaved read-only raster layers on a single page,
+plus the small helpers it relies on for repaint gating, pixel snapping, and
+on-screen visibility clamping.
+
+A layer NEVER changes page by being dragged: a drag clamps at the page's overlay
+bound (`clamp_page_point`) and the layer keeps its `page_idx`.
+
+`draw_page_overlays` takes the per-page `PageView` transform (from `mesh_geometry`)
+and a `TypingPageInteractionPolicy` snapshot (built in the canvas hook); its `ctx`
+comes from `ui.ctx()`.
+
+Key structures:
+- CenteringMarker (per-overlay geometry + render inputs for `draw_centering_assist`)
+
+Also owns the centering-assist ("Помочь с центровкой") drawing and interaction:
+`draw_centering_assist` paints the page-anchored guide frame + corner handles + the
+bound-center marker, `reconcile_centering_frame` keeps the chosen center bound to the
+frame center each frame (lazy-create / follow-move-drag / anchored auto-recenter), and
+`sync_centering_frame_to_layer` re-binds the frame after an explicit non-drag layer move.
+Corner-handle hits are resolved inside the selected overlay's own `ui.interact` (a
+`centering_frame_drag` state), mirroring the width/rotation handles. The pure geometry it
+uses lives in `tab/mesh_geometry.rs`.
+
+Notes:
+Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
+submodules of `tab` can use them. `use super::*;` pulls in the parent module's
+types and imports. Struct/enum definitions and the other `impl` blocks on
+`TypingTextOverlayLayer` remain in `tab.rs`; these methods reach the private items
+that stay there as descendants of module `tab`.
+*/
+
+use super::*;
+
+impl TypingTextOverlayLayer {
+    /// Master per-page draw for the typing tab: draws every visible text/image
+    /// overlay and raster layer of `view.page_idx`, runs their selection and
+    /// drag/rotate/scale interaction, transform-mode overlays, and the
+    /// centering assist, honoring the per-frame `policy` snapshot built by the
+    /// canvas hook. Returns the scene-space quads of the drawn overlays; the
+    /// hook stores them as per-page occluders that hide on-top bubbles and
+    /// aside connector lines underneath overlays. GUI-thread only; called once
+    /// per visible page per frame.
+    pub(super) fn draw_page_overlays(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: PageView,
+        policy: &TypingPageInteractionPolicy,
+    ) -> Vec<[Pos2; 4]> {
+        // `ctx` comes from `ui.ctx()`; clone once (Arc-backed, cheap) and reborrow so the rest of the
+        // body keeps its `ctx: &Context` shape while `ui` stays free to be borrowed mutably below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        // Unpack the per-page view transform and the interaction policy into the locals the body uses,
+        // so the (large) body logic below is unchanged by the signature consolidation.
+        let page_idx = view.page_idx;
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
+        let mask_panel_open = policy.mask_panel_open;
+        let panel_text_input_focused = policy.panel_text_input_focused;
+        let eyedropper_blocks_focus_clear = policy.eyedropper_blocks_focus_clear;
+        let auto_typing_settings = policy.auto_typing;
+        let strict_pixel_movement = policy.strict_pixel_movement;
+        let centering_assist_enabled = policy.centering.enabled;
+        let centering_assist_kind = policy.centering.kind;
+        let centering_show_center = policy.centering.show_center;
+        // Keep the layer's mirror of the centering-assist state fresh for the re-render dispatch sites
+        // reached from within this draw (Ctrl+wheel rotation, width drag, vector-transform, shape
+        // variant) and for the reconciliation below.
+        self.centering_assist_enabled = centering_assist_enabled;
+        self.centering_assist_kind = centering_assist_kind;
+        self.centering_show_center = centering_show_center;
+        if self
+            .selected_overlay_idx
+            .is_some_and(|idx| idx >= self.overlays.len())
+        {
+            self.selected_overlay_idx = None;
+        }
+        if self
+            .transform_mode_overlay_idx
+            .is_some_and(|idx| idx >= self.overlays.len())
+        {
+            self.transform_mode_overlay_idx = None;
+        }
+        // Whenever transform mode is not active, drop the transient VECTOR working state (mesh + drag)
+        // and reset the mode kind. Covers click-away/exit/loader-reset uniformly.
+        if self.transform_mode_overlay_idx.is_none()
+            && (self.transform_mode_kind != TypingTransformModeKind::Raster
+                || self.vector_transform_mesh.is_some()
+                || self.vector_transform_drag.is_some()
+                || self.vector_transform_base.is_some()
+                || self.vector_transform_base_rx.is_some())
+        {
+            self.exit_vector_transform_mode();
+        }
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|state| state.overlay_idx >= self.overlays.len())
+        {
+            self.drag_state = None;
+            self.drag_has_changes = false;
+        }
+        // A move session whose overlay no longer exists cannot be settled (there is nothing left to
+        // read or persist), so drop it rather than leaving it pointing at a shifted layer.
+        if self.move_session.as_ref().is_some_and(|session| {
+            matches!(session.target, TypingLayerMoveTarget::Overlay(idx) if idx >= self.overlays.len())
+        }) {
+            self.move_session = None;
+        }
+        if self
+            .width_resize_drag
+            .is_some_and(|state| state.overlay_idx >= self.overlays.len())
+        {
+            self.width_resize_drag = None;
+        }
+        if self
+            .centering_frame_drag
+            .is_some_and(|state| state.overlay_idx >= self.overlays.len())
+        {
+            self.centering_frame_drag = None;
+        }
+        // One selection at a time across the two layer kinds: an overlay selection wins (overlay
+        // interaction runs before the raster pass below; `select_raster` clears overlays directly).
+        if self.selected_overlay_idx.is_some() {
+            self.selected_raster_idx = None;
+            self.selected_raster_page = None;
+            self.transform_mode_raster_idx = None;
+        }
+        if mask_panel_open {
+            if let Some(selected_idx) = self.selected_overlay_idx {
+                let should_validate = self
+                    .overlays
+                    .get(selected_idx)
+                    .is_some_and(|overlay| overlay.page_idx == page_idx);
+                if should_validate
+                    && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
+                {
+                    self.mark_overlay_geometry_changed(selected_idx, false);
+                    // EDIT (visibility-limit clamp): deferred.
+                    self.mark_placement_save_dirty();
+                }
+            }
+            self.clear_selection();
+        }
+
+        if !ui.input(|i| i.pointer.primary_down()) {
+            if self.drag_state.is_some() && self.drag_has_changes {
+                if let Some(state) = self.drag_state.as_ref() {
+                    self.flush_overlay_texture_if_stale(state.overlay_idx);
+                }
+                // EDIT (move/rotate drag released off-widget): deferred.
+                self.mark_placement_save_dirty();
+            }
+            self.drag_state = None;
+            self.drag_has_changes = false;
+            // A width-resize drag persists per-frame (each `resize_selected_overlay_width` dispatches a
+            // re-render + placement save), so on button-up there is nothing to commit — just clear it so
+            // it can't get stuck if the widget's `drag_stopped` was never observed.
+            self.width_resize_drag = None;
+            // A centering-frame corner drag only mutates the transient frame (the reconciliation moves
+            // and saves the layer), so on button-up there is nothing to commit — just clear it.
+            self.centering_frame_drag = None;
+            // Settle a vector-transform drag whose pointer was released off-widget (the in-method
+            // `drag_stopped` path handles the normal on-widget release; whichever fires first wins via
+            // the `take`).
+            if let Some(drag) = self.vector_transform_drag.take()
+                && drag.has_changes
+            {
+                self.settle_vector_transform(drag.overlay_idx, ctx);
+            }
+        }
+
+        let clip_rect = ui.clip_rect().intersect(image_rect);
+        if self.poll_auto_typing_job(ctx) {
+            ctx.request_repaint();
+        }
+        if !clip_rect.is_positive() {
+            return Vec::new();
+        }
+        // Ensure the read-only PS raster layers and unified Z bands for this page are loaded; the
+        // actual raster quads are now drawn interleaved with the text overlays (one ordered pass
+        // below) so a raster moved above a text group in the PS editor renders on top.
+        self.ensure_raster_layers_for_page(page_idx);
+        let layout_editor_active = self.layout_editor.is_some();
+        if !mask_panel_open && !layout_editor_active {
+            self.try_trigger_selected_overlay_auto_typing_by_hotkey(
+                ctx,
+                view,
+                panel_text_input_focused,
+                auto_typing_settings,
+            );
+            self.try_rotate_selected_overlay_by_ctrl_wheel(ui, view);
+            self.try_rotate_selected_raster_by_ctrl_wheel(ui, page_idx);
+            self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
+            self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
+            // ONE arrow-nudge entry for both layer kinds; it resolves the selected target itself and
+            // consumes the arrow keys only once every guard has passed.
+            self.try_move_selected_layer_by_arrow_shortcuts(
+                ui,
+                view,
+                panel_text_input_focused,
+                strict_pixel_movement,
+            );
+            // Centering assist: after input handling, keep the bound center on the frame center (create
+            // the frame lazily; move the LAYER back for anchored changes; let the frame follow a
+            // layer move-drag). Runs before `draw_entries` so an anchored re-render recenters lag-free.
+            self.reconcile_centering_frame(ctx, view, strict_pixel_movement);
+        }
+        let mut adjusted_by_visibility_limit = false;
+        for idx in 0..self.overlays.len() {
+            let Some(overlay) = self.overlays.get(idx) else {
+                continue;
+            };
+            if overlay.page_idx != page_idx {
+                continue;
+            }
+            if self
+                .drag_state
+                .as_ref()
+                .is_some_and(|state| state.overlay_idx == idx && state.page_idx == page_idx)
+            {
+                continue;
+            }
+            // An open move session runs the limit itself, as part of its own apply step.
+            if self.layer_move_session_targets(TypingLayerMoveTarget::Overlay(idx), page_idx) {
+                continue;
+            }
+            if self.enforce_overlay_visibility_limit(idx, view, strict_pixel_movement) {
+                self.mark_overlay_geometry_changed(idx, false);
+                adjusted_by_visibility_limit = true;
+            }
+        }
+        if adjusted_by_visibility_limit {
+            // EDIT (per-frame visibility-limit clamp of every overlay on the page): deferred. This ran
+            // on any frame a clamp moved a layer, e.g. throughout a zoom gesture.
+            self.mark_placement_save_dirty();
+        }
+        let painter = ui.painter().with_clip_rect(clip_rect);
+        let mut needs_texture_upload = Vec::new();
+        for (idx, overlay) in self.overlays.iter().enumerate() {
+            if overlay.page_idx == page_idx
+                && (overlay.texture.is_none() || overlay.display_texture_stale)
+            {
+                needs_texture_upload.push(idx);
+            }
+        }
+        for idx in needs_texture_upload {
+            self.queue_overlay_texture_upload(idx);
+        }
+        if !self.pending_upload_indices.is_empty() {
+            ctx.request_repaint();
+        }
+
+        struct OverlayDrawEntry {
+            idx: usize,
+            bounds_rect: Rect,
+            selection_bounds_rect: Rect,
+            quad_scene: [Pos2; 4],
+            mesh_scene: Vec<Pos2>,
+            selection_mesh_scene: Vec<Pos2>,
+            mesh_cols: usize,
+            mesh_rows: usize,
+            occluder_quads: Vec<[Pos2; 4]>,
+            texture: egui::TextureHandle,
+            render_width_px: Option<u32>,
+        }
+
+        let mut draw_entries: Vec<OverlayDrawEntry> = Vec::new();
+        let current_frame = ui.ctx().cumulative_frame_nr();
+        for idx in 0..self.overlays.len() {
+            let Some(overlay) = self.overlays.get(idx) else {
+                continue;
+            };
+            if overlay.page_idx != page_idx || overlay.texture.is_none() {
+                continue;
+            }
+            if self.layout_editor.as_ref().is_some_and(|editor| {
+                editor.mode == TypingLayoutEditorMode::Editing
+                    && editor.overlay_idx == idx
+                    && editor.page_idx == page_idx
+            }) {
+                continue;
+            }
+            let geometry = overlay_scene_geometry(overlay, view);
+            if geometry.bounds_rect.width() <= 0.5 || geometry.bounds_rect.height() <= 0.5 {
+                continue;
+            }
+            if !geometry.bounds_rect.intersects(clip_rect) {
+                continue;
+            }
+            if let Some(overlay) = self.overlays.get_mut(idx) {
+                overlay.last_texture_used_frame = current_frame;
+            }
+            let Some(overlay) = self.overlays.get(idx) else {
+                continue;
+            };
+            let is_selected_text =
+                self.selected_overlay_idx == Some(idx) && overlay.kind == TypingOverlayKind::Text;
+            let render_width_px = if overlay.kind == TypingOverlayKind::Text {
+                overlay.render_data_json.as_ref().map(|render_data| {
+                    overlay_render_data_width_hint(
+                        Some(render_data),
+                        u32::try_from(overlay.size_px[0]).unwrap_or(u32::MAX),
+                    )
+                })
+            } else {
+                None
+            };
+            let selection_mesh_scene = if is_selected_text {
+                expand_selection_mesh_to_min_screen_side(
+                    &geometry.mesh_scene,
+                    geometry.mesh_cols,
+                    geometry.mesh_rows,
+                )
+            } else {
+                geometry.mesh_scene.clone()
+            };
+            let selection_bounds_rect = if is_selected_text {
+                deform_mesh_bounds(&selection_mesh_scene)
+            } else {
+                geometry.bounds_rect
+            };
+            draw_entries.push(OverlayDrawEntry {
+                idx,
+                bounds_rect: geometry.bounds_rect,
+                selection_bounds_rect,
+                quad_scene: geometry.quad_scene,
+                occluder_quads: build_mesh_occluder_quads(
+                    &geometry.mesh_scene,
+                    geometry.mesh_cols,
+                    geometry.mesh_rows,
+                ),
+                mesh_scene: geometry.mesh_scene,
+                selection_mesh_scene,
+                mesh_cols: geometry.mesh_cols,
+                mesh_rows: geometry.mesh_rows,
+                texture: overlay.texture.as_ref().expect("checked above").clone(),
+                render_width_px,
+            });
+        }
+
+        // Bottom-to-top by the UNIFIED manual band-Z (retire the old layer_idx + page-Y auto-order):
+        // the top overlay draws last (on top) AND registers its egui interaction last, so on an overlap
+        // the topmost-by-Z overlay wins the click — the same Z the raster/text unified hit-test and the
+        // `merged_fills` draw order use, so draw order == manual order == click order.
+        draw_entries.sort_by(|a, b| {
+            let z = |idx: usize| {
+                self.overlays
+                    .get(idx)
+                    .map(|o| self.overlay_band_z(page_idx, &o.uid, o.layer_idx))
+                    .unwrap_or(0)
+            };
+            z(a.idx).cmp(&z(b.idx))
+        });
+
+        if !draw_entries.is_empty() && !mask_panel_open && !layout_editor_active {
+            let mut clicked_overlay_idx: Option<usize> = None;
+            let mut pending_delete_overlay_idx: Option<usize> = None;
+            let mut pending_enter_layout_editor_idx: Option<usize> = None;
+            let popup_open_before = ui.ctx().any_popup_open();
+            // Sticky-фокус: если клик пришёлся внутрь рамки уже выделенного оверлея,
+            // фокус остаётся на нём, даже если сверху лежит перекрывающий оверлей или
+            // растровый слой. Считаем это один раз по позиции клика и по grab-мешу
+            // выделенного оверлея (та же область, что и `pointer_inside_grab_area`).
+            let click_in_selected_frame = ui
+                .input(|i| i.pointer.primary_clicked())
+                .then(|| ui.input(|i| i.pointer.interact_pos()))
+                .flatten()
+                .zip(self.selected_overlay_idx)
+                .is_some_and(|(pos, selected_idx)| {
+                    draw_entries.iter().any(|entry| {
+                        entry.idx == selected_idx
+                            && deform_mesh_contains_point(
+                                &entry.selection_mesh_scene,
+                                entry.mesh_cols,
+                                entry.mesh_rows,
+                                pos,
+                            )
+                    })
+                });
+            // Sticky-фокус на ПЕРЕТАСКИВАНИИ (по позиции курсора, без клика): курсор находится
+            // внутри grab-рамки уже выделенного оверлея. Тогда перекрывающий НЕвыделенный оверлей
+            // регистрируется как click-only (см. ниже), и egui отдаёт drag выделенному оверлею.
+            let pointer_in_selected_overlay_frame = ui
+                .input(|i| i.pointer.latest_pos())
+                .zip(self.selected_overlay_idx)
+                .is_some_and(|(pos, selected_idx)| {
+                    draw_entries.iter().any(|entry| {
+                        entry.idx == selected_idx
+                            && deform_mesh_contains_point(
+                                &entry.selection_mesh_scene,
+                                entry.mesh_cols,
+                                entry.mesh_rows,
+                                pos,
+                            )
+                    })
+                });
+            for entry in &draw_entries {
+                // VECTOR transform mode owns this overlay's interaction in a dedicated pass
+                // (`draw_vector_transform_overlay`), so skip the normal select/move/raster-deform
+                // interaction here — the two transform kinds never share drag state.
+                if self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector
+                {
+                    continue;
+                }
+                let is_transform_mode = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Raster;
+                let show_rotate_handle =
+                    self.selected_overlay_idx == Some(entry.idx) && !is_transform_mode;
+                let rotate_handle_with_corner = if show_rotate_handle {
+                    Some(rotation_handle_scene_with_corner(
+                        &entry.quad_scene,
+                        image_rect,
+                    ))
+                } else {
+                    None
+                };
+                // Width-guide end ticks are draggable to resize the layer's configured width. Shown only
+                // when `show_rotate_handle` (selected overlay, outside raster-transform mode), and
+                // `entry.render_width_px` is `Some` only for a TEXT overlay, so together this is
+                // text-only. The tick positions mirror `draw_text_overlay_width_guide` exactly.
+                let width_guide_ticks = if show_rotate_handle {
+                    entry.render_width_px.and_then(|render_width_px| {
+                        let overlay = self.overlays.get(entry.idx)?;
+                        // Rotation-invariant source->screen scale (see `draw_text_overlay_width_guide`).
+                        let display_scale = zoom * overlay.user_scale.max(0.01);
+                        let half_width =
+                            (render_width_px.max(1) as f32 * display_scale).max(1.0) * 0.5;
+                        let center_x = entry.selection_bounds_rect.center().x;
+                        let line_y =
+                            entry.selection_bounds_rect.top() - TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX;
+                        Some((
+                            Pos2::new(center_x - half_width, line_y),
+                            Pos2::new(center_x + half_width, line_y),
+                        ))
+                    })
+                } else {
+                    None
+                };
+                // Centering-assist frame corners (scene px) for the SELECTED text overlay while assist is
+                // on and not in raster transform mode. The corners can lie OUTSIDE the layer footprint
+                // (the frame defaults 25% larger), so their handle rects are unioned into the overlay's
+                // own `interact_rect` and hit-tested within the single overlay response — the same
+                // in-file idiom as the rotation/width handles — rather than as separate later-registered
+                // widgets (which egui would not award the drag over the body's own `click_and_drag`).
+                let centering_corners_scene: Option<[(CenteringFrameCorner, Pos2); 4]> =
+                    if is_transform_mode {
+                        None
+                    } else {
+                        self.centering_corner_handles_scene(entry.idx, view)
+                    };
+                // The rotation handle YIELDS to the centering-frame corner handles: it is pushed
+                // further out along its own corner->outward direction so the two handle sets never
+                // overlap visually or contest the same pointer position.
+                let rotate_handle_pos = rotate_handle_with_corner.map(|(corner, handle)| {
+                    if let Some(corners) = &centering_corners_scene {
+                        let obstacles: [Pos2; 4] = std::array::from_fn(|i| corners[i].1);
+                        push_rotation_handle_clear(
+                            corner,
+                            handle,
+                            &obstacles,
+                            CENTERING_ROTATE_HANDLE_CLEARANCE_PX,
+                        )
+                    } else {
+                        handle
+                    }
+                });
+                let mut interact_rect = if is_transform_mode {
+                    entry
+                        .bounds_rect
+                        .expand(TEXT_OVERLAY_TRANSFORM_HANDLE_RADIUS_PX * 2.0 + 2.0)
+                } else if self.selected_overlay_idx == Some(entry.idx) {
+                    entry.selection_bounds_rect
+                } else {
+                    entry.bounds_rect
+                };
+                if let Some(handle_pos) = rotate_handle_pos {
+                    let handle_rect = Rect::from_center_size(
+                        handle_pos,
+                        Vec2::splat(TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 4.0),
+                    );
+                    interact_rect = interact_rect.union(handle_rect);
+                }
+                if let Some((left_tick, right_tick)) = width_guide_ticks {
+                    let tick_size = Vec2::splat(TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX * 2.0);
+                    interact_rect = interact_rect
+                        .union(Rect::from_center_size(left_tick, tick_size))
+                        .union(Rect::from_center_size(right_tick, tick_size));
+                }
+                if let Some(corners) = centering_corners_scene {
+                    let handle_size = Vec2::splat(CENTERING_FRAME_HANDLE_HIT_RADIUS_PX * 2.0);
+                    for (_, pos) in corners {
+                        interact_rect =
+                            interact_rect.union(Rect::from_center_size(pos, handle_size));
+                    }
+                }
+                // Если курсор внутри рамки уже выделенного оверлея, перекрывающий НЕвыделенный
+                // оверлей не должен перехватывать DRAG: регистрируем его click-only, чтобы egui
+                // отдал drag выделенному оверлею (его виджет sense'ит click_and_drag). Клик
+                // (нажал-отпустил) по-прежнему попадает сюда и переселектит — см. блок
+                // sticky-фокуса по `click_in_selected_frame`.
+                // Тот же приём для ВЕКТОРНОЙ трансформации: её ручки живут в отдельном пассе
+                // (`draw_vector_transform_overlay`, регистрируется ПОСЛЕ этого цикла), а ручки по
+                // углам сетки лежат вне полигона оверлея, поэтому `pointer_in_selected_overlay_frame`
+                // там ложно false. egui НЕ отдаёт drag позже зарегистрированному перекрывающему
+                // виджету, если более ранний тоже sense'ит drag, — поэтому пока активна векторная
+                // трансформация, все ОСТАЛЬНЫЕ оверлеи (сам трансформируемый уже пропущен `continue`
+                // выше) регистрируем click-only, чтобы drag достался виджету ручек.
+                let vector_transform_active = self.transform_mode_overlay_idx.is_some()
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector;
+                let sense = if vector_transform_active
+                    || (pointer_in_selected_overlay_frame
+                        && self.selected_overlay_idx != Some(entry.idx))
+                {
+                    Sense::click()
+                } else {
+                    Sense::click_and_drag()
+                };
+                let response = ui.interact(
+                    interact_rect,
+                    Id::new(("typing_text_overlay", entry.idx)),
+                    sense,
+                );
+                let pointer_pos = response.interact_pointer_pos();
+                let pointer_inside_visual = pointer_pos.is_some_and(|pos| {
+                    deform_mesh_contains_point(
+                        &entry.mesh_scene,
+                        entry.mesh_cols,
+                        entry.mesh_rows,
+                        pos,
+                    )
+                });
+                let pointer_inside_grab_area = pointer_pos.is_some_and(|pos| {
+                    let hit_mesh = if self.selected_overlay_idx == Some(entry.idx) {
+                        &entry.selection_mesh_scene
+                    } else {
+                        &entry.mesh_scene
+                    };
+                    deform_mesh_contains_point(hit_mesh, entry.mesh_cols, entry.mesh_rows, pos)
+                });
+                let pointer_on_handle = pointer_pos.and_then(|pos| {
+                    if !is_transform_mode || !self.deform_mode.is_handle_mode() {
+                        return None;
+                    }
+                    match self.deform_mode {
+                        TypingDeformMode::Perspective => {
+                            hit_test_transform_handle(pos, &entry.quad_scene)
+                        }
+                        TypingDeformMode::Bend => hit_test_bend_handle(
+                            pos,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                        ),
+                        TypingDeformMode::Frame => hit_test_frame_handle(
+                            pos,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                            self.frame_handle_side_points,
+                        ),
+                        TypingDeformMode::Grid => hit_test_grid_handle(
+                            pos,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                            self.frame_handle_side_points,
+                        ),
+                        _ => None,
+                    }
+                });
+                let pointer_on_rotate_handle =
+                    pointer_pos
+                        .zip(rotate_handle_pos)
+                        .is_some_and(|(pointer, handle)| {
+                            pointer.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0
+                        });
+                // `Some(true)` -> right tick hit, `Some(false)` -> left tick, `None` -> neither.
+                let pointer_on_width_handle = pointer_pos.zip(width_guide_ticks).and_then(
+                    |(pointer, (left_tick, right_tick))| {
+                        let radius = TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX;
+                        if pointer.distance(right_tick) <= radius {
+                            Some(true)
+                        } else if pointer.distance(left_tick) <= radius {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    },
+                );
+                // Centering-frame corner under the pointer, if any (nearest within the hit radius).
+                let pointer_on_centering_handle =
+                    pointer_pos.zip(centering_corners_scene).and_then(|(pointer, corners)| {
+                        corners.iter().find_map(|(corner, pos)| {
+                            (pointer.distance(*pos) <= CENTERING_FRAME_HANDLE_HIT_RADIUS_PX)
+                                .then_some(*corner)
+                        })
+                    });
+                let pointer_targets_overlay = pointer_inside_grab_area
+                    || pointer_on_handle.is_some()
+                    || pointer_on_rotate_handle
+                    || pointer_on_width_handle.is_some()
+                    || pointer_on_centering_handle.is_some();
+                // Show the horizontal-resize cursor while HOVERING a width tick, or while actively
+                // dragging one. Hover uses `response.hover_pos()` (set on plain mouse-over), NOT
+                // `interact_pointer_pos()` above (which is `Some` only during an active click/drag, so it
+                // would flip the cursor only after pressing).
+                let width_resize_active = self
+                    .width_resize_drag
+                    .is_some_and(|state| state.overlay_idx == entry.idx);
+                let hover_on_width_handle = response.hover_pos().zip(width_guide_ticks).is_some_and(
+                    |(pointer, (left_tick, right_tick))| {
+                        let radius = TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX;
+                        pointer.distance(left_tick) <= radius
+                            || pointer.distance(right_tick) <= radius
+                    },
+                );
+                if hover_on_width_handle || width_resize_active {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+
+                if response.clicked() && pointer_targets_overlay {
+                    // Не перехватываем фокус перекрывающим оверлеем, если клик попал
+                    // в рамку уже выделенного (нижнего) оверлея — фокус удержит
+                    // блок sticky-фокуса после цикла.
+                    if !(click_in_selected_frame && self.selected_overlay_idx != Some(entry.idx)) {
+                        clicked_overlay_idx = Some(entry.idx);
+                        self.selected_overlay_idx = Some(entry.idx);
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                }
+                if response.secondary_clicked() && pointer_inside_visual {
+                    self.selected_overlay_idx = Some(entry.idx);
+                    if let Some(origin) = pointer_pos {
+                        self.start_shape_variant_preview_if_available(ui.ctx(), entry.idx, origin);
+                    }
+                }
+
+                // Vector-transform menu availability for this overlay: `Some(true)` = text overlay
+                // whose layout mode allows the vector warp; `Some(false)` = text overlay whose layout
+                // mode disallows it (disabled + tooltip); `None` = image overlay (item hidden).
+                let vector_menu_state = self.overlays.get(entry.idx).and_then(|overlay| {
+                    (overlay.kind == TypingOverlayKind::Text).then(|| {
+                        vector_transform_allowed_for_layout_mode(overlay_text_layout_mode(
+                            overlay.render_data_json.as_ref(),
+                        ))
+                    })
+                });
+                response.context_menu(|menu_ui| {
+                    if self.selected_overlay_idx != Some(entry.idx) {
+                        menu_ui.label(t!("typing.canvas.select_overlay_hint"));
+                        return;
+                    }
+                    if self
+                        .shape_variant_preview
+                        .as_ref()
+                        .is_none_or(|state| state.overlay_idx != entry.idx)
+                    {
+                        let origin = menu_ui
+                            .ctx()
+                            .pointer_latest_pos()
+                            .unwrap_or_else(|| menu_ui.min_rect().left_top());
+                        self.start_shape_variant_preview_if_available(
+                            menu_ui.ctx(),
+                            entry.idx,
+                            origin,
+                        );
+                    }
+                    if menu_ui
+                        .button(t!("typing.context_menu.enter_layout_edit_mode"))
+                        .clicked()
+                    {
+                        pending_enter_layout_editor_idx = Some(entry.idx);
+                        menu_ui.close();
+                    }
+                    menu_ui.separator();
+                    if !is_transform_mode {
+                        if menu_ui
+                            .button(t!("typing.context_menu.enter_transform_mode_raster"))
+                            .clicked()
+                        {
+                            if self.ensure_overlay_deform_mesh(entry.idx, view) {
+                                ms_log::trace_log!(
+                                    cat::TYPING,
+                                    "overlay_transform_mode enter idx={} kind=raster",
+                                    entry.idx
+                                );
+                                self.transform_mode_overlay_idx = Some(entry.idx);
+                                // Raster transform edits the runtime deform mesh; ensure no vector
+                                // working state lingers.
+                                self.exit_vector_transform_mode();
+                                self.deform_mode = TypingDeformMode::Perspective;
+                                self.drag_state = None;
+                            }
+                            menu_ui.close();
+                        }
+                        // Vector transform is TEXT-only and only for layouts that compose with the
+                        // post-layout warp (Normal / Shape / CustomVectorLines). Image overlays hide
+                        // it; Formula / CustomRasterLines show it disabled with a tooltip.
+                        match vector_menu_state {
+                            Some(true) => {
+                                if menu_ui
+                                    .button(t!("typing.context_menu.enter_transform_mode_vector"))
+                                    .clicked()
+                                {
+                                    ms_log::trace_log!(
+                                        cat::TYPING,
+                                        "overlay_transform_mode enter idx={} kind=vector",
+                                        entry.idx
+                                    );
+                                    self.selected_overlay_idx = Some(entry.idx);
+                                    self.transform_mode_overlay_idx = Some(entry.idx);
+                                    self.transform_mode_kind = TypingTransformModeKind::Vector;
+                                    self.deform_mode = TypingDeformMode::Perspective;
+                                    self.drag_state = None;
+                                    self.seed_vector_transform_mesh(entry.idx, view);
+                                    menu_ui.close();
+                                }
+                            }
+                            Some(false) => {
+                                menu_ui
+                                    .add_enabled(
+                                        false,
+                                        egui::Button::new(
+                                            t!("typing.context_menu.enter_transform_mode_vector"),
+                                        ),
+                                    )
+                                    .on_disabled_hover_text(t!("typing.context_menu.layout_not_supported"));
+                            }
+                            None => {}
+                        }
+                    } else {
+                        if menu_ui
+                            .button(t!("typing.context_menu.exit_transform_mode_raster"))
+                            .clicked()
+                        {
+                            ms_log::trace_log!(
+                                cat::TYPING,
+                                "overlay_transform_mode exit idx={}",
+                                entry.idx
+                            );
+                            if self.transform_mode_overlay_idx == Some(entry.idx) {
+                                self.transform_mode_overlay_idx = None;
+                            }
+                            self.drag_state = None;
+                            self.drag_has_changes = false;
+                            menu_ui.close();
+                        }
+                        if menu_ui
+                            .button(t!("typing.context_menu.reset_transform_raster"))
+                            .clicked()
+                        {
+                            ms_log::trace_log!(
+                                cat::TYPING,
+                                "overlay_transform_reset idx={}",
+                                entry.idx
+                            );
+                            if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                                overlay.deform_mesh = None;
+                            }
+                            self.mark_overlay_geometry_changed(entry.idx, false);
+                            // EDIT (reset raster transform from the context menu): deferred.
+                            self.mark_placement_save_dirty();
+                            self.drag_state = None;
+                            self.drag_has_changes = false;
+                            menu_ui.close();
+                        }
+                    }
+                    menu_ui.separator();
+                    if let Some(overlay) = self.overlays.get(entry.idx) {
+                        let toggle_label = if overlay.mask_clip_enabled {
+                            t!("typing.context_menu.disable_mask_clip")
+                        } else {
+                            t!("typing.context_menu.enable_mask_clip")
+                        };
+                        if menu_ui.button(toggle_label).clicked() {
+                            let mut new_state = false;
+                            if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                                overlay.mask_clip_enabled = !overlay.mask_clip_enabled;
+                                new_state = overlay.mask_clip_enabled;
+                            }
+                            ms_log::trace_log!(
+                                cat::TYPING,
+                                "overlay_mask_clip_toggle idx={} enabled={}",
+                                entry.idx,
+                                new_state
+                            );
+                            self.mark_overlay_pixels_dirty(entry.idx);
+                            // EDIT (mask-clip toggle from the context menu): deferred.
+                            self.mark_placement_save_dirty();
+                            menu_ui.close();
+                        }
+                    }
+                    menu_ui.separator();
+                    {
+                        // ▲ / ▼ move the overlay one step in the unified Z order (text + raster
+                        // interleaved, shared with the PS editor). No more per-overlay text-group
+                        // number — order is the shared layer stack.
+                        let mut move_z_up: Option<bool> = None;
+                        menu_ui.horizontal(|row| {
+                            row.label(t!("typing.context_menu.order"));
+                            if row.button("▲").clicked() {
+                                move_z_up = Some(true);
+                            }
+                            if row.button("▼").clicked() {
+                                move_z_up = Some(false);
+                            }
+                        });
+                        if let Some(up) = move_z_up {
+                            self.move_overlay_in_unified_z(page_idx, entry.idx, up);
+                        }
+                    }
+                    menu_ui.separator();
+                    if menu_ui.button(t!("typing.context_menu.delete_overlay")).clicked() {
+                        pending_delete_overlay_idx = Some(entry.idx);
+                        menu_ui.close();
+                    }
+                    self.update_shape_variant_preview_menu_rect(entry.idx, menu_ui.min_rect());
+                });
+
+                if response.drag_started() && pointer_targets_overlay {
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                    if let Some(pointer_pos) = pointer_pos {
+                        // A centering-frame corner starts a frame-resize drag (mutates the transient
+                        // frame; the reconciliation moves+saves the layer), NOT a placement drag.
+                        if let Some(corner) = pointer_on_centering_handle {
+                            self.selected_overlay_idx = Some(entry.idx);
+                            let frame_and_angle = self.overlays.get(entry.idx).and_then(|overlay| {
+                                overlay.centering_frame.map(|frame| {
+                                    let total_angle_deg = overlay.angle_deg
+                                        + overlay_render_data_global_rotation_deg(
+                                            overlay.render_data_json.as_ref(),
+                                        );
+                                    (frame, total_angle_deg)
+                                })
+                            });
+                            if let Some((frame, total_angle_deg)) = frame_and_angle {
+                                self.centering_frame_drag = Some(TypingCenteringFrameDragState {
+                                    overlay_idx: entry.idx,
+                                    page_idx,
+                                    corner,
+                                    start_frame: frame,
+                                    total_angle_deg,
+                                });
+                            }
+                            continue;
+                        }
+                        // A width-guide tick starts a width-resize drag (param edit + re-render), NOT a
+                        // placement drag, so set that state and skip the placement drag setup.
+                        if let Some(right) = pointer_on_width_handle {
+                            self.selected_overlay_idx = Some(entry.idx);
+                            self.width_resize_drag = Some(WidthResizeDragState {
+                                overlay_idx: entry.idx,
+                                page_idx,
+                                pointer_start_x: pointer_pos.x,
+                                start_width_px: entry.render_width_px.unwrap_or(0),
+                                right,
+                            });
+                            continue;
+                        }
+                        let Some((start_angle_deg, has_mesh, start_mesh)) =
+                            self.overlays.get(entry.idx).map(|overlay| {
+                                (
+                                    overlay.angle_deg,
+                                    overlay.deform_mesh.is_some(),
+                                    overlay.deform_mesh.clone().unwrap_or_else(|| {
+                                        default_overlay_quad_mesh(overlay, view)
+                                    }),
+                                )
+                            })
+                        else {
+                            continue;
+                        };
+
+                        ms_log::trace_log!(
+                            cat::INPUT,
+                            "overlay_drag_begin owner={} idx={} selected_was={:?} reason=drag_started",
+                            if self.selected_overlay_idx == Some(entry.idx) {
+                                "selected"
+                            } else {
+                                "reselect"
+                            },
+                            entry.idx,
+                            self.selected_overlay_idx
+                        );
+                        self.selected_overlay_idx = Some(entry.idx);
+                        let start_mesh_scene = scene_mesh_points(&start_mesh, view);
+                        let start_center_scene = deform_mesh_center_scene(&start_mesh_scene);
+                        let start_pointer_angle_rad =
+                            pointer_angle_rad(start_center_scene, pointer_pos);
+
+                        if self.transform_mode_overlay_idx == Some(entry.idx) {
+                            let _ = self.ensure_overlay_deform_mesh(entry.idx, view);
+                            if let Some(current_mesh) = self
+                                .overlays
+                                .get(entry.idx)
+                                .and_then(|overlay| overlay.deform_mesh.clone())
+                            {
+                                // A handle or brush edits the mesh's SHAPE and keeps `drag_state`;
+                                // anything else in raster transform mode is a whole-layer MOVE and
+                                // goes to the shared move session.
+                                let deform_mode = if let Some(handle_idx) = pointer_on_handle {
+                                    match self.deform_mode {
+                                        TypingDeformMode::Perspective => {
+                                            Some(TypingOverlayDragMode::PerspectiveHandle(handle_idx))
+                                        }
+                                        TypingDeformMode::Bend => {
+                                            Some(TypingOverlayDragMode::BendHandle(handle_idx))
+                                        }
+                                        TypingDeformMode::Frame => {
+                                            Some(TypingOverlayDragMode::FrameHandle(handle_idx))
+                                        }
+                                        TypingDeformMode::Grid => {
+                                            Some(TypingOverlayDragMode::GridHandle(handle_idx))
+                                        }
+                                        // Brush modes own no discrete handles, so a handle hit under
+                                        // one of them is not a handle drag: it falls through to the
+                                        // whole-layer move below.
+                                        TypingDeformMode::Bulge
+                                        | TypingDeformMode::Pinch
+                                        | TypingDeformMode::Push
+                                        | TypingDeformMode::Twirl
+                                        | TypingDeformMode::Restore
+                                        | TypingDeformMode::Smooth
+                                        | TypingDeformMode::Stretch
+                                        | TypingDeformMode::Fold => None,
+                                    }
+                                } else if self.deform_mode.is_brush_mode() && pointer_inside_visual {
+                                    Some(TypingOverlayDragMode::BrushStroke(self.deform_mode))
+                                } else {
+                                    None
+                                };
+                                match deform_mode {
+                                    Some(mode) => {
+                                        ms_log::trace_log!(
+                                            cat::INPUT,
+                                            "overlay_drag_begin transform=true idx={} page={} mode={:?} deform_mode={:?}",
+                                            entry.idx,
+                                            page_idx,
+                                            mode,
+                                            self.deform_mode
+                                        );
+                                        self.drag_state = Some(TypingOverlayDragState {
+                                            overlay_idx: entry.idx,
+                                            page_idx,
+                                            pointer_start_scene: pointer_pos,
+                                            mode,
+                                            start_has_mesh: has_mesh,
+                                            start_angle_deg,
+                                            start_pointer_angle_rad,
+                                            start_mesh: current_mesh,
+                                        });
+                                        self.drag_has_changes = false;
+                                    }
+                                    None => {
+                                        ms_log::trace_log!(
+                                            cat::INPUT,
+                                            "overlay_move_begin transform=true idx={} page={}",
+                                            entry.idx,
+                                            page_idx
+                                        );
+                                        // `false` = the overlay's geometry could not be
+                                        // snapshotted; no session opens, so the press simply does
+                                        // not become a drag (nothing is left half-started).
+                                        if !self.begin_layer_move(
+                                            TypingLayerMoveTarget::Overlay(entry.idx),
+                                            page_idx,
+                                            TypingLayerMoveSource::Pointer,
+                                            Some(pointer_pos),
+                                            view,
+                                        ) {
+                                            ms_log::trace_log!(
+                                                cat::INPUT,
+                                                "overlay_move_begin_failed transform=true idx={} page={}",
+                                                entry.idx,
+                                                page_idx
+                                            );
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        if pointer_on_rotate_handle {
+                            ms_log::trace_log!(
+                                cat::INPUT,
+                                "overlay_drag_begin transform=false idx={} page={} mode=Rotate",
+                                entry.idx,
+                                page_idx
+                            );
+                            self.drag_state = Some(TypingOverlayDragState {
+                                overlay_idx: entry.idx,
+                                page_idx,
+                                pointer_start_scene: pointer_pos,
+                                mode: TypingOverlayDragMode::Rotate,
+                                start_has_mesh: has_mesh,
+                                start_angle_deg,
+                                start_pointer_angle_rad,
+                                start_mesh,
+                            });
+                            self.drag_has_changes = false;
+                        } else {
+                            // Whole-layer move (with or without a deform mesh): one shared primitive,
+                            // which also owns the whole-pixel snap — bound to the first DISPLACEMENT,
+                            // so a bare click no longer moves or dirties the layer.
+                            ms_log::trace_log!(
+                                cat::INPUT,
+                                "overlay_move_begin transform=false idx={} page={}",
+                                entry.idx,
+                                page_idx
+                            );
+                            // `false` = the overlay's geometry could not be snapshotted; no session
+                            // opens, so the press simply does not become a drag.
+                            if !self.begin_layer_move(
+                                TypingLayerMoveTarget::Overlay(entry.idx),
+                                page_idx,
+                                TypingLayerMoveSource::Pointer,
+                                Some(pointer_pos),
+                                view,
+                            ) {
+                                ms_log::trace_log!(
+                                    cat::INPUT,
+                                    "overlay_move_begin_failed transform=false idx={} page={}",
+                                    entry.idx,
+                                    page_idx
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Centering-frame corner drag: resize the transient frame (opposite corner fixed). The
+                // per-frame reconciliation (anchored branch) then moves + saves the LAYER onto the new
+                // frame center, so this handler never mutates the overlay transform itself. Separate
+                // state field, so it runs BEFORE the placement `dragged()` handler.
+                if let Some(state) = self.centering_frame_drag
+                    && state.overlay_idx == entry.idx
+                    && state.page_idx == page_idx
+                {
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                    if response.dragged()
+                        && let Some(pointer_pos) = pointer_pos
+                    {
+                        let pointer_page = page_px_from_scene(image_rect, zoom, pointer_pos);
+                        let (center, half) = centering_frame_corner_drag(
+                            state.start_frame.center_page_px,
+                            state.start_frame.half_size_page_px,
+                            state.corner,
+                            pointer_page,
+                            state.total_angle_deg,
+                            CENTERING_FRAME_MIN_HALF_SIZE_PX,
+                        );
+                        let mut frame_changed = false;
+                        if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                            let next = CenteringFrame {
+                                center_page_px: center,
+                                half_size_page_px: half,
+                            };
+                            // The frame is persisted (schema v4), so a corner resize that moves NO
+                            // layer must still mark the placement dirty — otherwise it would never be
+                            // written. Equality-guarded: a drag frame where the pointer produced the
+                            // same rectangle must not schedule a redundant `layers.json` rewrite.
+                            frame_changed = overlay.centering_frame != Some(next);
+                            overlay.centering_frame = Some(next);
+                        }
+                        if frame_changed {
+                            // EDIT (centering-frame resize): deferred, like every other placement edit.
+                            self.mark_placement_save_dirty();
+                        }
+                        ctx.request_repaint();
+                    }
+                    if response.drag_stopped() {
+                        self.centering_frame_drag = None;
+                    }
+                    continue;
+                }
+
+                // Width-resize drag: change the layer's configured width_px and re-render (latest-wins).
+                // Runs BEFORE the placement `dragged()` handler below, whose `drag_state.take()` would
+                // otherwise `continue` past this block (width resize uses a separate state field).
+                if let Some(state) = self.width_resize_drag
+                    && state.overlay_idx == entry.idx
+                    && state.page_idx == page_idx
+                {
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                    if response.dragged()
+                        && let Some(pointer_pos) = pointer_pos
+                    {
+                        let display_scale = self
+                            .overlays
+                            .get(entry.idx)
+                            .map_or(zoom, |overlay| zoom * overlay.user_scale.max(0.01));
+                        let new_width = width_from_guide_drag(
+                            state.start_width_px,
+                            state.right,
+                            pointer_pos.x - state.pointer_start_x,
+                            display_scale,
+                        );
+                        self.resize_selected_overlay_width(entry.idx, new_width, ctx);
+                    }
+                    if response.drag_stopped() {
+                        self.width_resize_drag = None;
+                    }
+                    continue;
+                }
+
+                if response.dragged() {
+                    // A whole-layer MOVE is driven by the shared move session, not `drag_state`:
+                    // check it FIRST, since the two never coexist for the same overlay.
+                    if self.layer_move_session_targets(
+                        TypingLayerMoveTarget::Overlay(entry.idx),
+                        page_idx,
+                    ) {
+                        if let Some(pointer_pos) = pointer_pos {
+                            self.drive_pointer_layer_move(
+                                TypingLayerMoveTarget::Overlay(entry.idx),
+                                page_idx,
+                                pointer_pos,
+                                view,
+                                strict_pixel_movement,
+                            );
+                        }
+                        continue;
+                    }
+                    let Some(mut state) = self.drag_state.take() else {
+                        continue;
+                    };
+                    if state.overlay_idx != entry.idx || state.page_idx != page_idx {
+                        self.drag_state = Some(state);
+                        continue;
+                    }
+                    let Some(pointer_pos) = pointer_pos else {
+                        self.drag_state = Some(state);
+                        continue;
+                    };
+
+                    let page_size = page_size_from_image_rect(image_rect, zoom);
+                    let raw_delta_page_px = [
+                        (pointer_pos.x - state.pointer_start_scene.x) / zoom.max(f32::EPSILON),
+                        (pointer_pos.y - state.pointer_start_scene.y) / zoom.max(f32::EPSILON),
+                    ];
+                    // Every mode left here is a NON-move gesture, so the drag delta is used raw (the
+                    // whole-pixel quantization belongs to the move session).
+                    let delta_page_px = raw_delta_page_px;
+                    let mut overlay_changed = false;
+                    if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                        let prev_center_page_px = overlay.center_page_px;
+                        let prev_angle = overlay.angle_deg;
+                        let prev_mesh = overlay.deform_mesh.clone();
+                        match state.mode {
+                            // UNREACHABLE in practice, kept only so this match stays exhaustive over
+                            // the project's own enum (CLAUDE.md §17 — no catch-all arm): `MoveMesh`
+                            // is produced solely by `vector_transform.rs`, which drives it through
+                            // its own `vector_transform_drag` state and never through `drag_state`.
+                            TypingOverlayDragMode::MoveMesh => {}
+                            TypingOverlayDragMode::PerspectiveHandle(handle_idx) => {
+                                if handle_idx < 4 {
+                                    overlay.deform_mesh = Some(apply_perspective_corner_drag(
+                                        &state.start_mesh,
+                                        handle_idx,
+                                        delta_page_px,
+                                        page_size,
+                                    ));
+                                    sync_overlay_center_from_deform_mesh(overlay, page_size);
+                                }
+                            }
+                            TypingOverlayDragMode::BendHandle(handle_idx) => {
+                                if handle_idx < bend_handle_count() {
+                                    overlay.deform_mesh = Some(apply_bend_handle_drag(
+                                        &state.start_mesh,
+                                        handle_idx,
+                                        delta_page_px,
+                                        page_size,
+                                    ));
+                                    sync_overlay_center_from_deform_mesh(overlay, page_size);
+                                }
+                            }
+                            TypingOverlayDragMode::FrameHandle(handle_idx) => {
+                                if handle_idx < frame_handle_count(self.frame_handle_side_points) {
+                                    overlay.deform_mesh = Some(apply_sampled_handle_drag(
+                                        &state.start_mesh,
+                                        SampledHandleMode::Frame,
+                                        self.frame_handle_side_points,
+                                        handle_idx,
+                                        self.pull_neighbor_handles,
+                                        delta_page_px,
+                                        page_size,
+                                    ));
+                                    sync_overlay_center_from_deform_mesh(overlay, page_size);
+                                }
+                            }
+                            TypingOverlayDragMode::GridHandle(handle_idx) => {
+                                if handle_idx < grid_handle_count(self.frame_handle_side_points) {
+                                    overlay.deform_mesh = Some(apply_sampled_handle_drag(
+                                        &state.start_mesh,
+                                        SampledHandleMode::Grid,
+                                        self.frame_handle_side_points,
+                                        handle_idx,
+                                        self.pull_neighbor_handles,
+                                        delta_page_px,
+                                        page_size,
+                                    ));
+                                    sync_overlay_center_from_deform_mesh(overlay, page_size);
+                                }
+                            }
+                            TypingOverlayDragMode::BrushStroke(mode) => {
+                                let default_mesh =
+                                    default_overlay_deform_mesh(overlay, view);
+                                overlay.deform_mesh = Some(apply_brush_deform_drag(
+                                    mode,
+                                    &state.start_mesh,
+                                    &default_mesh,
+                                    state.pointer_start_scene,
+                                    pointer_pos,
+                                    view,
+                                    &self.deform_tool_settings,
+                                ));
+                                sync_overlay_center_from_deform_mesh(overlay, page_size);
+                            }
+                            TypingOverlayDragMode::Rotate => {
+                                let start_mesh_scene =
+                                    scene_mesh_points(&state.start_mesh, view);
+                                let center_scene = deform_mesh_center_scene(&start_mesh_scene);
+                                let current_angle = pointer_angle_rad(center_scene, pointer_pos);
+                                let delta_angle = normalize_angle_rad(
+                                    current_angle - state.start_pointer_angle_rad,
+                                );
+                                if state.start_has_mesh {
+                                    let rotated_scene = rotate_mesh_scene(
+                                        &start_mesh_scene,
+                                        center_scene,
+                                        delta_angle,
+                                    );
+                                    let rotated_uv = rotated_scene
+                                        .into_iter()
+                                        .map(|scene| page_px_from_scene(image_rect, zoom, scene))
+                                        .collect::<Vec<_>>();
+                                    overlay.deform_mesh = TypingOverlayDeformMesh::new(
+                                        state.start_mesh.cols,
+                                        state.start_mesh.rows,
+                                        rotated_uv,
+                                        page_size,
+                                    );
+                                    sync_overlay_center_from_deform_mesh(overlay, page_size);
+                                } else {
+                                    overlay.angle_deg = normalize_angle_deg(
+                                        state.start_angle_deg + delta_angle.to_degrees(),
+                                    );
+                                }
+                            }
+                        }
+                        if overlay.center_page_px != prev_center_page_px
+                            || (overlay.angle_deg - prev_angle).abs() > 1e-4
+                            || overlay.deform_mesh != prev_mesh
+                        {
+                            self.drag_has_changes = true;
+                            overlay_changed = true;
+                        }
+                    }
+                    if self.enforce_overlay_visibility_limit(entry.idx, view, strict_pixel_movement)
+                    {
+                        self.drag_has_changes = true;
+                        overlay_changed = true;
+                    }
+                    if overlay_changed {
+                        self.mark_overlay_geometry_changed(entry.idx, true);
+                    }
+                    // A brush stroke ACCUMULATES: re-anchor the start state to what was just
+                    // committed so the next frame's displacement stacks on it.
+                    let brush_continue =
+                        matches!(state.mode, TypingOverlayDragMode::BrushStroke(_));
+                    if brush_continue
+                        && let Some(overlay) = self.overlays.get(entry.idx)
+                    {
+                        state.page_idx = overlay.page_idx;
+                        state.pointer_start_scene = pointer_pos;
+                        state.start_angle_deg = overlay.angle_deg;
+                        if let Some(mesh) = overlay.deform_mesh.clone() {
+                            state.start_mesh = mesh;
+                        }
+                    }
+                    self.drag_state = Some(state);
+                }
+
+                if response.drag_stopped()
+                    && self
+                        .drag_state
+                        .as_ref()
+                        .is_some_and(|state| state.overlay_idx == entry.idx)
+                {
+                    if ms_log::trace::trace_enabled() {
+                        let (center, angle) = self
+                            .overlays
+                            .get(entry.idx)
+                            .map(|o| (o.center_page_px, o.angle_deg))
+                            .unwrap_or(([0.0, 0.0], 0.0));
+                        ms_log::trace_log!(
+                            cat::INPUT,
+                            "overlay_drag_end idx={} committed={} center=({:.1},{:.1}) angle={:.1}",
+                            entry.idx,
+                            self.drag_has_changes,
+                            center[0],
+                            center[1],
+                            angle
+                        );
+                    }
+                    if self.drag_has_changes {
+                        self.flush_overlay_texture_if_stale(entry.idx);
+                        // EDIT (move/rotate drag end): deferred.
+                        self.mark_placement_save_dirty();
+                    }
+                    self.drag_state = None;
+                    self.drag_has_changes = false;
+                }
+            }
+
+            // Клик внутри рамки выделенного оверлея считаем нацеленным на него:
+            // помечаем кадр как «попал в оверлей» (чтобы растровый слой выше не
+            // перехватил фокус, см. `interact_page_rasters`) и подставляем
+            // выделенный индекс в `clicked_overlay_idx`, чтобы не сработал сброс
+            // выделения при клике по «пустому» месту.
+            if click_in_selected_frame {
+                self.primary_pointer_targets_overlay_this_frame = true;
+                if clicked_overlay_idx.is_none() {
+                    clicked_overlay_idx = self.selected_overlay_idx;
+                }
+            }
+
+            self.poll_shape_variant_preview(ui.ctx());
+            if let Some(variant) = self.draw_shape_variant_preview(ui.ctx()) {
+                self.apply_shape_variant_to_overlay(ctx, variant);
+            }
+
+            if let Some(delete_idx) = pending_delete_overlay_idx {
+                self.remove_overlay(delete_idx);
+                return Vec::new();
+            }
+            if let Some(editor_idx) = pending_enter_layout_editor_idx {
+                self.begin_layout_editor_for_overlay(editor_idx, view);
+                ctx.request_repaint();
+            }
+            let popup_open_after = ui.ctx().any_popup_open();
+            let popup_open = popup_open_before || popup_open_after;
+            let delete_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
+            if delete_pressed
+                && !ui.ctx().egui_wants_keyboard_input()
+                && let Some(selected_idx) = self.selected_overlay_idx
+                && self
+                    .overlays
+                    .get(selected_idx)
+                    .is_some_and(|overlay| overlay.page_idx == page_idx)
+            {
+                self.remove_overlay(selected_idx);
+                return Vec::new();
+            }
+
+            let clicked_on_image_without_overlay = ui.input(|i| {
+                i.pointer.primary_clicked()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|pos| image_rect.contains(pos))
+                    && clicked_overlay_idx.is_none()
+            }) && !popup_open
+                && !ms_widgets::input_util::pointer_over_floating_area(ui.ctx())
+                && !eyedropper_blocks_focus_clear;
+            if clicked_on_image_without_overlay {
+                if self
+                    .selected_overlay_idx
+                    .and_then(|idx| self.overlays.get(idx))
+                    .is_some_and(|overlay| overlay.page_idx == page_idx)
+                {
+                    if let Some(selected_idx) = self.selected_overlay_idx
+                        && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
+                    {
+                        snap_overlay_center_to_pixels_if_enabled(
+                            self.overlays
+                                .get_mut(selected_idx)
+                                .expect("selected overlay exists after visibility enforcement"),
+                            strict_pixel_movement,
+                            page_size_from_image_rect(image_rect, zoom),
+                        );
+                        self.mark_overlay_geometry_changed(selected_idx, false);
+                        // EDIT (clamp on click-away). The deselect immediately below is itself a focus
+                        // loss, so `flush_edit_save_on_selection_change` writes this on the same frame.
+                        self.mark_placement_save_dirty();
+                    }
+                    if self.transform_mode_overlay_idx == self.selected_overlay_idx {
+                        self.transform_mode_overlay_idx = None;
+                    }
+                    self.selected_overlay_idx = None;
+                }
+                if self
+                    .drag_state
+                    .as_ref()
+                    .is_some_and(|state| state.page_idx == page_idx)
+                {
+                    self.drag_state = None;
+                    self.drag_has_changes = false;
+                }
+            }
+            if self
+                .transform_mode_overlay_idx
+                .is_some_and(|idx| self.selected_overlay_idx != Some(idx))
+                && !popup_open
+            {
+                self.transform_mode_overlay_idx = None;
+            }
+        }
+
+        // Unified-Z fill pass: interleave the read-only PS raster quads with the text/image overlay
+        // textured meshes in one pass ordered bottom-to-top by band Z. (Selection decorations and
+        // editing handles are drawn afterwards so they always sit on top.)
+        enum MergedFillItem {
+            /// Index into the page's cached `raster_layers_by_page` vector.
+            Raster(usize),
+            /// Index into `draw_entries`.
+            Overlay(usize),
+        }
+        let mut merged_fills: Vec<(u32, u32, MergedFillItem)> = Vec::new();
+        // Rasters: band Z from the matching `Raster` band (else top). Tiebreak `0` keeps the cached
+        // bottom-to-top raster order via the raster index in the third tuple slot's stable sort.
+        if let Some(rasters) = self.raster_layers_by_page.get(&page_idx) {
+            for (raster_idx, raster) in rasters.iter().enumerate() {
+                let band_z = self.raster_band_z(page_idx, &raster.uid);
+                merged_fills.push((band_z, 0, MergedFillItem::Raster(raster_idx)));
+            }
+        }
+        // Overlays: band Z from the overlay's text group / pinned-text band (else top). Tiebreak `1`
+        // so that, within the same band Z, overlays draw above rasters; `draw_entries` is already in
+        // the desired within-group order, preserved by the stable sort.
+        for (entry_pos, entry) in draw_entries.iter().enumerate() {
+            let band_z = self
+                .overlays
+                .get(entry.idx)
+                .map(|overlay| self.overlay_band_z(page_idx, &overlay.uid, overlay.layer_idx))
+                .unwrap_or_else(|| {
+                    self.bands_by_page
+                        .get(&page_idx)
+                        .map(|b| b.len() as u32)
+                        .unwrap_or(0)
+                });
+            merged_fills.push((band_z, 1, MergedFillItem::Overlay(entry_pos)));
+        }
+        // Stable sort: primary band Z, then raster-below-overlay tiebreak; existing raster order and
+        // within-group overlay order are preserved as the stable tiebreak.
+        merged_fills.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, item) in &merged_fills {
+            match item {
+                MergedFillItem::Raster(raster_idx) => {
+                    self.draw_one_raster_layer(ui.ctx(), &painter, view, *raster_idx);
+                }
+                MergedFillItem::Overlay(entry_pos) => {
+                    let entry = &draw_entries[*entry_pos];
+                    // Hide the plain baked PNG while the live VECTOR-transform warped preview is drawn
+                    // for this overlay (`draw_vector_transform_overlay` below textures the un-warped base
+                    // onto the working mesh). Skipping here avoids double-drawing the static + warped
+                    // copies. Falls back to drawing the baked PNG when the preview is not active.
+                    if self.vector_transform_preview_active(entry.idx) {
+                        continue;
+                    }
+                    draw_textured_deform_mesh(
+                        &painter,
+                        entry.texture.id(),
+                        &entry.mesh_scene,
+                        entry.mesh_cols,
+                        entry.mesh_rows,
+                        Color32::WHITE,
+                    );
+                }
+            }
+        }
+
+        for entry in &draw_entries {
+            if !mask_panel_open && self.selected_overlay_idx == Some(entry.idx) {
+                let selection_path = mesh_boundary_path(
+                    &entry.selection_mesh_scene,
+                    entry.mesh_cols,
+                    entry.mesh_rows,
+                );
+                draw_dashed_selection_path(&painter, &selection_path);
+                // Centering assist: over the SELECTED text overlay, draw the page-anchored guide frame
+                // (dashed rect + corner handles) plus the single bound-center marker. The frame rotates
+                // by the TOTAL visual angle (raster + vector). Drawn after the dashed selection path.
+                if self.centering_assist_enabled
+                    && let Some(overlay) = self.overlays.get(entry.idx)
+                    && overlay.kind == TypingOverlayKind::Text
+                    && let Some(frame) = overlay.centering_frame
+                {
+                    let total_angle_deg = overlay.angle_deg
+                        + overlay_render_data_global_rotation_deg(overlay.render_data_json.as_ref());
+                    draw_centering_assist(
+                        &painter,
+                        view,
+                        &CenteringMarker {
+                            quad_scene: entry.quad_scene,
+                            size_px: overlay.size_px,
+                            extra: &overlay.extra,
+                            frame,
+                            total_angle_deg,
+                        },
+                        policy.centering,
+                    );
+                }
+                if let Some(render_width_px) = entry.render_width_px {
+                    // Rotation-invariant source->screen scale (matches `default_overlay_quad_scene`):
+                    // the specified width must not stretch with the overlay's raster rotation.
+                    let display_scale = self
+                        .overlays
+                        .get(entry.idx)
+                        .map_or(zoom, |overlay| zoom * overlay.user_scale.max(0.01));
+                    draw_text_overlay_width_guide(
+                        &painter,
+                        entry.selection_bounds_rect,
+                        render_width_px,
+                        display_scale,
+                    );
+                }
+                // RASTER transform mode draws its handles on the overlay's runtime deform mesh here.
+                // VECTOR transform mode draws its OWN handles/wireframe on the working mesh from
+                // `draw_vector_transform_overlay`, so only the dashed selection path (above) is drawn
+                // here for it. A plain (non-transform) selection shows the rotation handle.
+                let raster_transform_here = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Raster;
+                let vector_transform_here = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector;
+                if raster_transform_here {
+                    match self.deform_mode {
+                        TypingDeformMode::Perspective => {
+                            draw_perspective_handles(&painter, &entry.quad_scene)
+                        }
+                        TypingDeformMode::Bend => draw_bend_handles(
+                            &painter,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                        ),
+                        TypingDeformMode::Frame => draw_frame_handles(
+                            &painter,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                            self.frame_handle_side_points,
+                        ),
+                        TypingDeformMode::Grid => draw_grid_handles(
+                            &painter,
+                            &entry.mesh_scene,
+                            entry.mesh_cols,
+                            entry.mesh_rows,
+                            self.frame_handle_side_points,
+                        ),
+                        _ => {}
+                    }
+                } else if !vector_transform_here {
+                    // Same avoidance as the interaction pass: the rotation handle yields to the
+                    // centering-frame corner handles so the drawn position matches the hit test.
+                    let (corner, handle) =
+                        rotation_handle_scene_with_corner(&entry.quad_scene, image_rect);
+                    let handle = if let Some(corners) =
+                        self.centering_corner_handles_scene(entry.idx, view)
+                    {
+                        let obstacles: [Pos2; 4] = std::array::from_fn(|i| corners[i].1);
+                        push_rotation_handle_clear(
+                            corner,
+                            handle,
+                            &obstacles,
+                            CENTERING_ROTATE_HANDLE_CLEARANCE_PX,
+                        )
+                    } else {
+                        handle
+                    };
+                    draw_rotation_handle_at(&painter, corner, handle);
+                }
+            }
+        }
+        // VECTOR transform mode owns its overlay's interaction + handle/wireframe drawing in a
+        // dedicated pass (drawn after the baked-PNG fill so it sits on top). Gated off while the mask
+        // panel or the layout editor is active, matching the normal overlay interaction gate.
+        if !mask_panel_open && !layout_editor_active {
+            self.draw_vector_transform_overlay(ui, ctx, view, &painter);
+        }
+        if self.layout_editor.is_some() && !mask_panel_open {
+            self.draw_layout_editor_on_page(ui, ctx, view, clip_rect);
+        }
+        if let Some(selected_idx) = self.transform_mode_overlay_idx
+            && self.transform_mode_kind == TypingTransformModeKind::Raster
+            && self.selected_overlay_idx == Some(selected_idx)
+            && self.deform_mode.is_brush_mode()
+            && let Some(selected_entry) =
+                draw_entries.iter().find(|entry| entry.idx == selected_idx)
+            && let Some(pointer_pos) = ui.ctx().input(|i| i.pointer.latest_pos())
+            && deform_mesh_contains_point(
+                &selected_entry.mesh_scene,
+                selected_entry.mesh_cols,
+                selected_entry.mesh_rows,
+                pointer_pos,
+            )
+        {
+            draw_brush_preview(
+                &painter,
+                pointer_pos,
+                self.deform_tool_settings.brush_radius_px,
+            );
+        }
+        self.draw_auto_typing_debug_visuals(&painter, page_idx, image_rect, auto_typing_settings);
+        if !mask_panel_open && !layout_editor_active {
+            self.interact_page_rasters(ui, view, &painter, strict_pixel_movement);
+        }
+        draw_entries
+            .into_iter()
+            .flat_map(|entry| entry.occluder_quads.into_iter())
+            .collect()
+    }
+
+    pub(super) fn wants_repaint(&self) -> bool {
+        self.loading_rx.is_some()
+            || self.create_selection.is_some()
+            || self.create_editor.is_some()
+            || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
+            || self.edit_render_rx.is_some()
+            || self.auto_typing_job.is_some()
+            || self.export_rx.is_some()
+            || self.create_status_error.is_some()
+            || self.create_status_warning.is_some()
+            || self.save_rx.is_some()
+            || !self.pending_upload_indices.is_empty()
+            || self.drag_state.is_some()
+            // A move session must keep frames coming: a KEYBOARD session ends on the first frame
+            // with no arrow held, and without a repaint that frame may never be drawn — stranding
+            // the write until some unrelated interaction.
+            || self.move_session.is_some()
+            || self.vector_transform_drag.is_some()
+            || self.vector_transform_base_rx.is_some()
+            || self.layout_editor.is_some()
+    }
+
+    pub(super) fn enforce_overlay_visibility_limit(
+        &mut self,
+        overlay_idx: usize,
+        view: PageView,
+        strict_pixel_movement: bool,
+    ) -> bool {
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
+        let Some(overlay) = self.overlays.get(overlay_idx) else {
+            return false;
+        };
+        if !image_rect.is_positive() || overlay.size_px[0] == 0 || overlay.size_px[1] == 0 {
+            return false;
+        }
+
+        let bounds = if overlay.deform_mesh.is_some() {
+            let deform_mesh = overlay_deform_mesh(overlay, view);
+            let page_size = view.page_size_px();
+            let bounds_uv = deform_mesh_bounds_uv(&deform_mesh, page_size);
+            if !bounds_uv.is_positive() {
+                return false;
+            }
+            Rect::from_min_max(
+                scene_from_uv(image_rect, bounds_uv.min.x, bounds_uv.min.y),
+                scene_from_uv(image_rect, bounds_uv.max.x, bounds_uv.max.y),
+            )
+        } else {
+            quad_bounds(&default_overlay_quad_scene(overlay, view))
+        };
+
+        // Pull an off-page box back so at least TEXT_OVERLAY_MIN_VISIBLE_FRACTION stays visible. The
+        // shared core (zero desired delta) is also used by `reconcile_centering_frame`, so the two
+        // agree on the feasible position and cannot ping-pong.
+        let (dx, dy) = clamp_translation_within_visible(
+            bounds,
+            image_rect,
+            TEXT_OVERLAY_MIN_VISIBLE_FRACTION,
+            0.0,
+            0.0,
+        );
+        if dx.abs() <= 1e-6 && dy.abs() <= 1e-6 {
+            return false;
+        }
+
+        let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
+            return false;
+        };
+        let page_size = view.page_size_px();
+        if let Some(deform_mesh) = overlay.deform_mesh.as_mut() {
+            let dx_px = dx / zoom.max(f32::EPSILON);
+            let dy_px = dy / zoom.max(f32::EPSILON);
+            deform_mesh.translate(dx_px, dy_px, page_size);
+            sync_overlay_center_from_deform_mesh(overlay, page_size);
+        } else {
+            let dx_px = dx / zoom.max(f32::EPSILON);
+            let dy_px = dy / zoom.max(f32::EPSILON);
+            overlay.center_page_px = clamp_page_point(
+                [
+                    overlay.center_page_px[0] + dx_px,
+                    overlay.center_page_px[1] + dy_px,
+                ],
+                page_size,
+            );
+        }
+        snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, page_size);
+        true
+    }
+}
+
+/// The per-overlay geometry + render inputs `draw_centering_assist` needs to place the guide FRAME
+/// and the bound-center MARKER for one selected text layer.
+struct CenteringMarker<'a> {
+    /// The overlay's on-screen quad (top-left, top-right, bottom-right, bottom-left); the marker is
+    /// mapped through it so it tracks the layer's on-screen position.
+    quad_scene: [Pos2; 4],
+    /// The overlay's rendered image size in pixels (marker UV denominator).
+    size_px: [usize; 2],
+    /// Renderer extra-info carrying the mean/median centers in final-image pixels.
+    extra: &'a RenderedTextExtraInfo,
+    /// The transient page-anchored guide frame.
+    frame: CenteringFrame,
+    /// The frame's VISUAL rotation in degrees (raster `angle_deg` + vector `global_rotation_deg`).
+    total_angle_deg: f32,
+}
+
+/// Paints the centering-assist overlay for a selected text layer: the page-anchored guide FRAME
+/// (cyan/purple dashed rectangle + four hollow corner handles) and the single bound-center MARKER.
+///
+/// `view` supplies the page↔scene transform; `marker` carries the per-overlay geometry (quad, size,
+/// renderer extra-info, frame, total angle); `centering` selects the marker metric (`kind`) and
+/// whether the marker is shown (`show_center`).
+///
+/// Frame points are mapped page-px -> scene DIRECTLY (unclamped): the frame may extend off-page and
+/// the painter's clip rect already bounds it (`scene_from_page_px` would wrongly clamp to page bounds).
+/// The marker is mapped through the overlay's drawn quad so it tracks the layer's on-screen position
+/// (an approximation under multi-cell mesh deformation — it interpolates over the four OUTER quad
+/// corners only, the same approximation the visual-center logic accepts).
+fn draw_centering_assist(
+    painter: &egui::Painter,
+    view: PageView,
+    marker: &CenteringMarker<'_>,
+    centering: TypingCenteringAssistConfig,
+) {
+    let image_rect = view.image_rect;
+    let zoom = view.zoom;
+    // Unclamped page-px -> scene mapping (see the doc note above).
+    let to_scene =
+        |p: [f32; 2]| Pos2::new(image_rect.left() + p[0] * zoom, image_rect.top() + p[1] * zoom);
+
+    // Frame: closed cyan/purple dashed rectangle over the four rotated corners (its own color
+    // pair so it never reads as the black-white selection outline).
+    let corners = centering_frame_corners_page_px(&marker.frame, marker.total_angle_deg);
+    let mut path: Vec<Pos2> = corners.iter().map(|p| to_scene(*p)).collect();
+    if let Some(first) = path.first().copied() {
+        path.push(first);
+    }
+    draw_dashed_path_with_colors(
+        painter,
+        &path,
+        CENTERING_FRAME_DASH_DARK,
+        CENTERING_FRAME_DASH_BRIGHT,
+    );
+
+    // Corner handles: a hollow white ring with a black outline, so the frame corner stays visible inside.
+    for corner in &corners {
+        let center = to_scene(*corner);
+        painter.circle_stroke(
+            center,
+            CENTERING_FRAME_HANDLE_RADIUS_PX,
+            Stroke::new(3.0, Color32::BLACK),
+        );
+        painter.circle_stroke(
+            center,
+            CENTERING_FRAME_HANDLE_RADIUS_PX,
+            Stroke::new(1.5, Color32::WHITE),
+        );
+    }
+
+    // The single bound-center marker (cross + circle), mapped through the overlay's drawn quad. Gated
+    // by "Показывать центр": the frame + handles above always draw while assist is on, only the marker
+    // is optional.
+    if centering.show_center {
+        let chosen_img = centering_chosen_img_px(marker.size_px, marker.extra, centering.kind);
+        let width = marker.size_px[0].max(1) as f32;
+        let height = marker.size_px[1].max(1) as f32;
+        let marker_pos = bilinear_quad_point(
+            marker.quad_scene,
+            (chosen_img[0] / width).clamp(0.0, 1.0),
+            (chosen_img[1] / height).clamp(0.0, 1.0),
+        );
+        let color = Color32::RED;
+        painter.line_segment(
+            [marker_pos + Vec2::new(-7.0, 0.0), marker_pos + Vec2::new(7.0, 0.0)],
+            Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [marker_pos + Vec2::new(0.0, -7.0), marker_pos + Vec2::new(0.0, 7.0)],
+            Stroke::new(1.5, color),
+        );
+        painter.circle_stroke(marker_pos, 10.0, Stroke::new(1.5, color));
+    }
+}
+
+impl TypingTextOverlayLayer {
+    /// Scene positions of the centering-frame corner handles for overlay `idx`, when the assist
+    /// is active for it (assist enabled + overlay selected + text overlay with a frame). Shared
+    /// by the interaction pass (hit rects / drag classification) and the decoration pass
+    /// (rotation-handle avoidance) so both see identical geometry. Callers gate transform mode.
+    fn centering_corner_handles_scene(
+        &self,
+        idx: usize,
+        view: PageView,
+    ) -> Option<[(CenteringFrameCorner, Pos2); 4]> {
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
+        if !self.centering_assist_enabled || self.selected_overlay_idx != Some(idx) {
+            return None;
+        }
+        let overlay = self.overlays.get(idx)?;
+        if overlay.kind != TypingOverlayKind::Text {
+            return None;
+        }
+        let frame = overlay.centering_frame?;
+        let total_angle_deg = overlay.angle_deg
+            + overlay_render_data_global_rotation_deg(overlay.render_data_json.as_ref());
+        let corners_page = centering_frame_corners_page_px(&frame, total_angle_deg);
+        // Unclamped page-px -> scene mapping: the frame may extend off-page (see
+        // `draw_centering_assist`).
+        Some(std::array::from_fn(|i| {
+            (
+                CenteringFrameCorner::ALL[i],
+                Pos2::new(
+                    image_rect.left() + corners_page[i][0] * zoom,
+                    image_rect.top() + corners_page[i][1] * zoom,
+                ),
+            )
+        }))
+    }
+
+    /// Per-frame centering-assist reconciliation for the selected text overlay on `page_idx`.
+    ///
+    /// Invariant (while assist is on for the selected overlay): the chosen center (page px) equals the
+    /// frame center. The frame is created lazily (center = chosen center, half-size = the layer
+    /// footprint scaled by `CENTERING_FRAME_DEFAULT_SCALE`). When a whole-layer MOVE drag is active the
+    /// frame FOLLOWS the layer; otherwise (re-render, rotation, kind switch, corner-frame resize) the
+    /// frame stays anchored and the LAYER is translated back so the binding holds. The anchored move
+    /// targets a FIXED POINT of the downstream position-correcting systems (`centering_reconcile_target_center`
+    /// applies the visibility limit, `strict_pixel_movement` snapping, and the apply-step page/box clamp
+    /// BEFORE deciding to move), so an unreachable off-page frame center converges in one move without
+    /// ping-ponging against `enforce_overlay_visibility_limit` or strict-pixel snapping. Deform meshes
+    /// translate rigidly (`translate_rigid`, shape preserved). Layer moves defer their save via
+    /// `mark_placement_save_dirty`; a move already at the fixed point marks nothing and requests no
+    /// repaint, so it cannot busy-loop at a page edge.
+    pub(super) fn reconcile_centering_frame(
+        &mut self,
+        ctx: &egui::Context,
+        view: PageView,
+        strict_pixel_movement: bool,
+    ) {
+        let page_idx = view.page_idx;
+        if !self.centering_assist_enabled {
+            return;
+        }
+        let Some(idx) = self.selected_overlay_idx else {
+            return;
+        };
+        // Do not fight the on-canvas raster/vector transform mode, which owns the selected overlay's
+        // geometry while active.
+        if self.transform_mode_overlay_idx == Some(idx) {
+            return;
+        }
+        let kind = self.centering_assist_kind;
+        let page_size = view.page_size_px();
+        let Some(overlay) = self.overlays.get(idx) else {
+            return;
+        };
+        if overlay.kind != TypingOverlayKind::Text || overlay.page_idx != page_idx {
+            return;
+        }
+        let chosen = centering_chosen_center_page_px(overlay, kind, page_size);
+        let Some(frame) = overlay.centering_frame else {
+            // Lazy creation: center on the chosen point, sized `CENTERING_FRAME_DEFAULT_SCALE` larger
+            // than the layer footprint (half-size in the frame's local axes).
+            let scale = overlay.user_scale.max(0.01);
+            let half = [
+                (overlay.size_px[0] as f32 * scale * 0.5 * CENTERING_FRAME_DEFAULT_SCALE)
+                    .max(CENTERING_FRAME_MIN_HALF_SIZE_PX),
+                (overlay.size_px[1] as f32 * scale * 0.5 * CENTERING_FRAME_DEFAULT_SCALE)
+                    .max(CENTERING_FRAME_MIN_HALF_SIZE_PX),
+            ];
+            let mut frame_created = false;
+            if let Some(overlay) = self.overlays.get_mut(idx) {
+                overlay.centering_frame = Some(CenteringFrame {
+                    center_page_px: chosen,
+                    half_size_page_px: half,
+                });
+                frame_created = true;
+            }
+            if frame_created {
+                // The frame is persisted (schema v4); the lazy creation is the only chance to record
+                // it when the user never resizes or moves anything afterwards. Runs exactly once per
+                // overlay (the branch is `centering_frame == None`), so it cannot mark per frame.
+                self.mark_placement_save_dirty();
+            }
+            return;
+        };
+        // An open move session on this overlay makes the frame FOLLOW, regardless of what drives it
+        // (pointer or arrows); a Rotate drag, corner-frame resize, re-render, or kind switch leaves
+        // the frame anchored (the layer moves back).
+        let move_drag_active = self
+            .move_session
+            .as_ref()
+            .is_some_and(|session| session.target == TypingLayerMoveTarget::Overlay(idx));
+        if move_drag_active {
+            if let Some(overlay) = self.overlays.get_mut(idx)
+                && let Some(frame) = overlay.centering_frame.as_mut()
+            {
+                frame.center_page_px = chosen;
+            }
+            return;
+        }
+        // Anchored: move the LAYER toward the frame center, but to a FIXED POINT of the downstream
+        // position-correcting systems (visibility limit + strict-pixel snap + the apply-step page/box
+        // clamp). Comparing the CONSTRAINED target against the current center (not chosen vs frame)
+        // makes the state converge in one move even when the frame center is unreachable off-page: no
+        // ping-pong with `enforce_overlay_visibility_limit`, no strict-pixel alternation, and (for a
+        // deform mesh) rigid-only translation that cannot cumulatively squash the mesh at a page edge.
+        let is_deform = overlay.deform_mesh.is_some();
+        let bounds = centering_overlay_page_bounds(overlay, view, page_size);
+        let current_center = overlay.center_page_px;
+        let target = centering_reconcile_target_center(
+            current_center,
+            chosen,
+            frame.center_page_px,
+            bounds,
+            is_deform,
+            strict_pixel_movement,
+            page_size,
+        );
+        let dx = target[0] - current_center[0];
+        let dy = target[1] - current_center[1];
+        if dx.hypot(dy) <= CENTERING_RECONCILE_EPS_PX {
+            // Already at the fixed point: nothing moves, so mark nothing and request no repaint.
+            return;
+        }
+        let mut moved = false;
+        if let Some(overlay) = self.overlays.get_mut(idx) {
+            let before = overlay.center_page_px;
+            if let Some(mesh) = overlay.deform_mesh.as_mut() {
+                mesh.translate_rigid(dx, dy, page_size);
+                sync_overlay_center_from_deform_mesh(overlay, page_size);
+            } else {
+                overlay.center_page_px =
+                    clamp_page_point([before[0] + dx, before[1] + dy], page_size);
+            }
+            // Belt-and-suspenders on top of the fixed-point gate above: only commit when the center
+            // actually moved, so a fully-clamped frame does not mark dirty + repaint every frame.
+            moved = (overlay.center_page_px[0] - before[0]).abs() > 1e-3
+                || (overlay.center_page_px[1] - before[1]).abs() > 1e-3;
+        }
+        if moved {
+            self.mark_overlay_geometry_changed(idx, true);
+            // EDIT (centering-assist auto-recenter): deferred, like every other placement edit.
+            self.mark_placement_save_dirty();
+            ctx.request_repaint();
+        }
+    }
+
+    /// Snaps the selected overlay's centering frame center onto the layer's chosen center (frame
+    /// FOLLOWS the layer). Called after an explicit non-drag layer move (arrow-key nudge) so the
+    /// reconciliation does not yank the frame back. No-op when assist is off or no frame exists.
+    pub(super) fn sync_centering_frame_to_layer(&mut self, overlay_idx: usize, page_size: [usize; 2]) {
+        if !self.centering_assist_enabled {
+            return;
+        }
+        let kind = self.centering_assist_kind;
+        let Some(overlay) = self.overlays.get(overlay_idx) else {
+            return;
+        };
+        if overlay.kind != TypingOverlayKind::Text || overlay.centering_frame.is_none() {
+            return;
+        }
+        let chosen = centering_chosen_center_page_px(overlay, kind, page_size);
+        if let Some(overlay) = self.overlays.get_mut(overlay_idx)
+            && let Some(frame) = overlay.centering_frame.as_mut()
+        {
+            frame.center_page_px = chosen;
+        }
+    }
+}

@@ -1,0 +1,106 @@
+[package]
+name = "ms-launcher"
+version = "0.1.0"
+edition = "2024"
+
+# The ManhwaStudio launcher: the application shell shown before a chapter is opened —
+# project catalogue, the detached "New Project" window (quick download, advanced download,
+# stitching, ribbon slicing, waifu2x, reline, the batch-processing graph), PSD/PSB import,
+# import/export pages, the first-run language modal and the launcher settings page.
+#
+# It is effectively a SECOND application, not a layer of the editor: the studio
+# (`src/app.rs` and the tab crates) does not reference it at all — only `src/main.rs` and
+# `src/web_entry.rs` do, through the `crate::launcher` re-export. It sits at the very top
+# of the stack, next to the studio, and nothing may depend on it.
+[features]
+# In-app onboarding tour of the launcher and the new-project window. Off by default and
+# forwarded from the ROOT crate's feature of the same name. Features are NOT inherited, so
+# this must also forward to `ms-settings-ui/tutorial`, where the overlay engine, the
+# controller and the persisted progress live — the launcher only owns the step scripts.
+tutorial = ["ms-settings-ui/tutorial"]
+
+[dependencies]
+# `user_config.json` (projects root, UI language, launcher preferences), `program_dir()` /
+# `data_dir()`, and `locale_store` for the editable on-disk UI locale catalog.
+ms-config = { path = "../ms-config" }
+# Diagnostics of every launcher flow (`ms_log::runtime_log`) — 130 call sites.
+ms-log = { path = "../ms-log" }
+# The catalogue scan of the projects root (titles, chapters, chapter validity).
+ms-project = { path = "../ms-project" }
+# Every widget the launcher is built from, plus `ui_fonts` for the window's font stack.
+ms-widgets = { path = "../ms-widgets" }
+# The settings surface shared with the studio: the settings page embeds
+# `SharedSettingsPanels`, the first-run modal reuses the locale helpers of the General
+# pane, and the launcher drives the same `AiBackendHandle` supervisor.
+ms-settings-ui = { path = "../ms-settings-ui" }
+# Host probes: GPU list, app-local Python discovery (settings page console), desktop
+# region capture (new-project screenshot source), clipboard paste and the AI install probe.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# Framed IPC with the Python AI backend: reline and the advanced download / batch nodes
+# call backend methods directly.
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# The installer/updater subsystem: the settings page offers environment repair and the
+# Torch re-install flow, and startup routes update intents through it.
+ms-installer = { path = "../ms-installer" }
+# `backend_health` — the reline flow checks the AI backend before starting.
+ms-tab-translation = { path = "../ms-tab-translation" }
+# `wiki::WikiTabState` — the launcher hosts the same wiki view as the editor.
+ms-tabs-simple = { path = "../ms-tabs-simple" }
+# The typesetting-language model behind the first-run language modal.
+ms-text-util = { path = "../ms-text-util" }
+# `t!` / `tf!` / `tp!` plus `resolve_key` for runtime-chosen catalog keys; the macros are
+# mounted crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Named worker threads: catalogue scans, downloads, stitching and image conversion never
+# run on the GUI thread.
+ms-thread = { path = "../ms-thread" }
+# The launcher windows are `eframe` applications; same feature set as the binary so no
+# second copy of the backend is built.
+eframe.workspace = true
+egui.workspace = true
+# Catalogue documents, downloader manifests and the batch-processing graph format.
+serde.workspace = true
+serde_json.workspace = true
+# Aggregated context on launcher startup failures (`anyhow::Result` entry points).
+anyhow.workspace = true
+# Page decoding/encoding for import, stitching, ribbon slicing and thumbnails.
+image.workspace = true
+# Independent pages are converted/stitched in parallel over the global pool.
+rayon.workspace = true
+# Wall-clock and monotonic time in the download/progress reporting; wasm-safe.
+web-time.workspace = true
+
+# Native-only halves. The launcher owns a real OS window and reaches the network and the
+# filesystem; its wasm build keeps the module signatures and returns "unavailable on web"
+# (see the `cfg(target_arch = "wasm32")` stub of `run_launcher_internal` in `lib.rs`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Startup placement of the launcher window on the user's chosen monitor.
+ms-window-geometry = { path = "../ms-window-geometry" }
+# Native file/folder dialogs of import, export and the new-project sources.
+rfd.workspace = true
+# HTTP for the quick/advanced downloaders and the site adapters.
+ureq.workspace = true
+# Chapter archives arrive as `.zip`, `.tar.gz` and `.tar.zst`.
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zstd.workspace = true
+# In-process PSD/PSB parsing for the import window.
+ag-psd.workspace = true
+# Timestamps in generated project/chapter names.
+chrono.workspace = true
+# waifu2x/upscaler dylib loading.
+libloading.workspace = true
+# The system UI-locale probe that preselects a language in the first-run modal.
+sys-locale.workspace = true
+
+[dev-dependencies]
+# Isolated on-disk fixtures for the catalogue/import tests.
+tempfile.workspace = true
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, which every test asserting `t!`
+# text must hold while it installs a catalog (the active catalog is a process-global).
+# A `#[cfg(test)]` item is invisible across a crate boundary, hence the feature; and cargo
+# does NOT unify features for a standalone `cargo check -p ms-launcher`, so it has to be
+# named here and not only in the binary's dev-dependencies.
+ms-config = { path = "../ms-config", features = ["test-support"] }

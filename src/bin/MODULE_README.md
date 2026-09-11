@@ -9,9 +9,12 @@ Each binary owns its test app state and should call shared modules only when it 
 real behavior. Heavy work must be moved to a background thread just as it would be in the main
 application.
 
-Some binaries include shared source with `#[path = ...]` because the project has no library target.
-That is acceptable for diagnostics, but production behavior must still live in normal `src/`
-modules used by the main application.
+Shared UI code is reached through a normal crate dependency (`ms-widgets` and the other `ms-*`
+crates), NOT through `#[path = ...]`. The one remaining `#[path]` mount is
+`tutorial_test` -> `crates/ms-settings-ui/src/tutorial/engine.rs`: that module is gated behind the
+`tutorial` feature there, which the demo must build WITHOUT, and it still has
+no library target. Production behavior must live in a crate or in a normal `src/` module used by
+the main application, never in a binary-local fork.
 
 ## Files and submodules
 - `text_edit_plus_test.rs`: focused egui tester for `TextEditPlus` text colors and ordered
@@ -23,8 +26,10 @@ modules used by the main application.
 
 ## Contracts and invariants
 - Test binaries must not introduce fake behavior into runtime modules.
-- Binaries may include shared source files with `#[path = ...]` when no library target exists, but
-  the included module must remain usable by the main application.
+- Shared code comes from a workspace crate. `#[path = ...]` is allowed only for a module that
+  cannot be reached as a normal item (today: `crates/ms-settings-ui/src/tutorial/engine.rs`, which
+  is behind a feature the demo does not enable), and the mounted module
+  must remain usable by the main application unchanged.
 - GUI test binaries should report startup errors to stderr.
 - Diagnostic code may use fixed fixture paths, but missing fixtures must fail visibly instead of
   producing placeholder data.

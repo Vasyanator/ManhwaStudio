@@ -1,0 +1,168 @@
+# Module: crates/ms-backend-ipc/src
+
+## Purpose
+Rust side of the Rust <-> Python AI-backend IPC. Provides a framed, multiplexed
+request/response + event client (`BackendClient`) over a pluggable byte transport.
+Every Rust subsystem reaches the backend through this crate (usually via the
+process-wide `shared_client()`); no other code opens its own backend connection.
+
+This is a standalone workspace crate. The binary mounts it under its historical module
+path with `pub use ms_backend_ipc as backend_ipc;` (`src/main.rs`), so every application
+call site keeps writing `crate::backend_ipc::…`.
+
+## Architecture
+Two layers, cleanly separated:
+
+1. Frame codec (`frame.rs`) — the wire format
+   `[u32 BE header_len][header_json][u32 BE blob_len][blob]`. `header_json` is a
+   UTF-8 JSON object; `blob` is raw binary. Size guards (`protocol::MAX_*`) are
+   enforced before allocation. `read_frame` uses fill-to-length loops, so it does
+   NOT assume one transport read == one frame.
+
+2. Pluggable transport (`transport.rs`) — carries the codec bytes:
+   - `Inner::Unix`: AF_UNIX `UnixStream` (default on Linux/Windows).
+   - `Inner::Ws`: loopback WebSocket. A dedicated I/O thread OWNS the
+     `tungstenite::WebSocket<TcpStream>`; app code never touches the socket. It
+     exchanges bytes through `WsShared`: an inbound `VecDeque<u8>` byte queue
+     (Condvar-signalled) and an outbound `mpsc` channel of whole buffers the I/O
+     thread sends as WS BINARY messages. The single I/O thread multiplexes read and
+     write on one WebSocket by using a short poll read timeout
+     (`WS_IO_POLL_INTERVAL`); the caller's app-level read timeout is enforced via the
+     inbound Condvar, never on the TCP socket.
+
+Data flow (per request): `BackendClient::begin_call` -> `write_frame` on the shared
+write half -> transport -> Python. The background `reader_loop` (`client.rs`) decodes
+frames with `read_frame` and demultiplexes by correlation `id` (responses/progress ->
+the waiting caller; `event{id:0}` -> per-topic subscribers). Reconnect is transparent
+on the next `call` after the reader observes EOF/error.
+
+Transport selection: `current_backend_endpoint()` returns `Unix(backend_socket_path())`
+on unix and the WS endpoint published via `set_ws_endpoint()` on windows. The backend
+supervisor (a different module) parses the backend's `MS_BACKEND_WS_PORT=<port>` line
+and calls `set_ws_endpoint(port, token)`.
+
+### Rejected alternatives (do not re-propose)
+Three ways out of "CPython on Windows cannot bind AF_UNIX" were weighed; the WS fallback won.
+
+- **Bump the managed Python to the release that adds Windows AF_UNIX (3.15).** Not reachable:
+  the managed runtime is pinned to 3.11 (`installer::utils::PYTHON_VERSION_REQUEST`) and the
+  compiled ML stack (torch and the rest) publishes no cp315 wheels.
+- **A Rust ctypes shim so the Python side speaks AF_UNIX anyway**, either hosting the socket or
+  — with client/server roles flipped — dialling it. Rejected: a hand-written FFI layer on the
+  IPC hot path, for one platform, reusable nowhere else.
+- **Loopback WebSocket (chosen).** Dependency-light on both sides (`tungstenite` in Rust,
+  `wsproto` in Python), and it is the only transport a browser can ever use — so a future web
+  client reuses this module's codec unchanged instead of needing a fourth transport.
+
+Socket isolation: `backend_socket_path()` normally yields the shared
+`manhwastudio_backend_socket` path. Under `--ignore-installed`, `main.rs` calls
+`seed_isolated_backend_socket_name(program_dir)` right after CLI parsing, which appends
+a stable FNV-1a-64 digest of the canonicalized runtime root to the file name. That makes
+a copy launched from a source checkout use its own socket instead of adopting (or being
+adopted by) an installed copy's backend. The WS transport needs no equivalent: its port
+is ephemeral and published per process.
+
+## Files and submodules
+- `lib.rs`: crate root and re-exports (`BackendClient`, `CallError`, `CallHandle`,
+  `shared_client`, `Frame`, `read_frame`, `write_frame`, `backend_socket_path`,
+  `seed_isolated_backend_socket_name`, and — native only — `BackendEndpoint`,
+  `set_ws_endpoint`, `current_backend_endpoint`).
+- `protocol.rs`: constants mirroring `modules/ai_backend/ipc/protocol.py` (version,
+  kinds, statuses, topics, method names, header keys) + header builders. Values must
+  match Python byte-for-byte. Edit here when the shared contract changes. Its
+  `python_protocol_version_matches_rust` test reads the Python file and asserts the
+  two `PROTOCOL_VERSION` constants agree.
+- `frame.rs`: the frame codec (`Frame`, `read_frame`, `write_frame`). Edit here for
+  wire-format / size-guard changes.
+- `transport.rs`: connection primitives — `BackendStream` (Read/Write/clone/shutdown),
+  `BackendEndpoint`, `connect_path`/`connect_ws`/`connect_endpoint`, the WS I/O thread
+  (`ws_io_loop`, `WsShared`, `WsHandle`), and the process-global WS endpoint holder.
+  Edit here to change how connections are opened, timed out, or torn down.
+- `client.rs`: `BackendClient`, `CallHandle`, reader thread, id demux, reconnect, event
+  subscriptions, `shared_client()`. A `#[cfg(wasm32)]` stub mirrors the public surface
+  and returns clear errors (no backend on web). Edit here for routing/lifecycle logic.
+
+## Contracts and invariants
+- Crate boundary: this crate depends on `ms-log` (diagnostics), `ms-i18n` (user-facing
+  failure strings), `ms-thread` (worker threads), `serde_json` and `web-time`, plus
+  `tungstenite` (native) and `uds_windows` (Windows). It must NOT gain a dependency on
+  application layers (`config`, `project`, the tabs) or on egui — the whole point of the
+  extraction is that it is a GUI-free leaf that type-checks in parallel with the binary.
+- `PROTOCOL_VERSION` is the ONLY compatibility gate between the application and the
+  Python backend. `verify_hello` hard-compares the `v` header of the server `hello`
+  against `protocol::PROTOCOL_VERSION` and refuses the connection on any difference
+  (`backend_ipc.client.protocol_version_mismatch`). Bump the constant in BOTH
+  `crates/ms-backend-ipc/src/protocol.rs` and `modules/ai_backend/ipc/protocol.py` whenever the
+  Rust <-> Python contract changes; the parity test in `protocol.rs` guards the mirror.
+- The PROGRAM version is never compared. `backend_version` from the `hello` header
+  (`BackendClient::backend_version()`) and from the health snapshot is DIAGNOSTIC only:
+  it is logged once per handshake so a mixed installation is visible in `last.log`, and
+  it must never gate a feature or raise UI.
+- The STUDIO half of that same log line comes from `client::set_studio_version`, a
+  write-once process-global the BINARY seeds at startup (`src/main.rs`, from
+  `HOST_VERSION.core`). This crate cannot read it for itself: `env!("CARGO_PKG_VERSION")`
+  compiled here expands to the library's own `0.1.0`. Unseeded it logs `<unknown>` rather
+  than a plausible-looking wrong number. It is diagnostic only — `hello_header()` does not
+  carry it, so it is not part of the wire contract and never affects `PROTOCOL_VERSION`.
+- Wire bytes are identical on both transports; the receiver treats all payloads as one
+  ordered byte stream and delimits frames by the length prefixes (WS: do NOT assume one
+  WS message == one frame).
+- Shutdown -> EOF contract: `BackendStream::shutdown()` on any clone must make a blocked
+  `read()` on a SIBLING clone return `Ok(0)`. The reader thread's clean exit depends on
+  this. Unix relies on `shutdown(Both)`; WS sets `closed`, wakes the inbound Condvar,
+  drops the outbound sender, and shuts the retained TCP clone down to unblock the I/O
+  thread.
+- One `write` == one whole buffer (frame). The WS `write` returns `buf.len()` and never
+  fragments a frame across WS messages; frame atomicity against concurrent writers still
+  comes from the `write_half` mutex in `client.rs`.
+- The auth token is never logged (only the WS port). WS handshake never enables TLS
+  (loopback only) so the x86_64-pc-windows-gnu target keeps building.
+- The GUI thread never blocks here: all backend I/O runs on the reader/I-O worker
+  threads; callers use `call`/`begin_call` with timeouts.
+
+## Live cross-language test (`live_backend_roundtrip_and_health_push`)
+The only test here that talks to a REAL Python backend instead of the in-process `TestServer`. It
+is `#[ignore]`d, so ordinary `cargo test` and CI never spawn Python. It spawns `ai_backend.py` from the repo root on a
+UNIQUE temp socket (`ms_ipc_live_<pid>_<ns>` in the temp dir, so a real backend is never clobbered),
+connects a real `BackendClient` to it, and asserts: the `hello` handshake populates
+`backend_version`; a `health` call returns the contracted keys (`ok`, `service == "mf_ai_backend"`,
+`backend_version`, `is_torch_available`) with no blob; a `browser.command` `version` call answers;
+and `subscribe(TOPIC_HEALTH)` receives a SERVER-PUSHED `health` event within 8 s (the point of the
+whole framed-protocol rework). A `Drop` guard kills the backend and removes the temp socket/log even
+on panic. Run it from the repo root:
+
+```sh
+cargo test -p ms-backend-ipc client::tests::live_ -- --ignored --nocapture
+```
+
+Every path the test uses (the repo root it runs `ai_backend.py` from, and the default interpreter)
+is derived from `CARGO_MANIFEST_DIR` by stripping two components — `cargo test` sets the cwd to the
+PACKAGE root, so a cwd-relative path would resolve inside `crates/ms-backend-ipc/`. The command can
+therefore be run from anywhere. `MS_IPC_PYTHON` overrides the interpreter (default
+`<repo>/venv/bin/python`) and is passed to `Command::new` verbatim, so an override must be an
+absolute path or a name resolvable on `PATH`. `--ignored` is required and `--nocapture` shows the
+`[live] …` progress lines.
+
+Torch caveat: the pushed event comes from the backend's health worker, which publishes only after
+`_build_health_snapshot` returns. Individual services are isolated by `_safe_service_health`
+(`modules/ai_backend/server.py`) — one that raises (e.g. `surya.health()`, which imports torch
+unconditionally) yields a `{"status":"error"}` sub-entry instead of sinking the snapshot — so a venv
+with a broken torch still pushes events, just with error placeholders and `is_torch_available:
+false`. A timeout at step (3) is therefore a real backend/protocol failure, not an expected torch
+symptom: read the backend log the test prints before blaming the environment.
+
+## Editing map
+- To change the wire format or size guards, see `frame.rs` (+ `protocol.rs` guards) and
+  keep `modules/ai_backend/ipc` in sync.
+- To add/adjust a method, topic, or header key, see `protocol.rs` (mirror Python), and
+  bump `PROTOCOL_VERSION` on both sides — on ANY such change, not only one judged breaking.
+  That judgement is the thing that gets made wrong, and bumping costs nothing here.
+- To change how a connection is opened, timed out, or shut down, see `transport.rs`.
+- To change the socket path (including the per-root isolation), see `transport.rs` — it is the
+  single source both the IPC client and the supervisor's `--socket` argument read from. The
+  isolation seed is process-global and must stay write-once, before any client or supervisor
+  exists.
+- To add a new transport variant, extend `BackendEndpoint` + `Inner` and match all arms
+  (no `_ =>` on the project enums), then wire it into `connect_endpoint`.
+- To change request routing, reconnect, or subscriptions, see `client.rs`.
+- The WS endpoint is published from the backend supervisor via `set_ws_endpoint`.

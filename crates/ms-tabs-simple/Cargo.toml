@@ -1,0 +1,61 @@
+[package]
+name = "ms-tabs-simple"
+version = "0.1.0"
+edition = "2024"
+
+# The four small, self-contained project-editor tabs extracted whole from `src/tabs/`:
+# «Персонажи» (`characters`), «Термины» (`terms`), «Заметки» (`notes`) and «Вики»
+# (`wiki`). They share one crate deliberately: each is a single file of ~600-1600 lines
+# with the same tiny dependency set, and four separate crates would only lengthen the
+# dependency chain that this whole split exists to shorten.
+#
+# Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::{characters, terms,
+# notes, wiki}`, so every existing `crate::tabs::characters::…` call site keeps its path.
+#
+# Layer: near the TOP of the library stack — above the project model, the widgets and the
+# storage seam, and below `app.rs` / `launcher/app.rs` (which own the tab states) and the
+# `translation` tab (which reads character and term note entries). It must never name
+# `app`, `launcher` or another tab.
+
+[dependencies]
+# The chapter/project domain model every one of the four tabs reads its paths from.
+ms-project = { path = "../ms-project" }
+# `WheelComboBox` for the character/term category pickers (`egui::ComboBox` is banned in
+# product UI).
+ms-widgets = { path = "../ms-widgets" }
+# The storage seam every JSON/markdown/image read and write goes through, so the web
+# build can swap the backend.
+ms-storage = { path = "../ms-storage" }
+# `paste_image`: the system clipboard image reader behind the character portrait paste.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# Background loaders (character portraits, note aggregation, wiki markdown parsing) go
+# through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Localized labels (`t!` / `tf!` / `tp!`, mounted crate-wide in `lib.rs`) plus the active
+# locale tag the wiki uses to pick its per-language document directory.
+ms-i18n = { path = "../ms-i18n" }
+# All four tabs draw.
+egui.workspace = true
+eframe.workspace = true
+# Character portraits and wiki images are decoded and re-encoded here.
+image.workspace = true
+# Persisted `characters.json` / `terms.json`.
+serde.workspace = true
+serde_json.workspace = true
+# Monotonic time that also works in a web build (note-refresh debounce).
+web-time.workspace = true
+
+# Native-only: the wiki's remote-image loader is a blocking HTTP GET. There is no
+# synchronous HTTP client on wasm, where `load_remote_image_rgba` compiles to an error
+# stub instead. Same version and feature set as the root manifest, so the two share one
+# copy in the graph.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq.workspace = true
+
+[dev-dependencies]
+# Same crate the binary declares, pulled in for TEST builds only to switch on
+# `test-support`: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock
+# every test that installs a UI locale must hold (the active catalog is one `ArcSwap`).
+# The wiki's plural-form test is the only user, which is why `ms-config` is absent from
+# `[dependencies]` entirely.
+ms-config = { path = "../ms-config", features = ["test-support"] }

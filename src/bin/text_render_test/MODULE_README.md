@@ -6,7 +6,7 @@ cosmic-text layout, rasterization, shape-aware wrapping, inline bold/italic tags
 post-render text effects in a small egui preview app.
 
 This directory is not a production entry point. Production typing behavior should live under
-`src/tabs/typing/` and be called from application code rather than copied from this test binary.
+`crates/ms-tab-typing/src/` and be called from application code rather than copied from this test binary.
 
 ## Architecture
 `src/bin/text_render_test.rs` owns the egui app shell, control state, font discovery, render job
@@ -68,5 +68,5 @@ RGBA buffer, and sequential application of JSON-described effects.
   or PNG save behavior, edit `src/bin/text_render_test.rs`.
 - To change renderer inputs, glyph layout, wrapping, hyphenation, RGBA compositing, or effect
   semantics for this diagnostic binary, edit `render.rs`.
-- To align this diagnostic with production typing output, compare against `src/tabs/typing/` and
+- To align this diagnostic with production typing output, compare against `crates/ms-tab-typing/src/` and
   move reusable production behavior there instead of making this directory the runtime owner.

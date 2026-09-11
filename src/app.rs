@@ -5,10 +5,10 @@ background page/overlay loading, tab routing, and global hotkey dispatch.
 
 Main structs:
 - `MangaApp`: root app state (project, shared models, canvas/tabs, loaders, hotkeys).
-- `PageImageInfo`: source-page geometry and load state independent from GPU residency.
-- `PageTexture` / `TextureTile`: tiled source-page GPU residency backed by decoded tile bytes.
 - `DecodedTile` / `DecodedPage`: background decode payload before GPU upload.
 - `UploadTask`: incremental texture upload state with per-frame budget.
+The source-page view model it fills in (`PageImageInfo`, `SourcePageLoadState`, `PageTexture`,
+`TextureTile`) lives in `crates/ms-models/src/page_view.rs`.
 
 Async/background pipeline:
 - `spawn_loader_thread`: one unified worker pool decodes BOTH source pages and clean overlays
@@ -68,6 +68,7 @@ use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snaps
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::{ComicType, ProjectData, save_comic_type_to_project_file};
 use crate::page_ops::{PageOpKind, PageOpOutcome, execute_page_op};
+use crate::page_view::{PageImageInfo, PageTexture, SourcePageLoadState, TextureTile};
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
@@ -245,7 +246,7 @@ pub struct MangaApp {
     /// tab borrows it disjointly from its own state.
     panel_dock: PanelDockState,
     /// The single writer of the `PanelLayout` section of `user_config.json`
-    /// (`src/widgets/panel_dock/persist.rs`). One per studio window, owned here
+    /// (`crates/ms-widgets/src/panel_dock/persist.rs`). One per studio window, owned here
     /// rather than by `panel_dock` itself, because that state is also built in
     /// tests and may neither spawn a thread nor reach the disk. `panel_dock` is
     /// polled for a dirty layout once per frame; the writer coalesces the burst
@@ -350,68 +351,6 @@ enum PendingCloseAction {
 struct PendingExitCleanup {
     action: PendingCloseAction,
     rx: Receiver<Result<(), String>>,
-}
-
-pub struct PageTexture {
-    pub tiles: Vec<TextureTile>,
-    pub linear_last_used_frame: u64,
-    pub nearest_last_used_frame: u64,
-}
-
-pub struct TextureTile {
-    pub linear_texture: Option<egui::TextureHandle>,
-    pub nearest_texture: Option<egui::TextureHandle>,
-    pub origin_px: egui::Vec2,
-    pub size_px: egui::Vec2,
-    pub rgba: Arc<[u8]>,
-}
-
-impl PageTexture {
-    #[must_use]
-    pub fn estimated_linear_gpu_bytes(&self) -> u64 {
-        self.tiles
-            .iter()
-            .filter(|tile| tile.linear_texture.is_some())
-            .map(|tile| u64::try_from(tile.rgba.len()).unwrap_or(u64::MAX))
-            .sum()
-    }
-
-    #[must_use]
-    pub fn estimated_nearest_gpu_bytes(&self) -> u64 {
-        self.tiles
-            .iter()
-            .filter(|tile| tile.nearest_texture.is_some())
-            .map(|tile| u64::try_from(tile.rgba.len()).unwrap_or(u64::MAX))
-            .sum()
-    }
-
-    pub fn drop_nearest_textures(&mut self) {
-        for tile in &mut self.tiles {
-            tile.nearest_texture = None;
-        }
-        self.nearest_last_used_frame = 0;
-    }
-
-    pub fn drop_linear_textures(&mut self) {
-        for tile in &mut self.tiles {
-            tile.linear_texture = None;
-        }
-        self.linear_last_used_frame = 0;
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PageImageInfo {
-    pub width_px: u32,
-    pub height_px: u32,
-    pub load_state: SourcePageLoadState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourcePageLoadState {
-    Loading,
-    Available,
-    Failed,
 }
 
 struct DecodedTile {
@@ -3370,7 +3309,7 @@ impl eframe::App for MangaApp {
         // writer thread. No-op when nothing is owed. Why this write is synchronous here — and
         // why a deadline would trade a visible hang for a silent loss — is argued at
         // `local_presets::flush_pending_local_presets_save` and in
-        // `src/tabs/typing/panel/MODULE_README.md`.
+        // `crates/ms-tab-typing/src/panel/MODULE_README.md`.
         if self.typing_tab.flush_pending_local_presets_save() {
             runtime_log::log_info(
                 "[app] on_exit: flushed a pending fonts/presets.json local-preset write",

@@ -9,8 +9,9 @@ Main responsibilities:
   machine-facing value used by every comparison and cross-process parse, and it is
   also what `winresource` reads from this script's own environment for the numeric
   Windows `FILEVERSION` (which has no encoding for a hash suffix anyway).
-  The composition itself lives in `src/version_format.rs` and is pulled in with
-  `include!` so that the exact code this script runs is covered by `cargo test`.
+  The composition itself lives in `crates/ms-config/src/version_format.rs` and is
+  pulled in with `include!` so that the exact code this script runs is covered by
+  `cargo test`.
   Every git failure — no `git` on PATH, no repository, no tags, a shallow clone,
   a non-zero exit — degrades silently to the plain `Cargo.toml` version. That is the
   normal state of a GitHub source ZIP, so it must never produce a `cargo:warning=`.
@@ -69,10 +70,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-// The version composition is shared verbatim with the crate (`mod version_format;` in
-// `src/main.rs`). `include!` rather than a copy, so that the code this script runs is the
-// code `cargo test` covers; the file's `#[cfg(test)] mod tests` is inert here.
-include!("src/version_format.rs");
+// The version composition is shared verbatim with the crate: it is a module of
+// `ms-config` (re-exported by the binary as `crate::version_format`, see `src/main.rs`).
+// `include!` rather than a copy, so that the code this script runs is the code
+// `cargo test` covers; the file's `#[cfg(test)] mod tests` is inert here.
+include!("crates/ms-config/src/version_format.rs");
 
 const SIGN_WAIT_SECONDS: u64 = 300;
 const SIGN_TS_URL: &str = "http://timestamp.sectigo.com";

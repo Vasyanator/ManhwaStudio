@@ -1,0 +1,97 @@
+[package]
+name = "ms-tab-translation"
+version = "0.1.0"
+edition = "2024"
+
+# The «Перевод» (translation) tab extracted whole from `src/tabs/translation/`: tab state
+# and canvas hooks, the OCR / text-detector / machine-translation controllers and their
+# workers, the concrete MT backends (Google / Yandex / DeepL / LLM), the push-driven AI
+# backend health model and every subpanel of the tab.
+#
+# Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::translation`, so every
+# existing `crate::tabs::translation::…` call site keeps its path.
+#
+# Layer: near the TOP of the library stack — above the canvas, the models, the widgets,
+# the tooling primitives and `ms-tabs-simple` (it reads character and term note entries
+# for the MT glossary), and below `app.rs`, `ai_backend_panel.rs`,
+# `ai_backend_supervisor.rs`, the launcher's reline flow and the `cleaning` tab, which all
+# reach into `backend_health` / `text_detector` / `machine_translation`. It must never
+# name `app`, `launcher` or a tab above it.
+
+[dependencies]
+# Framed IPC with the Python AI backend: every OCR, detector and health request goes
+# through `shared_client()`.
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# The canvas this tab draws pages and bubble overlays into; it implements `CanvasHooks`.
+ms-canvas = { path = "../ms-canvas" }
+# `user_config.json` sections owned by this tab, the `AppTab` enum and the settings
+# deep-link enum.
+ms-config = { path = "../ms-config" }
+# Diagnostics (`runtime_log`) for the OCR/MT/detector worker pipelines.
+ms-log = { path = "../ms-log" }
+# Image-cache budgets consulted before a page raster is uploaded.
+ms-memory = { path = "../ms-memory" }
+# The bubble and clean-overlay runtime models this tab reads and writes.
+ms-models = { path = "../ms-models" }
+# The chapter domain model the tab reads pages and bubbles from.
+ms-project = { path = "../ms-project" }
+# Host-environment probes: AI-backend capability/device reporting, the model registry and
+# the system clipboard image reader behind the advanced-recognition window.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# The four small tabs; this tab reads character names and term/character note entries to
+# build the MT glossary.
+ms-tabs-simple = { path = "../ms-tabs-simple" }
+# Every background worker this tab spawns goes through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# The reusable mask/polygon primitives behind the detector's region selection.
+ms-tools = { path = "../ms-tools" }
+# Every reusable widget the panels put on screen, plus `input_util`, `bubble_status` and
+# the configurable-hotkey registry (`input_manager_v2`) this tab registers specs with.
+ms-widgets = { path = "../ms-widgets" }
+# Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# The whole tab draws.
+egui.workspace = true
+eframe.workspace = true
+# Page crops handed to OCR and the detector, plus the composition panel's exports.
+image.workspace = true
+# The user-editable LLM prompt templates for OCR and machine translation.
+minijinja.workspace = true
+# Parallel raster passes in the detector and composition pipelines.
+rayon.workspace = true
+# Persisted panel state, prompt presets and every backend request/response payload.
+serde.workspace = true
+serde_json.workspace = true
+# Writing-system classification for the post-OCR ALL-CAPS fix (`ocr_case_fix`), which must
+# touch Latin/Cyrillic letters only.
+unicode-script.workspace = true
+# Monotonic time that also works in a web build (worker debounce and progress timers).
+web-time.workspace = true
+
+# Native-only dependencies, matching the root manifest exactly so the graph keeps one copy
+# of each: blocking HTTP (`ureq`), the LLM client stack (`genai` + `tokio`), the concrete
+# Google translator (`translators`), the OS credential store for API keys (`keyring`),
+# native file dialogs (`rfd`), the ONNX Runtime loader and the native OCR/detector manager.
+# Their call sites are `#[cfg(not(target_arch = "wasm32"))]`-gated; the wasm build compiles
+# error stubs instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq.workspace = true
+genai.workspace = true
+tokio.workspace = true
+translators.workspace = true
+keyring.workspace = true
+rfd.workspace = true
+# Native ONNX Runtime inference (the Paddle detection/recognition sessions this tab runs
+# in-process).
+ms-onnx = { path = "../ms-onnx" }
+# The loader that resolves/downloads the onnxruntime dylib; the detector panel renders its
+# `OrtDownloadProgress`.
+ms-onnx-runtime = { path = "../ms-onnx-runtime" }
+# The process-global OCR/detector engine manager (`recognize_manga` / `recognize_paddle`).
+ms-native-runtime = { path = "../ms-native-runtime" }
+
+[dev-dependencies]
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test
+# that installs a UI locale must hold (the active catalog is one `ArcSwap`).
+ms-config = { path = "../ms-config", features = ["test-support"] }

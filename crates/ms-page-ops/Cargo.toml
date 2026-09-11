@@ -1,0 +1,35 @@
+[package]
+name = "ms-page-ops"
+version = "0.1.0"
+edition = "2024"
+
+# Structural page operations on a chapter tree (insert / delete / reorder / rotate /
+# stitch / split), extracted wholesale from `src/page_ops/`. GUI-free by construction:
+# a crash-safe, journalled filesystem transaction plus the pure planning and JSON
+# remapping passes it runs. No egui and no `t!` — every error is typed (`PageOpError`)
+# and rendered by the caller.
+#
+# It also owns the two plain data types the transaction operates on, `Page` and
+# `ProjectPaths` (see `lib.rs`): they moved down here from `src/project.rs` so that the
+# `project` <-> `page_ops` cycle points one way only. `ms-project` re-exports both, so
+# `crate::project::{Page, ProjectPaths}` stays a valid path in the binary.
+[dependencies]
+# Chapter-tree layout constants (`SRC_DIR`, `CLEAN_LAYERS_DIR`, `BUBBLES_FILE`, ...)
+# that `ProjectPaths` and the transaction's own path builder are made of.
+ms-config = { path = "../ms-config" }
+# Progress / rollback / roll-forward diagnostics (`ms_log::runtime_log`). A page
+# operation is not observable in the UI while it runs, so the log is the record.
+ms-log = { path = "../ms-log" }
+# The on-disk journal and every page-keyed document the remap pass rewrites.
+serde.workspace = true
+serde_json.workspace = true
+# Page pixel sizes are probed with `image::image_dimensions` (header read, not a
+# decode); stitch/split compose and re-encode pages through the PNG encoder.
+image.workspace = true
+# `PageOpError` is a typed public error (`#[derive(thiserror::Error)]`).
+thiserror.workspace = true
+
+[dev-dependencies]
+# Isolated on-disk chapter fixtures for the transaction tests (`fs_exec`), which
+# build a real chapter tree and run the journalled operation against it.
+tempfile.workspace = true

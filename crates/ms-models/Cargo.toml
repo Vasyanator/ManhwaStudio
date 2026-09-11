@@ -1,0 +1,72 @@
+[package]
+name = "ms-models"
+version = "0.1.0"
+edition = "2024"
+
+# The shared runtime models the canvas and the tabs read and mutate, extracted from
+# `src/models/` (plus the crate-root `page_view.rs`, the source-page view model of the
+# same layer). Re-exported by the binary as `crate::models` and `crate::page_view`, so
+# every existing call site keeps its path.
+#
+# Layer: ABOVE `ms-project` (these models load and save the chapter domain model) and
+# BELOW the canvas and the tabs. egui appears only as a PIXEL FORMAT here
+# (`ColorImage` / `Color32`); an `egui::Ui` or `egui::Painter` in this crate would be a
+# layer violation — drawing belongs above.
+[dependencies]
+# The chapter domain model these models are built on (`Bubble`, `CanvasSettings`,
+# `Page`, `ProjectPaths`, `LegacyRibbonGeometry`).
+ms-project = { path = "../ms-project" }
+# Every file read/write goes through the process-wide storage backend
+# (`ms_storage::global::storage()`), never `std::fs`.
+ms-storage = { path = "../ms-storage" }
+# `runtime_log` for the models' failure paths plus the `trace_log!` / `trace_scope!`
+# macros used across the layer-document pipeline.
+ms-log = { path = "../ms-log" }
+# The bubble-status rule model persisted inside the canvas settings
+# (`ms_config::bubble_status`).
+ms-config = { path = "../ms-config" }
+# Image-cache budgets and eviction ordering consulted by the clean-overlay model.
+ms-memory = { path = "../ms-memory" }
+# Undo/redo history and the reversible raster delta behind cleaning commits
+# (`ActionHistory`, `RasterDiff`); the `raster` feature is what provides the delta.
+ms-actions = { path = "../ms-actions", features = ["raster"] }
+# Background savers of the layer document and the bubble model run on the project's
+# thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Text-effect rasterization reused by the layer document (`apply_effects_to_image`).
+ms-text-render = { path = "../ms-text-render" }
+# egui is used ONLY as a pixel container (`ColorImage` / `Color32`) and, in
+# `page_view`, as the GPU texture handle type.
+egui.workspace = true
+eframe.workspace = true
+# Decoding/scaling of page and overlay rasters on the export/save paths, which must
+# not depend on a GPU context.
+image.workspace = true
+# Every model document (layer manifest, bubble record, mask model) is JSON.
+serde_json.workspace = true
+serde.workspace = true
+# Typed public errors of the clean-assignment and layer-document paths.
+thiserror.workspace = true
+# Aggregated context on the bubble-model load/save paths (`anyhow::Context`).
+anyhow.workspace = true
+# Stable overlay identities in the layer document's text payload: a v5 UUID derived
+# from a fixed namespace, so the same overlay name always yields the same id.
+uuid.workspace = true
+
+[features]
+# Exposes this crate's test-only accessors (`LayerDoc::ensure_page_loaded` / `node`,
+# `LayerNode::is_text` / `display_image`) to DEPENDENT crates' tests. A `#[cfg(test)]`
+# item is invisible outside its own crate, and the typing tab's tests — which drive the
+# layer document end to end — live in the binary. Enable it from `[dev-dependencies]`
+# only, so no non-test build carries them.
+test-support = []
+
+[dev-dependencies]
+# Isolated on-disk chapter fixtures for the clean-assignment and layer-document tests,
+# which move real files through the storage backend.
+tempfile.workspace = true
+
+# Available-physical-memory probe used by the clean-overlay cache budget. Feature list
+# is the subset of the binary's own windows-sys features this crate actually names.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }

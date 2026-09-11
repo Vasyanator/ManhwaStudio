@@ -1,0 +1,71 @@
+[package]
+name = "ms-tab-ps-editor"
+version = "0.1.0"
+edition = "2024"
+
+# The «PS-подобный редактор» tab extracted whole from `src/tabs/ps_editor/`: its own
+# pan/zoom viewport, the layer stack and its tiled GPU texture cache, the page loader, the
+# tool set (select / brush / transform / deform / patch), the text-layer bridge and the
+# view-only «Коррекция» colour pass — the project's ONLY GL shader code.
+#
+# Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::ps_editor`, so every
+# existing `crate::tabs::ps_editor::…` call site keeps its path.
+#
+# Layer: near the TOP of the library stack — above the canvas, the models, the tooling
+# primitives, the widgets and `ms-tab-typing` (the layers panel renders typing's text
+# preview label), and below `app.rs` and the `page_manager` tab. It must never name `app`
+# or `launcher`.
+#
+# GL lifetime contract: the correction pass builds its GL program, VAO/VBO and scratch
+# texture lazily INSIDE an `eframe::egui_glow` paint callback (the only place a
+# `&glow::Context` exists) and frees them from `MangaApp::on_exit`, which stays in the
+# binary. `PsEditorTabState::release_gpu_resources` is therefore `pub` and must remain so.
+
+[dependencies]
+# Undo/redo of raster and layer-lifecycle edits (`ActionHistory`, `RasterDiff`).
+ms-actions = { path = "../ms-actions", features = ["raster"] }
+# `OverlayRectPx` and the shared canvas geometry types the page loader speaks.
+ms-canvas = { path = "../ms-canvas" }
+# `user_config.json` sections owned by this tab plus the `AppTab` enum.
+ms-config = { path = "../ms-config" }
+# Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics (`runtime_log`) plus the `trace_log!` / `trace_scope!` frame instrumentation
+# the viewport and the tile renderer emit.
+ms-log = { path = "../ms-log" }
+# Tile-upload budgets (`MemoryBudget`, `MemoryProfile`) consulted before every GPU upload.
+ms-memory = { path = "../ms-memory" }
+# The layer document, its effects chain, ordering bands and persistence, plus the clean
+# overlays model the two locked base layers mirror.
+ms-models = { path = "../ms-models" }
+# The chapter domain model the page loader reads pages from.
+ms-project = { path = "../ms-project" }
+# The «Текст» tab: the layers panel renders its text preview label for text rows.
+ms-tab-typing = { path = "../ms-tab-typing" }
+# Every background worker this tab spawns goes through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# The reusable mask brush, polygon rasterizer and host-neutral patch core the patch tool
+# implements `PatchHost` against.
+ms-tools = { path = "../ms-tools" }
+# Every reusable widget the panels put on screen, the dockable-panel subsystem
+# (`panel_dock`) this tab's UI is built from, and `input_util`.
+ms-widgets = { path = "../ms-widgets" }
+# The whole tab draws. `eframe` also re-exports `glow` and `egui_glow`, which the
+# correction pass uses directly — that is why no separate `glow` dependency is declared.
+egui.workspace = true
+eframe.workspace = true
+# Layer image decode/encode.
+image.workspace = true
+# Persisted layer manifests and tool presets. The tab reads and writes them as untyped
+# `serde_json::Value` trees, so it needs no `serde` derive dependency of its own.
+serde_json.workspace = true
+# Typed public errors of the layer/tool paths.
+thiserror.workspace = true
+# Stable ids for layers and layer groups.
+uuid.workspace = true
+
+[dev-dependencies]
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test
+# that installs a UI locale must hold (the active catalog is one `ArcSwap`).
+ms-config = { path = "../ms-config", features = ["test-support"] }

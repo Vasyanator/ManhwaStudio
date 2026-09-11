@@ -83,7 +83,7 @@ const CATEGORY_VISIBLE_ROWS: f32 = 10.0;
 ///
 /// This is an INTERFACE preference of the settings lists, not a property of any font: it
 /// changes what is drawn and nothing else. The displayed name is never a key — resolution
-/// always goes through the identity (see `src/tabs/typing/panel/MODULE_README.md`).
+/// always goes through the identity (see `crates/ms-tab-typing/src/panel/MODULE_README.md`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum FontNameDisplayMode {
     /// The user-facing name: the user's display-name override when set, else the file-stem

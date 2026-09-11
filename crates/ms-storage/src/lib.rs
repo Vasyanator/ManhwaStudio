@@ -14,6 +14,9 @@ Key structures:
 - NativeStorage        : rooted std::fs backend (desktop)
 - MemStorage           : in-memory virtual filesystem (web session store / tests)
 
+Key modules:
+- global               : process-wide backend selection (`global::storage()`)
+
 Notes:
 Paths are virtual, root-relative, and always use '/'; see `path::normalize`.
 The trait is object-safe so the application can hold `Arc<dyn Storage>` and pick
@@ -25,6 +28,10 @@ the backend at startup (native folder vs. browser IndexedDB-backed memory).
 // The crate is intentionally named after the domain concept it exports.
 #![allow(clippy::module_name_repetitions)]
 
+// Process-wide backend selection + the single `Arc<dyn Storage>` handle the
+// application uses. Cross-target: it picks `PassthroughStorage` on native and
+// `MemStorage` on wasm. Re-exported by the binary as `crate::storage`.
+pub mod global;
 mod mem;
 mod path;
 // `std::fs`-backed backends are desktop-only: they read real mtimes

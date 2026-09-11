@@ -41,8 +41,13 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   (The projects-dir + memory-profile editing/persistence moved to the shared
   `crate::general_settings_panel` widget; the `user_config.json` write lock moved to `config`.)
   (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
-  Also hosts the `user_config.json` writers for the AI runtime selector, the unified ONNX selection,
-  and the ONNX Runtime SIGILL load-guard: `save_ai_runtime` (writes `General.ai_runtime` and sets
+  The `user_config.json` writers for the AI runtime selector, the unified ONNX selection and the
+  typesetting-language / hanging-punctuation keys are DECLARED in `ms-config` (next to
+  `save_advanced_form_search_params`), together with their round-trip tests. They had to move down:
+  four of them are driven from `ms-settings-ui`'s AI-backend and General panes, which are shared
+  with the launcher's settings page and may not depend on this tab. This module re-exports only
+  `save_hanging_punctuation`, the one its own typesetting pane still calls. What they write:
+  `save_ai_runtime` (writes `General.ai_runtime` and sets
   `General.ai_runtime_configured=true`, marking the runtime as an explicit user choice so the native
   default no longer applies),
   `save_onnx_provider_device` (writes `General.ai_onnx_provider`/`ai_onnx_device_id` + the
@@ -50,19 +55,20 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `save_onnx_build` (writes `General.ai_onnx_build`, the native-only build slug picking the onnxruntime
   binary; wired to the "Билд" selector),
   `save_max_loaded_models` (writes `General.ai_max_loaded_models` as an integer), and
+  and, in `ms-config`'s `ort_load_guard`,
   `mark_ort_load_attempted` / `mark_ort_load_succeeded` / `reset_ort_load_guard` (mutate
   `General.ort_load_state[scope]`, where `scope` is `provider[:device]@version`). The three guard writers fsync the file after writing so the
   aborted-attempt marker survives an uncatchable SIGILL during onnxruntime load (and the marker write
   also fsyncs the parent directory on a first-ever create, Unix-only); all are synchronous
-  read-modify-write helpers meant to run off the GUI thread. ALL `user_config.json` RMW writers in
-  this module (`save_*` + `write_ort_load_state`) serialize on the process-wide write lock, now
-  `config::lock_user_config_write()` (moved to `config` so the shared general-settings widget serializes
-  on the same lock), so concurrent background/GUI-thread savers cannot interleave read/write and lose an
-  update (which could drop the just-written `attempted:true` SIGILL marker or clobber settings).
-  `save_ai_runtime` is wired to the
+  read-modify-write helpers meant to run off the GUI thread. EVERY `user_config.json` RMW writer of
+  the settings surfaces (`save_*` + `write_ort_load_state`) serializes on the process-wide
+  `config::lock_user_config_write()`, so concurrent background/GUI-thread savers cannot interleave
+  read/write and lose an update (which could drop the just-written `attempted:true` SIGILL marker or
+  clobber settings). `save_ai_runtime` is wired to the
   "Рантайм ИИ" selector in `ai_backend_panel`; the guard writers are wired to `native_runtime`'s ORT
-  load path and the "Повторить попытку ORT" reset control.
-  It also hosts `save_advanced_form_search_params` (`TextTab.advanced_form_search`, ONE JSON
+  load path and the "Повторить попытку ORT" reset control, which calls
+  `ms_config::ort_load_guard::reset_ort_load_guard` directly.
+  `ms-config` also hosts `save_advanced_form_search_params` (`TextTab.advanced_form_search`, ONE JSON
   object). Unlike its `TextTab` siblings this one is NOT driven from a settings pane: the knobs live
   in the typing tab's advanced-form window, which spawns the write on its own named thread. Only the
   placement of the object lives here; its SHAPE belongs to `tabs::typing::advanced_form_params`.
@@ -90,13 +96,13 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   hosts `hint_show_outside_default` — the initial value of a NEW hint bubble's
   `hint_show_outside_translation` flag (existing hints keep their own per-bubble value). Like
   `cache_pages` it is a cross-project USER preference: written to both the user and project canvas
-  files by `canvas/settings.rs`, but loaded user-file-primary with a project fallback in
-  `project.rs::canvas_settings_from_config`.
+  files by `crates/ms-canvas/src/settings.rs`, but loaded user-file-primary with a project fallback in
+  `crates/ms-project/src/lib.rs::canvas_settings_from_config`.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
   orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
   font-administration UI. The pane hosts the app-wide
   hanging-punctuation list editor (`TextTab.hanging_punctuation`, applied live via
-  `crate::text_punctuation` and persisted through `save_hanging_punctuation` in `mod.rs`)
+  `crate::text_punctuation` and persisted through `save_hanging_punctuation`, re-exported by `mod.rs` from `ms-config`)
   the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
   via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
   `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
@@ -106,7 +112,7 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   selects that group's first language), the SAME selector the general-settings widget renders. It
   applies live via `ms_text_util::language::set_text_language` (the typing tab's `panel/facade.rs`
   observes `text_language()` each frame and re-runs font-coverage classification off-thread) and
-  persists `TextTab.text_language` (the `lang.tag()`) through `save_text_language` in `mod.rs` on a
+  persists `TextTab.text_language` (the `lang.tag()`) through `ms_config::save_text_language` on a
   background thread; the process-global atomic is the single source of truth, so no selection state is
   stored on `SettingsTabState`. `mod.rs` passes the id-salt prefix
   `"settings.typesetting.text_language"` so its egui ids stay distinct from the general widget's,
@@ -158,7 +164,7 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   `TypesettingFontGroups` implementation. After consumption the user can collapse the revealed
   blocks again. Add a `SettingsDeepLink` variant + a `navigate_to` arm per new target.
 - Rejected alternative (do not re-propose): driving deep links through the tutorial engine
-  (`src/tutorial/`). It is feature-gated (`tutorial` in `Cargo.toml`, off by default, so the reveal
+  (`crates/ms-settings-ui/src/tutorial/`). It is feature-gated (`tutorial` in the root `Cargo.toml`, forwarded to `ms-settings-ui/tutorial` and `ms-launcher/tutorial`, off by default, so the reveal
   would vanish in a normal build) and step-scripted rather than addressable, i.e. it is a guided-tour
   player, not a general "reveal this setting" bus. `navigate_to` + `pending_reveal` is the vehicle,
   and the reveal highlight is painted by the pane itself (`paint_reveal_highlight` in the
@@ -194,12 +200,12 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   order come from `sections_for(Studio)`; do not hand-list sections in `mod.rs`.
 - To change shared canvas/ribbon settings, edit `canvas_ribbon.rs` and the save/apply helpers in
   `mod.rs`. `SharedCanvasSettings` has NO serde derives, so ADDING a field means threading it by
-  hand through: `models/bubbles_model.rs` (struct + `Default`), `project.rs::CanvasSettings`
+  hand through: `crates/ms-models/src/bubbles_model.rs` (struct + `Default`), `crates/ms-project/src/lib.rs::CanvasSettings`
   (struct + `Default`) and its loader `canvas_settings_from_config`, the two bridges in `app.rs`,
-  the two writers in `canvas/settings.rs`
+  the two writers in `crates/ms-canvas/src/settings.rs`
   (`save_canvas_settings_to_project_file` / `save_canvas_settings_to_user_file`),
   `CanvasView::apply_canvas_snapshot` / `canvas_snapshot` plus the `CanvasState` field in
-  `canvas/types.rs`, and finally the widget here. The struct literals carry no
+  `crates/ms-canvas/src/types.rs`, and finally the widget here. The struct literals carry no
   `..Default::default()`, so the compiler flags every construction site.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit the
   shared `crate::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
@@ -216,10 +222,10 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   `ms_text_util::language`). The typesetting-language selector is duplicated in
   `crate::general_settings_panel`; a change to its behavior must be mirrored there (both share the
   catalog keys, the process-global, and `save_text_language` — only the egui `id_salt`s differ).
-- To change the collapsed effect-defaults block, edit `src/tabs/typing/panel/effect_defaults.rs`;
+- To change the collapsed effect-defaults block, edit `crates/ms-tab-typing/src/panel/effect_defaults.rs`;
   `typesetting/mod.rs` only wraps its `ui()` in a `CollapsingHeader`. To change the font-settings
   block or the per-font properties window, edit `typesetting/font_settings.rs` /
   `typesetting/font_properties_window.rs` (settings-local UI); any new font MODEL access must go
   through the `crate::tabs::typing::font_admin` facade, never a fresh typing internal.
 - To change configurable shortcut UI or persistence, edit `hotkeys.rs` and coordinate with
-  `src/input_manager_v2.rs`.
+  `crates/ms-widgets/src/input_manager_v2.rs`.

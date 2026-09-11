@@ -14,8 +14,8 @@ ms-log = { path = "../ms-log" }
 # (direct dependency of the binary, transitive through fontdb/epaint) and pinned to the
 # same 0.25 line, so it adds no build cost. Only `std` is needed here: the crate parses
 # one table and never touches outlines, layout or variations.
-ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+ttf-parser.workspace = true
 
 [dev-dependencies]
 # On-disk fixtures for the byte store and the `name`-table reader.
-tempfile = "3"
+tempfile.workspace = true

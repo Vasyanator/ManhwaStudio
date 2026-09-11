@@ -1,0 +1,103 @@
+[package]
+name = "ms-tab-typing"
+version = "0.1.0"
+edition = "2024"
+
+# The «Текст» (typing) tab extracted whole from `src/tabs/typing/`: tab state, canvas
+# hooks, the text/image layer store, the top panel and all of its sections, the page
+# crop mask, PSD export and the auto-typing search. Re-exported by the binary from
+# `src/tabs/mod.rs` as `crate::tabs::typing`, so every existing
+# `crate::tabs::typing::...` call site keeps its path.
+#
+# Layer: the TOP of the library stack — above the canvas, the models, the widgets and
+# every leaf crate, and below only the binary's `app.rs`, which calls
+# `TypingTabState::draw`. It must never name `app`, `launcher` or another tab; the
+# settings tab reaches its font model through the `font_admin` facade only, and its
+# settings deep links go through `ms_config::settings_deep_link`.
+[features]
+# Exposes the process-global font-settings store's test helpers
+# (`font_admin::test_lock` / `test_reset`) to OTHER crates' tests. The store is one
+# static shared by this tab's model and the binary's settings-UI tests, so both must
+# serialize on the same lock. Off by default: the binary selects it in
+# `[dev-dependencies]` only, which keeps the helpers out of the shipped build.
+test-support = []
+
+[dependencies]
+# The canvas the tab draws pages into; it implements `ms_canvas::CanvasHooks`.
+ms-canvas = { path = "../ms-canvas" }
+# The layer document, bubble and clean-overlay runtime models plus `page_view`.
+ms-models = { path = "../ms-models" }
+# The chapter domain model the tab reads pages and bubbles from.
+ms-project = { path = "../ms-project" }
+# Every reusable widget the panel puts on screen, plus `input_util` and `ui_fonts`.
+ms-widgets = { path = "../ms-widgets" }
+# The reusable mask brush behind the page crop mask.
+ms-tools = { path = "../ms-tools" }
+# The production text renderer, re-exported crate-wide as `render_next`.
+ms-text-render = { path = "../ms-text-render" }
+# Text segmentation (re-exported as `segmentation`), the typesetting-language model and
+# hanging-punctuation policy.
+ms-text-util = { path = "../ms-text-util" }
+# The bundled UI font stack consulted by the font administration layer.
+ms-fonts = { path = "../ms-fonts" }
+# Animated WebP hints shown by the panel's help rows.
+ms-gifs = { path = "../ms-gifs" }
+# `user_config.json` sections owned by this tab (`TextTab.*`), the `AppTab` enum, the
+# Ctrl+wheel rotation-mode global (re-exported as `rotation_ctrl_wheel`) and the
+# settings deep-link enum.
+ms-config = { path = "../ms-config" }
+# The storage abstraction every preset/font/text-layer file goes through.
+ms-storage = { path = "../ms-storage" }
+# Image-cache budgets consulted before a page or preview raster is uploaded.
+ms-memory = { path = "../ms-memory" }
+# Every background worker this tab spawns goes through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Diagnostics (`runtime_log`) plus the `trace_log!` / `trace_scope!` frame instrumentation.
+ms-log = { path = "../ms-log" }
+# Localized panel labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`, and
+# `resolve_key` for the runtime-chosen catalog keys the language/preset lists carry.
+ms-i18n = { path = "../ms-i18n" }
+# The system clipboard image reader behind "вставить из буфера".
+ms-sysprobe = { path = "../ms-sysprobe" }
+# The whole tab draws.
+egui.workspace = true
+eframe.workspace = true
+# Text shaping/measurement shared with the renderer.
+cosmic-text.workspace = true
+swash.workspace = true
+# Page, preview and export rasters.
+image.workspace = true
+# PSD export of the composed text layers.
+ag-psd.workspace = true
+# Persisted presets, text params and panel state.
+serde.workspace = true
+serde_json.workspace = true
+# Content hash of a font file, spelled into a PERSISTED font identity, so its algorithm
+# may never change with a toolchain upgrade (see the root manifest's note).
+sha2.workspace = true
+# Stable ids for text layers and presets.
+uuid.workspace = true
+# Typed public errors of the text store and the panel's persistence paths.
+thiserror.workspace = true
+# Aggregated context on the config read-modify-write paths this tab owns.
+anyhow.workspace = true
+# Monotonic time that also works in a web build (debounce and animation timers).
+web-time.workspace = true
+
+# Native file dialogs behind the font/preset import and export controls. Native-only:
+# there is no `rfd` on wasm, where the call sites are compiled out.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd.workspace = true
+
+[dev-dependencies]
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test
+# that installs a UI locale must hold (the active catalog is one `ArcSwap`).
+ms-config = { path = "../ms-config", features = ["test-support"] }
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for
+# test builds: it exposes the layer document's test-only accessors (`ensure_page_loaded`,
+# `node`, `is_text`, `display_image`) this tab's tests drive. Declaring it here and not
+# above is what keeps those accessors out of the shipped build — and what makes a
+# STANDALONE `cargo clippy -p ms-tab-typing` compile, which the workspace-wide feature
+# union would otherwise mask.
+ms-models = { path = "../ms-models", features = ["test-support"] }

@@ -1,0 +1,87 @@
+[package]
+name = "ms-tab-cleaning"
+version = "0.1.0"
+edition = "2024"
+
+# The «Клининг» (cleaning) tab extracted whole from `src/tabs/cleaning/`: the tab state and
+# its canvas hooks, the complete tool set (mask brush, patch, region edit v2, the AI editor
+# engines Flux.2 / LaMa / SDXL, AOT and Flux-Fill inpainting, mask generation, watermark
+# removal and its library), the batch autoclean driver and the GUI-free chapter-level
+# watermark decomposition engine.
+#
+# Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::cleaning`, so every
+# existing `crate::tabs::cleaning::…` call site keeps its path.
+#
+# Layer: the TOP of the library stack — above the canvas, the models, the tooling
+# primitives, the widgets and `ms-tab-translation` (it drives the AI backend health, the
+# text detector and the MT service through it) — and below only `app.rs`, which calls
+# `CleaningTabState::draw`. It must never name `app` or `launcher`.
+#
+# It does NOT depend on `ms-tab-typing`: those two are the workspace's largest crates, and
+# an edge between them would serialize the build's critical path for nothing. Keep it that
+# way — route anything the tab needs from the typing side through the models instead.
+
+[dependencies]
+# Framed IPC with the Python AI backend: every inpainting / mask / watermark request goes
+# through `shared_client()`.
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# The canvas the tab draws pages and clean overlays into; it implements `CanvasHooks`.
+ms-canvas = { path = "../ms-canvas" }
+# `user_config.json` sections owned by this tab and its tools, plus the `AppTab` enum.
+ms-config = { path = "../ms-config" }
+# Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics (`runtime_log`) plus the `trace_log!` / `trace_scope!` frame instrumentation.
+ms-log = { path = "../ms-log" }
+# Image-cache budgets consulted before a page or preview raster is uploaded.
+ms-memory = { path = "../ms-memory" }
+# The clean-overlay and layer-document runtime models this tab writes, plus `page_view`.
+ms-models = { path = "../ms-models" }
+# The chapter domain model the tab and the autoclean driver enumerate pages from.
+ms-project = { path = "../ms-project" }
+# The Hugging Face token store behind the model downloads, the AI model registry and the
+# backend capability probe.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# The «Перевод» tab: AI backend health (`backend_health`), the text detector's mask helpers
+# and the MT service the Flux.2 engine translates prompts through.
+ms-tab-translation = { path = "../ms-tab-translation" }
+# Every background worker this tab spawns goes through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# The reusable mask brush, polygon rasterizer, the shared red-black SOR kernel, the dense
+# overlay-pixel solve and the host-neutral patch core this tab implements `PatchHost`
+# against.
+ms-tools = { path = "../ms-tools" }
+# Every reusable widget the panels put on screen, the dockable-panel subsystem and
+# `input_util`.
+ms-widgets = { path = "../ms-widgets" }
+# The whole tab draws.
+egui.workspace = true
+eframe.workspace = true
+# Timestamps in the watermark library's persisted metadata.
+chrono.workspace = true
+# Page, mask and preview rasters.
+image.workspace = true
+# Parallel raster passes across every tool pipeline.
+rayon.workspace = true
+# Persisted tool presets, engine settings and every backend request/response payload.
+serde.workspace = true
+serde_json.workspace = true
+# The classic patch tool's texture synthesis backend.
+texture-synthesis.workspace = true
+# Typed public errors of the tool and engine paths.
+thiserror.workspace = true
+# Monotonic time that also works in a web build (progress and debounce timers).
+web-time.workspace = true
+# The watermark library's on-disk bundle format.
+zip.workspace = true
+
+# Native file dialogs behind the model / watermark import and export controls. Native-only:
+# there is no `rfd` on wasm, where the call sites are compiled out.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd.workspace = true
+
+[dev-dependencies]
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test
+# that installs a UI locale must hold (the active catalog is one `ArcSwap`).
+ms-config = { path = "../ms-config", features = ["test-support"] }

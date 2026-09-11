@@ -1,0 +1,51 @@
+[package]
+name = "ms-tab-page-manager"
+version = "0.1.0"
+edition = "2024"
+
+# The «Менеджер страниц» tab extracted whole from `src/tabs/page_manager/`: the page card
+# grid with its badge caches and thumbnail worker, and the crop / split / stitch / clean
+# dialogs that request structural page operations.
+#
+# Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::page_manager`, so every
+# existing `crate::tabs::page_manager::…` call site keeps its path.
+#
+# Layer: near the TOP of the library stack — above `ms-page-ops`, `ms-models`, `ms-widgets`
+# and `ms-tab-ps-editor` (the crop/split/stitch previews reuse its viewport camera) — and
+# below only `app.rs`. The tab NEVER executes a structural operation itself: it emits
+# `PageManagerAction::RequestOp` and the app quiesces writers, runs the op and calls
+# `notify_pages_changed`. It must never name `app` or `launcher`.
+
+[dependencies]
+# `user_config.json` sections owned by this tab plus the `AppTab` enum the grid switches to.
+ms-config = { path = "../ms-config" }
+# Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics (`runtime_log`) for the thumbnail/scan worker and the dialog paths.
+ms-log = { path = "../ms-log" }
+# The layer document, bubble and clean-overlay models the badges are counted from, plus the
+# source-page view model (`page_view`) the thumbnails are decoded through.
+ms-models = { path = "../ms-models" }
+# The journalled structural page transaction (`PageOpKind`) every dialog builds a request
+# for. The tab describes the op; the app executes it.
+ms-page-ops = { path = "../ms-page-ops" }
+# The chapter domain model the grid enumerates pages from.
+ms-project = { path = "../ms-project" }
+# The PS editor's pan/zoom viewport camera, reused by the crop / split / stitch previews.
+ms-tab-ps-editor = { path = "../ms-tab-ps-editor" }
+# The thumbnail decode / `layers.json` scan workers go through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Every reusable widget the toolbar and dialogs put on screen, plus `input_util`.
+ms-widgets = { path = "../ms-widgets" }
+# The whole tab draws.
+egui.workspace = true
+eframe.workspace = true
+# Thumbnail and preview decode.
+image.workspace = true
+# Typed public errors of the dialog and worker paths.
+thiserror.workspace = true
+
+# Native file dialogs behind "insert page from disk". Native-only: there is no `rfd` on
+# wasm, where the call sites are compiled out.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd.workspace = true

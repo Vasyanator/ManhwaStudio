@@ -16,5 +16,7 @@ Contract:
   so this crate never resolves paths on its own.
 */
 
+#![warn(clippy::all)]
+
 pub mod runtime_log;
 pub mod trace;

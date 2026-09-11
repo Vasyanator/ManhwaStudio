@@ -10,11 +10,9 @@ real application widgets without running the full editor.
 ## Architecture
 `main.rs` is the `eframe::App` (uses `fn ui`, like the main program). It builds a
 tabbed window from the same reusable widgets the app uses — `WheelSlider`,
-`WheelSpinBox`, `WheelComboBox` — mounted with `#[path = "../../widgets/..."]`
-because the package has no library target. The wheel widgets reference
-`super::wheel_input_guard`, so they are mounted as children of one `mod widgets`
-parent that also mounts `wheel_input_guard`. Do not fork these files; they must
-stay usable by the main application.
+`WheelSpinBox`, `WheelComboBox` — taken from the `ms-widgets` crate, a normal
+dependency of this package. Do not fork them; the demo and the application must
+compile the same code.
 
 Callout/arrow placement (`compute_placement` + `classify_zone` in `tutorial.rs`):
 the viewport is split into 8 zones by rays from its centre to the points that
@@ -28,8 +26,8 @@ arrow leaves the callout at the mirror of where it enters the highlight. The
 callout width is fixed and its height is taken from the previous frame's measured
 size (stable per step) so the fixed-length arrow stays aligned.
 
-The overlay engine now lives in the main binary at `src/tutorial/engine.rs`; this
-bin mounts it via `#[path = "../../tutorial/engine.rs"] mod tutorial;` so the demo
+The overlay engine lives in `crates/ms-settings-ui/src/tutorial/engine.rs`; this bin
+mounts it via `#[path = "../../../crates/ms-settings-ui/src/tutorial/engine.rs"] mod tutorial;` so the demo
 and the production overlay can never diverge. The engine is the reusable part:
 - `TutorialRegistry` — per-frame map of `&'static str` key -> `Rect`. The UI
   calls `begin_frame()` once, then `mark(key, response.rect)` at each addressable
@@ -70,14 +68,15 @@ Overlay mechanics (verified against egui 0.35):
 - Widgets must respect z-order for the hitbox to cover them. `WheelSlider`
   previously detected hover from the raw pointer position (`hover_pos` vs its
   rect), bypassing occlusion, so it reacted through any overlay. It was fixed in
-  `src/widgets/wheel_slider.rs` (`pointer_over_response_rect`) to rely only on
+  `crates/ms-widgets/src/wheel_slider.rs` (`pointer_over_response_rect`) to rely only on
   egui's occlusion-aware hit-test (`Response::contains_pointer`), so the overlay
   layer now suppresses it like every other widget — no per-widget disabling.
 
 ## Files and submodules
 - `main.rs`: eframe app, tabbed demo UI, target-rect recording, demo tutorial
-  script (`build_steps`). Mounts the engine from `src/tutorial/engine.rs`.
-- (engine lives at `src/tutorial/engine.rs`; see `src/tutorial/MODULE_README.md`.)
+  script (`build_steps`). Mounts the engine from `crates/ms-settings-ui/src/tutorial/engine.rs`.
+- (engine lives at `crates/ms-settings-ui/src/tutorial/engine.rs`; see
+  `crates/ms-settings-ui/src/tutorial/MODULE_README.md`.)
 
 ## Contracts and invariants
 - egui 0.35 specifics: `Context::viewport_rect()` (not the removed
@@ -92,9 +91,9 @@ Overlay mechanics (verified against egui 0.35):
 
 ## Editing map
 - To change highlight/dim/arrow visuals or placement, edit
-  `src/tutorial/engine.rs` (shared with the app).
+  `crates/ms-settings-ui/src/tutorial/engine.rs` (shared with the app).
 - To add demo widgets or steps, edit `main.rs` (`build_steps` + the tab bodies).
-- The engine is already integrated into the app (`src/tutorial/`, launcher tour +
+- The engine is already integrated into the app (`crates/ms-settings-ui/src/tutorial/`, launcher tour +
   Settings "Обучение" pane); production step scripts live next to their UI.
 
 ## Verify

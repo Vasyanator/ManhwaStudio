@@ -1,0 +1,75 @@
+[package]
+name = "ms-widgets"
+version = "0.1.0"
+edition = "2024"
+
+# The application's reusable UI-primitive layer, extracted from `src/widgets/`
+# (plus the two neighbouring leaves of the same layer, `input_util.rs` and
+# `ui_fonts.rs`). Re-exported by the binary as `crate::widgets` / `crate::input_util`
+# / `crate::ui_fonts`, so every existing call site keeps its path.
+#
+# Boundary: this crate knows nothing about the project domain. It must never depend
+# on `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the tabs and the
+# canvas depend on IT, and the direction may not be reversed.
+[dependencies]
+# The whole crate is egui widgets; `ui_fonts` additionally drives `eframe::egui`'s
+# font registration and `panel_dock/window.rs` opens immediate child viewports.
+egui.workspace = true
+eframe.workspace = true
+# Localized widget labels (`t!` / `tf!`); the macros are mounted crate-wide via
+# `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics for the widgets' own failure paths (font loading, spellcheck
+# dictionaries, panel-layout persistence).
+ms-log = { path = "../ms-log" }
+# `panel_dock/persist.rs` owns the `PanelLayout` section of `user_config.json` and
+# writes it through `ms_config::config_saver`; `spellchecked_line.rs` resolves its
+# dictionary folder under `ms_config::data_dir()`.
+ms-config = { path = "../ms-config" }
+# `spellchecked_line.rs` picks its dictionary by the typesetting language
+# (`ms_text_util::language`); `hangul_keyboard.rs` uses `ms_text_util::hangul`.
+ms-text-util = { path = "../ms-text-util" }
+# `AiButton` gates itself on the process-global capability signals
+# (`ms_sysprobe::ai_backend_capabilities`: backend / torch / onnxruntime).
+ms-sysprobe = { path = "../ms-sysprobe" }
+# `HelpHint` streams its animated WebP hints from the bundled asset crate.
+ms-gifs = { path = "../ms-gifs" }
+# Panel-dock layout snapshots and the spellcheck word lists are JSON documents.
+serde_json.workspace = true
+# The panel-dock layout model is serialized into `user_config.json`.
+serde.workspace = true
+# Typed public errors of the panel-dock layer (`PanelLayoutError`, `DockModelError`).
+thiserror.workspace = true
+# Pure-Rust Hunspell-compatible spellchecker behind `SpellcheckedTextEdit`.
+zspell.workspace = true
+# Monotonic time that also works in a web build (animation/debounce timers).
+web-time.workspace = true
+# Every background worker the widgets spawn (font preview, help-hint decoding,
+# spellcheck dictionary loading) goes through the project's thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Aggregated context on the panel-layout persistence path (`anyhow::bail!`).
+anyhow.workspace = true
+
+# The bundled `fonts/ui` stack `ui_fonts.rs` installs. Native-only, with the SAME
+# gate the binary used: `ms-fonts` resolves a directory next to the executable and
+# reads files from disk, neither of which exists in a web build, so `ui_fonts`
+# compiles to a no-op there and the web entry point installs its own fonts.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ms-fonts = { path = "../ms-fonts" }
+# `ui_fonts::desktop` reads a font file's `name` table to pick the egui family a
+# title-local override registers under. Native-only with `ms-fonts`: only the
+# desktop half of the module parses files from disk.
+ttf-parser = { workspace = true, default-features = true }
+# Blocking download of a spellcheck dictionary pair (`spellchecked_line`). Native-only:
+# there is no synchronous HTTP client on wasm, where the download path returns an error.
+ureq.workspace = true
+
+[dev-dependencies]
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support`
+# for test builds: `panel_dock/persist.rs` drives its saver tests through
+# `ms_config::config_saver::test_harness`, and `panel_dock/window.rs` holds
+# `ms_config::locale_store::GLOBAL_LOCALE_LOCK` while it installs a UI locale.
+ms-config = { path = "../ms-config", features = ["test-support"] }
+# Isolated on-disk fixtures for the panel-layout persistence tests, which write real
+# `user_config.json` files through the storage backend.
+tempfile.workspace = true

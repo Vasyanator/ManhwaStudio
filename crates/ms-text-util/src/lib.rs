@@ -20,6 +20,8 @@ Contract:
   `text_punctuation::set_hanging_punctuation` and `language::set_text_language`.
 */
 
+#![warn(clippy::all)]
+
 pub mod hangul;
 pub mod language;
 pub mod segmentation;

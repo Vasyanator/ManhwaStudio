@@ -1,0 +1,50 @@
+[package]
+name = "ms-sysprobe"
+version = "0.1.0"
+edition = "2024"
+
+# Host-environment probes: GPU/accelerator detection, app-local Python runtime
+# discovery, desktop region capture, installed-AI-package classification. GUI-free;
+# no probe reads or writes a config document.
+[dependencies]
+# Diagnostics for the capture path (`ms_log::runtime_log`). The only link back to the
+# application's own layers.
+ms-log = { path = "../ms-log" }
+# `ai_install_probe` classifies a machine into the persisted `AiInstallType` level, which
+# is declared there. It reads no config document.
+ms-config = { path = "../ms-config" }
+# `ai_install_probe` runs its shell probe on a background thread and must stay
+# target-neutral about how one is created.
+ms-thread = { path = "../ms-thread" }
+# User-facing failure strings (`t!` / `tf!`), mounted crate-wide via
+# `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# `RgbaImage` is the public capture contract of `screen_capture`, and the module also
+# decodes the PNG/PPM output of the Linux/macOS capture tools with it.
+image.workspace = true
+# JSON output of the platform probes (`hyprctl -j`, `wlr-randr --json`); the AI probe's
+# Python snippet returns a typed JSON report, hence the derive.
+serde.workspace = true
+serde_json.workspace = true
+
+# Native-only halves of the two Hugging Face modules. `hf-hub` resolves repository file
+# URLs for `ai_models` (which then streams them itself, without the HF cache), and
+# `keyring` is the OS secret store `hf_token` keeps the access token in. Both are
+# compiled out on wasm, where the modules keep their signatures and return a typed
+# "unavailable on web" error — the same feature sets the binary already selects, so no
+# second copy is built.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The system clipboard behind `paste_image`. Native-only: there is no synchronous
+# clipboard on wasm, where the module's readers are compiled out.
+arboard.workspace = true
+hf-hub.workspace = true
+# `ai_models` streams each resolved file itself (into the app model tree, no HF cache
+# blobs or symlinks), so it needs the HTTP client directly and not only through hf-hub.
+ureq.workspace = true
+keyring.workspace = true
+
+# Windows GDI screen capture and the Job Object that kills spawned Python children with
+# the parent process. Feature list is the subset of the binary's own windows-sys features
+# these two modules use.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi"] }

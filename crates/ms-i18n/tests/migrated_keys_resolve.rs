@@ -17,7 +17,7 @@ locale here does not race the crate's other global-state tests.
 
 use ms_i18n::{LocaleTag, lookup, set_locale};
 
-/// A handful of keys migrated in the `src/tabs/settings/` + `src/widgets/` pilot,
+/// A handful of keys migrated in the `src/tabs/settings/` + `crates/ms-widgets/src/` pilot,
 /// paired with their expected Russian catalog value.
 const SAMPLE: &[(&str, &str)] = &[
     ("settings.canvas_ribbon.heading", "Лента"),

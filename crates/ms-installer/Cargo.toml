@@ -1,0 +1,73 @@
+[package]
+name = "ms-installer"
+version = "0.1.0"
+edition = "2024"
+
+# The desktop installer/updater subsystem of ManhwaStudio, extracted from
+# `src/installer/`: the managed Python environment (download, unpack, pip install,
+# Torch variant selection), the self-update of the shipped executable, and the two
+# `eframe` windows that drive both. It is a self-contained application surface, not a
+# library the editor calls into: the binary only starts it and reads its outcome.
+#
+# Desktop-only. It installs a native Python env and replaces the desktop binary,
+# neither of which exists on the web build, so every module is gated on
+# `cfg(not(target_arch = "wasm32"))` and the dependencies below sit in the matching
+# target table — the crate compiles to an empty lib on wasm, exactly as the module it
+# replaced compiled to nothing there.
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `program_dir()`/`data_dir()`, `user_config.json` and `AiInstallType` — the installer
+# both reads the install layout and persists the detected AI install level. Also the
+# home of `version_format::version_core`, which reduces both sides of every release
+# comparison.
+ms-config = { path = "../ms-config" }
+# Progress/diagnostic lines of the install and update flows (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# `gpu_utils` (accelerator + driver/runtime detection that picks the Torch variant) and
+# `python_manager` (discovery of the app-local Python runtime).
+ms-sysprobe = { path = "../ms-sysprobe" }
+# `ui_fonts::install` — the installer windows mount the same bundled UI font stack as
+# the rest of the application. This is the crate's ONLY widget-layer dependency.
+ms-widgets = { path = "../ms-widgets" }
+# Every user-visible string of the installer goes through `t!` / `tf!`; the macros are
+# mounted crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Named worker threads for the download/unpack/pip stages, which must never block the
+# installer window's GUI thread.
+ms-thread = { path = "../ms-thread" }
+# The installer and update windows are standalone `eframe` applications
+# (`eframe::run_native`), with the same feature set the binary selects so no second
+# copy of the backend is built.
+eframe.workspace = true
+# Release metadata from the GitHub API and the pip/Torch index queries.
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The Python runtime and the release payloads ship as `.tar.gz` (flate2 + tar) and
+# `.zip` (zip) archives.
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+# The Python runtime for some platforms ships as `.tar.zst`.
+zstd.workspace = true
+# The "choose a custom install folder" prompts of the update flow.
+rfd.workspace = true
+# The installer window paints the bundled application icon.
+image.workspace = true
+# Wall-clock and monotonic time in the progress/ETA reporting.
+web-time.workspace = true
+
+# `geteuid()` — the unix half of the "am I running elevated?" probe, whose Windows half
+# uses the token API in the `cfg(windows)` table below.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Elevation (`ShellExecuteW` + token inspection) and process handles for the Windows
+# uninstall and self-replace paths. Same feature set the binary selects.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+# Isolated on-disk fixtures for the layout/venv-inspection tests in `utils.rs`.
+tempfile.workspace = true

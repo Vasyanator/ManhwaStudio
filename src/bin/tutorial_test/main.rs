@@ -5,15 +5,13 @@ Purpose:
 Standalone debug binary for developing and visually verifying the tutorial /
 onboarding overlay engine (`tutorial.rs`). It opens a tabbed egui window whose
 controls are built the SAME way the main application builds them — reusing the
-real `WheelSlider` / `WheelSpinBox` / `WheelComboBox` widgets via `#[path]`
-mounts — so a step only has to point the tutorial at an element's key, without
-reworking the surrounding UI.
+real `WheelSlider` / `WheelSpinBox` / `WheelComboBox` widgets — so a step only has
+to point the tutorial at an element's key, without reworking the surrounding UI.
 
 How it reaches shared code:
-The package has no library target, so the reusable wheel widgets are mounted with
-`#[path = "../../widgets/..."]`. The wheel widgets reference
-`super::wheel_input_guard`, so they are mounted as children of one `mod widgets`
-parent that also mounts `wheel_input_guard`.
+The wheel widgets come from the `ms-widgets` crate, a normal dependency of this
+package. Only `tutorial/engine.rs` is still mounted with `#[path]`: it lives in the
+binary crate (feature-gated there), which has no library target to link against.
 
 Key structures:
 - `TutorialTestApp`: window state + `TutorialRegistry` + `Tutorial`.
@@ -41,30 +39,14 @@ use eframe::egui::{self, Align, Layout};
 #[macro_use]
 extern crate ms_i18n;
 
-// Reusable widgets from the main application. The package has no lib target, so
-// they are physically mounted with `#[path]`. The wheel widgets reference
-// `super::wheel_input_guard`, so all four are mounted at the crate root (their
-// `super` then resolves to `wheel_input_guard` here). Nested inline-mod mounts
-// fail because their base directory is a `widgets/` dir that does not exist.
-#[path = "../../widgets/wheel_input_guard.rs"]
-mod wheel_input_guard;
-#[path = "../../widgets/wheel_slider.rs"]
-mod wheel_slider;
-#[path = "../../widgets/wheel_spin_box.rs"]
-mod wheel_spin_box;
-#[path = "../../widgets/wheel_combo_box.rs"]
-mod wheel_combo_box;
-
 // The engine has been promoted to `src/tutorial/engine.rs` so launcher and studio
 // surfaces can `use crate::tutorial`. The demo mounts the real engine directly so
 // the demo and production overlay can never diverge.
-#[path = "../../tutorial/engine.rs"]
+#[path = "../../../crates/ms-settings-ui/src/tutorial/engine.rs"]
 mod tutorial;
 
+use ms_widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
 use tutorial::{Tutorial, TutorialRegistry, TutorialStep};
-use wheel_combo_box::WheelComboBox;
-use wheel_slider::WheelSlider;
-use wheel_spin_box::WheelSpinBox;
 
 const APP_TITLE: &str = "Tutorial Overlay Test";
 

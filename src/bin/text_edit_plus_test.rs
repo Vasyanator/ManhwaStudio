@@ -17,19 +17,13 @@ Key structures:
 - `RangeControl`
 
 Notes:
-This binary includes the widget source directly because the project currently has no library
-target. The same file is also compiled through `src/widgets/mod.rs` by the main application.
+The widget comes from the `ms-widgets` crate, the same code the main application links —
+this demo and the app can never diverge.
 */
-
-// The shared widget is included by path for this standalone demo because this crate has no
-// library target; some builder methods are exercised by the main app instead of this binary.
-#[allow(dead_code)]
-#[path = "../widgets/text_edit_plus.rs"]
-mod text_edit_plus;
 
 use eframe::egui;
 use egui::{Color32, DragValue, RichText};
-use text_edit_plus::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextColor};
+use ms_widgets::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextColor};
 
 const APP_TITLE: &str = "text_edit_plus_test";
 const DEFAULT_TEXT: &str = "Пример\nпереноса строки с выделенным фоном";

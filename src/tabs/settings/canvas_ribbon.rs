@@ -18,9 +18,12 @@ Notes:
 */
 
 use super::{DraggedBubbleConditionNode, SettingsTabState};
+// `BubbleBorderPaintColor` is the egui colour view of the persisted `[u8; 4]` border
+// colour; the style type itself is GUI-free and lives in `ms-config`.
 use crate::bubble_status::{
-    BubbleBorderKind, BubbleBorderStyle, BubbleStatusCondition, BubbleStatusField,
-    BubbleStatusRule, default_bubble_status_rules, normalize_bubble_status_rules,
+    BubbleBorderKind, BubbleBorderPaintColor, BubbleBorderStyle, BubbleStatusCondition,
+    BubbleStatusField, BubbleStatusRule, default_bubble_status_rules,
+    normalize_bubble_status_rules,
 };
 use crate::canvas::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleType, OnTopFocusMode,
@@ -1196,6 +1199,6 @@ fn default_user_rule(id: u64) -> BubbleStatusRule {
     BubbleStatusRule {
         id,
         condition: BubbleStatusCondition::Empty,
-        border: BubbleBorderStyle::new(BubbleBorderKind::Dashed, Color32::from_rgb(120, 170, 255)),
+        border: BubbleBorderStyle::new(BubbleBorderKind::Dashed, [120, 170, 255, 255]),
     }
 }
