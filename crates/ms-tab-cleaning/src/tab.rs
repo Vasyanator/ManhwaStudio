@@ -21,15 +21,18 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `draw`: кадр вкладки (гейты input, рендер canvas, UI панелей, overlay UI инструмента);
     все входы кадра приходят одним `CleaningDrawParams`, среди них `panel_dock` — состояние
     панельного дока, которым владеет приложение и которое одалживается на кадр.
-  - `draw_canvas_overlay_top_left` (в `CleaningHooks`): единственное место, где эта вкладка
-    гоняет док; объявляет «Ленту» через `canvas::declare_ribbon_tab` и пять собственных вкладок —
+  - `draw_canvas_overlay_top_left` (in `CleaningHooks`): the ONE place this program tab runs the
+    dock. It declares «Лента» through `canvas::declare_ribbon_tab` plus SIX tabs of its own —
     «Клин» (`CLEANING_CLEAN_TAB`), «Инструменты клина» (`CLEANING_TOOLS_TAB`), «Выбранный
     инструмент» (`CLEANING_ACTIVE_TOOL_TAB`), «Быстрый клин найденного текста»
-    (`CLEANING_QUICK_CLEAN_TAB`, видима по `quick_text_mask_panel_open`) и «Редактор области»
-    (`CLEANING_AREA_EDITOR_TAB`, видима по `CleaningTool::wants_main_panel` активного
-    инструмента). Раскладка по умолчанию — собственная (`cleaning_default_dock_layout`).
+    (`CLEANING_QUICK_CLEAN_TAB`, visible while `quick_text_mask_panel_open`), «Редактор области»
+    (`CLEANING_AREA_EDITOR_TAB`, visible while the active tool's `CleaningTool::wants_main_panel`)
+    and «Библиотека знаков» (`CLEANING_WATERMARK_LIBRARY_TAB`, visible while the active tool's
+    `CleaningTool::wants_library_panel`). The default arrangement is this tab's own
+    (`cleaning_default_dock_layout`).
   - `draw_clean_tab_body` / `draw_tools_tab_body` / `draw_active_tool_tab_body` /
-    `draw_quick_clean_tab_body` / `draw_area_editor_tab_body`: тела этих пяти вкладок. Всё, что требует `&mut CleaningTabState`
+    `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` /
+    `draw_watermark_library_tab_body`: the bodies of those six tabs. Всё, что требует `&mut CleaningTabState`
     (правки оверлея, запуск фоновых job-ов, смена инструмента), они не делают сами — идут внутри
     `canvas.draw` — а выставляют флаги `CleaningDockOut`, которые `apply_dock_out` применяет уже
     после `canvas.draw` в том же порядке, в каком это делали снесённые плавающие поверхности.
@@ -109,6 +112,11 @@ const CLEANING_QUICK_CLEAN_TAB: TabId = TabId::new("cleaning.quick_clean");
 /// canvas (`CleaningTool::draw_main_panel`). Shown only while the active tool asks
 /// for it through `CleaningTool::wants_main_panel`.
 const CLEANING_AREA_EDITOR_TAB: TabId = TabId::new("cleaning.area_editor");
+/// «Библиотека знаков» — the second tool-owned panel
+/// (`CleaningTool::draw_library_panel`): the watermark library's management screen.
+/// Shown only while the active tool asks for it through
+/// `CleaningTool::wants_library_panel`.
+const CLEANING_WATERMARK_LIBRARY_TAB: TabId = TabId::new("cleaning.watermark_library");
 
 /// Runtime marker painted on the badge of every Torch-backed tool button. A
 /// runtime NAME rather than prose, so it stays a literal
@@ -169,6 +177,27 @@ const CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 160.0);
 /// `the_default_dock_layout_solves_into_disjoint_panels` pins.
 const CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(344.0, 300.0);
 
+/// Smallest outer size, in points, the dock may shrink the «Библиотека знаков» panel
+/// to. FIXED numbers rather than caption-derived ones, for the same reason as
+/// «Редактор области»: the body is opaque per-tool UI whose captions this tab cannot
+/// measure. Its own rows wrap, and it scrolls, so the floor only has to keep an
+/// entry's preview plus one control column on screen.
+const CLEANING_WATERMARK_LIBRARY_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 180.0);
+/// Outer size, in points, the «Библиотека знаков» panel starts at.
+///
+/// The HEIGHT is the one a user settled on after working the panel — enough for the
+/// action row, the hint and status lines and about four entry rows without scrolling.
+///
+/// The WIDTH is NOT that user's, and cannot be: it is bounded by the same ceiling as
+/// «Редактор области», and for the same reason. This panel sits on the left chain
+/// under «Лента», whose own 340 pt plus the dock gap is where «Клин» starts, so
+/// anything from 348 pt up lays the two columns on top of each other on an ordinary
+/// 1600 pt area — `the_default_dock_layout_solves_into_disjoint_panels` pins it, and
+/// fails at the 506 pt the same user works at. Their width survives as their panel's
+/// own `size_override`; this constant is what a panel with no override starts from,
+/// and the left chain is what bounds it.
+const CLEANING_WATERMARK_LIBRARY_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(344.0, 483.0);
+
 /// Extra width, in points, added to every measured tool-button caption before the
 /// «Инструменты клина» minimum is folded out of them.
 ///
@@ -219,30 +248,40 @@ fn drawn_tool_indices() -> impl Iterator<Item = usize> {
 
 /// Builds the default dock arrangement of the «Клининг» program tab.
 ///
-/// Six panels reproducing where the migrated surfaces floated: the canvas' own
-/// «Лента» flush with the left edge, «Редактор области» docked UNDER it, «Клин» to
-/// the ribbon's right where the island sat, «Быстрый клин найденного текста» under
-/// «Клин» — the button that opens it lives there, and the left column is where the
-/// vertical room is, while hanging it off the right column would put an on-demand
-/// panel under a tool UI that is already the tallest thing on screen —,
-/// «Инструменты клина» flush with the right edge where the tool window sat, and
-/// «Выбранный инструмент» docked under it. All six are content-sized: their width
-/// is driven by their tabs' own `min_size`, and pinning a size here would only make
-/// the first solve fight it.
+/// Seven panels reproducing where the migrated surfaces floated: the canvas' own
+/// «Лента» flush with the left edge, «Библиотека знаков» docked UNDER it and
+/// «Редактор области» under that, «Клин» to the ribbon's right where the island sat,
+/// «Быстрый клин найденного текста» under «Клин» — the button that opens it lives
+/// there, and the left column is where the vertical room is, while hanging it off the
+/// right column would put an on-demand panel under a tool UI that is already the
+/// tallest thing on screen —, «Инструменты клина» flush with the right edge where the
+/// tool window sat, and «Выбранный инструмент» docked under it. All seven are
+/// content-sized: their width is driven by their tabs' own `min_size`, and pinning a
+/// size here would only make the first solve fight it.
 ///
-/// «Редактор области» is a LEAF of the arrangement: nothing is anchored to it, so a
-/// frame in which it is hidden — every tool but the area editor — simply drops it
-/// and leaves the other five exactly where they are, with no anchor inherited by
-/// anyone (`hiding_the_area_editor_leaves_every_other_panel_untouched`). Anchoring
-/// it under the ribbon rather than beside it is what makes that leaf position
-/// possible: «Лента» is itself `ViewportEdge::Left`, so a panel anchored to its
-/// `Left` would land outside the dock area and the solver's whole-chain translation
-/// would un-flush the ribbon.
+/// The left column is a CHAIN rather than two children of the ribbon, because two
+/// panels sharing a `target` + `edge` + `align` solve to the very same rect — the
+/// solver places every child of an anchor independently and the model checks only
+/// self-target, cross-host and cycles — so the second one would be buried and
+/// unreachable. «Библиотека знаков» takes the ribbon's `Bottom` slot and «Редактор
+/// области» hangs under IT. Both are conditional and both are leaves of what hangs
+/// off them, so dropping either for a frame costs nothing: `remove_panel` hands a
+/// dropped panel's own anchor down, so a frame without the library panel gives
+/// «Редактор области» `{ribbon, Bottom, 0.0}` — exactly where it sat before the
+/// library tab existed — and a frame without either leaves the remaining five panels
+/// at their unchanged rects
+/// (`hiding_the_area_editor_leaves_every_other_panel_untouched`,
+/// `hiding_the_library_panel_re_anchors_the_area_editor_to_the_ribbon`).
 ///
-/// No two panels share a `target` + `edge` + `align`: the three `Bottom` anchors name
-/// different targets («Лента», «Клин» and «Инструменты клина»), which is what keeps
-/// the solver — a total function of whatever layout it is given — from laying one
-/// panel exactly on top of another.
+/// Anchoring that column under the ribbon rather than beside it is what makes those
+/// leaf positions possible: «Лента» is itself `ViewportEdge::Left`, so a panel
+/// anchored to its `Left` would land outside the dock area and the solver's
+/// whole-chain translation would un-flush the ribbon.
+///
+/// No two panels share a `target` + `edge` + `align`: the four `Bottom` anchors name
+/// different targets («Лента», «Библиотека знаков», «Клин» and «Инструменты клина»),
+/// which is what keeps the solver — a total function of whatever layout it is given —
+/// from laying one panel exactly on top of another.
 ///
 /// Every canvas program tab needs a builder of ITS own — there is no shared
 /// ribbon-only one left — because the default layout doubles as the DICTIONARY the
@@ -265,10 +304,12 @@ pub fn cleaning_default_dock_layout() -> DockLayout {
     // A new id rather than a renumbering: «Лента» keeps id 0 so a user who already
     // arranged it under an earlier build finds their panel where they left it.
     let area_editor = PanelId::new(5);
+    let watermark_library = PanelId::new(6);
     let panels = [
         // Insertion order is anchor order: `insert_panel` rejects an anchor whose
-        // target does not exist yet, so the ribbon comes before both panels that
-        // hang off it — «Редактор области» below and «Клин» to its right.
+        // target does not exist yet, so the ribbon comes before every panel that
+        // hangs off it — «Библиотека знаков» below and «Клин» to its right — and the
+        // library panel comes before «Редактор области», which hangs off IT.
         (
             ribbon,
             vec![ms_canvas::CANVAS_RIBBON_TAB],
@@ -278,10 +319,19 @@ pub fn cleaning_default_dock_layout() -> DockLayout {
             },
         ),
         (
+            watermark_library,
+            vec![CLEANING_WATERMARK_LIBRARY_TAB],
+            PanelAnchor::Panel {
+                target: ribbon,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ),
+        (
             area_editor,
             vec![CLEANING_AREA_EDITOR_TAB],
             PanelAnchor::Panel {
-                target: ribbon,
+                target: watermark_library,
                 edge: DockEdge::Bottom,
                 align: 0.0,
             },
@@ -2188,6 +2238,16 @@ fn draw_area_editor_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
     }
 }
 
+/// Draws the «Библиотека знаков» tab body: the second panel a tool may own.
+///
+/// Dispatched exactly like `draw_area_editor_tab_body`, and reached only while the
+/// active tool asked for this panel through `CleaningTool::wants_library_panel`.
+fn draw_watermark_library_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    if let Some(tool) = cx.tools.get_mut(cx.active_tool_idx) {
+        tool.draw_library_panel(ui);
+    }
+}
+
 /// Draws one labelled group of tool buttons.
 fn draw_tool_button_group(
     ui: &mut egui::Ui,
@@ -2349,8 +2409,11 @@ impl CleaningHooks<'_> {
 
 impl CanvasHooks for CleaningHooks<'_> {
     /// Runs the «Клининг» tab's panel dock: the canvas' own «Лента» plus this tab's
-    /// five — «Клин», «Инструменты клина», «Выбранный инструмент», «Быстрый клин
-    /// найденного текста» and «Редактор области».
+    /// six — «Клин», «Инструменты клина», «Выбранный инструмент», «Быстрый клин
+    /// найденного текста», «Редактор области» and «Библиотека знаков». The last
+    /// three are conditional and are declared on every frame all the same, hidden
+    /// through `.visible(..)`: an undeclared tab loses its panel and is re-seeded a
+    /// fresh one on the next open.
     ///
     /// Implemented here, rather than after `canvas.draw` returns, for two reasons:
     /// the «Лента» body edits canvas settings and must land BEFORE
@@ -2403,6 +2466,12 @@ impl CanvasHooks for CleaningHooks<'_> {
             .tools
             .get(self.active_tool_idx)
             .is_some_and(|tool| tool.wants_main_panel());
+        // Same rule, same reason: the tool is the ONE source of truth for this panel's
+        // visibility and is re-asked every frame.
+        let library_panel_wanted = self
+            .tools
+            .get(self.active_tool_idx)
+            .is_some_and(|tool| tool.wants_library_panel());
         let mut cx = CleaningDockCx {
             canvas,
             total_pages: status.total_pages,
@@ -2460,15 +2529,25 @@ impl CanvasHooks for CleaningHooks<'_> {
             .initial_size(quick_clean_initial_size)
             .show(draw_quick_clean_tab_body);
         // Declared on EVERY frame for the same reason as the quick-clean tab, and
-        // visible only while the active tool asks for it. Hiding it is what makes the
-        // default arrangement identical to a five-panel one: the solver drops the
-        // panel and hands its own `ViewportEdge::Left` anchor down to «Лента».
+        // visible only while the active tool asks for it. Hiding it costs the other
+        // panels nothing: it is the last link of the left chain, so `frame_layout`
+        // drops it with no dependant to re-anchor.
         dock.tab(CLEANING_AREA_EDITOR_TAB)
             .title(|| t!("cleaning.tab.area_editor_tab"))
             .visible(area_editor_panel_wanted)
             .min_size(CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX)
             .initial_size(CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX)
             .show(draw_area_editor_tab_body);
+        // The third conditional tab, declared every frame like the other two. Hiding
+        // it hands its own `{«Лента», Bottom, 0.0}` anchor down to «Редактор области»
+        // (`DockLayout::remove_panel`), which is exactly where that panel sat before
+        // this tab existed.
+        dock.tab(CLEANING_WATERMARK_LIBRARY_TAB)
+            .title(|| t!("cleaning.tab.watermark_library_tab"))
+            .visible(library_panel_wanted)
+            .min_size(CLEANING_WATERMARK_LIBRARY_TAB_MIN_SIZE_PX)
+            .initial_size(CLEANING_WATERMARK_LIBRARY_TAB_INITIAL_SIZE_PX)
+            .show(draw_watermark_library_tab_body);
         // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a
         // panel the user detached into a sub-window, whose rect lives in that
         // window's own frame and would carve a dead zone out of this window's
@@ -3092,7 +3171,7 @@ mod tests {
     use super::{
         AREA_EDIT_TOOL_INDICES, BRUSH_TOOL_INDICES, CLEANING_ACTIVE_TOOL_TAB,
         CLEANING_AREA_EDITOR_TAB, CLEANING_CLEAN_TAB, CLEANING_PANEL_CHROME_WIDTH_PX,
-        CLEANING_QUICK_CLEAN_TAB, CLEANING_TOOLS_TAB,
+        CLEANING_QUICK_CLEAN_TAB, CLEANING_TOOLS_TAB, CLEANING_WATERMARK_LIBRARY_TAB,
         CleaningTabState, MASK_REMOVAL_TOOL_INDICES, cleaning_default_dock_layout,
         cleaning_row_width, cleaning_tab_outer_width, drawn_tool_indices,
         scale_blocks_source_to_page, scale_edge_to_i32,
@@ -3106,10 +3185,10 @@ mod tests {
     /// dictionary `panel_dock::persist` resolves stored tab keys against, so it has
     /// to be well-formed and to name every tab this program tab can declare.
     #[test]
-    fn the_default_dock_layout_places_the_six_cleaning_panels() {
+    fn the_default_dock_layout_places_the_seven_cleaning_panels() {
         let layout = cleaning_default_dock_layout();
         assert_eq!(layout.validate(), Ok(()));
-        assert_eq!(layout.panels().len(), 6);
+        assert_eq!(layout.panels().len(), 7);
 
         // «Лента» holds the LEFT viewport edge, and keeps the id every canvas program
         // tab's builder gives it, so a user who already arranged the ribbon under an
@@ -3126,10 +3205,26 @@ mod tests {
             }
         );
 
-        // «Редактор области» hangs UNDER the ribbon. Anchoring it to the ribbon's
+        // «Библиотека знаков» hangs UNDER the ribbon. Anchoring it to the ribbon's
         // `Left` instead would place it outside the dock area and un-flush the whole
         // chain, and giving it the viewport edge would make the ribbon depend on a
         // panel that is hidden for every tool but one.
+        let watermark_library = layout
+            .panel(PanelId::new(6))
+            .expect("the watermark-library panel exists");
+        assert_eq!(watermark_library.tabs, vec![CLEANING_WATERMARK_LIBRARY_TAB]);
+        assert_eq!(
+            watermark_library.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            }
+        );
+
+        // «Редактор области» continues that column under the library panel rather
+        // than taking the ribbon's `Bottom` slot a second time: two panels sharing a
+        // target+edge+align solve to the SAME rect and the second one is buried.
         let area_editor = layout
             .panel(PanelId::new(5))
             .expect("the area-editor panel exists");
@@ -3137,7 +3232,7 @@ mod tests {
         assert_eq!(
             area_editor.anchor,
             PanelAnchor::Panel {
-                target: PanelId::new(0),
+                target: PanelId::new(6),
                 edge: DockEdge::Bottom,
                 align: 0.0,
             }
@@ -3200,16 +3295,27 @@ mod tests {
                 align: 0.0,
             }
         );
-        assert_ne!(
-            quick_clean.anchor, active_tool.anchor,
-            "the three Bottom anchors must name different targets"
-        );
-        assert_ne!(quick_clean.anchor, area_editor.anchor);
-        assert_ne!(active_tool.anchor, area_editor.anchor);
+        // The four `Bottom` anchors must name four DIFFERENT targets: an identical
+        // target+edge+align lays two panels on exactly the same rect, and the model
+        // does not refuse it.
+        let bottom_anchors = [
+            quick_clean.anchor,
+            active_tool.anchor,
+            area_editor.anchor,
+            watermark_library.anchor,
+        ];
+        for (i, anchor_a) in bottom_anchors.iter().enumerate() {
+            for anchor_b in &bottom_anchors[i + 1..] {
+                assert_ne!(
+                    anchor_a, anchor_b,
+                    "two Bottom anchors share a target+edge+align: {anchor_a:?}"
+                );
+            }
+        }
 
         // Every panel is content-sized: they take their width from their tabs' own
         // `min_size`, which is measured per frame from the captions.
-        for id in [0, 1, 2, 3, 4, 5].map(PanelId::new) {
+        for id in [0, 1, 2, 3, 4, 5, 6].map(PanelId::new) {
             let panel = layout.panel(id).expect("a default panel exists");
             assert_eq!(panel.size_override, None, "{id} must stay content-sized");
         }
@@ -3224,28 +3330,30 @@ mod tests {
             CLEANING_ACTIVE_TOOL_TAB,
             CLEANING_QUICK_CLEAN_TAB,
             CLEANING_AREA_EDITOR_TAB,
+            CLEANING_WATERMARK_LIBRARY_TAB,
         ] {
             assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
         }
     }
 
     /// «Редактор области» is hidden for every tool but the area editor, so it must be
-    /// a LEAF: dropping it may not touch the other five, in the model or on screen.
+    /// a LEAF: dropping it may not touch the other six, in the model or on screen.
     ///
     /// `panel_dock::frame_layout` drops a panel with nothing to draw by calling
     /// `DockLayout::remove_panel`, which re-anchors every dependant to the REMOVED
     /// panel's own anchor. Nothing is anchored to this one, so that re-anchoring must
     /// have no dependants to reach — which is exactly what the anchor comparison
-    /// below checks, and the solve after it checks that the five surviving panels are
+    /// below checks, and the solve after it checks that the six surviving panels are
     /// laid out at the very same rects with the tab gone.
     #[test]
     fn hiding_the_area_editor_leaves_every_other_panel_untouched() {
-        const SURVIVORS: [PanelId; 5] = [
+        const SURVIVORS: [PanelId; 6] = [
             PanelId::new(0),
             PanelId::new(1),
             PanelId::new(2),
             PanelId::new(3),
             PanelId::new(4),
+            PanelId::new(6),
         ];
         let full = cleaning_default_dock_layout();
         let before: Vec<(PanelId, PanelAnchor)> = SURVIVORS
@@ -3261,7 +3369,7 @@ mod tests {
             .remove_panel(PanelId::new(5))
             .expect("the area-editor panel can be dropped for a frame");
         assert_eq!(hidden.validate(), Ok(()));
-        assert_eq!(hidden.panels().len(), 5);
+        assert_eq!(hidden.panels().len(), 6);
         for (id, anchor) in &before {
             let panel = hidden.panel(*id).expect("a survivor keeps its panel");
             assert_eq!(
@@ -3281,7 +3389,7 @@ mod tests {
             "the ribbon keeps the left viewport edge whether or not the tab is shown"
         );
 
-        // The same five rects with the tab gone: the model being unchanged is only
+        // The same six rects with the tab gone: the model being unchanged is only
         // half the property the user sees.
         let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
         let with = solve_default_layout(&full, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
@@ -3296,53 +3404,136 @@ mod tests {
         );
     }
 
+    /// «Библиотека знаков» sits BETWEEN the ribbon and «Редактор области», so hiding it
+    /// is the one case in this arrangement where a dependant inherits an anchor — and
+    /// what it must inherit is the ribbon's `Bottom` slot, i.e. exactly where the area
+    /// editor sat before this tab existed.
+    ///
+    /// Both panels are conditional and the library one is hidden far more often, so
+    /// this is the ORDINARY frame, not an edge case. Everything else must be untouched.
+    #[test]
+    fn hiding_the_library_panel_re_anchors_the_area_editor_to_the_ribbon() {
+        const UNAFFECTED: [PanelId; 5] = [
+            PanelId::new(0),
+            PanelId::new(1),
+            PanelId::new(2),
+            PanelId::new(3),
+            PanelId::new(4),
+        ];
+        let full = cleaning_default_dock_layout();
+        let before: Vec<(PanelId, PanelAnchor)> = UNAFFECTED
+            .iter()
+            .map(|id| {
+                let panel = full.panel(*id).expect("a default panel exists");
+                (*id, panel.anchor)
+            })
+            .collect();
+
+        let mut hidden = full.clone();
+        hidden
+            .remove_panel(PanelId::new(6))
+            .expect("the library panel can be dropped for a frame");
+        assert_eq!(hidden.validate(), Ok(()));
+        assert_eq!(hidden.panels().len(), 6);
+        assert_eq!(
+            hidden
+                .panel(PanelId::new(5))
+                .expect("the area editor survives the drop")
+                .anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            "the area editor must fall back onto the ribbon's own Bottom slot"
+        );
+        for (id, anchor) in &before {
+            let panel = hidden.panel(*id).expect("a survivor keeps its panel");
+            assert_eq!(
+                panel.anchor, *anchor,
+                "{id} inherited an anchor from the dropped library panel"
+            );
+        }
+
+        // With BOTH conditional left-column panels gone, the other five must be laid
+        // out exactly as they are with only the library one gone — the library panel
+        // is a pure insertion into the column, not a reshuffle of it.
+        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+        let mut neither = hidden.clone();
+        neither
+            .remove_panel(PanelId::new(5))
+            .expect("the area-editor panel can be dropped for a frame");
+        let without_library = solve_default_layout(&hidden, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
+        let without_both = solve_default_layout(&neither, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
+        let survivors: Vec<(PanelId, Rect)> = without_library
+            .into_iter()
+            .filter(|(id, _)| *id != PanelId::new(5))
+            .collect();
+        assert_eq!(
+            survivors, without_both,
+            "the area editor moved a panel that does not depend on it"
+        );
+    }
+
     /// What the user asked for: «Редактор области» opens directly UNDER «Лента», left
     /// edges flush, and never beside it or on top of it.
     #[test]
-    fn the_area_editor_opens_directly_under_the_ribbon() {
-        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
-        let solved = solve_default_layout(
-            &cleaning_default_dock_layout(),
-            area,
-            CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX,
-        );
-        let rect_of = |id: PanelId| {
-            solved
-                .iter()
-                .find(|(other, _)| *other == id)
-                .map(|(_, rect)| *rect)
-                .expect("every default panel is placed")
-        };
-        let ribbon = rect_of(PanelId::new(0));
-        let area_editor = rect_of(PanelId::new(5));
-        assert!(
-            (area_editor.left() - ribbon.left()).abs() < 1e-3,
-            "left edges must line up: ribbon {ribbon:?} vs area editor {area_editor:?}"
-        );
-        assert!(
-            area_editor.top() >= ribbon.bottom() - 1e-3,
-            "the area editor must start below the ribbon: {area_editor:?} vs {ribbon:?}"
-        );
-        assert!(
-            !area_editor.intersects(ribbon),
-            "the two must not overlap: {area_editor:?} vs {ribbon:?}"
-        );
-        // Nothing may be laid out in the gap between them, or "directly under" is a
-        // claim about ids rather than about what the user sees.
-        // Built through `max` so a sub-tolerance overlap cannot produce an INVERTED
-        // rect, whose `intersects` would answer nonsense instead of failing here.
-        let between = Rect::from_min_max(
-            Pos2::new(ribbon.left(), ribbon.bottom()),
-            Pos2::new(ribbon.right(), area_editor.top().max(ribbon.bottom())),
-        );
-        for (id, rect) in &solved {
-            if *id == PanelId::new(0) || *id == PanelId::new(5) {
-                continue;
-            }
+    fn the_left_column_panels_open_directly_under_the_ribbon() {
+        // Two frames, because the left column holds two conditional panels and the
+        // claim is about each one's ORDINARY frame: «Библиотека знаков» takes the
+        // ribbon's Bottom slot, and «Редактор области» takes it back whenever the
+        // library panel is hidden — which is every frame but the one the user opened
+        // it on.
+        let full = cleaning_default_dock_layout();
+        let mut library_hidden = full.clone();
+        library_hidden
+            .remove_panel(PanelId::new(6))
+            .expect("the library panel can be dropped for a frame");
+        for (frame, layout, under_ribbon) in [
+            ("library panel open", &full, PanelId::new(6)),
+            ("library panel hidden", &library_hidden, PanelId::new(5)),
+        ] {
+            let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+            let solved = solve_default_layout(layout, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
+            let rect_of = |id: PanelId| {
+                solved
+                    .iter()
+                    .find(|(other, _)| *other == id)
+                    .map(|(_, rect)| *rect)
+                    .expect("every default panel is placed")
+            };
+            let ribbon = rect_of(PanelId::new(0));
+            let below = rect_of(under_ribbon);
             assert!(
-                !rect.intersects(between),
-                "panel {id} sits between the ribbon and the area editor: {rect:?}"
+                (below.left() - ribbon.left()).abs() < 1e-3,
+                "{frame}: left edges must line up: ribbon {ribbon:?} vs {under_ribbon} {below:?}"
             );
+            assert!(
+                below.top() >= ribbon.bottom() - 1e-3,
+                "{frame}: {under_ribbon} must start below the ribbon: {below:?} vs {ribbon:?}"
+            );
+            assert!(
+                !below.intersects(ribbon),
+                "{frame}: the two must not overlap: {below:?} vs {ribbon:?}"
+            );
+            // Nothing may be laid out in the gap between them, or "directly under" is
+            // a claim about ids rather than about what the user sees.
+            // Built through `max` so a sub-tolerance overlap cannot produce an
+            // INVERTED rect, whose `intersects` would answer nonsense instead of
+            // failing here.
+            let between = Rect::from_min_max(
+                Pos2::new(ribbon.left(), ribbon.bottom()),
+                Pos2::new(ribbon.right(), below.top().max(ribbon.bottom())),
+            );
+            for (id, rect) in &solved {
+                if *id == PanelId::new(0) || *id == under_ribbon {
+                    continue;
+                }
+                assert!(
+                    !rect.intersects(between),
+                    "{frame}: panel {id} sits between the ribbon and {under_ribbon}: {rect:?}"
+                );
+            }
         }
     }
 
@@ -3350,18 +3541,20 @@ mod tests {
     /// the user SEES on a first run, and a panel laid out on top of another one is
     /// unreachable — the buried one cannot even be dragged out.
     ///
-    /// Four frames are checked, because two of the six panels are conditional:
-    /// «Быстрый клин найденного текста» follows its toggle and «Редактор области»
-    /// follows the active tool's `wants_main_panel`. `panel_dock::frame_layout` —
-    /// built on `DockLayout::remove_panel` — drops a hidden panel for the frame, so
-    /// each combination is a layout the user really gets.
+    /// Every combination of the THREE conditional panels is checked: «Быстрый клин
+    /// найденного текста» follows its toggle, «Редактор области» follows the active
+    /// tool's `wants_main_panel` and «Библиотека знаков» its `wants_library_panel`.
+    /// `panel_dock::frame_layout` — built on `DockLayout::remove_panel` — drops a
+    /// hidden panel for the frame, so each combination is a layout the user really
+    /// gets, including the one where the library panel is dropped from the MIDDLE of
+    /// the left column and the area editor inherits its anchor.
     ///
     /// The two tool panels hang off the RIGHT viewport edge while «Лента», «Клин»,
-    /// «Редактор области» and the quick-clean panel hang off the LEFT one, so
-    /// they form two independent chains that the solver clamps independently and
-    /// nothing stops from meeting in the middle of a narrow area (see the threshold
-    /// assertion below, measured for the ordinary frame in which the area editor is
-    /// hidden).
+    /// «Библиотека знаков», «Редактор области» and the quick-clean panel hang off the
+    /// LEFT one, so they form two independent chains that the solver clamps
+    /// independently and nothing stops from meeting in the middle of a narrow area
+    /// (see the threshold assertion below, measured for the ordinary frame in which
+    /// both left-column tool panels are hidden).
     #[test]
     fn the_default_dock_layout_solves_into_disjoint_panels() {
         // A maximised 1080p studio window: the canvas area of a 1920-wide window
@@ -3370,30 +3563,44 @@ mod tests {
         // window, not only a wide one.
         let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
         let all = cleaning_default_dock_layout();
-        let mut editor_hidden = all.clone();
-        editor_hidden
-            .remove_panel(PanelId::new(5))
-            .expect("the area-editor panel can be dropped for a frame");
-        // The ordinary frame: neither conditional panel is shown. This is the
-        // arrangement the pinned overlap band below was measured on.
-        let open = editor_hidden.clone();
-        let mut closed = editor_hidden;
-        closed
-            .remove_panel(PanelId::new(4))
-            .expect("the quick-clean panel can be dropped for a frame");
-        let mut all_but_quick_clean = all.clone();
-
-        all_but_quick_clean
-            .remove_panel(PanelId::new(4))
-            .expect("the quick-clean panel can be dropped for a frame");
-        for (frame, layout, expected_panels) in [
-            ("quick clean open", &open, 5),
-            ("quick clean closed", &closed, 4),
-            ("area editor open", &all_but_quick_clean, 5),
-            ("both conditional panels open", &all, 6),
-        ] {
+        // The three conditional panels, in the order a frame drops them: the library
+        // panel sits between the ribbon and the area editor, so dropping it hands its
+        // anchor to the area editor and the combination has to be solved, not assumed.
+        const CONDITIONAL: [PanelId; 3] = [PanelId::new(4), PanelId::new(5), PanelId::new(6)];
+        // The ordinary frame — no conditional panel shown — is `shown == 0b000`; it is
+        // the arrangement the pinned overlap band below was measured on.
+        let mut frames: Vec<(String, ms_widgets::panel_dock::DockLayout, usize)> = Vec::new();
+        for shown in 0..(1u8 << CONDITIONAL.len()) {
+            let mut layout = all.clone();
+            let mut names: Vec<String> = Vec::new();
+            for (bit, id) in CONDITIONAL.iter().enumerate() {
+                if shown & (1 << bit) == 0 {
+                    layout
+                        .remove_panel(*id)
+                        .expect("a conditional panel can be dropped for a frame");
+                } else {
+                    names.push(id.to_string());
+                }
+            }
+            let expected = 4 + names.len();
+            let frame = if names.is_empty() {
+                "no conditional panel".to_string()
+            } else {
+                format!("shown: {}", names.join(", "))
+            };
+            frames.push((frame, layout, expected));
+        }
+        // The frame the pinned overlap band below is measured on: the quick-clean
+        // panel open, both left-column tool panels hidden — the arrangement a user
+        // who is not in the area editor sees.
+        let mut open = all.clone();
+        for id in [PanelId::new(5), PanelId::new(6)] {
+            open.remove_panel(id)
+                .expect("a conditional panel can be dropped for a frame");
+        }
+        for (frame, layout, expected_panels) in &frames {
             let solved = solve_default_layout(layout, area, CLEAN_TAB_WIDEST_LOCALE_WIDTH_PX);
-            assert_eq!(solved.len(), expected_panels, "{frame}: every panel is placed");
+            assert_eq!(solved.len(), *expected_panels, "{frame}: every panel is placed");
             for (id, rect) in &solved {
                 assert!(
                     area.contains_rect(*rect),
@@ -3483,6 +3690,10 @@ mod tests {
                 PanelId::new(5),
                 super::CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX,
             ),
+            (
+                PanelId::new(6),
+                super::CLEANING_WATERMARK_LIBRARY_TAB_INITIAL_SIZE_PX,
+            ),
         ]
         .into_iter()
         .collect();
@@ -3507,6 +3718,10 @@ mod tests {
             (
                 PanelId::new(5),
                 super::CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX,
+            ),
+            (
+                PanelId::new(6),
+                super::CLEANING_WATERMARK_LIBRARY_TAB_MIN_SIZE_PX,
             ),
         ]
         .into_iter()

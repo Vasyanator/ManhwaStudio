@@ -23,6 +23,40 @@ Three modes, all driven from the one region-editor window:
   samples, the background jobs, the reports, the overlay patches and the on-disk
   library (`watermark_library.rs`); it owns no maths.
 
+The Torch requirement lives INSIDE the tool: `pytorch_required()` is a constant
+`false`, so the picker button is never AI-gated and the chapter mode stays
+reachable without Torch, while the two network entries of the mode picker and the
+run button carry the gate and name their own reason.
+
+The tool owns a SECOND dock tab beside «Выбранный инструмент»: «Библиотека знаков»
+(`wants_library_panel` / `draw_library_panel`, state in
+`watermark_library_window.rs`), toggled by the two «Библиотека знаков…» buttons.
+It also owns that panel's reach into the canvas: `library_arm` reserves the next
+completed selection FOR ONE ENTRY, and it is dropped the moment the screen that draws its cancel
+button is gone (`WatermarkLibraryWindow::arm_survives`, `deactivate`) — and SAYS SO on the
+panel (`drop_reservation_without_a_screen`), as it does for a parked rect that arrives with no
+reservation (`take_reservation_for_diverted`) and for a drag that produced no rectangle at all
+(`report_selection_refusal`). A reservation
+and the region base's SELECTION DIVERSION are one fact, kept in step by
+`sync_selection_diversion` after every mutation of `library_arm`: while a reservation
+is live the drag is cut out for the library and does NOT run the ordinary region
+editor — no loader job, no loading window, no editor left standing over the canvas
+with its zoom and undo shortcuts disabled. The canvas says so too: `draw_cursor`
+tints the crosshair and the rubber band with the cancel button's own red
+(`ARM_CANCEL_RGB`) while a reservation is in force, and the drag becomes easier to
+START: while armed a plain ЛКМ drag selects as well as Shift+ЛКМ, which is what the
+panel's own `library_arm_gesture_hint` tells the user. Every refusal of the capture lane — its own early returns and every error of
+`run_library_capture` — is reported the way a refused intake is: a red row on the armed entry
+(`WatermarkLibraryWindow::reject_capture`) plus a `log_warn`, never the status line alone.
+The crop the lane cuts is the selection grown by the measurement ring CLIPPED AT THE PAGE
+BORDER, and the real per-side margins travel with it (`GrownCrop` -> `CapturedCrop::margins` ->
+`ReferenceIntakeRequest::crop_margins`) so the intake derives the footprint that was cut: a mark
+stamped flush against the image edge has no background on that side and never will, and
+demanding the full ring on all four sides made such a mark unsamplable. The crops the
+capture writes are session scratch in the system temp directory; the panel deletes
+each one when it is committed or discarded, and `sweep_stale_scratch_crops` clears
+what a killed run left behind, once per process on a worker thread.
+
 Key items:
 - `WatermarkRemovalTool`: the `CleaningTool` implementation and its wiring.
 - `WatermarkMode` / `WatermarkNetworkMode`: the three-way user selection, and the
@@ -72,15 +106,20 @@ use super::mask_generation::{
     watermark_model_spec,
 };
 use super::watermark_entry::{
-    LibraryCandidate, alpha_assumption_from_stored, candidate_improves, luma_of_level,
-    rank_library_candidates, stored_calibration,
+    CropMargins, LibraryCandidate, ReferenceRefusal, StoredEntryIdentity,
+    alpha_assumption_from_stored, candidate_improves, engine_background, luma_of_level,
+    rank_library_candidates, rebuild_stored_kind, reference_crop_margin_px,
+    save_request_from_kind, stored_flat_background,
 };
 use super::watermark_library::{
-    EntrySummary, LibraryPlanes, LibrarySample, LoadedEntry, SaveEntryRequest,
-    StoredAlphaAssumption, StoredSampleBackground, StoredSampleOrigin, StoredSignature,
-    StoredSourceRef, list_entries, load_entry, save_entry,
+    EntrySummary, LibrarySample, LoadedEntry, SaveEntryRequest, StoredAlphaAssumption,
+    StoredSampleOrigin, StoredSourceRef, list_entries, load_entry, save_entry,
 };
-use super::watermark_library_window::WatermarkLibraryWindow;
+use super::watermark_library_window::{
+    ARM_CANCEL_RGB, CapturedCrop, LibraryArm, LibraryCaptureRefusal, LibraryPanelContext,
+    LibraryPanelRequest,
+    WatermarkLibraryWindow, remove_scratch_crop, thumbnail as library_window_thumbnail,
+};
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_config as config;
@@ -88,7 +127,7 @@ use ms_project::ProjectData;
 use crate::watermark_chapter::{
     AcceptanceEvidence, AlphaSource, AlphaUncertainty, CalibrationSample, DetectionParams,
     MarkSignature, MarkTemplate, ModelConditioning, ModelFitError, Occurrence, PixelRect,
-    RemovalResidual, SampleBackground, SampleParams, SampleRejection, SampleVerdict,
+    RemovalResidual, SampleParams, SampleRejection, SampleVerdict,
     SuggestedBackground, WatermarkKind, WatermarkModel, alpha_blend_operator,
     calibration_sample_from_page, discover_anchors, find_matching_kind, find_occurrences,
     remove_occurrences_on_page, scan_page, validate_calibration_sample,
@@ -107,6 +146,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use web_time::Duration;
@@ -192,8 +232,11 @@ impl WatermarkMode {
 
     /// Whether selecting this mode requires a working Torch runtime.
     ///
-    /// The chapter mode is deliberately AI-free, and the tool reports this through
-    /// `CleaningTool::pytorch_required` so a machine without Torch can still reach it.
+    /// The chapter mode is deliberately AI-free. This gates the two NETWORK entries of the
+    /// mode picker and the run button INSIDE the tool; it deliberately does NOT reach
+    /// `CleaningTool::pytorch_required`, which is a constant `false` so the picker button —
+    /// and `ensure_active_tool_available` behind it — can never make the chapter mode
+    /// unreachable on a machine without Torch.
     fn requires_torch(self) -> bool {
         self.network().is_some()
     }
@@ -777,8 +820,8 @@ enum ChapterRequest {
         index: usize,
         entry: Option<String>,
     },
-    /// Open the library management window.
-    OpenLibraryWindow,
+    /// Show or hide the «Библиотека знаков» dock panel.
+    ToggleLibraryPanel,
 }
 
 /// Which chapter job is in flight. Used for the status line and to keep the catalog UI
@@ -1062,6 +1105,310 @@ fn refresh_chapter_preview(catalog: &mut ChapterCatalog, index: usize) {
     mark.preview_revision = mark.preview_revision.wrapping_add(1);
 }
 
+/// The reservation left after one library-panel request is applied.
+///
+/// Exactly one reservation exists at a time, so arming a second purpose REPLACES the first
+/// instead of adding to it: that is what makes «+ новый» and «+ Выделить новый» mutually
+/// exclusive without either button knowing the other exists. Choosing which entry the chapter
+/// hunts says nothing about the next canvas selection and therefore leaves it alone.
+fn next_library_arm(
+    current: Option<LibraryArm>,
+    request: &LibraryPanelRequest,
+) -> Option<LibraryArm> {
+    match request {
+        LibraryPanelRequest::Arm(arm) => Some(arm.clone()),
+        LibraryPanelRequest::Disarm => None,
+        LibraryPanelRequest::SelectEntry(_) | LibraryPanelRequest::UnselectEntry(_) => current,
+    }
+}
+
+/// Everything the library capture worker needs to cut one armed selection out of its page.
+struct LibraryCaptureRequest {
+    page: ChapterPageTask,
+    /// Selection in OVERLAY coordinates, as the region editor reports it.
+    rect: OverlayRectPx,
+    sample_params: SampleParams,
+    max_side: u32,
+}
+
+/// Cuts the armed selection out of its page and measures the background under it.
+///
+/// The written crop is the selection GROWN by a measurement ring, because the reference intake
+/// derives the footprint by insetting the crop by that margin again: what the user dragged is
+/// the mark, and the band around it is the evidence about the background. The ring is measured
+/// here as well, on the page, so the panel knows straight away whether the crop can be
+/// committed or has to wait for the user to state a level — the on-disk sample format has no
+/// "level unknown" state.
+///
+/// The ring is CLIPPED at the page border rather than demanded on all four sides. A mark
+/// stamped against the edge of the image — which is where the user's marks sit — has no
+/// background on that side and never will, so a symmetric demand would make such a mark
+/// permanently unsamplable. The engine's own measurement has always worked this way
+/// (`validate_calibration_sample` clips the ring and admits it on a pixel COUNT), so nothing is
+/// widened here; what is removed is a symmetry this lane invented on top of it. The real
+/// margins are carried to the intake in [`CapturedCrop::margins`] so the footprint it derives is
+/// the one that was cut, and the measurement's partialness travels with the level.
+///
+/// The three ring outcomes are NOT the same thing: a flat ring measures the level, a ring
+/// refused as flat leaves the level to the user, and a ring that could not be measured at all
+/// makes the crop unusable — no stated level can license it, so it is refused here instead of
+/// being offered a colour control it could never satisfy.
+///
+/// # Errors
+/// A [`LibraryCaptureRefusal`] — an already-localized message plus the tag that says what the
+/// user could DO about it — for a page that cannot be decoded, a degenerate selection, a
+/// footprint above `max_side`, a selection with too little background left around it to judge
+/// flatness at all, and a scratch file that cannot be written.
+fn run_library_capture(request: LibraryCaptureRequest) -> Result<CapturedCrop, LibraryCaptureRefusal> {
+    let LibraryCaptureRequest {
+        page: page_task,
+        rect,
+        sample_params,
+        max_side,
+    } = request;
+    let page = decode_chapter_page(&page_task.path)
+        .map_err(LibraryCaptureRefusal::untagged)?;
+    let overlay_size = page_task
+        .overlay_size
+        .unwrap_or([page.width() as usize, page.height() as usize]);
+    let footprint = overlay_rect_to_page(rect, overlay_size, page.width(), page.height())
+        .ok_or_else(|| {
+            LibraryCaptureRefusal::tagged(
+                t!("cleaning.region.invalid_selection_size_error").to_string(),
+                ReferenceRefusal::TooSmall,
+            )
+        })?;
+    if footprint.width > max_side || footprint.height > max_side {
+        return Err(LibraryCaptureRefusal::tagged(
+            tf!(
+                "cleaning.tools.watermark.chapter.selection_too_large_error",
+                width = footprint.width,
+                height = footprint.height,
+                limit = max_side
+            ),
+            ReferenceRefusal::TooSmall,
+        ));
+    }
+    let margin = reference_crop_margin_px(&sample_params);
+    let grown = grow_page_rect(footprint, margin, page.width(), page.height()).ok_or_else(|| {
+        LibraryCaptureRefusal::tagged(
+            t!("cleaning.region.invalid_selection_size_error").to_string(),
+            ReferenceRefusal::TooSmall,
+        )
+    })?;
+    let GrownCrop { outer, margins } = grown;
+    let measured = match validate_calibration_sample(&page, footprint, &sample_params) {
+        SampleVerdict::Calibration { level, .. } => Some(level),
+        // The ring was measured and REFUSED as flat: the level is the one thing only the user
+        // can supply, and the intake accepts the crop once they state it.
+        SampleVerdict::TemplateOnly { .. } => None,
+        // No ring could be measured at all. Stating a level cannot license this crop — the
+        // intake refuses it whatever is asserted (`run_reference_intake`) — so the capture is
+        // refused HERE, before a scratch file is written and before the panel offers a colour
+        // control that could never lead anywhere.
+        SampleVerdict::Unusable {
+            reason: SampleRejection::BadRect,
+        } => {
+            return Err(LibraryCaptureRefusal::tagged(
+                t!("cleaning.tools.watermark.chapter.sample_unusable_rect").to_string(),
+                ReferenceRefusal::TooSmall,
+            ));
+        }
+        // Too little background survived to judge flatness AT ALL. This is the floor a mark at
+        // the page edge actually runs into, and it is a pixel count rather than a per-side
+        // margin — so the message names the count, and names the border when that is what took
+        // the pixels, instead of the generic "too close to the edge" it used to give.
+        SampleVerdict::Unusable {
+            reason: SampleRejection::RingTooSmall { pixels, needed },
+        } => {
+            let message = if margins.is_partial(margin) {
+                tf!(
+                    "cleaning.tools.watermark.chapter.library_capture_edge_ring_error",
+                    pixels = pixels,
+                    needed = needed
+                )
+            } else {
+                tf!(
+                    "cleaning.tools.watermark.chapter.sample_unusable_ring",
+                    pixels = pixels,
+                    needed = needed
+                )
+            };
+            return Err(LibraryCaptureRefusal::tagged(
+                message,
+                ReferenceRefusal::TooSmall,
+            ));
+        }
+    };
+    let crop = image::imageops::crop_imm(&page, outer.x, outer.y, outer.width, outer.height)
+        .to_image();
+    let path = library_scratch_crop_path();
+    crop.save(&path).map_err(|err| {
+        LibraryCaptureRefusal::untagged(tf!(
+            "cleaning.tools.watermark.chapter.library_image_write_error",
+            path = path.display(),
+            err = err
+        ))
+    })?;
+    Ok(CapturedCrop {
+        preview: library_window_thumbnail(&crop),
+        path,
+        measured,
+        margins,
+    })
+}
+
+/// One cut-out crop: the rectangle to cut, and how much background it actually carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrownCrop {
+    /// The rectangle to cut out of the page, footprint plus whatever ring fitted.
+    outer: PixelRect,
+    /// Background present on each side of the footprint inside `outer`. Equal to the requested
+    /// margin on every side unless the page border took some of it.
+    margins: CropMargins,
+}
+
+/// Grows `rect` by up to `margin` on every side, taking what the page can give.
+///
+/// A side the page border truncates contributes fewer pixels — or none — instead of failing the
+/// whole capture. This used to refuse, which made a mark stamped flush against the image edge
+/// permanently unsamplable: the ring it needs does not exist there and never will, and the user
+/// has such marks. The engine's measurement has always clipped its ring at the page and judged
+/// the result on a PIXEL COUNT, so admitting a truncated ring here widens nothing; it only stops
+/// this lane from demanding a symmetry the measurement never asked for. The asymmetry is not
+/// hidden: [`GrownCrop::margins`] travels to the intake, which derives the footprint from it
+/// instead of assuming a symmetric inset, and the ring's partialness is recorded with the level.
+///
+/// `None` only for a rect that is not inside the page at all, which is a bad selection rather
+/// than a tight one.
+fn grow_page_rect(
+    rect: PixelRect,
+    margin: u32,
+    page_width: u32,
+    page_height: u32,
+) -> Option<GrownCrop> {
+    if u64::from(rect.x) + u64::from(rect.width) > u64::from(page_width)
+        || u64::from(rect.y) + u64::from(rect.height) > u64::from(page_height)
+        || rect.width == 0
+        || rect.height == 0
+    {
+        return None;
+    }
+    let left = margin.min(rect.x);
+    let top = margin.min(rect.y);
+    // Cast-free: both sums are bounded by the page dimensions, which the check above proved.
+    let right = margin.min(page_width - rect.x - rect.width);
+    let bottom = margin.min(page_height - rect.y - rect.height);
+    Some(GrownCrop {
+        outer: PixelRect::new(
+            rect.x - left,
+            rect.y - top,
+            rect.width + left + right,
+            rect.height + top + bottom,
+        ),
+        margins: CropMargins {
+            left,
+            top,
+            right,
+            bottom,
+        },
+    })
+}
+
+/// Name prefix every session scratch crop shares, so the sweep can recognise its own files
+/// and touch nothing else in the system temp directory.
+const SCRATCH_CROP_PREFIX: &str = "manhwastudio-wm-capture-";
+
+/// How long a scratch crop left by ANOTHER process is kept before the sweep removes it.
+///
+/// A second instance of the program may legitimately be holding crops of its own, and there
+/// is no portable way to ask whether a recorded process id is still alive, so age is the
+/// guard: a day is far longer than any editing session that still remembers the crop, and
+/// the crop was never anything but session state.
+const SCRATCH_CROP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A fresh path for one session scratch crop.
+///
+/// The crops are session state by construction — a crop with no stated background cannot be
+/// persisted — so they live in the system temp directory, are named per process and per crop
+/// so two runs cannot collide, and are deleted by the panel when the crop is committed or
+/// discarded. A run that ends before the panel got to them is what `sweep_stale_scratch_crops`
+/// cleans up.
+fn library_scratch_crop_path() -> PathBuf {
+    static NEXT_CROP: AtomicU64 = AtomicU64::new(1);
+    let index = NEXT_CROP.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{SCRATCH_CROP_PREFIX}{}-{index}.png",
+        std::process::id()
+    ))
+}
+
+/// True when `name` is a scratch crop that no longer belongs to anybody this sweep may assume
+/// is alive: it carries the scratch prefix, it was not written by `current_pid`, and `age` has
+/// passed [`SCRATCH_CROP_MAX_AGE`].
+///
+/// Pure so the rule can be tested without touching the filesystem. A name whose process id
+/// does not parse is still one of ours by prefix and is aged out like any other; a file this
+/// process wrote is NEVER swept, because its crops may still be waiting in the panel.
+fn scratch_crop_is_stale(name: &str, age: Duration, current_pid: u32) -> bool {
+    let Some(rest) = name.strip_prefix(SCRATCH_CROP_PREFIX) else {
+        return false;
+    };
+    if !rest.ends_with(".png") {
+        return false;
+    }
+    let owner = rest.split_once('-').map(|(pid, _)| pid).unwrap_or(rest);
+    if owner.parse::<u32>().is_ok_and(|pid| pid == current_pid) {
+        return false;
+    }
+    age >= SCRATCH_CROP_MAX_AGE
+}
+
+/// Removes scratch crops that earlier runs left in the system temp directory.
+///
+/// The panel deletes a crop when it is committed or discarded, so the only crops this finds
+/// are those a run was killed on top of. Without the sweep they accumulate for the life of the
+/// machine; with it the directory holds at most one session's worth plus a day's grace for a
+/// concurrently running instance. Runs on a worker thread: it is directory I/O.
+fn sweep_stale_scratch_crops() {
+    let dir = std::env::temp_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] watermark scratch sweep could not read {}: {err}",
+                dir.display()
+            ));
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let current_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // A file whose age cannot be read counts as brand new, so an unreadable timestamp
+        // never costs somebody their crop.
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or(Duration::ZERO);
+        if !scratch_crop_is_stale(name, age, current_pid) {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(entry.path()) {
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] watermark scratch sweep could not remove {}: {err}",
+                entry.path().display()
+            ));
+        }
+    }
+}
+
 /// Request of the "add mark" / "add sample" worker.
 struct ChapterSampleRequest {
     catalog: ChapterCatalog,
@@ -1176,7 +1523,9 @@ fn run_chapter_sample(request: ChapterSampleRequest) -> Result<ChapterSampleOutc
 
     if let Some(sample) = sample {
         let SampleVerdict::Calibration {
-            level, ring_std, ..
+            level,
+            ring_std,
+            ring,
         } = verdict
         else {
             return Err(chapter_engine_error("calibration sample without a flat ring"));
@@ -1191,7 +1540,7 @@ fn run_chapter_sample(request: ChapterSampleRequest) -> Result<ChapterSampleOutc
                 x: rect.x,
                 y: rect.y,
             },
-            background: StoredSampleBackground::Flat { level, ring_std },
+            background: stored_flat_background(level, ring_std, ring),
         });
         refit_chapter_kind(&mut catalog.kinds[index])?;
     } else if verdict.usable_as_template() {
@@ -1236,15 +1585,10 @@ fn rebuild_chapter_kind(
     }
     kind.set_alpha_assumption(alpha_assumption_from_stored(assumption));
     for crop in crops {
-        let StoredSampleBackground::Flat { level, ring_std } = crop.background;
         let crop_rect = PixelRect::new(0, 0, crop.image.width(), crop.image.height());
-        let sample = CalibrationSample::from_page(
-            &crop.image,
-            0,
-            crop_rect,
-            SampleBackground::Flat { level, ring_std },
-        )
-        .map_err(chapter_engine_error)?;
+        let sample =
+            CalibrationSample::from_page(&crop.image, 0, crop_rect, engine_background(crop.background))
+                .map_err(chapter_engine_error)?;
         kind.add_sample(sample).map_err(chapter_engine_error)?;
     }
     refit_chapter_kind(&mut kind)?;
@@ -1465,8 +1809,14 @@ fn run_chapter_scan(
                     &sample_params,
                 )
                 .map_err(chapter_engine_error)?;
-                let (Some(sample), SampleVerdict::Calibration { level, ring_std, .. }) =
-                    (sample, verdict)
+                let (
+                    Some(sample),
+                    SampleVerdict::Calibration {
+                        level,
+                        ring_std,
+                        ring,
+                    },
+                ) = (sample, verdict)
                 else {
                     continue;
                 };
@@ -1480,7 +1830,7 @@ fn run_chapter_scan(
                         x: occurrence.rect.x,
                         y: occurrence.rect.y,
                     },
-                    background: StoredSampleBackground::Flat { level, ring_std },
+                    background: stored_flat_background(level, ring_std, ring),
                 });
             }
             catalog.marks[index].page_width = page.width();
@@ -1746,18 +2096,29 @@ fn run_chapter_use_match(request: ChapterMatchRequest) -> Result<ChapterSampleOu
 /// A user-facing message for an unreadable entry or an engine failure.
 fn run_chapter_library_load(entry_id: &str) -> Result<ChapterLoadOutcome, String> {
     let entry = load_entry(entry_id)?;
-    let rect = PixelRect::new(0, 0, entry.meta.width, entry.meta.height);
-    let template = MarkTemplate::from_page(&entry.template, rect).map_err(chapter_engine_error)?;
-    let mut kind = WatermarkKind::new(entry.meta.id.clone(), template, alpha_blend_operator());
-    if !entry.meta.anchors.is_empty() {
-        kind.template_mut()
-            .set_anchors(&entry.meta.anchors)
-            .map_err(chapter_engine_error)?;
-    }
-    kind.set_alpha_assumption(alpha_assumption_from_stored(entry.meta.alpha_assumption));
+    // The rebuild is SHARED with the reference intake and the sample editor
+    // (`watermark_entry::rebuild_stored_kind`): a stored entry becomes a model in exactly one
+    // place, so the three paths cannot disagree about how a kind is assembled.
+    // An EMPTY entry has no mark yet: nothing to correlate against, no footprint to scan for
+    // and no model to remove with. Refusing by name is the only honest answer — the alternative
+    // is a chapter mark made of a template that does not exist.
+    let Some(template) = entry.template.clone() else {
+        return Err(tf!(
+            "cleaning.tools.watermark.chapter.library_entry_empty_error",
+            name = entry.meta.name.clone()
+        ));
+    };
+    let kind = rebuild_stored_kind(
+        entry.meta.id.clone(),
+        &template,
+        (entry.meta.width, entry.meta.height),
+        &entry.meta.anchors,
+        entry.meta.alpha_assumption,
+        &entry.samples,
+    )?;
     let mut mark = ChapterMark::new(
         entry.meta.name.clone(),
-        entry.template.clone(),
+        template,
         entry
             .meta
             .sources
@@ -1766,24 +2127,9 @@ fn run_chapter_library_load(entry_id: &str) -> Result<ChapterLoadOutcome, String
     );
     mark.library_entry = Some(entry.meta.id.clone());
     mark.alpha_assumption = entry.meta.alpha_assumption;
-    for sample in entry.samples {
-        let StoredSampleBackground::Flat { level, ring_std } = sample.background;
-        let page_index = match sample.origin {
-            StoredSampleOrigin::Page { page_index, .. } => page_index,
-            StoredSampleOrigin::ReferenceCrop => 0,
-        };
-        let rect = PixelRect::new(0, 0, sample.image.width(), sample.image.height());
-        let calibration = CalibrationSample::from_page(
-            &sample.image,
-            page_index,
-            rect,
-            SampleBackground::Flat { level, ring_std },
-        )
-        .map_err(chapter_engine_error)?;
-        kind.add_sample(calibration).map_err(chapter_engine_error)?;
-        mark.crops.push(sample);
-    }
-    refit_chapter_kind(&mut kind)?;
+    // The crops are kept in LOCKSTEP with the kind's calibration samples: the engine never
+    // hands sample pixels back, and the library needs them to write the entry again.
+    mark.crops = entry.samples;
     mark.preview = kind.model().map(build_chapter_preview);
     mark.preview_revision = 1;
     let status = tf!(
@@ -1797,39 +2143,42 @@ fn run_chapter_library_load(entry_id: &str) -> Result<ChapterLoadOutcome, String
 ///
 /// Only the mark's flat calibration crops are handed over — an estimated per-pixel
 /// background is derived from a model rather than measured, and persisting one would let a
-/// later fold-in overwrite a measurement with an estimate.
+/// later fold-in overwrite a measurement with an estimate. The request itself is assembled by
+/// the SHARED `watermark_entry::save_request_from_kind`, so a chapter write and a library-side
+/// rewrite cannot describe the same kind differently.
+///
+/// A mark with NO flat crops is written DELIBERATELY, not by omission. Such a mark was
+/// discovered by correlation and never measured against a background the engine would call
+/// flat, so the entry it produces carries its template and its footprint but no samples and no
+/// model — a legitimate state the library expresses (`NotEnoughSamples`) and the one the user
+/// then adds crops to from the panel. It is logged as such, because "the entry I saved has no
+/// samples" is otherwise indistinguishable from a crop list that was lost on the way here.
 fn build_library_request(
     mark: &ChapterMark,
     kind: &WatermarkKind,
     source: Option<StoredSourceRef>,
 ) -> SaveEntryRequest {
-    SaveEntryRequest {
-        entry_id: mark.library_entry.clone(),
-        name: mark.name.clone(),
-        operator: kind.model().map_or_else(
-            || "alpha_blend".to_string(),
-            |model| model.operator().id().to_string(),
-        ),
-        width: kind.template().width(),
-        height: kind.template().height(),
-        anchors: kind.template().anchors().to_vec(),
-        anchor_key: kind.template().anchor_key(),
-        alpha_assumption: mark.alpha_assumption,
-        signature: kind.signature().map(|signature| StoredSignature {
-            reference_level: signature.reference_level,
-            deposit_chroma: signature.deposit_chroma,
-            mean_deposit: signature.mean_deposit,
-            peak_alpha: signature.peak_alpha,
-        }),
-        calibration: stored_calibration(kind),
-        source,
-        template: mark.template_crop.clone(),
-        samples: mark.crops.clone(),
-        planes: kind.model().map(|model| LibraryPlanes {
-            c: model.c().to_vec(),
-            s: model.s().to_vec(),
-        }),
+    if mark.crops.is_empty() {
+        ms_log::runtime_log::log_info(format!(
+            "[cleaning] watermark library: saving mark {:?} with NO calibration crops. \
+             The entry keeps its template and footprint and carries no model; samples can be \
+             added to it from the library panel.",
+            mark.name
+        ));
     }
+    save_request_from_kind(
+        StoredEntryIdentity {
+            entry_id: mark.library_entry.clone(),
+            name: mark.name.clone(),
+            alpha_assumption: mark.alpha_assumption,
+            source,
+        },
+        kind,
+        // A chapter mark ALWAYS has its template crop — it is what detection ran on — so this
+        // path never writes a template-less entry. That state belongs to «+ новый» alone.
+        Some(mark.template_crop.clone()),
+        mark.crops.clone(),
+    )
 }
 
 /// Search metadata of the open project: where this measurement came from.
@@ -1870,6 +2219,20 @@ fn chapter_source_ref(
 /// refused as a calibration target.
 fn describe_sample_verdict(verdict: &SampleVerdict) -> String {
     match verdict {
+        // A partial ring gets its OWN wording rather than the same sentence with a footnote:
+        // "measured against the page edge" is what the user can act on, and hiding it inside
+        // the ordinary line would let a one-sided measurement read as a complete one.
+        SampleVerdict::Calibration {
+            level,
+            ring_std,
+            ring,
+        } if ring.is_partial() => tf!(
+            "cleaning.tools.watermark.chapter.sample_calibration_partial",
+            level = format_levels(&[luma_of_level(*level)]),
+            std = format!("{:.1}", ring_std.iter().copied().fold(0.0f32, f32::max)),
+            pixels = ring.pixels,
+            full = ring.full_pixels
+        ),
         SampleVerdict::Calibration {
             level, ring_std, ..
         } => tf!(
@@ -1917,11 +2280,30 @@ fn format_levels(levels: &[f32]) -> String {
 /// Wording is load-bearing (`dev-docs/watermark_chapter_decomposition_plan.md`,
 /// "Corrections from the second implementation round"): what is measured exactly is the
 /// IMPRINT, never «c»; the stated percentage bounds the alpha SCALE only.
-fn describe_conditioning(conditioning: &ModelConditioning) -> Vec<String> {
+///
+/// `rests_on_assertion` is `true` when the model behind `conditioning` was fitted on at
+/// least one HAND-STATED background level (`ModelProvenance::manual_backgrounds` is
+/// non-zero). It is a CORRECTNESS input, not a decoration: such a model may never be
+/// described as measured, whatever the verdict tag says, so the two verdicts that claim a
+/// measurement switch to their `_asserted` wording. The library card enforces the same rule
+/// through `entry_verdict_line`, and the two must not be able to disagree about one entry.
+/// `pub(super)` for one reason only: the library panel's own wording test asserts that this
+/// function and `entry_verdict_line` cannot disagree about the SAME entry, and the obligation
+/// is only worth testing when both halves are checked together.
+pub(super) fn describe_conditioning(
+    conditioning: &ModelConditioning,
+    rests_on_assertion: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(match conditioning {
+        ModelConditioning::Separable { .. } if rests_on_assertion => {
+            t!("cleaning.tools.watermark.chapter.verdict_separable_asserted").to_string()
+        }
         ModelConditioning::Separable { .. } => {
             t!("cleaning.tools.watermark.chapter.verdict_separable").to_string()
+        }
+        ModelConditioning::DepositExact { .. } if rests_on_assertion => {
+            t!("cleaning.tools.watermark.chapter.verdict_deposit_exact_asserted").to_string()
         }
         ModelConditioning::DepositExact { .. } => {
             t!("cleaning.tools.watermark.chapter.verdict_deposit_exact").to_string()
@@ -1986,6 +2368,9 @@ fn describe_alpha_uncertainty(alpha: &AlphaUncertainty) -> String {
         }
         AlphaSource::EstimatedBackgrounds => {
             t!("cleaning.tools.watermark.chapter.alpha_source_estimated")
+        }
+        AlphaSource::ManualBackgrounds => {
+            t!("cleaning.tools.watermark.chapter.alpha_source_manual")
         }
         AlphaSource::Assumed => t!("cleaning.tools.watermark.chapter.alpha_source_assumed"),
     };
@@ -2059,12 +2444,34 @@ pub struct WatermarkRemovalTool {
     unload_status: Option<String>,
     progress: Arc<Mutex<WatermarkProgress>>,
     ai_backend_available: bool,
+    /// Whether the backend reports a usable Torch runtime, pushed by the tab every frame.
+    ///
+    /// The tool's own Torch gate lives here rather than on the picker button: the two network
+    /// modes need it, the chapter mode does not. An UNKNOWN answer arrives as `true` — the tab
+    /// resolves `is_torch_available.unwrap_or(true)` — which is the same optimistic treatment
+    /// the shared mask-source gating uses: a UI locked because a health snapshot has not
+    /// arrived yet is worse than a named backend error at run time.
+    ai_backend_torch_available: bool,
     /// Everything the local chapter mode owns. Survives closing the region editor, so a
     /// chapter-wide apply keeps running (and keeps reporting) after the window is gone.
     chapter: ChapterState,
-    /// The library management window. Tool-owned and independent of the region editor, so
-    /// it stays usable while a chapter job runs.
+    /// The «Библиотека знаков» dock panel's state. Tool-owned and independent of the region
+    /// editor, so it stays usable while a chapter job runs.
     library_window: WatermarkLibraryWindow,
+    /// What the next completed canvas selection is reserved for, when the library panel
+    /// reserved it. `Option` by design: exactly one reservation can be live, so arming a
+    /// second entry necessarily disarms the first.
+    library_arm: Option<LibraryArm>,
+    /// What the library panel asked for while it drew, raised inside `CanvasView::draw` and
+    /// consumed later in the SAME frame by `draw_overlay_ui`.
+    library_panel_request: Option<LibraryPanelRequest>,
+    /// The armed selection being cut out of its page. Its own lane on purpose: the library
+    /// panel's channel holds one job at a time and would make a capture wait behind an icon
+    /// batch, while the chapter channel would make it wait behind a chapter-wide scan.
+    library_capture_rx: Option<Receiver<Result<CapturedCrop, LibraryCaptureRefusal>>>,
+    /// The reservation the in-flight capture was started for, so a crop that comes back after
+    /// the user re-armed still lands where it was promised.
+    library_capture_arm: Option<LibraryArm>,
 }
 
 impl Default for WatermarkRemovalTool {
@@ -2086,10 +2493,22 @@ impl Default for WatermarkRemovalTool {
             unload_status: None,
             progress: Arc::new(Mutex::new(WatermarkProgress::default())),
             ai_backend_available: false,
+            ai_backend_torch_available: false,
             chapter: ChapterState::default(),
             library_window: WatermarkLibraryWindow::default(),
+            library_arm: None,
+            library_panel_request: None,
+            library_capture_rx: None,
+            library_capture_arm: None,
         };
         tool.request_settings_load();
+        // Once per process, and off the GUI thread: the scratch crops of a run that was killed
+        // before the panel could clean up would otherwise accumulate in the temp directory for
+        // the life of the machine.
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        SWEEP.call_once(|| {
+            thread::spawn(sweep_stale_scratch_crops);
+        });
         tool
     }
 }
@@ -2177,6 +2596,309 @@ impl WatermarkRemovalTool {
                 overlay_size: canvas.overlay_size(page.idx),
             })
             .collect()
+    }
+
+    /// Ids of the library entries the open chapter is currently searching for.
+    ///
+    /// Membership is the CATALOG, not `pinned_entry`: an entry is being hunted exactly when a
+    /// mark of its own was loaded from it. `ChapterCatalog::index_of` keys on the kind id, and
+    /// a kind loaded from the library carries the entry id, but a chapter-DISCOVERED mark is
+    /// `mark-{n}`; `library_entry` is what tells the two apart, so it is what is checked here
+    /// and in `unload_library_entry`.
+    fn chapter_library_selection(&self) -> Vec<String> {
+        self.chapter
+            .catalog
+            .kinds
+            .iter()
+            .zip(self.chapter.catalog.marks.iter())
+            .filter(|(kind, mark)| mark.library_entry.as_deref() == Some(kind.id()))
+            .map(|(kind, _)| kind.id().to_string())
+            .collect()
+    }
+
+    /// Ids of the library entries a chapter-DISCOVERED mark was written to.
+    ///
+    /// «В библиотеку» stamps the new entry id onto a mark whose kind id stays `mark-{n}`, so
+    /// such an entry is already in the chapter under a different name: loading it would give
+    /// the catalog a SECOND kind for one physical mark, and «Убрать» would then drop only the
+    /// loaded copy. It is therefore neither selectable nor unselectable — the card says it is
+    /// already here, and `ChapterRequest::LoadLibrary` refuses it for the same reason.
+    /// Index of the catalog mark that ALREADY represents `entry_id`, however it got there.
+    ///
+    /// Two things can put an entry in the chapter: loading it (the kind takes the entry's id)
+    /// and saving a discovered mark to it (the kind keeps `mark-{n}` and only the mark names
+    /// the entry). Both count, because either way a second load would give the catalog two
+    /// kinds for one physical mark and everything keyed on that id would resolve to whichever
+    /// came first.
+    fn chapter_entry_index(&self, entry_id: &str) -> Option<usize> {
+        self.chapter.catalog.index_of(entry_id).or_else(|| {
+            self.chapter
+                .catalog
+                .marks
+                .iter()
+                .position(|mark| mark.library_entry.as_deref() == Some(entry_id))
+        })
+    }
+
+    fn chapter_saved_entries(&self) -> Vec<String> {
+        self.chapter
+            .catalog
+            .kinds
+            .iter()
+            .zip(self.chapter.catalog.marks.iter())
+            .filter_map(|(kind, mark)| {
+                mark.library_entry
+                    .as_deref()
+                    .filter(|entry_id| *entry_id != kind.id())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Runs what the library panel asked for while it drew.
+    ///
+    /// Reached from `draw_overlay_ui`, i.e. after the dock body of the same frame, because
+    /// every branch here touches state the dock body may not: the chapter catalog, the
+    /// canvas, or a worker.
+    fn run_library_panel_request(
+        &mut self,
+        request: LibraryPanelRequest,
+        canvas: &CanvasView,
+        project: &ProjectData,
+    ) {
+        self.library_arm = next_library_arm(self.library_arm.take(), &request);
+        self.sync_selection_diversion();
+        match request {
+            LibraryPanelRequest::SelectEntry(entry_id) => {
+                self.start_chapter_request(ChapterRequest::LoadLibrary(entry_id), canvas, project);
+            }
+            LibraryPanelRequest::UnselectEntry(entry_id) => self.unload_library_entry(&entry_id),
+            // The reservation is the WHOLE effect of these two; it was applied above.
+            LibraryPanelRequest::Arm(_) | LibraryPanelRequest::Disarm => {}
+        }
+    }
+
+    /// Drops the chapter mark that was loaded from `entry_id`, and only that one.
+    ///
+    /// A mark the chapter DISCOVERED is never touched, even when it sits under a kind id that
+    /// happens to match: removing it would throw away measurements that cost a scan, and it
+    /// was never "the library entry the user selected" in the first place.
+    fn unload_library_entry(&mut self, entry_id: &str) {
+        let Some(index) = self
+            .chapter
+            .catalog
+            .index_of(entry_id)
+            .filter(|index| {
+                self.chapter
+                    .catalog
+                    .marks
+                    .get(*index)
+                    .and_then(|mark| mark.library_entry.as_deref())
+                    == Some(entry_id)
+            })
+        else {
+            return;
+        };
+        // Drop the mark's preview textures with it, or the map would keep one entry per mark
+        // ever created in this session.
+        self.chapter.textures.remove(entry_id);
+        self.chapter.catalog.remove(index);
+        self.chapter.selected = self
+            .chapter
+            .selected
+            .min(self.chapter.catalog.len().saturating_sub(1));
+        self.chapter.invalidate_scan();
+        self.chapter.status = Some(tf!(
+            "cleaning.tools.watermark.chapter.library_unloaded_status",
+            id = entry_id
+        ));
+    }
+
+    /// Keeps the region base's selection DIVERSION in step with the live reservation.
+    ///
+    /// The two are one fact: while a reservation is in force the next completed selection is a
+    /// library crop, and must not run the ordinary region editor — no loader job, no modal
+    /// spinner, no editor window left standing over the canvas with its zoom and undo shortcuts
+    /// disabled. Call this after every mutation of `library_arm`, including the ones that DROP
+    /// it, because dropping the diversion is what discards an unclaimed diverted rect.
+    fn sync_selection_diversion(&mut self) {
+        self.region_base
+            .set_selection_diverted(self.library_arm.is_some());
+    }
+
+    /// Drops a reservation whose screen is no longer drawn, SAYING SO.
+    ///
+    /// A reservation may only outlive the surface that made it for as long as that surface is
+    /// the one the user is looking at: the red «Отменить выделение» is the ONLY way to call it
+    /// off, so a reservation drawn on no screen is one the user cannot cancel. The panel
+    /// decides (it owns the screen); this owns the reservation and drops it.
+    ///
+    /// Dropping it in silence was the defect: the next drag would then open the ordinary
+    /// region editor instead of adding a sample, with nothing anywhere having said the
+    /// reservation was gone. The reason lands on the panel — the surface that drew the
+    /// reservation, and the one the user comes back to — and in the log, because a reservation
+    /// dying for a reason the user did not intend is a diagnosable event.
+    fn drop_reservation_without_a_screen(&mut self) {
+        let Some(arm) = self.library_arm.as_ref() else {
+            return;
+        };
+        if self.library_window.arm_survives(arm) {
+            return;
+        }
+        ms_log::runtime_log::log_warn(format!(
+            "[cleaning] watermark library reservation {arm:?} dropped: its screen is no longer drawn"
+        ));
+        self.library_arm = None;
+        self.sync_selection_diversion();
+        self.library_window
+            .set_status(t!("cleaning.tools.watermark.chapter.library_arm_lost_status").to_string());
+    }
+
+    /// Takes the reservation a parked rect belongs to, REPORTING the rect when none is live.
+    ///
+    /// `None` is the defensive branch: every path that clears `library_arm` also calls
+    /// `sync_selection_diversion`, which drops an unclaimed parked rect with it, so a rect
+    /// reaching here unclaimed means one of those paths stopped keeping that promise. It costs
+    /// a line to say so instead of dropping the user's gesture without a word — which on
+    /// screen is indistinguishable from a drag that did nothing at all.
+    #[must_use]
+    fn take_reservation_for_diverted(
+        &mut self,
+        page_idx: usize,
+        rect: OverlayRectPx,
+    ) -> Option<LibraryArm> {
+        let arm = self.library_arm.take();
+        if arm.is_none() {
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] diverted selection on page {page_idx} ({}x{} at {},{}) arrived with no reservation",
+                rect.w, rect.h, rect.x, rect.y
+            ));
+            self.library_window.set_status(
+                t!("cleaning.tools.watermark.chapter.library_arm_lost_status").to_string(),
+            );
+        }
+        arm
+    }
+
+    /// Repeats the region base's "that drag produced no rectangle" reason on the library panel.
+    ///
+    /// The base keeps the same reason in its own dock body, but a user who armed a reservation
+    /// is reading the LIBRARY panel, two tabs away. Drained unconditionally so the one-shot can
+    /// never go stale; shown only while a reservation is live, because otherwise the base's own
+    /// body is already the surface the user is looking at.
+    fn report_selection_refusal(&mut self) {
+        let refusal = self.region_base.take_selection_refusal();
+        if let Some(refusal) = refusal
+            && self.library_arm.is_some()
+        {
+            self.library_window.set_status(refusal);
+        }
+    }
+
+    /// Cuts the armed canvas selection out of its page on a worker thread.
+    ///
+    /// The reservation is consumed by the caller before this runs, so a capture that fails
+    /// does not leave the next selection silently spoken for.
+    ///
+    /// EVERY early return here is answered the same way a refused intake is: a red row on the
+    /// entry the drag was aimed at (`WatermarkLibraryWindow::reject_capture`) plus a line in the
+    /// runtime log. Neither is optional. The row is what the user sees — the panel's status line
+    /// is nowhere near the list they are watching — and the log line is what makes the failure
+    /// diagnosable from outside, which it was not: this lane used to report two of its refusals
+    /// to the status line alone and nothing at all to the log.
+    fn start_library_capture(
+        &mut self,
+        arm: LibraryArm,
+        page_idx: usize,
+        rect: OverlayRectPx,
+        canvas: &CanvasView,
+        project: &ProjectData,
+    ) {
+        if self.library_capture_rx.is_some() {
+            self.library_window.reject_capture(
+                &arm,
+                &LibraryCaptureRefusal::untagged(
+                    t!("cleaning.mask_editor.processing_already_running_status").to_string(),
+                ),
+            );
+            return;
+        }
+        let Some(page) = self
+            .chapter_page_tasks(canvas, project)
+            .into_iter()
+            .find(|task| task.page_idx == page_idx)
+        else {
+            self.library_window.reject_capture(
+                &arm,
+                &LibraryCaptureRefusal::untagged(tf!(
+                    "cleaning.tools.watermark.chapter.library_capture_page_error",
+                    page = page_idx + 1
+                )),
+            );
+            return;
+        };
+        let request = LibraryCaptureRequest {
+            page,
+            rect,
+            sample_params: self.settings.normalized().chapter_sample_params(),
+            max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.library_capture_rx = Some(rx);
+        self.library_capture_arm = Some(arm);
+        thread::spawn(move || {
+            let _ = tx.send(run_library_capture(request));
+        });
+    }
+
+    /// Folds a finished canvas capture into the library panel.
+    ///
+    /// A refusal lands on the entry the drag was aimed at, exactly as an accepted crop does —
+    /// see `start_library_capture` for why the status line alone was not enough.
+    fn poll_library_capture(&mut self) {
+        let Some(rx) = self.library_capture_rx.as_ref() else {
+            return;
+        };
+        let captured = match rx.try_recv() {
+            Ok(captured) => captured,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(LibraryCaptureRefusal::untagged(
+                t!("cleaning.mask_editor.processing_thread_crashed_error").to_string(),
+            )),
+        };
+        self.library_capture_rx = None;
+        let arm = self.library_capture_arm.take();
+        match (captured, arm) {
+            (Ok(crop), Some(arm)) => {
+                let sample_params = self.settings.normalized().chapter_sample_params();
+                self.library_window.accept_captured_crop(
+                    crop,
+                    &arm,
+                    sample_params,
+                    CHAPTER_MAX_TEMPLATE_SIDE,
+                );
+            }
+            // The crop is on disk but nothing claims it any more: no screen can show it and
+            // no screen can discard it, so the scratch file goes with the reservation that
+            // was its only owner.
+            (Ok(crop), None) => {
+                ms_log::runtime_log::log_warn(format!(
+                    "[cleaning] watermark library capture {} arrived with no reservation",
+                    crop.path.display()
+                ));
+                remove_scratch_crop(&crop.path);
+            }
+            (Err(refusal), Some(arm)) => self.library_window.reject_capture(&arm, &refusal),
+            // No reservation left to hang the row on, so the panel-wide line is the only
+            // surface there is — and it is still said out loud rather than dropped.
+            (Err(refusal), None) => {
+                ms_log::runtime_log::log_warn(format!(
+                    "[cleaning] watermark library capture refused with no reservation ({:?}): {}",
+                    refusal.refusal, refusal.message
+                ));
+                self.library_window.set_status(refusal.message);
+            }
+        }
     }
 
     /// Drains the chapter worker channel and folds every finished step into the state.
@@ -2424,8 +3146,10 @@ impl WatermarkRemovalTool {
             ChapterRequest::LoadLibrary(entry_id) => {
                 // Loading the same entry twice would give the catalog two kinds sharing one
                 // id, and everything keyed on that id (patches, previews, the save target)
-                // would resolve to whichever came first.
-                if let Some(index) = self.chapter.catalog.index_of(&entry_id) {
+                // would resolve to whichever came first. A mark the chapter DISCOVERED and
+                // then saved to the library is the same physical mark under a `mark-{n}` kind
+                // id, so it has to be recognised by `library_entry` as well.
+                if let Some(index) = self.chapter_entry_index(&entry_id) {
                     self.chapter.selected = index;
                     self.chapter.status = Some(
                         t!("cleaning.tools.watermark.chapter.library_already_loaded_status")
@@ -2454,7 +3178,7 @@ impl WatermarkRemovalTool {
                     });
                 });
             }
-            ChapterRequest::OpenLibraryWindow => self.library_window.open(),
+            ChapterRequest::ToggleLibraryPanel => self.library_window.toggle(),
         }
     }
 
@@ -2499,15 +3223,32 @@ impl CleaningTool for WatermarkRemovalTool {
         t!("cleaning.tools.watermark.title")
     }
 
-    /// The two network modes need Torch; the chapter mode is deliberately AI-free and must
-    /// stay reachable on a machine without it, so the requirement follows the current mode.
+    /// Always `false`: the Torch requirement of this tool lives INSIDE it.
+    ///
+    /// Only the two network modes need Torch, and «По главе (точное вычитание)» needs neither
+    /// backend nor Torch nor weights — so the picker BUTTON must never be AI-gated. Following
+    /// the mode here made the persisted default (`mask_only`) disable the button on a fresh
+    /// Torch-less install, hiding the one mode that would have worked; and because the same
+    /// answer feeds `ensure_active_tool_available` every frame, picking a network mode
+    /// force-deselected the tool. The gate is therefore drawn where it belongs: the two
+    /// network entries of the mode picker and the run button (`draw_mode_picker`,
+    /// `draw_actions`), both explaining themselves on hover.
     fn pytorch_required(&self) -> bool {
-        WatermarkMode::from_wire(&self.settings.mode).requires_torch()
+        false
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
         self.region_base.cancel_selection();
         self.session.clear();
+        // A canvas reservation belongs to the tool that is drawing: nothing cancels it while
+        // this tool is not active, and a selection made after coming back would otherwise be
+        // cut out as a library crop the user no longer expects.
+        self.library_arm = None;
+        // ORDER MATTERS: the tab calls `finish_stroke()` before `deactivate()`, so switching
+        // tools mid-drag completes a DIVERTED selection one statement before the reservation
+        // dies. Syncing here is what drops that orphan rect — without it the next activation
+        // would find a rect nothing armed and cut it out for a reservation that is gone.
+        self.sync_selection_diversion();
         // The chapter catalog and any job in flight deliberately survive: a chapter-wide
         // pass takes minutes and must not be thrown away by a stray tool switch.
     }
@@ -2517,13 +3258,18 @@ impl CleaningTool for WatermarkRemovalTool {
         if WatermarkMode::from_wire(&self.settings.mode) == WatermarkMode::Chapter {
             ui.small(t!("cleaning.tools.watermark.chapter.description_hint"));
             // Reachable without an open region editor: an entry can be built from reference
-            // crops alone, with no chapter and no selection involved.
+            // crops alone, with no chapter and no selection involved. A TOGGLE drawn pressed
+            // while the panel is open — a dock tab has no close affordance by design, so this
+            // button and its twin in the region editor are the whole story.
             if ui
-                .button(t!("cleaning.tools.watermark.chapter.library_manage_button"))
+                .add(
+                    egui::Button::new(t!("cleaning.tools.watermark.chapter.library_manage_button"))
+                        .selected(self.library_window.is_open()),
+                )
                 .on_hover_text(t!("cleaning.tools.watermark.chapter.library_manage_hint"))
                 .clicked()
             {
-                self.library_window.open();
+                self.library_window.toggle();
             }
         } else {
             ui.small(t!("cleaning.tools.watermark.description_hint"));
@@ -2557,7 +3303,53 @@ impl CleaningTool for WatermarkRemovalTool {
         self.ai_backend_available = available;
     }
 
+    fn set_ai_backend_torch_available(&mut self, available: bool) {
+        self.ai_backend_torch_available = available;
+    }
+
+    /// The «Библиотека знаков» panel follows the toggle the two library buttons drive.
+    fn wants_library_panel(&self) -> bool {
+        self.library_window.is_open()
+    }
+
+    /// Draws the library screen into its dock panel.
+    ///
+    /// The intake shares the tool's OWN ring measurement and footprint limit, so the library
+    /// and the chapter mode cannot disagree about either. The jobs behind it are polled from
+    /// `draw_overlay_ui`, not from here: this body does not run while the panel is hidden.
+    fn draw_library_panel(&mut self, ui: &mut egui::Ui) {
+        let sample_params = self.settings.normalized().chapter_sample_params();
+        // Rebuilt every frame rather than cached: the catalog holds a handful of marks, and a
+        // cached copy would be a second answer to "which entries is this chapter hunting"
+        // that could disagree with the catalog after a scan rebuilt it.
+        let selected_entries = self.chapter_library_selection();
+        let saved_entries = self.chapter_saved_entries();
+        let context = LibraryPanelContext {
+            sample_params,
+            max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+            selected_entries: &selected_entries,
+            saved_entries: &saved_entries,
+            armed: self.library_arm.as_deref(),
+            chapter_busy: self.chapter.busy(),
+        };
+        // The dock body may not touch the catalog or the canvas itself; what it asks for is
+        // consumed by `draw_overlay_ui` later in this same frame.
+        if let Some(request) = self.library_window.draw_panel_body(ui, &context) {
+            self.library_panel_request = Some(request);
+        }
+    }
+
     fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
+        // A click that ends an eyedropper sampling belongs to the colour control, not to the
+        // canvas: letting it through would start a selection drag under the picked pixel.
+        // BOTH predicates are needed. The colour widget clears `eyedropper_active` on the very
+        // frame the terminating click lands, and the dock body (where it is drawn) runs before
+        // this hook, so on that frame the first flag already reads false — only
+        // `primary_click_consumed_this_frame` still names the click. The typing tab guards the
+        // same pair for the same reason (`ms-tab-typing/src/panel/create_state.rs`).
+        if self.library_window.eyedropper_owns_primary_click() {
+            return false;
+        }
         self.region_base.wants_primary_stroke(point)
     }
 
@@ -2583,6 +3375,32 @@ impl CleaningTool for WatermarkRemovalTool {
         self.poll_and_maybe_query_status();
         self.poll_unload();
         self.poll_chapter_job(canvas);
+        // The library panel's workers are polled HERE, not from its dock body: the body does
+        // not run while the panel is hidden, so a job finishing after the user toggled it shut
+        // would never be collected. This hook runs every frame the tool is active.
+        self.poll_library_capture();
+        // The capture lane has its OWN channel, so `WatermarkLibraryWindow::busy` cannot see
+        // it and cannot ask for the repaint it needs. Without this the worker's answer — and
+        // the row or the status it produces — waits for whatever input happens to draw the
+        // next frame, which after a finished drag may be nothing at all: the user lets go of
+        // the mouse and the application goes quiet holding an answer it has not painted.
+        if self.library_capture_rx.is_some() {
+            ctx.request_repaint();
+        }
+        self.library_window.poll(ctx);
+        // A reservation may only outlive the surface that made it for as long as that surface
+        // is the one the user is looking at: the red «Отменить выделение» is the ONLY way to
+        // call it off, so a reservation drawn on no screen is one the user cannot cancel. The
+        // panel decides (it owns the screen); the tool owns the reservation and drops it. This
+        // runs BEFORE `run_library_panel_request` below, so a reservation the body asked for
+        // this very frame is not judged against the screen it was made on.
+        self.drop_reservation_without_a_screen();
+        if self.library_window.take_changed() {
+            // The panel wrote to disk, so the chapter mode's own copy of the entry list is
+            // stale. The panel body already drew this frame (the dock runs inside
+            // `CanvasView::draw`), so its flag is consumed in the same frame it was raised.
+            self.chapter.library_requested = true;
+        }
         // The library picker fills itself the first time the chapter mode is drawn and
         // whenever an entry was written, never on a frame that already has a job running.
         let chapter_mode = WatermarkMode::from_wire(&self.settings.mode) == WatermarkMode::Chapter;
@@ -2606,7 +3424,9 @@ impl CleaningTool for WatermarkRemovalTool {
                 unload_status,
                 progress,
                 ai_backend_available,
+                ai_backend_torch_available,
                 chapter,
+                library_window,
                 ..
             } = self;
             let mut editor_ctx = WatermarkEditorCtx {
@@ -2616,6 +3436,8 @@ impl CleaningTool for WatermarkRemovalTool {
                 unload_status,
                 progress,
                 ai_backend_available: *ai_backend_available,
+                ai_backend_torch_available: *ai_backend_torch_available,
+                library_panel_open: library_window.is_open(),
                 chapter,
                 settings_changed: &mut settings_changed,
                 want_status: &mut want_status,
@@ -2646,19 +3468,25 @@ impl CleaningTool for WatermarkRemovalTool {
         if let Some(request) = chapter_request {
             self.start_chapter_request(request, canvas, project);
         }
-        // The library window is tool-owned and outlives the region editor, so it is drawn
-        // after it and independently of it. Its intake shares the tool's own ring
-        // measurement and footprint limit, so the two paths cannot disagree.
-        self.library_window.show(
-            ctx,
-            self.settings.normalized().chapter_sample_params(),
-            CHAPTER_MAX_TEMPLATE_SIDE,
-        );
-        if self.library_window.take_changed() {
-            // The window wrote to disk, so the chapter mode's own copy of the entry list is
-            // stale.
-            self.chapter.library_requested = true;
+        // The dock body drew earlier in this same frame (it runs inside `CanvasView::draw`),
+        // so whatever it asked for is acted on here, where the canvas and the project exist.
+        if let Some(request) = self.library_panel_request.take() {
+            self.run_library_panel_request(request, canvas, project);
         }
+        // An armed drag never reached the region editor: `RegionEditToolBase` parked its rect
+        // instead of loading it (`set_selection_diverted`), and this is where the tool collects
+        // it. Taking the reservation before the capture starts means a capture that fails does
+        // not leave the next selection silently spoken for; taking the RECT first means a rect
+        // whose reservation died in the meantime is discarded here rather than stranded.
+        if let Some((page_idx, rect)) = self.region_base.take_diverted_selection()
+            && let Some(arm) = self.take_reservation_for_diverted(page_idx, rect)
+        {
+            self.start_library_capture(arm, page_idx, rect, canvas, project);
+        }
+        self.report_selection_refusal();
+        // Last word on the diversion: whatever this frame did to the reservation — armed it,
+        // cancelled it, consumed it, watched it expire — the flag now says the same thing.
+        self.sync_selection_diversion();
         if unload_requested && self.unload_rx.is_none() {
             let (tx, rx) = mpsc::channel();
             self.unload_rx = Some(rx);
@@ -2674,24 +3502,55 @@ impl CleaningTool for WatermarkRemovalTool {
             self.session.clear();
         }
         self.poll_and_maybe_save();
+        // LAST, so every mutation this frame made to what the panel shows is covered: the dock
+        // body already drew (it runs inside `CanvasView::draw`), so a status or a refusal row
+        // recorded anywhere above needs a frame of its own to be seen at all.
+        self.library_window.request_repaint_if_dirty(ctx);
     }
 
+    /// Paints the selection cursor, in the reservation's own colour while one is live.
+    ///
+    /// An armed drag does something completely different from an ordinary one — it is cut out
+    /// for the library and never opens the region editor — and until this existed the canvas
+    /// looked identical either way: same crosshair, same black-and-white band. The only signal
+    /// was the red «Отменить выделение» button, which lives on the dock panel, i.e. not where
+    /// the user is looking while dragging. The accent is the CANCEL BUTTON'S own colour, so the
+    /// canvas and the panel say the same thing in the same colour.
     fn draw_cursor(
         &mut self,
         ui: &mut egui::Ui,
         canvas: &CanvasView,
         pointer_scene_pos: Option<egui::Pos2>,
     ) {
+        if self.library_arm.is_some() {
+            self.region_base.draw_cursor_tinted(
+                ui,
+                canvas,
+                pointer_scene_pos,
+                Color32::from_rgb(ARM_CANCEL_RGB[0], ARM_CANCEL_RGB[1], ARM_CANCEL_RGB[2]),
+            );
+            return;
+        }
         self.region_base.draw_cursor(ui, canvas, pointer_scene_pos);
     }
 
+    /// Only the region-editor window is reported here.
+    ///
+    /// The library screen is a DOCK PANEL now, and a dock panel's rect reaches the tab's
+    /// occlusion gate on its own: `PanelDockOutput::drawn_panels` -> `dock_panel_rects` ->
+    /// `panel_rects` -> `CleaningTabState::canvas_pointer_occluded`. Reporting it a second
+    /// time here would be a duplicate the tool cannot keep in sync with the dock.
     fn captures_canvas_pointer(&self, pointer_pos: egui::Pos2) -> bool {
         self.region_base.editor_window_contains(pointer_pos)
-            || self.library_window.contains_pointer(pointer_pos)
     }
 
+    /// Only the modal region editor blocks zoom.
+    ///
+    /// The library panel deliberately does NOT: it is a session-long surface, and
+    /// `block_canvas_zoom` also disables the clean-overlay undo shortcuts, which a panel that
+    /// may stay open for a whole chapter must not do (`tools/MODULE_README.md`).
     fn block_canvas_zoom(&self) -> bool {
-        self.region_base.has_open_editor() || self.library_window.is_open()
+        self.region_base.has_open_editor()
     }
 }
 
@@ -2706,6 +3565,11 @@ struct WatermarkEditorCtx<'a> {
     unload_status: &'a mut Option<String>,
     progress: &'a Arc<Mutex<WatermarkProgress>>,
     ai_backend_available: bool,
+    /// Whether the backend reports a usable Torch runtime. Gates the two network entries of
+    /// the mode picker and the run button; an unknown answer arrives as `true`.
+    ai_backend_torch_available: bool,
+    /// Whether the «Библиотека знаков» dock panel is shown, so its button can draw pressed.
+    library_panel_open: bool,
     /// The chapter mode's whole state. Selection, renaming and deletion happen here
     /// directly; anything that needs a worker leaves through `chapter_request`.
     chapter: &'a mut ChapterState,
@@ -2717,6 +3581,36 @@ struct WatermarkEditorCtx<'a> {
     unload_requested: &'a mut bool,
     /// At most one chapter job request per frame.
     chapter_request: &'a mut Option<ChapterRequest>,
+}
+
+/// Draws one entry of the mode dropdown and applies a click to `selected`.
+///
+/// A Torch-backed mode is disabled while the backend reports no Torch and explains that on
+/// hover; the AI-free chapter mode is always selectable. Deliberately the same shape as the
+/// shared `mask_generation::draw_mask_source_entry`, down to the message and its colour, so
+/// the two Torch gates of this tab cannot word the same refusal differently.
+fn draw_mode_entry(
+    ui: &mut egui::Ui,
+    selected: &mut WatermarkMode,
+    candidate: WatermarkMode,
+    torch_available: bool,
+) {
+    let enabled = torch_available || !candidate.requires_torch();
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(candidate.label()).selected(*selected == candidate),
+    );
+    let response = if enabled {
+        response
+    } else {
+        response.on_disabled_hover_text(
+            egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
+                .color(Color32::from_rgb(240, 102, 102)),
+        )
+    };
+    if response.clicked() {
+        *selected = candidate;
+    }
 }
 
 impl WatermarkEditorCtx<'_> {
@@ -2780,8 +3674,14 @@ impl WatermarkEditorCtx<'_> {
 
     /// Draws the three-way mode picker. The chapter mode is local, so it also states that
     /// it needs no backend at all.
+    ///
+    /// The two NETWORK modes are disabled while the backend reports no Torch and say so on
+    /// hover; «По главе (точное вычитание)» is always selectable. A persisted selection is
+    /// never forced to change by this — a settings file naming a network mode still opens,
+    /// with the run button explaining why it cannot run.
     fn draw_mode_picker(&mut self, ui: &mut egui::Ui) {
         let mut mode = WatermarkMode::from_wire(&self.settings.mode);
+        let torch_available = self.ai_backend_torch_available;
         ui.horizontal(|ui| {
             ui.label(t!("cleaning.common.mode_label"));
             WheelComboBox::from_id_salt("cleaning_watermark_mode_picker")
@@ -2792,7 +3692,7 @@ impl WatermarkEditorCtx<'_> {
                         WatermarkMode::Clean,
                         WatermarkMode::Chapter,
                     ] {
-                        ui.selectable_value(&mut mode, candidate, candidate.label());
+                        draw_mode_entry(ui, &mut mode, candidate, torch_available);
                     }
                 });
         });
@@ -3087,7 +3987,13 @@ impl WatermarkEditorCtx<'_> {
         let Some(kind) = chapter.catalog.kinds.get(index) else {
             return;
         };
-        let conditioning_lines = describe_conditioning(kind.conditioning());
+        // A mark rebuilt from a library entry whose background was hand-stated keeps the
+        // verdict the engine gave it, so the assertion has to be read off the model's
+        // provenance: without it this editor would claim a measurement the card warns about.
+        let rests_on_assertion = kind
+            .model()
+            .is_some_and(|model| model.provenance().manual_backgrounds > 0);
+        let conditioning_lines = describe_conditioning(kind.conditioning(), rests_on_assertion);
         let noise_gain = kind.model().map(WatermarkModel::max_noise_gain);
         let template_size = (kind.template().width(), kind.template().height());
         let anchors = kind.template().anchor_key();
@@ -3308,6 +4214,7 @@ impl WatermarkEditorCtx<'_> {
     /// Draws the library picker: refresh, the entry list and a load button per entry.
     fn draw_chapter_library(&mut self, ui: &mut egui::Ui, scroll_id: u64) {
         let busy = self.chapter.busy();
+        let library_panel_open = self.library_panel_open;
         let chapter = &mut *self.chapter;
         let request = &mut *self.chapter_request;
         RegionEditToolBase::draw_region_editor_collapsible_section(
@@ -3328,16 +4235,21 @@ impl WatermarkEditorCtx<'_> {
                     {
                         *request = Some(ChapterRequest::RefreshLibrary);
                     }
+                    // A TOGGLE drawn pressed while the panel is open: a dock tab has no
+                    // close affordance of its own, so this button is the whole story.
                     if ui
-                        .button(t!(
-                            "cleaning.tools.watermark.chapter.library_manage_button"
-                        ))
+                        .add(
+                            egui::Button::new(t!(
+                                "cleaning.tools.watermark.chapter.library_manage_button"
+                            ))
+                            .selected(library_panel_open),
+                        )
                         .on_hover_text(t!(
                             "cleaning.tools.watermark.chapter.library_manage_hint"
                         ))
                         .clicked()
                     {
-                        *request = Some(ChapterRequest::OpenLibraryWindow);
+                        *request = Some(ChapterRequest::ToggleLibraryPanel);
                     }
                 });
                 if chapter.library.is_empty() {
@@ -3453,18 +4365,28 @@ impl WatermarkEditorCtx<'_> {
 
     /// Draws the run / undo / cancel row. The run button names what the current
     /// mode will do and explains on hover why it is disabled.
+    ///
+    /// Both network modes need a reachable backend AND a Torch runtime. Since
+    /// `CleaningTool::pytorch_required` is a constant `false` — the tool must stay selectable
+    /// for its AI-free chapter mode — this is the gate that keeps a Torch-less machine from
+    /// firing a request that can only fail. The hint is three-way in the same order as the
+    /// shared `mask_generation::generate_button_hover_text`: backend first, Torch second,
+    /// what the run does last.
     fn draw_actions(&mut self, ui: &mut egui::Ui, editor: &mut RegionEditorSession, running: bool) {
         let Some(mode) = WatermarkMode::from_wire(&self.settings.mode).network() else {
             return;
         };
         let backend_available = self.ai_backend_available;
-        let can_run = !running && backend_available;
+        let torch_available = self.ai_backend_torch_available;
+        let can_run = !running && backend_available && torch_available;
         let can_undo = !running && !self.session.undo_stack.is_empty();
         ui.horizontal(|ui| {
-            let run_hint = if backend_available {
-                t!("cleaning.tools.watermark.run_hint")
-            } else {
+            let run_hint = if !backend_available {
                 t!("cleaning.mask_editor.backend_unavailable_status")
+            } else if !torch_available {
+                t!("cleaning.common.pytorch_not_installed_status")
+            } else {
+                t!("cleaning.tools.watermark.run_hint")
             };
             if ui
                 .add_enabled(can_run, egui::Button::new(mode.run_button_label()))
@@ -3819,6 +4741,12 @@ fn save_watermark_settings(settings: &WatermarkRemovalSettings) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests build library records by hand; the product code reaches them through
+    // `watermark_entry`, which is why this is not in the module's own import list.
+    use super::super::watermark_library::StoredSignature;
+    // The intake itself is driven only here, to prove the CAPTURE lane's own output is
+    // acceptable to it; the product code runs it from the library panel's worker.
+    use super::super::watermark_entry::{ReferenceIntakeRequest, run_reference_intake};
 
     #[test]
     fn mode_wire_roundtrip() {
@@ -3842,12 +4770,66 @@ mod tests {
             WatermarkNetworkMode::Clean.ipc_method(),
             backend_ipc::protocol::METHOD_WATERMARK_REMOVE
         );
-        // The chapter mode is local: it has no backend method and needs no Torch, which is
-        // what keeps the tool selectable on a machine without it.
+        // The chapter mode is local: it has no backend method and needs no Torch. This
+        // mapping now gates the mode picker entries and the run button INSIDE the tool,
+        // not the tool's selectability — see `the_tool_is_never_torch_gated`.
         assert_eq!(WatermarkMode::Chapter.network(), None);
         assert!(!WatermarkMode::Chapter.requires_torch());
         assert!(WatermarkMode::MaskOnly.requires_torch());
         assert!(WatermarkMode::Clean.requires_torch());
+    }
+
+    /// The picker BUTTON must never be Torch-gated, whatever mode is persisted.
+    ///
+    /// `pytorch_required` feeds both the button's `AiRequirement::Torch` badge and
+    /// `CleaningTabState::ensure_active_tool_available`, which runs every frame. While it
+    /// followed the mode, the persisted default (`mask_only`) disabled the button on a
+    /// Torch-less machine — hiding the one mode that needs nothing — and selecting a network
+    /// mode force-deselected the tool on the next frame. The gate lives inside the tool now
+    /// (`draw_mode_picker`, `draw_actions`), so this answer is a constant.
+    #[test]
+    fn the_tool_is_never_torch_gated() {
+        let mut tool = WatermarkRemovalTool::default();
+        for mode in [
+            WatermarkMode::MaskOnly,
+            WatermarkMode::Clean,
+            WatermarkMode::Chapter,
+        ] {
+            tool.settings.mode = mode.wire().to_string();
+            assert!(
+                !tool.pytorch_required(),
+                "{mode:?} must not make the tool button Torch-gated"
+            );
+        }
+        // Including an unknown persisted value, which falls back to `mask_only`.
+        tool.settings.mode = "bogus".to_string();
+        assert!(!tool.pytorch_required());
+    }
+
+    /// The «Библиотека знаков» dock tab follows the library state and nothing else, and it
+    /// starts hidden: a dock tab has no close affordance, so the two «Библиотека знаков…»
+    /// buttons toggling this ONE flag are the whole story.
+    #[test]
+    fn the_library_panel_follows_the_library_toggle() {
+        let mut tool = WatermarkRemovalTool::default();
+        assert!(!tool.wants_library_panel());
+        tool.library_window.toggle();
+        assert!(tool.wants_library_panel());
+        tool.library_window.toggle();
+        assert!(!tool.wants_library_panel());
+    }
+
+    /// The library panel is a DOCK panel, so its rect reaches the tab's occlusion gate
+    /// through `PanelDockOutput::drawn_panels` and must not be reported a second time here —
+    /// and it must not block canvas zoom, which would also kill the clean-overlay undo
+    /// shortcuts for as long as the panel stays open.
+    #[test]
+    fn the_library_panel_neither_captures_the_pointer_nor_blocks_zoom() {
+        let mut tool = WatermarkRemovalTool::default();
+        tool.library_window.toggle();
+        assert!(tool.wants_library_panel());
+        assert!(!tool.block_canvas_zoom());
+        assert!(!tool.captures_canvas_pointer(egui::pos2(10.0, 10.0)));
     }
 
     #[test]
@@ -4131,6 +5113,708 @@ mod tests {
         (path, rects)
     }
 
+    /// A catalog holding one mark LOADED from a library entry and one the chapter discovered
+    /// on its own, with a kind id that would fool a plain `index_of` lookup.
+    fn catalog_with_library_and_discovered(entry_id: &str, discovered_id: &str) -> ChapterCatalog {
+        let mut catalog = ChapterCatalog::default();
+        for (id, library_entry) in [
+            (entry_id, Some(entry_id.to_string())),
+            (discovered_id, None),
+        ] {
+            let mut crop = RgbaImage::from_pixel(16, 16, image::Rgba([255, 255, 255, 255]));
+            stamp_synthetic_mark(&mut crop, 0, 0);
+            let template = MarkTemplate::from_page(&crop, PixelRect::new(0, 0, 16, 16))
+                .expect("template from the synthetic crop");
+            let kind = WatermarkKind::new(id.to_string(), template, alpha_blend_operator());
+            let mut mark = ChapterMark::new(id.to_string(), crop, 200);
+            mark.library_entry = library_entry;
+            catalog.push(kind, mark);
+        }
+        catalog
+    }
+
+    /// The card's «Выбрать»/«Убрать» reads chapter MEMBERSHIP, and «Убрать» drops only the
+    /// mark that came from that entry: a mark the chapter discovered for itself cost a scan
+    /// to collect and must survive a click on a library card that happens to sit next to it.
+    #[test]
+    fn the_card_toggle_reflects_catalog_membership_and_spares_discovered_marks() {
+        let mut tool = WatermarkRemovalTool::default();
+        tool.chapter.catalog = catalog_with_library_and_discovered("entry-a", "mark-1");
+        assert_eq!(tool.chapter_library_selection(), vec!["entry-a".to_string()]);
+
+        tool.unload_library_entry("mark-1");
+        assert_eq!(
+            tool.chapter.catalog.len(),
+            2,
+            "a chapter-discovered mark is not the library card's to remove"
+        );
+
+        tool.unload_library_entry("entry-a");
+        assert_eq!(tool.chapter.catalog.len(), 1);
+        assert!(tool.chapter_library_selection().is_empty());
+        assert!(
+            tool.chapter.catalog.index_of("mark-1").is_some(),
+            "the discovered mark is still the chapter's"
+        );
+    }
+
+    /// An entry a chapter-DISCOVERED mark was saved to is already in the chapter under a
+    /// `mark-{n}` kind id. It is therefore not selectable — a second load would give the
+    /// catalog two kinds for one physical mark — and not unselectable either, because the
+    /// mark it names cost a scan to measure.
+    #[test]
+    fn a_mark_saved_to_the_library_is_already_in_the_chapter() {
+        let mut tool = WatermarkRemovalTool::default();
+        tool.chapter.catalog = catalog_with_library_and_discovered("entry-a", "mark-1");
+        // «В библиотеку» on the discovered mark: the kind id stays `mark-1`.
+        tool.chapter.catalog.marks[1].library_entry = Some("entry-b".to_string());
+
+        assert_eq!(tool.chapter_library_selection(), vec!["entry-a".to_string()]);
+        assert_eq!(tool.chapter_saved_entries(), vec!["entry-b".to_string()]);
+        assert_eq!(
+            tool.chapter_entry_index("entry-b"),
+            Some(1),
+            "the entry is already represented, so a load must be refused"
+        );
+        assert_eq!(tool.chapter_entry_index("entry-a"), Some(0));
+        assert_eq!(tool.chapter_entry_index("entry-c"), None);
+
+        // And the mark itself is not the library card's to remove.
+        tool.unload_library_entry("entry-b");
+        assert_eq!(
+            tool.chapter.catalog.len(),
+            2,
+            "a mark the chapter discovered survives a click on the card it was saved to"
+        );
+    }
+
+    /// Exactly one canvas reservation is live at a time, so «+ новый» and «+ Выделить новый»
+    /// are mutually exclusive without either knowing the other exists — and cancelling clears
+    /// it, while choosing which entry the chapter hunts leaves it alone.
+    #[test]
+    fn exactly_one_canvas_reservation_is_live() {
+        let mut arm = next_library_arm(None, &LibraryPanelRequest::Arm("entry-b".to_string()));
+        assert_eq!(arm, Some("entry-b".to_string()));
+
+        arm = next_library_arm(
+            arm,
+            &LibraryPanelRequest::Arm("entry-a".to_string()),
+        );
+        assert_eq!(
+            arm,
+            Some("entry-a".to_string()),
+            "arming a second purpose replaces the first instead of adding to it"
+        );
+
+        arm = next_library_arm(
+            arm,
+            &LibraryPanelRequest::SelectEntry("entry-b".to_string()),
+        );
+        assert_eq!(arm, Some("entry-a".to_string()));
+
+        arm = next_library_arm(arm, &LibraryPanelRequest::Disarm);
+        assert_eq!(arm, None);
+        assert_eq!(next_library_arm(None, &LibraryPanelRequest::Disarm), None);
+    }
+
+    /// A reservation and the region base's DIVERSION are one fact: while a crop is reserved,
+    /// the next completed drag belongs to the library and must not run the region editor.
+    #[test]
+    fn a_reservation_diverts_the_next_selection_and_letting_it_go_undoes_that() {
+        let mut tool = WatermarkRemovalTool {
+            library_arm: Some("entry-b".to_string()),
+            ..Default::default()
+        };
+        tool.sync_selection_diversion();
+        tool.region_base.park_diverted_selection(
+            3,
+            OverlayRectPx {
+                x: 8,
+                y: 9,
+                w: 40,
+                h: 50,
+            },
+        );
+        let (page_idx, rect) = tool
+            .region_base
+            .take_diverted_selection()
+            .expect("an armed drag must be parked for the tool, not loaded into the editor");
+        assert_eq!(page_idx, 3);
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (8, 9, 40, 50));
+        assert!(
+            !tool.region_base.has_open_editor(),
+            "an armed drag must not open the region editor"
+        );
+
+        tool.library_arm = None;
+        tool.sync_selection_diversion();
+        tool.region_base.set_selection_diverted(true);
+        tool.region_base.park_diverted_selection(
+            3,
+            OverlayRectPx {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+        );
+        tool.sync_selection_diversion();
+        assert!(
+            tool.region_base.take_diverted_selection().is_none(),
+            "with no reservation live the diversion is off and any parked rect is dropped"
+        );
+    }
+
+    /// THE FIRST HALF OF THE BUG: while a reservation is armed the tool must accept a PLAIN
+    /// ЛКМ drag, and the hint the user is reading must say so.
+    ///
+    /// The Shift-only gate made an armed drag a complete no-op — no rubber band, no pan (the
+    /// canvas pans only with Space held), no message — and the one string that named Shift was
+    /// painted in a different dock tab from the library panel the user was reading.
+    #[test]
+    fn an_armed_tool_accepts_a_plain_drag_and_says_which_gesture_it_wants() {
+        let _guard = locale_guard();
+        let plain = super::super::base::StrokePoint {
+            page_idx: 0,
+            scene_pos: egui::pos2(12.0, 12.0),
+            modifiers: super::super::base::StrokeModifiers::default(),
+        };
+        let mut tool = WatermarkRemovalTool {
+            library_arm: Some("entry-b".to_string()),
+            ..Default::default()
+        };
+        tool.sync_selection_diversion();
+        assert!(
+            tool.wants_primary_stroke(plain),
+            "the button the user just pressed IS the statement of intent"
+        );
+        assert_eq!(
+            tool.region_base.selection_hint(),
+            t!("cleaning.region.selection_hint_armed"),
+            "the tool's own hint must name the gesture accepted in this state"
+        );
+        let gesture = t!("cleaning.tools.watermark.chapter.library_arm_gesture_hint");
+        assert_ne!(
+            gesture, "cleaning.tools.watermark.chapter.library_arm_gesture_hint",
+            "the panel's gesture line must exist in the catalog, not fall back to its own key"
+        );
+
+        tool.library_arm = None;
+        tool.sync_selection_diversion();
+        assert!(
+            !tool.wants_primary_stroke(plain),
+            "with nothing armed the Shift-only gate stands, as it does for every other tool"
+        );
+        assert_eq!(
+            tool.region_base.selection_hint(),
+            t!("cleaning.region.selection_hint")
+        );
+    }
+
+    /// A parked rect that reaches the tool with NO reservation must be REPORTED, not dropped.
+    ///
+    /// Defensive: every path that clears `library_arm` also calls `sync_selection_diversion`,
+    /// which drops the parked rect with it, so this state means one of them stopped keeping
+    /// that promise. Dropping the user's gesture without a word looks exactly like a drag that
+    /// did nothing at all — which is the whole class of defect this change closes.
+    #[test]
+    fn a_parked_rect_with_no_reservation_is_reported_instead_of_dropped() {
+        let _guard = locale_guard();
+        let mut tool = WatermarkRemovalTool {
+            library_arm: Some("entry-a".to_string()),
+            ..Default::default()
+        };
+        tool.sync_selection_diversion();
+        let rect = OverlayRectPx {
+            x: 5,
+            y: 6,
+            w: 32,
+            h: 24,
+        };
+        tool.region_base.park_diverted_selection(2, rect);
+        // The reservation dies without the diversion being re-synced — the state this branch
+        // exists to catch.
+        tool.library_arm = None;
+
+        assert!(
+            tool.take_reservation_for_diverted(2, rect).is_none(),
+            "there is no reservation to take"
+        );
+        assert!(
+            tool.library_window.status().is_some(),
+            "an orphan rect must reach the user, not the void"
+        );
+    }
+
+    /// A reservation whose screen stopped being drawn is dropped — and SAYS SO.
+    ///
+    /// The red «Отменить выделение» is the only way to call a reservation off, so one drawn on
+    /// no screen is one the user cannot cancel. Dropping it silently left the next drag opening
+    /// the ordinary region editor with nothing having explained why.
+    #[test]
+    fn a_reservation_whose_screen_is_gone_is_dropped_with_a_reason() {
+        let _guard = locale_guard();
+        let mut tool = WatermarkRemovalTool {
+            library_arm: Some("entry-a".to_string()),
+            ..Default::default()
+        };
+        tool.sync_selection_diversion();
+        // The panel is closed, so `arm_survives` is false: no screen draws the cancel button.
+        assert!(!tool.library_window.is_open());
+
+        tool.drop_reservation_without_a_screen();
+
+        assert!(tool.library_arm.is_none());
+        assert!(
+            tool.library_window.status().is_some(),
+            "a reservation that dies for a reason the user did not choose must be reported"
+        );
+    }
+
+    /// The ORDERING TRAP: `CleaningTabState::activate_tool` calls `finish_stroke()` before
+    /// `deactivate()`, so switching tools in the middle of an ARMED drag completes a diverted
+    /// selection one statement before the reservation dies. Neither the rect nor a capture may
+    /// survive that — a rect kept here would be cut out the next time the tool is armed.
+    #[test]
+    fn a_tool_switch_mid_armed_drag_strands_neither_the_rect_nor_a_capture() {
+        let mut tool = WatermarkRemovalTool {
+            library_arm: Some("entry-a".to_string()),
+            ..Default::default()
+        };
+        let mut canvas = CanvasView::default();
+        tool.sync_selection_diversion();
+        // `finish_stroke` -> `stroke_end` -> the base parks the rect, all BEFORE `deactivate`.
+        tool.region_base.park_diverted_selection(
+            1,
+            OverlayRectPx {
+                x: 2,
+                y: 2,
+                w: 16,
+                h: 16,
+            },
+        );
+
+        tool.deactivate(&mut canvas);
+
+        assert!(tool.library_arm.is_none());
+        assert!(
+            tool.region_base.take_diverted_selection().is_none(),
+            "the rect must die with the reservation that armed it"
+        );
+        assert!(
+            tool.library_capture_rx.is_none() && tool.library_capture_arm.is_none(),
+            "no capture may be left in flight by a tool switch"
+        );
+    }
+
+    /// A selection in the middle of the page gets its full ring on all four sides, and the
+    /// margins it reports say so — that is the case every existing entry was cut under, and it
+    /// must not move because the edge case was added.
+    #[test]
+    fn a_capture_away_from_the_edge_keeps_its_full_ring() {
+        assert_eq!(
+            grow_page_rect(PixelRect::new(10, 10, 20, 20), 4, 100, 100),
+            Some(GrownCrop {
+                outer: PixelRect::new(6, 6, 28, 28),
+                margins: CropMargins::uniform(4),
+            })
+        );
+    }
+
+    /// A selection with less than a full ring available takes what the page can give instead
+    /// of being refused. This is the user's real case: a mark stamped flush against the image
+    /// border has no background on that side and never will, so a symmetric demand made such a
+    /// mark permanently unsamplable. The per-side margins come back with the crop so the intake
+    /// derives the footprint that was cut.
+    #[test]
+    fn a_capture_at_the_page_edge_takes_the_ring_the_page_can_give() {
+        // Tight on the left: 1 px available of the 4 asked for.
+        assert_eq!(
+            grow_page_rect(PixelRect::new(1, 10, 20, 20), 4, 100, 100),
+            Some(GrownCrop {
+                outer: PixelRect::new(0, 6, 25, 28),
+                margins: CropMargins {
+                    left: 1,
+                    top: 4,
+                    right: 4,
+                    bottom: 4,
+                },
+            })
+        );
+        // The user's own geometry: footprint 319 wide at x=480 on an 800-px page leaves one
+        // pixel on the right. It used to be refused outright.
+        assert_eq!(
+            grow_page_rect(PixelRect::new(480, 200, 319, 236), 4, 800, 1200),
+            Some(GrownCrop {
+                outer: PixelRect::new(476, 196, 324, 244),
+                margins: CropMargins {
+                    left: 4,
+                    top: 4,
+                    right: 1,
+                    bottom: 4,
+                },
+            })
+        );
+        // Flush against the top: nothing above it at all, and that is still a crop.
+        assert_eq!(
+            grow_page_rect(PixelRect::new(10, 0, 20, 20), 4, 100, 100),
+            Some(GrownCrop {
+                outer: PixelRect::new(6, 0, 28, 24),
+                margins: CropMargins {
+                    left: 4,
+                    top: 0,
+                    right: 4,
+                    bottom: 4,
+                },
+            })
+        );
+    }
+
+    /// A rect that is not inside the page, or is empty, is still refused: that is a bad
+    /// selection rather than a tight one, and no amount of clipping makes it a crop.
+    #[test]
+    fn a_capture_outside_the_page_is_still_refused() {
+        assert_eq!(grow_page_rect(PixelRect::new(90, 10, 20, 20), 4, 100, 100), None);
+        assert_eq!(grow_page_rect(PixelRect::new(10, 90, 20, 20), 4, 100, 100), None);
+        assert_eq!(grow_page_rect(PixelRect::new(10, 10, 0, 20), 4, 100, 100), None);
+        assert_eq!(grow_page_rect(PixelRect::new(10, 10, 20, 0), 4, 100, 100), None);
+    }
+
+    /// A crop whose ring the engine could not MEASURE AT ALL is refused at capture time.
+    ///
+    /// Stating a level cannot license it — `run_reference_intake` returns `reference_ring_error`
+    /// whatever is asserted — so offering it the colour control would walk the user through
+    /// stating a background, committing, and losing the crop. The refusal also happens before
+    /// the scratch PNG is written, so nothing is left behind to leak.
+    #[test]
+    fn a_crop_with_no_measurable_ring_is_refused_instead_of_offered_a_colour() {
+        let _guard = locale_guard();
+        let (path, rects) = write_synthetic_page("capture-ring");
+        let scratch_before = count_scratch_crops();
+        let request = LibraryCaptureRequest {
+            page: ChapterPageTask {
+                page_idx: 0,
+                path: path.clone(),
+                overlay_size: Some([200, 600]),
+            },
+            rect: rects[0],
+            // A ring requirement no crop of this page can meet: the measurement then reports
+            // `RingTooSmall`, which is the verdict under test.
+            sample_params: SampleParams {
+                min_ring_pixels: usize::MAX,
+                ..SampleParams::default()
+            },
+            max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+        };
+        let error = run_library_capture(request).expect_err("an unmeasurable ring is refused");
+        assert!(
+            error.message.contains(&usize::MAX.to_string()),
+            "the message must name what the ring needed: {}",
+            error.message
+        );
+        assert_eq!(
+            count_scratch_crops(),
+            scratch_before,
+            "a refused capture writes no scratch file"
+        );
+
+        // The same selection with the ordinary tunables still measures, so the refusal is
+        // about the ring and not about the selection.
+        let ok = run_library_capture(LibraryCaptureRequest {
+            page: ChapterPageTask {
+                page_idx: 0,
+                path: path.clone(),
+                overlay_size: Some([200, 600]),
+            },
+            rect: rects[0],
+            sample_params: SampleParams::default(),
+            max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+        })
+        .expect("the synthetic mark sits on flat white");
+        assert!(ok.measured.is_some());
+        remove_scratch_crop(&ok.path);
+        let _ = fs::remove_dir_all(path.parent().expect("temp dir"));
+    }
+
+    /// THE USER'S OWN ENTRY, end to end through the capture lane.
+    ///
+    /// `wm-1786790637-268d778f`: footprint 319x236, anchor x=480, page width 800. The mark's
+    /// right edge therefore lands on 799 of an 800-px page and one pixel of background is left
+    /// where the ring wants four. Every attempt to add a sample to it died here — the capture
+    /// refused before a crop existed, so the panel had no row to put the reason on and the lane
+    /// wrote nothing to the log.
+    ///
+    /// It must now produce a crop whose level is measured, whose margins name the truncated
+    /// side, and which the intake then accepts.
+    #[test]
+    fn the_users_edge_hugging_entry_can_finally_take_a_sample() {
+        let _guard = locale_guard();
+        let dir = std::env::temp_dir().join("manhwastudio-wm-edge-entry-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        // An 800x1200 page whose background is flat and whose mark sits flush against the
+        // right border, exactly as `entry.json` records it.
+        let footprint = PixelRect::new(480, 200, 319, 236);
+        let mut page = RgbaImage::from_pixel(800, 1200, image::Rgba([240, 240, 240, 255]));
+        for y in footprint.y..footprint.y + footprint.height {
+            for x in footprint.x..footprint.x + footprint.width {
+                // Structured, so the ring could never be mistaken for the mark.
+                // Cast justification: the product is taken modulo 200, far inside u8.
+                let shade = ((x * 7 + y * 13) % 200) as u8;
+                page.put_pixel(x, y, image::Rgba([shade, shade, shade, 255]));
+            }
+        }
+        let path = dir.join("page.png");
+        page.save(&path).expect("write the page");
+
+        let captured = run_library_capture(LibraryCaptureRequest {
+            page: ChapterPageTask {
+                page_idx: 0,
+                path: path.clone(),
+                overlay_size: Some([800, 1200]),
+            },
+            rect: OverlayRectPx {
+                x: footprint.x as usize,
+                y: footprint.y as usize,
+                w: footprint.width as usize,
+                h: footprint.height as usize,
+            },
+            sample_params: SampleParams::default(),
+            max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+        })
+        .expect("a mark against the page border must be capturable");
+
+        let level = captured.measured.expect("the surviving ring measures the background");
+        assert!(
+            (level[0] - 240.0).abs() < 0.5,
+            "the measured level is the page's own background: {level:?}"
+        );
+        assert_eq!(
+            captured.margins,
+            CropMargins {
+                left: 4,
+                top: 4,
+                right: 1,
+                bottom: 4,
+            },
+            "and the crop states the background it actually carries on each side"
+        );
+        // The crop the intake will read is the footprint plus exactly those margins.
+        let crop = image::open(&captured.path).expect("the scratch crop was written").to_rgba8();
+        assert_eq!(crop.dimensions(), (319 + 4 + 1, 236 + 4 + 4));
+
+        remove_scratch_crop(&captured.path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE ACCEPTANCE TEST FOR THE CANVAS LANE: the user's own two marks build through
+    /// `run_library_capture` -> `run_reference_intake`, in either order, on real pixels.
+    ///
+    /// The file-picker lane already built them; this one did not, and it is the one the user
+    /// works in. Its input differs in exactly one way — it STATES its `CropMargins` — and that
+    /// statement used to veto the joint footprint rule outright, so the entry fell back on a
+    /// footprint shaped like whatever rectangle had been dragged. Two hand-cut crops of one mark
+    /// are almost never the same rectangle, so the second was refused as too small.
+    ///
+    /// `test/` is a working directory, not a published fixture path: the test is a no-op when the
+    /// files are absent and must never fail for a checkout that does not carry them.
+    #[test]
+    fn the_users_real_crops_build_both_marks_through_the_canvas_lane() {
+        let _guard = locale_guard();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/водяные метки");
+        for (names, level) in [
+            (["1_w.png", "1_b.png"], [255u8, 0u8]),
+            (["2_w.png", "2_b.png"], [255, 0]),
+        ] {
+            let paths = names.map(|name| fixtures.join(name));
+            if !paths.iter().all(|path| path.is_file()) {
+                continue;
+            }
+            let dir = std::env::temp_dir().join(format!("manhwastudio-wm-canvas-{}", names[0]));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("temp dir");
+
+            // Each crop pasted into a page of its OWN background, so the drag has real page
+            // around it exactly as the user's does. The selection is the crop's own rectangle:
+            // the capture lane then grows it by the ring margin and states what it took.
+            let mut captured = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                let crop = image::open(path)
+                    .unwrap_or_else(|err| panic!("{} decodes: {err}", path.display()))
+                    .to_rgba8();
+                let (cw, ch) = crop.dimensions();
+                let shade = level[index];
+                let mut page = RgbaImage::from_pixel(cw + 200, ch + 200, image::Rgba([shade, shade, shade, 255]));
+                for y in 0..ch {
+                    for x in 0..cw {
+                        page.put_pixel(100 + x, 100 + y, *crop.get_pixel(x, y));
+                    }
+                }
+                let page_path = dir.join(format!("page-{index}.png"));
+                page.save(&page_path).expect("write the page");
+                let shot = run_library_capture(LibraryCaptureRequest {
+                    page: ChapterPageTask {
+                        page_idx: 0,
+                        path: page_path,
+                        overlay_size: Some([(cw + 200) as usize, (ch + 200) as usize]),
+                    },
+                    rect: OverlayRectPx {
+                        x: 100,
+                        y: 100,
+                        w: cw as usize,
+                        h: ch as usize,
+                    },
+                    sample_params: SampleParams::default(),
+                    max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+                })
+                .unwrap_or_else(|err| panic!("{} must be capturable: {}", names[index], err.message));
+                assert_eq!(
+                    shot.margins,
+                    CropMargins::uniform(reference_crop_margin_px(&SampleParams::default())),
+                    "the selection sits well inside the page, so nothing was clipped"
+                );
+                captured.push(shot);
+            }
+
+            // Both orders, because the whole defect was that the first crop decided the geometry.
+            let mut ran = 0usize;
+            for order in [[0usize, 1usize], [1, 0]] {
+                let files: Vec<PathBuf> = order.iter().map(|&i| captured[i].path.clone()).collect();
+                let margins: Vec<Option<CropMargins>> =
+                    order.iter().map(|&i| Some(captured[i].margins)).collect();
+                let label = format!("{:?} via the canvas", order.map(|i| names[i]));
+                let outcome = run_reference_intake(ReferenceIntakeRequest {
+                    files,
+                    manual_levels: Vec::new(),
+                    crop_margins: margins,
+                    sample_params: SampleParams::default(),
+                    base: None,
+                    name: "Знак".to_string(),
+                    max_side: CHAPTER_MAX_TEMPLATE_SIDE,
+                })
+                .unwrap_or_else(|err| panic!("{label} must build: {}", err.message));
+                assert!(
+                    outcome.conditioning.is_separable(),
+                    "{label}: white and black separate the model: {:?}",
+                    outcome.conditioning
+                );
+                assert_eq!(outcome.request.samples.len(), 2);
+                // The footprint is the MARK's, so it is strictly smaller than the SMALLEST of the
+                // two selections in both axes — which is what no rule shaped like "cover the first
+                // crop" can ever produce for a pair where neither crop covers the other.
+                let smallest = paths
+                    .iter()
+                    .map(|path| {
+                        image::image_dimensions(path).unwrap_or_else(|err| panic!("{} reads: {err}", path.display()))
+                    })
+                    .fold((u32::MAX, u32::MAX), |acc, size| (acc.0.min(size.0), acc.1.min(size.1)));
+                assert!(
+                    outcome.request.width < smallest.0 && outcome.request.height < smallest.1,
+                    "{label}: the footprint {}x{} must be the mark's, not a drag's (smallest crop {smallest:?})",
+                    outcome.request.width,
+                    outcome.request.height
+                );
+                ran += 1;
+            }
+
+            assert_eq!(ran, 2, "both orders must have been exercised, not skipped");
+            for shot in &captured {
+                remove_scratch_crop(&shot.path);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A chapter mark saved to the library with NO calibration crops is a deliberate write, not
+    /// an omission: the entry keeps its template and its footprint, carries no model, and is
+    /// exactly the state the user then adds samples to from the panel.
+    ///
+    /// The user's own entry was created this way, silently. It stays possible — refusing it
+    /// would throw away a discovered mark's template — but it is now stated, and logged.
+    #[test]
+    fn a_chapter_save_with_no_crops_writes_a_deliberate_empty_sample_list() {
+        let _guard = locale_guard();
+        // A mark discovered by correlation alone: it has its template crop and nothing else,
+        // which is precisely what «В библиотеку» hands over in this case.
+        let mut template_crop =
+            RgbaImage::from_pixel(SYNTHETIC_MARK_SIDE, SYNTHETIC_MARK_SIDE, image::Rgba([255, 255, 255, 255]));
+        stamp_synthetic_mark(&mut template_crop, 0, 0);
+        let rect = PixelRect::new(0, 0, SYNTHETIC_MARK_SIDE, SYNTHETIC_MARK_SIDE);
+        let kind = WatermarkKind::new(
+            "mark-1",
+            MarkTemplate::from_page(&template_crop, rect).expect("template"),
+            alpha_blend_operator(),
+        );
+        let mark = ChapterMark::new("Знак".to_string(), template_crop, 200);
+        assert!(
+            mark.crops.is_empty(),
+            "this fixture is the no-calibration case under test"
+        );
+        let request = build_library_request(&mark, &kind, None);
+        assert!(
+            request.samples.is_empty(),
+            "no crop is invented to fill the list"
+        );
+        assert!(
+            request.template.is_some(),
+            "but the discovered template IS kept: it is the mark's identity"
+        );
+        assert!(
+            request.planes.is_none(),
+            "and no model is claimed from measurements that were never made"
+        );
+        assert_eq!(
+            request.calibration.verdict, "not_enough_samples",
+            "the verdict says what the entry is: {:?}",
+            request.calibration.verdict
+        );
+    }
+
+    /// Scratch crops of a run that was killed are swept; the ones this process may still be
+    /// holding never are, and neither is anything that is not ours.
+    #[test]
+    fn the_scratch_sweep_takes_only_what_no_run_can_still_be_holding() {
+        let pid = 4242;
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert!(scratch_crop_is_stale(
+            "manhwastudio-wm-capture-99-1.png",
+            day,
+            pid
+        ));
+        assert!(
+            !scratch_crop_is_stale("manhwastudio-wm-capture-99-1.png", Duration::ZERO, pid),
+            "another instance may still be holding a fresh crop"
+        );
+        assert!(
+            !scratch_crop_is_stale("manhwastudio-wm-capture-4242-1.png", day * 30, pid),
+            "this process's own crops are still reachable from the panel"
+        );
+        assert!(
+            !scratch_crop_is_stale("holiday-photo.png", day * 30, pid),
+            "the sweep touches nothing but its own files"
+        );
+        assert!(
+            !scratch_crop_is_stale("manhwastudio-wm-capture-99-1.txt", day * 30, pid),
+            "only the crops themselves are swept"
+        );
+    }
+
+    /// Scratch crops currently in the system temp directory, whoever wrote them.
+    fn count_scratch_crops() -> usize {
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(SCRATCH_CROP_PREFIX))
+            })
+            .count()
+    }
+
     fn sample_request(
         catalog: ChapterCatalog,
         path: &Path,
@@ -4283,7 +5967,7 @@ mod tests {
             samples: 3,
             alpha: AlphaUncertainty::from_percent(AlphaSource::Assumed, 30.0),
         };
-        let lines = describe_conditioning(&graded);
+        let lines = describe_conditioning(&graded, false);
         assert_eq!(lines.len(), 4);
         // The imprint is what is measured exactly — never «c».
         assert_eq!(
@@ -4301,7 +5985,7 @@ mod tests {
 
         // A refusal produces no alpha line, but still names the fix.
         let refused = ModelConditioning::NotEnoughSamples { have: 0, need: 2 };
-        let lines = describe_conditioning(&refused);
+        let lines = describe_conditioning(&refused, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[1],
@@ -4455,15 +6139,18 @@ mod tests {
         );
         assert_eq!(request.calibration.levels.len(), 2);
         assert_eq!(request.samples.len(), 3);
-        assert_eq!(request.template.dimensions(), (SYNTHETIC_MARK_SIDE, SYNTHETIC_MARK_SIDE));
+        let request_template = request.template.clone().expect("a chapter mark always has one");
+        assert_eq!(
+            request_template.dimensions(),
+            (SYNTHETIC_MARK_SIDE, SYNTHETIC_MARK_SIDE)
+        );
         let planes = request.planes.as_ref().expect("a fitted model has planes");
 
         // Rebuild the kind the way `run_chapter_library_load` does — from the crops only.
         let rect = PixelRect::new(0, 0, request.width, request.height);
-        let template = MarkTemplate::from_page(&request.template, rect).expect("template");
+        let template = MarkTemplate::from_page(&request_template, rect).expect("template");
         let mut restored = WatermarkKind::new("restored", template, alpha_blend_operator());
         for sample in &request.samples {
-            let StoredSampleBackground::Flat { level, ring_std } = sample.background;
             let sample_rect = PixelRect::new(0, 0, sample.image.width(), sample.image.height());
             restored
                 .add_sample(
@@ -4471,7 +6158,7 @@ mod tests {
                         &sample.image,
                         0,
                         sample_rect,
-                        SampleBackground::Flat { level, ring_std },
+                        engine_background(sample.background),
                     )
                     .expect("calibration sample"),
                 )
@@ -4508,7 +6195,7 @@ mod tests {
                 calibration: request.calibration.clone(),
                 sources: Vec::new(),
                 samples: Vec::new(),
-                template: "template.png".to_string(),
+                template: Some("template.png".to_string()),
                 planes: None,
             },
             template: request.template.clone(),
@@ -4524,6 +6211,8 @@ mod tests {
             ..signature
         });
         EntrySummary {
+            has_template: true,
+            partial_rings: 0,
             id: id.to_string(),
             name: id.to_string(),
             width: request.width,
@@ -4538,6 +6227,9 @@ mod tests {
             signature,
             sources: Vec::new(),
             updated_unix: 2,
+            format: 1,
+            clamped_pixels: request.calibration.clamped_pixels,
+            manual_backgrounds: Vec::new(),
         }
     }
 

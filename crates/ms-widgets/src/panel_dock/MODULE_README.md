@@ -12,8 +12,10 @@ layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` including the r
 gestures, the persistence layer (`persist.rs`) and the detached OS windows (`window.rs`). The
 production consumers are FOUR program tabs. Three of them are CANVAS tabs: «Текст», whose eight
 tabs plus the canvas' own «Лента» live in seven default panels, «Клининг», whose «Клин» /
-«Инструменты клина» / «Выбранный инструмент» / «Быстрый клин найденного текста» join «Лента» in
-five default panels, and «Перевод», whose «Последние персонажи» joins «Лента» in two default
+«Инструменты клина» / «Выбранный инструмент» / «Быстрый клин найденного текста» / «Редактор
+области» / «Библиотека знаков» join «Лента» in seven default panels — the last three are
+conditional, and two of them chain under «Лента» rather than sharing its `Bottom` slot — and
+«Перевод», whose «Последние персонажи» joins «Лента» in two default
 panels. The fourth, «PS редактор», is the first NON-canvas consumer: it declares no «Лента», its
 five tabs («PS редактор» / «Инструменты» / «Выбранный инструмент» / «Горячие клавиши» / «Слои») live in
 five default panels over its own full-area editing surface, and it therefore supplies its OWN

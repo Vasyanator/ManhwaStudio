@@ -35,16 +35,19 @@ Save operations collect overlay snapshots from the shared model and write `clean
 worker thread.
 
 This tab HOSTS the shared panel dock (`crates/ms-widgets/src/panel_dock`), and every floating surface it has
-is a dock tab. It declares SIX: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
+is a dock tab. It declares SEVEN: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
 `CanvasView::draw_ribbon_tab_body`, declared through `canvas::declare_ribbon_tab` — the canvas' one
-declaration of it) plus five of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
+declaration of it) plus six of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
 the quick-clean toggle and the save status), «Инструменты клина» (`cleaning.tools`: the tool picker,
 rows wrapping to the panel width), «Выбранный инструмент» (`cleaning.active_tool`:
 `CleaningTool::draw_ui`), «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
-quick-clean parameters, its two run buttons and its progress) and «Редактор области»
+quick-clean parameters, its two run buttons and its progress), «Редактор области»
 (`cleaning.area_editor`: `CleaningTool::draw_main_panel`, the MAIN interface of a tool that edits a
 region on the canvas — for «ИИ-редактор области» that is the SELECTED engine's own parameter panel
-plus the run/apply/cancel row and the frame's status line). Its default arrangement is `cleaning_default_dock_layout` — six panels,
+plus the run/apply/cancel row and the frame's status line) and «Библиотека знаков»
+(`cleaning.watermark_library`: `CleaningTool::draw_library_panel`, a SECOND tool-owned panel — for
+the watermark tool that is the management screen of its on-disk library). Its default arrangement
+is `cleaning_default_dock_layout` — seven panels,
 handed to the dock both by `app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
 dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
 `CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
@@ -89,20 +92,22 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   refinement) -> `find_occurrences` / `scan_page` / `scan_chapter` (anchor-band NCC, then the
   per-pixel-background gain test) -> `remove_occurrence` / `remove_occurrences_on_page`.
   `refit_with_refined_backgrounds` is the estimated-background refinement loop, with a fixed,
-  named iteration count. Design and the measurements it rests on:
+  named iteration count. `trimmed_footprint_from_model` / `trimmed_footprint_from_template`
+  MEASURE where the mark actually ends inside a footprint (see the footprint contract below). Design and the measurements it rests on:
   `dev-docs/watermark_chapter_decomposition_plan.md`. Consumed by the «По главе (точное
   вычитание)» mode of `tools/watermark_removal.rs`; `mod.rs` keeps an `allow(dead_code)` for the
   refinement surface the tool deliberately does not use (see the comment there).
-- `tools/`: cleaning tool trait — including the three additive, defaulted methods a tool that
-  places something on the canvas uses (`set_panel_rects`, fed from `panel_rects` after
-  `canvas.draw`; `wants_main_panel`, which drives the «Редактор области» tab's visibility; and
-  `draw_main_panel`, that tab's body, bound by the same "a body may not mutate the tab" rule as
+- `tools/`: cleaning tool trait — including the five additive, defaulted methods a tool that owns
+  more than «Выбранный инструмент» uses (`set_panel_rects`, fed from `panel_rects` after
+  `canvas.draw`; and two visibility/body PAIRS — `wants_main_panel` / `draw_main_panel` for
+  «Редактор области» and `wants_library_panel` / `draw_library_panel` for «Библиотека знаков»,
+  both bodies bound by the same "a body may not mutate the tab" rule as
   `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
   its only consumer `tools/ai_editor/`, which HOSTS the AI engines (FLUX.2 klein is the first) and
   splits their UI across those two tabs, local fill tools, stamp tool, the on-canvas patch tool
   (`tools/patch/`, gradient-domain seamless cloning), AI-backed
   inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
-  watermark library, the library management window and the reference-crop intake that builds an
+  watermark library, the library management panel and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
 - `mod.rs`: module wiring and public re-export of `CleaningTabState`.
 
@@ -124,10 +129,68 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   the levels, their spread and an `AlphaUncertainty` (percent plus the LSB cost, including on dark
   backgrounds) together with the sample that would collapse it. `estimate_model` refuses — no
   model, and `WatermarkKind::refit` drops any previous one — only when not even the deposit was
-  measured. Its `c`/`s` are per pixel PER CHANNEL: per channel is mandatory for `c`, while alpha
+  measured. That invariant has exactly ONE named exception, and it is a downgrade rather than a
+  loophole: a background level the USER asserts (`SampleBackground::Manual`, for an occurrence
+  whose ring the engine refused to call flat) feeds the fit exactly like a measured one, and the
+  model pays for it in typed provenance — `AlphaSource::ManualBackgrounds`, its uncertainty
+  floored at the no-information figure, and the count in `ModelProvenance::manual_backgrounds`.
+  Nothing built on such a model may say the imprint was measured. The automatic flatness test is
+  NOT weakened by it: an assertion is only ever consulted where the measurement refused, and it
+  is stated, never derived. Identity stays measurement-only — `MarkSignature::from_flat_sample`
+  ignores an asserted level, because one wrong claim must not be able to redirect auto-match
+  onto the wrong entry — and `refit_with_refined_backgrounds` leaves an asserted level alone for
+  the same reason it leaves a measured one alone: overwriting it would replace the user's
+  instruction with a guess.
+  The ring a level is measured from is CLIPPED to the page, and a truncated ring is a valid
+  measurement rather than a refusal: `validate_calibration_sample` admits a sample on a PIXEL
+  COUNT (`SampleParams::min_ring_pixels`), never on a per-side margin, so a mark stamped flush
+  against the image border — which is where real marks sit — is measured from the sides that
+  exist. Three things hold it honest. The flatness thresholds are NOT relaxed to pay for it: a
+  ring with real structure is still `TemplateOnly` whatever its coverage, which is what keeps a
+  one-sided ring from averaging one end of a gradient into a level the mark never sat on.
+  The coverage travels with the measurement (`RingCoverage` on the verdict and on
+  `SampleBackground::Flat`) and is counted out of a fit in `ModelProvenance::partial_rings`, so
+  no report can call such a measurement complete. And NO numeric penalty is attached to it: the
+  alpha uncertainty is calibrated on `FIT_NOISE_LSB`, documented as a per-occurrence
+  rasterization bias that does not average down with sample count, and nothing in `dev-docs/`
+  measures how a ring's pixel count moves it — inventing a figure would be exactly the
+  fabricated number the plan's "honest reporting" section forbids. A partial ring is therefore
+  REPORTED, not priced. It is also categorically NOT the `Manual` case: the level was measured.
+  Its `c`/`s` are per pixel PER CHANNEL: per channel is mandatory for `c`, while alpha
   measured channel-neutral on both chapters and the graded fit deliberately ties the channels
   together. Removal is licensed only for occurrences the gain test verified: a correlation-only
   accept is refused, because subtracting a mark that is not there injects an inverse mark.
+- A mark's FOOTPRINT is the rectangle the mark actually deposits in plus
+  `FOOTPRINT_TRIM_SAFETY_PX` of background — never the loose box a detector handed over. Outside
+  the deposit the model is `c = 0`, `s = 1`: fully transparent, no information and no removable
+  signal, yet every such pixel is stored twice in the planes AND demanded of every future
+  reference crop, which is how a 319x236 footprint around a 127x34 mark made a 224x170 drag
+  unusable and made the mark read as flush against an 800 px page's right edge.
+  `trimmed_footprint_from_model` and `trimmed_footprint_from_template` measure the real extent:
+  from `c`/`s` where the entry has a model, otherwise from the template against the mean of its
+  own `RING_WIDTH_PX` inner frame. `mark_extent_from_template` is that same template measurement
+  WITHOUT the safety border, and the two must not drift apart: the raw box is what says a crop
+  CUT the mark (it reaches the crop's own border), while the grown one reaches that border for a
+  mark merely near it and says nothing. Both err LARGE by construction — the thresholds sit at the
+  8-bit quantization floor (`1/255` of alpha, one LSB of deviation), so a template whose padding
+  is page content rather than flat background yields no trim at all instead of a cut mark. A
+  footprint with NO mark in it is `WatermarkError::FlatTemplate`, never a zero-sized rect.
+  The safety border is wider than `RING_WIDTH_PX`, which is what makes a second trim a no-op
+  rather than a slow erosion, and wider than `MAX_SUBPIXEL_SHIFT`. It is also the slack a
+  reference intake registers within: the extent and the gradient alignment are two independent
+  measurements of where one mark is, and on the measured reference pair they disagree by 3 px
+  because the mark is a glyph with a soft glow — the glyph is what deviates against white, the
+  glow is what deviates against black, so the 1-LSB extent measures a different part of the same
+  mark on each background, and the GRADIENT is the one that is right. Whoever MOVES a footprint owes
+  the anchors: an anchor is the page COLUMN of the footprint's left edge, so a trim shifts every
+  anchor by exactly the horizontal offset and by nothing else (the anchor set is columns only),
+  and an occurrence then lands at the same absolute page pixels as before the trim. There is
+  exactly ONE rule about who may derive a footprint, and it is about EVIDENCE, not about which
+  screen a crop came from: material with no stored geometry behind it takes the footprint its own
+  marks measure, material with stored geometry keeps it — and may re-derive it only through the
+  measured trim above, which owes the anchors. A rectangle a user dragged, or a detector boxed, is
+  a CEILING on that measurement and never its shape. `tools/watermark_entry.rs` is where both ends
+  of that rule live.
 - Watermark KIND identity is `MarkSignature` (deposit chroma plus opacity gain), never the
   template's shape: a colour mark and its greyscale twin can be pixel-identical in shape and
   still need different `c`/`s`. A catalog must resolve a new sample with `find_matching_kind`,
@@ -146,21 +209,27 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   why their rects are carried out of the hook rather than pushed straight into the field. A rect is
   never pushed into it directly: it arrives through `PanelDockOutput::drawn_panels`, which answers
   for the MAIN window alone.
-- «Лента» holds the LEFT viewport edge and «Редактор области» hangs UNDER it. Not beside it: the
-  ribbon is itself `ViewportEdge::Left`, so anchoring a panel to the ribbon's `Left` would place
-  that panel outside the dock area and the solver's whole-chain translation would un-flush the
-  ribbon. And not the other way round either — the area editor is hidden for every tool but one,
-  and a ribbon anchored to it would depend on a panel that usually is not there. As a LEAF nothing
-  is anchored to it, so `panel_dock::frame_layout` dropping it for a frame re-anchors no dependant
-  and the other five panels are laid out at exactly the rects they get without the tab. The area
-  editor took a fresh `PanelId` rather than a renumbering, so «Лента» keeps the id every canvas
-  program tab gives it.
-- Two of the six tabs are CONDITIONAL and both are declared on every frame, hidden through
-  `.visible(..)`: the quick-clean tab follows `quick_text_mask_panel_open`, and «Редактор области»
-  follows the ACTIVE TOOL's `CleaningTool::wants_main_panel()`, re-asked every frame and never
-  cached — a cached answer would keep the panel of the tool the app started with. Its `min_size`
-  and `initial_size` are FIXED constants, not caption-derived ones, for the same reason as
-  «Выбранный инструмент»: the body is opaque per-tool UI whose captions this tab cannot measure.
+- «Лента» holds the LEFT viewport edge, «Библиотека знаков» hangs UNDER it and «Редактор области»
+  under THAT. Not beside the ribbon: it is itself `ViewportEdge::Left`, so anchoring a panel to
+  the ribbon's `Left` would place that panel outside the dock area and the solver's whole-chain
+  translation would un-flush the ribbon. And not the other way round either — both tool panels are
+  hidden for every tool but one, and a ribbon anchored to either would depend on a panel that
+  usually is not there. A CHAIN rather than two children of the ribbon, because two panels sharing
+  a `target` + `edge` + `align` solve to the very same rect and the model does not refuse it, so
+  the second one would be buried. Dropping either for a frame is free: `remove_panel` hands a
+  dropped panel's own anchor down, so a frame without the library panel gives «Редактор области»
+  the ribbon's `Bottom` slot, nothing is anchored to the area editor at all, and the other panels
+  land at exactly the rects they get without the tabs. Both took a fresh `PanelId` rather than a
+  renumbering, so «Лента» keeps the id every canvas program tab gives it.
+- Three of the seven tabs are CONDITIONAL and all three are declared on every frame, hidden
+  through `.visible(..)`: the quick-clean tab follows `quick_text_mask_panel_open`, «Редактор
+  области» follows the ACTIVE TOOL's `CleaningTool::wants_main_panel()` and «Библиотека знаков»
+  its `CleaningTool::wants_library_panel()`, both re-asked every frame and never cached — a cached
+  answer would keep the panel of the tool the app started with. Their `min_size` and
+  `initial_size` are FIXED constants, not caption-derived ones, for the same reason as «Выбранный
+  инструмент»: the body is opaque per-tool UI whose captions this tab cannot measure. The width of
+  everything on the left chain is bounded by the ribbon's own width plus the dock gap, which is
+  where «Клин» starts.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — every
@@ -174,7 +243,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   and the tool switch (`activate_tool`) all need `&mut CleaningTabState` and would land
   mid-canvas-frame. Those are raised as flags on `CleaningDockOut` and run by `apply_dock_out`
   after the canvas draw returns, in the order the surfaces they came from ran them. The worker/job
-  code itself never moves into a body.
+  code itself never moves into a body. The same rule applies one level down, INSIDE a tool: the
+  «Библиотека знаков» body may mutate the library panel's own state, but anything reaching the
+  chapter catalog, the canvas or a worker leaves as a `LibraryPanelRequest` that the tool's
+  `draw_overlay_ui` runs later in the same frame.
 - Anything a tab body READS is polled BEFORE `canvas.draw`, not after it: `CleaningHooks` snapshots
   the save state and the active tool index when it is built, so `poll_save_job` and
   `ensure_active_tool_available` run at the top of `CleaningTabState::draw`. Polling after the draw
@@ -193,7 +265,9 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   layout and only its panel is skipped, while an undeclared one would be re-seeded a fresh panel on
   the next open. Its only affordance is the «Быстрый клин найденного текста» button in «Клин»,
   which is drawn `selected` while the tab is open: the `egui::Window` it replaced had a title-bar
-  ✕, and a dock tab has no close affordance by design (a tab is only ever MOVED).
+  ✕, and a dock tab has no close affordance by design (a tab is only ever MOVED). The same rule
+  governs «Библиотека знаков», whose one source of truth lives in the TOOL: its two «Библиотека
+  знаков…» buttons toggle it and are drawn `selected` while it is open.
 
 ## Editing map
 - To change top-level cleaning UI, save behavior, history, or quick-clean orchestration,
@@ -203,7 +277,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `cleaning_default_dock_layout` in the same file, and both places have to agree. The «Лента» tab's
   own content, sizes, title and declaration (`canvas::declare_ribbon_tab`) live in `crates/ms-canvas/src/`.
 - To change what a dock tab SHOWS, edit `draw_clean_tab_body` / `draw_tools_tab_body` /
-  `draw_active_tool_tab_body` / `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` in
+  `draw_active_tool_tab_body` / `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` /
+  `draw_watermark_library_tab_body` in
   `tab.rs`; to change what a click
   there DOES, add a field to `CleaningDockOut` and apply it in `apply_dock_out`.
 - To change how the tool buttons are laid out or how narrow the tool panel may get, edit

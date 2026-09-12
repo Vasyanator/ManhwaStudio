@@ -18,8 +18,8 @@ this design rests on.
 Pipeline, per `WatermarkKind` (a chapter may carry several distinct marks):
 
     validate_calibration_sample  -> a flat ring means B is known EXACTLY there
-      -> estimate_model          -> least squares over separated flat samples, Theil-Sen against
-                                    estimated backgrounds, or the deposit-exact graded fit
+      -> estimate_model          -> least squares over separated known-level samples, Theil-Sen
+                                    against estimated backgrounds, or the deposit-exact graded fit
       -> discover_anchors        -> the anchor SET the source stamps at (measured: 1 column in
                                     one chapter, 3 in another)
       -> find_occurrences        -> anchor-band NCC -> per-pixel-background gain test
@@ -33,6 +33,21 @@ Key structures:
   `c` and `s`; samples on one level still measure the deposit exactly and only leave the alpha
   scale uncertain, which yields a model plus a stated uncertainty; only a case where not even
   the deposit is measured is refused.
+- `RingCoverage`: how much of a measurement ring existed. The ring is CLIPPED to the page, so a
+  mark stamped against the image border is measured from the sides that exist and admitted on a
+  PIXEL COUNT (`SampleParams::min_ring_pixels`), never on a per-side margin. The flatness test
+  is unchanged by that — a structured ring is still refused — and the coverage travels with the
+  level and is counted in `ModelProvenance::partial_rings`, so no report can call a one-sided
+  measurement complete. No numeric penalty rides on it: nothing measured relates a ring's pixel
+  count to the alpha uncertainty, and inventing a figure is what the plan forbids.
+- `SampleBackground`: what is known about `B` under one sample — MEASURED from a flat ring
+  (with its coverage), ASSERTED by the user (`Manual`, carrying no `ring_std` because nothing
+  was measured), or estimated per pixel. An asserted level enters the fit exactly like a measured one; what it
+  does NOT do is claim to be evidence, so every model it feeds is downgraded to
+  `AlphaSource::ManualBackgrounds` and counted in `ModelProvenance::manual_backgrounds`. That
+  count is the named exception to "the engine never emits a model it cannot justify": the
+  arithmetic is still justified, the background under it is the user's claim, and the
+  provenance says so in types rather than in prose.
 - `AlphaUncertainty` / `AlphaAssumption`: how well the alpha scale is pinned and what that costs
   in LSB, on the measured calibration.
 - `MarkSignature`: SHAPE-INDEPENDENT identity of a mark (deposit chroma + opacity gain). Two
@@ -48,6 +63,19 @@ Key functions:
 - `discover_anchors()`, `find_occurrences()`, `scan_page()`, `scan_chapter()`
 - `find_matching_kind()`
 - `remove_occurrence()`, `remove_occurrences_on_page()`
+- `trimmed_footprint_from_model()`, `trimmed_footprint_from_template()`,
+  `mark_extent_from_template()`
+
+Footprint contract:
+A mark's FOOTPRINT is the rectangle the mark actually deposits in, plus `FOOTPRINT_TRIM_SAFETY_PX`
+of background — never the loose box a detector happened to hand over. Outside the deposit the model
+is `c = 0`, `s = 1`: fully transparent, no information, no removable signal, yet every such pixel is
+demanded of every future reference crop and stored twice in the `c`/`s` planes. The two
+`trimmed_footprint_*` functions MEASURE that rectangle (from the fitted model where there is one,
+otherwise from the template against its own border level); `mark_extent_from_template` is the same
+template measurement with NO safety border, which is what says a crop cut the mark and what a
+reference intake derives a joint footprint from. All of them err LARGE by construction — a
+threshold at the 8-bit quantization floor, so a background that is not flat yields no trim at all.
 
 Notes:
 Everything here is GUI-free and `Send`: no egui, no backend, no user-visible strings. Error
@@ -158,6 +186,18 @@ const ASSUMED_ALPHA_UNCERTAINTY_PERCENT: f32 = 30.0;
 /// percent. The plan's measurement: the iterated estimator does not converge to the truth, it
 /// CROSSES it, so its accuracy is +-10-20% and this takes the pessimistic end.
 const ESTIMATED_BACKGROUND_ALPHA_UNCERTAINTY_PERCENT: f32 = 20.0;
+/// Floor on the alpha-scale uncertainty of any fit that rests on a HAND-ASSERTED background
+/// level ([`SampleBackground::Manual`]), percent of alpha.
+///
+/// An asserted level carries no measurement, so the error in `B` is bounded by nothing the
+/// engine can see, and the two-point slope error `sigma*sqrt(2)/spread` — which assumes `B` is
+/// exact — stops describing it. The engine therefore refuses to quote a figure BETTER than the
+/// one it quotes when it has no slope information at all, which is
+/// `ASSUMED_ALPHA_UNCERTAINTY_PERCENT`. This is the same rule
+/// [`AlphaUncertainty::from_percent`] applies to a non-finite percentage: an uncertainty nothing
+/// quantifies is never a small one. It is a FLOOR, not a replacement — a fit that is already
+/// worse than this keeps its own worse figure.
+const MANUAL_BACKGROUND_ALPHA_UNCERTAINTY_FLOOR_PERCENT: f32 = ASSUMED_ALPHA_UNCERTAINTY_PERCENT;
 /// Iterations of the estimated-background refinement loop.
 ///
 /// This is a FREE PARAMETER, not a converged fixed point, and the number is measured rather than
@@ -535,6 +575,20 @@ pub(super) fn alpha_blend_operator() -> Arc<dyn CompositingOperator> {
     Arc::new(AlphaBlend)
 }
 
+/// Resolve a persisted [`CompositingOperator::id`] back into an operator.
+///
+/// `None` for an id this build does not implement. The caller MUST refuse rather than fall back
+/// on alpha blending: a multiply or gamma mark composited under an alpha-blend assumption is
+/// confidently wrong, not approximately right, which is the whole reason the operator is a trait
+/// and its id is persisted.
+#[must_use]
+pub(super) fn operator_from_id(id: &str) -> Option<Arc<dyn CompositingOperator>> {
+    match id {
+        "alpha_blend" => Some(alpha_blend_operator()),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Template
 // ---------------------------------------------------------------------------------------
@@ -715,6 +769,264 @@ fn luma_of(r: u8, g: u8, b: u8) -> f32 {
 }
 
 // ---------------------------------------------------------------------------------------
+// Footprint trim
+// ---------------------------------------------------------------------------------------
+
+/// Smallest per-pixel opacity a footprint pixel must reach before it counts as PART OF THE MARK,
+/// when the mark is known through a fitted model.
+///
+/// One LSB of an 8-bit output byte against the widest possible background swing: a pixel whose
+/// alpha is below `1/255` cannot move a single rendered byte at ANY background level, so it
+/// carries no removable deposit whatever the page under it. Deliberately far below
+/// [`ALPHA_SIGNIFICANT`], which answers a different question ("is this deposit worth
+/// reporting"): a trim must keep every pixel that could still matter, because an over-tight
+/// footprint corrupts removal while a loose one only costs crop size.
+const FOOTPRINT_TRIM_MIN_ALPHA: f32 = 1.0 / 255.0;
+
+/// Smallest deviation from the surrounding background level a TEMPLATE pixel must show before it
+/// counts as part of the mark, LSB.
+///
+/// One LSB is the smallest difference an 8-bit crop can record at all, so nothing below it is
+/// evidence of a deposit. Holding the threshold at the quantization floor — rather than at the
+/// template's own noise level — is what makes the rule SELF-LIMITING: on a template whose
+/// background is not in fact flat, every pixel deviates, the extent is the whole footprint and no
+/// trim happens. A noisy template therefore costs a missed trim, never a cut mark.
+const FOOTPRINT_TRIM_MIN_DEVIATION_LSB: f32 = 1.0;
+
+/// Background kept around the mark's measured extent when a footprint is trimmed, pixels.
+///
+/// Three things have to fit inside it. It EXCEEDS [`RING_WIDTH_PX`], so a trimmed footprint still
+/// presents a full ring of background to the level estimator — which is what makes a second trim
+/// of the same entry a no-op instead of a slow erosion. It covers [`MAX_SUBPIXEL_SHIFT`], so an
+/// occurrence that landed off the pixel grid still has its whole deposit inside the footprint.
+/// And it absorbs the one-pixel uncertainty of the extent itself, where an antialiased edge fades
+/// into the quantization floor.
+/// Also the slack the REFERENCE INTAKE carries around a jointly measured mark extent, and the
+/// largest disagreement it tolerates between where the aligner puts a crop's window and where
+/// that crop's own extent says the mark is — see `tools/watermark_entry.rs`.
+pub(super) const FOOTPRINT_TRIM_SAFETY_PX: u32 = 4;
+
+/// Expand the inclusive pixel box `(min_x, min_y)..=(max_x, max_y)` by
+/// [`FOOTPRINT_TRIM_SAFETY_PX`] and clamp it into a `width` x `height` footprint.
+///
+/// Both dimensions must be non-zero — every caller has already validated that through
+/// [`validate_page`] or [`WatermarkModel::from_parts`]. All arithmetic saturates, so the grown box
+/// can never leave the footprint and no subtraction can underflow.
+fn grown_extent(min_x: u32, min_y: u32, max_x: u32, max_y: u32, width: u32, height: u32) -> PixelRect {
+    let x0 = min_x.saturating_sub(FOOTPRINT_TRIM_SAFETY_PX);
+    let y0 = min_y.saturating_sub(FOOTPRINT_TRIM_SAFETY_PX);
+    let x1 = max_x
+        .saturating_add(FOOTPRINT_TRIM_SAFETY_PX)
+        .min(width.saturating_sub(1));
+    let y1 = max_y
+        .saturating_add(FOOTPRINT_TRIM_SAFETY_PX)
+        .min(height.saturating_sub(1));
+    PixelRect::new(
+        x0,
+        y0,
+        x1.saturating_sub(x0).saturating_add(1),
+        y1.saturating_sub(y0).saturating_add(1),
+    )
+}
+
+/// The sub-rectangle of a fitted model's footprint the mark actually deposits in, grown by
+/// [`FOOTPRINT_TRIM_SAFETY_PX`] of background and clamped to the footprint.
+///
+/// A detector's box is not the mark: it is the rectangle the detector happened to hand over, and
+/// outside the deposit the model is `c = 0`, `s = 1` — fully transparent, carrying no information
+/// and no removable signal. Every pixel of that padding still costs a stored plane entry and, far
+/// worse, is demanded of every future reference crop. This is the measurement that says where the
+/// mark really ends.
+///
+/// The returned rect is in FOOTPRINT-LOCAL coordinates: its origin is the footprint's own top
+/// left. A rect equal to `(0, 0, width, height)` means the footprint is already tight.
+///
+/// # Errors
+/// [`WatermarkError::BufferLength`] if a plane is not `width*height*3` long (revalidated here
+/// rather than assumed, CLAUDE.md §11), and [`WatermarkError::FlatTemplate`] when NO pixel reaches
+/// the floor at all — a model that deposits nowhere. The caller must keep its footprint rather
+/// than trim to nothing.
+pub(super) fn trimmed_footprint_from_model(model: &WatermarkModel) -> Result<PixelRect, WatermarkError> {
+    let (width, height) = (model.width(), model.height());
+    let (w, h) = (width as usize, height as usize);
+    let expected = w.saturating_mul(h).saturating_mul(3);
+    let (c, s) = (model.c(), model.s());
+    if c.len() != expected {
+        return Err(WatermarkError::BufferLength {
+            what: "model c plane",
+            len: c.len(),
+            expected,
+        });
+    }
+    if s.len() != expected {
+        return Err(WatermarkError::BufferLength {
+            what: "model s plane",
+            len: s.len(),
+            expected,
+        });
+    }
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * 3;
+            // Either half is enough. `1 - s` is the opacity, which is what a removal divides by;
+            // `c` is the additive deposit, which a mark of a very dark colour carries almost
+            // none of while still being opaque, and vice versa. Testing both is what keeps a
+            // degenerate-but-real mark inside the box.
+            let marked = (0..3).any(|channel| {
+                let index = base + channel;
+                1.0 - s[index] >= FOOTPRINT_TRIM_MIN_ALPHA
+                    || c[index] >= FOOTPRINT_TRIM_MIN_DEVIATION_LSB
+            });
+            if !marked {
+                continue;
+            }
+            any = true;
+            // Cast justification: `x < w` and `y < h`, both of which came from `u32` dimensions.
+            let (px, py) = (x as u32, y as u32);
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+    }
+    if !any {
+        return Err(WatermarkError::FlatTemplate { width, height });
+    }
+    Ok(grown_extent(min_x, min_y, max_x, max_y, width, height))
+}
+
+/// The sub-rectangle of `footprint` the mark occupies inside a stored TEMPLATE crop, grown by
+/// [`FOOTPRINT_TRIM_SAFETY_PX`] of background and clamped to the footprint.
+///
+/// This is the template-only proxy for [`trimmed_footprint_from_model`], for an entry that has no
+/// samples and therefore no `c`/`s`: the mark is wherever the crop differs from the flat level of
+/// the background it was cut on. It is SOUND exactly when the padding around the mark is that flat
+/// background — which is the case the trim exists for, a detector box grown loosely around a mark
+/// stamped on empty page. It is NOT sound as a statement about faint deposit on a busy background,
+/// and it does not pretend to be: on such a crop the background itself deviates by more than
+/// [`FOOTPRINT_TRIM_MIN_DEVIATION_LSB`] everywhere, the extent comes back as the whole footprint,
+/// and nothing is trimmed. The level is the plain mean of the [`RING_WIDTH_PX`]-wide frame just
+/// inside `footprint`; a mark that reaches that frame pulls the level towards itself, which again
+/// widens the extent rather than narrowing it. Alpha is ignored, as everywhere else in this
+/// engine.
+///
+/// The returned rect is in FOOTPRINT-LOCAL coordinates, as [`trimmed_footprint_from_model`]'s is.
+///
+/// # Errors
+/// [`WatermarkError::PageGeometry`] / [`WatermarkError::EmptyRect`] / [`WatermarkError::RectOutOfPage`]
+/// for unusable geometry, and [`WatermarkError::FlatTemplate`] when no pixel of the crop differs
+/// from its border level — a template that holds no mark at all. The caller must keep its
+/// footprint rather than trim to nothing.
+pub(super) fn trimmed_footprint_from_template(
+    template: &RgbaImage,
+    footprint: PixelRect,
+) -> Result<PixelRect, WatermarkError> {
+    let raw = mark_extent_from_template(template, footprint)?;
+    // Inclusive box: `raw` is half-open, `grown_extent` takes the last pixel still inside it.
+    // `raw.width`/`raw.height` are non-zero whenever `mark_extent_from_template` returns Ok.
+    Ok(grown_extent(
+        raw.x,
+        raw.y,
+        raw.x + raw.width - 1,
+        raw.y + raw.height - 1,
+        footprint.width,
+        footprint.height,
+    ))
+}
+
+/// The RAW rectangle of `footprint` whose pixels deviate from the crop's own border level — the
+/// mark's measured extent with NO safety border added.
+///
+/// This is the measurement [`trimmed_footprint_from_template`] grows by
+/// [`FOOTPRINT_TRIM_SAFETY_PX`]; both share one rule, and the raw form exists because two callers
+/// need the unpadded box itself:
+/// - deriving a NEW entry's footprint jointly from several reference crops, where every crop's own
+///   safety border would be added to a union that then no longer states what was measured;
+/// - detecting a crop that CUT the mark. A raw box touching the crop's own border means the mark
+///   continues outside the crop; the GROWN box touches the border routinely and says nothing.
+///
+/// The returned rect is in FOOTPRINT-LOCAL coordinates and is never empty.
+///
+/// # Errors
+/// [`WatermarkError::PageGeometry`] / [`WatermarkError::EmptyRect`] / [`WatermarkError::RectOutOfPage`]
+/// for unusable geometry, and [`WatermarkError::FlatTemplate`] when no pixel of the crop differs
+/// from its border level — a crop that holds no mark at all.
+pub(super) fn mark_extent_from_template(
+    template: &RgbaImage,
+    footprint: PixelRect,
+) -> Result<PixelRect, WatermarkError> {
+    let (pw, _ph) = validate_page(template)?;
+    validate_rect(template, footprint)?;
+    let raw = template.as_raw();
+    let (fw, fh) = (footprint.width as usize, footprint.height as usize);
+    let (ox, oy) = (footprint.x as usize, footprint.y as usize);
+    let ring = RING_WIDTH_PX as usize;
+    let on_frame = |x: usize, y: usize| -> bool {
+        x < ring || y < ring || fw.saturating_sub(x) <= ring || fh.saturating_sub(y) <= ring
+    };
+    let mut sums = [0f64; 3];
+    let mut frame_pixels = 0usize;
+    for y in 0..fh {
+        for x in 0..fw {
+            if !on_frame(x, y) {
+                continue;
+            }
+            let base = ((oy + y) * pw + ox + x) * 4;
+            for channel in 0..3 {
+                sums[channel] += f64::from(raw[base + channel]);
+            }
+            frame_pixels += 1;
+        }
+    }
+    if frame_pixels == 0 {
+        // Unreachable for a non-empty rect — `on_frame` is true for every pixel of a rect
+        // narrower than two ring widths — but a zero divisor must never be assumed away.
+        return Err(WatermarkError::EmptyRect { rect: footprint });
+    }
+    // Cast justification: a mean of 0..=255 values, exactly representable in f32.
+    let level: [f32; 3] = std::array::from_fn(|channel| (sums[channel] / frame_pixels as f64) as f32);
+
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut any = false;
+    for y in 0..fh {
+        for x in 0..fw {
+            let base = ((oy + y) * pw + ox + x) * 4;
+            let marked = (0..3).any(|channel| {
+                (f32::from(raw[base + channel]) - level[channel]).abs()
+                    > FOOTPRINT_TRIM_MIN_DEVIATION_LSB
+            });
+            if !marked {
+                continue;
+            }
+            any = true;
+            // Cast justification: `x < fw` and `y < fh`, both from `u32` rect dimensions.
+            let (px, py) = (x as u32, y as u32);
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+    }
+    if !any {
+        return Err(WatermarkError::FlatTemplate {
+            width: footprint.width,
+            height: footprint.height,
+        });
+    }
+    // Inclusive box -> half-open rect. Both `max_*` are >= their `min_*`, so neither
+    // subtraction underflows and neither dimension is zero.
+    Ok(PixelRect::new(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+// ---------------------------------------------------------------------------------------
 // Calibration samples
 // ---------------------------------------------------------------------------------------
 
@@ -723,10 +1035,45 @@ fn luma_of(r: u8, g: u8, b: u8) -> f32 {
 pub(super) enum SampleBackground {
     /// The ring around the mark is uniform, so `B` is known exactly and is the same everywhere
     /// under the footprint. This is the strongest input the estimator can receive.
-    Flat { level: [f32; 3], ring_std: [f32; 3] },
+    ///
+    /// `ring` says how much of that ring existed. A mark against a page border is measured from
+    /// the sides that survive clipping, which is still a measurement — the level and `ring_std`
+    /// mean exactly what they always meant — but it rests on fewer, one-sided pixels, so the
+    /// coverage is carried with the level and counted out of a fit in
+    /// [`ModelProvenance::partial_rings`] rather than dropped at the boundary.
+    Flat {
+        level: [f32; 3],
+        ring_std: [f32; 3],
+        ring: RingCoverage,
+    },
+    /// `B` was ASSERTED by the user for a sample whose ring the engine refused to call flat.
+    ///
+    /// It enters the fit exactly like [`SampleBackground::Flat`] — the user is telling the
+    /// engine what the background under this occurrence was — but it is NOT a measurement, so
+    /// it carries no `ring_std` (nothing was measured, and a fabricated `0.0` would claim a
+    /// measurement that never happened) and every model it contributes to is downgraded:
+    /// [`AlphaSource::ManualBackgrounds`] with its uncertainty floored at
+    /// `MANUAL_BACKGROUND_ALPHA_UNCERTAINTY_FLOOR_PERCENT`. Nothing in the automatic path ever
+    /// produces this variant; it exists only for a level a human states.
+    Manual { level: [f32; 3] },
     /// `B` was estimated per pixel (e.g. by [`provisional_background`] from an earlier model).
     /// Interleaved RGB, `width*height*3` entries.
     Estimated { values: Vec<f32> },
+}
+
+impl SampleBackground {
+    /// The one uniform background level under the whole footprint, when there is one.
+    ///
+    /// `Some` for a measured flat ring and for a hand-asserted level alike — both state a single
+    /// `B` per channel, which is what the closed-form and deposit-exact fits need. `None` for a
+    /// per-pixel estimate, which has no single level.
+    #[must_use]
+    pub fn known_level(&self) -> Option<[f32; 3]> {
+        match self {
+            Self::Flat { level, .. } | Self::Manual { level } => Some(*level),
+            Self::Estimated { .. } => None,
+        }
+    }
 }
 
 /// One occurrence used to fit the model: the observed pixels under the mark plus what is known
@@ -797,10 +1144,53 @@ impl CalibrationSample {
         &self.background
     }
 
-    /// True when `B` is known exactly (flat ring), which is what the closed form needs.
+    /// True when `B` was MEASURED exactly from a uniform ring.
+    ///
+    /// Deliberately false for [`SampleBackground::Manual`]: this predicate answers "is there a
+    /// measurement here", and it is what guards the one measurement-only decision the engine
+    /// still makes — [`refit_with_refined_backgrounds`] may overwrite anything that is not a
+    /// measurement with an estimate, and an asserted level must not be treated that way either.
+    /// Use [`CalibrationSample::has_known_level`] for "is `B` a single known value".
     #[must_use]
     pub fn is_flat(&self) -> bool {
         matches!(self.background, SampleBackground::Flat { .. })
+    }
+
+    /// True when the user asserted this sample's background level instead of the engine
+    /// measuring it.
+    #[must_use]
+    pub fn is_manual(&self) -> bool {
+        matches!(self.background, SampleBackground::Manual { .. })
+    }
+
+    /// How much of this sample's measurement ring existed, for a MEASURED background.
+    ///
+    /// `None` when there was no ring to measure — an asserted level or a per-pixel estimate —
+    /// which is a different statement from "the ring was complete" and must not be collapsed
+    /// into one.
+    #[must_use]
+    pub fn ring_coverage(&self) -> Option<RingCoverage> {
+        match &self.background {
+            SampleBackground::Flat { ring, .. } => Some(*ring),
+            SampleBackground::Manual { .. } | SampleBackground::Estimated { .. } => None,
+        }
+    }
+
+    /// True when this sample's background was measured from a ring the page edge truncated.
+    #[must_use]
+    pub fn has_partial_ring(&self) -> bool {
+        self.ring_coverage().is_some_and(|ring| ring.is_partial())
+    }
+
+    /// True when `B` is one known value over the whole footprint — measured or asserted.
+    ///
+    /// This is what the closed-form and deposit-exact fits key on: both need a single `B` per
+    /// channel and neither can tell where it came from. Where the provenance matters, it is
+    /// carried out of the fit in [`ModelProvenance::manual_backgrounds`] and priced into
+    /// [`AlphaUncertainty`], never re-derived from this predicate.
+    #[must_use]
+    pub fn has_known_level(&self) -> bool {
+        self.background.known_level().is_some()
     }
 
     #[inline]
@@ -811,7 +1201,9 @@ impl CalibrationSample {
     #[inline]
     fn background_at(&self, pixel: usize, channel: usize) -> f32 {
         match &self.background {
-            SampleBackground::Flat { level, .. } => level[channel],
+            SampleBackground::Flat { level, .. } | SampleBackground::Manual { level } => {
+                level[channel]
+            }
             SampleBackground::Estimated { values } => values[pixel * 3 + channel],
         }
     }
@@ -820,7 +1212,7 @@ impl CalibrationSample {
     /// sample sits on that level".
     fn mean_background_luma(&self) -> f32 {
         match &self.background {
-            SampleBackground::Flat { level, .. } => {
+            SampleBackground::Flat { level, .. } | SampleBackground::Manual { level } => {
                 LUMA_R * level[0] + LUMA_G * level[1] + LUMA_B * level[2]
             }
             SampleBackground::Estimated { values } => {
@@ -847,6 +1239,62 @@ pub(super) enum SampleRejection {
     RingTooSmall { pixels: usize, needed: usize },
 }
 
+/// How much of the ring around a calibration rect actually existed.
+///
+/// The ring is CLIPPED to the page, so a mark stamped against an image border is measured from
+/// the sides that exist rather than refused: fewer samples of a flat background are less data,
+/// not invalid data, and the admission floor is a PIXEL COUNT (`SampleParams::min_ring_pixels`),
+/// never a per-side margin. What changes is the precision behind the two numbers the ring
+/// produces — the level is the mean of `pixels` samples instead of `full_pixels`, and the
+/// flatness statistic is computed over that smaller, one-sided set — so the coverage travels
+/// with every measurement that rests on it and is counted out of a fit in
+/// [`ModelProvenance::partial_rings`].
+///
+/// One thing it deliberately does NOT do is carry a numeric penalty. The engine's alpha
+/// uncertainty is calibrated on `FIT_NOISE_LSB`, which `AlphaUncertainty::from_flat_fit`
+/// documents as a per-occurrence rasterization BIAS that does not average down with sample
+/// count; nothing in `dev-docs/watermark_chapter_decomposition_plan.md` measures how a ring's
+/// pixel count moves it. Attaching an invented figure would be exactly the fabricated number
+/// that document's "honest reporting" section forbids, so the coverage is REPORTED and the
+/// uncertainty is left as the data licenses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RingCoverage {
+    /// Ring pixels the measurement actually averaged.
+    pub pixels: usize,
+    /// Ring pixels the same ring would have had with nothing clipping it.
+    pub full_pixels: usize,
+}
+
+impl RingCoverage {
+    /// A ring nothing clipped: every pixel it could have had, it had.
+    #[must_use]
+    pub fn full(pixels: usize) -> Self {
+        Self {
+            pixels,
+            full_pixels: pixels,
+        }
+    }
+
+    /// True when the page edge (or a degenerate rect) cost the ring pixels it would otherwise
+    /// have had. A partial ring is a valid measurement with a weaker statistic behind it.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.pixels < self.full_pixels
+    }
+
+    /// Share of the complete ring that survived, 0..=1. 0.0 for a degenerate footprint whose
+    /// complete ring would have had no pixels either.
+    #[must_use]
+    pub fn share(&self) -> f32 {
+        if self.full_pixels == 0 {
+            return 0.0;
+        }
+        // Cast justification: both are ring pixel counts of a footprint bounded by the
+        // detector's own side cap, exactly representable in f32 far beyond that.
+        self.pixels as f32 / self.full_pixels as f32
+    }
+}
+
 /// Verdict on a user-picked (or auto-collected) sample rect.
 ///
 /// The distinction that matters: a sample whose ring is NOT uniform is refused as a calibration
@@ -858,16 +1306,23 @@ pub(super) enum SampleVerdict {
     Calibration {
         level: [f32; 3],
         ring_std: [f32; 3],
-        ring_pixels: usize,
+        /// How much of the ring existed. Partial is accepted (see [`RingCoverage`]) and must
+        /// be carried, not dropped.
+        ring: RingCoverage,
     },
     /// Ring not uniform: REFUSED as calibration, usable as a detection template.
+    ///
+    /// This is a DIFFERENT failure from a ring too small to judge at all
+    /// ([`SampleRejection::RingTooSmall`]) and from a ring that is merely partial: partialness
+    /// costs pixels, non-flatness costs the measurement itself, and the two never substitute
+    /// for each other.
     TemplateOnly {
         level: [f32; 3],
         ring_std: [f32; 3],
         ring_max_dev: [f32; 3],
         std_limit: f32,
         max_dev_limit: f32,
-        ring_pixels: usize,
+        ring: RingCoverage,
     },
     /// Unusable for anything.
     Unusable { reason: SampleRejection },
@@ -942,9 +1397,17 @@ impl SampleParams {
 
 /// Measure the ring around `rect` and decide what the sample is good for.
 ///
-/// The ring is the annulus of `params.ring_width` pixels around `rect`, clipped to the page. A
+/// The ring is the annulus of `params.ring_width` pixels around `rect`, CLIPPED TO THE PAGE. A
 /// uniform ring is what licenses reading `B` directly; a structured one means the background
 /// under the mark is unknown, and the engine says so instead of guessing.
+///
+/// A mark stamped against a page border therefore still measures: the sides that exist are
+/// averaged and the admission floor is `params.min_ring_pixels`, a pixel COUNT, never a
+/// per-side margin. The cost of that asymmetry is reported rather than hidden — the verdict
+/// carries a [`RingCoverage`], and a partial ring's level is the mean of a one-sided sample of
+/// the background. The flatness test is NOT relaxed to pay for it: a ring with real structure
+/// is still refused as [`SampleVerdict::TemplateOnly`] whatever its coverage, which is what
+/// keeps a truncated ring from silently averaging one end of a gradient into a "measured" level.
 ///
 /// Never panics: a bad rect or a starved ring returns [`SampleVerdict::Unusable`].
 #[must_use]
@@ -968,6 +1431,14 @@ pub(super) fn validate_calibration_sample(
     // Ring bounds: the rect grown by `ring_width`, clipped to the page. The inner hole is the
     // rect itself, so the ring never reads a pixel the mark could have touched.
     let ring = params.ring_width as usize;
+    // What an UNCLIPPED ring would have held, computed before the clip so the coverage can say
+    // how much the page edge cost. Saturating throughout: the product of two bounded pixel
+    // counts cannot overflow on a validated rect, and a degenerate one reports zero rather
+    // than wrapping.
+    let full_ring_pixels = (rect.width as usize)
+        .saturating_add(ring.saturating_mul(2))
+        .saturating_mul((rect.height as usize).saturating_add(ring.saturating_mul(2)))
+        .saturating_sub((rect.width as usize).saturating_mul(rect.height as usize));
     let x0 = (rect.x as usize).saturating_sub(ring);
     let y0 = (rect.y as usize).saturating_sub(ring);
     let x1 = ((rect.right() as usize) + ring).min(pw);
@@ -1028,13 +1499,23 @@ pub(super) fn validate_calibration_sample(
         }
     }
 
+    let coverage = RingCoverage {
+        pixels: count,
+        // A clip can only ever remove pixels, so a count above the unclipped figure would mean
+        // the two were computed from different rects; clamping keeps `is_partial` honest
+        // instead of letting an impossible pair read as "complete".
+        full_pixels: full_ring_pixels.max(count),
+    };
+    // The flatness thresholds are the SAME whatever the coverage: partialness costs pixels, not
+    // the right to be called structured. Weakening them for a truncated ring would turn "less
+    // evidence" into "a lower bar", which is the one substitution this measurement forbids.
     let flat = std.iter().all(|&v| v <= params.std_limit)
         && max_dev.iter().all(|&v| v <= params.max_dev_limit);
     if flat {
         SampleVerdict::Calibration {
             level,
             ring_std: std,
-            ring_pixels: count,
+            ring: coverage,
         }
     } else {
         SampleVerdict::TemplateOnly {
@@ -1043,7 +1524,7 @@ pub(super) fn validate_calibration_sample(
             ring_max_dev: max_dev,
             std_limit: params.std_limit,
             max_dev_limit: params.max_dev_limit,
-            ring_pixels: count,
+            ring: coverage,
         }
     }
 }
@@ -1065,7 +1546,9 @@ pub(super) fn calibration_sample_from_page(
     let verdict = validate_calibration_sample(page, rect, params);
     let sample = match &verdict {
         SampleVerdict::Calibration {
-            level, ring_std, ..
+            level,
+            ring_std,
+            ring,
         } => Some(CalibrationSample::from_page(
             page,
             page_index,
@@ -1073,6 +1556,7 @@ pub(super) fn calibration_sample_from_page(
             SampleBackground::Flat {
                 level: *level,
                 ring_std: *ring_std,
+                ring: *ring,
             },
         )?),
         SampleVerdict::TemplateOnly { .. } | SampleVerdict::Unusable { .. } => None,
@@ -1103,6 +1587,12 @@ pub(super) enum AlphaSource {
     /// Fitted against per-pixel background ESTIMATES, which are the model's own output one
     /// iteration earlier. Worth `ESTIMATED_BACKGROUND_ALPHA_UNCERTAINTY_PERCENT`, no better.
     EstimatedBackgrounds,
+    /// Fitted with at least one background level ASSERTED by the user
+    /// ([`SampleBackground::Manual`]) rather than measured. The fit is arithmetically the same
+    /// one a measurement would have produced, but its `B` is a claim, so the uncertainty is
+    /// floored at `MANUAL_BACKGROUND_ALPHA_UNCERTAINTY_FLOOR_PERCENT` and nothing downstream
+    /// may describe such a model as measured.
+    ManualBackgrounds,
     /// Not determined by the data at all: the deposit is exact and the scale is an assumption,
     /// anchored on the deposit's own lower bound or stated by the caller.
     Assumed,
@@ -1355,6 +1845,24 @@ pub(super) struct ModelProvenance {
     /// Pixels whose fitted `s` or `c` had to be clamped into the physically possible range.
     /// A large count means the samples disagree and the model should not be trusted.
     pub clamped_pixels: usize,
+    /// How many of the samples this fit actually ran on carried a HAND-ASSERTED background
+    /// level ([`SampleBackground::Manual`]) instead of a measured one.
+    ///
+    /// Non-zero means the model rests on a claim the engine could not check: it is still a
+    /// model, and removal through it is still the arithmetic the data licenses, but no report
+    /// built from this provenance may say the imprint was measured. The cost is already priced
+    /// into the verdict's [`AlphaUncertainty`]; this count is what names the assumption.
+    pub manual_backgrounds: usize,
+    /// How many of the samples this fit ran on had their background MEASURED from a ring the
+    /// page edge truncated ([`RingCoverage::is_partial`]).
+    ///
+    /// Unlike `manual_backgrounds` this is not an assumption: every one of those levels was
+    /// measured, and the flatness test they passed was the ordinary one. What it names is
+    /// weaker EVIDENCE — a mean over fewer, one-sided background pixels — so a report built
+    /// from this provenance may call the model measured and must not call the measurement
+    /// complete. No numeric penalty rides on it; see [`RingCoverage`] for why inventing one
+    /// would be dishonest.
+    pub partial_rings: usize,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1626,7 +2134,11 @@ impl MarkSignature {
     /// Measure a signature straight from a flat-background sample, before any model exists.
     ///
     /// Returns `None` for a sample whose background is a per-pixel estimate: an estimated
-    /// background cannot measure a deposit, it is derived from one.
+    /// background cannot measure a deposit, it is derived from one. Also `None` for an ASSERTED
+    /// level ([`SampleBackground::Manual`]) — deliberately, and unlike every other consumer of a
+    /// known level: a signature is the mark's IDENTITY, the key auto-match resolves a whole
+    /// chapter against, and a claimed background would let one wrong claim redirect calibration
+    /// onto the wrong entry. Identity stays measurement-only; the fit does not have to.
     #[must_use]
     pub fn from_flat_sample(sample: &CalibrationSample) -> Option<Self> {
         let SampleBackground::Flat { level, .. } = sample.background() else {
@@ -1792,30 +2304,32 @@ pub(super) fn estimate_model(
         .iter()
         .map(|&value| 1.0 - value)
         .fold(0.0f32, f32::max);
+    let alpha = match plan.method {
+        FitMethod::ClosedFormFlat => AlphaUncertainty::from_flat_fit(plan.spread, peak_alpha),
+        FitMethod::TheilSen => AlphaUncertainty::from_percent(
+            AlphaSource::EstimatedBackgrounds,
+            ESTIMATED_BACKGROUND_ALPHA_UNCERTAINTY_PERCENT,
+        ),
+        FitMethod::DepositExact => {
+            AlphaUncertainty::from_percent(AlphaSource::Assumed, fit.alpha_uncertainty_percent)
+        }
+    };
+    // A fit that ran on even one ASSERTED background level is downgraded here rather than at
+    // any reporting site: the verdict is the one thing every caller already reads, so the
+    // assumption cannot be lost on the way out. The figure is never improved, only floored.
+    let alpha = downgrade_for_manual_backgrounds(alpha, plan.manual_inputs);
     let conditioning = match plan.method {
-        FitMethod::ClosedFormFlat => ModelConditioning::Separable {
+        FitMethod::ClosedFormFlat | FitMethod::TheilSen => ModelConditioning::Separable {
             levels: plan.levels,
             spread: plan.spread,
             min_pixel_spread: plan.min_pixel_spread,
-            alpha: AlphaUncertainty::from_flat_fit(plan.spread, peak_alpha),
-        },
-        FitMethod::TheilSen => ModelConditioning::Separable {
-            levels: plan.levels,
-            spread: plan.spread,
-            min_pixel_spread: plan.min_pixel_spread,
-            alpha: AlphaUncertainty::from_percent(
-                AlphaSource::EstimatedBackgrounds,
-                ESTIMATED_BACKGROUND_ALPHA_UNCERTAINTY_PERCENT,
-            ),
+            alpha,
         },
         FitMethod::DepositExact => ModelConditioning::DepositExact {
             levels: plan.levels,
             spread: plan.spread,
             samples: fit_input.len(),
-            alpha: AlphaUncertainty::from_percent(
-                AlphaSource::Assumed,
-                fit.alpha_uncertainty_percent,
-            ),
+            alpha,
         },
     };
     let provenance = ModelProvenance {
@@ -1823,9 +2337,30 @@ pub(super) fn estimate_model(
         method: plan.method,
         conditioning,
         clamped_pixels: fit.clamped_pixels,
+        manual_backgrounds: plan.manual_inputs,
+        partial_rings: plan.partial_inputs,
     };
     WatermarkModel::from_parts(width, height, fit.c, fit.s, operator, provenance)
         .map_err(ModelFitError::Invalid)
+}
+
+/// Re-price an alpha uncertainty when the fit rested on hand-asserted background levels.
+///
+/// Returns `alpha` untouched when `manual_inputs` is zero. Otherwise the source becomes
+/// [`AlphaSource::ManualBackgrounds`] and the percentage is raised to at least
+/// `MANUAL_BACKGROUND_ALPHA_UNCERTAINTY_FLOOR_PERCENT` — never lowered, so a fit that was
+/// already worse keeps its own figure. The LSB costs follow from the percentage through the
+/// engine's measured constants, exactly as for every other source.
+fn downgrade_for_manual_backgrounds(alpha: AlphaUncertainty, manual_inputs: usize) -> AlphaUncertainty {
+    if manual_inputs == 0 {
+        return alpha;
+    }
+    AlphaUncertainty::from_percent(
+        AlphaSource::ManualBackgrounds,
+        alpha
+            .percent
+            .max(MANUAL_BACKGROUND_ALPHA_UNCERTAINTY_FLOOR_PERCENT),
+    )
 }
 
 /// Which fit the samples license, on which of them, and the levels the verdict will report.
@@ -1833,6 +2368,10 @@ struct FitPlan {
     method: FitMethod,
     /// Indices into the caller's sample slice that the fit runs on.
     inputs: Vec<usize>,
+    /// How many of `inputs` carry a hand-asserted background level rather than a measured one.
+    manual_inputs: usize,
+    /// How many of `inputs` had their background measured from a ring the page edge truncated.
+    partial_inputs: usize,
     /// Distinct background levels of those inputs, ascending.
     levels: Vec<f32>,
     /// Widest gap between them, LSB.
@@ -1860,7 +2399,17 @@ struct FittedPlanes {
 /// # Errors
 /// The refusing [`ModelConditioning`] variant, for the caller to wrap.
 fn plan_fit(samples: &[CalibrationSample], pixels: usize) -> Result<FitPlan, ModelConditioning> {
-    let flat: Vec<usize> = (0..samples.len()).filter(|&i| samples[i].is_flat()).collect();
+    // "Known level" rather than "measured level": a hand-asserted level states the same single
+    // `B` the closed form needs, so it feeds the fit identically. What it does NOT do is claim
+    // to be evidence, which is what `manual_count` carries out of here.
+    let flat: Vec<usize> = (0..samples.len())
+        .filter(|&i| samples[i].has_known_level())
+        .collect();
+    let manual_count = |indices: &[usize]| indices.iter().filter(|&&i| samples[i].is_manual()).count();
+    // Counted the same way and for the same reason: the fit cannot tell a truncated ring from a
+    // complete one, so the distinction has to be carried out of here rather than re-derived.
+    let partial_count =
+        |indices: &[usize]| indices.iter().filter(|&&i| samples[i].has_partial_ring()).count();
     let mut flat_levels: Vec<f32> = flat
         .iter()
         .map(|&index| samples[index].mean_background_luma())
@@ -1868,11 +2417,16 @@ fn plan_fit(samples: &[CalibrationSample], pixels: usize) -> Result<FitPlan, Mod
     flat_levels.sort_by(f32::total_cmp);
     let flat_spread = luma_spread(&flat_levels);
 
-    // 1. Exact backgrounds, far enough apart: the slope is measured, not assumed.
+    // 1. Known backgrounds, far enough apart: the slope comes out of the levels, not an
+    //    assumption about alpha.
     if flat.len() >= 2 && flat_spread >= MIN_BACKGROUND_SPREAD {
+        let manual_inputs = manual_count(&flat);
+        let partial_inputs = partial_count(&flat);
         return Ok(FitPlan {
             method: FitMethod::ClosedFormFlat,
             inputs: flat,
+            manual_inputs,
+            partial_inputs,
             levels: distinct_levels(&flat_levels),
             spread: flat_spread,
             // Flat samples give every pixel the same background, so the per-pixel spread is the
@@ -1890,9 +2444,14 @@ fn plan_fit(samples: &[CalibrationSample], pixels: usize) -> Result<FitPlan, Mod
     if samples.len() >= 2 && all_spread >= MIN_BACKGROUND_SPREAD {
         let (underdetermined, worst) = narrowest_pixel_spread(samples, pixels);
         if underdetermined == 0 {
+            let inputs: Vec<usize> = (0..samples.len()).collect();
+            let manual_inputs = manual_count(&inputs);
+            let partial_inputs = partial_count(&inputs);
             return Ok(FitPlan {
                 method: FitMethod::TheilSen,
-                inputs: (0..samples.len()).collect(),
+                inputs,
+                manual_inputs,
+                partial_inputs,
                 levels: distinct_levels(&all_levels),
                 spread: all_spread,
                 min_pixel_spread: if worst.is_finite() { worst } else { all_spread },
@@ -1909,12 +2468,16 @@ fn plan_fit(samples: &[CalibrationSample], pixels: usize) -> Result<FitPlan, Mod
         }
     }
 
-    // 3. At least one exactly known background: the deposit is exact everywhere under the mark,
-    //    so removal at that level is exact and only the alpha scale is an assumption.
+    // 3. At least one known background: the deposit follows exactly from it everywhere under the
+    //    mark, so removal at that level is exact and only the alpha scale is an assumption.
     if !flat.is_empty() {
+        let manual_inputs = manual_count(&flat);
+        let partial_inputs = partial_count(&flat);
         return Ok(FitPlan {
             method: FitMethod::DepositExact,
             inputs: flat,
+            manual_inputs,
+            partial_inputs,
             levels: distinct_levels(&flat_levels),
             spread: flat_spread,
             min_pixel_spread: flat_spread,
@@ -2027,7 +2590,8 @@ fn regress_planes(
 
 /// The graded fit: exact deposit, assumed alpha scale.
 ///
-/// With every calibration background known exactly, `D = B - I` is measured exactly, and for any
+/// With every calibration background known (measured, or asserted by the user), `D = B - I`
+/// follows exactly from it, and for any
 /// assumed `s` the constant follows exactly as `c = mean(I - s*B)`. The recovery is therefore
 /// EXACT at the observed level whatever alpha is assumed, and wrong away from it by
 /// `delta_alpha * (B - B0) / (1 - alpha)` — which is what the verdict quotes.
@@ -2059,7 +2623,9 @@ fn deposit_exact_planes(
             let mut magnitude = 0.0f32;
             let mut bound = 0.0f32;
             for sample in fit_input {
-                let SampleBackground::Flat { level, .. } = sample.background() else {
+                // Measured or asserted alike: this pass only needs the single `B` under the
+                // footprint. A per-pixel estimate has none, and never reaches this fit.
+                let Some(level) = sample.background().known_level() else {
                     continue;
                 };
                 for (channel, &background) in level.iter().enumerate() {
@@ -2125,7 +2691,7 @@ fn deposit_exact_planes(
                 let mut sum = 0.0f64;
                 let mut count = 0usize;
                 for sample in fit_input {
-                    let SampleBackground::Flat { level, .. } = sample.background() else {
+                    let Some(level) = sample.background().known_level() else {
                         continue;
                     };
                     sum += f64::from(sample.observed_at(pixel, channel) - s * level[channel]);
@@ -2533,9 +3099,10 @@ pub(super) fn find_matching_kind(
 /// This is the REFINEMENT path, not a bootstrap one: a per-pixel background beneath an opaque
 /// mark pixel cannot exist before a model does, so the kind must already carry one (typically the
 /// graded deposit-exact fit). Each iteration recomputes the `s`-weighted background estimate of
-/// every sample that HAS an estimated background and refits. Samples with an exactly measured
-/// flat background are left alone — downgrading a measurement to an estimate would throw away the
-/// only hard evidence in the set.
+/// every sample that HAS an estimated background and refits. Samples carrying a single known `B`
+/// — measured ([`SampleBackground::Flat`]) or asserted ([`SampleBackground::Manual`]) — are left
+/// alone: downgrading a measurement to an estimate would throw away the only hard evidence in
+/// the set, and overwriting an asserted level would discard the user's own instruction.
 ///
 /// The loop count is a FREE PARAMETER — see `BACKGROUND_REFINEMENT_ITERATIONS`: the estimate
 /// crosses the truth rather than converging on it, so the result is worth
@@ -2556,8 +3123,11 @@ pub(super) fn refit_with_refined_backgrounds(
     if kind.model.is_none() {
         return Err(ModelFitError::Invalid(WatermarkError::NoSamples));
     }
+    // Anything with a single known `B` is left alone: downgrading a measurement to an estimate
+    // would throw away the only hard evidence in the set, and downgrading a level the USER
+    // asserted would silently overwrite an instruction with a guess.
     let refinable: Vec<usize> = (0..kind.samples.len())
-        .filter(|&index| !kind.samples[index].is_flat())
+        .filter(|&index| !kind.samples[index].has_known_level())
         .collect();
     if refinable.is_empty() {
         return Err(ModelFitError::Invalid(WatermarkError::NothingToRefine));
@@ -3801,9 +4371,380 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------------------
+    // Footprint trim
+    // -----------------------------------------------------------------------------------
+
+    /// `mark` sitting at `at` inside a `footprint`-sized box that is fully transparent everywhere
+    /// else — exactly the shape a detector's loose box produces.
+    fn padded_mark(footprint: (u32, u32), at: (u32, u32), mark: &SyntheticMark) -> SyntheticMark {
+        let (fw, fh) = (footprint.0 as usize, footprint.1 as usize);
+        let mut c = vec![0f32; fw * fh * 3];
+        let mut s = vec![1f32; fw * fh * 3];
+        let mw = mark.width as usize;
+        for y in 0..mark.height as usize {
+            for x in 0..mw {
+                let from = (y * mw + x) * 3;
+                let to = (((at.1 as usize + y) * fw) + at.0 as usize + x) * 3;
+                c[to..to + 3].copy_from_slice(&mark.c[from..from + 3]);
+                s[to..to + 3].copy_from_slice(&mark.s[from..from + 3]);
+            }
+        }
+        SyntheticMark {
+            width: footprint.0,
+            height: footprint.1,
+            c,
+            s,
+        }
+    }
+
+    /// A flat `level` crop with an opaque block at `rect` and, one pixel outside it, a `fringe`
+    /// LSB halo — the antialiased edge a real mark has.
+    fn template_with_block(
+        size: (u32, u32),
+        rect: PixelRect,
+        level: u8,
+        block: u8,
+        fringe: u8,
+    ) -> RgbaImage {
+        RgbaImage::from_fn(size.0, size.1, |x, y| {
+            let inside = x >= rect.x
+                && y >= rect.y
+                && u64::from(x) < rect.right()
+                && u64::from(y) < rect.bottom();
+            let haloed = x + 1 >= rect.x
+                && y + 1 >= rect.y
+                && u64::from(x) <= rect.right()
+                && u64::from(y) <= rect.bottom();
+            let value = if inside {
+                block
+            } else if haloed {
+                level.saturating_sub(fringe)
+            } else {
+                level
+            };
+            image::Rgba([value, value, value, 255])
+        })
+    }
+
+    /// The measured defect: a detector box several times the size of the mark inside it. The trim
+    /// must return the mark's own extent plus the safety border and nothing else.
+    #[test]
+    fn a_loose_model_footprint_trims_to_the_marks_own_extent() {
+        let mark = SyntheticMark::new(24, 16, [0.18; 3]);
+        let model = padded_mark((200, 120), (80, 50), &mark).model();
+        let trimmed = trimmed_footprint_from_model(&model).expect("the mark deposits somewhere");
+        // `SyntheticMark` leaves its outermost 1 px frame transparent, so the deposit spans
+        // (81, 51)..=(102, 64); the safety border grows that by 4 on every side.
+        assert_eq!(trimmed, PixelRect::new(77, 47, 30, 22));
+        assert!(
+            trimmed.area() * 10 < u64::from(model.width()) * u64::from(model.height()),
+            "the padding is the overwhelming majority of the box and must be gone: {trimmed:?}"
+        );
+    }
+
+    /// The user's own entry, to the pixel: a 319x236 template whose mark occupies x 182..308,
+    /// y 110..143. Before the trim the footprint reads as flush against the right edge of an
+    /// 800 px page (anchor 480 + 319 = 799); after it, it does not.
+    #[test]
+    fn the_measured_entrys_template_trims_to_its_mark() {
+        let template = template_with_block(
+            (319, 236),
+            PixelRect::new(182, 110, 127, 34),
+            255,
+            40,
+            0,
+        );
+        let trimmed =
+            trimmed_footprint_from_template(&template, PixelRect::new(0, 0, 319, 236))
+                .expect("the template holds a mark");
+        assert_eq!(trimmed, PixelRect::new(178, 106, 135, 42));
+        // The mark's real extent is covered with room to spare on every side.
+        assert!(trimmed.x <= 182 && trimmed.y <= 110);
+        assert!(trimmed.right() >= 309 && trimmed.bottom() >= 144);
+        // The anchor moves with the footprint's left edge, and the mark stops hugging the page.
+        let anchor = 480 + trimmed.x;
+        assert_eq!(anchor, 658);
+        assert!(
+            u64::from(anchor) + u64::from(trimmed.width) + u64::from(RING_WIDTH_PX) <= 800,
+            "a trimmed mark must leave room for its own measurement ring on the page"
+        );
+        assert!(
+            480 + u64::from(319u32) + u64::from(RING_WIDTH_PX) > 800,
+            "the untrimmed footprint is the one that did not"
+        );
+    }
+
+    /// A faint antialiased edge is SIGNAL. Even where it fades to a single LSB — below the
+    /// detection floor, because one LSB is indistinguishable from rounding — the safety border is
+    /// what keeps it inside the footprint.
+    #[test]
+    fn a_faint_antialiased_edge_is_not_trimmed_away() {
+        // A 2 LSB halo is above the floor and is detected outright.
+        let detected = template_with_block((80, 60), PixelRect::new(30, 20, 10, 8), 255, 0, 2);
+        let trimmed = trimmed_footprint_from_template(&detected, PixelRect::new(0, 0, 80, 60))
+            .expect("the template holds a mark");
+        assert_eq!(trimmed, PixelRect::new(25, 15, 20, 18));
+
+        // A 1 LSB halo is at the quantization floor and is NOT detected — and is still inside
+        // the trimmed footprint, because the safety border is four pixels wide.
+        let faint = template_with_block((80, 60), PixelRect::new(30, 20, 10, 8), 255, 0, 1);
+        let trimmed = trimmed_footprint_from_template(&faint, PixelRect::new(0, 0, 80, 60))
+            .expect("the template holds a mark");
+        assert!(
+            trimmed.x <= 29 && trimmed.y <= 19,
+            "the one-LSB halo starts one pixel outside the block and must stay covered: \
+             {trimmed:?}"
+        );
+        assert!(trimmed.right() >= 41 && trimmed.bottom() >= 29, "{trimmed:?}");
+    }
+
+    /// The RAW extent states exactly what was measured; the trimmed one is that plus the safety
+    /// border. The reference intake needs both and they must not drift apart: the raw box is what
+    /// says a crop CUT the mark (it reaches the crop's border), and the grown one reaches that
+    /// border routinely and says nothing.
+    #[test]
+    fn the_raw_mark_extent_is_the_trimmed_one_without_its_safety_border() {
+        let block = PixelRect::new(30, 20, 10, 8);
+        let template = template_with_block((80, 60), block, 255, 0, 0);
+        let footprint = PixelRect::new(0, 0, 80, 60);
+        let raw = mark_extent_from_template(&template, footprint).expect("the template holds a mark");
+        assert_eq!(raw, block, "the raw extent is the deposit itself, to the pixel");
+        let trimmed = trimmed_footprint_from_template(&template, footprint)
+            .expect("the template holds a mark");
+        assert_eq!(
+            trimmed,
+            PixelRect::new(
+                block.x - FOOTPRINT_TRIM_SAFETY_PX,
+                block.y - FOOTPRINT_TRIM_SAFETY_PX,
+                block.width + FOOTPRINT_TRIM_SAFETY_PX * 2,
+                block.height + FOOTPRINT_TRIM_SAFETY_PX * 2
+            ),
+            "and the trimmed footprint is the same box grown by one safety border"
+        );
+
+        // A mark running into the crop's own border: the RAW box touches it, which is the signal,
+        // while the grown box touches it for a mark merely NEAR the border too.
+        let at_edge = template_with_block((80, 60), PixelRect::new(0, 20, 10, 8), 255, 0, 0);
+        let raw = mark_extent_from_template(&at_edge, footprint).expect("the template holds a mark");
+        assert_eq!(raw.x, 0, "the raw box reaches the border the mark was cut at");
+        // Three pixels in: clear of the level frame the extent rule reads its background from,
+        // and still inside the safety border the trimmed footprint adds.
+        let near_edge = template_with_block((80, 60), PixelRect::new(3, 20, 10, 8), 255, 0, 0);
+        let raw = mark_extent_from_template(&near_edge, footprint).expect("the template holds a mark");
+        assert_eq!(raw.x, 3, "a mark merely near the border does not");
+        assert_eq!(
+            trimmed_footprint_from_template(&near_edge, footprint)
+                .expect("the template holds a mark")
+                .x,
+            0,
+            "though its trimmed footprint does, which is why the raw box is the one to test"
+        );
+    }
+
+    /// A template holding nothing must be REFUSED, never trimmed to a zero-sized footprint.
+    #[test]
+    fn a_template_with_no_mark_is_refused_rather_than_trimmed_to_nothing() {
+        let blank = RgbaImage::from_pixel(40, 30, image::Rgba([255, 255, 255, 255]));
+        assert_eq!(
+            trimmed_footprint_from_template(&blank, PixelRect::new(0, 0, 40, 30)),
+            Err(WatermarkError::FlatTemplate {
+                width: 40,
+                height: 30
+            })
+        );
+        let empty = WatermarkModel::from_parts(
+            8,
+            6,
+            vec![0f32; 8 * 6 * 3],
+            vec![1f32; 8 * 6 * 3],
+            alpha_blend_operator(),
+            test_provenance(),
+        )
+        .expect("a transparent model is still a valid one");
+        assert_eq!(
+            trimmed_footprint_from_model(&empty),
+            Err(WatermarkError::FlatTemplate {
+                width: 8,
+                height: 6
+            })
+        );
+    }
+
+    /// Trimming twice must not erode the footprint: the safety border is wider than the ring the
+    /// level is measured from, so the second measurement sees the same background and the same
+    /// extent.
+    #[test]
+    fn a_second_trim_of_the_same_material_changes_nothing() {
+        let template = template_with_block(
+            (319, 236),
+            PixelRect::new(182, 110, 127, 34),
+            255,
+            40,
+            2,
+        );
+        let first = trimmed_footprint_from_template(&template, PixelRect::new(0, 0, 319, 236))
+            .expect("mark");
+        let cropped = RgbaImage::from_fn(first.width, first.height, |x, y| {
+            *template.get_pixel(first.x + x, first.y + y)
+        });
+        let second =
+            trimmed_footprint_from_template(&cropped, PixelRect::new(0, 0, first.width, first.height))
+                .expect("mark");
+        assert_eq!(
+            second,
+            PixelRect::new(0, 0, first.width, first.height),
+            "a trimmed footprint must already be tight"
+        );
+
+        let mark = SyntheticMark::new(24, 16, [0.18; 3]);
+        let model = padded_mark((200, 120), (80, 50), &mark).model();
+        let trimmed = trimmed_footprint_from_model(&model).expect("mark");
+        let (tw, th) = (trimmed.width as usize, trimmed.height as usize);
+        let mut c = vec![0f32; tw * th * 3];
+        let mut s = vec![1f32; tw * th * 3];
+        for y in 0..th {
+            for x in 0..tw {
+                let from = (((trimmed.y as usize + y) * model.width() as usize)
+                    + trimmed.x as usize
+                    + x)
+                    * 3;
+                let to = (y * tw + x) * 3;
+                c[to..to + 3].copy_from_slice(&model.c()[from..from + 3]);
+                s[to..to + 3].copy_from_slice(&model.s()[from..from + 3]);
+            }
+        }
+        let retrimmed = WatermarkModel::from_parts(
+            trimmed.width,
+            trimmed.height,
+            c,
+            s,
+            alpha_blend_operator(),
+            test_provenance(),
+        )
+        .expect("cropped planes are in range");
+        assert_eq!(
+            trimmed_footprint_from_model(&retrimmed),
+            Ok(PixelRect::new(0, 0, trimmed.width, trimmed.height))
+        );
+    }
+
+    /// THE test a trim has to pass: after it, an occurrence lands at the same ABSOLUTE page
+    /// pixels as before. A trim moves the footprint's origin, so it moves every anchor by the
+    /// same amount; get that wrong and a whole chapter is subtracted in the wrong place.
+    #[test]
+    fn a_trimmed_template_finds_the_mark_at_the_same_absolute_pixels() {
+        let mark = SyntheticMark::new(24, 18, [0.18; 3]);
+        let padded = padded_mark((80, 60), (28, 21), &mark);
+        // The mark's true position on the page, and the loose box the detector would hand over.
+        let mark_at = (120u32, 70u32);
+        let loose = PixelRect::new(mark_at.0 - 28, mark_at.1 - 21, 80, 60);
+        let mut page = textured_page(300, 200, 150);
+        mark.composite(&mut page, PixelRect::new(mark_at.0, mark_at.1, 24, 18), 1.0);
+
+        let loose_kind = {
+            let mut kind = WatermarkKind::new(
+                "test.trim_anchor",
+                MarkTemplate::from_page(&page, loose).expect("template"),
+                alpha_blend_operator(),
+            );
+            kind.template_mut().set_anchors(&[loose.x]).expect("anchors");
+            for sample in flat_samples(&padded, padded.rect_at(6, 6)) {
+                kind.add_sample(sample).expect("matching geometry");
+            }
+            kind.refit().expect("separable");
+            kind
+        };
+        let before = find_occurrences(&page, &loose_kind, &DetectionParams::default()).expect("scan");
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!((before[0].rect.x, before[0].rect.y), (loose.x, loose.y));
+
+        // Trim: the extent measured off the model, the template re-cut and the anchor moved by
+        // exactly the horizontal offset.
+        let extent =
+            trimmed_footprint_from_model(loose_kind.model().expect("the fit produced a model"))
+                .expect("the mark deposits somewhere");
+        assert!(extent.width < 80 && extent.height < 60, "{extent:?}");
+        let trimmed_rect = PixelRect::new(
+            loose.x + extent.x,
+            loose.y + extent.y,
+            extent.width,
+            extent.height,
+        );
+        let trimmed_padded = {
+            let (tw, th) = (extent.width as usize, extent.height as usize);
+            let mut c = vec![0f32; tw * th * 3];
+            let mut s = vec![1f32; tw * th * 3];
+            for y in 0..th {
+                for x in 0..tw {
+                    let from = (((extent.y as usize + y) * 80) + extent.x as usize + x) * 3;
+                    let to = (y * tw + x) * 3;
+                    c[to..to + 3].copy_from_slice(&padded.c[from..from + 3]);
+                    s[to..to + 3].copy_from_slice(&padded.s[from..from + 3]);
+                }
+            }
+            SyntheticMark {
+                width: extent.width,
+                height: extent.height,
+                c,
+                s,
+            }
+        };
+        let trimmed_kind = {
+            let mut kind = WatermarkKind::new(
+                "test.trim_anchor",
+                MarkTemplate::from_page(&page, trimmed_rect).expect("template"),
+                alpha_blend_operator(),
+            );
+            kind.template_mut()
+                .set_anchors(&[loose.x + extent.x])
+                .expect("anchors");
+            for sample in flat_samples(&trimmed_padded, trimmed_padded.rect_at(6, 6)) {
+                kind.add_sample(sample).expect("matching geometry");
+            }
+            kind.refit().expect("separable");
+            kind
+        };
+        assert_eq!(
+            trimmed_kind.template().anchor_key(),
+            (loose.x + extent.x).to_string()
+        );
+
+        let after =
+            find_occurrences(&page, &trimmed_kind, &DetectionParams::default()).expect("scan");
+        assert_eq!(after.len(), 1, "{after:?}");
+        // The occurrence moved by exactly the trim offset, so the mark sits at the same absolute
+        // pixels under both footprints.
+        assert_eq!(after[0].rect.x, before[0].rect.x + extent.x);
+        assert_eq!(after[0].rect.y, before[0].rect.y + extent.y);
+        assert!(after[0].rect.x <= mark_at.0 && after[0].rect.y <= mark_at.1);
+        assert!(after[0].rect.right() >= u64::from(mark_at.0 + 24));
+        assert!(after[0].rect.bottom() >= u64::from(mark_at.1 + 18));
+        assert!(after[0].is_removal_safe());
+    }
+
+    /// The template rule is SELF-LIMITING: on a crop whose padding is page content rather than
+    /// flat background, every pixel deviates from the mean, the extent is the whole footprint and
+    /// nothing is trimmed. An over-tight footprint would corrupt removal; a missed trim costs
+    /// only crop size.
+    #[test]
+    fn a_template_on_a_busy_background_is_not_trimmed_at_all() {
+        let busy = RgbaImage::from_fn(80, 60, |x, y| {
+            // A gradient plus a checker: no flat level anywhere.
+            let value = ((x * 3 + y * 2) % 200 + if (x + y) % 2 == 0 { 30 } else { 0 }) as u8;
+            image::Rgba([value, value, value, 255])
+        });
+        assert_eq!(
+            trimmed_footprint_from_template(&busy, PixelRect::new(0, 0, 80, 60)),
+            Ok(PixelRect::new(0, 0, 80, 60))
+        );
+    }
+
     fn test_provenance() -> ModelProvenance {
         ModelProvenance {
+            partial_rings: 0,
             samples: 2,
+            manual_backgrounds: 0,
             method: FitMethod::ClosedFormFlat,
             conditioning: ModelConditioning::Separable {
                 levels: vec![0.0, 255.0],
@@ -4525,6 +5466,55 @@ mod tests {
         );
     }
 
+    /// A background level the USER asserted is not a measurement, but the refinement loop must
+    /// leave it alone all the same: overwriting it with an estimate would silently replace an
+    /// instruction with a guess, and the loop is what would do it every iteration.
+    #[test]
+    fn refinement_never_overwrites_a_hand_asserted_level() {
+        let mark = SyntheticMark::new(16, 12, [0.18; 3]);
+        let rect = mark.rect_at(6, 6);
+        let template_page = {
+            let mut page = solid_page(rect.right() as u32 + 8, rect.bottom() as u32 + 8, [150; 3]);
+            mark.composite(&mut page, rect, 1.0);
+            page
+        };
+        let mut kind = WatermarkKind::new(
+            "test.manual-refine",
+            MarkTemplate::from_page(&template_page, rect).expect("template"),
+            alpha_blend_operator(),
+        );
+        for (page_index, level) in [0u8, 255].into_iter().enumerate() {
+            let mut page =
+                solid_page(rect.right() as u32 + 8, rect.bottom() as u32 + 8, [level; 3]);
+            mark.composite(&mut page, rect, 1.0);
+            kind.add_sample(
+                CalibrationSample::from_page(
+                    &page,
+                    page_index,
+                    rect,
+                    SampleBackground::Manual {
+                        level: [f32::from(level); 3],
+                    },
+                )
+                .expect("sample builds"),
+            )
+            .expect("matching geometry");
+        }
+        kind.refit().expect("two asserted levels still fit");
+        assert_eq!(kind.model().expect("model").provenance().manual_backgrounds, 2);
+
+        // Nothing here is refinable: every sample already states its own `B`.
+        let pages: Vec<&RgbaImage> = Vec::new();
+        assert!(matches!(
+            refit_with_refined_backgrounds(&pages, &mut kind, &DetectionParams::default()),
+            Err(ModelFitError::Invalid(WatermarkError::NothingToRefine))
+        ));
+        assert!(
+            kind.samples().iter().all(CalibrationSample::is_manual),
+            "an asserted level must survive the refinement path untouched"
+        );
+    }
+
     #[test]
     fn a_pixel_that_never_saw_two_backgrounds_is_reported_as_underdetermined() {
         let mark = SyntheticMark::new(16, 12, [0.18; 3]);
@@ -4925,5 +5915,193 @@ mod tests {
         );
         // A degenerate spread cannot be quoted as certain.
         assert!((AlphaUncertainty::from_flat_fit(0.0, 0.18).percent - 100.0).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Partial rings: a mark stamped against the page border
+    // -----------------------------------------------------------------------------------
+
+    /// A page with a flat background and one semi-transparent mark at `(x, y)`.
+    ///
+    /// The mark is a deliberately structured block — the ring must never be able to read it —
+    /// so a footprint placed exactly on it makes the ring the pure background.
+    fn page_with_mark(
+        width: u32,
+        height: u32,
+        background: [u8; 3],
+        mark: PixelRect,
+    ) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, y| {
+            let inside = x >= mark.x
+                && y >= mark.y
+                && u64::from(x) < mark.right()
+                && u64::from(y) < mark.bottom();
+            if !inside {
+                return image::Rgba([background[0], background[1], background[2], 255]);
+            }
+            // Cast justification: synthetic coordinates of a page bounded by the literals the
+            // callers pass, far inside u8 after the modulo.
+            let shade = ((x * 7 + y * 13) % 200) as u8;
+            image::Rgba([shade, shade, shade, 255])
+        })
+    }
+
+    /// The user's own geometry: a 319x236 mark whose left edge sits at x=480 on an 800-px page,
+    /// so only ONE pixel of background is left to its right while the ring wants three.
+    ///
+    /// This used to be unmeasurable through the library capture lane, which demanded the full
+    /// ring on every side. The measurement itself never did: it clips and judges the result on
+    /// a pixel count, and that is what this pins.
+    #[test]
+    fn a_mark_flush_against_the_page_edge_still_measures_and_says_the_ring_was_partial() {
+        let mark = PixelRect::new(480, 200, 319, 236);
+        let page = page_with_mark(800, 1200, [240, 240, 240], mark);
+        let verdict = validate_calibration_sample(&page, mark, &SampleParams::default());
+        let SampleVerdict::Calibration {
+            level,
+            ring_std,
+            ring,
+        } = verdict
+        else {
+            panic!("a flat background one pixel wide is still a flat background: {verdict:?}");
+        };
+        assert!((level[0] - 240.0).abs() < 0.01, "level {level:?}");
+        assert!(ring_std.iter().all(|&v| v < 0.01), "a uniform ring has no spread");
+        assert!(ring.is_partial(), "the page edge took pixels: {ring:?}");
+        assert!(
+            ring.pixels >= SampleParams::default().min_ring_pixels,
+            "the surviving ring is what admits the sample: {ring:?}"
+        );
+        assert!(
+            ring.pixels < ring.full_pixels,
+            "a truncated ring must not report itself complete: {ring:?}"
+        );
+        assert!(ring.share() < 1.0 && ring.share() > 0.5, "{:?}", ring.share());
+    }
+
+    /// The same mark away from every border is UNCHANGED by the partial-ring work: the same
+    /// level, the same verdict, and a coverage that says the ring was complete. This is the
+    /// regression pin — the measurement path every existing entry was written through.
+    #[test]
+    fn a_full_ring_sample_is_untouched_and_reports_complete_coverage() {
+        let mark = PixelRect::new(100, 200, 319, 236);
+        let page = page_with_mark(800, 1200, [240, 240, 240], mark);
+        let verdict = validate_calibration_sample(&page, mark, &SampleParams::default());
+        let SampleVerdict::Calibration {
+            level,
+            ring_std,
+            ring,
+        } = verdict
+        else {
+            panic!("a flat ring all the way round is the ordinary accepted case: {verdict:?}");
+        };
+        assert!((level[0] - 240.0).abs() < 0.01);
+        assert!(ring_std.iter().all(|&v| v < 0.01));
+        assert!(!ring.is_partial(), "nothing clipped this ring: {ring:?}");
+        assert_eq!(ring.pixels, ring.full_pixels);
+        // `(w+2r)(h+2r) - w*h` for w=319, h=236, r=3.
+        assert_eq!(ring.full_pixels, 325 * 242 - 319 * 236);
+    }
+
+    /// The floor is a PIXEL COUNT, not a per-side margin: a ring the border starves below
+    /// `min_ring_pixels` is refused, and the refusal names the count so the message can too.
+    #[test]
+    fn a_ring_starved_below_the_pixel_floor_is_still_refused() {
+        let mark = PixelRect::new(0, 0, 20, 19);
+        let page = page_with_mark(20, 20, [240, 240, 240], mark);
+        let verdict = validate_calibration_sample(&page, mark, &SampleParams::default());
+        let SampleVerdict::Unusable {
+            reason: SampleRejection::RingTooSmall { pixels, needed },
+        } = verdict
+        else {
+            panic!("20 ring pixels cannot support a flatness claim: {verdict:?}");
+        };
+        assert_eq!(pixels, 20);
+        assert_eq!(needed, MIN_RING_PIXELS);
+    }
+
+    /// Partial and NOT FLAT are different failures and stay different: a truncated ring that
+    /// carries real structure is refused as a template-only sample, with the flatness numbers
+    /// that refused it, and never admitted because it was short of pixels anyway.
+    #[test]
+    fn a_partial_ring_that_is_not_flat_is_refused_as_not_flat() {
+        let mark = PixelRect::new(480, 200, 319, 236);
+        // A horizontal gradient across the whole page: the surviving ring sides sit on
+        // different parts of it, which is exactly the bias a truncated ring could otherwise
+        // introduce into the level.
+        let mut page = page_with_mark(800, 1200, [240, 240, 240], mark);
+        for y in 0..1200 {
+            for x in 0..800 {
+                let inside = x >= mark.x
+                    && y >= mark.y
+                    && u64::from(x) < mark.right()
+                    && u64::from(y) < mark.bottom();
+                if inside {
+                    continue;
+                }
+                // Cast justification: `x` is bounded by 800, so `x / 4` fits u8 exactly.
+                let shade = (x / 4) as u8;
+                page.put_pixel(x, y, image::Rgba([shade, shade, shade, 255]));
+            }
+        }
+        let verdict = validate_calibration_sample(&page, mark, &SampleParams::default());
+        let SampleVerdict::TemplateOnly { ring, ring_std, .. } = verdict else {
+            panic!("a structured ring is a template, not a calibration target: {verdict:?}");
+        };
+        assert!(
+            ring_std.iter().any(|&v| v > FLAT_RING_STD_LIMIT),
+            "the flatness test is what refused it, not the coverage: {ring_std:?}"
+        );
+        assert!(ring.is_partial(), "and the coverage is still reported: {ring:?}");
+    }
+
+    /// The coverage travels all the way into a fitted model's provenance, so a report can say
+    /// the measurement was one-sided without re-deriving it from the samples.
+    #[test]
+    fn a_partial_ring_is_counted_in_the_model_provenance() {
+        let footprint = PixelRect::new(0, 0, 8, 8);
+        let mut samples = Vec::new();
+        for (level, ring) in [
+            (0.0f32, RingCoverage::full(120)),
+            (
+                255.0f32,
+                RingCoverage {
+                    pixels: 70,
+                    full_pixels: 120,
+                },
+            ),
+        ] {
+            let page = RgbaImage::from_fn(8, 8, |x, y| {
+                // A mark that actually varies, so the fit has something to separate.
+                let alpha = 0.2 + 0.1 * f32::from(u8::try_from((x + y) % 4).unwrap_or(0));
+                // Cast justification: an alpha composite of two 0..=255 values, rounded.
+                let value = (alpha * 30.0 + (1.0 - alpha) * level).clamp(0.0, 255.0).round() as u8;
+                image::Rgba([value, value, value, 255])
+            });
+            samples.push(
+                CalibrationSample::from_page(
+                    &page,
+                    0,
+                    footprint,
+                    SampleBackground::Flat {
+                        level: [level, level, level],
+                        ring_std: [0.1, 0.1, 0.1],
+                        ring,
+                    },
+                )
+                .expect("synthetic sample"),
+            );
+        }
+        let model = estimate_model(&samples, alpha_blend_operator(), AlphaAssumption::FromDeposit).expect("a fit");
+        assert_eq!(
+            model.provenance().partial_rings,
+            1,
+            "one of the two samples rests on a truncated ring"
+        );
+        assert_eq!(
+            model.provenance().manual_backgrounds,
+            0,
+            "a partial ring is a MEASUREMENT and must never be counted as an assertion"
+        );
     }
 }

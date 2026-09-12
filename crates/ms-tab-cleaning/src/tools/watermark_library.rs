@@ -9,21 +9,28 @@ so an entry can be copied, backed up or handed to another user as a folder.
 
 Layout of one entry (`<library>/<entry-id>/`):
   entry.json        metadata: identity, name, anchors, search metadata, calibration verdict
-  template.png      the RGBA crop the correlation reference is cut from
+  template.png      the RGBA crop the correlation reference is cut from; ABSENT for an EMPTY
+                    entry, which is `entry.json` alone
   planes/c.png      fitted `c = alpha*W`, 16-bit RGB, `c = value/65535*255`
   planes/s.png      fitted `s = 1 - alpha`, 16-bit RGB, `s = value/65535`
   samples/NNN.png   one RGBA crop per calibration sample, in file order
 
 Key structures:
-- `EntryFile`: the serde model of `entry.json` (format version 1).
+- `EntryFile`: the serde model of `entry.json`. The format version is the LOWEST one that can
+  express the document (`required_format`): 1 for an entry whose backgrounds were all measured,
+  which older builds can still read, 2 once any sample carries a hand-asserted level, and 3 for
+  an EMPTY entry — one with a name and an id but no template, no footprint and no samples, which
+  is what «+ новый» creates and what the user then adds crops to. `validate_entry_dir` refuses
+  every mixture of the two: a footprint, a sample or a plane with no template behind it
+  describes geometry no image backs.
 - `SaveEntryRequest` / `LoadedEntry`: the plain-data boundary this module speaks.
   Engine types (`WatermarkKind`, `WatermarkModel`, `MarkSignature`) never cross it;
   `watermark_entry.rs` maps between them, which keeps this module pure I/O.
 - `EntrySummary`: what a picker needs without decoding any image.
 
 Key functions:
-- `save_entry()`, `load_entry()`, `load_entry_template()`, `list_entries()`,
-  `rename_entry()`, `delete_entry()`;
+- `save_entry()`, `load_entry()`, `load_entry_template()`, `load_entry_planes()`,
+  `list_entries()`, `rename_entry()`, `delete_entry()`;
 - `export_entry_zip()`, `export_entry_dir()`, `import_entry()`, `validate_entry_dir()`;
 - `new_entry_id()`, `is_valid_entry_id()`.
 
@@ -31,20 +38,36 @@ Notes:
 - The CALIBRATION SAMPLES are the reconstruction source, not the plane PNGs: the engine
   builds a model only through `WatermarkKind::refit`, so a loaded entry is refitted from
   its crops. The planes are written for inspection and interchange and are verified
-  against a refit by this module's tests.
+  against a refit by this module's tests. `load_entry_planes` reads them back for DISPLAY
+  only — the card's mark-on-white icon — because that costs two small PNG decodes per entry
+  whatever the sample count, while a refit costs one decode per crop plus the fit. Anything
+  that needs the model itself still refits.
 - Every write goes through `write_atomic_bytes`: sibling temp in the SAME directory,
   `write_all` + `sync_all`, CLOSE, `rename`, then an fsync of the containing directory.
   This is the house recipe of `ms-tab-typing`'s `panel/doc_store.rs`, which is not reachable
   from here (it is crate-private to `ms-tab-typing`), so the recipe — not the code — is reused.
+- An ENTRY is more than one file, so file atomicity is not enough on its own: `save_entry`
+  builds the whole new directory in a staging sibling (`stage_entry`) and swaps it in at the
+  end (`commit_entry_dir`). A rewrite that fails — or a process that dies — therefore leaves
+  the previous entry intact and valid, instead of metadata naming crops a `samples/` wipe has
+  already removed. `import_entry` uses the same stage-then-rename shape.
 - Two guards hold on every metadata write, for the same reasons they hold for typing
   documents: a document of a NEWER schema is never overwritten (its unknown fields would
   be lost), and a document changed since it was read is MERGED rather than clobbered —
   the on-disk document is re-read at write time and its additive parts (creation time,
   source list, and every top-level field this build does not know) are carried forward.
-- Only samples over an exactly measured (flat) background are persisted. An estimated
-  per-pixel background is derived from a model rather than measured, so writing one would
-  let a later fold-in overwrite a measurement with an estimate
-  (`dev-docs/watermark_chapter_decomposition_plan.md`, corrections §5).
+- A persisted sample's background is either MEASURED from a flat ring (`Flat`) or ASSERTED by
+  the user (`Manual`, no `ring_std` — nothing was measured). A `Flat` record also says how much
+  of that ring existed (`ring_pixels` / `ring_full_pixels`): the measurement clips the ring at
+  the page border, so a mark stamped against the edge is measured from the sides that exist, and
+  the counts are what stop a reader from taking that for a ring measured all the way round.
+  They are purely additive and force NO version bump — an older reader that ignores them still
+  reads a genuine measurement, which is exactly why this is not the `Manual` situation. An ESTIMATED per-pixel background
+  is never written: it is derived from a model rather than measured, so writing one would let a
+  later fold-in overwrite a measurement with an estimate
+  (`dev-docs/watermark_chapter_decomposition_plan.md`, corrections §5). The `Manual` case is
+  what forces format 2; a format-1 reader fails on its unknown tag, which is the intended
+  refusal, because the alternative would be reading a claim as a measurement.
 - `name` is user data and is stored VERBATIM — never trimmed, cased or normalized, and
   never localized. `id` is persisted identity and stays literal too.
 - The origin of a sample is recorded but not required to be a page: an entry calibrated
@@ -62,9 +85,42 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use ms_config as config;
 
-/// Version of the on-disk entry format. Bumped when `entry.json` stops being readable
-/// by the previous reader; a newer format is refused rather than guessed at.
-pub(super) const WATERMARK_LIBRARY_FORMAT: u32 = 1;
+/// Newest on-disk entry format this build understands. A document declaring a HIGHER version is
+/// refused rather than guessed at.
+///
+/// Version 2 added [`StoredSampleBackground::Manual`]. A format-1 reader cannot be shown that
+/// document: `background` is an internally tagged enum with no catch-all, so an unknown `kind`
+/// is a hard parse failure there — which is the intended outcome, because the alternative would
+/// have been reading a level the user merely ASSERTED as if it had been measured.
+///
+/// Version 3 added the EMPTY entry: one with a name and an id but no template, no footprint and
+/// no samples, created the moment the user asks for a new mark and filled in afterwards. Its
+/// `template` is `null`, which an older build parses as a type error rather than as a version
+/// problem, so the bump is what turns that into the refusal this module already words properly.
+pub(super) const WATERMARK_LIBRARY_FORMAT: u32 = 3;
+
+/// Lowest format version that can express an entry with these `samples` and this template.
+///
+/// A document is written at the LOWEST version that can hold it, not at the newest this build
+/// knows: an entry whose backgrounds were all measured is exactly a format-1 document, so it
+/// stays readable by older builds instead of being locked out by a version bump it does not use.
+/// A hand-asserted background level forces version 2; an absent template forces version 3.
+///
+/// Ring coverage forces nothing: it is an additive pair of fields on a MEASURED background, so a
+/// reader that ignores it still reads exactly the measurement that was made.
+fn required_format(samples: &[StoredSampleRef], has_template: bool) -> u32 {
+    if !has_template {
+        return 3;
+    }
+    if samples
+        .iter()
+        .any(|sample| matches!(sample.background, StoredSampleBackground::Manual { .. }))
+    {
+        2
+    } else {
+        1
+    }
+}
 
 /// Largest entry id this module accepts, characters. Ids are directory names.
 const MAX_ENTRY_ID_LEN: usize = 64;
@@ -225,16 +281,82 @@ pub(super) enum StoredSampleOrigin {
     ReferenceCrop,
 }
 
-/// What is known about the background under one persisted crop. Only the exactly measured
-/// (flat) case is ever written; the enum is tagged so a future case can be added without
-/// breaking readers.
+/// What is known about the background under one persisted crop.
+///
+/// Two cases, and the difference between them is the whole point: `Flat` was MEASURED from a
+/// uniform ring, `Manual` was ASSERTED by the user for a crop whose ring the engine refused. A
+/// `Manual` record carries no `ring_std` — nothing was measured, and writing `0.0` would record
+/// a measurement that never happened — and its presence forces format 2 (see
+/// [`required_format`]), so no older reader can mistake the claim for a measurement.
+///
+/// A `Flat` record additionally says how much of the ring EXISTED. A mark stamped against a page
+/// border is measured from the sides that survive clipping, which the engine has always
+/// permitted (`validate_calibration_sample` clips the ring and admits it on a pixel COUNT); the
+/// two counts are what stop a later reader from mistaking that for a ring measured all the way
+/// round. They are purely additive: an entry every one of whose rings was complete serializes
+/// exactly the document it serialized before they existed, so no version bump rides on them, and
+/// an older build that ignores them still reads a genuine measurement rather than a claim —
+/// which is precisely why this is NOT the `Manual` situation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum StoredSampleBackground {
     Flat {
         level: [f32; 3],
         ring_std: [f32; 3],
+        /// Ring pixels the level was averaged over. `None` for an entry written before the
+        /// coverage was recorded — "unknown", never "complete".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ring_pixels: Option<usize>,
+        /// Ring pixels an unclipped ring would have held. `None` alongside `ring_pixels`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ring_full_pixels: Option<usize>,
     },
+    Manual {
+        level: [f32; 3],
+    },
+}
+
+impl StoredSampleBackground {
+    /// The background level under the crop, per channel, however it was obtained.
+    #[must_use]
+    pub(super) fn level(&self) -> [f32; 3] {
+        match self {
+            Self::Flat { level, .. } | Self::Manual { level } => *level,
+        }
+    }
+
+    /// Per-channel std of the ring the level was measured from, or `None` when the level was
+    /// asserted and no ring was ever measured.
+    #[must_use]
+    pub(super) fn ring_std(&self) -> Option<[f32; 3]> {
+        match self {
+            Self::Flat { ring_std, .. } => Some(*ring_std),
+            Self::Manual { .. } => None,
+        }
+    }
+
+    /// True when the level was stated by the user rather than measured by the engine.
+    #[must_use]
+    pub(super) fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual { .. })
+    }
+
+    /// True when the level was measured from a ring the page edge truncated.
+    ///
+    /// `false` for an asserted level (there was no ring) and for a record written before the
+    /// coverage was stored (it is unknown, and claiming partialness would be as wrong as
+    /// claiming completeness).
+    #[must_use]
+    pub(super) fn has_partial_ring(&self) -> bool {
+        match self {
+            Self::Flat {
+                ring_pixels: Some(pixels),
+                ring_full_pixels: Some(full),
+                ..
+            } => pixels < full,
+            Self::Flat { .. } | Self::Manual { .. } => false,
+        }
+    }
 }
 
 /// One calibration crop as recorded in `entry.json`.
@@ -279,7 +401,10 @@ pub(super) struct EntryFile {
     pub calibration: StoredCalibration,
     pub sources: Vec<StoredSourceRef>,
     pub samples: Vec<StoredSampleRef>,
-    pub template: String,
+    /// Entry-relative path of the correlation template, or `None` for an EMPTY entry that has
+    /// no mark yet. An empty entry has `width == 0`, `height == 0`, no anchors, no samples and
+    /// no planes; the first calibration crop written into it is what gives it all of them.
+    pub template: Option<String>,
     pub planes: Option<StoredPlanes>,
 }
 
@@ -303,6 +428,22 @@ pub(super) struct LibraryPlanes {
     pub s: Vec<f32>,
 }
 
+/// One entry's stored model, read back WITHOUT decoding its calibration crops.
+///
+/// This is the cheap half of a stored entry: two small PNGs and the metadata that says how to
+/// read them, instead of the template plus every sample plus a refit. It is what a list of
+/// entries can afford per row; anything that needs the model's provenance (or exactness beyond
+/// the 16-bit plane encoding) must still go through [`load_entry`] and a refit.
+#[derive(Debug, Clone)]
+pub(super) struct LoadedPlanes {
+    pub width: u32,
+    pub height: u32,
+    /// `CompositingOperator::id` the model was fitted under. The caller must resolve it and
+    /// refuse an id it does not implement rather than assuming alpha blending.
+    pub operator: String,
+    pub planes: LibraryPlanes,
+}
+
 /// Everything needed to write one entry.
 #[derive(Debug, Clone)]
 pub(super) struct SaveEntryRequest {
@@ -320,8 +461,11 @@ pub(super) struct SaveEntryRequest {
     pub signature: Option<StoredSignature>,
     pub calibration: StoredCalibration,
     pub source: Option<StoredSourceRef>,
-    /// The crop the correlation template is cut from.
-    pub template: RgbaImage,
+    /// The crop the correlation template is cut from, or `None` for an EMPTY entry — one the
+    /// user has created but not yet given a single crop. Such a request must also carry a zero
+    /// footprint, no samples and no planes; writing a template-less entry that claims a
+    /// footprint would describe geometry no image backs.
+    pub template: Option<RgbaImage>,
     pub samples: Vec<LibrarySample>,
     pub planes: Option<LibraryPlanes>,
 }
@@ -330,15 +474,29 @@ pub(super) struct SaveEntryRequest {
 #[derive(Debug, Clone)]
 pub(super) struct LoadedEntry {
     pub meta: EntryFile,
-    pub template: RgbaImage,
+    /// `None` for an EMPTY entry: it has no mark yet, so there is nothing to correlate
+    /// against and the first crop added to it defines both the template and the footprint.
+    pub template: Option<RgbaImage>,
     pub samples: Vec<LibrarySample>,
+}
+
+/// One persisted crop whose background level was ASSERTED by the user rather than measured.
+///
+/// The card needs both halves: the file names WHICH sample rests on a claim, and the level is
+/// what was claimed. Neither is localized — `file` is the entry-relative literal path.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ManualBackgroundRef {
+    /// Entry-relative path of the crop, as `entry.json` records it.
+    pub file: String,
+    /// The level the user asserted, per channel, 0..=255.
+    pub level: [f32; 3],
 }
 
 /// What a picker — and the library window — show without decoding any image.
 ///
 /// It carries everything the quality column needs (`verdict`, `levels`, `spread`, `samples`,
-/// `alpha`) and everything auto-match needs (`signature`, `width`, `height`), so neither has
-/// to open an entry to decide.
+/// `alpha`, `clamped_pixels`, `manual_backgrounds`) and everything auto-match needs
+/// (`signature`, `width`, `height`), so neither has to open an entry to decide.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct EntrySummary {
     pub id: String,
@@ -358,6 +516,22 @@ pub(super) struct EntrySummary {
     pub signature: Option<StoredSignature>,
     pub sources: Vec<StoredSourceRef>,
     pub updated_unix: u64,
+    /// On-disk format version of this entry. 1 for a measured-only entry, 2 once any sample
+    /// carries an asserted level.
+    pub format: u32,
+    /// Pixels whose fitted parameters had to be clamped into the physically possible range when
+    /// the entry was written. A value outside that range cannot come from alpha compositing, so
+    /// a large count is the recorded evidence that the samples disagree pixel for pixel.
+    pub clamped_pixels: usize,
+    /// Every sample whose background level the user ASSERTED. Empty for an entry built entirely
+    /// from measurements; non-empty means the entry may not be described as measured.
+    pub manual_backgrounds: Vec<ManualBackgroundRef>,
+    /// False for an EMPTY entry: one the user created but has given no crop yet, so it has no
+    /// mark to render, no footprint and nothing to match a chapter against.
+    pub has_template: bool,
+    /// How many samples rest on a background measured from a ring the page edge truncated.
+    /// Still measurements — see [`StoredSampleBackground`] — but from fewer, one-sided pixels.
+    pub partial_rings: usize,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -368,21 +542,29 @@ pub(super) struct EntrySummary {
 ///
 /// An update keeps the entry's creation time and unions its source references, so folding
 /// a second chapter into an entry enriches it instead of resetting it. The sample list is
-/// written as handed in: the caller owns the merge, and only exactly measured backgrounds
-/// ever reach this function. `request.name` is written VERBATIM.
+/// written as handed in: the caller owns the merge, backgrounds included — a sample may carry
+/// either an exactly measured level or one the user ASSERTED, and the stored format version is
+/// derived from that (`required_format`), never chosen by the caller. `request.name` is written
+/// VERBATIM.
+///
+/// The write is DIRECTORY-atomic, not merely file-atomic: the new entry is built whole in a
+/// staging directory beside the library and only then swapped in (see [`commit_entry_dir`]).
+/// A failed or interrupted write therefore leaves the entry exactly as it was, instead of a
+/// half-rewritten directory whose metadata names crops that no longer exist.
 ///
 /// # Errors
 /// Returns a user-facing message when the id is invalid, when the entry on disk carries a
 /// NEWER format than this build understands (it is never overwritten), when a directory
-/// cannot be created, when an image cannot be encoded, or when the metadata cannot be
-/// serialized or written.
+/// cannot be created, when an image cannot be encoded, when the metadata cannot be
+/// serialized or written, or when the finished staging directory cannot be swapped in.
 pub(super) fn save_entry(request: &SaveEntryRequest) -> Result<String, String> {
     save_entry_in(&config::watermark_library_dir(), request)
 }
 
-/// [`save_entry`] against an explicit library root. The root is a parameter so the tests
-/// can run against a temporary directory instead of the installation's own library.
-fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, String> {
+/// [`save_entry`] against an explicit library root. The root is a parameter so a test can run
+/// against a temporary directory instead of the installation's own library, which is why it is
+/// visible to the rest of `tools` rather than private here.
+pub(super) fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, String> {
     let entry_id = match request.entry_id.as_deref() {
         Some(existing) => {
             if !is_valid_entry_id(existing) {
@@ -400,29 +582,76 @@ fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, Stri
     // application may have changed it since this request was built, and its additive parts
     // must survive rather than be clobbered.
     let previous_raw = read_metadata_value(&dir).ok();
+    // The version is read from the RAW document first. A newer format may carry an enum tag this
+    // build cannot parse, and `from_value(..).ok()` would swallow that into `None` — which reads
+    // exactly like "there is no previous document" and would overwrite it.
+    if let Some(raw) = previous_raw.as_ref() {
+        refuse_newer_format_value(raw)?;
+    }
     let previous = previous_raw
         .as_ref()
         .and_then(|raw| serde_json::from_value::<EntryFile>(raw.clone()).ok());
     refuse_newer_format(previous.as_ref())?;
 
-    fs::create_dir_all(dir.join("planes"))
+    fs::create_dir_all(root)
         .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
-    let samples_dir = dir.join(ENTRY_SAMPLES_DIR);
-    // A rewritten entry must not keep crops from a previous, longer sample list: a stale
-    // file would be silently ignored by the reader and confuse anyone opening the folder.
-    if samples_dir.exists() {
-        fs::remove_dir_all(&samples_dir)
-            .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
+    // The whole entry is built HERE and swapped in afterwards. Nothing below this point may
+    // touch `dir`, which is still the entry the user has.
+    let staging = root.join(format!(
+        ".save-{}-{}",
+        std::process::id(),
+        now_unix_nanos_mix()
+    ));
+    let _ = fs::remove_dir_all(&staging);
+    let outcome = stage_entry(&staging, &entry_id, request, previous.as_ref(), previous_raw.as_ref())
+        .and_then(|()| commit_entry_dir(root, &dir, &staging));
+    if outcome.is_err() {
+        // A half-written staging directory is the only thing a failure leaves behind, and it
+        // is invisible to `list_entries_in` (its name is not a valid entry id). Remove it
+        // anyway so a repeated failure cannot fill the library root with debris.
+        let _ = fs::remove_dir_all(&staging);
     }
-    fs::create_dir_all(&samples_dir)
+    outcome.map(|()| entry_id)
+}
+
+/// Builds the complete new state of one entry inside `staging`.
+///
+/// `staging` must not exist yet. Every file of the entry is written here — template, crops,
+/// planes and `entry.json` — so the directory that comes out is a self-contained entry that
+/// [`validate_entry_dir`] accepts. The previous document is passed in rather than re-read,
+/// because it belongs to the entry directory this function may not touch.
+///
+/// # Errors
+/// A user-facing message for a directory that cannot be created, an image that cannot be
+/// encoded, a plane whose length does not match the footprint, or a failed write.
+fn stage_entry(
+    staging: &Path,
+    entry_id: &str,
+    request: &SaveEntryRequest,
+    previous: Option<&EntryFile>,
+    previous_raw: Option<&Value>,
+) -> Result<(), String> {
+    // `samples/` is created even for an entry with no crops: the layout is part of the
+    // format, and a reader opening the folder should not have to guess whether an absent
+    // directory means "no samples" or "a broken write".
+    fs::create_dir_all(staging.join(ENTRY_SAMPLES_DIR))
         .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
 
-    save_rgba(&request.template, &dir.join(ENTRY_TEMPLATE_FILE))?;
+    // An EMPTY entry writes no `template.png` at all rather than an invented placeholder: the
+    // file's absence and the metadata's `null` are the same fact, and a 1x1 stand-in would be a
+    // fake mark every reader downstream would have to learn to distrust.
+    let template_file = match request.template.as_ref() {
+        Some(template) => {
+            save_rgba(template, &staging.join(ENTRY_TEMPLATE_FILE))?;
+            Some(ENTRY_TEMPLATE_FILE.to_string())
+        }
+        None => None,
+    };
 
     let mut sample_refs = Vec::with_capacity(request.samples.len());
     for (index, sample) in request.samples.iter().enumerate() {
         let file = format!("{ENTRY_SAMPLES_DIR}/{index:03}.png");
-        save_rgba(&sample.image, &dir.join(&file))?;
+        save_rgba(&sample.image, &staging.join(&file))?;
         sample_refs.push(StoredSampleRef {
             file,
             width: sample.image.width(),
@@ -439,14 +668,14 @@ fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, Stri
                 request.width,
                 request.height,
                 C_PLANE_SCALE,
-                &dir.join(ENTRY_C_PLANE_FILE),
+                &staging.join(ENTRY_C_PLANE_FILE),
             )?;
             save_plane(
                 &planes.s,
                 request.width,
                 request.height,
                 S_PLANE_SCALE,
-                &dir.join(ENTRY_S_PLANE_FILE),
+                &staging.join(ENTRY_S_PLANE_FILE),
             )?;
             Some(StoredPlanes {
                 c: ENTRY_C_PLANE_FILE.to_string(),
@@ -460,7 +689,6 @@ fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, Stri
 
     let now = now_unix();
     let mut sources = previous
-        .as_ref()
         .map(|meta| meta.sources.clone())
         .unwrap_or_default();
     if let Some(source) = request.source.as_ref()
@@ -469,10 +697,12 @@ fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, Stri
         sources.push(source.clone());
     }
     let meta = EntryFile {
-        format: WATERMARK_LIBRARY_FORMAT,
-        id: entry_id.clone(),
+        // The lowest version that can express these samples, so a measured-only entry stays a
+        // format-1 document an older build can still read.
+        format: required_format(&sample_refs, template_file.is_some()),
+        id: entry_id.to_string(),
         name: request.name.clone(),
-        created_unix: previous.as_ref().map_or(now, |meta| meta.created_unix),
+        created_unix: previous.map_or(now, |meta| meta.created_unix),
         updated_unix: now,
         operator: request.operator.clone(),
         width: request.width,
@@ -484,11 +714,75 @@ fn save_entry_in(root: &Path, request: &SaveEntryRequest) -> Result<String, Stri
         calibration: request.calibration.clone(),
         sources,
         samples: sample_refs,
-        template: ENTRY_TEMPLATE_FILE.to_string(),
+        template: template_file,
         planes,
     };
-    write_metadata(&dir, &meta, previous_raw.as_ref())?;
-    Ok(entry_id)
+    write_metadata(staging, &meta, previous_raw)
+}
+
+/// Swaps a finished staging directory in as `dir`, removing whatever `dir` held before.
+///
+/// This is the commit point of every entry write, and it is what makes a rewrite survive a
+/// crash. A new entry is a single `rename`. Replacing an existing one is two renames — the old
+/// directory is moved aside first, because `rename` cannot overwrite a non-empty directory on
+/// either supported platform — and the second one is rolled back if it fails, so a failure
+/// never leaves the entry missing.
+///
+/// The remaining crash window is the instant BETWEEN those two renames, which no portable API
+/// can close (there is no `RENAME_EXCHANGE` on windows-gnu). It is two directory-metadata
+/// operations wide instead of the previous window, which spanned decoding and re-encoding
+/// every crop of the entry; and the salvage is a directory sitting in the library root under
+/// a `.replaced-*` name rather than a destroyed entry.
+///
+/// # Errors
+/// A user-facing message naming the directory a rename failed on.
+fn commit_entry_dir(root: &Path, dir: &Path, staging: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        rename_entry_dir(staging, dir)?;
+        sync_directory(root);
+        return Ok(());
+    }
+    let backup = root.join(format!(
+        ".replaced-{}-{}",
+        std::process::id(),
+        now_unix_nanos_mix()
+    ));
+    let _ = fs::remove_dir_all(&backup);
+    rename_entry_dir(dir, &backup)?;
+    if let Err(err) = rename_entry_dir(staging, dir) {
+        // The entry must not be left missing because the second rename failed: put the
+        // original back before reporting, so the user still has what they had.
+        if let Err(restore) = fs::rename(&backup, dir) {
+            ms_log::runtime_log::log_error(format!(
+                "[cleaning] watermark library: {} could not be restored from {}: {restore}. \
+                 The entry's previous contents are in that directory.",
+                dir.display(),
+                backup.display()
+            ));
+        }
+        return Err(err);
+    }
+    // Only now is the old content unreachable, so losing this removal costs nothing.
+    if let Err(err) = fs::remove_dir_all(&backup) {
+        ms_log::runtime_log::log_warn(format!(
+            "[cleaning] watermark library: {} was replaced but its previous contents in {} \
+             could not be removed: {err}",
+            dir.display(),
+            backup.display()
+        ));
+    }
+    sync_directory(root);
+    Ok(())
+}
+
+/// One directory rename of the commit step, with the user-facing message on failure.
+fn rename_entry_dir(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|err| {
+        tf!(
+            "cleaning.tools.watermark.chapter.library_write_error",
+            err = format!("{} -> {}: {err}", from.display(), to.display())
+        )
+    })
 }
 
 /// Replaces one entry's display name, keeping everything else exactly as it is on disk.
@@ -509,6 +803,7 @@ pub(super) fn rename_entry(entry_id: &str, name: &str) -> Result<(), String> {
 fn rename_entry_in(root: &Path, entry_id: &str, name: &str) -> Result<(), String> {
     let dir = entry_dir_in(root, entry_id)?;
     let raw = read_metadata_value(&dir)?;
+    refuse_newer_format_value(&raw)?;
     let mut meta: EntryFile = parse_metadata_value(&dir, &raw)?;
     refuse_newer_format(Some(&meta))?;
     meta.name = name.to_string();
@@ -574,6 +869,38 @@ fn refuse_newer_format(meta: Option<&EntryFile>) -> Result<(), String> {
     }
 }
 
+/// The same refusal read from the UNTYPED document, before it is interpreted as an
+/// [`EntryFile`].
+///
+/// The version has to be checked first, not after: a newer format may add an enum VARIANT, and
+/// every tagged enum here (`background`, `origin`, `alpha_assumption`) has no catch-all, so an
+/// unknown tag fails typed parsing before the `format` field is ever looked at. Checking the raw
+/// value turns "invalid JSON for this format" — which says nothing about what to do — into the
+/// version message, which names both versions and tells the user to update.
+///
+/// A document with no `format` field, or a non-integer one, is left to typed parsing to reject:
+/// this function only ever refuses a version it can read and compare.
+///
+/// # Errors
+/// The user-facing "newer format" message.
+fn refuse_newer_format_value(raw: &Value) -> Result<(), String> {
+    let Some(format) = raw
+        .get("format")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return Ok(());
+    };
+    if format > WATERMARK_LIBRARY_FORMAT {
+        return Err(tf!(
+            "cleaning.tools.watermark.chapter.library_format_error",
+            format = format,
+            supported = WATERMARK_LIBRARY_FORMAT
+        ));
+    }
+    Ok(())
+}
+
 /// Reads one entry back, including its template and calibration crops.
 ///
 /// # Errors
@@ -585,11 +912,14 @@ pub(super) fn load_entry(entry_id: &str) -> Result<LoadedEntry, String> {
 }
 
 /// [`load_entry`] against an explicit library root (see [`save_entry_in`]).
-fn load_entry_in(root: &Path, entry_id: &str) -> Result<LoadedEntry, String> {
+pub(super) fn load_entry_in(root: &Path, entry_id: &str) -> Result<LoadedEntry, String> {
     let dir = entry_dir_in(root, entry_id)?;
     let meta = read_metadata(&dir)?;
     refuse_newer_format(Some(&meta))?;
-    let template = load_entry_image(&dir, &meta.template, meta.width, meta.height)?;
+    let template = match meta.template.as_deref() {
+        Some(file) => Some(load_entry_image(&dir, file, meta.width, meta.height)?),
+        None => None,
+    };
     let mut samples = Vec::with_capacity(meta.samples.len());
     for reference in &meta.samples {
         let image = load_entry_image(&dir, &reference.file, reference.width, reference.height)?;
@@ -608,18 +938,128 @@ fn load_entry_in(root: &Path, entry_id: &str) -> Result<LoadedEntry, String> {
 
 /// Decodes ONLY one entry's correlation template — what a list row needs for its preview.
 ///
+/// `Ok(None)` for an EMPTY entry, which declares no template at all. That is a normal state,
+/// not a failure, and the caller has to draw something honest for it rather than an error.
+///
 /// # Errors
 /// The same messages [`load_entry`] would produce for that file.
-pub(super) fn load_entry_template(entry_id: &str) -> Result<RgbaImage, String> {
+pub(super) fn load_entry_template(entry_id: &str) -> Result<Option<RgbaImage>, String> {
     load_entry_template_in(&config::watermark_library_dir(), entry_id)
 }
 
 /// [`load_entry_template`] against an explicit library root (see [`save_entry_in`]).
-fn load_entry_template_in(root: &Path, entry_id: &str) -> Result<RgbaImage, String> {
+fn load_entry_template_in(root: &Path, entry_id: &str) -> Result<Option<RgbaImage>, String> {
     let dir = entry_dir_in(root, entry_id)?;
     let meta = read_metadata(&dir)?;
     refuse_newer_format(Some(&meta))?;
-    load_entry_image(&dir, &meta.template, meta.width, meta.height)
+    match meta.template.as_deref() {
+        Some(file) => load_entry_image(&dir, file, meta.width, meta.height).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Reads one entry's fitted parameter planes back, without touching its calibration crops.
+///
+/// `Ok(None)` when the entry declares no planes — i.e. `estimate_model` refused when it was
+/// written, so there is no model to read and the caller has nothing to reconstruct. That is a
+/// normal state, not an error.
+///
+/// The planes are the model to within the 16-bit encoding step (`C_PLANE_SCALE/65535` LSB for
+/// `c`, `1/65535` for `s`); the exact model is only ever the refit of the crops, which is why
+/// this is a reader for display and inspection and not a substitute for [`load_entry`].
+///
+/// # Errors
+/// A user-facing message for an invalid id, a missing or unparsable `entry.json`, a format
+/// version this build cannot read, a member path escaping the entry, a plane that is not 16-bit
+/// RGB at the template's own size, or a plane scale that is not finite and positive.
+pub(super) fn load_entry_planes(entry_id: &str) -> Result<Option<LoadedPlanes>, String> {
+    load_entry_planes_in(&config::watermark_library_dir(), entry_id)
+}
+
+/// [`load_entry_planes`] against an explicit library root (see [`save_entry_in`]).
+pub(super) fn load_entry_planes_in(
+    root: &Path,
+    entry_id: &str,
+) -> Result<Option<LoadedPlanes>, String> {
+    let dir = entry_dir_in(root, entry_id)?;
+    let meta = read_metadata(&dir)?;
+    refuse_newer_format(Some(&meta))?;
+    let Some(planes) = meta.planes.as_ref() else {
+        return Ok(None);
+    };
+    if !(planes.c_scale.is_finite()
+        && planes.c_scale > 0.0
+        && planes.s_scale.is_finite()
+        && planes.s_scale > 0.0)
+    {
+        return Err(t!("cleaning.tools.watermark.chapter.library_plane_scale_error").to_string());
+    }
+    let c = load_plane(&dir, &planes.c, meta.width, meta.height, planes.c_scale)?;
+    let s = load_plane(&dir, &planes.s, meta.width, meta.height, planes.s_scale)?;
+    Ok(Some(LoadedPlanes {
+        width: meta.width,
+        height: meta.height,
+        operator: meta.operator.clone(),
+        planes: LibraryPlanes { c, s },
+    }))
+}
+
+/// Decodes one 16-bit plane PNG into interleaved-RGB f32 values, `width*height*3` long.
+///
+/// The inverse of [`save_plane`]: `value = pixel / 65535 * scale`. The colour type is checked
+/// rather than converted, because an 8-bit plane quantizes `s` to 1/255 and would silently
+/// describe a different model; and the decoded length is checked against `width*height*3`
+/// rather than trusted, so a mismatched file returns a message instead of an index panic.
+///
+/// # Errors
+/// A user-facing message for a member path that escapes the entry, an undecodable file, a wrong
+/// colour type, a wrong size, or a raw buffer that is not `width*height*3` long.
+fn load_plane(
+    dir: &Path,
+    file: &str,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> Result<Vec<f32>, String> {
+    validate_plane(dir, file, width, height)?;
+    let path = entry_member_path(dir, file)?;
+    let image = image::open(&path)
+        .map_err(|err| {
+            tf!(
+                "cleaning.tools.watermark.chapter.library_image_read_error",
+                path = path.display(),
+                err = err
+            )
+        })?
+        .to_rgb16();
+    let raw = image.as_raw();
+    // `validate_plane` already pinned the dimensions and the colour type, so this multiplication
+    // cannot overflow for any image this format accepts; it is checked anyway because the length
+    // it produces is what indexes the buffer below.
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            tf!(
+                "cleaning.tools.watermark.chapter.library_geometry_error",
+                file = file,
+                width = width,
+                height = height,
+                expected_width = width,
+                expected_height = height
+            )
+        })?;
+    if raw.len() != expected {
+        return Err(tf!(
+            "cleaning.tools.watermark.chapter.library_plane_length_error",
+            actual = raw.len(),
+            expected = expected
+        ));
+    }
+    Ok(raw
+        .iter()
+        .map(|&value| f32::from(value) / f32::from(u16::MAX) * scale)
+        .collect())
 }
 
 /// Decodes one image of an entry and checks it against the size its record declares.
@@ -654,7 +1094,9 @@ fn load_entry_image(
 /// Lists every readable entry, newest update first, then by name.
 ///
 /// An entry whose metadata cannot be read is skipped and logged rather than failing the
-/// whole listing: one corrupt folder must not hide the rest of the library.
+/// whole listing: one corrupt folder must not hide the rest of the library. The log line
+/// distinguishes the two reasons, because they call for opposite actions: a document from a
+/// NEWER format needs a newer build, while anything else needs the folder looked at.
 #[must_use]
 pub(super) fn list_entries() -> Vec<EntrySummary> {
     list_entries_in(&config::watermark_library_dir())
@@ -679,10 +1121,26 @@ fn list_entries_in(root: &Path) -> Vec<EntrySummary> {
         }
         match read_metadata(&path) {
             Ok(meta) => out.push(summarize(&meta)),
-            Err(err) => ms_log::runtime_log::log_warn(format!(
-                "[cleaning] watermark library entry {} is unreadable: {err}",
-                path.display()
-            )),
+            Err(err) => {
+                let declared = read_metadata_value(&path)
+                    .ok()
+                    .and_then(|raw| raw.get("format").and_then(Value::as_u64));
+                match declared {
+                    Some(format) if format > u64::from(WATERMARK_LIBRARY_FORMAT) => {
+                        ms_log::runtime_log::log_warn(format!(
+                            "[cleaning] watermark library entry {} is written in format {format}, \
+                             and this build reads up to {WATERMARK_LIBRARY_FORMAT}; it is skipped \
+                             rather than read with the fields this build does not know dropped. \
+                             Update the application to open it. Reported as: {err}",
+                            path.display()
+                        ));
+                    }
+                    Some(_) | None => ms_log::runtime_log::log_warn(format!(
+                        "[cleaning] watermark library entry {} is unreadable: {err}",
+                        path.display()
+                    )),
+                }
+            }
         }
     }
     out.sort_by(|a, b| {
@@ -711,6 +1169,23 @@ fn summarize(meta: &EntryFile) -> EntrySummary {
         signature: meta.signature,
         sources: meta.sources.clone(),
         updated_unix: meta.updated_unix,
+        format: meta.format,
+        clamped_pixels: meta.calibration.clamped_pixels,
+        has_template: meta.template.is_some(),
+        partial_rings: meta
+            .samples
+            .iter()
+            .filter(|sample| sample.background.has_partial_ring())
+            .count(),
+        manual_backgrounds: meta
+            .samples
+            .iter()
+            .filter(|sample| sample.background.is_manual())
+            .map(|sample| ManualBackgroundRef {
+                file: sample.file.clone(),
+                level: sample.background.level(),
+            })
+            .collect(),
     }
 }
 
@@ -721,6 +1196,7 @@ fn summarize(meta: &EntryFile) -> EntrySummary {
 /// format.
 fn read_metadata(dir: &Path) -> Result<EntryFile, String> {
     let raw = read_metadata_value(dir)?;
+    refuse_newer_format_value(&raw)?;
     parse_metadata_value(dir, &raw)
 }
 
@@ -991,7 +1467,9 @@ fn save_plane(
 /// extracts exactly these members, so a foreign archive cannot smuggle in a file the format
 /// does not describe.
 fn entry_member_files(meta: &EntryFile) -> Vec<String> {
-    let mut files = vec![meta.template.clone()];
+    // An EMPTY entry has no template file, so its manifest starts with nothing. It is still a
+    // complete entry: `entry.json` alone describes it exactly.
+    let mut files: Vec<String> = meta.template.clone().into_iter().collect();
     if let Some(planes) = meta.planes.as_ref() {
         files.push(planes.c.clone());
         files.push(planes.s.clone());
@@ -1006,15 +1484,17 @@ fn entry_member_files(meta: &EntryFile) -> Vec<String> {
 ///
 /// Checks, in order: the metadata parses; the format is not NEWER than this build (a newer
 /// entry is refused rather than accepted with its unknown fields dropped); the id is a safe
-/// path segment; the footprint is non-degenerate; the member list is bounded; every member
-/// path stays inside the entry; the template and every calibration crop decode at exactly
-/// the size their record declares; and the plane PNGs, when present, are 16-bit RGB of the
-/// template's own size with usable scales.
+/// path segment; an entry that HAS a template has a non-degenerate footprint, and one that has
+/// none declares no footprint, no samples and no planes either; the member list is bounded;
+/// every member path stays inside the entry; the template and every calibration crop decode at
+/// exactly the size their record declares; and the plane PNGs, when present, are 16-bit RGB of
+/// the template's own size with usable scales.
 ///
 /// # Errors
 /// A user-facing message naming the first violated condition.
 pub(super) fn validate_entry_dir(dir: &Path) -> Result<EntryFile, String> {
     let raw = read_metadata_value(dir)?;
+    refuse_newer_format_value(&raw)?;
     let meta = parse_metadata_value(dir, &raw)?;
     refuse_newer_format(Some(&meta))?;
     if !is_valid_entry_id(&meta.id) {
@@ -1023,15 +1503,37 @@ pub(super) fn validate_entry_dir(dir: &Path) -> Result<EntryFile, String> {
             id = meta.id.clone()
         ));
     }
-    if meta.width == 0 || meta.height == 0 {
-        return Err(tf!(
-            "cleaning.tools.watermark.chapter.library_geometry_error",
-            file = meta.template.clone(),
-            width = meta.width,
-            height = meta.height,
-            expected_width = 1,
-            expected_height = 1
-        ));
+    match meta.template.clone() {
+        Some(template) => {
+            if meta.width == 0 || meta.height == 0 {
+                return Err(tf!(
+                    "cleaning.tools.watermark.chapter.library_geometry_error",
+                    file = template,
+                    width = meta.width,
+                    height = meta.height,
+                    expected_width = 1,
+                    expected_height = 1
+                ));
+            }
+        }
+        // An EMPTY entry is only empty if it is empty all the way through: a footprint, a
+        // sample or a plane with no template behind it describes geometry no image backs, and
+        // accepting it would let an import invent a mark this build could never render.
+        None => {
+            if meta.width != 0
+                || meta.height != 0
+                || !meta.samples.is_empty()
+                || meta.planes.is_some()
+            {
+                return Err(tf!(
+                    "cleaning.tools.watermark.chapter.library_empty_entry_error",
+                    id = meta.id.clone(),
+                    width = meta.width,
+                    height = meta.height,
+                    samples = meta.samples.len()
+                ));
+            }
+        }
     }
     let members = entry_member_files(&meta);
     if members.len() > MAX_IMPORT_MEMBERS {
@@ -1041,7 +1543,9 @@ pub(super) fn validate_entry_dir(dir: &Path) -> Result<EntryFile, String> {
             limit = MAX_IMPORT_MEMBERS
         ));
     }
-    load_entry_image(dir, &meta.template, meta.width, meta.height)?;
+    if let Some(template) = meta.template.as_deref() {
+        load_entry_image(dir, template, meta.width, meta.height)?;
+    }
     for sample in &meta.samples {
         load_entry_image(dir, &sample.file, sample.width, sample.height)?;
     }
@@ -1241,6 +1745,7 @@ fn stage_import(source: &Path, staging: &Path) -> Result<(), String> {
         .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
     if source.is_dir() {
         let raw = read_metadata_value(source)?;
+        refuse_newer_format_value(&raw)?;
         let meta = parse_metadata_value(source, &raw)?;
         refuse_newer_format(Some(&meta))?;
         let mut members = vec![ENTRY_METADATA_FILE.to_string()];
@@ -1299,6 +1804,9 @@ fn stage_import_zip(source: &Path, staging: &Path) -> Result<(), String> {
             err = err
         )
     })?;
+    // Before the typed parse, for the reason `refuse_newer_format_value` documents: a newer
+    // archive would otherwise fail with a JSON error instead of the version message.
+    refuse_newer_format_value(&raw)?;
     let meta: EntryFile = serde_json::from_value(raw).map_err(|err| {
         tf!(
             "cleaning.tools.watermark.chapter.library_parse_error",
@@ -1397,6 +1905,7 @@ fn write_staged_member(staging: &Path, member: &str, bytes: &[u8]) -> Result<(),
 /// A user-facing message for a failed validation or a failed move.
 fn finish_import(root: &Path, staging: &Path) -> Result<String, String> {
     let raw = read_metadata_value(staging)?;
+    refuse_newer_format_value(&raw)?;
     let mut meta = validate_entry_dir(staging)?;
     let entry_id = if root.join(&meta.id).exists() {
         // Never replace a local entry silently: an import that collides gets its own id and
@@ -1438,20 +1947,6 @@ fn now_unix_nanos_mix() -> u32 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    /// Reads a 16-bit plane PNG back into interleaved-RGB f32 values.
-    ///
-    /// Test-only: the runtime reconstructs a model by refitting its calibration crops, so
-    /// nothing in the product reads the planes. This exists to PROVE that the planes on
-    /// disk describe the model the crops reconstruct.
-    fn load_plane(path: &Path, scale: f32) -> Vec<f32> {
-        let image = image::open(path).expect("plane png opens").to_rgb16();
-        image
-            .as_raw()
-            .iter()
-            .map(|&value| f32::from(value) / f32::from(u16::MAX) * scale)
-            .collect()
-    }
 
     fn sample_request(dir_name: &str) -> SaveEntryRequest {
         let template = RgbaImage::from_fn(4, 3, |x, y| {
@@ -1495,7 +1990,7 @@ mod tests {
                 variant_id: "mark-1".to_string(),
                 chapter: Some("ch42".to_string()),
             }),
-            template: template.clone(),
+            template: Some(template.clone()),
             samples: vec![LibrarySample {
                 image: template,
                 origin: StoredSampleOrigin::Page {
@@ -1506,6 +2001,8 @@ mod tests {
                 background: StoredSampleBackground::Flat {
                     level: [255.0, 255.0, 255.0],
                     ring_std: [0.4, 0.5, 0.6],
+                    ring_pixels: Some(180),
+                    ring_full_pixels: Some(180),
                 },
             }],
             // 4x3 pixels, interleaved RGB: the planes must be exactly `width*height*3`.
@@ -1561,9 +2058,11 @@ mod tests {
                 background: StoredSampleBackground::Flat {
                     level: [0.0, 0.0, 0.0],
                     ring_std: [0.1, 0.1, 0.1],
+                    ring_pixels: Some(90),
+                    ring_full_pixels: Some(180),
                 },
             }],
-            template: "template.png".to_string(),
+            template: Some("template.png".to_string()),
             planes: None,
         };
         let raw = serde_json::to_string(&meta).expect("serialize entry metadata");
@@ -1599,7 +2098,7 @@ mod tests {
         assert_eq!(loaded.meta.sources.len(), 1);
         assert_eq!(loaded.samples.len(), 1);
         assert_eq!(loaded.samples[0].background, request.samples[0].background);
-        assert_eq!(loaded.template.dimensions(), (4, 3));
+        assert_eq!(loaded.template.as_ref().expect("template").dimensions(), (4, 3));
         assert_eq!(
             loaded.samples[0].image.as_raw(),
             request.samples[0].image.as_raw()
@@ -1608,8 +2107,16 @@ mod tests {
         // The planes on disk must describe the same model the crops reconstruct, within the
         // 16-bit encoding step (255/65535 LSB for c, 1/65535 for s).
         let planes = request.planes.as_ref().expect("request carries planes");
-        let c = load_plane(&dir.join(ENTRY_C_PLANE_FILE), C_PLANE_SCALE);
-        let s = load_plane(&dir.join(ENTRY_S_PLANE_FILE), S_PLANE_SCALE);
+        // Read through the PRODUCTION reader, not a test-local decoder: the reader is what the
+        // card's icon goes through, so this is also its round-trip test.
+        let read_back = load_entry_planes_in(&root, id)
+            .expect("planes read")
+            .expect("a fitted entry declares planes");
+        assert_eq!((read_back.width, read_back.height), (4, 3));
+        assert_eq!(read_back.operator, "alpha_blend");
+        let c = read_back.planes.c;
+        let s = read_back.planes.s;
+        let _ = &dir;
         assert_eq!(c.len(), planes.c.len());
         for (read, written) in c.iter().zip(planes.c.iter()) {
             assert!((read - written).abs() <= 0.01, "c drifted: {read} vs {written}");
@@ -1655,6 +2162,124 @@ mod tests {
         assert_eq!(
             load_entry_in(&root, id).expect("entry loads").samples.len(),
             1
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A rewrite that fails part way through must leave the entry EXACTLY as it was.
+    ///
+    /// This is the whole point of staging the directory: the previous shape wiped `samples/`
+    /// first and wrote `entry.json` last, so a failure in between left metadata naming crops
+    /// that no longer existed — an entry `validate_entry_dir` refuses, i.e. a lost entry. The
+    /// failure is injected through a plane whose length does not match the footprint, which
+    /// `save_plane` rejects AFTER the template and the crops have already been written.
+    #[test]
+    fn an_interrupted_rewrite_leaves_the_original_entry_intact() {
+        let id = "wm-selftest-atomic";
+        let root = temp_root("atomic");
+        let dir = root.join(id);
+        let mut request = sample_request(id);
+        let extra = request.samples[0].clone();
+        request.samples.push(extra);
+        save_entry_in(&root, &request).expect("the first write succeeds");
+        let before = fs::read_to_string(dir.join(ENTRY_METADATA_FILE)).expect("metadata reads");
+
+        let mut broken = sample_request(id);
+        broken.name = "replacement that must never land".to_string();
+        broken.samples.clear();
+        broken.planes = Some(LibraryPlanes {
+            c: vec![0.0; 3],
+            s: vec![0.0; 3],
+        });
+        let err = save_entry_in(&root, &broken).expect_err("a bad plane length must be refused");
+        assert!(!err.is_empty(), "the refusal must carry a reason");
+
+        // Everything the failed write would have destroyed is still there.
+        let meta = validate_entry_dir(&dir).expect("the original entry must still validate");
+        assert_eq!(meta.samples.len(), 2);
+        assert_eq!(meta.name, request.name);
+        assert!(dir.join("samples/000.png").exists());
+        assert!(dir.join("samples/001.png").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join(ENTRY_METADATA_FILE)).expect("metadata reads"),
+            before,
+            "a refused rewrite must not touch the document at all"
+        );
+        // The staging directory is cleaned up, and it could never be mistaken for an entry
+        // anyway: its name is not a valid entry id.
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .expect("library root reads")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name != id)
+            .collect();
+        assert!(leftovers.is_empty(), "staging debris left behind: {leftovers:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A successful rewrite replaces the directory whole: the crops of the new sample list are
+    /// the ones on disk, and nothing of the previous one survives.
+    #[test]
+    fn a_staged_rewrite_replaces_the_directory_and_keeps_the_creation_time() {
+        let id = "wm-selftest-swap";
+        let root = temp_root("swap");
+        let dir = root.join(id);
+        let mut request = sample_request(id);
+        let extra = request.samples[0].clone();
+        request.samples.push(extra);
+        save_entry_in(&root, &request).expect("the first write succeeds");
+        let created = read_metadata(&dir).expect("metadata reads").created_unix;
+
+        request.samples.truncate(1);
+        request.planes = None;
+        save_entry_in(&root, &request).expect("the rewrite succeeds");
+
+        let meta = validate_entry_dir(&dir).expect("the rewritten entry validates");
+        assert_eq!(meta.samples.len(), 1);
+        assert!(meta.planes.is_none());
+        assert_eq!(
+            meta.created_unix, created,
+            "a rewrite keeps the entry's creation time"
+        );
+        assert!(!dir.join("samples/001.png").exists());
+        assert!(
+            !dir.join(ENTRY_C_PLANE_FILE).exists(),
+            "an entry that lost its model must not keep the planes of the model it had"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Deleting the last hand-ASSERTED crop takes the document back to format 1.
+    ///
+    /// The version is derived from the samples actually written (`required_format`), never
+    /// latched: an entry that no longer rests on a claim is a format-1 document again and must
+    /// become readable by an older build, instead of staying locked out by a bump it no longer
+    /// uses.
+    #[test]
+    fn deleting_the_last_manual_crop_demotes_the_document_to_format_1() {
+        let id = "wm-selftest-demote";
+        let root = temp_root("demote");
+        let mut request = sample_request(id);
+        let mut asserted = request.samples[0].clone();
+        asserted.background = StoredSampleBackground::Manual {
+            level: [12.0, 12.0, 12.0],
+        };
+        request.samples.push(asserted);
+        save_entry_in(&root, &request).expect("entry saves");
+        assert_eq!(
+            read_metadata(&root.join(id)).expect("metadata reads").format,
+            2,
+            "a hand-asserted level forces format 2"
+        );
+
+        request.samples.truncate(1);
+        save_entry_in(&root, &request).expect("entry saves again");
+        let meta = read_metadata(&root.join(id)).expect("metadata reads");
+        assert_eq!(meta.format, 1);
+        assert!(
+            meta.samples
+                .iter()
+                .all(|sample| !sample.background.is_manual())
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -1719,7 +2344,7 @@ mod tests {
         assert_eq!(loaded.meta.name, request.name);
         assert_eq!(loaded.meta.name.as_bytes(), request.name.as_bytes());
         assert_eq!(loaded.samples.len(), request.samples.len());
-        assert_eq!(loaded.template.dimensions(), (4, 3));
+        assert_eq!(loaded.template.as_ref().expect("template").dimensions(), (4, 3));
         assert_eq!(loaded.meta.calibration, request.calibration);
 
         // A second import of the same archive must not replace the first one.
@@ -1839,6 +2464,226 @@ mod tests {
         });
         assert!(validate_entry_dir(&dir).is_err());
         assert!(load_entry_in(&root, id).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A crop whose background the user ASSERTED, for the format-2 tests.
+    fn manual_sample(template: &RgbaImage) -> LibrarySample {
+        LibrarySample {
+            image: template.clone(),
+            origin: StoredSampleOrigin::ReferenceCrop,
+            background: StoredSampleBackground::Manual {
+                level: [12.0, 13.0, 14.0],
+            },
+        }
+    }
+
+    /// The format is the LOWEST one that can express the document, so a measured-only entry
+    /// stays readable by a build that predates the manual-background variant.
+    #[test]
+    fn the_format_written_is_the_lowest_that_fits_the_document() {
+        let id = "wm-selftest-format-floor";
+        let root = temp_root("format-floor");
+        let mut request = sample_request(id);
+        save_entry_in(&root, &request).expect("measured entry saves");
+        assert_eq!(
+            load_entry_in(&root, id).expect("entry loads").meta.format,
+            1,
+            "an entry whose backgrounds were all measured is a format-1 document"
+        );
+
+        let template = request.samples[0].image.clone();
+        request.samples.push(manual_sample(&template));
+        save_entry_in(&root, &request).expect("entry with an asserted level saves");
+        assert_eq!(
+            load_entry_in(&root, id).expect("entry loads").meta.format,
+            2,
+            "one asserted level forces the version older builds must refuse"
+        );
+
+        // Dropping the asserted sample takes the document back to a version older builds read.
+        request.samples.truncate(1);
+        save_entry_in(&root, &request).expect("entry saves again");
+        assert_eq!(load_entry_in(&root, id).expect("entry loads").meta.format, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A manual background survives write -> read -> export -> import byte for byte, and the
+    /// listing names which sample carries it without decoding an image.
+    #[test]
+    fn a_manual_background_roundtrips_through_disk_and_interchange() {
+        let id = "wm-selftest-manual";
+        let source_root = temp_root("manual-source");
+        let target_root = temp_root("manual-target");
+        let mut request = sample_request(id);
+        let template = request.samples[0].image.clone();
+        request.samples.push(manual_sample(&template));
+        save_entry_in(&source_root, &request).expect("entry saves");
+
+        let loaded = load_entry_in(&source_root, id).expect("entry loads");
+        assert_eq!(loaded.meta.format, 2);
+        assert_eq!(
+            loaded.samples[1].background,
+            StoredSampleBackground::Manual {
+                level: [12.0, 13.0, 14.0]
+            },
+            "the asserted level comes back as an assertion, never as a measurement"
+        );
+        assert_eq!(loaded.samples[1].background.ring_std(), None);
+        assert!(loaded.samples[0].background.ring_std().is_some());
+
+        let summary = list_entries_in(&source_root)
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("the entry is listed");
+        assert_eq!(summary.format, 2);
+        assert_eq!(summary.manual_backgrounds.len(), 1);
+        assert_eq!(summary.manual_backgrounds[0].file, "samples/001.png");
+        assert_eq!(summary.manual_backgrounds[0].level, [12.0, 13.0, 14.0]);
+
+        let archive = source_root.join("manual.zip");
+        export_entry_zip_in(&source_root, id, &archive).expect("entry exports");
+        let imported = import_entry_in(&target_root, &archive).expect("entry imports");
+        let round_tripped = load_entry_in(&target_root, &imported).expect("imported entry loads");
+        assert_eq!(round_tripped.meta.format, 2);
+        assert_eq!(round_tripped.samples[1].background, loaded.samples[1].background);
+        assert_eq!(round_tripped.meta.samples.len(), 2);
+
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&target_root);
+    }
+
+    /// What a build that predates a background variant does with a document carrying it.
+    ///
+    /// The variant is internally tagged and serde offers no catch-all, so an unknown `kind` is a
+    /// hard parse failure — every reader REFUSES the entry rather than reading the level it does
+    /// not understand as a measured one, and the listing skips it with a logged reason instead
+    /// of half-loading it. Planting an unknown tag is the faithful way to reproduce that from
+    /// this build: to a format-1 reader, `"manual"` is exactly such a tag.
+    #[test]
+    fn an_unknown_background_tag_is_refused_by_every_reader() {
+        let id = "wm-selftest-unknown-background";
+        let root = temp_root("unknown-background");
+        save_entry_in(&root, &sample_request(id)).expect("entry saves");
+        let dir = root.join(id);
+        patch_metadata(&dir, |meta| {
+            let samples = meta
+                .get_mut("samples")
+                .and_then(Value::as_array_mut)
+                .expect("samples is an array");
+            samples[0]
+                .get_mut("background")
+                .and_then(Value::as_object_mut)
+                .expect("background is an object")
+                .insert("kind".to_string(), Value::from("from_a_newer_build"));
+        });
+        assert!(load_entry_in(&root, id).is_err(), "a reader must refuse it");
+        assert!(validate_entry_dir(&dir).is_err());
+        assert!(rename_entry_in(&root, id, "x").is_err());
+        assert!(
+            list_entries_in(&root).is_empty(),
+            "the listing skips it rather than showing a half-read entry"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The version is checked BEFORE the document is interpreted, so a newer entry is refused
+    /// with the version message even when it also carries a tag this build cannot parse.
+    #[test]
+    fn a_newer_format_is_refused_before_typed_parsing() {
+        let id = "wm-selftest-newer-first";
+        let root = temp_root("newer-first");
+        let target_root = temp_root("newer-first-target");
+        save_entry_in(&root, &sample_request(id)).expect("entry saves");
+        let dir = root.join(id);
+        patch_metadata(&dir, |meta| {
+            meta.insert(
+                "format".to_string(),
+                Value::from(WATERMARK_LIBRARY_FORMAT + 1),
+            );
+            let samples = meta
+                .get_mut("samples")
+                .and_then(Value::as_array_mut)
+                .expect("samples is an array");
+            samples[0]
+                .get_mut("background")
+                .and_then(Value::as_object_mut)
+                .expect("background is an object")
+                .insert("kind".to_string(), Value::from("from_a_newer_build"));
+        });
+        let expected = tf!(
+            "cleaning.tools.watermark.chapter.library_format_error",
+            format = WATERMARK_LIBRARY_FORMAT + 1,
+            supported = WATERMARK_LIBRARY_FORMAT
+        );
+        assert_eq!(
+            load_entry_in(&root, id).err(),
+            Some(expected.clone()),
+            "the user must be told to update, not shown a JSON error"
+        );
+        assert_eq!(validate_entry_dir(&dir).err(), Some(expected.clone()));
+        assert_eq!(
+            import_entry_in(&target_root, &dir).err(),
+            Some(expected.clone()),
+            "import refuses a newer schema than this build"
+        );
+        // And the newer document is never overwritten by a write that cannot understand it.
+        assert_eq!(save_entry_in(&root, &sample_request(id)).err(), Some(expected));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&target_root);
+    }
+
+    /// An entry without a fitted model declares no planes, and the reader says so rather than
+    /// inventing an empty pair.
+    #[test]
+    fn an_entry_without_planes_reads_back_as_no_model() {
+        let id = "wm-selftest-no-planes";
+        let root = temp_root("no-planes");
+        let mut request = sample_request(id);
+        request.planes = None;
+        save_entry_in(&root, &request).expect("entry saves");
+        assert!(
+            load_entry_planes_in(&root, id)
+                .expect("planes read")
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A plane file that is not what the format declares is refused with a message, never
+    /// decoded into a buffer the caller would then index.
+    #[test]
+    fn a_malformed_plane_is_refused_rather_than_decoded() {
+        let id = "wm-selftest-bad-plane";
+        let root = temp_root("bad-plane");
+        save_entry_in(&root, &sample_request(id)).expect("entry saves");
+        let dir = root.join(id);
+
+        // 8-bit instead of 16-bit: the bit depth is part of the format, not a detail.
+        let eight_bit: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(4, 3, Rgb([1, 2, 3]));
+        eight_bit
+            .save(dir.join(ENTRY_C_PLANE_FILE))
+            .expect("plane writes");
+        assert!(load_entry_planes_in(&root, id).is_err());
+
+        // The right depth at the wrong size.
+        let wrong_size: ImageBuffer<Rgb<u16>, Vec<u16>> =
+            ImageBuffer::from_pixel(5, 3, Rgb([1, 2, 3]));
+        wrong_size
+            .save(dir.join(ENTRY_C_PLANE_FILE))
+            .expect("plane writes");
+        assert!(load_entry_planes_in(&root, id).is_err());
+
+        // A scale the decoder cannot use.
+        let good: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::from_pixel(4, 3, Rgb([1, 2, 3]));
+        good.save(dir.join(ENTRY_C_PLANE_FILE)).expect("plane writes");
+        patch_metadata(&dir, |meta| {
+            meta.get_mut("planes")
+                .and_then(Value::as_object_mut)
+                .expect("planes is an object")
+                .insert("c_scale".to_string(), Value::from(0.0));
+        });
+        assert!(load_entry_planes_in(&root, id).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

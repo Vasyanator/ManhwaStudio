@@ -43,6 +43,24 @@ FILE HEADER (cleaning/tools/base.rs)
     `-`/`=`, `0`, колесо и scrub-zoom (Ctrl/Z + ЛКМ drag).
   - `has_open_editor` используется вкладкой cleaning, чтобы блокировать zoom CanvasView,
     пока открыто окно region editor.
+  - `set_selection_diverted` / `take_diverted_selection` у `RegionEditToolBase` — SELECTION
+    DIVERSION. While a tool has diversion armed, a finished drag is parked for that tool
+    (`route_finished_selection`) instead of becoming a pending load: no loader job, no loading
+    window, no editor, no `load_error`. The size limits and the rubber band are untouched and the
+    parked rect is the loader's own `source_rect`, so nothing is lost; the one thing diversion DOES
+    change about the drag is that a plain ЛКМ drag starts it too, not only Shift+ЛКМ
+    (`wants_primary_stroke`, `draw_ui_hint`). Turning
+    diversion off — and `cancel_selection` — DROP an unclaimed rect, so a tool must keep the flag
+    in step with the reason it armed it on every frame. Default is off: a tool that never diverts
+    is unaffected.
+  - `take_selection_refusal` у `RegionEditToolBase` — one-shot drain of the reason a finished drag
+    produced NO selection (empty rect, page without a laid-out rect, a violated size limit). The
+    same reason stays in `load_error` for `draw_ui_hint`; this copy exists so a tool that draws the
+    user's attention onto another surface can repeat it there instead of refusing in silence.
+  - `draw_cursor_tinted` у `RegionEditToolBase` paints the crosshair and the rubber band with a
+    caller-chosen INNER stroke colour (the black outer stroke is kept for legibility);
+    `draw_cursor` is that with white. A tool tints the cursor when a drag is about to do
+    something other than open the region editor.
   - `build_composited_region_image` режет базовую страницу и композитит overlay.
 - Shared `pub(super)` free functions (English, per AGENTS.md §3). The whole `tools` subtree reuses
   them and a copy of any of them in a tool is a defect:
@@ -221,6 +239,24 @@ pub trait CleaningTool {
     /// tool itself. It must NOT touch the canvas — a button here raises a flag that the tool
     /// consumes at the top of its next `draw_overlay_ui`.
     fn draw_main_panel(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Whether this tool wants the «Библиотека знаков» dock panel shown.
+    ///
+    /// A SECOND tool-owned dock tab, independent of `wants_main_panel`: the tab declares it
+    /// every frame and drives its visibility from this answer, re-asked every frame and never
+    /// cached. The answer is the tool's own single source of truth for "the panel is open" —
+    /// it must not be forked into a flag the tab keeps, or the two would drift apart.
+    fn wants_library_panel(&self) -> bool {
+        false
+    }
+
+    /// Body of the «Библиотека знаков» dock panel.
+    ///
+    /// Same rules as `draw_ui` and `draw_main_panel`: it runs inside `CanvasView::draw` and may
+    /// mutate ONLY the tool itself. It must not touch the canvas, start a tab-level job or
+    /// switch tools — a button here raises a flag the tool consumes in its next
+    /// `draw_overlay_ui`. Reached only while `wants_library_panel` answered `true`.
+    fn draw_library_panel(&mut self, _ui: &mut egui::Ui) {}
 
     fn draw_overlay_ui(
         &mut self,
@@ -850,6 +886,21 @@ pub struct RegionEditToolBase {
     selection_current_scene: Option<Pos2>,
     selection_rect_scene: Option<Rect>,
     pending_selection: Option<PendingRegionSelection>,
+    /// While `true`, a finished selection is handed to the OWNING TOOL instead of to the region
+    /// editor. See [`RegionEditToolBase::set_selection_diverted`]. Default `false`, so a tool
+    /// that never diverts behaves exactly as it did before this existed.
+    selection_diverted: bool,
+    /// The `(page_idx, source_rect)` a diverted selection produced, waiting to be taken by the
+    /// tool. Only ever `Some` while `selection_diverted` is set.
+    diverted_selection: Option<(usize, OverlayRectPx)>,
+    /// One-shot, already-localized reason the LAST finished drag produced no selection.
+    ///
+    /// `load_error` already shows such a reason in the tool's own dock body, but a tool that
+    /// diverts selections draws the user's attention somewhere else entirely (the watermark
+    /// library panel), and a refusal the user cannot see is a refusal that never happened.
+    /// [`RegionEditToolBase::take_selection_refusal`] drains it so the owning tool can repeat
+    /// it where the user is actually looking.
+    selection_refusal: Option<String>,
     pending_job_id: Option<u64>,
     next_job_id: u64,
     load_error: Option<String>,
@@ -876,6 +927,9 @@ impl RegionEditToolBase {
             selection_current_scene: None,
             selection_rect_scene: None,
             pending_selection: None,
+            selection_diverted: false,
+            diverted_selection: None,
+            selection_refusal: None,
             pending_job_id: None,
             next_job_id: 1,
             load_error: None,
@@ -928,8 +982,109 @@ impl RegionEditToolBase {
         Ok(())
     }
 
+    /// Decides whether a primary drag on the canvas starts a region selection.
+    ///
+    /// Shift+ЛКМ is the ordinary gesture, and it stays the ONLY one while nothing is armed:
+    /// a plain primary drag belongs to whatever else the tool does with it.
+    ///
+    /// While a DIVERSION is armed ([`RegionEditToolBase::set_selection_diverted`]) a PLAIN
+    /// primary drag starts the selection too. Arming is already an explicit statement of
+    /// intent — the user pressed a button that says "the next selection is mine" — so
+    /// demanding an undocumented modifier on top of it drops the gesture with no feedback at
+    /// all: a plain drag is inert on a region-edit tool (the canvas pans only with Space held,
+    /// `ms-canvas/src/scene.rs` `space_pan_drag_enabled`, and the cleaning tab claims no
+    /// Shift-drag hook), so accepting it while armed steals nothing from any other gesture.
+    #[must_use]
     pub fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
-        point.modifiers.shift
+        point.modifiers.shift || self.selection_diverted
+    }
+
+    /// Routes the NEXT finished selection to the owning tool instead of to the region editor.
+    ///
+    /// The drag itself keeps its rubber band, its clamping and its multiple-snapping, and on
+    /// release the rect is parked in [`take_diverted_selection`] instead of becoming a pending
+    /// load. It also becomes EASIER TO START: while a diversion is armed a plain primary drag
+    /// selects as well as Shift+ЛКМ does, because arming is already the statement of intent
+    /// that Shift stands for elsewhere (see [`RegionEditToolBase::wants_primary_stroke`]).
+    /// Nothing downstream then fires: no loader job, no
+    /// modal «Подготовка выделения» window, no editor, no `load_error`, no cursor change. That
+    /// is the whole point: a tool that wants the RECTANGLE and not the editor would otherwise
+    /// have to let the editor open and close it again.
+    ///
+    /// It is lossless for such a tool: `RegionLoadResult::target_rect_px` is the request's own
+    /// `source_rect` verbatim, so the loader hands back no geometry the diverted rect lacks.
+    ///
+    /// Turning diversion OFF also DROPS an unclaimed diverted rect: the rect belongs to the
+    /// reason the tool armed the diversion, and a rect that outlived it would be consumed by
+    /// whatever armed the diversion next. A tool must therefore keep this flag in step with
+    /// that reason on every frame.
+    ///
+    /// An editor already open, and a load already in flight, are deliberately NOT affected:
+    /// this only decides where the next COMPLETED selection goes.
+    pub fn set_selection_diverted(&mut self, diverted: bool) {
+        self.selection_diverted = diverted;
+        if !diverted {
+            self.diverted_selection = None;
+        }
+    }
+
+    /// Test seam: parks a rect exactly as a finished diverted drag does.
+    ///
+    /// `route_finished_selection` is reached only from `end_selection`, which needs a canvas
+    /// with a laid-out page rect — something a unit test of a TOOL cannot build, because the
+    /// scene layout is private to `ms-canvas`. A tool's own diversion contract (an armed drag
+    /// completing one statement before `deactivate` drops the reservation) is therefore driven
+    /// through here. Compiled out of the product build.
+    #[cfg(test)]
+    pub(super) fn park_diverted_selection(&mut self, page_idx: usize, source_rect: OverlayRectPx) {
+        assert!(
+            self.selection_diverted,
+            "parking a rect models a DIVERTED drag; arm the diversion first"
+        );
+        self.route_finished_selection(page_idx, source_rect);
+    }
+
+    /// Takes the `(page_idx, source_rect)` a diverted selection produced, if there is one.
+    ///
+    /// `source_rect` is in SOURCE page pixels, the same space `RegionLoadRequest::source_rect`
+    /// uses. Answering once is the contract: the caller owns the rect afterwards.
+    #[must_use]
+    pub fn take_diverted_selection(&mut self) -> Option<(usize, OverlayRectPx)> {
+        self.diverted_selection.take()
+    }
+
+    /// Records one already-localized reason a finished drag produced no selection.
+    ///
+    /// Writes BOTH channels on purpose: `load_error` keeps showing it in the tool's own dock
+    /// body for as long as the reason stands, and `selection_refusal` is the one-shot copy a
+    /// diverting tool drains to repeat it on the surface the user is actually reading.
+    fn refuse_selection(&mut self, reason: String) {
+        self.selection_refusal = Some(reason.clone());
+        self.load_error = Some(reason);
+    }
+
+    /// Takes the reason the last finished drag produced no selection, if there is one.
+    ///
+    /// Answering once is the contract: the caller owns the message and is responsible for
+    /// showing it. A tool that never diverts selections need not call this — `draw_ui_hint`
+    /// already renders the same reason from `load_error`.
+    #[must_use]
+    pub fn take_selection_refusal(&mut self) -> Option<String> {
+        self.selection_refusal.take()
+    }
+
+    /// The localized hint naming the gesture that starts a selection IN THE CURRENT STATE.
+    ///
+    /// Must track [`RegionEditToolBase::wants_primary_stroke`] exactly: a hint that names a
+    /// gesture the tool refuses sends the user to do something that does nothing, which is the
+    /// defect this pair exists to close.
+    #[must_use]
+    pub fn selection_hint(&self) -> String {
+        if self.selection_diverted {
+            t!("cleaning.region.selection_hint_armed").to_string()
+        } else {
+            t!("cleaning.region.selection_hint").to_string()
+        }
     }
 
     pub fn begin_selection(&mut self, canvas: &CanvasView, point: StrokePoint) {
@@ -954,6 +1109,11 @@ impl RegionEditToolBase {
             .map(|sel| sel.scene_rect);
     }
 
+    /// Ends the drag in flight and routes whatever it produced.
+    ///
+    /// A drag that produced NO rectangle is refused with a user-facing reason rather than
+    /// dropped: an empty rect is the single most common way a selection ends up doing nothing,
+    /// and until this existed it left no trace anywhere — no band, no message, no log.
     pub fn end_selection(&mut self, canvas: &CanvasView) {
         let page_idx = self.selecting_page_idx.take();
         let start = self.selection_start_scene.take();
@@ -963,19 +1123,53 @@ impl RegionEditToolBase {
             return;
         };
         let Some(mut selection) = self.build_selection(canvas, page_idx, start, current) else {
+            // `build_selection` answers `None` for exactly two reasons, and they are two
+            // different user-facing stories. Re-asking the canvas is cheap and is the only way
+            // to tell them apart without threading an error type through the two callers that
+            // legitimately ignore it (`begin_selection`, `update_selection`).
+            let reason = no_selection_reason(canvas.page_scene_rect(page_idx).is_some(), page_idx);
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] region selection on page {page_idx} produced no rectangle: {reason}"
+            ));
+            self.refuse_selection(reason);
             return;
         };
-        // Size limits are checked here, on release, so the drag itself stays visible
-        // and an over- or undersized selection is REFUSED WITH A REASON instead of
-        // silently producing no rectangle.
-        if let Err(err) = self.check_selection_limits(selection.source_rect) {
-            self.pending_selection = None;
-            self.load_error = Some(err);
+        if self.route_finished_selection(page_idx, selection.source_rect) {
             return;
         }
         selection.overlay_chunk = capture_overlay_chunk(canvas, page_idx, selection.scene_rect);
         self.pending_selection = Some(selection);
         self.load_error = None;
+    }
+
+    /// Decides what a finished selection becomes, and returns `true` once it is fully handled.
+    ///
+    /// Two outcomes end the selection here: REFUSED by the size limits (with a user-facing
+    /// reason in `load_error`), or DIVERTED to the owning tool. `false` means the ordinary
+    /// path — hand it to the region editor's loader.
+    ///
+    /// Split out of `end_selection` because this is the whole routing decision and it needs no
+    /// canvas: the overlay chunk it lets the caller skip is copied for the LOADER alone, and
+    /// neither outcome here ever reaches the loader.
+    ///
+    /// Size limits come first, so a diverted selection obeys exactly the same size contract as
+    /// one destined for the editor.
+    fn route_finished_selection(&mut self, page_idx: usize, source_rect: OverlayRectPx) -> bool {
+        // Size limits are checked here, on release, so the drag itself stays visible
+        // and an over- or undersized selection is REFUSED WITH A REASON instead of
+        // silently producing no rectangle.
+        if let Err(err) = self.check_selection_limits(source_rect) {
+            self.pending_selection = None;
+            self.refuse_selection(err);
+            return true;
+        }
+        if self.selection_diverted {
+            self.diverted_selection = Some((page_idx, source_rect));
+            self.pending_selection = None;
+            self.load_error = None;
+            return true;
+        }
+        false
     }
 
     pub fn cancel_selection(&mut self) {
@@ -984,6 +1178,11 @@ impl RegionEditToolBase {
         self.selection_current_scene = None;
         self.selection_rect_scene = None;
         self.pending_selection = None;
+        // A cancelled selection is cancelled whoever it was going to: an unclaimed diverted
+        // rect must not survive Escape and be consumed by the next diversion.
+        self.diverted_selection = None;
+        // Same for an undrained refusal: it describes a drag the user has just abandoned.
+        self.selection_refusal = None;
         self.pending_job_id = None;
         self.editor_window_rect = None;
         self.force_center_after_load = false;
@@ -999,8 +1198,14 @@ impl RegionEditToolBase {
         self.editor.is_some()
     }
 
+    /// Draws the selection hints of the region base, naming the gesture that is actually
+    /// accepted IN THE CURRENT STATE.
+    ///
+    /// While a diversion is armed a plain ЛКМ drag selects as well
+    /// ([`RegionEditToolBase::wants_primary_stroke`]), so the hint must say so then and must
+    /// NOT say so otherwise — a hint that names a gesture the tool refuses is worse than none.
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {
-        ui.label(t!("cleaning.region.selection_hint"));
+        ui.label(self.selection_hint());
         ui.small(t!("cleaning.region.esc_cancel_hint"));
         if let Some(mult) = self.selection_multiple
             && mult > 1
@@ -1467,6 +1672,23 @@ impl RegionEditToolBase {
         canvas: &CanvasView,
         pointer_scene_pos: Option<Pos2>,
     ) {
+        self.draw_cursor_tinted(ui, canvas, pointer_scene_pos, Color32::WHITE);
+    }
+
+    /// [`RegionEditToolBase::draw_cursor`] with the crosshair's and the rubber band's INNER
+    /// stroke painted in `accent` instead of white.
+    ///
+    /// The black outer stroke is kept whatever the accent, because it is what makes the cursor
+    /// legible over both a white page and a dark one. A tool uses this when a selection is
+    /// about to do something other than open the region editor and the canvas would otherwise
+    /// look identical either way.
+    pub fn draw_cursor_tinted(
+        &self,
+        ui: &mut egui::Ui,
+        canvas: &CanvasView,
+        pointer_scene_pos: Option<Pos2>,
+        accent: Color32,
+    ) {
         let Some(pointer_scene_pos) = pointer_scene_pos else {
             return;
         };
@@ -1486,7 +1708,7 @@ impl RegionEditToolBase {
                     egui::pos2(pointer_scene_pos.x - cross, pointer_scene_pos.y),
                     egui::pos2(pointer_scene_pos.x + cross, pointer_scene_pos.y),
                 ],
-                egui::Stroke::new(1.0, Color32::WHITE),
+                egui::Stroke::new(1.0, accent),
             );
             ui.painter().line_segment(
                 [
@@ -1500,7 +1722,7 @@ impl RegionEditToolBase {
                     egui::pos2(pointer_scene_pos.x, pointer_scene_pos.y - cross),
                     egui::pos2(pointer_scene_pos.x, pointer_scene_pos.y + cross),
                 ],
-                egui::Stroke::new(1.0, Color32::WHITE),
+                egui::Stroke::new(1.0, accent),
             );
         }
         if let Some(rect) = self.selection_rect_scene {
@@ -1513,7 +1735,7 @@ impl RegionEditToolBase {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0, Color32::WHITE),
+                egui::Stroke::new(1.0, accent),
                 egui::StrokeKind::Outside,
             );
         }
@@ -2890,6 +3112,25 @@ fn source_rect_to_scene_rect(
     rect.is_positive().then_some(rect)
 }
 
+/// The user-facing reason a finished drag produced no rectangle.
+///
+/// `page_laid_out` says whether the canvas still has a scene rect for the page the drag
+/// started on. Without one the drag ended somewhere the tool cannot map to page pixels at all;
+/// with one, the rect simply collapsed — the pointer came back to where it started, or the
+/// whole drag landed inside a single source pixel.
+///
+/// Split out of `end_selection` so both messages can be pinned by a test: producing the
+/// collapsed-rect case needs a page laid out by `ms-canvas`, whose scene rects a unit test of
+/// this crate cannot build.
+#[must_use]
+fn no_selection_reason(page_laid_out: bool, page_idx: usize) -> String {
+    if page_laid_out {
+        t!("cleaning.region.empty_selection_error").to_string()
+    } else {
+        tf!("cleaning.region.page_not_found_error", page_idx = page_idx)
+    }
+}
+
 fn clamp_scene_pos_to_rect(pos: Pos2, rect: Rect) -> Pos2 {
     egui::pos2(
         pos.x.clamp(rect.left(), rect.right()),
@@ -3659,4 +3900,225 @@ mod tests {
         assert!((mask[4] - 1.0).abs() <= f32::EPSILON);
     }
 
+    fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
+        OverlayRectPx { x, y, w, h }
+    }
+
+    /// The REGRESSION half of the diversion: `base.rs` is shared by every region tool, and a
+    /// tool that never diverts must reach the loader exactly as it always did.
+    #[test]
+    fn an_undiverted_selection_still_goes_to_the_region_editor() {
+        let mut base = RegionEditToolBase::new("test.undiverted", None);
+        assert!(!base.route_finished_selection(2, rect(4, 5, 16, 16)));
+        assert!(base.take_diverted_selection().is_none());
+        assert!(base.load_error.is_none());
+    }
+
+    /// An armed selection must leave NO trace of the ordinary editor path: nothing pending for
+    /// the loader (`start_pending_job` returns immediately without a `pending_selection`), no
+    /// job id, no error to render, and no editor.
+    #[test]
+    fn a_diverted_selection_produces_no_load_and_no_editor() {
+        let mut base = RegionEditToolBase::new("test.diverted", None);
+        base.set_selection_diverted(true);
+        assert!(base.route_finished_selection(7, rect(10, 20, 30, 40)));
+        assert!(base.pending_selection.is_none());
+        assert!(base.pending_job_id.is_none());
+        assert!(base.load_error.is_none());
+        assert!(!base.has_open_editor());
+        // `OverlayRectPx` carries no `PartialEq`, so the fields are compared one by one.
+        let (page_idx, taken) = base
+            .take_diverted_selection()
+            .expect("the diverted rect must be waiting for the tool");
+        assert_eq!(page_idx, 7);
+        assert_eq!((taken.x, taken.y, taken.w, taken.h), (10, 20, 30, 40));
+        // Answered exactly once: the caller owns the rect afterwards.
+        assert!(base.take_diverted_selection().is_none());
+    }
+
+    /// The size contract is not waived by diverting: a selection the limits refuse is refused
+    /// whoever it was going to, and nothing is parked for the tool.
+    #[test]
+    fn the_size_limits_outrank_the_diversion() {
+        let mut base = RegionEditToolBase::new("test.limits", None);
+        base.max_selection_area_px2 = 64;
+        base.set_selection_diverted(true);
+        assert!(base.route_finished_selection(0, rect(0, 0, 100, 100)));
+        assert!(base.take_diverted_selection().is_none());
+        assert!(base.load_error.is_some());
+    }
+
+    /// Turning the diversion off drops an unclaimed rect, and so does cancelling. Both matter:
+    /// the rect belongs to whatever armed the diversion, and one that outlived its reason would
+    /// be consumed by the next arming.
+    #[test]
+    fn an_unclaimed_diverted_rect_dies_with_its_reason() {
+        let mut base = RegionEditToolBase::new("test.drop", None);
+        base.set_selection_diverted(true);
+        assert!(base.route_finished_selection(1, rect(1, 1, 8, 8)));
+        base.set_selection_diverted(false);
+        assert!(base.take_diverted_selection().is_none());
+
+        base.set_selection_diverted(true);
+        assert!(base.route_finished_selection(1, rect(1, 1, 8, 8)));
+        base.cancel_selection();
+        assert!(base.take_diverted_selection().is_none());
+    }
+
+    /// One primary drag with no modifier held, as the cleaning tab delivers it.
+    fn plain_point() -> StrokePoint {
+        StrokePoint {
+            page_idx: 0,
+            scene_pos: Pos2::new(10.0, 10.0),
+            modifiers: StrokeModifiers::default(),
+        }
+    }
+
+    /// The same drag with Shift held.
+    fn shift_point() -> StrokePoint {
+        StrokePoint {
+            page_idx: 0,
+            scene_pos: Pos2::new(10.0, 10.0),
+            modifiers: StrokeModifiers {
+                shift: true,
+                ctrl: false,
+            },
+        }
+    }
+
+    /// THE BUG: a plain drag while a reservation is armed must start the selection. Armed, the
+    /// button the user just pressed IS the statement of intent, and the Shift gate turned the
+    /// drag into a no-op with no rubber band, no pan and no message.
+    ///
+    /// The other half is the REGRESSION guard, and it is why the change sits behind the
+    /// diversion flag: `base.rs` is shared by every region-edit cleaning tool, and an
+    /// un-armed plain drag must still be refused exactly as before.
+    #[test]
+    fn an_armed_plain_drag_selects_and_an_unarmed_one_still_does_not() {
+        let mut base = RegionEditToolBase::new("test.gate", None);
+        assert!(
+            !base.wants_primary_stroke(plain_point()),
+            "with nothing armed a plain drag must not start a selection"
+        );
+        assert!(base.wants_primary_stroke(shift_point()));
+
+        base.set_selection_diverted(true);
+        assert!(
+            base.wants_primary_stroke(plain_point()),
+            "an armed reservation must accept a plain ЛКМ drag"
+        );
+        assert!(
+            base.wants_primary_stroke(shift_point()),
+            "Shift keeps working while armed"
+        );
+
+        base.set_selection_diverted(false);
+        assert!(
+            !base.wants_primary_stroke(plain_point()),
+            "letting the reservation go restores the Shift-only gate"
+        );
+    }
+
+    /// The hint must name the gesture the tool ACTUALLY accepts in that state — a hint naming a
+    /// gesture the tool refuses is what sent the user to drag with nothing happening.
+    #[test]
+    fn the_hint_names_the_gesture_that_is_actually_accepted() {
+        let _guard = locale_guard();
+        let mut base = RegionEditToolBase::new("test.hint", None);
+        assert_eq!(base.selection_hint(), t!("cleaning.region.selection_hint"));
+        base.set_selection_diverted(true);
+        assert_eq!(
+            base.selection_hint(),
+            t!("cleaning.region.selection_hint_armed")
+        );
+        assert_ne!(
+            t!("cleaning.region.selection_hint_armed"),
+            "cleaning.region.selection_hint_armed",
+            "the armed hint must exist in the catalog, not fall back to its own key"
+        );
+        // Both hints are drawn by `draw_ui_hint`, which is the only caller.
+        base.set_selection_diverted(false);
+        assert_ne!(base.selection_hint(), t!("cleaning.region.selection_hint_armed"));
+    }
+
+    /// A finished drag that produced NO rectangle is REFUSED WITH A REASON, never dropped in
+    /// silence — that silence is how a selection could do nothing at all with no trace.
+    ///
+    /// Driven through the real `begin_selection` -> `end_selection` pair on a real
+    /// `CanvasView`, which is the path no test used to enter (every diversion test starts at
+    /// `park_diverted_selection`, i.e. after the rect already exists).
+    #[test]
+    fn a_drag_that_produces_no_rectangle_is_refused_with_a_reason() {
+        let _guard = locale_guard();
+        let canvas = CanvasView::default();
+        let mut base = RegionEditToolBase::new("test.empty", None);
+        base.set_selection_diverted(true);
+
+        base.begin_selection(&canvas, plain_point());
+        base.end_selection(&canvas);
+
+        assert!(
+            base.take_diverted_selection().is_none(),
+            "no rectangle means nothing to park"
+        );
+        let refusal = base
+            .take_selection_refusal()
+            .expect("a drag that produced nothing must say so");
+        assert!(!refusal.is_empty());
+        assert_eq!(
+            base.load_error.as_deref(),
+            Some(refusal.as_str()),
+            "the tool's own dock body keeps the same reason"
+        );
+        assert!(
+            base.take_selection_refusal().is_none(),
+            "the refusal is a one-shot: it is answered once and owned by the caller"
+        );
+    }
+
+    /// Both reasons a drag can produce no rectangle are distinct, non-empty sentences.
+    ///
+    /// The COLLAPSED-rect case cannot be reached through `end_selection` from this crate: it
+    /// needs a page with a laid-out scene rect, and `CanvasSceneState::page_rects` is private
+    /// to `ms-canvas`. `no_selection_reason` is the whole decision `end_selection` makes, so it
+    /// is pinned here directly instead of being stubbed through a seam.
+    #[test]
+    fn a_collapsed_rect_and_a_missing_page_read_differently() {
+        let _guard = locale_guard();
+        let collapsed = no_selection_reason(true, 4);
+        let missing = no_selection_reason(false, 4);
+        assert!(!collapsed.is_empty() && !missing.is_empty());
+        assert_ne!(collapsed, missing);
+        assert_eq!(collapsed, t!("cleaning.region.empty_selection_error"));
+        assert_ne!(
+            collapsed, "cleaning.region.empty_selection_error",
+            "the reason must exist in the catalog, not fall back to its own key"
+        );
+    }
+
+    /// A selection the size limits refuse must ALSO reach a diverting tool: the region base's
+    /// own dock body is not the surface such a tool draws the user's attention onto.
+    #[test]
+    fn a_refused_size_limit_reaches_a_diverting_tool_too() {
+        let mut base = RegionEditToolBase::new("test.limit-refusal", None);
+        base.max_selection_area_px2 = 64;
+        base.set_selection_diverted(true);
+        assert!(base.route_finished_selection(0, rect(0, 0, 100, 100)));
+        let refusal = base
+            .take_selection_refusal()
+            .expect("a refused size must be drainable by the owning tool");
+        assert_eq!(base.load_error.as_deref(), Some(refusal.as_str()));
+    }
+
+    /// Installs the embedded English catalog for the tests that compare localized text.
+    /// Serialized on the process-global locale lock, like every other locale-sensitive test
+    /// in this crate.
+    fn locale_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
+        ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
+        guard
+    }
 }
