@@ -261,6 +261,88 @@ For bug/issue requests, the user's verb selects the mode:
 * Explicit action phrasing - "Fix the bug", "Implement", "Add", "Refactor" ("Исправь", "Реализуй", "Добавь") - means perform the change.
 * If the request is not an explicit instruction to change code, only plan the changes; do not edit.
 
+### 2.5 Architectural Stop Conditions
+
+A feature that does not fit the existing architecture must not be forced into it. Wedging it in
+"just this once" is how a codebase stops being changeable: the next feature then has to fit an
+architecture that is one special case worse, and the cost is paid forever by everyone who reads
+the module afterwards. When one of the TRIGGERS below holds, STOP, tell the user what is wrong,
+and let them choose. This is a decision gate, not a licence to refuse work.
+
+**Triggers.** Each is a fact you can point at, not a feeling about code quality:
+
+1. **No seam fits.** The feature can only be added by threading a special case through a contract
+   that claims to be general, by widening a module boundary this document forbids widening, or by
+   touching subsystems that have no business knowing about each other.
+2. **One decision, many owners.** The thing you must change is decided in SEVERAL places instead
+   of one, so the change has to be made N times and the copies can silently drift apart. This is
+   the most valuable trigger because the damage is invisible until something diverges.
+3. **The file is already too big** — see "File size" below.
+
+**What to do — in this order, before any worker starts editing:**
+
+1. Say plainly, in a few sentences: what is wrong, the EVIDENCE (name the duplicated functions,
+   the boundary, the file and its size), what a refactor would change, and its rough size relative
+   to the feature.
+2. Offer exactly TWO options: **(a)** refactor first, then build the feature on the cleaned-up
+   architecture; **(b)** build the feature as it is, without the refactor.
+3. **If the user picks (a), do the whole thing without asking again**: plan the refactor, execute
+   it, verify it (§16), then build the feature on top. One approval covers both halves — coming
+   back for a second confirmation after the refactor lands is the friction this rule exists to
+   avoid. Only a NEW problem found mid-refactor is worth interrupting for.
+4. If the user picks (b), implement the feature in full and record the debt where §3 says it
+   belongs — the nearest `MODULE_README.md`, or `dev-docs/known_gaps.md` — with the reason and
+   what it will cost later. Do not re-raise the proposal in that task.
+
+**Guards. This rule is abused far more easily than it is under-used:**
+
+* **The default is still to do the work.** Most tasks trigger nothing. A proposal is warranted
+  when the architecture is a genuine obstacle to THIS task, never as a general code-quality
+  opinion, and never for code the task does not touch.
+* **Raise it as soon as the evidence exists, and never later than before the first edit.** In
+  Sub-Agent Manager Mode that is usually right after the explorers report, which is the first
+  moment the duplication is visible. A refactor proposed mid-implementation, or a refactor done
+  quietly "while I was in there", is scope creep (§14, §15) — not this rule.
+* **One proposal per task.** If the user declines, that is the decision: build the feature and
+  move on without repeating the argument.
+* **Never refactor and implement in one indistinguishable change.** Even under option (a) the
+  refactor is its own step, verified on its own, so a regression can be told apart from the
+  feature. A refactor must not change behavior; if it has to, say so before starting.
+
+**THIS ALREADY HAPPENED HERE, and the cost is still in the tree.** The advance between two
+adjacent glyphs is decided in FIVE separate places — `pipeline::horizontal_run_layout`,
+`pipeline::optical_horizontal_run_layout`, `formula::render::assign_formula_seed_advances`,
+`wrap::forms::GlyphWidths::build` and `wrap::horizontal::measure_word_width_px` — plus a sixth,
+`layout::vertical`, that applies no pair kerning at all. Adding user-authored kerning pairs
+therefore had to be implemented five times; a direction bug in right-to-left runs then had to be
+fixed in two of them and separately reasoned about in a third. Worse, the copies cannot be made
+to agree: the wrap measurement has no per-glyph font ids, so it CANNOT reproduce the draw-side
+same-face guard, and the feature shipped with a permanent, documented approximation where
+wrapping and drawing disagree on a fallback font. One owner for "what is the advance between
+these two glyphs" would have cost one implementation and no approximation. Nobody paused to say
+this before starting — which is exactly what this section now requires.
+
+**File size.** A file that keeps absorbing new responsibilities becomes unreadable and
+unreviewable long before it becomes unworkable, and every agent that opens it pays for that.
+
+* **Over ~3000 lines**: if your change extended it, say so in your final report, with the new
+  size. Awareness only — no gate.
+* **Over ~5000 lines**: the gate above fires when your change would add a NEW responsibility,
+  section or subsystem to it. Propose splitting it into a directory module first, under the same
+  two-option flow. A LOCALIZED edit — a bug fix, a few lines inside existing logic — does NOT
+  trigger anything, whatever the file's size.
+* A split follows §3: a directory module with its own `MODULE_README.md`, and the parent readme
+  updated to point at it. A split that leaves undocumented modules behind is not finished.
+* **Test modules are exempt.** A long `tests.rs` is a list of cases, not tangled logic; splitting
+  it buys little and costs review noise.
+* **Calibration, measured on this repository:** 36 files are already over 3000 lines and 13 over
+  5000, among them `ms-text-render/src/pipeline.rs` (8210), `src/app.rs` (5116) and
+  `ms-text-render/src/wrap/forms.rs` (5412). That is why the hard gate sits at 5000 AND requires
+  a new responsibility: a stricter rule would fire on nearly every task in this codebase, and a
+  rule that always fires is one everybody learns to ignore. For scale, the custom-kerning feature
+  took `font_properties_window.rs` from 1230 to 2467 lines in one change — nothing should have
+  stopped that one, but the NEXT feature to land in that file is the one that must pause.
+
 ---
 
 ## 3. Hierarchical Documentation for Agents
