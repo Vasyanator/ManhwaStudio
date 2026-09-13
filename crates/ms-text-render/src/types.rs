@@ -366,6 +366,12 @@ pub struct TextRenderParams {
     pub kerning_mode: KerningMode,
     pub kerning_px: f32,
     pub kerning_percent: f32,
+    /// Vertical glyph scale in percent (`100.0` = unscaled), clamped to `1..=300`
+    /// by the renderer. The scale is anchored at the text BASELINE — a glyph keeps
+    /// its baseline and only its ink extent changes — and is coupled to line
+    /// spacing through `effective_spacing_percent`, which the inline
+    /// `<stretching=W%,H%>` tag deliberately is NOT (see
+    /// `ms-text-render/src/MODULE_README.md`, GLYPH HEIGHT SCALE).
     pub glyph_height_percent: f32,
     pub glyph_width_percent: f32,
     pub width_px: u32,

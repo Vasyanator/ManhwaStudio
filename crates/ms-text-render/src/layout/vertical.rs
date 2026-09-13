@@ -34,6 +34,12 @@ bitmap blit produced (scale about the bitmap center, no rotation). Layout,
 bounds, optical spacing and visual-width measurement stay swash-bitmap based, so
 switching the draw is AA-only. Only COLR/bitmap color glyphs (no monochrome
 outline) fall back to the `raster.rs` bitmap blit.
+The glyph height scale keeps the BOX-CENTRE anchor here
+(`GlyphScaleSettings::scaled_rect`), unlike the baseline-anchored horizontal
+paths: a cell places its glyph by its own ink box and the cell step already
+follows the scaled ink height. The column gaps come from the plain
+`pipeline::compute_line_extra_spacing_table`, which an inline `<stretching>`
+span no longer feeds — see this module's `MODULE_README.md`.
 
 Mesh warp (`TextRenderParams.raster_transform`):
 Honored on the outline draw seam. The bounds pass captures the un-rotated scaled
@@ -283,11 +289,7 @@ pub(crate) fn render_vertical_text(
                 // branch uses) — this is the warp's normalization frame.
                 include_scaled_rect_bounds(
                     &mut pre_box,
-                    padded_x,
-                    padded_y,
-                    padded_w,
-                    padded_h,
-                    *glyph_scale,
+                    glyph_scale.scaled_rect(padded_x, padded_y, padded_w, padded_h),
                 );
             }
             if rotate_block {
@@ -318,11 +320,7 @@ pub(crate) fn render_vertical_text(
             } else {
                 include_scaled_rect_bounds(
                     &mut bounds,
-                    padded_x,
-                    padded_y,
-                    padded_w,
-                    padded_h,
-                    *glyph_scale,
+                    glyph_scale.scaled_rect(padded_x, padded_y, padded_w, padded_h),
                 );
             }
         }
@@ -589,6 +587,15 @@ pub(crate) fn render_vertical_text(
                 width: out_width as usize,
                 height: out_height as usize,
             };
+            // Box-centre anchor: a vertical cell places its glyph by its own ink
+            // box (the cell step already follows the scaled ink height), not on a
+            // shared baseline — see `GlyphScaleSettings::scaled_rect`.
+            let dst_rect = glyph_scale.scaled_rect(
+                draw_x as f32,
+                draw_y as f32,
+                glyph_w as f32,
+                glyph_h as f32,
+            );
             draw_scaled_glyph_rgba(
                 &mut canvas,
                 GlyphRgbaView {
@@ -596,8 +603,7 @@ pub(crate) fn render_vertical_text(
                     width: glyph_w,
                     height: glyph_h,
                 },
-                draw_x as f32,
-                draw_y as f32,
+                dst_rect,
                 *glyph_scale,
             );
         }

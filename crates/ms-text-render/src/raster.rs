@@ -8,6 +8,16 @@ Main responsibilities:
 - держать swash sampling и alpha blending вне pipeline;
 - собрать общие pixel/image helper'ы для horizontal/vertical/formula режимов;
 - стать целевым местом для переноса общих RGBA helper-функций из старого рендера.
+
+Notes:
+- `include_scaled_rect_bounds` and `draw_scaled_glyph_rgba` take the glyph's
+  ALREADY SCALED rect, never the unscaled box plus a scale. The vertical anchor of
+  the height scale differs per path (baseline for horizontal/rotated text, box
+  centre for the vertical cells), so the choice is made by the caller and bounds
+  and draw can never disagree about it — see the GLYPH HEIGHT SCALE contract in
+  `MODULE_README.md`. The rotated helpers (`rotated_rect_world_bounds`,
+  `include_rotated_rect_bounds`, `draw_rotated_scaled_glyph_rgba`) re-pin the rect
+  to their own `dst_center` and are therefore anchor-agnostic.
 */
 
 use super::pipeline::GlyphScaleSettings;
@@ -192,16 +202,19 @@ pub(crate) fn build_glyph_rgba_buffer(
     out
 }
 
+/// Grow `bounds` to cover an already SCALED, axis-aligned glyph rect.
+///
+/// `scaled_rect` is `(left, top, width, height)` in content px, as returned by
+/// `GlyphScaleSettings::scaled_rect` (box-centre anchor, cell-placed paths) or
+/// `GlyphScaleSettings::scaled_rect_about_baseline` (baseline anchor, the
+/// baseline-laid paths). The rect is taken pre-scaled rather than scaled here so
+/// the vertical ANCHOR is a decision each call site states explicitly — bounds
+/// and the draw pass must always pick the same one.
 pub(crate) fn include_scaled_rect_bounds(
     bounds: &mut PixelBounds,
-    left_px: f32,
-    top_px: f32,
-    width_px: f32,
-    height_px: f32,
-    glyph_scale: GlyphScaleSettings,
+    scaled_rect: (f32, f32, f32, f32),
 ) {
-    let (scaled_left, scaled_top, scaled_width, scaled_height) =
-        glyph_scale.scaled_rect(left_px, top_px, width_px, height_px);
+    let (scaled_left, scaled_top, scaled_width, scaled_height) = scaled_rect;
     bounds.include_rect(
         scaled_left.floor() as i32,
         scaled_top.floor() as i32,
@@ -222,15 +235,21 @@ pub(crate) struct GlyphRgbaView<'a> {
     pub(crate) height: usize,
 }
 
+/// Blit a color/bitmap-fallback glyph into `dst_rect` by reverse bilinear sampling.
+///
+/// `dst_rect` is the glyph's already SCALED destination box in CANVAS px —
+/// `(left, top, width, height)` — so the caller owns the vertical anchor
+/// (box centre on the cell-placed paths, baseline on the baseline-laid ones) and
+/// bounds/draw can never disagree about it. `glyph_scale` must be the same scale
+/// the rect was built with: only its `width_mul`/`height_mul` are used, to invert
+/// the mapping back into glyph-local pixels.
 pub(crate) fn draw_scaled_glyph_rgba(
     canvas: &mut RgbaCanvasView<'_>,
     glyph: GlyphRgbaView<'_>,
-    left_px: f32,
-    top_px: f32,
+    dst_rect: (f32, f32, f32, f32),
     glyph_scale: GlyphScaleSettings,
 ) {
-    let (scaled_left, scaled_top, scaled_width, scaled_height) =
-        glyph_scale.scaled_rect(left_px, top_px, glyph.width as f32, glyph.height as f32);
+    let (scaled_left, scaled_top, scaled_width, scaled_height) = dst_rect;
     let dst_min_x = scaled_left.floor() as i32;
     let dst_max_x = (scaled_left + scaled_width).ceil() as i32;
     let dst_min_y = scaled_top.floor() as i32;

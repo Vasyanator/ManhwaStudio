@@ -2199,7 +2199,13 @@ pub struct FormSearchParams {
     ///                 / (glyph_width_percent / 100)
     /// ```
     ///
-    /// (зеркало `pipeline.rs:433-436`). `units_per_em` — 1000 для [`GlyphWidths`] и
+    /// (зеркало `pipeline::render_text_to_image`, где считаются
+    /// `line_spacing_percent`/`extra_line_spacing_px`; сама формула связи —
+    /// `pipeline::effective_spacing_percent`). Обратите внимание: с
+    /// `glyph_height_percent` связан ТОЛЬКО глобальный параметр; строчный тег
+    /// `<stretching=W%,H%>` в интерлиньяж не входит (см. контракт GLYPH HEIGHT
+    /// SCALE в `ms-text-render/src/MODULE_README.md`), поэтому поиск форм его и
+    /// не учитывает. `units_per_em` — 1000 для [`GlyphWidths`] и
     /// ≈2 символа на em для [`CharWidthMetric`]. Горизонтальный масштаб глифов
     /// (`glyph_width_percent`) обязан входить в делитель: ширины меряются без него,
     /// и иначе потолок пропорции молча разъедется с тем, что видит пользователь.

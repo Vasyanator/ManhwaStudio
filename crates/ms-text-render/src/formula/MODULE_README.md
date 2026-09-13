@@ -51,6 +51,17 @@ the line paths.
   glyph scale, glyph offset, and text color overrides supplied by the main pipeline.
 - `FormulaRenderOutcome::FallbackToStandard` is an explicit layout decision for modes
   that cannot use a curve safely. Do not silently render a different mode.
+- Line stacking is NOT re-implemented here. `pipeline::line_baseline_advance_table`,
+  `compute_horizontal_line_baselines` and `horizontal_run_baseline_y` are imported, so
+  the inline line-spacing and grow-only `<stretching>` rules are identical to the
+  horizontal path — upward-only, real-ink, max-not-sum (see the parent
+  `MODULE_README.md`). This module used to carry
+  verbatim copies of all three; never re-fork them.
+  `default_extra_line_spacing_px` is threaded down to
+  `render_text_with_formula_layout_once` / `detect_shape_layout_fallback_reason` as
+  an explicit parameter. Do not re-derive it as `line_extra_spacing_table.first()`:
+  entry 0 can carry the grow-only inline height room, which would then be
+  subtracted from every later gap in the `has_inline_size_overrides` branch.
 - Rotated raster output must keep `RenderedTextImage.rgba` in unmultiplied RGBA order
   with a valid `width * height * 4` buffer.
 - `TextRenderParams.raster_transform` (vector mesh warp) IS honored on BOTH functions

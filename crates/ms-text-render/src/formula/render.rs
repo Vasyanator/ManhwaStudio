@@ -57,6 +57,17 @@ Glyph-ink spacing (MinimumPreviousDistance mode):
   `find_minimum_ink_distance_center_s` advances the arc-length position until the true
   ink-to-ink gap reaches `target_gap` (kerning-driven).
 
+Line stacking:
+- Not implemented here. `pipeline::line_baseline_advance_table`,
+  `compute_horizontal_line_baselines` and `horizontal_run_baseline_y` are imported,
+  so inline `<line-spacing>` and the grow-only `<stretching>` height rule behave
+  exactly as on the horizontal path. Verbatim copies of all three used to live in
+  this file; do not re-fork them.
+- The on-path glyph pivot itself keeps the box-centre anchor
+  (`GlyphScaleSettings::scaled_rect` + `drawn_line_glyph_destination_center_raw`):
+  a glyph here is placed against the CURVE, and the shared-baseline variant is the
+  explicit `LinePlacementReference::LineBox` option, not the default.
+
 Source:
 - `render_text_with_formula_layout`
 - `render_text_with_formula_layout_once`
@@ -90,8 +101,10 @@ use crate::inline_styles::{
 };
 use crate::optical::optical_base_advance;
 use crate::pipeline::{
-    FauxGlyphStyle, GlyphScaleSettings, KerningSettings, effective_spacing_percent,
-    hanging_edge_run_bounds, is_edge_run_hanging,
+    FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom, KerningSettings,
+    compute_horizontal_line_baselines, effective_spacing_percent,
+    hanging_edge_run_bounds, horizontal_run_baseline_y, is_edge_run_hanging,
+    line_baseline_advance_table,
     faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
     resolve_faux_counter_flag,
 };
@@ -403,13 +416,23 @@ pub(crate) fn render_text_with_formula_layout(
         effective_spacing_percent(params.line_spacing_percent, params.glyph_height_percent);
     let default_extra_line_spacing_px =
         params.line_spacing_px + font_size_px * (line_spacing_percent / 100.0);
-    let line_extra_spacing_table = compute_line_extra_spacing_table(
+    // Lines stack on BASELINES here too, so the table is the grow-only
+    // baseline-advance one: an inline `<stretching>` height span may push the
+    // next line further away, never pull it closer (see `pipeline.rs`).
+    let line_extra_spacing_table = line_baseline_advance_table(
         params,
         layout_text,
         layout_line_offsets.as_slice(),
         inline_style_spans,
         font_size_px,
         default_extra_line_spacing_px,
+        &InlineHeightRoom::measure(
+            params,
+            buffer,
+            font_system,
+            layout_line_offsets.as_slice(),
+            inline_style_spans,
+        ),
     );
 
     if params.text_layout_mode == TextLayoutMode::Shape
@@ -425,6 +448,7 @@ pub(crate) fn render_text_with_formula_layout(
             font_size_px,
             base_line_height_px,
             line_extra_spacing_table.as_slice(),
+            default_extra_line_spacing_px,
         )?
     {
         return Ok(FormulaRenderOutcome::FallbackToStandard(warning));
@@ -447,6 +471,7 @@ pub(crate) fn render_text_with_formula_layout(
             font_size_px,
             base_line_height_px,
             line_extra_spacing_table.as_slice(),
+            default_extra_line_spacing_px,
             render_margin_pad,
             line_placement_frac,
         )?;
@@ -539,13 +564,23 @@ fn render_text_with_drawn_lines_layout_once(
         effective_spacing_percent(params.line_spacing_percent, params.glyph_height_percent);
     let default_extra_line_spacing_px =
         params.line_spacing_px + font_size_px * (line_spacing_percent / 100.0);
-    let line_extra_spacing_table = compute_line_extra_spacing_table(
+    // Lines stack on BASELINES here too, so the table is the grow-only
+    // baseline-advance one: an inline `<stretching>` height span may push the
+    // next line further away, never pull it closer (see `pipeline.rs`).
+    let line_extra_spacing_table = line_baseline_advance_table(
         params,
         layout_text,
         layout_line_offsets.as_slice(),
         inline_style_spans,
         font_size_px,
         default_extra_line_spacing_px,
+        &InlineHeightRoom::measure(
+            params,
+            buffer,
+            font_system,
+            layout_line_offsets.as_slice(),
+            inline_style_spans,
+        ),
     );
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
@@ -2108,6 +2143,12 @@ fn render_text_with_formula_layout_once(
     font_size_px: f32,
     base_line_height_px: f32,
     line_extra_spacing_table: &[f32],
+    // The GLOBAL default extra line spacing the caller built the table around.
+    // Re-deriving it as `line_extra_spacing_table.first()` is wrong: with the
+    // grow-only inline height room, entry 0 can carry extra px that would then be
+    // SUBTRACTED from every later gap in the `has_inline_size_overrides` branch
+    // of `compute_horizontal_line_baselines`, pulling lines closer.
+    default_extra_line_spacing_px: f32,
     render_margin_pad: u32,
     line_placement_frac: f32,
 ) -> Result<RenderedTextImage, String> {
@@ -2128,7 +2169,6 @@ fn render_text_with_formula_layout_once(
     let extra_active = extra_acc.is_active();
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
-    let default_extra_line_spacing_px = line_extra_spacing_table.first().copied().unwrap_or(0.0);
     let line_baselines = compute_horizontal_line_baselines(
         buffer,
         base_line_height_px,
@@ -2629,10 +2669,12 @@ fn detect_shape_layout_fallback_reason(
     font_size_px: f32,
     base_line_height_px: f32,
     line_extra_spacing_table: &[f32],
+    // The GLOBAL default the table was built around; see
+    // `render_text_with_formula_layout_once`.
+    default_extra_line_spacing_px: f32,
 ) -> Result<Option<String>, String> {
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
-    let default_extra_line_spacing_px = line_extra_spacing_table.first().copied().unwrap_or(0.0);
     let line_baselines = compute_horizontal_line_baselines(
         buffer,
         base_line_height_px,
@@ -3077,97 +3119,6 @@ fn compute_inline_line_aligns(
 
 fn spans_have_inline_size_overrides(spans: &[InlineStyleSpan]) -> bool {
     spans.iter().any(|span| span.font_size_px.is_some())
-}
-
-fn compute_line_extra_spacing_table(
-    params: &TextRenderParams,
-    layout_text: &str,
-    layout_line_offsets: &[usize],
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    font_size_px: f32,
-    default_extra_line_spacing_px: f32,
-) -> Vec<f32> {
-    let Some(spans) = inline_style_spans else {
-        return vec![default_extra_line_spacing_px; layout_line_offsets.len().max(1)];
-    };
-    let mut out = Vec::with_capacity(layout_line_offsets.len().max(1));
-    for (line_idx, line_start) in layout_line_offsets.iter().copied().enumerate() {
-        let line_end = layout_line_offsets
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(layout_text.len());
-        let mut spacing_px = params.line_spacing_px;
-        let mut spacing_percent = params.line_spacing_percent;
-        let mut stretch_y_percent = params.glyph_height_percent;
-        for span in spans
-            .iter()
-            .filter(|span| span.end > line_start && span.start < line_end)
-        {
-            if let Some(value) = span.line_spacing_px {
-                spacing_px = value;
-            }
-            if let Some(value) = span.line_spacing_percent {
-                spacing_percent = value;
-            }
-            if let Some(value) = span.glyph_stretch_percent {
-                stretch_y_percent = value[1];
-            }
-        }
-        let effective_percent = effective_spacing_percent(spacing_percent, stretch_y_percent);
-        out.push(spacing_px + font_size_px * (effective_percent / 100.0));
-    }
-    if out.is_empty() {
-        out.push(default_extra_line_spacing_px);
-    }
-    out
-}
-
-fn compute_horizontal_line_baselines(
-    buffer: &Buffer,
-    base_line_height_px: f32,
-    default_extra_line_spacing_px: f32,
-    line_extra_spacing_table: &[f32],
-    has_inline_size_overrides: bool,
-) -> Vec<f32> {
-    let anchor_y = buffer
-        .layout_runs()
-        .next()
-        .map(|run| run.line_y)
-        .unwrap_or(base_line_height_px);
-    let mut baselines = Vec::new();
-    let mut cumulative_delta = 0.0f32;
-    for (line_idx, run) in buffer.layout_runs().enumerate() {
-        let baseline = horizontal_run_baseline_y(
-            &run,
-            line_idx,
-            anchor_y,
-            base_line_height_px,
-            default_extra_line_spacing_px,
-            has_inline_size_overrides,
-        ) + cumulative_delta;
-        baselines.push(baseline);
-        cumulative_delta += line_extra_spacing_table
-            .get(line_idx)
-            .copied()
-            .unwrap_or(default_extra_line_spacing_px)
-            - default_extra_line_spacing_px;
-    }
-    baselines
-}
-
-fn horizontal_run_baseline_y(
-    run: &LayoutRun<'_>,
-    line_idx: usize,
-    anchor_y: f32,
-    base_line_height_px: f32,
-    extra_line_spacing_px: f32,
-    has_inline_size_overrides: bool,
-) -> f32 {
-    if has_inline_size_overrides {
-        run.line_y
-    } else {
-        anchor_y + line_idx as f32 * base_line_height_px + line_idx as f32 * extra_line_spacing_px
-    }
 }
 
 fn inline_text_color_at_offset(

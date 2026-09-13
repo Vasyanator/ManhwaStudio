@@ -1353,12 +1353,19 @@ session long before this call.
   filter. Everything else (quality weights, node budgets) comes from
   `FormSearchParams::default()` and is not user-visible.
 - **`line_height_units` IS THE CALLER'S JOB, and the panel computes it in two halves.**
-  `create_advanced::advanced_form_line_height_em` mirrors `ms_text_render::pipeline`
-  (`pipeline.rs:432-437`) plus its `pub(crate)` `effective_spacing_percent`
-  (`pipeline.rs:2628-2630`), reproduced here because the crate does not export it:
+  `create_advanced::advanced_form_line_height_em` mirrors the
+  `line_spacing_percent`/`extra_line_spacing_px` block at the top of
+  `ms_text_render::pipeline::render_text_to_image`, plus its `pub(crate)`
+  `effective_spacing_percent`, reproduced here because the crate does not export it
+  (no line numbers on purpose — they went stale once already):
   `spacing% = clamp(line_spacing_percent + (glyph_height_percent − 100), ±300)`,
   `line_height_px = max(font_size_px + line_spacing_px + font_size_px·spacing%/100, 1)`,
-  `em = line_height_px / font_size_px / (glyph_width_percent/100)`. The HORIZONTAL glyph
+  `em = line_height_px / font_size_px / (glyph_width_percent/100)`. Only the GLOBAL
+  `glyph_height_percent` enters this formula: the inline `<stretching=W%,H%>` tag does not
+  affect the line-height metric the form search uses (the renderer only adds grow-only room
+  ABOVE a stretched line — see the GLYPH HEIGHT SCALE contract in
+  `ms-text-render/src/MODULE_README.md`), so the form search must not account for it.
+  The HORIZONTAL glyph
   scale must be in the divisor — widths are measured without it, so leaving it out silently
   detunes the aspect cap. The second half is the metric's own em scale, which only the WORKER
   knows because it depends on which metric it managed to build: `GLYPH_METRIC_UNITS_PER_EM`

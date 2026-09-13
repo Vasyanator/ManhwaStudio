@@ -35,6 +35,16 @@ Notes:
   shared `glyph_blit` helpers; the layout math, bounds/canvas assembly and
   inline-color contract are unchanged, and color glyphs keep the `raster.rs` bitmap
   blit;
+- the vertical glyph scale (global `glyph_height_percent` and the inline
+  `<stretching=W%,H%>` tag) is anchored at the run BASELINE through
+  `GlyphScaleSettings::scaled_center_about_baseline` / `scaled_rect_about_baseline`;
+  `scaled_rect` keeps the box-centre anchor for the cell-placed vertical path and
+  for callers that need only the scaled size. Line stacking follows
+  `line_baseline_advance_table`: an inline `<stretching>` span never drives
+  `compute_line_extra_spacing_table` (which stays a line-level, whole-text rule) and
+  can only GROW the gap ABOVE its own line, by the real ink rise of the stretched
+  glyphs on their OWN faces, maxed per line and never summed (`InlineHeightRoom`).
+  See the GLYPH HEIGHT SCALE contract in `MODULE_README.md`;
 - an attrs modification the registered fonts cannot serve is degraded BEFORE the
   shaper sees it: `synthesized_italic_slant_deg` / `synthesized_bold_params` rewrite
   a whole-overlay real italic/bold into the faux form on ONE params copy, and
@@ -149,6 +159,16 @@ impl GlyphScaleSettings {
         )
     }
 
+    /// Scaled glyph rect anchored at the box CENTRE on both axes.
+    ///
+    /// The centre is scale-invariant, so this is the placement for a glyph that
+    /// sits in a CELL rather than on a shared baseline (the vertical columns,
+    /// whose cell step already follows the scaled ink height) and for callers
+    /// that only need the scaled SIZE or a rect they re-centre themselves
+    /// (`include_rotated_rect_bounds` pins the rect to its own `dst_center`).
+    /// Baseline-laid text must use [`Self::scaled_rect_about_baseline`] instead —
+    /// a centre anchor lifts a height-scaled glyph off the baseline by
+    /// `(glyph_h / 2 - placement_top) * (1 - height_mul)`, which differs per glyph.
     #[must_use]
     pub(crate) fn scaled_rect(
         self,
@@ -159,8 +179,65 @@ impl GlyphScaleSettings {
     ) -> (f32, f32, f32, f32) {
         let center_x = left_px + width_px * 0.5;
         let center_y = top_px + height_px * 0.5;
-        let scaled_width = (width_px.max(1.0) * self.width_mul).max(1.0);
-        let scaled_height = (height_px.max(1.0) * self.height_mul).max(1.0);
+        let (scaled_width, scaled_height) = self.scaled_size(width_px, height_px);
+        (
+            center_x - scaled_width * 0.5,
+            center_y - scaled_height * 0.5,
+            scaled_width,
+            scaled_height,
+        )
+    }
+
+    /// Centre the SCALED glyph box must be pinned to when the vertical scale is
+    /// anchored at the text BASELINE.
+    ///
+    /// `left_px`/`top_px`/`width_px`/`height_px` are the UNSCALED bitmap placement
+    /// box in content space (y down); `baseline_y` is the pen baseline of the run
+    /// the glyph belongs to, in that same space (`src_top + placement_top`). The
+    /// horizontal scale keeps the box centre (the pen x is compensated by the
+    /// advance, not by the pivot), the vertical one maps the baseline to itself:
+    /// a height-scaled glyph keeps its baseline exactly where an unscaled glyph of
+    /// the same run would have it and only its ink extent changes.
+    ///
+    /// This is the value every baseline-laid draw site feeds to
+    /// [`glyph_outline_transform`] as `dst_center`, which pins the scaled box
+    /// centre there — so the returned point and
+    /// [`Self::scaled_rect_about_baseline`] describe the same box.
+    #[must_use]
+    pub(crate) fn scaled_center_about_baseline(
+        self,
+        left_px: f32,
+        top_px: f32,
+        width_px: f32,
+        height_px: f32,
+        baseline_y: f32,
+    ) -> (f32, f32) {
+        (
+            left_px + width_px * 0.5,
+            baseline_y + (top_px + height_px * 0.5 - baseline_y) * self.height_mul,
+        )
+    }
+
+    /// Scaled glyph rect with the VERTICAL scale anchored at `baseline_y`.
+    ///
+    /// Same box as [`Self::scaled_center_about_baseline`], expressed as
+    /// `(left, top, width, height)`. The size is the clamped [`Self::scaled_size`]
+    /// the bitmap blit and the bounds pass already used, so only the vertical
+    /// POSITION changes versus [`Self::scaled_rect`]. Bounds, the bitmap blit and
+    /// the extra-info samples must all use this on the baseline-laid paths, or the
+    /// canvas box drifts away from the drawn ink.
+    #[must_use]
+    pub(crate) fn scaled_rect_about_baseline(
+        self,
+        left_px: f32,
+        top_px: f32,
+        width_px: f32,
+        height_px: f32,
+        baseline_y: f32,
+    ) -> (f32, f32, f32, f32) {
+        let (center_x, center_y) =
+            self.scaled_center_about_baseline(left_px, top_px, width_px, height_px, baseline_y);
+        let (scaled_width, scaled_height) = self.scaled_size(width_px, height_px);
         (
             center_x - scaled_width * 0.5,
             center_y - scaled_height * 0.5,
@@ -870,16 +947,19 @@ pub fn render_text_to_image(
     let has_inline_size_overrides = mapped_inline_style_spans
         .as_deref()
         .is_some_and(spans_have_inline_size_overrides);
-    let line_extra_spacing_table = compute_line_extra_spacing_table(
-        params,
-        layout_text.as_str(),
-        layout_line_offsets.as_slice(),
-        mapped_inline_style_spans.as_deref(),
-        font_size_px,
-        extra_line_spacing_px,
-    );
     if params.text_line_mode == TextLineMode::Vertical {
         ms_log::trace_log!(cat::RENDER, "render_text path=vertical lines={}", layout_line_offsets.len());
+        // The vertical path reads these entries as COLUMN GAPS, so it takes the
+        // plain line-level table; the horizontal path below stacks BASELINES and
+        // takes the grow-only `line_baseline_advance_table` instead.
+        let line_extra_spacing_table = compute_line_extra_spacing_table(
+            params,
+            layout_text.as_str(),
+            layout_line_offsets.as_slice(),
+            mapped_inline_style_spans.as_deref(),
+            font_size_px,
+            extra_line_spacing_px,
+        );
         let mut rendered = render_vertical_text(VerticalRasterRequest {
             params,
             font_system: &mut *font_system,
@@ -898,11 +978,28 @@ pub fn render_text_to_image(
         return Ok(rendered);
     }
 
+    // Baselines stack on the grow-only advance table: an inline `<stretching>`
+    // height span may push the next line further away, never pull it closer.
+    let line_advance_table = line_baseline_advance_table(
+        params,
+        layout_text.as_str(),
+        layout_line_offsets.as_slice(),
+        mapped_inline_style_spans.as_deref(),
+        font_size_px,
+        extra_line_spacing_px,
+        &InlineHeightRoom::measure(
+            params,
+            &buffer,
+            font_system,
+            layout_line_offsets.as_slice(),
+            mapped_inline_style_spans.as_deref(),
+        ),
+    );
     let line_baselines = compute_horizontal_line_baselines(
         &buffer,
         base_line_height_px,
         extra_line_spacing_px,
-        line_extra_spacing_table.as_slice(),
+        line_advance_table.as_slice(),
         has_inline_size_overrides,
     );
 
@@ -1166,15 +1263,9 @@ pub fn render_text_to_image(
     for placement in &placements {
         // Faux ink pads (`bounds_pad`) widen the box for the offset/sheared
         // outline; they are exact zeros without faux, keeping the historical
-        // canvas byte-identical.
-        include_scaled_rect_bounds(
-            &mut bounds,
-            placement.src_left_i as f32 - placement.bounds_pad[0],
-            placement.src_top_i as f32 - placement.bounds_pad[1],
-            placement.glyph_w as f32 + 2.0 * placement.bounds_pad[0],
-            placement.glyph_h as f32 + 2.0 * placement.bounds_pad[1],
-            placement.scale,
-        );
+        // canvas byte-identical. The rect is height-anchored at the pen baseline,
+        // exactly like the draw pivot below.
+        include_scaled_rect_bounds(&mut bounds, placement.padded_scaled_rect());
     }
 
     if !bounds.initialized {
@@ -1315,6 +1406,32 @@ impl HorizontalGlyphPlacement {
     fn draws_ink(&self) -> bool {
         self.outline.is_some() || self.fallback.is_some()
     }
+
+    /// The run's pen baseline in content space — the anchor of the height scale.
+    ///
+    /// `src_top_i` is `physical.y - placement.top`, so adding `placement_top`
+    /// recovers exactly the integer pen `physical.y` the glyph was shaped at.
+    #[must_use]
+    fn baseline_y(&self) -> f32 {
+        self.src_top_i as f32 + self.placement_top
+    }
+
+    /// The scaled glyph rect, height-anchored at the baseline and widened by the
+    /// faux bounds pads (exactly the plain baseline-anchored rect when faux is
+    /// off — the pads are hard zeros).
+    ///
+    /// The pads are symmetric, so they do not move the rect's centre: bounds,
+    /// extra-info samples and the draw pivot stay on one box.
+    #[must_use]
+    fn padded_scaled_rect(&self) -> (f32, f32, f32, f32) {
+        self.scale.scaled_rect_about_baseline(
+            self.src_left_i as f32 - self.bounds_pad[0],
+            self.src_top_i as f32 - self.bounds_pad[1],
+            self.glyph_w as f32 + 2.0 * self.bounds_pad[0],
+            self.glyph_h as f32 + 2.0 * self.bounds_pad[1],
+            self.baseline_y(),
+        )
+    }
 }
 
 /// Collect one glyph placement for the normal horizontal path.
@@ -1420,8 +1537,17 @@ fn draw_horizontal_placement(
     // Prefer the true font outline: rasterize it at the exact world placement the
     // bitmap blit would have used (scale about the bitmap center, no rotation).
     if let Some(outline) = placement.outline.as_ref() {
-        let dst_center_x = src_left + glyph_w as f32 * 0.5;
-        let dst_center_y = src_top + glyph_h as f32 * 0.5;
+        // Height scale anchored at the pen baseline, not at the glyph's own box
+        // centre: a box-centre pivot lifts a shrunk glyph off the baseline by an
+        // amount that differs per glyph (its own ink box), which is what made a
+        // partially height-scaled word float at mid-height.
+        let (dst_center_x, dst_center_y) = placement.scale.scaled_center_about_baseline(
+            src_left,
+            src_top,
+            glyph_w as f32,
+            glyph_h as f32,
+            placement.baseline_y(),
+        );
         // Re-add the subpixel fraction cosmic-text baked into the bitmap coverage
         // (physical.x/y carried only the integer pen), so the outline matches it.
         let transform = glyph_outline_transform(
@@ -1483,6 +1609,16 @@ fn draw_horizontal_placement(
             width: out_width as usize,
             height: out_height as usize,
         };
+        // Same baseline anchor as the outline path above, shifted into canvas px
+        // by the bounds offsets — the bitmap fallback must land in the same box
+        // the bounds pass reserved for it.
+        let dst_rect = placement.scale.scaled_rect_about_baseline(
+            draw_x as f32,
+            draw_y as f32,
+            glyph_w as f32,
+            glyph_h as f32,
+            placement.baseline_y() + y_offset as f32,
+        );
         draw_scaled_glyph_rgba(
             &mut canvas,
             GlyphRgbaView {
@@ -1490,8 +1626,7 @@ fn draw_horizontal_placement(
                 width: glyph_w,
                 height: glyph_h,
             },
-            draw_x as f32,
-            draw_y as f32,
+            dst_rect,
             placement.scale,
         );
     }
@@ -1557,7 +1692,13 @@ impl RotatedGlyphPlacement {
     }
 
     /// The scaled glyph rect widened by the faux bounds pads (exactly the
-    /// plain `scaled_rect` when faux is off — the pads are hard zeros).
+    /// plain scaled rect when faux is off — the pads are hard zeros).
+    ///
+    /// Box-centre anchored on purpose: every consumer feeds this rect to
+    /// `include_rotated_rect_bounds`, which re-pins it to `center_x`/`center_y`
+    /// (already baseline-anchored and rotated), so only its SIZE and its
+    /// centre-relative extents are read. The pads are symmetric and therefore do
+    /// not move the centre either.
     fn padded_scaled_rect(&self) -> (f32, f32, f32, f32) {
         self.scale.scaled_rect(
             self.src_left - self.bounds_pad[0],
@@ -1616,8 +1757,17 @@ fn build_rotated_placement(
         scale.width_mul,
         scale.height_mul,
     );
-    let (scaled_left, scaled_top, scaled_width, scaled_height) =
-        scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
+    // Height scale anchored at the pen baseline (see
+    // `GlyphScaleSettings::scaled_center_about_baseline`): the rotation pivot IS
+    // the scaled box centre, so anchoring it here is what keeps a height-scaled
+    // glyph on the run's baseline before any rotation is applied.
+    let (center_x, center_y) = scale.scaled_center_about_baseline(
+        src_left,
+        src_top,
+        glyph_w as f32,
+        glyph_h as f32,
+        src_top + placement_top,
+    );
     Some(RotatedGlyphPlacement {
         outline,
         glyph_rgba,
@@ -1632,8 +1782,8 @@ fn build_rotated_placement(
         subpixel,
         faux,
         bounds_pad,
-        center_x: scaled_left + scaled_width * 0.5,
-        center_y: scaled_top + scaled_height * 0.5,
+        center_x,
+        center_y,
         rotation_rad: glyph_rotation_rad,
         group_key,
         group_rotation_rad,
@@ -2598,8 +2748,16 @@ fn place_optical_horizontal_contour(
         return None;
     }
 
-    let dst_center_x = src_left + glyph_w * 0.5;
-    let dst_center_y = src_top + glyph_h * 0.5;
+    // Same baseline anchor as `draw_horizontal_placement`, so the measured ink is
+    // the drawn ink. The baseline here is the probe pen (`pos_y = 0`), which the
+    // gap measurement never reads, but the two paths must not diverge.
+    let (dst_center_x, dst_center_y) = glyph_scale.scaled_center_about_baseline(
+        src_left,
+        src_top,
+        glyph_w,
+        glyph_h,
+        src_top + placement_top,
+    );
     let transform = glyph_outline_transform(
         dst_center_x,
         dst_center_y,
@@ -3323,6 +3481,20 @@ pub(crate) fn inline_kerning_for_glyph(
     inline_kerning_at_offset(params, spans, line_offset + glyph.start.min(glyph.end))
 }
 
+/// Per-line extra spacing in px, driven by the LINE-level inline tags only.
+///
+/// Entry `i` is the extra spacing of layout line `i`: `<line-spacing=px,%>` spans
+/// touching that line override `params.line_spacing_px`/`line_spacing_percent`
+/// (last overlapping span wins — a `<line-spacing>` tag is a request ABOUT the
+/// line, so touching the line is enough), and the result is coupled to the GLOBAL
+/// `glyph_height_percent` through [`effective_spacing_percent`], the documented
+/// whole-text rule (`ms-tab-typing/src/panel/MODULE_README.md`).
+///
+/// A per-character `<stretching=W%,H%>` span deliberately does NOT feed this
+/// table: it is not a statement about the line, and letting it in re-spaced the
+/// whole line (and, on the vertical path, the whole COLUMN GAP) because one word
+/// was scaled. The room a TALL inline span needs is added instead, grow-only and
+/// on the correct side, by [`line_baseline_advance_table`].
 pub(crate) fn compute_line_extra_spacing_table(
     params: &TextRenderParams,
     layout_text: &str,
@@ -3342,7 +3514,6 @@ pub(crate) fn compute_line_extra_spacing_table(
             .unwrap_or(layout_text.len());
         let mut spacing_px = params.line_spacing_px;
         let mut spacing_percent = params.line_spacing_percent;
-        let mut stretch_y_percent = params.glyph_height_percent;
         for span in spans
             .iter()
             .filter(|span| span.end > line_start && span.start < line_end)
@@ -3353,11 +3524,9 @@ pub(crate) fn compute_line_extra_spacing_table(
             if let Some(value) = span.line_spacing_percent {
                 spacing_percent = value;
             }
-            if let Some(value) = span.glyph_stretch_percent {
-                stretch_y_percent = value[1];
-            }
         }
-        let effective_percent = effective_spacing_percent(spacing_percent, stretch_y_percent);
+        let effective_percent =
+            effective_spacing_percent(spacing_percent, params.glyph_height_percent);
         out.push(spacing_px + font_size_px * (effective_percent / 100.0));
     }
     if out.is_empty() {
@@ -3366,11 +3535,215 @@ pub(crate) fn compute_line_extra_spacing_table(
     out
 }
 
+/// Grow-only vertical room, in px, that inline `<stretching>` height spans ask
+/// for ABOVE each layout line.
+///
+/// `above(i)` is how much higher a height-scaled run on layout line `i` reaches
+/// than the same run at the global `glyph_height_percent` would. It is measured
+/// as REAL INK: the glyph outline's own extent above the baseline
+/// (`Outline::local_bbox`, whose frame has `y = 0` on the baseline), taken at the
+/// glyph's own em from the glyph's OWN face and faux-bold variant — the same
+/// resolver the draw pass rasterizes — times that glyph's excess multiplier.
+///
+/// MAXIMUM, NEVER A SUM. A line carrying several height tags asks for the LARGEST
+/// rise any one of them needs, not their total: two 150 % spans on one line space
+/// exactly like one, and a 150 % span beside a 200 % one spaces exactly like the
+/// 200 % span alone, wherever the larger one sits in reading order. Every glyph
+/// folds into its line's entry with `max`; an accumulating `+=` here would be a
+/// defect, not an optimisation.
+///
+/// The face `ascent` metric is deliberately NOT
+/// used: it carries headroom well above the actual ink of most lines (a line of
+/// x-height glyphs tops out around 0.53 em against a ~0.9 em ascent), so scaling
+/// it makes the gap grow visibly faster than the letters do.
+///
+/// GROW UPWARD ONLY. There is no "below" side by design: a tall span enlarges
+/// only the gap ABOVE its own line, never the one below it. A large multiplier
+/// therefore pushes a descender (`р`, `у`, `д`) further down and it may crowd the
+/// following line — that is the ACCEPTED behaviour, chosen over spacing that
+/// grows on both sides; raising the line spacing is the author's lever. Do not
+/// "fix" this by re-adding a descent term.
+///
+/// The value is `0.0` on every line no `<stretching>` span makes taller than the
+/// global `glyph_height_percent`, so the whole mechanism is inert without the tag.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InlineHeightRoom {
+    above_px: Vec<f32>,
+}
+
+impl InlineHeightRoom {
+    /// Extra ink above line `line_idx`'s baseline; `0.0` past the last line.
+    #[must_use]
+    pub(crate) fn above(&self, line_idx: usize) -> f32 {
+        self.above_px.get(line_idx).copied().unwrap_or(0.0)
+    }
+
+    /// Test-only constructor taking the exact per-line room in px, so the advance
+    /// arithmetic can be pinned without shaping a buffer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_above(above_px: Vec<f32>) -> Self {
+        Self { above_px }
+    }
+
+    /// Measure the room from the SHAPED buffer, per layout run.
+    ///
+    /// A glyph contributes only the part of its height that exceeds the global
+    /// `glyph_height_percent` (`height_mul - global_mul`, clamped at zero), which
+    /// is what makes the rule grow-only; the multiplier comes from
+    /// [`inline_glyph_scale_for_glyph`] and the faux variant from
+    /// [`faux_style_for_glyph`], the same resolutions the draw pass uses, so the
+    /// measured ink is the drawn ink. Run index and `layout_line_offsets` index
+    /// are the same line here (the layout text is pre-wrapped), exactly as in
+    /// [`compute_horizontal_line_baselines`].
+    ///
+    /// Only glyphs that actually carry an excess are looked up, through a local
+    /// [`OutlineCache`] — a handful of extractions per render, none at all
+    /// without a `<stretching>` tag. A glyph with no fillable outline (a color /
+    /// emoji or embedded-bitmap glyph) has no outline box to read and falls back
+    /// to its face `ascent`: an over-allocation, which is the safe side of a
+    /// grow-only rule, and far cheaper than rasterizing it here just to measure.
+    #[must_use]
+    pub(crate) fn measure(
+        params: &TextRenderParams,
+        buffer: &Buffer,
+        font_system: &mut FontSystem,
+        layout_line_offsets: &[usize],
+        inline_style_spans: Option<&[InlineStyleSpan]>,
+    ) -> Self {
+        let line_count = layout_line_offsets.len().max(1);
+        let mut room = Self { above_px: vec![0.0; line_count] };
+        // No stretch tag anywhere -> no room to add, and no per-glyph lookup.
+        if !inline_style_spans.is_some_and(|spans| {
+            spans.iter().any(|span| span.glyph_stretch_percent.is_some())
+        }) {
+            return room;
+        }
+        let global_mul = (params.glyph_height_percent / 100.0).clamp(0.01, 3.0);
+        let mut outline_cache = OutlineCache::new();
+        // (face, em) -> ascent px, for the outline-less fallback only.
+        let mut face_ascents: std::collections::HashMap<(u64, u32), f32> =
+            std::collections::HashMap::new();
+        for (line_idx, run) in buffer.layout_runs().enumerate() {
+            while room.above_px.len() <= line_idx {
+                room.above_px.push(0.0);
+            }
+            for glyph in run.glyphs {
+                let excess = inline_glyph_scale_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    line_idx,
+                    glyph,
+                )
+                .height_mul
+                    - global_mul;
+                if excess <= 0.0 {
+                    continue;
+                }
+                let faux = faux_style_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    line_idx,
+                    glyph,
+                );
+                let ink_rise_px = match resolve_outline_for_glyph(
+                    font_system,
+                    &mut outline_cache,
+                    glyph,
+                    faux.bold,
+                ) {
+                    // The outline frame is y-down with `y = 0` on the baseline,
+                    // so the topmost ink is the MOST NEGATIVE y. A glyph whose
+                    // ink lies entirely below the baseline rises by nothing.
+                    Some(outline) => (-outline.local_bbox().0[1]).max(0.0),
+                    None => {
+                        let key = (hash_font_id(glyph.font_id), glyph.font_size.to_bits());
+                        *face_ascents.entry(key).or_insert_with(|| {
+                            font_system
+                                .get_font(glyph.font_id)
+                                .map(|font| {
+                                    font.as_swash()
+                                        .metrics(&[])
+                                        .scale(glyph.font_size)
+                                        .ascent
+                                        .max(0.0)
+                                })
+                                // Unreachable for a glyph this very `FontSystem`
+                                // shaped; the nominal em over-allocates, which is
+                                // the safe direction for a grow-only rule.
+                                .unwrap_or(glyph.font_size)
+                        })
+                    }
+                };
+                // MAX, never `+=`: several height tags on one line ask for the
+                // largest rise among them, not for their total.
+                room.above_px[line_idx] = room.above_px[line_idx].max(ink_rise_px * excess);
+            }
+        }
+        room
+    }
+}
+
+/// Baseline-advance table for the paths that stack lines on BASELINES: the
+/// line-level [`compute_line_extra_spacing_table`] plus the grow-only room an
+/// inline `<stretching>` height span needs.
+///
+/// Entry `i` is consumed by [`compute_horizontal_line_baselines`] as the extra
+/// advance of the gap BELOW line `i`, i.e. the gap ABOVE line `i+1`. Since the
+/// height scale is anchored at the baseline, a span taller than the global height
+/// reaches higher above its own baseline, so gap `i` makes room for line `i+1`'s
+/// extra ink rise — [`InlineHeightRoom::above`] and nothing else. The term is
+/// non-negative: the line box may grow, never shrink.
+///
+/// UPWARD ONLY, and a MAXIMUM rather than a sum. A tall span never enlarges the
+/// gap BELOW its own line (its descenders may crowd the next line; see
+/// [`InlineHeightRoom`] for why that is the accepted trade), and several height
+/// tags on one line ask for the largest of their individual rises, never their
+/// total — that maximum is taken per line inside [`InlineHeightRoom::measure`].
+///
+/// The vertical path must NOT use this table — there the same entries are COLUMN
+/// GAPS, where an ink-rise term is meaningless; it keeps the plain
+/// [`compute_line_extra_spacing_table`].
+#[must_use]
+pub(crate) fn line_baseline_advance_table(
+    params: &TextRenderParams,
+    layout_text: &str,
+    layout_line_offsets: &[usize],
+    inline_style_spans: Option<&[InlineStyleSpan]>,
+    font_size_px: f32,
+    default_extra_line_spacing_px: f32,
+    inline_height_room: &InlineHeightRoom,
+) -> Vec<f32> {
+    let mut table = compute_line_extra_spacing_table(
+        params,
+        layout_text,
+        layout_line_offsets,
+        inline_style_spans,
+        font_size_px,
+        default_extra_line_spacing_px,
+    );
+    for (line_idx, entry) in table.iter_mut().enumerate() {
+        *entry += inline_height_room.above(line_idx + 1);
+    }
+    table
+}
+
+/// Pen baseline (content px, y down) of every layout run in `buffer`.
+///
+/// `line_advance_table` must come from [`line_baseline_advance_table`] — entry
+/// `i` is the extra advance of the gap BELOW line `i`, so it shifts lines `i+1..`
+/// and never line `i` itself. `default_extra_line_spacing_px` is the value the
+/// uniform ladder in [`horizontal_run_baseline_y`] already contains; it cancels
+/// out of the telescoping sum there, and only matters in the
+/// `has_inline_size_overrides` branch, which replaces the ladder with
+/// cosmic-text's own `run.line_y`.
 pub(crate) fn compute_horizontal_line_baselines(
     buffer: &Buffer,
     base_line_height_px: f32,
     default_extra_line_spacing_px: f32,
-    line_extra_spacing_table: &[f32],
+    line_advance_table: &[f32],
     has_inline_size_overrides: bool,
 ) -> Vec<f32> {
     let anchor_y = buffer
@@ -3390,7 +3763,7 @@ pub(crate) fn compute_horizontal_line_baselines(
             has_inline_size_overrides,
         ) + cumulative_delta;
         baselines.push(baseline);
-        cumulative_delta += line_extra_spacing_table
+        cumulative_delta += line_advance_table
             .get(line_idx)
             .copied()
             .unwrap_or(default_extra_line_spacing_px)
@@ -3399,7 +3772,12 @@ pub(crate) fn compute_horizontal_line_baselines(
     baselines
 }
 
-fn horizontal_run_baseline_y(
+/// Baseline of one layout run BEFORE the per-gap advance corrections.
+///
+/// With no inline `<size>` tag this is the uniform ladder
+/// `anchor + i * (base_line_height + extra)`; when a `<size>` tag exists the
+/// shaper owns the line box and cosmic-text's own `run.line_y` is used instead.
+pub(crate) fn horizontal_run_baseline_y(
     run: &LayoutRun<'_>,
     line_idx: usize,
     anchor_y: f32,
@@ -3761,11 +4139,12 @@ pub(crate) fn is_edge_run_hanging(bounds: (usize, usize), index: usize) -> bool 
 fn horizontal_placement_extra_samples(
     placement: &HorizontalGlyphPlacement,
 ) -> ([[f32; 2]; 4], [f32; 2]) {
-    let (left, top, width, height) = placement.scale.scaled_rect(
+    let (left, top, width, height) = placement.scale.scaled_rect_about_baseline(
         placement.src_left_i as f32,
         placement.src_top_i as f32,
         placement.glyph_w as f32,
         placement.glyph_h as f32,
+        placement.baseline_y(),
     );
     let corners = [
         [left, top],
@@ -3782,6 +4161,10 @@ fn horizontal_placement_extra_samples(
 /// scaled box half-extents are rotated about the final center with the shared
 /// screen (y-down) `[cos -sin; sin cos]` convention (same as
 /// `rotated_rect_world_bounds`).
+///
+/// Only the scaled SIZE is read from the rect, so the box-centre-anchored
+/// `scaled_rect` is the right call here: the position comes from `center_x`/
+/// `center_y`, which `build_rotated_placement` already anchored at the baseline.
 #[must_use]
 fn rotated_placement_extra_samples(
     placement: &RotatedGlyphPlacement,
@@ -4007,6 +4390,73 @@ mod tests {
             }
         }
         (alpha_sum > 0.0).then_some(weighted_y / alpha_sum)
+    }
+
+    /// Alpha that counts as ink for the glyph-geometry probes below. Above the
+    /// anti-aliasing fringe of an outline edge, so a row/column is reported as
+    /// ink only where the glyph really covers it.
+    const INK_ALPHA: u8 = 32;
+
+    /// Ink bounding box `(min_x, max_x, min_y, max_y)` of every CONNECTED run of
+    /// inked columns, split on fully empty columns and returned left to right.
+    ///
+    /// With space-separated glyphs this is one entry per glyph, so `max_y` is
+    /// that glyph's ink BOTTOM — the row a baseline-anchored glyph shares with
+    /// its unscaled neighbours (`H`, `.` and friends have no descender).
+    fn ink_column_clusters(image: &RenderedTextImage) -> Vec<(usize, usize, usize, usize)> {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        let mut clusters: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut open: Option<(usize, usize, usize, usize)> = None;
+        for x in 0..width {
+            let mut column_min_y = None;
+            let mut column_max_y = 0usize;
+            for y in 0..height {
+                if image.rgba[(y * width + x) * 4 + 3] < INK_ALPHA {
+                    continue;
+                }
+                column_min_y.get_or_insert(y);
+                column_max_y = y;
+            }
+            match (column_min_y, open.as_mut()) {
+                (Some(min_y), Some(current)) => {
+                    current.1 = x;
+                    current.2 = current.2.min(min_y);
+                    current.3 = current.3.max(column_max_y);
+                }
+                (Some(min_y), None) => open = Some((x, x, min_y, column_max_y)),
+                (None, _) => {
+                    if let Some(finished) = open.take() {
+                        clusters.push(finished);
+                    }
+                }
+            }
+        }
+        clusters.extend(open);
+        clusters
+    }
+
+    /// Ink row bands `(min_y, max_y)`, split on fully empty rows, top to bottom.
+    /// One entry per text line as long as neighbouring lines do not overlap.
+    fn ink_row_bands(image: &RenderedTextImage) -> Vec<(usize, usize)> {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        let mut bands: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<(usize, usize)> = None;
+        for y in 0..height {
+            let inked = (0..width).any(|x| image.rgba[(y * width + x) * 4 + 3] >= INK_ALPHA);
+            match (inked, open.as_mut()) {
+                (true, Some(current)) => current.1 = y,
+                (true, None) => open = Some((y, y)),
+                (false, _) => {
+                    if let Some(finished) = open.take() {
+                        bands.push(finished);
+                    }
+                }
+            }
+        }
+        bands.extend(open);
+        bands
     }
 
     /// Faux params for the render tests: strong enough that the geometric
@@ -5514,6 +5964,668 @@ mod tests {
             "glyph-level inline override warning should disappear after implementation"
         );
         assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
+    }
+
+    /// The glyph height scale is anchored at the run BASELINE: an inline
+    /// `<stretching=100%,H%>` span changes a glyph's ink EXTENT and nothing else,
+    /// so its bottom edge stays on the same row as the unscaled glyphs beside it.
+    ///
+    /// Before the baseline anchor the scale pivoted the glyph's own ink-box
+    /// centre, which left a 50 % glyph floating ~6 px above the line (the reported
+    /// "текст" defect) and pushed a 200 % one below it. Tolerance is 1 px: the
+    /// outline is rasterized at the scaled size, so the bottom edge can land one
+    /// anti-aliased row either way.
+    #[test]
+    fn inline_height_scale_keeps_glyphs_on_the_line_baseline() {
+        for height_percent in [50u32, 200] {
+            let mut params = base_params();
+            params.enable_inline_style_tags = true;
+            params.width_px = 512;
+            params.text = format!("H <stretching=100%,{height_percent}%>H</stretching> H");
+
+            let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
+                panic!("render_next should render the inline height case: {error}")
+            });
+            let clusters = ink_column_clusters(&rendered);
+            assert_eq!(
+                clusters.len(),
+                3,
+                "the three space-separated H glyphs must stay separate at {height_percent}%: {clusters:?}"
+            );
+
+            let baseline_row = clusters[0].3;
+            for (idx, cluster) in clusters.iter().enumerate() {
+                let delta = cluster.3 as i64 - baseline_row as i64;
+                assert!(
+                    delta.abs() <= 1,
+                    "glyph {idx} ink bottom {} must sit on the baseline row {baseline_row} at {height_percent}% (delta {delta}): {clusters:?}",
+                    cluster.3
+                );
+            }
+
+            // The scale must still HAPPEN — a baseline anchor is not a no-op.
+            let plain_height = clusters[0].3 - clusters[0].2;
+            let scaled_height = clusters[1].3 - clusters[1].2;
+            if height_percent < 100 {
+                assert!(
+                    scaled_height * 2 < plain_height * 3,
+                    "the 50% glyph must be visibly shorter ({scaled_height} vs {plain_height})"
+                );
+            } else {
+                assert!(
+                    scaled_height > plain_height,
+                    "the 200% glyph must be visibly taller ({scaled_height} vs {plain_height})"
+                );
+            }
+        }
+    }
+
+    /// A partial-line inline `<stretching>` height span must not move the COLUMN
+    /// GAPS of vertical text.
+    ///
+    /// The vertical path reads `line_extra_spacing_table` as a horizontal gap
+    /// between columns, so the old "any overlapping stretch span rewrites the
+    /// line's height percent" rule leaked a per-character height change straight
+    /// into the spacing between whole columns (at 50 % it pulled them 18 px
+    /// closer here). The grow-only ink-rise room is meaningless for a
+    /// horizontal gap and is deliberately NOT applied there either, so the table
+    /// the vertical path consumes must be invariant to the tag in BOTH
+    /// directions.
+    ///
+    /// The end-to-end half of the check uses the shrinking direction only: a
+    /// TALLER glyph legitimately widens its own cell, because a vertical cell is
+    /// sized by its scaled ink extent (`measure_vertical_glyph_visual_width`,
+    /// `vertical_step_follows_glyph_ink_height`) — that is the cell width, not
+    /// the gap, and it is not what this contract is about.
+    #[test]
+    fn vertical_column_gaps_ignore_an_inline_height_span() {
+        let mut params = base_params();
+        params.enable_inline_style_tags = true;
+        params.text_line_mode = TextLineMode::Vertical;
+        let font_size_px = params.font_size_px;
+
+        // The exact table the vertical path is handed for its column gaps.
+        let column_gap_table = |text: &str| -> Vec<f32> {
+            let parsed = crate::inline_styles::parse_inline_style_tags(text, font_size_px);
+            let offsets = super::compute_layout_line_offsets(parsed.plain_text.as_str());
+            super::compute_line_extra_spacing_table(
+                &params,
+                parsed.plain_text.as_str(),
+                offsets.as_slice(),
+                Some(parsed.spans.as_slice()),
+                font_size_px,
+                0.0,
+            )
+        };
+        let plain_table = column_gap_table("HH\nHH");
+        for percent in ["50%", "200%"] {
+            let tagged_table =
+                column_gap_table(&format!("H<stretching=100%,{percent}>H</stretching>\nHH"));
+            assert_eq!(
+                tagged_table, plain_table,
+                "an inline height span must not change the column-gap table at {percent}"
+            );
+        }
+
+        // End-to-end: the shrinking direction cannot touch the cell width, so any
+        // movement of the ink columns would come from the gap.
+        let column_edges = |text: &str| -> Vec<(usize, usize)> {
+            let mut render_params = params.clone();
+            render_params.text = text.to_string();
+            render_params.width_px = 512;
+            let rendered = render_text_to_image(&render_params, None)
+                .unwrap_or_else(|error| panic!("vertical stretch render: {error}"));
+            ink_column_clusters(&rendered)
+                .into_iter()
+                .map(|(min_x, max_x, _, _)| (min_x, max_x))
+                .collect()
+        };
+        let plain = column_edges("HH\nHH");
+        assert_eq!(plain.len(), 2, "two ink columns expected: {plain:?}");
+        let shrunk = column_edges("H<stretching=100%,50%>H</stretching>\nHH");
+        assert_eq!(
+            shrunk.len(),
+            plain.len(),
+            "the column count must not change: {shrunk:?} vs {plain:?}"
+        );
+        assert_eq!(
+            shrunk[1].0 as i64 - shrunk[0].1 as i64,
+            plain[1].0 as i64 - plain[0].1 as i64,
+            "a partial 50% height span must not narrow the column gap ({shrunk:?} vs {plain:?})"
+        );
+    }
+
+    /// PURE geometry of the baseline anchor, at float precision.
+    ///
+    /// The pixel-level baseline tests reduce ink to integer rows with a 1 px
+    /// tolerance, so a sub-pixel per-glyph drift — exactly the shape of the old
+    /// box-centre bug, which displaced each glyph by
+    /// `(glyph_h / 2 − placement_top) · (1 − height_mul)` — could slip through.
+    /// This pins the invariant directly on glyphs with UNLIKE `placement_top`:
+    /// the scaled box's BOTTOM edge relative to the baseline must scale by
+    /// exactly `height_mul`, whatever the glyph's own ink box, and the whole box
+    /// must be untouched at `height_mul == 1`.
+    #[test]
+    fn baseline_anchored_scale_is_exact_for_unlike_ink_boxes() {
+        // (glyph_w, glyph_h, placement_top): a capital, a descender-only glyph
+        // (box entirely BELOW the baseline, negative top), a period sitting on
+        // the baseline, and a tall accented glyph.
+        let boxes = [
+            (20.0f32, 26.0f32, 26.0f32),
+            (14.0, 9.0, -1.0),
+            (5.0, 5.0, 5.0),
+            (21.0, 37.0, 37.0),
+        ];
+        let baseline_y = 100.0f32;
+
+        for height_mul in [0.5f32, 1.0, 2.0, 0.37, 2.91] {
+            let scale = super::GlyphScaleSettings { width_mul: 1.0, height_mul };
+            for (glyph_w, glyph_h, placement_top) in boxes {
+                // Content-space box top, as `build_horizontal_placement` derives it.
+                let src_top = baseline_y - placement_top;
+                let (_, center_y) = scale.scaled_center_about_baseline(
+                    0.0,
+                    src_top,
+                    glyph_w,
+                    glyph_h,
+                    baseline_y,
+                );
+                // The drawn box is `center +- scaled_height / 2` (the outline is
+                // scaled by `height_mul` about `center`, see `glyph_outline_transform`).
+                let scaled_bottom = center_y + glyph_h * height_mul * 0.5;
+                let scaled_top = center_y - glyph_h * height_mul * 0.5;
+                // Both edges are the unscaled ones scaled about the baseline.
+                let expect_bottom = baseline_y + (src_top + glyph_h - baseline_y) * height_mul;
+                let expect_top = baseline_y + (src_top - baseline_y) * height_mul;
+                assert!(
+                    (scaled_bottom - expect_bottom).abs() <= 1e-4,
+                    "bottom edge must scale about the baseline (h={glyph_h}, top={placement_top}, \
+                     mul={height_mul}): {scaled_bottom} vs {expect_bottom}"
+                );
+                assert!(
+                    (scaled_top - expect_top).abs() <= 1e-4,
+                    "top edge must scale about the baseline (h={glyph_h}, top={placement_top}, \
+                     mul={height_mul}): {scaled_top} vs {expect_top}"
+                );
+
+                // The rect form must describe the SAME box as the centre form.
+                let (_, rect_top, _, rect_height) = scale.scaled_rect_about_baseline(
+                    0.0,
+                    src_top,
+                    glyph_w,
+                    glyph_h,
+                    baseline_y,
+                );
+                assert!(
+                    (rect_top + rect_height * 0.5 - center_y).abs() <= 1e-4,
+                    "rect and centre helpers must agree: {rect_top}+{rect_height} vs {center_y}"
+                );
+
+                if (height_mul - 1.0).abs() <= f32::EPSILON {
+                    // An unscaled glyph must land exactly where the plain
+                    // box-centre placement puts it, bit for bit.
+                    let plain_center_y = src_top + glyph_h * 0.5;
+                    assert_eq!(
+                        center_y, plain_center_y,
+                        "height_mul == 1 must be an exact no-op (h={glyph_h}, top={placement_top})"
+                    );
+                }
+            }
+        }
+
+        // The defect this replaces: at a box-centre anchor two glyphs with
+        // unlike ink boxes end up on DIFFERENT baselines. Here they must not.
+        let scale = super::GlyphScaleSettings { width_mul: 1.0, height_mul: 0.5 };
+        let bottoms: Vec<f32> = boxes
+            .iter()
+            .map(|(glyph_w, glyph_h, placement_top)| {
+                let src_top = baseline_y - placement_top;
+                let (_, center_y) = scale.scaled_center_about_baseline(
+                    0.0,
+                    src_top,
+                    *glyph_w,
+                    *glyph_h,
+                    baseline_y,
+                );
+                // Baseline-relative bottom, normalized by the glyph's own
+                // unscaled baseline-relative bottom: identical for every glyph.
+                let unscaled_bottom = src_top + glyph_h - baseline_y;
+                (center_y + glyph_h * 0.5 * 0.5 - baseline_y) - unscaled_bottom * 0.5
+            })
+            .collect();
+        for offset in &bottoms {
+            assert!(
+                offset.abs() <= 1e-4,
+                "every glyph must scale about ONE baseline, not its own centre: {bottoms:?}"
+            );
+        }
+    }
+
+    /// Path of a secondary fixture face, used to build a MIXED-face line. Its
+    /// ink extents differ from `LiberationSans-Regular`, which is the whole
+    /// point: the grow-only room must follow the face that carries the stretch.
+    fn second_test_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/PanelCleaner/pcleaner/data/NotoMono-Regular.ttf")
+    }
+
+    /// The grow-only inline height room follows the glyphs that ACTUALLY carry
+    /// the stretch, on their OWN face, not the face of the line's first glyph.
+    ///
+    /// A tall `<stretching>` span can sit on an inline `<font=…>` or on a
+    /// fallback face whose letters reach higher than the face the line opens
+    /// with. Sizing the room from one buffer-wide face then mis-allocates the gap
+    /// above the line.
+    #[test]
+    fn inline_height_room_follows_the_stretched_glyphs_own_face() {
+        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, fontdb};
+
+        let mut db = fontdb::Database::new();
+        for path in [test_font_path(), second_test_font_path()] {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("fixture font {}: {error}", path.display()));
+            db.load_font_data(bytes);
+        }
+        let families: Vec<String> = db
+            .faces()
+            .filter_map(|face| face.families.first().cloned().map(|(name, _)| name))
+            .collect();
+        assert_eq!(families.len(), 2, "two fixture faces expected: {families:?}");
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+
+        let em = 36.0f32;
+        // Ink rise above the baseline of the glyphs each face draws for `text`,
+        // measured the way `InlineHeightRoom::measure` measures it.
+        let ink_rise = |font_system: &mut FontSystem, family: &str, text: &str| -> f32 {
+            let mut probe = Buffer::new(font_system, Metrics::new(em, em));
+            probe.set_size(font_system, None, None);
+            let attrs = Attrs::new()
+                .family(Family::Name(family))
+                .metrics(Metrics::new(em, em));
+            probe.set_text(font_system, text, &attrs, Shaping::Advanced);
+            probe.shape_until_scroll(font_system, false);
+            let glyphs: Vec<_> = probe
+                .layout_runs()
+                .flat_map(|run| run.glyphs.to_vec())
+                .collect();
+            let mut cache = crate::vector::OutlineCache::new();
+            glyphs
+                .iter()
+                .filter_map(|glyph| {
+                    crate::glyph_blit::resolve_outline_for_glyph(
+                        font_system,
+                        &mut cache,
+                        glyph,
+                        None,
+                    )
+                })
+                .map(|outline| (-outline.local_bbox().0[1]).max(0.0))
+                .fold(0.0f32, f32::max)
+        };
+        let opening_rise = ink_rise(&mut font_system, &families[0], "Ab");
+        let stretched_rise = ink_rise(&mut font_system, &families[1], "Cd");
+        assert!(
+            (stretched_rise - opening_rise).abs() > 0.5,
+            "the two fixture faces must draw visibly different ink heights, or this \
+             test cannot tell the two implementations apart \
+             ({opening_rise} vs {stretched_rise})"
+        );
+
+        // `Cd` is stretched to 300% AND shaped in the second face; `Ab` opens the
+        // line in the first face, exactly the mixed-face case.
+        let parsed = crate::inline_styles::parse_inline_style_tags(
+            "Ab<stretching=100%,300%>Cd</stretching>",
+            em,
+        );
+        assert_eq!(parsed.plain_text, "AbCd");
+
+        let opening_attrs = Attrs::new()
+            .family(Family::Name(families[0].as_str()))
+            .metrics(Metrics::new(em, em));
+        let stretched_attrs = Attrs::new()
+            .family(Family::Name(families[1].as_str()))
+            .metrics(Metrics::new(em, em));
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(em, em));
+        buffer.set_size(&mut font_system, None, None);
+        buffer.set_rich_text(
+            &mut font_system,
+            [("Ab", opening_attrs.clone()), ("Cd", stretched_attrs)],
+            &opening_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let mut params = base_params();
+        params.font_size_px = em;
+        params.enable_inline_style_tags = true;
+        let offsets = super::compute_layout_line_offsets(parsed.plain_text.as_str());
+        let room = super::InlineHeightRoom::measure(
+            &params,
+            &buffer,
+            &mut font_system,
+            offsets.as_slice(),
+            Some(parsed.spans.as_slice()),
+        );
+
+        // 300% against a 100% global height leaves an excess multiplier of 2.0.
+        let excess = 2.0f32;
+        assert!(
+            (room.above(0) - stretched_rise * excess).abs() <= 1e-3,
+            "the room must come from the STRETCHED glyphs' own face: {} vs {}",
+            room.above(0),
+            stretched_rise * excess
+        );
+        // The exact regression: sizing the room from the line's opening face.
+        assert!(
+            (room.above(0) - opening_rise * excess).abs() > 1e-3,
+            "sizing the room from the line's opening face is wrong ({} vs the \
+             opening face's {})",
+            room.above(0),
+            opening_rise * excess
+        );
+    }
+
+    /// A PARTIAL inline `<stretching>` height span never re-spaces its line, and
+    /// the grow-only room lands on the gap ABOVE the tagged line and nowhere else.
+    ///
+    /// Entry `i` is the extra advance of the gap below line `i` — the gap ABOVE
+    /// line `i+1` — so it must grow by line `i+1`'s ink rise and by nothing else.
+    /// Feeding an exact `InlineHeightRoom` pins that pairing without a shaped
+    /// buffer; the measurement itself is covered by
+    /// `inline_height_room_*` and the end-to-end tests.
+    #[test]
+    fn inline_height_span_grows_the_line_advance_and_never_shrinks_it() {
+        let mut params = base_params();
+        params.enable_inline_style_tags = true;
+        let font_size_px = params.font_size_px;
+        let no_room = super::InlineHeightRoom::default();
+
+        let advance_table = |text: &str, room: &super::InlineHeightRoom| -> Vec<f32> {
+            let parsed = crate::inline_styles::parse_inline_style_tags(text, font_size_px);
+            let offsets = super::compute_layout_line_offsets(parsed.plain_text.as_str());
+            super::line_baseline_advance_table(
+                &params,
+                parsed.plain_text.as_str(),
+                offsets.as_slice(),
+                Some(parsed.spans.as_slice()),
+                font_size_px,
+                0.0,
+                room,
+            )
+        };
+
+        let plain = advance_table("AB\nCD\nEF", &no_room);
+        assert_eq!(plain.len(), 3, "three layout lines: {plain:?}");
+
+        // Half the height on half of line 1 asks for no room, and the spacing
+        // table itself must not react to the stretch tag either.
+        let shrunk = advance_table("A<stretching=100%,50%>B</stretching>\nCD\nEF", &no_room);
+        assert_eq!(shrunk, plain, "a partial 50% span must not re-space the line");
+
+        // A tall span on line 1 (index 0) asks for room ABOVE line 1 — a gap that
+        // does not exist — so NO gap moves. This is the user-reported defect: the
+        // distance to the line BELOW a stretched line must not grow.
+        let first_line = super::InlineHeightRoom::from_above(vec![26.0, 0.0, 0.0]);
+        let tall_first = advance_table("A<stretching=100%,200%>B</stretching>\nCD\nEF", &first_line);
+        assert_eq!(
+            tall_first, plain,
+            "a tall span must not widen the gap BELOW its own line: {tall_first:?} vs {plain:?}"
+        );
+
+        // The same span on line 2 (index 1) grows the gap ABOVE it, entry 0, by
+        // that line's ink rise — and only that entry.
+        let second_line = super::InlineHeightRoom::from_above(vec![0.0, 26.0, 0.0]);
+        let tall_second =
+            advance_table("AB\nC<stretching=100%,200%>D</stretching>\nEF", &second_line);
+        assert!(
+            (tall_second[0] - plain[0] - 26.0).abs() <= 1e-3,
+            "gap above the tagged line must grow by its ink rise: {tall_second:?}"
+        );
+        assert!(
+            (tall_second[1] - plain[1]).abs() <= 1e-3,
+            "the gap below the tagged line must not move: {tall_second:?} vs {plain:?}"
+        );
+    }
+
+    /// Baseline-to-baseline advance between the two ink bands of a two-line
+    /// render. Every text here uses glyphs without descenders, so each band's
+    /// bottom row IS that line's baseline.
+    fn two_line_baseline_advance(text: &str) -> usize {
+        let mut params = base_params();
+        params.enable_inline_style_tags = true;
+        params.width_px = 512;
+        params.text = text.to_string();
+        let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
+            panic!("render_next should render the two-line height case: {error}")
+        });
+        let bands = ink_row_bands(&rendered);
+        assert_eq!(bands.len(), 2, "two separated text lines expected for {text:?}: {bands:?}");
+        bands[1].1 - bands[0].1
+    }
+
+    /// End-to-end: an inline `<stretching>` height span grows the gap ABOVE its
+    /// own line and NOTHING else.
+    ///
+    /// Two separate defects are pinned here, both user-reported.
+    /// - A 50 % span used to drive the whole line's spacing through
+    ///   `effective_spacing_percent`, pulling line 2 up by `font_size * 0.5`
+    ///   (72 -> 54 px here) until the ink bands merged.
+    /// - A 200 % span used to widen the gap BELOW its line as well, by the face
+    ///   descent (72 -> 80 px). The rule is upward-only now: the gap below a
+    ///   stretched line must be byte-identical to the untagged render, and a
+    ///   stretched descender is allowed to reach into it (see `InlineHeightRoom`).
+    #[test]
+    fn inline_height_span_grows_only_the_gap_above_its_own_line() {
+        let plain = two_line_baseline_advance("H H\nH H");
+
+        // Line 1 tagged: the gap BELOW it must not move, in either direction.
+        let shrunk_below = two_line_baseline_advance("H <stretching=100%,50%>H</stretching>\nH H");
+        let tall_below = two_line_baseline_advance("H <stretching=100%,200%>H</stretching>\nH H");
+        assert_eq!(
+            shrunk_below, plain,
+            "a partial 50% span must leave the gap below its line alone ({shrunk_below} vs {plain})"
+        );
+        assert_eq!(
+            tall_below, plain,
+            "a partial 200% span must NOT widen the gap below its line ({tall_below} vs {plain})"
+        );
+
+        // Line 2 tagged: the gap ABOVE it grows, by the glyph's ink rise. `H` is a
+        // cap-height glyph (~0.717 em = 25.8 px at 36 px), so the advance lands
+        // near 72 + 26; the face ascent (~32.6 px) would overshoot to ~105.
+        let tall_above = two_line_baseline_advance("H H\nH <stretching=100%,200%>H</stretching>");
+        assert!(
+            tall_above > plain,
+            "a 200% span must grow the gap above its line ({tall_above} vs {plain})"
+        );
+        assert!(
+            tall_above.abs_diff(plain + 26) <= 2,
+            "the growth must be the cap-height ink rise, not the face ascent \
+             ({tall_above} vs ~{} expected; the face-ascent rule overshot to ~{})",
+            plain + 26,
+            plain + 33
+        );
+    }
+
+    /// The room grows by the glyphs' REAL INK rise, not by the face `ascent`.
+    ///
+    /// A face's `ascent` includes headroom far above the ink of most lines, so
+    /// scaling it made the gap grow visibly faster than the letters did — the
+    /// user-reported "the distance to the line above grows a bit faster than the
+    /// character height". A line of x-height-only glyphs is where the two numbers
+    /// diverge most: `x` tops out around 0.53 em against a ~0.9 em ascent.
+    #[test]
+    fn inline_height_room_grows_by_real_ink_not_face_ascent() {
+        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, fontdb};
+
+        let mut db = fontdb::Database::new();
+        let bytes = std::fs::read(test_font_path()).expect("fixture font bytes");
+        db.load_font_data(bytes);
+        let family = db
+            .faces()
+            .next()
+            .and_then(|face| face.families.first().cloned())
+            .map(|(name, _language)| name)
+            .expect("fixture family name");
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+
+        let em = 36.0f32;
+        let attrs = Attrs::new()
+            .family(Family::Name(family.as_str()))
+            .metrics(Metrics::new(em, em));
+
+        // `xx` with the SECOND `x` stretched to 200%.
+        let parsed = crate::inline_styles::parse_inline_style_tags(
+            "x<stretching=100%,200%>x</stretching>",
+            em,
+        );
+        assert_eq!(parsed.plain_text, "xx");
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(em, em));
+        buffer.set_size(&mut font_system, None, None);
+        buffer.set_text(&mut font_system, parsed.plain_text.as_str(), &attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        // The two candidate measurements for the same glyph, side by side.
+        let glyphs: Vec<_> = buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.to_vec())
+            .collect();
+        let glyph = glyphs.first().expect("a shaped `x`");
+        let mut outline_cache = crate::vector::OutlineCache::new();
+        let ink_rise = crate::glyph_blit::resolve_outline_for_glyph(
+            &mut font_system,
+            &mut outline_cache,
+            glyph,
+            None,
+        )
+        .map(|outline| (-outline.local_bbox().0[1]).max(0.0))
+        .expect("`x` has an outline");
+        let face_ascent = font_system
+            .get_font(glyph.font_id)
+            .map(|font| font.as_swash().metrics(&[]).scale(em).ascent)
+            .expect("fixture face metrics");
+        assert!(
+            face_ascent - ink_rise > 10.0,
+            "the fixture must keep ink rise and face ascent far apart, or this test \
+             cannot tell the two rules apart ({ink_rise} vs {face_ascent})"
+        );
+
+        let mut params = base_params();
+        params.font_size_px = em;
+        params.enable_inline_style_tags = true;
+        let offsets = super::compute_layout_line_offsets(parsed.plain_text.as_str());
+        let room = super::InlineHeightRoom::measure(
+            &params,
+            &buffer,
+            &mut font_system,
+            offsets.as_slice(),
+            Some(parsed.spans.as_slice()),
+        );
+
+        // 200% against a 100% global height leaves an excess multiplier of 1.0.
+        assert!(
+            (room.above(0) - ink_rise).abs() <= 1e-3,
+            "the room must be the glyph's ink rise: {} vs {ink_rise}",
+            room.above(0)
+        );
+        assert!(
+            room.above(0) < face_ascent - 10.0,
+            "the room must NOT be the face ascent: {} vs {face_ascent}",
+            room.above(0)
+        );
+    }
+
+    /// Several height tags on ONE line ask for the LARGEST rise among them, never
+    /// for their sum.
+    ///
+    /// Two 150 % spans must space exactly like one, and any mix must space
+    /// exactly like its tallest member alone — wherever that member sits in
+    /// reading order, so a "last span wins" rule (the shape of the original
+    /// whole-line spacing defect) is caught as well as a summing one. All texts
+    /// use `x`, whose ink rise is ~19 px at 36 px: a sum of three spans would
+    /// overshoot the single-span advance by tens of px, far outside the 1 px
+    /// rasterization tolerance.
+    #[test]
+    fn several_height_spans_on_one_line_take_the_maximum_not_the_sum() {
+        let plain = two_line_baseline_advance("x x\nx x");
+        let single_200 =
+            two_line_baseline_advance("x x\nx <stretching=100%,200%>x</stretching> x x");
+        assert!(
+            single_200 > plain,
+            "a 200% span must grow the gap above its line ({single_200} vs {plain})"
+        );
+
+        // Two spans, the larger first and then last.
+        for text in [
+            "x x\nx <stretching=100%,200%>x</stretching> <stretching=100%,150%>x</stretching> x",
+            "x x\nx <stretching=100%,150%>x</stretching> <stretching=100%,200%>x</stretching> x",
+        ] {
+            assert_eq!(
+                two_line_baseline_advance(text),
+                single_200,
+                "two spans must space like their tallest alone, not like their sum: {text:?}"
+            );
+        }
+
+        // Three spans, the largest first, in the middle and last: a sum and a max
+        // can coincide on two equal values but never on three distinct ones.
+        for text in [
+            "x x\nx <stretching=100%,200%>x</stretching> <stretching=100%,150%>x</stretching> <stretching=100%,120%>x</stretching>",
+            "x x\nx <stretching=100%,120%>x</stretching> <stretching=100%,200%>x</stretching> <stretching=100%,150%>x</stretching>",
+            "x x\nx <stretching=100%,120%>x</stretching> <stretching=100%,150%>x</stretching> <stretching=100%,200%>x</stretching>",
+        ] {
+            assert_eq!(
+                two_line_baseline_advance(text),
+                single_200,
+                "three spans must space like their tallest alone, not like their sum: {text:?}"
+            );
+        }
+
+        // Two EQUAL spans must also space like one of them.
+        let one_150 = two_line_baseline_advance("x x\nx <stretching=100%,150%>x</stretching> x x");
+        let two_150 = two_line_baseline_advance(
+            "x x\nx <stretching=100%,150%>x</stretching> <stretching=100%,150%>x</stretching> x",
+        );
+        assert_eq!(
+            two_150, one_150,
+            "two identical spans must space exactly like one ({two_150} vs {one_150})"
+        );
+        assert!(
+            one_150 < single_200,
+            "a 150% span must ask for less room than a 200% one ({one_150} vs {single_200})"
+        );
+    }
+
+    /// The GLOBAL `glyph_height_percent` is anchored at the baseline too.
+    ///
+    /// It is the same defect, only harder to see: with a box-centre pivot every
+    /// glyph drifted by its OWN centre-to-baseline distance, so `H` and `.` ended
+    /// up on different baselines (measured 13 vs 18 at 50 %). Glyphs with very
+    /// different ink boxes must keep ONE shared bottom row at any height.
+    #[test]
+    fn global_glyph_height_keeps_one_shared_baseline() {
+        for height_percent in [50.0f32, 200.0] {
+            let mut params = base_params();
+            params.width_px = 512;
+            params.glyph_height_percent = height_percent;
+            params.text = "H .".to_string();
+
+            let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
+                panic!("render_next should render the global height case: {error}")
+            });
+            let clusters = ink_column_clusters(&rendered);
+            assert_eq!(
+                clusters.len(),
+                2,
+                "`H` and `.` must stay separate at {height_percent}%: {clusters:?}"
+            );
+            let delta = clusters[1].3 as i64 - clusters[0].3 as i64;
+            assert!(
+                delta.abs() <= 1,
+                "`H` and `.` must share one ink bottom row at {height_percent}% (delta {delta}): {clusters:?}"
+            );
+        }
     }
 
     #[test]

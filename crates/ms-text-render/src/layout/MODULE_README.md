@@ -66,6 +66,18 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
   canvas, overlay, or storage state from layout code.
 - The request's `layout_text`, `layout_line_offsets`, inline spans, and line spacing
   table must describe the same normalized text prepared by `pipeline.rs`.
+- `line_extra_spacing_table` entries are COLUMN GAPS here, not baseline advances. This
+  path therefore takes the plain `pipeline::compute_line_extra_spacing_table` and never
+  `line_baseline_advance_table`, whose grow-only ink-rise room is meaningless for
+  a horizontal gap. Since an inline `<stretching>` height span no longer feeds that
+  table at all, scaling one character can no longer widen the whole column gap. A
+  TALLER glyph does still widen its own CELL — `measure_vertical_glyph_visual_width`
+  sizes a cell by its scaled ink extent — and that is cell width, not gap.
+- A vertical cell places its glyph by its own ink BOX, not on a shared baseline: the
+  cell step already follows the scaled ink height (`vertical_step_follows_glyph_ink_height`),
+  so this path keeps the box-centre `GlyphScaleSettings::scaled_rect` while the
+  baseline-laid horizontal paths use `scaled_rect_about_baseline`. Bounds and the
+  bitmap blit must keep picking the SAME one.
 - Vertical wrapping and paragraph splitting belong in `wrap/vertical.rs`; this module
   must not introduce independent word-wrap policy.
 - `VerticalLineDirection` controls column ordering only. Glyph raster semantics should

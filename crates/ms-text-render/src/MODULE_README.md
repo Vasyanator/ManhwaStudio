@@ -589,6 +589,68 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   then snaps the shared band top(-1)/center(0)/baseline(+1). Gated to
   `CustomVectorLines`; the panel defaults NEW text to `LineBox`, old projects load
   as `GlyphHeight`. Unit-tested by `line_box_reference_shares_one_baseline_across_glyph_heights`.
+- GLYPH HEIGHT SCALE IS ANCHORED AT THE BASELINE. The vertical glyph scale — the
+  global `TextRenderParams.glyph_height_percent` and the per-character inline tag
+  `<stretching=W%,H%>` alike — maps the run's pen BASELINE to itself: a scaled glyph
+  keeps its baseline exactly where an unscaled glyph of the same run would sit and
+  only its ink extent changes. `GlyphScaleSettings::scaled_center_about_baseline`
+  (and its rect form `scaled_rect_about_baseline`) is the single source of that
+  anchor; every baseline-laid consumer must use it — the outline draw pivot, the
+  bitmap-fallback blit, the canvas bounds, the extra-info sample boxes and the
+  optical ink measurement — or the canvas box drifts away from the drawn ink.
+  `GlyphScaleSettings::scaled_rect` keeps the box-centre anchor and is for the
+  paths that place a glyph in a CELL instead (the vertical columns, whose cell step
+  already follows the scaled ink height) and for callers that read only the scaled
+  SIZE. A box-centre anchor on baseline-laid text lifts each glyph by
+  `(glyph_h / 2 − placement_top) · (1 − height_mul)`, which differs per glyph, so a
+  partially scaled word floats and glyphs with unlike ink boxes (`H` vs `.`) end up
+  on different baselines. Unit-tested by
+  `inline_height_scale_keeps_glyphs_on_the_line_baseline` and
+  `global_glyph_height_keeps_one_shared_baseline`.
+  - LINE SPACING IS A WHOLE-TEXT RULE, NOT A PER-SPAN ONE. Only the GLOBAL
+    `glyph_height_percent` is coupled to line spacing (`effective_spacing_percent`,
+    `spacing% = clamp(line_spacing% + (glyph_height% − 100), ±300)`; specified in
+    `ms-tab-typing/src/panel/MODULE_README.md` and mirrored by the form search).
+    A per-character `<stretching>` span is NOT a statement about the line and must
+    never enter `compute_line_extra_spacing_table` — letting it in re-spaced the
+    whole line (and, on the vertical path, the whole COLUMN GAP) because one word
+    was scaled. What a TALL span gets instead is grow-only room, added by
+    `line_baseline_advance_table`, under three rules that are product decisions,
+    not implementation accidents — do not "simplify" any of them away:
+    - UPWARD ONLY. A tall span enlarges the gap ABOVE its own line and nothing
+      else; the gap BELOW it is byte-identical to the untagged render. A large
+      multiplier therefore pushes a stretched descender (`р`, `у`, `д`) further
+      down, where it may crowd the following line. That is ACCEPTED: the author
+      raises the line spacing if they want the room. Symmetric growth was tried
+      and rejected — it moved text the author had not tagged.
+    - REAL INK, NOT THE FACE `ascent`. The room is the glyph outline's own extent
+      above the baseline (`Outline::local_bbox`, whose frame puts `y = 0` on the
+      baseline), at the glyph's own em, from the glyph's OWN face and faux
+      variant — the same resolvers the draw pass rasterizes, so the measured side
+      is the drawn side. `ascent` carries headroom far above the ink of most
+      lines (x-height glyphs top out near 0.53 em against a ~0.9 em ascent), and
+      scaling it made the gap grow visibly faster than the letters did. An
+      outline-less glyph (color/emoji, embedded bitmap) falls back to its face
+      ascent: an over-allocation, the safe side of a grow-only rule, and cheaper
+      than rasterizing it here just to measure.
+    - MAXIMUM, NEVER A SUM. Several height tags on one line ask for the largest
+      rise among them: two 150 % spans space exactly like one, and a 150 % span
+      beside a 200 % one spaces exactly like the 200 % alone, wherever the larger
+      one sits in reading order.
+    The room is `max(0, height_mul − global_height_mul)` times that ink rise,
+    maxed per line (`InlineHeightRoom::measure`, over the SHAPED buffer, looking
+    up only the glyphs that actually carry an excess). A span asking for LESS
+    height than the global parameter changes no spacing at all, so the line box
+    can grow but never shrink. The vertical path reads the same entries as column
+    gaps and therefore keeps the plain `compute_line_extra_spacing_table` — a cell
+    there is sized by its own scaled ink extent, which is the cell WIDTH, not the
+    gap.
+  - Every consumer of `line_baseline_advance_table` must pass
+    `compute_horizontal_line_baselines` the REAL default extra line spacing, never
+    `table.first()`: grow room landing in entry 0 would otherwise be subtracted
+    from every later gap in the `has_inline_size_overrides` branch, pulling lines
+    closer and breaking the grow-only rule exactly when `<size>` and a tall
+    `<stretching>` are mixed.
 - Faux bold/italic (`TextRenderParams.faux_bold: Option<FauxBoldParams>`,
   `faux_italic_slant_deg: Option<f32>`): synthetic styles applied to the VECTOR
   outline instead of switching faces. They take effect ONLY together with the
@@ -860,7 +922,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (`build_horizontal_placement`) reused for both the bounds box (via
   `include_scaled_rect_bounds` on the swash bitmap placement box) and the draw pass
   (`draw_horizontal_placement`); the inline-rotated path collects
-  `RotatedGlyphPlacement` the same way. Horizontal monochrome glyphs rasterize from
+  `RotatedGlyphPlacement` the same way. Both take their scaled box from
+  `GlyphScaleSettings::scaled_rect_about_baseline` /
+  `scaled_center_about_baseline` — bounds, blit and pivot must never pick different
+  vertical anchors (see the GLYPH HEIGHT SCALE contract). Horizontal monochrome glyphs rasterize from
   outlines via `glyph_blit::glyph_outline_transform`; the outline->world pivot lives
   in `glyph_blit.rs`, not here.
 - Kerning-mode contract (`KerningMode`, `types.rs`): `Auto` (user label "Авто")
