@@ -1287,6 +1287,53 @@ because a screenshot looked plausible.
 
 ---
 
+## Test hygiene: what a test may touch
+
+Binding for every test in this workspace — unit tests, integration tests and helper scripts
+alike. A test suite must be runnable on a fresh clone, on any machine, in any order, and must
+leave the working tree exactly as it found it.
+
+- **A test must NEVER write to a real config, database or document that the running program
+  reads or writes.** `user_config.json`, `fonts/fonts_data.json`, `fonts/presets.json`, the
+  locale files under `locale/`, a project's `_unsaved/` staging directory, the OS credential
+  store — all of them are the USER's data on a developer machine, and a test that writes one
+  corrupts real work. A process-global store that persists to such a document must suppress
+  persistence for the whole test process. **`cfg!(test)` alone is NOT a sufficient
+  suppression**: it is false when the crate is linked into ANOTHER crate's test binary, which
+  is where the store then writes for real. `font_settings_store::persistence_suppressed_by_tests`
+  is the reference implementation — `cfg!(test)` OR a sticky runtime latch armed by the
+  test-only doors (`test_lock` / `test_reset`). A `cfg!(feature = "test-support")` gate is not
+  a substitute: `cargo build --all-targets` unifies dev-dependency features into the binary it
+  produces, which would silently disable persistence in a runnable build.
+
+- **Depending on an UNTRACKED file is strongly discouraged.** A fresh clone does not have it,
+  so such a test only means something on the machine that created the file. When it is truly
+  unavoidable, the test must SKIP cleanly on absence — detect the missing file, log one line
+  and return — and must never fail, `unwrap` or `expect` its way into a red suite.
+
+- **Depending on a file OUTSIDE the repository is worse still.** It is acceptable only as
+  scratch work inside an agent's own working session. Before that work is reported finished
+  such a test is either deleted, or was written from the start as a local, untracked,
+  out-of-tree probe kept away from the main sources. It never reaches tracked code.
+
+- **A test leaves no files behind by default.** Scratch data goes to a uniquely named path
+  under `std::env::temp_dir()` and is removed by the test itself; nothing is written inside the
+  repository. Keeping artefacts is allowed only when the run explicitly asks for it (an env var
+  or CLI flag), and that must be off by default. The check is mechanical: after a full test
+  run, `git status --short` is empty and no new file appeared anywhere in the tree.
+
+- **No absolute path, and no path leading outside the repository, may appear in tracked
+  code.** Tracked sources, tests, docs and scripts address files repo-relative, or through the
+  existing resolvers (`resolve_fonts_dir()`, `ms_config::program_dir()`, `std::env::temp_dir()`).
+  A literal naming a developer's own machine — `/home/<user>/…`, `C:\Users\…`, a checkout
+  path — is a defect regardless of whether it works where it was written; machine-local notes
+  belong in `dev-docs/`, not in code. Exactly two things are NOT covered by this ban, and
+  nothing else is: a platform-fixed location the OS itself defines (the system-font table in
+  `ms-widgets/src/ui_fonts.rs` is the standing example), and a path-shaped string used purely
+  as opaque TEST DATA that no code ever opens — a legacy-config key, a serialization fixture.
+  The second kind must be plainly fictional (`/home/u/…`, `/Users/alice/…`); a real path
+  copied off a machine is never acceptable, even as a fixture.
+
 ## Что важно не ломать
 
 - **GUI-поток** — никакого I/O, декодирования изображений, сети, длительных вычислений.

@@ -32,7 +32,10 @@ Main responsibilities:
 - bump ONE shared monotonic revision on every real mutation so a poller can detect it;
 - persist the full state off the GUI thread after any mutation, SERIALIZED via `save_lock`
   and snapshotted afresh inside the writer thread so concurrent mutations coalesce to the
-  newest state and never race on the shared temp file.
+  newest state and never race on the shared temp file;
+- suppress persistence entirely in a TEST process (`persistence_suppressed_by_tests`), so no
+  test binary — this crate's own or another crate's — can write the developer's real
+  `fonts/fonts_data.json`.
 
 Key functions:
 - `imported_system_fonts` / `system_font_identity_for_path` / `learn_system_font_identity` /
@@ -144,6 +147,45 @@ fn save_lock() -> &'static Mutex<()> {
 fn debounced_save_scheduled() -> &'static AtomicBool {
     static SCHEDULED: AtomicBool = AtomicBool::new(false);
     &SCHEDULED
+}
+
+/// `true` once this process has been identified as a TEST process, after which no writer
+/// thread is ever spawned and nothing reaches the real `fonts/fonts_data.json`.
+///
+/// WHY A RUNTIME LATCH AND NOT `cfg!(test)` ALONE. `cfg!(test)` is true only while THIS
+/// crate is compiled as its own test target. Another crate's test binary — the binary's
+/// settings-UI tests, which reach this store through the `font_admin` facade and the
+/// `test-support` feature — links this crate as a PLAIN dependency, where `cfg!(test)` is
+/// false: every mutation there spawned a real writer thread aimed at the developer's own
+/// `fonts/fonts_data.json`, and each test process died mid-write, leaving one orphaned
+/// `.fonts_data.json.<pid>.tmp` behind per run. A won race would have overwritten the real
+/// document with test fixtures instead (the baseline is `Unchecked` after a reset, so the
+/// optimistic-concurrency guard accepts it).
+///
+/// A `cfg!(feature = "test-support")` gate would not be safe either: `cargo build
+/// --all-targets` unifies dev-dependency features into the binary it produces, so a normal
+/// run of `target/debug/manhwastudio_rs` would silently stop persisting anything. The latch
+/// is therefore armed at RUNTIME, by [`test_lock`] and [`test_reset`] — the only doors into
+/// this store a test has — and never cleared: a test process stays a test process.
+fn test_process_latch() -> &'static AtomicBool {
+    static LATCH: AtomicBool = AtomicBool::new(false);
+    &LATCH
+}
+
+/// Marks this process as a test process; see [`test_process_latch`]. Test-only and sticky.
+#[cfg(any(test, feature = "test-support"))]
+fn arm_test_process_latch() {
+    test_process_latch().store(true, Ordering::Release);
+}
+
+/// Whether persistence must be suppressed because this process is running tests.
+///
+/// `cfg!(test)` covers this crate's own tests (which never take [`test_lock`]); the latch
+/// covers every OTHER crate's test binary. Both are checked on every writer path, so no
+/// test process can write to the real fonts directory.
+#[must_use]
+fn persistence_suppressed_by_tests() -> bool {
+    cfg!(test) || test_process_latch().load(Ordering::Acquire)
 }
 
 /// `true` once a corrupt `fonts_data.json` could NOT be moved aside.
@@ -329,11 +371,12 @@ fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
 
 /// Persists the store to `fonts_data.json` off the GUI thread, immediately.
 ///
-/// Under `#[cfg(test)]` the body early-returns before spawning, so unit tests never write to
-/// disk; the save recipe itself is covered by `fonts_data`'s tests.
+/// In a TEST process the body early-returns before spawning, so no test ever writes to the
+/// real fonts directory (see [`persistence_suppressed_by_tests`]); the save recipe itself is
+/// covered by `fonts_data`'s tests.
 fn persist_off_thread() {
     // Tests never touch the real fonts dir; bail before spawning the writer thread.
-    if cfg!(test) {
+    if persistence_suppressed_by_tests() {
         return;
     }
     let fonts_dir = resolve_fonts_dir();
@@ -363,7 +406,7 @@ fn persist_off_thread_debounced() {
     // Tests never touch the real fonts dir, but the SCHEDULED flag is still set above: it is
     // the "a write is owed" state `flush_pending_saves` acts on, and a test that could not
     // observe it could not cover the exit flush at all.
-    if cfg!(test) {
+    if persistence_suppressed_by_tests() {
         return;
     }
     let fonts_dir = resolve_fonts_dir();
@@ -403,14 +446,14 @@ pub(crate) fn pending_debounced_save() -> bool {
 /// and no thread that would outlive the call; the work is one atomic write of a small JSON
 /// document, the same one the debounced writer would have done.
 ///
-/// Under `#[cfg(test)]` the flag is cleared but nothing is written (the process-global store
-/// must never touch the real fonts dir from a test); the write recipe itself is covered by
-/// `fonts_data`'s tests.
+/// In a TEST process the flag is cleared but nothing is written (the process-global store
+/// must never touch the real fonts dir from a test — see [`persistence_suppressed_by_tests`]);
+/// the write recipe itself is covered by `fonts_data`'s tests.
 pub(crate) fn flush_pending_saves() -> bool {
     if !debounced_save_scheduled().swap(false, Ordering::AcqRel) {
         return false;
     }
-    if cfg!(test) {
+    if persistence_suppressed_by_tests() {
         return true;
     }
     save_snapshot_now(&resolve_fonts_dir());
@@ -1571,6 +1614,11 @@ fn migrate_legacy_imported_fonts(fonts_dir: &Path) -> fonts_data::FontsData {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Taking this lock is the contract every store test already follows, which makes it the
+    // one place that reliably observes "a test is about to touch the process-global store".
+    // Arming here is what keeps ANOTHER crate's test binary from writing the developer's
+    // real `fonts/fonts_data.json`; see `test_process_latch`.
+    arm_test_process_latch();
     TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1583,6 +1631,9 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Callers must hold [`test_lock`]. Test-only.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_reset() {
+    // Armed here as well as in `test_lock`: a reset is the other door a test uses, and the
+    // latch must be set BEFORE the mutations that follow it can spawn a writer thread.
+    arm_test_process_latch();
     let mut guard = match store().write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1630,6 +1681,31 @@ mod tests {
 
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
         test_lock()
+    }
+
+    /// The test-process latch must be armed by the doors a test uses, and must stay armed.
+    ///
+    /// `cfg!(test)` is false when this crate is linked into ANOTHER crate's test binary,
+    /// which is exactly where every mutation used to spawn a writer aimed at the developer's
+    /// real `fonts/fonts_data.json`. There the latch is the only thing standing between a
+    /// test and the user's document, so its arming is a contract, not an implementation
+    /// detail.
+    #[test]
+    fn the_test_doors_arm_the_test_process_latch() {
+        let _lock = lock_tests();
+        assert!(
+            test_process_latch().load(Ordering::Acquire),
+            "taking the test lock must mark this process as a test process"
+        );
+        reset_store();
+        assert!(
+            test_process_latch().load(Ordering::Acquire),
+            "the latch is sticky: a reset must not clear it"
+        );
+        assert!(
+            persistence_suppressed_by_tests(),
+            "with the latch armed, no writer path may reach the real fonts directory"
+        );
     }
 
     /// Installs a legacy (v1) store state directly, as `seed_imported_system_fonts_from_config`

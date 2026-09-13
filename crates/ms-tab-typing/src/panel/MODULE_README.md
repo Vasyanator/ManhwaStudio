@@ -53,6 +53,21 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   - a corrupt document that could NOT be quarantined disables persistence for the session.
     `quarantine_bad_file` tries `rename` → `copy` → `QuarantineOutcome::Failed`; only on
     `Failed` is the original still the sole copy, and then nothing may rename over it.
+- **NO TEST PROCESS MAY REACH THE REAL DOCUMENT.** Every writer path in
+  `font_settings_store` (`persist_off_thread`, `persist_off_thread_debounced`,
+  `flush_pending_saves`) returns early when `persistence_suppressed_by_tests()` holds. That
+  predicate is `cfg!(test) || test_process_latch()`, and BOTH halves are needed: `cfg!(test)`
+  covers this crate's own tests, while the runtime latch — armed by `test_lock` / `test_reset`,
+  sticky for the process — covers ANOTHER crate's test binary, which links this crate as a
+  plain dependency where `cfg!(test)` is false. That was a real defect: the binary's
+  settings-UI tests spawned genuine writer threads at the developer's own
+  `fonts/fonts_data.json`, each test process died mid-write and left one orphaned
+  `.fonts_data.json.<pid>.tmp` per run, and a won race would have replaced the document with
+  test fixtures (the baseline is `Unchecked` after a reset, so the conflict guard accepts it).
+  A `cfg!(feature = "test-support")` gate is NOT a substitute: `cargo build --all-targets`
+  unifies dev-dependency features into the binary it produces, which would silently disable
+  persistence in a runnable build. The boundary is covered by
+  `font_groups::tests::store_mutations_never_touch_the_real_fonts_directory` in the binary.
 - **SCHEMA 2 — the font is named by its IDENTITY, never by a path.**
   ```jsonc
   { "version": 2,

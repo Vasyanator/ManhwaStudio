@@ -2135,6 +2135,74 @@ fn pick_font_card_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Sorted names of everything directly inside `dir`, or `None` when the directory does
+    /// not exist. Used to assert that a test left the real fonts directory byte-identical:
+    /// a stray writer shows up either as a new entry or as a directory created from nothing
+    /// (`fonts_data::save_checked` calls `create_dir_all` before it writes).
+    fn dir_entry_names(dir: &Path) -> Option<Vec<String>> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort_unstable();
+        Some(names)
+    }
+
+    /// REGRESSION. Mutating the process-global font store from THIS test binary must not
+    /// reach the developer's real `fonts/` directory.
+    ///
+    /// The store suppressed persistence with `cfg!(test)`, which is false when `ms-tab-typing`
+    /// is linked as a plain dependency — as it is here. Every mutation below therefore used to
+    /// spawn a real writer thread aimed at `fonts/fonts_data.json`; the test process exited
+    /// mid-write, leaving one orphaned `.fonts_data.json.<pid>.tmp` per run, and a won race
+    /// would have replaced the real document with these fixtures.
+    ///
+    /// The sleep is what makes the assertion meaningful: a spawned writer needs a moment to
+    /// reach the filesystem, and without it this test would race the very exit that used to
+    /// hide the defect. It costs a fixed quarter second and no flakiness in the other
+    /// direction — when nothing is spawned, nothing can ever appear.
+    #[test]
+    fn store_mutations_never_touch_the_real_fonts_directory() {
+        let _lock = font_admin::test_lock();
+        font_admin::test_reset();
+
+        // Repo-relative on purpose: this mirrors how the store itself resolves the directory
+        // (cwd + `fonts`), and no tracked source may carry an absolute path.
+        let fonts_dir = std::env::current_dir()
+            .expect("the test harness always has a working directory")
+            .join("fonts");
+        let before = dir_entry_names(&fonts_dir);
+
+        assert!(font_admin::create_virtual_group("Экшн"));
+        assert!(font_admin::add_virtual_group_member("Экшн", "A-Regular"));
+        assert!(font_admin::set_virtual_group_member_alias(
+            "Экшн",
+            "A-Regular",
+            Some("Обычный")
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // Reported as the DIFFERENCE, not as two full listings: the fonts directory holds
+        // dozens of entries, and a failure must name the file that appeared.
+        let after = dir_entry_names(&fonts_dir);
+        let appeared: Vec<&String> = match (&before, &after) {
+            (Some(before), Some(after)) => {
+                after.iter().filter(|name| !before.contains(name)).collect()
+            }
+            (None, Some(after)) => after.iter().collect(),
+            (_, None) => Vec::new(),
+        };
+        assert!(
+            appeared.is_empty(),
+            "a store mutation from a test process wrote into the real fonts directory: {appeared:?}"
+        );
+        assert!(
+            before.is_some() == after.is_some(),
+            "a store mutation from a test process created the fonts directory itself"
+        );
+        font_admin::test_reset();
+    }
+
     /// A group editor seeded on `name`, with the rename buffer prefilled to it.
     fn editor(name: &str) -> GroupEditorState {
         GroupEditorState {
