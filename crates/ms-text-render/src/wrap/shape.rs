@@ -45,7 +45,9 @@ pub(crate) struct ShapeWrapRequest<'a> {
     pub(crate) min_width_percent: f32,
     pub(crate) shape_variant: u8,
     pub(crate) allow_moderate_trees: bool,
-    pub(crate) hanging_punctuation: bool,
+    /// Hanging-punctuation strength `0.0..=1.0` (`TextRenderParams::hanging_weight`):
+    /// how much of a hanging character's width is dropped from the line's unit count.
+    pub(crate) hanging_punctuation: f32,
     pub(crate) preserve_edge_spaces: bool,
 }
 
@@ -114,7 +116,9 @@ pub(crate) fn reshape_text_for_shape(request: ShapeWrapRequest<'_>) -> LayoutTex
 
     if request.shape == TextShape::SoftPeak {
         let soft_wrap_settings = WrapSettings {
-            hanging_punctuation: true,
+            // SoftPeak forces the FULL hang regardless of the caller's strength: its
+            // target profile is built against fully hung line widths.
+            hanging_punctuation: 1.0,
             ..wrap_settings
         };
         let base_lines =
@@ -123,7 +127,7 @@ pub(crate) fn reshape_text_for_shape(request: ShapeWrapRequest<'_>) -> LayoutTex
         let targets = soft_peak_line_targets(
             base_lines.lines.as_slice(),
             base_units,
-            true,
+            1.0,
             request.shape_variant,
         );
         let balanced = wrap_text_with_targets_scored(
@@ -224,10 +228,14 @@ fn soft_peak_order_phases(line_count: usize, _variant: u8) -> Vec<ShapeMonotonic
         .collect()
 }
 
+/// Per-line unit targets of the `SoftPeak` profile.
+///
+/// `hanging_punctuation` is the hanging strength `0.0..=1.0` used to count a line's
+/// units (see `count_layout_units`); `SoftPeak` passes the full hang.
 fn soft_peak_line_targets(
     lines: &[String],
     base_units: usize,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
     variant: u8,
 ) -> Vec<usize> {
     let line_count = lines.len().max(1);
@@ -254,7 +262,10 @@ fn soft_peak_line_targets(
         .collect()
 }
 
-fn rectangle_target_units(lines: &[String], base_units: usize, hanging_punctuation: bool) -> usize {
+/// Common per-line unit target of the `Rectangle` profile: the average line length
+/// of a first, unconstrained wrap, counted at hanging strength `hanging_punctuation`
+/// (`0.0..=1.0`) and clamped into `base_units/2 ..= base_units`.
+fn rectangle_target_units(lines: &[String], base_units: usize, hanging_punctuation: f32) -> usize {
     let mut total = 0usize;
     let mut count = 0usize;
     for line in lines {
@@ -365,8 +376,8 @@ mod tests {
     #[test]
     fn soft_peak_variant_changes_target_bias_without_min_width_slider() {
         let lines = vec!["a".to_string(), "bb".to_string(), "c".to_string()];
-        let low = soft_peak_line_targets(lines.as_slice(), 10, true, 1);
-        let high = soft_peak_line_targets(lines.as_slice(), 10, true, 9);
+        let low = soft_peak_line_targets(lines.as_slice(), 10, 1.0, 1);
+        let high = soft_peak_line_targets(lines.as_slice(), 10, 1.0, 9);
 
         assert_eq!(low[1], 2);
         assert!(high[1] > low[1], "{low:?} {high:?}");

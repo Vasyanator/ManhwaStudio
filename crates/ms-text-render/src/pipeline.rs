@@ -210,12 +210,38 @@ impl KerningSettings {
     }
 }
 
+/// One laid-out horizontal run: pen positions plus the metrics alignment needs.
+///
+/// `leading_hang_px`/`trailing_hang_px` are the widths of the run's LEADING and
+/// TRAILING hanging-punctuation runs (see [`hanging_metrics_for_layout`]). They
+/// are reported raw, unweighted: the caller scales them by the hanging strength
+/// (`TextRenderParams::hanging_weight`). `glyph_xs` never depends on them — the
+/// hang is a whole-line translation, not a glyph move.
 #[derive(Debug, Clone)]
 struct HorizontalRunLayout {
     glyph_xs: Vec<f32>,
     line_width_px: f32,
-    visual_width_px: f32,
     leading_hang_px: f32,
+    trailing_hang_px: f32,
+}
+
+impl HorizontalRunLayout {
+    /// Width this line is ALIGNED by at hanging strength `weight`: the logical
+    /// width minus the weighted part of both hanging edge runs.
+    ///
+    /// Exact at the ends of the range: `weight == 0.0` returns `line_width_px`
+    /// bit for bit, `weight == 1.0` returns the fully hung visual width.
+    #[must_use]
+    fn align_width_px(&self, weight: f32) -> f32 {
+        self.line_width_px - weight * self.leading_hang_px - weight * self.trailing_hang_px
+    }
+
+    /// How far left the line origin moves at hanging strength `weight`, i.e. the
+    /// weighted part of the LEADING hang that is pushed outside the block.
+    #[must_use]
+    fn origin_shift_px(&self, weight: f32) -> f32 {
+        weight * self.leading_hang_px
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -936,14 +962,17 @@ pub fn render_text_to_image(
     let extra_active = extra_acc.is_active();
     let mut placements: Vec<HorizontalGlyphPlacement> = Vec::new();
     let mut line_idx = 0usize;
+    // Normalized once per render: `0.0` disables the hang, `1.0` is the full hang.
+    let hanging_weight = params.hanging_weight();
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
         if is_cancelled(cancel) {
             return Err("render_next render cancelled".to_string());
         }
         // Leading/trailing hanging-punctuation runs are excluded from the extra-info
-        // sampling only when hanging punctuation is enabled (see the contract).
-        let hanging_bounds = if extra_active && params.hanging_punctuation {
+        // sampling only above the strength threshold (see the contract on
+        // `TextRenderParams::excludes_hanging_from_extra_info`).
+        let hanging_bounds = if extra_active && params.excludes_hanging_from_extra_info() {
             hanging_edge_run_bounds(&run)
         } else {
             (0, run.glyphs.len())
@@ -959,23 +988,18 @@ pub fn render_text_to_image(
             mapped_inline_style_spans.as_deref(),
             font_size_px,
         );
+        // Hanging punctuation is a WEIGHT on the line, not a glyph move: the pen
+        // positions stay as shaped and only the width this line is aligned by, plus
+        // its origin, lose the weighted part of the hanging edge runs.
         let line_offset_x = horizontal_line_offset(
             width_px,
-            if params.hanging_punctuation {
-                run_layout.visual_width_px
-            } else {
-                run_layout.line_width_px
-            },
+            run_layout.align_width_px(hanging_weight),
             inline_line_aligns
                 .get(line_idx)
                 .copied()
                 .unwrap_or(params.align),
         ) as f32
-            - if params.hanging_punctuation {
-                run_layout.leading_hang_px
-            } else {
-                0.0
-            };
+            - run_layout.origin_shift_px(hanging_weight);
         let baseline_y = line_baselines.get(line_idx).copied().unwrap_or(run.line_y);
 
         for (glyph_idx, (glyph, glyph_x)) in run
@@ -1719,13 +1743,15 @@ fn render_horizontal_rotated(
     let inline_line_aligns =
         compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
     let mut line_idx = 0usize;
+    // Normalized once per render: `0.0` disables the hang, `1.0` is the full hang.
+    let hanging_weight = params.hanging_weight();
     let mut runs = buffer.layout_runs().peekable();
 
     while let Some(run) = runs.next() {
         if is_cancelled(cancel) {
             return Err("render_next render cancelled".to_string());
         }
-        let hanging_bounds = if extra_active && params.hanging_punctuation {
+        let hanging_bounds = if extra_active && params.excludes_hanging_from_extra_info() {
             hanging_edge_run_bounds(&run)
         } else {
             (0, run.glyphs.len())
@@ -1741,23 +1767,18 @@ fn render_horizontal_rotated(
             inline_style_spans,
             font_size_px,
         );
+        // Hanging punctuation is a WEIGHT on the line, not a glyph move: the pen
+        // positions stay as shaped and only the width this line is aligned by, plus
+        // its origin, lose the weighted part of the hanging edge runs.
         let line_offset_x = horizontal_line_offset(
             width_px,
-            if params.hanging_punctuation {
-                run_layout.visual_width_px
-            } else {
-                run_layout.line_width_px
-            },
+            run_layout.align_width_px(hanging_weight),
             inline_line_aligns
                 .get(line_idx)
                 .copied()
                 .unwrap_or(params.align),
         ) as f32
-            - if params.hanging_punctuation {
-                run_layout.leading_hang_px
-            } else {
-                0.0
-            };
+            - run_layout.origin_shift_px(hanging_weight);
         let baseline_y = line_baselines.get(line_idx).copied().unwrap_or(run.line_y);
 
         for (glyph_idx, (glyph, glyph_x)) in run
@@ -2195,8 +2216,8 @@ fn horizontal_run_layout(
         return HorizontalRunLayout {
             glyph_xs: Vec::new(),
             line_width_px: run.line_w,
-            visual_width_px: run.line_w,
             leading_hang_px: 0.0,
+            trailing_hang_px: 0.0,
         };
     }
 
@@ -2257,13 +2278,13 @@ fn horizontal_run_layout(
         && faux_extras.iter().all(|extra| *extra == 0.0)
     {
         let glyph_xs = run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>();
-        let (visual_width_px, leading_hang_px) =
+        let (leading_hang_px, trailing_hang_px) =
             hanging_metrics_for_layout(run, glyph_xs.as_slice(), run.line_w);
         return HorizontalRunLayout {
             glyph_xs,
             line_width_px: run.line_w,
-            visual_width_px,
             leading_hang_px,
+            trailing_hang_px,
         };
     }
 
@@ -2340,13 +2361,13 @@ fn horizontal_run_layout(
             glyph_x + faux_floored_advance(glyph.w, faux_extra)
         })
         .fold(0.0, f32::max);
-    let (visual_width_px, leading_hang_px) =
+    let (leading_hang_px, trailing_hang_px) =
         hanging_metrics_for_layout(run, glyph_xs.as_slice(), line_width_px);
     HorizontalRunLayout {
         glyph_xs,
         line_width_px,
-        visual_width_px,
         leading_hang_px,
+        trailing_hang_px,
     }
 }
 
@@ -2499,13 +2520,13 @@ fn optical_horizontal_run_layout(
         .zip(glyph_xs.iter().copied())
         .map(|(glyph, glyph_x)| glyph_x + glyph.w)
         .fold(0.0, f32::max);
-    let (visual_width_px, leading_hang_px) =
+    let (leading_hang_px, trailing_hang_px) =
         hanging_metrics_for_layout(run, glyph_xs.as_slice(), line_width_px);
     Some(HorizontalRunLayout {
         glyph_xs,
         line_width_px,
-        visual_width_px,
         leading_hang_px,
+        trailing_hang_px,
     })
 }
 
@@ -3614,13 +3635,28 @@ fn is_hanging_punctuation(ch: char) -> bool {
     )
 }
 
+/// Widths of the run's LEADING and TRAILING hanging-punctuation runs, in px.
+///
+/// Returns `(leading_hang_px, trailing_hang_px)`, both `>= 0`, measured against
+/// the pen positions `glyph_xs` (which must be one per glyph of `run`) and the
+/// run's logical `line_width_px`. Only the EDGE runs hang: punctuation between
+/// two ordinary glyphs is never counted.
+///
+/// Returns `(0.0, 0.0)` — "nothing hangs" — for an empty/mismatched run and for a
+/// DEGENERATE line whose glyphs are all hanging punctuation: hanging such a line
+/// would leave no visual width to align by, so it is aligned as if the feature
+/// were off. That guard is independent of the hanging strength, so the layout
+/// does not jump as the strength is raised.
+///
+/// The caller applies the strength (`TextRenderParams::hanging_weight`); this
+/// function knows nothing about it and never touches `glyph_xs`.
 fn hanging_metrics_for_layout(
     run: &LayoutRun<'_>,
     glyph_xs: &[f32],
     line_width_px: f32,
 ) -> (f32, f32) {
     if run.glyphs.is_empty() || glyph_xs.len() != run.glyphs.len() {
-        return (line_width_px.max(0.0), 0.0);
+        return (0.0, 0.0);
     }
 
     let mut left_boundary = glyph_xs.first().copied().unwrap_or(0.0);
@@ -3655,12 +3691,15 @@ fn hanging_metrics_for_layout(
     let left_edge = glyph_xs.first().copied().unwrap_or(0.0);
     let leading_hang_px = (left_boundary - left_edge).max(0.0);
     let trailing_hang_px = (line_width_px - right_boundary).max(0.0);
+    // The width the line would be aligned by at FULL strength. Computed here (and
+    // with the same left-to-right subtraction the caller uses) only to detect the
+    // degenerate all-hanging line.
     let visual_width_px = (line_width_px - leading_hang_px - trailing_hang_px).max(0.0);
 
     if visual_width_px <= f32::EPSILON {
-        (line_width_px.max(0.0), 0.0)
+        (0.0, 0.0)
     } else {
-        (visual_width_px, leading_hang_px)
+        (leading_hang_px, trailing_hang_px)
     }
 }
 
@@ -3847,7 +3886,7 @@ mod tests {
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
             force_remove_ellipsis_glyph: false,
-            hanging_punctuation: false,
+            hanging_punctuation: 0.0,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,
             text_wrap_mode: TextWrapMode::WholeWords,
@@ -5298,12 +5337,116 @@ mod tests {
         let mut params = base_params();
         params.text = "«Hello!»".to_string();
         params.align = HorizontalAlign::CENTER;
-        params.hanging_punctuation = true;
+        params.hanging_punctuation = 1.0;
 
         let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
             panic!("render_next should render hanging punctuation case: {error}")
         });
         assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
+    }
+
+    #[test]
+    fn the_hanging_weight_moves_the_line_origin_between_the_two_ends() {
+        // Synthetic run layout: 8px of leading hang, 2px of trailing hang inside a
+        // 30px line. The weight scales BOTH the alignment width and the origin shift,
+        // and must reproduce the two historical behaviours exactly at the ends.
+        let layout = super::HorizontalRunLayout {
+            glyph_xs: vec![0.0, 10.0, 20.0],
+            line_width_px: 30.0,
+            leading_hang_px: 8.0,
+            trailing_hang_px: 2.0,
+        };
+
+        // Weight 0 == the old "off": the logical width, bit for bit, and no shift.
+        assert_eq!(layout.align_width_px(0.0), 30.0);
+        assert_eq!(layout.origin_shift_px(0.0), 0.0);
+        // Weight 1 == the old "on": the fully hung visual width and the whole lead.
+        assert_eq!(layout.align_width_px(1.0), 20.0);
+        assert_eq!(layout.origin_shift_px(1.0), 8.0);
+        // A mid weight lands strictly between, on both numbers.
+        let mid_width = layout.align_width_px(0.5);
+        let mid_shift = layout.origin_shift_px(0.5);
+        assert!(
+            (20.0..30.0).contains(&mid_width) && mid_width > 20.0,
+            "mid alignment width {mid_width} must be strictly between 20 and 30"
+        );
+        assert!(
+            (0.0..8.0).contains(&mid_shift) && mid_shift > 0.0,
+            "mid origin shift {mid_shift} must be strictly between 0 and 8"
+        );
+
+        // ...and so does the resulting centered line origin, which is what the eye sees.
+        let origin = |weight: f32| {
+            super::horizontal_line_offset(
+                100,
+                layout.align_width_px(weight),
+                HorizontalAlign::CENTER,
+            ) as f32
+                - layout.origin_shift_px(weight)
+        };
+        let (off, mid, full) = (origin(0.0), origin(0.5), origin(1.0));
+        assert!(
+            full < mid && mid < off,
+            "the mid-weight origin must sit strictly between the two ends: \
+             off={off} mid={mid} full={full}"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_all_hanging_line_never_hangs_at_any_weight() {
+        // A line made only of hanging punctuation has no visual width to align by, so
+        // the guard reports "nothing hangs" — for EVERY weight, or the layout would
+        // jump as the slider moves.
+        let layout = super::HorizontalRunLayout {
+            glyph_xs: vec![0.0, 10.0],
+            line_width_px: 20.0,
+            leading_hang_px: 0.0,
+            trailing_hang_px: 0.0,
+        };
+        for weight in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert_eq!(layout.align_width_px(weight), 20.0, "weight {weight}");
+            assert_eq!(layout.origin_shift_px(weight), 0.0, "weight {weight}");
+        }
+    }
+
+    #[test]
+    fn the_hanging_weight_reaches_the_pixels_and_broken_values_are_clamped() {
+        // The weight comes from a UI slider and a project file, so a broken value must
+        // degrade to a legal one instead of poisoning the layout with NaN.
+        // TWO lines, only the first with a leading hanging quote: the hang slides that
+        // line left RELATIVE to the other one, which a one-line fixture could not show
+        // (a rigid translation of the only line is invisible once the canvas is
+        // cropped to the ink).
+        let mut params = base_params();
+        params.text = "«Hi\nAbc".to_string();
+        params.align = HorizontalAlign::LEFT;
+
+        let render = |weight: f32| {
+            let mut params = params.clone();
+            params.hanging_punctuation = weight;
+            let image = render_text_to_image(&params, None).expect("render should succeed");
+            (image.width, image.height, image.rgba)
+        };
+
+        let off = render(0.0);
+        let full = render(1.0);
+        assert_ne!(
+            off, full,
+            "the fixture must actually react to hanging punctuation, \
+             otherwise the assertions below are vacuous"
+        );
+        // NaN is "off", never "half" and never a panic.
+        assert_eq!(render(f32::NAN), off);
+        assert_eq!(render(-2.0), off);
+        assert_eq!(render(f32::NEG_INFINITY), off);
+        // Above the range the hang saturates instead of overshooting.
+        assert_eq!(render(4.0), full);
+        assert_eq!(render(f32::INFINITY), full);
+        // A legal mid weight is a real third layout, not a rounded end: the slider is
+        // continuous all the way down to the pixels.
+        let mid = render(0.5);
+        assert_ne!(mid, off, "a half hang must not collapse onto the off layout");
+        assert_ne!(mid, full, "a half hang must not collapse onto the full layout");
     }
 
     #[test]
@@ -5957,9 +6100,9 @@ mod tests {
             median_center: false,
         };
 
-        params.hanging_punctuation = false;
+        params.hanging_punctuation = 0.0;
         let off = render_text_to_image(&params, None).expect("render should succeed");
-        params.hanging_punctuation = true;
+        params.hanging_punctuation = 1.0;
         let on = render_text_to_image(&params, None).expect("render should succeed");
 
         assert_eq!(
@@ -6024,9 +6167,9 @@ mod tests {
             mean_center: true,
             median_center: true,
         };
-        params.hanging_punctuation = false;
+        params.hanging_punctuation = 0.0;
         let off = render_text_to_image(&params, None).expect("render should succeed");
-        params.hanging_punctuation = true;
+        params.hanging_punctuation = 1.0;
         let on = render_text_to_image(&params, None).expect("render should succeed");
         assert_eq!(off.extra, on.extra, "vertical centers must not react");
     }
@@ -6093,13 +6236,13 @@ mod tests {
         let mut off = base_params();
         off.text = "Hi.".to_string();
         off.align = HorizontalAlign::LEFT;
-        off.hanging_punctuation = false;
+        off.hanging_punctuation = 0.0;
         off.extra_info = RenderExtraInfoRequest {
             mean_center: true,
             median_center: true,
         };
         let mut on = off.clone();
-        on.hanging_punctuation = true;
+        on.hanging_punctuation = 1.0;
 
         let off_image = render_text_to_image(&off, None).expect("hanging-off render");
         let on_image = render_text_to_image(&on, None).expect("hanging-on render");

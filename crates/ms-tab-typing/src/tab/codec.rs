@@ -247,10 +247,14 @@ pub(crate) fn text_render_params_from_render_data(
                 .get("force_remove_ellipsis_glyph")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+        // Reads BOTH representations of the key (a `0.0..=1.0` strength, or the legacy
+        // bool this parameter used to be) through the schema's single normalizer.
+        // Absent = `0.0` (off), which is the schema-1 absent-meaning materialized by
+        // `upgrade_text_params_to_v2`.
         hanging_punctuation: text_params
             .get("hanging_punctuation")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .and_then(text_params_schema::hanging_punctuation_weight)
+            .unwrap_or(0.0),
         new_line_after_sentence: text_params
             .get("new_line_after_sentence")
             .and_then(Value::as_bool)
@@ -503,6 +507,10 @@ pub(crate) fn upgrade_text_params_to_v2(
         ("line_placement_reference", json!("glyph_height")),
         ("trim_extra_spaces", json!(false)),
         ("replace_ellipsis_with_dots", json!(false)),
+        // Still the legacy BOOL, not `0.0`: the parameter is an `f32` strength now, but
+        // `text_params_schema::hanging_punctuation_value` writes its "off" endpoint as
+        // `false` too, so the converted document is byte-identical to one this build
+        // saves with the parameter off — and `hanging_punctuation_weight` reads both.
         ("hanging_punctuation", json!(false)),
         ("text_shape", json!("rectangle")),
         ("width_px", json!(TEXT_RENDER_DATA_FALLBACK_WIDTH_PX)),

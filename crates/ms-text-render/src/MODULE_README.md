@@ -179,6 +179,26 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   See `effects/MODULE_README.md`.
 
 ## Contracts and invariants
+- HANGING PUNCTUATION IS A WEIGHT, NOT A FLAG. `TextRenderParams.hanging_punctuation`
+  is an `f32` STRENGTH in `0.0..=1.0`: `0.0` = off, `1.0` = the historical full hang,
+  and an intermediate `v` = the line's hanging edge run contributes only `1 - v` of
+  its real width TO THE LINE. Both ends of the range reproduce the two historical
+  behaviours exactly, which is the contract every consumer is written against.
+  - It never moves a glyph. Shaped pen positions (`glyph_xs`) are identical at every
+    strength; the weight only scales the alignment width and the origin of the whole
+    line (`HorizontalRunLayout::align_width_px` / `origin_shift_px` over the raw
+    `hanging_metrics_for_layout` edge-run widths).
+  - Layout hangs EDGE RUNS only; the wrap unit model (`ms_text_util`'s
+    `count_layout_units`) discounts EVERY hanging character of the line, interior ones
+    included. That asymmetry predates the weight and is deliberate.
+  - Two consumers cannot be weighted and are thresholded at
+    `HANGING_EXTRA_INFO_THRESHOLD` instead: the extra-info centers and the formula
+    glyph seeds that feed them (see the `extra_info` contract below). Read the
+    threshold through `TextRenderParams::excludes_hanging_from_extra_info`.
+  - Every consumer normalizes through `TextRenderParams::hanging_weight`
+    (`ms_text_util::text_punctuation::clamp_hanging_weight`): out of range is clamped
+    and `NaN` behaves as `0.0`, so a bad caller value can never reach the layout math.
+  - `TextLineMode::Vertical` ignores the field entirely — vertical text never hangs.
 - FONT BASE AND FALLBACK (`font_base.rs`) — the renderer does NOT use the operating
   system's fonts. Every `FontSystem` is built by `font_base::new_render_font_system`
   over one process-wide `fontdb::Database` holding exactly the bundled `fonts/ui`
@@ -692,8 +712,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   sites pass `default()`). Samples are taken at the VECTOR stage from the same
   placement box the draw pass uses (scaled/rotated, then mesh-warped through the
   same `MeshWarpContext::warp_world`); glyphs in a line's leading/trailing
-  hanging-punctuation runs are excluded when `hanging_punctuation` is on (same
-  edge-run semantics as `hanging_metrics_for_layout`). Offset consistency: the
+  hanging-punctuation runs are excluded when the hanging STRENGTH reaches
+  `HANGING_EXTRA_INFO_THRESHOLD` (same edge-run semantics as
+  `hanging_metrics_for_layout`). That consumer is thresholded, not weighted, and it
+  is the ONLY one: the mean center is the area centroid of a convex HULL, and hull
+  membership is binary — a glyph cannot be a fraction inside it. Read it through
+  `TextRenderParams::excludes_hanging_from_extra_info`, never by comparing the field. Offset consistency: the
   `finish` offset maps content->canvas, `raster::trim_rendered_image_to_alpha_bounds`
   shifts the centers by the crop origin, and `effects::apply_effects_pipeline`
   shifts them by the `content_origin_x/y` delta at its single exit (so effect
@@ -729,7 +753,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (`pipeline.rs`, per-glyph inline) and the formula/custom-line paths (`formula/render.rs`,
   marked once per seed in `collect_formula_glyph_seeds` as `hanging_excluded`). Vertical
   is deliberately EXCLUDED from the exclusion: `VerticalWrapRequest` carries no
-  `hanging_punctuation` flag, so nothing hangs there and its centers must not react to
+  `hanging_punctuation` weight, so nothing hangs there and its centers must not react to
   the setting. The shared predicates (`glyph_is_hanging_punctuation`,
   `hanging_edge_run_bounds`, `is_edge_run_hanging`) live in `pipeline.rs` next to
   `hanging_metrics_for_layout` so the exclusion and the visual hang always agree on what
@@ -824,6 +848,11 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   lines). The trim/effects center-shift seams live in
   `raster::trim_rendered_image_to_alpha_bounds` and
   `effects::apply_effects_pipeline`.
+- To change what a hanging-punctuation STRENGTH does, the sites are: the visual hang
+  (`pipeline.rs`: `hanging_metrics_for_layout` + `HorizontalRunLayout`), the wrap unit
+  model (`ms_text_util::segmentation::count_layout_units` and its `wrap/` callers), the
+  form-search metrics (`wrap/forms.rs`), and the thresholded extra-info exclusion
+  (`pipeline.rs`, `formula/render.rs`). Keep the `0.0`/`1.0` endpoints exact.
 - To change normal horizontal rendering, glyph scaling, kerning, hanging punctuation,
   line spacing, shape comparison, or routing, edit `pipeline.rs`. The normal
   horizontal path is SINGLE-PASS: `horizontal_run_layout` + `get_image` run once per

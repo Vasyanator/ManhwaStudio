@@ -6,6 +6,11 @@ Purpose:
 висящей пунктуации выносятся за края строки и не идут в счёт её ширины. Один набор
 на всё приложение.
 
+Here also lives `clamp_hanging_weight`, the single normalizer of the hanging
+strength the renderer and the wrap share (`0.0..=1.0`). It is deliberately in this
+module and not in the renderer: both crates read the same contract, and the weight
+is meaningless without the character set defined here. It does NOT touch the set.
+
 Contract (после выноса в крейт `ms-text-util`):
 Крейт config-free — сам он НЕ читает `user_config.json`. При первом обращении набор
 инициализируется из `DEFAULT_HANGING_PUNCTUATION`. Приложение на старте засевает
@@ -90,6 +95,31 @@ pub fn set_hanging_punctuation(text: &str) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Normalizes a hanging-punctuation STRENGTH into its contract range `0.0..=1.0`.
+///
+/// `0.0` = punctuation counts in full toward the line (historical "off"), `1.0` =
+/// it hangs completely and contributes nothing (historical "on"), an intermediate
+/// `v` = the hanging run contributes `1 - v` of its real width. Out-of-range
+/// values are clamped and `NaN` is treated as `0.0`, so a caller that computed the
+/// weight from user input or a config file can never poison the layout.
+///
+/// The zero it returns is always `+0.0`. `-0.0` (reachable from a hand-edited
+/// document) compares equal to `0.0` yet carries a different bit pattern, and
+/// consumers key caches by `f32::to_bits`, where the two zeros split one key in two.
+/// This being THE single normalizer of the value, a non-canonical zero must not
+/// survive it.
+#[must_use]
+pub fn clamp_hanging_weight(weight: f32) -> f32 {
+    // `f32::clamp` propagates NaN instead of rejecting it, so NaN is caught first.
+    if weight.is_nan() {
+        return 0.0;
+    }
+    let clamped = weight.clamp(0.0, 1.0);
+    // `f32::clamp` compares numerically and `-0.0 >= 0.0` holds, so a negative zero
+    // passes straight through it. Hand back the positive-zero literal instead.
+    if clamped == 0.0 { 0.0 } else { clamped }
+}
+
 /// Текущий набор как строка (в исходном порядке, для отображения в настройках).
 #[must_use]
 pub fn hanging_punctuation_string() -> String {
@@ -129,5 +159,34 @@ mod tests {
         assert!(is_hanging_punctuation('«'));
         assert!(!is_hanging_punctuation('а'));
         assert!(!is_hanging_punctuation('1'));
+    }
+
+    #[test]
+    fn hanging_weight_is_clamped_and_nan_means_off() {
+        assert_eq!(clamp_hanging_weight(0.0), 0.0);
+        assert_eq!(clamp_hanging_weight(1.0), 1.0);
+        assert_eq!(clamp_hanging_weight(0.25), 0.25);
+        assert_eq!(clamp_hanging_weight(-3.0), 0.0);
+        assert_eq!(clamp_hanging_weight(17.5), 1.0);
+        assert_eq!(clamp_hanging_weight(f32::INFINITY), 1.0);
+        assert_eq!(clamp_hanging_weight(f32::NEG_INFINITY), 0.0);
+        // NaN must behave exactly like "off", never propagate into the layout math.
+        assert_eq!(clamp_hanging_weight(f32::NAN), 0.0);
+
+        // Every zero the normalizer hands back is the POSITIVE one. `assert_eq!` cannot
+        // see this (`-0.0 == 0.0`), so the bit pattern is checked directly: consumers key
+        // caches by `to_bits`, where the two zeros would be two different keys.
+        for input in [-0.0f32, 0.0, -1.0, f32::NEG_INFINITY, f32::NAN] {
+            let clamped = clamp_hanging_weight(input);
+            assert_eq!(clamped, 0.0, "input {input} must clamp to zero");
+            assert!(
+                clamped.is_sign_positive(),
+                "input {input} must yield +0.0, got a negative zero"
+            );
+            assert_eq!(clamped.to_bits(), 0.0f32.to_bits(), "input {input}");
+        }
+        // A non-zero result passes through untouched, bit pattern included.
+        assert_eq!(clamp_hanging_weight(0.25).to_bits(), 0.25f32.to_bits());
+        assert_eq!(clamp_hanging_weight(1.0).to_bits(), 1.0f32.to_bits());
     }
 }

@@ -331,9 +331,11 @@ impl TypingCreatePanelState {
         self.faux_bold_outward_only = text_params_obj.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true);
         self.faux_italic = text_params_obj.get("faux_italic").and_then(Value::as_bool).unwrap_or(false);
         self.faux_italic_slant_deg = text_params_obj.get("faux_italic_slant_deg").and_then(value_as_f32).unwrap_or(14.0).clamp(-45.0, 45.0);
+        // Reads BOTH representations of the key (a `0.0..=1.0` number, or the legacy
+        // bool this parameter used to be) through the schema's single normalizer.
         self.hanging_punctuation = text_params_obj
             .get("hanging_punctuation")
-            .and_then(Value::as_bool)
+            .and_then(text_params_schema::hanging_punctuation_weight)
             .unwrap_or(self.hanging_punctuation);
         self.trim_extra_spaces = text_params_obj
             .get("trim_extra_spaces")

@@ -41,7 +41,7 @@ Montre à quoi ressemblera le texte avec les paramètres actuels, sans tenir com
 - `Autoriser les chevrons modérés` : influe sur la forme du texte. Autorise des creux dans la forme.
 - `Bold` : **police grasse**, ne fonctionne pas avec toutes les polices
 - `Italic` : police inclinée, ne fonctionne pas avec toutes
-- `Ponctuation suspendue` : les signes de ponctuation ne sont automatiquement pas pris en compte par l'alignement du texte. La liste des caractères se trouve dans les paramètres, mais ils y sont presque tous.
+- `Ponctuation suspendue` : un curseur de 0 à 100 %. Il définit le poids avec lequel la ponctuation en bord de ligne compte dans la largeur de celle-ci lors de l'alignement : 0 % — comme n'importe quel autre caractère, 100 % — elle ne compte pas du tout et déborde du bloc, une valeur intermédiaire lui laisse une partie de sa largeur (75 %, par exemple, ne laisse à la ponctuation que 25 % de sa largeur réelle). La liste des caractères se trouve dans les paramètres, mais ils y sont presque tous.
 - `Supprimer les espaces superflus` : supprime les espaces en bordure de ligne.
 - `Nouvelle ligne après la fin de phrase`
 - `Tout en majuscules`

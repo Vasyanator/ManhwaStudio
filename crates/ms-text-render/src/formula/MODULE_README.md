@@ -75,8 +75,11 @@ the line paths.
   transform's total `rotation_rad`) for BOTH the outline and bitmap-fallback glyphs,
   applies the mesh warp once via `map_points`, then `finish(x_offset, y_offset)`
   stores the centers into the returned image BEFORE the caller's trim/effects (both
-  self-correct the centers). These paths never read `hanging_punctuation`. The
-  default (no request) is a byte-identical no-op.
+  self-correct the centers). These paths never HANG punctuation visually — their line
+  origin uses the raw `run.line_w` — but `collect_formula_glyph_seeds` still marks the
+  line's leading/trailing hanging runs `hanging_excluded` once the hanging STRENGTH
+  reaches `HANGING_EXTRA_INFO_THRESHOLD`, so the reported centers agree with the
+  horizontal paths on what hangs. The default (no request) is a byte-identical no-op.
 - Horizontal alignment (`TextRenderParams.align`) positions the run ALONG the path on
   both on-path layouts, via the shared `on_path_align_fraction`. `justify` never reads
   `bias` (the slider is hidden in the UI while justify is on) and instead keeps each

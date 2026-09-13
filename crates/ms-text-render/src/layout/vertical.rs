@@ -1410,7 +1410,7 @@ mod tests {
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
             force_remove_ellipsis_glyph: false,
-            hanging_punctuation: false,
+            hanging_punctuation: 0.0,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,
             text_wrap_mode: TextWrapMode::WholeWords,

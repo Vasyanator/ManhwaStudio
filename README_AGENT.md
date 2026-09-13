@@ -138,8 +138,9 @@ bin (main.rs, app.rs, tabs/settings/)
   плейсхолдеры) и `tp!` (плюрали) возвращают `String`.
   **Сообщение, называющее кнопку, обязано подставлять её ключ через `{button}`**, а не
   дублировать подпись литералом: переводят их разные люди, и текст расходится.
-- **`ms-text-util`** (`crates/ms-text-util`) — `text_punctuation` (набор висячей
-  пунктуации) + `segmentation` + `language`. Config-free: набор по умолчанию —
+- **`ms-text-util`** (`crates/ms-text-util`) — `text_punctuation` (НАБОР символов висячей
+  пунктуации — сущность, отдельная от СИЛЫ висения, которая живёт в параметрах рендера)
+  + `segmentation` + `language`. Config-free: набор по умолчанию —
   `DEFAULT_HANGING_PUNCTUATION`, приложение засевает пользовательское значение на
   старте через `set_hanging_punctuation`
   (`main.rs::seed_hanging_punctuation_from_config`). `language` держит
@@ -157,6 +158,15 @@ bin (main.rs, app.rs, tabs/settings/)
   (бывший `ms_text_render`). Зависит от `ms-log`, `ms-text-util`, `ms-fonts`
   (детерминированная база шрифтов рендера, `font_base.rs` — см. раздел Render ниже);
   внешне cosmic-text/unicode-script/swash/zeno/image/rayon.
+  **Висящая пунктуация — это ВЕС `TextRenderParams.hanging_punctuation: f32` в `0.0..=1.0`,
+  а не флаг** (`0.0` — пунктуация считается обычным символом, `1.0` — не считается вовсе;
+  промежуточное `V` оставляет ей `1 - V` реальной ширины). Вес НЕ двигает позиции глифов
+  внутри строки: он масштабирует, сколько ведущий/хвостовой висящий прогон вносит в ширину
+  строки при выравнивании и в оценку вместимости при переносе. Единственный нормализатор —
+  `ms_text_util::text_punctuation::clamp_hanging_weight` (NaN → `0.0`). Исключение висящих
+  краёв из выборки extra-info/формул — принадлежность выпуклой оболочке, весом не выражается,
+  поэтому там ПОРОГ `HANGING_EXTRA_INFO_THRESHOLD = 0.5`. Персист вкладки typing принимает и
+  legacy-`bool` (`true` → `1.0`, `false` → `0.0`), и число.
 - **`ms-gifs`** (`crates/ms-gifs`) — GUI-free хранилище встроенных анимированных
   WebP-подсказок + их декодер. Ассеты (`assets/*.webp`, ~2.9 МБ) встроены через
   `include_bytes!` и разбиты по модулям-категориям, названным по вкладкам UI

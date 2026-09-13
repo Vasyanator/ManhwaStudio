@@ -180,7 +180,9 @@ struct FormulaGlyphSeed {
     /// `true` when this glyph sits in its line's leading/trailing hanging-punctuation
     /// run, so the draw pass must keep it OUT of the extra-info (mean/median center)
     /// sampling — it hangs past the text block and would drag the center with it.
-    /// Always `false` unless extra info was requested AND `hanging_punctuation` is on;
+    /// Always `false` unless extra info was requested AND the hanging strength is at
+    /// or above the exclusion threshold
+    /// (`TextRenderParams::excludes_hanging_from_extra_info`);
     /// it never affects the drawn pixels.
     hanging_excluded: bool,
 }
@@ -2756,8 +2758,9 @@ fn collect_formula_glyph_seeds(
     let mut runs = buffer.layout_runs().peekable();
     // Leading/trailing hanging-punctuation runs are marked (not dropped): the glyphs still
     // DRAW, they are only kept out of the extra-info center sampling. Computed only when that
-    // sampling is active and punctuation actually hangs, so the default path pays nothing.
-    let mark_hanging = params.extra_info.is_active() && params.hanging_punctuation;
+    // sampling is active and punctuation hangs at or above the exclusion threshold, so the
+    // default path pays nothing.
+    let mark_hanging = params.extra_info.is_active() && params.excludes_hanging_from_extra_info();
     while let Some(run) = runs.next() {
         let hanging_bounds = if mark_hanging {
             hanging_edge_run_bounds(&run)

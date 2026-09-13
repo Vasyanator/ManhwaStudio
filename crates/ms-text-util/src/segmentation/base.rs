@@ -28,7 +28,7 @@ Cyrillic engine need not depend on a Latin-named module.
 
 use std::borrow::Cow;
 
-use crate::text_punctuation::is_hanging_punctuation;
+use crate::text_punctuation::{clamp_hanging_weight, is_hanging_punctuation};
 
 /// Мягкий перенос (U+00AD): маркер словарной точки переноса внутри слова.
 pub const SOFT_HYPHEN: char = '\u{00AD}';
@@ -189,8 +189,11 @@ pub struct Block {
 /// Опции сегментации.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentOptions {
-    /// Учитывать висящую пунктуацию при подсчёте «юнитов» строки.
-    pub hanging_punctuation: bool,
+    /// Вес висящей пунктуации при подсчёте «юнитов» строки, `0.0..=1.0`:
+    /// `0.0` — знак считается целым юнитом, `1.0` — не считается совсем.
+    /// Значение нормализуется через `text_punctuation::clamp_hanging_weight`
+    /// в [`count_layout_units`]; см. его контракт.
+    pub hanging_punctuation: f32,
     /// Сохранять ведущие/хвостовые пробелы абзаца отдельными блоками.
     pub preserve_edge_spaces: bool,
     /// Разрешать перенос по уже существующим дефисам («Рао-кун»).
@@ -200,18 +203,100 @@ pub struct SegmentOptions {
     pub binding: BindingMode,
 }
 
-/// Считает «юниты» строки: видимые символы без мягких переносов/перевода строки и
-/// (опционально) без висящей пунктуации.
+/// Виден ли символ в «юнитной» модели строки: мягкие переносы и перевод строки
+/// не занимают места и не считаются никогда, независимо от висящей пунктуации.
 #[must_use]
-pub fn count_layout_units(text: &str, hanging_punctuation: bool) -> usize {
-    text.chars()
-        .filter(|&ch| {
-            ch != SOFT_HYPHEN
-                && ch != '\n'
-                && ch != '\r'
-                && (!hanging_punctuation || !is_hanging_punctuation(ch))
-        })
-        .count()
+fn is_layout_unit_char(ch: char) -> bool {
+    ch != SOFT_HYPHEN && ch != '\n' && ch != '\r'
+}
+
+/// Считает «юниты» строки: видимые символы без мягких переносов/перевода строки,
+/// где каждый знак висящей пунктуации весит `1 - hanging_punctuation`.
+///
+/// `hanging_punctuation` — сила висящей пунктуации `0.0..=1.0`
+/// (`text_punctuation::clamp_hanging_weight`, `NaN` = `0.0`): при `0.0` каждый
+/// знак считается целым юнитом, при `1.0` висящие знаки не считаются совсем.
+/// Оба конца диапазона воспроизводятся точно.
+///
+/// Округление — по строке целиком (см. [`weighted_layout_units`]), а не
+/// посимвольно: юнит остаётся целым числом. Непустая строка при `0 < w < 1`
+/// никогда не даёт 0 юнитов, даже если состоит из одних висящих знаков:
+/// схлопнуться в ноль она может только при `w == 1.0`.
+///
+/// В отличие от визуального подвеса (он трогает только КРАЕВЫЕ серии знаков),
+/// здесь учитывается ВСЯ висящая пунктуация строки, включая внутреннюю. Эта
+/// асимметрия существовала и до появления веса и сохранена намеренно.
+#[must_use]
+pub fn count_layout_units(text: &str, hanging_punctuation: f32) -> usize {
+    let weight = clamp_hanging_weight(hanging_punctuation);
+    if weight <= 0.0 {
+        // Горячий путь по умолчанию: без веса набор висящих знаков не опрашивается.
+        return text.chars().filter(|&ch| is_layout_unit_char(ch)).count();
+    }
+
+    let mut non_hanging = 0usize;
+    let mut hanging = 0usize;
+    for ch in text.chars().filter(|&ch| is_layout_unit_char(ch)) {
+        if is_hanging_punctuation(ch) {
+            hanging = hanging.saturating_add(1);
+        } else {
+            non_hanging = non_hanging.saturating_add(1);
+        }
+    }
+    weighted_layout_units(non_hanging, hanging, weight)
+}
+
+/// Округляет неотрицательное `value` до ближайшего `u32`, насыщая на границах.
+/// `NaN` и отрицательное дают `0`.
+#[must_use]
+fn round_to_u32(value: f64) -> u32 {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    let rounded = value.round();
+    if rounded >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    // Проверки выше доказывают `0.0 < rounded < u32::MAX` — приведение точное:
+    // ни усечения дробной части (число уже округлено), ни переполнения.
+    rounded as u32
+}
+
+/// Сводит сырые счётчики строки — обычных символов и знаков висящей пунктуации —
+/// в её взвешенное число юнитов: `non_hanging + round((1 - w) * hanging)`.
+///
+/// `hanging_punctuation` — та же сила `0.0..=1.0`, что и у [`count_layout_units`];
+/// `0.0` даёт `non_hanging + hanging`, `1.0` — ровно `non_hanging`. Нужен там, где
+/// счётчики накапливаются посимвольно и пересчитывать строку целиком дорого
+/// (аварийный разрыв слова в рендере), чтобы правило округления было одно на всех.
+///
+/// НИЖНЯЯ ГРАНИЦА: при `0 < w < 1` непустая строка всегда весит хотя бы 1 юнит.
+/// Без неё строка из одних висящих знаков схлопывалась бы в 0 задолго до `w == 1.0`
+/// (`round(1 * 0.25) == 0` уже при `w = 0.75`), а нулевой счётчик у непустой строки
+/// врапер читает как «строка пустая» при выборе ёмкости и точки разрыва. Граница
+/// нужна ровно в одном случае — `non_hanging == 0`: при любом обычном символе сумма
+/// и так не меньше единицы. Ноль остаётся достижим только при `w >= 1.0`, где он
+/// воспроизводит историческое поведение «висящее не считается вовсе».
+#[must_use]
+pub fn weighted_layout_units(non_hanging: usize, hanging: usize, hanging_punctuation: f32) -> usize {
+    let weight = clamp_hanging_weight(hanging_punctuation);
+    if weight <= 0.0 {
+        return non_hanging.saturating_add(hanging);
+    }
+    if weight >= 1.0 {
+        return non_hanging;
+    }
+    // Счёт символов приводится к `u32` явной проверкой, а не приведением: `f64`
+    // представляет любой `u32` точно, а строк длиннее `u32::MAX` символов не бывает
+    // (такая насытится, а не завернётся).
+    let hanging_capped = u32::try_from(hanging).unwrap_or(u32::MAX);
+    let counted = round_to_u32(f64::from(hanging_capped) * f64::from(1.0 - weight));
+    let units = non_hanging.saturating_add(usize::try_from(counted).unwrap_or(usize::MAX));
+    if units == 0 && hanging > 0 {
+        // Непустая строка целиком из висящих знаков: см. «НИЖНЯЯ ГРАНИЦА» выше.
+        return 1;
+    }
+    units
 }
 
 /// Собирает текст строки из блоков и считает её юниты. Между блоками вставляется
@@ -750,5 +835,109 @@ mod tests {
             assert!(!key.is_empty(), "empty key for {level:?}");
             assert!(keys.insert(key), "duplicate key {key:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hanging_weight_tests {
+    use super::{count_layout_units, weighted_layout_units};
+    use crate::text_punctuation::{DEFAULT_HANGING_PUNCTUATION, set_hanging_punctuation};
+
+    /// `«Аа!?»` — 2 обычных символа и 4 висящих знака в дефолтном наборе.
+    const SAMPLE: &str = "«Аа!?»";
+
+    #[test]
+    fn the_weight_endpoints_reproduce_the_historical_counts() {
+        set_hanging_punctuation(DEFAULT_HANGING_PUNCTUATION);
+        // 0.0 — прежнее «выключено»: считаются все видимые символы.
+        assert_eq!(count_layout_units(SAMPLE, 0.0), 6);
+        // 1.0 — прежнее «включено»: висящие знаки не считаются совсем.
+        assert_eq!(count_layout_units(SAMPLE, 1.0), 2);
+        // Мягкий перенос и перевод строки не считаются ни при каком весе.
+        assert_eq!(count_layout_units("a\u{00AD}b\nc", 0.0), 3);
+        assert_eq!(count_layout_units("a\u{00AD}b\nc", 1.0), 3);
+    }
+
+    #[test]
+    fn a_mid_weight_counts_hanging_punctuation_in_part() {
+        set_hanging_punctuation(DEFAULT_HANGING_PUNCTUATION);
+        // 4 висящих знака при весе 0.5 -> round(2.0) = 2 юнита сверх двух букв.
+        assert_eq!(count_layout_units(SAMPLE, 0.5), 4);
+        // 0.25 -> round(3.0) = 3; 0.75 -> round(1.0) = 1.
+        assert_eq!(count_layout_units(SAMPLE, 0.25), 5);
+        assert_eq!(count_layout_units(SAMPLE, 0.75), 3);
+        // Счёт монотонно не растёт с весом — иначе слайдер дёргал бы раскладку.
+        let mut prev = usize::MAX;
+        for weight in [0.0f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] {
+            let units = count_layout_units(SAMPLE, weight);
+            assert!(units <= prev, "units must not grow with the weight at {weight}");
+            prev = units;
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_or_nan_weight_is_normalized() {
+        set_hanging_punctuation(DEFAULT_HANGING_PUNCTUATION);
+        // NaN трактуется как «выключено», а не как «половина» и не как паника.
+        assert_eq!(count_layout_units(SAMPLE, f32::NAN), 6);
+        assert_eq!(count_layout_units(SAMPLE, -5.0), 6);
+        assert_eq!(count_layout_units(SAMPLE, 12.0), 2);
+        assert_eq!(weighted_layout_units(2, 4, f32::NAN), 6);
+        assert_eq!(weighted_layout_units(2, 4, f32::INFINITY), 2);
+    }
+
+    #[test]
+    fn an_all_hanging_line_keeps_at_least_one_unit_until_the_weight_reaches_one() {
+        set_hanging_punctuation(DEFAULT_HANGING_PUNCTUATION);
+        // Строка без единого обычного символа — единственный случай, где округление
+        // могло дать 0 юнитов у НЕПУСТОЙ строки. Врапер читает 0 как «пусто», поэтому
+        // ноль допустим только при полном подвесе.
+        for weight in [0.25f32, 0.5, 0.75, 0.999] {
+            assert!(
+                count_layout_units("!", weight) >= 1,
+                "a one-character hanging line must keep a unit at weight {weight}"
+            );
+            assert!(
+                count_layout_units("«!?»", weight) >= 1,
+                "a four-character hanging line must keep a unit at weight {weight}"
+            );
+        }
+        // Точные значения, чтобы граница не подменила собой само взвешивание.
+        assert_eq!(count_layout_units("«!?»", 0.25), 3);
+        assert_eq!(count_layout_units("«!?»", 0.5), 2);
+        assert_eq!(count_layout_units("«!?»", 0.75), 1);
+        // round(4 * 0.001) == 0 -> в дело вступает нижняя граница.
+        assert_eq!(count_layout_units("«!?»", 0.999), 1);
+        assert_eq!(count_layout_units("!", 0.25), 1);
+        assert_eq!(count_layout_units("!", 0.5), 1);
+        // round(1 * 0.25) == 0 -> граница.
+        assert_eq!(count_layout_units("!", 0.75), 1);
+        assert_eq!(count_layout_units("!", 0.999), 1);
+        // И только полный подвес обнуляет её — прежнее поведение «включено».
+        assert_eq!(count_layout_units("!", 1.0), 0);
+        assert_eq!(count_layout_units("«!?»", 1.0), 0);
+        // Граница не трогает пустую строку и не трогает строки с обычными символами.
+        assert_eq!(count_layout_units("", 0.5), 0);
+        assert_eq!(count_layout_units("\u{00AD}\n", 0.5), 0);
+        assert_eq!(weighted_layout_units(0, 0, 0.5), 0);
+        assert_eq!(weighted_layout_units(1, 1, 0.75), 1);
+    }
+
+    #[test]
+    fn the_incremental_counter_agrees_with_the_whole_line_counter() {
+        set_hanging_punctuation(DEFAULT_HANGING_PUNCTUATION);
+        // `weighted_layout_units` — то же правило округления, что и у
+        // `count_layout_units`: аварийный разрыв слова в рендере считает
+        // инкрементально и обязан получать тот же ответ.
+        for weight in [0.0f32, 0.2, 0.5, 0.75, 1.0] {
+            assert_eq!(
+                weighted_layout_units(2, 4, weight),
+                count_layout_units(SAMPLE, weight),
+                "weight {weight}"
+            );
+        }
+        // Округление половины — от нуля прочь: 3 знака при весе 0.5 дают 2.
+        assert_eq!(weighted_layout_units(0, 3, 0.5), 2);
+        assert_eq!(weighted_layout_units(0, 1, 0.5), 1);
     }
 }

@@ -128,7 +128,11 @@ impl TypingCreatePanelState {
                 "trim_extra_spaces": self.trim_extra_spaces,
                 "replace_ellipsis_with_dots": self.replace_ellipsis_with_dots,
                 "force_remove_ellipsis_glyph": self.force_remove_ellipsis_glyph,
-                "hanging_punctuation": self.hanging_punctuation,
+                // NOT a bare `f32`: the schema's writer emits the two exact endpoints as
+                // the LEGACY BOOL, so a project saved here keeps rendering correctly in
+                // an older build (which reads this key with `Value::as_bool`) and a value
+                // left at the default is still omitted.
+                "hanging_punctuation": text_params_schema::hanging_punctuation_value(self.hanging_punctuation),
                 "new_line_after_sentence": self.new_line_after_sentence,
                 "enable_inline_style_tags": self.enable_inline_style_tags,
                 "text_wrap_mode": match self.text_wrap_mode {

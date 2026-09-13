@@ -1267,7 +1267,7 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         trim_extra_spaces: false,
         replace_ellipsis_with_dots: false,
         force_remove_ellipsis_glyph: false,
-        hanging_punctuation: false,
+        hanging_punctuation: 0.0,
         new_line_after_sentence: false,
         enable_inline_style_tags: false,
         text_wrap_mode: TextWrapMode::Moderate,
@@ -1416,11 +1416,14 @@ fn storage_normalization_preserves_formed_text_and_modern_fields() {
         text_params.get("kerning").and_then(Value::as_str),
         Some("3.00")
     );
+    // The input is a LEGACY document, so the key is a bool there. Normalization is a
+    // whitelist pass-through and must carry it through in whatever shape it arrived;
+    // asserting through the schema's normalizer pins the MEANING rather than the shape.
     assert_eq!(
         text_params
             .get("hanging_punctuation")
-            .and_then(Value::as_bool),
-        Some(true)
+            .and_then(crate::panel::text_params_schema::hanging_punctuation_weight),
+        Some(1.0)
     );
     assert_eq!(
         text_params
@@ -2030,7 +2033,9 @@ fn render_params_apply_the_frozen_schema_two_defaults() {
     assert_eq!(parsed.line_placement_reference, LinePlacementReference::LineBox);
     assert!(parsed.trim_extra_spaces);
     assert!(parsed.replace_ellipsis_with_dots);
-    assert!(parsed.hanging_punctuation);
+    // The frozen schema-2 default is still the LEGACY bool `true`; it must read back as
+    // the fully-hanging strength.
+    assert_eq!(parsed.hanging_punctuation, 1.0);
     assert_eq!(parsed.text_shape, TextShape::Free);
     // ...while the very same payload WITHOUT `schema` keeps its legacy meanings.
     let legacy = text_render_params_from_render_data(&json!({
@@ -2044,8 +2049,92 @@ fn render_params_apply_the_frozen_schema_two_defaults() {
     );
     assert!(!legacy.trim_extra_spaces);
     assert!(!legacy.replace_ellipsis_with_dots);
-    assert!(!legacy.hanging_punctuation);
+    assert_eq!(legacy.hanging_punctuation, 0.0);
     assert_eq!(legacy.text_shape, TextShape::Rectangle);
+}
+
+/// `hanging_punctuation` changed type (bool -> `0.0..=1.0` strength) WITHOUT a schema
+/// bump, so both representations must keep loading forever, and a fractional value must
+/// survive the full write -> normalize -> read round trip unchanged.
+#[test]
+fn hanging_punctuation_reads_legacy_bool_and_round_trips_a_fraction() {
+    let read = |stored: Value| {
+        text_render_params_from_render_data(&json!({
+            "text_params": {
+                "schema": 2,
+                "text": "x",
+                "font": "Some-Font",
+                "hanging_punctuation": stored,
+            }
+        }))
+        .expect("params should parse")
+        .hanging_punctuation
+    };
+    // A document written before the slider existed carries a bool.
+    assert_eq!(read(json!(true)), 1.0);
+    assert_eq!(read(json!(false)), 0.0);
+    // A document written by this build carries the strength itself.
+    assert_eq!(read(json!(0.4)), 0.4);
+
+    // Full round trip through the REAL write path, so the test pins what the writer
+    // actually produces instead of a hand-written literal. A fractional strength has no
+    // legacy shape, so it is written as a number and must survive normalization untouched.
+    use crate::panel::text_params_schema;
+    let round_trip = |weight: f32| {
+        let mut params = serde_json::Map::new();
+        params.insert("text".to_string(), json!("x"));
+        params.insert("font".to_string(), json!("Some-Font"));
+        params.insert(
+            "hanging_punctuation".to_string(),
+            text_params_schema::hanging_punctuation_value(weight),
+        );
+        let written = text_params_schema::write_text_params(params);
+        let raw = json!({ "schema_version": 2, "text_params": written, "effects": [] });
+        let Some(normalized) = normalize_render_data_value(&raw, 500) else {
+            panic!("render data should normalize");
+        };
+        text_render_params_from_render_data(&normalized)
+            .expect("normalized params should parse")
+            .hanging_punctuation
+    };
+    assert_eq!(round_trip(0.4), 0.4);
+    assert_eq!(round_trip(0.05), 0.05);
+    // The endpoints survive the same trip even though the writer spells them as bools —
+    // and `1.0` gets there through the OMITTED frozen default, which is the whole point
+    // of writing it as `true`.
+    assert_eq!(round_trip(1.0), 1.0);
+    assert_eq!(round_trip(0.0), 0.0);
+}
+
+/// A project saved by THIS build must still render correctly in an OLDER one, which reads
+/// the key with `Value::as_bool` and falls back to "off" on anything else. The two exact
+/// endpoints are therefore written as the legacy bool, and the fully-hanging default is
+/// not written at all because it equals the frozen schema-2 default.
+#[test]
+fn hanging_punctuation_is_written_in_a_shape_an_old_build_can_read() {
+    use crate::panel::text_params_schema;
+    let write = |weight: f32| {
+        let mut params = serde_json::Map::new();
+        params.insert("text".to_string(), json!("x"));
+        params.insert("font".to_string(), json!("Some-Font"));
+        params.insert(
+            "hanging_punctuation".to_string(),
+            text_params_schema::hanging_punctuation_value(weight),
+        );
+        text_params_schema::write_text_params(params)
+    };
+    // Fully hanging == the frozen default -> the key is omitted, and an old build then
+    // falls back to its OWN default, which was the same "on".
+    assert_eq!(write(1.0).get("hanging_punctuation"), None);
+    // Off is written as the legacy `false`, which an old build reads verbatim.
+    assert_eq!(write(0.0).get("hanging_punctuation"), Some(&json!(false)));
+    // Only a fractional strength — a value an old build could not express at all — is a
+    // number; there it degrades to "off", which is accepted.
+    assert!(
+        write(0.4)
+            .get("hanging_punctuation")
+            .is_some_and(Value::is_number)
+    );
 }
 
 /// The whitelist rebuilder must carry the LEGACY font keys through verbatim: they are

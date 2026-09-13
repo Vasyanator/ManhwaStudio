@@ -623,7 +623,9 @@ impl TypingCreatePanelState {
                 TextShape::SoftPeak => t!("typing.params.shape_soft_option"),
             };
             let shape_summary = format!("{} · {}", shape_label, anti_aliasing_label(self.anti_aliasing));
-            let enabled_count = usize::from(self.hanging_punctuation)
+            // Hanging punctuation is a strength now, not a flag: the step counts as
+            // "enabled" at any non-zero value.
+            let enabled_count = usize::from(self.hanging_punctuation > 0.0)
                 + usize::from(self.trim_extra_spaces)
                 + usize::from(self.replace_ellipsis_with_dots)
                 + usize::from(self.new_line_after_sentence)
@@ -1885,11 +1887,12 @@ impl TypingCreatePanelState {
     }
 
     /// Text-processing section (default collapsed, gated on `!font_missing` then
-    /// `!selection_mode`): the six processing checkboxes (hanging punctuation,
-    /// strip extra spaces, replace ellipsis with three dots, newline after
-    /// sentence, all-uppercase, enable inline tags), plus the indented
+    /// `!selection_mode`): the hanging-punctuation STRENGTH slider (0..100 %, stored
+    /// as `0.0..=1.0`) followed by the five processing checkboxes (strip extra
+    /// spaces, replace ellipsis with three dots, newline after sentence,
+    /// all-uppercase, enable inline tags), plus the indented
     /// force-remove-ellipsis-glyph sub-checkbox shown only while the ellipsis
-    /// substitution is on. Moved verbatim from the former right column.
+    /// substitution is on.
     pub(super) fn draw_text_processing_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1901,17 +1904,28 @@ impl TypingCreatePanelState {
         let selection_mode = inline_style.is_some();
         ui.add_enabled_ui(!font_missing, |ui| {
             ui.add_enabled_ui(!selection_mode, |ui| {
-                // Horizontal row so the animated help icon sits after the checkbox label.
+                // Horizontal row so the animated help icon sits after the slider.
+                // The slider edits a LOCAL percent: the stored strength is `0.0..=1.0`
+                // (0 = off, 1 = fully hanging), which is not a comfortable drag range —
+                // same split as the alignment-bias slider below.
+                let mut hanging_percent = (self.hanging_punctuation.clamp(0.0, 1.0) * 100.0).round() as i32;
                 let hanging_punct_resp = ui
                     .horizontal(|ui| {
-                        let resp = ui
-                            .checkbox(&mut self.hanging_punctuation, t!("typing.params.hanging_punctuation"));
+                        let resp = ui.add(
+                            WheelSlider::new(&mut hanging_percent, 0..=100)
+                                .suffix("%")
+                                .text(t!("typing.params.hanging_punctuation"))
+                                .wheel_step(5),
+                        );
                         ms_widgets::HelpHint::animated(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
                         resp
                     })
                     .inner;
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &hanging_punct_resp);
-                *changed |= hanging_punct_resp.changed();
+                if hanging_punct_resp.changed() {
+                    self.hanging_punctuation = hanging_percent as f32 / 100.0;
+                    *changed = true;
+                }
                 let trim_spaces_resp =
                     ui.checkbox(&mut self.trim_extra_spaces, t!("typing.params.strip_extra_spaces"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &trim_spaces_resp);

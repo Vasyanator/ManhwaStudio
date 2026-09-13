@@ -41,7 +41,7 @@ Shows what the text will look like with the current parameters, ignoring the fon
 - `Allow moderate herringbone`: Affects the shape of the text. Allows dips in the shape.
 - `Bold`: **Bold font**, does not work with every font
 - `Italic`: Slanted font, does not work with every font
-- `Hanging punctuation`: Punctuation characters are automatically not affected by the text alignment. The list of characters can be found in the settings, but almost all of them are there.
+- `Hanging punctuation`: A slider from 0 to 100 %. It sets how much the punctuation at the edges of a line counts toward the line width when the text is aligned: 0 % — like any other character, 100 % — it does not count at all and hangs outside the block, a value in between leaves it part of its width (75 %, for example, leaves the punctuation only 25 % of its real width). The list of characters can be found in the settings, but almost all of them are there.
 - `Strip extra spaces`: Removes spaces at the edges of the lines.
 - `New line after sentence end`
 - `All uppercase`

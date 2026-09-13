@@ -1192,6 +1192,19 @@ saving, and export.
   owner, `text_params_schema::legacy_font_name_candidates`, so the codec (which converts) and
   the PSD export (which names the font for Photoshop) cannot drift apart; both take the FIRST
   entry when they need a single name, and the conversion walks the whole list.
+- **A key may carry MORE THAN ONE type across builds; the schema owns BOTH sides of the
+  reconciliation, and compatibility runs in both directions.** `hanging_punctuation` is an
+  `f32` strength (`0.0..=1.0`) that every older build persisted as a `bool` (`true` ≡ `1.0`,
+  `false` ≡ `0.0`). `text_params_schema::hanging_punctuation_weight` reads either shape and
+  is shared by `tab/codec.rs` and `panel/create_apply.rs`; `hanging_punctuation_value` writes
+  the two exact endpoints back as the legacy bool and only a strictly fractional value as a
+  number. Writing the endpoints as bools is what keeps an OLD build correct on a project this
+  one saved (it reads with `Value::as_bool` and would otherwise silently render the parameter
+  off), and what keeps `1.0` `Value`-equal to the frozen schema-2 default so a document at the
+  default still omits the key. `TEXT_PARAMS_SCHEMA_VERSION` is NOT bumped — no already-written
+  value changes meaning. A future type change of any other key follows this shape: one shared
+  reader, one shared writer, the frozen value untouched whenever its meaning survives, and the
+  old representation still emitted wherever it can express the value.
 - **The load-time normalizer is a WHITELIST.** `codec::normalize_text_params_object` (schema-1
   entries only — it passes a schema-2 payload through verbatim) rebuilds `text_params` key by
   key, so a stored key missing from BOTH its `json!` literal and its verbatim pass-through list

@@ -82,8 +82,8 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
   `extra_info::rotated_box_samples`, its center carried through the block rotation)
   for BOTH cell kinds (outline glyph and color-glyph bitmap fallback), applies the
   mesh warp once via `map_points`, then `finish(x_offset, y_offset)` stores the
-  centers into the built image. Vertical text never reads `hanging_punctuation`, so
-  no glyph is excluded. The default (no request) is a byte-identical no-op.
+  centers into the built image. Vertical text never reads `hanging_punctuation` at any
+  STRENGTH (it has no hang to weight), so no glyph is excluded. The default (no request) is a byte-identical no-op.
 - Glyph bounds, optical profiles, and blank cells must tolerate missing glyph alpha
   data without panics.
 - Coordinate names should stay explicit: column positions, cell tops, glyph origins,

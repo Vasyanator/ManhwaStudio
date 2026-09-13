@@ -13,7 +13,10 @@ Main responsibilities:
 - `read_text_params`: fill the defaults of the document's OWN schema, leaving a
   schema-less (v1) document to the legacy readers untouched;
 - own the SCHEMA-1 legacy font-key read ORDER (`legacy_font_name_candidates`), so the
-  codec's conversion and the PSD export cannot disagree about which key names the font.
+  codec's conversion and the PSD export cannot disagree about which key names the font;
+- own the read of any key whose TYPE changed across builds, so every reader resolves the
+  old and the new shape identically, and the matching WRITER that picks the shape an
+  older build can still read (`hanging_punctuation_weight` / `hanging_punctuation_value`).
 
 Key functions:
 - text_params_schema_version()
@@ -22,6 +25,8 @@ Key functions:
 - read_text_params()
 - legacy_font_path()
 - legacy_font_name_candidates()
+- hanging_punctuation_weight()
+- hanging_punctuation_value()
 
 Notes:
 The frozen default set is a CONTRACT, not a mirror of the panel's current defaults: a
@@ -77,6 +82,62 @@ pub(crate) const LEGACY_FONT_KEYS: [&str; 4] = [
 /// Set once a document declaring a NEWER schema has been reported, so the warning is
 /// written once per process instead of once per overlay per load.
 static FUTURE_SCHEMA_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Normalizes a stored `hanging_punctuation` value — in EITHER of its two historical
+/// representations — into the renderer's `0.0..=1.0` strength.
+///
+/// The key was a `bool` until the parameter became a strength slider, and documents
+/// written by every older build are still on disk, so both shapes must stay readable
+/// forever:
+/// * a JSON number is the strength itself, clamped into `0.0..=1.0`;
+/// * a JSON `true` is the fully-hanging `1.0` it used to mean, `false` is `0.0`.
+///
+/// Returns `None` for any other JSON kind (string, array, object, null) so the caller
+/// keeps its own default instead of silently reading a garbage value as `0.0`. This is
+/// the ONE reader of the key: both `create_apply` (panel state) and `codec`
+/// (`TextRenderParams`) go through it so they cannot disagree about a legacy document.
+#[must_use]
+pub(crate) fn hanging_punctuation_weight(value: &Value) -> Option<f32> {
+    if let Some(number) = value.as_f64() {
+        // `as f32` saturates an out-of-range magnitude to an infinity; `clamp_hanging_weight`
+        // maps both infinities into the range and rejects NaN, so no unchecked value escapes.
+        return Some(ms_text_util::text_punctuation::clamp_hanging_weight(number as f32));
+    }
+    value.as_bool().map(|on| if on { 1.0 } else { 0.0 })
+}
+
+/// Serializes a `0.0..=1.0` hanging-punctuation strength into the shape a stored
+/// `text_params` carries. The WRITE half of [`hanging_punctuation_weight`]; the two
+/// live together so the dual representation has one definition.
+///
+/// The two exact endpoints are written as the LEGACY BOOL — `1.0` as `true`, `0.0` as
+/// `false` — and only a strictly fractional value becomes a number. That is deliberate,
+/// for three reasons:
+/// * an OLDER build reads this key with `Value::as_bool` and falls back to "off" on a
+///   number. The endpoints are exactly the values such a build can express, so keeping
+///   their old shape means a project saved here still renders correctly after a rollback
+///   instead of silently losing its hanging punctuation;
+/// * `true` is `Value`-equal to the FROZEN schema-2 default, so a document left at the
+///   default omits the key entirely again ([`write_text_params`]) — no churn in existing
+///   project files;
+/// * `false` is `Value`-equal to the schema-1 absent-meaning materialized by the codec's
+///   conversion, so an off value round-trips through it unchanged.
+///
+/// A FRACTIONAL value read by an old build still degrades to "off". That is unavoidable
+/// and accepted: the value could not exist in that build at all.
+#[must_use]
+pub(crate) fn hanging_punctuation_value(weight: f32) -> Value {
+    let weight = ms_text_util::text_punctuation::clamp_hanging_weight(weight);
+    // Compared with `<=` / `>=` rather than `==` so `-0.0` and any value the clamp
+    // pinned to an endpoint take the bool branch too.
+    if weight <= 0.0 {
+        json!(false)
+    } else if weight >= 1.0 {
+        json!(true)
+    } else {
+        json!(weight)
+    }
+}
 
 /// The `font_path` a SCHEMA-1 `text_params` object carries, trimmed; `None` when absent or
 /// empty. Never written any more — this is the read side of the legacy contract, and the
@@ -195,6 +256,15 @@ pub(crate) fn frozen_v2_defaults() -> &'static Map<String, Value> {
             ("trim_extra_spaces", json!(true)),
             ("replace_ellipsis_with_dots", json!(true)),
             ("force_remove_ellipsis_glyph", json!(false)),
+            // DELIBERATELY still the boolean `true`, although the parameter is an
+            // `f32` strength now: the frozen VALUE is what an omitting document means,
+            // and `true` still means "fully hanging" (`hanging_punctuation_weight`
+            // reads it as `1.0`). Nothing already written changes meaning, so
+            // `TEXT_PARAMS_SCHEMA_VERSION` must NOT be bumped — and the writer keeps
+            // this default reachable: `hanging_punctuation_value` emits the two exact
+            // endpoints as the legacy bool, so `1.0` is `Value`-equal to this entry and
+            // a document at the default still omits the key. Only a strictly fractional
+            // strength is written, as a number.
             ("hanging_punctuation", json!(true)),
             ("new_line_after_sentence", json!(false)),
             ("enable_inline_style_tags", json!(false)),
@@ -353,6 +423,81 @@ pub(crate) fn read_text_params(
 mod tests {
     use super::*;
 
+    /// Both historical representations of `hanging_punctuation` must read back as the
+    /// same `0.0..=1.0` strength, out-of-range values must be clamped, and anything that
+    /// is not a number or a bool must be rejected so the caller keeps its own default.
+    #[test]
+    fn hanging_punctuation_accepts_both_representations() {
+        // Legacy bool: `true` was fully hanging, `false` was off.
+        assert_eq!(hanging_punctuation_weight(&json!(true)), Some(1.0));
+        assert_eq!(hanging_punctuation_weight(&json!(false)), Some(0.0));
+        // Current numeric representation, including a fraction and a JSON INTEGER `1`
+        // (which `serde_json` keeps as an integer, not a float).
+        assert_eq!(hanging_punctuation_weight(&json!(1.0)), Some(1.0));
+        assert_eq!(hanging_punctuation_weight(&json!(0.0)), Some(0.0));
+        assert_eq!(hanging_punctuation_weight(&json!(0.75)), Some(0.75));
+        assert_eq!(hanging_punctuation_weight(&json!(1)), Some(1.0));
+        // Out of range in both directions is clamped, never rejected: a value outside
+        // `0.0..=1.0` still expresses an intent ("off" / "fully hanging").
+        assert_eq!(hanging_punctuation_weight(&json!(5.0)), Some(1.0));
+        assert_eq!(hanging_punctuation_weight(&json!(-3.0)), Some(0.0));
+        // Anything else is NOT a strength; the caller must fall back to its own default.
+        assert_eq!(hanging_punctuation_weight(&json!("nan")), None);
+        assert_eq!(hanging_punctuation_weight(&json!(null)), None);
+        assert_eq!(hanging_punctuation_weight(&json!([1.0])), None);
+        // An absent key never reaches the helper — the `.get(..).and_then(..)` chain of
+        // both readers short-circuits — which is what makes `None` mean "keep default".
+        let obj = json!({ "text": "x" });
+        assert_eq!(
+            obj.get("hanging_punctuation").and_then(hanging_punctuation_weight),
+            None
+        );
+    }
+
+    /// The WRITER must emit the two exact endpoints as the LEGACY BOOL, so a project
+    /// saved by this build still renders correctly in an older one (which reads the key
+    /// with `Value::as_bool`) and a value left at the frozen default is still omitted.
+    /// Only a strictly fractional strength becomes a number, and every shape must survive
+    /// the write -> read round trip as the identical `f32`.
+    #[test]
+    fn hanging_punctuation_writes_the_endpoints_as_the_legacy_bool() {
+        assert_eq!(hanging_punctuation_value(1.0), json!(true));
+        assert_eq!(hanging_punctuation_value(0.0), json!(false));
+        // `-0.0` and out-of-range values are clamped onto an endpoint, so they take the
+        // bool branch too rather than leaking a stray number.
+        assert_eq!(hanging_punctuation_value(-0.0), json!(false));
+        assert_eq!(hanging_punctuation_value(-3.0), json!(false));
+        assert_eq!(hanging_punctuation_value(5.0), json!(true));
+        // NaN is "off" (`clamp_hanging_weight` rejects it), never a JSON null.
+        assert_eq!(hanging_punctuation_value(f32::NAN), json!(false));
+        // A strictly fractional strength is the only case that needs a number.
+        assert!(hanging_punctuation_value(0.4).is_number());
+        assert!(hanging_punctuation_value(0.75).is_number());
+
+        // Round trip through the real writer, not a hand-written literal.
+        for weight in [0.0_f32, 1.0, 0.4, 0.75, 0.05] {
+            assert_eq!(
+                hanging_punctuation_weight(&hanging_punctuation_value(weight)),
+                Some(weight),
+                "write -> read must be lossless for {weight}"
+            );
+        }
+
+        // THE POINT OF THE BOOL WRITER: a document at the frozen default omits the key.
+        let mut at_default = Map::new();
+        at_default.insert("text".to_string(), json!("x"));
+        at_default.insert(
+            "hanging_punctuation".to_string(),
+            hanging_punctuation_value(1.0),
+        );
+        let written = write_text_params(at_default);
+        assert_eq!(
+            written.get("hanging_punctuation"),
+            None,
+            "a fully-hanging value equals the frozen default and must not be written"
+        );
+    }
+
     /// Pins EVERY frozen schema-2 default. A default may not change without bumping
     /// `TEXT_PARAMS_SCHEMA_VERSION` and adding a read branch for the old version —
     /// otherwise every already-written document that OMITS the key silently changes
@@ -449,6 +594,10 @@ mod tests {
             ("trim_extra_spaces", json!(true)),
             ("replace_ellipsis_with_dots", json!(true)),
             ("force_remove_ellipsis_glyph", json!(false)),
+            // Still a bool although the panel field is an `f32` strength — see the
+            // matching comment in `frozen_v2_defaults`: the frozen value is preserved
+            // so no already-written document changes meaning, and the writer emits the
+            // endpoints in this same shape so the default stays omissible.
             ("hanging_punctuation", json!(true)),
             ("new_line_after_sentence", json!(false)),
             ("enable_inline_style_tags", json!(false)),

@@ -409,7 +409,26 @@ pub struct TextRenderParams {
     /// and the render is served from a separate `FontSystem` pool partition (see
     /// `font_system_pool.rs`). A font without the rule costs one GSUB scan, once.
     pub force_remove_ellipsis_glyph: bool,
-    pub hanging_punctuation: bool,
+    /// Hanging-punctuation STRENGTH, `0.0..=1.0`. Not a flag: `0.0` disables
+    /// hanging entirely, `1.0` is full hang, and an intermediate `v` means the
+    /// line's leading/trailing punctuation run contributes only `1 - v` of its
+    /// real width to that line.
+    ///
+    /// It is a WEIGHT ON THE LINE, never a glyph move: shaped pen positions are
+    /// untouched at every value, and the weight only scales how much of the edge
+    /// hang is removed from the line's alignment width and origin (horizontal
+    /// layout), and how much a hanging character counts as a wrap unit.
+    ///
+    /// One consumer cannot be weighted and uses a THRESHOLD instead: the
+    /// extra-info centers (and the formula seeds feeding them) exclude the
+    /// hanging edge runs when `v >= 0.5` — see
+    /// [`TextRenderParams::excludes_hanging_from_extra_info`].
+    ///
+    /// `TextLineMode::Vertical` ignores the field completely: vertical text never
+    /// hangs punctuation. Out-of-range and `NaN` values are normalized by every
+    /// consumer through [`TextRenderParams::hanging_weight`]; the renderer never
+    /// panics on a bad value.
+    pub hanging_punctuation: f32,
     pub new_line_after_sentence: bool,
     pub enable_inline_style_tags: bool,
     pub text_wrap_mode: TextWrapMode,
@@ -461,6 +480,34 @@ pub struct TextRenderParams {
     /// [`TextRenderShapeCompareParams`]. It is a per-render compute selection and
     /// is NOT persisted in project JSON.
     pub extra_info: RenderExtraInfoRequest,
+}
+
+/// Hanging strength at or above which the extra-info sampling drops the line's
+/// hanging edge runs (see [`TextRenderParams::excludes_hanging_from_extra_info`]).
+pub const HANGING_EXTRA_INFO_THRESHOLD: f32 = 0.5;
+
+impl TextRenderParams {
+    /// [`TextRenderParams::hanging_punctuation`] normalized to `0.0..=1.0`
+    /// (`NaN` -> `0.0`). Every layout and wrap consumer reads the weight through
+    /// this method, so an out-of-range caller value can never reach the math.
+    #[must_use]
+    pub fn hanging_weight(&self) -> f32 {
+        ms_text_util::text_punctuation::clamp_hanging_weight(self.hanging_punctuation)
+    }
+
+    /// Whether the extra-info centers must EXCLUDE the line's leading/trailing
+    /// hanging punctuation.
+    ///
+    /// This one consumer cannot be weighted: the mean center is the area centroid
+    /// of the convex HULL of the sampled glyph boxes, and hull membership is
+    /// binary — a glyph cannot be 0.37 inside it. So the continuous weight is
+    /// thresholded at [`HANGING_EXTRA_INFO_THRESHOLD`] ("more hanging than not"):
+    /// below half strength the punctuation still mostly counts toward the line,
+    /// and the reported center should keep matching what the eye sees.
+    #[must_use]
+    pub fn excludes_hanging_from_extra_info(&self) -> bool {
+        self.hanging_weight() >= HANGING_EXTRA_INFO_THRESHOLD
+    }
 }
 
 /// Caller selection of which "extra render info" items to compute.

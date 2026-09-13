@@ -687,7 +687,7 @@ mod tests {
         let text = "не знаю что 5 кг муки через лес ул. Ленина рядом сильнее подъезд";
 
         let glue = seg.segment(text, SegmentOptions {
-            hanging_punctuation: false,
+            hanging_punctuation: 0.0,
             preserve_edge_spaces: false,
             allow_hard_hyphen_breaks: true,
             binding: BindingMode::Glue,
@@ -703,7 +703,7 @@ mod tests {
         );
 
         let annotate = seg.segment(text, SegmentOptions {
-            hanging_punctuation: false,
+            hanging_punctuation: 0.0,
             preserve_edge_spaces: false,
             allow_hard_hyphen_breaks: true,
             binding: BindingMode::Annotate,

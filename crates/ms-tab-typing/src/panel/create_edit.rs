@@ -900,12 +900,17 @@ impl TypingCreatePanelState {
                                             );
                                         }
                                         // Horizontal row so the animated help icon
-                                        // sits after the checkbox label.
+                                        // sits after the slider. The slider edits a
+                                        // LOCAL percent; the stored strength is
+                                        // `0.0..=1.0` (0 = off, 1 = fully hanging).
+                                        let mut hanging_percent = (self.hanging_punctuation.clamp(0.0, 1.0) * 100.0).round() as i32;
                                         let hanging_punct_resp = ui
                                             .horizontal(|ui| {
-                                                let resp = ui.checkbox(
-                                                    &mut self.hanging_punctuation,
-                                                    t!("typing.params.hanging_punctuation"),
+                                                let resp = ui.add(
+                                                    WheelSlider::new(&mut hanging_percent, 0..=100)
+                                                        .suffix("%")
+                                                        .text(t!("typing.params.hanging_punctuation"))
+                                                        .wheel_step(5),
                                                 );
                                                 ms_widgets::HelpHint::animated(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
                                                 resp
@@ -915,7 +920,10 @@ impl TypingCreatePanelState {
                                             &mut block_hscroll_by_hovered_param,
                                             &hanging_punct_resp,
                                         );
-                                        changed |= hanging_punct_resp.changed();
+                                        if hanging_punct_resp.changed() {
+                                            self.hanging_punctuation = hanging_percent as f32 / 100.0;
+                                            changed = true;
+                                        }
                                         let trim_spaces_resp = ui.checkbox(
                                             &mut self.trim_extra_spaces,
                                             t!("typing.params.strip_extra_spaces"),

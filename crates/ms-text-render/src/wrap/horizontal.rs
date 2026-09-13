@@ -40,6 +40,7 @@ use ms_text_util::segmentation::{
     BindingMode, Block, HyphenationDictionaries, SegmentOptions, build_line_text_and_units,
     count_layout_units, with_default_segmenter,
 };
+use ms_text_util::text_punctuation::clamp_hanging_weight;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 use std::collections::HashMap;
 
@@ -130,7 +131,7 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
         text: &str,
         attrs: &Attrs<'_>,
         base_width_px: f32,
-        hanging_punctuation: bool,
+        hanging_punctuation: f32,
     ) -> usize {
         if let Some(font_system) = self.font_system.as_deref_mut() {
             estimate_line_capacity_units(
@@ -174,7 +175,9 @@ pub(super) struct WrapSettings<'a> {
     pub(super) line_order_phases: Option<&'a [ShapeMonotonicPhase]>,
     pub(super) strict_line_order: bool,
     pub(super) allow_moderate_trees: bool,
-    pub(super) hanging_punctuation: bool,
+    /// Hanging-punctuation strength `0.0..=1.0` (`TextRenderParams::hanging_weight`):
+    /// a hanging character counts as `1 - strength` of a layout unit.
+    pub(super) hanging_punctuation: f32,
     pub(super) hyphen_dicts: Option<&'a HyphenationDictionaries>,
     pub(super) word_break_policy: Option<WordBreakPolicy>,
     pub(super) preserve_edge_spaces: bool,
@@ -254,6 +257,15 @@ pub(super) fn wrap_text_with_targets_scored(
     }
 }
 
+/// How many layout units of `text` fit into `base_width_px` on one line.
+///
+/// The estimate divides a measured sample width by the sample's UNIT count, so both
+/// sides must agree on the hanging strength `hanging_punctuation` (`0.0..=1.0`):
+/// the unit count drops a hanging character by `strength` (`count_layout_units`),
+/// and the measured width is blended between the full sample and the sample with
+/// every hanging character removed. Both ends of the range are exact — `0.0`
+/// measures and counts the whole text, `1.0` measures and counts the stripped one —
+/// and only an intermediate strength pays for the second measurement.
 pub(super) fn estimate_line_capacity_units(
     text: &str,
     font_system: &mut FontSystem,
@@ -261,28 +273,35 @@ pub(super) fn estimate_line_capacity_units(
     font_size_px: f32,
     line_height_px: f32,
     base_width_px: f32,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
 ) -> usize {
-    let sample_text = text
+    let weight = clamp_hanging_weight(hanging_punctuation);
+    let full_sample = text
         .chars()
-        .filter(|&ch| {
-            ch != SOFT_HYPHEN
-                && ch != '\n'
-                && ch != '\r'
-                && (!hanging_punctuation || !is_hanging_punctuation(ch))
-        })
+        .filter(|&ch| ch != SOFT_HYPHEN && ch != '\n' && ch != '\r')
         .collect::<String>();
-    let sample_units = sample_text.chars().count();
+    let sample_units = count_layout_units(full_sample.as_str(), weight);
     if sample_units == 0 {
         return 1;
     }
-    let sample_width_px = measure_word_width_px(
-        sample_text.as_str(),
-        font_system,
-        attrs,
-        font_size_px,
-        line_height_px,
-    );
+    let mut measure = |sample: &str| {
+        measure_word_width_px(sample, font_system, attrs, font_size_px, line_height_px)
+    };
+    let sample_width_px = if weight <= 0.0 {
+        measure(full_sample.as_str())
+    } else {
+        let core_sample = full_sample
+            .chars()
+            .filter(|&ch| !is_hanging_punctuation(ch))
+            .collect::<String>();
+        if weight >= 1.0 {
+            measure(core_sample.as_str())
+        } else {
+            // Linear blend, written so the endpoints stay exact: at `weight == 1.0`
+            // the full-sample term is multiplied by an exact zero.
+            measure(full_sample.as_str()) * (1.0 - weight) + measure(core_sample.as_str()) * weight
+        }
+    };
     let avg_char_width_px = (sample_width_px / sample_units as f32).max(1.0);
     ((base_width_px / avg_char_width_px).floor() as usize).max(1)
 }
@@ -660,7 +679,7 @@ fn select_approximate_line_break_candidate(
 
 fn build_overflow_block_candidate(
     blocks: &[Block],
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
 ) -> Option<LineBreakCandidate> {
     let block = blocks.first()?;
     let wraps_at_soft_hyphen = blocks.len() > 1 && block.joint.is_soft_hyphen();
@@ -712,7 +731,7 @@ fn collect_line_break_candidates(
 fn build_emergency_break_candidate(
     blocks: &[Block],
     max_units: usize,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
 ) -> Option<LineBreakCandidate> {
     let block = blocks.first()?;
     if block.text.is_empty() || !is_hyphenatable_wrap_block(block) {
@@ -740,7 +759,7 @@ fn build_dictionary_break_candidate(
     blocks: &[Block],
     max_units: usize,
     target_width_px: f32,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
     dicts: &HyphenationDictionaries,
     scoring: &mut WrapScoringContext<'_, '_>,
 ) -> Option<LineBreakCandidate> {
@@ -982,7 +1001,7 @@ mod tests {
         base_units: usize,
         line_unit_targets: Option<&[usize]>,
         allow_moderate_trees: bool,
-        hanging_punctuation: bool,
+        hanging_punctuation: f32,
     ) -> Vec<String> {
         let mut scoring = WrapScoringContext::fallback();
         wrap_text_with_targets_scored(
@@ -1068,7 +1087,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1092,7 +1111,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1116,7 +1135,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1140,7 +1159,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: None,
                 preserve_edge_spaces: false,
@@ -1164,7 +1183,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1198,7 +1217,7 @@ mod tests {
             12,
             Some(targets.as_slice()),
             false,
-            false,
+            0.0,
         );
 
         assert_eq!(lines.len(), 4);
@@ -1231,7 +1250,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1249,7 +1268,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: true,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1273,7 +1292,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1298,7 +1317,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1328,7 +1347,7 @@ mod tests {
                 line_order_phases: None,
                 strict_line_order: false,
                 allow_moderate_trees: false,
-                hanging_punctuation: false,
+                hanging_punctuation: 0.0,
                 hyphen_dicts: None,
                 word_break_policy: Some(WordBreakPolicy::Minimal),
                 preserve_edge_spaces: false,
@@ -1356,12 +1375,12 @@ mod tests {
             16,
             Some(targets.as_slice()),
             true,
-            false,
+            0.0,
         );
 
         let widths = lines
             .iter()
-            .map(|line| count_layout_units(line, true))
+            .map(|line| count_layout_units(line, 1.0))
             .collect::<Vec<_>>();
 
         // Only check monotonicity over lines that have a real shape target. Text that cannot
@@ -1391,7 +1410,7 @@ mod tests {
         // Regression: the emergency guard used to refuse any all-caps Latin block, so
         // a shouted word with no dictionary break got no last-resort split at all and
         // overflowed the line.
-        let lines = wrap_text_with_targets("HYPHENATION", 5, None, true, false);
+        let lines = wrap_text_with_targets("HYPHENATION", 5, None, true, 0.0);
         assert!(
             lines.len() > 1,
             "an all-caps word must be emergency-split: {lines:?}"
@@ -1412,7 +1431,7 @@ mod tests {
         // The deliberate behaviour change: a lowercase word next to the shouted one
         // used to re-arm the acronym guard and leave "HYPHENATION" unbreakable. The
         // surrounding text has no say any more.
-        let lines = wrap_text_with_targets("the HYPHENATION", 5, None, true, false);
+        let lines = wrap_text_with_targets("the HYPHENATION", 5, None, true, 0.0);
         assert!(
             !lines.iter().any(|line| line.trim() == "HYPHENATION"),
             "the word must not survive whole and overflow the line: {lines:?}"
@@ -1428,13 +1447,13 @@ mod tests {
         // Pin of the new contract: wrapping an uppercase text is the uppercase of
         // wrapping its lowercase form, in both scripts.
         for lower_text in ["переносить", "hyphenation"] {
-            let lower = wrap_text_with_targets(lower_text, 6, None, true, false);
+            let lower = wrap_text_with_targets(lower_text, 6, None, true, 0.0);
             let upper = wrap_text_with_targets(
                 lower_text.to_uppercase().as_str(),
                 6,
                 None,
                 true,
-                false,
+                0.0,
             );
             assert!(
                 lower.len() > 1,

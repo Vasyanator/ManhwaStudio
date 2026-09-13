@@ -29,7 +29,10 @@ output images, or apply effects.
   hanging-punctuation classification. The hanging set itself is not hardcoded here:
   `is_hanging_punctuation` delegates to the app-wide editable list in
   `crate::text_punctuation` (default in `TextTab.hanging_punctuation`, edited in
-  Settings → General).
+  Settings → General). That editable SET is a different thing from the hanging
+  STRENGTH threaded through this module: every `hanging_punctuation: f32` here is
+  `TextRenderParams.hanging_punctuation` clamped to `0.0..=1.0`, and it decides how
+  MUCH a character of that set counts, never which characters are in it.
 - `horizontal.rs`: DP/scored paragraph wrapping, line-width measurement, candidate
   break collection, keep-together heuristics, and target-width scoring.
 - `hyphenation.rs`: embedded Russian/English dictionaries, soft-hyphen insertion,
@@ -42,7 +45,8 @@ output images, or apply effects.
   `Widen`/`Narrow`, pluggable `LineWidthMetric` line widths — `GlyphWidths` measures
   pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
   kerning table, `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
-  edge rule — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
+  edge rule at the caller's STRENGTH, blending the full-line and core measurements so
+  strength `0.0` and `1.0` reproduce the two historical widths exactly — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
   the ranked `search_forms` (see "Form search" below), and `choose_form`). The
   enumerator reuses the shared text segmenter (`segmentation::Segmenter::segment` after
   the dictionary soft-hyphen markup of `prepare_form_text`) so it splits on the same
@@ -239,6 +243,17 @@ Contracts:
   `search_forms` (`enumerate_forms` leaves `UNSCORED_QUALITY_MILLI` / `0`).
 
 ## Contracts and invariants
+- THE HANGING STRENGTH IS ONE NUMBER, THREADED WHOLE. `hanging_punctuation: f32`
+  (`0.0..=1.0`) travels unchanged from `TextRenderParams` through `ShapeWrapRequest` and
+  `WrapSettings` into `count_layout_units`/`find_emergency_split_index` and the
+  `forms.rs` metrics. Every consumer must reproduce today's two behaviours EXACTLY at
+  `0.0` and `1.0`; only what happens in between is new. Two deliberate details:
+  `TextShape::SoftPeak` forces `1.0` regardless of the caller (its target profile is
+  built against fully hung widths), and `estimate_line_capacity_units` must weight the
+  MEASURED sample width and the unit count together, because it divides one by the other.
+- The wrap unit model discounts EVERY hanging character of a line, interior ones
+  included, while the renderer's visual hang covers the leading/trailing runs only.
+  That asymmetry predates the strength and is intentional — do not "fix" it here.
 - Wrapping uses normalized text from `pipeline.rs`; inline style byte-offset remapping
   must happen outside or around this module, not by applying original tagged spans here.
   `forms.rs` is the documented exception and only for text→text work: it strips tags from a

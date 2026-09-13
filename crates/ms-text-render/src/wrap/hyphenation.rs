@@ -20,17 +20,23 @@ Source:
 use super::horizontal::WrapScoringContext;
 use ms_text_util::segmentation::HyphenationDictionaries;
 use ms_text_util::segmentation::base::SOFT_HYPHEN;
-use ms_text_util::segmentation::count_layout_units;
+use ms_text_util::segmentation::{count_layout_units, weighted_layout_units};
 use ms_text_util::segmentation::rules::{
     avoid_emergency_split, dictionary_split_is_valid, emergency_boundary_is_safe,
 };
 use ms_text_util::text_punctuation::is_hanging_punctuation;
 
+/// Picks the dictionary hyphenation point of `text` (ONE wrap block) whose head line
+/// best fits `target_width_px` without exceeding `max_units` layout units.
+///
+/// `hanging_punctuation` is the hanging strength `0.0..=1.0` the unit count is taken
+/// at (see `count_layout_units`). Returns the byte offset of the split, or `None`
+/// when the dictionary offers no valid point.
 pub(super) fn find_dictionary_split_index(
     text: &str,
     max_units: usize,
     target_width_px: f32,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
     dicts: &HyphenationDictionaries,
     scoring: &mut WrapScoringContext<'_, '_>,
 ) -> Option<usize> {
@@ -80,22 +86,32 @@ pub(super) fn find_dictionary_split_index(
 ///
 /// Returns `None` when the block must not be emergency-split at all
 /// (`avoid_emergency_split`) or when no safe boundary fits.
+///
+/// `hanging_punctuation` is the hanging strength `0.0..=1.0`. The two raw tallies are
+/// folded by `weighted_layout_units`, the SAME rule `count_layout_units` applies to a
+/// whole line, so the incremental walk here and the whole-line count can never
+/// disagree about whether a head fits `max_units`.
 pub(super) fn find_emergency_split_index(
     text: &str,
     max_units: usize,
-    hanging_punctuation: bool,
+    hanging_punctuation: f32,
 ) -> Option<usize> {
     if avoid_emergency_split(text) {
         return None;
     }
-    let mut units = 0usize;
+    let mut non_hanging = 0usize;
+    let mut hanging = 0usize;
     let mut split_at = None;
     for (idx, ch) in text.char_indices() {
-        if ch != SOFT_HYPHEN && (!hanging_punctuation || !is_hanging_punctuation(ch)) {
-            units = units.saturating_add(1);
+        if ch != SOFT_HYPHEN {
+            if is_hanging_punctuation(ch) {
+                hanging = hanging.saturating_add(1);
+            } else {
+                non_hanging = non_hanging.saturating_add(1);
+            }
         }
         let next_idx = idx + ch.len_utf8();
-        if units > max_units {
+        if weighted_layout_units(non_hanging, hanging, hanging_punctuation) > max_units {
             break;
         }
         // Language-group rule decides whether this boundary may carry an emergency break.
@@ -131,9 +147,9 @@ mod tests {
 
     #[test]
     fn emergency_split_skips_space_separated_block() {
-        assert!(find_emergency_split_index("да хоть", 2, false).is_none());
+        assert!(find_emergency_split_index("да хоть", 2, 0.0).is_none());
         // A whitespace block already has a normal wrap point, in either letter case.
-        assert!(find_emergency_split_index("ДА ХОТЬ", 2, false).is_none());
+        assert!(find_emergency_split_index("ДА ХОТЬ", 2, 0.0).is_none());
     }
 
     #[test]

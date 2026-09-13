@@ -1176,7 +1176,13 @@ impl TypingCreatePanelState {
             // for families that ship a real Italic face -> the width metric goes
             // stale. The slant magnitude is a pure shear and stays out.
             faux_italic: self.faux_italic,
-            hanging_punctuation: self.hanging_punctuation,
+            // RAW bits, not the float: the signature derives `Eq`, and any change of the
+            // strength — however small — must rebuild the width metric anyway. `-0.0`
+            // reaches the panel from a hand-edited document (`f32::clamp` has no sign-of-
+            // zero rule, so the schema's clamp lets it through); it means the same "off"
+            // as `0.0` but carries a different bit pattern, so its sign is canonicalized
+            // first to avoid one spurious metric rebuild.
+            hanging_punctuation_bits: if self.hanging_punctuation == 0.0 { 0.0_f32 } else { self.hanging_punctuation }.to_bits(),
         }
     }
 

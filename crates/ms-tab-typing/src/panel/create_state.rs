@@ -224,10 +224,14 @@ impl TypingCreatePanelState {
             uppercase_text: false,
             trim_extra_spaces: true,
             replace_ellipsis_with_dots: true,
-            // Off by default: patching the font's GSUB table is a deliberate opt-in for
-            // fonts that re-ligate the three dots back into an ellipsis glyph.
-            force_remove_ellipsis_glyph: false,
-            hanging_punctuation: true,
+            // On by default: fonts that re-ligate the three dots back into an ellipsis
+            // glyph are common enough that the GSUB patch is the expected behaviour.
+            // The FROZEN schema-2 default stays `false` (`text_params_schema.rs`), so a
+            // document that omits the key keeps meaning "off" — this default only makes
+            // the key start being written explicitly.
+            force_remove_ellipsis_glyph: true,
+            // Fully hanging — the strength the boolean parameter's `true` used to mean.
+            hanging_punctuation: 1.0,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,
             use_legacy_inline_tags: load_text_tab_use_legacy_inline_tags(),

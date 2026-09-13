@@ -355,7 +355,9 @@ fn split_vertical_token(
 ) -> (String, String) {
     if let Some(split_at) = hyphen_dicts
         .and_then(|dicts| find_dictionary_split_index_by_units(token, count, dicts))
-        .or_else(|| find_emergency_split_index(token, count.max(1), false))
+        // Vertical text never hangs punctuation, so its unit count is always taken
+        // at zero hanging strength.
+        .or_else(|| find_emergency_split_index(token, count.max(1), 0.0))
     {
         return (token[..split_at].to_string(), token[split_at..].to_string());
     }

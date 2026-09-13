@@ -2218,7 +2218,12 @@ struct TypingCreatePanelState {
     /// a single ellipsis glyph. Meaningful (and shown in the panel) ONLY while the parent
     /// flag is on; the renderer applies the effect only when BOTH are set.
     force_remove_ellipsis_glyph: bool,
-    hanging_punctuation: bool,
+    /// Strength of hanging punctuation, `0.0..=1.0` (the panel shows it as 0..100 %).
+    /// `0.0` disables it, `1.0` hangs edge punctuation entirely (what the former
+    /// boolean `true` meant), an intermediate `v` makes the hanging run contribute
+    /// `(1 - v)` of its real width. Every value entering this field is normalized
+    /// through `ms_text_util::text_punctuation::clamp_hanging_weight`.
+    hanging_punctuation: f32,
     new_line_after_sentence: bool,
     enable_inline_style_tags: bool,
     // Писать обычные («человекочитаемые») inline-теги вместо компактного `<m ...>`.
@@ -2532,7 +2537,10 @@ struct AdvancedFormMetricSpec {
     faux_bold: bool,
     force_italic: bool,
     faux_italic: bool,
-    hanging_punctuation: bool,
+    /// Strength of hanging punctuation, `0.0..=1.0` — snapshot of the panel field of
+    /// the same name. Decides how much an edge punctuation run counts toward a line's
+    /// measured width in the form search.
+    hanging_punctuation: f32,
 }
 
 /// An in-flight background resolve of [`AdvancedFormFont`].
@@ -2584,7 +2592,12 @@ struct AdvancedFormMetricSignature {
     /// slant magnitude itself is a pure shear and leaves advances unchanged, so
     /// it stays out of this signature.
     faux_italic: bool,
-    hanging_punctuation: bool,
+    /// Hanging-punctuation strength as RAW `f32` BITS (`f32::to_bits`), not as a float:
+    /// this signature derives `Eq`, which `f32` does not implement. Bit equality is also
+    /// the correct test here — the value is a cache key, so any change at all, however
+    /// small, must rebuild the width metric. Fed from `self.hanging_punctuation.to_bits()`
+    /// exactly like the neighbouring `faux_bold_thicken_percent`.
+    hanging_punctuation_bits: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

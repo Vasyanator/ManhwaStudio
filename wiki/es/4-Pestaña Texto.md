@@ -41,7 +41,7 @@ Muestra qué aspecto tendrá el texto con los parámetros actuales, sin tener en
 - `Permitir espiga moderada`: afecta a la forma del texto. Permite entrantes en la forma.
 - `Bold`: **fuente en negrita**, no funciona con todas las fuentes
 - `Italic`: fuente inclinada, no funciona con todas
-- `Puntuación colgante`: los signos de puntuación no se ven afectados automáticamente por la alineación del texto. La lista de caracteres está en los ajustes, pero allí están casi todos.
+- `Puntuación colgante`: un deslizador de 0 a 100 %. Define con qué peso la puntuación de los extremos de la línea cuenta para su anchura al alinear el texto: 0 % — como cualquier otro carácter, 100 % — no cuenta en absoluto y queda fuera del bloque, un valor intermedio le deja parte de su anchura (por ejemplo, un 75 % deja a la puntuación solo el 25 % de su anchura real). La lista de caracteres está en los ajustes, pero allí están casi todos.
 - `Eliminar espacios sobrantes`: elimina los espacios en los extremos de las líneas.
 - `Nueva línea tras el fin de la oración`
 - `Todo en mayúsculas`

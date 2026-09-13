@@ -10,7 +10,9 @@ Modules:
   compatibility-jamo caption tables. Independent of the language model.
 - `language`: the typesetting-language model (`TextLanguage`/`ScriptGroup`) and
   the process-global selected language (seeded by the app).
-- `text_punctuation`: the global hanging-punctuation set (seeded by the app).
+- `text_punctuation`: the global hanging-punctuation SET (seeded by the app) and
+  `clamp_hanging_weight`, the normalizer of the separate hanging STRENGTH
+  (`0.0..=1.0`) that the renderer and the wrap weight a hanging character by.
 - `segmentation`: language-aware line/unit segmentation used by wrapping.
 
 Contract:

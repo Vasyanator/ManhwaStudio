@@ -41,7 +41,7 @@ Mostra como o texto ficará com os parâmetros atuais, sem levar em conta o tama
 - `Permitir espinha de peixe moderada`: Afeta a forma do texto. Permite depressões na forma.
 - `Bold`: **Fonte em negrito**, não funciona com todas as fontes
 - `Italic`: Fonte inclinada, não funciona com todas
-- `Pontuação suspensa`: Os sinais de pontuação automaticamente não são afetados pelo alinhamento do texto. A lista de caracteres pode ser encontrada nas configurações, mas ali estão quase todos.
+- `Pontuação suspensa`: Um controle deslizante de 0 a 100 %. Define com que peso a pontuação nas bordas da linha conta para a largura dela no alinhamento do texto: 0 % — como qualquer outro caractere, 100 % — não conta nada e fica para fora do bloco, um valor intermediário deixa para ela parte da largura (75 %, por exemplo, deixa à pontuação apenas 25 % da sua largura real). A lista de caracteres pode ser encontrada nas configurações, mas ali estão quase todos.
 - `Remover espaços sobrantes`: Remove os espaços nas bordas das linhas.
 - `Nova linha após o fim da frase`
 - `Tudo em maiúsculas`

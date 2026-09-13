@@ -64,10 +64,14 @@ Width metric:
 пар, после чего ширина строки = сумма ширин глифов + кернинг. Это ловит случаи,
 где пробел/узкий глиф делает строку короче при равном числе символов. Если шрифт
 недоступен, используется `CharWidthMetric` (счёт символов, прежнее поведение).
-Висящая пунктуация: при включённой — ведущая/хвостовая висящая пунктуация (и
-дефис переноса) не идёт в ширину; при выключенной — считается. Сравнение ширин в
-предикатах формы идёт с допуском (`tolerance`), чтобы суб-глифовый джиттер не
-создавал ложных подъёмов/спусков.
+Висящая пунктуация задаётся СИЛОЙ `0.0..=1.0`, а не флагом: при `0.0` ведущая и
+хвостовая висящая пунктуация (и дефис переноса) идёт в ширину целиком, при `1.0` —
+не идёт вовсе, между ними ширина линейно смешивается между замером всей строки и
+замером её ядра (`blend_hanging_width`). Смешиваются именно два ЗАМЕРА, а не
+вычитается ширина краёв: вместе с краевыми знаками исчезают и пары кернинга на их
+стыке с ядром, поэтому иначе конец диапазона не совпал бы с прежним поведением.
+Сравнение ширин в предикатах формы идёт с допуском (`tolerance`), чтобы
+суб-глифовый джиттер не создавал ложных подъёмов/спусков.
 
 Notes:
 - пропорция формы считается в единицах метрики: `line_height_units` приходит от
@@ -91,6 +95,7 @@ use std::ops::Range;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
 use super::is_hanging_punctuation;
+use ms_text_util::text_punctuation::clamp_hanging_weight;
 use crate::inline_styles::{InlineTagClass, classify_inline_tag_body};
 use ms_text_util::segmentation::{
     BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions,
@@ -479,34 +484,80 @@ pub trait LineWidthMetric {
     fn tolerance(&self) -> u32;
 }
 
-/// Видимое «ядро» строки для замера: без мягких переносов; при включённой
-/// висящей пунктуации — ещё и без ведущей/хвостовой висящей пунктуации.
+/// Видимый текст строки для замера: без мягких переносов, без краевых пробелов.
 #[must_use]
-fn metric_core_text(line: &str, hanging: bool) -> String {
-    if hanging {
-        let (_, core, _) = split_hanging_edges(line);
-        core
-    } else {
-        line.trim().chars().filter(|&ch| ch != SOFT_HYPHEN).collect()
-    }
+fn metric_full_text(line: &str) -> String {
+    line.trim().chars().filter(|&ch| ch != SOFT_HYPHEN).collect()
 }
 
-/// Посимвольная метрика (число символов ядра). Запасной вариант без шрифта и
-/// прежнее поведение окна форм.
+/// «Ядро» строки: [`metric_full_text`] без ведущей/хвостовой висящей пунктуации.
+#[must_use]
+fn metric_core_text(line: &str) -> String {
+    let (_, core, _) = split_hanging_edges(line);
+    core
+}
+
+/// Смешивает замер полной строки и замер её ядра по силе висящей пунктуации
+/// `weight` (`0.0..=1.0`): `0.0` — вся строка, `1.0` — только ядро.
+///
+/// Концы диапазона точны: при `weight == 0.0` возвращается ровно `full`, при
+/// `1.0` — ровно `core`. Промежуточные значения линейно интерполируются и
+/// округляются до целой единицы метрики.
+#[must_use]
+fn blend_hanging_width(full: u32, core: u32, weight: f32) -> u32 {
+    if weight <= 0.0 {
+        return full;
+    }
+    if weight >= 1.0 {
+        return core;
+    }
+    let weight = f64::from(weight);
+    // `round_to_u32` сам округляет и насыщает: результат лежит между `full` и `core`,
+    // то есть внутри диапазона, но приведение остаётся в одном проверенном месте.
+    round_to_u32(f64::from(full) * (1.0 - weight) + f64::from(core) * weight)
+}
+
+/// Число видимых символов строки как единица посимвольной метрики.
+///
+/// Строк длиннее `u32::MAX` символов не бывает; такая насытится, а не завернётся.
+#[must_use]
+fn metric_char_units(text: &str) -> u32 {
+    u32::try_from(text.chars().count()).unwrap_or(u32::MAX)
+}
+
+/// Посимвольная метрика (число символов строки с учётом веса висящих краёв).
+/// Запасной вариант без шрифта и прежнее поведение окна форм.
 pub struct CharWidthMetric {
-    hanging: bool,
+    /// Сила висящей пунктуации `0.0..=1.0` (`TextRenderParams::hanging_weight`).
+    hanging: f32,
 }
 
 impl CharWidthMetric {
+    /// `hanging` — сила висящей пунктуации `0.0..=1.0`: `0.0` считает все символы
+    /// строки, `1.0` — только её ядро, промежуточное значение — линейно между.
+    /// Значение нормализуется (`NaN` = `0.0`), выход за диапазон обрезается.
     #[must_use]
-    pub fn new(hanging: bool) -> Self {
-        Self { hanging }
+    pub fn new(hanging: f32) -> Self {
+        Self {
+            hanging: clamp_hanging_weight(hanging),
+        }
     }
 }
 
 impl LineWidthMetric for CharWidthMetric {
     fn line_width(&self, line: &str) -> u32 {
-        metric_core_text(line, self.hanging).chars().count() as u32
+        if self.hanging <= 0.0 {
+            return metric_char_units(metric_full_text(line).as_str());
+        }
+        let core = metric_char_units(metric_core_text(line).as_str());
+        if self.hanging >= 1.0 {
+            return core;
+        }
+        blend_hanging_width(
+            metric_char_units(metric_full_text(line).as_str()),
+            core,
+            self.hanging,
+        )
     }
 
     fn tolerance(&self) -> u32 {
@@ -519,7 +570,8 @@ impl LineWidthMetric for CharWidthMetric {
 pub struct GlyphWidths {
     advances: HashMap<char, u32>,
     kerns: HashMap<(char, char), i32>,
-    hanging: bool,
+    /// Сила висящей пунктуации `0.0..=1.0` (`TextRenderParams::hanging_weight`).
+    hanging: f32,
     tolerance: u32,
 }
 
@@ -543,7 +595,7 @@ impl GlyphWidths {
         font_system: &mut FontSystem,
         attrs: &Attrs<'_>,
         form_source_text: &str,
-        hanging: bool,
+        hanging: f32,
         tolerance: u32,
         scope: InlineTagScope,
     ) -> Self {
@@ -589,18 +641,19 @@ impl GlyphWidths {
         Self {
             advances,
             kerns,
-            hanging,
+            hanging: clamp_hanging_weight(hanging),
             tolerance,
         }
     }
 }
 
-impl LineWidthMetric for GlyphWidths {
-    fn line_width(&self, line: &str) -> u32 {
-        let chars: Vec<char> = metric_core_text(line, self.hanging).chars().collect();
+impl GlyphWidths {
+    /// Ширина готового текста: сумма ширин глифов плюс поправки кернинга соседних пар.
+    #[must_use]
+    fn measured_width(&self, text: &str) -> u32 {
         let mut width: i64 = 0;
         let mut prev: Option<char> = None;
-        for &ch in &chars {
+        for ch in text.chars() {
             width += i64::from(self.advances.get(&ch).copied().unwrap_or(0));
             if let Some(p) = prev {
                 width += i64::from(self.kerns.get(&(p, ch)).copied().unwrap_or(0));
@@ -608,6 +661,26 @@ impl LineWidthMetric for GlyphWidths {
             prev = Some(ch);
         }
         width.max(0) as u32
+    }
+}
+
+impl LineWidthMetric for GlyphWidths {
+    fn line_width(&self, line: &str) -> u32 {
+        if self.hanging <= 0.0 {
+            return self.measured_width(metric_full_text(line).as_str());
+        }
+        let core = self.measured_width(metric_core_text(line).as_str());
+        if self.hanging >= 1.0 {
+            return core;
+        }
+        // Смешиваются два ЗАМЕРА, а не вычитается ширина краёв: при полном подвесе
+        // вместе с краевыми знаками исчезают и две пары кернинга на их стыке с ядром,
+        // поэтому только так конец диапазона совпадает с прежним поведением.
+        blend_hanging_width(
+            self.measured_width(metric_full_text(line).as_str()),
+            core,
+            self.hanging,
+        )
     }
 
     fn tolerance(&self) -> u32 {
@@ -1635,7 +1708,7 @@ fn segment_form_blocks(
     let blocks = seg.segment(
         prepared.text.as_str(),
         SegmentOptions {
-            hanging_punctuation: false,
+            hanging_punctuation: 0.0,
             preserve_edge_spaces: false,
             allow_hard_hyphen_breaks: true,
             // Строим граф один раз: служебные слова не склеиваем, а помечаем
@@ -3113,7 +3186,7 @@ pub fn choose_form(
     target_line_width: usize,
 ) -> Option<Vec<String>> {
     // Здесь шрифт недоступен — используем посимвольную метрику (как раньше).
-    let metric = CharWidthMetric::new(true);
+    let metric = CharWidthMetric::new(1.0);
     // Рендер зовёт это ПОСЛЕ разбора inline-стилей, то есть на уже очищенном тексте;
     // остаются только управляющие теги «не разрывать», и вернуть сюда нечего —
     // функция отдаёт строки, а не текст.
@@ -3181,7 +3254,7 @@ mod tests {
     }
 
     /// Посимвольная метрика с висящими краями — прежнее поведение окна форм.
-    const CHAR_METRIC: CharWidthMetric = CharWidthMetric { hanging: true };
+    const CHAR_METRIC: CharWidthMetric = CharWidthMetric { hanging: 1.0 };
 
     fn widths_of(form: &TextForm) -> Vec<u32> {
         form.lines
@@ -4270,7 +4343,7 @@ Pages wired down:                        333333.\n";
         // реальная форма ["a", "b"] имеет максимум 1 и проходит потолок пропорции
         // (1 / (2 строки × 1.0) = 0.5 ≤ 0.6). Отсев корзины по `T_L > aspect_cap`
         // (1.5 > 1.2) выбрасывал её — то есть был неадмиссибелен.
-        let metric = CharWidthMetric::new(false);
+        let metric = CharWidthMetric::new(0.0);
         assert_eq!(metric.line_width("a b"), 3);
         let params = FormSearchParams {
             aspect_max: 0.6,
@@ -5053,5 +5126,49 @@ Pages wired down:                        333333.\n";
                 form_text
             );
         }
+    }
+
+    #[test]
+    fn the_char_metric_weights_the_hanging_edges_linearly() {
+        // «Aa!» — ведущий знак «, ядро "Aa", хвостовая серия "!»": 5 символов, 2 в ядре.
+        const LINE: &str = "«Aa!»";
+        assert_eq!(CharWidthMetric::new(0.0).line_width(LINE), 5);
+        assert_eq!(CharWidthMetric::new(1.0).line_width(LINE), 2);
+        // Промежуточный вес — линейно между концами: 5 - 0.5*3 = 3.5 -> 4.
+        assert_eq!(CharWidthMetric::new(0.5).line_width(LINE), 4);
+        assert_eq!(CharWidthMetric::new(0.25).line_width(LINE), 4);
+        assert_eq!(CharWidthMetric::new(0.75).line_width(LINE), 3);
+        // Ширина не растёт с весом — иначе перебор форм дёргался бы на слайдере.
+        let mut prev = u32::MAX;
+        for weight in [0.0f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] {
+            let width = CharWidthMetric::new(weight).line_width(LINE);
+            assert!(width <= prev, "width must not grow with the weight at {weight}");
+            prev = width;
+        }
+        // Строка без висящих краёв не зависит от веса вовсе.
+        for weight in [0.0f32, 0.5, 1.0] {
+            assert_eq!(CharWidthMetric::new(weight).line_width("Aa"), 2);
+        }
+    }
+
+    #[test]
+    fn a_broken_hanging_weight_is_normalized_by_the_metric() {
+        const LINE: &str = "«Aa!»";
+        // NaN — это «выключено», а не паника и не половина.
+        assert_eq!(CharWidthMetric::new(f32::NAN).line_width(LINE), 5);
+        assert_eq!(CharWidthMetric::new(-4.0).line_width(LINE), 5);
+        assert_eq!(CharWidthMetric::new(9.0).line_width(LINE), 2);
+    }
+
+    #[test]
+    fn the_width_blend_is_exact_at_both_ends() {
+        // Контракт `blend_hanging_width`: концы диапазона возвращаются без
+        // арифметики, иначе метрика перестала бы совпадать с прежним поведением.
+        assert_eq!(blend_hanging_width(100, 60, 0.0), 100);
+        assert_eq!(blend_hanging_width(100, 60, 1.0), 60);
+        assert_eq!(blend_hanging_width(100, 60, 0.5), 80);
+        assert_eq!(blend_hanging_width(100, 60, 0.25), 90);
+        // Вырожденный случай: нечего подвешивать — вес ни на что не влияет.
+        assert_eq!(blend_hanging_width(42, 42, 0.37), 42);
     }
 }

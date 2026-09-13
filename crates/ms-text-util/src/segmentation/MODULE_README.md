@@ -28,7 +28,7 @@ clone and switching languages does not reload TeX patterns.
   the `Segmenter` trait (hooks `binding_conservatism`, `hyphenate_word`,
   `hyphen_cost`, `is_hard_hyphen_boundary`; default `segment`/`build_segments`/
   `soft_hyphenate_overlong`/`split_segment_into_parts`), and the shared
-  `count_layout_units` / `build_line_text_and_units`. Also hosts the
+  `count_layout_units` / `weighted_layout_units` / `build_line_text_and_units`. Also hosts the
   **script-neutral binding primitives** (`normalize_binding_token`,
   `is_single_letter_binding`, `is_numeric_measure_pair`) shared by the
   Cyrillic-Slavic and Latin-Slavic `binding_conservatism`. They live here rather
@@ -72,6 +72,18 @@ clone and switching languages does not reload TeX patterns.
   cache.
 
 ## Contracts and invariants
+- **The hanging-punctuation unit weight is a STRENGTH, not a flag.**
+  `SegmentOptions.hanging_punctuation` and `count_layout_units` take an `f32` in
+  `0.0..=1.0` (`text_punctuation::clamp_hanging_weight`; `NaN` = `0.0`): a hanging
+  character counts as `1 - strength` of a unit. `0.0` and `1.0` reproduce the two
+  historical counts exactly — that is a contract `ms-text-render` wraps against, so
+  neither end may drift. Rounding happens once per LINE (`weighted_layout_units`), never
+  per character, so a unit count stays a whole number. A NON-EMPTY line never counts 0
+  units while `0 < strength < 1` — an explicit floor, because plain rounding zeroes an
+  all-hanging line well before full strength (`round(1 * 0.25) == 0`) and a zero count
+  reads as "empty line" to the wrap's capacity and break decisions. Only
+  `strength >= 1.0` may return 0, reproducing the historical "on" behavior. `weighted_layout_units` is public
+  for callers that tally characters incrementally and must land on the same number.
 - Config-free: no submodule reads config. The app seeds the selected language via
   `crate::language::set_text_language` at startup (default `Ru`).
 - Russian is a hard bit-identical contract (golden tests in `cyrillic_slavic`).

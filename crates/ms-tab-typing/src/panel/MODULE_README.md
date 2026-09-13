@@ -942,6 +942,20 @@ session long before this call.
   panel default is fine (that key simply starts being written); changing a FROZEN value
   reinterprets every already-written document and requires bumping the version and adding a read
   branch. `defaults_are_frozen` pins every value so this cannot happen by accident.
+- `hanging_punctuation` IS PERSISTED IN TWO SHAPES, and BOTH the read and the write side are
+  owned by `text_params_schema` (`hanging_punctuation_weight` / `hanging_punctuation_value`)
+  so no call site can invent a third. The parameter is an `f32` strength (`0.0..=1.0`, 0 =
+  off, 1 = fully hanging) but is WRITTEN as the legacy `bool` at its two exact endpoints and
+  as a number only when strictly fractional. That is what keeps compatibility in BOTH
+  directions: an older build reads the key with `Value::as_bool`, so a project saved here
+  still renders correctly after a rollback, and `true` stays `Value`-equal to the FROZEN
+  schema-2 default, so a document at the default omits the key exactly as before (no churn in
+  existing files, no preset re-store). The version is NOT bumped — no already-written value
+  changes meaning. A fractional strength degrades to "off" in an old build; that is accepted,
+  since the value could not exist there. Reading accepts either shape (`true` ≡ `1.0`,
+  `false` ≡ `0.0`), clamps, and rejects every other JSON kind. The panel edits it as a
+  0..100 % `WheelSlider`; the section's «включено N» summary counts it as enabled at any
+  non-zero value.
 - SUB-PARAMETER `force_remove_ellipsis_glyph` (text-processing section) is a modifier of
   `replace_ellipsis_with_dots`, not an independent step. It is stored on its own (frozen
   default `false`, so no existing document changes meaning) but ANDed with its parent at every
