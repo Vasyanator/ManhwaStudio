@@ -4740,6 +4740,8 @@
   "typing.font_settings.properties_custom_kerning_left_label": "First character",
   "typing.font_settings.properties_custom_kerning_right_label": "Second character",
   "typing.font_settings.properties_custom_kerning_preview_label": "Preview",
+  "typing.font_settings.properties_custom_kerning_preview_size_label": "Size",
+  "typing.font_settings.properties_custom_kerning_preview_size_hint": "Preview font size in points, {min}–{max}. Visual only: it is not saved and cannot change what the pair does — the offset is stored in thousandths of an em, so the gap scales with any size.",
   "typing.font_settings.properties_custom_kerning_offset_label": "Distance",
   "typing.font_settings.properties_custom_kerning_offset_suffix": " ‰ em",
   "typing.font_settings.properties_custom_kerning_offset_hint": "Thousandths of an em: the adjustment does not depend on the glyph size, so the pair looks the same at every font size.",

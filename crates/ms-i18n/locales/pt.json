@@ -4542,6 +4542,8 @@
   "typing.font_settings.properties_custom_kerning_left_label": "Primeiro caractere",
   "typing.font_settings.properties_custom_kerning_right_label": "Segundo caractere",
   "typing.font_settings.properties_custom_kerning_preview_label": "Pré-visualização",
+  "typing.font_settings.properties_custom_kerning_preview_size_label": "Tamanho",
+  "typing.font_settings.properties_custom_kerning_preview_size_hint": "Tamanho da fonte da pré-visualização em pontos, {min}–{max}. Apenas visual: não é salvo e não altera o que o par faz — o deslocamento é armazenado em milésimos de eme, então o espaço escala com qualquer tamanho.",
   "typing.font_settings.properties_custom_kerning_offset_label": "Distância",
   "typing.font_settings.properties_custom_kerning_offset_suffix": " ‰ em",
   "typing.font_settings.properties_custom_kerning_offset_hint": "Milésimos de em: o ajuste não depende do tamanho do glifo, então o par fica igual em qualquer tamanho.",

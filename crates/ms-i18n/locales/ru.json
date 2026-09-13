@@ -4740,6 +4740,8 @@
   "typing.font_settings.properties_custom_kerning_left_label": "Первый символ",
   "typing.font_settings.properties_custom_kerning_right_label": "Второй символ",
   "typing.font_settings.properties_custom_kerning_preview_label": "Предпросмотр",
+  "typing.font_settings.properties_custom_kerning_preview_size_label": "Размер",
+  "typing.font_settings.properties_custom_kerning_preview_size_hint": "Размер шрифта предпросмотра в пунктах, {min}–{max}. Только для вида: не сохраняется и не влияет на саму пару — смещение хранится в тысячных долях кегля, поэтому зазор масштабируется при любом размере.",
   "typing.font_settings.properties_custom_kerning_offset_label": "Расстояние",
   "typing.font_settings.properties_custom_kerning_offset_suffix": " ‰ em",
   "typing.font_settings.properties_custom_kerning_offset_hint": "Тысячные доли кегельной: поправка не зависит от размера глифа, поэтому пара выглядит одинаково при любом кегле.",

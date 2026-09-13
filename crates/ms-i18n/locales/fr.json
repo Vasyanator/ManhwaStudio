@@ -4542,6 +4542,8 @@
   "typing.font_settings.properties_custom_kerning_left_label": "Premier caractère",
   "typing.font_settings.properties_custom_kerning_right_label": "Second caractère",
   "typing.font_settings.properties_custom_kerning_preview_label": "Aperçu",
+  "typing.font_settings.properties_custom_kerning_preview_size_label": "Taille",
+  "typing.font_settings.properties_custom_kerning_preview_size_hint": "Taille de police de l'aperçu en points, {min}–{max}. Purement visuel : non enregistré et sans effet sur la paire — le décalage est stocké en millièmes de cadratin, donc l'espace s'adapte à toute taille.",
   "typing.font_settings.properties_custom_kerning_offset_label": "Distance",
   "typing.font_settings.properties_custom_kerning_offset_suffix": " ‰ em",
   "typing.font_settings.properties_custom_kerning_offset_hint": "Millièmes de cadratin : le réglage ne dépend pas de la taille du glyphe, la paire garde donc le même aspect à toutes les tailles.",

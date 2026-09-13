@@ -14,8 +14,8 @@ Main responsibilities:
   collapsible built-in kerning list, custom-kerning-pair section) without blocking the GUI
   thread;
 - own the sibling custom-kerning EDITOR window (two characters + an advance offset in
-  thousandths of an em, plus a preview-only context on either side) and persist its result
-  through `font_admin::set_custom_kerning`;
+  thousandths of an em, plus a preview-only context on either side and a preview-only font
+  size) and persist its result through `font_admin::set_custom_kerning`;
 - analyze the font file OFF the GUI thread (glyph inventory + kerning extraction via
   `ttf-parser`) and deliver the result over an `mpsc` channel the window polls;
 - wire the display-name editor to `crate::tabs::typing::font_admin::set_display_name_override`
@@ -50,8 +50,8 @@ every rendered size and across fonts with different `units_per_em`. The font FIL
 touched. A custom pair OVERRIDES the font's own kerning for the same two characters, and an
 offset of `0.0` is a meaningful value that cancels a built-in pair.
 
-The editor's "Символы до" / "Символы после" fields are a VISUAL DEBUGGING AID and are never
-persisted: they live on `CustomKerningEditorState` alone, are absent from `CustomKerningPair`,
+The editor's "Символы до" / "Символы после" fields AND its preview font size are a VISUAL
+DEBUGGING AID and are never persisted: they live on `CustomKerningEditorState` alone, are absent from `CustomKerningPair`,
 and die with the editor window. They extend the live preview from the bare pair to the run
 `before + left + right + after`, laid out glyph by glyph (egui 0.35 applies no kerning in text
 layout, so a single-glyph galley's width IS that glyph's advance). Each gap of that run is
@@ -60,6 +60,11 @@ pairs, else the font's built-in value, else zero — with a custom value always 
 built-in one, matching the renderer. The one honest limit: the built-in list is capped at
 `MAX_KERNING_PAIRS`, so a context pair beyond the cap renders unkerned here while the renderer
 kerns it; the editor says so whenever `kerning_truncated` is set and a context is typed.
+The preview SIZE follows the same contract and starts at `PAIR_PREVIEW_FONT_SIZE`. It cannot
+change what the pair does — the offset is in thousandths of an em, so every gap is converted
+against the same live size the glyphs are painted at and the run stays a faithful scale model
+at any size. The strip's height is derived from that size (`PAIR_PREVIEW_HEIGHT_RATIO`), and
+the offset row's px read-out follows it too, so the number describes the strip on screen.
 */
 
 use crate::tabs::typing::font_admin::{self, CustomKerningPair, FontEntry};
@@ -92,10 +97,19 @@ const CUSTOM_KERNING_ROW_HEIGHT: f32 = 32.0;
 const CUSTOM_KERNING_LIST_MAX_HEIGHT: f32 = 200.0;
 /// Width (points) of the own-typeface pair column inside one custom-kerning row.
 const CUSTOM_KERNING_PAIR_COL_WIDTH: f32 = 64.0;
-/// Font size (points) the editor's live pair preview is painted at.
-const PAIR_PREVIEW_FONT_SIZE: f32 = 48.0;
-/// Height (points) of the editor's live pair preview strip.
-const PAIR_PREVIEW_HEIGHT: f32 = 76.0;
+/// DEFAULT font size (points) the editor's live pair preview is painted at. The size itself is
+/// adjustable per editor session (`CustomKerningEditorState::preview_font_size`); this is only
+/// where a freshly opened editor starts.
+const PAIR_PREVIEW_FONT_SIZE: f32 = 120.0;
+/// Inclusive bounds (points) the preview-size control accepts. The lower bound keeps the glyphs
+/// legible enough to judge a gap at all; the upper one keeps a pair inside the strip's width on
+/// an ordinary window before the run has to be clipped.
+const PAIR_PREVIEW_FONT_SIZE_MIN: f32 = 12.0;
+const PAIR_PREVIEW_FONT_SIZE_MAX: f32 = 400.0;
+/// Height of the preview strip as a multiple of the preview font size. The strip has to grow
+/// with the glyphs or a larger size would simply paint outside it; the ratio is the one the
+/// fixed 48 pt / 76 pt pair used before the size became adjustable.
+const PAIR_PREVIEW_HEIGHT_RATIO: f32 = 76.0 / 48.0;
 /// Upper bound on how many characters EACH preview-context field contributes to the editor's
 /// preview run. The run is laid out and painted glyph by glyph on the GUI thread every frame
 /// inside a fixed-width strip, so an unbounded paste would both walk off the strip and pay for
@@ -217,6 +231,13 @@ struct CustomKerningEditorState {
     context_before: String,
     /// PREVIEW-ONLY text painted AFTER the pair. Same contract as `context_before`.
     context_after: String,
+    /// PREVIEW-ONLY font size (points) the run is painted at, starting at
+    /// `PAIR_PREVIEW_FONT_SIZE`. Same contract as the context fields: never validated against
+    /// the font, never part of `CustomKerningPair`, never persisted, gone when the editor
+    /// closes. It CANNOT change what the pair does — the offset is stored in thousandths of an
+    /// em, so the gap scales with whatever size it is viewed at; this only decides how large
+    /// the user inspects it.
+    preview_font_size: f32,
     /// Localized validation message shown in the error color, cleared on the next attempt.
     error: Option<String>,
 }
@@ -231,6 +252,7 @@ impl CustomKerningEditorState {
             offset_per_mille: 0.0,
             context_before: String::new(),
             context_after: String::new(),
+            preview_font_size: PAIR_PREVIEW_FONT_SIZE,
             error: None,
         }
     }
@@ -246,6 +268,7 @@ impl CustomKerningEditorState {
             offset_per_mille: pair.offset_per_mille,
             context_before: String::new(),
             context_after: String::new(),
+            preview_font_size: PAIR_PREVIEW_FONT_SIZE,
             error: None,
         }
     }
@@ -1259,7 +1282,27 @@ fn draw_custom_kerning_editor_body(
     ui.small(t!("typing.font_settings.properties_custom_kerning_context_note"));
 
     ui.add_space(4.0);
-    ui.label(t!("typing.font_settings.properties_custom_kerning_preview_label"));
+    ui.horizontal(|ui| {
+        ui.label(t!("typing.font_settings.properties_custom_kerning_preview_label"));
+        ui.add_space(8.0);
+        ui.label(t!(
+            "typing.font_settings.properties_custom_kerning_preview_size_label"
+        ));
+        ui.add(
+            WheelSpinBox::new(&mut editor.preview_font_size)
+                .range(PAIR_PREVIEW_FONT_SIZE_MIN..=PAIR_PREVIEW_FONT_SIZE_MAX)
+                .speed(1.0)
+                .wheel_step(2.0)
+                .fixed_decimals(0),
+        )
+        // Bounds are formatted from the constants themselves so the text cannot drift from
+        // what the widget actually accepts.
+        .on_hover_text(tf!(
+            "typing.font_settings.properties_custom_kerning_preview_size_hint",
+            min = format!("{PAIR_PREVIEW_FONT_SIZE_MIN:.0}"),
+            max = format!("{PAIR_PREVIEW_FONT_SIZE_MAX:.0}")
+        ));
+    });
     let family = typeface.family(ui.ctx());
     // Snapshot what the kerning closure needs BEFORE it borrows anything: `editor` stays
     // mutably available for the offset wheel below.
@@ -1270,11 +1313,15 @@ fn draw_custom_kerning_editor_body(
         .zip(right)
         .map(|(left, right)| (left, right, editor.offset_per_mille));
     let run = build_preview_run(&editor.context_before, left, right, &editor.context_after);
+    // The live preview size, snapshotted with the rest: every gap is converted against the SAME
+    // size the glyphs are painted at, which is what keeps the preview a faithful scale model of
+    // the pair at any size.
+    let preview_font_size = editor.preview_font_size;
     let kern_px = |left: char, right: char| {
         resolve_run_kern_per_mille(stored, original, live_pair, builtin, left, right) / 1000.0
-            * PAIR_PREVIEW_FONT_SIZE
+            * preview_font_size
     };
-    draw_pair_preview(ui, &run, kern_px, family.as_ref());
+    draw_pair_preview(ui, &run, kern_px, family.as_ref(), preview_font_size);
     // A capped built-in kerning list makes the CONTEXT lie: a pair whose own kerning fell
     // outside `MAX_KERNING_PAIRS` renders unkerned here while the renderer kerns it. Same
     // honesty `draw_kerning_section` owes its own list, and only worth saying when there is
@@ -1308,8 +1355,10 @@ fn draw_custom_kerning_editor_body(
             max = format!("{CUSTOM_KERNING_LIMIT_PER_MILLE:.0}")
         ));
         // The ‰ value is abstract; the px read-out says what it does at the preview size,
-        // exactly as the built-in kerning list already shows both.
-        let px = editor.offset_per_mille / 1000.0 * PREVIEW_FONT_SIZE;
+        // exactly as the built-in kerning list already shows both. It follows the LIVE preview
+        // size, not a fixed one: the strip above is what the number is supposed to describe, so
+        // pinning it to some other size would make the read-out describe nothing on screen.
+        let px = editor.offset_per_mille / 1000.0 * preview_font_size;
         ui.label(tf!(
             "typing.font_settings.properties_kerning_px",
             px = format!("{px:.1}")
@@ -1541,8 +1590,11 @@ where
     PreviewRunLayout { offsets, width: pen }
 }
 
-/// Paints the preview run (context + edited pair + context) at `PAIR_PREVIEW_FONT_SIZE`,
-/// centred on its own extent, with `kern_px` applied in every gap.
+/// Paints the preview run (context + edited pair + context) at `font_size` points, centred on
+/// its own extent, with `kern_px` applied in every gap.
+///
+/// `font_size` is the editor's live preview size and must be the SAME size `kern_px` converted
+/// its thousandths-of-an-em values against, or the gaps would not scale with the glyphs.
 ///
 /// egui 0.35 applies NO kerning during text layout, so each character is painted separately at
 /// a pen computed by `layout_preview_run`; a single-glyph galley's width IS that glyph's
@@ -1560,9 +1612,11 @@ fn draw_pair_preview(
     run: &[char],
     kern_px: impl Fn(char, char) -> f32,
     family: Option<&egui::FontFamily>,
+    font_size: f32,
 ) {
+    // The strip grows with the glyphs: a fixed height would let a larger size paint outside it.
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), PAIR_PREVIEW_HEIGHT),
+        egui::vec2(ui.available_width(), font_size * PAIR_PREVIEW_HEIGHT_RATIO),
         egui::Sense::hover(),
     );
     let visuals = ui.visuals().clone();
@@ -1572,8 +1626,8 @@ fn draw_pair_preview(
         return;
     }
     let font_id = match family {
-        Some(fam) => egui::FontId::new(PAIR_PREVIEW_FONT_SIZE, fam.clone()),
-        None => egui::FontId::proportional(PAIR_PREVIEW_FONT_SIZE),
+        Some(fam) => egui::FontId::new(font_size, fam.clone()),
+        None => egui::FontId::proportional(font_size),
     };
     let color = visuals.text_color();
     // Galleys are cached by epaint on the layout job, so re-measuring the same bounded set of

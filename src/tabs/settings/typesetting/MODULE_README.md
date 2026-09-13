@@ -205,6 +205,16 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   capped at `MAX_KERNING_PAIRS`, so a context pair beyond the cap renders UNKERNED here while the
   renderer kerns it — the editor states this (following `draw_kerning_section`'s truncation-note
   style) whenever `kerning_truncated` is set and a context is typed.
+  PREVIEW FONT SIZE is adjustable per editor session and carries the SAME never-persisted
+  contract as the context fields: a `WheelSpinBox` over
+  `CustomKerningEditorState::preview_font_size`, starting at `PAIR_PREVIEW_FONT_SIZE` and bounded
+  by `PAIR_PREVIEW_FONT_SIZE_{MIN,MAX}`. It cannot change what the pair DOES — the offset is
+  stored in thousandths of an em, and every gap is converted against the same live size the
+  glyphs are painted at, so the run is a faithful scale model of the pair at whatever size it is
+  inspected. Two things follow that size rather than being fixed, and must keep doing so: the
+  strip's HEIGHT (`PAIR_PREVIEW_HEIGHT_RATIO` — a fixed height would let a larger size paint
+  outside the strip) and the offset row's px READ-OUT, which describes the strip on screen and
+  would otherwise quote a size nothing displays.
   VALIDATION, in the module's usual red-message style: both characters are
   required, and a `(left, right)` already bound by another custom pair is refused instead of
   silently overwriting it — the store keeps the FIRST entry for a repeated key, so a duplicate
