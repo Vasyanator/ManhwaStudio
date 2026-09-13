@@ -72,6 +72,24 @@ fn apply_display_name_overrides(entries: &mut [FontEntry]) {
     }
 }
 
+/// Applies the user-defined CUSTOM KERNING pairs to a FINALIZED font list, keyed by each
+/// entry's render IDENTITY.
+///
+/// Unlike the display-name override this is NOT display-only: the pairs travel to the
+/// renderer through the font provider, which cannot tell them apart from the font's own
+/// `kern`/GPOS pairs. The font FILE is never touched.
+///
+/// MUST run AFTER `assign_font_identity_names`, for the same reason
+/// [`apply_display_name_overrides`] must: the identity is the key, and running earlier would
+/// look up an entry's base identity and miss a `%hash`-suffixed one. A merged cluster of
+/// byte-identical copies has exactly ONE kerning slot (its identity).
+fn apply_custom_kerning(entries: &mut [FontEntry]) {
+    for entry in entries.iter_mut() {
+        entry.custom_kerning =
+            font_settings_store::font_custom_kerning(&entry.render_identity_name());
+    }
+}
+
 /// Normalizes a font identity for COMPARISON and MAP KEYS: `trim` + ASCII lowercase.
 ///
 /// The single definition of identity normalization, mirrored by
@@ -317,6 +335,8 @@ pub(super) fn bundled_ui_font_entry() -> Option<FontEntry> {
         // reserved identity never needs a collision suffix anyway.
         content_hash: 0,
         display_name: None,
+        // The bundled stack is not a user font file and carries no per-font settings.
+        custom_kerning: Vec::new(),
         identity_name: BUNDLED_UI_FONT_IDENTITY.to_string(),
         virtual_group_aliases: BTreeMap::new(),
     })
@@ -795,9 +815,9 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
 /// membership or a display-name override created there matched no panel entry and silently
 /// did nothing.
 pub(crate) struct CombinedFontList {
-    /// Merged, sorted, identity-assigned entries with display-name overrides applied. Does
-    /// NOT include the synthetic bundled-UI entry — that belongs to the PANEL list only and
-    /// is prepended by `load_fonts`.
+    /// Merged, sorted, identity-assigned entries with display-name overrides and custom
+    /// kerning applied. Does NOT include the synthetic bundled-UI entry — that belongs to the
+    /// PANEL list only and is prepended by `load_fonts`.
     pub entries: Vec<FontEntry>,
     /// One row per entry of `fonts_data.json`'s `system_fonts`, in stored order, INCLUDING
     /// the ones that could not be loaded this run.
@@ -852,8 +872,8 @@ pub(crate) struct ImportedSystemFontRow {
 /// then the loadable imported fonts appended, then the cross-source byte-identical fold, the
 /// label renumbering, the sort, and only then the collision-aware identity assignment — a
 /// folder font's name may be contested by an imported one, so identity cannot be resolved on
-/// either subset alone. The deferred v1 migration and the display-name overrides run last,
-/// against those final identities.
+/// either subset alone. The deferred v1 migration, the display-name overrides and the custom
+/// kerning pairs run last, against those final identities.
 pub(crate) fn build_combined_font_list(
     fonts_dir: &Path,
     imported_refs: &[fonts_data::SystemFontRef],
@@ -898,8 +918,9 @@ pub(crate) fn build_combined_font_list(
     run_pending_fonts_data_migration(&entries, fonts_dir);
     // Overrides are keyed by identity, so they are resolved only now: the combined identity
     // assignment can have suffixed an entry, and the migration above can have re-keyed the
-    // store.
+    // store. Custom kerning is keyed the same way and therefore resolved at the same point.
     apply_display_name_overrides(&mut entries);
+    apply_custom_kerning(&mut entries);
     relink_imported_rows(&mut imported_rows, &entries);
     CombinedFontList {
         entries,
@@ -1089,6 +1110,10 @@ pub(crate) fn load_imported_system_font_rows(
         // Read before `data.faces` is moved out below.
         let post_script_name = data.post_script_name().to_string();
         let display_name = font_settings_store::font_display_name_override(&identity_name);
+        // Both per-font settings are looked up on the entry's PRE-COLLISION identity here;
+        // `build_combined_font_list` re-resolves them on the final identities once the
+        // combined list exists, and this row is then relinked to that entry.
+        let custom_kerning = font_settings_store::font_custom_kerning(&identity_name);
         let entry = FontEntry {
             kind: FontEntryKind::File,
             label,
@@ -1102,6 +1127,7 @@ pub(crate) fn load_imported_system_font_rows(
             post_script_name,
             content_hash: data.content_hash,
             display_name,
+            custom_kerning,
             identity_name: identity_name.clone(),
             virtual_group_aliases: BTreeMap::new(),
         };
@@ -1426,6 +1452,8 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             // `build_combined_font_list`, once every entry carries its final identity
             // (the override key).
             display_name: None,
+            // Filled by `apply_custom_kerning` at the same point, keyed the same way.
+            custom_kerning: Vec::new(),
             identity_name,
             // Filled by `apply_virtual_groups` after the finalized list is built.
             virtual_group_aliases: BTreeMap::new(),
@@ -2257,6 +2285,9 @@ pub(crate) fn load_system_fonts() -> Vec<FontEntry> {
             // only where two files claim ONE identity — filled in right below.
             content_hash: 0,
             display_name,
+            // The picker catalog is never a panel list and never reaches the renderer, so it
+            // carries no kerning overrides; the properties window reads them by identity.
+            custom_kerning: Vec::new(),
             identity_name,
             virtual_group_aliases: BTreeMap::new(),
         });

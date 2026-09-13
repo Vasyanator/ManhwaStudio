@@ -21,6 +21,14 @@ On-path horizontal alignment (`TextRenderParams.align`):
 - Formula/shape: `map_formula_target_arc_length` splits the free curve length; the
   overflow branch keeps its compression and ignores alignment.
 
+User-authored kerning pairs:
+`assign_formula_seed_advances` applies them exactly as the horizontal pen loop does —
+a matching pair REPLACES the font's own value under every `KerningMode`, stepping by
+`nominal_glyph_advance_px(left)` plus the authored delta. Seeds are DETACHED from the
+`LayoutRun` they came from, so the source character is captured at seed time as
+`FormulaGlyphSeed::cluster_char`; it is `None` for a multi-character cluster and for
+the synthesized wrap hyphen, neither of which can carry an authored pair.
+
 Glyph rasterization (formula + custom-line composite pass):
 - Each placed glyph is drawn by rasterizing its true font outline
   (`render_next/vector.rs`) directly into the output via
@@ -84,7 +92,7 @@ use crate::drawn_lines::{
     DrawnLinePath, build_vector_line_paths, load_raster_line_paths,
 };
 use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
-use crate::font_registry::InlineFontRegistry;
+use crate::font_registry::{CustomKerningMap, InlineFontRegistry};
 use crate::glyph_blit::{
     glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset,
     nominal_glyph_advance_px, resolve_outline_for_glyph,
@@ -104,7 +112,7 @@ use crate::pipeline::{
     FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom, KerningSettings,
     compute_horizontal_line_baselines, effective_spacing_percent,
     hanging_edge_run_bounds, horizontal_run_baseline_y, is_edge_run_hanging,
-    line_baseline_advance_table,
+    line_baseline_advance_table, single_char_cluster,
     faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
     resolve_faux_counter_flag,
 };
@@ -155,6 +163,9 @@ pub(crate) struct FormulaRenderRequest<'a, 'font> {
     pub(crate) faux_face_baseline: FauxFaceBaseline,
     pub(crate) inline_style_spans: Option<&'a [InlineStyleSpan]>,
     pub(crate) inline_font_registry: &'a InlineFontRegistry,
+    /// Per-face user-authored kerning overrides for this render (selected font plus
+    /// every inline `<font=…>` font), built once by `pipeline::render_text_to_image`.
+    pub(crate) custom_kerning: &'a CustomKerningMap,
     pub(crate) layout_text: &'a str,
     pub(crate) font_size_px: f32,
     pub(crate) base_line_height_px: f32,
@@ -167,6 +178,15 @@ pub(crate) struct FormulaRenderRequest<'a, 'font> {
 #[derive(Debug, Clone)]
 struct FormulaGlyphSeed {
     glyph: LayoutGlyph,
+    /// The single `char` of this glyph's SOURCE cluster, or `None` when the cluster
+    /// is not exactly one character (a ligature, a base + combining mark) or the
+    /// glyph is synthesized rather than shaped from the text (the wrapped hyphen).
+    ///
+    /// Seeds are detached from the `LayoutRun` they came from, so the run text is no
+    /// longer reachable when advances are assigned; the character is captured here
+    /// instead. Only the user-authored kerning lookup reads it
+    /// (`pipeline::custom_pair_delta_px` states why a multi-char cluster is skipped).
+    cluster_char: Option<char>,
     text_color: [u8; 4],
     origin_x: f32,
     origin_y: f32,
@@ -406,6 +426,7 @@ pub(crate) fn render_text_with_formula_layout(
         faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
+        custom_kerning,
         layout_text,
         font_size_px,
         base_line_height_px,
@@ -444,6 +465,7 @@ pub(crate) fn render_text_with_formula_layout(
             faux_face_baseline,
             inline_style_spans,
             inline_font_registry,
+            custom_kerning,
             layout_line_offsets.as_slice(),
             font_size_px,
             base_line_height_px,
@@ -467,6 +489,7 @@ pub(crate) fn render_text_with_formula_layout(
             faux_face_baseline,
             inline_style_spans,
             inline_font_registry,
+            custom_kerning,
             layout_line_offsets.as_slice(),
             font_size_px,
             base_line_height_px,
@@ -554,6 +577,7 @@ fn render_text_with_drawn_lines_layout_once(
         faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
+        custom_kerning,
         layout_text,
         font_size_px,
         base_line_height_px,
@@ -605,6 +629,7 @@ fn render_text_with_drawn_lines_layout_once(
         faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
+        custom_kerning,
         layout_line_offsets.as_slice(),
         font_size_px,
         base_line_height_px,
@@ -2139,6 +2164,7 @@ fn render_text_with_formula_layout_once(
     faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
+    custom_kerning: &CustomKerningMap,
     layout_line_offsets: &[usize],
     font_size_px: f32,
     base_line_height_px: f32,
@@ -2185,6 +2211,7 @@ fn render_text_with_formula_layout_once(
         faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
+        custom_kerning,
         layout_line_offsets,
         font_size_px,
         base_line_height_px,
@@ -2665,6 +2692,7 @@ fn detect_shape_layout_fallback_reason(
     faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
+    custom_kerning: &CustomKerningMap,
     layout_line_offsets: &[usize],
     font_size_px: f32,
     base_line_height_px: f32,
@@ -2696,6 +2724,7 @@ fn detect_shape_layout_fallback_reason(
         faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
+        custom_kerning,
         layout_line_offsets,
         font_size_px,
         base_line_height_px,
@@ -2770,6 +2799,7 @@ fn collect_formula_glyph_seeds(
     faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
+    custom_kerning: &CustomKerningMap,
     layout_line_offsets: &[usize],
     font_size_px: f32,
     base_line_height_px: f32,
@@ -2834,6 +2864,7 @@ fn collect_formula_glyph_seeds(
                 })
                 .unwrap_or(0);
             out.push(FormulaGlyphSeed {
+                cluster_char: single_char_cluster(run.text, glyph),
                 glyph: glyph.clone(),
                 text_color: inline_text_color_for_glyph(
                     params.text_color,
@@ -2850,7 +2881,11 @@ fn collect_formula_glyph_seeds(
                     layout_line_offsets,
                     run.line_i,
                     glyph,
-                ),
+                )
+                // Keeps the run off the byte-identical fast path when this glyph's
+                // face carries overrides; the PAIRS are resolved in
+                // `assign_formula_seed_advances`.
+                .with_custom_pairs(custom_kerning.has_table(glyph.font_id)),
                 glyph_scale: inline_glyph_scale_for_glyph(
                     params,
                     inline_style_spans,
@@ -2940,6 +2975,9 @@ fn collect_formula_glyph_seeds(
                 &hyphen_glyph,
             );
             out.push(FormulaGlyphSeed {
+                // Synthesized, not shaped from the layout text: it has no source
+                // cluster, so it never participates in a user-authored pair.
+                cluster_char: None,
                 glyph: hyphen_glyph,
                 text_color: style_offset
                     .map(|offset| {
@@ -2982,15 +3020,35 @@ fn collect_formula_glyph_seeds(
     assign_formula_seed_advances(
         out.as_mut_slice(),
         font_system,
+        custom_kerning,
         font_size_px,
         (font_size_px * 0.5).max(1.0),
     );
     out
 }
 
+/// Fills every seed's `advance_px` — the pen step from that glyph to the NEXT one
+/// on the same line — from the shaped positions, the kerning mode and the
+/// user-authored overrides.
+///
+/// Custom kerning mirrors `pipeline::horizontal_run_layout` exactly: a pair listed
+/// in the left glyph's font table REPLACES the font's own value for that pair under
+/// every mode, stepping by `nominal_glyph_advance_px(left) + delta`. Uniform
+/// tracking is still added on top.
+///
+/// DIRECTION: unlike the horizontal pen, `advance_px` is a MAGNITUDE along the
+/// drawn line, never a signed x step — the shaped delta is floored positive here
+/// (`raw.max(glyph_width_floor).max(1.0)`) and every consumer floors it again
+/// (`drawn_line_start_offsets`, `drawn_line_seed_transform`,
+/// `render_text_with_formula_layout_once`) before walking the path. So the
+/// RTL sign mirroring `pipeline::custom_pair_step_px` performs has no counterpart
+/// on this path: seeds are advanced along the curve in logical order regardless of
+/// script direction. Formula/drawn lines are LTR-only by construction, which is a
+/// limitation of that whole path, not of the overrides.
 fn assign_formula_seed_advances(
     seeds: &mut [FormulaGlyphSeed],
     font_system: &mut FontSystem,
+    custom_kerning: &CustomKerningMap,
     font_size_px: f32,
     default_advance: f32,
 ) {
@@ -3046,20 +3104,29 @@ fn assign_formula_seed_advances(
                 let glyph_width_floor = (seeds[glyph_idx].glyph.w * 0.25).max(1.0);
                 let metric_advance = raw.max(glyph_width_floor).max(1.0);
                 let kerning = seeds[glyph_idx + 1].kerning;
-                let base_advance = match kerning.mode {
+                // A user-authored pair REPLACES the font's own value for that pair
+                // under every mode, exactly as on the horizontal path.
+                let custom_delta_px =
+                    custom_seed_pair_delta_px(custom_kerning, &seeds[glyph_idx], &seeds[glyph_idx + 1]);
+                let base_advance = match (custom_delta_px, kerning.mode) {
+                    (Some(delta_px), _) => {
+                        let own = nominal_glyph_advance_px(font_system, &seeds[glyph_idx].glyph)
+                            .unwrap_or(metric_advance);
+                        optical_base_advance(own, metric_advance) + delta_px
+                    }
                     // `Auto` keeps the shaped (font-pair-kerned) advance.
-                    KerningMode::Auto => metric_advance,
+                    (None, KerningMode::Auto) => metric_advance,
                     // `Fixed` steps by the glyph's OWN nominal (un-kerned) advance,
                     // dropping font pair kerning and the optical adjustment. The
                     // shaped advance bakes in pair kerning, so the raw metrics
                     // table is consulted; falls back to the shaped advance when the
                     // metric is unavailable.
-                    KerningMode::Fixed => {
+                    (None, KerningMode::Fixed) => {
                         let own = nominal_glyph_advance_px(font_system, &seeds[glyph_idx].glyph)
                             .unwrap_or(metric_advance);
                         optical_base_advance(own, metric_advance)
                     }
-                    KerningMode::Optical => {
+                    (None, KerningMode::Optical) => {
                         metric_advance
                             + optical_horizontal_pair_adjustment(
                                 profiles[glyph_idx],
@@ -3069,9 +3136,11 @@ fn assign_formula_seed_advances(
                             )
                     }
                 };
-                let spacing_basis = match kerning.mode {
-                    KerningMode::Auto | KerningMode::Fixed => metric_advance,
-                    KerningMode::Optical => ((profiles[glyph_idx].width_px()
+                // The tracking basis follows the branch the STEP actually took: an
+                // overridden pair is a metric step, not an optical one.
+                let spacing_basis = match (custom_delta_px, kerning.mode) {
+                    (Some(_), _) | (None, KerningMode::Auto | KerningMode::Fixed) => metric_advance,
+                    (None, KerningMode::Optical) => ((profiles[glyph_idx].width_px()
                         + profiles[glyph_idx + 1].width_px())
                         * 0.5)
                         .max(default_advance),
@@ -3086,6 +3155,27 @@ fn assign_formula_seed_advances(
             prev_advance = advance_px;
         }
     }
+}
+
+/// The user-authored advance delta in px between two adjacent SEEDS, or `None`
+/// when no override applies.
+///
+/// The seed-side mirror of `pipeline::custom_pair_delta_px` and it enforces the
+/// same guards: the same face on both sides (a pair across a font-fallback
+/// boundary belongs to no font's design), a face that actually carries a table,
+/// and a single-`char` source cluster on each side (captured as
+/// `FormulaGlyphSeed::cluster_char`, since the run text is gone by now).
+#[must_use]
+fn custom_seed_pair_delta_px(
+    custom_kerning: &CustomKerningMap,
+    prev: &FormulaGlyphSeed,
+    cur: &FormulaGlyphSeed,
+) -> Option<f32> {
+    if prev.glyph.font_id != cur.glyph.font_id {
+        return None;
+    }
+    let table = custom_kerning.table_for(prev.glyph.font_id)?;
+    table.delta_px(prev.cluster_char?, cur.cluster_char?, prev.glyph.font_size)
 }
 
 fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
@@ -3258,6 +3348,9 @@ fn inline_kerning_at_offset(
             .unwrap_or(params.kerning_px)
             .clamp(-300.0, 300.0),
         spacing_percent: effective_spacing_percent(kerning_percent, stretch_x_percent),
+        // Purely style-driven; the per-FONT override flag is stamped on afterwards
+        // by `with_custom_pairs`, which is the only thing that knows the face.
+        custom_pairs: false,
     }
 }
 
@@ -3977,6 +4070,9 @@ mod tests {
                 metadata: 0,
                 cache_key_flags: CacheKeyFlags::empty(),
             },
+            // This fixture exercises ALIGNMENT arithmetic only, with no font behind
+            // it, so there is no source cluster and no override to resolve.
+            cluster_char: None,
             text_color: [0, 0, 0, 255],
             origin_x: 0.0,
             origin_y: 0.0,
@@ -3984,6 +4080,7 @@ mod tests {
                 mode: KerningMode::Fixed,
                 spacing_px: 0.0,
                 spacing_percent: 0.0,
+                custom_pairs: false,
             },
             glyph_scale: GlyphScaleSettings {
                 width_mul: 1.0,
@@ -4290,5 +4387,187 @@ mod tests {
         }
         let last_end = plain.last().copied().unwrap_or(0.0) + 10.0;
         assert!((last_end - 80.0).abs() < 1e-3, "run length={last_end}");
+    }
+
+    /// Fixture font for the seed-advance contract: the same Liberation Sans the
+    /// pipeline tests use. A test binary cannot reach the shipped `fonts/ui` bundle,
+    /// and this contract is about the advance arithmetic, not about the bundle.
+    fn seed_fixture_font_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+    }
+
+    /// Shapes `text` with the fixture font and turns its first layout run into the
+    /// seeds `assign_formula_seed_advances` consumes, with the custom-pair flag SET
+    /// so the run cannot take the default-metric fast path.
+    ///
+    /// Returns the font system, the registered face id (what an override binds to)
+    /// and the seeds, one per shaped glyph, all on line 0.
+    fn formula_seeds_for(
+        text: &str,
+        font_size_px: f32,
+        mode: KerningMode,
+    ) -> (cosmic_text::FontSystem, fontdb::ID, Vec<FormulaGlyphSeed>) {
+        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+
+        let bytes = std::fs::read(seed_fixture_font_path()).expect("fixture font bytes");
+        let mut db = fontdb::Database::new();
+        db.load_font_data(bytes);
+        let face = db.faces().next().expect("fixture face");
+        let face_id = face.id;
+        let family = face
+            .families
+            .first()
+            .cloned()
+            .map(|(name, _language)| name)
+            .expect("fixture family name");
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+
+        let mut buffer = Buffer::new(
+            &mut font_system,
+            Metrics::new(font_size_px, font_size_px * 1.2),
+        );
+        buffer.set_size(&mut font_system, None, None);
+        let attrs = Attrs::new()
+            .family(Family::Name(family.as_str()))
+            .metrics(Metrics::new(font_size_px, font_size_px));
+        buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        let run = buffer.layout_runs().next().expect("one layout run");
+        let glyph_count = run.glyphs.len();
+        let seeds = run
+            .glyphs
+            .iter()
+            .enumerate()
+            .map(|(idx, glyph)| FormulaGlyphSeed {
+                glyph: glyph.clone(),
+                cluster_char: run.text.get(glyph.start..glyph.end).and_then(|cluster| {
+                    let mut chars = cluster.chars();
+                    let first = chars.next()?;
+                    chars.next().is_none().then_some(first)
+                }),
+                text_color: [0, 0, 0, 255],
+                origin_x: 0.0,
+                origin_y: 0.0,
+                kerning: KerningSettings {
+                    mode,
+                    spacing_px: 0.0,
+                    spacing_percent: 0.0,
+                    // Set unconditionally: the production caller sets it from the
+                    // render's `CustomKerningMap`, and leaving it false would take the
+                    // whole run down the fast path that ignores overrides.
+                    custom_pairs: true,
+                },
+                glyph_scale: GlyphScaleSettings {
+                    width_mul: 1.0,
+                    height_mul: 1.0,
+                },
+                glyph_offset_px: [0.0, 0.0],
+                extended_offset: InlineGlyphOffset::global_only([0.0, 0.0]),
+                style_offset: 0,
+                offset_span_range: None,
+                line_idx: 0,
+                glyph_idx_in_line: idx,
+                glyphs_in_line: glyph_count,
+                line_align: biased(0.0),
+                advance_px: 0.0,
+                faux: FauxGlyphStyle::NONE,
+                hanging_excluded: false,
+            })
+            .collect::<Vec<_>>();
+        drop(run);
+        (font_system, face_id, seeds)
+    }
+
+    /// A custom pair must move a FORMULA seed's advance exactly as it moves the
+    /// horizontal pen: the step becomes the left glyph's own (un-kerned) advance plus
+    /// the authored delta, so -100 / 0 / +100 per mille sit 10 px apart at em 100.
+    /// Formula/drawn lines are a separate advance accumulator, so the horizontal
+    /// tests say nothing about them.
+    #[test]
+    fn a_custom_pair_moves_a_formula_seed_advance() {
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use std::sync::Arc;
+
+        const EM: f32 = 100.0;
+        let advance_for = |pairs: &[(char, char, f32)]| -> f32 {
+            let (mut font_system, face_id, mut seeds) =
+                formula_seeds_for("AV", EM, KerningMode::Auto);
+            assert_eq!(seeds.len(), 2, "the fixture must shape 'AV' as two glyphs");
+            let mut custom_kerning = CustomKerningMap::default();
+            if !pairs.is_empty() {
+                custom_kerning.insert(
+                    face_id,
+                    Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                    "fixture",
+                );
+            }
+            super::assign_formula_seed_advances(
+                seeds.as_mut_slice(),
+                &mut font_system,
+                &custom_kerning,
+                EM,
+                (EM * 0.5).max(1.0),
+            );
+            seeds[0].advance_px
+        };
+
+        let shaped = advance_for(&[]);
+        let tightened = advance_for(&[('A', 'V', -100.0)]);
+        let neutral = advance_for(&[('A', 'V', 0.0)]);
+        let widened = advance_for(&[('A', 'V', 100.0)]);
+
+        assert!(
+            (neutral - tightened - 10.0).abs() < 1e-2
+                && (widened - neutral - 10.0).abs() < 1e-2,
+            "-100 / 0 / +100 per mille must sit exactly 10 px apart at em 100; got \
+             {tightened}, {neutral}, {widened}"
+        );
+        assert!(
+            (neutral - shaped).abs() > 1e-2,
+            "the fixture must kern 'AV' itself, otherwise a 0.0 entry proves nothing \
+             about REPLACING that value: un-kerned {neutral} vs shaped {shaped}"
+        );
+    }
+
+    /// The same guard as the horizontal pen: an unlisted pair must leave the seed
+    /// advances exactly where the shaped positions put them, even though the table's
+    /// mere presence takes the run off the fast path.
+    #[test]
+    fn an_unlisted_pair_leaves_formula_seed_advances_untouched() {
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use std::sync::Arc;
+
+        const EM: f32 = 100.0;
+        let advance_for = |pairs: &[(char, char, f32)]| -> f32 {
+            let (mut font_system, face_id, mut seeds) =
+                formula_seeds_for("AV", EM, KerningMode::Auto);
+            let mut custom_kerning = CustomKerningMap::default();
+            if !pairs.is_empty() {
+                custom_kerning.insert(
+                    face_id,
+                    Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                    "fixture",
+                );
+            }
+            super::assign_formula_seed_advances(
+                seeds.as_mut_slice(),
+                &mut font_system,
+                &custom_kerning,
+                EM,
+                (EM * 0.5).max(1.0),
+            );
+            seeds[0].advance_px
+        };
+
+        let shaped = advance_for(&[]);
+        let other_pair = advance_for(&[('Q', 'z', -200.0)]);
+        assert!(
+            (shaped - other_pair).abs() < 1e-3,
+            "an unlisted pair must not move a seed advance: {other_pair} vs {shaped}"
+        );
     }
 }

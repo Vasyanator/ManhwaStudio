@@ -33,6 +33,14 @@ Key functions:
   identity lookup in the app uses) and `is_bundled_ui_font_identity` (the synthetic bundled
   interface-font entry is NOT in `load_font_lists`, so availability checks must know it)
 - `display_name_override` / `set_display_name_override`
+- CUSTOM KERNING (`custom_kerning` / `set_custom_kerning`, plus the re-exported
+  `CustomKerningPair`): user-authored kerning pair overrides for one font, measured in
+  THOUSANDTHS OF AN EM so they are independent of the rendered size and of the font's
+  `units_per_em`. A pair of `0.0` is meaningful — it CANCELS a built-in pair — and is never
+  filtered out. The setter bumps the fonts revision, which is how an edit reaches the
+  renderer (the panel reloads its fonts and the provider re-publishes the pairs); the font
+  FILE is never modified. `FontEntry::custom_kerning()` reads the pairs resolved onto a
+  loaded font
 - virtual font groups (config-only named font sets): `list_virtual_groups` /
   `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group` /
   `add_virtual_group_member` / `remove_virtual_group_member` /
@@ -57,6 +65,10 @@ use super::panel::{fonts, font_settings_store};
 // Re-exported crate-wide as an OPAQUE type (fields/constructors stay private to typing);
 // external readers use the `pub(crate)` accessors on `FontEntry`.
 pub use super::panel::FontEntry;
+// Re-exported with its FIELDS, unlike `FontEntry`: the settings font-properties window must
+// CONSTRUCT pairs to store them, and a mirror type here would be a third copy of a struct
+// that carries no invariant beyond "finite offset" (enforced on store and on save).
+pub use super::panel::fonts_data::CustomKerningPair;
 
 /// Why an imported system font recorded in `fonts_data.json` could not be loaded this run.
 /// The UI maps each variant to a localized "unavailable" note on the row.
@@ -329,6 +341,24 @@ pub fn display_name_override(identity: &str) -> Option<String> {
 /// store revision, so cached font lists reload.
 pub fn set_display_name_override(identity: &str, value: Option<String>) -> bool {
     font_settings_store::set_font_display_name_override(identity, value)
+}
+
+/// Reads the user-defined custom kerning pairs of the font `identity`, in user order (empty
+/// when it has none). Offsets are in THOUSANDTHS OF AN EM. Cheap (in-memory snapshot);
+/// GUI-thread safe.
+#[must_use]
+pub fn custom_kerning(identity: &str) -> Vec<CustomKerningPair> {
+    font_settings_store::font_custom_kerning(identity)
+}
+
+/// Replaces the custom kerning pairs of the font `identity` with `pairs`, sanitized (see
+/// [`CustomKerningPair`]). A pair whose offset is `0.0` is KEPT: it cancels a built-in pair.
+///
+/// Returns `true` when the stored list actually changed; only then does it persist off the
+/// GUI thread and bump the store revision, which is what makes every open typing panel
+/// reload its fonts and pick up the new pairs. Cheap and GUI-thread safe either way.
+pub fn set_custom_kerning(identity: &str, pairs: Vec<CustomKerningPair>) -> bool {
+    font_settings_store::set_font_custom_kerning(identity, pairs)
 }
 
 /// A virtual font group exposed to non-typing code: its name and members, with each member

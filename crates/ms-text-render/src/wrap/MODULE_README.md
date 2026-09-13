@@ -34,17 +34,31 @@ output images, or apply effects.
   `TextRenderParams.hanging_punctuation` clamped to `0.0..=1.0`, and it decides how
   MUCH a character of that set counts, never which characters are in it.
 - `horizontal.rs`: DP/scored paragraph wrapping, line-width measurement, candidate
-  break collection, keep-together heuristics, and target-width scoring.
+  break collection, keep-together heuristics, and target-width scoring. Its
+  `WrapScoringContext` also corrects every shaped measurement for the selected font's
+  USER-AUTHORED kerning pairs: the shaper knows nothing about them, so each occurring
+  overridden pair contributes `authored - the font's own delta` (memoized per pair).
+  A width measurement carries no per-glyph font ids, so the pen loop's same-face guard
+  is reproduced by its CAUSE: `selected_face_covers_pair` (this module's root) must say
+  the selected font draws BOTH characters, because an uncovered character is exactly
+  the one that falls through to a fallback face at draw time. `forms.rs` gates the same
+  way. The residual — a pair the shaper split across runs or merged into a ligature — is
+  bounded by the pair's own authored magnitude and can move a line break, never a glyph.
+  With no font system at all the context corrects nothing: its "width" is a unit count.
 - `hyphenation.rs`: embedded Russian/English dictionaries, soft-hyphen insertion,
   safe split filtering, dictionary split lookup, and emergency split fallback.
 - `shape.rs`: shape width profiles for rectangle/oval/hexagon, soft peak no-tree ordering,
-  iterative horizontal reshaping, and approximate-shape warnings.
+  iterative horizontal reshaping, and approximate-shape warnings. `ShapeWrapRequest` carries
+  the selected font's `CustomKerningTable` down into `horizontal.rs`'s scoring context.
 - `vertical.rs`: vertical column preparation, paragraph splitting, shape-aware vertical
   targets, and vertical emergency token splitting.
 - `forms.rs`: shared discrete line-break "form" logic (presets `FreeNoTree`/`Lens`/
   `Widen`/`Narrow`, pluggable `LineWidthMetric` line widths — `GlyphWidths` measures
   pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
-  kerning table, `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
+  kerning table — into which a USER-AUTHORED kerning override REPLACES the font's own pair
+  value verbatim (`GlyphWidths::build`'s `custom_kerning` argument; the metric measures in
+  per-mille of the em, the same unit the overrides use, so the substitution is exact and a
+  `0.0` entry is stored rather than dropped), `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
   edge rule at the caller's STRENGTH, blending the full-line and core measurements so
   strength `0.0` and `1.0` reproduce the two historical widths exactly — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
   the ranked `search_forms` (see "Form search" below), and `choose_form`). The

@@ -7,7 +7,10 @@ Shape-aware horizontal layout поверх общего wrap-ядра новог
 Main responsibilities:
 - строить width profile для `Rectangle`, `Oval`, `Hexagon`;
 - выполнять iterative reshape текста под форму без участия raster-слоя;
-- возвращать предупреждения о приблизительном fallback отдельно от обычного wrap.
+- возвращать предупреждения о приблизительном fallback отдельно от обычного wrap;
+- проносить пользовательскую таблицу кернинг-пар выбранного шрифта
+  (`ShapeWrapRequest::custom_kerning`) в `WrapScoringContext`, иначе замеры ширин
+  разойдутся с тем, что рисует pen loop.
 
 Source:
 - `reshape_text_for_shape`
@@ -22,6 +25,7 @@ use super::horizontal::{
 };
 use super::{HyphenationDictionaries, WordBreakPolicy};
 use ms_text_util::segmentation::count_layout_units;
+use crate::font_provider::CustomKerningTable;
 use crate::types::{TextShape, TextWrapMode};
 use cosmic_text::{Attrs, FontSystem};
 
@@ -35,6 +39,10 @@ pub(crate) struct ShapeWrapRequest<'a> {
     pub(crate) text: &'a str,
     pub(crate) font_system: &'a mut FontSystem,
     pub(crate) attrs: &'a Attrs<'a>,
+    /// User-authored kerning overrides of the SELECTED font (`None` when it has
+    /// none). Wrapping must see them or the chosen line breaks drift from the pen
+    /// loop, which applies the very same overrides.
+    pub(crate) custom_kerning: Option<&'a CustomKerningTable>,
     pub(crate) font_size_px: f32,
     pub(crate) line_height_px: f32,
     pub(crate) base_width_px: f32,
@@ -65,6 +73,7 @@ pub(crate) fn reshape_text_for_shape(request: ShapeWrapRequest<'_>) -> LayoutTex
         request.attrs,
         request.font_size_px,
         request.line_height_px,
+        request.custom_kerning,
     );
     let base_units = scoring.estimate_base_units(
         request.text,

@@ -342,7 +342,9 @@ saving, and export.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
   `pub(crate)`) as a narrow facade — font loaders, imported-fonts add/remove +
-  revision, IDENTITY-keyed display-name overrides, VIRTUAL font group CRUD + membership/alias
+  revision, IDENTITY-keyed display-name overrides, IDENTITY-keyed CUSTOM KERNING pairs
+  (`custom_kerning` / `set_custom_kerning` + the re-exported `CustomKerningPair`), VIRTUAL font
+  group CRUD + membership/alias
   (config-only named font sets; members referenced by font IDENTITY on both sides of the facade),
   and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
   re-exports `FontEntry` as an opaque type. For a BULK import (many fonts at once) it also
@@ -350,7 +352,9 @@ saving, and export.
   `SystemFontLocation { identity, path }`; BLOCKING, off-thread only), the batch mutators
   `add_imported_fonts` / `add_virtual_group_members` (ONE revision bump + ONE document write per
   batch, skipping what already exists and never overwriting an existing member alias) and the
-  pure `is_valid_post_script_name` check. Used by the settings font-settings UI
+  pure `is_valid_post_script_name` check. `CustomKerningPair` is the ONE type re-exported with
+  its fields (the settings font-properties window must construct pairs); everything else stays
+  opaque. Used by the settings font-settings UI
   (`src/tabs/settings/typesetting/`, in the binary); nothing else in this crate is `pub` for it. Add a
   wrapper here rather than widening a panel internal.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
@@ -520,7 +524,9 @@ saving, and export.
     render-IDENTITY assignment (`assign_font_identity_names`: the representative face's
     PostScript name, `%hash`-suffixed on a same-name/different-bytes contest or on a claim of
     the reserved bundled-UI name), disambiguation, group listing
-    (free fns), and VIRTUAL-group injection (`apply_virtual_groups`: folds the user-defined
+    (free fns), the per-font settings apply passes (`apply_display_name_overrides` /
+    `apply_custom_kerning`, both keyed by identity and therefore both run LAST, after
+    `assign_font_identity_names`), and VIRTUAL-group injection (`apply_virtual_groups`: folds the user-defined
     `fonts_data` virtual groups into a finalized list — membership into `FontEntry.groups`,
     per-group aliases into `FontEntry.virtual_group_aliases` — and returns the merged combobox
     group list; MUST run after merge/disambiguation/identity; see `panel/MODULE_README.md`).
@@ -575,10 +581,11 @@ saving, and export.
     had drifted. `Durability::ContentsAndDirectory` is mandatory for any document whose
     previous home is DELETED once the write returned `Ok`.
   - `fonts_data.rs`: serde schema + disk I/O for the app-level per-font settings document
-    `fonts/fonts_data.json` (`version: 2`: `system_fonts` = imported fonts by PostScript NAME with a
-    `last_path` hint, `fonts` = per-font `display_name` override + default `profile` keyed by font
-    IDENTITY, `virtual_groups` = named member sets keyed by identity; `sanitize_virtual_groups`
-    cleans them on decode AND encode, and every unset field / empty collection is OMITTED). The
+    `fonts/fonts_data.json` (`version: 3`: `system_fonts` = imported fonts by PostScript NAME with a
+    `last_path` hint, `fonts` = per-font `display_name` override + default `profile` +
+    `custom_kerning` keyed by font IDENTITY, `virtual_groups` = named member sets keyed by
+    identity; `sanitize_virtual_groups` / `sanitize_custom_kerning` clean them on decode AND
+    encode, and every unset field / empty collection is OMITTED). The
     path-keyed `version: 1` form is READ FOREVER and decoded verbatim with
     `FontsData.pending_migration` set (see `font_settings_store`); it is never written back. Load
     returns a typed `LoadOutcome` (a corrupt file is quarantined, never degraded to empty) and
@@ -596,8 +603,9 @@ saving, and export.
     `TextTab.imported_system_fonts` list once (never written again; the key itself is deleted
     later, by `presets_store::drop_migrated_user_config_keys`, and only against CONTENT proof
     that `fonts_data.json` took the list over).
-    `add_/remove_imported_system_font` and `set_font_display_name_override` mutate state, bump the
-    SAME revision, and persist the whole snapshot off the GUI thread via `fonts_data::save`;
+    `add_/remove_imported_system_font`, `set_font_display_name_override` and
+    `set_font_custom_kerning` mutate state, bump the SAME revision, and persist the whole
+    snapshot off the GUI thread via `fonts_data::save`;
     the BATCH forms (`add_imported_system_fonts` / `add_virtual_group_members`) apply a whole
     slice under ONE write lock with ONE bump and ONE persist, and bump nothing when they added
     nothing;

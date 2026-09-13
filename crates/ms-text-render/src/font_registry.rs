@@ -15,6 +15,11 @@ Main responsibilities:
 - применять патч удаления «эллипсисных» лигатур (`font_ligature_patch`) ровно
   между резидентным short-circuit и регистрацией в fontdb, если система пула
   относится к режиму `EllipsisLigatureMode::Remove`;
+- строить `CustomKerningMap` — индекс «зарегистрированный face -> пользовательская
+  таблица кернинг-пар» (`FontContent.custom_kerning`), единственный мост между
+  `FontContent` и `LayoutGlyph::font_id`, который видят layout-пути; a face carries
+  exactly ONE table, and a rebinding to a DIFFERENT one is logged rather than applied
+  silently (see the "One face, one table" section on `CustomKerningMap::record`);
 - отвечать на вопрос «может ли эта база обслужить такие attrs» —
   `family_has_matching_face` (style/stretch) и `family_has_face_of_requested_weight`
   (weight), guard для любой МОДИФИКАЦИИ attrs (см. UNSERVICEABLE-ATTRS GUARD в
@@ -36,10 +41,179 @@ content id.
 */
 
 use super::font_ligature_patch::{self, EllipsisLigatureMode};
-use super::font_provider::{FontContent, FontProvider};
+use super::font_provider::{CustomKerningTable, FontContent, FontProvider};
 use super::font_system_pool::FontFaceCache;
 use cosmic_text::{Attrs, Family, FontSystem, Stretch, Style, Weight, fontdb};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+/// Per-render index from a REGISTERED FACE to the user-authored kerning overrides
+/// of the font it came from.
+///
+/// The layout paths only ever know a glyph's `fontdb::ID`
+/// (`cosmic_text::LayoutGlyph::font_id`), while the overrides arrive on a
+/// `FontContent` keyed by content id. This map is the bridge, built ONCE per
+/// render (selected font + every inline `<font=…>` font) and then queried per
+/// glyph pair.
+///
+/// A face with no overrides is simply absent, so [`Self::is_empty`] answering
+/// `true` is the cheap "this render has no custom kerning at all" test that keeps
+/// the byte-identical fast paths reachable.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CustomKerningMap {
+    by_face: HashMap<fontdb::ID, FaceOverrides>,
+}
+
+/// One face's binding: the table plus the working name of the font that supplied
+/// it.
+///
+/// The name is DIAGNOSTIC ONLY — never a lookup key — and exists so a conflicting
+/// rebinding (see [`CustomKerningMap::insert`]) can name both fonts instead of
+/// silently rendering one font's text with another font's pairs.
+#[derive(Debug, Clone)]
+struct FaceOverrides {
+    table: Arc<CustomKerningTable>,
+    font_name: Arc<str>,
+}
+
+impl CustomKerningMap {
+    /// Whether no face in this render carries overrides.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_face.is_empty()
+    }
+
+    /// The override table of `face`, or `None` when that face has none.
+    ///
+    /// Both lookups short-circuit on [`Self::is_empty`]: they sit in per-glyph-pair
+    /// loops, and hashing a `fontdb::ID` per pair is pure waste for the
+    /// overwhelmingly common render where no font has overrides at all.
+    #[must_use]
+    pub(crate) fn table_for(&self, face: fontdb::ID) -> Option<&CustomKerningTable> {
+        if self.is_empty() {
+            return None;
+        }
+        self.by_face
+            .get(&face)
+            .map(|overrides| overrides.table.as_ref())
+    }
+
+    /// Whether `face` carries a non-empty override table. The per-glyph flag that
+    /// takes a run off the byte-identical shaped-position fast path
+    /// (`pipeline::KerningSettings::uses_default_metric_layout`).
+    #[must_use]
+    pub(crate) fn has_table(&self, face: fontdb::ID) -> bool {
+        !self.is_empty() && self.by_face.contains_key(&face)
+    }
+
+    /// Records `content`'s overrides against EVERY face its bytes registered into
+    /// `font_cache`'s system, if it has any.
+    ///
+    /// Must be called AFTER [`load_font_content`] for the same content: the face
+    /// ids come from the load cache, so before the load there is nothing to key on.
+    /// A content with no (or an empty) table is a no-op, which is why a font
+    /// without overrides costs nothing.
+    ///
+    /// All faces of the file get the same table: the overrides are authored against
+    /// the font ENTRY, and the panel exposes one entry per file, so there is no
+    /// per-face authoring to distinguish.
+    ///
+    /// # One face, one table
+    ///
+    /// Faces are cached by `FontContent.content_id`, an identity of BYTES ONLY, so
+    /// two contents can only collide on a face when their bytes are identical. The
+    /// panel list guarantees that cannot mean two different tables: an entry's
+    /// table is resolved by its render identity (`panel::fonts::apply_custom_kerning`
+    /// keyed on `FontEntry::render_identity_name`), and
+    /// `panel::fonts::merge_duplicate_font_entries` folds byte-identical files into
+    /// ONE entry before that — its merge key is `(normalized PostScript name,
+    /// content hash)`, and identical bytes always yield both. The only entries that
+    /// skip the fold carry no table to collide with: the synthetic bundled-UI stack
+    /// entry is created with an empty `custom_kerning` after
+    /// `build_combined_font_list` has already run, and an unreadable/unparsable file
+    /// (`content_hash == 0`) registers no face at all, so `loaded_ids` is empty.
+    ///
+    /// That invariant lives in another crate and cannot be enforced from here, so a
+    /// violation is made LOUD rather than silent: rebinding a face to a DIFFERENT
+    /// table logs a warning naming both fonts (see [`Self::insert`]). A silent
+    /// rebinding would render one font's text with another font's pairs, which is
+    /// invisible in the output and undiagnosable from a bug report.
+    pub(crate) fn record(&mut self, font_cache: &FontFaceCache, content: &FontContent) {
+        let Some(table) = content.custom_kerning_table() else {
+            return;
+        };
+        let Some(ids) = font_cache.loaded_ids(content.content_id) else {
+            return;
+        };
+        for id in ids {
+            self.insert(*id, Arc::clone(table), content.name.as_str());
+        }
+    }
+
+    /// Binds one registered face to an override table directly.
+    ///
+    /// The keying step of [`Self::record`], split out so a test that builds its own
+    /// `fontdb::Database` (and therefore has the face id in hand but no load cache)
+    /// exercises the SAME map the production path fills. `font_name` is the working
+    /// name of the font the table came from; it is stored for diagnostics only.
+    ///
+    /// Rebinding a face to an EQUAL table is normal (the same font resolved again,
+    /// as selected font and as an inline `<font=…>` name) and silent. Rebinding it
+    /// to a different table breaks the "one face, one table" invariant documented on
+    /// [`Self::record`]: the later table wins — deterministically, so the render
+    /// stays reproducible — and a warning names both fonts.
+    pub(crate) fn insert(
+        &mut self,
+        face: fontdb::ID,
+        table: Arc<CustomKerningTable>,
+        font_name: &str,
+    ) {
+        self.insert_overrides(
+            face,
+            FaceOverrides {
+                table,
+                font_name: Arc::from(font_name),
+            },
+        );
+    }
+
+    /// Folds `other`'s entries into this map (used to merge the inline-font pass
+    /// into the selected font's map). Conflicts are reported exactly as in
+    /// [`Self::insert`].
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (face, overrides) in other.by_face {
+            self.insert_overrides(face, overrides);
+        }
+    }
+
+    /// The single write path of the map, so the conflict check cannot be bypassed.
+    fn insert_overrides(&mut self, face: fontdb::ID, overrides: FaceOverrides) {
+        if let Some(existing) = self.by_face.get(&face)
+            // Pointer equality first: the same font resolved twice shares one `Arc`,
+            // which is the overwhelmingly common rebinding and must not pay a table
+            // comparison.
+            && !Arc::ptr_eq(&existing.table, &overrides.table)
+            && *existing.table != *overrides.table
+        {
+            ms_log::runtime_log::log_warn(format!(
+                "custom kerning: face {face:?} is already bound to the {existing_pairs} \
+                 pair(s) of font '{existing_name}' and is being rebound to the \
+                 {new_pairs} pair(s) of font '{new_name}'. Both fonts resolved to \
+                 BYTE-IDENTICAL content, so they share one registered face and only one \
+                 table can apply; '{new_name}' wins for this render. Possible cause: two \
+                 font list entries with identical bytes escaped \
+                 `merge_duplicate_font_entries` and were given different kerning \
+                 overrides. Expect '{existing_name}' text to be drawn with \
+                 '{new_name}' pairs until the duplicate is removed.",
+                existing_pairs = existing.table.len(),
+                existing_name = existing.font_name,
+                new_pairs = overrides.table.len(),
+                new_name = overrides.font_name,
+            ));
+        }
+        self.by_face.insert(face, overrides);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RegisteredFontFace {
@@ -74,6 +248,10 @@ pub type InlineFontRegistry = BTreeMap<String, RegisteredFontFace>;
 pub struct InlineFontRegistryBuild {
     pub registry: InlineFontRegistry,
     pub warnings: Vec<String>,
+    /// Custom kerning overrides of the inline fonts, keyed by the faces they
+    /// registered. Collected here because this is the only place that holds an
+    /// inline font's `FontContent` — the caller merges it into the render's map.
+    pub(crate) custom_kerning: CustomKerningMap,
 }
 
 /// Loads `content`'s bytes into `font_system` (deduplicated by `content.content_id`
@@ -498,6 +676,9 @@ pub fn build_inline_font_registry(
 
         match load_font_content(font_system, font_cache, &content, content.face_index) {
             Ok(face) => {
+                // Strictly after the load: the face ids the overrides are keyed by
+                // only exist in the cache once the bytes are registered.
+                build.custom_kerning.record(font_cache, &content);
                 build.registry.insert(label, face);
             }
             Err(error) => build.warnings.push(format!(
@@ -603,6 +784,7 @@ mod tests {
             data: Arc::new(bytes),
             face_index: 0,
             content_id,
+            custom_kerning: None,
         };
         let mut system = font_base::new_render_font_system();
         let mut cache = FontFaceCache::for_system(&system);
@@ -698,6 +880,7 @@ mod tests {
             data: Arc::new(bytes),
             face_index: 0,
             content_id,
+            custom_kerning: None,
         };
         let selected = load_font_content(&mut system, &mut cache, &content, 0)
             .expect("the user's own copy must load");
@@ -756,6 +939,7 @@ mod tests {
             data: Arc::new(bytes),
             face_index: 0,
             content_id,
+            custom_kerning: None,
         };
 
         load_font_content(&mut system, &mut cache, &content, 0).expect("fixture must load");
@@ -844,6 +1028,7 @@ mod tests {
             data: Arc::new(bytes),
             face_index: 0,
             content_id,
+            custom_kerning: None,
         };
         let face = load_font_content(&mut system, &mut cache, &content, 0)
             .expect("the fixture must load into a bundle-backed system");
@@ -943,6 +1128,7 @@ mod tests {
             data: Arc::new(bytes),
             face_index: 0,
             content_id,
+            custom_kerning: None,
         }
     }
 
@@ -1071,5 +1257,55 @@ mod tests {
             !cache.is_tainted(),
             "loading one font twice must leave the system reusable"
         );
+    }
+
+    /// The map is a FACE -> table index, so one face can carry exactly one table.
+    /// Two fonts colliding on a face would otherwise leave the render depending on
+    /// map iteration order; the binding must be the LAST one written, deterministically,
+    /// and a warning (not a silent swap) is what tells the user it happened.
+    #[test]
+    fn one_face_keeps_exactly_one_kerning_table() {
+        use super::CustomKerningMap;
+        use crate::font_provider::CustomKerningTable;
+
+        let face = fontdb::ID::dummy();
+        let first = Arc::new(CustomKerningTable::from_pairs([('A', 'V', -40.0)]));
+        let second = Arc::new(CustomKerningTable::from_pairs([('A', 'V', 70.0)]));
+
+        let mut map = CustomKerningMap::default();
+        map.insert(face, Arc::clone(&first), "first font");
+        assert_eq!(
+            map.table_for(face).and_then(|table| table.delta_per_mille('A', 'V')),
+            Some(-40.0)
+        );
+
+        // A conflicting rebinding: the later table wins, and it wins the same way
+        // every run (this is what the warning reports rather than hides).
+        map.insert(face, Arc::clone(&second), "second font");
+        assert_eq!(
+            map.table_for(face).and_then(|table| table.delta_per_mille('A', 'V')),
+            Some(70.0),
+            "a conflicting rebinding must resolve to the LAST table, not to chance"
+        );
+
+        // The normal case — the SAME font resolved twice (selected font plus an
+        // inline `<font=...>` naming it) — must be inert.
+        map.insert(face, Arc::clone(&second), "second font");
+        assert_eq!(
+            map.table_for(face).and_then(|table| table.delta_per_mille('A', 'V')),
+            Some(70.0)
+        );
+
+        // `merge` is the inline-font pass folding into the selected font's map and
+        // must obey exactly the same rule.
+        let mut inline = CustomKerningMap::default();
+        inline.insert(face, Arc::clone(&first), "inline font");
+        map.merge(inline);
+        assert_eq!(
+            map.table_for(face).and_then(|table| table.delta_per_mille('A', 'V')),
+            Some(-40.0),
+            "merge must bind the merged-in table, like any other write"
+        );
+        assert!(map.has_table(face));
     }
 }

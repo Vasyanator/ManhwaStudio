@@ -36,6 +36,14 @@ on-canvas editor font (`tab/create_upload.rs`). The own-typeface PREVIEW of the 
 cards goes through `widgets::request_font_family`, which reads its file off-thread for
 the same reason.
 
+THE METRIC SEES THE FONT'S USER-AUTHORED KERNING PAIRS, and nothing had to be added to
+`AdvancedFormMetricSpec` for that: they ride on the resolved `FontContent`
+(`FontContent::custom_kerning_table`), which the spec already carries, and
+`forms::GlyphWidths::build` REPLACES the font's own pair value with the authored one —
+the same replacement the renderer's pen loop performs. Staleness is covered by the
+existing signature: a font reload clears `advanced_form_font`, so `font_content_id`
+passes through `None` and back, which rebuilds the cache with the new table.
+
 THE SEARCH INPUT IS THE RAW EDITOR TEXT, AND THE TAGS COME BACK. `advanced_form_source_text`
 returns `self.text` with its inline tags intact: `forms::search_forms` and
 `forms::GlyphWidths::build` each strip them themselves, once, from that raw string. Stripping
@@ -62,6 +70,7 @@ floor, narrow lean) must NOT re-run the search.
 */
 
 use super::*;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use super::advanced_form_params::{
@@ -1321,6 +1330,9 @@ fn build_advanced_form_glyph_widths_from_spec(
         spec.faux_italic,
         available,
     );
+    // The font's user-authored kerning overrides travel ON the resolved
+    // `FontContent`, so the metric replaces exactly the pairs the renderer's pen
+    // loop replaces. Nothing extra had to be snapshotted into the spec for this.
     Some(forms::GlyphWidths::build(
         &mut font_system,
         &attrs,
@@ -1328,6 +1340,7 @@ fn build_advanced_form_glyph_widths_from_spec(
         spec.hanging_punctuation,
         forms::DEFAULT_WIDTH_TOLERANCE,
         scope,
+        content.custom_kerning_table().map(Arc::as_ref),
     ))
 }
 

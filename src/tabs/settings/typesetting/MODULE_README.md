@@ -152,13 +152,75 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   (the PostScript name the project persists) and the file/face — an editable display-name override
   (wired to `font_admin::set_display_name_override(identity, ..)`; the window's `path` is only the
   byte source of the analysis and the preview),
-  a live own-typeface preview, a virtualized glyph grid, and a collapsible kerning-pair list.
-  The glyph inventory + kerning are extracted OFF the GUI thread via `ttf-parser` (cmap
+  a live own-typeface preview, and three collapsible sections: the virtualized glyph grid, the
+  font's BUILT-IN kerning pairs, and the user's CUSTOM kerning pairs. The glyph grid and the
+  built-in kerning list are collapsed by default (a CJK inventory is thousands of cells and would
+  otherwise bury everything under it); the custom-kerning section is OPEN by default because it
+  carries the feature's only entry point, the "+ Создать" button. Every localized header and
+  window pins its own `id_salt`/`Id`.
+  The glyph inventory + built-in kerning are extracted OFF the GUI thread via `ttf-parser` (cmap
   codepoints confirmed by `glyph_index`; `kern` Format 0 + GPOS `PairAdjustment` Format 1/2 over
   a capped glyph probe set), delivered over an `mpsc` channel the window polls. Pure extraction
   helpers are unit-tested; the end-to-end `analyze_font_bytes` has no fixture-font test (a
   permissively-licensed test font with known `kern`/GPOS pairs was out of scope — add a golden
   test when one is available).
+  CUSTOM KERNING is user data, not font data: the section reads and writes the whole list through
+  `font_admin::{custom_kerning, set_custom_kerning}` keyed by the font's IDENTITY, cached and
+  reloaded when `fonts_revision()` advances (same gate as the groups cache), and stored in
+  `fonts_data.json` — the font FILE is never touched, and the same section serves folder fonts and
+  imported system fonts alike because both reach this window through one identity. Offsets are in
+  THOUSANDTHS OF AN EM, which is what makes a pair size-independent: the renderer applies
+  `delta_px = offset_per_mille / 1000 * font_size_px`, so one value holds at every rendered size
+  and across fonts with different `units_per_em` (`design_units_to_per_mille` converts a built-in
+  value into that unit for the editor's read-out). A custom pair OVERRIDES the font's own kerning
+  for the same two characters, and `0.0` is a MEANINGFUL value that cancels a built-in pair —
+  nothing in this module may filter zeros out. Clicking a row opens the same editor prefilled.
+  The editor is a SIBLING `egui::Window` with a pinned `Id`, drawn at the top level of `show`
+  after the properties window's own `show(..)` — never nested in its closure — and its state lives
+  on `FontPropertiesState`, so closing the properties window discards an unsaved edit. It holds two
+  single-character fields, a `WheelSpinBox` over the ‰ offset (with a px read-out at
+  `PREVIEW_FONT_SIZE`), a live pair preview, and a note saying which built-in value the custom one
+  replaces (or that the font has none). The preview is painted GLYPH BY GLYPH with an explicit
+  advance because egui 0.35 applies no kerning in text layout; a single-glyph galley's width is
+  that glyph's advance.
+  PREVIEW CONTEXT ("Символы до" / "Символы после") is a VISUAL DEBUGGING AID and is NEVER
+  PERSISTED: the two buffers live on `CustomKerningEditorState` only, are absent from
+  `CustomKerningPair`, are never handed to `font_admin::set_custom_kerning`, and are discarded
+  with the editor (an edit opened on a stored pair starts with them empty — there is nothing to
+  prefill from). Each side is capped at `CUSTOM_KERNING_CONTEXT_CHAR_LIMIT` characters, enforced
+  by the field's `char_limit` AND again by `build_preview_run`, so the per-frame glyph layout
+  stays bounded on the GUI thread. The preview then lays out the whole run
+  `before + left + right + after` centred on its own extent (`layout_preview_run`; pen step =
+  own advance + the gap's kerning), and every gap is resolved by STRICT PRECEDENCE
+  (`resolve_run_kern_per_mille`): the editor's LIVE pair (its current characters and current
+  offset, so the wheel moves the preview immediately, and a re-key retires the stored key it was
+  opened on) → another of the user's stored custom pairs → the font's built-in value → zero. A
+  custom value always REPLACES the built-in one instead of stacking, matching the renderer; a
+  custom `0.0` therefore cancels a built-in pair inside the context too. Degenerate inputs are
+  deliberate, not accidental: an untyped pair character is simply absent from the run, an empty
+  run paints only the background strip (identical to the pre-context two-glyph preview), a
+  character the font lacks is painted and MEASURED through egui's own fallback so the run stays
+  self-consistent, and a `Pending`/`Unavailable` family falls the whole run back to the interface
+  font exactly as the glyph grid does. ONE DISCLOSED FIDELITY LIMIT: the built-in kerning list is
+  capped at `MAX_KERNING_PAIRS`, so a context pair beyond the cap renders UNKERNED here while the
+  renderer kerns it — the editor states this (following `draw_kerning_section`'s truncation-note
+  style) whenever `kerning_truncated` is set and a context is typed.
+  VALIDATION, in the module's usual red-message style: both characters are
+  required, and a `(left, right)` already bound by another custom pair is refused instead of
+  silently overwriting it — the store keeps the FIRST entry for a repeated key, so a duplicate
+  would otherwise be lost on save. Editing a pair and changing its characters RE-KEYS it in place
+  (old key gone, row order kept). The edited pair is addressed by its `(left, right)` KEY, never by
+  a list index: the store can be rewritten elsewhere while the editor is open. The pure helpers
+  (`design_units_to_per_mille`, `clamp_to_single_char` — character-wise, a byte cut would panic on
+  a multi-byte character — `conflicting_pair_index`, `apply_pair_edit`, plus the preview quartet
+  `build_preview_run` / `live_custom_offset_per_mille` / `resolve_run_kern_per_mille` /
+  `layout_preview_run`) are unit-tested.
+  TWO SILENT REDUCTIONS ARE DISCLOSED IN HOVERS rather than rejected, because both are correct
+  and rejecting either would be worse: a pasted grapheme CLUSTER (a combining sequence, an emoji
+  ZWJ sequence) keeps only its first `char` — a pair is defined between exactly two `char`s — and
+  an offset outside `±CUSTOM_KERNING_LIMIT_PER_MILLE` that was hand-edited into `fonts_data.json`
+  is clamped by `WheelSpinBox` and persisted clamped. The range hover formats its bounds from the
+  constant, so the text cannot drift from the control.
 
 ## Identity comparison and availability (`font_groups.rs`)
 - ONE normalization rule: `font_admin::normalize_font_identity` (trim + ASCII lowercase), the
@@ -342,8 +404,12 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 ## Editing map
 - To change the pane layout or the non-font blocks, edit `mod.rs`.
 - To change the font list, categories, or import picker, edit `font_settings.rs`.
-- To change the per-font properties window (rename editor, glyph grid, kerning viewer, the
-  per-font "Группы" membership section), edit `font_properties_window.rs`.
+- To change the per-font properties window (rename editor, glyph grid, built-in kerning viewer,
+  the custom-kerning section and its editor window, the per-font "Группы" membership section),
+  edit `font_properties_window.rs`.
+- To change how a custom kerning pair is STORED, resolved onto a font, or applied by the renderer,
+  the change is NOT here: edit the typing model behind `font_admin::set_custom_kerning`. This
+  module only reads and writes the whole list.
 - To change the "Группы" section, the group-editor window or the font-card IMPORT policy (name
   resolution, deduplication, auto-import, the status-line counts), edit `font_groups.rs`.
 - To change how a font-card PSD is read (traversal, font-name pick, title normalization), edit

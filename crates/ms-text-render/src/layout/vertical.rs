@@ -1453,6 +1453,7 @@ mod tests {
             data: std::sync::Arc::new(bytes),
             face_index: params.selected_face_index,
             content_id,
+            custom_kerning: None,
         }])
     }
 

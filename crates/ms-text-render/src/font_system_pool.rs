@@ -554,6 +554,7 @@ mod tests {
             data: Arc::clone(bytes) as crate::font_provider::FontBytes,
             face_index: 0,
             content_id,
+            custom_kerning: None,
         }
     }
 
@@ -800,6 +801,7 @@ mod tests {
             data: Arc::new(bytes.clone()),
             face_index: 0,
             content_id: font_content_id(&bytes),
+            custom_kerning: None,
         };
 
         let shaped_dots = |mode| {

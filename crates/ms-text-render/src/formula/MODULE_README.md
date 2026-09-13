@@ -49,6 +49,19 @@ the line paths.
   width, and font size are separate runtime inputs. Keep their meanings explicit.
 - Formula and custom-line rendering must preserve inline style, inline font, kerning,
   glyph scale, glyph offset, and text color overrides supplied by the main pipeline.
+- USER-AUTHORED KERNING PAIRS are applied here exactly as on the horizontal path (see
+  the CUSTOM KERNING contract in `../MODULE_README.md`): a matching pair REPLACES the
+  font's own value under every `KerningMode`, stepping by
+  `nominal_glyph_advance_px(left)` plus the authored delta
+  (`assign_formula_seed_advances`). Because a `FormulaGlyphSeed` is DETACHED from the
+  `LayoutRun` it came from, the source character is captured at seed time as
+  `FormulaGlyphSeed::cluster_char` (`None` for a multi-char cluster and for the
+  synthesized wrap hyphen, both of which can never carry an authored pair). One thing
+  does NOT carry over: `FormulaGlyphSeed::advance_px` is a MAGNITUDE along the drawn
+  line (floored positive at every consumer), not a signed x step, so the RTL sign
+  mirroring `pipeline::custom_pair_step_px` performs has no counterpart here. Formula
+  and drawn lines walk seeds in logical order regardless of script direction — a
+  limitation of that whole path, not of the overrides.
 - `FormulaRenderOutcome::FallbackToStandard` is an explicit layout decision for modes
   that cannot use a curve safely. Do not silently render a different mode.
 - Line stacking is NOT re-implemented here. `pipeline::line_baseline_advance_table`,

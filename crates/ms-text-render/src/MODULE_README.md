@@ -67,7 +67,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `FontContent.data` is `FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>` — exactly
   what `fontdb::Source::Binary` takes — so a provider may hand over an owned
   `Vec<u8>` OR the `'static` bytes `ms-fonts` already holds for a bundled font,
-  and neither is copied on the way into fontdb.
+  and neither is copied on the way into fontdb. It also owns
+  `CustomKerningTable`, the per-font USER-AUTHORED kerning pair overrides a
+  provider attaches to a `FontContent` (see the CUSTOM KERNING contract below).
 - `font_registry.rs`: selected/inline font loading and inline-font registry
   construction. The core loader `load_font_content` takes a resolved `FontContent`
   (bytes + face + content id) and never touches the filesystem — it is the ONLY
@@ -79,7 +81,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   the two guards every attrs MODIFICATION must pass — `family_has_matching_face`
   (style/stretch) and `family_has_face_of_requested_weight` (weight), see the
   UNSERVICEABLE-ATTRS GUARD contract below; both are `pub` so out-of-crate render
-  harnesses can apply the same rules.
+  harnesses can apply the same rules. It also owns `CustomKerningMap`, the
+  per-render `fontdb::ID` -> `CustomKerningTable` index: it is built from the load
+  cache's face ids right after each `load_font_content`, and is the ONLY bridge from
+  a `FontContent` to the `font_id` the layout paths actually see.
 - `font_ligature_patch.rs`: the byte-level GSUB patcher behind
   `TextRenderParams.force_remove_ellipsis_glyph`. Finds the glyph `cmap` maps
   U+2026 to and removes every `LigatureSubst` rule that OUTPUTS it, so a font
@@ -940,6 +945,97 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   legacy token `"metric"` deserializes to `Auto` so old overlays render
   identically. On the vertical path the stacking is ink-height based (no font pair
   kerning), so `Fixed` and `Auto` coincide there; only `Optical` differs.
+- CUSTOM KERNING (user-authored pair overrides). A font may carry a table of
+  `(left, right) -> offset` pairs the USER authored in the font settings, in
+  THOUSANDTHS OF AN EM (`delta_px = offset / 1000 * font_size_px`). The font FILE is
+  never touched.
+  - HOW IT TRAVELS: the app-side provider converts the persisted
+    `ms_tab_typing::font_admin::CustomKerningPair` list into a
+    `font_provider::CustomKerningTable` once per font-list revision and hangs it on
+    `FontContent.custom_kerning` (`Arc`, so the content stays cheap to clone into
+    render threads). `pipeline::render_text_to_image` turns that into a
+    `font_registry::CustomKerningMap` keyed by REGISTERED FACE — for the selected
+    font and, inside `build_inline_font_registry`, for every inline `<font=…>` font —
+    and threads the map into the pen loops. The persistence type and the runtime type
+    are deliberately separate; the provider is the only seam between them.
+    `custom_kerning` is NOT part of `content_id`: it changes no byte fontdb
+    registers, so the face load cache must still hit.
+  - ONE FACE, ONE TABLE. The map is keyed by `fontdb::ID`, and faces are cached by
+    `content_id` (an identity of BYTES only), so two fonts can only collide on a face
+    when their bytes are identical. The panel list is what rules out two tables in
+    that case: `panel::fonts::merge_duplicate_font_entries` folds byte-identical
+    files into ONE entry (key: normalized PostScript name + content hash) before
+    `apply_custom_kerning` resolves any table, and the entries that skip the fold —
+    the synthetic bundled-UI stack entry, an unreadable/unparsable file — carry no
+    table and register no face. That invariant lives in another crate, so
+    `CustomKerningMap` does not trust it silently: rebinding a face to a DIFFERENT
+    table logs a warning naming both fonts and keeps the later table
+    (deterministically), instead of rendering one font's text with another font's
+    pairs unnoticed.
+  - REPLACE, NOT ADD. When a pair matches, the pen steps by
+    `nominal_glyph_advance_px(left)` — the raw `hmtx` advance `Fixed` already uses —
+    plus the authored delta, under EVERY `KerningMode` (`Auto`, `Fixed`, `Optical`
+    alike). The font's own GPOS/`kern` contribution for that pair is dropped and the
+    user's number stands in its place; that is what makes an authored pair
+    indistinguishable from a built-in one. An entry of `0.0` is therefore MEANINGFUL
+    — it cancels a built-in pair — and must never be filtered out anywhere.
+    Uniform tracking (`KerningSettings::extra_spacing_px`) is a separate setting and
+    is still added on top, unchanged.
+  - DIRECTION. `nominal_glyph_advance_px` is an `hmtx` advance and therefore
+    UNSIGNED, while cosmic-text lays a right-to-left run out by subtracting each
+    advance, so its shaped step is negative. The override's magnitude is mirrored
+    back onto the run's own axis by `pipeline::custom_pair_step_px` (sign taken from
+    the shaped step, falling back to the left glyph's bidi level when that step is
+    degenerate), so a negative authored delta TIGHTENS a pair in both directions.
+    The formula path has no counterpart: its `advance_px` is a magnitude along the
+    drawn line, floored positive at every consumer. Out of scope and untouched:
+    `KerningMode::Fixed` WITHOUT an override still steps by the unsigned nominal
+    advance, so an un-overridden RTL run keeps its pre-existing direction there.
+  - GUARDS (conservative on purpose; do not "simplify" them away). A pair applies
+    only when both glyphs come from the SAME face (`font_id`) — a pair across a
+    font-fallback boundary belongs to no typeface's design — that face carries a
+    table, and EACH glyph's source cluster is exactly one `char`
+    (`pipeline::single_char_cluster`). The settings UI accepts exactly two
+    characters, so a ligature/multi-char cluster has no authored meaning.
+  - FAST PATH. `KerningSettings::custom_pairs` (stamped per glyph by
+    `with_custom_pairs` from `CustomKerningMap::has_table`) makes
+    `uses_default_metric_layout` return `false`, which is what keeps both the
+    horizontal (`horizontal_run_layout`) and formula
+    (`formula::assign_formula_seed_advances`) byte-identical shaped-position
+    shortcuts from swallowing the overrides.
+  - SITES. `pipeline::horizontal_run_layout` (metric branch),
+    `pipeline::optical_horizontal_run_layout` (an override wins over the optical
+    normalization for that one pair; the rest of the run stays optical), and
+    `formula::assign_formula_seed_advances` via `FormulaGlyphSeed::cluster_char`
+    (seeds are detached from their `LayoutRun`, so the source character is captured
+    at seed time).
+  - MEASUREMENT MUST STAY IN SYNC or wrapping drifts from what is drawn. Two paths:
+    `wrap::forms::GlyphWidths::build` (its `kerns` map already holds the font's own
+    pair delta in the very same per-mille unit, so an override is an exact
+    overwrite) and `wrap::horizontal::WrapScoringContext`, which corrects each shaped
+    measurement by `authored - the font's own delta`, memoized per pair. The second
+    Neither has per-glyph font ids, so the pen loop's same-face guard is reproduced
+    by its CAUSE instead: both gate the override on `wrap::selected_face_covers_pair`
+    — the selected font must cover BOTH characters, since an uncovered character is
+    exactly the one that falls through to a fallback face at draw time. An uncovered
+    pair is measured like any other pair. What remains unproven is that the shaper
+    actually put the two in one run and one `char` per cluster; that residual is
+    bounded by the pair's own authored magnitude on a single line, and it moves a
+    line break, never a drawn glyph. `WrapScoringContext` without a font system
+    corrects nothing at all: its "width" is a unit count, not px.
+  - REJECTED: patching the font BINARY. A legacy `kern` table is consulted by
+    rustybuzz ONLY when the font has no GPOS `kern` feature
+    (`rustybuzz-0.14.1/src/hb/ot_shape.rs:244`), so injecting one would silently do
+    nothing on most modern fonts; patching GPOS instead means growing the table and
+    rewriting the LookupList/FeatureList offsets; and no font-WRITING dependency
+    exists in the tree (`ttf-parser`/`read-fonts`/`skrifa` are read-only). That is
+    also why `font_ligature_patch.rs` is not a precedent: it is removal-only and
+    strictly size-preserving, which is exactly what makes it safe.
+  - KNOWN GAP, INTENTIONAL: the VERTICAL path applies no pair kerning of any kind
+    today (stacking is ink-height based, `layout/vertical.rs`), so it applies no
+    custom pairs either. `KerningSettings::custom_pairs` is left `false` there. Adding
+    them means first defining what a "pair" is for a vertical column, which is a
+    separate decision.
 - Horizontal glyph pen positions live in `horizontal_run_layout`. `Auto` (and the
   `Optical` fallback when a run cannot be optically kerned) is byte-identical to
   the shaped positions plus manual tracking; `Fixed` uses the nominal own advance.

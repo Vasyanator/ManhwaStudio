@@ -58,7 +58,9 @@ pub use font_system_pool::FontFaceCache;
 // Caller-supplied font source: fonts reach the render path by working name
 // through a `FontProvider`; the renderer never touches the filesystem itself,
 // and no path-keyed loader exists any more.
-pub use font_provider::{FontBytes, FontContent, FontContentSet, FontProvider, font_content_id};
+pub use font_provider::{
+    CustomKerningTable, FontBytes, FontContent, FontContentSet, FontProvider, font_content_id,
+};
 
 // Прогрев пула `FontSystem` из фонового потока: приложение вызывает
 // `ms_text_render::prewarm_font_system_pool()`, чтобы первый пользовательский

@@ -328,6 +328,7 @@ mod tests {
             post_script_name: identity.to_string(),
             content_hash,
             display_name: None,
+            custom_kerning: Vec::new(),
             identity_name: identity.to_string(),
             virtual_group_aliases: std::collections::BTreeMap::new(),
         }

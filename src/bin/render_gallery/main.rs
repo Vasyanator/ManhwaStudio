@@ -67,6 +67,7 @@ fn build_font_set() -> Result<FontContentSet, String> {
         data: Arc::new(bytes),
         face_index: 0,
         content_id,
+        custom_kerning: None,
     }]))
 }
 

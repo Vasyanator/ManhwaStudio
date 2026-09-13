@@ -1050,6 +1050,7 @@ mod tests {
                 data: Arc::new(Vec::new()),
                 face_index: 0,
                 content_id: self.content_id,
+                custom_kerning: None,
             })
         }
     }
@@ -1067,6 +1068,7 @@ mod tests {
                 data: Arc::new(Vec::new()),
                 face_index: 0,
                 content_id: self.content_id,
+                custom_kerning: None,
             })
         }
     }

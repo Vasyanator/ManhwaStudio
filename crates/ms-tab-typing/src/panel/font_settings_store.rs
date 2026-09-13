@@ -5,8 +5,8 @@ Purpose:
 Process-global runtime store for the app-level per-font settings persisted in
 `fonts/fonts_data.json` (via `super::fonts_data`). It owns the authoritative runtime
 copy of three things: the user-imported system fonts, the per-font settings
-(display-name override + default parameter profile), and the user-defined VIRTUAL font
-groups. A single monotonic revision counter lets a GUI poller detect any change and
+(display-name override + default parameter profile + user-defined custom kerning pairs), and
+the user-defined VIRTUAL font groups. A single monotonic revision counter lets a GUI poller detect any change and
 reload; every mutation snapshots the whole state and saves off-thread.
 
 EVERYTHING IS KEYED BY FONT IDENTITY (`FontEntry::render_identity_name`), never by a file
@@ -47,6 +47,9 @@ Key functions:
   not send every open panel through a font reload per added font
 - `font_display_name_override` / `set_font_display_name_override`
 - `font_profile` / `set_font_profile`
+- `font_custom_kerning` / `set_font_custom_kerning` (user-authored kerning overrides in ‰ em;
+  the setter bumps the revision and persists IMMEDIATELY, so open panels reload their fonts
+  and the new pairs reach the renderer without a restart)
 - `virtual_groups` / `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group`
 - `add_virtual_group_member` / `remove_virtual_group_member` / `set_virtual_group_member_alias`
 - `seed_imported_system_fonts_from_config` / `migrate_legacy_font_keys`
@@ -57,9 +60,10 @@ Notes:
 module and the `presets_io` load helper used for the one-time migration). The store is a
 plain `OnceLock<RwLock<StoreState>>`; it is not on any hot path, so no generation cache is
 needed. Seeding sets the state directly WITHOUT bumping the revision or persisting (it is
-the initial state, not a change). Display-name overrides, profiles, imported fonts and
-virtual groups share the SAME revision, so a change to any of them reloads both the settings
-font lists and the typing panels.
+the initial state, not a change). Display-name overrides, custom kerning, imported fonts
+and virtual groups share the SAME revision, so a change to any of them reloads both the
+settings font lists and the typing panels; per-font PROFILES deliberately do not bump it
+(see `set_font_profile`).
 */
 
 use super::*;
@@ -314,7 +318,8 @@ fn merge_disk_document(disk: fonts_data::FontsData) {
 /// - an imported system font we do not know by identity (or, for a not-yet-named legacy
 ///   entry, by path hint) is appended;
 /// - a per-font record we do not have is inserted; one we do have is filled FIELD-WISE from
-///   theirs only where ours is unset;
+///   theirs only where ours is unset, except the custom-kerning LIST, which is UNIONED by
+///   `(left, right)` with ours first (see [`union_custom_kerning`]);
 /// - a virtual group we do not have is appended; a group we share gains the members we lack,
 ///   and a member we hold without an alias picks up theirs.
 fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
@@ -339,6 +344,27 @@ fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
                 }
                 if ours.profile.is_none() {
                     ours.profile = record.profile;
+                }
+                // The same additive rule, spelled out for a LIST: the two lists are UNIONED
+                // by `(left, right)` instead of one replacing the other. An all-or-nothing
+                // arm discarded the other instance's ENTIRE list whenever ours was
+                // non-empty, even though pairs for different characters do not conflict at
+                // all.
+                let (merged, dropped) = union_custom_kerning(
+                    std::mem::take(&mut ours.custom_kerning),
+                    record.custom_kerning,
+                );
+                ours.custom_kerning = merged;
+                // Logging is not saving: name every pair that genuinely had to be dropped,
+                // individually, so a value the user typed in the other window cannot vanish
+                // without a word.
+                for pair in dropped {
+                    ms_log::runtime_log::log_warn(format!(
+                        "typing: fonts_data: another app instance stores a different custom \
+                         kerning offset for the pair '{}{}' of the font '{}' ({} ‰ em); this \
+                         instance's value is kept and theirs is DISCARDED.",
+                        pair.left, pair.right, key, pair.offset_per_mille
+                    ));
                 }
             }
         }
@@ -367,6 +393,45 @@ fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
             }
         }
     }
+}
+
+/// Unions two custom kerning lists by `(left, right)`, OURS FIRST.
+///
+/// Every pair of `ours` is kept with OUR `offset_per_mille`; every pair of `theirs` whose
+/// `(left, right)` we do not already hold is APPENDED, preserving their relative order. A key
+/// both sides hold keeps our offset — the same "ours wins" bias every other field of the merge
+/// uses, and ours is the value the user is currently looking at. The result goes through
+/// [`fonts_data::sanitize_custom_kerning`], so the union keeps the list's invariants:
+/// first-wins on a duplicate key, user order preserved, a non-finite offset dropped, and a
+/// `0.0` offset KEPT (it is how the user cancels a built-in pair).
+///
+/// Returns the merged list together with the pairs of `theirs` that genuinely had to be
+/// dropped — a key both sides hold with a DIFFERENT offset, where only one value can survive.
+/// A key both sides hold with the SAME offset loses nothing and is not reported; the caller
+/// warns about what the returned list could not carry.
+#[must_use]
+fn union_custom_kerning(
+    ours: Vec<fonts_data::CustomKerningPair>,
+    theirs: Vec<fonts_data::CustomKerningPair>,
+) -> (Vec<fonts_data::CustomKerningPair>, Vec<fonts_data::CustomKerningPair>) {
+    let mut merged = ours;
+    let mut dropped: Vec<fonts_data::CustomKerningPair> = Vec::new();
+    for pair in theirs {
+        // The lists are short (a handful of hand-authored pairs), so a linear scan per pair
+        // is cheaper than building a map, and it is what preserves the "ours first" order.
+        let held = merged
+            .iter()
+            .find(|kept| kept.left == pair.left && kept.right == pair.right);
+        match held {
+            Some(kept) => {
+                if kept.offset_per_mille != pair.offset_per_mille {
+                    dropped.push(pair);
+                }
+            }
+            None => merged.push(pair),
+        }
+    }
+    (fonts_data::sanitize_custom_kerning(merged), dropped)
 }
 
 /// Persists the store to `fonts_data.json` off the GUI thread, immediately.
@@ -825,6 +890,50 @@ pub(crate) fn set_font_display_name_override(
             return false;
         }
         record.display_name = normalized.clone();
+        true
+    });
+    if changed {
+        bump_revision();
+        persist_off_thread();
+    }
+    changed
+}
+
+/// Returns the user-defined custom kerning pairs for the font `identity`, in user order.
+///
+/// Empty when the font has none. The offsets are in THOUSANDTHS OF AN EM (see
+/// [`fonts_data::CustomKerningPair`]), so a consumer scales them by the rendered size. Cheap
+/// (a clone of a short list); GUI-thread safe.
+#[must_use]
+pub(crate) fn font_custom_kerning(identity: &str) -> Vec<fonts_data::CustomKerningPair> {
+    let guard = match store().read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    find_record(&guard, identity)
+        .map(|record| record.custom_kerning.clone())
+        .unwrap_or_default()
+}
+
+/// Replaces the custom kerning pairs of the font `identity` with `pairs` (sanitized by the
+/// same rule the document uses: non-finite offsets dropped, `(left, right)` deduplicated
+/// first-wins, user order preserved, ZERO offsets KEPT because a zero cancels a built-in
+/// pair).
+///
+/// Returns `true` when the stored list actually changed; only then does it bump the shared
+/// revision and persist off-thread IMMEDIATELY (not debounced, unlike the per-font profile).
+/// The bump is the mechanism: it makes every open typing panel reload its fonts, which is how
+/// an edited pair reaches the renderer without a restart. A no-op bumps and persists nothing.
+pub(crate) fn set_font_custom_kerning(
+    identity: &str,
+    pairs: Vec<fonts_data::CustomKerningPair>,
+) -> bool {
+    let sanitized = fonts_data::sanitize_custom_kerning(pairs);
+    let changed = mutate_font_record(identity, |record| {
+        if record.custom_kerning == sanitized {
+            return false;
+        }
+        record.custom_kerning = sanitized;
         true
     });
     if changed {
@@ -1444,7 +1553,10 @@ pub(crate) fn migrate_legacy_font_keys(resolution: &LegacyKeyResolution) -> bool
 ///
 /// A field only `later` carries is ADOPTED (the two legacy keys of a merged duplicate can
 /// each hold half of the settings); a field both carry keeps `target`'s value, and the
-/// dropped one is named in a warning so the user can see exactly what was discarded.
+/// dropped one is named in a warning so the user can see exactly what was discarded. The
+/// custom kerning LIST is UNIONED by `(left, right)` with `target` first
+/// ([`union_custom_kerning`]) — pairs for different characters do not conflict, so only a
+/// key both lists hold with a different offset is a loss, and only that is warned about.
 fn merge_settings_record(
     target: &mut fonts_data::FontSettingsRecord,
     later: fonts_data::FontSettingsRecord,
@@ -1472,6 +1584,25 @@ fn merge_settings_record(
         }
         (Some(_), None) => {}
         (None, later_profile) => target.profile = later_profile,
+    }
+    // The custom kerning list is a LIST, so the additive rule is a UNION: the two legacy
+    // keys can each hold pairs for different characters, and dropping `later`'s list whole
+    // would destroy half of them for no reason.
+    let (merged, dropped) = union_custom_kerning(
+        std::mem::take(&mut target.custom_kerning),
+        later.custom_kerning,
+    );
+    target.custom_kerning = merged;
+    // Only a pair the union could not carry is a loss; name each one, because logging is not
+    // saving.
+    for pair in dropped {
+        ms_log::runtime_log::log_warn(format!(
+            "typing: fonts_data migration: legacy key '{later_key}' names the font \
+             '{identity}', which an earlier key already named; both store a custom kerning \
+             offset for the pair '{}{}', so the later one ({} ‰ em) is DISCARDED and the \
+             earlier one is kept.",
+            pair.left, pair.right, pair.offset_per_mille
+        ));
     }
 }
 
@@ -2011,6 +2142,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("Мысли".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
         let member = |key: &str, alias: &str| fonts_data::VirtualFontGroupMember {
@@ -2198,6 +2330,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("Папка".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
         fonts.insert(
@@ -2205,6 +2338,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("Система".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
         seed_legacy(fonts_data::FontsData {
@@ -2397,6 +2531,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("Разговор".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
         fonts.insert(
@@ -2404,6 +2539,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: None,
                 profile: Some(serde_json::json!({ "schema": 2, "font_size_px": 42.0 })),
+                custom_kerning: Vec::new(),
             },
         );
         seed_legacy(fonts_data::FontsData {
@@ -2793,6 +2929,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("наше".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
 
@@ -2802,6 +2939,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("их".to_string()),
                 profile: Some(serde_json::json!({ "schema": 2 })),
+                custom_kerning: Vec::new(),
             },
         );
         theirs.insert(
@@ -2809,6 +2947,7 @@ mod tests {
             fonts_data::FontSettingsRecord {
                 display_name: Some("только их".to_string()),
                 profile: None,
+                custom_kerning: Vec::new(),
             },
         );
         merge_disk_into_state(
@@ -2870,6 +3009,258 @@ mod tests {
             state.virtual_groups[0].members[0].alias.as_deref(),
             Some("Бета"),
             "a member we hold without an alias picks up theirs"
+        );
+    }
+
+    /// Convenience constructor for one custom kerning pair.
+    fn kern(left: char, right: char, offset_per_mille: f32) -> fonts_data::CustomKerningPair {
+        fonts_data::CustomKerningPair {
+            left,
+            right,
+            offset_per_mille,
+        }
+    }
+
+    /// The mutator stores the pairs, bumps the shared revision (which is what makes open
+    /// panels reload their fonts and the renderer see the change), and a re-set of the SAME
+    /// list bumps nothing.
+    #[test]
+    fn setting_custom_kerning_bumps_the_revision_once() {
+        let _lock = lock_tests();
+        reset_store();
+
+        let before = imported_fonts_revision();
+        assert!(
+            font_custom_kerning("Comic-Regular").is_empty(),
+            "a font with no record has no pairs"
+        );
+
+        assert!(set_font_custom_kerning(
+            "Comic-Regular",
+            vec![kern('A', 'V', -40.0), kern('T', 'o', 0.0)]
+        ));
+        assert_eq!(
+            font_custom_kerning("Comic-Regular"),
+            vec![kern('A', 'V', -40.0), kern('T', 'o', 0.0)],
+            "stored verbatim, user order kept, the zero pair kept"
+        );
+        let after_set = imported_fonts_revision();
+        assert!(after_set > before, "a real change must bump the revision");
+
+        assert!(
+            !set_font_custom_kerning(
+                "Comic-Regular",
+                vec![kern('A', 'V', -40.0), kern('T', 'o', 0.0)]
+            ),
+            "storing the same list again is a no-op"
+        );
+        assert_eq!(
+            imported_fonts_revision(),
+            after_set,
+            "a no-op must bump nothing"
+        );
+    }
+
+    /// A record holding ONLY custom kerning must survive: `is_empty` counts the list, so
+    /// `mutate_font_record` does not drop the record it has just created.
+    #[test]
+    fn a_record_holding_only_custom_kerning_survives() {
+        let _lock = lock_tests();
+        reset_store();
+
+        assert!(set_font_custom_kerning("Comic-Regular", vec![kern('A', 'V', -40.0)]));
+        let snapshot = snapshot_data();
+        let record = snapshot
+            .fonts
+            .get("Comic-Regular")
+            .expect("a kerning-only record must be stored");
+        assert!(record.display_name.is_none());
+        assert!(record.profile.is_none());
+        assert_eq!(record.custom_kerning, vec![kern('A', 'V', -40.0)]);
+
+        // Clearing it back to empty leaves nothing worth storing, so the record goes away.
+        assert!(set_font_custom_kerning("Comic-Regular", Vec::new()));
+        assert!(!snapshot_data().fonts.contains_key("Comic-Regular"));
+    }
+
+    /// The incoming list is sanitized by the SAME rule the document uses, so the in-memory
+    /// state can never disagree with what a round trip would produce.
+    #[test]
+    fn setting_custom_kerning_sanitizes_the_incoming_list() {
+        let _lock = lock_tests();
+        reset_store();
+
+        assert!(set_font_custom_kerning(
+            "Comic-Regular",
+            vec![
+                kern('A', 'V', -40.0),
+                // Duplicate pair: the FIRST wins.
+                kern('A', 'V', 999.0),
+                kern('W', 'a', f32::NAN),
+                kern('T', 'o', 0.0),
+            ]
+        ));
+        assert_eq!(
+            font_custom_kerning("Comic-Regular"),
+            vec![kern('A', 'V', -40.0), kern('T', 'o', 0.0)]
+        );
+    }
+
+    /// The conflict merge is additive for custom kerning too, and for a LIST additive means
+    /// UNION: the other instance's pairs for characters we do not cover are kept alongside
+    /// ours. An all-or-nothing arm discarded its whole list whenever ours was non-empty.
+    #[test]
+    fn merging_another_instances_document_unions_custom_kerning() {
+        let mut state = StoreState::default();
+        state.fonts.insert(
+            "Shared-Regular".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![kern('A', 'V', -40.0)],
+            },
+        );
+        state.fonts.insert(
+            "Ours-Empty".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: Some("наше".to_string()),
+                profile: None,
+                custom_kerning: Vec::new(),
+            },
+        );
+
+        let mut theirs = BTreeMap::new();
+        theirs.insert(
+            "Shared-Regular".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![kern('T', 'o', 12.0)],
+            },
+        );
+        theirs.insert(
+            "Ours-Empty".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: Some("их".to_string()),
+                profile: None,
+                custom_kerning: vec![kern('W', 'a', -8.0)],
+            },
+        );
+        merge_disk_into_state(
+            &mut state,
+            fonts_data::FontsData {
+                system_fonts: Vec::new(),
+                fonts: theirs,
+                virtual_groups: Vec::new(),
+                pending_migration: false,
+            },
+        );
+
+        assert_eq!(
+            state.fonts.get("Shared-Regular").map(|r| r.custom_kerning.as_slice()),
+            Some([kern('A', 'V', -40.0), kern('T', 'o', 12.0)].as_slice()),
+            "disjoint lists UNION, ours first: neither instance's pair may be lost"
+        );
+        assert_eq!(
+            state.fonts.get("Ours-Empty").map(|r| r.custom_kerning.as_slice()),
+            Some([kern('W', 'a', -8.0)].as_slice()),
+            "an empty list of ours adopts theirs"
+        );
+    }
+
+    /// A pair BOTH instances hold keeps OUR offset (we are the newer writer, and ours is the
+    /// value the user is looking at), while their pairs for other characters are still
+    /// appended — including a `0.0` one, which the union may not filter out.
+    #[test]
+    fn merging_a_shared_kerning_pair_keeps_our_offset_and_appends_the_rest() {
+        let mut state = StoreState::default();
+        state.fonts.insert(
+            "Shared-Regular".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![kern('A', 'V', -40.0), kern('T', 'o', 5.0)],
+            },
+        );
+
+        let mut theirs = BTreeMap::new();
+        theirs.insert(
+            "Shared-Regular".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![
+                    // Same key, different offset: ours survives, theirs is warned about.
+                    kern('A', 'V', 99.0),
+                    // Same key, same offset: nothing is lost, nothing is reported.
+                    kern('T', 'o', 5.0),
+                    // A cancellation pair only they hold; zero is meaningful and must survive.
+                    kern('W', 'a', 0.0),
+                ],
+            },
+        );
+        merge_disk_into_state(
+            &mut state,
+            fonts_data::FontsData {
+                system_fonts: Vec::new(),
+                fonts: theirs,
+                virtual_groups: Vec::new(),
+                pending_migration: false,
+            },
+        );
+
+        assert_eq!(
+            state.fonts.get("Shared-Regular").map(|r| r.custom_kerning.as_slice()),
+            Some([kern('A', 'V', -40.0), kern('T', 'o', 5.0), kern('W', 'a', 0.0)].as_slice()),
+            "ours wins on a shared key, their extra pairs are appended, the zero pair is kept"
+        );
+    }
+
+    /// The union rule applies to the deferred v1 key collapse as well: two legacy keys naming
+    /// one font can each hold different pairs, and the later key's list may not be dropped
+    /// whole just because the earlier one is non-empty.
+    #[test]
+    fn two_legacy_keys_naming_one_font_union_their_custom_kerning() {
+        let _lock = lock_tests();
+        reset_store();
+        let mut fonts = BTreeMap::new();
+        fonts.insert(
+            "A-copy.ttf".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![kern('A', 'V', -40.0)],
+            },
+        );
+        fonts.insert(
+            "B-copy.ttf".to_string(),
+            fonts_data::FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                // One pair only this key holds, and one that re-states the other key's pair
+                // with a different offset (the earlier key wins that one).
+                custom_kerning: vec![kern('T', 'o', 12.0), kern('A', 'V', 999.0)],
+            },
+        );
+        seed_legacy(fonts_data::FontsData {
+            system_fonts: Vec::new(),
+            fonts,
+            virtual_groups: Vec::new(),
+            pending_migration: true,
+        });
+        let mut resolution = LegacyKeyResolution::default();
+        for key in ["A-copy.ttf", "B-copy.ttf"] {
+            resolution
+                .by_key
+                .insert(key.to_string(), "Comic-Regular".to_string());
+        }
+
+        assert!(migrate_legacy_font_keys(&resolution));
+        assert_eq!(
+            font_custom_kerning("Comic-Regular"),
+            vec![kern('A', 'V', -40.0), kern('T', 'o', 12.0)],
+            "the second key's own pair survives the collapse; the re-stated one keeps the \
+             first key's offset"
         );
     }
 }

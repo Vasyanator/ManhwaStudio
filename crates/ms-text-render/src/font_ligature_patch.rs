@@ -1014,6 +1014,7 @@ mod tests {
             // documented on `ellipsis_free_bytes` — and the pointer check would
             // fail for a reason that is not a bug.
             content_id: font_content_id(&bytes) ^ 0x5f3a_9c11_0000_0001,
+            custom_kerning: None,
         };
         let first = ellipsis_free_bytes(&content);
         let second = ellipsis_free_bytes(&content);
@@ -1040,6 +1041,7 @@ mod tests {
             data: Arc::new(bytes.clone()),
             face_index: 0,
             content_id: font_content_id(&bytes),
+            custom_kerning: None,
         };
         let returned = ellipsis_free_bytes(&content);
         assert!(

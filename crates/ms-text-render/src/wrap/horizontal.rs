@@ -21,6 +21,18 @@ remaining blocks; it is `(start_index, split_tail)` over the original slice: the
 one-element-longer temporary view. This keeps memoization keys and state transitions
 O(1) in allocation instead of cloning/hashing the whole block suffix per DP state.
 
+Custom-kerning correction:
+Line widths are measured by SHAPING, and the shaper knows nothing about user-authored
+kerning pairs — so `WrapScoringContext` adds, per occurring overridden pair,
+`authored delta - the font's own delta` (the second derived by three shaping passes
+and memoized per pair). Without it the wrap would choose breaks against widths the
+pen loop does not draw. A width measurement carries no per-glyph font ids, so the pen
+loop's same-face guard is reproduced by its CAUSE: the correction is claimed only for
+a pair whose BOTH characters the selected font covers (`wrap::selected_face_covers_pair`),
+because an uncovered character is exactly the one that falls through to a fallback
+font at draw time. The residual gap is stated on that function; it can move a line
+break, never a glyph.
+
 Source:
 - `collect_line_break_candidates`
 - `wrap_text_with_targets*`
@@ -41,6 +53,7 @@ use ms_text_util::segmentation::{
     count_layout_units, with_default_segmenter,
 };
 use ms_text_util::text_punctuation::clamp_hanging_weight;
+use crate::font_provider::CustomKerningTable;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 use std::collections::HashMap;
 
@@ -78,6 +91,14 @@ pub(super) struct WrapScoringContext<'font, 'attrs> {
     font_size_px: f32,
     line_height_px: f32,
     width_cache_px: HashMap<String, f32>,
+    /// User-authored kerning overrides of the SELECTED font, or `None`. A line's
+    /// shaped width does not contain them (the shaper knows nothing about them), so
+    /// every measurement is corrected by [`Self::custom_kerning_correction_px`].
+    custom_kerning: Option<&'attrs CustomKerningTable>,
+    /// Per-pair `authored delta - the font's own delta`, in px at `font_size_px`,
+    /// memoized because deriving the font's own delta costs three shaping passes.
+    /// Only pairs that actually occur in a measured line ever land here.
+    custom_pair_correction_px: HashMap<(char, char), f32>,
 }
 
 impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
@@ -89,14 +110,23 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             font_size_px: 1.0,
             line_height_px: 1.0,
             width_cache_px: HashMap::new(),
+            custom_kerning: None,
+            custom_pair_correction_px: HashMap::new(),
         }
     }
 
+    /// Scoring context measuring with `font_system`/`attrs`.
+    ///
+    /// `custom_kerning` are the SELECTED font's user-authored pair overrides (`None`
+    /// when it has none). They must be supplied whenever the render has them: the
+    /// wrap decides line breaks from these widths, so a measurement that ignores an
+    /// override drifts from what the pen loop draws.
     pub(super) fn new(
         font_system: &'font mut FontSystem,
         attrs: &'attrs Attrs<'attrs>,
         font_size_px: f32,
         line_height_px: f32,
+        custom_kerning: Option<&'attrs CustomKerningTable>,
     ) -> Self {
         Self {
             font_system: Some(font_system),
@@ -104,6 +134,8 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             font_size_px,
             line_height_px,
             width_cache_px: HashMap::new(),
+            custom_kerning: custom_kerning.filter(|table| !table.is_empty()),
+            custom_pair_correction_px: HashMap::new(),
         }
     }
 
@@ -122,8 +154,105 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             ),
             _ => fallback_units as f32,
         };
+        let width_px = width_px + self.custom_kerning_correction_px(line_text);
         self.width_cache_px.insert(line_text.to_string(), width_px);
         width_px
+    }
+
+    /// Total px this line's width must move because user-authored pairs REPLACE the
+    /// font's own kerning for them; `0.0` when the font has no overrides.
+    ///
+    /// The shaped width already contains the font's own pair delta, and an override
+    /// replaces it, so the correction of one pair is `authored - font's own`. The
+    /// font's own delta is derived the same way the form metric derives it — shape
+    /// `ab`, subtract the two isolated advances — and is memoized per pair, so a
+    /// document with `n` overridden pairs pays at most `3n` extra shaping passes for
+    /// the whole wrap.
+    ///
+    /// Bounded, not exact: a width measurement has no per-glyph font ids, so the pen
+    /// loop's same-face guard is reproduced by its CAUSE instead — a pair is
+    /// corrected only when the selected font covers both of its characters
+    /// ([`super::selected_face_covers_pair`]). A pair that would fall through to a
+    /// fallback font at draw time is therefore skipped here too. What remains is
+    /// documented on that function; it only ever shifts a wrap estimate, never a
+    /// drawn glyph.
+    fn custom_kerning_correction_px(&mut self, line_text: &str) -> f32 {
+        if self.custom_kerning.is_none() {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        let mut prev: Option<char> = None;
+        for ch in line_text.chars() {
+            if let Some(left) = prev {
+                total += self.custom_pair_correction_for(left, ch);
+            }
+            prev = Some(ch);
+        }
+        total
+    }
+
+    /// Memoized `authored delta - the font's own delta` in px for one pair; `0.0`
+    /// when the pair is not overridden, when the selected font does not cover both
+    /// of its characters, or when this context has no font system to measure with.
+    ///
+    /// The no-font-system case yields `0.0` rather than the bare authored delta:
+    /// without a font system `measure_line_width_px` returns a UNIT count, not px,
+    /// so a px correction on top of it is not an approximation but a category error.
+    fn custom_pair_correction_for(&mut self, left: char, right: char) -> f32 {
+        if let Some(correction) = self.custom_pair_correction_px.get(&(left, right)).copied() {
+            return correction;
+        }
+        let Some(authored_px) = self
+            .custom_kerning
+            .and_then(|table| table.delta_px(left, right, self.font_size_px))
+        else {
+            return 0.0;
+        };
+        // The override may only be claimed for a pair the SELECTED font actually
+        // draws — the pen loop applies nothing to a pair that fell through to a
+        // fallback face. The answer is memoized below, so the face scan and the
+        // three shaping passes happen at most once per pair.
+        let correction = if self.selected_font_covers_pair(left, right) {
+            self.shaped_pair_delta_px(left, right)
+                .map_or(0.0, |own_px| authored_px - own_px)
+        } else {
+            0.0
+        };
+        self.custom_pair_correction_px
+            .insert((left, right), correction);
+        correction
+    }
+
+    /// Whether the font this context measures with covers BOTH characters of the
+    /// pair; `false` when the context has no font system (nothing was measured in
+    /// px, so nothing may be corrected in px).
+    fn selected_font_covers_pair(&mut self, left: char, right: char) -> bool {
+        match (self.font_system.as_deref_mut(), self.attrs) {
+            (Some(font_system), Some(attrs)) => {
+                super::selected_face_covers_pair(font_system, attrs, left, right)
+            }
+            _ => false,
+        }
+    }
+
+    /// The font's OWN kerning delta for the pair in px — `width("ab") - width("a")
+    /// - width("b")`, the same three-shaping derivation the form metric uses — or
+    /// `None` when this context has no font system to shape with.
+    fn shaped_pair_delta_px(&mut self, left: char, right: char) -> Option<f32> {
+        let (Some(font_system), Some(attrs)) = (self.font_system.as_deref_mut(), self.attrs) else {
+            return None;
+        };
+        let mut scratch = String::with_capacity(left.len_utf8() + right.len_utf8());
+        scratch.push(left);
+        scratch.push(right);
+        let pair = measure_word_width_px(&scratch, font_system, attrs, self.font_size_px, self.line_height_px);
+        scratch.clear();
+        scratch.push(left);
+        let left_px = measure_word_width_px(&scratch, font_system, attrs, self.font_size_px, self.line_height_px);
+        scratch.clear();
+        scratch.push(right);
+        let right_px = measure_word_width_px(&scratch, font_system, attrs, self.font_size_px, self.line_height_px);
+        Some(pair - left_px - right_px)
     }
 
     pub(super) fn estimate_base_units(
@@ -1465,5 +1594,127 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(upper, upper_of_lower, "lower: {lower:?}");
         }
+    }
+
+    /// Wrapping measures line widths by shaping, which knows nothing about
+    /// user-authored pairs, so the scoring context must correct every measurement
+    /// by `authored - the font's own` for each overridden pair it contains. Without
+    /// it the wrap would choose breaks against widths the pen loop does not draw.
+    #[test]
+    fn the_scoring_context_corrects_measured_widths_by_authored_pairs() {
+        use crate::font_provider::CustomKerningTable;
+        use cosmic_text::{Attrs, Family, FontSystem, fontdb};
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
+        let bytes = std::fs::read(path).expect("fixture font bytes");
+        let mut db = fontdb::Database::new();
+        db.load_font_data(bytes);
+        let family = db
+            .faces()
+            .next()
+            .and_then(|face| face.families.first().cloned())
+            .map(|(name, _language)| name)
+            .expect("fixture family name");
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let attrs = Attrs::new().family(Family::Name(family.as_str()));
+
+        let plain_px = {
+            let mut scoring = WrapScoringContext::new(&mut font_system, &attrs, 100.0, 120.0, None);
+            scoring.measure_line_width_px("AV", 0)
+        };
+        // -120 per mille of a 100 px em: the pair must land 12 px tighter than the
+        // UN-kerned width, i.e. the font's own `AV` kern is replaced, not stacked on.
+        let table = CustomKerningTable::from_pairs([('A', 'V', -120.0)]);
+        let kerned_px = {
+            let mut scoring =
+                WrapScoringContext::new(&mut font_system, &attrs, 100.0, 120.0, Some(&table));
+            scoring.measure_line_width_px("AV", 0)
+        };
+        let own_px = {
+            let mut scoring = WrapScoringContext::new(&mut font_system, &attrs, 100.0, 120.0, None);
+            let pair = scoring.measure_line_width_px("AV", 0);
+            let left = scoring.measure_line_width_px("A", 0);
+            let right = scoring.measure_line_width_px("V", 0);
+            pair - left - right
+        };
+        assert!(
+            own_px < -1.0,
+            "Liberation Sans must kern 'AV' itself, otherwise this proves nothing \
+             about REPLACING that value; got {own_px}"
+        );
+        assert!(
+            (kerned_px - (plain_px - own_px - 12.0)).abs() < 1e-2,
+            "measured width must move by authored minus the font's own kern: \
+             {kerned_px} vs {plain_px} (own {own_px})"
+        );
+
+        // An override the line does not contain must leave the measurement alone.
+        let elsewhere = CustomKerningTable::from_pairs([('Q', 'z', -500.0)]);
+        let untouched_px = {
+            let mut scoring =
+                WrapScoringContext::new(&mut font_system, &attrs, 100.0, 120.0, Some(&elsewhere));
+            scoring.measure_line_width_px("AV", 0)
+        };
+        assert!((untouched_px - plain_px).abs() < 1e-3);
+    }
+
+    /// The wrap measurement may only correct a pair the SELECTED font actually draws.
+    /// A pair whose characters fall through to a fallback face gets no correction at
+    /// draw time, so correcting it here would move line BREAKS against glyphs that
+    /// never move — by the pair's whole authored magnitude, which nothing bounds.
+    #[test]
+    fn the_wrap_measurement_skips_a_pair_the_font_cannot_draw() {
+        use crate::font_provider::CustomKerningTable;
+        use cosmic_text::{Attrs, Family, FontSystem, Metrics, fontdb};
+
+        // Arabic ain + beh: absent from Liberation Sans (the fixture), Latin 'AV' is not.
+        const UNCOVERED: &str = "\u{0639}\u{0628}";
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
+        let bytes = std::fs::read(path).expect("fixture font bytes");
+        let mut db = fontdb::Database::new();
+        db.load_font_data(bytes);
+        let family = db
+            .faces()
+            .next()
+            .and_then(|face| face.families.first().cloned())
+            .map(|(name, _language)| name)
+            .expect("fixture family name");
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+        let attrs = Attrs::new()
+            .family(Family::Name(family.as_str()))
+            .metrics(Metrics::new(100.0, 100.0));
+
+        let width_of = |font_system: &mut FontSystem,
+                        text: &str,
+                        table: Option<&CustomKerningTable>| {
+            let mut scoring =
+                WrapScoringContext::new(font_system, &attrs, 100.0, 120.0, table);
+            scoring.measure_line_width_px(text, 2)
+        };
+
+        let table = CustomKerningTable::from_pairs([
+            ('\u{0639}', '\u{0628}', -400.0),
+            ('A', 'V', -400.0),
+        ]);
+
+        let plain_uncovered = width_of(&mut font_system, UNCOVERED, None);
+        let kerned_uncovered = width_of(&mut font_system, UNCOVERED, Some(&table));
+        assert!(
+            (plain_uncovered - kerned_uncovered).abs() < 1e-3,
+            "an uncovered pair must not move the measured width: {kerned_uncovered} vs \
+             {plain_uncovered}"
+        );
+
+        // Control on the SAME table: the covered pair still moves, so the assertion
+        // above proves the coverage gate rather than a dead correction path.
+        let plain_covered = width_of(&mut font_system, "AV", None);
+        let kerned_covered = width_of(&mut font_system, "AV", Some(&table));
+        assert!(
+            kerned_covered < plain_covered - 1.0,
+            "a covered pair must still tighten the measured width: {kerned_covered} vs \
+             {plain_covered}"
+        );
     }
 }

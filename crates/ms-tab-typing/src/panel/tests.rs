@@ -3991,6 +3991,7 @@ paths change.
                 fonts_data::FontSettingsRecord {
                     display_name: Some("Основа".to_string()),
                     profile: None,
+                    custom_kerning: Vec::new(),
                 },
             )]),
             virtual_groups: vec![fonts_data::VirtualFontGroup {
@@ -4190,6 +4191,7 @@ paths change.
                 fonts_data::FontSettingsRecord {
                     display_name: Some("Основной".to_string()),
                     profile: None,
+                    custom_kerning: Vec::new(),
                 },
             )]),
             virtual_groups: vec![fonts_data::VirtualFontGroup {
@@ -5638,6 +5640,7 @@ paths change.
             post_script_name: post_script_name.to_string(),
             content_hash: 0,
             display_name: None,
+            custom_kerning: Vec::new(),
             identity_name: base_font_identity_name(post_script_name, family, &label),
             virtual_group_aliases: std::collections::BTreeMap::new(),
         }
@@ -5721,6 +5724,7 @@ paths change.
                 data: Arc::new(Vec::new()),
                 face_index: 0,
                 content_id: 7,
+                custom_kerning: None,
             })
         }
     }

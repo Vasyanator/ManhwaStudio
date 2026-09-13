@@ -5,20 +5,40 @@ Purpose:
 Serde schema and disk I/O for the app-level per-font settings document
 `fonts_data.json`, stored inside the app fonts directory (`resolve_fonts_dir()`).
 This file is the single on-disk home for the user-imported system fonts, per-font
-settings (display-name override + default parameter profile) and user-defined VIRTUAL
-font groups. Font discovery never picks it up because it only scans `.ttf/.otf/.ttc`.
+settings (display-name override + default parameter profile + user-defined custom kerning
+pairs) and user-defined VIRTUAL font groups. Font discovery never picks it up because it
+only scans `.ttf/.otf/.ttc`.
 
-SCHEMA VERSION 2 — the font is named by its IDENTITY, never by a path:
+SCHEMA VERSION 3 — the font is named by its IDENTITY, never by a path:
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "system_fonts": [ { "font": "Roboto-Medium", "last_path": "/home/…/Roboto-Medium.ttf" } ],
-  "fonts": { "CCWildWordsLower-Regular": { "display_name": "Разговор", "profile": { … } } },
+  "fonts": { "CCWildWordsLower-Regular": {
+               "display_name": "Разговор",
+               "profile": { … },
+               "custom_kerning": [ { "left": "A", "right": "V", "em": -40.0 } ] } },
   "virtual_groups": [ { "name": "Возлюбленная",
                         "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ]
 }
 ```
+
+CUSTOM KERNING IS MEASURED IN THOUSANDTHS OF AN EM (`em`, ‰ em), never in font design
+units. The renderer applies `delta_px = em / 1000.0 * font_size_px`, so the user's tuning is
+independent of BOTH the rendered size and the font file's `units_per_em` — a font updated to
+a different upem does not silently rescale it. `left`/`right` are single-character STRINGS; a
+string that is not exactly one `char` is dropped on decode with a warning. A pair whose `em`
+is `0.0` IS MEANINGFUL AND IS KEPT: it is how the user CANCELS a non-zero built-in pair, so
+nothing here filters zeros out (the settings UI's built-in extractor drops them, which is a
+different rule for a different list).
+
+VERSION 3 IS A GATE, NOT A MIGRATION. `custom_kerning` is purely additive and a v2 (or v1)
+document decodes exactly as before. The number was bumped because this document is REWRITTEN
+IN FULL on every debounced profile edit and there is no `deny_unknown_fields`: an older build
+would read a v3 document, silently drop the key it does not know, and write that loss back
+within seconds. The bump makes such a build refuse the write (`SaveError::NewerVersion`) and
+persist no font-settings change instead — the same trade `presets.json` version 2 makes.
 
 - `fonts` keys and `virtual_groups[].members[].font` are font IDENTITIES
   (`FontEntry::render_identity_name`), so moving or renaming a font FILE no longer drops
@@ -36,22 +56,23 @@ VERSION 1 (LEGACY) IS READ FOREVER. A v1 document keys everything by FILE PATH
 (`imported_system_fonts`, `font_settings`, and path keys inside `virtual_groups`). It is
 decoded verbatim with `FontsData::pending_migration = true`; `font_settings_store` then
 re-keys it to identities after the first successful font-list build (the `path → identity`
-map does not exist any earlier) and rewrites the document as v2. The legacy keys are never
-written back.
+map does not exist any earlier) and rewrites the document in the CURRENT schema. The
+legacy keys are never written back.
 
 THE SCHEMA VERSION IS DECIDED BY CONTENT WHEN THE `version` FIELD IS ABSENT. A document
-carrying `system_fonts`/`fonts` but no `version` is a v2 document (a hand edit, a truncated
-write, an older writer); reading it as an empty v1 — which a `0` default made it do — threw
-every key away on the next save. Both payload shapes are decoded and UNIONED, so a document
-that somehow carries v1 AND v2 keys loses neither.
+carrying `system_fonts`/`fonts` but no `version` is an IDENTITY-KEYED (v2+) document (a hand
+edit, a truncated write, an older writer); reading it as an empty v1 — which a `0` default
+made it do — threw every key away on the next save. Both payload shapes are decoded and
+UNIONED, so a document that somehow carries v1 AND identity-keyed keys loses neither.
 
-`pending_migration` IS PART OF THE PERSISTED v2 PAYLOAD. A deferred migration that could not
-resolve every legacy key rewrites the document in the CURRENT schema but must stay pending,
-or the next launch would read a v2 document, never retry, and the unresolved keys would be
-frozen forever (the "will apply again" promise in the migration log has to be true).
+`pending_migration` IS PART OF THE PERSISTED IDENTITY-KEYED PAYLOAD. A deferred migration
+that could not resolve every legacy key rewrites the document in the CURRENT schema but must
+stay pending, or the next launch would read an identity-keyed document, never retry, and the
+unresolved keys would be frozen forever (the "will apply again" promise in the migration log
+has to be true).
 
 Main responsibilities:
-- define the versioned JSON schema (`version: 2`) and its serde mirror, plus the read-only
+- define the versioned JSON schema (`version: 3`) and its serde mirror, plus the read-only
   v1 mirror;
 - load the document as a typed `LoadOutcome` (`Missing` / `Loaded` / `Invalid`) so the
   caller can distinguish "first run" from "corrupt file" — a corrupt file must NOT be
@@ -68,12 +89,15 @@ Main responsibilities:
   document, so a second app instance's settings can be merged instead of clobbered.
 
 Key types:
+- `CustomKerningPair` (one user-authored kerning override, in ‰ em; sanitized by
+  `sanitize_custom_kerning` on load and save)
 - `FontsData` (decoded in-memory form consumed by `font_settings_store`)
 - `LoadOutcome` (Missing / Loaded / Invalid load result)
 - `DocumentFingerprint` / `SaveBaseline` / `SaveError` (the write guard)
 - `QuarantineOutcome` (what happened to a corrupt document)
 - `SystemFontRef` (one imported system font: identity + last-known path hint)
-- `FontSettingsRecord` (per-font settings: display-name override + default profile)
+- `FontSettingsRecord` (per-font settings: display-name override + default profile +
+  custom kerning pairs)
 - `VirtualFontGroup` / `VirtualFontGroupMember` (user-defined virtual font groups; serde
   mirror AND decoded form; sanitized by `sanitize_virtual_groups` on load and save)
 
@@ -96,7 +120,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Current on-disk schema version of `fonts_data.json` (identity-keyed).
-pub(crate) const FONTS_DATA_VERSION: u32 = 2;
+///
+/// Version 3 added `fonts.<identity>.custom_kerning`. It is a GATE, not a migration: the
+/// field is purely additive and every older document still decodes unchanged, but an older
+/// BUILD must refuse to rewrite a v3 document (see the file header) instead of dropping the
+/// key it cannot see on the next debounced profile write.
+pub(crate) const FONTS_DATA_VERSION: u32 = 3;
 
 /// Last schema version that keyed everything by FILE PATH. A document at or below this
 /// version is decoded with the legacy rules and flagged for the deferred re-key.
@@ -111,6 +140,46 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Serde mirror of one [`CustomKerningPair`]. JSON shape:
+/// `{ "left": "A", "right": "V", "em": -40.0 }`.
+///
+/// `left`/`right` are single-character STRINGS rather than code points, so the document
+/// stays readable and hand-editable; a value that is not exactly one `char` is dropped by
+/// [`decode_custom_kerning`] with a warning. `em` is the advance delta in THOUSANDTHS OF AN
+/// EM (see [`CustomKerningPair::offset_per_mille`]); it is written even when `0.0`, because
+/// a zero pair is a deliberate cancellation of a built-in one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct CustomKerningEntry {
+    /// Left-hand character of the pair, as a one-character string.
+    #[serde(default)]
+    left: String,
+    /// Right-hand character of the pair, as a one-character string.
+    #[serde(default)]
+    right: String,
+    /// Advance delta in thousandths of an em. Negative tightens, positive widens.
+    #[serde(default)]
+    em: f32,
+}
+
+/// One user-defined kerning pair override for a font, replacing whatever the font's own
+/// `kern`/GPOS tables say for that pair. The font FILE is never modified.
+///
+/// `offset_per_mille` is the advance delta between `left` and `right` in THOUSANDTHS OF AN
+/// EM (positive widens, negative tightens), so the tuning is independent of both the
+/// rendered size and the font's `units_per_em`; the renderer applies
+/// `delta_px = offset_per_mille / 1000.0 * font_size_px`. A value of `0.0` is MEANINGFUL —
+/// it cancels a built-in pair — and is therefore never filtered out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomKerningPair {
+    /// Left-hand character of the pair.
+    pub left: char,
+    /// Right-hand character of the pair.
+    pub right: char,
+    /// Advance delta in thousandths of an em. Finite by construction
+    /// ([`sanitize_custom_kerning`] drops NaN/±∞); `0.0` cancels a built-in pair.
+    pub offset_per_mille: f32,
+}
+
 /// Per-font user settings block stored under a font IDENTITY in `fonts_data.json`.
 /// Fields are optional and skipped when empty so the document stays minimal.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -122,6 +191,9 @@ struct FontSettingsEntry {
     /// means "the font has no remembered parameters yet".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<Value>,
+    /// User-defined kerning pair overrides, in user order. Omitted when empty (v3+).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_kerning: Vec<CustomKerningEntry>,
 }
 
 /// One imported system font as stored on disk: its PostScript name plus the last path it
@@ -180,8 +252,8 @@ struct FontsDataFile {
     /// Schema version; see `FONTS_DATA_VERSION`. A newer version is warned about but the
     /// known fields are still parsed best-effort. `None` means the field was ABSENT, which
     /// is NOT the same as `0`: the version is then inferred from the payload shape by
-    /// [`decode`], because reading a v2-shaped document as an empty v1 would destroy it on
-    /// the next save. Always written by [`encode`].
+    /// [`decode`], because reading an identity-keyed document as an empty v1 would destroy
+    /// it on the next save. Always written by [`encode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<u32>,
     /// Whether a deferred v1 → v2 re-key is still owed (see the file header). Written only
@@ -217,21 +289,27 @@ pub(crate) struct SystemFontRef {
     pub last_path: Option<PathBuf>,
 }
 
-/// Per-font settings in the decoded runtime form. Both fields are `None` when unset; a
-/// record with two `None`s is dropped rather than stored.
+/// Per-font settings in the decoded runtime form. A record carrying nothing at all is
+/// dropped rather than stored (see [`FontSettingsRecord::is_empty`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct FontSettingsRecord {
     /// User display-name override; blank values are normalized away on decode.
     pub display_name: Option<String>,
     /// The font's default parameter profile.
     pub profile: Option<Value>,
+    /// User-defined kerning pair overrides, in user order, sanitized
+    /// ([`sanitize_custom_kerning`]). Empty means "the font uses only its built-in pairs".
+    pub custom_kerning: Vec<CustomKerningPair>,
 }
 
 impl FontSettingsRecord {
-    /// Whether the record carries nothing worth storing (both fields unset).
+    /// Whether the record carries nothing worth storing, i.e. every field is unset.
+    ///
+    /// `custom_kerning` counts: a record holding ONLY kerning overrides would otherwise be
+    /// dropped by `mutate_font_record` the instant it was created.
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.display_name.is_none() && self.profile.is_none()
+        self.display_name.is_none() && self.profile.is_none() && self.custom_kerning.is_empty()
     }
 }
 
@@ -299,8 +377,8 @@ pub(crate) enum SaveError {
     /// human-readable description including the path and the OS error.
     Io(String),
     /// The document on disk declares a schema version this build does not understand.
-    /// Rewriting it as v2 would silently drop every field that version added, so the write
-    /// is refused; the user keeps the newer file intact.
+    /// Rewriting it in the CURRENT schema would silently drop every field that version
+    /// added, so the write is refused; the user keeps the newer file intact.
     NewerVersion {
         /// The version the on-disk document declares.
         found: u32,
@@ -531,8 +609,98 @@ fn sanitize_virtual_groups(groups: Vec<VirtualFontGroup>) -> Vec<VirtualFontGrou
     out
 }
 
+/// Sanitizes a list of custom kerning pairs, applied on BOTH decode and encode so the
+/// on-disk and in-memory forms are always well-formed. Rules (user order preserved):
+/// - drop a pair whose `offset_per_mille` is not finite (NaN / ±∞ would serialize as JSON
+///   `null` and come back as `0.0`, silently turning a broken value into a cancellation);
+/// - deduplicate by `(left, right)`, FIRST wins — a later duplicate is a second opinion
+///   about the same pair, and only one of them can ever be applied.
+///
+/// A pair whose offset is `0.0` IS KEPT. Zero is the user's way to CANCEL a non-zero
+/// built-in pair, so it carries information that dropping it would destroy; the built-in
+/// extractor in the settings UI drops zeros because it is describing the FONT, not the
+/// user's overrides. Characters are compared verbatim: `A`/`a` are different pairs.
+///
+/// `pub(crate)` because `font_settings_store` must apply the SAME rule to an incoming list:
+/// a mutator that stored an unsanitized list would make the in-memory state disagree with
+/// what the document round-trips.
+#[must_use]
+pub(crate) fn sanitize_custom_kerning(pairs: Vec<CustomKerningPair>) -> Vec<CustomKerningPair> {
+    let mut seen: HashSet<(char, char)> = HashSet::new();
+    let mut out: Vec<CustomKerningPair> = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        if !pair.offset_per_mille.is_finite() {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: fonts_data: dropping a custom kerning pair '{}{}' whose offset is not \
+                 a finite number ({}); it cannot be persisted or applied.",
+                pair.left, pair.right, pair.offset_per_mille
+            ));
+            continue;
+        }
+        if !seen.insert((pair.left, pair.right)) {
+            continue;
+        }
+        out.push(pair);
+    }
+    out
+}
+
+/// The single `char` of `raw`, or `None` when it is empty or holds more than one.
+///
+/// A kerning pair addresses exactly two characters; anything else in that slot is a hand
+/// edit or a foreign writer and cannot be applied to anything.
+fn single_char(raw: &str) -> Option<char> {
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
+}
+
+/// Converts the serde mirror of a font's custom kerning list into the decoded runtime form,
+/// dropping (with a warning) every entry whose `left`/`right` is not exactly one character,
+/// then applying [`sanitize_custom_kerning`].
+fn decode_custom_kerning(entries: Vec<CustomKerningEntry>) -> Vec<CustomKerningPair> {
+    let pairs = entries
+        .into_iter()
+        .filter_map(|entry| {
+            match (single_char(&entry.left), single_char(&entry.right)) {
+                (Some(left), Some(right)) => Some(CustomKerningPair {
+                    left,
+                    right,
+                    offset_per_mille: entry.em,
+                }),
+                _ => {
+                    // A pair naming no single character addresses no glyph pair; it is kept
+                    // out of the runtime form rather than guessed at.
+                    ms_log::runtime_log::log_warn(format!(
+                        "typing: fonts_data: dropping a custom kerning entry whose left/right \
+                         is not exactly one character (left: {:?}, right: {:?}).",
+                        entry.left, entry.right
+                    ));
+                    None
+                }
+            }
+        })
+        .collect();
+    sanitize_custom_kerning(pairs)
+}
+
+/// Converts the decoded custom kerning list back into its serde mirror, sanitizing first so
+/// a runtime list that was mutated in place cannot write a malformed document.
+#[must_use]
+fn encode_custom_kerning(pairs: &[CustomKerningPair]) -> Vec<CustomKerningEntry> {
+    sanitize_custom_kerning(pairs.to_vec())
+        .into_iter()
+        .map(|pair| CustomKerningEntry {
+            left: pair.left.to_string(),
+            right: pair.right.to_string(),
+            em: pair.offset_per_mille,
+        })
+        .collect()
+}
+
 /// Normalizes one decoded per-font settings record: a blank display-name override behaves
-/// exactly like "no override", so it is dropped rather than stored.
+/// exactly like "no override", so it is dropped rather than stored; the custom kerning list
+/// is sanitized (see [`decode_custom_kerning`]).
 fn decode_settings_entry(entry: FontSettingsEntry) -> FontSettingsRecord {
     FontSettingsRecord {
         display_name: entry
@@ -540,6 +708,7 @@ fn decode_settings_entry(entry: FontSettingsEntry) -> FontSettingsRecord {
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty()),
         profile: entry.profile,
+        custom_kerning: decode_custom_kerning(entry.custom_kerning),
     }
 }
 
@@ -562,23 +731,25 @@ fn decode_settings_map(
 
 /// Converts the serde mirror into the decoded runtime form, UNIONING both schema payloads.
 ///
-/// Neither payload is ever discarded: a document that carries v2 keys AND leftover v1 keys
-/// (a hand edit, a half-written file, a partially migrated one) keeps both, with the v2 form
-/// winning on a key clash. The v1 half is what raises `pending_migration`.
+/// Neither payload is ever discarded: a document that carries identity-keyed (v2+) keys AND
+/// leftover v1 keys (a hand edit, a half-written file, a partially migrated one) keeps both,
+/// with the identity-keyed form winning on a key clash. The v1 half is what raises
+/// `pending_migration`.
 ///
 /// VERSION INFERENCE. The `version` field decides when it is present. When it is ABSENT the
-/// PAYLOAD decides: a document carrying `system_fonts`/`fonts` is v2. The old rule — serde's
-/// `0` default, therefore "≤ 1", therefore v1 — read such a document as an EMPTY v1 and the
-/// next save wrote that emptiness back, destroying every identity-keyed setting in it. With
-/// nothing to go on at all (no version, no payload) the document is treated as legacy, which
-/// is the harmless direction: a pending migration only ever re-keys and never drops.
+/// PAYLOAD decides: a document carrying `system_fonts`/`fonts` is identity-keyed. The old
+/// rule — serde's `0` default, therefore "≤ 1", therefore v1 — read such a document as an
+/// EMPTY v1 and the next save wrote that emptiness back, destroying every identity-keyed
+/// setting in it. With nothing to go on at all (no version, no payload) the document is
+/// treated as legacy, which is the harmless direction: a pending migration only ever re-keys
+/// and never drops.
 fn decode(file: FontsDataFile) -> FontsData {
-    let has_v2_payload = !file.system_fonts.is_empty() || !file.fonts.is_empty();
+    let has_identity_payload = !file.system_fonts.is_empty() || !file.fonts.is_empty();
     let has_legacy_payload =
         !file.imported_system_fonts.is_empty() || !file.font_settings.is_empty();
     let declares_legacy = match file.version {
         Some(version) => version <= LEGACY_FONTS_DATA_VERSION,
-        None => !has_v2_payload,
+        None => !has_identity_payload,
     };
 
     let mut system_fonts: Vec<SystemFontRef> = file
@@ -618,7 +789,7 @@ fn decode(file: FontsDataFile) -> FontsData {
 
     let mut fonts = decode_settings_map(file.fonts);
     for (key, record) in decode_settings_map(file.font_settings) {
-        // The v2 form wins: a key present in both was already migrated.
+        // The identity-keyed form wins: a key present in both was already migrated.
         fonts.entry(key).or_insert(record);
     }
 
@@ -626,10 +797,10 @@ fn decode(file: FontsDataFile) -> FontsData {
         system_fonts,
         fonts,
         virtual_groups: sanitize_virtual_groups(file.virtual_groups),
-        // A v2 document carries the flag explicitly (a migration that could not resolve
-        // everything writes it back), so it survives the rewrite the migration itself
-        // performs — without that, the next launch would read a v2 document, never retry,
-        // and freeze the unresolved keys forever.
+        // An identity-keyed document carries the flag explicitly (a migration that could
+        // not resolve everything writes it back), so it survives the rewrite the migration
+        // itself performs — without that, the next launch would read an identity-keyed
+        // document, never retry, and freeze the unresolved keys forever.
         pending_migration: declares_legacy || has_legacy_payload || file.pending_migration,
     }
 }
@@ -688,7 +859,7 @@ fn save_to_file(
 /// `baseline` (a second running app instance wrote it; overwriting drops whatever it added).
 ///
 /// WHY REFUSING RATHER THAN PRESERVING UNKNOWN FIELDS. Carrying unknown keys through a
-/// `#[serde(flatten)]` bag would let this build stamp `"version": 2` onto a payload whose
+/// `#[serde(flatten)]` bag would let this build stamp the CURRENT version onto a payload whose
 /// other half is v99 — a document that is neither, and whose unknown fields may reference
 /// the very keys this build re-keys during migration. Refusing keeps the newer file exactly
 /// as its writer left it, which is the only outcome that cannot corrupt it. The cost is that
@@ -752,6 +923,7 @@ fn encode(data: &FontsData) -> FontsDataFile {
                 FontSettingsEntry {
                     display_name: record.display_name.clone(),
                     profile: record.profile.clone(),
+                    custom_kerning: encode_custom_kerning(&record.custom_kerning),
                 },
             )
         })
@@ -820,12 +992,13 @@ mod tests {
         FontSettingsRecord {
             display_name: Some(display_name.to_string()),
             profile: None,
+            custom_kerning: Vec::new(),
         }
     }
 
     #[test]
-    fn round_trip_v2_through_temp_file() {
-        let path = unique_temp_path("roundtrip_v2");
+    fn round_trip_current_schema_through_temp_file() {
+        let path = unique_temp_path("roundtrip_v3");
         let mut fonts = BTreeMap::new();
         fonts.insert("CCWildWordsLower-Regular".to_string(), named("Разговор"));
         fonts.insert(
@@ -833,6 +1006,7 @@ mod tests {
             FontSettingsRecord {
                 display_name: None,
                 profile: Some(serde_json::json!({ "schema": 2, "font_size_px": 42.0 })),
+                custom_kerning: Vec::new(),
             },
         );
         let data = FontsData {
@@ -852,12 +1026,12 @@ mod tests {
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
         let loaded = expect_loaded(load_outcome_from_file(&path));
-        assert_eq!(loaded, data, "a v2 document must round-trip verbatim");
+        assert_eq!(loaded, data, "a current-schema document must round-trip verbatim");
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn saved_document_declares_v2_and_omits_unset_fields() {
+    fn saved_document_declares_v3_and_omits_unset_fields() {
         let path = unique_temp_path("slim_v2");
         let mut fonts = BTreeMap::new();
         fonts.insert("Comic-Regular".to_string(), named("Разговор"));
@@ -872,7 +1046,7 @@ mod tests {
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
         let raw = fs::read_to_string(&path).expect("read back");
-        assert!(raw.contains("\"version\": 2"), "the document must declare v2");
+        assert!(raw.contains("\"version\": 3"), "the document must declare v3");
         // Unset optionals and empty collections are omitted, never written as null/[].
         assert!(!raw.contains("profile"), "an unset profile must be omitted");
         assert!(!raw.contains("alias"), "an unset alias must be omitted");
@@ -1045,6 +1219,7 @@ mod tests {
             FontSettingsRecord {
                 display_name: None,
                 profile: Some(profile.clone()),
+                custom_kerning: Vec::new(),
             },
         );
         let data = FontsData {
@@ -1272,7 +1447,7 @@ mod tests {
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
         let raw = fs::read_to_string(&path).expect("read back");
-        assert!(raw.contains("\"version\": 2"), "it is written as v2");
+        assert!(raw.contains("\"version\": 3"), "it is written in the current schema");
         let loaded = expect_loaded(load_outcome_from_file(&path));
         assert!(
             loaded.pending_migration,
@@ -1300,9 +1475,9 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// DEFECT 6. A document from a FUTURE schema must never be rewritten as v2: everything the
-    /// newer version added (here `font_collections`) would silently disappear. Reading it
-    /// best-effort stays allowed; writing over it does not.
+    /// DEFECT 6. A document from a FUTURE schema must never be rewritten in the current
+    /// schema: everything the newer version added (here `font_collections`) would silently
+    /// disappear. Reading it best-effort stays allowed; writing over it does not.
     #[test]
     fn a_newer_version_document_is_never_overwritten() {
         let path = unique_temp_path("future_version_write");
@@ -1503,5 +1678,218 @@ mod tests {
         assert!(!path.exists(), "the corrupt file must be moved away");
         assert!(bad.exists(), "the corrupt file must land at fonts_data.json.bad");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Convenience constructor for one custom kerning pair.
+    fn kern(left: char, right: char, offset_per_mille: f32) -> CustomKerningPair {
+        CustomKerningPair {
+            left,
+            right,
+            offset_per_mille,
+        }
+    }
+
+    /// Custom kerning survives a save -> load cycle VERBATIM, user order included, and a
+    /// record holding ONLY kerning is neither dropped as empty nor reordered.
+    #[test]
+    fn custom_kerning_round_trips_in_user_order() {
+        let path = unique_temp_path("kerning_roundtrip");
+        let mut fonts = BTreeMap::new();
+        fonts.insert(
+            "Comic-Regular".to_string(),
+            FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                // Deliberately NOT sorted: the user's order is the stored order.
+                custom_kerning: vec![
+                    kern('V', 'A', -40.0),
+                    kern('A', 'V', -40.0),
+                    kern('Т', 'о', 12.5),
+                ],
+            },
+        );
+        let data = FontsData {
+            system_fonts: Vec::new(),
+            fonts,
+            virtual_groups: Vec::new(),
+            pending_migration: false,
+        };
+        save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded, data, "custom kerning must round-trip verbatim");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pair of `0.0` is the user CANCELLING a built-in pair, so it must survive the whole
+    /// round trip; dropping it (as the built-in extractor does) would silently restore the
+    /// font's own kerning for that pair.
+    #[test]
+    fn a_zero_valued_custom_pair_survives_the_round_trip() {
+        let path = unique_temp_path("kerning_zero");
+        let mut fonts = BTreeMap::new();
+        fonts.insert(
+            "Comic-Regular".to_string(),
+            FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![kern('A', 'V', 0.0)],
+            },
+        );
+        let data = FontsData {
+            system_fonts: Vec::new(),
+            fonts,
+            virtual_groups: Vec::new(),
+            pending_migration: false,
+        };
+        save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
+        let raw = fs::read_to_string(&path).expect("read back");
+        assert!(raw.contains("custom_kerning"), "a zero pair must still be written");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(
+            loaded.fonts.get("Comic-Regular").map(|record| record.custom_kerning.as_slice()),
+            Some([kern('A', 'V', 0.0)].as_slice()),
+            "a zero-valued pair must come back unchanged"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pair character that is itself JSON syntax — the double quote and the backslash — must
+    /// survive the round trip, and the document must stay parseable.
+    ///
+    /// Nothing here builds JSON by hand (`save_to_file` goes through `serde_json`), so the
+    /// escaping is the serializer's job; this test is what keeps it that way. A future "cheaper"
+    /// hand-rolled writer would corrupt the whole document on the first quote a user types, and
+    /// the pair characters are free-form user input from a text field.
+    /// The SPACE character is pinned alongside them because `single_char` deliberately does not
+    /// trim: a space is a legitimate half of a kerning pair, and trimming it would drop the pair.
+    #[test]
+    fn pair_characters_that_are_json_syntax_survive_the_round_trip() {
+        let path = unique_temp_path("kerning_json_syntax");
+        let mut fonts = BTreeMap::new();
+        fonts.insert(
+            "Comic-Regular".to_string(),
+            FontSettingsRecord {
+                display_name: None,
+                profile: None,
+                custom_kerning: vec![
+                    kern('"', '"', -30.0),
+                    kern('\\', 'A', 15.0),
+                    kern(' ', '"', -5.0),
+                    kern('\n', 'A', 7.0),
+                ],
+            },
+        );
+        let data = FontsData {
+            system_fonts: Vec::new(),
+            fonts,
+            virtual_groups: Vec::new(),
+            pending_migration: false,
+        };
+        save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
+        let raw = fs::read_to_string(&path).expect("read back");
+        // The serializer must have ESCAPED the quote rather than emitted it raw, or the
+        // document below would not parse at all.
+        assert!(raw.contains(r#""left": "\"""#), "the quote must be written escaped: {raw}");
+        assert!(raw.contains(r#""left": "\\""#), "the backslash must be written escaped: {raw}");
+        serde_json::from_str::<serde_json::Value>(&raw).expect("the document must stay valid JSON");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded, data, "every pair character must come back verbatim");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An empty kerning list is OMITTED from the document, like every other unset field.
+    #[test]
+    fn an_empty_custom_kerning_list_is_not_written() {
+        let path = unique_temp_path("kerning_omitted");
+        let mut fonts = BTreeMap::new();
+        fonts.insert("Comic-Regular".to_string(), named("Разговор"));
+        let data = FontsData {
+            system_fonts: Vec::new(),
+            fonts,
+            virtual_groups: Vec::new(),
+            pending_migration: false,
+        };
+        save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
+        let raw = fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains("custom_kerning"),
+            "an empty kerning list must be omitted, never written as []"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Decode-side sanitation: a `left`/`right` that is not exactly one character is dropped,
+    /// a non-finite offset is dropped, a duplicate `(left, right)` keeps the FIRST entry, the
+    /// surviving order is the document order, and a ZERO offset is kept.
+    #[test]
+    fn custom_kerning_is_sanitized_on_decode() {
+        let path = unique_temp_path("kerning_sanitize");
+        let raw = r#"{
+            "version": 3,
+            "fonts": { "Comic-Regular": { "custom_kerning": [
+                { "left": "A", "right": "V", "em": -40.0 },
+                { "left": "", "right": "V", "em": -10.0 },
+                { "left": "AB", "right": "V", "em": -10.0 },
+                { "left": "A", "right": "V", "em": 999.0 },
+                { "left": "T", "right": "o", "em": 0.0 },
+                { "left": "W", "right": "a", "em": 1e39 }
+            ] } }
+        }"#;
+        fs::write(&path, raw).expect("write kerning doc");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(
+            loaded.fonts.get("Comic-Regular").map(|record| record.custom_kerning.as_slice()),
+            // `1e39` is finite as JSON but overflows f32 to +inf, so it is dropped along
+            // with the multi-char entries;
+            // the second `A`/`V` loses to the first; the zero pair is kept.
+            Some([kern('A', 'V', -40.0), kern('T', 'o', 0.0)].as_slice())
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A v2 document (no `custom_kerning` anywhere) still decodes exactly as before: the new
+    /// field simply defaults to empty and nothing about the record changes.
+    #[test]
+    fn a_v2_document_still_decodes_without_custom_kerning() {
+        let path = unique_temp_path("v2_compat");
+        let raw = r#"{
+            "version": 2,
+            "system_fonts": [ { "font": "Roboto-Medium", "last_path": "/x/Roboto-Medium.ttf" } ],
+            "fonts": { "Comic-Regular": { "display_name": "Разговор", "profile": { "schema": 2 } } },
+            "virtual_groups": [ { "name": "G", "members": [ { "font": "Comic-Regular" } ] } ]
+        }"#;
+        fs::write(&path, raw).expect("write v2 doc");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert!(!loaded.pending_migration, "a v2 document owes no re-key");
+        assert_eq!(loaded.system_fonts, vec![system_font("Roboto-Medium", "/x/Roboto-Medium.ttf")]);
+        let record = loaded.fonts.get("Comic-Regular").expect("the record must decode");
+        assert_eq!(record.display_name.as_deref(), Some("Разговор"));
+        assert!(record.profile.is_some(), "the v2 profile must survive the bump");
+        assert!(record.custom_kerning.is_empty(), "a v2 document carries no kerning");
+        assert_eq!(loaded.virtual_groups.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A v1 (path-keyed) document is unaffected by the bump: it still decodes verbatim and is
+    /// still flagged for the deferred re-key. The v1 mirror reuses `FontSettingsEntry`, so the
+    /// new field is simply absent there.
+    #[test]
+    fn a_v1_document_still_decodes_after_the_version_bump() {
+        let path = unique_temp_path("v1_compat");
+        let raw = r#"{
+            "version": 1,
+            "imported_system_fonts": ["/home/u/.fonts/Roboto-Medium.ttf"],
+            "font_settings": { "groups/ВВД/Мысли.ttf": { "display_name": "Мысли" } }
+        }"#;
+        fs::write(&path, raw).expect("write v1 doc");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert!(loaded.pending_migration, "a v1 document must still be flagged pending");
+        let record = loaded
+            .fonts
+            .get("groups/ВВД/Мысли.ttf")
+            .expect("the legacy path key must survive");
+        assert_eq!(record.display_name.as_deref(), Some("Мысли"));
+        assert!(record.custom_kerning.is_empty());
+        let _ = fs::remove_file(&path);
     }
 }

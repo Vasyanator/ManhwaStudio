@@ -18,11 +18,16 @@ Main responsibilities:
 - serve the synthetic BUNDLED `fonts/ui` entry from the `'static` bytes `ms-fonts`
   already holds, so the built-in font is never read a second time;
 - carry each font's ORIGINAL name (real family/name) through to the renderer for
-  callers that need the real identity (e.g. PSD export, future virtual fonts).
+  callers that need the real identity (e.g. PSD export, future virtual fonts);
+- convert each font's USER-AUTHORED kerning pair overrides (`FontEntry::custom_kerning`,
+  persisted in `fonts_data.json`) into the renderer's `CustomKerningTable` and attach
+  them to every `FontContent` this provider hands out. This module is the ONLY seam
+  between the persisted `CustomKerningPair` list and the render-side lookup table.
 
 Key structures:
 - `ProviderEntry`: how to obtain one font's bytes (a file path, or a bundled stack
-  font whose bytes are already resident).
+  font whose bytes are already resident), plus that font's shared
+  `CustomKerningTable`.
 - `FontByteSource`: what a cache slot belongs to — a file, or one bundled stack font.
 - `FileStamp` / `CachedFontBytes`: the cached buffer and what proves it is still current.
 - `TabFontProvider`: the panel-owned `FontProvider`.
@@ -50,6 +55,12 @@ modification time at most once per `CACHE_REVALIDATION_INTERVAL` per font (one
 check per resolve: `resolve` runs on the render threads for every text image and
 every inline `<font=…>` span.
 
+CUSTOM KERNING IS BUILT ONCE PER PROVIDER, i.e. once per font-list revision, and is
+handed out by `Arc` clone from every resolve — never rebuilt on a render thread. It
+needs no invalidation of its own: editing the overrides bumps the font-settings
+revision, and `create_state::poll_font_settings_changes` -> `spawn_font_reload` ->
+`poll_font_reload_results` replaces this whole provider.
+
 A failing resolve is never silent: an unreadable file is logged with its path and
 the OS reason (once per path and operation, since the resolve is retried on every
 render), and a poisoned cache mutex is recovered and logged once instead of dropping
@@ -58,7 +69,9 @@ the cache and re-reading the file on every resolve. Only an UNKNOWN name resolve
 */
 
 use super::*;
-use crate::render_next::{FontBytes, FontContent, FontProvider, font_content_id};
+use crate::render_next::{
+    CustomKerningTable, FontBytes, FontContent, FontProvider, font_content_id,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -139,6 +152,39 @@ struct ProviderEntry {
     face_index: usize,
     original_name: String,
     bundled: Option<&'static ms_fonts::StackFont>,
+    /// The font's user-authored kerning pair overrides
+    /// (`FontEntry::custom_kerning`), already converted to the renderer's
+    /// lookup-optimised form, or `None` when the font has none.
+    ///
+    /// Built ONCE per provider (i.e. per font-list revision) and handed out by
+    /// `Arc` clone from every resolve, so a render thread never rebuilds it. An
+    /// edit of the overrides bumps the font-settings revision, which rebuilds the
+    /// whole provider (`create_state::poll_font_settings_changes` ->
+    /// `spawn_font_reload` -> `poll_font_reload_results`), so there is nothing to
+    /// invalidate here.
+    custom_kerning: Option<Arc<CustomKerningTable>>,
+}
+
+/// Converts a font entry's persisted kerning pairs into the renderer's runtime
+/// table, or `None` when it has none.
+///
+/// The two types are deliberately separate layers: `fonts_data::CustomKerningPair`
+/// is the serializable, ordered, user-editable record, `CustomKerningTable` is the
+/// render-side lookup map. This function is the ONLY seam between them.
+///
+/// A pair whose offset is `0.0` is KEPT — it cancels a built-in pair — so nothing
+/// here filters on the value.
+#[must_use]
+fn custom_kerning_table(font: &FontEntry) -> Option<Arc<CustomKerningTable>> {
+    let pairs = font.custom_kerning();
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(Arc::new(CustomKerningTable::from_pairs(
+        pairs
+            .iter()
+            .map(|pair| (pair.left, pair.right, pair.offset_per_mille)),
+    )))
 }
 
 /// App-side font provider: maps a working name (font label, normalized) to a font.
@@ -247,6 +293,7 @@ impl TabFontProvider {
             face_index: font.faces.first().map(|face| face.face_index).unwrap_or(0),
             original_name: font.original_name.clone(),
             bundled: font.bundled_stack_font(),
+            custom_kerning: custom_kerning_table(font),
         };
         // Primary keys: normalized collision-aware identities, FIRST-wins on collision.
         for font in fonts {
@@ -532,6 +579,7 @@ impl FontProvider for TabFontProvider {
                     data: Arc::clone(&cached.data),
                     face_index: entry.face_index,
                     content_id: cached.content_id,
+                    custom_kerning: entry.custom_kerning.clone(),
                 });
             }
             // The file changed: fall through and re-read it, replacing the entry.
@@ -590,6 +638,7 @@ impl FontProvider for TabFontProvider {
             data,
             face_index: entry.face_index,
             content_id,
+            custom_kerning: entry.custom_kerning,
         })
     }
 }
@@ -637,6 +686,7 @@ mod tests {
             post_script_name: post_script_name.to_string(),
             content_hash,
             display_name: None,
+            custom_kerning: Vec::new(),
             identity_name: super::super::fonts::base_font_identity_name(
                 post_script_name,
                 original_name,
@@ -1193,4 +1243,64 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The renderer can only apply user-authored kerning it is HANDED: the overrides
+    /// live on the font entry and must reach every resolve of that font, including
+    /// the cached fast path (the second resolve below). A font without overrides must
+    /// carry `None`, which is what keeps layout byte-identical to before they existed.
+    #[test]
+    fn resolve_hands_the_renderer_the_fonts_authored_kerning_pairs() {
+        let (dir, path) = fixture_font_file("kerning", b"kerning fixture bytes");
+        let mut with_pairs = font_entry("kerned", &path.to_string_lossy(), "Kerned Family");
+        with_pairs.custom_kerning = vec![
+            fonts_data::CustomKerningPair {
+                left: 'A',
+                right: 'V',
+                offset_per_mille: -40.0,
+            },
+            // A zero offset CANCELS a built-in pair, so it must survive the trip.
+            fonts_data::CustomKerningPair {
+                left: 'T',
+                right: 'o',
+                offset_per_mille: 0.0,
+            },
+        ];
+        let plain = font_entry("plain", "/fonts/plain.ttf", "Plain Family");
+        let fonts = fonts_with_identities(vec![with_pairs, plain]);
+        let provider = TabFontProvider::with_revalidation(&fonts, Duration::ZERO);
+
+        for pass in ["first (file read)", "second (byte cache)"] {
+            let content = provider
+                .resolve("Kerned Family")
+                .expect("the fixture file is readable");
+            let table = content
+                .custom_kerning_table()
+                .unwrap_or_else(|| panic!("{pass}: the authored pairs must reach the renderer"));
+            assert_eq!(
+                table.delta_px('A', 'V', 1000.0),
+                Some(-40.0),
+                "{pass}: -40 per mille of a 1000 px em is -40 px"
+            );
+            assert_eq!(
+                table.delta_px('T', 'o', 1000.0),
+                Some(0.0),
+                "{pass}: a zero entry must arrive as Some(0.0), not as a missing pair"
+            );
+            assert_eq!(table.delta_px('V', 'A', 1000.0), None, "{pass}: pairs are ordered");
+        }
+
+        // A font with no overrides must carry none at all, so every fast path in the
+        // renderer stays reachable for it.
+        let plain_entry = provider
+            .by_name
+            .get(&normalize_name("Plain Family"))
+            .expect("the plain font resolves");
+        assert!(
+            plain_entry.custom_kerning.is_none(),
+            "a font without authored pairs must carry no table"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

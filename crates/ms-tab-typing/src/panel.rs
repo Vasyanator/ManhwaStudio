@@ -1135,6 +1135,17 @@ pub struct FontEntry {
     /// `label`). Set to the per-entry base default at construction; overwritten by
     /// `assign_font_identity_names` once the full list is known.
     identity_name: String,
+    /// User-defined custom kerning pairs for this font, resolved at load time from
+    /// `fonts_data.json` by `fonts::apply_custom_kerning` (which MUST run after
+    /// `assign_font_identity_names`, because the identity is the key).
+    ///
+    /// NOT display-only, unlike `display_name`: these travel to the renderer through
+    /// `TabFontProvider`, which hands them over as if the font file declared them. Offsets
+    /// are in THOUSANDTHS OF AN EM (see `fonts_data::CustomKerningPair`), so they are
+    /// independent of both the rendered size and the file's `units_per_em`. Empty for a font
+    /// the user never tuned, and for every list that does not run the identity pass (the
+    /// system-font picker catalog).
+    custom_kerning: Vec<fonts_data::CustomKerningPair>,
     /// Per-VIRTUAL-group display aliases for this font, keyed by the (merged) group
     /// name → the alias to SHOW while that group is active. Populated by
     /// `fonts::apply_virtual_groups` from each membership's optional per-group alias.
@@ -1195,6 +1206,15 @@ impl FontEntry {
     /// Representative font FILE path. `pub(crate)` accessor for the settings font UI.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The user's custom kerning pairs for this font, in user order (empty when it has
+    /// none). Offsets are in thousandths of an em; see the `custom_kerning` field.
+    ///
+    /// `pub` (via the `font_admin` re-export of this opaque type) so the font provider can
+    /// hand them to the renderer and the settings font-properties window can edit them.
+    pub fn custom_kerning(&self) -> &[fonts_data::CustomKerningPair] {
+        &self.custom_kerning
     }
 
     /// Base render/inline-tag label (file stem, no disambiguation). `pub(crate)` for the

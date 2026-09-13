@@ -47,8 +47,9 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     very keys the migration re-keys. The refusal is reported as an error, not swallowed.
   - a document that changed since the caller's `SaveBaseline` fingerprint (a SECOND running app
     instance wrote it) is reported as `SaveError::Conflict` WITH the parsed on-disk document;
-    the store merges it in (`merge_disk_into_state`: additive — theirs is added, ours is kept)
-    and retries once. The accepted asymmetry is that a deletion by the other instance can come
+    the store merges it in (`merge_disk_into_state`: additive — theirs is added, ours is kept,
+    per-font records FIELD-WISE, except the custom-kerning LIST, which is UNIONED by
+    `(left, right)` with ours first — see the custom-kerning section below) and retries once. The accepted asymmetry is that a deletion by the other instance can come
     back, which is the same "never destroy the last clue" bias as everywhere else here.
   - a corrupt document that could NOT be quarantined disables persistence for the session.
     `quarantine_bad_file` tries `rename` → `copy` → `QuarantineOutcome::Failed`; only on
@@ -68,19 +69,63 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   unifies dev-dependency features into the binary it produces, which would silently disable
   persistence in a runnable build. The boundary is covered by
   `font_groups::tests::store_mutations_never_touch_the_real_fonts_directory` in the binary.
-- **SCHEMA 2 — the font is named by its IDENTITY, never by a path.**
+- **SCHEMA 3 — the font is named by its IDENTITY, never by a path.**
   ```jsonc
-  { "version": 2,
+  { "version": 3,
     "system_fonts": [ { "font": "Roboto-Medium", "last_path": "/home/…/Roboto-Medium.ttf" } ],
-    "fonts": { "CCWildWordsLower-Regular": { "display_name": "Разговор", "profile": { … } } },
+    "fonts": { "CCWildWordsLower-Regular": {
+                 "display_name": "Разговор",
+                 "profile": { … },
+                 "custom_kerning": [ { "left": "A", "right": "V", "em": -40.0 } ] } },
     "virtual_groups": [ { "name": "Возлюбленная",
                           "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ] }
   ```
   `fonts` keys and `members[].font` are `FontEntry::render_identity_name()` values, so MOVING OR
-  RENAMING a font file no longer drops its display name, its profile or its group membership —
-  only editing the font's own PostScript name does. Unset fields (`display_name`, `profile`,
-  `alias`, `last_path`) and empty collections are OMITTED; a per-font record left with nothing is
-  dropped rather than written.
+  RENAMING a font file no longer drops its display name, its profile, its custom kerning or its
+  group membership — only editing the font's own PostScript name does. Unset fields
+  (`display_name`, `profile`, `alias`, `last_path`) and empty collections (`custom_kerning`
+  included) are OMITTED; a per-font record left with nothing is dropped rather than written —
+  which is why `FontSettingsRecord::is_empty` counts `custom_kerning`, or a record holding only
+  kerning would be dropped the instant it was created.
+- **CUSTOM KERNING PAIRS: user data, in ‰ em, applied as if the font declared them.**
+  `fonts.<identity>.custom_kerning` is a user-authored, ORDERED list of `(left, right, em)`
+  overrides for one font; the font FILE is never modified. It reaches the renderer through
+  `fonts::apply_custom_kerning` → `FontEntry.custom_kerning` → the font provider, so the
+  renderer cannot tell an override from a built-in pair.
+  - **THE UNIT IS THOUSANDTHS OF AN EM**, never font design units: the renderer applies
+    `delta_px = em / 1000.0 * font_size_px`. That makes the tuning independent of BOTH the
+    rendered size (the user's requirement) and the font's `units_per_em`, so a font file updated
+    to a different upem does not silently rescale it. The settings UI converts a BUILT-IN pair
+    for display with `per_mille = value_units * 1000.0 / units_per_em`.
+  - **A PAIR OF `0.0` IS MEANINGFUL AND IS NEVER DROPPED.** Zero is how the user CANCELS a
+    non-zero built-in pair, so nothing on the decode, encode or store path filters zeros out.
+    (The built-in EXTRACTOR in the settings UI does drop them — it is describing the FONT, a
+    different list with a different rule.)
+  - **THE TWO MERGES UNION THE LIST, they do not choose one of them.** Both the conflict
+    merge (`merge_disk_into_state`, another running instance's document) and the deferred v1
+    key collapse (`merge_settings_record`, two legacy keys naming one font) go through
+    `union_custom_kerning`: every pair of OURS keeps our offset, every pair of THEIRS whose
+    `(left, right)` we do not hold is APPENDED in their order, and the result is re-sanitized.
+    All-or-nothing would be right for an `Option` field and is wrong for a list — pairs for
+    different characters do not conflict, and discarding the other side's whole list destroyed
+    them. Only a key BOTH sides hold with a DIFFERENT offset is a real loss, and each such pair
+    is warned about individually (logging is not saving).
+  - `sanitize_custom_kerning` runs on decode AND encode AND in the store mutator: a non-finite
+    offset is dropped (it would serialize as JSON `null` and come back as a `0.0`, i.e. as a
+    cancellation nobody asked for), `(left, right)` is deduplicated FIRST-WINS, and user order is
+    preserved. `left`/`right` are single-character STRINGS on disk; anything that is not exactly
+    one `char` is dropped on decode with a warning.
+  - `set_font_custom_kerning` follows the DISPLAY-NAME model, not the profile model: on a real
+    change it bumps the shared revision and persists IMMEDIATELY (not debounced). The bump is the
+    delivery mechanism — it is what makes every open typing panel reload its fonts, which is how
+    an edited pair reaches the renderer without a restart. A no-op bumps and persists nothing.
+- **VERSION 3 IS A GATE, NOT A MIGRATION.** `custom_kerning` is purely additive and a v2 (or v1)
+  document decodes exactly as before. The number was bumped because this document is REWRITTEN IN
+  FULL on every debounced profile edit and carries no `deny_unknown_fields`: an older build would
+  read a v3 document, drop the key it cannot see, and write that loss back within seconds —
+  total silent loss of user-authored kerning. The bump makes such a build refuse the write
+  (`SaveError::NewerVersion`) and persist no font-settings change instead. Same trade as
+  `presets.json` version 2 (see the create-preset section).
 - `system_fonts[].font` is the imported font's UNSUFFIXED identity (its PostScript name): that
   entry names a FILE's face, while the `%hash` contest suffix is a property of one panel LIST.
   **THE NAME LOCATES THE FONT; `last_path` IS ONLY A HINT.**
@@ -136,8 +181,8 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `render_identity_name()` may carry a `%hash` suffix and would match nothing there.
 - **ONE COMBINED LIST FOR BOTH CONSUMERS.** `fonts::build_combined_font_list(fonts_dir, refs)`
   builds folder + imported, merges byte-identical copies across the two sources, sorts, assigns
-  the collision-aware identity, runs the deferred migration and applies display-name overrides —
-  once. `load_fonts` prepends the bundled entry on top of it for the PANEL;
+  the collision-aware identity, runs the deferred migration and applies the per-font settings
+  (display-name overrides, then custom kerning) — once. `load_fonts` prepends the bundled entry on top of it for the PANEL;
   `font_admin::load_font_lists` splits it back into categories for the SETTINGS pane (folder =
   representative path under the fonts dir). Building the settings categories independently hid
   every cross-source name collision from them: the folder-only pass showed the bare identity
@@ -176,8 +221,9 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   - A key that resolves to nothing is KEPT VERBATIM and logged — it is the only remaining clue
     about the font it meant, and it may resolve after the user reinstalls that font. Two legacy
     keys collapsing onto one identity MERGE FIELD-WISE (`merge_settings_record`: the two keys of
-    a merged duplicate can each hold half the settings — one the display name, the other the
-    profile), and a collapsing group member keeps the first non-empty ALIAS
+    a merged duplicate can each hold half the settings — one the display name, another the
+    profile, another the custom kerning, where an EMPTY list plays the role of `None`), and a
+    collapsing group member keeps the first non-empty ALIAS
     (`merge_group_member`). Only a field both records set and that actually differs is dropped,
     and that loss is warned about individually — logging is not saving.
   - The rewrite goes through the store's normal off-thread atomic save and does NOT bump the
@@ -194,6 +240,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   imported system fonts + per-font records + virtual groups + the pending-migration flag behind
   one `RwLock`, sharing ONE revision counter. Any user-visible mutation bumps the revision (so
   settings lists and typing panels reload) and persists the whole snapshot off the GUI thread.
+  `set_font_custom_kerning` is one of them; `set_font_profile` is the one exception (below).
   BATCH mutators exist for the bulk paths (`add_imported_system_fonts`,
   `add_virtual_group_members`): one write-lock section, ONE bump and ONE persist per batch —
   a per-entry loop would send every open panel through a font reload per added entry. They skip
@@ -239,6 +286,22 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   the identity is the key) feeds `FontEntry::display_label()` used at presentation sites
   (`create_state::font_display_label`, and the settings font-settings rows). It never
   reaches persistence or the renderer.
+- Custom kerning is the OPPOSITE: `FontEntry.custom_kerning` (populated by
+  `fonts::apply_custom_kerning`, run immediately after the display-name pass and under the SAME
+  "must follow `assign_font_identity_names`" constraint, since both are keyed by identity) is
+  handed to the renderer through the font provider. `font_provider.rs` is the ONLY seam
+  between the two representations: `custom_kerning_table` converts the persisted, ordered
+  `CustomKerningPair` list into the renderer's `ms_text_render::CustomKerningTable` ONCE per
+  provider (i.e. per font-list revision), stores it on the `ProviderEntry` and hands it out by
+  `Arc` clone on `FontContent.custom_kerning` from every resolve — the cached byte path
+  included. It needs no invalidation of its own: an edit bumps the font-settings revision and
+  `create_state::poll_font_settings_changes` → `spawn_font_reload` →
+  `poll_font_reload_results` rebuilds the whole provider. The renderer side of the contract
+  (replace-not-add, the same-face and single-char-cluster guards, the fast path, and the
+  measurement paths that must stay in sync) is the CUSTOM KERNING contract in
+  `ms-text-render/src/MODULE_README.md`. Like every other per-font setting it is
+  resolved ONLY on the combined list — the folder-only pass (`fonts::folder_font_entries`) runs
+  neither, for the pre-collision-identity reason spelled out under the deferred v1 migration.
 - Virtual groups are injected into the panel font list by `fonts::apply_virtual_groups`,
   called at EVERY panel load site (`create_state::new` on the folder-only list, and the
   `spawn_font_reload` worker on the combined list) AFTER
