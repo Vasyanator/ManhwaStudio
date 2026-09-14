@@ -522,7 +522,7 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                 color_tolerance_percent: parse_gradient_color_tolerance(obj),
                 area_mode: parse_gradient_area_mode(obj),
             })),
-            "gradient4" => out.push(EffectCard::Gradient4(Gradient4EffectCard {
+            "gradient4" => out.push(EffectCard::Gradient4(Box::new(Gradient4EffectCard {
                 color_top_left: ColorField::new(
                     obj.get("color_top_left")
                         .and_then(parse_color32_value)
@@ -571,7 +571,7 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                 ),
                 color_tolerance_percent: parse_gradient_color_tolerance(obj),
                 area_mode: parse_gradient_area_mode(obj),
-            })),
+            }))),
             "reflect" => out.push(EffectCard::Reflect(ReflectEffectCard {
                 axis: match obj
                     .get("axis")

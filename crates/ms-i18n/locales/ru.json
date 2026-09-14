@@ -5058,6 +5058,8 @@
   "widgets.ai_button.requires_pytorch_or_onnxruntime": "Требуется PyTorch или onnxruntime.",
   "widgets.color_preset_picker.cancel_button": "Отменить",
   "widgets.color_preset_picker.cancel_tooltip": "Снять выделение с ячейки. Подобранный цвет останется.",
+  "widgets.color_preset_picker.copy_hex_tooltip": "Скопировать HEX-код цвета",
+  "widgets.color_preset_picker.hex_tooltip": "HEX-код цвета: #rrggbb или #rrggbbaa. Можно ввести вручную.",
   "widgets.color_preset_picker.update_button": "Обновить",
   "widgets.color_preset_picker.update_tooltip": "Записать текущий цвет в выбранную ячейку пресетов.",
   "widgets.hangul_keyboard.clear_button": "Очистить",

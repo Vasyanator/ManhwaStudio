@@ -276,8 +276,17 @@ crate's `[dev-dependencies]`, so no production build carries them.
   deliberately picked as a replacement made behind its back. The eyedropper contract (own
   screenshot token, `eyedropper_active`, `primary_click_consumed_this_frame`) is unchanged by
   the preset mode.
-- `color_preset_picker.rs`: the egui palette popup extended with two rows of color presets
-  (`PRESET_COLUMNS` x `PRESET_ROWS` = `PRESET_COUNT` cells) and an update/cancel action row.
+- `color_preset_picker.rs`: the egui palette popup extended with an editable hex field, two
+  rows of color presets (`PRESET_COLUMNS` x `PRESET_ROWS` = `PRESET_COUNT` cells) and an
+  update/cancel action row. The hex row sits UNDER the whole stock palette, not under its
+  R/G/B row: everything between them is painted by egui's own `color_picker_color32` in a
+  single call whose private internals would have to be forked to insert a row in the middle.
+  Its binding is two-way and lives in `HexField`, which remembers the color the text
+  describes so that a value being typed is never overwritten under the caret while a color
+  the palette or a preset cell moved to still is. Only the two forms the field shows,
+  `#rrggbb` and `#rrggbbaa`, are accepted back: the CSS short forms are valid hex that a
+  six-digit value passes THROUGH while being typed, and accepting them would zero the alpha
+  halfway through the word.
   `ColorPresets` is plain data: the widget reads cells and overwrites ONE of them on an
   explicit confirmation, but ownership and persistence belong to the caller, which is told to
   save by `ColorPresetPickerOutput::presets_changed`. `to_stored`/`from_stored` speak

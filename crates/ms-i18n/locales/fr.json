@@ -4790,6 +4790,8 @@
   "widgets.ai_button.requires_pytorch_or_onnxruntime": "PyTorch ou onnxruntime requis.",
   "widgets.color_preset_picker.cancel_button": "Annuler",
   "widgets.color_preset_picker.cancel_tooltip": "Retire la sélection de la case. La couleur choisie est conservée.",
+  "widgets.color_preset_picker.copy_hex_tooltip": "Copier le code hexadécimal de la couleur",
+  "widgets.color_preset_picker.hex_tooltip": "Code hexadécimal de la couleur : #rrggbb ou #rrggbbaa. Peut être saisi à la main.",
   "widgets.color_preset_picker.update_button": "Mettre à jour",
   "widgets.color_preset_picker.update_tooltip": "Enregistre la couleur actuelle dans la case de préréglage sélectionnée.",
   "widgets.hangul_keyboard.clear_button": "Effacer",

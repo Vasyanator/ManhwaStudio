@@ -4790,6 +4790,8 @@
   "widgets.ai_button.requires_pytorch_or_onnxruntime": "Requer PyTorch ou onnxruntime.",
   "widgets.color_preset_picker.cancel_button": "Cancelar",
   "widgets.color_preset_picker.cancel_tooltip": "Remove a seleção da célula. A cor escolhida é mantida.",
+  "widgets.color_preset_picker.copy_hex_tooltip": "Copiar o código hexadecimal da cor",
+  "widgets.color_preset_picker.hex_tooltip": "Código hexadecimal da cor: #rrggbb ou #rrggbbaa. Pode ser digitado à mão.",
   "widgets.color_preset_picker.update_button": "Atualizar",
   "widgets.color_preset_picker.update_tooltip": "Grava a cor atual na célula de predefinição selecionada.",
   "widgets.hangul_keyboard.clear_button": "Limpar",

@@ -2,11 +2,13 @@
 File: color_preset_picker.rs
 
 Purpose:
-Color picker that extends the stock egui palette popup with two rows of
-per-title color presets and an explicit "update / cancel" pair of actions.
+Color picker that extends the stock egui palette popup with an editable hex
+field, two rows of per-title color presets and an explicit "update / cancel"
+pair of actions.
 
 Main responsibilities:
-- draw the color swatch button and its popup (palette + preset grid + actions);
+- draw the color swatch button and its popup (palette + hex row + preset grid
+  + actions);
 - own the UI-only selection state (which preset cell is targeted, the color
   that cell was last synchronized with, and what proves the selection still
   describes the world);
@@ -18,7 +20,11 @@ Key structures:
   solely responsible for loading and saving it.
 - `PresetDefaults`: what fills the cells a caller has no stored value for.
 - `ColorPresetPicker`: the widget's UI state (selected cell + anchor color +
-  the two witnesses used to detect an outside replacement).
+  the two witnesses used to detect an outside replacement, plus the hex field's
+  text).
+- `HexField`: the text of the hex row and the color that text describes, which
+  is what keeps the binding two-way without the field and the palette fighting
+  over the text.
 - `ColorPresetPickerOutput`: per-frame result of `ColorPresetPicker::draw`.
 
 Key functions:
@@ -39,13 +45,18 @@ Notes:
   `Alpha::BlendOrAdditive`, which is exactly what `Ui::color_edit_button_srgba`
   uses (egui-0.35.0/src/ui.rs:2043); the two must not drift apart, otherwise the
   "Blending" row would appear or disappear depending on which picker is shown.
+- The hex row sits UNDER the whole stock palette rather than directly under its
+  R/G/B row: everything between them (the color strip, the "Blending" radio, the
+  three sliders) is painted by egui's own `color_picker_color32` in one call,
+  whose private internals would have to be forked wholesale to insert a row in
+  the middle. That fork is exactly what the previous note forbids.
 - The widget never touches the disk and never blocks: persistence of
   `ColorPresets` belongs to the caller.
 */
 use eframe::egui;
 use egui::{
     Color32, CornerRadius, Popup, PopupCloseBehavior, Rect, Response, Sense, Stroke, StrokeKind,
-    Vec2, vec2,
+    Vec2, ecolor::HexColor, vec2,
 };
 
 /// Number of preset cells in one row of the grid.
@@ -67,6 +78,25 @@ const COLOR_SLIDER_WIDTH: f32 = 275.0;
 
 /// Gap between two neighbouring preset cells, in points.
 const PRESET_CELL_GAP: f32 = 4.0;
+
+/// Width of the hex text field, in points.
+///
+/// Sized for its longest content, `#rrggbbaa`, plus the field's own padding.
+/// The row deliberately does NOT span [`COLOR_SLIDER_WIDTH`]: a text field as
+/// wide as the palette would read as the widget's main input, which it is not.
+const HEX_FIELD_WIDTH: f32 = 96.0;
+
+/// Character limit of the hex text field.
+///
+/// The longest accepted form is `#rrggbbaa` (9 characters); the slack on top of
+/// it exists so a paste that carries stray whitespace still parses after the
+/// trim in [`parse_hex_text`], instead of being truncated into garbage.
+const HEX_TEXT_LIMIT: usize = 12;
+
+/// Glyph of the "copy" button, taken verbatim from the stock picker's own copy
+/// button (egui-0.35.0/src/widgets/color_picker.rs:429) so the two read as the
+/// same control. An icon, not a translatable string; its tooltip is localized.
+const COPY_GLYPH: &str = "📋";
 
 /// Inset of the color swatch inside its cell, in points. The highlight of a
 /// selected or hovered cell is painted in this margin, so the swatch itself is
@@ -210,6 +240,7 @@ impl ColorPresets {
 #[derive(Debug, Default)]
 pub struct ColorPresetPicker {
     state: PresetSelection,
+    hex: HexField,
 }
 
 /// Per-frame result of [`ColorPresetPicker::draw`].
@@ -273,6 +304,8 @@ impl ColorPresetPicker {
                 egui::color_picker::Alpha::BlendOrAdditive,
             );
             ui.add_space(PRESET_CELL_GAP);
+            self.draw_hex_row(ui, color);
+            ui.add_space(PRESET_CELL_GAP);
             self.draw_grid(ui, color, presets);
             ui.add_space(PRESET_CELL_GAP);
             presets_changed = self.draw_actions(ui, *color, presets);
@@ -308,6 +341,51 @@ impl ColorPresetPicker {
     /// including the rollback that ends a cancelled sampling.
     pub fn note_color_picked_by_user(&mut self, color: Color32) {
         self.state.remember_color(color);
+    }
+
+    /// Draws the hex row: the editable `#rrggbb` / `#rrggbbaa` text of the
+    /// current color, and the button that copies it to the clipboard.
+    ///
+    /// The binding is two-way: the text follows every change of `color` made
+    /// elsewhere in the popup, and a parsable edit of the text writes `color`
+    /// back. Nothing is returned, because `draw` reports a changed color from
+    /// its own before/after comparison of the whole frame.
+    fn draw_hex_row(&mut self, ui: &mut egui::Ui, color: &mut Color32) {
+        // The id is needed BEFORE the field is drawn, to ask whether the user
+        // is typing in it; `TextEdit::id` then pins the field to it instead of
+        // letting it take an auto id that would not match.
+        let field_id = ui.make_persistent_id("color_preset_hex");
+        let focused = ui.memory(|memory| memory.has_focus(field_id));
+        self.hex.sync(*color, focused);
+
+        ui.horizontal(|ui| {
+            let response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.hex.text)
+                        .id(field_id)
+                        .desired_width(HEX_FIELD_WIDTH)
+                        .char_limit(HEX_TEXT_LIMIT),
+                )
+                .on_hover_text(t!("widgets.color_preset_picker.hex_tooltip"));
+            if response.changed()
+                && let Some(parsed) = self.hex.apply_text(*color)
+            {
+                *color = parsed;
+            }
+
+            // Mirrors the stock picker's own copy button
+            // (egui-0.35.0/src/widgets/color_picker.rs:428-438), which is a
+            // bare glyph button that copies through the context. What is copied
+            // is the text as shown, so the clipboard never disagrees with the
+            // field the user is looking at.
+            if ui
+                .button(COPY_GLYPH)
+                .on_hover_text(t!("widgets.color_preset_picker.copy_hex_tooltip"))
+                .clicked()
+            {
+                ui.ctx().copy_text(self.hex.text.clone());
+            }
+        });
     }
 
     /// Draws the preset grid and applies clicks on its cells.
@@ -535,6 +613,108 @@ impl PresetSelection {
         // so this is what the cell holds from the next frame's point of view.
         self.selected_cell_color = color;
         Some(index)
+    }
+}
+
+/// Text state of the hex field, free of any `egui::Ui` access so the whole
+/// binding can be unit-tested.
+///
+/// UI-only, like the selection: it describes a value being typed, which means
+/// nothing outside the frames the popup is open.
+#[derive(Debug, Default)]
+struct HexField {
+    /// What the field shows. Owned here because `egui::TextEdit` edits a
+    /// `String` in place.
+    text: String,
+    /// The color `text` currently describes, or `None` while it describes no
+    /// color at all (half-typed, or simply invalid). This is what tells a color
+    /// the FIELD produced apart from one the palette or a preset cell produced,
+    /// and therefore what makes the binding two-way without a fight over the
+    /// text between the two sides.
+    shown: Option<Color32>,
+}
+
+impl HexField {
+    /// Brings the text in line with `color`.
+    ///
+    /// With no focus the text is always rewritten into the canonical form, so
+    /// leaving the field also tidies up whatever was typed into it. While the
+    /// user is typing, only a color that moved SOMEWHERE ELSE (the palette, a
+    /// preset cell, the eyedropper) may overwrite the text under the caret; a
+    /// value that parses into nothing yet is the user's to finish.
+    fn sync(&mut self, color: Color32, focused: bool) {
+        if focused && (self.shown.is_none() || self.shown == Some(color)) {
+            return;
+        }
+        self.text = hex_text_for(color);
+        self.shown = Some(color);
+    }
+
+    /// Applies the text the user just edited.
+    ///
+    /// `current` is the color before the edit; it supplies the alpha the short
+    /// hex forms do not carry. Returns the color the text describes, or `None`
+    /// when it describes none — in which case the color is left alone and the
+    /// user keeps typing.
+    fn apply_text(&mut self, current: Color32) -> Option<Color32> {
+        self.shown = parse_hex_text(&self.text, current);
+        self.shown
+    }
+}
+
+/// Formats `color` for the hex field.
+///
+/// Six digits (`#rrggbb`) whenever the alpha byte carries no editable
+/// magnitude — an opaque color (255), or egui's additive marker (0, whose rgb
+/// is already premultiplied) — and eight (`#rrggbbaa`) for a partly transparent
+/// color, whose alpha the six-digit form would drop.
+fn hex_text_for(color: Color32) -> String {
+    match color.a() {
+        0 | 255 => HexColor::Hex6(color),
+        _ => HexColor::Hex8(color),
+    }
+    .to_string()
+}
+
+/// Parses what the user typed in the hex field.
+///
+/// Accepts exactly the two forms the field itself shows — six digits
+/// (`#rrggbb`, which keeps `current`'s alpha, see [`with_alpha_of`]) and eight
+/// (`#rrggbbaa`, which sets it) — with the leading `#` optional and surrounding
+/// whitespace ignored. Returns `None` for everything else, which is how a
+/// half-typed value leaves the color alone instead of clearing it.
+///
+/// The CSS short forms egui also understands, three and four digits, are
+/// deliberately REJECTED. The text is parsed on every keystroke, and `#ff00` is
+/// a valid four-digit "transparent yellow" that every user typing `#ff0000`
+/// passes through: accepting it would zero the alpha halfway through the word
+/// and hand a transparent — or, with a non-zero rgb, an additive — color to the
+/// six-digit form that follows it.
+fn parse_hex_text(text: &str, current: Color32) -> Option<Color32> {
+    let trimmed = text.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    match HexColor::from_str_without_hash(digits).ok()? {
+        HexColor::Hex6(rgb) => Some(with_alpha_of(rgb, current)),
+        HexColor::Hex8(rgba) => Some(rgba),
+        HexColor::Hex3(_) | HexColor::Hex4(_) => None,
+    }
+}
+
+/// Re-applies `current`'s alpha to an opaque color parsed from the six-digit
+/// hex form, which carries none.
+///
+/// `Color32` is premultiplied, so the two alpha regimes need different
+/// constructors: a normal color is rebuilt from UNMULTIPLIED components, while
+/// an alpha of 0 — egui's additive regime, where a non-zero rgb is stored
+/// already premultiplied (ecolor-0.35.0/src/hsva.rs:45-50) — must be rebuilt as
+/// such. `from_rgba_unmultiplied` maps EVERY alpha-0 color to `TRANSPARENT`
+/// (ecolor-0.35.0/src/color32.rs:135-137), so using it here would silently turn
+/// an additive color black.
+fn with_alpha_of(rgb: Color32, current: Color32) -> Color32 {
+    let [r, g, b, _] = rgb.to_array();
+    match current.a() {
+        0 => Color32::from_rgba_premultiplied(r, g, b, 0),
+        alpha => Color32::from_rgba_unmultiplied(r, g, b, alpha),
     }
 }
 
@@ -957,5 +1137,113 @@ mod tests {
         assert_eq!(count_as_f32(0), 0.0);
         assert_eq!(count_as_f32(PRESET_COLUMNS), 10.0);
         assert_eq!(count_as_f32(PRESET_COUNT), 20.0);
+    }
+
+    #[test]
+    fn hex_text_keeps_the_alpha_byte_only_when_it_carries_a_magnitude() {
+        assert_eq!(hex_text_for(RED), "#ff0000");
+        assert_eq!(hex_text_for(Color32::WHITE), "#ffffff");
+        // Half-transparent: the alpha has to survive the round trip through the
+        // text, so the eight-digit form is the only honest one.
+        let half = Color32::from_rgba_unmultiplied(255, 0, 0, 128);
+        assert_eq!(hex_text_for(half), "#ff000080");
+        // Additive (egui's alpha-0 marker): the rgb is already premultiplied
+        // and the alpha byte is a flag, not a magnitude.
+        assert_eq!(hex_text_for(Color32::from_rgba_premultiplied(10, 20, 30, 0)), "#0a141e");
+    }
+
+    #[test]
+    fn hex_text_round_trips_through_the_parser() {
+        for color in [
+            RED,
+            BLUE,
+            Color32::BLACK,
+            Color32::WHITE,
+            Color32::from_rgba_unmultiplied(12, 34, 56, 200),
+        ] {
+            let text = hex_text_for(color);
+            assert_eq!(parse_hex_text(&text, Color32::BLACK), Some(color), "{text}");
+        }
+    }
+
+    #[test]
+    fn parsing_accepts_the_two_shown_forms_and_rejects_the_rest() {
+        // The hash and the surrounding whitespace are optional.
+        assert_eq!(parse_hex_text("#ff0000", Color32::WHITE), Some(RED));
+        assert_eq!(parse_hex_text("ff0000", Color32::WHITE), Some(RED));
+        assert_eq!(parse_hex_text("  #ff0000\t", Color32::WHITE), Some(RED));
+
+        // Six digits carry no alpha, so the current one is kept...
+        let half_blue = Color32::from_rgba_unmultiplied(0, 0, 255, 128);
+        assert_eq!(parse_hex_text("#ff0000", half_blue).map(|color| color.a()), Some(128));
+        // ...while eight digits set it.
+        assert_eq!(
+            parse_hex_text("#ff000040", half_blue),
+            Some(Color32::from_rgba_unmultiplied(255, 0, 0, 0x40))
+        );
+        assert_eq!(parse_hex_text("#ff0000ff", half_blue), Some(RED));
+
+        // The CSS short forms are valid hex yet deliberately refused: they are
+        // the states a six-digit value passes through while being typed.
+        assert_eq!(parse_hex_text("#f00", Color32::WHITE), None);
+        assert_eq!(parse_hex_text("#ff00", Color32::WHITE), None);
+
+        // Half-typed or plainly invalid: the color is left alone.
+        assert_eq!(parse_hex_text("#ff000", Color32::WHITE), None);
+        assert_eq!(parse_hex_text("#gg0000", Color32::WHITE), None);
+        assert_eq!(parse_hex_text("", Color32::WHITE), None);
+        assert_eq!(parse_hex_text("#", Color32::WHITE), None);
+    }
+
+    #[test]
+    fn short_form_preserves_an_additive_color_instead_of_blanking_it() {
+        // `from_rgba_unmultiplied` maps every alpha-0 color to TRANSPARENT, so
+        // the additive regime needs the premultiplied constructor; getting this
+        // wrong turns an additive color black without a word.
+        let additive = Color32::from_rgba_premultiplied(1, 2, 3, 0);
+        let parsed = parse_hex_text("#0a141e", additive);
+        assert_eq!(parsed, Some(Color32::from_rgba_premultiplied(10, 20, 30, 0)));
+    }
+
+    #[test]
+    fn unfocused_field_always_shows_the_current_color() {
+        let mut field = HexField::default();
+        field.sync(RED, false);
+        assert_eq!(field.text, "#ff0000");
+
+        // A color the palette or a preset cell moved to is picked up.
+        field.sync(BLUE, false);
+        assert_eq!(field.text, "#0000ff");
+
+        // Leaving the field also tidies up a non-canonical spelling of the very
+        // same color.
+        field.text = "00f".to_owned();
+        field.shown = Some(BLUE);
+        field.sync(BLUE, false);
+        assert_eq!(field.text, "#0000ff");
+    }
+
+    #[test]
+    fn a_half_typed_value_survives_until_the_color_moves_elsewhere() {
+        let mut field = HexField::default();
+        field.sync(RED, false);
+
+        // "#00" parses into nothing: the color stays, and the text is the
+        // user's to finish.
+        field.text = "#00".to_owned();
+        assert_eq!(field.apply_text(RED), None);
+        field.sync(RED, true);
+        assert_eq!(field.text, "#00");
+
+        // Finishing it applies the color...
+        field.text = "#0000ff".to_owned();
+        assert_eq!(field.apply_text(RED), Some(BLUE));
+        // ...and the now-valid text is not reformatted under the caret.
+        field.sync(BLUE, true);
+        assert_eq!(field.text, "#0000ff");
+
+        // But a color moved by the palette while the field is focused wins.
+        field.sync(RED, true);
+        assert_eq!(field.text, "#ff0000");
     }
 }

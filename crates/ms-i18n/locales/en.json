@@ -5058,6 +5058,8 @@
   "widgets.ai_button.requires_pytorch_or_onnxruntime": "Requires PyTorch or onnxruntime.",
   "widgets.color_preset_picker.cancel_button": "Cancel",
   "widgets.color_preset_picker.cancel_tooltip": "Stop aiming at the cell. The picked color is kept.",
+  "widgets.color_preset_picker.copy_hex_tooltip": "Copy the hex code of the color",
+  "widgets.color_preset_picker.hex_tooltip": "Hex code of the color: #rrggbb or #rrggbbaa. Can be typed in by hand.",
   "widgets.color_preset_picker.update_button": "Update",
   "widgets.color_preset_picker.update_tooltip": "Write the current color into the selected preset cell.",
   "widgets.hangul_keyboard.clear_button": "Clear",

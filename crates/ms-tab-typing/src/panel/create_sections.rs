@@ -501,7 +501,7 @@ impl TypingCreatePanelState {
                 color_tolerance_percent: 0.0,
                 area_mode: GradientAreaMode::FullImage,
             }),
-            AvailableEffectKind::Gradient4 => EffectCard::Gradient4(Gradient4EffectCard {
+            AvailableEffectKind::Gradient4 => EffectCard::Gradient4(Box::new(Gradient4EffectCard {
                 color_top_left: ColorField::new(Color32::WHITE),
                 color_top_right: ColorField::new(Color32::WHITE),
                 color_bottom_left: ColorField::new(Color32::BLACK),
@@ -512,7 +512,7 @@ impl TypingCreatePanelState {
                 target_color: ColorField::new(text_color),
                 color_tolerance_percent: 0.0,
                 area_mode: GradientAreaMode::FullImage,
-            }),
+            })),
             AvailableEffectKind::Reflect => EffectCard::Reflect(ReflectEffectCard {
                 axis: ReflectAxis::Y,
             }),

@@ -1391,7 +1391,10 @@ enum EffectCard {
     Interference(InterferenceEffectCard),
     Glow(GlowEffectCard),
     Gradient2(Gradient2EffectCard),
-    Gradient4(Gradient4EffectCard),
+    // Boxed: four corner colors plus a target color make this card several
+    // times the size of the next-largest variant, and an unboxed one would put
+    // that size into every `EffectCard` in the list (`clippy::large_enum_variant`).
+    Gradient4(Box<Gradient4EffectCard>),
     Reflect(ReflectEffectCard),
     Shake(ShakeEffectCard),
 }
