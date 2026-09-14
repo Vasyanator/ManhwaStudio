@@ -14,13 +14,21 @@ Soft glow owns two pieces of math kept here next to its only caller: the per-sid
 dilation dispatch (rectangle vs. ellipse element, `image_ops`) and
 `soft_glow_response_curve`, the bias/knee remap applied to the blurred outline. The
 curve is the identity at bias 0, which is what keeps pre-curve projects unchanged.
+
+`glow_v1`/`glow_v2` in the `Static` opacity mode scale their layer by
+`image_ops::under_layer_coverage_gain`, so the constant-alpha layer is hidden by the source's
+COVERAGE (alpha normalized by `image_ops::source_peak_alpha`) instead of by its raw alpha. The
+gain is exactly 1.0 whenever the source has an opaque pixel, so opaque text renders bit for bit
+as before. It is a scale on the layer, not a second source-over factor: the source coverage still
+enters the result exactly once, in `blend_source_text`.
 */
 
 use super::super::raster::blend_pixel_over;
 use super::super::types::RenderedTextImage;
 use super::image_ops::{
     EDT_COST_INF, dilate_alpha_ellipse, dilate_alpha_rect, euclidean_distance_transform_with_costs,
-    gaussian_blur_alpha_f32_in_place, gaussian_blur_kernel_radius,
+    gaussian_blur_alpha_f32_in_place, gaussian_blur_kernel_radius, source_peak_alpha,
+    under_layer_coverage_gain,
 };
 use super::parse::{GlowEffectParams, SoftGlowEffectParams, SoftGlowShape, StrokeOpacityMode};
 use rayon::prelude::*;
@@ -37,7 +45,10 @@ use rayon::prelude::*;
 ///
 /// The glow layer carries its own alpha, unreduced by the source alpha; the source is then
 /// composited over it, which is what accounts for the source coverage. See the alpha contract
-/// on `blend_source_text`.
+/// on `blend_source_text`. The one correction applied to the layer is the `Static` mode's
+/// coverage gain (`under_layer_coverage_gain`), which hides the constant-alpha layer behind the
+/// glyph body of a TRANSLUCENT source; it is exactly 1.0 for a source with an opaque pixel and
+/// is not a second coverage factor.
 pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEffectParams) {
     let radius = glow.radius_px.max(0.0);
     if radius <= f32::EPSILON {
@@ -90,9 +101,18 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
     }
 
     let source = image.rgba.clone();
+    let peak_a = source_peak_alpha(&source);
+    // Only the static mode plates a constant alpha across the glyph body and therefore needs the
+    // coverage correction; `FromContour` already follows the source alpha and is left untouched.
+    let coverage_gain_enabled = match glow.opacity_mode {
+        StrokeOpacityMode::FromContour => false,
+        StrokeOpacityMode::Static => true,
+    };
     let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
     // Glow-only intensity in [0, 1]; kept in f32 through splat + blur, rounded once at composite.
     let mut glow_alpha = vec![0.0f32; out_width as usize * out_height as usize];
+    // Source alpha in PADDED coordinates, so the composite pass can look it up by output index.
+    let mut source_alpha_expanded = vec![0u8; out_width as usize * out_height as usize];
     let origin_x = pad as i32;
     let origin_y = pad as i32;
 
@@ -106,6 +126,7 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
 
             let base_x = origin_x + x as i32;
             let base_y = origin_y + y as i32;
+            source_alpha_expanded[base_y as usize * out_width as usize + base_x as usize] = src_a;
             let contour_alpha = src_a as f32 / 255.0;
 
             for (ox, oy, falloff) in offsets.iter() {
@@ -141,7 +162,12 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
         if intensity <= 0.0 {
             return;
         }
-        let glow_a = (intensity * color_alpha_factor * 255.0)
+        let coverage_gain = if coverage_gain_enabled {
+            under_layer_coverage_gain(source_alpha_expanded[idx], peak_a)
+        } else {
+            1.0
+        };
+        let glow_a = (intensity * color_alpha_factor * 255.0 * coverage_gain)
             .round()
             .clamp(0.0, 255.0) as u8;
         if glow_a == 0 {
@@ -181,7 +207,7 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
 /// its rim.
 ///
 /// As in `glow_v1`, the glow layer is not reduced by the source alpha — see the alpha contract
-/// on `blend_source_text`.
+/// on `blend_source_text` — and the `Static` mode applies the same coverage gain.
 pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEffectParams) {
     let radius = glow.radius_px.max(0.0);
     if radius <= f32::EPSILON {
@@ -212,11 +238,20 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
     }
 
     let source = image.rgba.clone();
+    let peak_a = source_peak_alpha(&source);
+    // Only the static mode plates a constant alpha across the glyph body and therefore needs the
+    // coverage correction; `FromContour` already follows the source alpha and is left untouched.
+    let coverage_gain_enabled = match glow.opacity_mode {
+        StrokeOpacityMode::FromContour => false,
+        StrokeOpacityMode::Static => true,
+    };
     let out_width_usize = out_width as usize;
     let out_height_usize = out_height as usize;
     let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
     // Sub-pixel squared-distance cost field: non-seed pixels stay at EDT_COST_INF.
     let mut cost_field = vec![EDT_COST_INF; out_width_usize * out_height_usize];
+    // Source alpha in PADDED coordinates, so the composite pass can look it up by output index.
+    let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
     let origin_x = pad as i32;
     let origin_y = pad as i32;
     let mut has_contour = false;
@@ -232,6 +267,7 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
             let base_x = origin_x + x as i32;
             let base_y = origin_y + y as i32;
             let base_idx = base_y as usize * out_width_usize + base_x as usize;
+            source_alpha_expanded[base_idx] = src_a;
             // Approximate the sub-pixel distance from the pixel center to the true glyph edge:
             // fully covered (a=255) sits on the edge (0.0); partial coverage pushes the edge
             // outward by up to half a pixel, so the seed carries a small squared-distance cost.
@@ -285,7 +321,12 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
         if intensity <= 0.0 {
             return;
         }
-        let glow_a = (intensity * color_alpha_factor * 255.0)
+        let coverage_gain = if coverage_gain_enabled {
+            under_layer_coverage_gain(source_alpha_expanded[idx], peak_a)
+        } else {
+            1.0
+        };
+        let glow_a = (intensity * color_alpha_factor * 255.0 * coverage_gain)
             .round()
             .clamp(0.0, 255.0) as u8;
         if glow_a == 0 {
@@ -593,6 +634,7 @@ fn blend_source_text(
 
 #[cfg(test)]
 mod tests {
+    use super::super::image_ops::rgba_digest;
     use super::super::parse::{
         GlowEffectParams, SoftGlowEffectParams, SoftGlowShape, StrokeOpacityMode,
     };
@@ -632,7 +674,10 @@ mod tests {
     /// loop. Asserts the rayon path is bit-identical to the pre-parallelization loop.
     fn apply_glow_effect_v1_seq(image: &mut RenderedTextImage, glow: &GlowEffectParams) {
         use super::super::super::raster::blend_pixel_over;
-        use super::super::image_ops::{gaussian_blur_alpha_f32_in_place, gaussian_blur_kernel_radius};
+        use super::super::image_ops::{
+            gaussian_blur_alpha_f32_in_place, gaussian_blur_kernel_radius, source_peak_alpha,
+            under_layer_coverage_gain,
+        };
         use super::{blend_source_text, glow_falloff_alpha, glow_smoothing_sigma};
 
         let radius = glow.radius_px.max(0.0);
@@ -678,8 +723,17 @@ mod tests {
             return;
         }
         let source = image.rgba.clone();
+        let peak_a = source_peak_alpha(&source);
+        // Only the static mode plates a constant alpha across the glyph body and therefore needs the
+        // coverage correction; `FromContour` already follows the source alpha and is left untouched.
+        let coverage_gain_enabled = match glow.opacity_mode {
+            StrokeOpacityMode::FromContour => false,
+            StrokeOpacityMode::Static => true,
+        };
         let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
         let mut glow_alpha = vec![0.0f32; out_width as usize * out_height as usize];
+        // Source alpha in PADDED coordinates, so the composite pass can look it up by output index.
+        let mut source_alpha_expanded = vec![0u8; out_width as usize * out_height as usize];
         let origin_x = pad as i32;
         let origin_y = pad as i32;
         for y in 0..height {
@@ -691,6 +745,7 @@ mod tests {
                 }
                 let base_x = origin_x + x as i32;
                 let base_y = origin_y + y as i32;
+                source_alpha_expanded[base_y as usize * out_width as usize + base_x as usize] = src_a;
                 let contour_alpha = src_a as f32 / 255.0;
                 for (ox, oy, falloff) in offsets.iter() {
                     let tx = base_x + *ox;
@@ -716,7 +771,12 @@ mod tests {
             if intensity <= 0.0 {
                 continue;
             }
-            let glow_a = (intensity * color_alpha_factor * 255.0)
+            let coverage_gain = if coverage_gain_enabled {
+                under_layer_coverage_gain(source_alpha_expanded[idx], peak_a)
+            } else {
+                1.0
+            };
+            let glow_a = (intensity * color_alpha_factor * 255.0 * coverage_gain)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -744,7 +804,7 @@ mod tests {
         use super::super::super::raster::blend_pixel_over;
         use super::super::image_ops::{
             EDT_COST_INF, euclidean_distance_transform_with_costs, gaussian_blur_alpha_f32_in_place,
-            gaussian_blur_kernel_radius,
+            gaussian_blur_kernel_radius, source_peak_alpha, under_layer_coverage_gain,
         };
         use super::{blend_source_text, glow_falloff_alpha, glow_smoothing_sigma};
 
@@ -772,10 +832,19 @@ mod tests {
             return;
         }
         let source = image.rgba.clone();
+        let peak_a = source_peak_alpha(&source);
+        // Only the static mode plates a constant alpha across the glyph body and therefore needs the
+        // coverage correction; `FromContour` already follows the source alpha and is left untouched.
+        let coverage_gain_enabled = match glow.opacity_mode {
+            StrokeOpacityMode::FromContour => false,
+            StrokeOpacityMode::Static => true,
+        };
         let out_width_usize = out_width as usize;
         let out_height_usize = out_height as usize;
         let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
         let mut cost_field = vec![EDT_COST_INF; out_width_usize * out_height_usize];
+        // Source alpha in PADDED coordinates, so the composite pass can look it up by output index.
+        let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
         let origin_x = pad as i32;
         let origin_y = pad as i32;
         let mut has_contour = false;
@@ -789,6 +858,7 @@ mod tests {
                 let base_x = origin_x + x as i32;
                 let base_y = origin_y + y as i32;
                 let base_idx = base_y as usize * out_width_usize + base_x as usize;
+                source_alpha_expanded[base_idx] = src_a;
                 let coverage = src_a as f32 / 255.0;
                 let d0 = (0.5 - coverage).max(0.0);
                 cost_field[base_idx] = d0 * d0;
@@ -828,7 +898,12 @@ mod tests {
             if intensity <= 0.0 {
                 continue;
             }
-            let glow_a = (intensity * color_alpha_factor * 255.0)
+            let coverage_gain = if coverage_gain_enabled {
+                under_layer_coverage_gain(source_alpha_expanded[idx], peak_a)
+            } else {
+                1.0
+            };
+            let glow_a = (intensity * color_alpha_factor * 255.0 * coverage_gain)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -990,6 +1065,74 @@ mod tests {
         let glow = sample_glow_params();
         let mut parallel = sample_glyph_image();
         let mut sequential = sample_glyph_image();
+        apply_glow_effect_v2(&mut parallel, &glow);
+        apply_glow_effect_v2_seq(&mut sequential, &glow);
+        assert_eq!(parallel.rgba, sequential.rgba);
+    }
+
+    /// Translucent counterpart of `sample_glyph_image`: the same block with NO fully opaque
+    /// pixel, so `peak_a` is 128 and the static coverage normalization actually does something.
+    ///
+    /// At `peak_a == 255` the gain is identically `1.0` and the static composite degenerates to
+    /// the legacy one, so an opaque source cannot exercise the new branch — in the sequential
+    /// mirrors least of all, which is what this image exists for.
+    fn translucent_glyph_image() -> RenderedTextImage {
+        let width = 19usize;
+        let height = 17usize;
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 6..11 {
+            for x in 7..13 {
+                let idx = (y * width + x) * 4;
+                rgba[idx] = 250;
+                rgba[idx + 1] = 250;
+                rgba[idx + 2] = 250;
+                // Two coverage levels under one peak: a body at 128 and a rim at 96.
+                rgba[idx + 3] = if x == 7 || x == 12 || y == 6 || y == 10 {
+                    96
+                } else {
+                    128
+                };
+            }
+        }
+        RenderedTextImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+            warnings: Vec::new(),
+            content_origin_x: 0,
+            content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
+        }
+    }
+
+    /// `sample_glow_params` in the static opacity mode — the only mode that applies the coverage
+    /// gain, and therefore the only one that binds the sequential mirrors to the new branch.
+    fn static_sample_glow_params() -> GlowEffectParams {
+        GlowEffectParams {
+            opacity_mode: StrokeOpacityMode::Static,
+            ..sample_glow_params()
+        }
+    }
+
+    /// Bit-identity of the parallel and sequential composites on the STATIC branch of a
+    /// TRANSLUCENT source: `sample_glow_params` is `FromContour` over an opaque image, so the
+    /// mirror tests above run none of the coverage-gain code and would not notice it drifting.
+    #[test]
+    fn glow_v1_static_parallel_composite_matches_sequential_on_a_translucent_source() {
+        let glow = static_sample_glow_params();
+        let mut parallel = translucent_glyph_image();
+        let mut sequential = translucent_glyph_image();
+        apply_glow_effect_v1(&mut parallel, &glow);
+        apply_glow_effect_v1_seq(&mut sequential, &glow);
+        assert_eq!(parallel.rgba, sequential.rgba);
+    }
+
+    #[test]
+    fn glow_v2_static_parallel_composite_matches_sequential_on_a_translucent_source() {
+        let glow = static_sample_glow_params();
+        let mut parallel = translucent_glyph_image();
+        let mut sequential = translucent_glyph_image();
         apply_glow_effect_v2(&mut parallel, &glow);
         apply_glow_effect_v2_seq(&mut sequential, &glow);
         assert_eq!(parallel.rgba, sequential.rgba);
@@ -1327,6 +1470,29 @@ mod tests {
         assert_no_rim_alpha_notch("glow_v2", |image| apply_glow_effect_v2(image, &glow));
     }
 
+    /// `smoothness_glow_params` in the static opacity mode, whose layer alpha does not follow the
+    /// source contour at all. The rim invariant must hold there too: the static path now scales
+    /// its layer by the coverage gain, and scaling is exactly where a second coverage factor
+    /// could sneak back in.
+    fn static_smoothness_glow_params() -> GlowEffectParams {
+        GlowEffectParams {
+            opacity_mode: StrokeOpacityMode::Static,
+            ..smoothness_glow_params()
+        }
+    }
+
+    #[test]
+    fn glow_v1_static_leaves_no_alpha_notch_on_the_antialiased_rim() {
+        let glow = static_smoothness_glow_params();
+        assert_no_rim_alpha_notch("glow_v1_static", |image| apply_glow_effect_v1(image, &glow));
+    }
+
+    #[test]
+    fn glow_v2_static_leaves_no_alpha_notch_on_the_antialiased_rim() {
+        let glow = static_smoothness_glow_params();
+        assert_no_rim_alpha_notch("glow_v2_static", |image| apply_glow_effect_v2(image, &glow));
+    }
+
     #[test]
     fn soft_glow_leaves_no_alpha_notch_on_the_antialiased_rim() {
         let glow = sample_soft_glow_params();
@@ -1495,5 +1661,114 @@ mod tests {
     fn glow_v1_alpha_profile_is_smooth() {
         let glow = smoothness_glow_params();
         assert_glow_profiles_smooth(false, |image| apply_glow_effect_v1(image, &glow));
+    }
+
+    /// 17x13 canvas holding a solid 7x5 block whose pixels ALL share one alpha — what a
+    /// translucent text color produces away from the glyph rim. The peak alpha equals the block
+    /// alpha, so every block pixel is at full contour coverage. Returns the block bounds too.
+    fn uniform_block_image(alpha: u8) -> (RenderedTextImage, usize, usize, usize, usize) {
+        let width = 17usize;
+        let height = 13usize;
+        let (bx0, bx1, by0, by1) = (5usize, 12usize, 4usize, 9usize);
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in by0..by1 {
+            for x in bx0..bx1 {
+                let idx = (y * width + x) * 4;
+                rgba[idx] = 200;
+                rgba[idx + 1] = 40;
+                rgba[idx + 2] = 90;
+                rgba[idx + 3] = alpha;
+            }
+        }
+        let image = RenderedTextImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+            warnings: Vec::new(),
+            content_origin_x: 0,
+            content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
+        };
+        (image, bx0, bx1, by0, by1)
+    }
+
+    /// Static-mode glow over a uniformly translucent source: the glyph body must come out exactly
+    /// as it went in, and the glow must still be drawn around it.
+    ///
+    /// Before the coverage normalization the static layer was a constant plate under the whole
+    /// splat, body included, so 50 %-transparent text was composited over it and came out opaque
+    /// and tinted by the glow color.
+    fn assert_static_glow_keeps_translucent_body(
+        name: &str,
+        apply: impl Fn(&mut RenderedTextImage, &GlowEffectParams),
+    ) {
+        let glow = GlowEffectParams {
+            radius_px: 4.0,
+            color: [30, 200, 255, 255],
+            opacity_mode: StrokeOpacityMode::Static,
+            transparency_percent: 0.0,
+            fade_strength: 0.0,
+            fade_shift: 0.0,
+        };
+        let (source, bx0, bx1, by0, by1) = uniform_block_image(128);
+        let expected = source.rgba.clone();
+        let source_width = source.width as usize;
+        let mut image = source;
+        apply(&mut image, &glow);
+
+        let out_width = image.width as usize;
+        let pad_x = image.content_origin_x as usize;
+        let pad_y = image.content_origin_y as usize;
+        for y in by0..by1 {
+            for x in bx0..bx1 {
+                let src_idx = (y * source_width + x) * 4;
+                let dst_idx = ((y + pad_y) * out_width + x + pad_x) * 4;
+                assert_eq!(
+                    image.rgba[dst_idx..dst_idx + 4],
+                    expected[src_idx..src_idx + 4],
+                    "{name}: body pixel ({x}, {y}) was repainted by the glow"
+                );
+            }
+        }
+        // The glow itself is untouched outside the source, where nothing covers it: one pixel out
+        // of a radius-4 linear falloff is worth ~0.75 of the layer (~183/255 after smoothing).
+        let outside = image.rgba[((by0 + pad_y) * out_width + bx0 + pad_x - 1) * 4 + 3];
+        assert!(outside > 150, "{name}: glow ring alpha {outside} is too weak");
+    }
+
+    #[test]
+    fn glow_v1_static_keeps_a_uniformly_translucent_source_unchanged() {
+        assert_static_glow_keeps_translucent_body("glow_v1", apply_glow_effect_v1);
+    }
+
+    #[test]
+    fn glow_v2_static_keeps_a_uniformly_translucent_source_unchanged() {
+        assert_static_glow_keeps_translucent_body("glow_v2", apply_glow_effect_v2);
+    }
+
+    /// Frozen output: a source containing an opaque pixel must render byte for byte as it did
+    /// before the coverage normalization, because that is every project authored so far.
+    ///
+    /// `block_image(true)` mixes alpha 255 with a 96-alpha antialiased fringe, so its peak is 255
+    /// and the correction has to collapse to the identity across both. Re-capture the digests
+    /// only for a deliberate visual change to already-saved glow effects.
+    #[test]
+    fn glow_static_output_is_frozen_for_an_opaque_source() {
+        let glow = GlowEffectParams {
+            radius_px: 6.0,
+            color: [30, 200, 255, 200],
+            opacity_mode: StrokeOpacityMode::Static,
+            transparency_percent: 25.0,
+            fade_strength: 0.4,
+            fade_shift: -0.3,
+        };
+        let mut v1 = block_image(true).0;
+        apply_glow_effect_v1(&mut v1, &glow);
+        assert_eq!(rgba_digest(&v1.rgba), 10_296_521_172_146_914_213);
+
+        let mut v2 = block_image(true).0;
+        apply_glow_effect_v2(&mut v2, &glow);
+        assert_eq!(rgba_digest(&v2.rgba), 15_440_735_914_408_658_941);
     }
 }

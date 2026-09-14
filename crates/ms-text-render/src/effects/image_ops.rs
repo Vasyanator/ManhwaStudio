@@ -10,6 +10,13 @@ Main responsibilities:
 - содержать локальные тесты на безопасные image helper'ы.
 
 Notes:
+This file also owns the alpha-composition math shared by stroke and glow: `source_peak_alpha`
+(the source-opacity estimate that separates contour coverage from baked-in text transparency),
+`required_under_alpha_for_total_alpha` (the source-over inversion used to place a layer UNDER a
+partially transparent source) and `under_layer_coverage_gain` (the same inversion expressed as a
+multiplier, which is what keeps opaque sources bit-exact). One owner, because "how much of a
+layer survives under this pixel" was previously answered separately per effect.
+
 Dilation comes in two production forms, both taking four independent per-side extents:
 `dilate_alpha_rect` (separable sliding-window maximum, O(width*height)) and
 `dilate_alpha_ellipse` (per-quadrant semi-axes, O(width*height*(up+down+1))). The legacy
@@ -873,6 +880,93 @@ pub(crate) fn average_opaque_rgba(rgba: &[u8]) -> [u8; 4] {
     ]
 }
 
+/// Peak alpha of an unmultiplied RGBA buffer: the maximum alpha byte over every pixel.
+///
+/// Post-effects only ever see a finished RGBA buffer, whose alpha already mixes two different
+/// quantities: the antialiasing COVERAGE of the glyph contour and the OPACITY baked in from the
+/// text color (`raster::sample_swash_pixel` multiplies the glyph mask by the tint alpha). A body
+/// pixel of 50 %-transparent text and a rim pixel of opaque text are indistinguishable there.
+/// The peak is the estimate that separates them again: `src_a / peak_a` is the coverage the
+/// pixel would have had if the source had been fully opaque.
+///
+/// Returns `0` for an empty or fully transparent buffer; a caller must treat that as "no coverage
+/// information at all" instead of dividing by it.
+///
+/// Approximation, stated rather than hidden: the peak is one global number, so it is only exact
+/// when the whole source shares a single opacity. Text mixing spans of DIFFERENT alpha normalizes
+/// against its most opaque span, and the more transparent spans keep their old behavior; a buffer
+/// that already contains opaque pixels from an earlier effect in the chain pins the peak at 255
+/// and disables the correction entirely.
+#[must_use]
+pub(crate) fn source_peak_alpha(rgba: &[u8]) -> u8 {
+    rgba.chunks_exact(4)
+        .map(|pixel| pixel[3])
+        .max()
+        .unwrap_or(0)
+}
+
+/// Alpha an under-layer must carry so that compositing the source over it reaches
+/// `desired_total_a` as the final alpha.
+///
+/// Straight-alpha source-over yields `total = source_a + under * (1 - source_a / 255)`; this is
+/// that relation solved for `under`. `desired_total_a` is an alpha in `[0, 255]` and is taken as
+/// `f32` so a caller does not have to round it to a byte first. Returns `0` when the source
+/// already reaches the requested alpha on its own, and when the source is fully opaque and no
+/// under-layer can be seen at all. The result is rounded UP, so the composite never falls short
+/// of the request.
+///
+/// This is the ONE sanctioned way to put a layer under a partially transparent source: the layer
+/// keeps being composited by the ordinary straight-alpha source-over, so the source coverage is
+/// still applied exactly once and no notch appears on an antialiased rim.
+#[must_use]
+pub(crate) fn required_under_alpha_for_total_alpha(desired_total_a: f32, source_a: u8) -> u8 {
+    if desired_total_a <= source_a as f32 || source_a == u8::MAX {
+        return 0;
+    }
+
+    let source_cov = source_a as f32 / 255.0;
+    let uncovered = 1.0 - source_cov;
+    if uncovered <= f32::EPSILON {
+        return 0;
+    }
+
+    let desired_cov = desired_total_a / 255.0;
+    let needed_cov = ((desired_cov - source_cov) / uncovered).clamp(0.0, 1.0);
+    (needed_cov * 255.0).ceil().clamp(0.0, 255.0) as u8
+}
+
+/// Gain applied to an under-layer's alpha so that the layer is hidden by the source's COVERAGE
+/// instead of by its raw alpha.
+///
+/// `peak_a` comes from [`source_peak_alpha`], and coverage is `source_a / peak_a`. The returned
+/// gain is `(1 - coverage) / (1 - source_a / 255)`: exactly the factor that turns the
+/// straight-alpha source-over total `source_a + layer * (1 - source_a / 255)` into
+/// `source_a + layer * (1 - coverage)`. It is therefore the same inversion as
+/// [`required_under_alpha_for_total_alpha`], expressed as a multiplier instead of a desired total.
+/// That form is what keeps the opaque case bit-exact: at `peak_a == 255` the numerator and the
+/// denominator are the same `f32` expression, the gain is exactly `1.0`, and multiplying a layer
+/// alpha by `1.0` changes none of its bits — going through the `u8` inversion instead would run
+/// the layer through a `ceil` and could shift it by one alpha level.
+///
+/// The gain is in `[0, 1]` (a smaller peak means more of the pixel is covered by the source, not
+/// less). It is `0` where the source is fully opaque, and `0` where the pixel sits at peak
+/// opacity — there the source covers the pixel completely, however transparent it is, so nothing
+/// behind it may show through.
+#[must_use]
+pub(crate) fn under_layer_coverage_gain(source_a: u8, peak_a: u8) -> f32 {
+    if source_a == 0 {
+        // No source here: the layer is unobstructed, and this is also the only input that could
+        // make the ratio below a 0/0 NaN (it is the only case with peak_a == 0).
+        return 1.0;
+    }
+    let uncovered = 1.0 - source_a as f32 / 255.0;
+    if uncovered <= f32::EPSILON {
+        return 0.0;
+    }
+    let coverage = source_a as f32 / peak_a as f32;
+    ((1.0 - coverage) / uncovered).clamp(0.0, 1.0)
+}
+
 /// Deterministic value noise in `[-1, 1]`, bilinearly interpolated over an integer lattice.
 ///
 /// `x`/`y` are pixel coordinates; `scale_px` is the lattice cell size in pixels (clamped to a
@@ -937,6 +1031,23 @@ pub(crate) fn smoothstep01(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
+/// FNV-1a 64 digest of a raw RGBA buffer, used by the frozen-output goldens.
+///
+/// Those goldens pin "this effect renders EXACTLY as it did before" for sources that must not be
+/// affected by a change; a digest keeps the expectation to one number instead of a multi-kilobyte
+/// byte literal. A failure means the rendered bytes moved, which for a frozen golden is a visual
+/// change to every already-saved project and has to be deliberate.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn rgba_digest(rgba: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in rgba {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 #[must_use]
 pub(crate) fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) -> bool {
@@ -976,7 +1087,8 @@ mod tests {
     use super::{
         EDT_COST_INF, blend_full_image_over, dilate_alpha_ellipse, dilate_alpha_max_filter3,
         dilate_alpha_rect, euclidean_distance_transform_with_costs, gaussian_blur_alpha_in_place,
-        gaussian_blur_rgba_in_place, image_has_alpha_on_edge, sample_rgba_premultiplied_bilinear,
+        gaussian_blur_rgba_in_place, image_has_alpha_on_edge, required_under_alpha_for_total_alpha,
+        sample_rgba_premultiplied_bilinear, source_peak_alpha, under_layer_coverage_gain,
     };
     use crate::raster::blend_pixel_over;
     use crate::types::RenderedTextImage;
@@ -1605,5 +1717,73 @@ mod tests {
         assert_eq!(g, 0.0);
         assert_eq!(b, 0.0);
         assert_eq!(a, 1.0);
+    }
+
+    #[test]
+    fn source_peak_alpha_reports_the_maximum_alpha_byte() {
+        assert_eq!(source_peak_alpha(&[]), 0);
+        assert_eq!(source_peak_alpha(&[9, 9, 9, 0, 9, 9, 9, 0]), 0);
+        assert_eq!(source_peak_alpha(&[1, 2, 3, 128, 4, 5, 6, 200, 7, 8, 9, 17]), 200);
+        // Alpha is the 4th byte of every pixel, never a color channel.
+        assert_eq!(source_peak_alpha(&[255, 255, 255, 12]), 12);
+    }
+
+    /// Byte-exactness guard for the whole static-opacity fix: whenever the source contains at
+    /// least one fully opaque pixel the coverage gain must be EXACTLY `1.0`, so multiplying a
+    /// layer alpha by it cannot move a single bit. Every project authored with opaque text (and
+    /// every imported opaque image) depends on this.
+    #[test]
+    fn coverage_gain_is_exactly_one_for_an_opaque_peak() {
+        for source_a in 0..=254u8 {
+            let gain = under_layer_coverage_gain(source_a, 255);
+            assert_eq!(gain.to_bits(), 1.0f32.to_bits(), "source_a {source_a}");
+            // ... and the multiplication the composite passes perform is then a no-op.
+            for layer in [0.0f32, 1.0, 7.3125, 128.5, 254.999] {
+                assert_eq!((layer * gain).to_bits(), layer.to_bits());
+            }
+        }
+        // A fully opaque source hides anything under it.
+        assert_eq!(under_layer_coverage_gain(255, 255), 0.0);
+    }
+
+    /// A source whose alpha is uniform (a translucent text color, no antialiased rim) is at peak
+    /// opacity everywhere it exists, so it covers those pixels completely and nothing behind it
+    /// may show through. This is the bug the gain exists to fix.
+    #[test]
+    fn coverage_gain_hides_the_layer_under_a_uniformly_translucent_source() {
+        for alpha in 1..=255u8 {
+            assert_eq!(under_layer_coverage_gain(alpha, alpha), 0.0, "alpha {alpha}");
+        }
+        // Absent source: the layer is fully visible whatever the peak is.
+        assert_eq!(under_layer_coverage_gain(0, 0), 1.0);
+        assert_eq!(under_layer_coverage_gain(0, 128), 1.0);
+        // Half the peak coverage lets roughly half the layer through.
+        let gain = under_layer_coverage_gain(64, 128);
+        assert!((gain - 0.5 / (1.0 - 64.0 / 255.0)).abs() <= 1e-6, "gain {gain}");
+    }
+
+    /// The inverted alpha must actually reach the requested total when it is composited the
+    /// ordinary way (under-layer first, source over it), and never fall short of it.
+    #[test]
+    fn required_under_alpha_reaches_the_requested_total() {
+        for source_a in (0..=250u8).step_by(5) {
+            for desired in (0..=255u8).step_by(5) {
+                let under = required_under_alpha_for_total_alpha(f32::from(desired), source_a);
+                let mut pixel = [0u8; 4];
+                if under > 0 {
+                    blend_pixel_over(&mut pixel, 10, 20, 30, under);
+                }
+                blend_pixel_over(&mut pixel, 200, 40, 90, source_a);
+                let reached = pixel[3];
+                let target = desired.max(source_a);
+                assert!(
+                    reached >= target.saturating_sub(1) && reached <= target.saturating_add(1),
+                    "source {source_a}, desired {desired}: under {under} reached {reached}"
+                );
+            }
+        }
+        // Degenerate inputs stay at zero instead of producing a stray layer.
+        assert_eq!(required_under_alpha_for_total_alpha(200.0, 255), 0);
+        assert_eq!(required_under_alpha_for_total_alpha(100.0, 128), 0);
     }
 }

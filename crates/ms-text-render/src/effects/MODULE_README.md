@@ -46,7 +46,9 @@ max 0/255 for both the RGBA and alpha paths).
 - `parse.rs`: external effects JSON contract, stage parsing, aliases, defaults, and
   typed parameter structures.
 - `stroke_shadow.rs`: alpha-contour stroke and shadow layers with optional blur/source
-  color behavior.
+  color behavior. The stroke's `Static` opacity mode adds only the part of its constant layer that
+  the normalized contour coverage does not already cover (`static_stroke_desired_total_alpha`);
+  `shadow` has no opacity mode.
 - `blur.rs`: Gaussian blur and motion blur post-effects.
 - `glow.rs`: contour glow (`glow_v1`/`glow_v2`), soft glow, and falloff. Soft glow dilates the
   source alpha by four independent per-side extents (`radius_px` plus a signed `expand_*` per
@@ -62,7 +64,15 @@ max 0/255 for both the RGBA and alpha paths).
   enter the result. Pre-multiplying the glow by `1 - src_a` counts the coverage twice
   (`out_a = a + g(1-a)²` instead of `a + g(1-a)`) and punches a translucent notch into every
   antialiased rim, which reads as a light halo hugging the glyphs; `glow_v1`/`glow_v2` did that
-  until it was removed, and the rim-notch tests pin the rule for all three variants. Cost asymmetry matters here: `Square` is `O(w*h)` while `Round`
+  until it was removed, and the rim-notch tests pin the rule for all three variants, in both
+  opacity modes. Those tests run an OPAQUE source, where the static coverage gain is identically
+  1.0, so they pin the source-over rule and the opaque-source invariance — not the gain itself.
+  The gain is a scale on the layer applied before that single source-over, and what covers it is
+  the translucent-source tests instead: the static parallel-vs-sequential goldens on a translucent
+  source (`peak_a` 128 — the ONLY tests that execute the new branch of the sequential mirrors),
+  the `*_keeps_a_uniformly_translucent_source_unchanged` behavior tests, the exhaustive
+  `coverage_gain_*` unit tests in `image_ops.rs`, and the frozen output digests that pin the
+  opaque case byte for byte. Cost asymmetry matters here: `Square` is `O(w*h)` while `Round`
   is `O(w*h*(up+down+1))`, so a 1000x600 source at radius 512 + expand 512 takes ~0.035 s square
   vs ~3.7 s round (~9.2 s with blur 256) in release, and that run cannot be aborted part-way —
   `apply_effects_pipeline` checks cancellation only BETWEEN effects.
@@ -89,8 +99,12 @@ max 0/255 for both the RGBA and alpha paths).
   chromatic aberration, `scanlines`). Every pass is a pure row gather from an immutable source
   snapshot (parallel == sequential); growing kinds pad the canvas (digital/scanlines: horizontal;
   rgb_split: all sides) and update `content_origin`. Shares the noise helpers in `image_ops.rs`.
-- `image_ops.rs`: shared low-level image helpers used by multiple effects. Also owns the shared
-  deterministic noise primitives (`hash_noise_signed` splitmix64 hash, `value_noise_signed`
+- `image_ops.rs`: shared low-level image helpers used by multiple effects. Owns the alpha
+  composition math shared by stroke and glow: `source_peak_alpha` (peak alpha of the source
+  buffer, the estimate of how opaque the source is), `required_under_alpha_for_total_alpha` (the
+  source-over inversion that places a layer under a partially transparent source) and
+  `under_layer_coverage_gain` (the same inversion as a multiplier on the layer alpha). Also owns
+  the shared deterministic noise primitives (`hash_noise_signed` splitmix64 hash, `value_noise_signed`
   bilinear value noise, `smoothstep01`, `lerp_f32`, `i32_to_u64_wrapping`) used by both
   `dry_media` and `interference` so there is one tested noise implementation.
   Dilation has two production forms, both taking four per-side extents (`left`, `right`, `up`,
@@ -123,6 +137,39 @@ max 0/255 for both the RGBA and alpha paths).
   must give that layer its own alpha, unreduced by the source alpha. The straight-alpha
   source-over is the only place the source coverage may be applied; applying it twice leaves a
   translucent ring on every antialiased rim (see the glow bullet above).
+- A layer whose alpha does NOT follow the source contour (the `Static` opacity mode of `stroke`,
+  `glow_v1` and `glow_v2`) must be attenuated by the source's COVERAGE, which is the buffer alpha
+  NORMALIZED by `source_peak_alpha` — never by the raw `1 - src_a`, and never by a second
+  source-over. Buffer alpha conflates two quantities: the antialiasing coverage of the contour and
+  the opacity baked in from the text color (`raster::sample_swash_pixel` multiplies the glyph mask
+  by the tint alpha), so a body pixel of 50 %-transparent text is indistinguishable from a rim
+  pixel of opaque text. Without the normalization a static layer plates the whole glyph body at
+  full alpha and the translucent text is composited over it, coming out opaque and tinted by the
+  effect color. The correction is applied by inverting the desired total alpha
+  (`required_under_alpha_for_total_alpha`) or by the equivalent multiplier
+  (`under_layer_coverage_gain`) — those two are the ONLY sanctioned ways to put a layer under a
+  partially transparent source.
+- The two effects implement DIFFERENT static-layer semantics, deliberately: stroke uses
+  `src_a + max(target - 255 * coverage, 0)` and glow uses `src_a + target * (1 - coverage)`. They
+  agree only at `target == 255`. Neither was unified onto the other, because each reproduces its
+  OWN previous composite byte for byte at `peak_a == 255`, and that invariance across every
+  already-saved project outranks having one formula. Do not "harmonize" them without accepting a
+  visual change to existing projects.
+- `source_peak_alpha` is an APPROXIMATION and its limits are part of the contract: it is a single
+  global number, so it is exact only when the whole source shares one opacity. Text mixing spans
+  of DIFFERENT alpha normalizes against its most opaque span, and the more transparent spans keep
+  the old plating behavior; a buffer that already holds opaque pixels from an earlier effect in
+  the chain pins the peak at 255 and disables the correction entirely — an opaque shadow or
+  stroke EARLIER in the stage list is enough to restore the old plating behavior for every effect
+  after it, and that is a known limitation of the approach, not a bug in a particular effect.
+  A global peak (rather than a local maximum over the effect's own kernel) is deliberate: it
+  guarantees that any source with one opaque pixel renders bit for bit as before, which is what
+  every already-saved project needs.
+- The `FromContour` opacity mode of `glow_v1`/`glow_v2` has a related, still-unfixed defect: its
+  layer is scaled by the source alpha (v1) or not at all (v2, `base_opacity = 1.0`), so a
+  uniformly 50 %-transparent source comes out at alpha 192 (v1) or fully opaque 255 (v2) under
+  the glyph body. It was left alone deliberately — changing it would alter how every saved project
+  using that mode renders. `stroke` in `FromContour` is correct.
 - Empty images and zero-sized intermediate dimensions must be handled without panics.
 - Long or multi-pass effects must honor the cancellation checks performed by
   `apply_effects_pipeline` before each effect.
@@ -135,6 +182,12 @@ max 0/255 for both the RGBA and alpha paths).
 - To change interference (помехи/glitch) behavior or add a sub-kind, edit `interference.rs`
   (the sub-kind dispatch + `*_fill_row` kernels) and, for a new sub-kind, `InterferenceKind`
   and its parsing in `parse.rs`.
+- To change how much of an under-layer survives behind the source (either opacity mode), edit
+  `source_peak_alpha` / `required_under_alpha_for_total_alpha` / `under_layer_coverage_gain` in
+  `image_ops.rs`, then audit both callers: `static_stroke_desired_total_alpha` in
+  `stroke_shadow.rs` and the composite passes of `apply_glow_effect_v1`/`v2` in `glow.rs`. Each of
+  those has a sequential mirror in its test module that must be changed identically, plus a frozen
+  output digest that must keep holding for opaque sources.
 - To change soft-glow geometry (per-side extents, outline shape) or its blur response, edit
   `apply_soft_glow_effect` / `soft_glow_response_curve` in `glow.rs`, the dilation helpers in
   `image_ops.rs`, and `SoftGlowEffectParams` + `parse_soft_glow_effect_params` in `parse.rs`.
