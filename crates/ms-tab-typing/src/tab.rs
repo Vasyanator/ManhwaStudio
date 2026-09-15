@@ -2857,6 +2857,33 @@ struct TypingLayoutEditorLine {
     flip_text: bool,
 }
 
+impl TypingLayoutEditorLine {
+    /// A fresh, point-less layout-editor line carrying the panel's defaults.
+    ///
+    /// SINGLE SOURCE OF TRUTH for what a NEW line starts as. Every creation site
+    /// (the two `+` buttons, the implicit first line, the reset of the last
+    /// remaining line, and the fallback when an overlay has no saved layout) goes
+    /// through here; the defaults used to be a struct literal repeated five times.
+    ///
+    /// `distance_mode` defaults to `MinimumPreviousDistance`: it keeps a real,
+    /// even ink-to-ink gap around a bend, which is what a curved line is for.
+    /// This is the default for NEW lines ONLY — lines restored from a project or
+    /// a preset keep whatever they were saved with, and a value missing from the
+    /// stored JSON still falls back to `ByLineLength`
+    /// (`layout_editor::vector_line_distance_mode_from_value`), so existing
+    /// projects render exactly as before.
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            points: Vec::new(),
+            corner_smoothing_px: 0.0,
+            text_direction: TextVectorLineTextDirection::LeftToRight,
+            distance_mode: TextVectorLineDistanceMode::MinimumPreviousDistance,
+            flip_text: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TypingLayoutEditorState {
     overlay_idx: usize,

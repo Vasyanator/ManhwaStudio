@@ -15,6 +15,13 @@ simply depends on it (`ms_text_render::render_text_to_image` / `::types::*`) —
 Key items:
 - `Case`: one named render case (params + output name).
 - `all_cases()`: the fixed feature-matrix of cases.
+- `onpath_case()` / `wave_points()` / `sharp_turn_points()`: builders for the
+  custom-vector-line cases. The on-path cases come in pairs that differ ONLY by
+  `distance_mode`, so the curvature-compensating `MinimumPreviousDistance` can be
+  compared against the plain arc-length walk on identical geometry.
+- `raster_line_pixels()` / `write_raster_line_source()`: the generated layout
+  image the `CustomRasterLines` case traces its line out of. Written to
+  `<outdir>/inputs/`, never next to the goldens.
 - `rgba_diff` / `DiffStats`: pure buffer comparison helper for regression tests.
 - `main`: parse argv[1]=outdir, render every case, write `<outdir>/<name>.png`.
 
@@ -150,8 +157,127 @@ fn wave_points() -> Vec<TextVectorPoint> {
     points
 }
 
+/// A polyline with three SHARP corners (about 60, 75 and 72 degrees), the
+/// geometry where on-path spacing is hardest: the chord between two adjacent
+/// glyphs falls far behind their arc-length step, and a glyph can reach the one
+/// two places before it.
+fn sharp_turn_points() -> Vec<TextVectorPoint> {
+    [
+        (40.0, 90.0),
+        (280.0, 90.0),
+        (420.0, 330.0),
+        (700.0, 330.0),
+        (770.0, 110.0),
+    ]
+    .into_iter()
+    .map(|(x, y)| TextVectorPoint { x, y })
+    .collect()
+}
+
+/// Pixels of the single line drawn into the custom-RASTER-line source image:
+/// a shallow one-sided circular arc, EXACTLY ONE pixel per image column.
+///
+/// One pixel per column matters, it is not a style choice: the tracer
+/// (`drawn_lines::trace_ordered_pixels`) walks 8-connected neighbours preferring
+/// the straightest one, so a chain two pixels thick anywhere leaves a pixel
+/// behind, and the walk doubles back to collect the leftovers once it reaches
+/// the far end — which folds the path and piles the tail glyphs on top of each
+/// other. The arc is x-monotone with `|dy/dx| <= 0.62`, so stepping x by one and
+/// rounding y gives a clean 8-connected chain.
+fn raster_line_pixels() -> Vec<(u32, u32)> {
+    // Circle through (450, 120) with its center straight below it; only the
+    // shallow top section is used, so the bend is consistently one-sided.
+    let (center_x, center_y, radius) = (450.0f32, 640.0f32, 520.0f32);
+    let half_span = 270.0f32;
+    let first = (center_x - half_span) as u32;
+    let last = (center_x + half_span) as u32;
+    (first..=last)
+        .filter_map(|x| {
+            let dx = x as f32 - center_x;
+            let y = center_y - (radius * radius - dx * dx).sqrt();
+            // `as u32` is safe: y stays inside the 420 px canvas by construction.
+            (y >= 0.0).then(|| (x, y.round() as u32))
+        })
+        .collect()
+}
+
+/// Write the layout source image the `CustomRasterLines` case traces its line
+/// from: one 1-pixel-wide red (`DRAWN_LINE_PALETTE[0]`) chain whose FIRST pixel
+/// is opaque (the start marker, alpha >= `start_alpha`) and whose remaining
+/// pixels sit at a lower alpha (>= `continuation_alpha`).
+///
+/// Generated rather than committed so the harness stays a single self-contained
+/// binary with no binary fixtures, and deterministic because the geometry is
+/// closed-form. It is written under `<outdir>/inputs/`, NOT next to the golden
+/// PNGs, so a directory-wide golden comparison never sees it.
+///
+/// # Errors
+/// Returns a message if the directory or the PNG cannot be written.
+fn write_raster_line_source(path: &Path) -> Result<(), String> {
+    const START_ALPHA: u8 = 255;
+    const CONTINUATION_ALPHA: u8 = 128;
+    let mut image = image::RgbaImage::new(900, 420);
+    for (index, (x, y)) in raster_line_pixels().into_iter().enumerate() {
+        if x >= image.width() || y >= image.height() {
+            continue;
+        }
+        let alpha = if index == 0 {
+            START_ALPHA
+        } else {
+            CONTINUATION_ALPHA
+        };
+        image.put_pixel(x, y, image::Rgba([255, 0, 0, alpha]));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    image
+        .save(path)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+/// Build a single-line on-path custom-vector-line case.
+///
+/// Shares everything except the text, the polyline, the corner smoothing and the
+/// spacing mode, so two cases that differ ONLY by `distance_mode` can be
+/// compared pixel for pixel on identical geometry.
+fn onpath_case(
+    text: &str,
+    points: Vec<TextVectorPoint>,
+    corner_smoothing_px: f32,
+    distance_mode: TextVectorLineDistanceMode,
+) -> TextRenderParams {
+    let mut params = base_params();
+    params.text = text.to_string();
+    params.font_size_px = 44.0;
+    params.text_layout_mode = TextLayoutMode::CustomVectorLines;
+    params.text_line_mode = TextLineMode::Horizontal;
+    params.vector_lines_layout = TextVectorLinesLayoutParams {
+        width_px: 900,
+        height_px: 420,
+        use_tangent_rotation: true,
+        static_rotation_rad: 0.0,
+        normal_offset_px: 0.0,
+        letter_spacing_mul: 1.0,
+        letter_spacing_px: 0.0,
+        lines: vec![TextVectorLine {
+            points,
+            corner_smoothing_px,
+            text_direction: TextVectorLineTextDirection::LeftToRight,
+            distance_mode,
+            flip_text: false,
+        }],
+    };
+    params
+}
+
 /// The fixed feature-matrix of golden cases. Order is stable across runs.
-fn all_cases() -> Vec<Case> {
+///
+/// `raster_lines_image` is the layout source written by
+/// [`write_raster_line_source`]; the `CustomRasterLines` case traces its line
+/// out of it.
+fn all_cases(raster_lines_image: &Path) -> Vec<Case> {
     let paragraph =
         "Привет, мир! Hello world.\nЭто тест переноса строк and mixed Latin текста для базовой проверки раскладки.";
 
@@ -246,6 +372,98 @@ fn all_cases() -> Vec<Case> {
         }],
     };
     cases.push(Case { name: "onpath_curve", params: onpath });
+
+    // 8b. The SAME wave in `ByLineLength`, so the two spacing modes can be
+    // compared on identical geometry: `ByLineLength` is the straight-line
+    // typography the ink mode must reproduce once the bend is taken out.
+    cases.push(Case {
+        name: "onpath_curve_by_length",
+        params: onpath_case(
+            "Волна wave волна curve",
+            wave_points(),
+            8.0,
+            TextVectorLineDistanceMode::ByLineLength,
+        ),
+    });
+
+    // 8c/8d. A sharp-cornered polyline in both modes. Here the chord between
+    // adjacent glyphs is far shorter than their arc step and a glyph can reach
+    // past its immediate predecessor, so this is where the ink mode has to do
+    // real work rather than agree with the arc-length walk.
+    cases.push(Case {
+        name: "onpath_sharp_turn",
+        params: onpath_case(
+            "Резкий поворот sharp turn",
+            sharp_turn_points(),
+            2.0,
+            TextVectorLineDistanceMode::MinimumPreviousDistance,
+        ),
+    });
+    cases.push(Case {
+        name: "onpath_sharp_turn_by_length",
+        params: onpath_case(
+            "Резкий поворот sharp turn",
+            sharp_turn_points(),
+            2.0,
+            TextVectorLineDistanceMode::ByLineLength,
+        ),
+    });
+
+    // 8e/8f. Pairs with strongly asymmetric side bearings (`ГЛ`, `АВ`, `Ту`,
+    // `АV`, `j`, quotes): the shapes whose real facing edge is nowhere near
+    // their bounding box, i.e. the ones a bbox-half-width spacing target got
+    // most wrong.
+    cases.push(Case {
+        name: "onpath_sidebearings",
+        params: onpath_case(
+            "ГЛАВА Ту АV j «Ж»",
+            wave_points(),
+            8.0,
+            TextVectorLineDistanceMode::MinimumPreviousDistance,
+        ),
+    });
+    cases.push(Case {
+        name: "onpath_sidebearings_by_length",
+        params: onpath_case(
+            "ГЛАВА Ту АV j «Ж»",
+            wave_points(),
+            8.0,
+            TextVectorLineDistanceMode::ByLineLength,
+        ),
+    });
+
+    // 8g. `TextLayoutMode::Formula`. The other on-path cases are all
+    // `CustomVectorLines`; this one is the only golden that exercises the
+    // FORMULA arc-length accumulator and `OnPathStepSpacing::for_formula` (whose
+    // seed floor is half the em, not 1 px), so a change to the step arithmetic
+    // can no longer slip through unnoticed on that path.
+    let mut formula_wave = base_params();
+    formula_wave.text = "Формула formula волна".to_string();
+    formula_wave.font_size_px = 44.0;
+    formula_wave.width_px = 820;
+    formula_wave.text_layout_mode = TextLayoutMode::Formula;
+    formula_wave.formula_layout = TextFormulaLayoutParams {
+        x_expr: "t * w".to_string(),
+        y_expr: "130 * sin(t * tau)".to_string(),
+        rotation_expr: "0".to_string(),
+        use_tangent_rotation: true,
+        ..TextFormulaLayoutParams::default()
+    };
+    cases.push(Case { name: "formula_wave", params: formula_wave });
+
+    // 8h. `TextLayoutMode::CustomRasterLines`, the third consumer of the same
+    // on-path step. It traces its line out of the generated layout image, which
+    // also keeps the raster tracer itself (`drawn_lines::load_raster_line_paths`)
+    // under a golden.
+    let mut raster_line = base_params();
+    raster_line.text = "Растровая линия raster".to_string();
+    raster_line.font_size_px = 40.0;
+    raster_line.text_layout_mode = TextLayoutMode::CustomRasterLines;
+    raster_line.drawn_lines_layout = TextDrawnLinesLayoutParams {
+        image_path: Some(raster_lines_image.to_path_buf()),
+        ..TextDrawnLinesLayoutParams::default()
+    };
+    cases.push(Case { name: "raster_line_arc", params: raster_line });
 
     // 9. Stroke + shadow effects, locked via JSON, on white text.
     let mut effects = base_params();
@@ -431,7 +649,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut cases = all_cases();
+    // The custom-raster-line case needs a layout image to trace; it is generated
+    // into a SUBDIRECTORY so it never lands among the golden PNGs themselves.
+    let raster_lines_image = outdir.join("inputs").join("raster_lines.png");
+    if let Err(err) = write_raster_line_source(&raster_lines_image) {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut cases = all_cases(&raster_lines_image);
     for case in &mut cases {
         case.params.anti_aliasing = aa_mode;
     }

@@ -29,9 +29,11 @@ through the same draw-pass pivot (`place_optical_vertical_contour` +
 closest facing points; a scanline projection, NOT a Euclidean min-distance). That
 min gap is normalized toward the column median gap so the closest points become
 uniform, and the same min gap feeds the collision floor. The self-calibrating
-median / delta / base-advance math
-AND the pair-gap metric are the shared axis-agnostic core in `render_next::optical`
-(reused with the horizontal path — no duplicate formula or metric). Every non-Optical
+median / delta / base-advance math is the shared axis-agnostic core in
+`render_next::optical`, and the pair-gap MEASUREMENT is owned by
+`render_next::pair_gap` (`directional_pair_gap` over `GapAxis::VERTICAL`;
+`optical_pair_gap` is only an adapter). Both are reused with the horizontal path —
+no duplicate formula or metric. Every non-Optical
 kerning mode keeps `delta == 0` and stays BYTE-IDENTICAL to the pre-optical
 stacking. The vertical stacking is ink-height based and never applies font pair
 kerning, so `Fixed` and `Auto` coincide on this path (only `Optical` re-spaces);

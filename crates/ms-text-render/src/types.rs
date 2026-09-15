@@ -954,9 +954,30 @@ pub enum TextVectorLineTextDirection {
     RightToLeft,
 }
 
+/// How far apart adjacent glyphs sit along one custom VECTOR line.
+///
+/// Per line, so two lines of the same overlay may differ. Ignored by every other
+/// `TextLayoutMode` (the formula/shape and custom RASTER line paths always walk
+/// by arc length). The full contract of each variant lives in
+/// `formula/MODULE_README.md`.
+///
+/// This enum has no `Default`: the two callers disagree on purpose. The layout
+/// editor starts a NEW line at `MinimumPreviousDistance`
+/// (`TypingLayoutEditorLine::new` in `ms-tab-typing`), while a line deserialized
+/// without a stored mode falls back to `ByLineLength` so saved projects keep the
+/// spacing they were rendered with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextVectorLineDistanceMode {
+    /// Plain arc-length walk: each glyph steps along the path by its own advance
+    /// (font metrics, kerning, letter spacing). Static by design — the drawn
+    /// spacing is exactly what the text metrics ask for, bend or no bend.
     ByLineLength,
+    /// Uniform ink spacing: every adjacent inked pair of the line is placed at the
+    /// SAME ink-to-ink distance — the median of that line's gaps measured on a
+    /// virtual straight reference layout. Optical kerning on glyph contours,
+    /// applied along the curve, so the font's side bearings are partly overruled
+    /// and the run does not match the same text set straight. Spaces and
+    /// user-authored kerning pairs are exempt.
     MinimumPreviousDistance,
 }
 

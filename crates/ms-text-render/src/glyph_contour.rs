@@ -1,10 +1,17 @@
 /*
-File: src/tabs/typing/render_next/glyph_contour.rs
+File: crates/ms-text-render/src/glyph_contour.rs
 
 Purpose:
-Represent a glyph's ink boundary as one or more closed outer polygons so the
-text-on-path engine can measure the true minimum distance between the shapes of
-two adjacent glyphs, instead of using center-to-center spacing.
+Represent a glyph's ink boundary as one or more closed outer polygons, place it
+in world space, and provide the omnidirectional Euclidean distance between two
+placed shapes, so the spacing engines can space adjacent glyphs by their real ink
+instead of by center-to-center metrics.
+
+NOT the pair-gap metric: how far apart two adjacent glyphs sit along their
+advance direction is measured by `pair_gap::directional_pair_gap`, the single
+owner of that question. `min_placed_distance` here is omnidirectional and clamped
+at zero; see its declaration comment and the MEASUREMENT CONTRACT in
+`MODULE_README.md`.
 
 Main responsibilities:
 - hold glyph-local closed outer contour(s) (produced upstream by
@@ -21,6 +28,8 @@ Key functions:
 - GlyphContour::placed_sheared (adds the faux-italic baseline shear)
 - GlyphContour::is_empty
 - min_placed_distance
+- placed_aabb_gap (the cheap AABB lower bound in front of it; the single owner
+  of that formula, also used by the on-path clearance tests)
 
 Notes:
 - Contour vertices live in the glyph-local frame chosen by the producer; for the
@@ -143,6 +152,18 @@ impl GlyphContour {
 /// `f32::INFINITY` when either side has no components. Per-component AABB
 /// rejection skips component pairs whose bounding boxes are already farther
 /// apart than the current best distance.
+///
+/// This is NOT the pair-gap metric and must not be used as one. It is
+/// omnidirectional (the closest approach in ANY direction, typically a diagonal
+/// between two corners) and unsigned (clamped to `0.0` on overlap), so using it
+/// to decide how far to move an adjacent glyph inverts the sign of the
+/// correction on slanted or overhanging pairs — measured on Cyrillic pairs such
+/// as "ст"/"кс". The directional whitespace along a pair's advance axis is owned
+/// by `pair_gap::directional_pair_gap`; see the MEASUREMENT CONTRACT in
+/// `MODULE_README.md`. What this function is good for is the opposite question:
+/// an omnidirectional clearance floor, i.e. "do these two shapes come closer
+/// than X anywhere", which is what the on-path advance search in
+/// `formula/render.rs` asks.
 #[must_use]
 pub fn min_placed_distance(a: &PlacedContour, b: &PlacedContour) -> f32 {
     if a.components.is_empty() || b.components.is_empty() {
@@ -168,6 +189,20 @@ pub fn min_placed_distance(a: &PlacedContour, b: &PlacedContour) -> f32 {
         }
     }
     best
+}
+
+/// Lower bound on the distance between two placed glyphs, from their cached
+/// world AABBs alone (`0.0` when the boxes overlap or touch).
+///
+/// The true minimum distance is never smaller than this, so a pair already
+/// farther apart than some floor by their boxes needs no `O(edges^2)` test:
+/// this is the cheap rejection in front of [`min_placed_distance`] and in front
+/// of the on-path clearance predicates in `formula/render.rs`. Same formula as
+/// the per-component rejection [`min_placed_distance`] uses internally, over the
+/// whole-contour boxes instead of per-component ones.
+#[must_use]
+pub fn placed_aabb_gap(a: &PlacedContour, b: &PlacedContour) -> f32 {
+    aabb_gap((a.aabb_min, a.aabb_max), (b.aabb_min, b.aabb_max))
 }
 
 /// Inclusive AABB of a polygon's vertices as `(min, max)`.
@@ -327,7 +362,7 @@ fn dist_sq(a: [f32; 2], b: [f32; 2]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphContour, min_placed_distance};
+    use super::{GlyphContour, min_placed_distance, placed_aabb_gap};
 
     /// Build an axis-aligned rectangle contour from inclusive corner coords.
     fn rect_contour(x0: f32, y0: f32, x1: f32, y1: f32) -> GlyphContour {
@@ -387,6 +422,28 @@ mod tests {
         let b = rect_contour(9.0, 0.0, 10.0, 1.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
         let d = min_placed_distance(&a, &b);
         assert!((d - 3.0).abs() < 1e-4, "distance was {d}");
+    }
+
+    #[test]
+    fn placed_aabb_gap_is_a_lower_bound_on_the_real_distance() {
+        // Two separated rects: the boxes are the shapes here, so the bound is
+        // exact (5 horizontally).
+        let a = rect_contour(0.0, 0.0, 2.0, 4.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let b = rect_contour(7.0, 0.0, 9.0, 4.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let bound = placed_aabb_gap(&a, &b);
+        assert!((bound - 5.0).abs() < 1e-4, "bound was {bound}");
+        assert!(bound <= min_placed_distance(&a, &b) + 1e-4, "must be a lower bound");
+
+        // Overlapping boxes: the bound collapses to 0 and stays a lower bound.
+        let c = rect_contour(1.0, 1.0, 5.0, 5.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        assert_eq!(placed_aabb_gap(&a, &c), 0.0);
+
+        // A diagonal separation: the bound is the corner-to-corner distance of
+        // the boxes, never more than the true distance.
+        let d = rect_contour(5.0, 8.0, 7.0, 10.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let bound = placed_aabb_gap(&a, &d);
+        assert!((bound - 5.0).abs() < 1e-4, "diagonal bound was {bound}");
+        assert!(bound <= min_placed_distance(&a, &d) + 1e-4, "must be a lower bound");
     }
 
     #[test]

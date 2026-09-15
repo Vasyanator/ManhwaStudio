@@ -19,7 +19,9 @@ closest facing points; a scanline projection, not a Euclidean min-distance). Tha
 min gap is normalized toward the column median so the closest points become
 uniform, and the same min gap feeds the collision floor. The pure numeric core
 (`median_of_gaps`/`optical_delta`/`optical_base_advance`/`optical_pair_gap`) is
-shared with the horizontal path in `render_next::optical`.
+shared with the horizontal path in `render_next::optical`; the gap measurement
+itself is owned by `render_next::pair_gap` (`directional_pair_gap` over
+`GapAxis::VERTICAL`), which `optical_pair_gap` only adapts to.
 Every non-Optical kerning mode keeps `delta == 0` and stays byte-identical to
 the pre-optical stacking. The vertical stacking is ink-height based and never
 applies font pair kerning, so `Fixed` and `Auto` coincide here (only `Optical`
@@ -1085,7 +1087,8 @@ fn vertical_base_advance(prev_ink_height_px: f32, base_gap_px: f32) -> f32 {
 /// For every adjacent INKED glyph pair `(idx, idx+1)` the two ink contours are
 /// placed in the metric stacking configuration (prev ink-top at local 0, cur
 /// ink-top at prev's base advance) and the MINIMUM DIRECTIONAL top-to-bottom ink
-/// whitespace is measured with `optical_pair_gap` (`OpticalAxis::Vertical`): the
+/// whitespace is measured with `optical_pair_gap` (`OpticalAxis::Vertical`, an
+/// adapter over the owner `pair_gap::directional_pair_gap`): the
 /// smallest `cur_top(x) - prev_bottom(x)` over the pair's overlapping horizontal
 /// band (the closest facing points; a scanline projection, not a Euclidean
 /// min-distance). A pair broken by a blank/space, a missing ink profile, an

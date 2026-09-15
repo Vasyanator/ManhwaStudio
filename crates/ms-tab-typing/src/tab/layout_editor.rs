@@ -91,28 +91,20 @@ pub(super) fn draw_layout_editor_vector_lines_tab(
                     ui.vertical_centered(|ui| {
                         if ui.button("+").clicked() {
                             let next_idx = editor.lines.len() + 1;
-                            editor.lines.push(TypingLayoutEditorLine {
-                                label: tf!("typing.layout_editor.line_add_label", next_idx = next_idx),
-                                points: Vec::new(),
-                                corner_smoothing_px: 0.0,
-                                text_direction: TextVectorLineTextDirection::LeftToRight,
-                                distance_mode: TextVectorLineDistanceMode::ByLineLength,
-                                flip_text: false,
-                            });
+                            editor.lines.push(TypingLayoutEditorLine::new(tf!(
+                                "typing.layout_editor.line_add_label",
+                                next_idx = next_idx
+                            )));
                             editor.active_line_idx = editor.lines.len().saturating_sub(1);
                         }
                     });
                 });
             if plus_response.response.clicked() {
                 let next_idx = editor.lines.len() + 1;
-                editor.lines.push(TypingLayoutEditorLine {
-                    label: tf!("typing.layout_editor.line_add_label", next_idx = next_idx),
-                    points: Vec::new(),
-                    corner_smoothing_px: 0.0,
-                    text_direction: TextVectorLineTextDirection::LeftToRight,
-                    distance_mode: TextVectorLineDistanceMode::ByLineLength,
-                    flip_text: false,
-                });
+                editor.lines.push(TypingLayoutEditorLine::new(tf!(
+                    "typing.layout_editor.line_add_label",
+                    next_idx = next_idx
+                )));
                 editor.active_line_idx = editor.lines.len().saturating_sub(1);
             }
         });
@@ -202,14 +194,9 @@ pub(super) fn vector_line_distance_mode_label(mode: TextVectorLineDistanceMode) 
 
 pub(super) fn ensure_layout_editor_has_line(editor: &mut TypingLayoutEditorState) {
     if editor.lines.is_empty() {
-        editor.lines.push(TypingLayoutEditorLine {
-            label: t!("typing.layout_editor.line_first_label").to_string(),
-            points: Vec::new(),
-            corner_smoothing_px: 0.0,
-            text_direction: TextVectorLineTextDirection::LeftToRight,
-            distance_mode: TextVectorLineDistanceMode::ByLineLength,
-            flip_text: false,
-        });
+        editor.lines.push(TypingLayoutEditorLine::new(
+            t!("typing.layout_editor.line_first_label").to_string(),
+        ));
     }
     editor.active_line_idx = editor
         .active_line_idx
@@ -219,11 +206,10 @@ pub(super) fn ensure_layout_editor_has_line(editor: &mut TypingLayoutEditorState
 pub(super) fn remove_layout_editor_line(editor: &mut TypingLayoutEditorState, idx: usize) {
     if editor.lines.len() <= 1 {
         if let Some(line) = editor.lines.first_mut() {
-            line.points.clear();
-            line.corner_smoothing_px = 0.0;
-            line.text_direction = TextVectorLineTextDirection::LeftToRight;
-            line.distance_mode = TextVectorLineDistanceMode::ByLineLength;
-            line.flip_text = false;
+            // Deleting the last remaining line empties it instead of removing it; it
+            // must come back exactly as a freshly added line, so reuse the one
+            // constructor and keep only the label the user already sees.
+            *line = TypingLayoutEditorLine::new(std::mem::take(&mut line.label));
         }
         editor.active_line_idx = 0;
         return;

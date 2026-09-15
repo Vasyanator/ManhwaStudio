@@ -2728,7 +2728,8 @@ fn horizontal_run_layout(
 /// 1. Base advance is each glyph's OWN shaped advance (`prev.w`), falling back to
 ///    the metric advance `cur.x - prev.x` when `prev.w` is not positive/finite.
 /// 2. For every adjacent inked pair the MINIMUM DIRECTIONAL horizontal whitespace
-///    is measured (`optical_pair_gap`, `OpticalAxis::Horizontal`): the smallest
+///    is measured (`optical_pair_gap`, `OpticalAxis::Horizontal` — an adapter over
+///    the owner `pair_gap::directional_pair_gap`): the smallest
 ///    `cur_left(y) - prev_right(y)` over the pair's overlapping vertical band (the
 ///    closest facing points), from the glyph outlines placed through the exact
 ///    draw-pass transform. This projected measure (not a Euclidean min-distance)

@@ -132,9 +132,14 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   one place.
 - `drawn_lines.rs`: raster layout-line tracing and vector-line path normalization for
   custom line layout modes.
-- `glyph_contour.rs`: placement (affine transform + AABB) and minimum-distance geometry
-  for glyph ink contours used by on-path minimum-distance spacing. The contours
-  themselves are produced by `vector::glyph_contour_from_outline`.
+- `glyph_contour.rs`: representation and placement (affine transform + AABB) of glyph
+  ink contours, plus the OMNIDIRECTIONAL Euclidean `min_placed_distance` used by the
+  on-path advance search as a clearance floor, and `placed_aabb_gap`, the single owner
+  of the cheap AABB lower bound in front of it (used both by `min_placed_distance`'s own
+  per-component rejection and by the on-path clearance tests in `formula/render.rs`;
+  never write a second copy of that formula). The contours themselves are produced by
+  `vector::glyph_contour_from_outline`. It does NOT own the pair-gap metric — see
+  `pair_gap.rs` and the MEASUREMENT CONTRACT below.
 - `vector.rs`: vector-glyph layer for the `VECTOR_ENGINE_REFACTOR.md` move — swash
   outline extraction/flattening + cache, the single zeno coverage-mask rasterizer
   (monochrome tint contract + `blend_pixel_over`), the anti-aliasing coverage->alpha
@@ -165,15 +170,34 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   the rotated draw paths. Knows nothing about fonts/layout/raster. Unit-tested in
   place.
 - `optical.rs`: axis-agnostic pure numeric core for optical kerning
-  (`median_of_gaps`, `optical_delta`, `optical_base_advance`) plus the shared
-  directional gap metric (`optical_pair_gap` over `OpticalAxis`, returning the
-  minimum facing gap as `f32`, `f32::INFINITY` when non-kernable), the
-  `OpticalContourCache` type, and the
-  simplify-tolerance / min-gap-floor constants. Exactly one source of truth for
-  the optical spacing math AND the pair-gap measurement, reused by the horizontal
-  path (`pipeline.rs`) and the vertical path (`layout/vertical.rs`). Only the
-  contour PLACEMENT (the exact draw-pass transform) stays in the axis-specific
-  callers; the scanline gap metric itself lives here. Unit-tested in place.
+  (`median_of_gaps`, `optical_delta`, `optical_base_advance`), the
+  `OpticalContourCache` type, and the simplify-tolerance / min-gap-floor
+  constants. Exactly one source of truth for the optical spacing FORMULA, reused
+  by the horizontal path (`pipeline.rs`), the vertical path
+  (`layout/vertical.rs`) and the on-path `MinimumPreviousDistance` mode
+  (`formula/render.rs`), which normalizes a line onto `median_of_gaps` of its
+  straight-reference pairs and clamps each pair through `optical_delta`. The gap
+  MEASUREMENT lives in `pair_gap.rs`;
+  `OpticalAxis` + `optical_pair_gap` here are only the optical paths' adapter
+  onto it (`OpticalAxis::Horizontal`/`Vertical` -> `GapAxis::HORIZONTAL`/
+  `VERTICAL`). Why the generalization cost the two world axes nothing, EXACTLY:
+  on `GapAxis::HORIZONTAL`/`VERTICAL` every projection is a dot product with a
+  unit world axis, i.e. it returns the vertex coordinate itself, and
+  `cross_extent` then reproduces the same AABB extents the per-axis code read off
+  `PlacedContour` — so band, sample count, sample offsets and per-scanline gap are
+  the same numbers, not merely close ones. The adapter's tests do NOT prove that:
+  they are five rectangle cases asserted to `1e-3`, i.e. a behavioural check.
+  Contour PLACEMENT (the exact draw-pass transform) stays in the axis-specific
+  callers.
+  Unit-tested in place.
+- `pair_gap.rs`: THE single owner of "what is the gap between these two placed
+  glyph contours" — `directional_pair_gap(prev, cur, GapAxis)`, the minimum
+  directional projected ink whitespace along an arbitrary oriented axis. `GapAxis`
+  carries the forward (advance) and cross (band) unit vectors, so a pair whose
+  glyphs are ROTATED relative to the world axes (text on a path) is measured in
+  its own local frame; `GapAxis::HORIZONTAL`/`VERTICAL` are the world-aligned
+  special cases. Pure `[f32; 2]` math, no font/layout types. Unit-tested in place.
+  See the MEASUREMENT CONTRACT below before adding a second gap metric anywhere.
 - `wrap/`: text wrapping and hyphenation subsystem.
   See `wrap/MODULE_README.md`.
 - `layout/`: layout-to-raster positioning code that is not generic wrapping.
@@ -1008,7 +1032,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     normalization for that one pair; the rest of the run stays optical), and
     `formula::assign_formula_seed_advances` via `FormulaGlyphSeed::cluster_char`
     (seeds are detached from their `LayoutRun`, so the source character is captured
-    at seed time).
+    at seed time). The on-path `MinimumPreviousDistance` walk consults the table a
+    SECOND time, for the same reason the optical branch does: an overridden pair is
+    exempt from the uniform-ink normalization and excluded from the line's median
+    target, while the rest of the line is still normalized.
   - MEASUREMENT MUST STAY IN SYNC or wrapping drifts from what is drawn. Two paths:
     `wrap::forms::GlyphWidths::build` (its `kerns` map already holds the font's own
     pair delta in the very same per-mille unit, so an override is an exact
@@ -1048,24 +1075,56 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   contour cache. MVP limitation: optical pairs are considered only WITHIN a
   cosmic-text layout run (pairs straddling a run boundary keep the shaped
   advance). The pure numeric core (`median_of_gaps`, `optical_delta`,
-  `optical_base_advance`) lives in the shared `optical.rs` module.
+  `optical_base_advance`) lives in the shared `optical.rs` module, and the gap
+  measurement in `pair_gap.rs`.
 - The optical spacing math (`median_of_gaps`, `optical_delta`,
-  `optical_base_advance`, the directional `optical_pair_gap` metric, the
-  `OpticalContourCache` type, the simplify tolerance and min-gap floor) is
-  axis-agnostic and lives ONLY in `optical.rs`. Both the horizontal
-  (`pipeline.rs`) and vertical (`layout/vertical.rs`) paths reuse it; do not
-  duplicate the formula or the metric. It is unit-tested in `optical.rs`.
-  MEASUREMENT CONTRACT: the per-pair gap is the MINIMUM DIRECTIONAL projected
-  whitespace along the advance axis — the closest facing points — NOT the Euclidean
-  minimum distance (`min_placed_distance` is used only by the on-path/formula
-  spacing, not here). It scans the pair's overlap band (horizontal: shared vertical
-  band, gap = `cur_left - prev_right`; vertical: shared horizontal band,
-  gap = `cur_top - prev_bottom`) and returns the SMALLEST per-scanline gap. That
-  single min gap is both the target for median normalization (so the tightest
-  points become uniform) and the collision floor. No band overlap -> infinite gap
-  (not kerned). The directional projection removes the earlier sign-inversion on
-  slanted/overhanging pairs (e.g. Cyrillic "ст"/"кс") that a diagonal min-distance
-  produced.
+  `optical_base_advance`, the `OpticalContourCache` type, the simplify tolerance
+  and min-gap floor) is axis-agnostic and lives ONLY in `optical.rs`. All three
+  paths reuse it — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`)
+  and on-path `MinimumPreviousDistance` (`formula/render.rs`, whose target is the
+  median of a line's STRAIGHT-REFERENCE gaps rather than of its on-curve ones, so
+  the spacing does not follow the curve's geometry); do not duplicate the
+  formula. It is unit-tested in `optical.rs`.
+  MEASUREMENT CONTRACT — read this before writing any code that asks how far apart
+  two adjacent glyphs are:
+  * There is exactly ONE owner of that question: `pair_gap::directional_pair_gap`.
+    It takes the two placed contours and a `GapAxis` (forward/cross unit vectors)
+    and returns the MINIMUM DIRECTIONAL projected whitespace along `forward` over
+    the pair's overlap band on `cross` — the closest facing points. Do not add a
+    second gap metric; extend this one (that is what the axis vectors are for).
+  * `OpticalAxis` + `optical_pair_gap` in `optical.rs` are a thin adapter onto it
+    for the two world-aligned axes (horizontal: shared vertical band,
+    gap = `cur_left - prev_right`; vertical: shared horizontal band,
+    gap = `cur_top - prev_bottom`). No measurement logic lives there.
+  * The THIRD consumer is on-path spacing: `formula/render.rs` measures a
+    `MinimumPreviousDistance` pair on the CHORD between the two glyphs' ink
+    placement centers (`pair_chord_axis` -> `on_path_pair_gap`). The chord, not
+    either glyph's path tangent, because the measure must be symmetric under
+    swapping the pair. This is the case the vector-carried axis was generalized
+    for: both glyphs are rotated, and by different amounts. It consumes the metric
+    twice: once per line in the straight reference, to derive that line's median
+    target, and once per candidate position while solving for it.
+  * Because the axis is carried as VECTORS rather than as an array index, the
+    metric works on a pair whose glyphs are rotated relative to the world axes:
+    `PlacedContour` vertices are world-space with the rotation already baked in,
+    so no axis-aligned geometry is required.
+  * Degenerate results, relied on by the callers: `f32::INFINITY` when either
+    contour has no components, when a contour has components but no vertices, when
+    the projected bands do not overlap (a zero-width touching band counts as NO
+    overlap), or when no sampled scanline crosses ink on both sides — `f32::INFINITY`
+    means "not kernable" and yields `optical_delta == 0.0`. The result is SIGNED and
+    goes NEGATIVE when the two inks overlap on some scanline; it is never clamped at
+    zero.
+  * That single min gap is both the target for median normalization (so the
+    tightest points become uniform) and the collision floor.
+  * It is NOT the Euclidean minimum distance. `glyph_contour::min_placed_distance`
+    is omnidirectional and clamped at `0.0`; it is used by the on-path advance
+    search as a clearance floor ("do these shapes come closer than X anywhere"),
+    which covers the one thing the directional metric cannot see — an overhang
+    reaching a neighbour on scanlines that neighbour has no ink on. Never as a
+    pair gap. The directional projection is what removes the
+    sign-inversion on slanted/overhanging pairs (e.g. Cyrillic "ст"/"кс") that a
+    diagonal min-distance produced.
   Optical spacing is exact on the measured layout but sub-pixel-approximate on the
   rendered pixels: the provisional measurement pen's `SubpixelBin` can differ from
   the accumulated draw pen by up to ~0.75px/axis. Since `delta` is now applied along
@@ -1090,7 +1149,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `KerningMode::Optical` is IMPLEMENTED for the vertical path too: it measures the
   true top-to-bottom ink whitespace of adjacent inked glyphs in a column and
   normalizes it toward the column median, gated strictly on Optical (`Fixed`/`Auto`
-  and every non-Optical mode stay byte-identical). It reuses `optical.rs` and shares the vertical
+  and every non-Optical mode stay byte-identical). It reuses `optical.rs` (spacing
+  formula) and `pair_gap.rs` (gap measurement) and shares the vertical
   render's `OutlineCache` + `OpticalContourCache`.
 - To change formula, shape-path, or custom raster/vector line placement, edit
   `formula/` and `drawn_lines.rs`.

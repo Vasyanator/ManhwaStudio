@@ -34,9 +34,8 @@ the line paths.
   outline) keep the legacy rotated bitmap blit. For `CustomVectorLines` lines set to
   `MinimumPreviousDistance`, it derives each glyph's ink contour from that outline
   (`vector::glyph_contour_from_outline` -> `render_next/glyph_contour.rs`, cached by
-  cosmic-text `CacheKey`) and searches the arc-length position so the true ink-to-ink
-  gap to the previous glyph reaches a kerning-driven target, instead of center-to-center
-  distance.
+  cosmic-text `CacheKey`) and moves the glyph along the path until the pair reproduces
+  the gap it would have in a STRAIGHT line — see the mode's contract below.
 
 ## Contracts and invariants
 - Formula input comes from `TextFormulaLayoutParams`; do not read panel state,
@@ -62,6 +61,103 @@ the line paths.
   mirroring `pipeline::custom_pair_step_px` performs has no counterpart here. Formula
   and drawn lines walk seeds in logical order regardless of script direction — a
   limitation of that whole path, not of the overrides.
+- THE ARC-LENGTH STEP BETWEEN TWO ADJACENT GLYPHS IS DECIDED IN ONE PLACE AND ONLY
+  ONE: `OnPathStepSpacing::step_px` in `render.rs`. All three consumers go through it —
+  the alignment pre-pass (`drawn_line_start_offsets`), the custom-line walk
+  (`drawn_line_seed_transform`) and the formula/shape accumulator
+  (`render_text_with_formula_layout_once`). Each of them used to hold a verbatim copy
+  of the expression and the copies had already drifted; do not re-fork them. The
+  pre-pass in particular REPLAYS the walk, so a second copy misaligns every line
+  silently. Build the value through `OnPathStepSpacing::for_custom_lines` /
+  `for_formula` (they clamp the letter-spacing inputs), never as a struct literal.
+  - Two floors with different jobs: the SEED floor guards the glyph's own advance
+    before the letter-spacing multiplier scales it; `MIN_ON_PATH_STEP_PX` guards the
+    final step so negative additive tracking cannot stall or reverse the cursor.
+  - KNOWN DEFECT, preserved on purpose: the seed floor differs per path — `1.0` for
+    custom raster/vector lines, `(font_size_px * 0.5).max(1.0)` for formula/shape. On a
+    formula curve that spaces every narrow glyph (`i`, `l`, `.`) out to half an em and
+    stops an authored negative kerning pair from tightening a step at all. Lowering it
+    is a rendering change and must be done together with
+    `detect_shape_layout_fallback_reason`, which estimates run length with the same
+    floor and whose compression ratio decides the shape fallback.
+  - `seed_metric_advance_px` is a SEPARATE, earlier floor
+    (`max(raw_delta, glyph_w * 0.25, 1.0)`) applied in `assign_formula_seed_advances`.
+    It turns the shaped pen delta into a positive magnitude, guarding against a
+    non-monotonic (RTL) run and against font pair kerning below `-75%` of the left
+    advance. It guards the METRIC advance only, so it does NOT clip user-authored
+    kerning: an authored pair steps by the glyph's nominal advance plus the delta and
+    can leave `FormulaGlyphSeed::advance_px` negative on purpose — clamping that is
+    `OnPathStepSpacing::step_px`'s job alone.
+- `MinimumPreviousDistance` (per `CustomVectorLine`) GIVES EVERY ADJACENT PAIR OF A LINE
+  THE SAME INK-TO-INK DISTANCE. It is optical kerning on the glyph contours, applied
+  along the curve: the run is spaced by what the ink actually does, not by the font's
+  side bearings. That is a deliberate, user-requested trade — the font's side bearings
+  are partly overruled and the same text set on a curve does NOT match the same text set
+  in a straight line. The whole mode is six decisions, all in `render.rs`:
+  - REFERENCE. Every placed glyph is ALSO placed in a virtual straight layout
+    (`straight_reference_transform`: the path point `(x, 0)` with the constant tangent
+    `(1, 0)`, walked by the NOMINAL along-path step read off the arc-length seed, so
+    advances, letter spacing, authored kerning and inline offsets enter it without a
+    second copy of the cursor arithmetic). It runs through the same
+    `on_path_transform_from_sample` as the real placement, so normal offset, flip,
+    static vs. tangent rotation and per-glyph rotation/offset all apply identically.
+  - MEASURE. A pair's gap is `on_path_pair_gap`: `pair_gap::directional_pair_gap` on the
+    CHORD between the two glyphs' ink placement centers (`pair_chord_axis`). The chord,
+    not either tangent, so the measure is symmetric under swapping the pair; on a
+    circular arc it is exactly the bisector of the two tangents and, unlike the
+    bisector, it does not degenerate at large turn angles. Coincident centers yield
+    `None` ("no advance direction"), treated as unmeasurably close.
+  - TARGET. ONE number per LINE, not per pair: the MEDIAN of that line's
+    reference-layout gaps (`straight_reference_target_gaps`, using the shared
+    `optical::median_of_gaps`). Taken in the REFERENCE, never on the curve, so dragging a
+    path node cannot re-space the rest of the line; it is also the same statistic
+    `KerningMode::Optical` normalizes on. The per-pair target is that median passed
+    through `optical::optical_delta`, so the +/- font-size sanity bound and the
+    anti-collision floor are literally the horizontal/vertical optical ones. Nothing
+    about side bearings, bounding boxes or advances is modelled.
+  - WHICH PAIRS ARE NORMALIZED. Both glyphs must have ink: an inkless glyph (a space)
+    ends the pair chain, so an inter-word distance neither enters the median nor gets
+    normalized, and words cannot merge. A pair carrying a USER-AUTHORED kerning override
+    (`custom_seed_pair_delta_px`) is EXEMPT — it keeps the distance its author gave it
+    and is excluded from the median, mirroring `pipeline.rs`, where an authored pair
+    cancels optical kerning outright. A pair whose inks do not face each other even when
+    straight has nothing to normalize and keeps its arc-length seed.
+  - WHAT IS NOT AN INVARIANT ANY MORE: "on a straight line the mode equals
+    `ByLineLength`". It was, while the target was the pair's own reference gap; a uniform
+    target necessarily re-spaces a straight run of mixed side bearings. What still holds
+    is the degenerate case: when every pair of the line already has the same gap, the
+    median IS that gap and the arc-length seeds stand — at any angle, because
+    `directional_pair_gap` derives its band, sample count and sample offsets from dot
+    products with the frame, so a rotation cancels exactly.
+  - SEARCH. `solve_directional_gap_center_s` moves the glyph in EITHER direction (a bend
+    tightens a pair on its concave side and loosens it on the convex side; a
+    forward-only search leaves the second case visibly loose), bounded by the glyph's own
+    advance and by the line's run start, so a backward move can never change what
+    `drawn_line_drop_side` decides. The gap is NOT monotone in the arc position — a path
+    is a polyline, so a glyph crossing a node changes rotation in a step — so the search
+    does not bisect the whole range: the sign of the seed's error picks a direction, a
+    coarse scan walks outward and stops at the FIRST sign change, and only that bracket
+    is bisected. The result is the crossing NEAREST the seed, i.e. the minimal
+    correction, and a distant non-monotone region cannot pull the glyph across it.
+  - SAFETY NET. After the directional pass, `find_clearance_center_s` pushes forward
+    until the glyph keeps an omnidirectional `min_placed_distance` floor from the last
+    `ON_PATH_INK_NEIGHBOR_WINDOW` (4) INKED glyphs — not just its predecessor, because a
+    sharp turn brings older ones within reach. Two caps make this harmless: the floor is
+    `ON_PATH_INK_CLEARANCE_FLOOR_PX` (0.5) capped by what that pair achieves in the
+    REFERENCE layout (`pair_clearance_floor`), so a pair the font or an authored negative
+    kerning pair draws tighter than that keeps its own tightness; and it is a clearance,
+    never a target. It exists because the directional metric compares the two glyphs
+    within one scanline only and is therefore blind to an overhang reaching a neighbour
+    on scanlines that neighbour has no ink on (a `Г` arm over the next letter's
+    shoulder).
+  - A glyph with no ink (a space) gets no directional target and does not enter the
+    window, but does NOT clear it: the first glyph of the next word must still not
+    collide with the last word on a sharp turn. The reference walk
+    (`StraightReferenceWalk`, the single owner of that recurrence, shared by the median
+    pre-pass and the real walk) follows every placed glyph, inkless ones included, so the
+    two frames never drift apart.
+  - There is no bitmap-measured ink extent any more. The target comes off the outline
+    contour, so `SeedInkGeometry` carries the contour and the bitmap PLACEMENT only.
 - `FormulaRenderOutcome::FallbackToStandard` is an explicit layout decision for modes
   that cannot use a curve safely. Do not silently render a different mode.
 - Line stacking is NOT re-implemented here. `pipeline::line_baseline_advance_table`,
@@ -126,21 +222,39 @@ the line paths.
     `shift_following` bumps, floored at `0.0`. A plain inline `line_px` offset moves its
     own glyph only and is deliberately NOT counted, so one nudged glyph never drags the
     line's alignment — at the price that a glyph nudged past the line end is invisible to
-    the alignment and can still be clipped. EXACT for `ByLineLength`. For
-    `MinimumPreviousDistance` it is a lower bound whose error ACCUMULATES and is unbounded
-    in principle: every forward push of the ink search shifts all following glyphs, so an
-    end-aligned ink-spaced run can lose a clipped suffix past its line end.
+    the alignment and can still be clipped. EXACT for `ByLineLength`, and final there.
+  - `MinimumPreviousDistance` cannot be predicted by that replay — each glyph's ink
+    correction shifts all following ones, and on a path that bends the same way
+    throughout the corrections do not cancel, so the run really is longer than the
+    replay says. The replayed value is therefore only a STARTING ESTIMATE, and
+    `refine_min_distance_start_offsets` replaces it: it re-walks the line
+    (`measure_min_distance_run_len_px`, the real placement walk with every correction),
+    recomputes the offset from the MEASURED run length through the same
+    `drawn_line_start_offset`, and iterates until the offset settles (at most
+    `ON_PATH_ALIGN_REFINE_PASSES`, tolerance `ON_PATH_ALIGN_REFINE_TOLERANCE_PX`).
+    The measurement walk sets `DrawnLinePlacementState::measure_only`, which makes a
+    past-the-end glyph advance the cursor by its nominal step instead of freezing it —
+    otherwise an overflowing run could never measure longer than its line and the
+    offset could never go negative. Only lines that are BOTH in this mode AND
+    alignment-sensitive (`on_path_align_fraction != 0.0`) pay for it; a start-aligned
+    line, which is the default for custom lines and for justify, is skipped entirely.
+    Without this refinement an end-aligned run on a one-sided bend lost its last glyph.
   - Formula/shape: the arc-length accumulator is one continuous run for the whole text,
     so only the block-level `params.align` applies (no per-line override). It splits the
     free curve length in `map_formula_target_arc_length`. On OVERFLOW that function keeps
     compressing the run onto the curve and ignores alignment — there is no free space to
     distribute and `detect_shape_layout_fallback_reason` is defined against exactly that
     compression ratio.
-- The on-path glyph transform has a single source of truth (`drawn_line_transform_at` +
-  `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the ink-distance
-  search, and `placed_contour_for_transform` all build the outline->world placement with
-  the same `glyph_outline_transform` pivot, so a measured contour lands on exactly the
-  pixels the glyph is rasterized to (zero shift versus the old bitmap placement).
+- The on-path glyph transform has a single source of truth
+  (`on_path_transform_from_sample`, reached through `drawn_line_transform_at` for a real
+  path sample and through `straight_reference_transform` for the straight reference
+  layout, plus `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the
+  ink search, and `placed_contour_for_transform` all build the outline->world placement
+  with the same `glyph_outline_transform` pivot, so a measured contour lands on exactly
+  the pixels the glyph is rasterized to (zero shift versus the old bitmap placement).
+  `place_seed_ink_for_transform` is the one place that turns a `SeedInkGeometry` plus a
+  transform into a placed ink (contour + placement anchor); candidate placements,
+  reference placements and the stored final placement all go through it.
 - Perpendicular line placement (`TextRenderParams.line_placement_percent`) is applied by
   the shared `apply_line_placement` helper. For the drawn/vector-line path it is folded
   INTO `drawn_line_glyph_destination_center_raw`, which now places the glyph INK CENTER on
@@ -170,5 +284,22 @@ the line paths.
   verify formula render callers still receive useful errors.
 - To change glyph placement along formula, raster-line, or vector-line paths, edit
   `render.rs`.
+- To change how far apart two adjacent glyphs sit along a path (letter spacing, the
+  per-path floors), edit `OnPathStepSpacing` in `render.rs` and nothing else — it is the
+  sole owner of the NOMINAL step.
+- To change uniform ink spacing (`MinimumPreviousDistance`), edit the pieces named in
+  its contract above: the reference (`straight_reference_transform` /
+  `StraightReferenceWalk`), the target (`straight_reference_target_gaps`, whose
+  statistics and clamps belong to `optical.rs`), the measure
+  (`pair_chord_axis` / `on_path_pair_gap`), the search
+  (`solve_directional_gap_center_s`) or the safety net (`pair_clearance_floor` /
+  `find_clearance_center_s`). The gap MEASUREMENT itself belongs to `pair_gap.rs`; do
+  not grow a second one here.
+- To change where a line's run STARTS on its path (alignment), edit
+  `drawn_line_start_offset` / `drawn_line_start_offsets` for the arc-length estimate and
+  `refine_min_distance_start_offsets` / `measure_min_distance_run_len_px` for the
+  `MinimumPreviousDistance` measurement that replaces it. The per-line cursor recurrence
+  itself is owned by `LineArcCursor`; the three walks that replay it (alignment pre-pass,
+  median pre-pass, real placement) must all go through that type.
 - To change the public formula parameter contract, start in `render_next/types.rs`,
   then update this module, the smoke anchor in `mod.rs`, and typing serialization.

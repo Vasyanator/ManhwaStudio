@@ -1,5 +1,5 @@
 /*
-File: src/tabs/typing/render_next/optical.rs
+File: crates/ms-text-render/src/optical.rs
 
 Purpose:
 Axis-agnostic pure numeric core shared by the optical-kerning paths. The
@@ -7,14 +7,17 @@ horizontal path (`pipeline.rs`) and the vertical path (`layout/vertical.rs`)
 both re-space adjacent inked glyphs by measuring the MINIMUM DIRECTIONAL
 projected ink whitespace of each pair — the closest facing points between the two
 glyphs — and normalizing it toward the run/column median so the tightest points
-are uniform. The per-pair gap is a scanline projection along the advance axis
-(NOT a Euclidean minimum distance): for the horizontal axis it is the smallest
-horizontal whitespace over the overlapping vertical band; for the vertical axis
-it is the smallest vertical whitespace over the overlapping horizontal band.
+are uniform. The self-calibrating math and the shared cache/tolerance/floor
+constants live here, so there is exactly one source of truth for the optical
+spacing formula.
+
+The gap MEASUREMENT itself is not implemented here: it is owned by `pair_gap.rs`
+(`directional_pair_gap` over a `GapAxis`), which measures on an arbitrary
+oriented axis so the on-path path can share it. `OpticalAxis` and
+`optical_pair_gap` are the optical paths' thin adapter onto that owner, and the
+world-axis-aligned frames are `GapAxis::HORIZONTAL` / `GapAxis::VERTICAL`.
 Contour placement (the exact draw-pass transform) stays in the axis-specific
-callers; the scanline metric, the self-calibrating math, and the shared
-cache/tolerance/floor constants live here, so there is exactly one source of
-truth for the optical spacing formula.
+callers.
 
 Key types:
 - OpticalContourCache
@@ -33,12 +36,8 @@ mode never touches this module.
 */
 
 use super::glyph_contour::{GlyphContour, PlacedContour};
+use super::pair_gap::{GapAxis, directional_pair_gap};
 use std::collections::HashMap;
-
-/// Upper bound on the number of scanline samples taken across the overlap band
-/// of a pair. Very tall/wide glyph pairs widen the step (coarser than 1px)
-/// instead of scanning every pixel row/column, bounding the cost per pair.
-const OPTICAL_MAX_SCAN_SAMPLES: usize = 512;
 
 /// Bezier-flattening simplify tolerance (px) for glyph ink contours used by the
 /// optical accumulation on both axes; kept equal to the on-path value in
@@ -106,6 +105,10 @@ pub(crate) fn optical_base_advance(own_advance: f32, metric_advance: f32) -> f32
 /// - `Vertical`: the gap is the vertical whitespace (`cur_top - prev_bottom`)
 ///   measured over the pair's overlapping HORIZONTAL band (prev is the upper
 ///   glyph, cur the lower glyph).
+///
+/// Both are world-axis-aligned special cases of the general oriented frame
+/// [`GapAxis`]; this enum exists so the optical call sites keep naming their
+/// advance axis instead of building vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpticalAxis {
     Horizontal,
@@ -142,110 +145,23 @@ pub(crate) fn optical_delta(gap: f32, target: f32, font_size: f32) -> f32 {
 /// contours along `axis` (see [`OpticalAxis`]) — the closest facing points of the
 /// pair (px).
 ///
+/// Thin adapter: it only maps [`OpticalAxis`] onto the world-axis-aligned
+/// [`GapAxis`] frames and delegates to [`directional_pair_gap`], the single owner
+/// of the measurement. The full contract — signed result, negative on overlapping
+/// ink, `f32::INFINITY` for every non-measurable case (empty contour, no
+/// vertices, no band overlap, no scanline with ink on both sides) — is documented
+/// there and holds verbatim here.
+///
 /// `prev` and `cur` must already be placed in the SAME world frame the draw pass
 /// uses (horizontal: prev at pen 0, cur at pen `prev.w`; vertical: prev ink-top
-/// at local 0, cur ink-top at prev's base advance). The measure is a scanline
-/// projection, NOT a Euclidean minimum distance: it reports the whitespace along
-/// the advance axis so slanted/overhanging features do not invert the sign of the
-/// correction.
-///
-/// Returns `f32::INFINITY` when the glyphs do not overlap on the band axis
-/// (perpendicular to the advance axis), when either contour is empty, or when no
-/// scanline has ink on BOTH glyphs. Otherwise returns the SMALLEST per-scanline
-/// gap over the contributing scanlines (the tightest facing points). Never panics.
+/// at local 0, cur ink-top at prev's base advance). Never panics.
 #[must_use]
 pub(crate) fn optical_pair_gap(prev: &PlacedContour, cur: &PlacedContour, axis: OpticalAxis) -> f32 {
-    if prev.components.is_empty() || cur.components.is_empty() {
-        return f32::INFINITY;
-    }
-
-    // `band_axis` is the coordinate we sample along (perpendicular to the
-    // advance); `gap_axis` is the coordinate the whitespace is measured on. For
-    // the horizontal advance we scan rows (y) and measure x; for the vertical
-    // advance we scan columns (x) and measure y.
-    let (band_axis, gap_axis) = match axis {
-        OpticalAxis::Horizontal => (1usize, 0usize),
-        OpticalAxis::Vertical => (0usize, 1usize),
+    let axis = match axis {
+        OpticalAxis::Horizontal => GapAxis::HORIZONTAL,
+        OpticalAxis::Vertical => GapAxis::VERTICAL,
     };
-
-    // Overlap band on the sampling axis; no overlap -> not kernable.
-    let lo = prev.aabb_min[band_axis].max(cur.aabb_min[band_axis]);
-    let hi = prev.aabb_max[band_axis].min(cur.aabb_max[band_axis]);
-    let span = hi - lo;
-    if !span.is_finite() || span <= 0.0 {
-        return f32::INFINITY;
-    }
-
-    // ~1px step, clamped to OPTICAL_MAX_SCAN_SAMPLES samples (step widens for very
-    // tall/wide pairs). Sampling at row centers (`+ 0.5` of the step) keeps the
-    // scanline off the band endpoints and off exact integer vertices, which the
-    // even-odd crossing test handles poorly.
-    let sample_count = (span.ceil() as usize)
-        .clamp(1, OPTICAL_MAX_SCAN_SAMPLES);
-    let step = span / sample_count as f32;
-
-    let mut min_gap = f32::INFINITY;
-    let mut contributing = 0usize;
-    for i in 0..sample_count {
-        let s = lo + (i as f32 + 0.5) * step;
-        // prev faces cur with its far edge (MAX gap coord); cur faces prev with
-        // its near edge (MIN gap coord). A row contributes only when BOTH glyphs
-        // have ink crossing that scanline.
-        let Some((_, prev_far)) = scanline_crossings(&prev.components, band_axis, gap_axis, s) else {
-            continue;
-        };
-        let Some((cur_near, _)) = scanline_crossings(&cur.components, band_axis, gap_axis, s) else {
-            continue;
-        };
-        // The closest facing points are the smallest per-scanline gap.
-        min_gap = min_gap.min(cur_near - prev_far);
-        contributing += 1;
-    }
-
-    if contributing == 0 {
-        return f32::INFINITY;
-    }
-    min_gap
-}
-
-/// Min/max `gap_axis` coordinate where the closed-polygon edges of `components`
-/// cross the scanline `band_axis == s`.
-///
-/// Each component is a closed ring (closing edge `last -> first` implicit). An
-/// edge `p0 -> p1` crosses the scanline when `(p0[band] <= s) != (p1[band] <= s)`;
-/// the crossing `gap_axis` coordinate is the linear interpolation at `s`. Returns
-/// `None` when no edge crosses (the glyph has no ink at that scanline). The
-/// divisor `p1[band] - p0[band]` is non-zero exactly because the endpoints fall
-/// on opposite sides of `s`.
-fn scanline_crossings(
-    components: &[Vec<[f32; 2]>],
-    band_axis: usize,
-    gap_axis: usize,
-    s: f32,
-) -> Option<(f32, f32)> {
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    let mut found = false;
-    for component in components {
-        let n = component.len();
-        if n < 2 {
-            continue;
-        }
-        for i in 0..n {
-            let p0 = component[i];
-            let p1 = component[(i + 1) % n];
-            let b0 = p0[band_axis];
-            let b1 = p1[band_axis];
-            if (b0 <= s) != (b1 <= s) {
-                let t = (s - b0) / (b1 - b0);
-                let g = p0[gap_axis] + t * (p1[gap_axis] - p0[gap_axis]);
-                lo = lo.min(g);
-                hi = hi.max(g);
-                found = true;
-            }
-        }
-    }
-    if found { Some((lo, hi)) } else { None }
+    directional_pair_gap(prev, cur, axis)
 }
 
 #[cfg(test)]

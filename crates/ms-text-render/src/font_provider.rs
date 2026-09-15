@@ -320,7 +320,7 @@ mod tests {
     fn pairs_iteration_yields_every_override() {
         let table = CustomKerningTable::from_pairs([('A', 'V', -40.0), ('T', 'o', 0.0)]);
         let mut listed: Vec<(char, char, f32)> = table.pairs().collect();
-        listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        listed.sort_by_key(|pair| (pair.0, pair.1));
         assert_eq!(listed, vec![('A', 'V', -40.0), ('T', 'o', 0.0)]);
     }
 }

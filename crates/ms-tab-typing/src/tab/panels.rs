@@ -414,14 +414,9 @@ impl TypingTextOverlayLayer {
             .map(layout_editor_lines_from_vector_layout)
             .filter(|lines| !lines.is_empty())
             .unwrap_or_else(|| {
-                vec![TypingLayoutEditorLine {
-                    label: t!("typing.layout_editor.line_first_label").to_string(),
-                    points: Vec::new(),
-                    corner_smoothing_px: 0.0,
-                    text_direction: TextVectorLineTextDirection::LeftToRight,
-                    distance_mode: TextVectorLineDistanceMode::ByLineLength,
-                    flip_text: false,
-                }]
+                vec![TypingLayoutEditorLine::new(
+                    t!("typing.layout_editor.line_first_label").to_string(),
+                )]
             });
         self.layout_editor = Some(TypingLayoutEditorState {
             overlay_idx,

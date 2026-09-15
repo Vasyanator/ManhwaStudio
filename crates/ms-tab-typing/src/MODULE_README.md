@@ -415,6 +415,11 @@ saving, and export.
     `scene_from_page_px` / `page_px_from_scene` methods wrap the same-named free fns (kept as the math
     source of truth). Re-exported at the typing-module level (`tab::PageView`) so `mask.rs` can name it.
   - `layout_editor.rs`: vector-line layout-editor free fns (frame/line hit-test, draw, conversions).
+    A NEW line's defaults live in exactly one place — `TypingLayoutEditorLine::new` (`tab.rs`) —
+    and `distance_mode` starts at `MinimumPreviousDistance`, which holds an even ink-to-ink gap
+    around a bend. That default applies to NEW lines only: `vector_line_distance_mode_from_value`
+    still falls back to `ByLineLength` for a line restored from a project or preset whose JSON
+    carries no mode, so existing overlays keep rendering exactly as they were saved.
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
     Also the project's ONLY transparency checkerboard for text previews
     (`paint_shape_variant_checkerboard`, used by the shape-variant menu; `pub(super)`) and the
