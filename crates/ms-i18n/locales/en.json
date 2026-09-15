@@ -4486,6 +4486,7 @@
   "typing.context_menu.delete_layer": "Delete layer",
   "typing.context_menu.delete_overlay": "Delete overlay",
   "typing.context_menu.disable_mask_clip": "Disable mask clipping",
+  "typing.context_menu.duplicate_overlay": "Duplicate layer",
   "typing.context_menu.enable_mask_clip": "Enable mask clipping",
   "typing.context_menu.enter_layout_edit_mode": "Enter layout edit mode",
   "typing.context_menu.enter_transform_mode": "Enter transform mode",

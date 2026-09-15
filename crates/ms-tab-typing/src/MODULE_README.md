@@ -372,7 +372,8 @@ saving, and export.
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
-  - `selection_rasters.rs`: overlay/raster selection, remove, raster interact/menu/transform/deform and
+  - `selection_rasters.rs`: overlay/raster selection, remove, text-layer duplication
+    (`duplicate_overlay`), raster interact/menu/transform/deform and
     the NON-move raster drags (rotate, perspective corner handle) — a whole-layer move belongs to
     `move_layer.rs`.
     Also `resize_selected_overlay_width` (the on-canvas width-guide drag handle): it edits the selected
@@ -872,6 +873,53 @@ saving, and export.
   EXCEPTION: `save_drawn_lines_layout_image_if_needed` stays — the `CustomRasterLines` `_layout.png`
   has disk as its SOLE store (the renderer reads it back) and derives from `file_name` + dimensions
   only, so it is the only disk artifact keyed to a created overlay's `file_name`.
+- **A structural change requested during the draw is APPLIED AFTER THE PAINT PASS, never by returning
+  early** (`tab/draw_page.rs::draw_page_overlays`). Delete and duplicate are requested from inside the
+  per-page interaction block, but the ONLY place text overlays and PS rasters are painted is the unified
+  fill pass that comes AFTER it. An arm that mutated and then `return`ed skipped that pass, so the page
+  painted no text and no rasters for one frame — the "everything blinks out on delete/duplicate" the
+  user saw (creation never blinked: it lands in `poll_create_overlay_jobs` at frame start, outside the
+  draw). The rule: record the request in a local, skip the remaining index-driven interaction arms and
+  `interact_page_rasters` while one is recorded (that — not the painting — is what the `return` was
+  really buying), let the frame paint from the pre-change state, and apply it as the LAST statement,
+  after `draw_entries` has been consumed so no stale index can survive. The change lands one frame
+  later; durability is unchanged, since both paths still dispatch their eager structural save.
+- **No re-projection may run while a runtime holds text geometry the doc does not have**
+  (`tab/doc_layers.rs::reconcile_page_text_geometry_into_doc`). A settled text drag lives ONLY in the
+  runtime: `settle_layer_move`'s overlay branch marks the deferred placement save and writes nothing to
+  the doc (a doc write per gesture would cost a whole-page re-projection). Any structural edit routed to
+  the doc before that deferred save lands re-projects the page and overwrites the runtime's
+  center/angle/scale/deform from the STALE node — silently undoing the drag, which the eager structural
+  save then makes permanent. The reconcile pushes the page's live text geometry into the doc FIRST, and
+  it has exactly two call sites, which together cover every path: `route_to_doc_reporting` (the funnel
+  every structural doc edit passes through — delete, duplicate, ▲▼, raster transform/deform/mask-clip,
+  effects) and `persist_current_page_rasters` (which writes doc→disk WITHOUT the funnel, and is the
+  pre-flush of both band-order writers). It takes the already-locked document and writes only on a real
+  difference — so it cannot recurse (unlike `sync_overlay_state_into_doc`, which routes per page), costs
+  no extra re-projection, and preserves `route_to_doc_reporting`'s "a no-op changes nothing" contract.
+- **Text-layer duplication is a CREATE, not a clone** (`selection_rasters.rs::duplicate_overlay`,
+  reachable from the overlay ПКМ menu and from Ctrl/Cmd+D on the selected layer). TEXT overlays only —
+  image overlays and rasters are refused (`None`). The copy is APPENDED (the overlay vector is
+  append-only), goes through the single insertion point `insert_runtime_overlay`, and mints a FRESH uid
+  plus a fresh `file_name`: a shared uid would make `sync_from_doc` reconcile two runtimes onto one doc
+  node and the `(page, uid)`-keyed tables collide, and a shared `file_name` would make both layers write
+  the same `_layout.png`. The pixels/render data are copied verbatim — no re-render, no PNG copy: the
+  doc's flush writes the copy's own uid-keyed PNG because its node is `pixels_dirty`. The one disk
+  artifact that IS copied is the `CustomRasterLines` `_layout.png` sibling, which has disk as its sole
+  store. Geometry is offset one `DUPLICATE_OVERLAY_OFFSET_PAGE_PX` DOWN the page through the same
+  clamped move math a drag uses, and a deform mesh is translated by the same delta (its points are
+  absolute page px). The copy takes the selection, and its band Z is moved from the top of the stack to
+  DIRECTLY ABOVE its source (`doc_layers.rs::place_node_directly_above_in_unified_z`), which REQUIRES a
+  synchronous WHOLE-PAGE flush first (`persist_current_page_rasters` → the doc's `flush_page`, rasters
+  AND text): the order written is the flattened page, and `persist::apply_band_order` leaves any band
+  whose uid is not in the on-disk tree at its stale Z — flushing only the text would renumber text
+  around unmoved rasters. Two consequences ride along, both shared with the ▲▼ reorder rather than new
+  here: the flush is synchronous on the GUI thread (accepted — ▲▼ already does the identical, heavier
+  write on a one-shot user action, and deferring it would invert the "disk band order is the authority"
+  contract), and `apply_band_order` PINS every text node on the page at an explicit Z, dissolving any
+  remaining legacy text-group auto-order on it (harmless: `write_page_text_payload` forces `pinned` on
+  every write anyway). Like a deletion, the save is STRUCTURAL and eager
+  (`dispatch_structural_placement_save`), never deferred.
 - A created overlay's `file_name` is `typing_overlay_p{page+1:04}_{uid}.png`
   (`created_overlay_file_name`), minted from the overlay's own fresh v4 uid, so uniqueness is
   STRUCTURAL — no filesystem probe, no wall-clock resolution to trust. It is a RUNTIME handle only:
@@ -1290,9 +1338,14 @@ saving, and export.
   logic in the matching submodule below.
 - To change overlay/raster selection, non-move drags (rotate / deform handles), or context menus, edit
   `tab/selection_rasters.rs`.
+- To change text-layer DUPLICATION (what is copied, the offset, the menu item), edit
+  `tab/selection_rasters.rs`; its Ctrl/Cmd+D hotkey and its menu item live in `tab/draw_page.rs`, and
+  where the copy lands in the unified Z stack is `tab/doc_layers.rs`.
 - To change how a layer MOVES (pointer or arrows, either layer kind — clamp, pixel snap, settle,
   persistence), edit `tab/move_layer.rs`; its pure delta math lives in `tab/mesh_geometry.rs`.
-- To change the master per-page drawing, edit `tab/draw_page.rs`.
+- To change the master per-page drawing, edit `tab/draw_page.rs`. A change that ADDS or DELETES a layer
+  from inside that draw must follow the "apply after the paint pass" rule above — never `return` before
+  the fill pass.
 - To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
 - To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.
 - To change the on-canvas VECTOR transform (seed/interaction/settle/reset), edit `tab/vector_transform.rs`;

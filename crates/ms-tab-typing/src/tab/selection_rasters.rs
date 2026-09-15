@@ -4,9 +4,10 @@ File: tab/selection_rasters.rs
 Purpose:
 Selection state and raster-layer canvas interaction for the typing tab: clearing
 and switching the single active selection (text overlay vs raster), the edit-panel
-selection payload, overlay/raster removal, wheel/keyboard transform shortcuts
-(rotate, scale), raster deform-mesh seeding, geometry persistence routing, and the
-raster select/rotate/perspective canvas interaction with its context menu.
+selection payload, overlay/raster removal, text-layer DUPLICATION, wheel/keyboard
+transform shortcuts (rotate, scale), raster deform-mesh seeding, geometry
+persistence routing, and the raster select/rotate/perspective canvas interaction
+with its context menu.
 
 NOT here — a whole-layer MOVE, by pointer or by arrow keys, for either layer kind:
 that is the shared move session in `tab/move_layer.rs`. `interact_page_rasters`
@@ -24,6 +25,15 @@ private items that stay there as descendants of module `tab`.
 */
 
 use super::*;
+
+/// Downward offset, in PAGE px, applied to a duplicated text layer so the copy is immediately
+/// visible instead of sitting exactly behind its source.
+///
+/// Mirrors the canvas' `DUPLICATE_BUBBLE_OFFSET_PX` in intent, but NOT in unit: that constant is
+/// screen px (a bubble anchor is placed in scene space), while a text layer's center lives in page
+/// px, so this offset is zoom-independent. 40 page px is about one line of typical lettering, which
+/// reads as "just below the original" without throwing the copy across the page.
+pub(super) const DUPLICATE_OVERLAY_OFFSET_PAGE_PX: f32 = 40.0;
 
 impl TypingTextOverlayLayer {
     pub(super) fn clear_selection(&mut self) {
@@ -272,6 +282,202 @@ impl TypingTextOverlayLayer {
         // overlay resurrect from the stale on-disk set. The save persists the whole live state, so it
         // settles any deferred edit on this overlay too — but only once actually dispatched.
         self.dispatch_structural_placement_save("overlay delete");
+    }
+
+    /// Duplicates the TEXT overlay at `overlay_idx` and returns the copy's index in `self.overlays`.
+    ///
+    /// The copy is APPENDED (the overlay vector is append-only — every index-keyed side table and the
+    /// per-index egui id depend on that), offset [`DUPLICATE_OVERLAY_OFFSET_PAGE_PX`] DOWN the page and
+    /// clamped to the page bounds, placed DIRECTLY ABOVE the source in the page's unified band-Z order,
+    /// and SELECTED in place of the source.
+    ///
+    /// Copied verbatim: rendered pixels + `size_px`, `render_data_json`, `user_scale`, `angle_deg`,
+    /// `mask_clip_enabled`, the text-group axis `layer_idx`, the page, the centering-assist centers, and
+    /// the deform mesh — translated by the SAME offset, since its control points are absolute page px and
+    /// an untranslated mesh would warp the copy onto the original's position. Minted FRESH: the `uid`
+    /// (a v4 UUID, so the doc node, its rendered PNG and every uid-keyed table are the copy's own) and
+    /// the `file_name` runtime handle derived from it. NOT carried over: the centering-assist frame, the
+    /// GPU texture (the copy is queued for its own upload) and `original_file_name` (a pre-effects image
+    /// base, meaningless for text).
+    ///
+    /// For a `TextLayoutMode::CustomRasterLines` layer the source's `{stem}_layout.png` sibling — the
+    /// SOLE store of its drawn lines — is copied next to the new handle; a copy failure is logged and the
+    /// duplicate proceeds with an empty layout rather than aborting.
+    ///
+    /// Side effects on the state the source owned, beyond the selection move: an open move session is
+    /// SETTLED first (so a gesture interrupted by the duplicate still lands its write), and when the
+    /// source was the active transform target the vector-transform preview is TORN DOWN
+    /// (`exit_vector_transform_mode`) — `insert_runtime_overlay` clears only `transform_mode_overlay_idx`,
+    /// which would leave `vector_transform_base`/`_drag` pointing at a layer that is no longer selected.
+    ///
+    /// Returns `None` when `overlay_idx` is out of range, does not name a TEXT overlay (image overlays
+    /// and raster layers are not duplicated here), or names a layer whose rendered pixels are missing or
+    /// inconsistent with `size_px` — that last case is LOGGED, because a copy without well-formed pixels
+    /// would get no doc node and could never persist. No `None` path creates, moves or deletes a layer;
+    /// the last two do run the settle above and may memoize the page size, so `None` means "no
+    /// duplicate", not "nothing happened at all".
+    ///
+    /// Persistence is STRUCTURAL and EAGER, exactly like [`Self::remove_overlay`]: the Z placement
+    /// flushes the page to the staging manifest first (see
+    /// [`Self::place_node_directly_above_in_unified_z`], including the pinning side effect it documents),
+    /// and the live state is dispatched through `dispatch_structural_placement_save` instead of being
+    /// deferred to a later flush point.
+    pub(super) fn duplicate_overlay(&mut self, overlay_idx: usize) -> Option<usize> {
+        // TEXT only. An image overlay is a placed PNG whose file lifecycle this path does not own, and a
+        // raster layer is not an overlay at all.
+        let page_idx = self
+            .overlays
+            .get(overlay_idx)
+            .filter(|overlay| overlay.kind == TypingOverlayKind::Text)
+            .map(|overlay| overlay.page_idx)?;
+        // A duplicate taken mid-gesture must land the pending write first: settling consumes the move
+        // session, so the copy is taken from geometry that is already final and the source's own move
+        // is not lost.
+        self.settle_layer_move();
+        // Resolved before the source is borrowed: `page_size_px` takes `&mut self` (it memoizes).
+        let page_size = self.page_size_px(page_idx);
+        let source = self.overlays.get(overlay_idx)?;
+        // Refuse a source whose pixels are not well-formed: `insert_runtime_overlay` builds the doc Text
+        // node ONLY for a consistent image, so the copy would otherwise be a runtime-only orphan with no
+        // node, no Z and no persistence — a layer that vanishes on the next reload. The settle above has
+        // already run by now; that is a write the source owed anyway, not part of the duplication.
+        if source.size_px[0] == 0
+            || source.size_px[1] == 0
+            || source.source_rgba.len() != source.size_px[0] * source.size_px[1] * 4
+        {
+            ms_log::runtime_log::log_warn(format!(
+                "[typing] duplicate layer: the source layer has no usable rendered pixels \
+                 (size={:?}, rgba bytes={}), so nothing was duplicated.",
+                source.size_px,
+                source.source_rgba.len()
+            ));
+            return None;
+        }
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        // The duplicate goes through the CREATE path (`insert_runtime_overlay`), so it takes the create
+        // path's in-session handle shape; the doc still owns the persisted PNG name, keyed on the uid.
+        let file_name = created_overlay_file_name(page_idx, &uid);
+        // Offset DOWN through the shared move math, so the copy obeys the same page bounds a dragged
+        // layer does. A mesh translates RIGIDLY and reports the delta the clamp actually allowed; the
+        // affine center is shifted by that SAME delta so center and mesh stay in step (the runtime center
+        // mirrors the mesh centroid). No pixel snap: this is not a user gesture.
+        let offset = [0.0, DUPLICATE_OVERLAY_OFFSET_PAGE_PX];
+        let (deform_mesh, applied_offset) = match source.deform_mesh.as_ref() {
+            Some(mesh) => {
+                let (moved, applied) = moved_mesh_from_base(mesh, offset, page_size, false);
+                (Some(moved), applied)
+            }
+            None => (None, offset),
+        };
+        let source_uid = source.uid.clone();
+        let source_file_name = source.file_name.clone();
+        let layout_mode = overlay_text_layout_mode(source.render_data_json.as_ref());
+        let decoded = TypingOverlayDecoded {
+            uid: uid.clone(),
+            kind: source.kind,
+            page_idx,
+            center_page_px: moved_center_from_base(
+                source.center_page_px,
+                applied_offset,
+                page_size,
+                false,
+            ),
+            mask_clip_enabled: source.mask_clip_enabled,
+            layer_idx: source.layer_idx,
+            user_scale: source.user_scale,
+            angle_deg: source.angle_deg,
+            deform_mesh,
+            file_name: file_name.clone(),
+            // A text overlay has no pre-effects image base; carrying the source's would make two
+            // runtimes name one file.
+            original_file_name: None,
+            render_data_json: source.render_data_json.clone(),
+            size_px: source.size_px,
+            rgba: source.source_rgba.clone(),
+            // Warnings belong to the RENDER that produced the pixels; nothing was rendered here.
+            warnings: Vec::new(),
+            extra: source.extra.clone(),
+        };
+
+        // `CustomRasterLines` keeps its drawn lines ONLY in the `_layout.png` sibling of the overlay's
+        // runtime handle; every other layout re-derives from `render_data_json`.
+        if layout_mode == TextLayoutMode::CustomRasterLines {
+            self.copy_drawn_lines_layout_image(&source_file_name, &file_name);
+        }
+        // The copy takes the selection, so a transform preview that belonged to the SOURCE must be torn
+        // down rather than left pointing at a layer that is no longer selected (mirrors `remove_overlay`).
+        if self.transform_mode_overlay_idx == Some(overlay_idx) {
+            self.exit_vector_transform_mode();
+        }
+
+        // ONE insertion point: it builds the doc Text node, keeps the load-bearing push-then-`add_node`
+        // ordering, queues the texture upload and selects the copy.
+        self.insert_runtime_overlay(decoded);
+        // `insert_runtime_overlay` appends and `sync_from_doc` never reorders or drops runtimes, so the
+        // copy is the last entry carrying this uid. Resolved by uid rather than assumed, because the
+        // index is this function's return value.
+        let Some(new_idx) = self.overlays.iter().rposition(|overlay| overlay.uid == uid) else {
+            ms_log::runtime_log::log_warn(
+                "[typing] duplicate layer: the inserted copy could not be found in the overlay list",
+            );
+            return None;
+        };
+
+        // ONE selection at a time across the two layer kinds: the copy takes it, so the raster-side
+        // selection fields are cleared with it (`clear_selection`'s invariant). `insert_runtime_overlay`
+        // already cleared `transform_mode_overlay_idx` and `drag_state`.
+        self.selected_overlay_idx = Some(new_idx);
+        self.drag_has_changes = false;
+        self.selected_raster_idx = None;
+        self.selected_raster_page = None;
+        self.transform_mode_raster_idx = None;
+
+        self.place_node_directly_above_in_unified_z(page_idx, &source_uid, &uid);
+
+        ms_log::trace_log!(
+            cat::TYPING,
+            "duplicate_overlay src_idx={} new_idx={} uid={} page={}",
+            overlay_idx,
+            new_idx,
+            uid,
+            page_idx
+        );
+        // STRUCTURAL — stays EAGER, deliberately NOT deferred, for the same reason as `remove_overlay`:
+        // a new layer's durability must not depend on a later flush point being reached.
+        self.dispatch_structural_placement_save("overlay duplicate");
+        Some(new_idx)
+    }
+
+    /// Copies the `CustomRasterLines` `{stem}_layout.png` sibling of `source_file_name`'s handle to
+    /// `target_file_name`'s, so a duplicated layer owns its own copy of the ONLY store of its drawn
+    /// lines.
+    ///
+    /// Reads from the staging dir first, then the committed fallback, and always writes into the staging
+    /// dir. A missing source is NOT an error (the user has drawn no line yet; the renderer creates a
+    /// blank layout on demand). A failed copy is LOGGED with both paths and the cause, and the caller
+    /// continues — losing the drawn lines of one copy must not abort the duplication.
+    fn copy_drawn_lines_layout_image(&self, source_file_name: &str, target_file_name: &str) {
+        let Some(save_dir) = self.text_images_save_dir.as_ref() else {
+            return;
+        };
+        let source_name = layout_image_file_name_for_overlay(source_file_name);
+        let Some(source_path) = [Some(save_dir), self.text_images_fallback_dir.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join(&source_name))
+            .find(|path| path.is_file())
+        else {
+            return;
+        };
+        let target_path = save_dir.join(layout_image_file_name_for_overlay(target_file_name));
+        if let Err(err) = fs::copy(&source_path, &target_path) {
+            ms_log::runtime_log::log_warn(format!(
+                "[typing] duplicate layer: could not copy the drawn-lines layout image.\nFrom: {}\nTo: {}\nError: {err}",
+                source_path.display(),
+                target_path.display()
+            ));
+        }
     }
 
     /// Removes a raster layer from the current page: drops the doc node (the source of truth), removes
@@ -952,9 +1158,17 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Flushes the doc page's RASTER nodes to disk (whole-page `save_page_rasters`), used after a
-    /// raster mask-clip toggle (routed through the doc) so the flag survives a reload / save-to-project.
-    /// `save_page_rasters` carries each raster's `mask_clip`. No-op if the doc/page is not resident.
+    /// Flushes the doc page to disk (whole-page `save_page_rasters` + the doc's text write), used after a
+    /// raster mask-clip toggle (routed through the doc) so the flag survives a reload / save-to-project,
+    /// and as the pre-flush of the two band-order writers. `save_page_rasters` carries each raster's
+    /// `mask_clip`. No-op if the doc/page is not resident.
+    ///
+    /// The page's live text geometry is reconciled into the doc first, for the same reason
+    /// `route_to_doc_reporting` does it (`reconcile_page_text_geometry_into_doc`): this writes the DOC to
+    /// disk, so without it a settled-but-unsaved drag would be overwritten on disk by the stale node —
+    /// and this path does NOT go through the doc funnel, so the funnel cannot cover it. No version bump:
+    /// the reconcile only makes the doc agree with the projection callers already see, so there is
+    /// nothing for anyone to re-project.
     pub(super) fn persist_current_page_rasters(&mut self, page_idx: usize) {
         let Some(primary) = self.layers_primary_dir.clone() else {
             return;
@@ -966,6 +1180,7 @@ impl TypingTextOverlayLayer {
         let Ok(mut guard) = doc.lock() else {
             return;
         };
+        doc_layers::reconcile_page_text_geometry_into_doc(&self.overlays, page_idx, &mut guard);
         if let Err(err) = guard.flush_page(page_idx, &primary, fallback.as_deref()) {
             ms_log::runtime_log::log_warn(format!("[typing] persist raster mask-clip: {err}"));
         }

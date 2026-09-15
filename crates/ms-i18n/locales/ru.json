@@ -4486,6 +4486,7 @@
   "typing.context_menu.delete_layer": "Удалить слой",
   "typing.context_menu.delete_overlay": "Удалить оверлей",
   "typing.context_menu.disable_mask_clip": "Выключить обрезание маской",
+  "typing.context_menu.duplicate_overlay": "Дублировать слой",
   "typing.context_menu.enable_mask_clip": "Включить обрезание маской",
   "typing.context_menu.enter_layout_edit_mode": "Войти в режим изменения раскладки",
   "typing.context_menu.enter_transform_mode": "Войти в режим трансформации",

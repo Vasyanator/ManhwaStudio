@@ -4308,6 +4308,7 @@
   "typing.context_menu.delete_layer": "Excluir camada",
   "typing.context_menu.delete_overlay": "Excluir sobreposição",
   "typing.context_menu.disable_mask_clip": "Desativar recorte por máscara",
+  "typing.context_menu.duplicate_overlay": "Duplicar camada",
   "typing.context_menu.enable_mask_clip": "Ativar recorte por máscara",
   "typing.context_menu.enter_layout_edit_mode": "Entrar no modo de edição de disposição",
   "typing.context_menu.enter_transform_mode": "Entrar no modo de transformação",

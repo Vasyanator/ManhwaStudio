@@ -4308,6 +4308,7 @@
   "typing.context_menu.delete_layer": "Supprimer le calque",
   "typing.context_menu.delete_overlay": "Supprimer le calque de superposition",
   "typing.context_menu.disable_mask_clip": "Désactiver le rognage par masque",
+  "typing.context_menu.duplicate_overlay": "Dupliquer le calque",
   "typing.context_menu.enable_mask_clip": "Activer le rognage par masque",
   "typing.context_menu.enter_layout_edit_mode": "Entrer en mode d'édition de la disposition",
   "typing.context_menu.enter_transform_mode": "Entrer en mode transformation",

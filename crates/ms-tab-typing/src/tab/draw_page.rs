@@ -11,6 +11,11 @@ on-screen visibility clamping.
 A layer NEVER changes page by being dragged: a drag clamps at the page's overlay
 bound (`clamp_page_point`) and the layer keeps its `page_idx`.
 
+A structural change requested during the draw (delete / duplicate) is RECORDED in a
+local and applied as the LAST statement of `draw_page_overlays`, after the unified
+fill pass. Returning early instead skips that pass and paints an empty page for one
+frame. See `MODULE_README.md`, "applied after the paint pass".
+
 `draw_page_overlays` takes the per-page `PageView` transform (from `mesh_geometry`)
 and a `TypingPageInteractionPolicy` snapshot (built in the canvas hook); its `ctx`
 comes from `ui.ctx()`.
@@ -359,9 +364,23 @@ impl TypingTextOverlayLayer {
             z(a.idx).cmp(&z(b.idx))
         });
 
+        // A structural change (delete / duplicate) requested by this frame's interaction. It is
+        // RECORDED here and APPLIED as the very last thing this function does — see the comment at the
+        // apply site. Returning early instead (which is what these arms used to do) skipped the fill
+        // pass below, so the page painted no text AND no raster layers for one frame: the "everything
+        // blinks out on delete/duplicate" the user reported. Creation never blinked because it lands in
+        // `poll_create_overlay_jobs` at frame start, outside the draw.
+        #[derive(Debug, Clone, Copy)]
+        enum PendingStructuralChange {
+            Delete(usize),
+            Duplicate(usize),
+        }
+        let mut pending_structural: Option<PendingStructuralChange> = None;
+
         if !draw_entries.is_empty() && !mask_panel_open && !layout_editor_active {
             let mut clicked_overlay_idx: Option<usize> = None;
             let mut pending_delete_overlay_idx: Option<usize> = None;
+            let mut pending_duplicate_overlay_idx: Option<usize> = None;
             let mut pending_enter_layout_editor_idx: Option<usize> = None;
             let popup_open_before = ui.ctx().any_popup_open();
             // Sticky-фокус: если клик пришёлся внутрь рамки уже выделенного оверлея,
@@ -818,6 +837,20 @@ impl TypingTextOverlayLayer {
                         }
                     }
                     menu_ui.separator();
+                    // Duplication is TEXT-only: an image overlay is a placed PNG whose file lifecycle
+                    // `duplicate_overlay` does not own, so the item is HIDDEN for it rather than shown
+                    // disabled. The `&&` short-circuits, so the button is not added at all.
+                    if self
+                        .overlays
+                        .get(entry.idx)
+                        .is_some_and(|overlay| overlay.kind == TypingOverlayKind::Text)
+                        && menu_ui
+                            .button(t!("typing.context_menu.duplicate_overlay"))
+                            .clicked()
+                    {
+                        pending_duplicate_overlay_idx = Some(entry.idx);
+                        menu_ui.close();
+                    }
                     if menu_ui.button(t!("typing.context_menu.delete_overlay")).clicked() {
                         pending_delete_overlay_idx = Some(entry.idx);
                         menu_ui.close();
@@ -1340,79 +1373,109 @@ impl TypingTextOverlayLayer {
             }
 
             if let Some(delete_idx) = pending_delete_overlay_idx {
-                self.remove_overlay(delete_idx);
-                return Vec::new();
+                pending_structural = Some(PendingStructuralChange::Delete(delete_idx));
+            } else if let Some(duplicate_idx) = pending_duplicate_overlay_idx {
+                pending_structural = Some(PendingStructuralChange::Duplicate(duplicate_idx));
             }
-            if let Some(editor_idx) = pending_enter_layout_editor_idx {
-                self.begin_layout_editor_for_overlay(editor_idx, view);
-                ctx.request_repaint();
-            }
-            let popup_open_after = ui.ctx().any_popup_open();
-            let popup_open = popup_open_before || popup_open_after;
-            let delete_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
-            if delete_pressed
-                && !ui.ctx().egui_wants_keyboard_input()
-                && let Some(selected_idx) = self.selected_overlay_idx
-                && self
-                    .overlays
-                    .get(selected_idx)
-                    .is_some_and(|overlay| overlay.page_idx == page_idx)
-            {
-                self.remove_overlay(selected_idx);
-                return Vec::new();
-            }
+            // Everything below reads or mutates state by overlay INDEX, and a recorded structural change
+            // is about to shift those indices — which is the job the early `return` used to do. It is the
+            // only part of the frame that must be skipped; the painting below must NOT be.
+            if pending_structural.is_none() {
+                if let Some(editor_idx) = pending_enter_layout_editor_idx {
+                    self.begin_layout_editor_for_overlay(editor_idx, view);
+                    ctx.request_repaint();
+                }
+                let popup_open_after = ui.ctx().any_popup_open();
+                let popup_open = popup_open_before || popup_open_after;
+                let delete_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
+                if delete_pressed
+                    && !ui.ctx().egui_wants_keyboard_input()
+                    && let Some(selected_idx) = self.selected_overlay_idx
+                    && self
+                        .overlays
+                        .get(selected_idx)
+                        .is_some_and(|overlay| overlay.page_idx == page_idx)
+                {
+                    pending_structural = Some(PendingStructuralChange::Delete(selected_idx));
+                }
 
-            let clicked_on_image_without_overlay = ui.input(|i| {
-                i.pointer.primary_clicked()
-                    && i.pointer
-                        .interact_pos()
-                        .is_some_and(|pos| image_rect.contains(pos))
-                    && clicked_overlay_idx.is_none()
-            }) && !popup_open
-                && !ms_widgets::input_util::pointer_over_floating_area(ui.ctx())
-                && !eyedropper_blocks_focus_clear;
-            if clicked_on_image_without_overlay {
-                if self
-                    .selected_overlay_idx
-                    .and_then(|idx| self.overlays.get(idx))
-                    .is_some_and(|overlay| overlay.page_idx == page_idx)
+                // Ctrl/Cmd+D duplicates the selected TEXT layer of THIS page. The guards are evaluated
+                // BEFORE the consume (short-circuit), so a press that this page cannot act on stays in the
+                // event queue for whoever else may want it; a press we do act on is consumed so it cannot
+                // fire twice across simultaneously visible pages.
+                let can_duplicate = pending_structural.is_none()
+                    && !ui.ctx().egui_wants_keyboard_input()
+                    && !panel_text_input_focused
+                    && self.selected_overlay_idx.is_some_and(|selected_idx| {
+                        self.overlays.get(selected_idx).is_some_and(|overlay| {
+                            overlay.page_idx == page_idx && overlay.kind == TypingOverlayKind::Text
+                        })
+                    });
+                let duplicate_pressed = ui.ctx().input_mut(|input| {
+                    can_duplicate && input.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
+                });
+                if duplicate_pressed
+                    && let Some(selected_idx) = self.selected_overlay_idx
                 {
-                    if let Some(selected_idx) = self.selected_overlay_idx
-                        && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
+                    pending_structural = Some(PendingStructuralChange::Duplicate(selected_idx));
+                }
+
+                let clicked_on_image_without_overlay = ui.input(|i| {
+                    i.pointer.primary_clicked()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|pos| image_rect.contains(pos))
+                        && clicked_overlay_idx.is_none()
+                }) && !popup_open
+                    && !ms_widgets::input_util::pointer_over_floating_area(ui.ctx())
+                    && !eyedropper_blocks_focus_clear;
+                // Re-tested here, not only at the top of the block: the Delete/Ctrl+D arms above may have
+                // recorded a change since, and this arm mutates the selection and the selected layer's
+                // geometry by index.
+                if clicked_on_image_without_overlay && pending_structural.is_none() {
+                    if self
+                        .selected_overlay_idx
+                        .and_then(|idx| self.overlays.get(idx))
+                        .is_some_and(|overlay| overlay.page_idx == page_idx)
                     {
-                        snap_overlay_center_to_pixels_if_enabled(
-                            self.overlays
-                                .get_mut(selected_idx)
-                                .expect("selected overlay exists after visibility enforcement"),
-                            strict_pixel_movement,
-                            page_size_from_image_rect(image_rect, zoom),
-                        );
-                        self.mark_overlay_geometry_changed(selected_idx, false);
-                        // EDIT (clamp on click-away). The deselect immediately below is itself a focus
-                        // loss, so `flush_edit_save_on_selection_change` writes this on the same frame.
-                        self.mark_placement_save_dirty();
+                        if let Some(selected_idx) = self.selected_overlay_idx
+                            && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
+                        {
+                            snap_overlay_center_to_pixels_if_enabled(
+                                self.overlays
+                                    .get_mut(selected_idx)
+                                    .expect("selected overlay exists after visibility enforcement"),
+                                strict_pixel_movement,
+                                page_size_from_image_rect(image_rect, zoom),
+                            );
+                            self.mark_overlay_geometry_changed(selected_idx, false);
+                            // EDIT (clamp on click-away). The deselect immediately below is itself a focus
+                            // loss, so `flush_edit_save_on_selection_change` writes this on the same frame.
+                            self.mark_placement_save_dirty();
+                        }
+                        if self.transform_mode_overlay_idx == self.selected_overlay_idx {
+                            self.transform_mode_overlay_idx = None;
+                        }
+                        self.selected_overlay_idx = None;
                     }
-                    if self.transform_mode_overlay_idx == self.selected_overlay_idx {
-                        self.transform_mode_overlay_idx = None;
+                    if self
+                        .drag_state
+                        .as_ref()
+                        .is_some_and(|state| state.page_idx == page_idx)
+                    {
+                        self.drag_state = None;
+                        self.drag_has_changes = false;
                     }
-                    self.selected_overlay_idx = None;
                 }
                 if self
-                    .drag_state
-                    .as_ref()
-                    .is_some_and(|state| state.page_idx == page_idx)
+                    .transform_mode_overlay_idx
+                    .is_some_and(|idx| self.selected_overlay_idx != Some(idx))
+                    && !popup_open
+                    && pending_structural.is_none()
                 {
-                    self.drag_state = None;
-                    self.drag_has_changes = false;
+                    self.transform_mode_overlay_idx = None;
                 }
-            }
-            if self
-                .transform_mode_overlay_idx
-                .is_some_and(|idx| self.selected_overlay_idx != Some(idx))
-                && !popup_open
-            {
-                self.transform_mode_overlay_idx = None;
-            }
+            } // end: skipped while a structural change is pending
         }
 
         // Unified-Z fill pass: interleave the read-only PS raster quads with the text/image overlay
@@ -1610,13 +1673,33 @@ impl TypingTextOverlayLayer {
             );
         }
         self.draw_auto_typing_debug_visuals(&painter, page_idx, image_rect, auto_typing_settings);
-        if !mask_panel_open && !layout_editor_active {
+        // Raster interaction is SKIPPED while a structural change is pending, exactly as the old early
+        // return skipped it: it selects and moves rasters by index against a page whose layer set is
+        // about to change, and it would also steal the click that requested the change.
+        if !mask_panel_open && !layout_editor_active && pending_structural.is_none() {
             self.interact_page_rasters(ui, view, &painter, strict_pixel_movement);
         }
-        draw_entries
+        // Occluders are built from the PRE-change entries — the set this frame actually painted, which is
+        // what the bubble-hiding rules must agree with.
+        let occluders: Vec<[Pos2; 4]> = draw_entries
             .into_iter()
             .flat_map(|entry| entry.occluder_quads.into_iter())
-            .collect()
+            .collect();
+        // THE LAST STATEMENT, deliberately: `draw_entries` is consumed above, so no `entry.idx` can
+        // survive into the shifted overlay list, and the whole frame has already been painted from the
+        // pre-change state. The change therefore becomes visible one frame later instead of blanking
+        // this one; durability is unaffected (both paths still dispatch their eager structural save).
+        if let Some(change) = pending_structural {
+            match change {
+                PendingStructuralChange::Delete(idx) => self.remove_overlay(idx),
+                PendingStructuralChange::Duplicate(idx) => {
+                    self.duplicate_overlay(idx);
+                }
+            }
+            // egui draws nothing while idle, so ask for the frame that shows the result.
+            ctx.request_repaint();
+        }
+        occluders
     }
 
     pub(super) fn wants_repaint(&self) -> bool {

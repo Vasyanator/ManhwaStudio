@@ -4,7 +4,8 @@ File: tab/doc_layers.rs
 Purpose:
 Unified layer-document integration for the typing tab: projecting the shared
 `LayerDoc` into this tab's per-page runtime state and routing edits back to it.
-Covers band-Z reordering (text + raster interleaved), page-size resolution,
+Covers band-Z reordering (text + raster interleaved, one-step moves as well as the
+absolute "directly above this node" placement a duplicate needs), page-size resolution,
 raster-layer loading, doc<->tab sync/route helpers, single-raster drawing, unified
 hit-testing, per-frame canvas bookkeeping, layout-editor state queries, and the
 GPU-cache snapshot/eviction methods on `TypingTextOverlayLayer`.
@@ -181,8 +182,28 @@ impl TypingTextOverlayLayer {
         }
         order.swap(i, j);
 
-        // Persist the new band order (pin + Z) to disk — the authority both tabs read back.
-        match persist::save_page_band_order(&primary, page_idx, &order) {
+        self.persist_unified_band_order(page_idx, &primary, &order, uid);
+    }
+
+    /// Persists `order` (bottom-to-top) as the page's unified band order and mirrors it into every place
+    /// this tab reads Z from. The shared tail of the band-order writers.
+    ///
+    /// `persist::save_page_band_order` writes pin + Z into `layers.json` — the disk authority both tabs
+    /// read back. On success the cached bands for `page_idx` are dropped so the next projection reloads
+    /// the new pinned-band order, and the SAME order is mirrored into the shared doc via `set_z_order`,
+    /// so the doc (and, through its version bump, the PS tab) re-projects without a disk round-trip. When
+    /// no doc is wired or the page is not resident, the cached rasters are dropped too so they reload
+    /// from disk instead. A write failure is logged and leaves both the disk order and the projections
+    /// untouched. `uid` names the node the reorder was about and only feeds the trace log.
+    fn persist_unified_band_order(
+        &mut self,
+        page_idx: usize,
+        primary: &Path,
+        order: &[ms_models::layer_model::persist::BandRef],
+        uid: &str,
+    ) {
+        use ms_models::layer_model::persist;
+        match persist::save_page_band_order(primary, page_idx, order) {
             Ok(()) => {
                 // Drop the cached bands so the next projection reloads the new pinned-band order.
                 self.bands_by_page.remove(&page_idx);
@@ -216,6 +237,86 @@ impl TypingTextOverlayLayer {
                 "не удалось изменить порядок слоя в общем Z: {e}"
             )),
         }
+    }
+
+    /// Moves the node `uid` so it sits DIRECTLY ABOVE `anchor_uid` in the page's unified band-Z order,
+    /// leaving every other band's relative order untouched. Used by layer duplication, where the copy is
+    /// added on TOP of the stack and must drop back to just above its source.
+    ///
+    /// The WHOLE page — rasters AND text — is flushed to the staging manifest first
+    /// ([`Self::persist_current_page_rasters`], i.e. the doc's `flush_page`), and that is load-bearing
+    /// for BOTH kinds: `persist::apply_band_order` resolves every band against the ON-DISK node list and
+    /// silently leaves a node it cannot find at its stale `z`. The order written here is the FLATTENED
+    /// page, so it renumbers rasters as well as text; flushing only the text would renumber the text
+    /// around rasters whose `z` never moved, desyncing the two on disk (correct on canvas via the doc
+    /// mirror, snapped back on the next reload). Same pre-flush, same reason, as
+    /// [`Self::move_node_in_unified_z`].
+    ///
+    /// **Pinning side effect** (shared with the ▲▼ reorder, and NOT specific to this helper):
+    /// `apply_band_order` unpins every text node on the page and re-pins only the ones the order lists,
+    /// so writing a band order PINS all of that page's text at explicit Zs and dissolves any remaining
+    /// legacy text-group auto-ordering on it. For ▲▼ that is the user's explicit request; here it rides
+    /// along with a duplicate, which is not — it is accepted because text is fully-manual
+    /// pinned-with-explicit-Z anyway (`write_page_text_payload` forces `pinned` on every write), so the
+    /// visual order is unchanged either way.
+    ///
+    /// **GUI thread**: the pre-flush is SYNCHRONOUS on the GUI thread. That is deliberate, not an
+    /// oversight — it is the identical write the «Порядок ▲▼» menu action already performs (and that one
+    /// re-encodes raster PNGs, strictly heavier), on the same kind of one-shot explicit user action.
+    /// Deferring it would invert the documented contract that the on-disk band order is the authority
+    /// both tabs read back: the order would be written against a manifest that does not yet contain the
+    /// node it is ordering.
+    ///
+    /// A no-op when no staging dir is wired (logged — the copy then keeps the top of the stack), when
+    /// either uid has no band on the page, or when the node already sits directly above the anchor —
+    /// which is exactly the case of an anchor that was itself the topmost band.
+    pub(super) fn place_node_directly_above_in_unified_z(
+        &mut self,
+        page_idx: usize,
+        anchor_uid: &str,
+        uid: &str,
+    ) {
+        use ms_models::layer_model::persist;
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            ms_log::runtime_log::log_warn(
+                "[typing] layer order: no staging layers dir is wired, so the new layer keeps the top \
+                 of the layer stack instead of dropping to just above its source.",
+            );
+            return;
+        };
+        // See the doc comment: EVERY node this order names — the new text node included — must already
+        // exist in the manifest, or `apply_band_order` leaves it at its stale z. `flush_page` writes both
+        // rasters and text, which is exactly the set `flatten_page_bands_to_refs` emits bands for.
+        self.persist_current_page_rasters(page_idx);
+
+        let mut order = self.flatten_page_bands_to_refs(page_idx);
+        let position = |order: &[persist::BandRef], want: &str| {
+            order.iter().position(|band| {
+                matches!(
+                    band,
+                    persist::BandRef::PinnedText(u) | persist::BandRef::Raster(u) if u == want
+                )
+            })
+        };
+        let (Some(from), Some(anchor)) = (position(&order, uid), position(&order, anchor_uid)) else {
+            ms_log::trace_log!(
+                cat::TYPING,
+                "place_node_directly_above_in_unified_z page={} uid={} anchor={} -> band(s) missing",
+                page_idx,
+                uid,
+                anchor_uid
+            );
+            return;
+        };
+        // Target index AFTER the node itself is taken out of the order: removing it shifts every later
+        // band down by one, so an anchor above the node lands at `anchor - 1` and one below stays put.
+        let to = if from < anchor { anchor } else { anchor + 1 };
+        if from == to {
+            return; // already directly above the anchor
+        }
+        let band = order.remove(from);
+        order.insert(to, band);
+        self.persist_unified_band_order(page_idx, &primary, &order, uid);
     }
 
     /// Once-per-frame check: if the shared `LayerDoc` changed since we last projected (its `version`
@@ -783,7 +884,8 @@ impl TypingTextOverlayLayer {
     /// no-op edit as changed costs a whole-page re-projection plus a redundant rewrite of
     /// `layers.json` on the next flush.
     ///
-    /// Returns `true` only when the doc was wired, the page resident, AND `edit` reported a change.
+    /// Returns `true` when the doc was wired, the page resident, AND either `edit` reported a change or
+    /// the pre-edit geometry reconcile below found live geometry the doc did not have.
     pub(super) fn route_to_doc_reporting<F>(&mut self, page_idx: usize, edit: F) -> bool
     where
         F: FnOnce(&mut ms_models::layer_model::layer_doc::LayerDoc) -> bool,
@@ -798,7 +900,13 @@ impl TypingTextOverlayLayer {
             // The page is not resident in the doc; let the caller fall back to its legacy path.
             return false;
         }
-        if !edit(&mut guard) {
+        // INVARIANT (see `reconcile_page_text_geometry_into_doc`): no re-projection may run while a
+        // runtime holds text geometry the doc does not have. This is the single funnel every structural
+        // doc edit passes through, so reconciling HERE closes the whole class at once instead of once
+        // per caller.
+        let geometry_reconciled =
+            reconcile_page_text_geometry_into_doc(&self.overlays, page_idx, &mut guard);
+        if !edit(&mut guard) && !geometry_reconciled {
             return false;
         }
         // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
@@ -1390,4 +1498,72 @@ impl TypingTextOverlayLayer {
         }
         true
     }
+}
+
+/// Pushes every runtime's LIVE text geometry (affine transform + deform grid) for `page_idx` into the
+/// matching doc Text node, and reports whether anything actually differed. Pure w.r.t. the tab: it takes
+/// the runtimes by reference and the already-locked document, so it can run inside the doc funnel
+/// without re-locking or recursing (unlike `sync_overlay_state_into_doc`, which routes per page).
+///
+/// **The invariant it exists to hold: no `sync_from_doc` may run while a runtime holds text geometry the
+/// doc does not have.** A settled text drag lives ONLY in the runtime — `settle_layer_move`'s overlay
+/// branch deliberately marks the placement save dirty and writes nothing to the doc, because a doc write
+/// per gesture would cost a whole-page re-projection. Any structural edit routed to the doc before that
+/// deferred save lands re-projects the page and overwrites `center_page_px` / `angle_deg` / `user_scale` /
+/// `deform_mesh` from the STALE node, silently undoing the drag — and the eager structural save that
+/// follows then makes the revert durable. Reconciling first makes the re-projection write back exactly
+/// what it read.
+///
+/// Only fields `sync_from_doc`'s reconcile branch overwrites are pushed. `mask_clip`, `layer_idx` and the
+/// centering frame are NOT: that branch leaves them alone on an existing runtime, and
+/// `sync_overlay_state_into_doc` remains their owner at save time.
+///
+/// Comparison is EXACT (`!=` on the raw `f32`s): the question is not "are these nearly equal" but "does
+/// the doc hold precisely what the projection would write back". Non-finite geometry therefore reports a
+/// change on every call; that is pathological state, not a supported one.
+pub(super) fn reconcile_page_text_geometry_into_doc(
+    overlays: &[TypingOverlayRuntime],
+    page_idx: usize,
+    doc: &mut ms_models::layer_model::layer_doc::LayerDoc,
+) -> bool {
+    use ms_models::layer_model::layer_doc::NodeBody;
+    let mut changed = false;
+    for overlay in overlays.iter().filter(|o| o.page_idx == page_idx) {
+        let transform = overlay.transform_rec();
+        let deform = overlay.deform_mesh.as_ref().map(|mesh| {
+            ms_models::layer_model::manifest::DeformRec {
+                cols: mesh.cols,
+                rows: mesh.rows,
+                points_px: mesh.points_px.clone(),
+            }
+        });
+        // A runtime with no node (an image overlay created in-session, or one that outlived its node)
+        // is not projected from the doc either, so it has nothing to reconcile.
+        let Some(node) = doc.node_mut(page_idx, &overlay.uid) else {
+            continue;
+        };
+        if !matches!(node.body, NodeBody::Text { .. }) {
+            continue;
+        }
+        if node.transform.cx != transform.cx
+            || node.transform.cy != transform.cy
+            || node.transform.rotation != transform.rotation
+            || node.transform.scale != transform.scale
+        {
+            node.transform = transform;
+            changed = true;
+        }
+        let deform_differs = match (node.deform.as_ref(), deform.as_ref()) {
+            (None, None) => false,
+            (Some(a), Some(b)) => {
+                a.cols != b.cols || a.rows != b.rows || a.points_px != b.points_px
+            }
+            _ => true,
+        };
+        if deform_differs {
+            node.deform = deform;
+            changed = true;
+        }
+    }
+    changed
 }

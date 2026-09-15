@@ -1045,6 +1045,615 @@ fn real_interleave_doc_text_survives_empty_loader_completion() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Best-effort cleanup of a duplication-test fixture dir, with the one failure that is EXPECTED
+/// tolerated and everything else reported.
+///
+/// `duplicate_overlay` ends in `dispatch_structural_placement_save`, which spawns a DETACHED save
+/// worker; that worker may still be writing into this dir when the test returns, so a removal here can
+/// legitimately race it. Correctness does not depend on this call at all — it is the fixture's PRE-wipe
+/// (`layer_with_doc_text_nodes`) that guarantees a clean manifest, and that one panics on failure. A
+/// failure here is therefore only temp-dir hygiene, and is logged rather than failing a passing test.
+fn remove_fixture_dir(dir: &std::path::Path) {
+    if let Err(err) = std::fs::remove_dir_all(dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("test cleanup: could not remove {}: {err}", dir.display());
+    }
+}
+
+/// Wires a layer whose text persistence is live (staging dir + shared doc + known page size) and seeds
+/// one doc text node per entry of `uids` on page 0, bottom-to-top in the order given. `dir` is the
+/// caller-owned staging dir, wiped here before seeding. Returns the layer and the shared doc handle.
+///
+/// The duplication tests need a REAL doc (the copy IS a doc node) and a REAL dir (the band order is
+/// written to disk, the authority both tabs read back), so they cannot run against a bare default.
+fn layer_with_doc_text_nodes(dir: &std::path::Path, uids: &[&str]) -> (TypingTextOverlayLayer, Arc<Mutex<ms_models::layer_model::layer_doc::LayerDoc>>) {
+    use ms_models::layer_model::layer_doc::LayerDoc;
+    use ms_models::layer_model::persist;
+
+    // The wipe is load-bearing and its failure must NOT be swallowed: `write_page_text_payload` MERGES
+    // into whatever manifest it finds, so a leftover `layers.json` from an earlier run of this test
+    // would decide the band-order assertions instead of the seed below.
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!(
+            "the fixture dir {} must be wiped before seeding, else a stale manifest decides the result: {err}",
+            dir.display()
+        ),
+    }
+    std::fs::create_dir_all(dir).unwrap();
+    let payloads: Vec<persist::TextPayloadOut> = uids
+        .iter()
+        .enumerate()
+        .map(|(i, uid)| {
+            let img = ColorImage::filled([4, 3], Color32::GREEN);
+            let file = persist::write_text_image(dir, 0, uid, &img).unwrap();
+            persist::TextPayloadOut {
+                uid: (*uid).into(),
+                name: (*uid).into(),
+                z: u32::try_from(i).unwrap(),
+                layer_idx: 0,
+                pinned: true,
+                visible: true,
+                opacity: 1.0,
+                group_uid: None,
+                pinned_by_group: false,
+                payload_uid: (*uid).into(),
+                render_data: json!({ "text": *uid }),
+                is_image: false,
+                transform: ms_models::layer_model::manifest::TransformRec {
+                    cx: 10.0,
+                    cy: 20.0 + 10.0 * i as f32,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                deform: None,
+                rendered_file: Some(file),
+                mask_clip: None,
+                text_centers: None,
+                centering_frame: None,
+            }
+        })
+        .collect();
+    persist::write_page_text_payload(dir, None, 0, &payloads).unwrap();
+
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, dir, None, None, &page_sizes).unwrap();
+
+    let mut layer = TypingTextOverlayLayer {
+        layers_primary_dir: Some(dir.to_path_buf()),
+        text_images_save_dir: Some(dir.to_path_buf()),
+        // Without a seeded page size, `page_size_px` falls back to [1, 1] and the page clamp would
+        // collapse every offset to sub-pixel — the duplication offset would be untestable.
+        page_sizes_px: page_sizes.clone(),
+        ..Default::default()
+    };
+    layer.sync_from_doc(0, &doc);
+    let doc = Arc::new(Mutex::new(doc));
+    layer.set_layer_doc(doc.clone());
+    (layer, doc)
+}
+
+#[test]
+fn duplicating_a_text_layer_appends_a_fresh_copy_below_and_selects_it() {
+    // Contract: the copy is APPENDED (the overlay vector is append-only), carries a FRESH uid and
+    // file_name (a shared uid would make `sync_from_doc` reconcile two runtimes onto one doc node, and a
+    // shared file_name would make both write the same `_layout.png`), is offset DOWNWARD on the page,
+    // leaves the source untouched, and takes the selection.
+    let dir = std::env::temp_dir().join(format!("typ_dup_basic_{}", std::process::id()));
+    let (mut layer, _doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+    assert_eq!(layer.overlays.len(), 1);
+    let source_center = layer.overlays[0].center_page_px;
+    let source_uid = layer.overlays[0].uid.clone();
+    let source_file = layer.overlays[0].file_name.clone();
+
+    let new_idx = layer
+        .duplicate_overlay(0)
+        .expect("a text overlay duplicates");
+
+    assert_eq!(new_idx, 1, "the copy is APPENDED, never inserted in the middle");
+    assert_eq!(layer.overlays.len(), 2);
+    assert_eq!(layer.overlays[0].uid, source_uid, "the source keeps its identity");
+    assert_eq!(
+        layer.overlays[0].center_page_px, source_center,
+        "the source is not moved by the duplication"
+    );
+    let copy = &layer.overlays[new_idx];
+    assert_ne!(copy.uid, source_uid, "the copy mints its own uid");
+    assert_ne!(copy.file_name, source_file, "and its own runtime file handle");
+    assert!(copy.file_name.contains(&copy.uid), "the handle is derived from that uid");
+    assert_eq!(
+        copy.center_page_px,
+        [source_center[0], source_center[1] + selection_rasters::DUPLICATE_OVERLAY_OFFSET_PAGE_PX],
+        "the copy sits one offset DOWN the page, so it is visible instead of hidden behind the source"
+    );
+    assert_eq!(copy.size_px, layer.overlays[0].size_px);
+    assert_eq!(copy.source_rgba, layer.overlays[0].source_rgba, "the pixels are copied verbatim");
+    assert!(copy.texture.is_none() && copy.display_texture_stale, "the copy owns no GPU texture yet");
+    assert_eq!(
+        layer.selected_overlay_idx,
+        Some(new_idx),
+        "the copy becomes the selected layer INSTEAD of the source"
+    );
+    assert_eq!(layer.selected_raster_idx, None);
+    assert_eq!(layer.selected_raster_page, None);
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn a_duplicate_lands_directly_above_its_source_in_the_unified_z_order() {
+    // The copy is added on TOP of the stack by `add_node`, so it must be moved back down to sit directly
+    // above its source — and the move must survive the manifest, which means the copy's node has to be
+    // flushed to disk BEFORE the band order is written (`apply_band_order` silently skips an unknown uid).
+    let dir = std::env::temp_dir().join(format!("typ_dup_z_{}", std::process::id()));
+    // Seeded bottom-to-top: "ta" under "tb".
+    let (mut layer, _doc) = layer_with_doc_text_nodes(&dir, &["ta", "tb"]);
+    assert_eq!(layer.overlays.len(), 2);
+
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+    let copy_uid = layer.overlays[new_idx].uid.clone();
+
+    let z_ta = layer.overlay_band_z(0, "ta", 0);
+    let z_tb = layer.overlay_band_z(0, "tb", 0);
+    let z_copy = layer.overlay_band_z(0, &copy_uid, 0);
+    assert!(
+        z_ta < z_copy && z_copy < z_tb,
+        "the copy sits DIRECTLY above its source, not on top of the whole stack (ta={z_ta}, copy={z_copy}, tb={z_tb})"
+    );
+
+    // The same order reached the disk authority both tabs read back.
+    let order = ms_models::layer_model::persist::load_page_bands(&dir, None, 0);
+    let uids: Vec<String> = {
+        let mut bands: Vec<&ms_models::layer_model::ordering::Band> = order.iter().collect();
+        bands.sort_by_key(|b| b.z());
+        bands
+            .iter()
+            .filter_map(|b| match b {
+                ms_models::layer_model::ordering::Band::PinnedText { uid, .. } => Some(uid.clone()),
+                ms_models::layer_model::ordering::Band::Raster { uid, .. } => Some(uid.clone()),
+                ms_models::layer_model::ordering::Band::TextGroup { .. } => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        uids,
+        vec!["ta".to_string(), copy_uid, "tb".to_string()],
+        "the persisted band order carries the copy between its source and the layer above"
+    );
+
+    remove_fixture_dir(&dir);
+}
+
+/// Reproduces the state a finished text drag leaves behind: the runtime carries the new center, the doc
+/// node still carries the old one, and the gesture has been settled (so `reapply_layer_move_after_reproject`
+/// no longer protects it). `settle_layer_move`'s overlay branch deliberately writes nothing to the doc —
+/// it only marks the deferred placement save — which is exactly the divergence this fixture needs.
+fn settle_a_text_drag(layer: &mut TypingTextOverlayLayer, overlay_idx: usize, to: [f32; 2]) {
+    let from = layer.overlays[overlay_idx].center_page_px;
+    // The per-frame apply the drag would have done (`write_layer_move_geometry`), runtime-only.
+    layer.overlays[overlay_idx].center_page_px = to;
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Overlay(overlay_idx),
+        page_idx: layer.overlays[overlay_idx].page_idx,
+        source: TypingLayerMoveSource::Pointer,
+        base: TypingLayerMoveBase::Center(from),
+        page_size_px: [100, 100],
+        pointer_start_scene: Some(Pos2::ZERO),
+        delta_page_px: [to[0] - from[0], to[1] - from[1]],
+        snap_applied: true,
+        strict_pixel_movement: false,
+        has_changes: true,
+    });
+    layer.settle_layer_move();
+    assert!(layer.move_session.is_none(), "fixture: the gesture is settled, as it is before Ctrl+D");
+}
+
+/// The `cx`/`cy` the shared doc holds for `uid` on page 0.
+fn doc_center(
+    doc: &Arc<Mutex<ms_models::layer_model::layer_doc::LayerDoc>>,
+    uid: &str,
+) -> [f32; 2] {
+    let guard = doc.lock().unwrap();
+    let node = guard
+        .page(0)
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|n| n.uid == uid)
+        .expect("the node");
+    [node.transform.cx, node.transform.cy]
+}
+
+#[test]
+fn a_settled_drag_survives_a_following_duplicate() {
+    // LIVE BUG: drag a text layer, then Ctrl+D — the SOURCE jumped back to its pre-drag position while
+    // the copy appeared at the dragged spot, and the eager structural save made that revert permanent.
+    // Cause: the dragged center lives only in the runtime, and `insert_runtime_overlay`'s `route_to_doc`
+    // re-projects the whole page from the STALE doc node over it.
+    let dir = std::env::temp_dir().join(format!("typ_dup_dragged_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+    let seeded = layer.overlays[0].center_page_px;
+
+    settle_a_text_drag(&mut layer, 0, [30.0, 20.0]);
+    assert_eq!(
+        doc_center(&doc, "ta"),
+        seeded,
+        "fixture: the doc is genuinely STALE at this point — without that, the test proves nothing"
+    );
+
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+
+    assert_eq!(
+        layer.overlays[0].center_page_px,
+        [30.0, 20.0],
+        "the source stays where it was dragged; the duplicate must not undo the drag"
+    );
+    assert_eq!(
+        layer.overlays[new_idx].center_page_px,
+        [30.0, 20.0 + selection_rasters::DUPLICATE_OVERLAY_OFFSET_PAGE_PX],
+        "and the copy is offset below the DRAGGED position, not below the old one"
+    );
+    assert_eq!(
+        doc_center(&doc, "ta"),
+        [30.0, 20.0],
+        "the doc caught up with the drag instead of overwriting it, so the save cannot revert it"
+    );
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn a_settled_drag_survives_deleting_another_layer() {
+    // The same hole is in EVERY structural `route_to_doc` caller, not just duplication: deleting layer A
+    // re-projects the page and reverted a just-dragged layer B. The fix lives in the doc funnel, so this
+    // path is covered by the same reconcile.
+    let dir = std::env::temp_dir().join(format!("typ_del_dragged_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta", "tb"]);
+    let tb_idx = layer
+        .overlays
+        .iter()
+        .position(|o| o.uid == "tb")
+        .expect("tb runtime");
+
+    settle_a_text_drag(&mut layer, tb_idx, [55.0, 65.0]);
+
+    // Delete the OTHER layer.
+    let ta_idx = layer
+        .overlays
+        .iter()
+        .position(|o| o.uid == "ta")
+        .expect("ta runtime");
+    layer.remove_overlay(ta_idx);
+
+    let tb = layer
+        .overlays
+        .iter()
+        .find(|o| o.uid == "tb")
+        .expect("tb survives the deletion");
+    assert_eq!(
+        tb.center_page_px,
+        [55.0, 65.0],
+        "deleting a different layer must not revert a settled drag"
+    );
+    assert_eq!(doc_center(&doc, "tb"), [55.0, 65.0], "and the doc carries it");
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn the_band_order_a_duplicate_writes_carries_a_not_yet_flushed_raster() {
+    // REGRESSION: the order written is the FLATTENED page — rasters included — and
+    // `persist::apply_band_order` leaves any band whose uid is not in the ON-DISK tree at its stale `z`.
+    // A pre-flush covering only TEXT therefore renumbered the text around a raster that lives in the doc
+    // but not yet in the manifest, desyncing the two (right on canvas via the doc mirror, snapped back
+    // on reload). The pre-flush must write BOTH kinds.
+    use ms_models::layer_model::layer_doc::{LayerNode, NodeBody, NodeKind};
+
+    let dir = std::env::temp_dir().join(format!("typ_dup_raster_z_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta", "tb"]);
+    // A raster that exists ONLY in the shared doc (e.g. added by the PS tab, not yet flushed), sitting
+    // on TOP of both texts because `add_node` appends at max z + 1.
+    {
+        let mut guard = doc.lock().unwrap();
+        let pixels = ColorImage::filled([2, 2], Color32::RED);
+        guard.add_node(
+            0,
+            LayerNode {
+                uid: "r0".into(),
+                name: "R".into(),
+                kind: NodeKind::Raster,
+                z: 0, // replaced by add_node
+                visible: true,
+                opacity: 1.0,
+                group_uid: None,
+                text_layer_idx: None,
+                transform: ms_models::layer_model::manifest::TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                deform: None,
+                generation: 0,
+                pixels_dirty: true,
+                body: NodeBody::Raster {
+                    base_image: pixels.clone(),
+                    display_image: pixels,
+                    effects: Vec::new(),
+                    base_file: String::new(),
+                    mask_clip: None,
+                },
+            },
+        );
+        layer.sync_from_doc(0, &guard);
+    }
+
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+    let copy_uid = layer.overlays[new_idx].uid.clone();
+
+    let bands = ms_models::layer_model::persist::load_page_bands(&dir, None, 0);
+    let mut sorted: Vec<&ms_models::layer_model::ordering::Band> = bands.iter().collect();
+    sorted.sort_by_key(|b| b.z());
+    let uids: Vec<String> = sorted
+        .iter()
+        .filter_map(|b| match b {
+            ms_models::layer_model::ordering::Band::PinnedText { uid, .. }
+            | ms_models::layer_model::ordering::Band::Raster { uid, .. } => Some(uid.clone()),
+            ms_models::layer_model::ordering::Band::TextGroup { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        uids,
+        vec!["ta".to_string(), copy_uid, "tb".to_string(), "r0".to_string()],
+        "the doc-only raster reached the manifest before the band order was written, so it kept its \
+         place on top instead of being left at a stale z"
+    );
+    let zs: Vec<u32> = sorted.iter().map(|b| b.z()).collect();
+    assert_eq!(
+        zs,
+        (0..u32::try_from(uids.len()).unwrap()).collect::<Vec<_>>(),
+        "every band on the page was renumbered — none was skipped for being absent from the tree"
+    );
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn duplicating_a_deformed_layer_moves_mesh_and_center_by_the_same_delta() {
+    // The mesh's control points are ABSOLUTE page px: an untranslated mesh would leave the copy warped
+    // onto the original's position, and a mesh translated by a DIFFERENT delta than the center would
+    // desync the two geometry stores (the runtime center mirrors the mesh centroid). The page clamp is
+    // what makes this non-trivial — near a page bound the mesh can only move part of the way, and the
+    // center must follow by exactly that much and no more.
+    let dir = std::env::temp_dir().join(format!("typ_dup_mesh_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+
+    // The mesh is seeded on the DOC node, not just on the runtime: the doc is the source of truth and
+    // `sync_from_doc` projects its `deform` back over the runtime's, so a runtime-only mesh is a state
+    // the tab never actually holds.
+    let seed_source_mesh = |layer: &mut TypingTextOverlayLayer, points: &[[f32; 2]], center: [f32; 2]| {
+        let mut guard = doc.lock().unwrap();
+        let node = guard.node_mut(0, "ta").expect("the seeded text node");
+        node.deform = Some(ms_models::layer_model::manifest::DeformRec {
+            cols: 2,
+            rows: 2,
+            points_px: points.to_vec(),
+        });
+        node.transform.cx = center[0];
+        node.transform.cy = center[1];
+        layer.sync_from_doc(0, &guard);
+    };
+
+    // Case 1: mid-page, so the full offset is allowed.
+    let mid_points = vec![[5.0, 40.0], [15.0, 40.0], [5.0, 50.0], [15.0, 50.0]];
+    seed_source_mesh(&mut layer, &mid_points, [10.0, 45.0]);
+    assert_eq!(
+        layer.overlays[0].deform_mesh.as_ref().map(|m| m.points_px.clone()),
+        Some(mid_points.clone()),
+        "fixture: the source really is deformed before we duplicate it"
+    );
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+    let offset = selection_rasters::DUPLICATE_OVERLAY_OFFSET_PAGE_PX;
+    let copy_mesh = layer.overlays[new_idx]
+        .deform_mesh
+        .as_ref()
+        .expect("the copy carries its own mesh");
+    assert_eq!(
+        copy_mesh.points_px,
+        mid_points
+            .iter()
+            .map(|p| [p[0], p[1] + offset])
+            .collect::<Vec<_>>(),
+        "every control point shifts by the offset, so the mesh keeps its shape"
+    );
+    assert_eq!(
+        layer.overlays[new_idx].center_page_px,
+        [10.0, 45.0 + offset],
+        "the center follows the same delta"
+    );
+    assert_eq!(
+        layer.overlays[0].deform_mesh.as_ref().map(|m| m.points_px.clone()),
+        Some(mid_points),
+        "the SOURCE mesh is untouched"
+    );
+
+    // Case 2: against the lower page bound (1.9 * 100 = 190), so only part of the offset is allowed.
+    let edge_points = vec![[5.0, 175.0], [15.0, 175.0], [5.0, 185.0], [15.0, 185.0]];
+    seed_source_mesh(&mut layer, &edge_points, [10.0, 180.0]);
+    let clamped_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+    let allowed = 5.0f32; // 190 (bound) - 185 (lowest control point)
+    assert!(allowed < offset, "the fixture must actually exercise the clamp");
+    let clamped_mesh = layer.overlays[clamped_idx]
+        .deform_mesh
+        .as_ref()
+        .expect("the copy carries its own mesh");
+    assert_eq!(
+        clamped_mesh.points_px,
+        edge_points
+            .iter()
+            .map(|p| [p[0], p[1] + allowed])
+            .collect::<Vec<_>>(),
+        "the clamp stops the mesh at the page bound WITHOUT squashing it"
+    );
+    assert_eq!(
+        layer.overlays[clamped_idx].center_page_px,
+        [10.0, 180.0 + allowed],
+        "the center moves by the delta the clamp actually allowed, not by the requested offset"
+    );
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn a_duplicate_carries_every_placement_parameter_verbatim() {
+    // Scale, angle, mask-clip and the text-group axis are the source's own settings, not defaults: the
+    // copy must look identical to the original apart from its position, uid and file handle. These
+    // round-trip through the doc node `insert_runtime_overlay` builds, so this also covers the
+    // projection back onto the runtime.
+    let dir = std::env::temp_dir().join(format!("typ_dup_params_{}", std::process::id()));
+    let (mut layer, _doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+    let render_data = json!({ "text": "ta", "text_params": { "width_px": 321 } });
+    {
+        let source = &mut layer.overlays[0];
+        source.user_scale = 1.7;
+        source.angle_deg = 12.5;
+        source.mask_clip_enabled = true;
+        source.layer_idx = 3;
+        source.render_data_json = Some(render_data.clone());
+    }
+
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+
+    let copy = &layer.overlays[new_idx];
+    assert!((copy.user_scale - 1.7).abs() < 1e-6, "scale carried");
+    assert!((copy.angle_deg - 12.5).abs() < 1e-6, "angle carried");
+    assert!(copy.mask_clip_enabled, "mask-clip flag carried");
+    assert_eq!(copy.layer_idx, 3, "the text-group axis carried");
+    assert_eq!(copy.render_data_json, Some(render_data), "render data carried verbatim");
+    assert_eq!(copy.kind, TypingOverlayKind::Text);
+    assert!(
+        copy.centering_frame.is_none(),
+        "the centering-assist frame is NOT carried: it is bound to the source's own center"
+    );
+
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn duplicating_a_custom_raster_lines_layer_copies_its_layout_image() {
+    // `CustomRasterLines` keeps its drawn lines ONLY in the `_layout.png` sibling of the overlay's
+    // runtime file handle — the renderer reads them back from there. The copy mints a FRESH handle, so
+    // without an explicit file copy its layout would come up blank.
+    let dir = std::env::temp_dir().join(format!("typ_dup_layout_{}", std::process::id()));
+    let (mut layer, _doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+    layer.overlays[0].render_data_json = Some(json!({
+        "text_params": { "text_layout_mode": "custom_raster_lines" }
+    }));
+    // A layer that HAS drawn lines was created in-session, so it carries the create-path handle. This
+    // matters: `prune_orphan_pngs` deletes any unlisted `ps_p{page:04}_*.png`, which is the shape a
+    // RELOADED overlay's handle has — so the expected bytes are captured before the duplicate's flush
+    // runs either way.
+    layer.overlays[0].file_name = created_overlay_file_name(0, "ta");
+    let source_layout = dir.join(layout_image_file_name_for_overlay(&layer.overlays[0].file_name));
+    image::save_buffer(
+        &source_layout,
+        &[7u8; 2 * 2 * 4],
+        2,
+        2,
+        image::ColorType::Rgba8,
+    )
+    .unwrap();
+    let expected_bytes = std::fs::read(&source_layout).unwrap();
+
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+
+    let copy_layout = dir.join(layout_image_file_name_for_overlay(&layer.overlays[new_idx].file_name));
+    assert_ne!(copy_layout, source_layout, "the copy derives its own layout name");
+    assert!(
+        copy_layout.is_file(),
+        "the drawn-lines layout was copied to the new handle ({})",
+        copy_layout.display()
+    );
+    assert_eq!(
+        std::fs::read(&copy_layout).unwrap(),
+        expected_bytes,
+        "and byte-for-byte, so the copy renders the same lines"
+    );
+
+    // A layer with any other layout mode has no such sibling and must not grow one.
+    let other_dir = std::env::temp_dir().join(format!("typ_dup_nolayout_{}", std::process::id()));
+    let (mut plain, _plain_doc) = layer_with_doc_text_nodes(&other_dir, &["tb"]);
+    let plain_idx = plain.duplicate_overlay(0).expect("a text overlay duplicates");
+    assert!(
+        !other_dir
+            .join(layout_image_file_name_for_overlay(&plain.overlays[plain_idx].file_name))
+            .exists(),
+        "a Normal-layout copy gets no layout image"
+    );
+
+    remove_fixture_dir(&dir);
+    remove_fixture_dir(&other_dir);
+}
+
+#[test]
+fn duplication_rejects_an_image_overlay_and_an_out_of_range_index() {
+    // Image overlays are a placed PNG whose file lifecycle `duplicate_overlay` does not own, so the
+    // request is REFUSED rather than half-honoured; the same for an index that names nothing.
+    let mut layer = TypingTextOverlayLayer {
+        overlays: vec![text_runtime_from_doc_node(
+            "img",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            true, // is_image
+            0,
+            None,
+            [4, 3],
+            vec![0u8; 4 * 3 * 4],
+        )],
+        ..Default::default()
+    };
+    layer.selected_overlay_idx = Some(0);
+
+    assert_eq!(layer.duplicate_overlay(0), None, "an image overlay is not duplicated here");
+    assert_eq!(layer.duplicate_overlay(7), None, "an out-of-range index changes nothing");
+    assert_eq!(layer.overlays.len(), 1, "neither call appended anything");
+    assert_eq!(layer.selected_overlay_idx, Some(0), "and neither moved the selection");
+
+    // A TEXT layer with no well-formed pixels is refused too: `insert_runtime_overlay` would build no
+    // doc node for it, so the copy could never be given a Z or be persisted.
+    let mut layer = TypingTextOverlayLayer {
+        overlays: vec![text_runtime_from_doc_node(
+            "empty",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            false,
+            0,
+            None,
+            [0, 0],
+            Vec::new(),
+        )],
+        ..Default::default()
+    };
+    assert_eq!(
+        layer.duplicate_overlay(0),
+        None,
+        "a text layer with no rendered pixels is refused rather than half-duplicated"
+    );
+    assert_eq!(layer.overlays.len(), 1);
+}
+
 fn decoded_text_overlay(uid: &str, page_idx: usize, center: [f32; 2]) -> TypingOverlayDecoded {
     TypingOverlayDecoded {
         uid: uid.into(),
