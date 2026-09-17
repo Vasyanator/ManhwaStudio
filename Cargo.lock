@@ -3961,6 +3961,7 @@ dependencies = [
  "cosmic-text",
  "eframe",
  "egui",
+ "flate2",
  "image 0.25.10",
  "ms-canvas",
  "ms-config",
@@ -3978,6 +3979,7 @@ dependencies = [
  "ms-thread",
  "ms-tools",
  "ms-widgets",
+ "pdf-writer",
  "rfd",
  "serde",
  "serde_json",
@@ -4832,6 +4834,18 @@ name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+
+[[package]]
+name = "pdf-writer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e456864a7a304047bff84977dc6fb162bd956475d40ba50b2dcecaada7f753"
+dependencies = [
+ "bitflags 2.13.0",
+ "itoa",
+ "memchr",
+ "ryu",
+]
 
 [[package]]
 name = "pdqselect"

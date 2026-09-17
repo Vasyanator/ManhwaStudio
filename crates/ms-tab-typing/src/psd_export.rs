@@ -253,7 +253,10 @@ fn report_ambiguous_export_fonts(
              format cannot carry our content-discriminated identity, so the name is written as \
              is and nothing is dropped.",
             job.page_idx,
-            job.output_path.display(),
+            // A PSD job always comes from the one-to-one route and therefore always carries an
+            // output path; naming the SOURCE page instead is the honest fallback if that ever
+            // changes, and keeps this diagnostic free of an `unwrap`.
+            job.output_path.as_deref().unwrap_or(job.page_path.as_path()).display(),
             font.identity,
             font.post_script_name,
             font.claimant_count,
@@ -845,7 +848,7 @@ mod tests {
         let job = TypingExportPageJob {
             page_idx: 0,
             page_path: PathBuf::from("unused.png"),
-            output_path: PathBuf::from("unused.psd"),
+            output_path: Some(PathBuf::from("unused.psd")),
             clean_overlay_path: None,
             clean_overlay_rgba: None,
             overlays: vec![ov_a, ov_b],
@@ -1082,7 +1085,7 @@ mod tests {
         let job = TypingExportPageJob {
             page_idx: 0,
             page_path: PathBuf::from("unused.png"),
-            output_path: PathBuf::from("unused.psd"),
+            output_path: Some(PathBuf::from("unused.psd")),
             clean_overlay_path: None,
             clean_overlay_rgba: None,
             overlays: vec![

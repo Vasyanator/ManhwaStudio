@@ -69,6 +69,13 @@ swash.workspace = true
 image.workspace = true
 # PSD export of the composed text layers.
 ag-psd.workspace = true
+# PDF export of the composed (optionally re-paginated) pages. Low-level writer: the PDF
+# this tab emits is one full-page image per page, so nothing above that layer is needed.
+# Declared locally rather than in `[workspace.dependencies]` because this crate is its
+# only user.
+pdf-writer = "0.15"
+# Lossless `FlateDecode` compression of the RGB image streams embedded in that PDF.
+flate2.workspace = true
 # Persisted presets, text params and panel state.
 serde.workspace = true
 serde_json.workspace = true

@@ -1601,6 +1601,42 @@ session long before this call.
   RELEASES its generation, or a stillborn claim would declare itself newest forever and the
   save already in flight would write nothing at all.
 
+## Export block: format, destination and re-pagination (`panel.rs` + `create_sections.rs`)
+The «Действия» tab's export block offers three formats and, between the format selector and
+the green save button, the «перенарезка» (re-pagination) options. Every rule below is a pure
+free function in `panel.rs`, deliberately NOT inlined into the drawing code, so each decision
+has exactly ONE owner and is unit-testable without a GUI (`panel/tests.rs`):
+
+- `repaginate_block_visible(format)` — the block is hidden for `Psd`: re-pagination re-cuts a
+  flat ribbon and cannot preserve layers. The pipeline ALSO rejects that combination as a hard
+  error (`tab/export.rs::resolve_export_route`); the UI hiding it is convenience, not the guard.
+- `repaginate_default_for_format(format, comic_type)` — `Pdf` defaults ON, `Png`/`Psd` OFF; but
+  a `ComicType::Pages` title defaults OFF for EVERY format, because re-pagination is a webtoon
+  operation. Applied on a format change and on a comic-type change, never per frame.
+- `apply_repaginate_toggle(..)` — the TWO-CLICK guard on a page-based title: the first click
+  that would ENABLE re-pagination does not enable it, it raises `repaginate_pages_warning`
+  (drawn under the checkbox in `create_presets::FONT_DIAGNOSTIC_WARNING_COLOR`); the second
+  click enables it. Disabling clears the warning. `Ribbon`/`Custom` titles enable on the first
+  click with no warning.
+- `export_dialog_kind(format)` / `export_button_label_key(format)` — one decision drives BOTH the
+  button's caption and which dialog opens (save-file for `Pdf`, folder picker otherwise), so the
+  two can never disagree. `pdf_export_file_name(base)` builds the prefilled «‹тайтл› ‹глава›.pdf».
+
+**Invariant — the confirmation may not outlive the block's visibility.** `repaginate_pages_warning`
+lives on the shared `TypingTopPanelState`, but the block is drawn only while the panel is in
+`CreateText` mode with a non-PSD format AND the «Действия» dock tab is open. The section reports
+whether it actually drew the block (`TypingRightSectionActions::repaginate_block_drawn`) and
+`expire_repaginate_pages_warning`, called from `begin_frame`, drops a warning that the previous
+frame did not draw. Without that, selecting a text layer (which flips the panel to `EditText`)
+would hide the warning while the flag survived, and the next SINGLE click would enable
+re-pagination — the guard the user asked for, silently gone.
+
+**Per-frame context.** `set_export_context(comic_type, output_base_name)` is pushed every frame
+from `tab.rs`, exactly like `set_export_default_dir`. It must act only on a real comic-type
+TRANSITION: reacting every frame would re-apply the default continuously and make the checkbox
+untouchable. A transition deliberately overrides a manual toggle, since the default is a function
+of the comic type.
+
 ## Editing map
 - To change the create-preset FILE (a key, the version, the save guard), see
   `presets_store.rs`; to change the WRITE RECIPE or the concurrency vocabulary of EITHER panel

@@ -683,14 +683,12 @@ fn placement_save_debounce_tick(
     }
 }
 
-/// A to-folder/PSD export deferred until the whole-project page preload completes (Phase 2). Carries
-/// only the destination directory and format; the clip-mask snapshot is captured when the export
+/// An export deferred until the whole-project page preload completes (Phase 2).
+///
+/// It is EXACTLY the dispatched request — destination, format, re-pagination settings and
+/// output base name — and nothing else: the clip-mask snapshot is captured when the export
 /// actually runs, not when it is deferred, so it reflects the final mask state.
-#[derive(Debug, Clone)]
-struct PendingTypingExport {
-    output_dir: PathBuf,
-    export_format: TypingExportFormat,
-}
+type PendingTypingExport = TypingExportRequest;
 
 impl Default for TypingTabState {
     fn default() -> Self {
@@ -949,7 +947,7 @@ impl TypingTabState {
         self.text_overlays.preload_all_pages_progress()
     }
 
-    /// Runs a deferred to-folder/PSD export once the async whole-project preload PASS has drained
+    /// Runs a deferred export once the async whole-project preload PASS has drained
     /// (Phase 2) AND the whole-chapter clip-mask loader has drained (Phase 3), UNLESS a project save is
     /// pending/in-flight (`save_busy`, Finding 2 mutual exclusion).
     ///
@@ -967,7 +965,7 @@ impl TypingTabState {
     ///
     /// While any gate is unmet a repaint is requested so the frame loop advances instead of
     /// idle-stalling with an export pending. Once ready it consumes `pending_export_after_preload` via
-    /// `take_pending_export_if_ready` and dispatches `request_export_to_folder`.
+    /// `take_pending_export_if_ready` and dispatches `request_export`.
     ///
     /// The clip-mask snapshot is captured HERE, at the real run point, not when the export was deferred:
     /// the mask store is whole-chapter/eager (loaded in full at chapter open, independent of page
@@ -993,14 +991,7 @@ impl TypingTabState {
             return; // pass not fully drained yet (defensive; the gate above already checked it)
         };
         let mask_snapshot = self.mask_layer.export_masks_snapshot();
-        self.text_overlays.request_export_to_folder(
-            ctx,
-            project,
-            mask_snapshot,
-            pending.output_dir,
-            pending.export_format,
-            self.top_panel.font_post_script_names(),
-        );
+        self.text_overlays.request_export(ctx, project, mask_snapshot, pending, self.top_panel.font_post_script_names());
     }
 
     /// Records whether a project save is pending on the whole-project preload or already in flight
@@ -1012,7 +1003,7 @@ impl TypingTabState {
         self.save_busy = save_busy;
     }
 
-    /// Returns whether a to-folder/PSD export worker is currently rendering.
+    /// Returns whether an export worker is currently rendering.
     #[must_use]
     pub fn export_in_progress(&self) -> bool {
         self.text_overlays.export_rx.is_some()
@@ -1756,6 +1747,12 @@ impl CanvasHooks for TypingHooks<'_> {
         }
         self.top_panel
             .set_export_default_dir(project.project_dir.clone());
+        // The export panel needs two project facts it cannot reach on its own: the comic type
+        // (re-pagination defaults OFF and warns for a page-based title — it is a webtoon
+        // operation) and the `"<title> <chapter>"` base name that prefills the PDF save dialog
+        // and numbers re-paginated pages. Both are cheap and pushed every frame like the
+        // default dir above, so a chapter switch cannot leave a stale one behind.
+        self.top_panel.set_export_context(project.comic_type, export_base_name(project));
         // The character table's project favorites are TITLE-scoped, so the path
         // comes from `ProjectPaths`, not from the chapter dir.
         self.top_panel
@@ -1931,7 +1928,7 @@ impl CanvasHooks for TypingHooks<'_> {
                 request,
             );
         }
-        if let Some((export_dir, export_format)) = self.top_panel.take_export_to_folder_request() {
+        if let Some(export_request) = self.top_panel.take_export_request() {
             let layers_ready = self.text_overlays.all_pages_loaded(project);
             let masks_ready = self.mask_layer.masks_loaded(project);
             // Fast path ONLY when everything the composite reads is ready AND no save is busy: layers
@@ -1940,14 +1937,7 @@ impl CanvasHooks for TypingHooks<'_> {
             // the export is DEFERRED to `run_pending_export_if_ready`, which re-gates on all three.
             if layers_ready && masks_ready && !self.save_busy {
                 let mask_snapshot = self.mask_layer.export_masks_snapshot();
-                self.text_overlays.request_export_to_folder(
-                    ctx,
-                    project,
-                    mask_snapshot,
-                    export_dir,
-                    export_format,
-                    self.top_panel.font_post_script_names(),
-                );
+                self.text_overlays.request_export(ctx, project, mask_snapshot, export_request, self.top_panel.font_post_script_names());
             } else {
                 // Something the composite reads is not ready, or a save is busy. Migrated/v3 pages
                 // materialize their text overlays only on load (so exporting now would silently drop
@@ -1966,20 +1956,10 @@ impl CanvasHooks for TypingHooks<'_> {
                 // never-completing layer gate; its in-function residency pass materializes whatever it
                 // can, and masks are captured as-is (the pre-existing no-doc degenerate behavior).
                 if layers_ready || self.text_overlays.preload_all_pages_active() || self.save_busy {
-                    self.text_overlays.set_pending_export(PendingTypingExport {
-                        output_dir: export_dir,
-                        export_format,
-                    });
+                    self.text_overlays.set_pending_export(export_request);
                 } else {
                     let mask_snapshot = self.mask_layer.export_masks_snapshot();
-                    self.text_overlays.request_export_to_folder(
-                        ctx,
-                        project,
-                        mask_snapshot,
-                        export_dir,
-                        export_format,
-                        self.top_panel.font_post_script_names(),
-                    );
+                    self.text_overlays.request_export(ctx, project, mask_snapshot, export_request, self.top_panel.font_post_script_names());
                 }
             }
         }
@@ -2093,7 +2073,7 @@ struct BubbleCreateTextRequest {
     rect_coords: RectCoords,
 }
 
-/// Pure dispatch gate for a deferred to-folder/PSD export — the testable core of
+/// Pure dispatch gate for a deferred export — the testable core of
 /// [`TypingTabState::run_pending_export_if_ready`]. True iff the export may dispatch NOW:
 /// - `!preload_active`: the whole-project layer preload PASS has drained. Gates on pass COMPLETION,
 ///   not full residency, so a page that genuinely failed to decode (and never became resident) does
@@ -2707,18 +2687,62 @@ pub(super) struct TypingExportRasterSnapshot {
     pub(super) mask_clip_enabled: bool,
 }
 
-/// Output format chosen in the typing tab "export to folder" flow.
+/// Output format chosen in the typing tab export flow.
+///
+/// Project-owned enum: every `match` on it must stay exhaustive (no `_` arm), so that a
+/// future format forces every call site to be reconsidered. The format also decides the
+/// SHAPE of the destination — `Png`/`Psd` write one file per page into a folder, `Pdf`
+/// writes one document — which is why [`TypingExportDestination`] is checked against it
+/// (`resolve_export_route` in `tab/export.rs`) instead of being inferred from a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum TypingExportFormat {
     #[default]
     Png,
     Psd,
+    Pdf,
+}
+
+/// Where an export writes: a folder of per-page files, or one PDF document.
+///
+/// Typed on purpose — the export used to thread a bare `PathBuf` that every site had to
+/// KNOW meant a directory, which a single-file format cannot express. The pairing with
+/// [`TypingExportFormat`] is validated once, in `resolve_export_route`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TypingExportDestination {
+    /// A directory that receives one file per exported page. Created if missing.
+    Folder(PathBuf),
+    /// The `.pdf` file the whole chapter is written to. Its parent is created if missing.
+    PdfFile(PathBuf),
+}
+
+/// One dispatched export: destination, format, re-pagination settings and the base name
+/// re-paginated pages are numbered from.
+///
+/// Built by the top panel when the user picks a destination and consumed by
+/// `TypingTextOverlayLayer::request_export`. It is also what a deferred export
+/// ([`PendingTypingExport`]) holds while it waits for the whole-project preload.
+#[derive(Debug, Clone)]
+pub(super) struct TypingExportRequest {
+    /// Folder or file the run writes to; must match `format` (see `resolve_export_route`).
+    pub(super) destination: TypingExportDestination,
+    /// Output format of the run.
+    pub(super) format: TypingExportFormat,
+    /// Re-pagination ("перенарезка") settings. When disabled the composed pages are written
+    /// one-to-one; when enabled they are stitched into same-width ribbons and re-sliced.
+    pub(super) repaginate: crate::export_repaginate::TypingRepaginateSettings,
+    /// `"<title> <chapter>"`, already sanitized for a file name (see `export_base_name`).
+    /// Re-paginated pages are named from it; the one-to-one paths keep the source page stem.
+    pub(super) output_base_name: String,
 }
 
 pub(super) struct TypingExportPageJob {
     pub(super) page_idx: usize,
     pub(super) page_path: PathBuf,
-    pub(super) output_path: PathBuf,
+    /// Where this page's OWN output file goes, when the export writes pages one-to-one
+    /// (`Png`/`Psd` without re-pagination). `None` on the collecting routes (PDF, and any
+    /// re-paginating route): there the composed pages are stitched and re-cut, so no file
+    /// corresponds to one source page and inventing a path here would be a lie.
+    pub(super) output_path: Option<PathBuf>,
     pub(super) clean_overlay_path: Option<PathBuf>,
     pub(super) clean_overlay_rgba: Option<Arc<image::RgbaImage>>,
     pub(super) overlays: Vec<TypingExportOverlaySnapshot>,
@@ -2739,9 +2763,14 @@ pub(super) struct TypingExportPageJob {
 }
 
 struct TypingExportResult {
+    /// Source pages that were composed successfully. Counted in SOURCE pages even when
+    /// re-pagination writes a different number of files, so that it stays comparable with
+    /// `total` and with the running progress the panel shows.
     exported: usize,
+    /// Source pages the run was asked to export.
     total: usize,
-    output_dir: PathBuf,
+    /// Where the run wrote — the picked folder, or the picked `.pdf` file.
+    destination: TypingExportDestination,
     /// Localized, deduplicated notes about what the OUTPUT FORMAT could not express, in a
     /// run that otherwise succeeded (every page was written). Today: PSD text layers whose
     /// font name is claimed by several installed fonts — see
@@ -3232,8 +3261,8 @@ pub(super) struct TypingTextOverlayLayer {
     /// `drive_page_preload` so `preload_all_pages_progress` is a cheap getter (no doc lock).
     preload_all_progress: (usize, usize),
     /// Export request deferred until the async whole-project page preload finishes (Phase 2). Set when a
-    /// to-folder/PSD export is requested while not every page is resident: the preload is started and
-    /// this holds the destination + format until `take_pending_export_if_ready` consumes it. `None` when
+    /// export is requested while not every page is resident: the preload is started and
+    /// this holds the whole request until `take_pending_export_if_ready` consumes it. `None` when
     /// no export is pending. The clip-mask snapshot is intentionally NOT stored here — it is captured at
     /// the actual run point (`TypingTabState::run_pending_export_if_ready`), so it reflects final state.
     pending_export_after_preload: Option<PendingTypingExport>,

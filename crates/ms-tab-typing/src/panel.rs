@@ -133,6 +133,11 @@ use ms_config as config;
 use ms_log::trace::cat;
 use crate::auto_typing::TypingAutoTypingSettings;
 use crate::tab::TypingExportFormat;
+// Typed export destination/request of the «Действия» export block: the panel queues one of
+// these instead of a bare folder path, because a PDF export targets a FILE.
+use crate::tab::{TypingExportDestination, TypingExportRequest};
+// Re-pagination settings edited by the export block and carried in every export request.
+use crate::export_repaginate::{TypingRepaginateMode, TypingRepaginateSettings};
 use crate::tab::decode_vector_mesh_warp;
 use crate::render_next::forms::{
     self, InlineTagScope, PeakBase, PresetLabel, TextForm, TextFormPreset,
@@ -824,8 +829,33 @@ pub struct TypingTopPanelState {
     clean_overlays_visible: bool,
     clean_overlays_initialized: bool,
     pending_clean_overlays_visible: Option<bool>,
-    pending_export_to_folder: Option<PathBuf>,
+    /// Destination picked in the export dialog, awaiting drain by the tab. `Folder(..)` for
+    /// PNG/PSD, `PdfFile(..)` for PDF; the variant is decided by the format at click time.
+    pending_export_destination: Option<TypingExportDestination>,
     export_format: TypingExportFormat,
+    /// Re-pagination («перенарезка») options of the export block. Reset to the per-format
+    /// default by every format change (see [`repaginate_default_for_format`]); otherwise owned
+    /// by the user.
+    repaginate: TypingRepaginateSettings,
+    /// Whether the "this is a page-based title" confirmation is currently shown under the
+    /// re-pagination checkbox. See [`apply_repaginate_toggle`] for the two-click contract.
+    ///
+    /// Its lifetime is owned by [`TypingTopPanelState::expire_repaginate_pages_warning`]: a
+    /// confirmation the user cannot SEE must never survive into the next frame, or the
+    /// two-click guard silently degrades to one click.
+    repaginate_pages_warning: bool,
+    /// Whether the re-pagination block was actually drawn in the PREVIOUS frame, as reported
+    /// by the section that decides its visibility ([`TypingRightSectionActions::repaginate_block_drawn`]).
+    /// Read only by [`TypingTopPanelState::expire_repaginate_pages_warning`].
+    repaginate_block_drawn: bool,
+    /// Comic type of the OPEN title, pushed in every frame by the tab
+    /// (`set_export_context`). `None` while no title is open. Only the re-pagination
+    /// defaults and the page-title warning read it.
+    export_comic_type: Option<ms_project::ComicType>,
+    /// Base name (no extension) the export should give its output, pushed in every frame by
+    /// the tab (`set_export_context`). Prefills the PDF save dialog and travels in the
+    /// export request. Empty while no title is open.
+    export_base_name: String,
     pending_round_text_positions: bool,
     export_default_dir: Option<PathBuf>,
     export_status: TypingExportUiStatus,
@@ -1014,8 +1044,13 @@ impl Default for TypingTopPanelState {
             clean_overlays_visible: true,
             clean_overlays_initialized: false,
             pending_clean_overlays_visible: None,
-            pending_export_to_folder: None,
+            pending_export_destination: None,
             export_format: TypingExportFormat::default(),
+            repaginate: TypingRepaginateSettings::default(),
+            repaginate_pages_warning: false,
+            repaginate_block_drawn: false,
+            export_comic_type: None,
+            export_base_name: String::new(),
             pending_round_text_positions: false,
             export_default_dir: None,
             export_status: TypingExportUiStatus::Hidden,
@@ -2016,16 +2051,142 @@ struct TypingRightSectionInputs<'a> {
     export_status: &'a TypingExportUiStatus,
     /// Currently selected export format.
     export_format: TypingExportFormat,
+    /// Comic type of the open title, or `None` when no title is open. Decides the
+    /// re-pagination defaults and whether the page-title confirmation is demanded.
+    comic_type: Option<ms_project::ComicType>,
+    /// Current re-pagination options (drives the checkbox, the mode choice and the fields).
+    repaginate: TypingRepaginateSettings,
+    /// Whether the page-title confirmation is shown under the re-pagination checkbox.
+    repaginate_pages_warning: bool,
+    /// Base output name (no extension) used to prefill the PDF save dialog.
+    export_base_name: &'a str,
 }
 
 struct TypingRightSectionActions {
     toggle_mask: bool,
     changed_clean_overlays: Option<bool>,
-    export_to_folder: Option<PathBuf>,
+    /// Destination picked in the export dialog this frame, if the user confirmed one.
+    export_destination: Option<TypingExportDestination>,
     changed_export_format: Option<TypingExportFormat>,
+    /// New re-pagination options when the user edited them this frame.
+    changed_repaginate: Option<TypingRepaginateSettings>,
+    /// New page-title confirmation state when the checkbox click changed it this frame.
+    changed_repaginate_pages_warning: Option<bool>,
+    /// Whether the re-pagination block (checkbox + confirmation + options) was drawn this
+    /// frame. Reported by the ONE place that decides its visibility, so the facade can expire
+    /// a confirmation the user can no longer see instead of re-deciding the visibility itself.
+    repaginate_block_drawn: bool,
     round_text_positions: bool,
     create_image_request: Option<TypingCreateImageRequest>,
     changed_strict_pixel_movement: Option<bool>,
+}
+
+/// Quick aspect-ratio presets offered next to the re-pagination ratio fields, as
+/// `(width, height)` terms.
+///
+/// Data, not captions: each button's text is built as `"{width}:{height}"`, so the list
+/// carries no user-visible string and can be extended without touching the catalogs.
+const REPAGINATE_RATIO_PRESETS: [(u32, u32); 5] = [(9, 16), (3, 4), (2, 3), (1, 1), (16, 9)];
+
+/// File name used for a PDF export when the tab could not supply a base name.
+///
+/// An on-disk name, not a caption (`docs/i18n_exclusions.md`), so it stays a literal.
+const DEFAULT_PDF_BASE_NAME: &str = "export";
+
+/// Which save dialog the green export button opens.
+///
+/// Project-owned enum: every `match` on it must stay exhaustive, so that a third
+/// destination kind forces both the panel and the tab to be reconsidered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypingExportDialogKind {
+    /// Pick a DIRECTORY; the export writes one file per page into it (PNG, PSD).
+    Folder,
+    /// Pick a FILE to save; the export writes every page into that one document (PDF).
+    PdfFile,
+}
+
+/// Whether the re-pagination block is offered at all for `format`.
+///
+/// Hidden for PSD: a layered PSD keeps its text as editable layers, and re-slicing a
+/// stitched ribbon can only produce flattened pixels, so the option would be a lie.
+#[must_use]
+pub(super) fn repaginate_block_visible(format: TypingExportFormat) -> bool {
+    match format {
+        TypingExportFormat::Png | TypingExportFormat::Pdf => true,
+        TypingExportFormat::Psd => false,
+    }
+}
+
+/// Whether re-pagination starts ENABLED after the user selects `format`.
+///
+/// Re-pagination is a webtoon operation, so a PAGE-based title (`ComicType::Pages`) never
+/// defaults to it whatever the format; for every other title kind PDF defaults to on (a PDF
+/// of a webtoon is read as pages) and PNG/PSD default to off. `comic_type` is `None` while no
+/// title is open, which is treated like a non-page title.
+#[must_use]
+pub(super) fn repaginate_default_for_format(format: TypingExportFormat, comic_type: Option<ms_project::ComicType>) -> bool {
+    match comic_type {
+        Some(ms_project::ComicType::Pages) => false,
+        Some(ms_project::ComicType::Ribbon | ms_project::ComicType::Custom) | None => match format {
+            TypingExportFormat::Pdf => true,
+            TypingExportFormat::Png | TypingExportFormat::Psd => false,
+        },
+    }
+}
+
+/// Resolves one click on the re-pagination checkbox into the new `(enabled, warning)` pair.
+///
+/// `requested` is the state the checkbox would take on its own, `warning_shown` the current
+/// confirmation state. On a PAGE-based title the FIRST attempt to enable is refused and
+/// raises the confirmation instead ("это страничный тайтл…"); the next click, made with the
+/// confirmation on screen, goes through. Disabling always succeeds and clears the
+/// confirmation, and so does any click on a non-page title.
+#[must_use]
+pub(super) fn apply_repaginate_toggle(requested: bool, comic_type: Option<ms_project::ComicType>, warning_shown: bool) -> (bool, bool) {
+    if !requested {
+        return (false, false);
+    }
+    let needs_confirmation = matches!(comic_type, Some(ms_project::ComicType::Pages)) && !warning_shown;
+    if needs_confirmation { (false, true) } else { (true, false) }
+}
+
+/// Which dialog the green export button must open for `format`.
+#[must_use]
+pub(super) fn export_dialog_kind(format: TypingExportFormat) -> TypingExportDialogKind {
+    match format {
+        TypingExportFormat::Png | TypingExportFormat::Psd => TypingExportDialogKind::Folder,
+        TypingExportFormat::Pdf => TypingExportDialogKind::PdfFile,
+    }
+}
+
+/// Catalog key of the green export button's caption for `format`.
+///
+/// PNG and PSD write a file per page into a directory ("…в папку"); PDF writes one document
+/// ("…в файл"). Resolved through [`ms_i18n::resolve_key`] at the call site, which is why the
+/// decision can live in one place instead of being duplicated as two `t!` arms.
+#[must_use]
+pub(super) fn export_button_label_key(format: TypingExportFormat) -> &'static str {
+    match format {
+        TypingExportFormat::Png | TypingExportFormat::Psd => "typing.export.overlay_and_save_button",
+        TypingExportFormat::Pdf => "typing.export.overlay_and_save_to_file_button",
+    }
+}
+
+/// Builds the file name the PDF save dialog is prefilled with from an output base name.
+///
+/// Trailing/leading whitespace is dropped and a `.pdf` extension is appended unless `base`
+/// already carries one (case-insensitively). An empty base name falls back to
+/// [`DEFAULT_PDF_BASE_NAME`] — the dialog must be prefilled with something valid, and the
+/// user can still rename it there.
+#[must_use]
+pub(super) fn pdf_export_file_name(base: &str) -> String {
+    let trimmed = base.trim();
+    let stem = if trimmed.is_empty() { DEFAULT_PDF_BASE_NAME } else { trimmed };
+    // Extension comparison goes through `Path`, never through a byte slice of the tail: a
+    // title name may end in a multi-byte character, where slicing off four bytes would land
+    // mid-character and panic.
+    let already_pdf = Path::new(stem).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+    if already_pdf { stem.to_string() } else { format!("{stem}.pdf") }
 }
 
 struct TypingCreatePanelState {

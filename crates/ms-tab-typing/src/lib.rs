@@ -38,6 +38,11 @@ pub mod font_admin;
 mod mask;
 mod panel;
 mod psd_export;
+// Pure page-re-pagination engine: stitches composed export pages into same-width ribbons
+// and re-slices them into pages of a chosen aspect ratio / fixed height. GUI-free, no I/O.
+mod export_repaginate;
+// Multi-page PDF writer used by the `Pdf` export format: one full-page raster per page.
+mod pdf_export;
 // The Ctrl+wheel rotation-mode global now lives in `ms-config` (re-exported by `main.rs` as
 // `ms_config::rotation_ctrl_wheel`) so that the config default tree can read its default without
 // depending on `tabs`. This re-export keeps existing

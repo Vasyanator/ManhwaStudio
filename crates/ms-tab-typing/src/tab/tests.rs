@@ -40,7 +40,7 @@ fn flatten_composites_raster_from_disk_fallback() {
     let job = TypingExportPageJob {
         page_idx: 0,
         page_path: base,
-        output_path: dir.join("out.png"),
+        output_path: Some(dir.join("out.png")),
         clean_overlay_path: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
@@ -111,7 +111,7 @@ fn flatten_composites_raster_from_disk_fallback() {
     let job2 = TypingExportPageJob {
         page_idx: 0,
         page_path: base2,
-        output_path: dir.join("out2.png"),
+        output_path: Some(dir.join("out2.png")),
         clean_overlay_path: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
@@ -169,7 +169,7 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
     let job = TypingExportPageJob {
         page_idx: 0,
         page_path: base,
-        output_path: dir.join("out.png"),
+        output_path: Some(dir.join("out.png")),
         clean_overlay_path: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
@@ -233,7 +233,7 @@ fn flatten_clips_mask_clip_enabled_raster_in_export() {
         TypingExportPageJob {
             page_idx: 0,
             page_path: base.clone(),
-            output_path: dir.join("out.png"),
+            output_path: Some(dir.join("out.png")),
             clean_overlay_path: None,
             clean_overlay_rgba: None,
             overlays: Vec::new(),
@@ -6127,4 +6127,385 @@ fn the_layout_editor_mode_switch_keeps_its_two_sided_behaviour() {
         layer.layout_editor.is_none(),
         "entering Preview runs the re-render, which drops an editor without a layer"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Export: file-name sanitizing, chapter base name, route resolution and the
+// re-pagination pass that feeds the PNG / PDF sinks.
+// ---------------------------------------------------------------------------
+
+/// Builds a synthetic composed page whose every pixel encodes its ABSOLUTE row index inside
+/// the ribbon, so a slice's content can be traced back to the rows it should have come from.
+fn composed_ribbon_page(width_px: u32, height_px: u32, first_ribbon_row: u32) -> TypingComposedPage {
+    let mut rgba = Vec::new();
+    for row in 0..height_px {
+        let value = u8::try_from(first_ribbon_row + row).unwrap();
+        for _ in 0..width_px {
+            rgba.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    TypingComposedPage { rgba, width_px, height_px }
+}
+
+/// Builds an export request; every test below varies only the three fields it cares about.
+fn export_request(destination: TypingExportDestination, format: TypingExportFormat, repaginate_enabled: bool) -> TypingExportRequest {
+    let repaginate = crate::export_repaginate::TypingRepaginateSettings { enabled: repaginate_enabled, ..Default::default() };
+    TypingExportRequest { destination, format, repaginate, output_base_name: "Тайтл 1".to_string() }
+}
+
+#[test]
+fn sanitize_file_name_keeps_cyrillic_and_replaces_forbidden_characters() {
+    // A Cyrillic title must survive verbatim — it is the normal case here, not an edge case.
+    assert_eq!(sanitize_file_name_component("Башня Бога 01"), "Башня Бога 01");
+    // Every character Windows forbids becomes `_`; the rest of the name is untouched.
+    assert_eq!(sanitize_file_name_component(r#"a<b>c:d"e/f\g|h?i*j"#), "a_b_c_d_e_f_g_h_i_j");
+    // Control characters are replaced rather than turned into whitespace, and runs of real
+    // whitespace collapse to a single space.
+    assert_eq!(sanitize_file_name_component("гл\t1   часть\n2"), "гл_1 часть_2");
+    // Allowed punctuation stays.
+    assert_eq!(sanitize_file_name_component("Title (v2) - part_1.5"), "Title (v2) - part_1.5");
+    // Nothing usable left => empty, which callers must handle (never an invented name).
+    assert_eq!(sanitize_file_name_component("   "), "");
+    assert_eq!(sanitize_file_name_component(""), "");
+}
+
+#[test]
+fn sanitize_file_name_trims_dots_and_guards_reserved_device_names() {
+    // Windows silently drops a trailing dot, so it is trimmed here instead of surprising later.
+    assert_eq!(sanitize_file_name_component("  ..Глава 7..  "), "Глава 7");
+    // Reserved device names cannot be file names on Windows even with an extension.
+    assert_eq!(sanitize_file_name_component("CON"), "CON_");
+    assert_eq!(sanitize_file_name_component("nul"), "nul_");
+    assert_eq!(sanitize_file_name_component("com4"), "com4_");
+    assert_eq!(sanitize_file_name_component("LPT9.part"), "LPT9.part_");
+    // Names that merely start like a device are not reserved.
+    assert_eq!(sanitize_file_name_component("COM10"), "COM10");
+    assert_eq!(sanitize_file_name_component("CONTENT"), "CONTENT");
+}
+
+#[test]
+fn export_base_name_joins_title_and_chapter_and_degrades_to_empty() {
+    let base = export_base_name_from_dirs(Path::new("/projects/Башня Бога"), Path::new("/projects/Башня Бога/Глава 12"));
+    assert_eq!(base, "Башня Бога Глава 12");
+    // A half that sanitizes to nothing is dropped instead of leaving a stray separator.
+    assert_eq!(export_base_name_from_dirs(Path::new("/projects/..."), Path::new("/projects/.../Глава 12")), "Глава 12");
+    assert_eq!(export_base_name_from_dirs(Path::new("/projects/Башня Бога"), Path::new("/")), "Башня Бога");
+    // Nothing usable at all: the empty base is a supported input downstream (pages are then
+    // numbered without a name), so it must NOT be replaced by a made-up one.
+    assert_eq!(export_base_name_from_dirs(Path::new("/"), Path::new("/")), "");
+}
+
+#[test]
+fn export_route_matches_format_to_destination() {
+    let folder = TypingExportDestination::Folder(PathBuf::from("/out/chapter"));
+    let file = TypingExportDestination::PdfFile(PathBuf::from("/out/chapter.pdf"));
+
+    assert_eq!(
+        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Png, false)).unwrap(),
+        TypingExportRoute::StreamedFiles { dir: PathBuf::from("/out/chapter") }
+    );
+    assert_eq!(
+        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Psd, false)).unwrap(),
+        TypingExportRoute::StreamedFiles { dir: PathBuf::from("/out/chapter") }
+    );
+    assert_eq!(
+        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Png, true)).unwrap(),
+        TypingExportRoute::RepaginatedPng { dir: PathBuf::from("/out/chapter") }
+    );
+    assert_eq!(
+        resolve_export_route(&export_request(file.clone(), TypingExportFormat::Pdf, true)).unwrap(),
+        TypingExportRoute::Pdf { file: PathBuf::from("/out/chapter.pdf") }
+    );
+
+    // Both mismatch directions are rejected instead of being reinterpreted: a PDF cannot be
+    // written into a folder of per-page files, and a per-page format cannot target one file.
+    assert!(resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Pdf, false)).is_err());
+    assert!(resolve_export_route(&export_request(file.clone(), TypingExportFormat::Png, false)).is_err());
+    assert!(resolve_export_route(&export_request(file, TypingExportFormat::Psd, false)).is_err());
+}
+
+#[test]
+fn export_route_rejects_psd_combined_with_repagination() {
+    // A re-sliced page is no longer the page whose layer stack a PSD carries, so the flag is
+    // reported as an error rather than silently ignored (the panel also hides the section).
+    let request = export_request(TypingExportDestination::Folder(PathBuf::from("/out/chapter")), TypingExportFormat::Psd, true);
+    assert!(resolve_export_route(&request).is_err());
+}
+
+#[test]
+fn repaginated_export_slices_same_width_ribbons_and_writes_numbered_pages() {
+    use crate::export_repaginate::{TypingRepaginateMode, TypingRepaginateSettings};
+
+    let dir = std::env::temp_dir().join(format!("typ_repaginate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Two ribbons: pages 0 and 1 are 4 px wide (6 + 5 = 11 rows), page 2 is 3 px wide (7 rows),
+    // so the width change must start a new ribbon instead of stitching all three.
+    let pages = [composed_ribbon_page(4, 6, 0), composed_ribbon_page(4, 5, 6), composed_ribbon_page(3, 7, 0)];
+    let settings = TypingRepaginateSettings { enabled: true, mode: TypingRepaginateMode::FixedHeight, fixed_height_px: 4, ..Default::default() };
+
+    // The run plans its output page count up front (it selects the file-name padding):
+    // 11 rows -> 4 + 4 + 3, then 7 rows -> 4 + 3.
+    let sizes: Vec<(u32, u32)> = pages.iter().map(|page| (page.width_px, page.height_px)).collect();
+    let total_output = repaginated_output_page_count(&sizes, &settings).unwrap();
+    assert_eq!(total_output, 5);
+
+    let mut sink = TypingCollectedSink::RepaginatedPng { dir: dir.clone(), base: "Тайтл 1".to_string(), total_output, written: 0 };
+    let mut stage = TypingRibbonStage::new(settings);
+    for page in &pages {
+        stage.push_page(page, &mut sink).unwrap();
+    }
+    stage.finish(&mut sink).unwrap();
+    // The plan and the actual run must agree, or the file names would have been padded wrong.
+    assert_eq!(sink.finish().unwrap(), total_output);
+
+    let read_page = |number: usize| image::open(dir.join(format!("Тайтл 1 {number:03}.png"))).unwrap().to_rgba8();
+    // Per-page dimensions: full-height pages, and a SHORTER (never padded) tail per ribbon.
+    let expected = [(4u32, 4u32), (4, 4), (4, 3), (3, 4), (3, 3)];
+    for (index, (width, height)) in expected.iter().enumerate() {
+        let image = read_page(index + 1);
+        assert_eq!((image.width(), image.height()), (*width, *height), "output page {}", index + 1);
+    }
+    // The second output page starts at the ribbon's absolute row 4 and crosses into the SECOND
+    // source page at its own row 2 (absolute row 6) — the stitch re-pagination exists for.
+    let second = read_page(2);
+    assert_eq!(second.get_pixel(0, 0).0, [4, 4, 4, 255]);
+    assert_eq!(second.get_pixel(3, 2).0, [6, 6, 6, 255]);
+    // The second ribbon restarts at its own row 0, proving the width change cut the ribbon.
+    assert_eq!(read_page(4).get_pixel(0, 0).0, [0, 0, 0, 255]);
+    assert_eq!(read_page(5).get_pixel(2, 2).0, [6, 6, 6, 255]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes a solid-colour source page and returns a job that composes it unchanged (no клин,
+/// no rasters, no overlays), so an end-to-end export test exercises the PIPELINE rather than
+/// the compositor.
+fn plain_export_job(dir: &Path, page_idx: usize, width_px: u32, height_px: u32, output_path: Option<PathBuf>, export_format: TypingExportFormat) -> TypingExportPageJob {
+    let page_path = dir.join(format!("src_{page_idx}.png"));
+    let value = u8::try_from(page_idx).unwrap();
+    let pixels = vec![value; (width_px * height_px * 4) as usize];
+    image::save_buffer(&page_path, &pixels, width_px, height_px, image::ColorType::Rgba8).unwrap();
+    TypingExportPageJob {
+        page_idx,
+        page_path,
+        output_path,
+        clean_overlay_path: None,
+        clean_overlay_rgba: None,
+        overlays: Vec::new(),
+        rasters: Vec::new(),
+        mask: None,
+        export_format,
+        layers_primary_dir: None,
+        layers_fallback_dir: None,
+        font_post_script_names: Default::default(),
+    }
+}
+
+#[test]
+fn a_collecting_export_run_drains_its_window_and_writes_every_output_page() {
+    use crate::export_repaginate::{TypingRepaginateMode, TypingRepaginateSettings};
+
+    // End-to-end through the real worker pool: this is what would hang if the sliding window
+    // gate (`TypingComposeWindow`) could deadlock, and what would mis-order pages if the
+    // reorder buffer were wrong. More pages than the window admits, on purpose.
+    let dir = std::env::temp_dir().join(format!("typ_collect_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source_pages = 24usize;
+    let jobs: Vec<TypingExportPageJob> = (0..source_pages)
+        .map(|page_idx| {
+            // A width change halfway through must start a second ribbon.
+            let width_px = if page_idx < 12 { 8 } else { 6 };
+            plain_export_job(&dir, page_idx, width_px, 5, None, TypingExportFormat::Png)
+        })
+        .collect();
+    let request = TypingExportRequest {
+        destination: TypingExportDestination::Folder(out_dir.clone()),
+        format: TypingExportFormat::Png,
+        repaginate: TypingRepaginateSettings { enabled: true, mode: TypingRepaginateMode::FixedHeight, fixed_height_px: 10, ..Default::default() },
+        output_base_name: "Тайтл 1".to_string(),
+    };
+    let (tx, rx) = mpsc::channel::<TypingExportEvent>();
+    let result = export_typing_pages(jobs, request, None, tx).unwrap();
+
+    // Progress stays counted in SOURCE pages, so it ends at the page count, not the file count.
+    let progress: Vec<usize> = rx
+        .into_iter()
+        .map(|event| match event {
+            TypingExportEvent::Progress { done, .. } => done,
+            TypingExportEvent::Finished(_) => 0,
+        })
+        .collect();
+    assert_eq!(progress, (1..=source_pages).collect::<Vec<_>>(), "one in-order progress event per source page");
+    assert_eq!((result.exported, result.total), (source_pages, source_pages));
+
+    // Each ribbon is 12 pages x 5 rows = 60 rows, cut into 6 pages of 10 rows: 12 files.
+    let mut written: Vec<String> = std::fs::read_dir(&out_dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    written.sort();
+    assert_eq!(written.len(), 12);
+    assert_eq!(written.first().map(String::as_str), Some("Тайтл 1 001.png"));
+    assert_eq!(written.last().map(String::as_str), Some("Тайтл 1 012.png"));
+    // Page 7 is the first page of the SECOND ribbon, so it carries the new width.
+    let seventh = image::open(out_dir.join("Тайтл 1 007.png")).unwrap().to_rgba8();
+    assert_eq!((seventh.width(), seventh.height()), (6, 10));
+    // Ordering: the first output page starts with source page 0's fill value, and the second
+    // one starts with source page 2's (each source page is 5 rows, each output page 10).
+    let first = image::open(out_dir.join("Тайтл 1 001.png")).unwrap().to_rgba8();
+    assert_eq!(first.get_pixel(0, 0).0, [0, 0, 0, 0]);
+    let second = image::open(out_dir.join("Тайтл 1 002.png")).unwrap().to_rgba8();
+    assert_eq!(second.get_pixel(0, 0).0, [2, 2, 2, 2]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
+    let dir = std::env::temp_dir().join(format!("typ_pdf_export_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("nested").join("Тайтл 1 Глава 1.pdf");
+
+    let jobs: Vec<TypingExportPageJob> = (0..3).map(|page_idx| plain_export_job(&dir, page_idx, 7, 4, None, TypingExportFormat::Pdf)).collect();
+    let request = TypingExportRequest {
+        destination: TypingExportDestination::PdfFile(pdf_path.clone()),
+        format: TypingExportFormat::Pdf,
+        repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
+        output_base_name: "Тайтл 1 Глава 1".to_string(),
+    };
+    let (tx, _rx) = mpsc::channel::<TypingExportEvent>();
+    let result = export_typing_pages(jobs, request, None, tx).unwrap();
+    assert_eq!((result.exported, result.total), (3, 3));
+    // The parent directory is created by the run, and the document is written once, whole.
+    let bytes = std::fs::read(&pdf_path).unwrap();
+    assert!(bytes.starts_with(b"%PDF-"), "a PDF document was written");
+
+    // The same jobs with a FOLDER destination are a routing error, not a guess.
+    let jobs: Vec<TypingExportPageJob> = (0..3).map(|page_idx| plain_export_job(&dir, page_idx, 7, 4, None, TypingExportFormat::Pdf)).collect();
+    let bad_request = TypingExportRequest {
+        destination: TypingExportDestination::Folder(dir.join("out")),
+        format: TypingExportFormat::Pdf,
+        repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
+        output_base_name: String::new(),
+    };
+    let (tx, _rx) = mpsc::channel::<TypingExportEvent>();
+    assert!(export_typing_pages(jobs, bad_request, None, tx).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Marker in a source page's file name that makes [`compose_panicking_on_marked_page`] unwind on
+/// it. A `TypingComposeFn` is a bare `fn` pointer and captures nothing, so WHICH page explodes is
+/// carried by the job itself.
+const EXPORT_PANIC_PAGE_MARKER: &str = "boom_";
+
+/// Composition that really UNWINDS on the marked page and delegates every other page to the
+/// production composer.
+///
+/// A panic is the ONE worker failure no `Result` can express — the real composer turns every
+/// anticipated failure into an `Err`, so it cannot be provoked from job data. Hence this stand-in,
+/// injected through the collecting pipeline's `TypingComposeFn` seam.
+fn compose_panicking_on_marked_page(job: &TypingExportPageJob) -> Result<TypingComposedPage, String> {
+    let marked = job.page_path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(EXPORT_PANIC_PAGE_MARKER));
+    assert!(!marked, "deliberate test panic while composing an export page");
+    compose_typing_export_page(job)
+}
+
+/// Number of source pages a panicking-worker run uses: MORE than the compose window admits, so
+/// the surviving workers are genuinely blocked on the gate when one of them dies — which is the
+/// half of the defect that hangs rather than merely truncating.
+///
+/// The window comes from its owner (`compose_window_pages`) instead of being restated here. The
+/// cap keeps `plain_export_job`'s `u8` page fill value in range; a machine with more than ~120
+/// cores would fall back to a run the workers never block in, where the defect still shows up as
+/// a truncated document rather than a hang.
+fn panic_run_page_count() -> usize {
+    compose_window_pages(export_worker_count(usize::MAX)).saturating_add(8).min(250)
+}
+
+/// Builds `pages` trivial PDF export jobs whose composition is otherwise unremarkable, marking the
+/// job at `exploding_page_idx` so that [`compose_panicking_on_marked_page`] unwinds on it.
+fn exploding_export_jobs(dir: &Path, pages: usize, exploding_page_idx: usize) -> Vec<TypingExportPageJob> {
+    (0..pages)
+        .map(|page_idx| {
+            let mut job = plain_export_job(dir, page_idx, 6, 4, None, TypingExportFormat::Pdf);
+            if page_idx == exploding_page_idx {
+                let marked = dir.join(format!("{EXPORT_PANIC_PAGE_MARKER}{page_idx}.png"));
+                std::fs::rename(&job.page_path, &marked).unwrap();
+                job.page_path = marked;
+            }
+            job
+        })
+        .collect()
+}
+
+/// Runs the collecting pipeline into a PDF on its own thread and gives up after `deadline`.
+///
+/// The deadline is the point: the defect this guards against is a HANG (a worker that panics
+/// without reporting its ordinal leaves the others blocked on the compose window forever, so the
+/// consumer's channel never closes), and a hanging assertion would wedge the whole suite instead
+/// of failing it.
+fn collecting_pdf_run_with_deadline(jobs: Vec<TypingExportPageJob>, pdf_path: &Path, compose: fn(&TypingExportPageJob) -> Result<TypingComposedPage, String>, deadline: std::time::Duration) -> Result<TypingExportResult, String> {
+    let sink = TypingCollectedSink::Pdf { file: pdf_path.to_path_buf(), builder: crate::pdf_export::TypingPdfBuilder::new() };
+    let destination = TypingExportDestination::PdfFile(pdf_path.to_path_buf());
+    // `progress_rx` is kept alive for the whole run: the pipeline tolerates a closed progress
+    // channel, but these tests are about the worker pool, not about that tolerance.
+    let (progress_tx, progress_rx) = mpsc::channel::<TypingExportEvent>();
+    let (done_tx, done_rx) = mpsc::channel::<Result<TypingExportResult, String>>();
+    let worker = thread::spawn(move || {
+        let outcome = export_typing_pages_collected(jobs, sink, None, None, destination, progress_tx, compose);
+        // The only receiver is `done_rx` below; a send failure would mean the test already gave
+        // up on the deadline, and there is nobody left to hand the outcome to.
+        let _ = done_tx.send(outcome);
+    });
+    let outcome = done_rx.recv_timeout(deadline).expect("the collecting export must terminate instead of hanging on its compose window");
+    worker.join().expect("the export thread itself must not panic");
+    drop(progress_rx);
+    outcome
+}
+
+#[test]
+fn a_panicking_compose_worker_ends_the_collecting_run_with_an_error_instead_of_hanging() {
+    // Without the `TypingComposeReport` drop guard this HANGS: the panicking worker sends nothing
+    // for its ordinal, so the consumer never advances past it, the surviving workers stay blocked
+    // in `TypingComposeWindow` holding their `tx` clones, and the consumer's `for message in rx`
+    // never ends. The deadline turns that hang into a failure instead of a wedged suite.
+    let dir = std::env::temp_dir().join(format!("typ_panic_mid_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("out.pdf");
+
+    // Page 2 explodes early, while the window still holds the run's tail back.
+    let jobs = exploding_export_jobs(&dir, panic_run_page_count(), 2);
+    let outcome = collecting_pdf_run_with_deadline(jobs, &pdf_path, compose_panicking_on_marked_page, std::time::Duration::from_secs(120));
+
+    // A lost page is a failure, never a quietly shorter document.
+    assert!(outcome.is_err(), "a panicking worker must be reported as an export error, not as a success");
+    assert!(!pdf_path.exists(), "no document may be written for a run that lost a page");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_panicking_compose_worker_on_the_last_page_writes_no_document() {
+    // The partial-document half of the same hole: every page but the last one has already been fed
+    // to the PDF builder when the panic happens, so a run that did not notice would serialize a
+    // document silently missing its final page.
+    let dir = std::env::temp_dir().join(format!("typ_panic_tail_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("nested").join("out.pdf");
+    std::fs::create_dir_all(pdf_path.parent().unwrap()).unwrap();
+
+    let pages = panic_run_page_count();
+    let jobs = exploding_export_jobs(&dir, pages, pages - 1);
+    let outcome = collecting_pdf_run_with_deadline(jobs, &pdf_path, compose_panicking_on_marked_page, std::time::Duration::from_secs(120));
+
+    assert!(outcome.is_err(), "a panicking worker must be reported as an export error, not as a success");
+    assert!(!pdf_path.exists(), "the sink is never finished for a failed run, so no file is left behind");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -307,7 +307,7 @@ The main data flow is:
    overlays, deform meshes, and optional typing masks into final page images
    (`flatten_typing_export_page_rgba`, shared by PNG and PSD). Export is GATED on full residency
    (Phase 2): the trigger defers dispatch behind the whole-project preload (see the preload contract
-   below) so EVERY page's text is materialized before snapshotting. ORDERING: `request_export_to_folder`
+   below) so EVERY page's text is materialized before snapshotting. ORDERING: `request_export`
    builds the text/image overlay snapshot (`build_export_overlay_snapshots`) AFTER the raster residency
    pass (`ensure_raster_layers_for_page` -> `sync_from_doc`), not before — building it earlier silently
    dropped the text of migrated/v3 pages the user never visited (their overlays materialize into
@@ -429,7 +429,15 @@ saving, and export.
     `use_dark_shape_variant_checkerboard`. The VALUE is `pub(crate)` because
     the sibling `panel` module picks one of three flat greys behind a local-preset row and
     must not grow a second luminance rule to do it.
-  - `export.rs`: PNG/PSD export jobs + page composition/flatten free fns.
+  - `export.rs`: export jobs, page composition/flatten free fns, and the TWO export
+    pipelines. `resolve_export_route` is the single decision point mapping
+    (format × destination × re-pagination) onto `StreamedFiles` (today's per-page
+    compose→encode→write, unchanged for PNG/PSD without re-pagination),
+    `RepaginatedPng` or `Pdf`; the collecting routes need composed pixels in page order,
+    so workers only COMPOSE and a reorder buffer consumes by `page_idx`, throttled by
+    `TypingComposeWindow` (Mutex+Condvar sliding window) to keep peak memory bounded.
+    Incompatible combinations (PSD + re-pagination, format/destination mismatch) are hard
+    errors, never silently reinterpreted.
   - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
   - `helpers.rs`: selection→page resolution, bubble/area seed text (incl. the `BubbleClass::Hint`
     exclusion predicates `is_hint_bubble` / `bubble_offers_create_text_header`), doc-node runtime,
@@ -656,6 +664,22 @@ saving, and export.
   runs while the panel is open.
 - `auto_typing.rs`: optical center computation for rendered overlays and region-growing
   bubble detection from the shared composited page cache.
+- `export_repaginate.rs`: the PURE re-pagination engine behind the export panel's
+  «перенарезка» option. GUI-free and I/O-free: `group_pages_into_ribbons` (consecutive
+  pages of EQUAL width form one ribbon — widths are never rescaled, a width change starts
+  a new ribbon), `RibbonSlicer` (streams composed pages in, emits re-sliced pages out, so
+  peak memory is ~one target page + one input page instead of the whole chapter),
+  `TypingRepaginateSettings::target_height_px` (aspect ratio applied to the ribbon's own
+  width, or a fixed pixel height; `None` means "cannot re-paginate" and MUST be surfaced
+  as an error, never silently defaulted). Each ribbon's last slice stays SHORTER than the
+  target — it is deliberately not padded. Owns the settings types the panel edits.
+- `pdf_export.rs`: the multi-page PDF writer for `TypingExportFormat::Pdf`. One full-page
+  raster per page, `/DeviceRGB` 8bpc `/FlateDecode` — LOSSLESS on purpose (JPEG ringing
+  around stroked/glowing text is a visible defect in a typesetting program's output).
+  Alpha is composited over WHITE, since a PDF page has no transparency backdrop. The page
+  box is 1 px = 1 pt, scaled down by one shared factor when a side would exceed PDF's
+  hard 14400 pt limit — the pixels are kept, the sheet is simply physically smaller.
+  Returns bytes; the caller owns the `ms_storage` write.
 - `rotation_ctrl_wheel`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,
   default Vector) selecting how the Ctrl+wheel gesture rotates a selected overlay. Config-free;
   seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
@@ -1030,9 +1054,10 @@ saving, and export.
   text verbatim), so dispatching once the pass drains is safe. `drive_page_preload` counts genuine decode
   errors and logs one aggregated warning on completion (plus per-page detail) so the operation proceeds
   loudly, not silently. EXPORT is wired to this preloader (Phase 2): the export trigger in
-  `draw_canvas_overlay_top_left` (`tab.rs`) runs `request_export_to_folder` immediately only when every
+  `draw_canvas_overlay_top_left` (`tab.rs`) runs `request_export` immediately only when every
   page is resident AND masks are loaded AND no save is busy; otherwise it starts `begin_preload_all_pages`
-  (when layers are the blocker), stores a `pending_export_after_preload` (dir + format only) on
+  (when layers are the blocker), stores a `pending_export_after_preload` (the whole `TypingExportRequest`: typed destination,
+  format, re-pagination settings and output base name) on
   `TypingTextOverlayLayer`, and shows the `TypingExportUiStatus::Preparing` indicator. That indicator is
   gated on `has_pending_export()` ALONE (not `preload_all_pages_active`), so it stays visible until the
   export actually dispatches — it must not vanish when the pass drains on the give-up path while the
@@ -1351,7 +1376,10 @@ saving, and export.
 - To change the on-canvas VECTOR transform (seed/interaction/settle/reset), edit `tab/vector_transform.rs`;
   its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.
 - To change persisted overlay schema parsing/normalization, edit `tab/codec.rs`.
-- To change export composition, edit `tab/export.rs`.
+- To change export composition or either export pipeline, edit `tab/export.rs`.
+- To change how re-paginated pages are stitched or sliced, edit `export_repaginate.rs`; to
+  change the PDF the `Pdf` format emits, edit `pdf_export.rs`. Both are pure — keep I/O and
+  the `ms_storage` writes in `tab/export.rs`.
 - To change create/edit UI, presets, font loading, inline tag controls, or effect cards,
   edit `panel.rs`.
 - To change clipping mask loading, painting, fill, save, or export snapshots, edit

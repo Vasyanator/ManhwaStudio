@@ -35,6 +35,9 @@ impl TypingTopPanelState {
     /// frame's, so the caller runs this first, then the dock, then
     /// [`TypingTopPanelState::end_frame`]. Must be called exactly once per frame.
     pub(crate) fn begin_frame(&mut self, ctx: &egui::Context) {
+        // Runs before the dock, i.e. before anything can draw the export block again, so the
+        // page-title confirmation is judged on what the PREVIOUS frame actually showed.
+        self.expire_repaginate_pages_warning();
         // Cached font coverage (`FontEntry.coverage`) is computed at load time against the
         // then-current typesetting language. If the user has since changed the language, that
         // cache is stale, so reload both font lists off-thread to recompute coverage. The
@@ -86,6 +89,28 @@ impl TypingTopPanelState {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// SINGLE owner of the page-title confirmation's lifetime: drops the confirmation unless
+    /// the block that hosts it was drawn in the previous frame, then re-arms the per-frame
+    /// flag for this frame.
+    ///
+    /// The confirmation is the first half of the two-click guard on a page-based title
+    /// (`apply_repaginate_toggle`), so it must never outlive the yellow line the user can
+    /// see: the export block disappears whenever the panel flips to edit mode
+    /// (`preview_enabled`), the format is PSD, or the «Действия» dock tab is closed — and a
+    /// confirmation surviving any of those would arm the SECOND click while the user still
+    /// sees a fresh, unwarned checkbox. Called from [`Self::begin_frame`] only: the drawing
+    /// side merely reports whether it drew the block
+    /// ([`TypingRightSectionActions::repaginate_block_drawn`]), so no call site has to
+    /// remember to clear anything.
+    pub(super) fn expire_repaginate_pages_warning(&mut self) {
+        if !self.repaginate_block_drawn {
+            self.repaginate_pages_warning = false;
+        }
+        // A frame that never draws the block leaves this `false`, which is exactly what the
+        // next frame's check must see.
+        self.repaginate_block_drawn = false;
     }
 
     /// Per-frame epilogue: drains the in-app settings deep-link a font-group "?"
@@ -258,6 +283,10 @@ impl TypingTopPanelState {
             export_default_dir: self.export_default_dir.as_deref(),
             export_status: &self.export_status,
             export_format: self.export_format,
+            comic_type: self.export_comic_type,
+            repaginate: self.repaginate,
+            repaginate_pages_warning: self.repaginate_pages_warning,
+            export_base_name: self.export_base_name.as_str(),
         };
         let actions = match self.mode {
             TypingTopPanelMode::CreateText => self.create_panel.draw_right_section(ui, inputs),
@@ -272,9 +301,25 @@ impl TypingTopPanelState {
         }
         if let Some(format) = actions.changed_export_format {
             self.export_format = format;
+            // A format change RESETS the re-pagination toggle to that format's default
+            // (PDF on, PNG/PSD off — never on a page-based title). Only `enabled` is reset:
+            // the ratio/height the user tuned survives, so switching formats back and forth
+            // does not silently discard it. The page-title confirmation belongs to the
+            // previous format's decision and is cleared with it.
+            self.repaginate.enabled = repaginate_default_for_format(format, self.export_comic_type);
+            self.repaginate_pages_warning = false;
         }
-        if let Some(path) = actions.export_to_folder {
-            self.pending_export_to_folder = Some(path);
+        if let Some(repaginate) = actions.changed_repaginate {
+            self.repaginate = repaginate;
+        }
+        if let Some(warning) = actions.changed_repaginate_pages_warning {
+            self.repaginate_pages_warning = warning;
+        }
+        // Reported by the section, never re-derived here: `expire_repaginate_pages_warning`
+        // drops the confirmation on the next frame unless the block was on screen in this one.
+        self.repaginate_block_drawn = actions.repaginate_block_drawn;
+        if let Some(destination) = actions.export_destination {
+            self.pending_export_destination = Some(destination);
         }
         if actions.round_text_positions {
             self.pending_round_text_positions = true;
@@ -590,10 +635,19 @@ impl TypingTopPanelState {
         self.pending_clean_overlays_visible.take()
     }
 
-    pub(crate) fn take_export_to_folder_request(&mut self) -> Option<(PathBuf, TypingExportFormat)> {
-        self.pending_export_to_folder
-            .take()
-            .map(|path| (path, self.export_format))
+    /// Drains the export the user confirmed in the dialog, if any.
+    ///
+    /// Returns the picked destination together with the settings that were in effect at the
+    /// moment of the click: the format, the re-pagination options, and the output base name
+    /// last pushed by [`Self::set_export_context`]. `None` while no export is queued; the
+    /// request is handed out exactly once.
+    pub(crate) fn take_export_request(&mut self) -> Option<TypingExportRequest> {
+        self.pending_export_destination.take().map(|destination| TypingExportRequest {
+            destination,
+            format: self.export_format,
+            repaginate: self.repaginate,
+            output_base_name: self.export_base_name.clone(),
+        })
     }
 
     pub(crate) fn take_round_text_positions_request(&mut self) -> bool {
@@ -606,6 +660,32 @@ impl TypingTopPanelState {
 
     pub(crate) fn set_export_default_dir(&mut self, path: PathBuf) {
         self.export_default_dir = Some(path);
+    }
+
+    /// Pushes the per-frame export context of the OPEN title into the panel.
+    ///
+    /// Mirrors [`Self::set_export_default_dir`]: called every frame from
+    /// `TypingTabState::draw`. `comic_type` is `None` while no title is open and decides the
+    /// re-pagination defaults plus the page-title confirmation; `output_base_name` is the
+    /// extension-less name the export should give its output and prefills the PDF save
+    /// dialog.
+    ///
+    /// A CHANGE of `comic_type` — a title switch, or the non-modal comic-type prompt answered
+    /// after the format was already picked — re-applies the per-format default
+    /// ([`repaginate_default_for_format`]) and clears the page-title confirmation. This
+    /// deliberately overrides a manual toggle: the default IS a function of the comic type
+    /// (re-pagination is a webtoon operation), so a checkbox left on from the previous type
+    /// would hand a page-based title a re-paginating export the user was never asked to
+    /// confirm. Only a real transition acts — the same value is pushed every frame, and
+    /// re-applying it then would pin the checkbox to its default and make it untouchable.
+    /// `output_base_name` is a plain input and reacts to nothing.
+    pub(crate) fn set_export_context(&mut self, comic_type: Option<ms_project::ComicType>, output_base_name: String) {
+        if self.export_comic_type != comic_type {
+            self.export_comic_type = comic_type;
+            self.repaginate.enabled = repaginate_default_for_format(self.export_format, comic_type);
+            self.repaginate_pages_warning = false;
+        }
+        self.export_base_name = output_base_name;
     }
 
     /// Binds the character table's PROJECT favorite list to the open title's

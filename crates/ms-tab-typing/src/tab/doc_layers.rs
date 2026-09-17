@@ -1348,7 +1348,7 @@ impl TypingTextOverlayLayer {
     /// Takes the deferred export IFF the whole-project preload PASS has fully drained
     /// (`!preload_all_pages_active`). Returns `None` (leaving the request pending) while the pass is
     /// still running. The caller then captures the mask snapshot and dispatches
-    /// `request_export_to_folder`.
+    /// `request_export`.
     ///
     /// Gating on pass COMPLETION rather than full residency (`all_pages_loaded`) is deliberate and
     /// required for correctness: a page whose decode genuinely fails (corrupt `layers.json`/

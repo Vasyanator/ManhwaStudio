@@ -6802,3 +6802,248 @@ paths change.
         );
         assert!(extras.changed(), "the removal is a change the dock must write");
     }
+
+    // ---------------------------------------------------------------------------------
+    // Export block: re-pagination defaults, the page-title confirmation state machine, and
+    // the per-format destination/label choice. All of it is pure decision logic lifted out
+    // of `draw_right_section` precisely so it can be tested without a GUI.
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn repaginate_defaults_on_for_pdf_and_off_for_the_raster_formats() {
+        for comic_type in [None, Some(ms_project::ComicType::Ribbon), Some(ms_project::ComicType::Custom)] {
+            assert!(
+                repaginate_default_for_format(TypingExportFormat::Pdf, comic_type),
+                "PDF must default to re-pagination for {comic_type:?}"
+            );
+            assert!(!repaginate_default_for_format(TypingExportFormat::Png, comic_type));
+            assert!(!repaginate_default_for_format(TypingExportFormat::Psd, comic_type));
+        }
+    }
+
+    #[test]
+    fn a_page_based_title_defaults_re_pagination_off_for_every_format() {
+        let pages = Some(ms_project::ComicType::Pages);
+
+        assert!(!repaginate_default_for_format(TypingExportFormat::Pdf, pages));
+        assert!(!repaginate_default_for_format(TypingExportFormat::Png, pages));
+        assert!(!repaginate_default_for_format(TypingExportFormat::Psd, pages));
+    }
+
+    #[test]
+    fn the_block_is_hidden_only_for_psd() {
+        assert!(repaginate_block_visible(TypingExportFormat::Png));
+        assert!(repaginate_block_visible(TypingExportFormat::Pdf));
+        assert!(
+            !repaginate_block_visible(TypingExportFormat::Psd),
+            "a layered PSD cannot carry re-sliced pages, so the option must not be offered"
+        );
+    }
+
+    #[test]
+    fn enabling_re_pagination_on_a_page_title_warns_first_and_enables_on_the_second_click() {
+        let pages = Some(ms_project::ComicType::Pages);
+
+        // First click: refused, confirmation raised.
+        let (enabled, warning) = apply_repaginate_toggle(true, pages, false);
+        assert!(!enabled, "the first click must NOT enable re-pagination");
+        assert!(warning, "the first click must raise the confirmation");
+
+        // Second click, made with the confirmation on screen: goes through and clears it.
+        let (enabled, warning) = apply_repaginate_toggle(true, pages, true);
+        assert!(enabled, "the second click must enable re-pagination");
+        assert!(!warning, "enabling must clear the confirmation");
+    }
+
+    #[test]
+    fn disabling_re_pagination_always_succeeds_and_clears_the_warning() {
+        for comic_type in [None, Some(ms_project::ComicType::Pages), Some(ms_project::ComicType::Ribbon)] {
+            for warning_shown in [false, true] {
+                let (enabled, warning) = apply_repaginate_toggle(false, comic_type, warning_shown);
+                assert!(!enabled, "turning it off must always turn it off ({comic_type:?})");
+                assert!(!warning, "turning it off must clear the confirmation ({comic_type:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_ribbon_title_enables_re_pagination_on_the_first_click_without_a_warning() {
+        for comic_type in [None, Some(ms_project::ComicType::Ribbon), Some(ms_project::ComicType::Custom)] {
+            let (enabled, warning) = apply_repaginate_toggle(true, comic_type, false);
+            assert!(enabled, "{comic_type:?} must enable on the first click");
+            assert!(!warning, "{comic_type:?} must raise no confirmation");
+        }
+    }
+
+    #[test]
+    fn the_export_button_targets_a_folder_for_rasters_and_a_file_for_pdf() {
+        assert_eq!(export_dialog_kind(TypingExportFormat::Png), TypingExportDialogKind::Folder);
+        assert_eq!(export_dialog_kind(TypingExportFormat::Psd), TypingExportDialogKind::Folder);
+        assert_eq!(export_dialog_kind(TypingExportFormat::Pdf), TypingExportDialogKind::PdfFile);
+
+        assert_eq!(export_button_label_key(TypingExportFormat::Png), "typing.export.overlay_and_save_button");
+        assert_eq!(export_button_label_key(TypingExportFormat::Psd), "typing.export.overlay_and_save_button");
+        assert_eq!(export_button_label_key(TypingExportFormat::Pdf), "typing.export.overlay_and_save_to_file_button");
+    }
+
+    /// The two captions must actually exist in the catalog and differ — a copy-paste of one
+    /// key into both arms would pass the mapping test above and still ship one label.
+    #[test]
+    fn both_export_button_captions_resolve_and_differ() {
+        // The catalog slot is one process-global `ArcSwap`; tests serialize on the shared lock.
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
+        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
+        ms_i18n::set_locale(&en).expect("en catalog installs");
+
+        let folder = ms_i18n::resolve_key(export_button_label_key(TypingExportFormat::Png));
+        let file = ms_i18n::resolve_key(export_button_label_key(TypingExportFormat::Pdf));
+
+        assert_ne!(folder, export_button_label_key(TypingExportFormat::Png), "the folder caption must be translated, not echoed back as its key");
+        assert_ne!(file, export_button_label_key(TypingExportFormat::Pdf), "the file caption must be translated, not echoed back as its key");
+        assert_ne!(folder, file, "the PDF button must not reuse the folder caption");
+    }
+
+    #[test]
+    fn the_pdf_dialog_file_name_appends_one_extension_and_never_an_empty_stem() {
+        assert_eq!(pdf_export_file_name("chapter_01"), "chapter_01.pdf");
+        assert_eq!(pdf_export_file_name("  chapter_01  "), "chapter_01.pdf");
+        assert_eq!(pdf_export_file_name("chapter_01.pdf"), "chapter_01.pdf");
+        assert_eq!(pdf_export_file_name("chapter_01.PDF"), "chapter_01.PDF");
+        assert_eq!(pdf_export_file_name(""), "export.pdf");
+        assert_eq!(pdf_export_file_name("   "), "export.pdf");
+        // A name ending in a multi-byte character must not be sliced mid-character.
+        assert_eq!(pdf_export_file_name("Глава 1"), "Глава 1.pdf");
+        assert_eq!(pdf_export_file_name("Глава.pdf"), "Глава.pdf");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Export block, lifetime of the page-title confirmation and of the re-pagination
+    // default: both are panel STATE transitions rather than pure decisions, so they are
+    // driven through the real facade methods here.
+    // ---------------------------------------------------------------------------------
+
+    /// Runs one panel frame over the «Действия» tab body: the confirmation-expiry prologue,
+    /// then the body itself.
+    ///
+    /// The production prologue is `begin_frame`, which also pumps the font and preset
+    /// workers; only its confirmation tick matters here, so the test drives that half
+    /// directly and leaves the workers alone.
+    fn step_actions_frame(state: &mut TypingTopPanelState) {
+        state.expire_repaginate_pages_warning();
+        egui::__run_test_ui(|ui| state.draw_actions_tab_body(ui));
+    }
+
+    #[test]
+    fn the_page_title_confirmation_does_not_survive_the_block_being_hidden_by_edit_mode() {
+        let mut state = TypingTopPanelState::default();
+        state.export_format = TypingExportFormat::Pdf;
+        state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
+        // State left by a first click on the checkbox: refused, confirmation on screen.
+        state.repaginate_pages_warning = true;
+        state.repaginate_block_drawn = true;
+
+        // While the block stays on screen the confirmation must survive, or the second click
+        // could never go through.
+        step_actions_frame(&mut state);
+        assert!(
+            state.repaginate_pages_warning,
+            "a confirmation the user can see must survive an ordinary frame"
+        );
+
+        // Selecting a text layer flips the panel to edit mode, which draws no export block.
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        step_actions_frame(&mut state);
+        // Deselecting returns to create mode: the block is drawn again, and it must come back
+        // WITHOUT the yellow line, which nothing on screen had asked for.
+        state.sync_selected_overlay_for_edit(None);
+        step_actions_frame(&mut state);
+        assert!(
+            !state.repaginate_pages_warning,
+            "a confirmation hidden by a panel-mode flip must not be repainted on return"
+        );
+
+        // …so the next click is again a FIRST click: it warns instead of enabling.
+        let (enabled, warning) = apply_repaginate_toggle(true, state.export_comic_type, state.repaginate_pages_warning);
+        assert!(!enabled, "the guard must still refuse the first click after the block reappears");
+        assert!(warning, "the first click after the block reappears must raise the confirmation again");
+    }
+
+    #[test]
+    fn the_page_title_confirmation_does_not_survive_a_format_that_hides_the_block() {
+        let mut state = TypingTopPanelState::default();
+        state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
+        // PSD hides the whole block (`repaginate_block_visible`). A format click clears the
+        // confirmation on its own; this asserts the second, independent guard — even a
+        // confirmation that reached this state some other way cannot outlive one frame of an
+        // invisible block.
+        state.export_format = TypingExportFormat::Psd;
+        state.repaginate_pages_warning = true;
+        state.repaginate_block_drawn = true;
+
+        step_actions_frame(&mut state);
+        step_actions_frame(&mut state);
+
+        assert!(
+            !state.repaginate_pages_warning,
+            "PSD draws no re-pagination block, so its confirmation must be dropped"
+        );
+    }
+
+    #[test]
+    fn a_comic_type_change_re_applies_the_per_format_re_pagination_default() {
+        let mut state = TypingTopPanelState::default();
+        state.export_format = TypingExportFormat::Pdf;
+        // The comic-type prompt is non-modal: the user can pick PDF while the title's type is
+        // still unknown, where PDF defaults to ON.
+        state.repaginate.enabled = repaginate_default_for_format(TypingExportFormat::Pdf, None);
+        state.repaginate_pages_warning = true;
+        assert!(state.repaginate.enabled, "PDF with an unknown comic type defaults to re-pagination");
+
+        // …and answers «Страничный» only afterwards.
+        state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
+        assert!(
+            !state.repaginate.enabled,
+            "a page-based title must not keep a re-paginating export the user was never asked to confirm"
+        );
+        assert!(!state.repaginate_pages_warning, "the stale confirmation belongs to the previous comic type");
+
+        // A switch to a webtoon title re-applies the format default the other way.
+        state.set_export_context(Some(ms_project::ComicType::Ribbon), "Title 02".to_string());
+        assert!(state.repaginate.enabled, "a ribbon title re-applies the PDF default (on)");
+
+        state.set_export_context(Some(ms_project::ComicType::Custom), "Title 03".to_string());
+        assert!(state.repaginate.enabled, "a custom title is treated as a non-page title");
+
+        // The same transition under a format whose default is OFF.
+        state.export_format = TypingExportFormat::Png;
+        state.set_export_context(Some(ms_project::ComicType::Ribbon), "Title 04".to_string());
+        assert!(!state.repaginate.enabled, "PNG defaults to no re-pagination for every comic type");
+    }
+
+    #[test]
+    fn the_per_frame_export_context_push_leaves_the_users_re_pagination_choice_alone() {
+        let mut state = TypingTopPanelState::default();
+        state.export_format = TypingExportFormat::Png;
+        state.set_export_context(Some(ms_project::ComicType::Ribbon), "Title 01".to_string());
+        assert!(!state.repaginate.enabled, "PNG starts off");
+
+        // The user turns re-pagination on by hand and raises no confirmation (ribbon title).
+        state.repaginate.enabled = true;
+        // `set_export_context` is pushed on EVERY frame with the same value; re-applying the
+        // default there would pin the checkbox to `false` and make it untouchable.
+        for _ in 0..10 {
+            state.set_export_context(Some(ms_project::ComicType::Ribbon), "Title 01".to_string());
+        }
+        assert!(state.repaginate.enabled, "the per-frame push must not undo a manual toggle");
+
+        // Nor may it drop a confirmation the user is still looking at on a page-based title.
+        state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
+        state.repaginate_pages_warning = true;
+        for _ in 0..10 {
+            state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
+        }
+        assert!(
+            state.repaginate_pages_warning,
+            "only a real comic-type transition may clear the confirmation"
+        );
+    }

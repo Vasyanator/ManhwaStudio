@@ -546,12 +546,19 @@ impl TypingCreatePanelState {
             export_default_dir,
             export_status,
             export_format,
+            comic_type,
+            repaginate,
+            repaginate_pages_warning,
+            export_base_name,
         } = inputs;
         let mut out = TypingRightSectionActions {
             toggle_mask: false,
             changed_clean_overlays: None,
-            export_to_folder: None,
+            export_destination: None,
             changed_export_format: None,
+            changed_repaginate: None,
+            changed_repaginate_pages_warning: None,
+            repaginate_block_drawn: false,
             round_text_positions: false,
             create_image_request: None,
             changed_strict_pixel_movement: None,
@@ -569,16 +576,27 @@ impl TypingCreatePanelState {
                 let mut format = export_format;
                 ui.horizontal(|ui| {
                     ui.label(t!("typing.export.format_label"));
-                    if ui
-                        .selectable_value(&mut format, TypingExportFormat::Png, "PNG")
-                        .clicked()
-                        || ui
-                            .selectable_value(&mut format, TypingExportFormat::Psd, "PSD")
-                            .clicked()
-                    {
+                    // Format NAMES are proper nouns and stay literal (the i18n exclusion for
+                    // protocol/format identifiers); everything else in this block is a key.
+                    //
+                    // Each button is drawn into its own binding on purpose: a `||` chain
+                    // short-circuits, so a click on the first option would skip DRAWING the
+                    // remaining ones for that frame and the row would flicker.
+                    let png_clicked = ui.selectable_value(&mut format, TypingExportFormat::Png, "PNG").clicked();
+                    let psd_clicked = ui.selectable_value(&mut format, TypingExportFormat::Psd, "PSD").clicked();
+                    let pdf_clicked = ui.selectable_value(&mut format, TypingExportFormat::Pdf, "PDF").clicked();
+                    if png_clicked || psd_clicked || pdf_clicked {
                         out.changed_export_format = Some(format);
                     }
                 });
+            }
+            // SINGLE owner of "is the re-pagination block on screen": the same decision is
+            // reported to the facade, which expires the page-title confirmation whenever the
+            // block that hosts it was not drawn. Re-deciding it there would be a second copy
+            // of this condition, free to drift from this one.
+            out.repaginate_block_drawn = self.preview_enabled && repaginate_block_visible(export_format);
+            if out.repaginate_block_drawn {
+                draw_repaginate_block(ui, comic_type, repaginate, repaginate_pages_warning, &mut out);
             }
             if self.preview_enabled {
                 // Primary export action: painted green to stand out among the
@@ -587,22 +605,35 @@ impl TypingCreatePanelState {
                 let clicked = egui::Frame::group(ui.style())
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
-                        let label = egui::RichText::new(t!("typing.export.overlay_and_save_button"))
+                        // The caption depends on the destination KIND (a folder of page
+                        // files vs. one document), which `export_button_label_key` decides
+                        // together with the dialog below so the two can never disagree.
+                        let caption = ms_i18n::resolve_key(export_button_label_key(export_format));
+                        let label = egui::RichText::new(caption)
                             .color(Color32::from_rgb(230, 230, 230));
                         ui.add(egui::Button::new(label).fill(Color32::from_rgb(46, 140, 56)))
                             .clicked()
                     })
                     .inner;
                 if clicked {
-                    // Native folder picker; on web there is no OS dialog (folder export
-                    // is handled by a zip download in the web-glue phase).
+                    // Native picker; on web there is no OS dialog (folder export is handled
+                    // by a zip download in the web-glue phase).
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         let mut dialog = FileDialog::new();
                         if let Some(path) = export_default_dir {
                             dialog = dialog.set_directory(path);
                         }
-                        out.export_to_folder = dialog.pick_folder();
+                        out.export_destination = match export_dialog_kind(export_format) {
+                            TypingExportDialogKind::Folder => {
+                                dialog.pick_folder().map(TypingExportDestination::Folder)
+                            }
+                            TypingExportDialogKind::PdfFile => dialog
+                                .set_file_name(pdf_export_file_name(export_base_name))
+                                .add_filter(t!("typing.export.pdf_files_label"), &["pdf"])
+                                .save_file()
+                                .map(TypingExportDestination::PdfFile),
+                        };
                     }
                 }
             }
@@ -729,5 +760,125 @@ impl TypingCreatePanelState {
             }
         });
         out
+    }
+}
+
+/// Draws the re-pagination («перенарезка») options of the export block and reports every
+/// edit through `out`.
+///
+/// Free function rather than a method: it touches no panel state at all — the settings come
+/// in as a value (`repaginate`) and go back out as `TypingRightSectionActions`, exactly like
+/// the rest of this section's inputs. The caller decides whether the block is shown at all
+/// (`repaginate_block_visible`), so this function never re-checks the format.
+///
+/// `comic_type` is the open title's kind and only reaches [`apply_repaginate_toggle`];
+/// `repaginate_pages_warning` is the current state of the page-title confirmation.
+fn draw_repaginate_block(
+    ui: &mut egui::Ui,
+    comic_type: Option<ms_project::ComicType>,
+    repaginate: TypingRepaginateSettings,
+    repaginate_pages_warning: bool,
+    out: &mut TypingRightSectionActions,
+) {
+    let mut settings = repaginate;
+    let mut changed = false;
+    // Mirror of the confirmation state AFTER this frame's click, so a warning raised by the
+    // click is painted in the same frame that refused the toggle.
+    let mut warning_visible = repaginate_pages_warning;
+
+    ui.add_space(4.0);
+    // The checkbox is driven through a scratch copy: on a page-based title the first attempt
+    // to enable must be REFUSED, so the authoritative value is whatever
+    // `apply_repaginate_toggle` returns, never what the widget wrote.
+    let mut enabled_request = settings.enabled;
+    if ui
+        .checkbox(&mut enabled_request, t!("typing.export.repaginate_toggle"))
+        .on_hover_text(t!("typing.export.repaginate_toggle_tooltip"))
+        .changed()
+    {
+        let (enabled, warning) = apply_repaginate_toggle(enabled_request, comic_type, repaginate_pages_warning);
+        if enabled != settings.enabled {
+            settings.enabled = enabled;
+            changed = true;
+        }
+        warning_visible = warning;
+        if warning != repaginate_pages_warning {
+            out.changed_repaginate_pages_warning = Some(warning);
+        }
+    }
+    if warning_visible {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(t!("typing.export.repaginate_pages_warning"))
+                    .color(super::create_presets::FONT_DIAGNOSTIC_WARNING_COLOR),
+            )
+            .wrap(),
+        );
+    }
+
+    if settings.enabled {
+        ui.indent("typing.export.repaginate_options", |ui| {
+            let mut mode = settings.mode;
+            ui.horizontal(|ui| {
+                let ratio_clicked = ui
+                    .selectable_value(&mut mode, TypingRepaginateMode::Ratio, t!("typing.export.repaginate_mode_ratio"))
+                    .clicked();
+                let fixed_clicked = ui
+                    .selectable_value(&mut mode, TypingRepaginateMode::FixedHeight, t!("typing.export.repaginate_mode_fixed_height"))
+                    .clicked();
+                if ratio_clicked || fixed_clicked {
+                    settings.mode = mode;
+                    changed = true;
+                }
+            });
+            match settings.mode {
+                TypingRepaginateMode::Ratio => {
+                    ui.horizontal(|ui| {
+                        // Both terms are >= 1: a zero makes `target_height_px` return `None`,
+                        // i.e. silently no re-pagination at all.
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut settings.ratio_width)
+                                    .range(1..=10_000)
+                                    .prefix(t!("typing.export.repaginate_ratio_width_label")),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut settings.ratio_height)
+                                    .range(1..=10_000)
+                                    .prefix(t!("typing.export.repaginate_ratio_height_label")),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(t!("typing.export.repaginate_ratio_presets_label"));
+                        // The preset buttons compare against the CURRENT pair, so the active
+                        // preset is highlighted and a hand-typed ratio highlights none.
+                        let mut ratio = (settings.ratio_width, settings.ratio_height);
+                        for (width, height) in REPAGINATE_RATIO_PRESETS {
+                            if ui.selectable_value(&mut ratio, (width, height), format!("{width}:{height}")).clicked() {
+                                settings.ratio_width = width;
+                                settings.ratio_height = height;
+                                changed = true;
+                            }
+                        }
+                    });
+                }
+                TypingRepaginateMode::FixedHeight => {
+                    changed |= ui
+                        .add(
+                            WheelSpinBox::new(&mut settings.fixed_height_px)
+                                .range(1..=100_000)
+                                .prefix(t!("typing.export.repaginate_fixed_height_label")),
+                        )
+                        .changed();
+                }
+            }
+        });
+    }
+
+    if changed {
+        out.changed_repaginate = Some(settings);
     }
 }
