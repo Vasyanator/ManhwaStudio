@@ -76,9 +76,12 @@ fn value_f32(v: &Value) -> Option<f32> {
 //   deform:   `deform_mesh` (`points_px` page-px or `points_uv` page-relative) → else a `transform_uv`
 //             quad expanded to a `DEFORM_SURFACE_COLS`×`ROWS` projective mesh.
 //
-// (Cross-entry legacy families — absolute ribbon `x`/`y`+`region_w`/`region_h`, and top-left-anchored
-// bare `u`/`v` that needs the PNG footprint — are normalized to `img_u`/`img_v` UPSTREAM by the typing
-// tab's `migrate_legacy_text_overlays` before this decoder runs; the doc loader runs the same step.)
+// (Cross-entry legacy families — absolute ribbon `x`/`y`+`region_w`/`region_h`, and the two OLDEST
+// top-left-anchored bare `u`/`v` generations that need the overlay's displayed footprint — are
+// normalized to `img_u`/`img_v` UPSTREAM by [`migrate_overlay_entries`], the single shared cross-entry
+// step that the typing loader, the doc loader and the chapter migration all run before this decoder.
+// Bare `u`/`v` from every LATER legacy generation is already a centre and passes through that step
+// verbatim — see [`legacy_uv_anchor`].)
 
 /// Out-of-page slack allowed on normalized uv coordinates (overlays may sit partly off the page).
 const MAX_OUT_OF_BOUNDS_UV: f32 = 0.90;
@@ -329,14 +332,19 @@ fn json_f32(v: f32) -> Value {
         .unwrap_or(Value::Null)
 }
 
-// --- Cross-entry legacy migration (ribbon x/y + top-left u/v) -------------------------------------
+// --- Cross-entry legacy migration (ribbon x/y + top-left-anchored u/v) ---------------------------
 //
 // The oldest overlay families need information spanning MULTIPLE entries (the chapter's shared ribbon
-// scale) or the overlay PNG footprint, so they cannot be resolved by the per-entry `decode_*` above.
-// This step normalizes them to the modern center-anchored `img_u`/`img_v` so the per-entry decoder
-// then resolves them correctly. Shared by the typing tab's loader and the doc loader so an old chapter
-// decodes identically in both (preventing the "everything snaps to page-center" corruption when the
-// doc, now authoritative, migrates a chapter to the inline v3 payload).
+// scale) or the overlay's displayed footprint, so they cannot be resolved by the per-entry `decode_*`
+// above. This step normalizes them to the modern center-anchored `img_u`/`img_v` so the per-entry
+// decoder then resolves them correctly. Shared by the typing tab's loader and the doc loader so an old
+// chapter decodes identically in both (preventing the "everything snaps to page-center" corruption when
+// the doc, now authoritative, migrates a chapter to the inline v3 payload).
+//
+// Bare `u`/`v` is a CENTRE anchor by default and is shifted only for the two oldest generations, which
+// [`legacy_uv_anchor`] separates (they need DIFFERENT shifts — see [`LegacyUvAnchor`]); treating every
+// `u`/`v` entry as a top-left anchor displaced the whole Qt-2.X majority down-right by half its own
+// footprint, and treating both top-left generations alike mis-shifted each by a `user_scale` factor.
 
 /// True when the entry already uses a modern center-anchored placement (`img_x_px`/`img_y_px` or
 /// `img_u`/`img_v`) and needs no cross-entry migration.
@@ -346,6 +354,185 @@ pub fn overlay_entry_is_modern(obj: &Map<String, Value>) -> bool {
         || obj.contains_key("img_y_px")
         || obj.contains_key("img_u")
         || obj.contains_key("img_v")
+}
+
+/// Anchor convention of a legacy overlay's bare `u`/`v`, one variant per legacy writer generation.
+///
+/// `text_info.json` was written by four generations of the legacy Python app, and the meaning of
+/// `u`/`v` changed twice. `W` is the page width in px, `png_w`/`png_h` the overlay PNG's own pixels
+/// and `us` the entry's `user_scale` (default `1.0`):
+///
+/// | Generation | Marker keys | `u`/`v` is… | Displayed size |
+/// |---|---|---|---|
+/// | 1. Tkinter | `region_w`/`region_h`, else `page` with no Qt key | top-left of the **scaled** box | `w_frac*W*us` × aspect |
+/// | 2. Qt pre-`align` | `text`, no `align`, no `style` | top-left of the **unscaled** box | `w_frac*W*us` × aspect |
+/// | 3a. Qt with `align` | `text` + top-level `align` | the CENTRE | native PNG × `us` |
+/// | 3b. Qt 2.X | nested `style` object | the CENTRE | native PNG × `us` |
+///
+/// Generation 1 (`old_or_test/ui/tabs/text_tab_new/text_ops.py:245-254` writes it; `.../overlays.py:92`
+/// draws it with `canvas.create_image(..., anchor='nw')` and `.../overlays.py:270-280` keeps that
+/// top-left pinned across a rescale) anchors the box it actually DISPLAYS, so the shift to a centre is
+/// half of `w_frac*W*us` — the size the save path `.../saving.py:56,80` baked into the archived pages.
+/// (`overlays.py:82` dropping `us` on the initial load is a live-preview-only legacy bug and is
+/// deliberately NOT reproduced.)
+///
+/// Generation 2 has no surviving writer tree of its own, but BOTH Qt overlay items that do survive pin
+/// the transform origin to the box centre before scaling or rotating —
+/// `old_or_test/text_tab_old/text_overlay_item.py:118`
+/// (`setTransformOriginPoint(self.boundingRect().center())`) and
+/// `old_or_test/2.X/ui_new/tabs/text_tab/text_overlay_item.py:222`
+/// (`setTransformOriginPoint(self._rect.center())`). Scaling is therefore centre-preserving: `user_scale`
+/// moves neither corner of the *unscaled* box the position refers to, so the shift to a centre is half of
+/// `w_frac*W` and `us` does not enter the position at all. Validated on all 186 entries of the one
+/// chapter that uses this generation: median error 0.5 px, p90 2.4 px, against 111 px median for the
+/// centre reading.
+///
+/// Generations 3a/3b already store the true visual centroid (`setPos(centre - pixmap*user_scale/2)`),
+/// so their `u`/`v` is copied verbatim.
+///
+/// Classification order matters and is asymmetric in cost: a false top-left re-introduces the "every
+/// overlay displaced down-right by half its footprint" bug across a whole chapter of the legacy
+/// majority, while a false centre only under-shifts an older, rarer chapter. Hence the Tkinter markers
+/// are tested FIRST — `region_w`/`region_h` is emitted by every Tkinter entry and by no Qt writer, so
+/// a Tkinter entry that also carries `text` can never fall through into the Qt clause. `align` is the
+/// generation-3a marker because it appeared in one writer step together with nine siblings
+/// (`line_spacing`, `extra_vpadding`, `stroke_width`, `grad_angle_deg`, …); `stroke_color_rgba`,
+/// `glow_color_rgba` and `reflect` are written only when non-null and therefore must NEVER be used as
+/// markers. `user_scale` cannot discriminate either — `overlays.py` writes it back into a Tkinter
+/// entry when the user key-scales an overlay, which is why it may only ever VETO the weaker `page`
+/// clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyUvAnchor {
+    /// The modern reading: `u`/`v` is already the overlay's centre (Qt with `align`, and Qt 2.X).
+    Centre,
+    /// Tkinter: `u`/`v` is the top-left of the SCALED box (`w_frac * page_w * user_scale`).
+    TkinterScaledTopLeft,
+    /// Qt pre-`align`: `u`/`v` is the top-left of the UNSCALED box (`w_frac * page_w`); `user_scale`
+    /// scales about the box centre and so does not shift the position.
+    QtUnscaledTopLeft,
+}
+
+/// Classifies the legacy writer generation an entry's bare `u`/`v` belongs to. See [`LegacyUvAnchor`]
+/// for the generation table, the markers and why the clause order is what it is.
+#[must_use]
+pub fn legacy_uv_anchor(obj: &Map<String, Value>) -> LegacyUvAnchor {
+    // Tkinter first: `region_w`/`region_h` is exclusive to that writer, so an entry carrying it is
+    // Tkinter even when it also has `text`, and can never reach the Qt clause below.
+    if obj.contains_key("region_w") || obj.contains_key("region_h") {
+        return LegacyUvAnchor::TkinterScaledTopLeft;
+    }
+    // Pre-`region_w` Tkinter entries that `overlays.py` migrated in place: `page`, and none of the
+    // keys only a Qt writer emits.
+    if obj.contains_key("page")
+        && !obj.contains_key("text")
+        && !obj.contains_key("style")
+        && !obj.contains_key("user_scale")
+    {
+        return LegacyUvAnchor::TkinterScaledTopLeft;
+    }
+    // Qt before the `align` writer step: a text entry with neither `align` nor a nested `style`.
+    if obj.contains_key("text") && !obj.contains_key("align") && !obj.contains_key("style") {
+        return LegacyUvAnchor::QtUnscaledTopLeft;
+    }
+    LegacyUvAnchor::Centre
+}
+
+/// Page-pixel geometry a top-left-anchored legacy entry must be migrated with.
+#[derive(Debug, Clone, Copy)]
+struct LegacyTopLeftGeometry {
+    /// Half-extent to ADD to the top-left `u`/`v` (in page px) to obtain the centre. `[0.0, 0.0]`
+    /// when nothing is known about the overlay's size, so the entry is left unshifted.
+    shift_px: [f32; 2],
+    /// Explicit uniform `scale` the migrated entry must carry so the modern decoder reproduces the
+    /// legacy DISPLAYED width from the PNG's own pixels. `None` when `w_frac` or the PNG size is
+    /// unknown — the entry then keeps whatever scale it already had.
+    scale: Option<f32>,
+}
+
+/// Displayed/anchor geometry, in PAGE pixels, of a top-left-anchored overlay whose PNG measures
+/// `png_w`×`png_h` px.
+///
+/// Neither legacy loader drew the strip at its native size: both resized it to `w_frac * page_width`
+/// and took the height from the PNG aspect (Tkinter `overlays.py`: `target_w = int(w_frac * disp_w)`,
+/// `scale = target_w / base.width`, `target_h = int(base.height * scale)`). The two generations differ
+/// only in what `user_scale` does to the ANCHOR:
+/// - [`LegacyUvAnchor::TkinterScaledTopLeft`]: the anchor is the corner of the scaled box, so the
+///   half-extent uses `w_frac * page_w * user_scale`;
+/// - [`LegacyUvAnchor::QtUnscaledTopLeft`]: scaling is centre-preserving, so the half-extent uses the
+///   UNSCALED `w_frac * page_w` and `user_scale` is ignored here.
+///
+/// Both generations displayed the strip at `w_frac * page_w * user_scale` wide, which is what
+/// [`LegacyTopLeftGeometry::scale`] reports. Degradation, in order:
+/// - `w_frac` usable AND the PNG size known: the full result above, with an explicit `scale`;
+/// - `w_frac` usable but the PNG size unknown (the caller's lookup returns `(0.0, 0.0)` for a missing
+///   file): the HORIZONTAL half-shift is still fully determined by `w_frac * page_w * anchor_scale`, so
+///   it is applied; the vertical one needs the PNG aspect and stays `0.0`, and no `scale` is emitted
+///   (it divides by `png_w`);
+/// - `w_frac` absent, non-finite or `<= 0`: the half-extent degrades to the native PNG footprint —
+///   times `user_scale` for the Tkinter family, unscaled for the Qt one, mirroring the rule above —
+///   which is `(0.0, 0.0)`, i.e. no shift, when the PNG size is unknown too, and no `scale` is emitted.
+///
+/// Never panics and never divides by a zero width.
+///
+/// Approximation for a ROTATED Tkinter entry. The half-extent computed here is that of the UNROTATED
+/// box, but the Tkinter loader and its save path rotate with `expand=True` BEFORE measuring
+/// (`old_or_test/ui/tabs/text_tab_new/overlays.py:76`, `.../saving.py:50`), so the footprint they
+/// actually anchored is the larger EXPANDED bounding box — a rotated entry's migrated centre is
+/// therefore approximate. The Tkinter writer does persist a rotation (`.../overlays.py:393` rotates and
+/// `:421` writes the resulting `angle` back into the entry), so such entries are possible in principle;
+/// a scan of every archived `text_info.json` in the corpus this migration was measured against found
+/// none — 0 rotated among 1381 Tkinter entries — so the approximation is currently unexercised. It is
+/// not corrected because the caller supplies only the UNROTATED PNG size, from which the expanded
+/// rotated extent cannot be recovered.
+fn legacy_top_left_geometry(
+    anchor: LegacyUvAnchor,
+    obj: &Map<String, Value>,
+    page_size: [usize; 2],
+    png_w: f32,
+    png_h: f32,
+) -> LegacyTopLeftGeometry {
+    // `user_scale` (or its modern `scale` spelling); the same floor the per-entry decoder applies.
+    let user_scale = obj
+        .get("scale")
+        .or_else(|| obj.get("user_scale"))
+        .and_then(value_f32)
+        .filter(|s| s.is_finite())
+        .unwrap_or(1.0)
+        .max(0.01);
+    // The Tkinter anchor moves with `user_scale`; the Qt pre-`align` one does not (centre-preserving
+    // scaling), so only the former folds it into the anchor box.
+    let anchor_scale = match anchor {
+        LegacyUvAnchor::TkinterScaledTopLeft => user_scale,
+        LegacyUvAnchor::QtUnscaledTopLeft | LegacyUvAnchor::Centre => 1.0,
+    };
+    let w_frac = obj
+        .get("w_frac")
+        .and_then(value_f32)
+        .filter(|f| f.is_finite() && *f > 0.0);
+    if let Some(w_frac) = w_frac {
+        let page_w = page_size[0].max(1) as f32;
+        let anchor_w = w_frac * page_w * anchor_scale;
+        if png_w > 0.0 && png_h > 0.0 {
+            let displayed_w = w_frac * page_w * user_scale;
+            return LegacyTopLeftGeometry {
+                shift_px: [anchor_w * 0.5, anchor_w * (png_h / png_w) * 0.5],
+                scale: Some(displayed_w / png_w),
+            };
+        }
+        // PNG size unknown, `w_frac` known. The anchor box's WIDTH does not depend on the PNG at all,
+        // so the horizontal half-shift stays exact and is applied; only the height came from the PNG
+        // aspect, so the vertical half-shift degrades to 0 rather than to a guess. `scale` is withheld
+        // because it is `displayed_w / png_w`. This path is close to dead in practice: the typing
+        // decoder `decode_overlay_from_storage_entry` (`crates/ms-tab-typing/src/tab/codec.rs`,
+        // `image::open(&image_path).ok()?`) DROPS an overlay whose PNG will not load, so an entry that
+        // reaches rendering with an unreadable PNG normally does not exist — but the dimension lookup
+        // and that decode consult different directory sets, so the case is not structurally impossible.
+        return LegacyTopLeftGeometry { shift_px: [anchor_w * 0.5, 0.0], scale: None };
+    }
+    LegacyTopLeftGeometry {
+        shift_px: [png_w * anchor_scale * 0.5, png_h * anchor_scale * 0.5],
+        scale: None,
+    }
 }
 
 /// Parses the 1-based page number from a legacy overlay `page` string such as `"1_1"` or `"1_19"`
@@ -382,11 +569,26 @@ fn legacy_overlay_page_idx(obj: &Map<String, Value>, page_count: usize) -> Optio
 /// - absolute ribbon `x`/`y` (+ optional `region_w`/`region_h`) with no `img_idx`/`u`/`v`: the
 ///   chapter's continuous-ribbon scale is recovered via [`LegacyRibbonGeometry`] from all such entries,
 ///   then each region center maps to normalized `img_u`/`img_v`;
-/// - normalized top-left `u`/`v`: converted to a CENTER anchor by adding half the overlay PNG footprint
-///   (`png_size * scale`), matching the modern center convention.
+/// - normalized `u`/`v`: already a CENTER anchor for the two newest legacy generations, and copied to
+///   `img_u`/`img_v` verbatim. The two top-left generations [`legacy_uv_anchor`] recognizes are
+///   shifted by half their anchor box, which differs per generation (see [`LegacyUvAnchor`] and
+///   [`legacy_top_left_geometry`]).
 ///
-/// `png_size(obj)` supplies the overlay PNG `(width, height)` in pixels for the top-left case (the
-/// caller owns image IO; return `(0.0, 0.0)` when unknown). `page_sizes[idx] = [w, h]` are page pixels.
+/// Deliberate migration-time NORMALIZATION of the displayed size, for the two top-left generations
+/// only: both drew the strip at `w_frac * page_w * user_scale`, while the modern decoder sizes an
+/// overlay from its PNG's own pixels times the placement scale — and the two have drifted apart (a
+/// median of 14 px, up to ~6 %, in the measured chapters). So when both `w_frac` and the PNG size are
+/// known, this step writes an explicit `scale = w_frac * page_w * user_scale / png_w` into the entry.
+/// [`decode_overlay_placement`] prefers `scale` over the `user_scale` alias, so this cleanly overrides
+/// it without having to delete the legacy key. Centre-anchored entries are left alone: their PNG is
+/// already native and their `user_scale` is already the right factor.
+///
+/// `png_size(obj)` supplies the overlay PNG `(width, height)` in pixels for the top-left cases (the
+/// caller owns image IO; return `(0.0, 0.0)` when unknown — the entry then keeps whatever half-shift
+/// `w_frac` alone determines, and gets no injected `scale`; see [`legacy_top_left_geometry`]).
+/// `page_sizes[idx] = [w, h]` are page pixels. An entry whose resolved page index is ABSENT from
+/// `page_sizes` has no known page geometry: a top-left `u`/`v` is then copied verbatim rather than
+/// shifted by a half-extent derived from a placeholder page.
 #[must_use]
 pub fn migrate_overlay_entries<F>(
     items: &[Value],
@@ -444,23 +646,51 @@ where
             let Some(idx) = legacy_overlay_page_idx(obj, page_count) else {
                 return item.clone();
             };
-            let page_size = page_sizes.get(&idx).copied().unwrap_or([1, 1]);
+            // `None` = this entry's page is not in the map at all (an explicit `img_idx` is not
+            // clamped, and the map may be sparse). The `[1, 1]` placeholder keeps the ribbon and
+            // `Centre` paths working unchanged; the top-left path checks `known_page_size` instead.
+            let known_page_size = page_sizes.get(&idx).copied();
+            let page_size = known_page_size.unwrap_or([1, 1]);
 
+            // Explicit `scale` a top-left family needs so the migrated box keeps its legacy WIDTH.
+            let mut normalized_scale: Option<f32> = None;
             let center_uv = if let (Some(u), Some(v)) = (
                 obj.get("u").and_then(value_f32),
                 obj.get("v").and_then(value_f32),
             ) {
-                // Legacy normalized top-left anchor -> center: add half the PNG footprint.
-                let scale = obj
-                    .get("scale")
-                    .or_else(|| obj.get("user_scale"))
-                    .and_then(value_f32)
-                    .unwrap_or(1.0)
-                    .max(0.01);
-                let (pw, ph) = png_size(obj);
-                let top_left = uv_to_page_px([u, v], page_size);
-                let center_px = [top_left[0] + pw * scale * 0.5, top_left[1] + ph * scale * 0.5];
-                Some(page_px_to_uv(center_px, page_size))
+                let anchor = legacy_uv_anchor(obj);
+                match anchor {
+                    LegacyUvAnchor::TkinterScaledTopLeft | LegacyUvAnchor::QtUnscaledTopLeft
+                        if known_page_size.is_none() =>
+                    {
+                        // The page this entry belongs to is not in `page_sizes`, so the `[1, 1]`
+                        // placeholder above is NOT the page. Both the half-shift and the normalized
+                        // `scale` are expressed in page pixels (`w_frac * page_w`), and the uv→px→uv
+                        // round-trip through a 1×1 "page" is meaningless; the vertical half-extent
+                        // would additionally be wrong by the true `page_w / page_h`. Leaving `u`/`v`
+                        // unshifted is off by at most half a footprint, whereas shifting by a
+                        // placeholder-derived extent is off by an unbounded, unknowable amount — so
+                        // copy the corner verbatim and inject no `scale`.
+                        Some([u, v])
+                    }
+                    LegacyUvAnchor::TkinterScaledTopLeft | LegacyUvAnchor::QtUnscaledTopLeft => {
+                        // `u`/`v` is the overlay's TOP-LEFT corner: shift by half the anchor box the
+                        // generation actually used (scaled for Tkinter, unscaled for Qt pre-`align`).
+                        let (pw, ph) = png_size(obj);
+                        let geometry = legacy_top_left_geometry(anchor, obj, page_size, pw, ph);
+                        normalized_scale = geometry.scale;
+                        let top_left = uv_to_page_px([u, v], page_size);
+                        Some(page_px_to_uv(
+                            [
+                                top_left[0] + geometry.shift_px[0],
+                                top_left[1] + geometry.shift_px[1],
+                            ],
+                            page_size,
+                        ))
+                    }
+                    // Every later generation already stores the CENTRE; only the key is renamed.
+                    LegacyUvAnchor::Centre => Some([u, v]),
+                }
             } else if let (Some(x), Some(y), Some(geom)) = (
                 obj.get("x").and_then(Value::as_f64),
                 obj.get("y").and_then(Value::as_f64),
@@ -487,6 +717,11 @@ where
                 out.remove("v");
                 out.remove("x");
                 out.remove("y");
+            }
+            // Size normalization: the legacy displayed width expressed as a modern `scale` over the
+            // PNG's own pixels. `scale` wins over the `user_scale` alias in the per-entry decoder.
+            if let Some(scale) = normalized_scale.filter(|s| s.is_finite() && *s > 0.0) {
+                out.insert("scale".to_string(), Value::from(scale));
             }
             Value::Object(out)
         })
@@ -675,21 +910,470 @@ mod tests {
     }
 
     #[test]
-    fn migrate_top_left_uv_to_center_via_png_footprint() {
-        // Legacy top-left `u`/`v` → center by adding half the PNG footprint (png_size * scale).
+    fn migrate_tkinter_top_left_uv_uses_displayed_w_frac_footprint() {
+        // Generation 1 (Tkinter, `old_or_test/ui/tabs/text_tab_new/`): a realistic entry — `page` +
+        // `region_w`/`region_h`, no `text`/`style`/`user_scale`. Its `u`/`v` is the TOP-LEFT corner
+        // (`overlays.py` draws it with `anchor='nw'`), and the strip was displayed at
+        // `w_frac * page_width`, NOT at the PNG's native size.
         let mut page_sizes: std::collections::HashMap<usize, [usize; 2]> =
             std::collections::HashMap::new();
         page_sizes.insert(0, [100, 100]);
         let items = vec![serde_json::json!({
-            "img_idx": 0, "u": 0.0, "v": 0.0, "scale": 1.0, "file": "a.png"
+            "file": "a.png", "page": "1_1", "img_idx": 0,
+            "u": 0.0, "v": 0.0, "w_frac": 0.4, "angle": 0.0,
+            "region_w": 40, "region_h": 80
         })];
-        // PNG is 20x40 px → center offset (10, 20) px → uv (0.1, 0.2) on a 100×100 page.
+        // PNG 20×40 px (aspect 2.0); w_frac 0.4 × page 100 → displayed 40×80 px → half = (20, 40) px
+        // → uv (0.2, 0.4). The NATIVE-size reading would have given (0.1, 0.2) — that is the bug.
         let out = migrate_overlay_entries(&items, &page_sizes, |_| (20.0, 40.0));
         let obj = out[0].as_object().unwrap();
         let u = obj.get("img_u").and_then(value_f32).unwrap();
         let v = obj.get("img_v").and_then(value_f32).unwrap();
-        assert!((u - 0.1).abs() < 1e-4, "top-left u 0 + 10px/100 = 0.1");
-        assert!((v - 0.2).abs() < 1e-4, "top-left v 0 + 20px/100 = 0.2");
+        assert!((u - 0.2).abs() < 1e-4, "displayed width 0.4*100=40 px → half 20 px → u 0.2, got {u}");
+        assert!((v - 0.4).abs() < 1e-4, "displayed height 40*2=80 px → half 40 px → v 0.4, got {v}");
+        // Size normalization: the strip was displayed 40 px wide but its PNG is 20 px → scale 2.0.
+        let scale = obj.get("scale").and_then(value_f32).unwrap();
+        assert!((scale - 2.0).abs() < 1e-4, "scale = w_frac*W*us/png_w = 40/20 = 2.0, got {scale}");
+
+        // With no `w_frac` the footprint degrades to the native PNG size times `user_scale`, and no
+        // `scale` is invented (the legacy displayed width is simply unknown).
+        let no_frac = vec![serde_json::json!({
+            "file": "a.png", "page": "1_1", "img_idx": 0, "u": 0.0, "v": 0.0,
+            "region_w": 40, "region_h": 80
+        })];
+        let out = migrate_overlay_entries(&no_frac, &page_sizes, |_| (20.0, 40.0));
+        let obj = out[0].as_object().unwrap();
+        assert!((obj.get("img_u").and_then(value_f32).unwrap() - 0.1).abs() < 1e-4);
+        assert!((obj.get("img_v").and_then(value_f32).unwrap() - 0.2).abs() < 1e-4);
+        assert!(!obj.contains_key("scale"), "no `w_frac` → no size normalization");
+
+        // Unknown PNG size (the lookup returns (0,0)) WITH a usable `w_frac`: the horizontal
+        // half-shift is `w_frac * page_w * us / 2 = 0.4*100/2 = 20 px` → u 0.2 and does not involve the
+        // PNG at all, so it is still applied. Only the vertical half-extent came from the PNG aspect,
+        // so it degrades to 0. No `scale` is invented (it divides by `png_w`) and nothing divides by
+        // zero.
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (0.0, 0.0));
+        let obj = out[0].as_object().unwrap();
+        assert!(
+            (obj.get("img_u").and_then(value_f32).unwrap() - 0.2).abs() < 1e-4,
+            "the `w_frac`-only horizontal half-shift survives a missing PNG"
+        );
+        assert!((obj.get("img_v").and_then(value_f32).unwrap() - 0.0).abs() < 1e-6);
+        assert!(!obj.contains_key("scale"), "unknown PNG size → no size normalization");
+    }
+
+    #[test]
+    fn migrate_tkinter_top_left_uv_folds_user_scale_into_shift_and_scale() {
+        // Generation 1 WITH `user_scale`. `overlays.py:270-280` keeps the top-left pinned when the
+        // user key-scales an overlay and writes `user_scale` back into the entry, and the save path
+        // (`.../text_tab_new/saving.py:56,80`) bakes the strip in at `w_frac*W*user_scale` — which is
+        // what the archived rendered pages contain. 220 real entries across the user's chapters
+        // `ch17`/`ch18`/`ch19` carry `user_scale` between 0.185 and 1.1, so dropping the factor here
+        // mis-shifts every one of them. (`overlays.py:82` ignoring `user_scale` on the INITIAL load is
+        // a live-preview-only legacy bug and is deliberately not reproduced.)
+        let page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            [(0, [1000, 2000])].into_iter().collect();
+        let items = vec![serde_json::json!({
+            "file": "t_3.png", "page": "1_1", "img_idx": 0,
+            "u": 0.1, "v": 0.2, "w_frac": 0.5, "angle": 0.0, "user_scale": 0.8,
+            "region_w": 500, "region_h": 250
+        })];
+        // PNG 250×125 (aspect 0.5). Displayed 0.5*1000*0.8 = 400 px wide, 200 px tall → half
+        // (200, 100) px → centre (0.1*1000+200, 0.2*2000+100) = (300, 500) px → uv (0.3, 0.25).
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (250.0, 125.0));
+        let obj = out[0].as_object().unwrap();
+        let u = obj.get("img_u").and_then(value_f32).unwrap();
+        let v = obj.get("img_v").and_then(value_f32).unwrap();
+        assert!((u - 0.3).abs() < 1e-4, "half of w_frac*W*us = 200 px → u 0.3, got {u}");
+        assert!((v - 0.25).abs() < 1e-4, "half of the aspect height = 100 px → v 0.25, got {v}");
+        // Without the `user_scale` factor the shift would have been half of 500 px → u 0.35.
+        assert!((u - 0.35).abs() > 1e-3, "the unscaled reading (u 0.35) is the defect being fixed");
+
+        // And the displayed width is re-expressed over the PNG's own pixels: 400/250 = 1.6.
+        let scale = obj.get("scale").and_then(value_f32).unwrap();
+        assert!((scale - 1.6).abs() < 1e-4, "scale = w_frac*W*us/png_w = 400/250 = 1.6, got {scale}");
+        // `scale` beats the `user_scale` alias in the per-entry decoder, so THIS is the factor used.
+        let placement = decode_overlay_placement(obj, [1000, 2000]);
+        assert!((placement.transform.scale - 1.6).abs() < 1e-4, "`scale` overrides `user_scale`");
+    }
+
+    #[test]
+    fn migrate_qt_pre_align_uv_is_an_unscaled_top_left() {
+        // Generation 2 (Qt before the `align` writer step). The ONE chapter on disk that uses it
+        // (`ch20`, 186 entries) has exactly this key set:
+        // {angle, color, file, font, img_idx, size, text, u, user_scale, v, w_frac} — `text` but
+        // neither a top-level `align` nor a nested `style`.
+        //
+        // Measured evidence: every surviving Qt overlay item pins the transform origin to the box
+        // centre — `old_or_test/text_tab_old/text_overlay_item.py:118`
+        // (`setTransformOriginPoint(self.boundingRect().center())`) and
+        // `old_or_test/2.X/ui_new/tabs/text_tab/text_overlay_item.py:222`
+        // (`setTransformOriginPoint(self._rect.center())`) — so `user_scale` scales about the box
+        // CENTRE and cannot move the UNSCALED box the stored corner refers to. Reading `u`/`v` as the
+        // unscaled top-left reproduced all 186 entries with a median error of 0.5 px (p90 2.4 px);
+        // reading them as a centre was off by 111 px median.
+        let page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            [(0, [1000, 4000])].into_iter().collect();
+        let entry = |user_scale: f64| {
+            serde_json::json!({
+                "angle": 0.0, "color": "#000000", "file": "t_0.png", "font": "Anime Ace",
+                "img_idx": 0, "size": 22, "text": "привет",
+                "u": 0.2, "user_scale": user_scale, "v": 0.25, "w_frac": 0.4
+            })
+        };
+        // PNG 500×250 (aspect 0.5). Unscaled box 0.4*1000 = 400 px wide, 200 px tall → half
+        // (200, 100) px → centre (0.2*1000+200, 0.25*4000+100) = (400, 1100) px → uv (0.4, 0.275).
+        let items = vec![entry(0.826), entry(1.1)];
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (500.0, 250.0));
+
+        let first = out[0].as_object().unwrap();
+        assert_eq!(
+            legacy_uv_anchor(items[0].as_object().unwrap()),
+            LegacyUvAnchor::QtUnscaledTopLeft,
+            "`text` without `align`/`style` is the pre-`align` Qt generation"
+        );
+        let u = first.get("img_u").and_then(value_f32).unwrap();
+        let v = first.get("img_v").and_then(value_f32).unwrap();
+        assert!((u - 0.4).abs() < 1e-4, "half of the UNSCALED w_frac*W = 200 px → u 0.4, got {u}");
+        assert!((v - 0.275).abs() < 1e-4, "half of the aspect height = 100 px → v 0.275, got {v}");
+        assert!(!first.contains_key("u") && !first.contains_key("v"), "legacy keys retired");
+
+        // The centre must NOT depend on `user_scale`: the two entries differ only in it.
+        let second = out[1].as_object().unwrap();
+        assert_eq!(
+            first.get("img_u"),
+            second.get("img_u"),
+            "centre is independent of `user_scale` (centre-preserving scaling)"
+        );
+        assert_eq!(first.get("img_v"), second.get("img_v"), "same for the v coordinate");
+
+        // The displayed SIZE does depend on it: w_frac*W*us/png_w.
+        let s0 = first.get("scale").and_then(value_f32).unwrap();
+        let s1 = second.get("scale").and_then(value_f32).unwrap();
+        assert!((s0 - 0.4 * 1000.0 * 0.826 / 500.0).abs() < 1e-4, "scale 0.6608, got {s0}");
+        assert!((s1 - 0.4 * 1000.0 * 1.1 / 500.0).abs() < 1e-4, "scale 0.88, got {s1}");
+    }
+
+    #[test]
+    fn migrate_qt_2x_uv_is_a_centre_and_is_never_shifted() {
+        // REGRESSION. Generation 3 (Qt 2.X, `old_or_test/2.X/ui_new/tabs/text_tab/text_view.py`) is
+        // the legacy majority and stores the overlay's true visual CENTRE in `u`/`v`
+        // (`_on_item_changed` writes `_uv_from_scene(idx, centroid)`; the loader does
+        // `setPos(centre - pixmap*user_scale/2)`). The key shape below is the real one from the
+        // user's chapter `ch41` (134 entries, 690×16308 pages).
+        //
+        // Measured evidence that this is a centre: every rendered strip was located inside the
+        // 2.x-rendered `saved/*.png` pages at `(u*W − sw/2, v*H − sh/2)` (median mean-abs-diff
+        // 5.88/255, max 12.9), while the top-left reading `(u*W, v*H)` matched nothing (median 224)
+        // and put 42 of 134 strips outside the page. Shifting these by half a footprint displaced
+        // every overlay down-right by a median of (129, 40) px.
+        let mut page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            std::collections::HashMap::new();
+        page_sizes.insert(0, [690, 16308]);
+        let items = vec![serde_json::json!({
+            "img_idx": 0, "u": 0.3742, "v": 0.5118, "w_frac": 0.37,
+            "user_scale": 1.0, "angle": 0.0, "file": "t_0.png",
+            "text": "привет", "cut_enabled": true,
+            "style": { "font_family": "Anime Ace", "font_size": 22, "align": "center" }
+        })];
+        // A large PNG footprint would be very visible if it were (wrongly) applied.
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (256.0, 128.0));
+        let obj = out[0].as_object().unwrap();
+        assert_eq!(
+            legacy_uv_anchor(items[0].as_object().unwrap()),
+            LegacyUvAnchor::Centre,
+            "a nested `style` object is the Qt 2.X marker"
+        );
+        let u = obj.get("img_u").and_then(value_f32).unwrap();
+        let v = obj.get("img_v").and_then(value_f32).unwrap();
+        assert!((u - 0.3742).abs() < 1e-6, "Qt 2.X `u` is a centre and is copied verbatim, got {u}");
+        assert!((v - 0.5118).abs() < 1e-6, "Qt 2.X `v` is a centre and is copied verbatim, got {v}");
+        assert_eq!(obj.get("img_idx").and_then(Value::as_u64), Some(0));
+        assert!(!obj.contains_key("u") && !obj.contains_key("v"), "legacy keys retired");
+        // Its PNG is already native and `user_scale` is already the right factor: no normalization.
+        assert!(!obj.contains_key("scale"), "centre families keep their own `user_scale`");
+    }
+
+    #[test]
+    fn migrate_qt_with_align_flat_style_uv_is_a_centre() {
+        // Generation 3a (`old_or_test/text_tab_old/text_view.py`): `text` + FLAT style keys including
+        // the top-level `align`, no nested `style` object, no `page`/`region_*`. Its loader places the
+        // item at `centre - local_centre * user_scale`, so `u`/`v` is a CENTRE — no shift. `align` is
+        // the sound marker for this writer step because it landed together with nine siblings
+        // (`line_spacing`, `extra_vpadding`, `stroke_width`, `grad_angle_deg`, …); keys such as
+        // `stroke_color_rgba` are written only when non-null and come and go per file.
+        let mut page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            std::collections::HashMap::new();
+        page_sizes.insert(0, [400, 800]);
+        let items = vec![serde_json::json!({
+            "img_idx": 0, "u": 0.25, "v": 0.6, "w_frac": 0.3, "user_scale": 1.25,
+            "angle": 5.0, "file": "o_0.png", "text": "hi",
+            "font": "Arial", "size": 20, "color": [0, 0, 0, 255], "align": "center",
+            "line_spacing": 1.1, "extra_vpadding": 0, "stroke_width": 0
+        })];
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (120.0, 60.0));
+        let obj = out[0].as_object().unwrap();
+        assert_eq!(
+            legacy_uv_anchor(items[0].as_object().unwrap()),
+            LegacyUvAnchor::Centre,
+            "a top-level `align` marks the post-`align` Qt writer, whose `u`/`v` is a centre"
+        );
+        assert!((obj.get("img_u").and_then(value_f32).unwrap() - 0.25).abs() < 1e-6);
+        assert!((obj.get("img_v").and_then(value_f32).unwrap() - 0.6).abs() < 1e-6);
+        assert!(!obj.contains_key("scale"), "centre families keep their own `user_scale`");
+    }
+
+    #[test]
+    fn legacy_uv_anchor_discriminates_the_generations() {
+        use LegacyUvAnchor::{Centre, QtUnscaledTopLeft, TkinterScaledTopLeft};
+
+        // `region_w`/`region_h` is the exclusive Tkinter marker and stands alone — even when the
+        // entry also carries `user_scale`, which `overlays.py` writes back on a key-scale.
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "page": "1_1", "u": 0.0, "v": 0.0, "region_w": 10, "region_h": 20, "user_scale": 1.4
+            }))),
+            TkinterScaledTopLeft
+        );
+        // Ordering case: a Tkinter entry that ALSO carries `text` must not fall into the Qt clause —
+        // the `region_*` test runs first, so it stays Tkinter.
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "page": "1_1", "u": 0.0, "v": 0.0, "region_w": 10, "region_h": 20, "text": "x"
+            }))),
+            TkinterScaledTopLeft,
+            "`region_w` outranks the `text` clause"
+        );
+        // Pre-`region_w` Tkinter entry: `page` and none of the Qt-only keys.
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "page": "1_2", "u": 0.1, "v": 0.2, "w_frac": 0.25, "file": "a.png"
+            }))),
+            TkinterScaledTopLeft
+        );
+        // `style`/`user_scale` veto the weaker `page` clause and, with no `text`, leave a centre.
+        for veto in ["style", "user_scale"] {
+            let mut o = obj(serde_json::json!({ "page": "1_2", "u": 0.1, "v": 0.2 }));
+            o.insert(veto.to_string(), Value::from(1.0));
+            assert_eq!(legacy_uv_anchor(&o), Centre, "`{veto}` must veto the `page` clause");
+        }
+        // `text` also vetoes the `page` clause, but a bare `text` entry is the pre-`align` Qt
+        // generation, which is top-left too — just with the UNSCALED box. (No Qt writer emits `page`,
+        // so this combination does not occur on disk; `text` is nonetheless a Qt-only key.)
+        let mut with_text = obj(serde_json::json!({ "page": "1_2", "u": 0.1, "v": 0.2 }));
+        with_text.insert("text".to_string(), Value::from("x"));
+        assert_eq!(legacy_uv_anchor(&with_text), QtUnscaledTopLeft);
+
+        // Generation 2: `text`, no `align`, no `style` (the real `ch20` key set).
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "angle": 0.0, "color": "#000000", "file": "t_0.png", "font": "Anime Ace",
+                "img_idx": 0, "size": 22, "text": "x", "u": 0.2, "user_scale": 0.9,
+                "v": 0.25, "w_frac": 0.4
+            }))),
+            QtUnscaledTopLeft
+        );
+        // Generation 3a: the same shape plus a top-level `align`.
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "img_idx": 0, "u": 0.4, "v": 0.5, "user_scale": 1.0, "text": "x", "align": "center"
+            }))),
+            Centre
+        );
+        // Generation 3b: a nested `style` object.
+        assert_eq!(
+            legacy_uv_anchor(&obj(serde_json::json!({
+                "img_idx": 0, "u": 0.4, "v": 0.5, "user_scale": 1.0, "text": "x", "style": {}
+            }))),
+            Centre
+        );
+        // Nothing recognizable → the safe default (a false top-left is the costly direction).
+        assert_eq!(legacy_uv_anchor(&Map::new()), Centre);
+    }
+
+    #[test]
+    fn migrate_overlay_entries_is_idempotent() {
+        // Feeding the migration its OWN output back must be a no-op: every migrated entry now carries
+        // `img_u`/`img_v`, so `overlay_entry_is_modern` short-circuits it — in particular the injected
+        // `scale` must NOT be recomputed over the already-normalized entry and compound. A realistic
+        // mix: Tkinter top-left, Qt pre-`align` top-left, Qt 2.X centre, absolute ribbon, and an
+        // already-modern entry.
+        let page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            [(0, [1000, 2000]), (1, [1000, 2400])].into_iter().collect();
+        let items = vec![
+            serde_json::json!({
+                "file": "t_0.png", "page": "1_1", "img_idx": 0, "u": 0.1, "v": 0.2,
+                "w_frac": 0.5, "angle": 0.0, "user_scale": 0.8, "region_w": 500, "region_h": 250
+            }),
+            serde_json::json!({
+                "angle": 0.0, "color": "#000000", "file": "t_1.png", "font": "Anime Ace",
+                "img_idx": 1, "size": 22, "text": "привет", "u": 0.2, "user_scale": 1.1,
+                "v": 0.25, "w_frac": 0.4
+            }),
+            serde_json::json!({
+                "img_idx": 0, "u": 0.3742, "v": 0.5118, "w_frac": 0.37, "user_scale": 1.0,
+                "angle": 0.0, "file": "t_2.png", "text": "привет",
+                "style": { "font_family": "Anime Ace", "font_size": 22, "align": "center" }
+            }),
+            serde_json::json!({
+                "page": "1_2", "x": 10.0, "y": 2400.0, "region_w": 200.0, "region_h": 40.0,
+                "file": "t_3.png"
+            }),
+            serde_json::json!({
+                "img_idx": 0, "img_x_px": 50.0, "img_y_px": 60.0, "file": "t_4.png",
+                "overlay_type": "text"
+            }),
+        ];
+
+        let png = |_: &Map<String, Value>| (250.0_f32, 125.0_f32);
+        let once = migrate_overlay_entries(&items, &page_sizes, png);
+        let twice = migrate_overlay_entries(&once, &page_sizes, png);
+        assert_eq!(once, twice, "migration is idempotent on its own output");
+
+        // The injected `scale` in particular must be identical, not squared.
+        let scale_of = |out: &[Value], i: usize| out[i].as_object().unwrap().get("scale").cloned();
+        assert_eq!(scale_of(&once, 0), scale_of(&twice, 0), "Tkinter `scale` does not compound");
+        assert_eq!(scale_of(&once, 1), scale_of(&twice, 1), "Qt pre-`align` `scale` does not compound");
+        // And a third pass changes nothing either.
+        let thrice = migrate_overlay_entries(&twice, &page_sizes, png);
+        assert_eq!(twice, thrice, "still a fixed point after a third pass");
+    }
+
+    #[test]
+    fn migrate_tkinter_entry_carrying_both_x_and_u_uses_the_uv_path() {
+        // The one hybrid shape that exists on disk: `Сегодня я буду _/ch17` has an entry keyed
+        // {angle, file, img_idx, page, region_h, region_w, u, v, w_frac, x, y} — Tkinter `region_*`
+        // AND leftover absolute `x`/`y`. It must (a) classify as Tkinter, (b) take the `u`/`v` path,
+        // and (c) be EXCLUDED from the cross-entry ribbon solve, which skips any entry carrying
+        // `u`/`v` — otherwise its stale `x`/`y` would drag the chapter-wide ribbon scale.
+        let page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            [(0, [1000, 2000]), (1, [1000, 2000])].into_iter().collect();
+        let hybrid = serde_json::json!({
+            "angle": 0.0, "file": "t_7.png", "img_idx": 0, "page": "1_1",
+            "region_h": 250, "region_w": 500, "u": 0.1, "v": 0.2, "w_frac": 0.5,
+            "x": 999.0, "y": 999.0
+        });
+        assert_eq!(
+            legacy_uv_anchor(hybrid.as_object().unwrap()),
+            LegacyUvAnchor::TkinterScaledTopLeft,
+            "`region_w`/`region_h` classifies it as Tkinter even with `x`/`y` present"
+        );
+
+        // (a)+(b): the centre comes from `u`/`v` + the Tkinter half-shift, NOT from `x`/`y`.
+        // PNG 250×125 (aspect 0.5). Displayed 0.5*1000*1.0 = 500 px wide, 250 px tall → half
+        // (250, 125) px → centre (0.1*1000+250, 0.2*2000+125) = (350, 525) px → uv (0.35, 0.2625).
+        let out = migrate_overlay_entries(&[hybrid.clone()], &page_sizes, |_| (250.0, 125.0));
+        let obj = out[0].as_object().unwrap();
+        let u = obj.get("img_u").and_then(value_f32).unwrap();
+        let v = obj.get("img_v").and_then(value_f32).unwrap();
+        assert!((u - 0.35).abs() < 1e-4, "u comes from the `u`/`v` path, got {u}");
+        assert!((v - 0.2625).abs() < 1e-4, "v comes from the `u`/`v` path, got {v}");
+        assert!(!obj.contains_key("x") && !obj.contains_key("y"), "stale absolute keys retired");
+
+        // (c): adding it to a chapter of real ribbon entries must not move their solved geometry.
+        let ribbon = vec![
+            serde_json::json!({"page":"1_1","x":10.0,"y":10.0,"region_w":20.0,"region_h":4.0,"file":"r0.png"}),
+            serde_json::json!({"page":"1_2","x":10.0,"y":2100.0,"region_w":20.0,"region_h":4.0,"file":"r1.png"}),
+        ];
+        let without = migrate_overlay_entries(&ribbon, &page_sizes, |_| (0.0, 0.0));
+        let mut with = ribbon.clone();
+        with.push(hybrid);
+        let with = migrate_overlay_entries(&with, &page_sizes, |_| (250.0, 125.0));
+        assert_eq!(
+            without[..],
+            with[..without.len()],
+            "the hybrid entry is excluded from the ribbon solve (it carries `u`/`v`)"
+        );
+    }
+
+    #[test]
+    fn migrate_top_left_uv_is_unshifted_when_the_page_size_is_unknown() {
+        // An explicit `img_idx` is authoritative and NOT clamped, so an entry can resolve to a page
+        // that is absent from `page_sizes` (the doc may hold a subset). The `[1, 1]` placeholder the
+        // migration then uses is not the page: a half-shift derived from it would be wrong by an
+        // unbounded factor, and the vertical one additionally by `page_w / page_h`. Both top-left
+        // generations must therefore copy `u`/`v` verbatim and inject no `scale`.
+        let page_sizes: std::collections::HashMap<usize, [usize; 2]> =
+            [(0, [1000, 2000])].into_iter().collect();
+        let tkinter = serde_json::json!({
+            "file": "t_0.png", "img_idx": 7, "u": 0.1, "v": 0.2, "w_frac": 0.5,
+            "angle": 0.0, "user_scale": 0.8, "region_w": 500, "region_h": 250
+        });
+        let qt = serde_json::json!({
+            "angle": 0.0, "file": "t_1.png", "font": "Anime Ace", "img_idx": 7, "size": 22,
+            "text": "x", "u": 0.2, "user_scale": 1.1, "v": 0.25, "w_frac": 0.4
+        });
+        let items = vec![tkinter, qt];
+        let out = migrate_overlay_entries(&items, &page_sizes, |_| (250.0, 125.0));
+
+        let first = out[0].as_object().unwrap();
+        assert!((first.get("img_u").and_then(value_f32).unwrap() - 0.1).abs() < 1e-6, "Tkinter u kept");
+        assert!((first.get("img_v").and_then(value_f32).unwrap() - 0.2).abs() < 1e-6, "Tkinter v kept");
+        assert!(!first.contains_key("scale"), "no `scale` from a placeholder page width");
+        assert_eq!(first.get("img_idx").and_then(Value::as_u64), Some(7), "the index is preserved");
+
+        let second = out[1].as_object().unwrap();
+        assert!((second.get("img_u").and_then(value_f32).unwrap() - 0.2).abs() < 1e-6, "Qt u kept");
+        assert!((second.get("img_v").and_then(value_f32).unwrap() - 0.25).abs() < 1e-6, "Qt v kept");
+        assert!(!second.contains_key("scale"), "no `scale` from a placeholder page width");
+
+        // Control: the SAME entries, with page 7 present in the map, ARE shifted — so the guard is
+        // what makes the difference above, not some unrelated early return.
+        let known: std::collections::HashMap<usize, [usize; 2]> =
+            [(7, [1000, 2000])].into_iter().collect();
+        let shifted = migrate_overlay_entries(&items, &known, |_| (250.0, 125.0));
+        let first = shifted[0].as_object().unwrap();
+        // Tkinter: anchor 0.5*1000*0.8 = 400 px wide → half 200 px → u = (100 + 200)/1000 = 0.3.
+        let u = first.get("img_u").and_then(value_f32).unwrap();
+        assert!((u - 0.3).abs() < 1e-4, "a KNOWN page size does shift the Tkinter corner, got {u}");
+        assert!(first.contains_key("scale"), "and does inject the normalized `scale`");
+    }
+
+    #[test]
+    fn legacy_top_left_geometry_degrades_on_bad_w_frac_and_unknown_png() {
+        // Degenerate `w_frac` must never panic and never divide by zero. Note that JSON cannot carry a
+        // NaN literal, so the `is_finite()` guard is reached through an f64 that OVERFLOWS f32
+        // (`value_f32` casts f64→f32, and `1e300 as f32` is +inf) rather than through a NaN.
+        let page = [1000, 2000];
+        let anchor = LegacyUvAnchor::TkinterScaledTopLeft;
+        let bad_fracs = [
+            serde_json::json!(0.0),
+            serde_json::json!(-0.5),
+            serde_json::json!(1e300),
+            Value::Null,
+            serde_json::json!("0.5"),
+        ];
+        for frac in bad_fracs {
+            let mut o = obj(serde_json::json!({ "u": 0.1, "v": 0.2, "user_scale": 2.0 }));
+            o.insert("w_frac".to_string(), frac.clone());
+
+            // Known PNG: the half-extent degrades to the NATIVE footprint × `user_scale`.
+            let g = legacy_top_left_geometry(anchor, &o, page, 250.0, 125.0);
+            assert!(
+                (g.shift_px[0] - 250.0).abs() < 1e-3 && (g.shift_px[1] - 125.0).abs() < 1e-3,
+                "native footprint × user_scale 2.0 → half (250, 125) px for w_frac {frac}, got {:?}",
+                g.shift_px
+            );
+            assert!(g.scale.is_none(), "no legacy displayed width is known for w_frac {frac}");
+
+            // Unknown PNG on top of that: no shift at all, and still no panic.
+            let g = legacy_top_left_geometry(anchor, &o, page, 0.0, 0.0);
+            assert_eq!(g.shift_px, [0.0, 0.0], "fully unknown footprint → no shift for w_frac {frac}");
+            assert!(g.scale.is_none());
+        }
+
+        // A usable `w_frac` with an unknown PNG keeps the horizontal half-shift and drops only the
+        // vertical one (finding: the known half of the shift must not be thrown away).
+        let o = obj(serde_json::json!({ "u": 0.1, "v": 0.2, "w_frac": 0.5, "user_scale": 0.8 }));
+        let g = legacy_top_left_geometry(anchor, &o, page, 0.0, 0.0);
+        assert!((g.shift_px[0] - 200.0).abs() < 1e-3, "0.5*1000*0.8/2 = 200 px, got {:?}", g.shift_px);
+        assert_eq!(g.shift_px[1], 0.0, "the vertical half-extent needs the PNG aspect");
+        assert!(g.scale.is_none(), "`scale` divides by png_w and is withheld");
+
+        // The Qt pre-`align` generation ignores `user_scale` in the anchor box, same degradation.
+        let g = legacy_top_left_geometry(LegacyUvAnchor::QtUnscaledTopLeft, &o, page, 0.0, 0.0);
+        assert!((g.shift_px[0] - 250.0).abs() < 1e-3, "unscaled 0.5*1000/2 = 250 px, got {:?}", g.shift_px);
+        assert_eq!(g.shift_px[1], 0.0);
     }
 
     #[test]

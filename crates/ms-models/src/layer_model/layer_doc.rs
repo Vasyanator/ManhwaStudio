@@ -484,9 +484,15 @@ impl LayerDoc {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .and_then(|file| {
+                    // Overlay PNGs live FLAT in the text dirs, but a legacy `file` may carry a
+                    // directory prefix. Resolve by the final component only, exactly as the other two
+                    // `migrate_overlay_entries` callers do (`migrate::overlay_png_path`, the typing
+                    // loader in `tab/helpers.rs`) — otherwise the same entry gets a footprint in two
+                    // callers and none here, and its migrated centre would differ between them.
+                    .and_then(|file| Path::new(file).file_name().and_then(|n| n.to_str()))
+                    .and_then(|name| {
                         text_dirs.iter().find_map(|dir| {
-                            image::image_dimensions(dir.join(file))
+                            image::image_dimensions(dir.join(name))
                                 .ok()
                                 .map(|(w, h)| (w as f32, h as f32))
                         })

@@ -63,12 +63,41 @@ geometry permanently).
   or its `user_scale` alias; deform `deform_mesh` (`points_px` or legacy `points_uv`) or a `transform_uv`
   quad expanded to a 13×13 projective mesh. `decode_deform_mesh` is the single mesh parser.
 - CROSS-ENTRY migration — `migrate_overlay_entries` normalizes the oldest families (absolute ribbon
-  `x`/`y`+`region_w`/`region_h` via `project::LegacyRibbonGeometry`, and top-left `u`/`v` via the PNG
-  footprint passed by the caller) to modern `img_u`/`img_v` BEFORE per-entry decode. Both the typing
-  loader and the doc loader run it. The absolute-ribbon family recovers a CHAPTER-WIDE scale from every
-  page's aspect ratio, so it requires the FULL chapter page-size map — passing only the loaded page's
-  size makes other pages default to a square aspect and corrupts the solve (and, because any doc edit
-  flushes the page's text inline and then ignores `text_info.json`, that corruption is permanent).
+  `x`/`y`+`region_w`/`region_h` via `project::LegacyRibbonGeometry`, and the two top-left-anchored
+  `u`/`v` generations) to modern `img_u`/`img_v` BEFORE per-entry decode. Both the typing
+  loader and the doc loader run it. **Bare `u`/`v` is a CENTRE by default** and is copied verbatim;
+  `legacy_uv_anchor` returns which of the three `LegacyUvAnchor` conventions an entry uses (`W` = page
+  width px, `us` = `user_scale`, PNG aspect for the height):
+  - `TkinterScaledTopLeft` (`region_w`/`region_h`, or `page` with none of `text`/`style`/`user_scale`):
+    `u`/`v` is the corner of the SCALED box — shift by half `w_frac * W * us`;
+  - `QtUnscaledTopLeft` (`text`, no top-level `align`, no nested `style`): every surviving Qt overlay
+    item pins the transform origin to the box centre (`old_or_test/text_tab_old/text_overlay_item.py:118`,
+    `old_or_test/2.X/ui_new/tabs/text_tab/text_overlay_item.py:222`), so scaling is centre-preserving and
+    `u`/`v` is the corner of the UNSCALED box — shift by half `w_frac * W`, with `us` NOT entering the
+    position;
+  - `Centre` (top-level `align`, or a nested `style`, or nothing recognizable): copied verbatim.
+  The `region_*` markers are tested first, so a Tkinter entry that also carries `text` cannot fall into
+  the Qt clause. Treating every `u`/`v` entry as a top-left anchor displaced the whole Qt-2.X legacy
+  majority down-right by half its own footprint; treating both top-left generations alike mis-shifts
+  each by a `user_scale` factor.
+  For the two top-left generations ONLY, the migration also normalizes the displayed SIZE: both drew
+  the strip at `w_frac * W * us` while the modern decoder sizes an overlay from its PNG's own pixels
+  times the placement scale, and the two have drifted (median 14 px, up to ~6 %). So when `w_frac` and
+  the PNG size are known it writes an explicit `scale = w_frac * W * us / png_w`, which the per-entry
+  decoder prefers over the `user_scale` alias. Centre families are left alone.
+  The `png_size` callback the caller supplies is used only in the top-left cases and returns
+  `(0.0, 0.0)` for a missing PNG. The half-shift then degrades in steps: `w_frac` alone still fixes the
+  HORIZONTAL half (`w_frac * W * us / 2`), so that part is applied; only the vertical half, which needs
+  the PNG aspect, drops to 0, and no `scale` is injected (it divides by `png_w`). With no usable
+  `w_frac` either, there is no shift at all. A separate guard covers an entry whose page index is
+  ABSENT from the page-size map: `[1, 1]` is then a placeholder, not a page, so a top-left `u`/`v` is
+  copied verbatim instead of being shifted by a meaningless extent (the ribbon and centre paths are
+  unaffected). All three callers must resolve the PNG by `Path::file_name()`, since overlay PNGs sit
+  flat in the text dirs while a legacy `file` may carry a directory prefix.
+  The absolute-ribbon family recovers a CHAPTER-WIDE scale from every page's aspect ratio, so it
+  requires the FULL chapter page-size map — passing only the loaded page's size makes other pages
+  default to a square aspect and corrupts the solve (and, because any doc edit flushes the page's text
+  inline and then ignores `text_info.json`, that corruption is permanent).
 - WRITE — `encode_transform_fields` (center→img_x/y, rad→`rotation_deg`) and `encode_deform_mesh`
   (`DeformRec`→`deform_mesh`) are the single serialization point for the disk vocabulary; the typing
   tab's `build_storage_overlay_entry` calls them (no hand-rolled deg/mesh serialization remains).
