@@ -2459,6 +2459,7 @@
   "launcher.new_project.review_images_count": "Images : {review} / {review_2}",
   "launcher.new_project.ribbon_empty_description": "Ouvrez un dossier et la fenêtre assemblera une simple bande verticale à partir des images trouvées.",
   "launcher.new_project.ribbon_empty_hint": "La bande est vide pour l'instant",
+  "launcher.new_project.ribbon_uniform_width_check": "Afficher à largeur égale",
   "launcher.new_project.run_reline_button": "Lancer avec Reline",
   "launcher.new_project.run_waifu2x_button": "Lancer avec waifu2x",
   "launcher.new_project.save_alt_failed": "L'enregistrement de la version alternative a échoué.",

@@ -2459,6 +2459,7 @@
   "launcher.new_project.review_images_count": "Imágenes: {review} / {review_2}",
   "launcher.new_project.ribbon_empty_description": "Abra una carpeta y la ventana ensamblará una tira vertical simple con las imágenes encontradas.",
   "launcher.new_project.ribbon_empty_hint": "La tira está vacía por ahora",
+  "launcher.new_project.ribbon_uniform_width_check": "Mostrar con el mismo ancho",
   "launcher.new_project.run_reline_button": "Pasar por Reline",
   "launcher.new_project.run_waifu2x_button": "Pasar por waifu2x",
   "launcher.new_project.save_alt_failed": "El guardado de la versión alternativa falló.",

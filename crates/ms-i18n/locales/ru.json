@@ -2462,6 +2462,7 @@
   "launcher.new_project.review_images_count": "Картинок: {review} / {review_2}",
   "launcher.new_project.ribbon_empty_description": "Откройте папку, и окно соберёт простую вертикальную ленту из найденных изображений.",
   "launcher.new_project.ribbon_empty_hint": "Лента пока пуста",
+  "launcher.new_project.ribbon_uniform_width_check": "Отображать одинаковой ширины",
   "launcher.new_project.run_reline_button": "Прогнать через Reline",
   "launcher.new_project.run_waifu2x_button": "Прогнать через waifu2x",
   "launcher.new_project.save_alt_failed": "Сохранение альтер-версии завершилось с ошибкой.",

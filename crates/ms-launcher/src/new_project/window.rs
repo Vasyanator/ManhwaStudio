@@ -84,6 +84,14 @@ const RIBBON_PREVIEW_SPACING: f32 = 10.0;
 const RIBBON_DELETE_BUTTON_SIZE: f32 = 26.0;
 const RIBBON_CROP_BUTTON_WIDTH: f32 = 116.0;
 const RIBBON_IMAGE_CONTROL_GAP: f32 = 6.0;
+/// Smallest share of the available viewer width the ribbon container may be dragged down to.
+const RIBBON_MIN_WIDTH_FRACTION: f32 = 0.2;
+/// Width (points) of the invisible drag strip centered on each ribbon container edge. Half of it
+/// reaches inside the container, which stays within the frame's 12pt inner margin and therefore
+/// never overlaps the page rects or the marked-scrollbar gutter.
+const RIBBON_RESIZE_GRAB_WIDTH: f32 = 18.0;
+/// Width (points) of the painted resize handle bar drawn on each ribbon container edge.
+const RIBBON_RESIZE_HANDLE_WIDTH: f32 = 10.0;
 const MANUAL_CUT_HANDLE_WIDTH: f32 = 116.0;
 const MANUAL_CUT_HANDLE_HEIGHT: f32 = 24.0;
 const MANUAL_CUT_APPLY_BUTTON_SIZE: egui::Vec2 = egui::vec2(128.0, 30.0);
@@ -565,6 +573,15 @@ pub struct NewProjectWindowState {
     reline_simple_resize_enabled: bool,
     reline_simple_resize_target: String,
     reline_model_picker_open: bool,
+    /// When `true` (the default) every ribbon page is scaled to fill the ribbon width. When
+    /// `false` all pages share one scale derived from the widest page, so their on-screen widths
+    /// keep the ratio of their source widths. Persisted under
+    /// `NewProjectWindow/RibbonUniformWidth`.
+    ribbon_uniform_width: bool,
+    /// Share of the available viewer width used by the ribbon container, in
+    /// `RIBBON_MIN_WIDTH_FRACTION..=1.0`. `1.0` (the default) means the ribbon spans the whole
+    /// viewer column. Persisted under `NewProjectWindow/RibbonWidthFraction`.
+    ribbon_width_fraction: f32,
     save_title: usize,
     save_title_input: String,
     save_title_combo: EditableComboBox,
@@ -730,6 +747,8 @@ impl NewProjectWindowState {
             reline_simple_resize_enabled: false,
             reline_simple_resize_target: "2800".to_string(),
             reline_model_picker_open: false,
+            ribbon_uniform_width: load_ribbon_uniform_width(),
+            ribbon_width_fraction: load_ribbon_width_fraction(),
             save_title: 0,
             save_title_input: "Title A".to_string(),
             save_title_combo: EditableComboBox::new("launcher_new_project_save_title")
@@ -3796,6 +3815,18 @@ impl NewProjectWindowState {
                         ui.colored_label(egui::Color32::from_rgb(255, 120, 120), error);
                     }
 
+                    ui.add_space(6.0);
+                    let uniform_width_before = self.ribbon_uniform_width;
+                    ui.checkbox(
+                        &mut self.ribbon_uniform_width,
+                        t!("launcher.new_project.ribbon_uniform_width_check"),
+                    );
+                    // Persist on toggle only: the config write touches the filesystem and must
+                    // not run once per frame.
+                    if self.ribbon_uniform_width != uniform_width_before {
+                        save_ribbon_uniform_width(self.ribbon_uniform_width);
+                    }
+
                     ui.add_space(10.0);
                     self.show_ribbon(ui);
                 });
@@ -3804,225 +3835,346 @@ impl NewProjectWindowState {
 
     fn show_ribbon(&mut self, ui: &mut Ui) {
         let available_height = safe_dimension(ui.available_size_before_wrap().y, VIEWER_MIN_HEIGHT);
-        Frame::new()
-            .fill(egui::Color32::from_rgba_premultiplied(18, 18, 22, 160))
-            .stroke(Stroke::new(
-                1.0,
-                ui.visuals().widgets.noninteractive.bg_stroke.color,
-            ))
-            .corner_radius(12.0)
-            .inner_margin(egui::Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_min_height((available_height - 8.0).max(220.0));
-                let mut cut_marker_screen_positions = Vec::new();
-                let mut page_boundary_screen_positions = Vec::new();
-                let scroll_output = MarkedScrollArea::vertical("launcher_new_project_ribbon_scroll")
-                    .floating(false)
-                    .gutter_width(MANUAL_CUT_SCROLL_ARROW_WIDTH)
+        let outer_rect = ui.available_rect_before_wrap();
+        // Reserve the whole ribbon area up front so the edge handles interact against a stable
+        // region. No space is allocated twice: `scope_builder` ends in `advance_cursor_after_rect`,
+        // which SETS the cursor from the child rect instead of incrementing it.
+        ui.allocate_rect(outer_rect, egui::Sense::hover());
+        let container_width = self.apply_ribbon_resize(ui, outer_rect);
+        let container_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                outer_rect.center().x - container_width * 0.5,
+                outer_rect.min.y,
+            ),
+            egui::vec2(container_width, outer_rect.height()),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(container_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(18, 18, 22, 160))
+                    .stroke(Stroke::new(
+                        1.0,
+                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                    ))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
-                        if self.source_import.is_loading()
-                            || self.advanced_download.is_loading()
-                            || self.quick_download.is_loading()
-                            || self.test_chapter_check_rx.is_some()
-                            || self.stitch.is_loading()
-                            || self.save.is_loading()
-                            || self.waifu2x.is_loading()
-                            || self.reline.is_loading()
-                        {
-                            let progress = self.current_progress(true);
-                            ui.add(
-                                ProgressBar::new(progress.fraction)
-                                    .animate(true)
-                                    .desired_width(fill_width(ui))
-                                    .text(progress.label),
-                            );
-                            return;
-                        }
-
-                        if self.ribbon.pages().is_empty() {
-                            ui.add_space(24.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(RichText::new(t!("launcher.new_project.ribbon_empty_hint")).size(18.0));
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(
-                                        t!("launcher.new_project.ribbon_empty_description"),
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                            });
-                            ui.add_space(24.0);
-                            return;
-                        }
-
-                        let pages_len = self.ribbon.pages().len();
-                        let mut ribbon_action = None;
-                        let mut add_manual_cut_at = None;
-                        let mut manual_cut_context_guide = self.manual_cut_context_guide;
-                        let mut selected_page = self.selected_ribbon_page;
-                        for index in 0..pages_len {
-                            let mut manual_overlay = None;
-                            ui.vertical(|ui| {
+                        ui.set_min_height((available_height - 8.0).max(220.0));
+                        let mut cut_marker_screen_positions = Vec::new();
+                        let mut page_boundary_screen_positions = Vec::new();
+                        let scroll_output = MarkedScrollArea::vertical("launcher_new_project_ribbon_scroll")
+                            .floating(false)
+                            .gutter_width(MANUAL_CUT_SCROLL_ARROW_WIDTH)
+                            .show(ui, |ui| {
+                                if self.source_import.is_loading()
+                                    || self.advanced_download.is_loading()
+                                    || self.quick_download.is_loading()
+                                    || self.test_chapter_check_rx.is_some()
+                                    || self.stitch.is_loading()
+                                    || self.save.is_loading()
+                                    || self.waifu2x.is_loading()
+                                    || self.reline.is_loading()
                                 {
-                                    let page = &mut self.ribbon.pages_mut()[index];
-                                    let width_scale = safe_dimension(ui.available_width(), 120.0)
-                                        / page.original_size[0].max(1) as f32;
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}  {}x{}",
-                                            page.name,
-                                            page.original_size[0],
-                                            page.original_size[1]
-                                        ))
-                                        .small()
-                                        .weak(),
+                                    let progress = self.current_progress(true);
+                                    ui.add(
+                                        ProgressBar::new(progress.fraction)
+                                            .animate(true)
+                                            .desired_width(fill_width(ui))
+                                            .text(progress.label),
                                     );
-                                    let image_size = egui::vec2(
-                                        page.original_size[0] as f32 * width_scale,
-                                        page.original_size[1] as f32 * width_scale,
-                                    );
-                                    let (image_rect, image_response) =
-                                        ui.allocate_exact_size(image_size, egui::Sense::click());
-                                    if image_response.clicked() {
-                                        selected_page = Some(index);
-                                    }
-                                    if image_response.secondary_clicked()
-                                        && let Some(pointer_pos) = image_response.interact_pointer_pos()
-                                    {
-                                        let page_height = page.original_size[1].max(1);
-                                        let image_y =
-                                            ((pointer_pos.y - image_rect.top()) / width_scale)
-                                                .round()
-                                                .clamp(
-                                                    1.0,
-                                                    page_height.saturating_sub(1) as f32,
-                                                )
-                                                as usize;
-                                        manual_cut_context_guide = Some(ManualCutGuide {
-                                            page_index: index,
-                                            y: image_y,
-                                        });
-                                    }
-                                    image_response.context_menu(|ui| {
-                                        if ui.button(t!("launcher.new_project.add_cut_line_menu")).clicked() {
-                                            add_manual_cut_at = manual_cut_context_guide;
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                index > 0,
-                                                Button::new(t!("launcher.new_project.stitch_with_prev_menu")),
+                                    return;
+                                }
+
+                                if self.ribbon.pages().is_empty() {
+                                    ui.add_space(24.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new(t!("launcher.new_project.ribbon_empty_hint")).size(18.0));
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(
+                                                t!("launcher.new_project.ribbon_empty_description"),
                                             )
-                                            .clicked()
-                                        {
-                                            ribbon_action =
-                                                Some((index, RibbonImageControlAction::MergeWithPrevious));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                index + 1 < pages_len,
-                                                Button::new(t!("launcher.new_project.stitch_with_next_menu")),
-                                            )
-                                            .clicked()
-                                        {
-                                            ribbon_action =
-                                                Some((index, RibbonImageControlAction::MergeWithNext));
-                                            ui.close();
-                                        }
+                                            .small()
+                                            .weak(),
+                                        );
                                     });
-                                    let viewport_rect = ui.clip_rect().expand(128.0);
-                                    for (tile_index, tile) in page.tiles.iter_mut().enumerate() {
-                                        if tile.texture.is_none() {
-                                            let texture = ui.ctx().load_texture(
-                                                format!("launcher-new-project-ribbon-{index}-{tile_index}"),
-                                                tile.color_image.clone(),
-                                                TextureOptions::LINEAR,
+                                    ui.add_space(24.0);
+                                    return;
+                                }
+
+                                let pages_len = self.ribbon.pages().len();
+                                let mut ribbon_action = None;
+                                let mut add_manual_cut_at = None;
+                                let mut manual_cut_context_guide = self.manual_cut_context_guide;
+                                let mut selected_page = self.selected_ribbon_page;
+                                let uniform_width = self.ribbon_uniform_width;
+                                // Proportional mode measures every page against the widest one,
+                                // so this is resolved once instead of per page.
+                                let widest_page_px = self
+                                    .ribbon
+                                    .pages()
+                                    .iter()
+                                    .map(|page| page.original_size[0])
+                                    .max()
+                                    .unwrap_or(1);
+                                for index in 0..pages_len {
+                                    let mut manual_overlay = None;
+                                    ui.vertical(|ui| {
+                                        {
+                                            let page = &mut self.ribbon.pages_mut()[index];
+                                            let content_width = safe_dimension(ui.available_width(), 120.0);
+                                            let scale_base_px = ribbon_scale_base_px(
+                                                uniform_width,
+                                                page.original_size[0],
+                                                widest_page_px,
                                             );
-                                            tile.texture = Some(texture);
-                                        }
-                                        if let Some(texture) = tile.texture.as_ref() {
-                                            let tile_rect = egui::Rect::from_min_size(
-                                                egui::pos2(
-                                                    image_rect.left()
-                                                        + tile.origin_px[0] as f32 * width_scale,
-                                                    image_rect.top()
-                                                        + tile.origin_px[1] as f32 * width_scale,
-                                                ),
-                                                egui::vec2(
-                                                    tile.size[0] as f32 * width_scale,
-                                                    tile.size[1] as f32 * width_scale,
-                                                ),
+                                            let (width_scale, image_size) = ribbon_page_display_size(
+                                                content_width,
+                                                page.original_size,
+                                                scale_base_px,
                                             );
-                                            if tile_rect.intersects(viewport_rect) {
-                                                ui.painter().image(
-                                                    texture.id(),
-                                                    tile_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::Pos2::ZERO,
-                                                        egui::pos2(1.0, 1.0),
+                                            // Narrower-than-full pages are centered; the label
+                                            // follows the image's left edge. In uniform mode the
+                                            // inset is zero, so this is the previous layout.
+                                            let left_inset = ribbon_page_left_inset(content_width, image_size.x);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(left_inset);
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{}  {}x{}",
+                                                        page.name,
+                                                        page.original_size[0],
+                                                        page.original_size[1]
+                                                    ))
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                            });
+                                            // The row spans the full content width so the empty
+                                            // margin beside a narrow page stays inert; only
+                                            // `image_rect` senses clicks.
+                                            let row_rect = ui
+                                                .allocate_exact_size(
+                                                    egui::vec2(content_width, image_size.y),
+                                                    egui::Sense::hover(),
+                                                )
+                                                .0;
+                                            let image_rect = egui::Rect::from_min_size(
+                                                egui::pos2(row_rect.left() + left_inset, row_rect.top()),
+                                                image_size,
+                                            );
+                                            let image_response = ui.interact(
+                                                image_rect,
+                                                egui::Id::new(("launcher_new_project_ribbon_page", index)),
+                                                egui::Sense::click(),
+                                            );
+                                            if image_response.clicked() {
+                                                selected_page = Some(index);
+                                            }
+                                            if image_response.secondary_clicked()
+                                                && let Some(pointer_pos) = image_response.interact_pointer_pos()
+                                            {
+                                                let page_height = page.original_size[1].max(1);
+                                                let image_y =
+                                                    ((pointer_pos.y - image_rect.top()) / width_scale)
+                                                        .round()
+                                                        .clamp(
+                                                            1.0,
+                                                            page_height.saturating_sub(1) as f32,
+                                                        )
+                                                        as usize;
+                                                manual_cut_context_guide = Some(ManualCutGuide {
+                                                    page_index: index,
+                                                    y: image_y,
+                                                });
+                                            }
+                                            image_response.context_menu(|ui| {
+                                                if ui.button(t!("launcher.new_project.add_cut_line_menu")).clicked() {
+                                                    add_manual_cut_at = manual_cut_context_guide;
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        index > 0,
+                                                        Button::new(t!("launcher.new_project.stitch_with_prev_menu")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ribbon_action =
+                                                        Some((index, RibbonImageControlAction::MergeWithPrevious));
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        index + 1 < pages_len,
+                                                        Button::new(t!("launcher.new_project.stitch_with_next_menu")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ribbon_action =
+                                                        Some((index, RibbonImageControlAction::MergeWithNext));
+                                                    ui.close();
+                                                }
+                                            });
+                                            let viewport_rect = ui.clip_rect().expand(128.0);
+                                            for (tile_index, tile) in page.tiles.iter_mut().enumerate() {
+                                                if tile.texture.is_none() {
+                                                    let texture = ui.ctx().load_texture(
+                                                        format!("launcher-new-project-ribbon-{index}-{tile_index}"),
+                                                        tile.color_image.clone(),
+                                                        TextureOptions::LINEAR,
+                                                    );
+                                                    tile.texture = Some(texture);
+                                                }
+                                                if let Some(texture) = tile.texture.as_ref() {
+                                                    let tile_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(
+                                                            image_rect.left()
+                                                                + tile.origin_px[0] as f32 * width_scale,
+                                                            image_rect.top()
+                                                                + tile.origin_px[1] as f32 * width_scale,
+                                                        ),
+                                                        egui::vec2(
+                                                            tile.size[0] as f32 * width_scale,
+                                                            tile.size[1] as f32 * width_scale,
+                                                        ),
+                                                    );
+                                                    if tile_rect.intersects(viewport_rect) {
+                                                        ui.painter().image(
+                                                            texture.id(),
+                                                            tile_rect,
+                                                            egui::Rect::from_min_max(
+                                                                egui::Pos2::ZERO,
+                                                                egui::pos2(1.0, 1.0),
+                                                            ),
+                                                            egui::Color32::WHITE,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if selected_page == Some(index) {
+                                                ui.painter().rect_stroke(
+                                                    image_rect.expand(2.0),
+                                                    10.0,
+                                                    Stroke::new(
+                                                        2.0,
+                                                        egui::Color32::from_rgb(247, 196, 97),
                                                     ),
-                                                    egui::Color32::WHITE,
+                                                    egui::StrokeKind::Outside,
                                                 );
                                             }
+
+                                            ribbon_action = show_ribbon_image_controls(
+                                                ui,
+                                                image_rect,
+                                                row_rect,
+                                                index,
+                                                pages_len,
+                                            )
+                                            .or(ribbon_action);
+
+                                            if index + 1 < pages_len {
+                                                page_boundary_screen_positions.push(image_rect.bottom());
+                                            }
+                                            manual_overlay = Some((image_rect, page.original_size, width_scale));
                                         }
-                                    }
-                                    if selected_page == Some(index) {
-                                        ui.painter().rect_stroke(
-                                            image_rect.expand(2.0),
-                                            10.0,
-                                            Stroke::new(
-                                                2.0,
-                                                egui::Color32::from_rgb(247, 196, 97),
-                                            ),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                    }
-
-                                    ribbon_action = show_ribbon_image_controls(
-                                        ui,
-                                        image_rect,
-                                        index,
-                                        pages_len,
-                                    )
-                                    .or(ribbon_action);
-
+                                        if let Some((image_rect, original_size, width_scale)) = manual_overlay
+                                            && self.should_show_manual_cut_guides(index) {
+                                                cut_marker_screen_positions.extend(self.draw_manual_cut_guides(
+                                                    ui,
+                                                    index,
+                                                    image_rect,
+                                                    original_size,
+                                                    width_scale,
+                                                ));
+                                            }
+                                    });
                                     if index + 1 < pages_len {
-                                        page_boundary_screen_positions.push(image_rect.bottom());
+                                        ui.add_space(RIBBON_PREVIEW_SPACING);
                                     }
-                                    manual_overlay = Some((image_rect, page.original_size, width_scale));
                                 }
-                                if let Some((image_rect, original_size, width_scale)) = manual_overlay
-                                    && self.should_show_manual_cut_guides(index) {
-                                        cut_marker_screen_positions.extend(self.draw_manual_cut_guides(
-                                            ui,
-                                            index,
-                                            image_rect,
-                                            original_size,
-                                            width_scale,
-                                        ));
-                                    }
+                                self.selected_ribbon_page =
+                                    selected_page.map(|index| index.min(pages_len.saturating_sub(1)));
+                                self.manual_cut_context_guide = manual_cut_context_guide;
+                                self.apply_ribbon_action(ribbon_action);
+                                if let Some(guide) = add_manual_cut_at {
+                                    self.add_manual_cut_guide(guide);
+                                }
                             });
-                            if index + 1 < pages_len {
-                                ui.add_space(RIBBON_PREVIEW_SPACING);
-                            }
-                        }
-                        self.selected_ribbon_page =
-                            selected_page.map(|index| index.min(pages_len.saturating_sub(1)));
-                        self.manual_cut_context_guide = manual_cut_context_guide;
-                        self.apply_ribbon_action(ribbon_action);
-                        if let Some(guide) = add_manual_cut_at {
-                            self.add_manual_cut_guide(guide);
-                        }
+                        self.draw_manual_cut_scroll_markers(
+                            &scroll_output,
+                            ui.painter(),
+                            &cut_marker_screen_positions,
+                            &page_boundary_screen_positions,
+                        );
                     });
-                self.draw_manual_cut_scroll_markers(
-                    &scroll_output,
-                    ui.painter(),
-                    &cut_marker_screen_positions,
-                    &page_boundary_screen_positions,
-                );
-            });
+            },
+        );
+        draw_ribbon_resize_handles(ui, outer_rect, container_width);
+    }
+
+    /// Runs the ribbon's left/right edge drag handles and returns the resolved container width in
+    /// points.
+    ///
+    /// The result is always within `RIBBON_MIN_WIDTH_FRACTION..=1.0` of `outer_rect.width()`.
+    /// `self.ribbon_width_fraction` is updated as a fraction (so the ribbon keeps its relative
+    /// width when the window is resized) and is written to user config only when a drag ends,
+    /// never per frame. Painting of the handle bars is deliberately left to
+    /// `draw_ribbon_resize_handles`, which runs after the ribbon frame so the bars are not
+    /// covered by the frame fill.
+    fn apply_ribbon_resize(&mut self, ui: &mut Ui, outer_rect: egui::Rect) -> f32 {
+        let available_width = safe_dimension(outer_rect.width(), 120.0);
+        let min_width = available_width * RIBBON_MIN_WIDTH_FRACTION;
+        let mut width =
+            (clamp_ribbon_width_fraction(self.ribbon_width_fraction) * available_width).clamp(min_width, available_width);
+
+        let left_x = outer_rect.center().x - width * 0.5;
+        let right_x = outer_rect.center().x + width * 0.5;
+        let left_handle = egui::Rect::from_min_max(
+            egui::pos2(left_x - RIBBON_RESIZE_GRAB_WIDTH * 0.5, outer_rect.min.y),
+            egui::pos2(left_x + RIBBON_RESIZE_GRAB_WIDTH * 0.5, outer_rect.max.y),
+        );
+        let right_handle = egui::Rect::from_min_max(
+            egui::pos2(right_x - RIBBON_RESIZE_GRAB_WIDTH * 0.5, outer_rect.min.y),
+            egui::pos2(right_x + RIBBON_RESIZE_GRAB_WIDTH * 0.5, outer_rect.max.y),
+        );
+
+        let left_response = ui.interact(
+            left_handle,
+            egui::Id::new("launcher_new_project_ribbon_resize_left"),
+            egui::Sense::drag(),
+        );
+        let right_response = ui.interact(
+            right_handle,
+            egui::Id::new("launcher_new_project_ribbon_resize_right"),
+            egui::Sense::drag(),
+        );
+
+        if left_response.hovered()
+            || left_response.dragged()
+            || right_response.hovered()
+            || right_response.dragged()
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+
+        // The container is centered, so each edge moves by half the width change: the delta is
+        // doubled to keep the grabbed edge under the pointer. A left-edge drag mirrors the sign.
+        if left_response.dragged() {
+            width = (width - left_response.drag_delta().x * 2.0).clamp(min_width, available_width);
+        }
+        if right_response.dragged() {
+            width = (width + right_response.drag_delta().x * 2.0).clamp(min_width, available_width);
+        }
+
+        self.ribbon_width_fraction = clamp_ribbon_width_fraction(width / available_width);
+        if left_response.drag_stopped() || right_response.drag_stopped() {
+            save_ribbon_width_fraction(self.ribbon_width_fraction);
+        }
+        width
     }
 
     fn can_start_stitch(&self) -> bool {
@@ -6826,6 +6978,83 @@ fn safe_dimension(value: f32, fallback: f32) -> f32 {
     }
 }
 
+/// Pixel width that one ribbon page's on-screen scale is measured against.
+///
+/// In uniform mode the base is the page's own width, so every page fills the ribbon content width
+/// exactly. In proportional mode all pages share the widest page's width, so their on-screen
+/// widths keep the ratio of their source widths. Never returns 0, so the caller's division is
+/// always safe; a `widest_page_px` smaller than `page_width_px` (impossible for a real ribbon) is
+/// raised to the page width rather than upscaling the page past the ribbon.
+fn ribbon_scale_base_px(uniform: bool, page_width_px: usize, widest_page_px: usize) -> usize {
+    if uniform {
+        page_width_px.max(1)
+    } else {
+        widest_page_px.max(page_width_px).max(1)
+    }
+}
+
+/// Uniform scale factor and on-screen size (points) for one ribbon page.
+///
+/// `content_width` is the ribbon's usable width in points, `original_size` the page's post-crop
+/// pixel size `[w, h]`, and `scale_base_px` the pixel width that maps onto the full content width
+/// (see `ribbon_scale_base_px`). The same factor is applied to both axes, so the aspect ratio is
+/// preserved. A non-finite or degenerate `content_width` falls back to 120pt via `safe_dimension`.
+fn ribbon_page_display_size(
+    content_width: f32,
+    original_size: [usize; 2],
+    scale_base_px: usize,
+) -> (f32, egui::Vec2) {
+    let content_width = safe_dimension(content_width, 120.0);
+    let scale = content_width / scale_base_px.max(1) as f32;
+    (
+        scale,
+        egui::vec2(
+            original_size[0] as f32 * scale,
+            original_size[1] as f32 * scale,
+        ),
+    )
+}
+
+/// Left inset (points) that centers a page of `image_width` inside a `content_width` ribbon row.
+///
+/// Returns `0.0` when the page already fills the row (uniform mode) or when either value is
+/// non-finite, so the page can never be pushed off the left edge of the ribbon.
+fn ribbon_page_left_inset(content_width: f32, image_width: f32) -> f32 {
+    let inset = (content_width - image_width) * 0.5;
+    if inset.is_finite() { inset.max(0.0) } else { 0.0 }
+}
+
+/// Clamps a ribbon width fraction into `RIBBON_MIN_WIDTH_FRACTION..=1.0`.
+///
+/// A non-finite value (a corrupt config entry, or a division by a degenerate width) falls back to
+/// `1.0` so the ribbon can never end up hidden or inverted.
+fn clamp_ribbon_width_fraction(fraction: f32) -> f32 {
+    if fraction.is_finite() {
+        fraction.clamp(RIBBON_MIN_WIDTH_FRACTION, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Paints the two ribbon resize handle bars on the container edges.
+///
+/// Called after the ribbon frame so the frame fill cannot cover the inner half of each bar.
+/// `container_width` is the resolved width returned by `apply_ribbon_resize`.
+fn draw_ribbon_resize_handles(ui: &Ui, outer_rect: egui::Rect, container_width: f32) {
+    let painter = ui.painter();
+    let half = container_width * 0.5;
+    for x in [outer_rect.center().x - half, outer_rect.center().x + half] {
+        let handle_rect = egui::Rect::from_center_size(
+            egui::pos2(x, outer_rect.center().y),
+            egui::vec2(
+                RIBBON_RESIZE_HANDLE_WIDTH,
+                (outer_rect.height() - 12.0).max(48.0),
+            ),
+        );
+        painter.rect_filled(handle_rect, 4.0, egui::Color32::from_rgb(64, 64, 70));
+    }
+}
+
 fn manual_cut_y_is_valid(y: usize, page_height: usize) -> bool {
     y >= MANUAL_CUT_MIN_EDGE_DISTANCE_PX
         && y.saturating_add(MANUAL_CUT_MIN_EDGE_DISTANCE_PX) <= page_height
@@ -6958,9 +7187,16 @@ fn ribbon_control_button(label: &str, fill: egui::Color32, enabled: bool) -> But
         .corner_radius(999.0)
 }
 
+/// Draws the floating crop/move/delete button group for one ribbon page.
+///
+/// `image_rect` is the page image on screen and `bounds` the full-width ribbon content row it sits
+/// in. The group is anchored to the image's right edge, but is kept inside `bounds` so a page
+/// narrower than the ~148pt group (proportional mode on a shrunken ribbon) cannot push the buttons
+/// out of the visible ribbon. For a page wider than the group the clamp is inert.
 fn show_ribbon_image_controls(
     ui: &mut Ui,
     image_rect: egui::Rect,
+    bounds: egui::Rect,
     index: usize,
     pages_len: usize,
 ) -> Option<(usize, RibbonImageControlAction)> {
@@ -6973,7 +7209,16 @@ fn show_ribbon_image_controls(
         image_rect.top() + 8.0,
         (image_rect.bottom() - button_span - 8.0).max(image_rect.top() + 8.0),
     );
-    let sticky_left = (image_rect.right() - group_width - 8.0).max(image_rect.left() + 8.0);
+    let preferred_left = (image_rect.right() - group_width - 8.0).max(image_rect.left() + 8.0);
+    let min_left = bounds.left() + 8.0;
+    let max_left = bounds.right() - group_width - 8.0;
+    let sticky_left = if max_left >= min_left {
+        preferred_left.clamp(min_left, max_left)
+    } else {
+        // The ribbon itself is narrower than the button group: left-align and let it overflow
+        // rather than invert the clamp.
+        min_left
+    };
     let controls_rect = egui::Rect::from_min_size(
         egui::pos2(sticky_left, sticky_top),
         egui::vec2(group_width, button_span),
@@ -7916,6 +8161,84 @@ fn save_reline_ui_mode(mode: RelineUiMode) {
     }
 }
 
+/// Load the persisted ribbon "equal width" preference from user config.
+///
+/// Returns `true` when the key is missing, holds a non-boolean, or the config cannot be read, so
+/// the historical full-width ribbon stays the default.
+fn load_ribbon_uniform_width() -> bool {
+    let cfg = match config::load_user_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[new-project] failed to load user config for ribbon uniform width: {err}"
+            ));
+            return true;
+        }
+    };
+    cfg.get_path(&["NewProjectWindow", "RibbonUniformWidth"])
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Persist the ribbon "equal width" preference. Called only on toggle change, not per frame.
+fn save_ribbon_uniform_width(uniform: bool) {
+    let result = (|| -> anyhow::Result<()> {
+        let mut cfg = config::load_user_config()?;
+        cfg.set_path(
+            &["NewProjectWindow", "RibbonUniformWidth"],
+            serde_json::Value::Bool(uniform),
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        ms_log::runtime_log::log_warn(format!(
+            "[new-project] failed to save ribbon uniform width: {err}"
+        ));
+    }
+}
+
+/// Load the persisted ribbon width fraction from user config.
+///
+/// The stored value is clamped into `RIBBON_MIN_WIDTH_FRACTION..=1.0`; a missing, non-numeric, or
+/// non-finite entry yields `1.0` (full width), which is the historical appearance.
+fn load_ribbon_width_fraction() -> f32 {
+    let cfg = match config::load_user_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[new-project] failed to load user config for ribbon width fraction: {err}"
+            ));
+            return 1.0;
+        }
+    };
+    cfg.get_path(&["NewProjectWindow", "RibbonWidthFraction"])
+        .and_then(serde_json::Value::as_f64)
+        // A UI width fraction only ever needs f32 precision, and `clamp_ribbon_width_fraction`
+        // rejects the non-finite values an out-of-range `f64` can narrow into.
+        .map(|value| clamp_ribbon_width_fraction(value as f32))
+        .unwrap_or(1.0)
+}
+
+/// Persist the ribbon width fraction. Called when a resize drag ends, not per drag frame.
+fn save_ribbon_width_fraction(fraction: f32) {
+    let clamped = clamp_ribbon_width_fraction(fraction);
+    let result = (|| -> anyhow::Result<()> {
+        let mut cfg = config::load_user_config()?;
+        let number = serde_json::Number::from_f64(f64::from(clamped))
+            .ok_or_else(|| anyhow::anyhow!("ribbon width fraction {clamped} is not representable"))?;
+        cfg.set_path(
+            &["NewProjectWindow", "RibbonWidthFraction"],
+            serde_json::Value::Number(number),
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        ms_log::runtime_log::log_warn(format!(
+            "[new-project] failed to save ribbon width fraction: {err}"
+        ));
+    }
+}
+
 fn arc_image_clone(image: Arc<RgbaImage>) -> RgbaImage {
     (*image).clone()
 }
@@ -7995,5 +8318,143 @@ mod macos_capture_bounds_tests {
             macos_monitor_size_to_bounds(egui::vec2(f32::INFINITY, 900.0)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, ribbon_page_display_size,
+        ribbon_page_left_inset, ribbon_scale_base_px,
+    };
+
+    /// Points of slack allowed when comparing derived layout sizes.
+    const EPS: f32 = 0.001;
+
+    /// Resolves a page's on-screen size the way `show_ribbon` does, for a given mode.
+    fn display_size(
+        uniform: bool,
+        content_width: f32,
+        page: [usize; 2],
+        widest_px: usize,
+    ) -> (f32, egui::Vec2) {
+        let base = ribbon_scale_base_px(uniform, page[0], widest_px);
+        ribbon_page_display_size(content_width, page, base)
+    }
+
+    #[test]
+    fn uniform_mode_fills_the_content_width_for_every_page() {
+        let content_width = 800.0;
+        for page in [[1440_usize, 2048_usize], [720, 1024], [180, 180]] {
+            let (_, size) = display_size(true, content_width, page, 1440);
+            assert!(
+                (size.x - content_width).abs() < EPS,
+                "page {page:?} rendered at {} instead of {content_width}",
+                size.x
+            );
+        }
+    }
+
+    #[test]
+    fn proportional_mode_scales_relative_to_the_widest_page() {
+        let content_width = 800.0;
+        let widest_px = 800_usize;
+
+        let (_, widest) = display_size(false, content_width, [800, 1200], widest_px);
+        assert!((widest.x - content_width).abs() < EPS);
+
+        let (_, half) = display_size(false, content_width, [400, 600], widest_px);
+        assert!(
+            (half.x - content_width * 0.5).abs() < EPS,
+            "half-width page rendered at {}",
+            half.x
+        );
+
+        let (_, eighth) = display_size(false, content_width, [100, 150], widest_px);
+        assert!(
+            (eighth.x - content_width / 8.0).abs() < EPS,
+            "eighth-width page rendered at {}",
+            eighth.x
+        );
+    }
+
+    #[test]
+    fn uniform_mode_never_insets_a_page() {
+        let content_width = 800.0;
+        let (_, size) = display_size(true, content_width, [1440, 2048], 1440);
+        assert!(ribbon_page_left_inset(content_width, size.x).abs() < EPS);
+    }
+
+    #[test]
+    fn proportional_mode_centers_a_narrow_page() {
+        let content_width = 800.0;
+        let (_, size) = display_size(false, content_width, [400, 600], 800);
+        let inset = ribbon_page_left_inset(content_width, size.x);
+        // Half the leftover room on the left means the same half is left on the right.
+        assert!((inset - 200.0).abs() < EPS, "inset = {inset}");
+        assert!((content_width - (inset + size.x) - inset).abs() < EPS);
+    }
+
+    #[test]
+    fn left_inset_never_goes_negative_or_non_finite() {
+        assert!(ribbon_page_left_inset(300.0, 900.0).abs() < EPS);
+        assert!(ribbon_page_left_inset(f32::NAN, 100.0).abs() < EPS);
+        assert!(ribbon_page_left_inset(f32::INFINITY, f32::INFINITY).abs() < EPS);
+    }
+
+    #[test]
+    fn both_modes_preserve_the_aspect_ratio() {
+        let page = [1440_usize, 2048_usize];
+        let source_ratio = page[1] as f32 / page[0] as f32;
+        for uniform in [true, false] {
+            let (_, size) = display_size(uniform, 640.0, page, 2000);
+            assert!(
+                ((size.y / size.x) - source_ratio).abs() < EPS,
+                "uniform={uniform}: ratio {} != {source_ratio}",
+                size.y / size.x
+            );
+        }
+    }
+
+    #[test]
+    fn scale_base_never_upscales_a_page_past_the_ribbon() {
+        // A widest-page value smaller than the page itself cannot happen for a real ribbon, but
+        // must not produce a page wider than the content width if it ever does.
+        let (_, size) = display_size(false, 500.0, [900, 900], 300);
+        assert!(size.x <= 500.0 + EPS, "page rendered at {}", size.x);
+        assert_eq!(ribbon_scale_base_px(false, 0, 0), 1);
+        assert_eq!(ribbon_scale_base_px(true, 0, 4096), 1);
+    }
+
+    #[test]
+    fn degenerate_content_width_falls_back_instead_of_dividing_by_zero() {
+        let (scale, size) = ribbon_page_display_size(0.0, [100, 200], 100);
+        assert!(scale.is_finite() && scale > 0.0);
+        assert!((size.x - 120.0).abs() < EPS, "size.x = {}", size.x);
+
+        let (scale, _) = ribbon_page_display_size(f32::NAN, [100, 200], 100);
+        assert!(scale.is_finite());
+    }
+
+    #[test]
+    fn width_fraction_is_clamped_to_the_allowed_range() {
+        assert!((clamp_ribbon_width_fraction(1.0) - 1.0).abs() < EPS);
+        assert!((clamp_ribbon_width_fraction(0.5) - 0.5).abs() < EPS);
+        assert!((clamp_ribbon_width_fraction(2.5) - 1.0).abs() < EPS);
+        assert!(
+            (clamp_ribbon_width_fraction(0.01) - RIBBON_MIN_WIDTH_FRACTION).abs() < EPS,
+            "below-minimum fractions must clamp up to the minimum"
+        );
+        assert!(
+            (clamp_ribbon_width_fraction(-3.0) - RIBBON_MIN_WIDTH_FRACTION).abs() < EPS,
+            "negative fractions must clamp up to the minimum"
+        );
+    }
+
+    #[test]
+    fn garbage_width_fraction_falls_back_to_full_width() {
+        assert!((clamp_ribbon_width_fraction(f32::NAN) - 1.0).abs() < EPS);
+        assert!((clamp_ribbon_width_fraction(f32::INFINITY) - 1.0).abs() < EPS);
+        assert!((clamp_ribbon_width_fraction(f32::NEG_INFINITY) - 1.0).abs() < EPS);
     }
 }

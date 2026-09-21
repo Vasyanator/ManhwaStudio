@@ -29,7 +29,11 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 ## Files and submodules
 - `mod.rs`: public module map for the detached new-project window.
 - `window.rs`: `NewProjectWindowState`, viewport rendering, left-panel modes, ribbon preview,
-  crop/manual cut UI, save forms, controller polling, and open-project handoff after save.
+  crop/manual cut UI, save forms, controller polling, and open-project handoff after save. The
+  ribbon preview's on-screen geometry is decided by two persisted preferences
+  (`NewProjectWindow/RibbonUniformWidth`, `NewProjectWindow/RibbonWidthFraction`) resolved through
+  the pure helpers `ribbon_scale_base_px` / `ribbon_page_display_size` /
+  `clamp_ribbon_width_fraction`.
 - `open_source.rs`: source picker and workers for folders, saved HTML, archives, and single image
   files; includes byte-signature image detection, natural ordering, filtering, and progress events.
 - `project_io.rs`: projects-root catalog scan, target resolution, parallel PNG save pipeline, and
@@ -117,4 +121,8 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   preset-to-pipeline mapping, edit `show_reline_simple`/`build_reline_simple_options` in
   `window.rs`.
 - To change detached window UI flow or controller wiring, edit `window.rs`.
+- To change how ribbon pages are scaled or how wide the ribbon container is, edit
+  `show_ribbon`/`apply_ribbon_resize` in `window.rs`. Every page rect derives from one
+  `(width_scale, image_size)` pair, so downstream tile painting, manual-cut guides, page-boundary
+  markers and the gutter arrows follow any scale change without their own math.
 - To change batch graph editing or execution, edit `batch_processing/`.

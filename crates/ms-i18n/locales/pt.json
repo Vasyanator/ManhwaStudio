@@ -2459,6 +2459,7 @@
   "launcher.new_project.review_images_count": "Imagens: {review} / {review_2}",
   "launcher.new_project.ribbon_empty_description": "Abra uma pasta e a janela montará uma tira vertical simples com as imagens encontradas.",
   "launcher.new_project.ribbon_empty_hint": "A tira ainda está vazia",
+  "launcher.new_project.ribbon_uniform_width_check": "Exibir com a mesma largura",
   "launcher.new_project.run_reline_button": "Passar pelo Reline",
   "launcher.new_project.run_waifu2x_button": "Passar pelo waifu2x",
   "launcher.new_project.save_alt_failed": "O salvamento da versão alternativa falhou.",

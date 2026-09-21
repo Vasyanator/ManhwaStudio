@@ -2462,6 +2462,7 @@
   "launcher.new_project.review_images_count": "Images: {review} / {review_2}",
   "launcher.new_project.ribbon_empty_description": "Open a folder and the window will assemble a simple vertical ribbon from the images found.",
   "launcher.new_project.ribbon_empty_hint": "The ribbon is empty for now",
+  "launcher.new_project.ribbon_uniform_width_check": "Display at equal width",
   "launcher.new_project.run_reline_button": "Run through Reline",
   "launcher.new_project.run_waifu2x_button": "Run through waifu2x",
   "launcher.new_project.save_alt_failed": "Saving the alternative version failed.",
