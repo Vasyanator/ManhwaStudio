@@ -1,0 +1,93 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/characters",
+    "parent": "",
+    "seg": "characters",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/characters/0",
+    "parent": "/characters",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/characters/0/aliases",
+    "parent": "/characters/0",
+    "seg": "aliases",
+    "kind": "leaf",
+    "payload": "[\"A\",\"Annie\"]"
+  },
+  {
+    "path": "/characters/0/color",
+    "parent": "/characters/0",
+    "seg": "color",
+    "kind": "leaf",
+    "payload": "\"#ff0000\""
+  },
+  {
+    "path": "/characters/0/name",
+    "parent": "/characters/0",
+    "seg": "name",
+    "kind": "leaf",
+    "payload": "\"Ann\""
+  },
+  {
+    "path": "/characters/1",
+    "parent": "/characters",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/characters/1/name",
+    "parent": "/characters/1",
+    "seg": "name",
+    "kind": "leaf",
+    "payload": "\"Bob\""
+  },
+  {
+    "path": "/terms",
+    "parent": "",
+    "seg": "terms",
+    "kind": "arr",
+    "payload": "1"
+  },
+  {
+    "path": "/terms/0",
+    "parent": "/terms",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/terms/0/note",
+    "parent": "/terms/0",
+    "seg": "note",
+    "kind": "leaf",
+    "payload": "null"
+  },
+  {
+    "path": "/terms/0/source",
+    "parent": "/terms/0",
+    "seg": "source",
+    "kind": "leaf",
+    "payload": "\"형\""
+  },
+  {
+    "path": "/terms/0/target",
+    "parent": "/terms/0",
+    "seg": "target",
+    "kind": "leaf",
+    "payload": "\"брат\""
+  }
+]

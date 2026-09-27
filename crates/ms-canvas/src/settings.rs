@@ -21,6 +21,8 @@ Key functions:
 
 Notes:
 - Actual filesystem writes are executed by the background saver worker from `workers.rs`.
+- The title `settings.json` is written ONLY through `ms_docstore::update` (serialized,
+  atomic, malformed file never overwritten); this module edits only its own keys there.
 - This module keeps settings-specific logic out of the main canvas facade.
 */
 
@@ -33,9 +35,9 @@ use super::{
 use ms_config as config;
 use ms_models::bubbles_model::SharedCanvasSettings;
 use ms_project::ProjectData;
+use ms_docstore::{DocKind, DocRef, WriteOptions};
 use ms_log::runtime_log;
 use serde_json::{Map, Value};
-use std::fs;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use ms_thread::JoinHandle;
@@ -200,36 +202,39 @@ impl CanvasView {
     }
 }
 
-fn load_json_object_root(path: &Path, scope: &str) -> Result<Value, String> {
-    if !path.exists() {
-        return Ok(Value::Object(Map::new()));
-    }
-
-    let raw = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {scope} '{}': {err}", path.display()))?;
-    let root = serde_json::from_str::<Value>(&raw)
-        .map_err(|err| format!("failed to parse {scope} '{}': {err}", path.display()))?;
-    if root.is_object() {
-        Ok(root)
-    } else {
-        Err(format!(
-            "failed to parse {scope} '{}': root JSON value is not an object",
-            path.display()
-        ))
-    }
-}
-
+/// Persists the project-scoped canvas subset into the title's `settings.json` through the
+/// serialized `ms_docstore::update` read-modify-write.
+///
+/// The mutator edits ONLY the keys this writer owns (`canvas.*` fields of the snapshot, the
+/// four top-level bubble/focus keys and the listed legacy removals); every other section
+/// (`OCR`, `canvas.project_custom_spellcheck_words`, ...) is kept as found, and the document
+/// lock serializes this writer against the other `settings.json` writers.
+///
+/// # Errors
+/// Returns a technical message when the existing file is malformed or its root is not an
+/// object (the file is left untouched), or when the atomic write fails.
 pub fn save_canvas_settings_to_project_file(
     settings_file: &Path,
     snapshot: &SharedCanvasSettings,
 ) -> Result<(), String> {
-    let mut root = load_json_object_root(settings_file, "project canvas settings file")?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(format!(
-            "project canvas settings root became non-object unexpectedly: '{}'",
-            settings_file.display()
-        ));
-    };
+    let doc = DocRef::new(settings_file, DocKind::ProjectSettings);
+    // Default options = the historical layout (2-space pretty, no trailing newline, parent
+    // directories created).
+    ms_docstore::update(&doc, WriteOptions::default(), |root| {
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(format!(
+                "failed to parse project canvas settings file '{}': root JSON value is not an object",
+                settings_file.display()
+            ));
+        };
+        apply_project_canvas_snapshot(root_obj, snapshot);
+        Ok(())
+    })
+    .map_err(|err| format!("failed to save project canvas settings file '{}': {err}", settings_file.display()))
+}
+
+/// Writes the project-scoped canvas keys of `snapshot` into the `settings.json` root object.
+fn apply_project_canvas_snapshot(root_obj: &mut Map<String, Value>, snapshot: &SharedCanvasSettings) {
 
     let mut canvas_obj = root_obj
         .get("canvas")
@@ -340,13 +345,6 @@ pub fn save_canvas_settings_to_project_file(
     root_obj.remove("paste_into_field");
     root_obj.remove("visible_page_radius");
     root_obj.remove("bubble_load_delay_ms");
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(settings_file, payload).map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 /// Persists the shared canvas subset through the serialized user-config RMW boundary.
@@ -424,4 +422,41 @@ pub fn save_canvas_settings_to_user_file(
         Ok(())
     })
     .map_err(|err| err.to_string())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// The canvas writer must keep keys owned by other `settings.json` writers.
+    #[test]
+    fn project_save_keeps_foreign_keys() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        let seed = r#"{"OCR":{"engine":"paddle"},"canvas":{"project_custom_spellcheck_words":"a\nb","scale_bubbles":true}}"#;
+        std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+        save_canvas_settings_to_project_file(&path, &SharedCanvasSettings::default())?;
+        let raw = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        let root: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+        assert_eq!(root["OCR"]["engine"], "paddle");
+        assert_eq!(root["canvas"]["project_custom_spellcheck_words"], "a\nb");
+        assert_eq!(root["canvas"]["bubble_type"], "hybrid");
+        assert!(root["canvas"].get("scale_bubbles").is_none());
+        assert_eq!(root["bubble_type"], "hybrid");
+        assert!(!raw.ends_with('\n'));
+        Ok(())
+    }
+
+    /// A malformed or non-object `settings.json` is reported and left byte-identical.
+    #[test]
+    fn project_save_never_overwrites_malformed_file() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        for seed in ["{ not json", "[1, 2]"] {
+            std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+            assert!(save_canvas_settings_to_project_file(&path, &SharedCanvasSettings::default()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
+        }
+        Ok(())
+    }
 }

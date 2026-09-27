@@ -32,8 +32,10 @@ from __future__ import annotations
 # python_protocol_version_matches_rust guards the mirror, but nothing can detect
 # a bump that was never made. The hello handshake compares this value; a
 # mismatch is a clean error (see PROTOCOL.md "Error model").
+# The contract also covers the on-disk user_config storage semantics shared with
+# Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
 # ============================================================================
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # ============================================================================
 # FRAME SIZE GUARDS

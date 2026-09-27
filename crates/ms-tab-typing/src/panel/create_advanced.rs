@@ -1561,13 +1561,12 @@ fn merge_advanced_form_bounds<T: Ord + Copy + Default>(
     }
 }
 
-/// Порядковый барьер отложенных записей ручек поиска форм.
+/// Ordering barrier of the deferred form-search knob writes.
 ///
-/// Каждая правка ручек порождает СВОЙ поток записи, а общий замок
-/// `config::lock_user_config_write()` упорядочивает записи, но не спасает от
-/// ИНВЕРСИИ: два потока, стартовавшие в порядке «старое, новое», вправе взять
-/// замок в порядке «новое, старое», и на диск ляжет устаревший снимок — ручка
-/// молча откатилась бы при следующем запуске.
+/// Every knob edit spawns ITS OWN writer thread. The `user_config.json` document lock
+/// (`ms_docstore`) serializes the writes but does not prevent an INVERSION: two threads
+/// started as "old, new" may take the lock as "new, old", and the stale snapshot would
+/// land on disk — the knob would silently roll back on the next launch.
 ///
 /// Барьер выдаёт монотонный номер поколения на КАЖДЫЙ старт записи
 /// ([`AdvancedFormParamsSaveGate::claim`]) и пропускает к диску только поток с
@@ -1577,9 +1576,9 @@ fn merge_advanced_form_bounds<T: Ord + Copy + Default>(
 pub(super) struct AdvancedFormParamsSaveGate {
     /// Последнее выданное поколение; `0` — не выдано ни одного.
     latest: AtomicU64,
-    /// Держится на всё время «проверка + запись». Внутри него берётся
-    /// `config::lock_user_config_write()`, и НИКОГДА наоборот — обратного порядка
-    /// в проекте нет, поэтому пара замков не образует цикла.
+    /// Held for the whole "check + write". The `user_config.json` document lock is taken
+    /// INSIDE it, NEVER the other way round — no code takes them in the reverse order, so
+    /// the pair cannot form a cycle.
     write_lock: Mutex<()>,
 }
 

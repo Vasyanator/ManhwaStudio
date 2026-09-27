@@ -51,10 +51,10 @@ use crate::widgets::{
 use typesetting::{FontListKind, FontNameDisplayMode, FontNameDisplayModes};
 // `Context` is what turns the `Option` of `as_object_mut` into a typed anyhow error
 // inside `config::update_user_config_file`'s mutator.
-use serde_json::{Map, Value};
-use std::fs;
+use anyhow::Context;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::{Duration, Instant};
@@ -72,14 +72,71 @@ pub(super) struct DraggedBubbleConditionNode {
 pub(super) struct CanvasSettingsRuntime {
     pub(super) tx: Sender<Option<CanvasSettingsSaveRequest>>,
     pub(super) thread: JoinHandle<()>,
+    /// Word lists the saver failed to write; the GUI re-marks them unsynced so the next save
+    /// retries them.
+    pub(super) word_failures: Receiver<WordListSaveFailure>,
 }
 
+/// Which spellcheck word list a save concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WordList {
+    /// The shared (user-level) custom dictionary.
+    Custom,
+    /// The current project's word list.
+    Project,
+}
+
+/// A word list the saver thread could not write, with the exact text it tried to write.
+#[derive(Debug)]
+pub(super) struct WordListSaveFailure {
+    pub(super) list: WordList,
+    pub(super) words: String,
+}
+
+/// One canvas-settings save for the settings saver thread.
+///
+/// The two spellcheck word lists are `Some` only when the editor's text differs from what
+/// this editor last loaded or sent ([`words_to_send`]): both lists are also written by the
+/// spellcheck context menu's own worker, so re-sending an unchanged in-memory copy with
+/// every canvas-settings save would overwrite a word added there in the meantime.
 #[derive(Debug, Clone)]
 pub(super) struct CanvasSettingsSaveRequest {
     pub(super) snapshot: SharedCanvasSettings,
     pub(super) comic_type: ComicType,
-    pub(super) custom_spellcheck_words: String,
-    pub(super) project_spellcheck_words: String,
+    pub(super) custom_spellcheck_words: Option<String>,
+    pub(super) project_spellcheck_words: Option<String>,
+}
+
+impl CanvasSettingsSaveRequest {
+    /// Coalesces a queued request with a `newer` one: the newer snapshot wins, and a word
+    /// list the newer request does not carry keeps this request's pending edit.
+    fn absorb_newer(self, newer: Self) -> Self {
+        Self {
+            snapshot: newer.snapshot,
+            comic_type: newer.comic_type,
+            custom_spellcheck_words: newer.custom_spellcheck_words.or(self.custom_spellcheck_words),
+            project_spellcheck_words: newer.project_spellcheck_words.or(self.project_spellcheck_words),
+        }
+    }
+}
+
+/// The word list to send with a save: `Some(current)` when it differs from `synced` (the
+/// text this editor last loaded or sent; `None` = unknown, e.g. after a failed write), which
+/// then becomes `current`; `None` otherwise.
+fn words_to_send(current: &str, synced: &mut Option<String>) -> Option<String> {
+    if synced.as_deref() == Some(current) {
+        return None;
+    }
+    *synced = Some(current.to_owned());
+    Some(current.to_owned())
+}
+
+/// Reacts to a failed write of `failed`: when it is still the baseline (no newer text was
+/// sent since), the baseline becomes unknown so the next save re-sends the list.
+fn remark_unsynced_after_failure(synced: &mut Option<String>, failed: &str) {
+    if synced.as_deref() == Some(failed) {
+        *synced = None;
+    }
 }
 
 #[derive(Debug)]
@@ -107,6 +164,12 @@ pub struct SettingsTabState {
     canvas_settings_runtime: Option<CanvasSettingsRuntime>,
     spellcheck_custom_words: String,
     project_spellcheck_custom_words: String,
+    /// The shared dictionary text as last loaded from or sent to disk by this editor
+    /// (`None`: a write failed, re-send at the next save).
+    spellcheck_custom_words_synced: Option<String>,
+    /// The project word list as last loaded from or sent to disk by this editor
+    /// (`None`: a write failed, re-send at the next save).
+    project_spellcheck_words_synced: Option<String>,
     spellcheck_words_revision_seen: u64,
     ai_backend_handle: AiBackendHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
@@ -183,6 +246,8 @@ impl SettingsTabState {
             canvas_settings_runtime: None,
             spellcheck_custom_words: String::new(),
             project_spellcheck_custom_words: String::new(),
+            spellcheck_custom_words_synced: Some(String::new()),
+            project_spellcheck_words_synced: Some(String::new()),
             spellcheck_words_revision_seen: current_spellcheck_words_revision(),
             ai_backend_handle,
             dragged_bubble_condition_node: None,
@@ -246,6 +311,8 @@ impl SettingsTabState {
                 ));
                 String::new()
             });
+        self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
+        self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
         self.spellcheck_words_revision_seen = current_spellcheck_words_revision();
         self.bubbles_model = Some(bubbles_model);
         self.clean_overlays_model = Some(clean_overlays_model);
@@ -337,7 +404,7 @@ impl SettingsTabState {
 }
 
 impl SettingsTabState {
-    fn publish_canvas_settings(&self) {
+    fn publish_canvas_settings(&mut self) {
         let comic_type = ComicType::from_canvas_preset_fields(
             &self.canvas_settings.aside_compact_mode,
             self.canvas_settings.separate_pages,
@@ -362,12 +429,23 @@ impl SettingsTabState {
         }
 
         if let Some(runtime) = self.canvas_settings_runtime.as_ref() {
-            let _ = runtime.tx.send(Some(CanvasSettingsSaveRequest {
+            // Failed word-list writes reported since the last save are re-sent with this one.
+            for failure in runtime.word_failures.try_iter() {
+                let synced = match failure.list {
+                    WordList::Custom => &mut self.spellcheck_custom_words_synced,
+                    WordList::Project => &mut self.project_spellcheck_words_synced,
+                };
+                remark_unsynced_after_failure(synced, &failure.words);
+            }
+            let request = CanvasSettingsSaveRequest {
                 snapshot: self.canvas_settings.clone(),
                 comic_type,
-                custom_spellcheck_words: self.spellcheck_custom_words.clone(),
-                project_spellcheck_words: self.project_spellcheck_custom_words.clone(),
-            }));
+                custom_spellcheck_words: words_to_send(&self.spellcheck_custom_words, &mut self.spellcheck_custom_words_synced),
+                project_spellcheck_words: words_to_send(&self.project_spellcheck_custom_words, &mut self.project_spellcheck_words_synced),
+            };
+            if runtime.tx.send(Some(request)).is_err() {
+                runtime_log::log_error("[settings] canvas settings saver thread is gone; this save was not written");
+            }
         }
     }
 
@@ -375,7 +453,7 @@ impl SettingsTabState {
         self.canvas_settings = snapshot;
     }
 
-    pub fn persist_canvas_settings(&self) {
+    pub fn persist_canvas_settings(&mut self) {
         self.publish_canvas_settings();
     }
 
@@ -411,6 +489,8 @@ impl SettingsTabState {
                 ));
                 String::new()
             });
+        self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
+        self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
         self.spellcheck_words_revision_seen = current_revision;
     }
 }
@@ -425,23 +505,23 @@ impl Drop for SettingsTabState {
     }
 }
 
+/// Spawns the settings saver thread: it persists each (coalesced) canvas-settings request
+/// to the project and user config and writes the word lists a request carries, reporting a
+/// failed word-list write on `word_failures` so the GUI retries it with the next save.
 fn spawn_canvas_settings_save_worker(
     user_settings_file: PathBuf,
     project_settings_file: PathBuf,
 ) -> CanvasSettingsRuntime {
     let (tx, rx) = mpsc::channel::<Option<CanvasSettingsSaveRequest>>();
+    let (failure_tx, word_failures) = mpsc::channel::<WordListSaveFailure>();
     let thread = thread::spawn(move || {
-        while let Ok(first) = rx.recv() {
-            let Some(mut latest) = first else {
-                break;
-            };
-            while let Ok(next) = rx.try_recv() {
-                let Some(request) = next else {
-                    return;
-                };
-                latest = request;
+        let report_failure = |list: WordList, words: &str| {
+            // A closed receiver only means the settings tab is gone; nobody is left to retry.
+            if failure_tx.send(WordListSaveFailure { list, words: words.to_owned() }).is_err() {
+                runtime_log::log_warn("[settings] word-list save failure has no receiver; it will not be retried");
             }
-
+        };
+        run_canvas_settings_saver(&rx, |latest| {
             if !project_settings_file.as_os_str().is_empty() {
                 if let Err(err) =
                     save_canvas_settings_to_project_file(&project_settings_file, &latest.snapshot)
@@ -453,7 +533,7 @@ fn spawn_canvas_settings_save_worker(
                 }
 
                 if let Err(err) =
-                    save_comic_type_to_project_file(&project_settings_file, latest.comic_type)
+                    save_comic_type_to_project_file(&project_settings_file, latest.comic_type, ms_docstore::Durability::Contents)
                 {
                     runtime_log::log_error(format!(
                         "[settings] failed to persist comic_type='{}' to {}; error={err}",
@@ -472,27 +552,94 @@ fn spawn_canvas_settings_save_worker(
                 ));
             }
 
-            if let Err(err) = save_custom_spellcheck_words(&latest.custom_spellcheck_words) {
+            if let Some(words) = &latest.custom_spellcheck_words
+                && let Err(err) = save_custom_spellcheck_words(words)
+            {
                 runtime_log::log_error(format!(
-                    "[settings] failed to persist custom spellcheck dictionary; error={err}"
+                    "[settings] failed to persist custom spellcheck dictionary; it is retried with the next settings save; error={err}"
                 ));
+                report_failure(WordList::Custom, words);
             }
 
             if !project_settings_file.as_os_str().is_empty()
-                && let Err(err) = save_project_spellcheck_words(
-                    &project_settings_file,
-                    &latest.project_spellcheck_words,
-                )
+                && let Some(words) = &latest.project_spellcheck_words
+                && let Err(err) = save_project_spellcheck_words(&project_settings_file, words)
             {
                 runtime_log::log_error(format!(
-                    "[settings] failed to persist project spellcheck words '{}'; error={err}",
+                    "[settings] failed to persist project spellcheck words '{}'; it is retried with the next settings save; error={err}",
                     project_settings_file.display()
                 ));
+                report_failure(WordList::Project, words);
             }
-        }
+        });
     });
 
-    CanvasSettingsRuntime { tx, thread }
+    CanvasSettingsRuntime { tx, thread, word_failures }
+}
+
+/// The saver loop: blocks for a request, coalesces every request already queued behind it
+/// ([`CanvasSettingsSaveRequest::absorb_newer`]) and hands the result to `save`. A `None`
+/// (shutdown / rebind) or a closed channel ends the loop — but a `None` found while
+/// coalescing ends it only AFTER the requests merged before it were saved, so the final
+/// save before a shutdown is never dropped.
+fn run_canvas_settings_saver(rx: &Receiver<Option<CanvasSettingsSaveRequest>>, mut save: impl FnMut(&CanvasSettingsSaveRequest)) {
+    while let Ok(first) = rx.recv() {
+        let Some(mut latest) = first else {
+            break;
+        };
+        let mut stop = false;
+        while let Ok(next) = rx.try_recv() {
+            match next {
+                Some(request) => latest = latest.absorb_newer(request),
+                None => {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+        save(&latest);
+        if stop {
+            break;
+        }
+    }
+}
+
+/// Upserts one string value `section.key = value` into `user_config.json`, preserving every
+/// other key, in ONE serialized read-modify-write ([`config::update_user_config_file`]: atomic
+/// replace, serialized with every other config writer). A non-object `section` value is replaced
+/// by a fresh object. A malformed existing document is reported and left untouched.
+///
+/// Performs synchronous disk I/O — call it from a worker thread, never from the GUI thread.
+///
+/// # Errors
+/// A user-facing string with the read/parse/write failure and the path.
+fn upsert_user_config_string(
+    user_settings_file: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    config::update_user_config_file(user_settings_file, |root| {
+        // `update_user_config_file` guarantees an object root before the mutator runs.
+        let root_obj = root
+            .as_object_mut()
+            .context(t!("settings.config_io.prepare_root_error").to_string())?;
+        let mut section_obj = root_obj
+            .get(section)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        section_obj.insert(key.to_string(), Value::String(value.to_string()));
+        root_obj.insert(section.to_string(), Value::Object(section_obj));
+        Ok(())
+    })
+    .map_err(|err| format!("{err:#}"))
+}
+
+/// Reads the `user_config.json` root for a best-effort preference lookup: a missing,
+/// unreadable or malformed document yields `None` (the caller then uses its default).
+fn read_user_config_root_or_none(user_settings_file: &Path) -> Option<Value> {
+    read_user_config_root(user_settings_file).ok()
 }
 
 /// Reads every switchable font surface's name-display mode from `user_config.json`
@@ -504,10 +651,7 @@ fn spawn_canvas_settings_save_worker(
 /// time or off the GUI thread, never per frame.
 #[must_use]
 pub(super) fn load_font_name_display_modes(user_settings_file: &Path) -> FontNameDisplayModes {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return FontNameDisplayModes::default();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_root_or_none(user_settings_file) else {
         return FontNameDisplayModes::default();
     };
     let text_tab = payload.get("TextTab").and_then(Value::as_object);
@@ -528,43 +672,25 @@ pub(super) fn load_font_name_display_modes(user_settings_file: &Path) -> FontNam
 /// Persists ONE font surface's name-display mode under its `TextTab` key in
 /// `user_config.json`, preserving every other key.
 ///
-/// Serialized on the process-wide `config::lock_user_config_write()` like the pane's other
-/// writers, so a background save never clobbers a concurrent one. Performs synchronous disk
-/// I/O — call it from a worker thread, never from the GUI thread. Returns a user-facing
-/// error string describing what failed.
+/// One serialized read-modify-write (see [`upsert_user_config_string`]), so a background
+/// save never clobbers a concurrent one. Performs synchronous disk I/O — call it from a
+/// worker thread, never from the GUI thread.
+///
+/// # Errors
+/// A user-facing error string describing what failed; a malformed file is left untouched.
 pub(super) fn save_font_name_display_mode(
     user_settings_file: &Path,
     list: FontListKind,
     mode: FontNameDisplayMode,
 ) -> Result<(), String> {
-    let _write_guard = config::lock_user_config_write();
-    let mut root = read_user_config_root(user_settings_file)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.config_io.prepare_root_error").to_string());
-    };
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        list.config_key().to_string(),
-        Value::String(mode.as_config_str().to_string()),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    upsert_user_config_string(user_settings_file, "TextTab", list.config_key(), mode.as_config_str())
 }
 
+/// Reads the typing panel layout (`General.typing_panel_layout`) from `user_config.json`.
+/// A missing/malformed document, absent key or unknown token yields
+/// [`TypingPanelLayout::Vertical`]. One blocking read — never call it per frame.
 pub(super) fn load_typing_panel_layout(user_settings_file: &Path) -> TypingPanelLayout {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return TypingPanelLayout::Vertical;
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_root_or_none(user_settings_file) else {
         return TypingPanelLayout::Vertical;
     };
     payload
@@ -576,81 +702,30 @@ pub(super) fn load_typing_panel_layout(user_settings_file: &Path) -> TypingPanel
         .unwrap_or(TypingPanelLayout::Vertical)
 }
 
+/// Persists the typing panel layout to `General.typing_panel_layout` in `user_config.json`
+/// (one serialized read-modify-write, other keys preserved). Worker thread only.
+///
+/// # Errors
+/// A user-facing error string; a malformed file is reported and left untouched.
 pub(super) fn save_typing_panel_layout(
     user_settings_file: &Path,
     layout: TypingPanelLayout,
 ) -> Result<(), String> {
-    let _write_guard = config::lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        GENERAL_TYPING_PANEL_LAYOUT_KEY.to_string(),
-        Value::String(layout.as_config_str().to_string()),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    upsert_user_config_string(user_settings_file, "General", GENERAL_TYPING_PANEL_LAYOUT_KEY, layout.as_config_str())
 }
 
+/// Persists the rotation Ctrl+wheel mode to `TextTab.rotation_ctrl_wheel_mode` in
+/// `user_config.json` (one serialized read-modify-write, other keys preserved). Worker
+/// thread only.
+///
+/// # Errors
+/// A user-facing error string; a malformed file is reported and left untouched.
 pub(super) fn save_rotation_ctrl_wheel_mode(
     user_settings_file: &Path,
     mode: crate::tabs::typing::rotation_ctrl_wheel::RotationCtrlWheelMode,
 ) -> Result<(), String> {
-    let _write_guard = config::lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        config::TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY.to_string(),
-        Value::String(mode.as_config_str().to_string()),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    upsert_user_config_string(user_settings_file, "TextTab", config::TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY, mode.as_config_str())
 }
-
-
 
 // The `General.ort_load_state` crash guard (`mark_ort_load_attempted` /
 // `mark_ort_load_succeeded` / `reset_ort_load_guard`, plus the shared
@@ -676,6 +751,7 @@ pub(super) use config::save_hanging_punctuation;
 #[cfg(test)]
 mod font_name_mode_tests {
     use super::*;
+    use std::fs;
 
     /// Reads back a written config file as JSON.
     fn read_root(path: &Path) -> Value {
@@ -814,8 +890,50 @@ mod font_name_mode_tests {
 }
 
 #[cfg(test)]
+mod section_writer_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn typing_panel_layout_round_trips_and_preserves_other_keys() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+        fs::write(&path, r#"{"General":{"ui_language":"ru"},"TextTab":{"x":1}}"#).expect("write seed config");
+
+        save_typing_panel_layout(&path, TypingPanelLayout::Vertical).expect("save layout");
+        assert_eq!(load_typing_panel_layout(&path), TypingPanelLayout::Vertical);
+
+        let raw = fs::read_to_string(&path).expect("config written");
+        let root: Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(root["General"]["ui_language"], Value::String("ru".to_string()));
+        assert_eq!(root["General"][GENERAL_TYPING_PANEL_LAYOUT_KEY], Value::String(TypingPanelLayout::Vertical.as_config_str().to_string()));
+        assert_eq!(root["TextTab"]["x"], Value::from(1));
+    }
+
+    /// Declared behavior change: these writers used to degrade an unparsable file to `{}` and
+    /// write it back, destroying every other setting. Now the error is reported and the file
+    /// is left byte-for-byte unchanged.
+    #[test]
+    fn a_malformed_config_is_reported_and_left_untouched() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+        let malformed = r#"{"General":{"ui_language":"ru"},"TextTab":{"#;
+        fs::write(&path, malformed).expect("write malformed config");
+
+        save_typing_panel_layout(&path, TypingPanelLayout::Vertical).expect_err("layout writer must not overwrite");
+        save_rotation_ctrl_wheel_mode(&path, crate::tabs::typing::rotation_ctrl_wheel::RotationCtrlWheelMode::Raster)
+            .expect_err("rotation writer must not overwrite");
+        save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Identity).expect_err("name-mode writer must not overwrite");
+        assert_eq!(fs::read_to_string(&path).expect("file still present"), malformed);
+        // Readers fall back to their defaults.
+        assert_eq!(load_typing_panel_layout(&path), TypingPanelLayout::Vertical);
+    }
+}
+
+#[cfg(test)]
 mod advanced_form_search_save_tests {
     use super::*;
+    use std::fs;
     use crate::tabs::typing::advanced_form_params::AdvancedFormParams;
 
     /// Reads back a written config file as JSON.
@@ -900,3 +1018,75 @@ mod advanced_form_search_save_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod spellcheck_words_save_tests {
+    use super::*;
+
+    fn request(custom: Option<&str>, project: Option<&str>) -> CanvasSettingsSaveRequest {
+        CanvasSettingsSaveRequest {
+            snapshot: SharedCanvasSettings::default(),
+            comic_type: ComicType::from_canvas_preset_fields("none", false),
+            custom_spellcheck_words: custom.map(str::to_owned),
+            project_spellcheck_words: project.map(str::to_owned),
+        }
+    }
+
+    /// The race this guards against: the editor loaded "alpha", the spellcheck context menu
+    /// then persisted "beta" through its own worker, and an unrelated canvas-settings save
+    /// follows before the editor refreshed. The unchanged editor text must not be sent, so
+    /// the added word survives on disk.
+    #[test]
+    fn an_unchanged_editor_sends_no_word_list() {
+        let mut synced = Some("alpha".to_owned());
+        assert_eq!(words_to_send("alpha", &mut synced), None);
+        assert_eq!(synced.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn an_edited_list_is_sent_once_and_becomes_the_baseline() {
+        let mut synced = Some("alpha".to_owned());
+        assert_eq!(words_to_send("alpha\ngamma", &mut synced).as_deref(), Some("alpha\ngamma"));
+        assert_eq!(synced.as_deref(), Some("alpha\ngamma"));
+        assert_eq!(words_to_send("alpha\ngamma", &mut synced), None, "a second save of the same text is not re-sent");
+    }
+
+    #[test]
+    fn coalescing_keeps_a_pending_edit_the_newer_request_does_not_carry() {
+        let merged = request(Some("shared edit"), None).absorb_newer(request(None, Some("project edit")));
+        assert_eq!(merged.custom_spellcheck_words.as_deref(), Some("shared edit"));
+        assert_eq!(merged.project_spellcheck_words.as_deref(), Some("project edit"));
+        let newest = request(Some("old"), None).absorb_newer(request(Some("new"), None));
+        assert_eq!(newest.custom_spellcheck_words.as_deref(), Some("new"));
+    }
+
+    /// A request queued together with the shutdown signal (persist, then drop) must still be
+    /// written: the shutdown is honored only after the coalesced save.
+    #[test]
+    fn a_shutdown_queued_behind_saves_writes_the_coalesced_request_first() {
+        let (tx, rx) = mpsc::channel();
+        for request in [request(Some("first"), None), request(None, Some("project")), request(Some("last"), None)] {
+            tx.send(Some(request)).expect("receiver alive");
+        }
+        tx.send(None).expect("receiver alive");
+        // Anything after the stop signal belongs to no one and is not saved.
+        tx.send(Some(request(Some("after stop"), None))).expect("receiver alive");
+        let mut saved = Vec::new();
+        run_canvas_settings_saver(&rx, |latest| saved.push((latest.custom_spellcheck_words.clone(), latest.project_spellcheck_words.clone())));
+        assert_eq!(saved, vec![(Some("last".to_owned()), Some("project".to_owned()))]);
+    }
+
+    #[test]
+    fn a_failed_write_makes_the_next_save_resend_the_list() {
+        let mut synced = Some("alpha".to_owned());
+        assert_eq!(words_to_send("alpha\nbeta", &mut synced).as_deref(), Some("alpha\nbeta"));
+        // The saver reports that "alpha\nbeta" could not be written.
+        remark_unsynced_after_failure(&mut synced, "alpha\nbeta");
+        assert_eq!(words_to_send("alpha\nbeta", &mut synced).as_deref(), Some("alpha\nbeta"), "the unchanged list is retried");
+        assert_eq!(words_to_send("alpha\nbeta", &mut synced), None, "and not re-sent once more");
+        // A failure of an OLDER text does not disturb a newer baseline.
+        remark_unsynced_after_failure(&mut synced, "alpha");
+        assert_eq!(synced.as_deref(), Some("alpha\nbeta"));
+    }
+}
+

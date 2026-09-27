@@ -18,11 +18,15 @@ Threading/persistence:
   without cloning the whole list via `snapshot()`.
 - The saver always writes to the unsaved staging folder (`unsaved_bubbles_path`).
   The main chapter file is only updated by an explicit "save to project" merge.
-- `has_unsaved_changes()` returns true when the unsaved staging file exists on disk.
+- `has_unsaved_changes()` returns true when the unsaved staging bubbles document exists
+  (probed through `ms_docstore::exists`, format-independent).
+- Every write of the bubbles document (`write_bubbles_snapshot_to`) goes through
+  `ms_docstore` (atomic whole-document replace), never a raw file write.
 */
 
 use ms_config::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
 use ms_project::Bubble;
+use ms_docstore::{DocKind, DocRef};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -211,12 +215,10 @@ impl BubblesModel {
         );
         let saver_tx = Arc::new(Mutex::new(saver_sender));
         let bubble_index_by_id = build_bubble_index(&bubbles);
-        // Query the storage seam for the staging file so the web build checks its
-        // in-memory/IndexedDB store instead of the desktop filesystem.
-        let has_unsaved_changes = {
-            let unsaved_str = unsaved_bubbles_path.to_string_lossy();
-            ms_storage::global::storage().exists(unsaved_str.as_ref())
-        };
+        // Ask the document store whether the staging bubbles document exists (in any
+        // format; it probes through the storage seam, so the web build checks its
+        // in-memory/IndexedDB store).
+        let has_unsaved_changes = ms_docstore::exists(&DocRef::new(&unsaved_bubbles_path, DocKind::Bubbles));
         Self {
             bubbles: Arc::new(bubbles),
             bubble_index_by_id,
@@ -509,8 +511,7 @@ impl BubblesModel {
     pub fn mark_saved_to_project(&mut self) {
         // A mutation accepted while the save barrier was held is written to a newly recreated
         // staging file after the merge. Preserve that post-save dirty state instead of clearing it.
-        let unsaved_path = self.unsaved_bubbles_path.to_string_lossy();
-        self.has_unsaved_changes = ms_storage::global::storage().exists(unsaved_path.as_ref());
+        self.has_unsaved_changes = ms_docstore::exists(&DocRef::new(&self.unsaved_bubbles_path, DocKind::Bubbles));
     }
 
     fn touch_and_save(&mut self) -> Result<()> {
@@ -688,19 +689,22 @@ fn process_bubbles_saver_control(
 ///
 /// Structural page operations call this only after [`BubblesModel::pause_saver_for_page_op`],
 /// which prevents the normal coalescing saver from racing the transaction.
+///
+/// The document is written whole through `ms_docstore` (atomic temp+rename on native, a
+/// plain seam write on the web build), missing parent directories created. An existing
+/// document keeps its format; a NEW one is created in the chapter's format
+/// (`ms_page_ops::chapter_docs::chapter_doc_for_write`, docstore rule B.3), so a JSON chapter
+/// stays JSON in Prod mode. JSON bytes are as before: 2-space pretty array, no trailing newline.
+/// Durability per `ms_page_ops::chapter_docs::chapter_doc_durability`: a `{chapter}_unsaved`
+/// staging document is not fsynced (JSON), any other keeps `Durability::Contents`.
+///
+/// # Errors
+/// Returns an error naming `path` when serialization, directory creation or the write fails.
 pub fn write_bubbles_snapshot_to(path: &Path, bubbles: &[Bubble]) -> Result<()> {
-    // Routed through the storage seam so the web build persists bubbles to its
-    // in-memory/IndexedDB store instead of the desktop filesystem.
-    let store = ms_storage::global::storage();
-    if let Some(parent) = path.parent() {
-        let parent_str = parent.to_string_lossy();
-        store
-            .create_dir_all(parent_str.as_ref())
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    let raw = serde_json::to_string_pretty(bubbles).context("failed to serialize bubbles")?;
-    store
-        .write(path.to_string_lossy().as_ref(), raw.as_bytes())
+    use ms_page_ops::chapter_docs;
+    let durability = chapter_docs::chapter_doc_durability(path, DocKind::Bubbles, ms_docstore::Durability::Contents);
+    let opts = ms_docstore::WriteOptions { durability, ..ms_docstore::WriteOptions::default() };
+    ms_docstore::write(&chapter_docs::chapter_doc_for_write(path, DocKind::Bubbles), bubbles, opts)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

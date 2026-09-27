@@ -13,7 +13,8 @@ Main responsibilities:
   reinstall, updating that installed executable, replacing the installed executable with the
   running one (executable ONLY), and running this copy standalone;
 - start background installer workers and consume their progress events;
-- persist the selected AI dependency level into the installed `user_config.json`;
+- persist the selected AI dependency level into the installed `user_config.json`
+  (one `ms_docstore::update` of the install target's document);
 - expose startup service entry points used by `main.rs`.
 
 Notes:
@@ -1588,31 +1589,59 @@ enum UiState {
     Failed,
 }
 
+/// Records `General.ai_install_type` in the install target's `user_config.json`.
+///
+/// One serialized read-modify-write through `ms_docstore::update` (atomic replace, the
+/// historical pretty layout without a trailing newline). Like the former `JsonConfig`
+/// path it also backfills missing `user_config_defaults()` keys and treats a non-object
+/// root as `{}`. A malformed existing document is left untouched and reported.
+///
+/// # Errors
+/// A localized message: `open_config_error` when the existing document cannot be read or
+/// parsed, `save_ai_type_error` when the replacement cannot be written.
 fn persist_ai_install_type_for_install_target(
     install_target_dir: &Path,
     install_type: config::AiInstallType,
 ) -> Result<(), String> {
-    let mut cfg = config::JsonConfig::new(
-        install_target_dir.join(config::USER_CONFIG_FILE),
-        config::user_config_defaults(),
-    )
-    .map_err(|err| {
-        tf!(
-            "installer.install.open_config_error",
-            path = install_target_dir.display(),
-            err = format!("{err:#}")
-        )
-    })?;
-    cfg.set_path(
-        &["General", config::GENERAL_AI_INSTALL_TYPE_KEY],
-        serde_json::Value::String(install_type.as_str().to_string()),
-    )
-    .map_err(|err| {
-        tf!(
-            "installer.install.save_ai_type_error",
-            path = cfg.path.display(),
-            err = format!("{err:#}")
-        )
+    let path = install_target_dir.join(config::USER_CONFIG_FILE);
+    let doc = ms_docstore::DocRef::new(&path, ms_docstore::DocKind::UserConfig);
+    let defaults = config::user_config_defaults();
+    let outcome = ms_docstore::update(&doc, ms_docstore::WriteOptions::default(), |root| {
+        if !root.is_object() {
+            *root = serde_json::Value::Object(serde_json::Map::new());
+        }
+        config::merge_missing(root, &defaults);
+        let general = root
+            .as_object_mut()
+            .ok_or_else(|| "user config root is not an object".to_string())?
+            .entry("General")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !general.is_object() {
+            *general = serde_json::Value::Object(serde_json::Map::new());
+        }
+        general
+            .as_object_mut()
+            .ok_or_else(|| "user config `General` is not an object".to_string())?
+            .insert(
+                config::GENERAL_AI_INSTALL_TYPE_KEY.to_string(),
+                serde_json::Value::String(install_type.as_str().to_string()),
+            );
+        Ok(())
+    });
+    outcome.map_err(|err| {
+        ms_log::runtime_log::log_error(format!(
+            "[install] failed to record ai_install_type={} in '{}': {err}",
+            install_type.as_str(),
+            path.display()
+        ));
+        match err {
+            ms_docstore::DocStoreError::Malformed { .. } | ms_docstore::DocStoreError::Storage(_) => tf!(
+                "installer.install.open_config_error",
+                path = install_target_dir.display(),
+                err = err.to_string()
+            ),
+            _ => tf!("installer.install.save_ai_type_error", path = path.display(), err = err.to_string()),
+        }
     })
 }
 
@@ -1870,5 +1899,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&test_dir).expect("test config directory should be removable");
+    }
+
+    /// A malformed install-target user config is reported and never overwritten; a valid
+    /// one keeps its keys, gains the missing defaults, and records the install type.
+    #[test]
+    fn persist_ai_install_type_keeps_malformed_config_and_existing_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(config::USER_CONFIG_FILE);
+
+        std::fs::write(&path, "{ not json").expect("fixture must be writable");
+        assert!(persist_ai_install_type_for_install_target(dir.path(), config::AiInstallType::Base).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("fixture readable"), "{ not json");
+
+        std::fs::write(&path, r#"{"General":{"ui_language":"xx-custom"},"Custom":{"k":1}}"#).expect("fixture must be writable");
+        persist_ai_install_type_for_install_target(dir.path(), config::AiInstallType::Full).expect("valid config must be updated");
+        let raw = std::fs::read_to_string(&path).expect("updated config readable");
+        assert!(!raw.ends_with('\n'), "historical layout has no trailing newline");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(config::AiInstallType::from_user_settings(&value), config::AiInstallType::Full);
+        assert_eq!(value["General"]["ui_language"], "xx-custom", "existing values are kept");
+        assert_eq!(value["Custom"]["k"], 1, "unknown sections are kept");
+        let defaults = config::user_config_defaults();
+        for key in defaults.as_object().expect("defaults are an object").keys() {
+            assert!(value.get(key).is_some(), "default section `{key}` must be backfilled");
+        }
     }
 }

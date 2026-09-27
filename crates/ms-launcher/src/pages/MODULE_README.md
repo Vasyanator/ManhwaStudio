@@ -22,7 +22,15 @@ state arrives.
   back button, and `PageNavAction`.
 - `open_page.rs`: projects-root title/chapter scanning, `_unsaved` chapter detection, project
   validation through `ProjectValidationState`, open selection creation, last opened title
-  persistence, and per-title last opened chapter persistence in `user_config.json`.
+  persistence, and per-title last opened chapter persistence in `user_config.json`. Also the
+  chapter storage-format banner: the validation worker adds
+  `project_scan::chapter_storage_report` (committed + `_unsaved` owned documents), and a
+  chapter not in `default_format()` gets a Convert offer run on the `launcher-chapter-convert`
+  worker (`project_scan::convert_chapter_storage`). The same worker parses the title's
+  unsaved session (`project_scan::damaged_unsaved_documents`); a damaged session disables
+  Restore, names the damaged files, and offers only the discard path ("Discard session and
+  open" = plain Open, which deletes `{chapter}_unsaved`). Committed-tree damage stays a
+  non-discardable warning. Nothing is deleted without that explicit click.
 - `import_page.rs`: `.mschapter` metadata read, editable target title/chapter form, archive
   extraction into the projects root, safe path validation, and optional open-after-import action.
 - `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and
@@ -46,6 +54,21 @@ state arrives.
   or detached new-project window directly.
 - Project root changes must be returned as `PageNavAction::ProjectsRootChanged` so `LauncherApp`
   can refresh every page and detached window that caches the root.
+- A storage-mode switch started from the settings page is reported, once its conversion job
+  finished, as `PageNavAction::StorageModeChanged` (mapped from the shared General outcome);
+  `LauncherApp::apply_storage_mode` is the refresh hook for format-dependent page state.
+  It calls `OpenPageState::revalidate_selection` so the chapter-format banner is re-probed.
+- Chapter storage format: a chapter keeps its format across a mode switch and stays openable
+  when it mismatches; converting it is only an explicit user action. Open/Restore are disabled
+  while the chapter conversion runs, Convert is disabled while the process-wide
+  `storage_mode_job` runs (that job moves `default_format()`, the conversion target), and an
+  unreadable document replaces the Convert offer with a warning. The chapter worker holds a
+  `storage_mode_job::ChapterConversionLease` (taken before the target is read, released before
+  the result is sent), so the global switch is refused and its radio disabled meanwhile.
+- The settings page delivers every action a frame produced (e.g. a saved projects root AND a
+  finished storage switch): extras are queued and returned one per frame, in order.
+- Notice banners (one text + at most one action) use `theme::notice_banner` with a stable
+  `id_salt`; do not hand-roll another `Frame`.
 - `PageNavAction::OpenProject` must carry an `OpenProjectSelection` that has passed launcher-side
   validation.
 - Import must reject unsafe archive paths and preserve explicit user-facing errors plus diagnostic

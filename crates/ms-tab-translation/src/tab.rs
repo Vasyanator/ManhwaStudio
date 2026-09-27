@@ -190,7 +190,7 @@ Key TranslationTabState field groups:
 - Footer/characters runtime: `character_names` (assembled autocomplete base) and its two inputs
   `character_names_project` (`characters.json` roster) + `character_names_chapter` (names typed on
   this chapter's bubbles), `characters_loaded_for`,
-  `characters_file_mtime`, `character_names_watch_last_check_s`,
+  `characters_file_signature`, `character_names_watch_last_check_s`,
   `pending_characters_refresh`, `footer_bootstrapped`,
   `footer_tracking_synced_revision`, `footer_known_ids`,
   `footer_overrides`, `pending_footer_patches`, `pending_footer_patch_changed_at`,
@@ -272,9 +272,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
-// SystemTime here only carries `std::fs` mtimes (change detection), never a
-// wall-clock `now()`, so it stays std to match `Metadata::modified`.
-use std::time::SystemTime;
 
 /// (detected results per page, total loaded, total failed)
 type DetectionLoadResult = Result<(Vec<(usize, TextDetectorPageResult)>, usize, usize), String>;
@@ -773,7 +770,8 @@ pub struct TranslationTabState {
     /// Recomputed inside the bubble-revision gate of `sync_footer_tracking`.
     character_names_chapter: Vec<String>,
     characters_loaded_for: Option<PathBuf>,
-    characters_file_mtime: Option<SystemTime>,
+    /// Docstore signature of `characters.json` at the last roster load; the watch compares it.
+    characters_file_signature: Option<ms_docstore::Signature>,
     character_names_watch_last_check_s: f64,
     pending_characters_refresh: bool,
     footer_bootstrapped: bool,
@@ -1019,7 +1017,7 @@ impl TranslationTabState {
             character_names_project: Vec::new(),
             character_names_chapter: Vec::new(),
             characters_loaded_for: None,
-            characters_file_mtime: None,
+            characters_file_signature: None,
             character_names_watch_last_check_s: -10_000.0,
             pending_characters_refresh: false,
             footer_bootstrapped: false,
@@ -1775,7 +1773,7 @@ impl TranslationTabState {
         };
         self.rebuild_character_names();
         self.characters_loaded_for = Some(project.paths.characters_dir.clone());
-        self.characters_file_mtime = characters_file_mtime(project);
+        self.characters_file_signature = characters_file_signature(project);
     }
 
     /// Reassembles `character_names` from its two inputs (`characters.json` roster and the names
@@ -1819,8 +1817,8 @@ impl TranslationTabState {
             return;
         }
         self.character_names_watch_last_check_s = now_s;
-        let mtime = characters_file_mtime(project);
-        if mtime != self.characters_file_mtime {
+        let signature = characters_file_signature(project);
+        if signature != self.characters_file_signature {
             self.pending_characters_refresh = true;
         }
     }
@@ -6665,9 +6663,20 @@ fn recent_character_rank_from_text(text: &str, shift_down: bool) -> Option<usize
     }
 }
 
-fn characters_file_mtime(project: &ProjectData) -> Option<SystemTime> {
+/// Cheap change probe of the title `characters.json` through the document store; `None`
+/// when it is absent or cannot be stated (the latter is logged).
+fn characters_file_signature(project: &ProjectData) -> Option<ms_docstore::Signature> {
     let path = project.paths.characters_dir.join("characters.json");
-    fs::metadata(path).ok()?.modified().ok()
+    match ms_docstore::signature(&ms_docstore::DocRef::new(&path, ms_docstore::DocKind::Characters)) {
+        Ok(signature) => signature,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[translation::characters_watch] failed to probe characters file; path={} error={err}",
+                path.display()
+            ));
+            None
+        }
+    }
 }
 
 /// Rounds one float detector rect outward into an integer `[x1, y1, x2, y2]` covering
@@ -7638,16 +7647,26 @@ fn spawn_translation_settings_saver_thread()
                 &latest.composition_options,
                 &latest.text_detector_options,
             ) {
-                eprintln!(
-                    "failed to persist translation settings {}: {err}",
+                // Structured log: a malformed `settings.json` is now left untouched, so this
+                // is where the user-facing trace of a skipped save lives.
+                ms_log::runtime_log::log_error(format!(
+                    "[translation::settings_saver] failed to persist translation settings; path={} error={err} possible_cause=malformed or unwritable settings.json (the file was left untouched)",
                     latest.settings_file.display()
-                );
+                ));
             }
         }
     });
     (tx, handle)
 }
 
+/// Persists the translation tab's four sections (`OCR`, `machine_translation`, `composition`,
+/// `text_detector`) into the title `settings.json` through the serialized
+/// `ms_docstore::update`, so concurrent writers of other keys are never reverted.
+///
+/// # Errors
+/// Returns a technical message when the existing file cannot be read, does not parse, or
+/// its root is not a JSON object (in every case it is left untouched), or when the atomic
+/// write fails.
 fn save_translation_settings_to_project_file(
     settings_file: &Path,
     ocr_options: &OcrPanelOptions,
@@ -7655,20 +7674,30 @@ fn save_translation_settings_to_project_file(
     composition_options: &CompositionPanelOptions,
     text_detector_options: &TextDetectorPanelOptions,
 ) -> Result<(), String> {
-    let mut root = if settings_file.exists() {
-        match fs::read_to_string(settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
+    let doc = ms_docstore::DocRef::new(settings_file, ms_docstore::DocKind::ProjectSettings);
+    // Default options = the historical layout (2-space pretty, no trailing newline, parent
+    // directories created). A malformed or unreadable file is an error and stays untouched,
+    // and so is a parseable non-object root (as in the canvas and spellcheck writers of the
+    // same document): replacing it would destroy whatever it holds.
+    ms_docstore::update(&doc, ms_docstore::WriteOptions::default(), |root| {
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(format!("settings root of '{}' is not a JSON object", settings_file.display()));
+        };
+        apply_translation_settings_sections(root_obj, ocr_options, mt_options, composition_options, text_detector_options);
+        Ok(())
+    })
+    .map_err(|err| format!("failed to save translation settings '{}': {err}", settings_file.display()))
+}
+
+/// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
+/// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
+fn apply_translation_settings_sections(
+    root_obj: &mut Map<String, Value>,
+    ocr_options: &OcrPanelOptions,
+    mt_options: &MtPanelOptions,
+    composition_options: &CompositionPanelOptions,
+    text_detector_options: &TextDetectorPanelOptions,
+) {
 
     let mut ocr_obj = root_obj
         .get("OCR")
@@ -8121,13 +8150,6 @@ fn save_translation_settings_to_project_file(
         "text_detector".to_string(),
         Value::Object(text_detector_obj),
     );
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(settings_file, payload).map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 fn normalized_lang_input(raw: &str, fallback: &str) -> String {
@@ -8871,5 +8893,66 @@ mod tests {
             tab.character_names[2], "Секретарша",
             "the chapter-collected names survived the reload"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod settings_persistence_tests {
+    use super::{
+        CompositionPanelOptions, MtPanelOptions, OcrPanelOptions, TextDetectorPanelOptions, Value,
+        save_translation_settings_to_project_file,
+    };
+
+    fn save_defaults(path: &std::path::Path) -> Result<(), String> {
+        save_translation_settings_to_project_file(
+            path,
+            &OcrPanelOptions::default(),
+            &MtPanelOptions::default(),
+            &CompositionPanelOptions::default(),
+            &TextDetectorPanelOptions::default(),
+        )
+    }
+
+    /// The translation writer owns only its four sections; `canvas` and top-level keys of
+    /// other writers survive.
+    #[test]
+    fn save_keeps_keys_of_other_writers() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"canvas":{"bubble_type":"aside"},"comic_type":"ribbon"}"#).map_err(|err| err.to_string())?;
+        save_defaults(&path)?;
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|err| err.to_string())?).map_err(|err| err.to_string())?;
+        assert_eq!(root["canvas"]["bubble_type"], "aside");
+        assert_eq!(root["comic_type"], "ribbon");
+        for section in ["OCR", "machine_translation", "composition", "text_detector"] {
+            assert!(root[section].is_object(), "{section} written");
+        }
+        Ok(())
+    }
+
+    /// Declared behavior change: a corrupt `settings.json` is no longer replaced by `{}` plus
+    /// the four sections; the save fails and the file stays byte-identical.
+    #[test]
+    fn save_never_overwrites_malformed_file() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        let seed = "{\"canvas\": {";
+        std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+        assert!(save_defaults(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
+        Ok(())
+    }
+
+    /// A parseable document whose root is not an object is an error too, and stays
+    /// byte-identical (consistent with the other `settings.json` writers).
+    #[test]
+    fn save_never_overwrites_a_non_object_root() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        let seed = "[1, 2]";
+        std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+        assert!(save_defaults(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
+        Ok(())
     }
 }

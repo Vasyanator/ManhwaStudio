@@ -27,6 +27,9 @@ ms-config = { path = "../ms-config" }
 ms-log = { path = "../ms-log" }
 # The catalogue scan of the projects root (titles, chapters, chapter validity).
 ms-project = { path = "../ms-project" }
+# Storage formats of chapter documents: the open page compares a chapter's format report
+# with `default_format()` (the current Dev/Prod mode) and offers converting it.
+ms-docstore = { path = "../ms-docstore" }
 # Every widget the launcher is built from, plus `ui_fonts` for the window's font stack.
 ms-widgets = { path = "../ms-widgets" }
 # The settings surface shared with the studio: the settings page embeds
@@ -97,6 +100,8 @@ sys-locale.workspace = true
 [dev-dependencies]
 # Isolated on-disk fixtures for the catalogue/import tests.
 tempfile.workspace = true
+# Chapter document names (`chapter_docs::layers_doc`) for the chapter-conversion fixtures.
+ms-page-ops = { path = "../ms-page-ops" }
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
 # builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, which every test asserting `t!`
 # text must hold while it installs a catalog (the active catalog is a process-global).

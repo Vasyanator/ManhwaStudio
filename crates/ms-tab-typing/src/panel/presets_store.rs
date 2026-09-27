@@ -13,9 +13,9 @@ Main responsibilities:
 - quarantine a corrupt document to `presets.json.bad` (rename, else copy), and DISABLE saving
   for the session when neither worked — that document is then the only copy of the user's
   presets and the atomic write's final rename would destroy it;
-- save a full snapshot ATOMICALLY and CRASH-DURABLY through the shared `doc_store` recipe
-  (temp sibling + `write_all` + `sync_all` + rename + DIRECTORY fsync), reporting a TYPED
-  error instead of swallowing it;
+- save a full snapshot ATOMICALLY and CRASH-DURABLY through `ms_docstore`
+  (`DocKind::Presets`; temp sibling + `write_all` + `sync_all` + rename + DIRECTORY fsync),
+  reporting a TYPED error instead of swallowing it;
 - guard that save with the same optimistic concurrency `fonts_data.json` uses: a document
   from a NEWER schema is never overwritten, and a document a SECOND app instance changed is
   merged in and retried once instead of being clobbered;
@@ -43,8 +43,13 @@ Key functions:
 
 Notes:
 `use super::*;` pulls in the parent `panel` module's imports (`fs`, `Path`, `PathBuf`,
-`HashMap`, `Value`). The write recipe and the fingerprint/baseline vocabulary are NOT
-duplicated here: they belong to `doc_store`, shared with `fonts_data`. The RESOLUTION of
+`HashMap`, `Value`). The write recipe, the per-document write lock and the
+fingerprint/baseline vocabulary are NOT duplicated here: they belong to `ms_docstore`,
+shared with `fonts_data`. Every save runs as ONE `ms_docstore::with_lock` critical section
+on the document; the per-path writer bookkeeping (`TargetState`) is only ever touched
+inside that lock. The `user_config.json` reads go through `ms_docstore` too
+(`DocKind::UserConfig`), its one write through `config::update_user_config_file`. The
+RESOLUTION of
 legacy font references to identities is deliberately NOT here either: it needs the panel's
 font list and lives in `create_presets::migrate_legacy_presets`.
 
@@ -213,7 +218,7 @@ pub(super) enum LoadOutcome {
         document: StoredDocument,
         /// Fingerprint of the exact bytes read — this reader's optimistic-concurrency
         /// baseline for its first save.
-        fingerprint: doc_store::DocumentFingerprint,
+        fingerprint: ms_docstore::Fingerprint,
     },
     /// The file exists but could not be read or parsed.
     Invalid,
@@ -279,8 +284,9 @@ pub(super) enum PresetsStoreError {
         /// OS reason.
         reason: String,
     },
-    /// The atomic write itself failed; see [`doc_store::AtomicWriteError`].
-    Write(doc_store::AtomicWriteError),
+    /// The write itself failed in the document store (atomic write recipe, or the
+    /// store's own read of the current file); see [`ms_docstore::DocStoreError`].
+    Write(ms_docstore::DocStoreError),
     /// The document on disk declares a schema version this build does not understand.
     /// Rewriting it as v2 would silently drop every field that newer version added.
     NewerVersion {
@@ -379,6 +385,12 @@ pub(super) fn data_path(fonts_dir: &Path) -> PathBuf {
     fonts_dir.join(PRESETS_FILE_NAME)
 }
 
+/// The document-store name of the `presets.json` document at `path`.
+#[must_use]
+fn document(path: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(path, ms_docstore::DocKind::Presets)
+}
+
 /// Reads `fonts/presets.json`, distinguishing "not there yet" from "corrupt".
 pub(super) fn load_outcome(fonts_dir: &Path) -> LoadOutcome {
     load_outcome_from_file(&data_path(fonts_dir))
@@ -387,24 +399,26 @@ pub(super) fn load_outcome(fonts_dir: &Path) -> LoadOutcome {
 /// Path-parameterized core of [`load_outcome`], split out so the read logic can be
 /// unit-tested against a temp file instead of the real fonts directory.
 fn load_outcome_from_file(path: &Path) -> LoadOutcome {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        // A missing file is the normal pre-migration case; anything else is a read error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
-        Err(err) => {
+    // ONE read: the TYPED parse of the bytes (not of a `Value`, which would silently
+    // collapse a duplicated field serde's struct reader rejects) and the fingerprint of the
+    // same bytes, so the baseline describes exactly the state that was decoded.
+    let read = ms_docstore::with_lock(&document(path), read_typed_snapshot);
+    let (file, fingerprint) = match read {
+        Ok(Some(read)) => read,
+        // A missing file is the normal pre-migration case.
+        Ok(None) => return LoadOutcome::Missing,
+        Err(ms_docstore::DocStoreError::Malformed { cause, .. }) => {
             ms_log::runtime_log::log_warn(format!(
-                "typing: cannot read presets.json; treating as corrupt (will quarantine). \
-                 Path: {} Error: {err}",
+                "typing: malformed presets.json; treating as corrupt (will quarantine). \
+                 Path: {} Error: {cause}",
                 path.display()
             ));
             return LoadOutcome::Invalid;
         }
-    };
-    let file: PresetsFile = match serde_json::from_str(&raw) {
-        Ok(file) => file,
+        // Anything else is a read error.
         Err(err) => {
             ms_log::runtime_log::log_warn(format!(
-                "typing: malformed presets.json; treating as corrupt (will quarantine). \
+                "typing: cannot read presets.json; treating as corrupt (will quarantine). \
                  Path: {} Error: {err}",
                 path.display()
             ));
@@ -421,7 +435,7 @@ fn load_outcome_from_file(path: &Path) -> LoadOutcome {
     }
     LoadOutcome::Loaded {
         document: decode(file),
-        fingerprint: doc_store::fingerprint(&raw),
+        fingerprint,
     }
 }
 
@@ -460,42 +474,31 @@ pub(super) enum QuarantineOutcome {
 /// is only to pick the concurrency baseline for the next write.
 pub(super) fn quarantine_bad_file(fonts_dir: &Path) -> QuarantineOutcome {
     let path = data_path(fonts_dir);
-    let bad = path.with_extension("json.bad");
-    let rename_error = match fs::rename(&path, &bad) {
-        Ok(()) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: quarantined corrupt presets.json to {}",
-                bad.display()
-            ));
-            return QuarantineOutcome::Moved;
+    let doc = document(&path);
+    // Quarantine and (on failure) the persistence block run in ONE critical section, so no
+    // save of this process can slip in between "could not move it aside" and "blocked".
+    ms_docstore::with_lock(&doc, |locked| {
+        match locked.quarantine("bad", ms_docstore::QuarantineNaming::Replace, ms_docstore::QuarantineFallback::CopyIfRenameFails) {
+            // Already gone: the path is free, exactly as after a successful move.
+            Ok(ms_docstore::Quarantined::Moved(_) | ms_docstore::Quarantined::Absent) => QuarantineOutcome::Moved,
+            Ok(ms_docstore::Quarantined::Copied { .. }) => QuarantineOutcome::Copied,
+            Err(err) => {
+                with_target_state(&path, |target| target.blocked = true);
+                ms_log::runtime_log::log_error(format!(
+                    "typing: could not quarantine the corrupt presets.json ({err}). It is the \
+                     only copy of the saved create presets, so saving presets is DISABLED for \
+                     this session; move or delete {} by hand to re-enable it.",
+                    doc.path_for(ms_docstore::DocFormat::Json).display()
+                ));
+                QuarantineOutcome::Failed
+            }
         }
-        Err(err) => err.to_string(),
-    };
-    // The rename can fail while the bytes are perfectly readable (a cross-device `.bad`
-    // target, a read-only directory entry, a Windows share lock). A copy is enough: a second,
-    // recoverable copy exists, which is the entire point of the quarantine.
-    match fs::copy(&path, &bad) {
-        Ok(_) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: could not RENAME the corrupt presets.json ({rename_error}); copied it \
-                 to {} instead, so the original may be overwritten safely. Path: {}",
-                bad.display(),
-                path.display()
-            ));
-            QuarantineOutcome::Copied
-        }
-        Err(err) => {
-            block_persistence(fonts_dir);
-            ms_log::runtime_log::log_error(format!(
-                "typing: could not quarantine the corrupt presets.json — neither rename \
-                 ({rename_error}) nor copy ({err}) worked. It is the only copy of the saved \
-                 create presets, so saving presets is DISABLED for this session; move or \
-                 delete {} by hand to re-enable it.",
-                path.display()
-            ));
-            QuarantineOutcome::Failed
-        }
-    }
+    })
+}
+
+/// The typed document and the fingerprint of the SAME bytes, inside the caller's lock.
+fn read_typed_snapshot(locked: &ms_docstore::LockedDoc<'_>) -> ms_docstore::Result<Option<(PresetsFile, ms_docstore::Fingerprint)>> {
+    locked.read_typed_snapshot::<PresetsFile>()
 }
 
 /// Converts the serde mirror into the decoded runtime form.
@@ -700,31 +703,45 @@ fn encode_local_presets(local_presets: &[LocalPreset]) -> Vec<LocalPresetFileEnt
 
 /// Per-target-file writer state: the newest snapshot already written and what this process
 /// believes is on disk.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct TargetState {
     /// Highest [`next_save_ticket`] value already written to this path.
     ticket: u64,
     /// Optimistic-concurrency expectation for the next write to this path.
-    baseline: doc_store::SaveBaseline,
+    baseline: ms_docstore::SaveBaseline,
     /// `true` once a corrupt document at this path could NOT be quarantined; while it holds,
-    /// every [`save`] to this path is refused (see [`block_persistence`]).
+    /// every [`save`] to this path is refused (set once by [`quarantine_bad_file`], under the
+    /// document lock, when a corrupt document could be neither renamed nor copied aside).
     blocked: bool,
 }
 
-/// Serializes every `presets.json` writer in this process AND remembers, PER TARGET FILE,
-/// the highest ticket already written plus the concurrency baseline.
+/// Remembers, PER TARGET FILE, the highest ticket already written plus the concurrency
+/// baseline and the "persistence blocked" flag.
 ///
-/// Two writers would otherwise create, truncate and rename the SAME per-process temp file
-/// concurrently and could leave a half-written document renamed over the real one (mirrors
-/// `font_settings_store`'s save lock). The per-path ticket is what additionally keeps a slow
-/// writer from putting an older snapshot back over a newer one; the per-path baseline is
-/// what keeps a SECOND RUNNING APP INSTANCE from being clobbered. Both are keyed by path
-/// rather than global so two different documents (production has one, tests have many)
-/// never supersede each other.
-fn save_state() -> &'static std::sync::Mutex<HashMap<PathBuf, TargetState>> {
-    static SAVE_STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, TargetState>>> =
+/// This map is only STORAGE: every read-decide-write of an entry happens INSIDE the
+/// document's `ms_docstore` write lock (see [`with_target_state`]), which is what serializes
+/// the writers of one document — two of them would otherwise race on the same per-process
+/// temp file, and a slow one could put an older snapshot back over a newer one. The map's own
+/// mutex is held only for the copy in or out, never across I/O. The per-path ticket is what
+/// keeps a slow writer from putting an older snapshot back over a newer one; the per-path
+/// baseline is what keeps a SECOND RUNNING APP INSTANCE from being clobbered. Both are keyed
+/// by path rather than global so two different documents (production has one, tests have
+/// many) never supersede each other.
+fn target_states() -> &'static std::sync::Mutex<HashMap<PathBuf, TargetState>> {
+    static TARGET_STATES: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, TargetState>>> =
         std::sync::OnceLock::new();
-    SAVE_STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    TARGET_STATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Runs `f` on the bookkeeping entry of `path`. The CALLER must hold the document lock of
+/// `path` (`ms_docstore::with_lock`), so the entry cannot change between two calls made
+/// inside one critical section.
+fn with_target_state<R>(path: &Path, f: impl FnOnce(&mut TargetState) -> R) -> R {
+    // A poisoned mutex still guards consistent `Copy` data; recover rather than panic.
+    let mut states = target_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(states.entry(path.to_path_buf()).or_default())
 }
 
 /// Ticket dispenser ordering concurrent saves; see [`next_save_ticket`].
@@ -744,26 +761,12 @@ pub(super) fn next_save_ticket() -> u64 {
 ///
 /// Called by the seeding read: the bytes just read ARE the baseline of the first save, so a
 /// document another instance writes in the meantime is detected instead of overwritten.
-pub(super) fn set_baseline(fonts_dir: &Path, baseline: doc_store::SaveBaseline) {
+/// Taken under the document lock, so it waits for an in-flight [`save`] and then wins.
+pub(super) fn set_baseline(fonts_dir: &Path, baseline: ms_docstore::SaveBaseline) {
     let path = data_path(fonts_dir);
-    let mut state = save_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.entry(path).or_default().baseline = baseline;
-}
-
-/// Refuses every further [`save`] to `fonts_dir/presets.json` in this process.
-///
-/// Set exactly once, by [`quarantine_bad_file`] when a corrupt document could be neither
-/// renamed nor copied aside: that document is then the only copy of the user's presets, and
-/// the atomic write's final `rename` would destroy it. There is no way to clear it short of
-/// restarting the app after moving the file by hand — which is what the error message says.
-fn block_persistence(fonts_dir: &Path) {
-    let path = data_path(fonts_dir);
-    let mut state = save_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.entry(path).or_default().blocked = true;
+    ms_docstore::with_lock(&document(&path), |_| {
+        with_target_state(&path, |target| target.baseline = baseline);
+    });
 }
 
 /// Atomically writes a full snapshot of `document` to `fonts/presets.json`, creating the
@@ -774,7 +777,8 @@ fn block_persistence(fonts_dir: &Path) {
 /// because nothing is wrong and nothing was lost — a newer state of the same data is on
 /// disk).
 ///
-/// CONCURRENCY. The write is guarded by the document's own state, exactly as
+/// CONCURRENCY. The whole save is ONE critical section under the document's `ms_docstore`
+/// write lock. The write is guarded by the document's own state, exactly as
 /// `fonts_data::save_checked` guards its own: a NEWER schema version is refused, and a
 /// document that changed since this process's baseline (a second running app instance wrote
 /// it) is PARSED, MERGED INTO the snapshot — additively: theirs is added, ours is kept — and
@@ -786,9 +790,9 @@ fn block_persistence(fonts_dir: &Path) {
 /// key.
 ///
 /// DURABILITY. The containing directory is fsynced before this returns
-/// ([`doc_store::Durability::ContentsAndDirectory`]), because the caller DELETES the presets
-/// from `user_config.json` once this succeeded: without the directory flush a power loss in
-/// that window could leave neither document.
+/// ([`ms_docstore::Durability::ContentsAndDirectory`]), because the caller DELETES the
+/// presets from `user_config.json` once this succeeded: without the directory flush a power
+/// loss in that window could leave neither document.
 ///
 /// # Errors
 /// Returns a [`PresetsStoreError`] on directory creation, serialization, read-back, write,
@@ -801,41 +805,70 @@ pub(super) fn save(
     ticket: u64,
 ) -> Result<SaveReport, PresetsStoreError> {
     let path = data_path(fonts_dir);
-    // A poisoned lock still guards the same section; recover rather than panic. Held across
-    // the whole write, so two writers cannot share the temp file.
-    let mut state = save_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let target = state.entry(path.clone()).or_default();
+    ms_docstore::with_lock(&self::document(&path), |locked| {
+        save_locked(locked, &path, document, ticket)
+    })
+}
+
+/// Body of [`save`], run while the document lock is held.
+fn save_locked(
+    locked: &ms_docstore::LockedDoc<'_>,
+    path: &Path,
+    document: &StoredDocument,
+    ticket: u64,
+) -> Result<SaveReport, PresetsStoreError> {
+    let target = with_target_state(path, |target| *target);
     // A corrupt document that could not be moved aside is the ONLY copy of the user's
     // presets; the atomic write ends in a `rename` over it, so nothing may be written at all.
     if target.blocked {
-        return Err(PresetsStoreError::PersistenceDisabled { path });
+        return Err(PresetsStoreError::PersistenceDisabled {
+            path: path.to_path_buf(),
+        });
     }
     if ticket <= target.ticket {
         return Ok(SaveReport::default());
     }
-    if let Err(err) = fs::create_dir_all(fonts_dir) {
-        return Err(PresetsStoreError::CreateDir {
-            dir: fonts_dir.to_path_buf(),
-            reason: err.to_string(),
-        });
-    }
 
+    let mut baseline = target.baseline;
     let mut snapshot = document.clone();
     let mut report = SaveReport::default();
     // Two attempts: the first may discover another instance's document, which is merged in;
     // the second writes the merged result. A conflict on the retry means the other instance
     // is writing continuously — reported rather than fought over.
     for attempt in 0..2 {
-        match inspect_existing(&path, target.baseline)? {
-            ExistingState::Replaceable => {}
-            ExistingState::Conflict { disk, fingerprint } => {
+        let disk = inspect_existing(locked, path)?;
+        // A parsed document that already fails the baseline is a conflict decided from the
+        // SAME read that produced it; only otherwise does the store's write check it.
+        let outcome = match &disk {
+            Some((_, found)) if !baseline.accepts(*found) => Err(WriteOutcome::Conflict(*found)),
+            Some(_) | None => write_document(locked, &snapshot, baseline),
+        };
+        match outcome {
+            Ok(fingerprint) => {
+                with_target_state(path, |target| {
+                    target.baseline = ms_docstore::SaveBaseline::Matching(fingerprint);
+                    target.ticket = ticket;
+                });
+                return Ok(report);
+            }
+            // The document changed since `baseline`: nothing was written.
+            Err(WriteOutcome::Conflict(found)) => {
+                // The merged document and the next baseline must describe ONE state, or the
+                // retry could overwrite content that was never merged. When the store saw
+                // other bytes than our read (unparsable, or a foreign write in between),
+                // read again.
+                let disk = match disk {
+                    Some((disk, fingerprint)) if fingerprint == found => Some((disk, fingerprint)),
+                    Some(_) | None => inspect_existing(locked, path)?,
+                };
                 let parsable = disk.is_some();
                 // Only the FIRST attempt merges: a second conflict means the other instance
                 // is writing continuously, and retrying forever would be a livelock.
-                let (Some(disk), 0) = (disk, attempt) else {
-                    return Err(PresetsStoreError::Conflict { path, parsable });
+                let (Some((disk, fingerprint)), 0) = (disk, attempt) else {
+                    return Err(PresetsStoreError::Conflict {
+                        path: path.to_path_buf(),
+                        parsable,
+                    });
                 };
                 for (name, preset) in disk.presets {
                     // Ours wins a name clash: this snapshot is what the user has on screen.
@@ -844,24 +877,21 @@ pub(super) fn save(
                         report.merged_from_disk.insert(name, preset);
                     }
                 }
-                merge_default_local_set(&path, &mut snapshot, disk.default_local, &mut report);
+                merge_default_local_set(path, &mut snapshot, disk.default_local, &mut report);
                 ms_log::runtime_log::log_info(format!(
                     "typing presets: {} changed under us (another app instance); merged {} \
                      preset(s) from disk and retrying the save.",
                     path.display(),
                     report.merged_from_disk.len()
                 ));
-                target.baseline = doc_store::SaveBaseline::Matching(fingerprint);
-                continue;
+                baseline = ms_docstore::SaveBaseline::Matching(fingerprint);
+                with_target_state(path, |target| target.baseline = baseline);
             }
+            Err(WriteOutcome::Failed(err)) => return Err(err),
         }
-        let fingerprint = write_document(&path, &snapshot)?;
-        target.baseline = doc_store::SaveBaseline::Matching(fingerprint);
-        target.ticket = ticket;
-        return Ok(report);
     }
     Err(PresetsStoreError::Conflict {
-        path,
+        path: path.to_path_buf(),
         parsable: true,
     })
 }
@@ -955,42 +985,29 @@ pub(super) fn same_local_preset(a: &LocalPreset, b: &LocalPreset) -> bool {
     a.id() == b.id()
 }
 
-/// What [`inspect_existing`] found in front of a pending write.
-#[derive(Debug)]
-enum ExistingState {
-    /// Nothing is there, or what is there is exactly what the caller expected.
-    Replaceable,
-    /// The document changed since the caller's baseline.
-    Conflict {
-        /// The freshly parsed on-disk document, or `None` when it cannot be parsed at all
-        /// (then it must not be overwritten: it is the only copy of whatever it holds).
-        disk: Option<StoredDocument>,
-        /// Fingerprint of the on-disk bytes — the caller's new baseline once merged.
-        fingerprint: doc_store::DocumentFingerprint,
-    },
-}
-
-/// Inspects the document currently at `path` and decides whether it may be replaced.
+/// Inspects the document currently on disk (inside the caller's lock) in front of a
+/// pending write.
 ///
 /// Mirrors `fonts_data::guard_existing_document`: a FUTURE schema version is refused
-/// outright (this build cannot round-trip its unknown fields), and a document that no longer
-/// matches `baseline` is reported as a conflict together with its parsed content so the
-/// caller can merge rather than clobber. A file that is ABSENT never blocks a write.
+/// outright (this build cannot round-trip its unknown fields). Returns the parsed on-disk
+/// document — `None` when it is absent or cannot be parsed at all (then, on a conflict, it
+/// must not be overwritten: it is the only copy of whatever it holds) — so the caller can
+/// merge rather than clobber — together with the fingerprint of the bytes it was parsed
+/// from, so the caller decides the baseline conflict from the same read. For an unparsable
+/// file the store's write ([`write_document`]) enforces the baseline itself.
 ///
 /// # Errors
 /// [`PresetsStoreError::ReadExisting`] when the file exists but cannot be read, and
 /// [`PresetsStoreError::NewerVersion`] for a future schema.
 fn inspect_existing(
+    locked: &ms_docstore::LockedDoc<'_>,
     path: &Path,
-    baseline: doc_store::SaveBaseline,
-) -> Result<ExistingState, PresetsStoreError> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        // Nothing on disk: any baseline may proceed (a `Matching` baseline whose file
-        // vanished has nothing left to preserve).
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExistingState::Replaceable);
-        }
+) -> Result<Option<(StoredDocument, ms_docstore::Fingerprint)>, PresetsStoreError> {
+    // Typed parse of the exact bytes: a document that does not decode as `PresetsFile`
+    // counts as unparsable, exactly like invalid JSON.
+    let parsed = match read_typed_snapshot(locked) {
+        Ok(parsed) => parsed,
+        Err(ms_docstore::DocStoreError::Malformed { .. }) => None,
         Err(err) => {
             return Err(PresetsStoreError::ReadExisting {
                 path: path.to_path_buf(),
@@ -998,40 +1015,58 @@ fn inspect_existing(
             });
         }
     };
-    let parsed: Option<PresetsFile> = serde_json::from_str(&raw).ok();
     if let Some(found) = parsed
         .as_ref()
-        .map(|file| file.version)
+        .map(|(file, _)| file.version)
         .filter(|version| *version > PRESETS_VERSION)
     {
         return Err(PresetsStoreError::NewerVersion { found });
     }
-    let fingerprint = doc_store::fingerprint(&raw);
-    if baseline.accepts(fingerprint) {
-        return Ok(ExistingState::Replaceable);
-    }
-    Ok(ExistingState::Conflict {
-        disk: parsed.map(decode),
-        fingerprint,
-    })
+    Ok(parsed.map(|(file, fingerprint)| (decode(file), fingerprint)))
 }
 
-/// Serializes `document` and writes it over `path` durably. Returns the fingerprint of the
-/// bytes just written — the caller's new baseline.
+/// Why [`write_document`] did not write.
+#[derive(Debug)]
+enum WriteOutcome {
+    /// The file no longer matches the baseline; carries the fingerprint of what is on disk
+    /// (the caller's new baseline once it has merged it). Nothing was written.
+    Conflict(ms_docstore::Fingerprint),
+    /// Any other failure, already typed for the caller.
+    Failed(PresetsStoreError),
+}
+
+/// Serializes `document` and writes it durably over the locked document, provided the file
+/// still satisfies `baseline` (an absent file always does). Returns the fingerprint of the
+/// bytes just written — the caller's new baseline. Layout: 2-space pretty JSON plus a
+/// trailing newline (the historical bytes).
 fn write_document(
-    path: &Path,
+    locked: &ms_docstore::LockedDoc<'_>,
     document: &StoredDocument,
-) -> Result<doc_store::DocumentFingerprint, PresetsStoreError> {
-    let file = encode(document);
-    let mut text =
-        serde_json::to_string_pretty(&file).map_err(|err| PresetsStoreError::Serialize {
-            reason: err.to_string(),
-        })?;
-    text.push('\n');
-    let fingerprint = doc_store::fingerprint(&text);
-    doc_store::write_atomic(path, &text, doc_store::Durability::ContentsAndDirectory)
-        .map_err(PresetsStoreError::Write)?;
-    Ok(fingerprint)
+    baseline: ms_docstore::SaveBaseline,
+) -> Result<ms_docstore::Fingerprint, WriteOutcome> {
+    let options = ms_docstore::WriteOptions {
+        durability: ms_docstore::Durability::ContentsAndDirectory,
+        baseline,
+        pretty: true,
+        trailing_newline: true,
+        create_parent_dirs: true,
+    };
+    locked
+        .write(&encode(document), options)
+        .map_err(|err| match err {
+            ms_docstore::DocStoreError::Conflict { found, .. } => WriteOutcome::Conflict(found),
+            // The only `Io` the write path produces is the parent-directory creation.
+            ms_docstore::DocStoreError::Io { path, source } => {
+                WriteOutcome::Failed(PresetsStoreError::CreateDir {
+                    dir: path,
+                    reason: source.to_string(),
+                })
+            }
+            ms_docstore::DocStoreError::Serialize { cause, .. } => {
+                WriteOutcome::Failed(PresetsStoreError::Serialize { reason: cause })
+            }
+            other => WriteOutcome::Failed(PresetsStoreError::Write(other)),
+        })
 }
 
 /// Reads the LEGACY `user_config.TextTab.create_presets` map, if any.
@@ -1053,10 +1088,7 @@ pub(super) fn load_legacy_presets() -> Vec<LegacyPresetEntry> {
 /// tested against a temp config instead of the real `user_config.json`.
 #[must_use]
 fn load_legacy_presets_from(user_settings_file: &Path) -> Vec<LegacyPresetEntry> {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return Vec::new();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(user_settings_file) else {
         return Vec::new();
     };
     let Some(presets_obj) = payload
@@ -1192,10 +1224,7 @@ fn legacy_imports_are_taken_over(fonts_dir: &Path, user_settings_file: &Path) ->
 /// `user_settings_file`. A missing or malformed file yields an empty list.
 #[must_use]
 fn present_text_tab_keys(user_settings_file: &Path, keys: &[&str]) -> Vec<String> {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return Vec::new();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(user_settings_file) else {
         return Vec::new();
     };
     let Some(text_tab) = payload.get("TextTab").and_then(Value::as_object) else {
@@ -1369,12 +1398,12 @@ mod tests {
     fn a_successful_save_makes_the_directory_entry_durable() {
         let dir = unique_temp_dir("durable");
         save(&dir, &StoredDocument::default(), next_save_ticket()).expect("save presets");
-        let steps = doc_store::recorded_steps(&data_path(&dir));
+        let steps = ms_docstore::recorded_steps(&data_path(&dir));
         assert_eq!(
             steps,
             vec![
-                doc_store::WriteStep::Renamed,
-                doc_store::WriteStep::DirectoryDurable
+                ms_docstore::WriteStep::Renamed,
+                ms_docstore::WriteStep::DirectoryDurable
             ],
             "presets.json must be durable before the legacy source may be deleted"
         );

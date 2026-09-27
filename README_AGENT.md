@@ -45,7 +45,8 @@ Agent-facing architecture docs stay where they are (`README_AGENT.md`, per-direc
 - **IPC к Python backend**: framed IPC via `crate::backend_ipc` over a pluggable transport — AF_UNIX by default (Linux/Windows, path from `backend_ipc::backend_socket_path()` — shared by default, per-runtime-root under `--ignore-installed`) with a loopback WebSocket fallback on Windows; the transport-agnostic frame codec is `[u32 BE header_len][header_json][u32 BE blob_len][blob]`. Rust-side app-managed model downloads use the official `hf-hub` crate to resolve repository URLs, then stream files directly into `ManhwaStudio_AI_Models` without HF cache blobs or symlinks
 - **Окна ОС**: `winit` **0.30** — зависимость КРЕЙТА `ms-window-geometry` (не корневого манифеста), ТОЛЬКО ради перечисления мониторов, которого egui/eframe не дают вовсе. Версия совпадает с той, что тянет eframe, поэтому типы унифицируются; строить на winit что-либо ещё нельзя
 - **Потоки**: `std::thread`, `tokio` (async где нужно), `rayon`
-- **Сериализация**: `serde_json`, `serde`
+- **Сериализация**: `serde_json`, `serde`. On `serde_json` the `float_roundtrip` feature must stay enabled (exact text → f64, required by the `.db` codec's Value-equality contract) and `preserve_order` must NEVER be enabled (`Map` stays a `BTreeMap`: canonical key order)
+- **Хранилище документов**: `rusqlite` with `bundled` (SQLite compiled from source; native-only dependency of `ms-docstore` — a C toolchain per target is required, `x86_64-w64-mingw32-gcc` for windows-gnu). Python mirrors the `.db` codec with the stdlib `sqlite3` in the repo-root `docstore.py`. See «Storage mode (Dev/Prod)»
 - **Python AI backend**: a separate `ai_backend.py` process that serves the framed IPC over a pluggable transport — AF_UNIX by default (path from `backend_ipc::backend_socket_path()`), loopback WebSocket fallback on Windows. The `--socket` argument is optional and defaults to the same standard path; the Rust process manager passes it explicitly when starting the backend. Compatibility between the application and the backend is governed by `PROTOCOL_VERSION` ALONE (`crates/ms-backend-ipc/src/protocol.rs` mirrored by `modules/ai_backend/ipc/protocol.py`), hard-compared in the `hello` handshake; a mismatch aborts the connection. It MUST be bumped in BOTH files on ANY change to that contract, not only on one judged breaking — a new method, a new header or payload field, a new topic, a changed meaning of an existing field, a changed blob format. Deciding whether a change "really" breaks anything is exactly the judgement that gets made wrong, and bumping costs nothing because both halves ship and update together. The parity test `backend_ipc::protocol::tests::python_protocol_version_matches_rust` guards the mirror, but nothing can detect a bump that was never made: a client and a backend from different builds then agree on a contract that does not exist and fail at runtime instead of being refused in `hello`. The program version (`config.VERSION` / `CARGO_PKG_VERSION`) is NEVER compared: the backend publishes `backend_version` in the `hello` header and in the health snapshot as DIAGNOSTIC information only (logged at connect), with no UI warning. Backend включает выбор PyTorch device, ONNX provider/device и лимита одновременно резидентных AI-моделей через `/device`; отсутствующий пользовательский выбор хранится как `not-selected`, но backend сразу резолвит его в runtime default (сначала GPU, затем CPU), сообщает Rust UI о незаданном выборе, когда Torch+CUDA впервые становятся доступны, а ONNX на Windows предпочитает DirectML и просит Rust UI выбрать конкретный DirectML adapter, если их несколько. Health snapshot публикует `is_torch_available`, а Rust зеркалит это в глобальный capability-slot для UI и runtime-гейтов. Backend держит общий LRU-style `LoadedModelManager`, который считает и выгружает idle PyTorch-модели и ONNX `InferenceSession` перед загрузкой новых. Модели, управляемые кодом ManhwaStudio, лежат в `ManhwaStudio_AI_Models/Torch` и `ManhwaStudio_AI_Models/ONNX`; Rust-side calls to app-managed backend models must first pass through `crates/ms-sysprobe/src/ai_models.rs`, which lazily downloads only the required files from `Vasyanator2/ManhwaStudio_AI_Models` directly into the app model tree. PaddleOCR OCR/detector выполняются через Python ONNX Runtime и модели из `ManhwaStudio_AI_Models/ONNX/PaddleOCR`; MangaOCR OCR поддерживает два локальных ONNX-export каталога `ManhwaStudio_AI_Models/ONNX/MangaOCR/base` / `ManhwaStudio_AI_Models/ONNX/MangaOCR/2025`, а также отдельный ленивый PyTorch-вариант через пакет `manga_ocr`, который импортируется только при явном выборе этого режима. EasyOCR, Surya и PaddleOCR-VL используют model-cache своих библиотек (PaddleOCR-VL — Hugging Face hub cache, грузится через Transformers с `trust_remote_code`, только при выборе этого движка). Если Torch недоступен, torch-dependent backend endpoints отвечают ошибкой, а ONNX-маршруты продолжают работать. Compiled ONNX cache хранится в `ManhwaStudio_AI_Models/.cache`. Ограничение: при выборе `MIGraphXExecutionProvider` detection-модель принудительно запускается на CPU, а MiGraphX-специфичные width-bucket/fixed-batch обходы применяются только к recognizer.
 - **Цели**: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`
 - **MSRV**: `rust-version` в корневом `Cargo.toml` (сейчас **1.92**, потолок задаёт `egui`/`eframe` 0.35). Это единственный источник правды: скрипты `tools/run-dev/` парсят это поле и отказываются собирать на более старом тулчейне. Поднимать только когда зависимость реально этого требует; дублировать число куда-либо нельзя
@@ -77,7 +78,7 @@ bin (main.rs, app.rs, tabs/settings/)
   ← ms-project / ms-widgets / ms-native-runtime
   ← ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry
   ← ms-config / ms-text-render
-  ← ms-backend-ipc / ms-fonts / ms-memory / ms-onnx
+  ← ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx
   ← ms-log
   ← ms-actions / ms-gifs / ms-i18n / ms-storage / ms-text-util / ms-thread
 ```
@@ -220,6 +221,16 @@ bin (main.rs, app.rs, tabs/settings/)
   поэтому крейт собирается и под `x86_64-*`, и под `wasm32-unknown-unknown`.
   ⚠️ `Storage::write` — это `std::fs::write`: перезапись файла на месте, без temp+rename и без
   fsync, так что запись конфига не атомарна к падению процесса.
+- **`ms-docstore`** (`crates/ms-docstore`) — single owner of "read / update / write a named
+  logical document" (`user_config`, `fonts_data`, `presets`, title and chapter documents):
+  callers name a document by `DocRef` (extension-less path + `DocKind`), never by its file.
+  Unlocked reads through the `ms-storage` seam; every mutation under a process-local,
+  NON-reentrant per-document lock; `update` is the serialized read-modify-write and never
+  overwrites a malformed document; native writes are atomic temp+rename with fsync. A
+  document is `<stem>.json` or `<stem>.db` (SQLite fragment store, native only) behind one
+  API — see «Storage mode (Dev/Prod)». Depends only on `ms-storage` + `ms-log` (+ `rusqlite`
+  natively), receives paths and must NOT depend on `ms-config`. Details —
+  `crates/ms-docstore/MODULE_README.md`.
 - **`ms-thread`** (`crates/ms-thread`) — кросс-таргетный шим создания потоков: реэкспортирует
   `std::thread`-совместимую поверхность (`spawn`, `Builder`, `JoinHandle`, `sleep`, `yield_now`,
   `current`, `scope`, `available_parallelism`). На нативных таргетах это прямой `std::thread`,
@@ -808,7 +819,7 @@ original, and a bbox relative to the sent image) and the model returns
 
 | Pane | Ответственность |
 |---|---|
-| **General** | projects_dir + memory profile + масштаб интерфейса через общий виджет `crate::general_settings_panel` (тот же, что в лаунчере; синхронная запись под `config::lock_user_config_write()`); enforcement вертикального typing-panel layout остаётся studio-only |
+| **General** | projects_dir + memory profile + масштаб интерфейса через общий виджет `crate::general_settings_panel` (тот же, что в лаунчере; synchronous write serialized by the `user_config.json` document lock); enforcement вертикального typing-panel layout остаётся studio-only |
 | **CanvasRibbon** | SharedCanvasSettings (лента), ComicType, BubbleStatus rules |
 | **Typesetting** («Тайп») | text-typesetting options: висящая пунктуация (`TextTab.hanging_punctuation`, live через `crate::text_punctuation`), режим «Поворот Ctrl+колесо» (`TextTab.rotation_ctrl_wheel_mode`, live через `crate::tabs::typing::rotation_ctrl_wheel`) и редактор стандартных параметров карточек эффектов (`TextTab.effect_defaults`, self-contained typing-panel widget `EffectDefaultsEditorState`) |
 | **AiBackend** | запуск/остановка `ai_backend.py`, device, CUDA/ONNX diagnostics |
@@ -973,22 +984,12 @@ original, and a bbox relative to the sent image) and the model returns
   только когда процесс-глобальный in-flight-счётчик (`native_runtime::IN_FLIGHT`) вернулся к 0 —
   иначе другой guarded-оп ещё может SIGILL'нуть, и маркер должен остаться. Маркер-write fsync'ает
   родительский каталог при первом создании файла (Unix).
-  **Сериализация `user_config.json`** держится на `config::lock_user_config_write()` (приватный
-  статик в `config.rs`; НЕ `settings::`). Лок берётся ВНУТРИ пишущих путей, а не вызывающими:
-  `config::update_user_config_file` (единая RMW-граница: читает, даёт мутатору править root, пишет —
-  всё под локом) и `JsonConfig::{new, save, set, set_path}` + `load_user_config`, которые берут лок
-  path-aware (только для `user_config.json`, по флагу `is_user_config`, снятому при конструировании)
-  и внутри зовут приватный `save_unlocked`. Лок **не реентрантный**: код под ним обязан звать
-  `*_unlocked`-вариант, а мутатор `update_user_config_file` не вправе вызывать другой user-config
-  writer. `set`/`set_path` перечитывают файл под локом (reload-RMW), поэтому не затирают чужие ключи
-  своей устаревшей in-memory копией.
-  **На границе `update_user_config_file`/`JsonConfig` малформед-JSON — ошибка, а НЕ повод перезаписать
-  файл пустым объектом.** Это НЕ общее свойство: несколько прямых `save_*` в `tabs/settings/mod.rs`
-  (`save_typing_panel_layout`, `save_hanging_punctuation`, `save_rotation_ctrl_wheel_mode`,
-  `save_text_language`) и `app.rs::persist_canvas_hint_collapsed_state` берут лок, но при нечитаемом/
-  битом файле всё ещё деградируют root до пустого объекта и пишут его целиком — то есть один сбой
-  чтения стирает все настройки вместе с ORT-маркером. Лост-апдейта там нет (лок держат), но
-  clobber-класс остаётся; мигрировать их на `update_user_config_file` — отдельная задача.
+  **`user_config.json` serialization**: every mutation is ONE `ms_docstore::update` under the
+  document's process-local lock — through `config::update_user_config_file` (the RMW boundary),
+  a `ms-config` section writer, or `JsonConfig::{new, set, set_path}` / `load_user_config`, which
+  re-read under the lock and so never write back a stale in-memory copy. The lock is
+  NON-reentrant: a mutator must not call another user-config writer. A malformed document is an
+  error at every writer and is never overwritten.
   **Отложенная запись секций (`crates/ms-config/src/config_saver.rs`)** — единый механизм для секций, которые
   пишутся из GUI-потока по жесту пользователя: `ConfigSaver<T>` (сегодня `"Window"` из
   `window_geometry.rs` и `"PanelLayout"` из `widgets/panel_dock/persist.rs`). Поток-писатель
@@ -1109,10 +1110,58 @@ egui `Id`, выводимый из текста подписи (`ComboBox::from_
 ## Конфигурация (`ms-config`, шим `crate::config`)
 
 - Константы путей: `BUBBLES_FILE`, `SRC_DIR`, `CLEAN_LAYERS_DIR`, etc.
-- `JsonConfig`: load/merge/save с `merge_missing` (default backfill).
+- `JsonConfig`: load/merge/set с `merge_missing` (default backfill; `merge_missing` is public and
+  is the ONE backfill rule — the installer calls it too).
+- Owned documents: `user_config`, `fonts_data`, `presets`, a title's `settings`, `characters`,
+  `terms`, character favorites and color presets, a chapter's `layers` manifest and `bubbles` —
+  are read and written ONLY through `ms-docstore` (`DocRef` + `DocKind`), never with `std::fs`
+  or the storage seam directly. Every read-modify-write is ONE `ms_docstore::update` (or one
+  `with_lock` section); a value read earlier is never written back outside the lock.
 - `user_config_defaults()`: полное дерево дефолтов (General, Canvas, Window, Hotkeys, TranslationTab, TextTab с formula presets). Секция `Window` (стартовый монитор и геометрия главного окна) самоверсионирована и принадлежит `crates/ms-window-geometry/src/lib.rs` — см. раздел «Startup monitor and window geometry». Секция `PanelLayout` (раскладка плавающих панелей) тоже самоверсионирована и принадлежит `crates/ms-widgets/src/panel_dock/persist.rs` — версия в дефолтах берётся из константы владельца, поэтому разъехаться не может.
 - `project_config_defaults()`: per-project дефолты.
 - `USER_CONFIG_FILE` — имя `user_config.json`; `program_dir()` — launch working directory с fallback на директорию exe.
+
+## Storage mode (Dev/Prod)
+
+- **Mode key**: `General.storage_mode` in `user_config` — `"prod"` (default; also a missing
+  value, and an unknown one, which is logged) → `.db`; `"dev"` → `.json`. Spelling is trimmed
+  and ASCII case-insensitive on both the Rust (`ms_config::storage_mode`) and Python side.
+  wasm32 is Dev-only (`DocFormat::Db` is `Unsupported` there).
+- **Owner**: `ms-docstore`. `.db` = SQLite fragment store: one `frag` row per JSON node, with an
+  id-keyed array (`id`/`uid`) stored as one `ent` row per element — i.e. one row per layer /
+  bubble — plus a `meta` table (`schema_version`, `doc_kind`, `revision`, `writer`). A `.db`
+  update is ONE `BEGIN IMMEDIATE` transaction that writes only the row DIFF; SQLite locking
+  serializes writers across processes. Schema/split rule: `crates/ms-docstore/MODULE_README.md`.
+- **Resolution**: exactly one file → that format, whatever the default (a lone `.db` failing the
+  header sniff is `Malformed`, never "absent"); none → the caller's new-format hint (chapters:
+  the format of their siblings) else the process default; BOTH → the default format's file is
+  authoritative and the first locked access deletes the other only if it is Value-equal, else
+  `Ambiguous` (nothing is ever deleted).
+- **Conversion protocol** (`ms_docstore::convert_document`, under the document lock): read
+  source → temp in the target format → reopen + Value-equal validation → fsync + rename + dir
+  fsync → delete the source. The source is deleted only after the target is in place and
+  validated; any crash converges via the both-exist rule.
+- **Startup**: `ms_config::storage_mode::init_storage_mode_at_startup` is the FIRST document
+  access of the process: it probes `user_config` in whichever format exists and sets the
+  docstore default from its mode before anything else reads or writes.
+- **Switch driver** (`ms_project::storage_mode::convert_globals`, only via the one process-wide
+  job slot `ms-settings-ui::storage_mode_job`, on a worker): (a) persist the mode into
+  `user_config` in its CURRENT format, then switch the docstore default; (b) `fonts_data`,
+  `presets`; (c) each title's documents under the CURRENT projects root only; (d) `user_config`
+  LAST and only after a clean (b)+(c). `user_config`'s format is the sentinel: while it differs
+  from the recorded mode the next start re-runs the driver (startup reconciliation).
+- **Chapters are never converted by the switch**: a chapter keeps its format (new chapter
+  documents join their siblings' format); the launcher's open page shows a banner offering to
+  convert a chapter that is not in the current mode's format. Page-ops journals are schema v4
+  (`PlannedJsonWrite::format`); a pending v3 journal is still recovered as all-JSON.
+- **Python parity**: the backend reads/writes `user_config` only, through `docstore.py`, which
+  mirrors the codec row for row (golden cases in `crates/ms-docstore/fixtures/`, opt-in
+  cross-check `MS_DOCSTORE_FIXTURE_OUT` (Rust) → `MS_DOCSTORE_FIXTURE_IN` (`test_docstore.py`)).
+  It never creates or deletes a document and refuses to write while both files exist. The
+  shared on-disk semantics are part of the IPC contract: `PROTOCOL_VERSION` 3. The backend
+  autostart waits until the `storage_mode_job` slot is free (gate polled on the supervisor
+  worker), and the supervisor never spawns a payload lacking `docstore.py`.
+- Known limits: `dev-docs/known_gaps.md` (KG-013, KG-014, KG-016..KG-020).
 
 ---
 
@@ -1325,7 +1374,7 @@ leave the working tree exactly as it found it.
 
 - **No absolute path, and no path leading outside the repository, may appear in tracked
   code.** Tracked sources, tests, docs and scripts address files repo-relative, or through the
-  existing resolvers (`resolve_fonts_dir()`, `ms_config::program_dir()`, `std::env::temp_dir()`).
+  existing resolvers (`ms_config::app_fonts_dir()`, `ms_config::program_dir()`, `std::env::temp_dir()`).
   A literal naming a developer's own machine — `/home/<user>/…`, `C:\Users\…`, a checkout
   path — is a defect regardless of whether it works where it was written; machine-local notes
   belong in `dev-docs/`, not in code. Exactly two things are NOT covered by this ban, and
@@ -1338,6 +1387,16 @@ leave the working tree exactly as it found it.
 ## Что важно не ломать
 
 - **GUI-поток** — никакого I/O, декодирования изображений, сети, длительных вычислений.
+- **Owned documents go through `ms-docstore` only** (the ten kinds listed under «Конфигурация»):
+  never `std::fs` them, one serialized `update` per read-modify-write, and a malformed document
+  is never overwritten (writers report it; only an explicit `ms_docstore::quarantine` moves it
+  aside). Lock order where two locks nest: `MANIFEST_LOCK` (layer manifest) → document lock,
+  never the reverse; the document lock is non-reentrant. Every `.db` commit costs a fixed
+  set of fsyncs (~100 ms on an HDD), so batch writes of one document: the layer saver applies a
+  whole drain pass as ONE manifest transaction (`persist::ManifestTxn`), never one per page.
+  `{chapter}_unsaved` JSON is written without fsync (`chapter_docs::chapter_doc_durability`).
+  A staging doc that does not parse makes the session DAMAGED: resume is refused naming the file,
+  the launcher disables Restore and offers discard; it is never auto-deleted.
 - **Шрифты UI** — ставятся только через `ui_fonts::install*` / `ui_fonts::ensure_covers` и
   только `Context::add_font`. `Context::set_fonts` заменяет весь набор определений (снесёт
   рантайм-семейства typing → паника epaint), `Context::fonts`/`fonts_mut` паникуют до первого

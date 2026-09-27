@@ -2421,18 +2421,18 @@ impl PsEditorTabState {
             });
             Ok(())
         } else {
-            // No saver: synchronous fallback, byte-identical to the previous direct call.
+            // No saver: synchronous fallback. Same transaction shape as the saver job, including the
+            // committed `fallback_dir`: a page staging has no record of is seeded from committed first,
+            // so deleting its last raster stages it PRESENT-but-EMPTY instead of leaving it absent
+            // (absent means "use committed" to the loader and the merge, which would resurrect it).
             let outs: Vec<persist::RasterLayerOut> = owned_layers
                 .iter()
                 .map(saver::OwnedRasterLayer::as_out)
                 .collect();
-            persist::save_page_rasters(
-                &project.paths.unsaved_layers_dir,
-                page_idx,
-                &outs,
-                &groups,
-                &removed_uids,
-            )
+            persist::ManifestTxn::begin(&project.paths.unsaved_layers_dir).and_then(|mut txn| {
+                txn.save_page_rasters(page_idx, &outs, &groups, &removed_uids, Some(&project.paths.layers_dir))?;
+                txn.commit().map(|_wrote| ())
+            })
         };
 
         match persist_result {

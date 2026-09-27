@@ -1,0 +1,30 @@
+{
+  "both": [
+    {
+      "id": "x",
+      "uid": "u1"
+    },
+    {
+      "id": "y",
+      "uid": "u2"
+    }
+  ],
+  "uid_first": [
+    {
+      "uid": "u1"
+    },
+    {
+      "uid": "u2",
+      "id": 5
+    }
+  ],
+  "id_first_missing_later": [
+    {
+      "id": "x",
+      "uid": "u1"
+    },
+    {
+      "uid": "u2"
+    }
+  ]
+}

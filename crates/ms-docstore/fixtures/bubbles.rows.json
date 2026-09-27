@@ -1,0 +1,37 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/bubbles",
+    "parent": "",
+    "seg": "bubbles",
+    "kind": "arr_id",
+    "payload": "[7,3]"
+  },
+  {
+    "path": "/bubbles/3",
+    "parent": "/bubbles",
+    "seg": "3",
+    "kind": "ent",
+    "payload": "{\"id\":3,\"page\":1,\"rect\":[0,0,5,5],\"text\":\"\",\"translated\":true}"
+  },
+  {
+    "path": "/bubbles/7",
+    "parent": "/bubbles",
+    "seg": "7",
+    "kind": "ent",
+    "payload": "{\"character\":\"Ann\",\"extra\":{\"angle\":12.5,\"style\":\"bold\"},\"id\":7,\"page\":0,\"rect\":[10,20,110,220],\"text\":\"Hello\"}"
+  },
+  {
+    "path": "/next_id",
+    "parent": "",
+    "seg": "next_id",
+    "kind": "leaf",
+    "payload": "8"
+  }
+]

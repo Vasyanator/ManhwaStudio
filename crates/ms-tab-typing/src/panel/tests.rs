@@ -1354,7 +1354,7 @@ paths change.
         );
         assert_ne!(
             default_dir,
-            fonts::resolve_fonts_dir(),
+            ms_config::storage_mode::app_fonts_dir(),
             "a unit test must never bind to the checkout's own fonts directory"
         );
 
@@ -2162,7 +2162,7 @@ paths change.
 
     /// The legacy `user_config` keys are deleted ONLY after a save that actually succeeded
     /// (and, inside `presets_store::save`, only after the new document and its directory
-    /// entry are durable — `doc_store`'s own journal test pins that half).
+    /// entry are durable — `ms_docstore`'s own journal test pins that half).
     #[test]
     fn the_legacy_config_keys_are_dropped_only_after_a_successful_save() {
         let dir = unique_preset_dir("cleanup_order");
@@ -2211,10 +2211,10 @@ paths change.
             &state.preset_store_tx,
         );
         assert_eq!(
-            doc_store::recorded_steps(&presets_store::data_path(&dir)),
+            ms_docstore::recorded_steps(&presets_store::data_path(&dir)),
             vec![
-                doc_store::WriteStep::Renamed,
-                doc_store::WriteStep::DirectoryDurable
+                ms_docstore::WriteStep::Renamed,
+                ms_docstore::WriteStep::DirectoryDurable
             ],
             "presets.json must be durable before the legacy source is deleted"
         );
@@ -6935,8 +6935,10 @@ paths change.
 
     #[test]
     fn the_page_title_confirmation_does_not_survive_the_block_being_hidden_by_edit_mode() {
-        let mut state = TypingTopPanelState::default();
-        state.export_format = TypingExportFormat::Pdf;
+        let mut state = TypingTopPanelState {
+            export_format: TypingExportFormat::Pdf,
+            ..TypingTopPanelState::default()
+        };
         state.set_export_context(Some(ms_project::ComicType::Pages), "Title 01".to_string());
         // State left by a first click on the checkbox: refused, confirmation on screen.
         state.repaginate_pages_warning = true;
@@ -6991,8 +6993,10 @@ paths change.
 
     #[test]
     fn a_comic_type_change_re_applies_the_per_format_re_pagination_default() {
-        let mut state = TypingTopPanelState::default();
-        state.export_format = TypingExportFormat::Pdf;
+        let mut state = TypingTopPanelState {
+            export_format: TypingExportFormat::Pdf,
+            ..TypingTopPanelState::default()
+        };
         // The comic-type prompt is non-modal: the user can pick PDF while the title's type is
         // still unknown, where PDF defaults to ON.
         state.repaginate.enabled = repaginate_default_for_format(TypingExportFormat::Pdf, None);
@@ -7022,8 +7026,10 @@ paths change.
 
     #[test]
     fn the_per_frame_export_context_push_leaves_the_users_re_pagination_choice_alone() {
-        let mut state = TypingTopPanelState::default();
-        state.export_format = TypingExportFormat::Png;
+        let mut state = TypingTopPanelState {
+            export_format: TypingExportFormat::Png,
+            ..TypingTopPanelState::default()
+        };
         state.set_export_context(Some(ms_project::ComicType::Ribbon), "Title 01".to_string());
         assert!(!state.repaginate.enabled, "PNG starts off");
 

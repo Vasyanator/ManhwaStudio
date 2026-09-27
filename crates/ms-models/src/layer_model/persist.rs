@@ -12,6 +12,18 @@ Staging:
 Saves are written to the chapter's `*_unsaved/layers/` dir; the existing project-merge step copies
 it into the main `layers/` on "save to project". Loads read the unsaved dir first and fall back to
 the main dir (both for the manifest and for each PNG), mirroring how `text_images/` is loaded.
+
+Transactions:
+`ManifestTxn` is the one read-modify-write of a manifest under `MANIFEST_LOCK`; the page writers
+(`save_page_rasters`, `write_page_text_payload`, `update_raster_effects`) are operations on it, so a
+caller that saves many pages (the layer saver) commits once. PNGs are written before the manifest
+names them; unreferenced PNGs are deleted only after the commit. Staging manifests are written
+without fsync (`chapter_docs::chapter_doc_durability`).
+
+Absent vs. empty in staging:
+A page ABSENT from the staging manifest means "use the committed page" (per-page loader fallback and
+merge). A deletion that empties a page that exists anywhere is therefore recorded as a
+PRESENT-but-EMPTY page, never by removing it; both the raster and the text writer follow this rule.
 */
 
 use super::manifest::{
@@ -33,6 +45,11 @@ pub const TEXT_PAYLOAD_STORE: &str = "text_info";
 /// Serializes every `layers.json` read-modify-write. The manifest is shared by two independent
 /// subsystems — the PS editor writes raster nodes, the typing tab writes text nodes — and the
 /// typing save runs on a worker thread, so concurrent RMW must not interleave.
+///
+/// It stays in addition to the `ms_docstore` per-document lock because it guards a MULTI-STEP
+/// critical section (manifest read, per-page edit, PNG writes/pruning, manifest write), not just
+/// the whole-document write. Lock order is fixed: `MANIFEST_LOCK` first, then the document lock
+/// taken inside `write_manifest` (`ms_docstore::write`). Nothing may take them the other way round.
 static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// A raster layer handed in for saving (pixels borrowed from the live stack).
@@ -135,6 +152,13 @@ pub fn text_image_file_name(page_idx: usize, uid: &str) -> String {
 /// PS editor explicitly deleted/merged away this session) are dropped from the manifest and pruned.
 /// Any base PNG for this page that is no longer referenced is deleted. When nothing is written and
 /// the page had nothing persisted, this is a no-op (it does not create an empty manifest or directory).
+///
+/// One manifest transaction ([`ManifestTxn`]): the unreferenced PNGs are pruned only AFTER the new
+/// manifest is written, so a failed write never leaves the old manifest naming a deleted file.
+///
+/// This entry point knows no committed tree, so it never seeds a page that is absent from
+/// `layers_dir` (see [`ManifestTxn::save_page_rasters`] for the seeding variant a staging writer
+/// should use). A page already recorded in `layers_dir` that is emptied stays PRESENT-but-EMPTY.
 pub fn save_page_rasters(
     layers_dir: &Path,
     page_idx: usize,
@@ -142,6 +166,29 @@ pub fn save_page_rasters(
     groups: &[GroupMeta],
     removed_uids: &[String],
 ) -> Result<(), String> {
+    let mut txn = ManifestTxn::begin(layers_dir)?;
+    txn.save_page_rasters(page_idx, layers, groups, removed_uids, None)?;
+    txn.commit().map(|_wrote| ())
+}
+
+/// Body of [`save_page_rasters`] applied to an open transaction's in-memory `manifest`. Writes the
+/// dirty/new base PNGs immediately (a PNG must exist before a manifest names it) and schedules the
+/// page's orphan prune for after the commit. Returns whether the manifest was modified (`false` for
+/// the "nothing to write and nothing recorded" no-op, and for a seeded page the write would not
+/// change).
+///
+/// `fallback_dir` is the committed layers dir when `txn` edits a staging manifest: a page absent from
+/// staging is first seeded from it (the per-page "absent in staging == committed" contract), so the
+/// committed text and unowned rasters are carried and an emptied page can be recorded as an explicit
+/// PRESENT-but-EMPTY override instead of falling back to committed.
+fn apply_save_page_rasters(
+    txn: &mut ManifestTxn,
+    page_idx: usize,
+    layers: &[RasterLayerOut],
+    groups: &[GroupMeta],
+    removed_uids: &[String],
+    fallback_dir: Option<&Path>,
+) -> Result<bool, String> {
     let _span = ms_log::trace_scope!(
         cat::PERSIST,
         "save_page_rasters page={} layers={} groups={} removed={}",
@@ -150,9 +197,19 @@ pub fn save_page_rasters(
         groups.len(),
         removed_uids.len()
     );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
+    let layers_dir = txn.layers_dir.clone();
+    let layers_dir = layers_dir.as_path();
+    // Seed a page staging has no record of from the committed fallback, mirroring the text / effects
+    // writers. Without it an absent staging page means "committed wins": deleting its last raster
+    // could not be expressed (the page stayed absent, so loader and merge fell back to the committed
+    // rasters), and a partial raster edit staged a page without the committed text.
+    let staged_before = txn.manifest.page(page_idx).is_some();
+    txn.ensure_page_staged(page_idx, fallback_dir)?;
+    // A page recorded anywhere (staging, or committed via the seed) is kept PRESENT even when emptied.
+    let page_existed = txn.manifest.page(page_idx).is_some();
+    let seeded_before = (page_existed && !staged_before).then(|| PageSnapshot::of_unordered(&txn.manifest, page_idx));
+    let mut wrote_png = false;
+    let manifest = &mut txn.manifest;
 
     // Text nodes and their group bands (written by the typing tab) must survive a raster rewrite.
     let preserved: Vec<LayerRec> = manifest
@@ -259,27 +316,19 @@ pub fn save_page_rasters(
     let layers_dir_str = layers_dir.to_string_lossy();
     if layers.is_empty()
         && groups.is_empty()
-        && manifest.page(page_idx).is_none()
+        && !page_existed
         && !ms_storage::global::storage().exists(layers_dir_str.as_ref())
     {
-        return Ok(());
+        return Ok(false);
     }
 
     ms_storage::global::storage()
         .create_dir_all(layers_dir_str.as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
 
-    let mut keep: Vec<String> = Vec::with_capacity(layers.len());
+    // Preserved (other-tab) rasters are carried verbatim; their PNGs survive the deferred prune
+    // because the final page still references them.
     let mut recs: Vec<LayerRec> = preserved;
-    // Keep the PNGs of preserved (other-tab) rasters alive through pruning, then carry their nodes.
-    for r in &preserved_rasters {
-        if let Some(b) = &r.base_file {
-            keep.push(b.clone());
-        }
-        if let Some(rf) = &r.rendered_file {
-            keep.push(rf.clone());
-        }
-    }
     recs.extend(preserved_rasters);
     for layer in layers.iter() {
         let z = existing_raster_z
@@ -295,10 +344,6 @@ pub fn save_page_rasters(
         // non-destructive effects chain (set by the typing tab) survives a PS whole-page save.
         let (base_file, rendered_file, effects, image_size) = match existing {
             Some((Some(base), rendered, eff, size)) if !layer.pixels_dirty => {
-                keep.push(base.clone());
-                if let Some(r) = rendered {
-                    keep.push(r.clone());
-                }
                 (
                     base.clone(),
                     rendered.clone(),
@@ -310,7 +355,7 @@ pub fn save_page_rasters(
                 // Dirty or new: (re)write the base PNG from the (display==base) image; effects bake in.
                 let file = base_file_name(page_idx, &layer.uid);
                 write_png(&layers_dir.join(&file), layer.image)?;
-                keep.push(file.clone());
+                wrote_png = true;
                 (file, None, Vec::new(), layer.image.size)
             }
         };
@@ -344,8 +389,6 @@ pub fn save_page_rasters(
         });
     }
 
-    prune_orphan_pngs(layers_dir, page_idx, &keep);
-
     let group_recs: Vec<GroupRec> = groups
         .iter()
         .map(|g| GroupRec {
@@ -358,21 +401,24 @@ pub fn save_page_rasters(
         })
         .collect();
 
-    if recs.is_empty() && group_recs.is_empty() {
+    // WRITE-keep-present (same rule as the text writer): only a page recorded NOWHERE that is still
+    // empty is omitted. An emptied page that existed stays as an explicit PRESENT-but-EMPTY record:
+    // absent would mean "fall back to committed" to the loader and the merge, resurrecting the deleted
+    // rasters (or, for a staged text tombstone, the deleted committed text).
+    if recs.is_empty() && group_recs.is_empty() && !page_existed {
         manifest.remove_page(page_idx);
         ms_log::trace_log!(
             cat::PERSIST,
-            "save_page_rasters page={} removed empty page from manifest",
+            "save_page_rasters page={} never recorded and empty, omitted",
             page_idx
         );
     } else {
         ms_log::trace_log!(
             cat::PERSIST,
-            "save_page_rasters page={} recs={} groups={} pngs_kept={}",
+            "save_page_rasters page={} recs={} groups={}",
             page_idx,
             recs.len(),
-            group_recs.len(),
-            keep.len()
+            group_recs.len()
         );
         manifest.upsert_page(PageLayers {
             img_idx: page_idx,
@@ -381,12 +427,18 @@ pub fn save_page_rasters(
             tree: recs,
         });
     }
-    ms_log::trace_log!(
-        cat::PERSIST,
-        "save_page_rasters writing manifest {}",
-        manifest_path.display()
-    );
-    write_manifest(&manifest_path, &manifest)
+    if let Some(before) = seeded_before
+        && !wrote_png
+        && before.same_as(&PageSnapshot::of_unordered(&txn.manifest, page_idx))
+    {
+        // The seeded committed page is unchanged: undo the seed so a no-op save stages nothing.
+        txn.manifest.remove_page(page_idx);
+        ms_log::trace_log!(cat::PERSIST, "save_page_rasters page={} unchanged vs committed, elided", page_idx);
+        return Ok(false);
+    }
+    // Orphan PNGs are pruned only after the manifest naming the new page set is written.
+    txn.cleanup.prune_pages.push(page_idx);
+    Ok(true)
 }
 
 /// Loads the persisted raster layers for one page, ordered bottom-to-top.
@@ -681,6 +733,9 @@ pub fn update_raster_geometry(
 /// the rendered PNG (`rendered_file_name`) and records `rendered_file`; without it (empty chain),
 /// clears `rendered_file` and deletes any stale rendered PNG. The base PNG is never touched, so the
 /// effects stay fully reversible across restarts. A no-op if the page or node is absent.
+///
+/// One manifest transaction ([`ManifestTxn`]); a replaced rendered PNG is deleted only after the
+/// manifest that no longer names it is written.
 pub fn update_raster_effects(
     layers_dir: &Path,
     page_idx: usize,
@@ -689,6 +744,22 @@ pub fn update_raster_effects(
     rendered: Option<&ColorImage>,
     fallback_dir: Option<&Path>,
 ) -> Result<(), String> {
+    let mut txn = ManifestTxn::begin(layers_dir)?;
+    txn.update_raster_effects(page_idx, uid, effects, rendered, fallback_dir)?;
+    txn.commit().map(|_wrote| ())
+}
+
+/// Body of [`update_raster_effects`] applied to an open transaction. Writes the new `_fx` PNG
+/// immediately and schedules the removal of a replaced one for after the commit. Returns whether the
+/// manifest was modified (`false` when the page or node is absent).
+fn apply_update_raster_effects(
+    txn: &mut ManifestTxn,
+    page_idx: usize,
+    uid: &str,
+    effects: &[serde_json::Value],
+    rendered: Option<&ColorImage>,
+    fallback_dir: Option<&Path>,
+) -> Result<bool, String> {
     let _span = ms_log::trace_scope!(
         cat::PERSIST,
         "update_raster_effects page={} uid={} effects_len={} has_rendered={}",
@@ -697,19 +768,17 @@ pub fn update_raster_effects(
         effects.len(),
         rendered.is_some()
     );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
-    ensure_page_staged(&mut manifest, page_idx, fallback_dir)?;
-    let Some(page) = manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
-        return Ok(());
+    txn.ensure_page_staged(page_idx, fallback_dir)?;
+    let layers_dir = txn.layers_dir.clone();
+    let Some(page) = txn.manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
+        return Ok(false);
     };
     let Some(node) = page
         .tree
         .iter_mut()
         .find(|r| r.kind == LayerKindRec::Raster && r.uid == uid)
     else {
-        return Ok(());
+        return Ok(false);
     };
     ms_storage::global::storage()
         .create_dir_all(layers_dir.to_string_lossy().as_ref())
@@ -728,14 +797,14 @@ pub fn update_raster_effects(
             node.effects = Vec::new();
         }
     }
-    // Remove a now-unreferenced old rendered PNG.
+    // A now-unreferenced old rendered PNG is removed after the commit (never before: until the new
+    // manifest is written the old one still names it).
     if let Some(old) = old_rendered
         && node.rendered_file.as_deref() != Some(old.as_str())
     {
-        let _ =
-            ms_storage::global::storage().remove_file(layers_dir.join(&old).to_string_lossy().as_ref());
+        txn.cleanup.remove_files.push((page_idx, old));
     }
-    write_manifest(&manifest_path, &manifest)
+    Ok(true)
 }
 
 /// The PS-owned order/identity fields of a text node — the subset that `write_page_text_payload`
@@ -848,22 +917,44 @@ pub struct TextInlineIn {
 /// pixels is the CALLER's job — `LayerDoc::flush_page` / `flush_page_text` (and the saver worker that
 /// replays them) call [`write_text_image`] for every text node whose in-memory render is dirty or
 /// whose file is missing, immediately before calling this. The typing render itself never writes the
-/// rendered text PNG. Runs under `MANIFEST_LOCK`.
+/// rendered text PNG. Runs under `MANIFEST_LOCK` as one manifest transaction ([`ManifestTxn`]).
 pub fn write_page_text_payload(
     layers_dir: &Path,
     fallback_dir: Option<&Path>,
     page_idx: usize,
     nodes: &[TextPayloadOut],
 ) -> Result<(), String> {
+    let mut txn = ManifestTxn::begin(layers_dir)?;
+    txn.write_page_text_payload(fallback_dir, page_idx, nodes, false)?;
+    txn.commit().map(|_wrote| ())
+}
+
+/// Body of [`write_page_text_payload`] applied to an open transaction. Returns whether the manifest
+/// was modified.
+///
+/// `elide_if_unchanged`: when `true` and the page this write would produce serializes IDENTICALLY to
+/// the page that is effective on disk right now (the staging page, or — when staging has none — the
+/// committed page that would be seeded), the write is dropped and any seed undone, so the manifest is
+/// left exactly as it was. This is safe because both readers of staging resolve a page per page:
+/// `read_page_with_fallback` and the save-to-project merge see the same page either way. Callers must
+/// pass `false` whenever the write is load-bearing beyond its content (e.g. a text PNG was just
+/// written into the staging dir for this page).
+fn apply_write_page_text_payload(
+    txn: &mut ManifestTxn,
+    fallback_dir: Option<&Path>,
+    page_idx: usize,
+    nodes: &[TextPayloadOut],
+    elide_if_unchanged: bool,
+) -> Result<bool, String> {
     let _span = ms_log::trace_scope!(
         cat::PERSIST,
         "write_page_text_payload page={} text_nodes={}",
         page_idx,
         nodes.len()
     );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
+    let layers_dir = txn.layers_dir.clone();
+    let layers_dir = layers_dir.as_path();
+    let staged_before = txn.manifest.page(page_idx).is_some();
 
     // Whether this page was already known on disk (primary staging OR the committed fallback). A page
     // that EXISTED but is now emptied (last text deleted) must stay PRESENT-but-EMPTY in the manifest —
@@ -872,13 +963,10 @@ pub fn write_page_text_payload(
     // page (present in unsaved) and replaces committed text with the empty set. Removing it (or never
     // writing it) makes the page ABSENT, which the loader/merge both treat as "fall back to committed" →
     // the deleted text RESURRECTS. Only a page that never existed ANYWHERE is omitted.
-    let page_existed = manifest.page(page_idx).is_some()
-        || fallback_dir.is_some_and(|d| {
-            read_manifest(&d.join(MANIFEST_FILE))
-                .ok()
-                .flatten()
-                .is_some_and(|m| m.page(page_idx).is_some())
-        });
+    // A committed manifest that cannot be read counts as "page absent" here, as it always has; the
+    // seeding below still surfaces that read error.
+    let page_existed = staged_before
+        || fallback_dir.is_some_and(|d| txn.fallback_page(d, page_idx).ok().flatten().is_some());
 
     // Nothing to write only when the page never existed anywhere AND there is no staging dir yet — i.e.
     // there is genuinely no page record to preserve. A previously-existing page emptied to nothing still
@@ -888,12 +976,8 @@ pub fn write_page_text_payload(
         && !page_existed
         && !ms_storage::global::storage().exists(layers_dir.to_string_lossy().as_ref())
     {
-        return Ok(());
+        return Ok(false);
     }
-
-    ms_storage::global::storage()
-        .create_dir_all(layers_dir.to_string_lossy().as_ref())
-        .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
 
     // Seed the page from the committed fallback when the staging manifest has no record of it yet.
     // Without this, a text-only flush on a page whose rasters live ONLY in the committed manifest (e.g.
@@ -904,7 +988,10 @@ pub fn write_page_text_payload(
     // the page is absent from staging, so a session that already staged a raster deletion is not undone)
     // carries the committed rasters/groups onto the staging page so the text replace keeps them. Mirrors
     // `update_raster_effects`/`update_raster_geometry`, which already stage via `ensure_page_staged`.
-    ensure_page_staged(&mut manifest, page_idx, fallback_dir)?;
+    txn.ensure_page_staged(page_idx, fallback_dir)?;
+    // The page as it is effective on disk before this write (see `elide_if_unchanged`).
+    let effective_before = elide_if_unchanged.then(|| PageSnapshot::of(&txn.manifest, page_idx));
+    let manifest = &mut txn.manifest;
 
     // Keep every non-text node (rasters) plus the page's PS groups; replace only the text nodes.
     // Text groups (`text_groups`) are intentionally NOT carried: text is fully-manual pinned-with-Z now,
@@ -974,7 +1061,22 @@ pub fn write_page_text_payload(
             tree,
         });
     }
-    write_manifest(&manifest_path, &manifest)
+    if let Some(before) = effective_before
+        && before.same_as(&PageSnapshot::of(&txn.manifest, page_idx))
+    {
+        // Nothing the readers can observe would change: drop the write and undo a committed seed so
+        // an unchanged page never materializes (or rewrites) the staging manifest.
+        if !staged_before {
+            txn.manifest.remove_page(page_idx);
+        }
+        ms_log::trace_log!(cat::PERSIST, "write_page_text_payload page={} unchanged, elided", page_idx);
+        return Ok(false);
+    }
+    // Created only for a write that really happens, so an elided page leaves no stray staging dir.
+    ms_storage::global::storage()
+        .create_dir_all(layers_dir.to_string_lossy().as_ref())
+        .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
+    Ok(true)
 }
 
 /// Builds the schema-v3 `layers.json` record for a TEXT node with its full inline payload. `ident`
@@ -1482,16 +1584,291 @@ pub fn merge_unsaved_layers_into_committed(
     Ok(true)
 }
 
+/// Replaces the whole `layers.json` at `path` with `manifest` through `ms_docstore` (atomic
+/// temp+rename on native). An existing manifest keeps its format (`.json` or `.db`); a NEW one is
+/// created in the chapter's format (`ms_page_ops::chapter_docs::chapter_doc_for_write`, docstore
+/// rule B.3). JSON bytes match the historical writer: 2-space pretty, struct field order, no
+/// trailing newline. The parent directory must already exist (callers create it), as before.
+/// Callers hold `MANIFEST_LOCK`; the document lock is taken inside (order: MANIFEST_LOCK → doc lock).
+/// Durability comes from `ms_page_ops::chapter_docs::chapter_doc_durability`: a `{chapter}_unsaved`
+/// staging manifest is not fsynced (JSON only; `.db` ignores it), a committed one is (`Contents`).
 fn write_manifest(path: &Path, manifest: &LayersManifest) -> Result<(), String> {
-    let text =
-        serde_json::to_string_pretty(manifest).map_err(|e| format!("serialize manifest: {e}"))?;
-    ms_storage::global::storage()
-        .write(path.to_string_lossy().as_ref(), text.as_bytes())
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    use ms_page_ops::chapter_docs;
+    let kind = ms_docstore::DocKind::Layers;
+    let durability = chapter_docs::chapter_doc_durability(path, kind, ms_docstore::Durability::Contents);
+    let opts = ms_docstore::WriteOptions { create_parent_dirs: false, durability, ..ms_docstore::WriteOptions::default() };
+    ms_docstore::write(&chapter_docs::chapter_doc_for_write(path, kind), manifest, opts)
+        .map(|_fingerprint| ())
+        .map_err(|e| match e {
+            ms_docstore::DocStoreError::Serialize { cause, .. } => format!("serialize manifest: {cause}"),
+            other => format!("write {}: {other}", path.display()),
+        })
 }
 
-/// Removes base PNGs for `page_idx` that are not in `keep`.
-fn prune_orphan_pngs(layers_dir: &Path, page_idx: usize, keep: &[String]) {
+/// File removals a [`ManifestTxn`] defers until its manifest write has succeeded. Deleting a file the
+/// OLD manifest still names before the NEW manifest is on disk would leave a dangling reference if
+/// the write then failed; deferring keeps "a PNG named by the manifest exists" true at every step.
+#[derive(Debug, Default)]
+struct DeferredCleanup {
+    /// Pages whose `ps_p{page:04}_*.png` files not referenced by the final page are pruned
+    /// (scheduled by a raster save).
+    prune_pages: Vec<usize>,
+    /// `(page, file name)` of individual PNGs that became unreferenced (a replaced `_fx` render).
+    remove_files: Vec<(usize, String)>,
+}
+
+/// The state of one page inside a [`ManifestTxn`] before an operation, restored by
+/// [`ManifestTxn::rollback`] so a failed (or panicked) operation leaves no partial edit behind.
+#[derive(Debug)]
+pub(super) struct PageCheckpoint {
+    page_idx: usize,
+    page: Option<PageLayers>,
+    touched: bool,
+    prune_len: usize,
+    remove_len: usize,
+}
+
+/// A page's serialized on-disk form, for the "would this write change anything" comparison.
+#[derive(Debug)]
+enum PageSnapshot {
+    Absent,
+    Value(serde_json::Value),
+    /// Serialization failed; never equal to anything, so the comparison errs on the side of writing.
+    Unknown,
+}
+
+impl PageSnapshot {
+    /// The page as it reads back from disk: serialized, parsed and serialized again, so an in-memory
+    /// value that the store would normalize (e.g. an inline image overlay's `render_data:
+    /// Some(Null)`, which reads back as `None`) compares equal to the record already on disk.
+    fn of(manifest: &LayersManifest, page_idx: usize) -> Self {
+        let Some(page) = manifest.page(page_idx) else {
+            return Self::Absent;
+        };
+        serde_json::to_value(page)
+            .and_then(serde_json::from_value::<PageLayers>)
+            .and_then(|read_back| serde_json::to_value(&read_back))
+            .map_or(Self::Unknown, Self::Value)
+    }
+
+    /// Like [`of`](Self::of), but with the page's `tree` sorted by each node's serialized form, so two
+    /// pages holding the same nodes in a different `tree` order compare equal. For the raster writer,
+    /// which rebuilds `tree` in its own order (preserved nodes first) while readers order by `z`.
+    fn of_unordered(manifest: &LayersManifest, page_idx: usize) -> Self {
+        let Self::Value(mut value) = Self::of(manifest, page_idx) else {
+            return Self::of(manifest, page_idx);
+        };
+        if let Some(tree) = value.get_mut("tree").and_then(serde_json::Value::as_array_mut) {
+            tree.sort_by_cached_key(serde_json::Value::to_string);
+        }
+        Self::Value(value)
+    }
+
+    /// Whether both snapshots serialize identically (an `Unknown` side is never the same).
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::Value(a), Self::Value(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// ONE read-modify-write of a layers manifest (`layers.json` / `layers.db`) that any number of page
+/// operations share, so a batch of page saves costs one document commit instead of one per page.
+///
+/// Holds `MANIFEST_LOCK` from [`begin`](Self::begin) until it is committed or dropped (lock order:
+/// `MANIFEST_LOCK` → the document lock taken by the single write). Every operation is atomic within
+/// the transaction: on `Err` its page is restored from a checkpoint, so one failing page never leaves
+/// a half-edited record for the others' commit. PNGs an operation must reference are written during
+/// the operation (before the manifest can name them); files that become unreferenced are deleted only
+/// after [`commit`](Self::commit) wrote the manifest. Dropping a transaction without committing
+/// writes no manifest (PNGs already written stay as unreferenced files for a later prune).
+/// Not `Send` (it holds a `MutexGuard`): use it on the thread that began it.
+pub struct ManifestTxn {
+    layers_dir: PathBuf,
+    manifest_path: PathBuf,
+    manifest: LayersManifest,
+    /// Whether any operation modified `manifest` (an untouched transaction commits without writing).
+    touched: bool,
+    cleanup: DeferredCleanup,
+    /// Committed-tree manifests read at most once per transaction (seeding + `page_existed`).
+    fallback_cache: HashMap<PathBuf, Result<Option<LayersManifest>, String>>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ManifestTxn {
+    /// Takes `MANIFEST_LOCK` and reads the manifest in `layers_dir` (an absent one starts empty).
+    ///
+    /// # Errors
+    /// The manifest exists but cannot be read or parsed.
+    pub fn begin(layers_dir: &Path) -> Result<Self, String> {
+        let guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let manifest_path = layers_dir.join(MANIFEST_FILE);
+        let manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
+        Ok(Self {
+            layers_dir: layers_dir.to_path_buf(),
+            manifest_path,
+            manifest,
+            touched: false,
+            cleanup: DeferredCleanup::default(),
+            fallback_cache: HashMap::new(),
+            _guard: guard,
+        })
+    }
+
+    /// Whether a [`commit`](Self::commit) would write the manifest.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.touched
+    }
+
+    /// [`save_page_rasters`] within this transaction. `fallback_dir` (the committed layers dir, when
+    /// this transaction edits a staging manifest) seeds a page staging has no record of, so an emptied
+    /// page is recorded PRESENT-but-EMPTY and overrides committed; `None` never seeds.
+    ///
+    /// # Errors
+    /// Seeding (committed manifest unreadable), a PNG or a directory write failed; the page is left
+    /// as it was before the call.
+    pub fn save_page_rasters(&mut self, page_idx: usize, layers: &[RasterLayerOut], groups: &[GroupMeta], removed_uids: &[String], fallback_dir: Option<&Path>) -> Result<(), String> {
+        self.guarded(page_idx, |txn| apply_save_page_rasters(txn, page_idx, layers, groups, removed_uids, fallback_dir)).map(|_changed| ())
+    }
+
+    /// [`write_page_text_payload`] within this transaction; see `apply_write_page_text_payload` for
+    /// `elide_if_unchanged`. Returns whether the manifest was modified by this call.
+    ///
+    /// # Errors
+    /// The committed fallback manifest could not be read for seeding; the page is left as it was.
+    pub fn write_page_text_payload(&mut self, fallback_dir: Option<&Path>, page_idx: usize, nodes: &[TextPayloadOut], elide_if_unchanged: bool) -> Result<bool, String> {
+        self.guarded(page_idx, |txn| apply_write_page_text_payload(txn, fallback_dir, page_idx, nodes, elide_if_unchanged))
+    }
+
+    /// [`update_raster_effects`] within this transaction.
+    ///
+    /// # Errors
+    /// Seeding, the `_fx` PNG write, or a directory creation failed; the page is left as it was.
+    pub fn update_raster_effects(&mut self, page_idx: usize, uid: &str, effects: &[serde_json::Value], rendered: Option<&ColorImage>, fallback_dir: Option<&Path>) -> Result<(), String> {
+        self.guarded(page_idx, |txn| apply_update_raster_effects(txn, page_idx, uid, effects, rendered, fallback_dir)).map(|_changed| ())
+    }
+
+    /// Records `page_idx`'s current state so a multi-operation unit (e.g. a page's whole effects
+    /// list, or code that may panic) can be undone with [`rollback`](Self::rollback).
+    #[must_use]
+    pub(super) fn checkpoint(&self, page_idx: usize) -> PageCheckpoint {
+        PageCheckpoint {
+            page_idx,
+            page: self.manifest.page(page_idx).cloned(),
+            touched: self.touched,
+            prune_len: self.cleanup.prune_pages.len(),
+            remove_len: self.cleanup.remove_files.len(),
+        }
+    }
+
+    /// Restores the page, the dirty flag and the deferred cleanups recorded by `checkpoint`.
+    /// Operations only ever touch their own page, so restoring that one page undoes them fully.
+    pub(super) fn rollback(&mut self, checkpoint: PageCheckpoint) {
+        match checkpoint.page {
+            Some(page) => self.manifest.upsert_page(page),
+            None => {
+                self.manifest.remove_page(checkpoint.page_idx);
+            }
+        }
+        self.touched = checkpoint.touched;
+        self.cleanup.prune_pages.truncate(checkpoint.prune_len);
+        self.cleanup.remove_files.truncate(checkpoint.remove_len);
+    }
+
+    /// Runs one page operation atomically: `Ok(true)` marks the transaction dirty, `Err` rolls the
+    /// page back.
+    fn guarded(&mut self, page_idx: usize, op: impl FnOnce(&mut Self) -> Result<bool, String>) -> Result<bool, String> {
+        let checkpoint = self.checkpoint(page_idx);
+        match op(self) {
+            Ok(changed) => {
+                self.touched |= changed;
+                Ok(changed)
+            }
+            Err(err) => {
+                self.rollback(checkpoint);
+                Err(err)
+            }
+        }
+    }
+
+    /// `page_idx` of the committed manifest in `fallback_dir`, read at most once per transaction.
+    fn fallback_page(&mut self, fallback_dir: &Path, page_idx: usize) -> Result<Option<PageLayers>, String> {
+        let entry = self
+            .fallback_cache
+            .entry(fallback_dir.to_path_buf())
+            .or_insert_with(|| read_manifest(&fallback_dir.join(MANIFEST_FILE)));
+        match entry {
+            Ok(manifest) => Ok(manifest.as_ref().and_then(|m| m.page(page_idx)).cloned()),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
+    /// [`ensure_page_staged`] against this transaction's manifest and cached fallback.
+    fn ensure_page_staged(&mut self, page_idx: usize, fallback_dir: Option<&Path>) -> Result<(), String> {
+        if self.manifest.page(page_idx).is_some() {
+            return Ok(());
+        }
+        let Some(fb) = fallback_dir else {
+            return Ok(());
+        };
+        if let Some(page) = self.fallback_page(fb, page_idx)? {
+            self.manifest.upsert_page(page);
+        }
+        Ok(())
+    }
+
+    /// Writes the manifest ONCE if any operation modified it, then runs the deferred removals.
+    /// Returns whether the manifest was written. Releases `MANIFEST_LOCK`.
+    ///
+    /// # Errors
+    /// The manifest write failed. Nothing was deleted then, and every operation of this transaction
+    /// must be treated as not persisted.
+    pub fn commit(self) -> Result<bool, String> {
+        if !self.touched {
+            return Ok(false);
+        }
+        ms_log::trace_log!(
+            cat::PERSIST,
+            "manifest txn commit {} pages={}",
+            self.manifest_path.display(),
+            self.manifest.pages.len()
+        );
+        write_manifest(&self.manifest_path, &self.manifest)?;
+        self.run_deferred_cleanup();
+        Ok(true)
+    }
+
+    /// Deletes the scheduled files, skipping any the committed manifest still references (so a later
+    /// operation of the same transaction that re-referenced a file always wins).
+    fn run_deferred_cleanup(&self) {
+        let referenced = |page_idx: usize| -> HashSet<&str> {
+            self.manifest
+                .page(page_idx)
+                .map(|p| p.tree.iter().flat_map(|r| [r.base_file.as_deref(), r.rendered_file.as_deref()]).flatten().collect())
+                .unwrap_or_default()
+        };
+        for (page_idx, name) in &self.cleanup.remove_files {
+            if !referenced(*page_idx).contains(name.as_str()) {
+                // Best-effort: a leftover unreferenced PNG is harmless and pruned by a later raster save.
+                let _ = ms_storage::global::storage().remove_file(self.layers_dir.join(name).to_string_lossy().as_ref());
+            }
+        }
+        let mut pruned: HashSet<usize> = HashSet::new();
+        for page_idx in &self.cleanup.prune_pages {
+            if pruned.insert(*page_idx) {
+                let keep = referenced(*page_idx);
+                prune_orphan_pngs(&self.layers_dir, *page_idx, &keep);
+            }
+        }
+    }
+}
+
+/// Removes this page's `ps_p{page:04}_*.png` files (base, `_fx` and `_text` renders) whose name is
+/// not in `keep` — the files the committed page references.
+fn prune_orphan_pngs(layers_dir: &Path, page_idx: usize, keep: &HashSet<&str>) {
     let prefix = page_file_prefix(page_idx);
     let Ok(entries) = ms_storage::global::storage().read_dir(layers_dir.to_string_lossy().as_ref())
     else {
@@ -1500,7 +1877,7 @@ fn prune_orphan_pngs(layers_dir: &Path, page_idx: usize, keep: &[String]) {
     for entry in entries {
         // `DirEntry.name` is only the final component; rebuild the child path by joining the dir.
         let name = entry.name;
-        if name.starts_with(&prefix) && name.ends_with(".png") && !keep.iter().any(|k| k == &name) {
+        if name.starts_with(&prefix) && name.ends_with(".png") && !keep.contains(name.as_str()) {
             let child = layers_dir.join(&name);
             let _ = ms_storage::global::storage().remove_file(child.to_string_lossy().as_ref());
         }
@@ -4092,4 +4469,319 @@ mod tests {
             let _ = fs::remove_dir_all(d);
         }
     }
+
+    /// A raster layer with `uid` for the save-merge fixtures below.
+    fn fixture_raster<'a>(uid: &str, pic: &'a ColorImage) -> RasterLayerOut<'a> {
+        RasterLayerOut {
+            uid: uid.into(),
+            name: uid.into(),
+            visible: true,
+            opacity: 1.0,
+            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            group_uid: None,
+            image: pic,
+            pixels_dirty: true,
+            mask_clip: None,
+        }
+    }
+
+    #[test]
+    fn write_manifest_bytes_match_the_historical_pretty_layout() {
+        // Byte compatibility of the docstore-backed writer: 2-space pretty JSON in struct field
+        // order, no trailing newline, and no temp file left next to it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(MANIFEST_FILE);
+        let pic = img([2, 2], Color32::WHITE);
+        save_page_rasters(tmp.path(), 0, &[fixture_raster("r0", &pic)], &[], &[]).unwrap();
+        let manifest = read_manifest(&path).unwrap().unwrap();
+        write_manifest(&path, &manifest).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), serde_json::to_string_pretty(&manifest).unwrap());
+        let leftovers: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn save_merge_with_the_real_layer_merge_preserves_committed_only_pages() {
+        // End to end over `ms_project::save_merge`: the staging manifest must NOT be byte-copied
+        // over the committed one (that would truncate committed-only pages); the injected per-page
+        // merge runs instead, bubbles are copied through the store, and the staging dir is removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("ch");
+        let unsaved = tmp.path().join("ch_unsaved");
+        let committed_layers = project.join(ms_config::LAYERS_DIR);
+        let unsaved_layers = unsaved.join(ms_config::LAYERS_DIR);
+        let pic = img([2, 2], Color32::WHITE);
+        for p in 0..3 {
+            save_page_rasters(&committed_layers, p, &[fixture_raster(&format!("c{p}"), &pic)], &[], &[]).unwrap();
+        }
+        save_page_rasters(&unsaved_layers, 0, &[fixture_raster("edited0", &pic)], &[], &[]).unwrap();
+        fs::write(project.join(ms_config::BUBBLES_FILE), b"[]").unwrap();
+        fs::write(unsaved.join(ms_config::BUBBLES_FILE), b"[\n  {\n    \"id\": 3\n  }\n]").unwrap();
+
+        let owned: HashSet<usize> = [0].into_iter().collect();
+        ms_project::save_merge::merge_unsaved_into_project(&unsaved, &project, |committed, staging| {
+            merge_unsaved_layers_into_committed(committed, staging, &owned).map(|_wrote| ())
+        })
+        .unwrap();
+
+        assert!(!unsaved.exists(), "staging removed");
+        let merged = read_manifest(&committed_layers.join(MANIFEST_FILE)).unwrap().unwrap();
+        let mut pages: Vec<usize> = merged.pages.iter().map(|p| p.img_idx).collect();
+        pages.sort_unstable();
+        assert_eq!(pages, vec![0, 1, 2], "committed-only pages preserved");
+        assert!(merged.page(0).unwrap().tree.iter().any(|r| r.uid == "edited0"));
+        assert!(merged.page(2).unwrap().tree.iter().any(|r| r.uid == "c2"));
+        assert_eq!(fs::read(project.join(ms_config::BUBBLES_FILE)).unwrap(), b"[\n  {\n    \"id\": 3\n  }\n]");
+        let leftovers: Vec<String> = [project.clone(), committed_layers.clone()]
+            .iter()
+            .flat_map(|dir| fs::read_dir(dir).unwrap())
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Moves the document `doc` (currently JSON) into `format` (a no-op for JSON).
+    fn put_in_format(doc: &ms_docstore::DocRef, format: ms_docstore::DocFormat) {
+        if format == ms_docstore::DocFormat::Db {
+            ms_docstore::convert_document(doc, format, &ms_docstore::NoHook).unwrap();
+        }
+        assert!(doc.path_for(format).is_file(), "{} must exist", doc.path_for(format).display());
+    }
+
+    /// The other format than `format`.
+    fn other_format(format: ms_docstore::DocFormat) -> ms_docstore::DocFormat {
+        match format {
+            ms_docstore::DocFormat::Json => ms_docstore::DocFormat::Db,
+            ms_docstore::DocFormat::Db => ms_docstore::DocFormat::Json,
+        }
+    }
+
+    #[test]
+    fn save_merge_is_correct_for_every_committed_and_staging_format_pair() {
+        // The staging and committed trees may hold the owned documents in different formats (a
+        // converted chapter with a pre-conversion staging mirror, or the reverse). Whatever the
+        // pair, the committed chapter must end up with exactly ONE file per document, in the
+        // COMMITTED document's format, holding the merged content.
+        use ms_docstore::DocFormat;
+        use ms_page_ops::chapter_docs::{bubbles_doc, layers_doc};
+        for committed_format in [DocFormat::Json, DocFormat::Db] {
+            for staging_format in [DocFormat::Json, DocFormat::Db] {
+                let tmp = tempfile::tempdir().unwrap();
+                let project = tmp.path().join("ch");
+                let unsaved = tmp.path().join("ch_unsaved");
+                let committed_layers = project.join(ms_config::LAYERS_DIR);
+                let unsaved_layers = unsaved.join(ms_config::LAYERS_DIR);
+                let pic = img([2, 2], Color32::WHITE);
+                for p in 0..3 {
+                    save_page_rasters(&committed_layers, p, &[fixture_raster(&format!("c{p}"), &pic)], &[], &[]).unwrap();
+                }
+                save_page_rasters(&unsaved_layers, 0, &[fixture_raster("edited0", &pic)], &[], &[]).unwrap();
+                fs::write(project.join(ms_config::BUBBLES_FILE), b"[]").unwrap();
+                fs::write(unsaved.join(ms_config::BUBBLES_FILE), b"[\n  {\n    \"id\": 3\n  }\n]").unwrap();
+                for doc in [layers_doc(&project), bubbles_doc(&project)] {
+                    put_in_format(&doc, committed_format);
+                }
+                for doc in [layers_doc(&unsaved), bubbles_doc(&unsaved)] {
+                    put_in_format(&doc, staging_format);
+                }
+
+                let owned: HashSet<usize> = [0].into_iter().collect();
+                ms_project::save_merge::merge_unsaved_into_project(&unsaved, &project, |committed, staging| {
+                    merge_unsaved_layers_into_committed(committed, staging, &owned).map(|_wrote| ())
+                })
+                .unwrap();
+
+                let case = format!("committed {committed_format:?}, staging {staging_format:?}");
+                assert!(!unsaved.exists(), "{case}: staging removed");
+                for doc in [layers_doc(&project), bubbles_doc(&project)] {
+                    assert!(doc.path_for(committed_format).is_file(), "{case}: {} kept its format", doc.stem().display());
+                    assert!(!doc.path_for(other_format(committed_format)).exists(), "{case}: no second format of {}", doc.stem().display());
+                }
+                let merged = read_manifest(&committed_layers.join(MANIFEST_FILE)).unwrap().unwrap();
+                let mut pages: Vec<usize> = merged.pages.iter().map(|p| p.img_idx).collect();
+                pages.sort_unstable();
+                assert_eq!(pages, vec![0, 1, 2], "{case}: committed-only pages preserved");
+                assert!(merged.page(0).unwrap().tree.iter().any(|r| r.uid == "edited0"), "{case}");
+                assert!(merged.page(2).unwrap().tree.iter().any(|r| r.uid == "c2"), "{case}");
+                assert_eq!(ms_docstore::read_value(&bubbles_doc(&project)).unwrap(), Some(serde_json::json!([{"id": 3}])), "{case}");
+                let leftovers: Vec<String> = [project.clone(), committed_layers.clone()]
+                    .iter()
+                    .flat_map(|dir| fs::read_dir(dir).unwrap())
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .filter(|name| name.ends_with(".tmp") || name.ends_with("-journal"))
+                    .collect();
+                assert!(leftovers.is_empty(), "{case}: {leftovers:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn new_staging_documents_join_the_chapter_format() {
+        // A staging manifest / bubbles document created in-session takes the chapter's format
+        // (docstore rule B.3), not the process default: DB chapter -> `.db`, JSON chapter -> `.json`.
+        use ms_docstore::DocFormat;
+        use ms_page_ops::chapter_docs::{bubbles_doc, layers_doc};
+        for chapter_format in [DocFormat::Json, DocFormat::Db] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("ch");
+            let unsaved = tmp.path().join("ch_unsaved");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(ms_config::BUBBLES_FILE), b"[]").unwrap();
+            put_in_format(&bubbles_doc(&project), chapter_format);
+
+            let pic = img([2, 2], Color32::WHITE);
+            save_page_rasters(&unsaved.join(ms_config::LAYERS_DIR), 0, &[fixture_raster("r0", &pic)], &[], &[]).unwrap();
+            crate::bubbles_model::write_bubbles_snapshot_to(&unsaved.join(ms_config::BUBBLES_FILE), &[]).unwrap();
+            for doc in [layers_doc(&unsaved), bubbles_doc(&unsaved)] {
+                assert!(doc.path_for(chapter_format).is_file(), "{chapter_format:?}: {} created in the chapter format", doc.stem().display());
+                assert!(!doc.path_for(other_format(chapter_format)).exists(), "{chapter_format:?}");
+            }
+        }
+    }
+
+    /// A raster-only save prunes only files the committed page no longer references: the page's live
+    /// `_text.png` renders share the `ps_p{page}_` prefix and must survive it, while a removed
+    /// raster's base PNG is pruned (after the manifest write).
+    #[test]
+    fn raster_save_prune_keeps_referenced_text_pngs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let raster = |uid: &str| RasterLayerOut {
+            uid: uid.into(),
+            name: uid.into(),
+            visible: true,
+            opacity: 1.0,
+            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            group_uid: None,
+            image: &PNG_2X2,
+            pixels_dirty: true,
+            mask_clip: None,
+        };
+        save_page_rasters(dir, 0, &[raster("r1"), raster("r2")], &[], &[]).expect("rasters");
+        let text_png = write_text_image(dir, 0, "t", &img([2, 2], Color32::WHITE)).expect("text png");
+        let mut t = text_payload_out("t", 5, 0, false);
+        t.rendered_file = Some(text_png.clone());
+        write_page_text_payload(dir, None, 0, &[t]).expect("text");
+
+        save_page_rasters(dir, 0, &[raster("r1")], &[], &["r2".to_string()]).expect("drop r2");
+        assert!(dir.join(&text_png).is_file(), "a referenced text render must survive a raster save");
+        assert!(dir.join(base_file_name(0, "r1")).is_file());
+        assert!(!dir.join(base_file_name(0, "r2")).exists(), "the removed raster's PNG is pruned");
+    }
+
+    /// A committed chapter whose page 3 holds `rasters` and no text, plus a doc that loaded page 3 from
+    /// it (staging absent, as right after a reopen). Returns `(committed, unsaved, doc)`.
+    fn reopened_raster_only_page(root: &Path, rasters: &[&str]) -> (PathBuf, PathBuf, crate::layer_model::layer_doc::LayerDoc) {
+        let committed = root.join("layers");
+        let unsaved = root.join("layers_unsaved");
+        let outs: Vec<RasterLayerOut> = rasters
+            .iter()
+            .map(|uid| RasterLayerOut {
+                uid: (*uid).into(),
+                name: (*uid).into(),
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                deform: None,
+                group_uid: None,
+                image: &PNG_2X2,
+                pixels_dirty: true,
+                mask_clip: None,
+            })
+            .collect();
+        save_page_rasters(&committed, 3, &outs, &[], &[]).expect("seed committed rasters");
+        let page_sizes: HashMap<usize, [usize; 2]> = (0..=3).map(|p| (p, [2, 2])).collect();
+        let mut doc = crate::layer_model::layer_doc::LayerDoc::new();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes).expect("load page 3");
+        let loaded = doc.page(3).expect("resident").nodes.iter().filter(|n| n.is_raster()).count();
+        assert_eq!(loaded, rasters.len(), "seed: the doc loaded every committed raster");
+        (committed, unsaved, doc)
+    }
+
+    /// Raster uids of page 3 as the loader resolves it (`primary` first, per-page committed fallback).
+    fn page3_raster_uids(primary: &Path, fallback: Option<&Path>) -> Vec<String> {
+        load_page_rasters(primary, fallback, 3).expect("load rasters").layers.into_iter().map(|l| l.uid).collect()
+    }
+
+    /// Deleting EVERY raster of a text-less page through the synchronous doc flush must persist: the
+    /// emptied page stays PRESENT-but-EMPTY in staging (it overrides committed), survives the text
+    /// write of the same flush, and the merge writes it into committed.
+    #[test]
+    fn deleting_every_raster_of_a_textless_page_persists_through_the_sync_flush() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, unsaved, mut doc) = reopened_raster_only_page(tmp.path(), &["r1"]);
+
+        assert!(doc.remove_node(3, "r1"));
+        doc.flush_page_dropping_raster(3, &unsaved, Some(committed.as_path()), "r1").expect("flush");
+
+        assert!(page3_raster_uids(&unsaved, Some(committed.as_path())).is_empty(), "staging view: the deleted raster must not fall back to committed");
+        let owned: HashSet<usize> = [3].into_iter().collect();
+        merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).expect("merge");
+        assert!(page3_raster_uids(&committed, None).is_empty(), "after save-to-project the deleted raster must not come back");
+    }
+
+    /// A text tombstone (text-only page whose last text was deleted, staged PRESENT-but-EMPTY) must
+    /// survive a later raster save that carries no rasters — e.g. the PS editor persisting that page
+    /// on leave. Removing the empty page would make the committed text resurrect.
+    #[test]
+    fn an_empty_raster_save_keeps_a_staged_text_tombstone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let committed = tmp.path().join("layers");
+        let unsaved = tmp.path().join("layers_unsaved");
+        let file = write_text_image(&committed, 3, "t3", &img([2, 2], Color32::GREEN)).expect("text png");
+        let mut t3 = text_payload_out("t3", 1, 0, false);
+        t3.rendered_file = Some(file);
+        write_page_text_payload(&committed, None, 3, &[t3]).expect("committed text");
+
+        // Delete the last text: the text writer stages the page PRESENT-but-EMPTY.
+        write_page_text_payload(&unsaved, Some(committed.as_path()), 3, &[]).expect("tombstone");
+        assert!(load_page_text_nodes(&unsaved, Some(committed.as_path()), 3).expect("load").is_empty());
+
+        // Both raster writers a PS page-leave can take: the sync free fn and the saver's transaction.
+        save_page_rasters(&unsaved, 3, &[], &[], &[]).expect("empty raster save");
+        assert!(load_page_text_nodes(&unsaved, Some(committed.as_path()), 3).expect("load").is_empty(), "sync raster save must keep the tombstone");
+        let mut txn = ManifestTxn::begin(&unsaved).expect("txn");
+        txn.save_page_rasters(3, &[], &[], &[], Some(committed.as_path())).expect("txn raster save");
+        txn.commit().expect("commit");
+        assert!(load_page_text_nodes(&unsaved, Some(committed.as_path()), 3).expect("load").is_empty(), "txn raster save must keep the tombstone");
+
+        let owned: HashSet<usize> = [3].into_iter().collect();
+        merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).expect("merge");
+        assert!(load_page_text_nodes(&committed, None, 3).expect("load").is_empty(), "the deleted text must not come back");
+    }
+
+    /// A raster-only save on a page staged nowhere yet seeds it from committed, so the committed TEXT of
+    /// that page stays visible in staging when the rasters are deleted (and a page with nothing to
+    /// change writes nothing).
+    #[test]
+    fn raster_save_with_fallback_seeds_committed_text_and_elides_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, unsaved, _doc) = reopened_raster_only_page(tmp.path(), &["r1"]);
+        let file = write_text_image(&committed, 3, "t3", &img([2, 2], Color32::GREEN)).expect("text png");
+        let mut t3 = text_payload_out("t3", 9, 0, false);
+        t3.rendered_file = Some(file);
+        write_page_text_payload(&committed, None, 3, &[t3]).expect("committed text");
+
+        // A save that owns nothing and removes nothing leaves staging untouched.
+        let mut txn = ManifestTxn::begin(&unsaved).expect("txn");
+        txn.save_page_rasters(3, &[], &[], &[], Some(committed.as_path())).expect("no-op save");
+        assert!(!txn.is_dirty(), "a raster save that changes nothing must not stage the page");
+        drop(txn);
+        assert!(!unsaved.join(MANIFEST_FILE).exists());
+
+        let mut txn = ManifestTxn::begin(&unsaved).expect("txn");
+        txn.save_page_rasters(3, &[], &[], &["r1".to_string()], Some(committed.as_path())).expect("delete r1");
+        txn.commit().expect("commit");
+        assert!(page3_raster_uids(&unsaved, Some(committed.as_path())).is_empty(), "r1 deleted");
+        assert_eq!(load_page_text_nodes(&unsaved, Some(committed.as_path()), 3).expect("load").len(), 1, "committed text stays visible in staging");
+    }
+
+    static PNG_2X2: std::sync::LazyLock<ColorImage> = std::sync::LazyLock::new(|| ColorImage::filled([2, 2], Color32::RED));
 }

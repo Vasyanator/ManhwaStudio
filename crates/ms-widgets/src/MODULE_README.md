@@ -38,7 +38,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
   (not in the binary) because it is a pure egui-input primitive over `ms_config::app_tab::AppTab`:
   the binary's `app.rs` and settings hotkeys pane AND the `ms-tab-translation` crate both register
-  specs with it. Defaults stay in Rust code; only user overrides are stored on disk.
+  specs with it. Defaults stay in Rust code; only user overrides are stored on disk (read via
+  `ms_docstore::read_value`, written via `ms_config::update_user_config_file`).
 - `ui_fonts.rs`: the single owner of the bundled `fonts/ui` stack. Every egui context the
   application creates installs the same chain through it, off the GUI thread. Native-only
   internals (`mod desktop`); the wasm build compiles the two entry points to no-ops.
@@ -59,6 +60,9 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `desired_rows` ignored). Everything else — the spellcheck layouter, the builder methods, and the
   `TextEditOutput` contract — is shared, so a caller that needs a genuinely one-line value must pick
   `singleline` rather than `multiline().desired_rows(1)`.
+  The project word list lives in the title `settings.json` and is accessed ONLY through
+  `ms_docstore` (`read_value`, `signature`, and an `update` that edits only
+  `canvas.project_custom_spellcheck_words`, so it cannot revert keys other writers own).
   The active dictionary follows the TYPESETTING language (`ms_text_util::language::text_language`,
   like hyphenation and font coverage), never the UI language. `dictionary_spec(language)` is the
   language→dictionary provenance table (on-disk stem + verified `.aff`/`.dic` URLs); it is pure,

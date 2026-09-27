@@ -1352,14 +1352,24 @@ fn ensure_uv_runtime(
     resolve_uv_executable(&uv_dir)
 }
 
+/// Reads `General.ai_install_type` from `root_dir/user_config.json` as a read-only probe.
+///
+/// Never creates or rewrites the document (no default backfill): the only value read here
+/// has the default `None`, which is also what an absent key yields. An absent document
+/// means `None`; an unreadable or malformed one is logged and also treated as `None`, so
+/// the update continues without the Full-only PyTorch step.
 fn read_current_ai_install_type(root_dir: &Path) -> config::AiInstallType {
-    let cfg = config::JsonConfig::new(
-        root_dir.join(config::USER_CONFIG_FILE),
-        config::user_config_defaults(),
-    );
-    match cfg {
-        Ok(cfg) => config::AiInstallType::from_user_settings(&cfg.data),
-        Err(_) => config::AiInstallType::None,
+    let doc = ms_docstore::DocRef::new(root_dir.join(config::USER_CONFIG_FILE), ms_docstore::DocKind::UserConfig);
+    match ms_docstore::read_value(&doc) {
+        Ok(Some(settings)) => config::AiInstallType::from_user_settings(&settings),
+        Ok(None) => config::AiInstallType::None,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[update] failed to read the AI install type of '{}': {err}; assuming None",
+                root_dir.display()
+            ));
+            config::AiInstallType::None
+        }
     }
 }
 
@@ -5396,5 +5406,25 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(".part"))
             .collect();
         assert!(leftovers.is_empty(), "staging files must not survive a failure: {leftovers:?}");
+    }
+
+    /// The update's install-type probe must never create or rewrite the install
+    /// target's `user_config.json` (no default backfill on disk).
+    #[test]
+    fn read_current_ai_install_type_is_read_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(super::config::USER_CONFIG_FILE);
+
+        assert_eq!(super::read_current_ai_install_type(dir.path()), super::config::AiInstallType::None);
+        assert!(!path.exists(), "an absent user config must stay absent");
+
+        let raw = r#"{"General":{"ai_install_type":"Full"}}"#;
+        std::fs::write(&path, raw).expect("fixture must be writable");
+        assert_eq!(super::read_current_ai_install_type(dir.path()), super::config::AiInstallType::Full);
+        assert_eq!(std::fs::read_to_string(&path).expect("fixture readable"), raw, "no defaults may be backfilled");
+
+        std::fs::write(&path, "{ not json").expect("fixture must be writable");
+        assert_eq!(super::read_current_ai_install_type(dir.path()), super::config::AiInstallType::None);
+        assert_eq!(std::fs::read_to_string(&path).expect("fixture readable"), "{ not json");
     }
 }

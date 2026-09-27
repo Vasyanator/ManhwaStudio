@@ -28,26 +28,24 @@ ADDED serde-default `Option` fields, so an older file is already a valid newer o
 */
 
 use super::manifest::{LayersManifest, LAYERS_SCHEMA_VERSION};
+use ms_docstore::{DocKind, DocRef};
 use serde_json::Value;
 use std::path::Path;
 
 /// Reads `layers.json` at `path` and returns it as a canonical, current-version `LayersManifest`,
-/// migrating any older format up. `Ok(None)` when the file does not exist; `Err` only on IO / JSON
+/// migrating any older format up. `Ok(None)` when the document does not exist; `Err` only on IO / JSON
 /// errors. This is the one entry point `persist::read_manifest` delegates to.
+///
+/// The read goes through `ms_docstore` (the owner of the chapter documents; unlocked, the atomic
+/// writer guarantees an untorn file). Error strings keep their historical `read …` / `parse …` shape.
 pub fn read_manifest(path: &Path) -> Result<Option<LayersManifest>, String> {
-    // Route existence + read through the storage seam so the web backend uses its virtual store.
-    // `exists()` is a slight widening of the previous `is_file()` (it also matches a directory), but
-    // `layers.json` is a deterministic FILE name, so a directory there would be a corrupt project and
-    // the subsequent `read_to_string` would surface it as an error rather than silently succeeding.
-    let path_str = path.to_string_lossy();
-    if !ms_storage::global::storage().exists(path_str.as_ref()) {
-        return Ok(None);
-    }
-    let text = ms_storage::global::storage()
-        .read_to_string(path_str.as_ref())
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let value: Value =
-        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let doc = DocRef::new(path, DocKind::Layers);
+    let value = match ms_docstore::read_value(&doc) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Ok(None),
+        Err(ms_docstore::DocStoreError::Malformed { cause, .. }) => return Err(format!("parse {}: {cause}", path.display())),
+        Err(err) => return Err(format!("read {}: {err}", path.display())),
+    };
     let manifest = manifest_from_value(value, &path.display().to_string())?;
     Ok(Some(manifest))
 }

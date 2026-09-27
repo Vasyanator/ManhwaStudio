@@ -68,6 +68,12 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - Successful installation records `General.ai_install_type` in the installed `user_config.json`:
   fast/base writes `Base`, full writes `Full`. This is done by the UI on a successful worker
   result, for both installer purposes.
+- The install target's `user_config.json` belongs to ANOTHER root than the running process's
+  `data_dir()`, so it is always named as `ms_docstore::DocRef::new(root.join(USER_CONFIG_FILE),
+  DocKind::UserConfig)` and never opened directly: the install-type record is one
+  `ms_docstore::update` (backfills missing defaults, never overwrites a malformed file), and
+  every other access (`venv_check`, the update worker's install-type probe) is a read-only
+  `ms_docstore::read_value` that must not create or rewrite the document.
 - Environment repair provisions ONLY the Python environment of an existing root. It must NEVER:
   download or extract `ManhwaStudio.zip`, copy the executable, write the app icon, create
   shortcuts, touch the Windows registry, run `finalize_windows_post_install`, request elevation,

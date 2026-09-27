@@ -31,6 +31,9 @@ Key structures:
 Key functions:
 - execute_page_op(): run one operation as a crash-safe transaction.
 - recover_pending_page_op(): resolve an interrupted transaction at project load.
+- chapter_docs::chapter_doc_for_write(): the `DocRef` (with the chapter-format hint) every
+  writer of a chapter's `layers` / bubbles document uses; chapter_doc_durability(): its
+  staging-vs-committed durability.
 
 Notes:
 Structural operations are applied immediately to BOTH trees (committed and
@@ -47,6 +50,10 @@ project afterwards. Must never run on the GUI thread.
 // preview uses the engine's own canvas size, point mappings and crop legality
 // rule instead of a second copy of the formulas.
 pub mod crop_geometry;
+// The chapter's owned documents as `ms_docstore::DocRef`s and the rule-B.3 "new chapter
+// document joins the chapter's format" decision, shared by the save merge (`ms-project`)
+// and the staging savers (`ms-models`).
+pub mod chapter_docs;
 mod fs_exec;
 mod json_remap;
 mod plan;

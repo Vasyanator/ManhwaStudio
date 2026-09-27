@@ -1,3 +1,28 @@
+/*
+File: crates/ms-tabs-simple/src/characters.rs
+
+Purpose:
+«Персонажи» tab: character cards (portrait, name, groups, description) over the title's
+`characters/characters.json`, plus the readers other crates use.
+
+Key structures:
+- `CharactersTabState`: cached roster, filters, editor and portrait-thumbnail state.
+- `CharacterEntry`: persisted roster entry (`name`, `description`, `group`).
+
+Key functions:
+- `load_character_names()` / `load_characters_for_notes()`: roster readers for the
+  translation tab and the notes worker.
+- `load_entries()` / `save_entries()`: the only access to `characters.json`, through
+  `ms_docstore` (`read` / atomic `write`).
+
+Notes:
+- A malformed `characters.json` is reported and left untouched, also by later saves
+  (`load_error` blocks them; `save_entries_in` refuses a malformed existing document); the
+  legacy `*.txt` migration runs only when the document is absent.
+- Roster load/save still run on the GUI thread (pre-existing AGENTS.md §5 gap); portraits
+  and clipboard work are worker-driven.
+*/
+
 use ms_sysprobe::paste_image;
 use ms_project::ProjectData;
 use ms_widgets::WheelComboBox;
@@ -194,6 +219,11 @@ pub struct CharactersTabState {
     thumb_texture_serial: u64,
     clipboard_rx: Option<Receiver<ClipboardImageResult>>,
     clipboard_in_flight: bool,
+    /// The localized load failure of the current roster, while it lasts. `entries` is then
+    /// EMPTY (not the document's content), so every save and delete is refused and this
+    /// message shown again: writing the empty list back would replace the unreadable or
+    /// malformed file. Cleared only by a successful (re)load.
+    load_error: Option<String>,
 }
 
 impl Default for CharactersTabState {
@@ -218,6 +248,7 @@ impl Default for CharactersTabState {
             thumb_texture_serial: 0,
             clipboard_rx: None,
             clipboard_in_flight: false,
+            load_error: None,
         }
     }
 }
@@ -746,6 +777,9 @@ impl CharactersTabState {
         project: &ProjectData,
         pending: PendingSave,
     ) -> Option<CharactersTabAction> {
+        if !self.writes_allowed() {
+            return None;
+        }
         let original_name = match &pending.mode {
             EditorMode::Add => None,
             EditorMode::Edit { original_name } => Some(original_name.clone()),
@@ -836,6 +870,9 @@ impl CharactersTabState {
         project: &ProjectData,
         name: &str,
     ) -> Option<CharactersTabAction> {
+        if !self.writes_allowed() {
+            return None;
+        }
         let Some(idx) = self.find_entry_index(name) else {
             self.error_message = Some(t!("characters.save.already_deleted").to_string());
             return None;
@@ -854,6 +891,18 @@ impl CharactersTabState {
         self.info_message = Some(t!("characters.save.deleted").to_string());
         self.editor = None;
         Some(CharactersTabAction::CharactersChanged)
+    }
+
+    /// Whether the in-memory roster may be written back. After a failed load it may not
+    /// (see `load_error`); the load error is then shown again instead.
+    fn writes_allowed(&mut self) -> bool {
+        match &self.load_error {
+            Some(load_error) => {
+                self.error_message = Some(load_error.clone());
+                false
+            }
+            None => true,
+        }
     }
 
     fn ensure_loaded(&mut self, project: &ProjectData) {
@@ -881,12 +930,15 @@ impl CharactersTabState {
         match load_entries(project) {
             Ok(entries) => {
                 self.entries = entries;
+                self.load_error = None;
                 self.rebuild_group_filters();
             }
             Err(err) => {
                 self.entries.clear();
                 self.rebuild_group_filters();
-                self.error_message = Some(tf!("characters.save.load_error", err = err));
+                let message = tf!("characters.save.load_error", err = err);
+                self.error_message = Some(message.clone());
+                self.load_error = Some(message);
             }
         }
     }
@@ -1193,37 +1245,54 @@ fn save_color_image_png(path: &Path, image: &ColorImage) -> Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
+/// Loads the title's character roster (`characters/characters.json`), normalized
+/// (trimmed non-empty names, normalized groups, deduped and sorted by lowercase name).
+///
+/// When the document is ABSENT, legacy `characters/*.txt` files are migrated: they are
+/// written as the new `characters.json` and then deleted.
+///
+/// # Errors
+/// Returns a technical message when the characters directory cannot be created, the
+/// document cannot be read, or it does not parse as a roster. A malformed
+/// `characters.json` is NEVER replaced: no migration runs and the `*.txt` files stay.
 fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
+    load_entries_in(&project.paths.characters_dir)
+}
+
+/// [`load_entries`] for the characters directory `chars_dir`.
+///
+/// # Errors
+/// As [`load_entries`].
+fn load_entries_in(chars_dir: &Path) -> Result<Vec<CharacterEntry>, String> {
     let store = ms_storage::global::storage();
-    let chars_dir = &project.paths.characters_dir;
     let chars_dir_str = chars_dir.to_string_lossy();
     store
         .create_dir_all(chars_dir_str.as_ref())
         .map_err(|err| err.to_string())?;
-    let json_path = json_path_for(project);
-    let json_path_str = json_path.to_string_lossy();
-    if store.exists(json_path_str.as_ref()) {
-        let raw = store
-            .read_to_string(json_path_str.as_ref())
-            .map_err(|err| err.to_string())?;
-        if let Ok(parsed) = serde_json::from_str::<Vec<CharacterEntry>>(&raw) {
-            let mut normalized = parsed
-                .into_iter()
-                .filter_map(|entry| {
-                    let name = entry.name.trim().to_string();
-                    if name.is_empty() {
-                        return None;
-                    }
-                    Some(CharacterEntry {
-                        name,
-                        description: entry.description,
-                        groups: normalize_groups(entry.groups),
-                    })
+    let json_path = chars_dir.join(CHARACTERS_FILE_NAME);
+    if let Some(parsed) = ms_docstore::read::<Vec<CharacterEntry>>(&characters_doc(chars_dir)).map_err(|err| {
+        ms_log::runtime_log::log_error(format!(
+            "[characters::load] failed to load characters; path={} error={err} possible_cause=damaged characters.json (left untouched, no txt migration)",
+            json_path.display()
+        ));
+        err.to_string()
+    })? {
+        let mut normalized = parsed
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.name.trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(CharacterEntry {
+                    name,
+                    description: entry.description,
+                    groups: normalize_groups(entry.groups),
                 })
-                .collect::<Vec<_>>();
-            dedupe_and_sort_entries(&mut normalized);
-            return Ok(normalized);
-        }
+            })
+            .collect::<Vec<_>>();
+        dedupe_and_sort_entries(&mut normalized);
+        return Ok(normalized);
     }
 
     let mut from_txt = Vec::new();
@@ -1262,7 +1331,9 @@ fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
         }
     }
     dedupe_and_sort_entries(&mut from_txt);
-    save_entries(project, &from_txt)?;
+    // The `*.txt` sources are deleted right below, so the new roster's directory entry must
+    // be durable first (otherwise a power loss could leave neither).
+    save_entries_in(chars_dir, &from_txt, ms_docstore::Durability::ContentsAndDirectory)?;
     for path in txt_files_to_remove {
         let path_str = path.to_string_lossy();
         let _ = store.remove_file(path_str.as_ref());
@@ -1270,29 +1341,38 @@ fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
     Ok(from_txt)
 }
 
+/// Replaces the title's `characters.json` with `entries` (atomic write through the
+/// document store, historical 2-space layout without a trailing newline; the characters
+/// directory is created when missing). Runs on the GUI thread, so the write is not fsynced
+/// (`Durability::None`: a crash may lose it, never tear the file).
+///
+/// # Errors
+/// Returns a technical message when the existing document cannot be read or is malformed
+/// (it is never replaced), or the new one cannot be serialized or written.
 fn save_entries(project: &ProjectData, entries: &[CharacterEntry]) -> Result<(), String> {
-    let store = ms_storage::global::storage();
-    let chars_dir_str = project.paths.characters_dir.to_string_lossy();
-    store
-        .create_dir_all(chars_dir_str.as_ref())
-        .map_err(|err| err.to_string())?;
-    let path = json_path_for(project);
-    let tmp = path.with_extension("json.tmp");
-    let path_str = path.to_string_lossy();
-    let tmp_str = tmp.to_string_lossy();
-    let raw = serde_json::to_string_pretty(entries).map_err(|err| err.to_string())?;
-    store
-        .write(tmp_str.as_ref(), raw.as_bytes())
-        .map_err(|err| err.to_string())?;
-    if store.exists(path_str.as_ref()) {
-        store
-            .remove_file(path_str.as_ref())
-            .map_err(|err| err.to_string())?;
-    }
-    store
-        .rename(tmp_str.as_ref(), path_str.as_ref())
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    save_entries_in(&project.paths.characters_dir, entries, ms_docstore::Durability::None)
+}
+
+/// [`save_entries`] for the characters directory `chars_dir` with `durability`. Under the
+/// document lock the existing document is read first: an unreadable or malformed one is
+/// NEVER replaced (the check and the write are one critical section).
+///
+/// # Errors
+/// As [`save_entries`].
+fn save_entries_in(chars_dir: &Path, entries: &[CharacterEntry], durability: ms_docstore::Durability) -> Result<(), String> {
+    let options = ms_docstore::WriteOptions { durability, ..ms_docstore::WriteOptions::default() };
+    ms_docstore::with_lock(&characters_doc(chars_dir), |locked| {
+        locked.read_value().map_err(|err| err.to_string())?;
+        locked.write(entries, options).map(|_| ()).map_err(|err| err.to_string())
+    })
+}
+
+/// File name of the roster inside a title's characters directory.
+const CHARACTERS_FILE_NAME: &str = "characters.json";
+
+/// The roster `characters.json` inside `chars_dir` as a docstore document.
+fn characters_doc(chars_dir: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(chars_dir.join(CHARACTERS_FILE_NAME), ms_docstore::DocKind::Characters)
 }
 
 fn dedupe_and_sort_entries(entries: &mut Vec<CharacterEntry>) {
@@ -1352,10 +1432,77 @@ fn sanitize_texture_id(name: &str) -> String {
         .collect()
 }
 
-fn json_path_for(project: &ProjectData) -> PathBuf {
-    project.paths.characters_dir.join("characters.json")
-}
-
 fn image_path_for(project: &ProjectData, name: &str) -> PathBuf {
     project.paths.characters_dir.join(format!("{name}.png"))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod persistence_tests {
+    use super::{CHARACTERS_FILE_NAME, CharacterEntry, CharactersTabState, load_entries_in, save_entries_in};
+    use ms_docstore::Durability;
+
+    fn io<T, E: std::fmt::Display>(result: Result<T, E>) -> Result<T, String> {
+        result.map_err(|err| err.to_string())
+    }
+
+    /// Declared behavior change: a malformed `characters.json` is reported and left
+    /// byte-identical, and the legacy `*.txt` files are neither migrated nor deleted.
+    #[test]
+    fn malformed_roster_is_never_replaced_by_txt_migration() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let json = dir.path().join(CHARACTERS_FILE_NAME);
+        let txt = dir.path().join("Alice.txt");
+        io(std::fs::write(&json, "[{\"name\": "))?;
+        io(std::fs::write(&txt, "legacy"))?;
+        assert!(load_entries_in(dir.path()).is_err());
+        assert_eq!(io(std::fs::read_to_string(&json))?, "[{\"name\": ");
+        assert!(txt.exists());
+        Ok(())
+    }
+
+    /// An absent roster is migrated from `*.txt` (written, then the txt removed), and a
+    /// saved roster reads back normalized in the historical layout.
+    #[test]
+    fn absent_roster_migrates_txt_and_round_trips() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let txt = dir.path().join("Bob.txt");
+        io(std::fs::write(&txt, " about bob \n"))?;
+        let migrated = load_entries_in(dir.path())?;
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].name, "Bob");
+        assert_eq!(migrated[0].description, "about bob");
+        assert!(!txt.exists());
+
+        let entries = vec![CharacterEntry { name: "Zed".to_string(), description: String::new(), groups: vec!["a".to_string()] }];
+        save_entries_in(dir.path(), &entries, Durability::None)?;
+        let raw = io(std::fs::read_to_string(dir.path().join(CHARACTERS_FILE_NAME)))?;
+        assert_eq!(raw, io(serde_json::to_string_pretty(&entries))?);
+        let loaded = load_entries_in(dir.path())?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].groups, vec!["a".to_string()]);
+        Ok(())
+    }
+
+    /// A save never replaces a malformed roster (e.g. corrupted after it was loaded).
+    #[test]
+    fn save_refuses_to_replace_a_malformed_roster() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let json = dir.path().join(CHARACTERS_FILE_NAME);
+        io(std::fs::write(&json, "[{\"name\": "))?;
+        let entries = vec![CharacterEntry { name: "Zed".to_string(), description: String::new(), groups: Vec::new() }];
+        assert!(save_entries_in(dir.path(), &entries, Durability::None).is_err());
+        assert_eq!(io(std::fs::read_to_string(&json))?, "[{\"name\": ");
+        Ok(())
+    }
+
+    /// After a failed load the tab refuses to write and shows the load error again.
+    #[test]
+    fn a_failed_load_blocks_writes_until_a_successful_reload() {
+        let mut state = CharactersTabState::default();
+        state.load_error = Some("load failed".to_string());
+        assert!(!state.writes_allowed());
+        assert_eq!(state.error_message.as_deref(), Some("load failed"));
+        state.load_error = None;
+        assert!(state.writes_allowed());
+    }
 }

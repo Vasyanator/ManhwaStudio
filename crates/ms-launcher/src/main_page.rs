@@ -8,6 +8,7 @@ Main responsibilities:
 - mirror the Python launcher's central menu card;
 - keep the button grid and footer layout isolated from runtime logic;
 - show installer-mode notices from `General.ai_install_type` under the main menu;
+- show the storage-mode conversion status line (progress, then a dismissable failure notice);
 - render the central UI card on top of the blur layer with the same button/status composition as launcher.py.
 */
 
@@ -135,6 +136,8 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
             show_ai_install_notice(ui, notice);
         }
 
+        show_storage_conversion_status(app, ui);
+
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.add_space(24.0);
             ui.label(theme::footer(&app.state.footer_label));
@@ -214,6 +217,44 @@ fn show_ai_install_notice(ui: &mut Ui, notice: AiInstallNotice) {
                 .wrap(),
             );
         });
+}
+
+/// Status of the process-wide storage-mode conversion (`storage_mode_job`) under the menu:
+/// a progress line while it runs (the startup reconciliation after an upgrade may take a
+/// while and never blocks the menu), then — only when documents failed — a notice listing
+/// them until the user dismisses it. Nothing is shown for a clean or absent job.
+fn show_storage_conversion_status(app: &mut LauncherApp, ui: &mut Ui) {
+    use ms_settings_ui::storage_mode_job::{self as job, ConversionJobState};
+
+    match job::conversion_job_state() {
+        ConversionJobState::Running { done, total, .. } => {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.colored_label(theme::TEXT_MUTED, tf!("launcher.storage.converting", done = done, total = total));
+            });
+            // Progress arrives from the worker without any input event.
+            ui.ctx().request_repaint_after(web_time::Duration::from_millis(100));
+        }
+        ConversionJobState::Finished { id, outcome, .. } if !outcome.is_complete() && app.state.storage_notice_dismissed_job != Some(id) => {
+            ui.add_space(14.0);
+            Frame::new()
+                .fill(Color32::from_rgba_premultiplied(96, 18, 22, 150))
+                .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(238, 96, 104, 170)))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.set_width(AI_INSTALL_NOTICE_WIDTH);
+                    ui.vertical(|ui| {
+                        ms_settings_ui::storage_mode_setting::draw_conversion_failures(ui, &outcome);
+                        if ui.button(t!("launcher.storage.dismiss")).clicked() {
+                            app.state.storage_notice_dismissed_job = Some(id);
+                        }
+                    });
+                });
+        }
+        ConversionJobState::Idle | ConversionJobState::Pending { .. } | ConversionJobState::Finished { .. } => {}
+    }
 }
 
 fn menu_top_space(viewport_height: f32, has_update_notice: bool) -> f32 {

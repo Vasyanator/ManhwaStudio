@@ -141,16 +141,33 @@ impl TutorialProgress {
     }
 }
 
-/// Load-modify-write the `Tutorials` section. `set_path` saves synchronously, so
-/// this runs on the background thread spawned by `persist`.
+/// Writes the `Tutorials` section of the real user config (see [`persist_to_config_at`]).
+/// Synchronous: runs on the background thread spawned by `persist`.
 fn persist_to_config(completed: &[String], autoplay: bool) -> anyhow::Result<()> {
-    let mut cfg = config::load_user_config()?;
-    cfg.set_path(
-        &["Tutorials", "completed"],
-        Value::Array(completed.iter().cloned().map(Value::String).collect()),
-    )?;
-    cfg.set_path(&["Tutorials", "autoplay"], Value::Bool(autoplay))?;
-    Ok(())
+    persist_to_config_at(&config::user_config_path(), completed, autoplay)
+}
+
+/// ONE serialized read-modify-write of the user-config document at `path`: backfills the
+/// missing default keys (the seeding `load_user_config` used to do before the write) and
+/// replaces `Tutorials.completed` / `Tutorials.autoplay`. Every other key survives; a
+/// malformed document is reported and never overwritten.
+///
+/// # Errors
+/// A read/parse/write failure of the document, with its path in the context.
+fn persist_to_config_at(path: &std::path::Path, completed: &[String], autoplay: bool) -> anyhow::Result<()> {
+    config::update_user_config_file(path, |root| {
+        config::merge_missing(root, &config::user_config_defaults());
+        let root_obj = root.as_object_mut().ok_or_else(|| anyhow::anyhow!("user config root is not an object"))?;
+        let section = root_obj.entry("Tutorials").or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !section.is_object() {
+            *section = Value::Object(serde_json::Map::new());
+        }
+        if let Value::Object(section) = section {
+            section.insert("completed".to_owned(), Value::Array(completed.iter().cloned().map(Value::String).collect()));
+            section.insert("autoplay".to_owned(), Value::Bool(autoplay));
+        }
+        Ok(())
+    })
 }
 
 /// Load progress once and wrap it in a shared handle for a surface to distribute
@@ -158,4 +175,35 @@ fn persist_to_config(completed: &[String], autoplay: bool) -> anyhow::Result<()>
 #[must_use]
 pub fn shared_progress() -> TutorialProgressHandle {
     Arc::new(Mutex::new(TutorialProgress::load()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn persist_writes_the_section_once_keeps_other_keys_and_seeds_defaults() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        std::fs::write(&path, serde_json::to_vec(&json!({"General": {"theme": "light"}, "Tutorials": {"autoplay": true, "extra": 1}}))?)?;
+        persist_to_config_at(&path, &["launcher_main".to_owned()], false)?;
+        let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(value["Tutorials"]["completed"], json!(["launcher_main"]));
+        assert_eq!(value["Tutorials"]["autoplay"], json!(false));
+        assert_eq!(value["Tutorials"]["extra"], json!(1), "unrelated keys of the section survive");
+        assert_eq!(value["General"]["theme"], json!("light"), "existing values are never replaced");
+        assert!(value["General"].get("ui_scale_percent").is_some(), "defaults are backfilled");
+        Ok(())
+    }
+
+    #[test]
+    fn persist_never_overwrites_a_malformed_config() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        std::fs::write(&path, b"{ broken")?;
+        assert!(persist_to_config_at(&path, &[], true).is_err());
+        assert_eq!(std::fs::read(&path)?, b"{ broken");
+        Ok(())
+    }
 }

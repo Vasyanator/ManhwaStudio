@@ -22,6 +22,9 @@ edition = "2024"
 # home of `version_format::version_core`, which reduces both sides of every release
 # comparison.
 ms-config = { path = "../ms-config" }
+# The install target's `user_config.json` is read and updated through the document store
+# (`DocRef` of kind `UserConfig`), never by opening the file directly.
+ms-docstore = { path = "../ms-docstore" }
 # Progress/diagnostic lines of the install and update flows (`ms_log::runtime_log`).
 ms-log = { path = "../ms-log" }
 # `gpu_utils` (accelerator + driver/runtime detection that picks the Torch variant) and

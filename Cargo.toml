@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 
 # Single pin for every third-party crate used by MORE THAN ONE manifest in this workspace.
 # Members write `<dep>.workspace = true` instead of repeating a version, so a version can no
@@ -148,6 +148,10 @@ ms-page-ops = { path = "crates/ms-page-ops" }
 # `ComicType`) and its load-time reconcile passes, re-exported as `crate::project`
 # from `src/main.rs`. Everything above it in `src/` reads the loaded project.
 ms-project = { path = "crates/ms-project" }
+# The owned-document store (every JSON document the app owns goes through it). The
+# binary names it directly only to pin the web build's document format at startup
+# (`src/web_entry.rs`); all reads/writes go through the crates that own each document.
+ms-docstore = { path = "crates/ms-docstore" }
 # Host-environment probes (GPU/accelerator detection, app-local Python runtime,
 # desktop region capture), re-exported as `crate::{gpu_utils, python_manager,
 # screen_capture}` from `src/main.rs`. Cross-target like the module declarations it

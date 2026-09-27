@@ -48,6 +48,10 @@ ms-gifs = { path = "../ms-gifs" }
 ms-config = { path = "../ms-config" }
 # The storage abstraction every preset/font/text-layer file goes through.
 ms-storage = { path = "../ms-storage" }
+# The document store that owns every JSON document this tab persists (`fonts_data.json`,
+# `presets.json`, the title's `char_favorites.json` / `color_presets.json`, and the
+# `user_config.json` reads): atomic writes, per-document write lock, optimistic baselines.
+ms-docstore = { path = "../ms-docstore" }
 # Image-cache budgets consulted before a page or preview raster is uploaded.
 ms-memory = { path = "../ms-memory" }
 # Every background worker this tab spawns goes through the project thread wrapper.
@@ -108,3 +112,7 @@ ms-config = { path = "../ms-config", features = ["test-support"] }
 # STANDALONE `cargo clippy -p ms-tab-typing` compile, which the workspace-wide feature
 # union would otherwise mask.
 ms-models = { path = "../ms-models", features = ["test-support"] }
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: it exposes the atomic-write step journal (`recorded_steps` / `WriteStep`) the
+# presets durability tests assert on.
+ms-docstore = { path = "../ms-docstore", features = ["test-support"] }

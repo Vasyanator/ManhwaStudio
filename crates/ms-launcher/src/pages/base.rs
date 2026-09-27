@@ -33,6 +33,9 @@ pub enum PageNavAction {
     OpenProject(OpenProjectSelection),
     StartUpdate,
     ProjectsRootChanged(PathBuf),
+    /// A storage-mode switch started from the settings page finished converting the
+    /// global/title documents; pages whose state depends on document formats refresh.
+    StorageModeChanged(config::StorageMode),
     AiInstallTypeChanged(config::AiInstallType),
 }
 

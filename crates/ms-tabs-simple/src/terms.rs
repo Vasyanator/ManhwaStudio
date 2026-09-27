@@ -8,7 +8,10 @@ Main items:
 - Editor/confirm windows: add/edit/delete flows and overwrite confirmation.
 
 Storage behavior:
-- Reads/writes `project.paths.terms_file`.
+- Reads/writes `project.paths.terms_file` ONLY through `ms_docstore` (`read` / atomic
+  `write`); load/save still run on the GUI thread (pre-existing AGENTS.md §5 gap), so saves
+  are not fsynced (`Durability::None`). After a failed load every save is refused
+  (`load_error`), and a save never replaces a malformed existing document.
 - Supports legacy `tags` wire format as string or string array.
 - Keeps names/tags normalized and sorted, with case-insensitive dedupe.
 */
@@ -137,6 +140,11 @@ pub struct TermsTabState {
     pending_delete_name: Option<String>,
     info_message: Option<String>,
     error_message: Option<String>,
+    /// The localized load failure of the current glossary, while it lasts. `entries` is
+    /// then EMPTY (not the document's content), so every save and delete is refused and
+    /// this message shown again: writing the empty list back would replace the unreadable
+    /// or malformed file. Cleared only by a successful (re)load.
+    load_error: Option<String>,
 }
 
 impl Default for TermsTabState {
@@ -152,6 +160,7 @@ impl Default for TermsTabState {
             pending_delete_name: None,
             info_message: None,
             error_message: None,
+            load_error: None,
         }
     }
 }
@@ -509,6 +518,9 @@ impl TermsTabState {
     }
 
     fn apply_pending_save(&mut self, project: &ProjectData, pending: PendingSave) -> bool {
+        if !self.writes_allowed() {
+            return false;
+        }
         match pending.mode {
             EditorMode::Add => {
                 if let Some(idx) = self.find_entry_index(&pending.entry.name) {
@@ -541,6 +553,9 @@ impl TermsTabState {
     }
 
     fn delete_term(&mut self, project: &ProjectData, name: &str) -> bool {
+        if !self.writes_allowed() {
+            return false;
+        }
         let Some(idx) = self.find_entry_index(name) else {
             self.error_message = Some(t!("terms.save.already_deleted").to_string());
             return false;
@@ -555,6 +570,18 @@ impl TermsTabState {
         self.editor = None;
         self.info_message = Some(t!("terms.save.deleted").to_string());
         true
+    }
+
+    /// Whether the in-memory glossary may be written back. After a failed load it may not
+    /// (see `load_error`); the load error is then shown again instead.
+    fn writes_allowed(&mut self) -> bool {
+        match &self.load_error {
+            Some(load_error) => {
+                self.error_message = Some(load_error.clone());
+                false
+            }
+            None => true,
+        }
     }
 
     fn ensure_loaded(&mut self, project: &ProjectData) {
@@ -579,12 +606,15 @@ impl TermsTabState {
         match load_entries(project) {
             Ok(entries) => {
                 self.entries = entries;
+                self.load_error = None;
                 self.rebuild_tag_filters();
             }
             Err(err) => {
                 self.entries.clear();
                 self.rebuild_tag_filters();
-                self.error_message = Some(tf!("terms.save.load_error", err = err));
+                let message = tf!("terms.save.load_error", err = err);
+                self.error_message = Some(message.clone());
+                self.load_error = Some(message);
             }
         }
     }
@@ -656,18 +686,25 @@ pub fn load_terms_for_notes(project: &ProjectData) -> Result<Vec<TermNoteEntry>,
         .collect())
 }
 
+/// Loads the title's glossary (`terms.json`), normalized (safe non-empty names, trimmed
+/// original names, normalized tags, deduped and sorted by lowercase name). An absent
+/// document is an empty glossary.
+///
+/// # Errors
+/// Returns a technical message when the document cannot be read or does not parse as a
+/// glossary; the file is left untouched.
 fn load_entries(project: &ProjectData) -> Result<Vec<TermEntry>, String> {
-    let store = ms_storage::global::storage();
-    let path = terms_path_for(project);
-    let path_str = path.to_string_lossy();
-    if !store.exists(path_str.as_ref()) {
-        return Ok(Vec::new());
-    }
+    load_entries_from(terms_path_for(project))
+}
 
-    let raw = store
-        .read_to_string(path_str.as_ref())
-        .map_err(|err| err.to_string())?;
-    let parsed: Vec<TermEntry> = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+/// [`load_entries`] for the glossary file `terms_file`.
+///
+/// # Errors
+/// As [`load_entries`].
+fn load_entries_from(terms_file: &Path) -> Result<Vec<TermEntry>, String> {
+    let Some(parsed) = ms_docstore::read::<Vec<TermEntry>>(&terms_doc(terms_file)).map_err(|err| err.to_string())? else {
+        return Ok(Vec::new());
+    };
 
     let mut normalized = parsed
         .into_iter()
@@ -688,31 +725,35 @@ fn load_entries(project: &ProjectData) -> Result<Vec<TermEntry>, String> {
     Ok(normalized)
 }
 
+/// Replaces the title's `terms.json` with `entries` (atomic write through the document
+/// store, historical 2-space layout without a trailing newline; the parent directory is
+/// created when missing). Runs on the GUI thread, so the write is not fsynced
+/// (`Durability::None`: a crash may lose it, never tear the file).
+///
+/// # Errors
+/// Returns a technical message when the existing document cannot be read or is malformed
+/// (it is never replaced), or the new one cannot be serialized or written.
 fn save_entries(project: &ProjectData, entries: &[TermEntry]) -> Result<(), String> {
-    let store = ms_storage::global::storage();
-    let path = terms_path_for(project);
-    if let Some(parent) = path.parent() {
-        let parent_str = parent.to_string_lossy();
-        store
-            .create_dir_all(parent_str.as_ref())
-            .map_err(|err| err.to_string())?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let path_str = path.to_string_lossy();
-    let tmp_str = tmp.to_string_lossy();
-    let raw = serde_json::to_string_pretty(entries).map_err(|err| err.to_string())?;
-    store
-        .write(tmp_str.as_ref(), raw.as_bytes())
-        .map_err(|err| err.to_string())?;
-    if store.exists(path_str.as_ref()) {
-        store
-            .remove_file(path_str.as_ref())
-            .map_err(|err| err.to_string())?;
-    }
-    store
-        .rename(tmp_str.as_ref(), path_str.as_ref())
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    save_entries_to(terms_path_for(project), entries, ms_docstore::Durability::None)
+}
+
+/// [`save_entries`] for the glossary file `terms_file` with `durability`. Under the
+/// document lock the existing document is read first: an unreadable or malformed one is
+/// NEVER replaced (the check and the write are one critical section).
+///
+/// # Errors
+/// As [`save_entries`].
+fn save_entries_to(terms_file: &Path, entries: &[TermEntry], durability: ms_docstore::Durability) -> Result<(), String> {
+    let options = ms_docstore::WriteOptions { durability, ..ms_docstore::WriteOptions::default() };
+    ms_docstore::with_lock(&terms_doc(terms_file), |locked| {
+        locked.read_value().map_err(|err| err.to_string())?;
+        locked.write(entries, options).map(|_| ()).map_err(|err| err.to_string())
+    })
+}
+
+/// The glossary file `terms_file` as a docstore document.
+fn terms_doc(terms_file: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(terms_file, ms_docstore::DocKind::Terms)
 }
 
 fn dedupe_and_sort_entries(entries: &mut Vec<TermEntry>) {
@@ -758,4 +799,63 @@ fn safe_name(raw: &str) -> String {
 
 fn terms_path_for(project: &ProjectData) -> &Path {
     &project.paths.terms_file
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod persistence_tests {
+    use super::{TermEntry, TermsTabState, load_entries_from, save_entries_to};
+    use ms_docstore::Durability;
+
+    fn io<T, E: std::fmt::Display>(result: Result<T, E>) -> Result<T, String> {
+        result.map_err(|err| err.to_string())
+    }
+
+    /// Absent glossary is empty; a malformed one is an error and stays byte-identical.
+    #[test]
+    fn absent_is_empty_and_malformed_is_left_untouched() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let path = dir.path().join("terms.json");
+        assert!(load_entries_from(&path)?.is_empty());
+        io(std::fs::write(&path, "{oops"))?;
+        assert!(load_entries_from(&path).is_err());
+        assert_eq!(io(std::fs::read_to_string(&path))?, "{oops");
+        Ok(())
+    }
+
+    /// A save never replaces a malformed glossary (e.g. corrupted after it was loaded).
+    #[test]
+    fn save_refuses_to_replace_a_malformed_glossary() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let path = dir.path().join("terms.json");
+        io(std::fs::write(&path, "{oops"))?;
+        let entries = vec![TermEntry { name: "Qi".to_string(), orig_name: String::new(), description: String::new(), tags: Vec::new() }];
+        assert!(save_entries_to(&path, &entries, Durability::None).is_err());
+        assert_eq!(io(std::fs::read_to_string(&path))?, "{oops");
+        Ok(())
+    }
+
+    /// After a failed load the tab refuses to write and shows the load error again.
+    #[test]
+    fn a_failed_load_blocks_writes_until_a_successful_reload() {
+        let mut state = TermsTabState { load_error: Some("load failed".to_string()), ..TermsTabState::default() };
+        assert!(!state.writes_allowed());
+        assert_eq!(state.error_message.as_deref(), Some("load failed"));
+        state.load_error = None;
+        assert!(state.writes_allowed());
+    }
+
+    /// A saved glossary keeps the historical layout (struct field order, no trailing
+    /// newline) and reads back.
+    #[test]
+    fn save_round_trips_in_historical_layout() -> Result<(), String> {
+        let dir = io(tempfile::tempdir())?;
+        let path = dir.path().join("terms.json");
+        let entries = vec![TermEntry { name: "Qi".to_string(), orig_name: "气".to_string(), description: "energy".to_string(), tags: vec!["x".to_string()] }];
+        save_entries_to(&path, &entries, Durability::None)?;
+        assert_eq!(io(std::fs::read_to_string(&path))?, io(serde_json::to_string_pretty(&entries))?);
+        let loaded = load_entries_from(&path)?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].orig_name, "气");
+        Ok(())
+    }
 }

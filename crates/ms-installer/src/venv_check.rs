@@ -95,7 +95,8 @@ impl NotReadyReason {
     }
 }
 
-/// Reads `root_dir/user_config.json` without creating or rewriting it.
+/// Reads `root_dir/user_config.json` through the document store without creating or
+/// rewriting it.
 ///
 /// An absent file yields an empty object (the same shape a fresh install has), so
 /// the caller sees "no recorded install type" instead of an error.
@@ -103,14 +104,12 @@ impl NotReadyReason {
 /// # Errors
 /// Returns a diagnostic message when the file exists but cannot be read or parsed.
 fn read_user_settings(root_dir: &Path) -> Result<serde_json::Value, String> {
-    let path = root_dir.join(config::USER_CONFIG_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-            .map_err(|err| format!("failed to parse {}: {err}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(serde_json::Value::Object(serde_json::Map::new()))
-        }
-        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+    let doc = ms_docstore::DocRef::new(root_dir.join(config::USER_CONFIG_FILE), ms_docstore::DocKind::UserConfig);
+    match ms_docstore::read_value(&doc) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(serde_json::Value::Object(serde_json::Map::new())),
+        // `DocStoreError`'s Display already names the path and the parse/OS cause.
+        Err(err) => Err(format!("failed to read user settings: {err}")),
     }
 }
 

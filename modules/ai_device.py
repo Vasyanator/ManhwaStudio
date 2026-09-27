@@ -677,6 +677,18 @@ def _diagnose_apple_metal() -> str:
     return "\n".join(parts)
 
 
+def set_config_path(document: dict, keys: tuple[str, ...], value: Any) -> None:
+    """Sets `document[k0]...[kn] = value`, replacing non-object intermediates with `{}`."""
+    node = document
+    for key in keys[:-1]:
+        nested = node.get(key)
+        if not isinstance(nested, dict):
+            nested = {}
+            node[key] = nested
+        node = nested
+    node[keys[-1]] = value
+
+
 class AIDevice(str):
     """
     Device wrapper that can be passed directly to torch.device(...).
@@ -770,23 +782,22 @@ class AIDevice(str):
 
     @staticmethod
     def _set_config_value(user_config: Any, value: str) -> None:
-        node = getattr(user_config, "config", None)
-        if not isinstance(node, dict):
-            raise TypeError("user_config must provide dict-like 'config' attribute")
+        """Persists `General.ai_device = value` and `General.ai_device_configured = True`.
 
-        cur = node
-        for key in AIDevice.CONFIG_PATH[:-1]:
-            nested = cur.get(key)
-            if not isinstance(nested, dict):
-                nested = {}
-                cur[key] = nested
-            cur = nested
-        cur[AIDevice.CONFIG_PATH[-1]] = value
-        cur[AIDevice.CONFIGURED_PATH[-1]] = True
+        `user_config` must provide `update(mutator)` (`config.BaseUserConfig` or the
+        backend's in-memory stand-in); only these two keys of the document are touched.
+        Store failures propagate (`docstore.DocStoreError`) so the IPC caller reports them.
+        """
+        update = getattr(user_config, "update", None)
+        if not callable(update):
+            raise TypeError("user_config must provide an 'update(mutator)' method")
 
-        save = getattr(user_config, "save", None)
-        if callable(save):
-            save()
+        def mutate(document: dict) -> None:
+            section = AIDevice.CONFIG_PATH[:-1]
+            set_config_path(document, AIDevice.CONFIG_PATH, value)
+            set_config_path(document, section + (AIDevice.CONFIGURED_PATH[-1],), True)
+
+        update(mutate)
 
     @staticmethod
     def _normalize_device(value: str) -> str:

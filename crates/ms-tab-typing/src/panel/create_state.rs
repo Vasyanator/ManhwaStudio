@@ -36,7 +36,7 @@ use super::*;
 
 /// Fonts directory a freshly constructed panel binds to.
 ///
-/// In a normal build this is `fonts::resolve_fonts_dir()`. Under `#[cfg(test)]` it is an
+/// In a normal build this is `ms_config::storage_mode::app_fonts_dir()`. Under `#[cfg(test)]` it is an
 /// INJECTED directory (`set_test_fonts_dir`), defaulting to a per-thread path that does not
 /// exist: a unit test must never depend on — or be timed by — whatever font bundle happens
 /// to sit next to the developer's checkout. Tests that DO want real font files create a temp
@@ -53,7 +53,7 @@ fn panel_fonts_dir() -> PathBuf {
     }
     #[cfg(not(test))]
     {
-        resolve_fonts_dir()
+        ms_config::storage_mode::app_fonts_dir()
     }
 }
 

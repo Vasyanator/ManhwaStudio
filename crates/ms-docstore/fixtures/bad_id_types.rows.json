@@ -1,0 +1,114 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/bools",
+    "parent": "",
+    "seg": "bools",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/bools/0",
+    "parent": "/bools",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/bools/0/id",
+    "parent": "/bools/0",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "true"
+  },
+  {
+    "path": "/bools/1",
+    "parent": "/bools",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/bools/1/id",
+    "parent": "/bools/1",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "false"
+  },
+  {
+    "path": "/floats",
+    "parent": "",
+    "seg": "floats",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/floats/0",
+    "parent": "/floats",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/floats/0/id",
+    "parent": "/floats/0",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "1.0"
+  },
+  {
+    "path": "/floats/1",
+    "parent": "/floats",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/floats/1/id",
+    "parent": "/floats/1",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "2.0"
+  },
+  {
+    "path": "/nested",
+    "parent": "",
+    "seg": "nested",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/nested/0",
+    "parent": "/nested",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/nested/0/id",
+    "parent": "/nested/0",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "[1]"
+  },
+  {
+    "path": "/nested/1",
+    "parent": "/nested",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/nested/1/id",
+    "parent": "/nested/1",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "[2]"
+  }
+]

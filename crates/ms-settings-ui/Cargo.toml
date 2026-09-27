@@ -25,6 +25,9 @@ tutorial = []
 ms-config = { path = "../ms-config" }
 # Diagnostics of the panes and of the backend supervisor (`ms_log::runtime_log`).
 ms-log = { path = "../ms-log" }
+# `DocStoreError`: recognizing a malformed user_config in the transaction error chain so
+# the General pane keeps its localized parse-error message.
+ms-docstore = { path = "../ms-docstore" }
 # Every widget these panes are built from (`WheelComboBox`, `WheelSlider`, `AiButton`, …).
 ms-widgets = { path = "../ms-widgets" }
 # `MemoryProfile` / `MemoryManager`: the memory-profile selector of the General pane.
@@ -44,6 +47,10 @@ ms-tab-translation = { path = "../ms-tab-translation" }
 ms-text-util = { path = "../ms-text-util" }
 # Named worker threads: no pane may probe, spawn or write on the GUI thread.
 ms-thread = { path = "../ms-thread" }
+# The storage-mode conversion driver (`storage_mode::convert_globals`) the General pane's
+# Dev/Prod switch and the startup reconciliation run on a worker. A domain crate, not a
+# tab: it never depends back on this one.
+ms-project = { path = "../ms-project" }
 # `ExecutionProvider` — the ONNX provider tokens the AI pane offers.
 ms-onnx = { path = "../ms-onnx" }
 # The panes are egui widgets; `eframe::egui` is re-exported through eframe in some files,
@@ -73,3 +80,7 @@ ms-native-runtime = { path = "../ms-native-runtime" }
 ms-window-geometry = { path = "../ms-window-geometry" }
 # The native folder picker behind the General pane's "projects root" button.
 rfd.workspace = true
+
+[dev-dependencies]
+# Isolated user-config files for the persistence tests (tutorial progress).
+tempfile.workspace = true

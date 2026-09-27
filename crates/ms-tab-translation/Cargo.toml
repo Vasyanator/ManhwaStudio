@@ -27,6 +27,9 @@ ms-canvas = { path = "../ms-canvas" }
 # `user_config.json` sections owned by this tab, the `AppTab` enum and the settings
 # deep-link enum.
 ms-config = { path = "../ms-config" }
+# The title `settings.json` sections this tab owns are written through the serialized
+# `ms_docstore::update`; `characters.json` is change-probed with `ms_docstore::signature`.
+ms-docstore = { path = "../ms-docstore" }
 # Diagnostics (`runtime_log`) for the OCR/MT/detector worker pipelines.
 ms-log = { path = "../ms-log" }
 # Image-cache budgets consulted before a page raster is uploaded.
@@ -95,3 +98,5 @@ ms-native-runtime = { path = "../ms-native-runtime" }
 # builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test
 # that installs a UI locale must hold (the active catalog is one `ArcSwap`).
 ms-config = { path = "../ms-config", features = ["test-support"] }
+# Temp directories for the `settings.json` persistence tests.
+tempfile.workspace = true

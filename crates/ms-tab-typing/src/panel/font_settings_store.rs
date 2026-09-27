@@ -56,7 +56,7 @@ Key functions:
 
 Notes:
 `use super::*;` pulls in the parent `panel` module's types and imports (`PathBuf`,
-`Path`, `HashSet`, `HashMap`, `thread` = `ms_thread`, `resolve_fonts_dir`, the `fonts_data`
+`Path`, `HashSet`, `HashMap`, `thread` = `ms_thread`, the `fonts_data`
 module and the `presets_io` load helper used for the one-time migration). The store is a
 plain `OnceLock<RwLock<StoreState>>`; it is not on any hot path, so no generation cache is
 needed. Seeding sets the state directly WITHOUT bumping the revision or persisting (it is
@@ -444,7 +444,7 @@ fn persist_off_thread() {
     if persistence_suppressed_by_tests() {
         return;
     }
-    let fonts_dir = resolve_fonts_dir();
+    let fonts_dir = ms_config::storage_mode::app_fonts_dir();
     let spawn_result = thread::Builder::new()
         .name("typing-save-fonts-data".to_string())
         .spawn(move || save_snapshot_now(&fonts_dir));
@@ -474,7 +474,7 @@ fn persist_off_thread_debounced() {
     if persistence_suppressed_by_tests() {
         return;
     }
-    let fonts_dir = resolve_fonts_dir();
+    let fonts_dir = ms_config::storage_mode::app_fonts_dir();
     let spawn_result = thread::Builder::new()
         .name("typing-save-fonts-data-debounced".to_string())
         .spawn(move || {
@@ -521,7 +521,7 @@ pub(crate) fn flush_pending_saves() -> bool {
     if persistence_suppressed_by_tests() {
         return true;
     }
-    save_snapshot_now(&resolve_fonts_dir());
+    save_snapshot_now(&ms_config::storage_mode::app_fonts_dir());
     true
 }
 
@@ -1644,7 +1644,7 @@ fn merge_group_member(
 /// Sets the state directly WITHOUT bumping the revision or persisting via the mutators — this
 /// is the initial state, not a change, so a poller must not treat startup as a mutation.
 pub fn seed_imported_system_fonts_from_config() {
-    seed_from_fonts_dir(&resolve_fonts_dir());
+    seed_from_fonts_dir(&ms_config::storage_mode::app_fonts_dir());
 }
 
 /// Directory-parameterized core of [`seed_imported_system_fonts_from_config`], split out so

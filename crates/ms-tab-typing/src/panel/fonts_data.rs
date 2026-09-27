@@ -3,7 +3,7 @@ File: panel/fonts_data.rs
 
 Purpose:
 Serde schema and disk I/O for the app-level per-font settings document
-`fonts_data.json`, stored inside the app fonts directory (`resolve_fonts_dir()`).
+`fonts_data.json`, stored inside the app fonts directory (`ms_config::storage_mode::app_fonts_dir()`).
 This file is the single on-disk home for the user-imported system fonts, per-font
 settings (display-name override + default parameter profile + user-defined custom kerning
 pairs) and user-defined VIRTUAL font groups. Font discovery never picks it up because it
@@ -93,7 +93,7 @@ Key types:
   `sanitize_custom_kerning` on load and save)
 - `FontsData` (decoded in-memory form consumed by `font_settings_store`)
 - `LoadOutcome` (Missing / Loaded / Invalid load result)
-- `DocumentFingerprint` / `SaveBaseline` / `SaveError` (the write guard)
+- `Fingerprint` / `SaveBaseline` / `SaveError` (the write guard)
 - `QuarantineOutcome` (what happened to a corrupt document)
 - `SystemFontRef` (one imported system font: identity + last-known path hint)
 - `FontSettingsRecord` (per-font settings: display-name override + default profile +
@@ -106,12 +106,14 @@ Key functions:
 
 Notes:
 `use super::*;` pulls in the parent `panel` module's imports (`Path`, `PathBuf`,
-`fs`). The crash-safe write recipe and the fingerprint/baseline vocabulary live in
-`panel/doc_store.rs`, shared with `presets_store` (`DocumentFingerprint` / `SaveBaseline`
-are re-exported here under their historical names). Compiled
-unconditionally (no wasm cfg gates): raw `std::fs`. A read/parse failure yields
-`LoadOutcome::Invalid` with a `runtime_log` warning instead of degrading to empty, so
-imported fonts + overrides are never silently wiped.
+`fs`). The document is read and written ONLY through `ms_docstore` (`DocKind::FontsData`):
+the crash-safe write recipe, the per-document write lock and the fingerprint/baseline
+vocabulary (`Fingerprint` / `SaveBaseline`, re-exported here) all live there. The guard +
+write of `save_checked` run as ONE `ms_docstore::with_lock` critical section, and the
+conflict report's document and fingerprint come from ONE read (`read_typed_snapshot`). The
+quarantine rename/copy is `ms_docstore::quarantine` (under the same lock). A read/parse failure yields `LoadOutcome::Invalid` with a `runtime_log`
+warning instead of degrading to empty, so imported fonts + overrides are never silently
+wiped.
 */
 
 use super::*;
@@ -157,8 +159,25 @@ struct CustomKerningEntry {
     #[serde(default)]
     right: String,
     /// Advance delta in thousandths of an em. Negative tightens, positive widens.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_em_saturating")]
     em: f32,
+}
+
+/// Decodes `em` through `f64` and narrows it to `f32`, saturating an out-of-range magnitude to
+/// `±inf` so [`decode_custom_kerning`] drops the entry.
+///
+/// The workspace enables `serde_json/float_roundtrip` (required by `ms-docstore` for lossless
+/// document conversion); with it a direct `f32` decode of e.g. `1e39` fails the WHOLE document
+/// instead of yielding `inf`, which would turn one bad pair into an unreadable `fonts_data.json`.
+fn deserialize_em_saturating<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wide = f64::deserialize(deserializer)?;
+    // `as` from f64 to f32 rounds to nearest and saturates to ±inf beyond f32::MAX by
+    // definition — exactly the pre-`float_roundtrip` behavior the sanitizer relies on.
+    #[allow(clippy::cast_possible_truncation)] // deliberate saturating narrowing, see above
+    Ok(wide as f32)
 }
 
 /// One user-defined kerning pair override for a font, replacing whatever the font's own
@@ -341,6 +360,31 @@ pub(crate) fn data_path(fonts_dir: &Path) -> PathBuf {
     fonts_dir.join(FONTS_DATA_FILE_NAME)
 }
 
+/// The document-store name of the `fonts_data.json` document at `path`.
+#[must_use]
+fn document(path: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(path, ms_docstore::DocKind::FontsData)
+}
+
+/// How `fonts_data.json` is written: 2-space pretty JSON plus a trailing newline (the
+/// historical byte layout), fonts directory created on demand, and contents-only
+/// durability. Nothing deletes a data source once this document is written (the legacy
+/// `user_config` keys are dropped by `presets_store`, which uses the directory-durable
+/// mode), and a lost directory-entry flush at worst loses a brand-new file that the next
+/// mutation rewrites. The write is frequent (every debounced profile edit), so the extra
+/// directory fsync would be paid per keystroke for a guarantee this document does not need.
+/// The baseline is checked by the store under the document lock.
+#[must_use]
+fn write_options(baseline: SaveBaseline) -> ms_docstore::WriteOptions {
+    ms_docstore::WriteOptions {
+        durability: ms_docstore::Durability::Contents,
+        baseline,
+        pretty: true,
+        trailing_newline: true,
+        create_parent_dirs: true,
+    }
+}
+
 /// Typed result of attempting to load `fonts_data.json`. The three cases must be handled
 /// differently by the seeding logic: `Missing` is the normal first run (run the legacy
 /// migration), `Loaded` carries a parsed document (use it as-is), and `Invalid` means the
@@ -357,18 +401,17 @@ pub(crate) enum LoadOutcome {
         data: FontsData,
         /// Fingerprint of the exact bytes that were read — the caller's optimistic-concurrency
         /// baseline for its first save (see [`SaveBaseline`]).
-        fingerprint: DocumentFingerprint,
+        fingerprint: Fingerprint,
     },
     /// The file exists but could not be read or parsed; the caller must quarantine it.
     Invalid,
 }
 
-/// The fingerprint/baseline vocabulary of the write guard. Both are OWNED by `doc_store`
+/// The fingerprint/baseline vocabulary of the write guard. Both are OWNED by `ms_docstore`
 /// and shared with `presets_store`: the "is the file still what I last read?" question, its
 /// answer and the crash-safe write recipe are one mechanism, and two copies of it drift
-/// (they already had). Re-exported under the historical names so every caller and test here
-/// reads unchanged.
-pub(crate) use super::doc_store::{DocumentFingerprint, SaveBaseline};
+/// (they already had). Re-exported so `font_settings_store` names them through this module.
+pub(crate) use ms_docstore::{Fingerprint, SaveBaseline};
 
 /// Why [`save_checked`] refused to (or could not) write.
 #[derive(Debug)]
@@ -392,7 +435,7 @@ pub(crate) enum SaveError {
         disk: Option<Box<FontsData>>,
         /// Fingerprint of the conflicting on-disk bytes, i.e. the caller's new baseline
         /// once it has merged them in.
-        fingerprint: DocumentFingerprint,
+        fingerprint: Fingerprint,
     },
 }
 
@@ -439,12 +482,6 @@ pub(crate) enum QuarantineOutcome {
     },
 }
 
-/// 64-bit digest of `contents`; see `doc_store::fingerprint`, which owns the rule.
-#[must_use]
-fn document_fingerprint(contents: &str) -> DocumentFingerprint {
-    super::doc_store::fingerprint(contents)
-}
-
 /// Loads `fonts_data.json` from `fonts_dir` into a typed [`LoadOutcome`]. A missing file is
 /// `Missing`; a read or parse failure is `Invalid` (warned about, never silently emptied);
 /// otherwise `Loaded` (a NEWER version is warned about and still parsed best-effort).
@@ -457,25 +494,28 @@ pub(crate) fn load_outcome(fonts_dir: &Path) -> LoadOutcome {
 /// Path-parameterized core of [`load_outcome`], split out so the read logic can be
 /// unit-tested against a temp file instead of the real fonts directory.
 fn load_outcome_from_file(path: &Path) -> LoadOutcome {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        // A missing file is the normal first-run case; anything else is a real read error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
-        Err(err) => {
+    // ONE read: the TYPED parse and the fingerprint come from the same bytes, so the
+    // baseline describes exactly the state the data was decoded from. The typed parse must
+    // come from the bytes, not from a parsed `Value`: serde's derived struct reader rejects
+    // a duplicated document-level field ("duplicate field"), which a `Value` would silently
+    // collapse to its last occurrence.
+    let read = ms_docstore::with_lock(&document(path), read_typed_snapshot);
+    let (file, fingerprint) = match read {
+        Ok(Some(read)) => read,
+        // A missing file is the normal first-run case.
+        Ok(None) => return LoadOutcome::Missing,
+        Err(ms_docstore::DocStoreError::Malformed { cause, .. }) => {
             ms_log::runtime_log::log_warn(format!(
-                "typing: cannot read fonts_data.json; treating as corrupt (will quarantine). \
-                 Path: {} Error: {err}",
+                "typing: malformed fonts_data.json; treating as corrupt (will quarantine). \
+                 Path: {} Error: {cause}",
                 path.display()
             ));
             return LoadOutcome::Invalid;
         }
-    };
-
-    let file: FontsDataFile = match serde_json::from_str(&raw) {
-        Ok(file) => file,
+        // Anything else is a real read error.
         Err(err) => {
             ms_log::runtime_log::log_warn(format!(
-                "typing: malformed fonts_data.json; treating as corrupt (will quarantine). \
+                "typing: cannot read fonts_data.json; treating as corrupt (will quarantine). \
                  Path: {} Error: {err}",
                 path.display()
             ));
@@ -505,59 +545,42 @@ fn load_outcome_from_file(path: &Path) -> LoadOutcome {
             path.display()
         ));
     }
-    LoadOutcome::Loaded {
-        data,
-        fingerprint: document_fingerprint(&raw),
-    }
+    LoadOutcome::Loaded { data, fingerprint }
+}
+
+/// The typed document and the fingerprint of the SAME bytes, inside the caller's lock.
+fn read_typed_snapshot(locked: &ms_docstore::LockedDoc<'_>) -> ms_docstore::Result<Option<(FontsDataFile, Fingerprint)>> {
+    locked.read_typed_snapshot::<FontsDataFile>()
 }
 
 /// Moves a corrupt `fonts_data.json` out of the way so the next mutation cannot overwrite —
 /// and thereby destroy — a possibly-recoverable document.
 ///
-/// Tries `rename` to `fonts_data.json.bad` first (overwriting an older quarantine); if that
-/// fails, falls back to a `copy`, which preserves the content even when the original cannot
-/// be unlinked. The outcome MUST be honored by the caller: on [`QuarantineOutcome::Failed`]
-/// the corrupt file is still the only copy of the user's data, and persistence has to stay
-/// off until it is dealt with.
+/// `ms_docstore::quarantine` under the document lock (so no writer of this process can
+/// replace the file mid-quarantine): `rename` to `fonts_data.json.bad` first (overwriting an
+/// older quarantine); if that fails, a `copy`, which preserves the content even when the
+/// original cannot be unlinked (a cross-device target, a read-only directory entry, a
+/// Windows share lock). The outcome MUST be honored by the caller: on
+/// [`QuarantineOutcome::Failed`] the corrupt file is still the only copy of the user's data,
+/// and persistence has to stay off until it is dealt with.
 pub(crate) fn quarantine_bad_file(fonts_dir: &Path) -> QuarantineOutcome {
-    let path = data_path(fonts_dir);
-    // `fonts_data.json` -> `fonts_data.json.bad`; `fs::rename` overwrites an older `.bad`.
-    let bad = path.with_extension("json.bad");
-    let rename_error = match fs::rename(&path, &bad) {
-        Ok(()) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: quarantined corrupt fonts_data.json to {}",
-                bad.display()
-            ));
-            return QuarantineOutcome::Moved;
-        }
-        Err(err) => err.to_string(),
-    };
-    // The rename can fail while the bytes are perfectly readable (a cross-device `.bad`
-    // target, a read-only directory entry, a Windows share lock). A copy is enough: it makes
-    // a second, recoverable copy exist, which is the entire point of the quarantine.
-    match fs::copy(&path, &bad) {
-        Ok(_) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: could not RENAME the corrupt fonts_data.json ({rename_error}); copied \
-                 it to {} instead, so the original may be overwritten safely. Path: {}",
-                bad.display(),
-                path.display()
-            ));
-            QuarantineOutcome::Copied
-        }
+    let doc = document(&data_path(fonts_dir));
+    match ms_docstore::quarantine(&doc, "bad", ms_docstore::QuarantineNaming::Replace, ms_docstore::QuarantineFallback::CopyIfRenameFails) {
+        // Already gone: the path is free, exactly as after a successful move.
+        Ok(ms_docstore::Quarantined::Moved(_) | ms_docstore::Quarantined::Absent) => QuarantineOutcome::Moved,
+        Ok(ms_docstore::Quarantined::Copied { .. }) => QuarantineOutcome::Copied,
         Err(err) => {
             ms_log::runtime_log::log_error(format!(
-                "typing: could not quarantine the corrupt fonts_data.json — neither rename \
-                 ({rename_error}) nor copy ({err}) worked. It is the only copy of these \
-                 settings, so saving per-font settings is DISABLED for this session; move or \
-                 delete {} by hand to re-enable it.",
-                path.display()
+                "typing: could not quarantine the corrupt fonts_data.json ({err}). It is the \
+                 only copy of these settings, so saving per-font settings is DISABLED for this \
+                 session; move or delete {} by hand to re-enable it.",
+                doc.path_for(ms_docstore::DocFormat::Json).display()
             ));
-            QuarantineOutcome::Failed {
-                rename_error,
-                copy_error: err.to_string(),
-            }
+            let (rename_error, copy_error) = match err {
+                ms_docstore::DocStoreError::Quarantine { rename_error, copy_error, .. } => (rename_error, copy_error.unwrap_or_default()),
+                other => (other.to_string(), String::new()),
+            };
+            QuarantineOutcome::Failed { rename_error, copy_error }
         }
     }
 }
@@ -822,41 +845,58 @@ pub(crate) fn save_checked(
     fonts_dir: &Path,
     data: &FontsData,
     baseline: SaveBaseline,
-) -> Result<DocumentFingerprint, SaveError> {
-    // Create the fonts dir on demand so a first-ever save (e.g. one-time migration)
-    // succeeds even when the app runs before any font is present.
-    if let Err(err) = fs::create_dir_all(fonts_dir) {
-        return Err(SaveError::Io(format!(
-            "cannot create fonts directory {}: {err}",
-            fonts_dir.display()
-        )));
-    }
+) -> Result<Fingerprint, SaveError> {
+    // The store creates the fonts dir on demand (`create_parent_dirs`), so a first-ever save
+    // (e.g. one-time migration) succeeds even when the app runs before any font is present.
     save_to_file(&data_path(fonts_dir), data, baseline)
 }
 
 /// Path-parameterized core of [`save_checked`], split out so the write recipe and its guard
-/// can be unit-tested against a temp file. Assumes the parent directory already exists.
+/// can be unit-tested against a temp file.
+///
+/// The guard (newer-version refusal + baseline check) and the write run as ONE critical
+/// section under the document's write lock, so no writer of this process can slip in
+/// between "the file is still what we expected" and "replace it".
 fn save_to_file(
     path: &Path,
     data: &FontsData,
     baseline: SaveBaseline,
-) -> Result<DocumentFingerprint, SaveError> {
-    guard_existing_document(path, baseline)?;
+) -> Result<Fingerprint, SaveError> {
     let file = encode(data);
-    let mut text = serde_json::to_string_pretty(&file)
-        .map_err(|err| SaveError::Io(format!("cannot serialize fonts_data.json: {err}")))?;
-    text.push('\n');
-    let fingerprint = document_fingerprint(&text);
-    write_atomic(path, &text).map_err(SaveError::Io)?;
-    Ok(fingerprint)
+    ms_docstore::with_lock(&document(path), |locked| {
+        let disk = guard_existing_document(locked)?;
+        // Conflict decided from the SAME read as `disk`, so the reported document and its
+        // fingerprint always describe one state: a caller that merges `disk` and retries
+        // with `fingerprint` can never overwrite content it has not seen.
+        if let Some((disk_file, found)) = &disk
+            && !baseline.accepts(*found)
+        {
+            return Err(SaveError::Conflict { disk: Some(Box::new(decode(disk_file.clone()))), fingerprint: *found });
+        }
+        locked
+            .write(&file, write_options(baseline))
+            .map_err(|err| match err {
+                // The store re-checks the baseline against the bytes on disk right before
+                // the rename: the file is unparsable (so `disk` was `None`), or another app
+                // instance wrote it after our read. Re-read so the reported document and
+                // fingerprint again come from one read.
+                ms_docstore::DocStoreError::Conflict { found, .. } => match read_typed_snapshot(locked) {
+                    Ok(Some((file, fingerprint))) => SaveError::Conflict { disk: Some(Box::new(decode(file))), fingerprint },
+                    Ok(None) | Err(_) => SaveError::Conflict { disk: None, fingerprint: found },
+                },
+                other => SaveError::Io(format!(
+                    "cannot write {}: {other}",
+                    path.display()
+                )),
+            })
+    })
 }
 
-/// Inspects the document currently at `path` and decides whether it may be replaced.
-///
-/// Two things make a replacement unacceptable, and both are silent data loss if allowed:
-/// a document from a FUTURE schema (whose unknown fields this build cannot round-trip —
-/// see the "choose one" note below), and a document that changed since the caller's
-/// `baseline` (a second running app instance wrote it; overwriting drops whatever it added).
+/// Inspects the document currently on disk (inside the caller's lock) and refuses a
+/// replacement of a document from a FUTURE schema. Returns the parsed on-disk document and
+/// the fingerprint of the bytes it was parsed from (`None` when absent or unparsable), from
+/// which the caller decides the baseline conflict; for an unparsable file the store's write
+/// enforces the baseline itself.
 ///
 /// WHY REFUSING RATHER THAN PRESERVING UNKNOWN FIELDS. Carrying unknown keys through a
 /// `#[serde(flatten)]` bag would let this build stamp the CURRENT version onto a payload whose
@@ -866,36 +906,37 @@ fn save_to_file(
 /// settings changed in this session are not persisted, which is why the refusal is reported
 /// as an error rather than swallowed.
 ///
-/// A file that is ABSENT never blocks a write: there is nothing to lose.
-fn guard_existing_document(path: &Path, baseline: SaveBaseline) -> Result<(), SaveError> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        // Nothing on disk: any baseline may proceed (a `Matching` baseline whose file
-        // vanished has nothing left to preserve).
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+/// A file that is ABSENT never blocks a write: there is nothing to lose. An UNPARSABLE file
+/// yields `None`: whether it may be replaced is then decided by the baseline alone, exactly
+/// as for a parsable one (a conflicting unparsable file is reported with `disk: None` and
+/// must not be overwritten).
+///
+/// # Errors
+/// [`SaveError::Io`] when the existing file cannot be read, [`SaveError::NewerVersion`] for
+/// a future schema.
+fn guard_existing_document(
+    locked: &ms_docstore::LockedDoc<'_>,
+) -> Result<Option<(FontsDataFile, Fingerprint)>, SaveError> {
+    // Typed parse of the exact bytes (a document that does not decode as `FontsDataFile`,
+    // e.g. one with a duplicated field, counts as unparsable, exactly like invalid JSON).
+    let parsed = match read_typed_snapshot(locked) {
+        Ok(parsed) => parsed,
+        Err(ms_docstore::DocStoreError::Malformed { .. }) => None,
         Err(err) => {
             return Err(SaveError::Io(format!(
                 "cannot read the existing {} before replacing it: {err}",
-                path.display()
+                locked.doc().path_for(ms_docstore::DocFormat::Json).display()
             )));
         }
     };
-    let fingerprint = document_fingerprint(&raw);
-    let parsed: Option<FontsDataFile> = serde_json::from_str(&raw).ok();
     if let Some(found) = parsed
         .as_ref()
-        .and_then(|file| file.version)
+        .and_then(|(file, _)| file.version)
         .filter(|version| *version > FONTS_DATA_VERSION)
     {
         return Err(SaveError::NewerVersion { found });
     }
-    if baseline.accepts(fingerprint) {
-        return Ok(());
-    }
-    Err(SaveError::Conflict {
-        disk: parsed.map(|file| Box::new(decode(file))),
-        fingerprint,
-    })
+    Ok(parsed)
 }
 
 /// Converts the decoded runtime form into the serde mirror for serialization, stamping the
@@ -940,20 +981,6 @@ fn encode(data: &FontsData) -> FontsDataFile {
         imported_system_fonts: Vec::new(),
         font_settings: BTreeMap::new(),
     }
-}
-
-/// Atomically replaces `path` with `contents` through the shared `doc_store` recipe (sibling
-/// temp + `write_all` + `sync_all` + close + `rename`).
-///
-/// `fonts_data.json` asks for [`doc_store::Durability::Contents`] only: nothing deletes a
-/// data source once this returns (the legacy `user_config` keys are dropped by
-/// `presets_store`, which uses the directory-durable mode), and a lost directory-entry flush
-/// at worst loses a brand-new file that the next mutation rewrites. The write is frequent
-/// (every debounced profile edit), so the extra directory fsync would be paid per keystroke
-/// for a guarantee this document does not need.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    super::doc_store::write_atomic(path, contents, super::doc_store::Durability::Contents)
-        .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -1580,6 +1607,31 @@ mod tests {
         assert_ne!(first, second, "the new bytes get a new fingerprint");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("\"G\""));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An UNPARSABLE document that no longer matches the caller's baseline is reported as a
+    /// conflict WITHOUT a parsed payload and is left byte-for-byte untouched: it is the only
+    /// copy of whatever it holds. With no expectation at all (`Unchecked`, e.g. after a
+    /// quarantine that could only copy the file aside) it is replaced.
+    #[test]
+    fn an_unparsable_conflicting_document_is_reported_and_left_untouched() {
+        let path = unique_temp_path("unparsable_conflict");
+        let expected = save_to_file(&path, &FontsData::default(), SaveBaseline::Unchecked)
+            .expect("initial save");
+        fs::write(&path, "{ not json").expect("another writer corrupts the file");
+
+        let error = save_to_file(&path, &FontsData::default(), SaveBaseline::Matching(expected))
+            .expect_err("a changed, unparsable file must not be overwritten");
+        assert!(
+            matches!(error, SaveError::Conflict { disk: None, .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read back"), "{ not json");
+
+        save_to_file(&path, &FontsData::default(), SaveBaseline::Unchecked)
+            .expect("an unchecked save replaces it");
+        assert!(matches!(load_outcome_from_file(&path), LoadOutcome::Loaded { .. }));
         let _ = fs::remove_file(&path);
     }
 

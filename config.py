@@ -4,15 +4,23 @@ Shared runtime configuration for Python launcher/tools.
 
 Main items:
 - Global path constants for project assets and model folders.
-- `BaseUserConfig` / `NestedConfig`: JSON-backed user settings wrapper.
+- `BaseUserConfig` / `NestedConfig`: user settings wrapper over `docstore.py`
+  (`user_config.json` in Dev mode, `user_config.db` in Prod mode). Read-only on
+  import; every write is a serialized `update(mutator)` of the on-disk document.
 - `get_projects_root` / `set_projects_root`: canonical projects folder resolver
-  (uses `user_config.json -> General.projects_dir`, default `{Documents}/manhwastudio_projects`).
+  (uses `user_config -> General.projects_dir`, default `{Documents}/manhwastudio_projects`).
 """
 
+import copy
+import logging
 import os
+import threading
 from pathlib import Path
-import json
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import docstore
+
+_log = logging.getLogger(__name__)
 VERSION = "3.6.0"
 
 
@@ -105,73 +113,122 @@ for folder in folders:
         print(f"Создана папка: {folder}")
 
 class NestedConfig:
-    """Обёртка для вложенных словарей с доступом через точку."""
+    """Dot-access view of a nested section of a `BaseUserConfig`.
 
-    def __init__(self, root, data):
-        self._root = root  # ссылка на UserConfig для сохранения
-        self._data = data  # реальный словарь
+    Reading returns the in-memory value (document merged with defaults). Assigning an
+    attribute persists ONLY that key through `BaseUserConfig.update`.
+    """
+
+    def __init__(self, root: "BaseUserConfig", data: Dict[str, Any], keys: Tuple[str, ...]):
+        object.__setattr__(self, "_root", root)  # owning config, performs the persistence
+        object.__setattr__(self, "_data", data)  # in-memory section dict
+        object.__setattr__(self, "_keys", keys)  # path of this section from the document root
 
     def __getattr__(self, item):
         value = self._data.get(item)
         if isinstance(value, dict):
-            return NestedConfig(self._root, value)
+            return NestedConfig(self._root, value, self._keys + (item,))
         return value
 
     def __setattr__(self, key, value):
-        if key in {"_root", "_data"}:
-            return super().__setattr__(key, value)
-
-        self._data[key] = value
-        self._root.save()
+        path = self._keys + (key,)
+        self._root.update(lambda document: docstore.set_path(document, path, value))
 
     def __repr__(self):
         return repr(self._data)
-    
+
+
 class BaseUserConfig:
+    """The Python backend's view of the user_config document (`.json` in Dev, `.db` in Prod).
+
+    Contract:
+    - Construction only READS: a missing or unreadable document leaves `config` equal to
+      the defaults in memory and is logged; nothing is ever written on import.
+    - `config` = the document merged with `defaults` (missing keys only), in memory only.
+    - Writes go exclusively through `update(mutator)`: a serialized read-modify-write of
+      the CURRENT on-disk document (see `docstore.update_document`), after which `config`
+      is refreshed from that document. The mutator must touch only its own keys.
+    """
+
     def __init__(self, path: str, defaults: Dict[str, Any]):
         self.path = path
+        self.stem = docstore.stem_of(Path(path))
         self.defaults = defaults
         self.config = {}
+        self._lock = threading.RLock()
 
         self._load()
         self._apply_defaults()
-        self.save()
 
     def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, 'r', encoding='utf-8') as f:
-                    self.config = json.load(f)
-            except Exception:
-                self.config = {}
-        else:
+        """Loads the document into `config`; on absence or any error keeps `{}` (defaults follow)."""
+        try:
+            document = docstore.read_document(self.stem)
+        except docstore.DocStoreError as exc:
+            _log.error(
+                "Could not read user settings; using built-in defaults for this session. "
+                "Stem: %s. Error kind: %s. Error: %s. The file is left untouched.",
+                self.stem, exc.kind.value, exc,
+            )
             self.config = {}
+            return
+        if document is None:
+            _log.warning("User settings document %s(.json|.db) does not exist; using built-in defaults.", self.stem)
+            self.config = {}
+        elif not isinstance(document, dict):
+            _log.error("User settings document %s is not a JSON object (%s); using built-in defaults.", self.stem, type(document).__name__)
+            self.config = {}
+        else:
+            self.config = document
 
     def _apply_defaults(self):
         def merge(d, default):
             for k, v in default.items():
                 if k not in d:
-                    d[k] = v
+                    d[k] = copy.deepcopy(v)
                 elif isinstance(d[k], dict) and isinstance(v, dict):
                     merge(d[k], v)
         merge(self.config, self.defaults)
 
-    def save(self):
-        with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, ensure_ascii=False, indent=4)
+    def update(self, mutator: Callable[[Dict[str, Any]], None]) -> None:
+        """Persists `mutator` applied to the current on-disk document, then refreshes `config`.
+
+        On a store failure other than a failing mutator, the mutator is still applied to the
+        in-memory `config` (so this session honours the choice); every failure is logged and
+        `docstore.DocStoreError` is re-raised for the caller to report.
+        """
+        with self._lock:
+            captured: Dict[str, Any] = {}
+
+            def capture(document: Dict[str, Any]) -> None:
+                mutator(document)
+                captured["document"] = copy.deepcopy(document)
+
+            try:
+                docstore.update_document(self.stem, capture)
+            except docstore.DocStoreError as exc:
+                _log.error(
+                    "Could not save user settings. Stem: %s. Error kind: %s. Error: %s. "
+                    "The change applies to this session only.",
+                    self.stem, exc.kind.value, exc,
+                )
+                if exc.kind is not docstore.ErrorKind.MUTATOR:
+                    mutator(self.config)
+                raise
+            self.config = captured["document"]
+            self._apply_defaults()
 
     def __getattr__(self, item):
         value = self.config.get(item)
         if isinstance(value, dict):
-            return NestedConfig(self, value)
+            return NestedConfig(self, value, (item,))
         return value
 
     def __setattr__(self, key, value):
-        if key in {"path", "defaults", "config"}:
+        if key in {"path", "stem", "defaults", "config", "_lock"}:
             return super().__setattr__(key, value)
 
-        self.config[key] = value
-        self.save()
+        self.update(lambda document: docstore.set_path(document, (key,), value))
 
 # --------- ГЛОБАЛЬНАЯ КОНФИГУРАЦИЯ ---------
 USER_CONFIG_DEFAULTS = {
@@ -355,20 +412,13 @@ def get_projects_root() -> str:
 
 
 def set_projects_root(new_path: str) -> str:
+    """Persists `General.projects_dir` (normalized) and returns it.
+
+    Raises `docstore.DocStoreError` when the settings document cannot be updated (it is
+    never created here); the in-memory value is updated either way.
+    """
     normalized = normalize_projects_root(new_path)
-    try:
-        UserConfig.General.projects_dir = normalized
-    except Exception:
-        data = getattr(UserConfig, "config", None)
-        if isinstance(data, dict):
-            general = data.get("General")
-            if not isinstance(general, dict):
-                general = {}
-                data["General"] = general
-            general["projects_dir"] = normalized
-            save = getattr(UserConfig, "save", None)
-            if callable(save):
-                save()
+    UserConfig.update(lambda document: docstore.set_path(document, ("General", "projects_dir"), normalized))
     return normalized
 
 

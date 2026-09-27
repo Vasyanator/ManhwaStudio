@@ -1,0 +1,22 @@
+{
+  "characters": [
+    {
+      "name": "Ann",
+      "color": "#ff0000",
+      "aliases": [
+        "A",
+        "Annie"
+      ]
+    },
+    {
+      "name": "Bob"
+    }
+  ],
+  "terms": [
+    {
+      "source": "형",
+      "target": "брат",
+      "note": null
+    }
+  ]
+}

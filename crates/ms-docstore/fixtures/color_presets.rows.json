@@ -1,0 +1,44 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/colors",
+    "parent": "",
+    "seg": "colors",
+    "kind": "arr",
+    "payload": "3"
+  },
+  {
+    "path": "/colors/0",
+    "parent": "/colors",
+    "seg": "0",
+    "kind": "leaf",
+    "payload": "[255,0,0]"
+  },
+  {
+    "path": "/colors/1",
+    "parent": "/colors",
+    "seg": "1",
+    "kind": "leaf",
+    "payload": "[0,255,0,128]"
+  },
+  {
+    "path": "/colors/2",
+    "parent": "/colors",
+    "seg": "2",
+    "kind": "leaf",
+    "payload": "[0,0,255]"
+  },
+  {
+    "path": "/name",
+    "parent": "",
+    "seg": "name",
+    "kind": "leaf",
+    "payload": "\"palette\""
+  }
+]

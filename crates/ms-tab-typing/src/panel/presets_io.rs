@@ -21,18 +21,39 @@ remains here is only what still belongs to `user_config.json`.
 Notes:
 Uses `use super::*;` to pull in the parent module's types and imports. Moved
 free fns are `pub(super)` so panel.rs and sibling submodules can call them.
+Every `user_config.json` READ goes through `read_user_config_value` (the
+`ms_docstore` reader, `DocKind::UserConfig`); every WRITE through
+`config::update_user_config_file` (the serialized read-modify-write).
 */
 
 use super::*;
 
+/// Reads the whole `user_config.json` at `user_settings_file` through the document store.
+///
+/// `None` when it is absent, unreadable or malformed. Every caller here treats that as
+/// "nothing stored, use the built-in default" and never writes on that path, so a
+/// malformed config is never destroyed by a reader; a failure other than absence is logged
+/// (not propagated) so it is at least diagnosable.
+#[must_use]
+pub(super) fn read_user_config_value(user_settings_file: &Path) -> Option<Value> {
+    let doc = ms_docstore::DocRef::new(user_settings_file, ms_docstore::DocKind::UserConfig);
+    match ms_docstore::read_value(&doc) {
+        Ok(value) => value,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: cannot read the user config; using built-in defaults for the TextTab \
+                 settings read here. Path: {} Error: {err}",
+                user_settings_file.display()
+            ));
+            None
+        }
+    }
+}
+
 /// Читает настройку «использовать обычные inline-теги вместо машиночитаемых».
 /// По умолчанию `false` — панель пишет компактный `<m ...>`. Пока не подключено к UI.
 pub(super) fn load_text_tab_use_legacy_inline_tags() -> bool {
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return false;
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(&config::user_config_path()) else {
         return false;
     };
     payload
@@ -52,11 +73,7 @@ pub(super) fn load_text_tab_use_legacy_inline_tags() -> bool {
 /// exactly like `load_text_tab_formula_presets` and `load_text_tab_effect_defaults` beside it.
 #[must_use]
 pub(super) fn load_text_tab_param_identity_mode() -> ParamIdentityMode {
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return ParamIdentityMode::Font;
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(&config::user_config_path()) else {
         return ParamIdentityMode::Font;
     };
     let stored = payload
@@ -525,11 +542,7 @@ pub(super) fn text_vector_line_distance_mode_from_value(value: Option<&Value>) -
 
 pub(super) fn load_text_tab_formula_presets() -> HashMap<String, TypingFormulaPreset> {
     let fallback = default_text_tab_formula_presets();
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return fallback;
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(&config::user_config_path()) else {
         return fallback;
     };
     let Some(presets_obj) = payload
@@ -558,11 +571,7 @@ pub(super) fn load_text_tab_formula_presets() -> HashMap<String, TypingFormulaPr
 /// unreadable file, or malformed JSON yields an empty map — this never panics and never
 /// surfaces an error, because absence simply means "use the built-in defaults".
 pub(super) fn load_text_tab_effect_defaults() -> HashMap<String, Value> {
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return HashMap::new();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(&config::user_config_path()) else {
         return HashMap::new();
     };
     let Some(defaults_obj) = payload
@@ -650,10 +659,7 @@ pub(crate) fn load_text_tab_imported_system_fonts() -> Vec<PathBuf> {
 /// legacy list against `fonts_data.json` before that key may be deleted — the same read
 /// rule, so it deliberately does not get a second implementation.
 pub(super) fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return Vec::new();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+    let Some(payload) = read_user_config_value(user_settings_file) else {
         return Vec::new();
     };
     let Some(array) = payload

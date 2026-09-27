@@ -47,17 +47,29 @@ fsync and same-volume renames, which the seam does not model. The page manager
 is a native-desktop feature; on wasm the journal never exists and `recover` is
 an inert no-op. Directory fsync is best-effort and Unix-only, mirroring
 `tabs/settings/mod.rs::fsync_parent_dir_best_effort`.
+The two OWNED chapter documents (`layers/layers`, the bubbles document) exist as
+`.json` OR `.db`. The scan resolves each one under the store's document lock (which
+finishes an interrupted conversion, rule B.4) and records the ACTUAL format with the
+lossless `Value` (`read_owned_doc`); the plan discards that actual file and phase B
+rewrites it in the same format: a `.json` through this module's `atomic_write`, a
+`.db` through `ms_docstore::write_whole_atomic` (whole rebuild in a validated temp,
+stale `-journal` removed, atomic rename). The store keeps no connection open between
+calls, so no handle exists during the phase-A renames. `text_info.json`, detection
+blocks (`text_detection/{idx}_blocks.json`), journals and trash archives are not owned
+documents and stay plain JSON files.
 */
 
 use super::crop_geometry::{PageRotation, QuarterTurns, RotatedPage};
 use super::plan::{
     self, ChapterSnapshot, ComposeSource, DetectionBlocks, DetectionFiles, JOURNAL_B_FILE_NAME,
-    JOURNAL_FILE_NAME, MoveDest, NewPageContent, PageOpPlan, PlannedCreate, PlannedMove,
+    JOURNAL_FILE_NAME, MoveDest, NewPageContent, OwnedDocFormat, PageOpPlan, PlannedCreate,
+    PlannedJsonWrite, PlannedMove, PlannedWriteFormat,
     TextInfoFile, TextInfoLocation, TreeSnapshot,
 };
 use super::{PageOpError, PageOpKind, PageOpOutcome};
 use crate::{Page, ProjectPaths};
 use ms_log::runtime_log;
+use ms_docstore::{DocKind, DocRef};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,8 +84,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `ComposeSource::rotation` (the crop's rotate-then-crop recipe), which an
 /// older binary would deserialize while silently ignoring the rotation — it
 /// would then roll a half-finished crop forward with UNROTATED pixels, so the
-/// version guard must reject such a journal rather than accept it.
-const JOURNAL_SCHEMA_VERSION: u32 = 3;
+/// version guard must reject such a journal rather than accept it. v4 added
+/// `PlannedJsonWrite::format` (an owned chapter document stored as `.db`): an
+/// older binary ignoring it would `atomic_write` JSON text into a `.db` target.
+/// A v4 journal is refused by a v3 binary. This binary still RECOVERS a v3
+/// journal left pending by the previous release (`upgrade_v3_journal`): v3
+/// predates `.db` documents, so every one of its writes is a plain JSON file.
+/// Any other version (older than v3, or newer than this binary) is refused (the
+/// project load fails with `PageOpError::Journal`, the journal left in place).
+const JOURNAL_SCHEMA_VERSION: u32 = 4;
+
+/// The previous journal schema, still accepted for recovery (see
+/// `JOURNAL_SCHEMA_VERSION`).
+const JOURNAL_SCHEMA_VERSION_V3: u32 = 3;
 
 /// Transaction phase recorded in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,21 +245,7 @@ pub(crate) fn recover(project_dir: &Path) -> Result<(), PageOpError> {
     let raw = fs::read_to_string(journal_path).map_err(|err| {
         io_ctx(&err, format!("read journal {}", journal_path.display()))
     })?;
-    let journal: Journal = serde_json::from_str(&raw).map_err(|err| {
-        PageOpError::Journal(format!(
-            "journal {} is not readable ({err}); it was left in place for manual \
-             inspection",
-            journal_path.display()
-        ))
-    })?;
-    if journal.schema_version != JOURNAL_SCHEMA_VERSION {
-        return Err(PageOpError::Journal(format!(
-            "journal {} has unsupported schema version {} (expected \
-             {JOURNAL_SCHEMA_VERSION}); it was left in place for manual inspection",
-            journal_path.display(),
-            journal.schema_version
-        )));
-    }
+    let journal = parse_journal(&raw, journal_path)?;
     let expected_phase = if journal_path == journal_paths.b {
         JournalPhase::B
     } else {
@@ -477,7 +486,7 @@ fn scan_tree(
     let text_images_files: BTreeSet<String> =
         list_file_names(text_images_dir)?.into_iter().collect();
 
-    let layers_manifest = read_json_if_exists(&layers_dir.join("layers.json"))?;
+    let (layers_manifest, layers_manifest_format) = read_owned_doc(&layers_dir.join("layers.json"), DocKind::Layers)?;
 
     let mut layer_png_sizes: std::collections::BTreeMap<String, [u32; 2]> =
         std::collections::BTreeMap::new();
@@ -518,7 +527,8 @@ fn scan_tree(
         }
     }
 
-    let bubbles = match read_json_if_exists(bubbles_file)? {
+    let (bubbles, bubbles_format) = read_owned_doc(bubbles_file, DocKind::Bubbles)?;
+    let bubbles = match bubbles {
         Some(Value::Array(entries)) => Some(entries),
         Some(_) => {
             return Err(PageOpError::Json(format!(
@@ -535,9 +545,11 @@ fn scan_tree(
         layers_files,
         layer_png_sizes,
         layers_manifest,
+        layers_manifest_format,
         text_images_files,
         text_info,
         bubbles,
+        bubbles_format,
     })
 }
 
@@ -621,7 +633,41 @@ fn list_dir_entry_names(dir: &Path) -> Result<Vec<String>, PageOpError> {
     Ok(names)
 }
 
-/// Reads and parses a JSON file, `Ok(None)` when it does not exist.
+/// Reads one of the chapter documents owned by `ms_docstore` (`layers/layers`, the bubbles
+/// document; `path` names either format's file or the stem) as a lossless `Value` together
+/// with the format it is ACTUALLY stored in; `(None, Json)` when it does not exist.
+///
+/// Resolution and read happen in ONE locked section, so a both-formats leftover of an
+/// interrupted conversion is repaired first (rule B.4: a Value-equal leftover is deleted) and
+/// the plan never rewrites one file while a stale sibling of the other format survives. The
+/// store keeps no connection open after the call returns.
+///
+/// # Errors
+/// [`PageOpError::Json`] for a malformed document (or two formats holding DIFFERENT
+/// documents); [`PageOpError::Io`] otherwise, carrying the OS error's `io::ErrorKind` when the
+/// store reports one (as `io_ctx` does for the other scan reads).
+fn read_owned_doc(path: &Path, kind: DocKind) -> Result<(Option<Value>, OwnedDocFormat), PageOpError> {
+    let doc = DocRef::new(path, kind);
+    let read = ms_docstore::with_lock(&doc, |locked| -> ms_docstore::Result<(Option<Value>, OwnedDocFormat)> {
+        let Some(format) = locked.actual_format()? else { return Ok((None, OwnedDocFormat::Json)) };
+        Ok((locked.read_value()?, OwnedDocFormat::from_docstore(format)))
+    });
+    read.map_err(|err| match err {
+        ms_docstore::DocStoreError::Malformed { cause, .. } => {
+            PageOpError::Json(format!("{} is not valid JSON: {cause}", path.display()))
+        }
+        ms_docstore::DocStoreError::Ambiguous { cause, .. } => PageOpError::Json(format!(
+            "{} exists as both .json and .db holding different documents ({cause}); resolve it by hand before a page operation",
+            doc.stem().display()
+        )),
+        ms_docstore::DocStoreError::Storage(ms_docstore::StorageError::Io { source, .. })
+        | ms_docstore::DocStoreError::Io { source, .. } => io_ctx(&source, format!("read {}", path.display())),
+        other => PageOpError::Io(std::io::Error::other(format!("read {}: {other}", path.display()))),
+    })
+}
+
+/// Reads and parses a JSON file that is NOT an owned document (`text_info.json`), `Ok(None)`
+/// when it does not exist.
 fn read_json_if_exists(path: &Path) -> Result<Option<Value>, PageOpError> {
     if !path.is_file() {
         return Ok(None);
@@ -696,6 +742,21 @@ fn verify_targets_free(title_dir: &Path, plan: &PageOpPlan) -> Result<(), PageOp
     Ok(())
 }
 
+/// Rejects a journaled `.db` write whose target is not that document's `.db`
+/// file (`layers.db` inside `layers/`, the bubbles `.db` elsewhere): phase B
+/// would otherwise materialize a database under an arbitrary name.
+fn validate_write_format(write: &PlannedJsonWrite) -> Result<(), PageOpError> {
+    let PlannedWriteFormat::Db { kind } = write.format else { return Ok(()) };
+    let expected = format!("{}.{}", kind.file_stem(), OwnedDocFormat::Db.extension());
+    if Path::new(&write.target).file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(PageOpError::Journal(format!(
+            "journal writes a {kind:?} database to '{}', expected a file named '{expected}'",
+            write.target
+        )));
+    }
+    Ok(())
+}
+
 /// Rejects malformed or conflicting journal paths before recovery touches the
 /// filesystem. Generated plans pass the same check before their first write.
 fn validate_plan(plan: &PageOpPlan) -> Result<(), PageOpError> {
@@ -754,6 +815,7 @@ fn validate_plan(plan: &PageOpPlan) -> Result<(), PageOpError> {
     }
     for write in &plan.json_writes {
         validate_path(&write.target)?;
+        validate_write_format(write)?;
         if !outputs.insert(write.target.as_str()) {
             return Err(PageOpError::Journal(format!(
                 "journal contains duplicate output path '{}'",
@@ -810,6 +872,64 @@ fn write_journal(
             .map_err(|err| io_ctx(&err, format!("remove phase-A journal {}", paths.a.display())))?;
         fsync_dir_best_effort(paths.a.parent());
     }
+    Ok(())
+}
+
+/// Parses a journal slot's text, accepting the current schema and the previous
+/// one (v3, upgraded in memory by `upgrade_v3_journal`). The returned journal
+/// always carries `JOURNAL_SCHEMA_VERSION`.
+///
+/// # Errors
+/// `PageOpError::Journal` when the text is not a journal, its version is
+/// neither v3 nor the current one, or a v3 journal does not have the v3 shape.
+fn parse_journal(raw: &str, journal_path: &Path) -> Result<Journal, PageOpError> {
+    let unreadable = |err: &dyn std::fmt::Display| {
+        PageOpError::Journal(format!(
+            "journal {} is not readable ({err}); it was left in place for manual \
+             inspection",
+            journal_path.display()
+        ))
+    };
+    let mut value: Value = serde_json::from_str(raw).map_err(|err| unreadable(&err))?;
+    let version = value.get("schema_version").and_then(Value::as_u64).ok_or_else(|| unreadable(&"missing or non-integer schema_version"))?;
+    if version == u64::from(JOURNAL_SCHEMA_VERSION_V3) {
+        upgrade_v3_journal(&mut value).map_err(|reason| unreadable(&reason))?;
+        runtime_log::log_warn(format!(
+            "[page-ops] recovering a schema-v{JOURNAL_SCHEMA_VERSION_V3} journal {} left by a previous release",
+            journal_path.display()
+        ));
+    } else if version != u64::from(JOURNAL_SCHEMA_VERSION) {
+        return Err(PageOpError::Journal(format!(
+            "journal {} has unsupported schema version {version} (expected \
+             {JOURNAL_SCHEMA_VERSION}); it was left in place for manual inspection",
+            journal_path.display()
+        )));
+    }
+    serde_json::from_value(value).map_err(|err| unreadable(&err))
+}
+
+/// Rewrites a v3 journal `Value` into the v4 shape in place: v3 predates `.db`
+/// documents, so every `plan.json_writes` entry gets `"format": "json"` (its
+/// target is a plain JSON file written verbatim), and `schema_version` becomes
+/// the current one. v4's `format` field stays REQUIRED for a v4 journal.
+///
+/// # Errors
+/// A description when the value lacks `plan.json_writes`, an entry is not an
+/// object, or an entry already carries a `format` (not a v3 journal).
+fn upgrade_v3_journal(value: &mut Value) -> Result<(), String> {
+    let writes = value
+        .get_mut("plan")
+        .and_then(|plan| plan.get_mut("json_writes"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "v3 journal without plan.json_writes".to_string())?;
+    for write in writes {
+        let entry = write.as_object_mut().ok_or_else(|| "v3 journal write is not an object".to_string())?;
+        if entry.contains_key("format") {
+            return Err("v3 journal write already carries a format (not a v3 journal)".to_string());
+        }
+        entry.insert("format".to_string(), Value::String("json".to_string()));
+    }
+    value["schema_version"] = Value::from(JOURNAL_SCHEMA_VERSION);
     Ok(())
 }
 
@@ -1382,10 +1502,10 @@ fn run_phase_b(title_dir: &Path, plan: &PageOpPlan, redo_a: bool) -> Result<(), 
             resolve_move(title_dir, planned, path)?;
         }
     }
-    // 4. Remapped JSON documents (bodies journaled at plan time).
+    // 4. Remapped JSON documents (bodies journaled at plan time), each in the
+    //    format its original was found in.
     for write in &plan.json_writes {
-        let target = title_dir.join(&write.target);
-        atomic_write(&target, write.content.as_bytes())?;
+        write_planned_document(title_dir, write)?;
     }
     // 5. Superseded originals.
     for planned in &plan.moves {
@@ -1404,6 +1524,32 @@ fn run_phase_b(title_dir: &Path, plan: &PageOpPlan, redo_a: bool) -> Result<(), 
         atomic_write(&target, write.content.as_bytes())?;
     }
     Ok(())
+}
+
+/// Phase-B step 4 for one journaled document: a plain JSON target gets the
+/// journaled text verbatim (`atomic_write`); an owned `.db` target is rebuilt
+/// whole from the journaled logical body (`ms_docstore::write_whole_atomic`:
+/// validated temp, stale `-journal` removed, atomic rename, directory fsync).
+/// Idempotent: a replay simply replaces the file again.
+///
+/// # Errors
+/// [`PageOpError::Journal`] when a journaled `.db` body is not JSON (the journal
+/// is corrupt); [`PageOpError::Io`] for write failures.
+fn write_planned_document(title_dir: &Path, write: &PlannedJsonWrite) -> Result<(), PageOpError> {
+    let target = title_dir.join(&write.target);
+    match write.format {
+        PlannedWriteFormat::Json => atomic_write(&target, write.content.as_bytes()),
+        PlannedWriteFormat::Db { kind } => {
+            let value: Value = serde_json::from_str(&write.content).map_err(|err| {
+                PageOpError::Journal(format!("journaled body of '{}' is not JSON ({err})", write.target))
+            })?;
+            ms_docstore::write_whole_atomic(&DocRef::new(&target, kind.to_docstore()), &value, ms_docstore::DocFormat::Db).map_err(|err| match err {
+                ms_docstore::DocStoreError::Storage(ms_docstore::StorageError::Io { source, .. })
+                | ms_docstore::DocStoreError::Io { source, .. } => io_ctx(&source, format!("write {}", target.display())),
+                other => PageOpError::Io(std::io::Error::other(format!("write {}: {other}", target.display()))),
+            })
+        }
+    }
 }
 
 /// Recovery-only verification of the durable phase-A state. The executor
@@ -2611,6 +2757,33 @@ mod tests {
         assert_stitched_layout(&fx);
     }
 
+    /// The owned documents of the scan: absent is `None`, malformed is `Json` (never an
+    /// `Io`), and an unreadable one keeps its OS error kind.
+    #[test]
+    fn scan_owned_documents_missing_malformed_and_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layers = tmp.path().join("layers.json");
+        assert!(matches!(read_owned_doc(&layers, DocKind::Layers), Ok((None, OwnedDocFormat::Json))));
+        fs::write(&layers, "{\"pages\": [").expect("write malformed");
+        assert!(matches!(read_owned_doc(&layers, DocKind::Layers), Err(PageOpError::Json(_))));
+        fs::remove_file(&layers).expect("remove");
+        // A DIRECTORY at the document path cannot be read as a file.
+        fs::create_dir(&layers).expect("mkdir");
+        match read_owned_doc(&layers, DocKind::Layers) {
+            Err(PageOpError::Io(err)) => assert_ne!(err.kind(), std::io::ErrorKind::Other, "the OS error kind must survive: {err}"),
+            other => panic!("expected an Io error, got {other:?}"),
+        }
+    }
+
+    /// A malformed committed bubbles document aborts the whole scan with `Json`.
+    #[test]
+    fn scan_rejects_a_malformed_bubbles_document() {
+        let fx = build_fixture();
+        fs::write(&fx.paths.bubbles_file, "[{\"id\": ").expect("corrupt bubbles");
+        let op = PageOpKind::Move { from: 0, to: 1 };
+        assert!(matches!(scan_chapter(&fx.paths, &fx.pages, &op), Err(PageOpError::Json(_))));
+    }
+
     #[test]
     fn scan_detects_a_non_empty_alt_vers_directory() {
         let fx = build_decodable_fixture();
@@ -3529,5 +3702,280 @@ mod tests {
         assert_eq!(fs::read(fx.paths.src_dir.join("001.png")).expect("page 1"), b"SRC-PAGE-2");
         assert!(!fx.paths.src_dir.join("002.png").exists());
         assert_no_transaction_residue(&fx.title);
+    }
+
+    // -----------------------------------------------------------------------
+    // Owned chapter documents stored as `.db` (docstore Prod format).
+    // -----------------------------------------------------------------------
+
+    /// The four owned documents of the fixture: committed bubbles, committed
+    /// layers, staging bubbles, staging layers.
+    fn owned_docs(fx: &Fixture) -> [DocRef; 4] {
+        fx.paths.chapter_doc_siblings()
+    }
+
+    /// Converts the fixture's committed / staging owned documents into the
+    /// given formats (the fixture writes them as `.json`).
+    fn convert_owned(fx: &Fixture, committed: ms_docstore::DocFormat, staging: ms_docstore::DocFormat) {
+        for (i, doc) in owned_docs(fx).iter().enumerate() {
+            let target = if i < 2 { committed } else { staging };
+            if target == ms_docstore::DocFormat::Db {
+                ms_docstore::convert_document(doc, target, &ms_docstore::NoHook).expect("convert fixture document");
+            }
+        }
+    }
+
+    /// Every owned document exists ONLY in its expected format, and no
+    /// `SQLite` journal or docstore temp is left anywhere in the title.
+    fn assert_owned_formats(fx: &Fixture, committed: ms_docstore::DocFormat, staging: ms_docstore::DocFormat) {
+        for (i, doc) in owned_docs(fx).iter().enumerate() {
+            let expected = if i < 2 { committed } else { staging };
+            let other = match expected {
+                ms_docstore::DocFormat::Json => ms_docstore::DocFormat::Db,
+                ms_docstore::DocFormat::Db => ms_docstore::DocFormat::Json,
+            };
+            assert!(doc.path_for(expected).is_file(), "{} must stay {expected:?}", doc.stem().display());
+            assert!(!doc.path_for(other).exists(), "{} gained a second format", doc.stem().display());
+        }
+        for (rel, _) in walk(&fx.title) {
+            assert!(!rel.ends_with("-journal") && !ms_docstore::is_temp_artifact(Path::new(&rel)), "leftover store artifact: {rel}");
+        }
+    }
+
+    /// Reads an owned document through the store (either format).
+    fn read_doc(doc: &DocRef) -> Value {
+        ms_docstore::read_value(doc).expect("read owned document").expect("owned document exists")
+    }
+
+    /// `(id, img_idx)` of every bubble of `doc`.
+    fn bubble_pages(doc: &DocRef) -> Vec<(i64, i64)> {
+        read_doc(doc)
+            .as_array()
+            .expect("bubbles array")
+            .iter()
+            .map(|b| (b["id"].as_i64().expect("id"), b["img_idx"].as_i64().expect("img_idx")))
+            .collect()
+    }
+
+    /// The document assertions of `Delete {{ indices: [1] }}` on the fixture,
+    /// read through the store so they hold for either format.
+    fn assert_deleted_documents(fx: &Fixture) {
+        let [committed_bubbles, committed_layers, unsaved_bubbles, unsaved_layers] = owned_docs(fx);
+        assert_eq!(bubble_pages(&committed_bubbles), vec![(1, 0), (3, 2)]);
+        let bubbles = read_doc(&committed_bubbles);
+        assert!(bubbles[1].get("crop_page_idx").is_none(), "crop link to the deleted page removed");
+        assert_eq!(bubble_pages(&unsaved_bubbles), vec![(9, 1)]);
+        let manifest = read_doc(&committed_layers);
+        let pages: Vec<i64> = manifest["pages"].as_array().expect("pages").iter().map(|p| p["img_idx"].as_i64().expect("idx")).collect();
+        assert_eq!(pages, vec![0, 1]);
+        assert_eq!(manifest["pages"][1]["tree"][0]["rendered_file"], json!("ps_p0001_u2_text.png"));
+        assert_eq!(read_doc(&unsaved_layers)["pages"].as_array().expect("pages").len(), 0);
+        // Trash archives stay plain JSON whatever the documents' format.
+        let trash_base = fx.paths.project_dir.join(super::super::plan::TRASH_DIR_NAME);
+        let trash = fs::read_dir(&trash_base).expect("trash").flatten().next().expect("one trash folder").path();
+        assert_eq!(read_json(&trash.join("ch1/deleted_bubbles.json"))[0]["id"], json!(2));
+        assert_eq!(read_json(&trash.join("ch1_unsaved/layers/deleted_layers_pages.json"))[0]["img_idx"], json!(1));
+    }
+
+    #[test]
+    fn delete_on_a_db_chapter_rewrites_the_databases_in_place() {
+        use ms_docstore::DocFormat;
+        let fx = build_fixture();
+        convert_owned(&fx, DocFormat::Db, DocFormat::Db);
+        let op = PageOpKind::Delete { indices: vec![1] };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        assert_eq!(snapshot.committed.bubbles_format, OwnedDocFormat::Db);
+        assert_eq!(snapshot.unsaved.layers_manifest_format, OwnedDocFormat::Db);
+        let plan = plan::build_plan(&snapshot, &op, 4040).expect("plan");
+        let db_targets: Vec<&str> = plan.json_writes.iter().filter(|w| matches!(w.format, PlannedWriteFormat::Db { .. })).map(|w| w.target.as_str()).collect();
+        assert_eq!(db_targets.len(), 4, "every owned document is journaled as a .db write: {db_targets:?}");
+        assert!(db_targets.iter().all(|t| t.ends_with(".db")));
+        assert!(plan.moves.iter().any(|m| m.from == "ch1/translation_bubbles.db" && m.dest == MoveDest::Discard), "the ACTUAL file is discarded");
+
+        super::execute(&fx.paths, &fx.pages, &op).expect("delete executes");
+        assert_deleted_documents(&fx);
+        assert_owned_formats(&fx, DocFormat::Db, DocFormat::Db);
+        assert_no_transaction_residue(&fx.title);
+    }
+
+    #[test]
+    fn delete_on_a_mixed_chapter_keeps_each_tree_in_its_format() {
+        use ms_docstore::DocFormat;
+        for (committed, staging) in [(DocFormat::Db, DocFormat::Json), (DocFormat::Json, DocFormat::Db)] {
+            let fx = build_fixture();
+            convert_owned(&fx, committed, staging);
+            super::execute(&fx.paths, &fx.pages, &PageOpKind::Delete { indices: vec![1] }).expect("delete executes");
+            assert_deleted_documents(&fx);
+            assert_owned_formats(&fx, committed, staging);
+            assert_no_transaction_residue(&fx.title);
+        }
+    }
+
+    #[test]
+    fn crash_after_phase_a_on_a_db_chapter_rolls_back_byte_exact() {
+        use ms_docstore::DocFormat;
+        let fx = build_fixture();
+        convert_owned(&fx, DocFormat::Db, DocFormat::Db);
+        let before = walk(&fx.title);
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4041).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        assert!(!owned_docs(&fx)[0].path_for(DocFormat::Db).exists(), "phase A moved the database away");
+        super::recover(&fx.paths.project_dir).expect("rollback");
+        assert_eq!(before, walk(&fx.title), "the databases are restored byte for byte");
+    }
+
+    #[test]
+    fn crash_mid_phase_b_on_a_db_chapter_replays_the_journaled_databases() {
+        use ms_docstore::DocFormat;
+        let fx = build_fixture();
+        convert_owned(&fx, DocFormat::Db, DocFormat::Json);
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4042).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        write_journal(&journal_paths, &plan, JournalPhase::B, &op).expect("journal b");
+        // The "crash" hits after phase B wrote the documents (step 4) but
+        // before the superseded originals were discarded (step 5): recovery
+        // must replay the writes over the already-written databases.
+        for planned in &plan.moves {
+            if let MoveDest::Final { path } = &planned.dest {
+                resolve_move(&fx.title, planned, path).expect("partial B");
+            }
+        }
+        for write in &plan.json_writes {
+            write_planned_document(&fx.title, write).expect("step 4 before the crash");
+        }
+        super::recover(&fx.paths.project_dir).expect("roll forward");
+        assert!(!journal_paths.b.exists());
+
+        let [committed_bubbles, _, unsaved_bubbles, _] = owned_docs(&fx);
+        assert_eq!(bubble_pages(&committed_bubbles), vec![(1, 3), (2, 0), (3, 2)]);
+        assert_eq!(read_doc(&committed_bubbles)[2]["crop_page_idx"], json!(0));
+        assert_eq!(bubble_pages(&unsaved_bubbles), vec![(9, 1)]);
+        assert_owned_formats(&fx, DocFormat::Db, DocFormat::Json);
+        assert_no_transaction_residue(&fx.title);
+    }
+
+    /// Rewrites the journal slot at `path` into the exact shape the previous
+    /// release (schema v3) wrote: no `format` on any JSON write.
+    fn downgrade_journal_to_v3(path: &Path) {
+        let mut raw: Value = read_json(path);
+        raw["schema_version"] = json!(3);
+        for write in raw["plan"]["json_writes"].as_array_mut().expect("json_writes array") {
+            assert_eq!(write["format"], json!("json"), "a JSON chapter plans plain JSON writes");
+            write.as_object_mut().expect("write object").remove("format");
+        }
+        fs::write(path, serde_json::to_vec(&raw).expect("serialize")).expect("rewrite journal");
+    }
+
+    #[test]
+    fn a_pending_v3_journal_after_phase_a_rolls_back() {
+        let fx = build_fixture();
+        let before = walk(&fx.title);
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4043).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        downgrade_journal_to_v3(&journal_paths.a);
+        super::recover(&fx.paths.project_dir).expect("a v3 journal is recovered");
+        assert_eq!(before, walk(&fx.title), "rollback restores the exact state");
+        assert!(!journal_paths.a.exists());
+    }
+
+    #[test]
+    fn a_pending_v3_journal_in_phase_b_rolls_forward_with_json_writes() {
+        let fx = build_fixture();
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4044).expect("plan");
+        assert!(!plan.json_writes.is_empty(), "the fixture move rewrites JSON documents");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal a");
+        run_phase_a(&fx.title, &plan).expect("phase A");
+        write_journal(&journal_paths, &plan, JournalPhase::B, &op).expect("journal b");
+        downgrade_journal_to_v3(&journal_paths.b);
+        super::recover(&fx.paths.project_dir).expect("a v3 journal is rolled forward");
+        assert!(!journal_paths.b.exists());
+        assert_moved_layout(&fx);
+    }
+
+    #[test]
+    fn journals_of_unknown_schema_versions_are_refused_and_kept() {
+        for version in [2_u32, 5] {
+            let fx = build_fixture();
+            let op = PageOpKind::Move { from: 0, to: 3 };
+            let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+            let plan = plan::build_plan(&snapshot, &op, 4045).expect("plan");
+            let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+            write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+            let mut raw: Value = read_json(&journal_paths.a);
+            raw["schema_version"] = json!(version);
+            fs::write(&journal_paths.a, serde_json::to_vec(&raw).expect("serialize")).expect("rewrite journal");
+            let before = walk(&fx.title);
+            match super::recover(&fx.paths.project_dir) {
+                Err(PageOpError::Journal(message)) => assert!(message.contains(&format!("unsupported schema version {version}")), "{message}"),
+                other => panic!("a v{version} journal must be refused, got {other:?}"),
+            }
+            assert_eq!(before, walk(&fx.title), "nothing touched, journal kept");
+        }
+    }
+
+    #[test]
+    fn a_v3_journal_carrying_a_format_is_refused_and_kept() {
+        let fx = build_fixture();
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4046).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        let mut raw: Value = read_json(&journal_paths.a);
+        raw["schema_version"] = json!(3);
+        fs::write(&journal_paths.a, serde_json::to_vec(&raw).expect("serialize")).expect("rewrite journal");
+        let before = walk(&fx.title);
+        assert!(matches!(super::recover(&fx.paths.project_dir), Err(PageOpError::Journal(_))));
+        assert_eq!(before, walk(&fx.title), "nothing touched, journal kept");
+    }
+
+    #[test]
+    fn a_v4_journal_write_without_a_format_is_refused() {
+        let fx = build_fixture();
+        let op = PageOpKind::Move { from: 0, to: 3 };
+        let snapshot = scan_chapter(&fx.paths, &fx.pages, &op).expect("scan");
+        let plan = plan::build_plan(&snapshot, &op, 4047).expect("plan");
+        let journal_paths = JournalPaths::new(&fx.paths.project_dir);
+        write_journal(&journal_paths, &plan, JournalPhase::A, &op).expect("journal");
+        downgrade_journal_to_v3(&journal_paths.a);
+        let mut raw: Value = read_json(&journal_paths.a);
+        raw["schema_version"] = json!(4);
+        fs::write(&journal_paths.a, serde_json::to_vec(&raw).expect("serialize")).expect("rewrite journal");
+        assert!(matches!(super::recover(&fx.paths.project_dir), Err(PageOpError::Journal(_))));
+        assert!(journal_paths.a.exists());
+    }
+
+    #[test]
+    fn a_journaled_database_write_to_a_foreign_name_is_refused() {
+        let plan = PageOpPlan {
+            old_to_new: vec![Some(0)],
+            new_page_count: 1,
+            trash_root: "ch1/.pageop_trash/1".to_string(),
+            moves: Vec::new(),
+            creates: Vec::new(),
+            json_writes: vec![PlannedJsonWrite {
+                target: "ch1/src/000.db".to_string(),
+                format: PlannedWriteFormat::Db { kind: plan::OwnedDocKind::Layers },
+                content: "{}".to_string(),
+            }],
+            trash_writes: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(matches!(validate_plan(&plan), Err(PageOpError::Journal(_))));
     }
 }

@@ -42,6 +42,9 @@ Notes:
   одном языке, не переживал переключение.
 - Пользовательские исключения объединяют app-global `custom.dic` и project-local
   список из `settings.json`.
+- The title `settings.json` is read, probed and updated ONLY through `ms_docstore`
+  (`read_value`, `signature`, serialized `update` that edits only
+  `canvas.project_custom_spellcheck_words`); `.aff`/`.dic` files stay plain files.
 */
 
 use ms_text_util::language::{TextLanguage, text_language};
@@ -739,9 +742,9 @@ fn persist_custom_word_request(request: &SpellcheckCustomWordRequest) -> Result<
             let Some(settings_file) = current_project_spellcheck_settings_file() else {
                 return Err("project settings file is not bound".to_string());
             };
-            let mut words = load_project_spellcheck_words(&settings_file)?;
-            append_custom_word(&mut words, &request.word);
-            save_project_spellcheck_words(&settings_file, &words)
+            // One serialized read-modify-write: a separate load + save would let a concurrent
+            // settings-tab save of the list be lost.
+            update_project_spellcheck_words(&settings_file, |words| append_custom_word(words, &request.word))
         }
     }
 }
@@ -998,20 +1001,18 @@ fn dictionary_signature(
         }
     }
     if let Some(path) = project_settings_file {
-        match fs::metadata(path) {
-            Ok(meta) => {
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |duration| duration.as_secs());
-                signature.push(format!(
-                    "project_custom|{}|{}|{modified}",
-                    path.display(),
-                    meta.len()
-                ));
+        // The title `settings.json` is a docstore document: probe it through the store so the
+        // key keeps working whatever format the document has on disk.
+        match ms_docstore::signature(&project_settings_doc(path)) {
+            Ok(Some(ms_docstore::Signature::Bytes { len, mtime_ns })) => {
+                // Whole seconds, as the dictionary-file entries above use.
+                let modified = mtime_ns.map_or(0, |nanos| nanos / 1_000_000_000);
+                signature.push(format!("project_custom|{}|{len}|{modified}", path.display()));
             }
-            Err(_) => signature.push(format!("project_custom|{}|missing", path.display())),
+            Ok(None) => signature.push(format!("project_custom|{}|missing", path.display())),
+            // A stat failure still yields a distinct key (the cache is rebuilt once it clears);
+            // the load that follows reports the failure itself.
+            Err(err) => signature.push(format!("project_custom|{}|unreadable|{err}", path.display())),
         }
     }
     signature
@@ -1169,8 +1170,22 @@ pub fn load_custom_spellcheck_words() -> Result<String, String> {
     Ok(parse_custom_dictionary_words(&content).join("\n"))
 }
 
+/// Reads the project custom spellcheck words (`canvas.project_custom_spellcheck_words`) from
+/// the title `settings.json`, normalized and newline-joined. An absent document yields "".
+///
+/// # Errors
+/// Returns a technical message when the document cannot be read, does not parse, or its
+/// root is not an object.
 pub fn load_project_spellcheck_words(settings_file: &Path) -> Result<String, String> {
-    let root = load_json_object_root(settings_file, "project spellcheck settings file")?;
+    let root = ms_docstore::read_value(&project_settings_doc(settings_file))
+        .map_err(|err| format!("failed to read project spellcheck settings file '{}': {err}", settings_file.display()))?
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !root.is_object() {
+        return Err(format!(
+            "failed to parse project spellcheck settings file '{}': root JSON value is not an object",
+            settings_file.display()
+        ));
+    }
     let words = root
         .get("canvas")
         .and_then(Value::as_object)
@@ -1202,32 +1217,49 @@ pub fn save_custom_spellcheck_words(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Stores the project custom spellcheck words into `canvas.project_custom_spellcheck_words`
+/// of the title `settings.json` through the serialized `ms_docstore::update`; no other key
+/// is touched. Bumps the words revision and clears the spellcheck cache on success.
+///
+/// # Errors
+/// Returns a technical message when the existing document is malformed or not an object
+/// (left untouched) or when the atomic write fails.
 pub fn save_project_spellcheck_words(settings_file: &Path, raw: &str) -> Result<(), String> {
-    let mut root = load_json_object_root(settings_file, "project spellcheck settings file")?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(format!(
-            "project spellcheck settings root became non-object unexpectedly: '{}'",
-            settings_file.display()
-        ));
-    };
+    update_project_spellcheck_words(settings_file, |words| {
+        words.clear();
+        words.push_str(raw);
+    })
+}
 
-    let mut canvas_obj = root_obj
-        .get("canvas")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    canvas_obj.insert(
-        PROJECT_CUSTOM_WORDS_KEY.to_string(),
-        Value::String(normalize_custom_words(raw).join("\n")),
-    );
-    root_obj.insert("canvas".to_string(), Value::Object(canvas_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = settings_file.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
-    }
-    write_text_file(settings_file, &payload)?;
+/// The one read-modify-write of the project word list: under the document lock, hands the
+/// stored list (newline-joined; "" when absent) to `edit`, then stores the normalized result
+/// and touches no other key. Bumps the words revision and clears the cache on success.
+///
+/// # Errors
+/// As [`save_project_spellcheck_words`].
+fn update_project_spellcheck_words(settings_file: &Path, edit: impl FnOnce(&mut String)) -> Result<(), String> {
+    // Default options = the historical layout (2-space pretty, no trailing newline, parent
+    // directories created).
+    ms_docstore::update(&project_settings_doc(settings_file), ms_docstore::WriteOptions::default(), |root| {
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(format!(
+                "failed to parse project spellcheck settings file '{}': root JSON value is not an object",
+                settings_file.display()
+            ));
+        };
+        let canvas = root_obj.entry("canvas").or_insert_with(|| Value::Object(Map::new()));
+        // A non-object `canvas` is replaced by a fresh object (the historical behavior).
+        if !canvas.is_object() {
+            *canvas = Value::Object(Map::new());
+        }
+        if let Some(canvas_obj) = canvas.as_object_mut() {
+            let mut words = normalize_custom_words(canvas_obj.get(PROJECT_CUSTOM_WORDS_KEY).and_then(Value::as_str).unwrap_or_default()).join("\n");
+            edit(&mut words);
+            canvas_obj.insert(PROJECT_CUSTOM_WORDS_KEY.to_string(), Value::String(normalize_custom_words(&words).join("\n")));
+        }
+        Ok(())
+    })
+    .map_err(|err| format!("failed to save project spellcheck settings file '{}': {err}", settings_file.display()))?;
     SPELLCHECK_WORDS_REVISION.fetch_add(1, Ordering::Relaxed);
     invalidate_spellcheck_cache();
     Ok(())
@@ -1327,23 +1359,9 @@ fn custom_dictionary_paths_for_root(root_dir: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-fn load_json_object_root(path: &Path, scope: &str) -> Result<Value, String> {
-    if !path.exists() {
-        return Ok(Value::Object(Map::new()));
-    }
-
-    let raw = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {scope} '{}': {err}", path.display()))?;
-    let root = serde_json::from_str::<Value>(&raw)
-        .map_err(|err| format!("failed to parse {scope} '{}': {err}", path.display()))?;
-    if root.is_object() {
-        Ok(root)
-    } else {
-        Err(format!(
-            "failed to parse {scope} '{}': root JSON value is not an object",
-            path.display()
-        ))
-    }
+/// The title `settings.json` as a docstore document.
+fn project_settings_doc(settings_file: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(settings_file, ms_docstore::DocKind::ProjectSettings)
 }
 
 fn resolve_spellcheck_dir() -> PathBuf {
@@ -1561,5 +1579,39 @@ mod tests {
             assert_eq!(key.word, "casa");
             assert_eq!(key.language, language);
         }
+    }
+
+    /// The project word list round-trips through `settings.json` without touching the keys
+    /// other writers own, and the append path keeps what was already stored.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn project_words_update_only_their_key() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"OCR":{"engine":"paddle"},"canvas":{"bubble_type":"aside"}}"#).map_err(|err| err.to_string())?;
+        save_project_spellcheck_words(&path, "Foo\nbar\nfoo\n")?;
+        update_project_spellcheck_words(&path, |words| append_custom_word(words, "Baz"))?;
+        assert_eq!(load_project_spellcheck_words(&path)?, "Foo\nbar\nBaz");
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|err| err.to_string())?).map_err(|err| err.to_string())?;
+        assert_eq!(root["OCR"]["engine"], "paddle");
+        assert_eq!(root["canvas"]["bubble_type"], "aside");
+        Ok(())
+    }
+
+    /// A malformed or non-object `settings.json` is reported by both the reader and the
+    /// writer and stays byte-identical; an absent one reads as an empty list.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn project_words_never_overwrite_malformed_settings() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        assert_eq!(load_project_spellcheck_words(&path)?, "");
+        for seed in ["{ broken", "\"text\""] {
+            std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+            assert!(load_project_spellcheck_words(&path).is_err());
+            assert!(save_project_spellcheck_words(&path, "word").is_err());
+            assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
+        }
+        Ok(())
     }
 }

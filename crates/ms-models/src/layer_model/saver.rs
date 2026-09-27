@@ -7,21 +7,31 @@ save-to-project merge worker) hand a fully OWNED page-save job to a background t
 holder never blocks on PNG encode + manifest read-modify-write, and never holds the doc lock during
 I/O.
 
-The worker mirrors the EXACT persist sequence of `LayerDoc::flush_page` / `flush_page_text` — it adds
-no new write LOGIC, it only moves the existing `persist::*` calls off-thread. Jobs are bucketed per
-page index and the LATEST data for each kind (rasters / text) is kept (coalesced), so a burst of
-edits to one page collapses into a single on-disk write while a Full + a TextOnly job for the same
-page MERGE (neither kind's data is dropped).
+The worker mirrors the EXACT persist sequence of `LayerDoc::flush_page` / `flush_page_text`
+(rasters → text → effects per page). Jobs are bucketed per page index and the LATEST data for each
+kind (rasters / text / per-uid effects) is kept (coalesced), so a burst of edits to one page collapses
+into a single write while a Full + a TextOnly job for the same page MERGE (neither kind's data is
+dropped). Every drain pass then writes each target manifest ONCE: all its pages are applied to one
+`persist::ManifestTxn` and committed together (one docstore commit per pass, not per page), and a
+text write that would not change the page effective on disk is elided.
+
+Error contract: a per-page failure (PNG encode, raster write, seeding) fails only that page's kind; a
+failed commit fails EVERY job of the pass. Results feed the barrier's failed-text set and the
+per-kind acknowledgement map.
 
 Key types:
 - `OwnedRasterLayer` / `RasterSavePart` / `TextSavePart` — owned mirrors of the inputs to
   `persist::save_page_rasters` / `persist::update_raster_effects` / `persist::write_page_text_payload`,
   so the worker holds no borrow into the doc.
 - `PageSaveJob` — one page's owned save payload (its dirs + optional raster part + optional text part).
-- `SaverMsg` — the worker mailbox protocol (`Job` / `Barrier` / `Shutdown`).
+- `SaverMsg` — the worker mailbox protocol (`Job` / `Jobs` (one-pass batch) / `Barrier` / `Shutdown`).
 - `LayerSaver` — owns the worker thread + its `Sender` and `JoinHandle`.
 - `LayerSaverHandle` — a cheap-clone `Sender` wrapper so a merge worker can enqueue / barrier without
   locking the doc.
+
+Key functions:
+- `worker_loop` → `run_bucket` (group a pass by manifest) → `run_manifest_pass` (prepare text PNGs,
+  apply every job to one transaction, commit once).
 
 Notes:
 The whole point is that `PageSaveJob` carries OWNED `ColorImage`s, not borrows, so the worker can run
@@ -40,6 +50,7 @@ use serde_json::Value;
 use super::manifest::{CenteringFrameRec, DeformRec, TextCentersRec, TransformRec};
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use ms_log::runtime_log;
+use ms_log::trace::cat;
 
 /// The independently acknowledged persistence kinds. Effects are part of the raster contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,58 +248,31 @@ impl PageSaveJob {
         }
     }
 
-    /// Runs this job's persist writes on the calling (worker) thread, mirroring the EXACT sequence of
-    /// `LayerDoc::flush_page` / `flush_page_text`:
-    /// 1. rasters via `persist::save_page_rasters` (when a raster part is present),
-    /// 2. text via `persist::write_page_text_payload` (when a text part is present; PNGs re-encoded
-    ///    only when dirty/missing, as in `write_page_text`),
-    /// 3. effects reconcile via `persist::update_raster_effects` for every raster with a non-empty
-    ///    chain (after rasters, before/after text is irrelevant — they touch different fields).
-    ///
-    fn run(&self) -> RunOutcome {
+    /// Encodes the text PNGs this job's text part needs, reproducing `LayerDoc::write_page_text`'s
+    /// "rewrite PNG iff dirty or missing" rule, and builds the payload for the single text writer.
+    /// Runs OUTSIDE the manifest lock (PNG encoding is the slow part). `None` when the job carries no
+    /// text part.
+    fn prepare_text(&self) -> Option<Result<PreparedText, String>> {
+        let text = self.text.as_ref()?;
         let layers_dir = self.layers_dir.as_path();
         let fallback_dir = self.fallback_dir.as_deref();
-
-        // 1) Rasters: build the borrowed `RasterLayerOut`s and call the same writer the sync flush uses.
-        let raster = self.raster.as_ref().map(|raster| {
-            let outs: Vec<RasterLayerOut<'_>> =
-                raster.layers.iter().map(OwnedRasterLayer::as_out).collect();
-            persist::save_page_rasters(
-                layers_dir,
-                self.page_idx,
-                &outs,
-                &raster.groups,
-                &raster.removed_uids,
-            )
-        });
-
-        // 2) Text: reproduce `write_page_text`'s "rewrite PNG iff dirty or missing" rule, then the
-        // single text writer.
-        let text = self.text.as_ref().map(|text| {
-            (|| {
-            let mut text_outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(text.nodes.len());
+        Some((|| {
+            let mut wrote_png = false;
+            let mut outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(text.nodes.len());
             for node in &text.nodes {
                 let file_name = persist::text_image_file_name(self.page_idx, &node.uid);
                 // Presence check via the storage seam (was `Path::is_file`): a deterministic text-PNG
                 // name is either present or not, and storage `exists` answers the same question.
                 let primary_path = layers_dir.join(&file_name);
-                let present = ms_storage::global::storage()
-                    .exists(primary_path.to_string_lossy().as_ref())
-                    || fallback_dir.is_some_and(|d| {
-                        ms_storage::global::storage()
-                            .exists(d.join(&file_name).to_string_lossy().as_ref())
-                    });
+                let present = ms_storage::global::storage().exists(primary_path.to_string_lossy().as_ref())
+                    || fallback_dir.is_some_and(|d| ms_storage::global::storage().exists(d.join(&file_name).to_string_lossy().as_ref()));
                 let rendered_file = if node.pixels_dirty || !present {
-                    Some(persist::write_text_image(
-                        layers_dir,
-                        self.page_idx,
-                        &node.uid,
-                        &node.image,
-                    )?)
+                    wrote_png = true;
+                    Some(persist::write_text_image(layers_dir, self.page_idx, &node.uid, &node.image)?)
                 } else {
                     Some(file_name)
                 };
-                text_outs.push(persist::TextPayloadOut {
+                outs.push(persist::TextPayloadOut {
                     uid: node.uid.clone(),
                     name: node.name.clone(),
                     z: node.z,
@@ -309,54 +293,104 @@ impl PageSaveJob {
                     centering_frame: node.centering_frame,
                 });
             }
-            persist::write_page_text_payload(layers_dir, fallback_dir, self.page_idx, &text_outs)
-            })()
+            Ok(PreparedText { outs, wrote_png })
+        })())
+    }
+
+    /// Applies this job to the pass's open manifest transaction, mirroring the EXACT sequence of
+    /// `LayerDoc::flush_page` / `flush_page_text`:
+    /// 1. rasters via `ManifestTxn::save_page_rasters` (when a raster part is present),
+    /// 2. text via `ManifestTxn::write_page_text_payload` with the payload from [`Self::prepare_text`],
+    ///    elided when it would not change the page (and no text PNG was written for it),
+    /// 3. effects reconcile via `ManifestTxn::update_raster_effects` for every raster with a non-empty
+    ///    chain, then the targeted effects-only items — as ONE unit that is rolled back as a whole
+    ///    when any item fails.
+    ///
+    /// Each kind is atomic within the transaction, so a failing kind never leaves a partial page
+    /// edit for the others' commit. Nothing is on disk until the pass commits.
+    fn apply(&self, txn: &mut persist::ManifestTxn, text: Option<Result<PreparedText, String>>) -> KindResults {
+        let page = self.page_idx;
+        let fallback_dir = self.fallback_dir.as_deref();
+
+        let raster = self.raster.as_ref().map(|raster| {
+            let outs: Vec<RasterLayerOut<'_>> = raster.layers.iter().map(OwnedRasterLayer::as_out).collect();
+            txn.save_page_rasters(page, &outs, &raster.groups, &raster.removed_uids, fallback_dir)
         });
 
-        // 3) Effects reconcile: rewrite the chain + rendered PNG for every raster with a non-empty
-        // chain, exactly as `flush_page_inner` does after `save_page_rasters`.
+        let text = text.map(|prepared| {
+            let prepared = prepared?;
+            // A text PNG written into staging for this page makes the manifest write load-bearing
+            // (it must name the fresh file in THIS tree), so only a PNG-free write may be elided.
+            txn.write_page_text_payload(fallback_dir, page, &prepared.outs, !prepared.wrote_png).map(|_changed| ())
+        });
+
+        let checkpoint = txn.checkpoint(page);
         let effects = (|| {
-        if let Some(raster) = &self.raster {
-            for layer in &raster.layers {
-                if !layer.effects.is_empty() {
-                    persist::update_raster_effects(
-                        layers_dir,
-                        self.page_idx,
-                        &layer.uid,
-                        &layer.effects,
-                        layer.display_image.as_ref(),
-                        fallback_dir,
-                    )?;
+            if let Some(raster) = &self.raster {
+                for layer in raster.layers.iter().filter(|l| !l.effects.is_empty()) {
+                    txn.update_raster_effects(page, &layer.uid, &layer.effects, layer.display_image.as_ref(), fallback_dir)?;
                 }
             }
-        }
-
-        // 3b) Targeted effects-only updates: reconcile a single raster's chain WITHOUT a whole-page
-        // raster rewrite. This is the ONLY path that can express the CLEAR case (empty chain +
-        // `display_image: None`), which the raster reconcile loop above skips. Mirrors each caller's
-        // direct `persist::update_raster_effects` call exactly.
-        for item in &self.effects {
-            persist::update_raster_effects(
-                layers_dir,
-                self.page_idx,
-                &item.uid,
-                &item.effects,
-                item.display_image.as_ref(),
-                fallback_dir,
-            )?;
-        }
-        Ok(())
+            // Targeted effects-only updates: reconcile a single raster's chain WITHOUT a whole-page
+            // raster rewrite. The ONLY path that can express the CLEAR case (empty chain +
+            // `display_image: None`), which the raster reconcile loop above skips.
+            for item in &self.effects {
+                txn.update_raster_effects(page, &item.uid, &item.effects, item.display_image.as_ref(), fallback_dir)?;
+            }
+            Ok(())
         })();
-        RunOutcome { raster, text, effects }
+        if effects.is_err() {
+            txn.rollback(checkpoint);
+        }
+        KindResults { raster, text, effects }
+    }
+
+    /// All present kinds failed with `err` (a panic, or a transaction that could not begin).
+    fn failed_results(&self, err: &str) -> KindResults {
+        KindResults {
+            raster: self.raster.as_ref().map(|_| Err(err.to_string())),
+            text: self.text.as_ref().map(|_| Err(err.to_string())),
+            effects: if self.effects.is_empty() { Ok(()) } else { Err(err.to_string()) },
+        }
     }
 }
 
-/// Independent persist results for one job. Effects contribute to the raster acknowledgement.
+/// A job's text payload after its PNGs were encoded; `wrote_png` records whether any PNG was written.
 #[derive(Debug)]
-struct RunOutcome {
+struct PreparedText {
+    outs: Vec<persist::TextPayloadOut>,
+    wrote_png: bool,
+}
+
+/// Independent persist results for one job within a pass. Effects contribute to the raster
+/// acknowledgement.
+#[derive(Debug)]
+struct KindResults {
     raster: Option<Result<(), String>>,
     text: Option<Result<(), String>>,
     effects: Result<(), String>,
+}
+
+impl KindResults {
+    /// `(raster_ok, text_ok)` once the pass's single manifest commit returned `commit_ok`: a failed
+    /// commit persisted nothing, so every kind the job carried is reported failed.
+    fn acks(&self, commit_ok: bool) -> (bool, bool) {
+        let raster_ok = commit_ok && self.raster.as_ref().is_none_or(Result::is_ok) && self.effects.is_ok();
+        let text_ok = commit_ok && self.text.as_ref().is_none_or(Result::is_ok);
+        (raster_ok, text_ok)
+    }
+
+    fn log_errors(&self, page: usize) {
+        if let Some(Err(err)) = self.raster.as_ref() {
+            runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} raster: {err}"));
+        }
+        if let Some(Err(err)) = self.text.as_ref() {
+            runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} text: {err}"));
+        }
+        if let Err(err) = &self.effects {
+            runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} effects: {err}"));
+        }
+    }
 }
 
 /// The background saver's mailbox protocol.
@@ -371,6 +405,11 @@ struct RunOutcome {
 pub enum SaverMsg {
     /// Persist one page (coalesced per page in the worker).
     Job(PageSaveJob),
+    /// Persist several pages that the sender built together (e.g. every resident page's text at
+    /// save-to-project). One message guarantees they land in the SAME drain pass — hence one
+    /// manifest commit — whereas separate `Job`s sent with work in between can each wake the worker
+    /// into its own pass.
+    Jobs(Vec<PageSaveJob>),
     /// Process every currently-queued job, then signal completion on the sender. Used by
     /// `barrier_blocking` so a caller can be sure all prior enqueued jobs are on disk (e.g. before a
     /// save-to-project merge reads the staging files). The reply reports pages whose latest write
@@ -396,6 +435,20 @@ impl LayerSaverHandle {
         if self.tx.send(SaverMsg::Job(job)).is_err() {
             runtime_log::log_error(
                 "[layer_model::saver] enqueue failed: background saver thread is gone",
+            );
+        }
+    }
+
+    /// Enqueues several page-save jobs as ONE message, so the worker applies them in one drain pass
+    /// (one manifest commit per target manifest). An empty batch sends nothing. A send failure is
+    /// logged and dropped, like [`Self::enqueue`].
+    pub fn enqueue_batch(&self, jobs: Vec<PageSaveJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        if self.tx.send(SaverMsg::Jobs(jobs)).is_err() {
+            runtime_log::log_error(
+                "[layer_model::saver] batch enqueue failed: background saver thread is gone",
             );
         }
     }
@@ -472,6 +525,11 @@ impl LayerSaver {
         self.handle().enqueue(job);
     }
 
+    /// Enqueues several jobs into one drain pass (see [`LayerSaverHandle::enqueue_batch`]).
+    pub fn enqueue_batch(&self, jobs: Vec<PageSaveJob>) {
+        self.handle().enqueue_batch(jobs);
+    }
+
     /// Blocks until every previously enqueued job completes, returning pages whose latest TEXT write failed
     /// (see [`LayerSaverHandle::barrier_blocking`]).
     ///
@@ -539,18 +597,20 @@ fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
 
         // Fold the first message, then drain everything immediately available.
         let mut msg = Some(first);
+        let mut fold = |job: PageSaveJob| {
+            let page = job.page_idx;
+            match bucket.get_mut(&page) {
+                Some(existing) => existing.merge_in_place(job),
+                None => {
+                    order.push(page);
+                    bucket.insert(page, job);
+                }
+            }
+        };
         loop {
             match msg.take() {
-                Some(SaverMsg::Job(job)) => {
-                    let page = job.page_idx;
-                    match bucket.get_mut(&page) {
-                        Some(existing) => existing.merge_in_place(job),
-                        None => {
-                            order.push(page);
-                            bucket.insert(page, job);
-                        }
-                    }
-                }
+                Some(SaverMsg::Job(job)) => fold(job),
+                Some(SaverMsg::Jobs(jobs)) => jobs.into_iter().for_each(&mut fold),
                 Some(SaverMsg::Barrier(done)) => pending_barriers.push(done),
                 Some(SaverMsg::Shutdown) => {
                     shutdown = true;
@@ -576,13 +636,11 @@ fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
     }
 }
 
-/// Runs every job in `bucket` following `order` (deterministic write order), logging — not
-/// propagating — a per-page persist error so one bad page does not stall the others.
-///
-/// Each `job.run()` is wrapped in `catch_unwind`: a panic inside a persist call (e.g. an OOM in PNG
-/// encoding, or a logic bug) must NOT unwind out of the worker loop and kill the saver thread —
-/// that would silently drop all later enqueues and leave every future `barrier_blocking` unable to
-/// complete. Catching keeps the worker alive so other pages still save and barriers still reply.
+/// Runs every job in `bucket` following `order` (deterministic write order). Jobs are grouped by
+/// target manifest (`layers_dir`, first-seen order) and each group is ONE manifest transaction
+/// ([`run_manifest_pass`]): a drain pass that coalesced K pages costs one document commit, not K.
+/// Per-kind results are logged — not propagated — and fold into the failed-page sets and acks, so one
+/// bad page does not stall the others.
 fn run_bucket(
     bucket: &HashMap<usize, PageSaveJob>,
     order: &[usize],
@@ -590,40 +648,105 @@ fn run_bucket(
     failed_text_pages: &mut HashSet<usize>,
     ack_map: &Arc<Mutex<SaveAckMap>>,
 ) {
-    for page in order {
-        let Some(job) = bucket.get(page) else {
-            continue;
-        };
-        // `AssertUnwindSafe`: `PageSaveJob` is consumed read-only by `run` and dropped after; a panic
-        // leaves no observer of a half-mutated value (the on-disk write is the only effect, guarded
-        // by persist's own error handling), so asserting unwind-safety is sound here.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
-            Ok(outcome) => {
-                let raster_ok = outcome.raster.as_ref().is_none_or(Result::is_ok) && outcome.effects.is_ok();
-                let text_ok = outcome.text.as_ref().is_none_or(Result::is_ok);
-                if let Some(Err(err)) = outcome.raster.as_ref() {
-                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} raster: {err}"));
-                }
-                if let Some(Err(err)) = outcome.text.as_ref() {
-                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} text: {err}"));
-                }
-                if let Err(err) = &outcome.effects {
-                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} effects: {err}"));
-                }
-                update_failed_set(failed_raster_pages, *page, job.raster_epoch.is_some(), raster_ok);
-                update_failed_set(failed_text_pages, *page, job.text_epoch.is_some(), text_ok);
-                record_job_acks(ack_map, job, raster_ok, text_ok);
-            }
-            Err(_) => {
-                update_failed_set(failed_raster_pages, *page, job.raster_epoch.is_some(), false);
-                update_failed_set(failed_text_pages, *page, job.text_epoch.is_some(), false);
-                record_job_acks(ack_map, job, false, false);
-                runtime_log::log_error(format!(
-                    "[layer_model::saver] PANIC while persisting page {page}; saver thread continues"
-                ));
-            }
+    let mut groups: Vec<(&std::path::Path, Vec<&PageSaveJob>)> = Vec::new();
+    for job in order.iter().filter_map(|page| bucket.get(page)) {
+        match groups.iter_mut().find(|(dir, _)| *dir == job.layers_dir.as_path()) {
+            Some((_, jobs)) => jobs.push(job),
+            None => groups.push((job.layers_dir.as_path(), vec![job])),
         }
     }
+    for (layers_dir, jobs) in groups {
+        for (job, (raster_ok, text_ok)) in jobs.iter().zip(run_manifest_pass(layers_dir, &jobs)) {
+            update_failed_set(failed_raster_pages, job.page_idx, job.raster_epoch.is_some(), raster_ok);
+            update_failed_set(failed_text_pages, job.page_idx, job.text_epoch.is_some(), text_ok);
+            record_job_acks(ack_map, job, raster_ok, text_ok);
+        }
+    }
+}
+
+/// Persists `jobs` (all targeting the manifest in `layers_dir`) with ONE manifest write and returns
+/// `(raster_ok, text_ok)` per job, in order.
+///
+/// 1. Per-page preparation outside the manifest lock: each job's text PNGs are encoded. A failure
+///    (or panic) there fails only THAT page's text.
+/// 2. One `persist::ManifestTxn`: every job is applied to the in-memory manifest; a failing or
+///    panicking job is rolled back to its checkpoint and fails alone.
+/// 3. One commit. If it fails, nothing was persisted, so EVERY job of the pass reports every kind it
+///    carried as failed (the doc then keeps them dirty for retry; the barrier revokes text ownership).
+///
+/// Panics are caught at each step (`catch_unwind`): a panic must not unwind out of the worker loop
+/// and kill the saver thread — that would silently drop all later enqueues and leave every future
+/// `barrier_blocking` unable to complete.
+fn run_manifest_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob]) -> Vec<(bool, bool)> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    // `AssertUnwindSafe` throughout: jobs are read-only, and the transaction's page state is restored
+    // from its checkpoint after a caught panic, so no observer ever sees a half-mutated value.
+    let prepared: Vec<Option<Result<PreparedText, String>>> = jobs
+        .iter()
+        .map(|job| {
+            catch_unwind(AssertUnwindSafe(|| job.prepare_text()))
+                .unwrap_or_else(|_| Some(Err("panic while encoding the text PNGs".to_string())))
+        })
+        .collect();
+
+    let mut txn = match catch_unwind(AssertUnwindSafe(|| persist::ManifestTxn::begin(layers_dir))) {
+        Ok(Ok(txn)) => txn,
+        Ok(Err(err)) => return fail_whole_pass(layers_dir, jobs, &format!("read manifest: {err}")),
+        Err(_) => return fail_whole_pass(layers_dir, jobs, "panic while reading the manifest"),
+    };
+    let mut results: Vec<KindResults> = Vec::with_capacity(jobs.len());
+    for (job, text) in jobs.iter().zip(prepared) {
+        let checkpoint = txn.checkpoint(job.page_idx);
+        let result = match catch_unwind(AssertUnwindSafe(|| job.apply(&mut txn, text))) {
+            Ok(result) => result,
+            Err(_) => {
+                txn.rollback(checkpoint);
+                runtime_log::log_error(format!(
+                    "[layer_model::saver] PANIC while persisting page {}; saver thread continues",
+                    job.page_idx
+                ));
+                job.failed_results("panic while applying the page")
+            }
+        };
+        result.log_errors(job.page_idx);
+        results.push(result);
+    }
+
+    let commit_ok = match catch_unwind(AssertUnwindSafe(|| txn.commit())) {
+        Ok(Ok(wrote)) => {
+            ms_log::trace_log!(
+                cat::PERSIST,
+                "saver pass {} jobs={} manifest_written={}",
+                layers_dir.display(),
+                jobs.len(),
+                wrote
+            );
+            true
+        }
+        Ok(Err(err)) => {
+            log_pass_failure(layers_dir, jobs, &format!("write manifest: {err}"));
+            false
+        }
+        Err(_) => {
+            log_pass_failure(layers_dir, jobs, "panic while writing the manifest");
+            false
+        }
+    };
+    results.iter().map(|r| r.acks(commit_ok)).collect()
+}
+
+/// Logs a pass-wide failure (every job in it lost its writes) and reports all jobs failed.
+fn fail_whole_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob], err: &str) -> Vec<(bool, bool)> {
+    log_pass_failure(layers_dir, jobs, err);
+    vec![(false, false); jobs.len()]
+}
+
+fn log_pass_failure(layers_dir: &std::path::Path, jobs: &[&PageSaveJob], err: &str) {
+    let pages: Vec<usize> = jobs.iter().map(|job| job.page_idx).collect();
+    runtime_log::log_error(format!(
+        "[layer_model::saver] failed to persist pages {pages:?} of {}: {err}. None of these pages was saved; they stay dirty for retry.",
+        layers_dir.display()
+    ));
 }
 
 fn update_failed_set(failed: &mut HashSet<usize>, page: usize, present: bool, ok: bool) {
@@ -1150,5 +1273,255 @@ mod tests {
         ]);
         saver.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- One manifest transaction per pass (batched commits) --------------------------------------
+
+    /// Failed raster pages, failed text pages, and the acknowledgements `(page, kind, epoch, ok)`.
+    type PassResult = (HashSet<usize>, HashSet<usize>, Vec<(usize, SaveKind, u64, bool)>);
+
+    /// Runs ONE drain pass over `jobs` exactly as the worker does (`run_bucket`), on the calling
+    /// thread, so a test controls what one pass contains. Returns the failed raster / text page sets
+    /// and the recorded acknowledgements.
+    fn run_pass(jobs: Vec<PageSaveJob>) -> PassResult {
+        let mut bucket = HashMap::new();
+        let mut order = Vec::new();
+        for job in jobs {
+            order.push(job.page_idx);
+            bucket.insert(job.page_idx, job);
+        }
+        let ack_map = Arc::new(Mutex::new(SaveAckMap::default()));
+        let (mut failed_raster, mut failed_text) = (HashSet::new(), HashSet::new());
+        run_bucket(&bucket, &order, &mut failed_raster, &mut failed_text, &ack_map);
+        let mut acks = ack_map.lock().expect("ack map").take();
+        acks.sort_by_key(|(page, kind, _, _)| (*page, matches!(kind, SaveKind::Text)));
+        (failed_raster, failed_text, acks)
+    }
+
+    fn text_job(page: usize, layers_dir: &Path, fallback_dir: Option<&Path>, nodes: Vec<OwnedTextNode>, epoch: u64) -> PageSaveJob {
+        PageSaveJob {
+            page_idx: page,
+            layers_dir: layers_dir.to_path_buf(),
+            fallback_dir: fallback_dir.map(Path::to_path_buf),
+            raster: None,
+            raster_epoch: None,
+            text: Some(TextSavePart { nodes }),
+            text_epoch: Some(epoch),
+            effects: Vec::new(),
+        }
+    }
+
+    /// A text node positioned at `(cx, cy)`, with an explicit z so the payload round-trips exactly.
+    fn text_at(uid: &str, z: u32, cx: f32, cy: f32, pixels_dirty: bool) -> OwnedTextNode {
+        let render_data = serde_json::json!({ "text": uid });
+        OwnedTextNode { z, transform: tf(cx, cy), pixels_dirty, render_data, ..text_node(uid, Color32::WHITE) }
+    }
+
+    /// Committed + staging layer dirs of a chapter `ch` under `root`, with the committed manifest
+    /// created (empty) in `format`, so a NEW staging manifest joins that format (rule B.3).
+    fn chapter(root: &Path, format: ms_docstore::DocFormat) -> (PathBuf, PathBuf) {
+        let committed = root.join("ch").join("layers");
+        let staging = root.join("ch_unsaved").join("layers");
+        std::fs::create_dir_all(&committed).expect("mkdir committed");
+        let doc = ms_docstore::DocRef::new(committed.join("layers.json"), ms_docstore::DocKind::Layers).with_new_format(format);
+        ms_docstore::write_value(&doc, &serde_json::json!({"schema_version": 4, "pages": []}), ms_docstore::WriteOptions::default()).expect("seed committed");
+        (committed, staging)
+    }
+
+    fn staging_doc(staging: &Path) -> ms_docstore::DocRef {
+        ms_docstore::DocRef::new(staging.join("layers.json"), ms_docstore::DocKind::Layers)
+    }
+
+    /// Number of atomic JSON replacements (temp + rename) of the staging manifest so far.
+    fn json_writes(staging: &Path) -> usize {
+        ms_docstore::recorded_steps(&staging.join("layers.json")).iter().filter(|s| **s == ms_docstore::WriteStep::Renamed).count()
+    }
+
+    fn page_transform_cx(primary: &Path, fallback: Option<&Path>, page: usize, uid: &str) -> Option<f32> {
+        persist::load_page_text_nodes(primary, fallback, page)
+            .expect("load")
+            .into_iter()
+            .find(|n| n.uid == uid)
+            .and_then(|n| n.inline)
+            .and_then(|i| i.transform)
+            .map(|t| t.cx)
+    }
+
+    /// A pass that coalesced K pages makes exactly ONE commit to a `.db` staging manifest (its
+    /// revision advances by one), and every page lands.
+    #[test]
+    fn k_pages_in_one_pass_are_one_db_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Db);
+        let pages = 0..5usize;
+        let (_, failed, _) = run_pass(pages.clone().map(|p| text_job(p, &staging, Some(&committed), vec![text_at("t", 0, 1.0, 1.0, true)], 1)).collect());
+        assert!(failed.is_empty());
+        assert_eq!(ms_docstore::actual_format(&staging_doc(&staging)).expect("format"), Some(ms_docstore::DocFormat::Db));
+        let before = ms_docstore::revision(&staging_doc(&staging)).expect("revision").expect("db revision");
+
+        let (_, failed, acks) = run_pass(pages.clone().map(|p| text_job(p, &staging, Some(&committed), vec![text_at("t", 0, 40.0, 1.0, false)], 2)).collect());
+        assert!(failed.is_empty());
+        assert!(acks.iter().all(|(_, _, _, ok)| *ok));
+        let after = ms_docstore::revision(&staging_doc(&staging)).expect("revision").expect("db revision");
+        assert_eq!(after, before + 1, "five changed pages in one pass must be one commit");
+        for p in pages {
+            assert_eq!(page_transform_cx(&staging, None, p, "t"), Some(40.0));
+        }
+    }
+
+    /// The same on a JSON chapter: one atomic replacement per pass, and a staging manifest is written
+    /// without a directory fsync (it is scratch data; see `chapter_doc_durability`).
+    #[test]
+    fn k_pages_in_one_pass_are_one_json_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let (_, failed, _) = run_pass((0..6).map(|p| text_job(p, &staging, Some(&committed), vec![text_at("t", 0, 1.0, 1.0, true)], 1)).collect());
+        assert!(failed.is_empty());
+        assert_eq!(json_writes(&staging), 1, "six pages in one pass must be one manifest write");
+        assert!(
+            !ms_docstore::recorded_steps(&staging.join("layers.json")).contains(&ms_docstore::WriteStep::DirectoryDurable),
+            "a staging manifest is never directory-fsynced"
+        );
+        assert!(staging.join("layers.json").is_file());
+        assert!(!staging.join("layers.db").exists(), "a JSON chapter's staging stays JSON");
+    }
+
+    /// When the single manifest write fails, NOTHING of the pass was persisted, so every job reports
+    /// every kind it carried as failed — never a silent partial success.
+    #[test]
+    fn failed_commit_fails_every_job_of_the_pass() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let mut jobs: Vec<PageSaveJob> = (0..3).map(|p| text_job(p, &staging, Some(&committed), vec![text_at("t", 0, 1.0, 1.0, true)], 10 + p as u64)).collect();
+        jobs.push(PageSaveJob { raster_epoch: Some(20), ..full_job(3, &staging, vec![raster("r", Color32::RED)]) });
+        ms_docstore::arm_fault(Some(ms_docstore::FaultPoint::TempWrite));
+        let (failed_raster, failed_text, acks) = run_pass(jobs);
+        ms_docstore::arm_fault(None);
+        assert_eq!(failed_text, HashSet::from([0, 1, 2]));
+        assert_eq!(failed_raster, HashSet::from([3]));
+        assert_eq!(acks.len(), 4);
+        assert!(acks.iter().all(|(_, _, _, ok)| !*ok), "every job of a failed commit is reported failed: {acks:?}");
+        assert!(!staging.join("layers.json").exists(), "no manifest was written");
+    }
+
+    /// A per-page failure (a text PNG that cannot be encoded, a raster that cannot be written) fails
+    /// only that page; the rest of the pass still commits, once.
+    #[test]
+    fn per_page_failure_is_isolated_within_the_pass() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let mut broken_text = text_at("bad", 0, 1.0, 1.0, true);
+        broken_text.image.pixels.truncate(1);
+        let mut broken_raster = raster("bad_r", Color32::RED);
+        broken_raster.base_image.pixels.truncate(1);
+        let jobs = vec![
+            text_job(0, &staging, Some(&committed), vec![text_at("t0", 0, 1.0, 1.0, true)], 1),
+            text_job(1, &staging, Some(&committed), vec![broken_text], 2),
+            text_job(2, &staging, Some(&committed), vec![text_at("t2", 0, 1.0, 1.0, true)], 3),
+            PageSaveJob { raster_epoch: Some(4), ..full_job(3, &staging, vec![broken_raster]) },
+        ];
+        let (failed_raster, failed_text, _) = run_pass(jobs);
+        assert_eq!(failed_text, HashSet::from([1]));
+        assert_eq!(failed_raster, HashSet::from([3]));
+        assert_eq!(json_writes(&staging), 1, "the surviving pages still share one write");
+        let manifest = crate::layer_model::compat::read_manifest(&staging.join("layers.json")).expect("read").expect("manifest");
+        let pages: Vec<usize> = manifest.pages.iter().map(|p| p.img_idx).collect();
+        assert_eq!(pages, vec![0, 2], "failed pages leave no partial record");
+    }
+
+    /// Unchanged pages cost no write at all; a delete-only and a placement-only change are written,
+    /// and the loader + save-to-project merge see exactly the doc's text for every page.
+    #[test]
+    fn unchanged_pages_are_not_written_changed_ones_are() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let nodes = |p: usize| vec![text_at("a", 0, 10.0 + p as f32, 5.0, false), text_at("b", 1, 20.0, 5.0, false)];
+        // The committed chapter holds the text (and its PNGs) as the last save left it.
+        let committed_jobs = (0..4)
+            .map(|p| text_job(p, &committed, None, nodes(p).into_iter().map(|n| OwnedTextNode { pixels_dirty: true, ..n }).collect(), 1))
+            .collect();
+        assert!(run_pass(committed_jobs).1.is_empty());
+
+        // Save-to-project enqueues every resident page; none changed → no staging manifest at all.
+        let (_, failed, acks) = run_pass((0..4).map(|p| text_job(p, &staging, Some(&committed), nodes(p), 2)).collect());
+        assert!(failed.is_empty() && acks.iter().all(|(_, _, _, ok)| *ok), "an elided page is a successful save");
+        assert!(!staging.join("layers.json").exists() && !staging.join("layers.db").exists(), "unchanged pages write nothing");
+        assert_eq!(json_writes(&staging), 0);
+
+        // Page 1: delete-only (b removed). Page 2: placement-only (a moved). Pages 0 and 3 unchanged.
+        let jobs = vec![
+            text_job(0, &staging, Some(&committed), nodes(0), 3),
+            text_job(1, &staging, Some(&committed), vec![nodes(1).remove(0)], 3),
+            text_job(2, &staging, Some(&committed), vec![text_at("a", 0, 99.0, 5.0, false), nodes(2).remove(1)], 3),
+            text_job(3, &staging, Some(&committed), nodes(3), 3),
+        ];
+        assert!(run_pass(jobs).1.is_empty());
+        assert_eq!(json_writes(&staging), 1);
+        let manifest = crate::layer_model::compat::read_manifest(&staging.join("layers.json")).expect("read").expect("manifest");
+        let pages: Vec<usize> = manifest.pages.iter().map(|p| p.img_idx).collect();
+        assert_eq!(pages, vec![1, 2], "only the changed pages are staged");
+
+        let uids = |dir: &Path, fb: Option<&Path>, p: usize| -> Vec<String> {
+            let mut u: Vec<String> = persist::load_page_text_nodes(dir, fb, p).expect("load").into_iter().map(|n| n.uid).collect();
+            u.sort();
+            u
+        };
+        assert_eq!(uids(&staging, Some(&committed), 0), vec!["a", "b"]);
+        assert_eq!(uids(&staging, Some(&committed), 1), vec!["a"], "the deletion is visible");
+        assert_eq!(page_transform_cx(&staging, Some(&committed), 2, "a"), Some(99.0), "the move is visible");
+
+        let owned: HashSet<usize> = (0..4).collect();
+        persist::merge_unsaved_layers_into_committed(&committed, &staging, &owned).expect("merge");
+        assert_eq!(uids(&committed, None, 0), vec!["a", "b"]);
+        assert_eq!(uids(&committed, None, 1), vec!["a"]);
+        assert_eq!(page_transform_cx(&committed, None, 2, "a"), Some(99.0));
+        assert_eq!(uids(&committed, None, 3), vec!["a", "b"]);
+    }
+
+    /// A text job that had to write a PNG into staging is never elided, even when its payload equals
+    /// the committed page: the staging manifest must name the fresh file in its own tree.
+    #[test]
+    fn text_job_that_wrote_a_png_is_not_elided() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        assert!(run_pass(vec![text_job(0, &committed, None, vec![text_at("a", 0, 1.0, 1.0, true)], 1)]).1.is_empty());
+        assert!(run_pass(vec![text_job(0, &staging, Some(&committed), vec![text_at("a", 0, 1.0, 1.0, true)], 2)]).1.is_empty());
+        assert_eq!(json_writes(&staging), 1, "a re-rendered text is staged");
+        assert!(staging.join(persist::text_image_file_name(0, "a")).is_file());
+    }
+
+    /// Deleting EVERY raster of a text-less committed page through the saver must persist, both for
+    /// the doc's whole-page job (raster + empty text in one transaction — the text half must not
+    /// re-seed the committed rasters) and for the PS editor's raster-only job with explicit
+    /// `removed_uids`. Then save-to-project must not bring the rasters back.
+    #[test]
+    fn deleting_every_raster_of_a_textless_page_persists_through_the_saver() {
+        for with_text_half in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+            assert!(run_pass(vec![full_job(0, &committed, vec![raster("r1", Color32::RED), raster("r2", Color32::BLUE)])]).0.is_empty());
+            let rasters = |dir: &Path, fb: Option<&Path>| -> Vec<String> {
+                persist::load_page_rasters(dir, fb, 0).expect("load").layers.into_iter().map(|l| l.uid).collect()
+            };
+            assert_eq!(rasters(&committed, None), vec!["r1", "r2"], "seed");
+
+            let job = PageSaveJob {
+                page_idx: 0,
+                layers_dir: staging.clone(),
+                fallback_dir: Some(committed.clone()),
+                raster: Some(RasterSavePart { layers: Vec::new(), groups: Vec::new(), removed_uids: vec!["r1".into(), "r2".into()] }),
+                raster_epoch: Some(1),
+                text: with_text_half.then(|| TextSavePart { nodes: Vec::new() }),
+                text_epoch: with_text_half.then_some(1),
+                effects: Vec::new(),
+            };
+            let (failed_raster, failed_text, _) = run_pass(vec![job]);
+            assert!(failed_raster.is_empty() && failed_text.is_empty(), "text half {with_text_half}");
+            assert!(rasters(&staging, Some(&committed)).is_empty(), "text half {with_text_half}: staging view must not fall back to committed");
+
+            let owned: HashSet<usize> = [0].into_iter().collect();
+            persist::merge_unsaved_layers_into_committed(&committed, &staging, &owned).expect("merge");
+            assert!(rasters(&committed, None).is_empty(), "text half {with_text_half}: the deleted rasters must not come back");
+        }
     }
 }

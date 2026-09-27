@@ -12,9 +12,10 @@ combo lived only in the studio. This module renders that one panel against a per
 returns a [`GeneralSettingsOutcome`] describing the per-call-site runtime effects the
 caller must apply (there is no app-global channel here, unlike `ai_backend_panel`).
 
-Persistence is SYNCHRONOUS and serialized through the process-wide
-`config::lock_user_config_write()` so a write never clobbers the ONNX Runtime SIGILL
-load-guard marker (see `README_AGENT`'s user_config write-lock invariant).
+Persistence is SYNCHRONOUS and goes through `ms_config::update_user_config_file`, the
+serialized user-config read-modify-write, so a write never clobbers the ONNX Runtime
+SIGILL load-guard marker or another writer's keys (see `README_AGENT`'s user_config
+write-lock invariant).
 
 The UI-language selector lists the locales found in the on-disk `locale/` folder
 (scanned ONCE at construction — never per frame; see CLAUDE.md §5), each shown by
@@ -38,8 +39,9 @@ Key items:
 - `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing.
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
-- `draw_general_settings_panel`: renders the projects-dir editor + memory-profile
-  combo + interface-scale slider + UI-language selector + typesetting-language selector.
+- `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
+  (`storage_mode_setting`) + memory-profile combo + interface-scale slider + UI-language
+  selector + typesetting-language selector.
 - `apply_ui_scale` / `apply_ui_scale_from_user_settings`: apply `General.ui_scale_percent`
   to an egui context (called by each `run_native` constructor closure).
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
@@ -61,6 +63,7 @@ use ms_log::runtime_log;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
 use ms_thread as thread;
+use crate::storage_mode_setting::{StorageModeSettingState, draw_storage_mode_setting};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -110,6 +113,8 @@ pub struct GeneralSettingsPanelState {
     pub preferred_monitor: Option<ms_window_geometry::MonitorKey>,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
+    /// The Dev/Prod storage row (conversion job bookkeeping of this surface).
+    pub storage_mode: StorageModeSettingState,
 }
 
 /// One selectable interface language for the UI-language selector.
@@ -136,6 +141,9 @@ pub struct GeneralSettingsOutcome {
     pub projects_dir_saved: Option<PathBuf>,
     /// Set to the new profile when the memory-profile selection changed.
     pub memory_profile_changed: Option<MemoryProfile>,
+    /// Set to the target mode on the frame a storage-mode switch started by this pane
+    /// finished converting (successfully or with per-document failures).
+    pub storage_mode_changed: Option<ms_config::StorageMode>,
 }
 
 impl Default for GeneralSettingsPanelState {
@@ -198,6 +206,7 @@ impl GeneralSettingsPanelState {
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
+            storage_mode: StorageModeSettingState::default(),
         }
     }
 
@@ -213,8 +222,8 @@ impl GeneralSettingsPanelState {
 /// Renders the shared general-settings widget (projects-directory editor + global
 /// memory-profile combo) and returns the runtime effects the caller must apply.
 ///
-/// Persists a changed projects dir / memory profile synchronously (serialized on
-/// `config::lock_user_config_write()`); persistence failures set an error status and
+/// Persists a changed projects dir / memory profile synchronously (one serialized
+/// `ms_docstore` update of `user_config.json`, under its document lock); persistence failures set an error status and
 /// are logged. The native folder picker button is desktop-only.
 #[must_use]
 pub fn draw_general_settings_panel(
@@ -283,6 +292,11 @@ pub fn draw_general_settings_panel(
             }
         }
     }
+
+    ui.separator();
+
+    // Dev/Prod document storage, next to the projects root whose titles it converts.
+    outcome.storage_mode_changed = draw_storage_mode_setting(ui, &mut state.storage_mode, std::path::Path::new(&state.saved_projects_dir));
 
     ui.separator();
 
@@ -690,8 +704,7 @@ fn persist_text_language(language: TextLanguage) {
 ///
 /// Persistence is synchronous, matching this widget's projects-dir / memory-profile
 /// writes: one tiny key write on an explicit user action, serialized on the
-/// `config::lock_user_config_write()` lock so it never clobbers the ORT load-guard
-/// marker. The install is live (no restart) and the frame is repainted so the new
+/// `user_config.json` document lock so it never clobbers the ORT load-guard marker. The install is live (no restart) and the frame is repainted so the new
 /// strings show immediately.
 fn apply_ui_language_change(ui: &egui::Ui, state: &mut GeneralSettingsPanelState) {
     let tag = state.ui_language_tag.clone();
@@ -944,54 +957,82 @@ fn normalize_projects_dir_value(raw_value: &str) -> String {
 }
 
 /// Synchronously persists several `<section>.<key>` values in `user_config.json` in one
-/// atomic locked read-modify-write, serialized on the process-wide write lock so it
-/// never clobbers the ORT load-guard marker (see `README_AGENT`'s user_config write-lock
-/// invariant).
+/// serialized read-modify-write through [`ms_config::update_user_config_file`] (the
+/// single user-config transaction owner: process-wide lock + atomic write), so it never
+/// clobbers the ORT load-guard marker or a concurrent writer's keys.
 ///
 /// `entries` is a list of `(section, key, value)`: each `value` is inserted at
-/// `root[section][key]`, creating the section object if absent and preserving every
-/// unrelated key. Reads the current file once while holding
-/// `config::lock_user_config_write()` (a missing file starts from an empty object),
-/// applies all entries, and rewrites the file exactly once. A parse error is surfaced
-/// rather than silently resetting the config, so a temporarily unreadable file is never
-/// clobbered. Returns a user-facing (Cyrillic) error string on failure. Synchronous disk
-/// I/O, but a single tiny write triggered by an explicit user action.
+/// `root[section][key]`, creating the section object if absent (a non-object section is
+/// replaced by an object) and preserving every unrelated key. A missing file starts from
+/// an empty object; all entries land in exactly one write. A malformed file is surfaced
+/// as the localized parse error and is NEVER overwritten. Returns a user-facing error
+/// string on failure.
 ///
-/// `pub(crate)` so the launcher's first-run language modal persists both language keys
+/// Runs on the GUI thread (explicit user action, one tiny write). That is a known
+/// CLAUDE.md §5 exception kept as-is in this step; the write may briefly wait behind
+/// another user-config writer holding the transaction lock.
+///
+/// `pub` so the launcher's first-run language modal persists both language keys
 /// (`General.ui_language` + `TextTab.text_language`) atomically through this one path.
 pub fn persist_config_keys(entries: &[(&str, &str, serde_json::Value)]) -> Result<(), String> {
+    persist_config_keys_at(&ms_config::user_config_path(), entries)
+}
+
+/// [`persist_config_keys`] against an explicit user-config `path` (tests use a temp file).
+fn persist_config_keys_at(path: &std::path::Path, entries: &[(&str, &str, serde_json::Value)]) -> Result<(), String> {
     use serde_json::{Map, Value};
 
-    let _guard = ms_config::lock_user_config_write();
-    let path = ms_config::user_config_path();
+    let result = ms_config::update_user_config_file(path, |root| {
+        // Same repair as before the docstore migration: a parseable but non-object root
+        // (e.g. `[]`) is replaced by an empty object instead of failing the save.
+        if !root.is_object() {
+            *root = Value::Object(Map::new());
+        }
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(anyhow::anyhow!(t!("settings.general.config_root_error").to_string()));
+        };
+        for (section, key, value) in entries {
+            let mut section_obj = root_obj
+                .get(*section)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            section_obj.insert((*key).to_string(), value.clone());
+            root_obj.insert((*section).to_string(), Value::Object(section_obj));
+        }
+        Ok(())
+    });
+    result.map_err(|err| {
+        let message = config_write_error_message(path, &err);
+        runtime_log::log_error(format!(
+            "[general-settings] failed to persist user config keys; path={}; keys={:?}; error={err:#}",
+            path.display(),
+            entries.iter().map(|(section, key, _)| format!("{section}.{key}")).collect::<Vec<_>>()
+        ));
+        message
+    })
+}
 
-    let mut root = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<Value>(&raw)
-            .map_err(|err| tf!("settings.general.config_parse_error", path = path.display(), err = err))?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(err) => return Err(tf!("settings.general.config_read_error", path = path.display(), err = err)),
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
+/// Maps a failed user-config transaction to the user-facing message.
+///
+/// A parse failure (the file exists but is not valid JSON — reported either as a
+/// `serde_json::Error` or as `ms_docstore::DocStoreError::Malformed` somewhere in the
+/// error chain) keeps the localized `config_parse_error` text; every other failure
+/// (read, directory creation, write) is shown as its full context chain.
+fn config_write_error_message(path: &std::path::Path, err: &anyhow::Error) -> String {
+    let parse_cause = err.chain().find_map(|cause| {
+        if let Some(json_err) = cause.downcast_ref::<serde_json::Error>() {
+            return Some(json_err.to_string());
+        }
+        if let Some(ms_docstore::DocStoreError::Malformed { cause, .. }) = cause.downcast_ref::<ms_docstore::DocStoreError>() {
+            return Some(cause.clone());
+        }
+        None
+    });
+    match parse_cause {
+        Some(cause) => tf!("settings.general.config_parse_error", path = path.display(), err = cause),
+        None => format!("{err:#}"),
     }
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.general.config_root_error").to_string());
-    };
-    for (section, key, value) in entries {
-        let mut section_obj = root_obj
-            .get(*section)
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        section_obj.insert((*key).to_string(), value.clone());
-        root_obj.insert((*section).to_string(), Value::Object(section_obj));
-    }
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    std::fs::write(&path, payload).map_err(|err| err.to_string())
 }
 
 /// Thin wrapper over [`persist_config_keys`] for a single `General.<key>` write.
@@ -1002,6 +1043,50 @@ fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unique temp path for one test's user config; the caller removes its directory.
+    fn temp_config_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("ms-settings-ui-p2a-{tag}-{}", std::process::id()))
+            .join("user_config.json")
+    }
+
+    #[test]
+    fn persist_config_keys_preserves_unrelated_keys_and_creates_sections() {
+        let path = temp_config_path("merge");
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(&path, r#"{"General":{"keep":1,"ui_language":"ru"},"Other":{"x":true}}"#).expect("seed config");
+
+        persist_config_keys_at(&path, &[
+            ("General", "ui_language", serde_json::json!("en")),
+            ("TextTab", "text_language", serde_json::json!("en-US")),
+        ])
+        .expect("persist");
+
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse back");
+        assert_eq!(root, serde_json::json!({
+            "General": {"keep": 1, "ui_language": "en"},
+            "Other": {"x": true},
+            "TextTab": {"text_language": "en-US"},
+        }));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn persist_config_keys_never_overwrites_malformed_config() {
+        let path = temp_config_path("malformed");
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let broken = "{\"General\": ";
+        std::fs::write(&path, broken).expect("seed broken config");
+
+        let result = persist_config_keys_at(&path, &[("General", "ui_language", serde_json::json!("en"))]);
+
+        assert!(result.is_err(), "a malformed config must fail the save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), broken);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn normalize_empty_and_whitespace_use_default_root() {

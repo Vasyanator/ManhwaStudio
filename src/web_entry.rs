@@ -13,7 +13,8 @@ and the bundled demo chapter. Cross-origin isolation for threads is retrofitted
 by `web/coi-serviceworker.js`.
 
 Key items:
-- start(): wasm `fn main` calls this; starts the eframe web app.
+- start(): wasm `fn main` calls this; pins the owned-document format to JSON (web is
+  Dev-only) and starts the eframe web app.
 - WebApp: Launcher | Editor phases behind one eframe::App.
 - seed_test_chapter(): writes the generated demo chapter into storage.
 
@@ -31,9 +32,15 @@ const CANVAS_ID: &str = "the_canvas_id";
 /// Virtual projects root inside the storage backend.
 const PROJECTS_ROOT: &str = "/projects";
 
-/// Boots the web app: panic hook → storage backend → demo chapter → launcher.
+/// Boots the web app: panic hook → document format (JSON) → storage backend → demo chapter →
+/// launcher.
 pub fn start() {
     console_error_panic_hook::set_once();
+    // The web build is Dev-only (no Prod storage mode): owned documents are always JSON.
+    // JSON is already `ms_docstore`'s default; setting it explicitly pins the contract so
+    // a future default change cannot silently switch the browser build to a store it
+    // does not support.
+    ms_docstore::set_default_format(ms_docstore::DocFormat::Json);
 
     if crate::storage::install(Arc::new(ms_storage::MemStorage::new())).is_err() {
         console_error("storage backend was already installed");

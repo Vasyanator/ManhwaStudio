@@ -1,0 +1,114 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/pages",
+    "parent": "",
+    "seg": "pages",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/pages/0",
+    "parent": "/pages",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/pages/0/groups",
+    "parent": "/pages/0",
+    "seg": "groups",
+    "kind": "arr_id",
+    "payload": "[\"g1\"]"
+  },
+  {
+    "path": "/pages/0/groups/\"g1\"",
+    "parent": "/pages/0/groups",
+    "seg": "\"g1\"",
+    "kind": "ent",
+    "payload": "{\"members\":[\"a1\",\"t1\"],\"uid\":\"g1\"}"
+  },
+  {
+    "path": "/pages/0/page",
+    "parent": "/pages/0",
+    "seg": "page",
+    "kind": "leaf",
+    "payload": "0"
+  },
+  {
+    "path": "/pages/0/size",
+    "parent": "/pages/0",
+    "seg": "size",
+    "kind": "leaf",
+    "payload": "[800,1200]"
+  },
+  {
+    "path": "/pages/0/tree",
+    "parent": "/pages/0",
+    "seg": "tree",
+    "kind": "arr_id",
+    "payload": "[\"a1\",\"t1\"]"
+  },
+  {
+    "path": "/pages/0/tree/\"a1\"",
+    "parent": "/pages/0/tree",
+    "seg": "\"a1\"",
+    "kind": "ent",
+    "payload": "{\"children\":[\"t1\"],\"effects\":[{\"color\":[0,0,0,128],\"offset\":[1,2],\"type\":\"shadow\"}],\"kind\":\"group\",\"name\":\"Group\",\"render_data\":{\"cache\":{\"h\":20,\"w\":10},\"hash\":\"ff00\"},\"uid\":\"a1\"}"
+  },
+  {
+    "path": "/pages/0/tree/\"t1\"",
+    "parent": "/pages/0/tree",
+    "seg": "\"t1\"",
+    "kind": "ent",
+    "payload": "{\"effects\":[],\"kind\":\"text\",\"name\":\"Text 1\",\"render_data\":null,\"uid\":\"t1\"}"
+  },
+  {
+    "path": "/pages/1",
+    "parent": "/pages",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/pages/1/groups",
+    "parent": "/pages/1",
+    "seg": "groups",
+    "kind": "leaf",
+    "payload": "[]"
+  },
+  {
+    "path": "/pages/1/page",
+    "parent": "/pages/1",
+    "seg": "page",
+    "kind": "leaf",
+    "payload": "1"
+  },
+  {
+    "path": "/pages/1/size",
+    "parent": "/pages/1",
+    "seg": "size",
+    "kind": "leaf",
+    "payload": "[800,900]"
+  },
+  {
+    "path": "/pages/1/tree",
+    "parent": "/pages/1",
+    "seg": "tree",
+    "kind": "leaf",
+    "payload": "[]"
+  },
+  {
+    "path": "/version",
+    "parent": "",
+    "seg": "version",
+    "kind": "leaf",
+    "payload": "2"
+  }
+]

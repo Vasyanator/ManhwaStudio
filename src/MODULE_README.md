@@ -117,8 +117,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   normalization, magic-byte JPEG->PNG conversion in `src`/`cleaned`/`clean_layers`, clean-layer
   filename normalization (including the legacy `<group>_<page>` cleaned numbering, e.g.
   `1_1.png` -> `001.png`), legacy absolute-coordinate bubble migration (`LegacyRibbonGeometry`),
-  unsaved staging paths, and filesystem helpers. `Page` and `ProjectPaths` are re-exported from
-  `ms-page-ops`, which declares them. See `crates/ms-project/src/MODULE_README.md`.
+  unsaved staging paths, filesystem helpers, and the "save to project" staging→committed merge
+  (`save_merge::merge_unsaved_into_project`; `app.rs::start_save_to_project` calls it on its worker
+  and injects the per-page layer-manifest merge from `models::layer_model::persist`). `Page` and
+  `ProjectPaths` are re-exported from `ms-page-ops`, which declares them. See
+  `crates/ms-project/src/MODULE_README.md`.
 - `project_scan` (crate `ms-project`, re-exported by `main.rs`): filesystem scan of the projects
   ROOT shared by the launcher and startup — title/chapter enumeration, openability validation
   (`ProjectValidationState`) and unsaved-chapter detection. Plain I/O: no UI, no app state. It is
@@ -359,9 +362,14 @@ and either opens a validated project or starts the Rust launcher. The launcher r
 outcome to startup; it does not start the editor on its own.
 
 Startup routing order in `run_main`: CLI parse -> (Linux desktop integration and the isolated
-backend-socket seed, both decided by `--ignore-installed`) -> Windows service flags -> config /
-locale / UI-scale seeding -> `--check-venv` (terminal) -> `--continue-update` -> `--update` ->
-`--test-launcher` -> AI backend supervisor -> project resolution -> studio window.
+backend-socket seed, both decided by `--ignore-installed`) -> Windows service flags -> storage-mode
+probe (`init_storage_mode_at_startup`: the FIRST document access; seeds the docstore default format)
+-> config / locale / UI-scale seeding -> `--check-venv` (terminal) -> `--continue-update` ->
+`--update` -> `--test-launcher` -> AI backend supervisor -> project resolution -> studio window.
+A pending storage reconciliation (user_config still in the other format than its recorded mode) is
+started on a worker right before the launcher, or — on a direct `--project` start — by
+`studio_bootstrap` once the project has loaded (`ms-settings-ui`'s `storage_mode_job`); an
+incomplete reconciliation is surfaced in the studio's top bar (`MangaApp::draw_storage_reconcile_notice`).
 
 Before any of that, `reject_conflicting_startup_flags` validates the command line: combining
 `--ignore-installed` with a flag that manages an installed copy (`args::INSTALLED_COPY_FLAGS` —
@@ -518,7 +526,7 @@ prompts instead of blocking the GUI thread.
   `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:
   `ms-settings-ui`'s `general_settings_panel.rs`. Per-UI
   `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to
-  `user_config.json` serialized on `config::lock_user_config_write()`, except the typesetting
+  `user_config.json` through `config::update_user_config_file`, except the typesetting
   language, which is written off-thread through `tabs::settings::save_text_language`.
 - Global interface scale (`General.ui_scale_percent`, 50-200 %): also `ms-settings-ui`'s `general_settings_panel.rs`.
   It is a `Context::set_zoom_factor` call, so it rescales a whole window (fonts, spacing, widget

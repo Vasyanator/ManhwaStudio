@@ -40,7 +40,9 @@ Main items:
   position), so dropping a fresh 1-based source next to a 0-based clean folder no longer shifts the
   overlays back a page.
 - `ProjectData::load_resume_unsaved`: like `load`, but reads bubbles/text-info from the
-  `{chapter}_unsaved/` folder when present (crash-recovery mode).
+  `{chapter}_unsaved/` folder when present (crash-recovery mode). A staging document that
+  exists but does not parse refuses the resume with an error naming the file(s); the
+  session is never discarded or substituted automatically (launcher offers the discard).
 - `ProjectPaths::unsaved_dir` and related fields: paths to the parallel `_unsaved` folder
   where all in-session mutations are staged before an explicit "save to project".
 - `ProjectPaths::image_bubbles_dir` and `unsaved_image_bubbles_dir`: saved and staged external
@@ -56,7 +58,9 @@ loading pipeline works on native (real FS) and web (in-memory store). Images are
 in-memory bytes (`image::load_from_memory` / `ImageReader`) and encoded to a buffer before being
 handed to the seam; there is no `copy`, so copies are emulated as read + write. The only native-
 specific call left is `canonicalize()` on the incoming real project dir, which has no seam analog
-and runs before the virtual layer applies.
+and runs before the virtual layer applies. The owned documents (`settings.json` writes, the bubbles
+document) go through `ms_docstore` instead (which itself reads via the seam). The save-to-project
+merge lives in `save_merge.rs` (native `std::fs`).
 */
 
 #![warn(clippy::all)]
@@ -80,11 +84,14 @@ pub use ms_page_ops::{Page, ProjectPaths};
 // Unlike the load path it uses `std::fs` directly (native-only browsing of a real
 // projects root), not the `ms_storage` seam — see the note in `MODULE_README.md`.
 pub mod project_scan;
+pub mod save_merge;
+pub mod storage_mode;
 
 use anyhow::{Context, Result};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use ms_config as config;
 use ms_config::JsonConfig;
+use ms_docstore::{DocKind, DocRef, WriteOptions};
 use ms_config::bubble_status::{
     BubbleStatusRule, bubble_status_rules_from_value, default_bubble_status_rules,
 };
@@ -276,6 +283,10 @@ impl ProjectData {
 
     /// Crash-recovery load: if `{chapter}_unsaved/translation_bubbles.json` exists
     /// it is used instead of the main one; otherwise falls back to the main file.
+    ///
+    /// # Errors
+    /// Besides the `load` errors: a localized error naming the damaged file(s) when an owned
+    /// `{chapter}_unsaved` document exists but is malformed (`project_scan::damaged_unsaved_documents`).
     pub fn load_resume_unsaved(project_dir: &Path, user_settings: &Value) -> Result<Self> {
         Self::load_internal(project_dir, user_settings, true)
     }
@@ -311,6 +322,22 @@ impl ProjectData {
                 project_dir.display()
             )
         })?;
+
+        // Staging writes skip fsync, so after a power loss a `{chapter}_unsaved` document can
+        // be zero-length or truncated; every page load and save of the session would then
+        // fail. Refuse the resume up front with an error naming the damaged files. Nothing is
+        // deleted here: discarding the session is the user's explicit choice in the launcher.
+        if resume_unsaved {
+            let damaged = project_scan::damaged_unsaved_documents(&project_dir);
+            if !damaged.is_empty() {
+                runtime_log::log_error(format!(
+                    "unsaved session of {} is damaged ({} document(s)); resume refused",
+                    project_dir.display(),
+                    damaged.len()
+                ));
+                anyhow::bail!(project_scan::damaged_unsaved_session_message(&damaged));
+            }
+        }
 
         let title_dir = project_dir
             .parent()
@@ -354,7 +381,7 @@ impl ProjectData {
         let settings_file = title_dir.join(config::PROJECT_SETTINGS_FILE);
 
         // Unsaved staging folder lives next to the chapter folder.
-        let unsaved_dir = title_dir.join(format!("{chapter_name}_unsaved"));
+        let unsaved_dir = title_dir.join(format!("{chapter_name}{}", ms_page_ops::chapter_docs::UNSAVED_DIR_SUFFIX));
         let unsaved_bubbles_file = unsaved_dir.join(config::BUBBLES_FILE);
         let unsaved_clean_layers_dir = unsaved_dir.join(config::CLEAN_LAYERS_DIR);
         let unsaved_image_bubbles_dir = unsaved_dir.join("image_bubbles");
@@ -406,7 +433,7 @@ impl ProjectData {
 
         // In resume mode, prefer the unsaved bubbles file if it exists.
         let effective_bubbles_file = if resume_unsaved
-            && storage().exists(unsaved_bubbles_file.to_string_lossy().as_ref())
+            && ms_docstore::exists(&DocRef::new(&unsaved_bubbles_file, DocKind::Bubbles))
         {
             &unsaved_bubbles_file
         } else {
@@ -440,23 +467,6 @@ impl ProjectData {
 
     pub fn exists(&self) -> bool {
         storage().is_dir(self.project_dir.to_string_lossy().as_ref())
-    }
-
-    pub fn autosave_bubbles(&self) -> Result<()> {
-        let raw = serde_json::to_string_pretty(self.bubbles.as_ref())
-            .context("failed to serialize bubbles")?;
-        storage()
-            .write(
-                self.paths.bubbles_file.to_string_lossy().as_ref(),
-                raw.as_bytes(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to write bubbles file {}",
-                    self.paths.bubbles_file.display()
-                )
-            })?;
-        Ok(())
     }
 
     pub fn ensure_saved(&self) -> Result<()> {
@@ -1431,14 +1441,18 @@ fn parse_sort_parts(name: &str) -> (Option<u64>, u8, String) {
 /// Returns an error if the file cannot be read, is not valid bubble JSON, or legacy
 /// conversion fails (for example when page dimensions cannot be read).
 fn load_bubbles(path: &Path, pages: &[Page]) -> Result<(Vec<Bubble>, bool)> {
-    if !storage().exists(path.to_string_lossy().as_ref()) {
-        return Ok((Vec::new(), false));
-    }
-    let data = storage()
-        .read_to_string(path.to_string_lossy().as_ref())
-        .with_context(|| format!("failed to read bubbles json: {}", path.display()))?;
-    let raw: Vec<Value> = serde_json::from_str(&data)
-        .with_context(|| format!("invalid bubbles json: {}", path.display()))?;
+    // The document store owns the bubbles document; a parse failure surfaces as
+    // `Malformed` and a read failure as `Storage`, both reported with the path.
+    let raw: Vec<Value> = match ms_docstore::read::<Vec<Value>>(&DocRef::new(path, DocKind::Bubbles)) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok((Vec::new(), false)),
+        Err(err @ ms_docstore::DocStoreError::Malformed { .. }) => {
+            return Err(anyhow::Error::new(err).context(format!("invalid bubbles json: {}", path.display())));
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!("failed to read bubbles json: {}", path.display())));
+        }
+    };
 
     // Fast path: no legacy entries, deserialize straight into the current model.
     if !raw.iter().any(value_is_legacy_xy) {
@@ -1740,27 +1754,46 @@ fn solve_page_left(
 
 /// Persists migrated legacy bubbles back to `path` in the current format.
 ///
-/// The original legacy file is backed up once to a sibling `*_legacy_xy.json` file before
-/// being overwritten, so the pre-migration data is never lost.
+/// `path` is the bubbles document's logical `.json` path; the document may be stored as
+/// `.json` or `.db`. The original legacy document is backed up once to a sibling
+/// `*_legacy_xy.json` plain file (NOT an owned document) before being overwritten, so the
+/// pre-migration data is never lost: a `.json` source is copied byte-for-byte, a `.db`
+/// source is backed up as the pretty JSON text of its logical `Value`. Backup and rewrite
+/// run inside ONE document-lock section, so no other writer of this process can change the
+/// document between them. The rewrite keeps the stored format (atomic replace).
 ///
 /// # Errors
-/// Returns an error if the backup copy or the rewrite fails.
+/// Returns an error if the document vanished, the backup read/write fails, or the
+/// rewrite fails; on a backup failure the document is left untouched.
 fn persist_migrated_bubbles(path: &Path, bubbles: &[Bubble]) -> Result<()> {
     let backup = legacy_backup_path(path);
-    if !storage().exists(backup.to_string_lossy().as_ref()) {
-        // Storage has no `copy`; emulate the one-time backup as read + write of the raw bytes.
-        let original = storage()
-            .read(path.to_string_lossy().as_ref())
-            .with_context(|| format!("failed to back up legacy bubbles to {}", backup.display()))?;
-        storage()
-            .write(backup.to_string_lossy().as_ref(), &original)
-            .with_context(|| format!("failed to back up legacy bubbles to {}", backup.display()))?;
-    }
-    let json =
-        serde_json::to_string_pretty(bubbles).context("failed to serialize migrated bubbles")?;
-    storage()
-        .write(path.to_string_lossy().as_ref(), json.as_bytes())
-        .with_context(|| format!("failed to write migrated bubbles: {}", path.display()))?;
+    let doc = DocRef::new(path, DocKind::Bubbles);
+    ms_docstore::with_lock(&doc, |locked| -> Result<()> {
+        if !storage().exists(backup.to_string_lossy().as_ref()) {
+            let backup_ctx = || format!("failed to back up legacy bubbles to {}", backup.display());
+            let format = locked.actual_format().with_context(backup_ctx)?.with_context(|| {
+                format!("legacy bubbles document vanished before migration: {}", path.display())
+            })?;
+            let original = match format {
+                // Storage has no `copy`; the raw bytes keep the backup byte-identical.
+                ms_docstore::DocFormat::Json => storage()
+                    .read(locked.doc().path_for(ms_docstore::DocFormat::Json).to_string_lossy().as_ref())
+                    .with_context(backup_ctx)?,
+                // A `.db` has no JSON bytes to copy: serialize its logical value instead.
+                ms_docstore::DocFormat::Db => {
+                    let value = locked.read_value().with_context(backup_ctx)?.with_context(|| {
+                        format!("legacy bubbles document vanished before migration: {}", path.display())
+                    })?;
+                    serde_json::to_vec_pretty(&value).with_context(backup_ctx)?
+                }
+            };
+            storage().write(backup.to_string_lossy().as_ref(), &original).with_context(backup_ctx)?;
+        }
+        locked
+            .write(bubbles, WriteOptions::default())
+            .with_context(|| format!("failed to write migrated bubbles: {}", path.display()))?;
+        Ok(())
+    })?;
     runtime_log::log_info(format!(
         "migrated {} legacy bubble(s) to page-normalized format: {}",
         bubbles.len(),
@@ -1977,49 +2010,39 @@ fn comic_type_from_config(settings: &Value) -> Option<ComicType> {
         .and_then(ComicType::from_config_value)
 }
 
+/// Stores `comic_type` under the `comic_type` key of the title's `settings.json`, leaving
+/// every other key as it is.
+///
+/// Runs as ONE serialized read-modify-write (`ms_docstore::update`), so a concurrent writer
+/// of another `settings.json` section cannot lose this key or have its own keys reverted.
+/// An absent file is created (`{"comic_type": ...}`); a valid document whose root is not an
+/// object is replaced by an object (historical behavior).
+///
+/// `durability`: a caller on the GUI thread passes `Durability::None` (atomic, no fsync:
+/// a crash may lose this write but never tears the file); a worker passes
+/// `Durability::Contents`.
+///
+/// # Errors
+/// Returns a technical message (logged by the caller) when the file cannot be read, is
+/// NOT valid JSON (the malformed file is left untouched — it is never overwritten), or
+/// cannot be written.
 pub fn save_comic_type_to_project_file(
     settings_file: &Path,
     comic_type: ComicType,
+    durability: ms_docstore::Durability,
 ) -> Result<(), String> {
-    let mut root = if storage().exists(settings_file.to_string_lossy().as_ref()) {
-        match storage().read_to_string(settings_file.to_string_lossy().as_ref()) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(err) => {
-                return Err(format!(
-                    "failed to read project settings '{}': {err}",
-                    settings_file.display()
-                ));
-            }
+    let doc = DocRef::new(settings_file, DocKind::ProjectSettings);
+    ms_docstore::update(&doc, WriteOptions { durability, ..WriteOptions::default() }, |root| {
+        if !root.is_object() {
+            *root = Value::Object(Map::new());
         }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(format!(
-            "project settings root is not an object: '{}'",
-            settings_file.display()
-        ));
-    };
-    root_obj.insert(
-        "comic_type".to_string(),
-        Value::String(comic_type.as_config_str().to_string()),
-    );
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = settings_file.parent() {
-        storage()
-            .create_dir_all(parent.to_string_lossy().as_ref())
-            .map_err(|err| err.to_string())?;
-    }
-    storage()
-        .write(settings_file.to_string_lossy().as_ref(), payload.as_bytes())
-        .map_err(|err| err.to_string())?;
-    Ok(())
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(format!("project settings root is not an object: '{}'", settings_file.display()));
+        };
+        root_obj.insert("comic_type".to_string(), Value::String(comic_type.as_config_str().to_string()));
+        Ok(())
+    })
+    .map_err(|err| format!("failed to save comic type to project settings '{}': {err}", settings_file.display()))
 }
 
 #[allow(dead_code)]
@@ -2117,6 +2140,53 @@ mod tests {
         ComicType, LegacyEntry, LegacyRibbonGeometry, overlay_name_match_key, value_is_legacy_xy,
     };
     use serde_json::json;
+
+    /// A current-format bubble for the migration-persist tests.
+    fn migrated_bubble() -> super::Bubble {
+        serde_json::from_value(json!({"id": 1, "img_idx": 0, "img_u": 0.25, "img_v": 0.5, "side": null}))
+            .expect("current-format bubble")
+    }
+
+    /// A legacy (absolute-coordinate) bubbles document stored as `.db` is backed up to
+    /// `*_legacy_xy.json` as the pretty JSON of its value, then rewritten in place as `.db`.
+    #[test]
+    fn persist_migrated_bubbles_backs_up_a_db_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(ms_config::BUBBLES_FILE);
+        let doc = ms_docstore::DocRef::new(&path, ms_docstore::DocKind::Bubbles);
+        let legacy = json!([{"id": 1, "img_idx": 0, "x": 120.0, "y": 340.5, "side": null}]);
+        ms_docstore::write_whole_atomic(&doc, &legacy, ms_docstore::DocFormat::Db).expect("seed .db");
+
+        super::persist_migrated_bubbles(&path, &[migrated_bubble()]).expect("persist");
+
+        let backup = super::legacy_backup_path(&path);
+        let backup_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&backup).expect("backup written")).expect("backup is JSON");
+        assert_eq!(backup_value, legacy, "the backup holds the pre-migration document");
+        assert_eq!(ms_docstore::actual_format(&doc).expect("format"), Some(ms_docstore::DocFormat::Db));
+        assert!(!path.exists(), "no stray .json next to the .db");
+        let rewritten = ms_docstore::read_value(&doc).expect("read").expect("present");
+        assert_eq!(rewritten[0]["img_u"], json!(0.25));
+        assert!(rewritten[0].get("x").is_none());
+    }
+
+    /// A `.json` source keeps the byte-identical backup, and an existing backup is never
+    /// overwritten by a later migration.
+    #[test]
+    fn persist_migrated_bubbles_copies_a_json_document_verbatim_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(ms_config::BUBBLES_FILE);
+        let original = b"[ {\"id\": 1, \"img_idx\": 0, \"x\": 1.0, \"y\": 2.0} ]\n".to_vec();
+        std::fs::write(&path, &original).expect("seed .json");
+
+        super::persist_migrated_bubbles(&path, &[migrated_bubble()]).expect("persist");
+        let backup = super::legacy_backup_path(&path);
+        assert_eq!(std::fs::read(&backup).expect("backup"), original);
+
+        std::fs::write(&path, b"[]").expect("reseed");
+        super::persist_migrated_bubbles(&path, &[migrated_bubble()]).expect("persist again");
+        assert_eq!(std::fs::read(&backup).expect("backup"), original, "backup is one-time");
+    }
 
     /// `canvas_preset` and `from_canvas_preset_fields` must be exact inverses.
     ///

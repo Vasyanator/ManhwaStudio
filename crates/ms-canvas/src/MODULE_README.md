@@ -336,7 +336,9 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - `settings.rs`: canvas settings snapshots and persistence worker. Its `user_config.json` half writes
   through `config::update_user_config_file` (the serialized read-modify-write boundary), never a bare
   `fs::write`: this worker runs off the GUI thread and an unlocked read-modify-write here could drop
-  the ORT SIGILL guard marker written concurrently under the same lock.
+  the ORT SIGILL guard marker written concurrently under the same lock. Its title `settings.json`
+  half goes through `ms_docstore::update` for the same reason: the mutator edits only the canvas
+  keys, so it cannot revert keys other writers (translation tab, spellcheck words) own.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
 - `pixel_grid.rs`: the ONE per-source-pixel inspection grid, shared with `tabs::ps_editor`
   (`pub(crate)` for that reason). `pixel_grid_spans` is pure geometry (clip-bounded, unit-tested);

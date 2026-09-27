@@ -15,6 +15,8 @@ Key structures:
   return-to-launcher / exit buttons), `Running` (delegates `ui` and `on_exit` to `MangaApp`),
   and `ClosingDiscarded` (a close arrived during `Loading`; the worker's result has been
   received and discarded, so the deferred close proceeds).
+- Deferred storage-mode reconciliation: on a direct `--project` start, the pending
+  conversion (`storage_mode_job`) is started once the project has loaded.
 - `spawn_project_load_thread`: named worker that mirrors the previous synchronous startup
   sequence (`detect_unsaved_for_project` choosing `load_resume_unsaved` vs `load`).
 
@@ -29,6 +31,9 @@ Closing the window during `Loading` is intercepted (`CancelClose`): the load wor
 non-atomic filesystem writes (`cleaned/` seeding placeholders, JPEG->PNG re-encode +
 source removal) and killing it mid-write can permanently corrupt the chapter, so the shell
 waits for the worker's result, discards it, and only then really closes.
+A damaged `{chapter}_unsaved` session (a staging document that does not parse) makes
+`load_resume_unsaved` fail with a localized error naming the files; the error screen's
+"Exit to launcher" is the route to discarding it there. Nothing is deleted automatically.
 `MangaApp::new` does not need `eframe::CreationContext`, which is what makes late
 construction inside a frame possible. Native-only: compiled together with the native
 windowed startup flow (`run_main_window`), gated off wasm at the module declaration.
@@ -189,6 +194,15 @@ impl StudioBootstrapApp {
                     );
                     if let Some(tab) = self.reload_tab.take() {
                         app.set_active_tab(tab);
+                    }
+                    // A direct `--project` start deferred the storage-mode reconciliation
+                    // (see `run_main`) until the project is loaded, so the conversion never
+                    // competes with the load. No-op when nothing is pending or it already ran;
+                    // progress and failures show in the General settings pane and the log, and an
+                    // incomplete run raises the studio's top-bar notice
+                    // (`MangaApp::draw_storage_reconcile_notice`).
+                    if let Some(job) = crate::storage_mode_job::start_pending_reconciliation() {
+                        runtime_log::log_info(format!("[studio-bootstrap] started the deferred storage-mode reconciliation (job {job})"));
                     }
                     BootstrapState::Running(Box::new(app))
                 }

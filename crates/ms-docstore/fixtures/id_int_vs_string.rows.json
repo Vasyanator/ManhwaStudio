@@ -1,0 +1,30 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/items",
+    "parent": "",
+    "seg": "items",
+    "kind": "arr_id",
+    "payload": "[12,\"12\"]"
+  },
+  {
+    "path": "/items/\"12\"",
+    "parent": "/items",
+    "seg": "\"12\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"12\",\"v\":2}"
+  },
+  {
+    "path": "/items/12",
+    "parent": "/items",
+    "seg": "12",
+    "kind": "ent",
+    "payload": "{\"id\":12,\"v\":1}"
+  }
+]

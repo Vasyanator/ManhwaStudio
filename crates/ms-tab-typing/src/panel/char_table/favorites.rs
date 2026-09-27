@@ -6,9 +6,9 @@ The two favorite-character stores of the character table and their persistence.
 They are deliberately asymmetric because their homes already differ:
 
 - GLOBAL  -> `user_config.json`, key `TextTab.char_table_global_favorites`
-             (an array of single-character strings). Read through
-             `ms_config::JsonConfig`, written through
-             `ms_config::update_user_config_file`.
+             (an array of single-character strings). Read by
+             `CharTableState::ensure_loaded` through `ms_docstore`, written
+             through `ms_config::update_user_config_file`.
 - PROJECT -> `{title_dir}/char_favorites.json`, a versioned document
              `{ "version": 1, "characters": ["★", "→"] }`. TITLE-scoped on
              purpose: every chapter of one manga shares one list.
@@ -28,15 +28,15 @@ Key types:
 - `FavoritesError` (typed persistence failure)
 
 Notes:
-EVERY filesystem operation on the PROJECT document goes through
-`ms_storage::global::storage()`, never `std::fs`: `ms-project` and everything
-below it must keep working on the wasm virtual store. The GLOBAL store touches
-no filesystem directly at all — `ms_config` owns that file, including its
-process-wide write lock.
+The PROJECT document is read and written ONLY through `ms_docstore`
+(`DocKind::CharFavorites`): atomic temp+rename writes under the per-document
+lock, reads through the `ms-storage` seam on wasm, so it keeps working on the wasm
+virtual store. The quarantine (rename to a free `.bad*` name) is
+`ms_docstore::quarantine`, under the same document lock. The GLOBAL store touches no filesystem directly at all —
+`ms_config` owns that file, including its process-wide write lock.
 */
 
 use ms_config as config;
-use ms_storage::global::storage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -171,8 +171,15 @@ pub(super) fn global_favorites_json(chars: &[char]) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Project store (`{title_dir}/char_favorites.json`, via `storage()`)
+// Project store (`{title_dir}/char_favorites.json`, via `ms_docstore`)
 // ---------------------------------------------------------------------------
+
+/// The document-store name of the project favorites document at `path` (a
+/// `….json` path, as `ProjectPaths::char_favorites_file` builds it).
+#[must_use]
+fn project_document(path: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(path, ms_docstore::DocKind::CharFavorites)
+}
 
 /// Loads the project favorites document at `path` into a typed [`LoadOutcome`].
 ///
@@ -182,13 +189,17 @@ pub(super) fn global_favorites_json(chars: &[char]) -> Vec<Value> {
 /// still parsed best-effort). Never panics.
 #[must_use]
 pub(super) fn load_project_document(path: &Path) -> LoadOutcome {
-    let store = storage();
-    let path_str = path.to_string_lossy();
-    if !store.exists(path_str.as_ref()) {
-        return LoadOutcome::Missing;
-    }
-    let raw = match store.read_to_string(path_str.as_ref()) {
-        Ok(raw) => raw,
+    let file: CharFavoritesFile = match ms_docstore::read(&project_document(path)) {
+        Ok(Some(file)) => file,
+        Ok(None) => return LoadOutcome::Missing,
+        Err(ms_docstore::DocStoreError::Malformed { cause, .. }) => {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: malformed {CHAR_FAVORITES_FILE_NAME}; treating as corrupt (will \
+                 quarantine). Path: {} Error: {cause}",
+                path.display()
+            ));
+            return LoadOutcome::Invalid;
+        }
         Err(err) => {
             // NOT `Invalid`: the document may be perfectly valid and merely
             // unreadable right now, and quarantining it would rename a good file
@@ -199,17 +210,6 @@ pub(super) fn load_project_document(path: &Path) -> LoadOutcome {
                 path.display()
             ));
             return LoadOutcome::Unreadable;
-        }
-    };
-    let file: CharFavoritesFile = match serde_json::from_str(&raw) {
-        Ok(file) => file,
-        Err(err) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: malformed {CHAR_FAVORITES_FILE_NAME}; treating as corrupt (will \
-                 quarantine). Path: {} Error: {err}",
-                path.display()
-            ));
-            return LoadOutcome::Invalid;
         }
     };
     if file.version != CHAR_FAVORITES_VERSION {
@@ -233,132 +233,91 @@ pub(super) fn load_project_document(path: &Path) -> LoadOutcome {
 /// this code cannot fix; refusing is better than looping.
 const MAX_QUARANTINE_CANDIDATES: u32 = 100;
 
-/// Picks a quarantine destination that does not exist yet.
-///
-/// `{file}.bad` first, then `{file}.bad.1`, `{file}.bad.2`, … The plain rename
-/// used underneath REPLACES an existing destination (`std::fs::rename` on Unix),
-/// so reusing one name would destroy the previously quarantined copy — which is
-/// the very content quarantine exists to preserve.
-///
-/// # Errors
-/// [`FavoritesError::Quarantine`] when every probed name is taken.
-fn free_quarantine_path(path: &Path) -> Result<PathBuf, FavoritesError> {
-    let store = storage();
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| CHAR_FAVORITES_FILE_NAME.to_owned());
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    for attempt in 0..MAX_QUARANTINE_CANDIDATES {
-        let candidate = if attempt == 0 {
-            parent.join(format!("{file_name}.bad"))
-        } else {
-            parent.join(format!("{file_name}.bad.{attempt}"))
-        };
-        if !store.exists(candidate.to_string_lossy().as_ref()) {
-            return Ok(candidate);
-        }
-    }
-    Err(FavoritesError::Quarantine {
-        path: path.display().to_string(),
-        destination: parent.join(format!("{file_name}.bad")).display().to_string(),
-        reason: format!(
-            "no free destination among {MAX_QUARANTINE_CANDIDATES} candidates; earlier \
-             quarantined copies must be removed first"
-        ),
-    })
-}
-
 /// Moves a MALFORMED project document aside before replacement is permitted.
 ///
-/// The destination is the first free `{file}.bad`/`{file}.bad.N` name, so an
-/// earlier quarantined copy is never overwritten. Only a document known to be
-/// malformed may be passed here — an unread one may be perfectly good.
+/// `ms_docstore::quarantine` under the document lock: the destination is the first free
+/// `{file}.bad`/`{file}.bad.N` name, so an earlier quarantined copy is never overwritten
+/// (the rename underneath REPLACES an existing destination, which would destroy the very
+/// content quarantine exists to preserve). Only a document known to be malformed may be
+/// passed here — an unread one may be perfectly good. A document that has vanished
+/// meanwhile needs no quarantine.
 ///
 /// # Errors
 /// Returns [`FavoritesError::Quarantine`] when the recoverable original could
-/// not be moved; callers must leave the list unchanged and unsaved.
+/// not be moved (or every probed name is taken); callers must leave the list unchanged and
+/// unsaved.
 pub(super) fn quarantine_bad_project_document(path: &Path) -> Result<(), FavoritesError> {
-    let bad = free_quarantine_path(path)?;
-    let store = storage();
-    store
-        .rename(
-            path.to_string_lossy().as_ref(),
-            bad.to_string_lossy().as_ref(),
-        )
-        .map_err(|err| FavoritesError::Quarantine {
+    let doc = project_document(path);
+    let naming = ms_docstore::QuarantineNaming::FirstFree { max_candidates: MAX_QUARANTINE_CANDIDATES };
+    match ms_docstore::quarantine(&doc, "bad", naming, ms_docstore::QuarantineFallback::RenameOnly) {
+        // The store logs the move (WARN). `Absent`: nothing left to preserve; `Copied`
+        // cannot happen with `RenameOnly`.
+        Ok(ms_docstore::Quarantined::Moved(_) | ms_docstore::Quarantined::Absent | ms_docstore::Quarantined::Copied { .. }) => Ok(()),
+        Err(ms_docstore::DocStoreError::Quarantine { path, destination, rename_error, .. }) => Err(FavoritesError::Quarantine {
             path: path.display().to_string(),
-            destination: bad.display().to_string(),
-            reason: err.to_string(),
-        })?;
-    ms_log::runtime_log::log_warn(format!(
-        "typing: quarantined corrupt {CHAR_FAVORITES_FILE_NAME} to {}",
-        bad.display()
-    ));
-    Ok(())
+            destination: destination.display().to_string(),
+            reason: rename_error,
+        }),
+        Err(other) => {
+            let source = doc.path_for(ms_docstore::DocFormat::Json);
+            Err(FavoritesError::Quarantine {
+                path: source.display().to_string(),
+                destination: format!("{}.bad", source.display()),
+                reason: other.to_string(),
+            })
+        }
+    }
 }
 
 /// Writes `chars` to the project document at `path`, creating the parent
 /// directory if needed.
 ///
-/// The write is atomic: a sibling temp file is written first and then renamed
-/// over the target, so a crash mid-write cannot truncate an existing list.
+/// The write goes through `ms_docstore` (atomic sibling temp + fsync + rename
+/// under the document lock), so a crash mid-write cannot truncate an existing
+/// list. Layout: 2-space pretty JSON plus a trailing newline (the historical
+/// bytes).
 ///
 /// # Errors
 /// [`FavoritesError`] on directory creation, serialization, write, or rename
 /// failure. Callers persist off the GUI thread.
 pub(super) fn save_project_document(path: &Path, chars: &[char]) -> Result<(), FavoritesError> {
-    let store = storage();
-    if let Some(parent) = path.parent() {
-        let parent_str = parent.to_string_lossy();
-        store
-            .create_dir_all(parent_str.as_ref())
-            .map_err(|err| FavoritesError::CreateDir {
-                dir: parent.display().to_string(),
-                reason: err.to_string(),
-            })?;
-    }
     let file = CharFavoritesFile {
         version: CHAR_FAVORITES_VERSION,
         characters: global_favorites_json(&normalize(chars.iter().copied())),
     };
-    let mut text =
-        serde_json::to_string_pretty(&file).map_err(|err| FavoritesError::Serialize {
-            reason: err.to_string(),
-        })?;
-    text.push('\n');
+    let options = ms_docstore::WriteOptions {
+        trailing_newline: true,
+        ..ms_docstore::WriteOptions::default()
+    };
+    ms_docstore::write(&project_document(path), &file, options)
+        .map(|_fingerprint| ())
+        .map_err(|err| favorites_error_from_store(path, err))
+}
 
-    // Temp sibling + rename: the target is replaced atomically, so a crash
-    // between the two steps leaves the previous list intact. The temp name is
-    // per-process so two processes cannot collide on it.
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| CHAR_FAVORITES_FILE_NAME.to_owned());
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let temp_str = temp.to_string_lossy().into_owned();
-    store
-        .write(temp_str.as_str(), text.as_bytes())
-        .map_err(|err| FavoritesError::Write {
-            path: temp.display().to_string(),
-            reason: err.to_string(),
-        })?;
-    store
-        .rename(temp_str.as_str(), path.to_string_lossy().as_ref())
-        .map_err(|err| {
-            // Best-effort cleanup of the orphaned temp file; the rename failure
-            // is the error we report (a failed cleanup must not mask it).
-            if let Err(cleanup_err) = store.remove_file(temp_str.as_str()) {
-                ms_log::runtime_log::log_warn(format!(
-                    "typing: could not remove orphaned temp file {temp_str}: {cleanup_err}"
-                ));
-            }
+/// Maps a document-store write failure onto the diagnostic [`FavoritesError`]
+/// variants (which name the failing step and path).
+#[must_use]
+fn favorites_error_from_store(path: &Path, err: ms_docstore::DocStoreError) -> FavoritesError {
+    match err {
+        // The only `Io` of the write path is the parent-directory creation.
+        ms_docstore::DocStoreError::Io { path: dir, source } => FavoritesError::CreateDir {
+            dir: dir.display().to_string(),
+            reason: source.to_string(),
+        },
+        ms_docstore::DocStoreError::Serialize { cause, .. } => {
+            FavoritesError::Serialize { reason: cause }
+        }
+        ms_docstore::DocStoreError::Write(ms_docstore::AtomicWriteError::Rename { path, reason }) => {
             FavoritesError::Rename {
                 path: path.display().to_string(),
-                reason: err.to_string(),
+                reason,
             }
-        })
+        }
+        other => FavoritesError::Write {
+            path: path.display().to_string(),
+            reason: other.to_string(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +409,8 @@ fn save_project_snapshot(snapshot: ProjectSaveSnapshot) -> Result<(), String> {
 /// Title-scoped favorite characters, backed by `{title_dir}/char_favorites.json`.
 ///
 /// TITLE-scoped, not chapter-scoped: every chapter of one manga shares one list
-/// (`dev-docs/char_table_plan.md` §2). All filesystem access goes through
-/// `ms_storage::global::storage()`.
+/// (`dev-docs/char_table_plan.md` §2). The document is read and written through
+/// `ms_docstore`, including its quarantine.
 #[derive(Debug)]
 pub(super) struct ProjectFavorites {
     path: Option<PathBuf>,
@@ -665,6 +624,7 @@ impl ProjectFavorites {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_storage::global::storage;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Unique temp path so parallel tests never share a file.
@@ -701,6 +661,24 @@ mod tests {
         let chars = vec!['★', '→', '±', '♪'];
         save_project_document(&path, &chars).expect("save must succeed");
         assert_eq!(expect_loaded(load_project_document(&path)), chars);
+        cleanup(&path);
+    }
+
+    /// The store write reproduces the historical bytes (2-space pretty JSON plus a
+    /// trailing newline) and leaves no sibling temp file behind.
+    #[test]
+    fn project_document_bytes_are_pretty_with_a_trailing_newline_and_no_temp_file() {
+        let path = unique_temp_path("bytes");
+        save_project_document(&path, &['★']).expect("save must succeed");
+        let raw = storage()
+            .read_to_string(path.to_string_lossy().as_ref())
+            .expect("read back");
+        assert_eq!(raw, "{\n  \"version\": 1,\n  \"characters\": [\n    \"★\"\n  ]\n}\n");
+        let temp = ms_docstore::temp_path_for(&path);
+        assert!(
+            !storage().exists(temp.to_string_lossy().as_ref()),
+            "the atomic write must not leave its temp file behind"
+        );
         cleanup(&path);
     }
 

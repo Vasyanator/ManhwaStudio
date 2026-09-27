@@ -16,9 +16,15 @@ edition = "2024"
 # The chapter domain model these models are built on (`Bubble`, `CanvasSettings`,
 # `Page`, `ProjectPaths`, `LegacyRibbonGeometry`).
 ms-project = { path = "../ms-project" }
+# `chapter_docs::chapter_doc_for_write`: the chapter-format hint (docstore rule B.3) for NEW
+# staging `layers` / bubbles documents. Already a transitive dependency through ms-project.
+ms-page-ops = { path = "../ms-page-ops" }
 # Every file read/write goes through the process-wide storage backend
 # (`ms_storage::global::storage()`), never `std::fs`.
 ms-storage = { path = "../ms-storage" }
+# Owner of the chapter documents these models persist (`layers/layers.json`,
+# `translation_bubbles.json`): unlocked reads, atomic whole-document writes.
+ms-docstore = { path = "../ms-docstore" }
 # `runtime_log` for the models' failure paths plus the `trace_log!` / `trace_scope!`
 # macros used across the layer-document pipeline.
 ms-log = { path = "../ms-log" }
@@ -65,6 +71,10 @@ test-support = []
 # Isolated on-disk chapter fixtures for the clean-assignment and layer-document tests,
 # which move real files through the storage backend.
 tempfile.workspace = true
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for the
+# layer-saver tests, which count manifest writes through the store's step journal and inject a
+# failing write (`recorded_steps` / `arm_fault`).
+ms-docstore = { path = "../ms-docstore", features = ["test-support"] }
 
 # Available-physical-memory probe used by the clean-overlay cache budget. Feature list
 # is the subset of the binary's own windows-sys features this crate actually names.

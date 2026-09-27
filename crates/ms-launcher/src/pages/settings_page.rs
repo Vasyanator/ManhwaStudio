@@ -89,6 +89,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 // `Path` is only referenced by native folder-picking and shell-path helpers.
 #[cfg(not(target_arch = "wasm32"))]
@@ -160,6 +161,9 @@ pub struct SettingsPageState {
     #[cfg(not(target_arch = "wasm32"))]
     torch_upgrade: TorchUpgradeState,
     log_popup_open: bool,
+    /// Actions reported in one frame beyond the one `show` can return (e.g. a saved
+    /// projects root AND a finished storage switch); delivered one per frame, in order.
+    queued_actions: VecDeque<PageNavAction>,
     /// Shared app-global backend handle, passed by reference into the shared
     /// `AiBackend` panel each frame so the launcher exposes the same backend
     /// controls as the studio settings tab.
@@ -296,6 +300,7 @@ impl SettingsPageState {
             #[cfg(not(target_arch = "wasm32"))]
             torch_upgrade: TorchUpgradeState::default(),
             log_popup_open: false,
+            queued_actions: VecDeque::new(),
             ai_backend,
         }
     }
@@ -366,9 +371,7 @@ impl SettingsPageState {
                                     SettingsSurface::Launcher,
                                     &self.ai_backend,
                                 );
-                                if let Some(root) = outcome.projects_dir_saved {
-                                    action = Some(PageNavAction::ProjectsRootChanged(root));
-                                }
+                                queue_shared_outcome(&mut self.queued_actions, outcome.projects_dir_saved, outcome.storage_mode_changed);
                                 // The launcher has no MemoryManager; the memory profile is
                                 // already persisted by the shared widget, so
                                 // `outcome.memory_profile_changed` is intentionally ignored.
@@ -381,9 +384,7 @@ impl SettingsPageState {
                                     SettingsSurface::Launcher,
                                     &self.ai_backend,
                                 );
-                                if let Some(root) = outcome.projects_dir_saved {
-                                    action = Some(PageNavAction::ProjectsRootChanged(root));
-                                }
+                                queue_shared_outcome(&mut self.queued_actions, outcome.projects_dir_saved, outcome.storage_mode_changed);
                                 // The launcher has no MemoryManager; the memory profile is
                                 // already persisted by the shared widget, so
                                 // `outcome.memory_profile_changed` is intentionally ignored.
@@ -422,6 +423,11 @@ impl SettingsPageState {
 
         self.show_save_log_popup(ui, save_log_button_rect);
 
+        let action = next_action(&mut self.queued_actions, action);
+        if !self.queued_actions.is_empty() {
+            // The rest is delivered on the next frames even without input.
+            ui.ctx().request_repaint();
+        }
         action
     }
 
@@ -2218,7 +2224,48 @@ fn sh_escape(path: &Path) -> String {
     sh_escape_str(&path.to_string_lossy())
 }
 
+/// Queues the launcher actions a shared settings section reported this frame, in delivery
+/// order: a saved projects root first, then a finished storage-mode switch (both must reach
+/// `LauncherApp`; neither may overwrite the other).
+fn queue_shared_outcome(queue: &mut VecDeque<PageNavAction>, projects_dir_saved: Option<PathBuf>, storage_mode_changed: Option<config::StorageMode>) {
+    queue.extend(projects_dir_saved.map(PageNavAction::ProjectsRootChanged));
+    queue.extend(storage_mode_changed.map(PageNavAction::StorageModeChanged));
+}
+
+/// The one action `show` returns this frame: the oldest pending one. `frame_action` (this
+/// frame's navigation or tab result) is appended behind the shared-section actions queued
+/// earlier in the frame, so e.g. a saved projects root still reaches `LauncherApp` before a
+/// Back navigation leaves the page. Nothing is dropped — the rest waits for later frames.
+fn next_action(queue: &mut VecDeque<PageNavAction>, frame_action: Option<PageNavAction>) -> Option<PageNavAction> {
+    queue.extend(frame_action);
+    queue.pop_front()
+}
+
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn sh_escape_str(value: &str) -> String {
     value.replace('\'', r"'\''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_projects_root_and_a_storage_switch_in_one_frame_are_both_delivered_in_order() {
+        let mut queue = VecDeque::new();
+        let root = PathBuf::from("projects");
+        queue_shared_outcome(&mut queue, Some(root.clone()), Some(config::StorageMode::Dev));
+        assert_eq!(next_action(&mut queue, Some(PageNavAction::BackToMain)), Some(PageNavAction::ProjectsRootChanged(root)));
+        assert_eq!(next_action(&mut queue, None), Some(PageNavAction::StorageModeChanged(config::StorageMode::Dev)));
+        assert_eq!(next_action(&mut queue, None), Some(PageNavAction::BackToMain));
+        assert_eq!(next_action(&mut queue, None), None);
+    }
+
+    #[test]
+    fn a_frame_without_shared_outcomes_returns_its_own_action_immediately() {
+        let mut queue = VecDeque::new();
+        queue_shared_outcome(&mut queue, None, None);
+        assert_eq!(next_action(&mut queue, Some(PageNavAction::StartUpdate)), Some(PageNavAction::StartUpdate));
+        assert!(queue.is_empty());
+    }
 }

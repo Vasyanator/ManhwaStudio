@@ -35,7 +35,12 @@ candidate.
 
 ## Files and submodules
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
-  coalesced background saving.
+  coalesced background saving. The bubbles document is written only through
+  `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
+  probed with `ms_docstore::exists` — never a raw file write. The `DocRef` comes from
+  `ms_page_ops::chapter_docs::chapter_doc_for_write`, so a NEW staging document is
+  created in the chapter's format (`.json` / `.db`, docstore rule B.3), never the
+  process default when the chapter already has a document.
 - `clean_assign.rs`: worker-thread filesystem API for discovering orphan clean images,
   checking attachment fit, decoding/resizing attachments, and moving committed files to trash.
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, dirty

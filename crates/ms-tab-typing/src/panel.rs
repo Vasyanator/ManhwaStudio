@@ -171,7 +171,6 @@ use rfd::FileDialog;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -262,9 +261,6 @@ use presets_io::*;
 // The SINGLE owner of `fonts/presets.json` (the create-preset document), its atomic write
 // and the one-shot migration out of `user_config.TextTab.create_presets`.
 mod presets_store;
-/// Shared crash-safe write recipe + optimistic-concurrency vocabulary of the panel's two
-/// JSON documents (`fonts_data.json`, `presets.json`).
-pub(crate) mod doc_store;
 mod ui_helpers;
 use ui_helpers::*;
 mod effect_parse;

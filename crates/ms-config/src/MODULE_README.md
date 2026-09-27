@@ -8,7 +8,7 @@ The project's global configuration and runtime-path layer, extracted verbatim fr
   derived from them (bundled resources, the Python env and backend, `user_config.json`,
   `ManhwaStudio_AI_Models`, `spell_check`, `last.log`, per-engine model trees).
 - **What is a setting worth when nobody set it?** — `user_config_defaults()` /
-  `project_config_defaults()`, and the `JsonConfig` load/merge/save wrapper that backfills
+  `project_config_defaults()`, and the `JsonConfig` load/merge/set wrapper that backfills
   a missing key without rewriting an already-complete document.
 
 It is the hub every upper layer reads, so it depends on nothing above it: no egui, no
@@ -18,7 +18,7 @@ It is the hub every upper layer reads, so it depends on nothing above it: no egu
 ```text
 ms-log ─┐
 ms-memory ─┤
-ms-storage ─┼─> ms-config ──(re-exported as `crate::config`)──> manhwastudio_rs
+ms-docstore ─┼─> ms-config ──(re-exported as `crate::config`)──> manhwastudio_rs
 ms-text-util ─┤
 ms-i18n ─┘
 ```
@@ -32,12 +32,14 @@ names this crate directly:
 | `pub use ms_config::app_tab;` | `crate::app_tab::…`, and `crate::tabs::AppTab` on top of it |
 | `pub use ms_config::rotation_ctrl_wheel;` | `crate::rotation_ctrl_wheel::…`, and `crate::tabs::typing::rotation_ctrl_wheel::…` |
 
-The WHOLE-DOCUMENT config paths — `Config::load`, `Config::save` and
-`update_user_config_file` — go through the process-wide storage backend
-(`ms_storage::global::storage()`), which is what lets them run against browser-backed
-storage. They are the seam, not a blanket rule: the single-setting savers,
-`load_raw_user_settings_for_startup` and the directory creation in `ensure_model_dirs`
-still call `std::fs` directly and are desktop-only paths.
+Every access to a config DOCUMENT goes through `ms-docstore`: `JsonConfig` (user config
+and a title's `settings.json`), `load_user_config`, `load_raw_user_settings_for_startup`,
+`update_user_config_file`, the section writers, `read_user_config_root` and the ORT
+load-guard markers. The store reads through `ms_storage::global::storage()` on every
+target (so the web build serves `user_config.json` from its in-memory/IndexedDB store),
+writes natively by atomic temp+rename, and serializes every write per document.
+`user_config_doc()` / `project_settings_doc(title_dir)` name the two documents for other
+crates. Only non-document I/O (`ensure_model_dirs`, the locale folder) uses `std::fs`.
 
 Two things that look like they belong further up live here anyway, and both for the same
 reason: the default trees NAME them, and an inherent `impl` may only be written in the crate
@@ -54,8 +56,9 @@ that defines the type.
   SIGILL decision model, and the interface-scale helpers. It also holds the TARGETED section
   writers of the settings surfaces (`save_advanced_form_search_params`, `save_text_language`,
   `save_hanging_punctuation`, `save_ai_runtime`, `save_onnx_provider_device`, `save_onnx_build`,
-  `save_max_loaded_models`): each takes `lock_user_config_write()`, re-reads the file, inserts
-  into ONE section and rewrites the document, so every unrelated key survives. They live here
+  `save_max_loaded_models`): each is ONE `update_user_config_root` transaction
+  (`ms_docstore::update`) that edits ONE section, so every unrelated key survives and a
+  malformed document is reported, never overwritten. They live here
   and not in the studio settings tab because their callers — `ms-settings-ui`'s panes and
   `ms-tab-typing` — may not depend on that tab. All of them do blocking I/O: never on the GUI
   thread.
@@ -86,11 +89,19 @@ that defines the type.
 - `ort_load_guard.rs`: the crash-safe `General.ort_load_state` markers written around every
   onnxruntime dylib load (`mark_ort_load_attempted` / `mark_ort_load_succeeded` /
   `reset_ort_load_guard`), plus the shared `read_user_config_root` the section writers in
-  `lib.rs` use. It sits here because its WRITER is crate `ms-native-runtime` and its READER
+  surfaces read for display. It sits here because its WRITER is crate `ms-native-runtime` and its READER
   (`read_ort_load_guard` / `ort_load_decision`) is `lib.rs`; the only surface offering the
   retry control is `ms-settings-ui`'s AI-backend pane, which calls `reset_ort_load_guard` here
-  directly. Carries the ONE fsync of this codebase —
-  an uncatchable SIGILL can arrive the instant the write returns.
+  directly. Its writes use `Durability::ContentsAndDirectory` — an uncatchable SIGILL can
+  arrive the instant the write returns.
+- `storage_mode.rs`: the Dev/Prod document storage mode — `StorageMode` (frozen
+  `"prod"`/`"dev"` under `General.storage_mode`, default Prod), `probe_storage_mode` (pure
+  probe of a user-config document) and `init_storage_mode_at_startup`, which seeds
+  `ms_docstore::set_default_format` as the process's FIRST document access (`main.rs`). Also
+  the fonts-directory document locations (`app_fonts_dir`, `fonts_data_doc`,
+  `fonts_presets_doc`); `app_fonts_dir` is the ONLY fonts-directory resolver
+  (the typing tab owns those documents' contents but resolves the directory here). The conversion
+  driver itself lives in `ms-project` (`storage_mode::convert_globals`).
 - `locale_store.rs`: native-only (`#[cfg(not(target_arch = "wasm32"))]`) on-disk layer for the
   UI localization catalog. Unpacks the catalogs `ms-i18n` embeds into an editable
   `data_dir()/locale` folder, reconciles each file on every launch (never overwriting or
@@ -109,22 +120,38 @@ binary that installs a UI locale). Those crates enable `test-support` from their
 - **No dependency may point upwards.** Nothing here may name `egui`, `tabs`, `app`, or any
   other item of the binary. A new need for one of those means the caller passes a value in,
   or the type moves down — not that this crate grows a dependency.
-- **`user_config.json` transactions are serialized** by the crate-level write lock
-  (`lock_user_config_write`). Every mutation of that document goes through
-  `update_user_config_file`; do not read-modify-write it anywhere else.
+- **`user_config.json` transactions are serialized** by the `ms-docstore` document lock.
+  Every mutation of that document is ONE `ms_docstore::update` — through
+  `update_user_config_file` (or a section writer here); do not read-modify-write it
+  anywhere else, and never write back a value read earlier outside the lock.
+- **The document lock is the only lock of `user_config.json`, and it is NON-reentrant.**
+  Inside an `update_user_config_file` mutator, or inside `ms_docstore::with_lock`/`update`
+  of a user-config document, never call another user-config writer.
+- **Default backfill has one rule, `merge_missing`** (insert absent keys, never replace
+  values). Writers outside `JsonConfig` that must produce the same document shape (the
+  installer's install-target config) call it instead of copying it.
+- **A malformed document is never overwritten** by any writer here (`Malformed` →
+  error, file untouched). A non-object root is still treated as `{}`.
 - **`JsonConfig` backfills, it does not rewrite.** A semantically complete document is left
   byte-identical on disk; only genuinely missing keys are materialized.
+  `set`/`set_path` re-read the document under the lock and edit only the named path.
+  Its `DocKind` is inferred from the file name (`settings.json` → `ProjectSettings`, else
+  `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
-  `dir_name()` / `settings_file_name()`, `MemoryProfile::as_config_str()` and the
+  `dir_name()` / `settings_file_name()`, `MemoryProfile::as_config_str()`,
+  `StorageMode::as_config_str()` (A11) and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across
   releases AND across UI languages, and are never localized
   (`dev-docs/i18n_exclusions.md` A3/A5/B1). Localized labels (`title()`, `label()`,
   `summary()`) are display-only and must never reach a file or the wire.
-- **Whole-document config I/O goes through `ms_storage::global`.** `Config::load` /
-  `Config::save` / `update_user_config_file` must keep using the storage seam: a direct
-  `std::fs` call on those paths would break the web build. The single-setting savers and
-  the startup raw read deliberately use `std::fs` and are desktop-only; moving one onto a
-  web-reachable path means moving it onto the seam first.
+- **The storage mode is seeded before any document access.** The startup probe reads the mode
+  from whichever file user_config is stored in; a missing key means Prod; a user_config in
+  the other format than its recorded mode means a conversion is pending (the driver converts
+  user_config LAST, so it is the sentinel). A malformed user_config selects the mode of its
+  existing file and schedules nothing.
+- **Config document I/O goes through `ms-docstore`.** A direct `std::fs` (or storage-seam)
+  read or write of `user_config.json` / `settings.json` here would bypass the document
+  lock and the atomic write, and break the web build.
 - **Standalone clippy on BOTH targets is part of verification.** A workspace-wide run unifies
   features and can mask a missing one; run
   `cargo clippy -p ms-config --target x86_64-unknown-linux-gnu -- -D warnings` and the same

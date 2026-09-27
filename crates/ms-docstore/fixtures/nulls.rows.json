@@ -1,0 +1,65 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/a",
+    "parent": "",
+    "seg": "a",
+    "kind": "leaf",
+    "payload": "null"
+  },
+  {
+    "path": "/b",
+    "parent": "",
+    "seg": "b",
+    "kind": "leaf",
+    "payload": "[null,null]"
+  },
+  {
+    "path": "/c",
+    "parent": "",
+    "seg": "c",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/c/d",
+    "parent": "/c",
+    "seg": "d",
+    "kind": "leaf",
+    "payload": "null"
+  },
+  {
+    "path": "/e",
+    "parent": "",
+    "seg": "e",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/e/0",
+    "parent": "/e",
+    "seg": "0",
+    "kind": "leaf",
+    "payload": "null"
+  },
+  {
+    "path": "/e/1",
+    "parent": "/e",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/e/1/f",
+    "parent": "/e/1",
+    "seg": "f",
+    "kind": "leaf",
+    "payload": "null"
+  }
+]

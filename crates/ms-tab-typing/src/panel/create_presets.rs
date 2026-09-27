@@ -1588,7 +1588,7 @@ pub(super) fn spawn_presets_seed(fonts_dir: &Path, events: &Sender<PresetStoreEv
     if cfg!(test) {
         return;
     }
-    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Absent);
+    presets_store::set_baseline(fonts_dir, ms_docstore::SaveBaseline::Absent);
     let fonts_dir = fonts_dir.to_path_buf();
     let events = events.clone();
     let spawn_result = thread::Builder::new()
@@ -1631,7 +1631,7 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
         } => {
             presets_store::set_baseline(
                 fonts_dir,
-                doc_store::SaveBaseline::Matching(fingerprint),
+                ms_docstore::SaveBaseline::Matching(fingerprint),
             );
             (
                 PresetStoreEvent::Seeded {
@@ -1657,13 +1657,13 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
             match presets_store::quarantine_bad_file(fonts_dir) {
                 // The corrupt file is gone; the next save creates a fresh document.
                 presets_store::QuarantineOutcome::Moved => {
-                    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Absent);
+                    presets_store::set_baseline(fonts_dir, ms_docstore::SaveBaseline::Absent);
                 }
                 // The corrupt file is still in place but its content is preserved in the
                 // `.bad` copy, so replacing it is safe — and its bytes are not our baseline.
                 presets_store::QuarantineOutcome::Copied
                 | presets_store::QuarantineOutcome::Failed => {
-                    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Unchecked);
+                    presets_store::set_baseline(fonts_dir, ms_docstore::SaveBaseline::Unchecked);
                 }
             }
             (
@@ -1684,7 +1684,7 @@ pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
 ///
 /// ORDERING CONTRACT: the legacy `user_config` keys are deleted only after `save` returned
 /// `Ok`, and `save` returns only once the document AND its directory entry are durable
-/// (`doc_store::Durability::ContentsAndDirectory`). Without that a power loss between the
+/// (`ms_docstore::Durability::ContentsAndDirectory`). Without that a power loss between the
 /// two could leave the presets in neither file.
 ///
 /// `default_local_generation` travels with the outcome in BOTH directions: a success marks

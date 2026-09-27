@@ -31,7 +31,11 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   being unloaded. It never loads models itself; services own their runtime objects.
 - `device_service.py`: selected Torch device and ONNX provider/device-id state, accelerated
   defaults, human-readable device-name probing (CUDA / DirectML / MiGraphX), CUDA-ROCm diagnostics
-  for the Rust settings tab, and persistence into `UserConfig`.
+  for the Rust settings tab, and persistence into `UserConfig`. Every write is
+  `UserConfig.update(mutator)` touching only its own keys (a serialized re-read + write of the
+  on-disk `user_config.json`/`.db` via the root `docstore.py`); automatic fallbacks and the
+  model-limit normalization at startup are best-effort (logged, never abort a query) and the
+  limit is written only when the stored value differs.
 - `rocm_runtime.py`: `configure_rocm_runtime()` — MIOpen tuning and the allocator override, applied
   once at backend startup. It is also what tells `error_text` whether this process is on ROCm.
 - `error_text.py`: `sanitize_torch_error()` — strips Torch's `expandable_segments:True` out-of-memory

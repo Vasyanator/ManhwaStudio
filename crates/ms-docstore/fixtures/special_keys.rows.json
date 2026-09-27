@@ -1,0 +1,93 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/",
+    "parent": "",
+    "seg": "",
+    "kind": "leaf",
+    "payload": "5"
+  },
+  {
+    "path": "/a~1b",
+    "parent": "",
+    "seg": "a/b",
+    "kind": "leaf",
+    "payload": "1"
+  },
+  {
+    "path": "/c~0d",
+    "parent": "",
+    "seg": "c~d",
+    "kind": "leaf",
+    "payload": "2"
+  },
+  {
+    "path": "/emoji😀",
+    "parent": "",
+    "seg": "emoji😀",
+    "kind": "leaf",
+    "payload": "null"
+  },
+  {
+    "path": "/list",
+    "parent": "",
+    "seg": "list",
+    "kind": "arr_id",
+    "payload": "[\"x/y\",\"a~b\",\"ключ\"]"
+  },
+  {
+    "path": "/list/\"a~0b\"",
+    "parent": "/list",
+    "seg": "\"a~b\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"a~b\"}"
+  },
+  {
+    "path": "/list/\"x~1y\"",
+    "parent": "/list",
+    "seg": "\"x/y\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"x/y\"}"
+  },
+  {
+    "path": "/list/\"ключ\"",
+    "parent": "/list",
+    "seg": "\"ключ\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"ключ\"}"
+  },
+  {
+    "path": "/~01",
+    "parent": "",
+    "seg": "~1",
+    "kind": "leaf",
+    "payload": "3"
+  },
+  {
+    "path": "/ключ",
+    "parent": "",
+    "seg": "ключ",
+    "kind": "leaf",
+    "payload": "4"
+  },
+  {
+    "path": "/日本",
+    "parent": "",
+    "seg": "日本",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/日本/x~1y~0z",
+    "parent": "/日本",
+    "seg": "x/y~z",
+    "kind": "leaf",
+    "payload": "true"
+  }
+]

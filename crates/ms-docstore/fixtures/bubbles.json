@@ -1,0 +1,33 @@
+{
+  "bubbles": [
+    {
+      "id": 7,
+      "page": 0,
+      "rect": [
+        10,
+        20,
+        110,
+        220
+      ],
+      "text": "Hello",
+      "character": "Ann",
+      "extra": {
+        "style": "bold",
+        "angle": 12.5
+      }
+    },
+    {
+      "id": 3,
+      "page": 1,
+      "rect": [
+        0,
+        0,
+        5,
+        5
+      ],
+      "text": "",
+      "translated": true
+    }
+  ],
+  "next_id": 8
+}

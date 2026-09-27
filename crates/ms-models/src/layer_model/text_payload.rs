@@ -1262,7 +1262,7 @@ mod tests {
         // (a)+(b): the centre comes from `u`/`v` + the Tkinter half-shift, NOT from `x`/`y`.
         // PNG 250×125 (aspect 0.5). Displayed 0.5*1000*1.0 = 500 px wide, 250 px tall → half
         // (250, 125) px → centre (0.1*1000+250, 0.2*2000+125) = (350, 525) px → uv (0.35, 0.2625).
-        let out = migrate_overlay_entries(&[hybrid.clone()], &page_sizes, |_| (250.0, 125.0));
+        let out = migrate_overlay_entries(std::slice::from_ref(&hybrid), &page_sizes, |_| (250.0, 125.0));
         let obj = out[0].as_object().unwrap();
         let u = obj.get("img_u").and_then(value_f32).unwrap();
         let v = obj.get("img_v").and_then(value_f32).unwrap();

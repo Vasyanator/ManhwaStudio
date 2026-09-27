@@ -1,0 +1,50 @@
+[package]
+name = "ms-docstore"
+version = "0.1.0"
+edition = "2024"
+
+# Document-store layer of ManhwaStudio: the single owner of "read / update / write a
+# named logical document" (user_config, fonts_data, presets, project settings, chapter
+# layers/bubbles, ...) in either format: `<stem>.json` (atomic temp+rename) or `<stem>.db`
+# (SQLite fragment codec, native only), under a per-document process-local lock; wasm32 goes
+# through the `ms-storage` seam and is JSON-only. It receives paths from its callers and
+# must never depend on `ms-config` (which sits ABOVE it).
+[dependencies]
+# Write-failure diagnostics (`ms_log::runtime_log::log_error`).
+ms-log = { path = "../ms-log" }
+# On wasm32 every file operation goes through the process-wide backend
+# (`ms_storage::global::storage()`), so the web build serves documents from its
+# in-memory/IndexedDB store. Native code uses `std::fs` on the real `Path` (the seam's
+# `&str` paths are lossy for non-UTF-8 names, and it has no `sync_all`); `StorageError`
+# stays the error vocabulary on both targets.
+ms-storage = { path = "../ms-storage" }
+serde.workspace = true
+# NEVER enable `preserve_order` on serde_json: `Map` must stay a BTreeMap so a document's
+# key order is canonical. The Value-equality losslessness contract of the (step-2) SQLite
+# codec and its Python mirror relies on it.
+# `float_roundtrip`: the default parser is best-effort for floats (may be 1 ULP off), which
+# would break the codec's "Value-equal after a text round trip" contract (conversion
+# validation, diff-write stability, Python parity). Exact parsing costs ~2x on floats only.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# `Fingerprint`: first 8 bytes of the SHA-256 of one exact document state.
+sha2.workspace = true
+thiserror.workspace = true
+# `Signature::Bytes::mtime_ns` is computed from `ms_storage::Metadata::modified`, a
+# `web_time::SystemTime` (std's type on native, a polyfill on wasm).
+web-time.workspace = true
+
+# The SQLite fragment codec (`sqlite.rs`, `split.rs`, `convert.rs`) is native-only: on
+# wasm32 `DocFormat::Db` is `Unsupported`. `bundled` compiles SQLite from source (C
+# toolchain per target: host gcc, x86_64-w64-mingw32-gcc for windows-gnu).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[features]
+# Exposes the atomic-write step journal (`recorded_steps`, `WriteStep`) and the fault
+# injector (`arm_fault`, `FaultPoint`) to DEPENDENT crates' tests. A `#[cfg(test)]` item is
+# invisible outside its own crate. Enable it from `[dev-dependencies]` only.
+test-support = []
+
+[dev-dependencies]
+# Isolated on-disk fixtures: every test works inside its own temp directory.
+tempfile.workspace = true

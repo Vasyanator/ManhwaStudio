@@ -798,8 +798,9 @@ impl LayerDoc {
 
     /// Page indices currently resident (loaded) in the doc. A resident page had its text loaded by
     /// `ensure_page_loaded` (both tabs load text on page load), so the doc's view of that page's text
-    /// is authoritative — including deletions. The save-to-project flush iterates these to make staging
-    /// text-complete for OWNED pages, and the unsaved→committed merge treats them as owned (whole-page
+    /// is authoritative — including deletions. The save-to-project flush iterates these so every OWNED
+    /// page's effective on-disk text (staging, else committed) equals the doc's — the saver skips a
+    /// write that would not change it — and the unsaved→committed merge treats them as owned (whole-page
     /// replace); a page NOT resident was never loaded this session, so the merge preserves its committed
     /// text instead of dropping it.
     #[must_use]
@@ -1407,8 +1408,9 @@ impl LayerDoc {
         self.bump_version();
     }
 
-    /// Persists a page's RASTER nodes back to disk via `persist::save_page_rasters` (passing each
-    /// node's base image + `pixels_dirty` and the page's groups, bottom-to-top by current `z`), then
+    /// Persists a page's RASTER nodes back to disk via `persist::ManifestTxn::save_page_rasters` seeded
+    /// from `fallback_dir` (passing each node's base image + `pixels_dirty` and the page's groups,
+    /// bottom-to-top by current `z`; an emptied page stays PRESENT-but-EMPTY in staging), then
     /// re-writes the effects chain + rendered PNG for any raster node with a non-empty chain via
     /// `persist::update_raster_effects` (the doc is authoritative over the rasters it holds). After a
     /// successful flush, every raster node's `pixels_dirty` is cleared.
@@ -1505,13 +1507,12 @@ impl LayerDoc {
             outs.len(),
             page.groups.len()
         );
-        persist::save_page_rasters(
-            layers_dir,
-            page_idx,
-            &outs,
-            &page.groups,
-            removed_raster_uids,
-        )?;
+        // Through a transaction with the committed `fallback_dir`, so a page staged nowhere yet is seeded
+        // first and an emptied page is recorded PRESENT-but-EMPTY (an explicit override of committed)
+        // instead of being dropped back to "absent == committed", which resurrected deleted rasters.
+        let mut txn = persist::ManifestTxn::begin(layers_dir)?;
+        txn.save_page_rasters(page_idx, &outs, &page.groups, removed_raster_uids, fallback_dir)?;
+        txn.commit()?;
 
         // Text flush (schema v3): write every TEXT node's inline payload (see `write_page_text`).
         Self::write_page_text(page, page_idx, layers_dir, fallback_dir)?;
@@ -1799,6 +1800,47 @@ impl LayerDoc {
         } else {
             self.flush_page_text(page_idx, layers_dir, fallback_dir)
         }
+    }
+
+    /// ASYNC text-only save of SEVERAL pages as one saver batch (`LayerSaverHandle::enqueue_batch`):
+    /// every job is built first and sent as ONE message, so the worker writes them in one drain pass
+    /// — one manifest commit — instead of possibly one pass per page. Without a saver, each page falls
+    /// back to the synchronous [`flush_page_text`]. Non-resident pages are skipped (reported `Ok`,
+    /// matching [`enqueue_page_text_save`]).
+    ///
+    /// Returns one result per entry of `pages`, in order: with a saver every page is `Ok` (the write
+    /// outcome arrives through the acknowledgements and the barrier); on the synchronous fallback, a
+    /// page's own flush error.
+    pub fn enqueue_pages_text_save(
+        &mut self,
+        pages: &[usize],
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+    ) -> Vec<(usize, Result<(), String>)> {
+        if self.saver.is_none() {
+            return pages.iter().map(|&page_idx| (page_idx, self.flush_page_text(page_idx, layers_dir, fallback_dir))).collect();
+        }
+        let mut jobs = Vec::with_capacity(pages.len());
+        for &page_idx in pages {
+            let Some(text) = self.build_text_save_part(page_idx) else {
+                continue;
+            };
+            let text_epoch = self.next_save_epoch(page_idx, SaveKind::Text);
+            jobs.push(PageSaveJob {
+                page_idx,
+                layers_dir: layers_dir.to_path_buf(),
+                fallback_dir: fallback_dir.map(Path::to_path_buf),
+                raster: None,
+                raster_epoch: None,
+                text: Some(text),
+                text_epoch: Some(text_epoch),
+                effects: Vec::new(),
+            });
+        }
+        if let Some(saver) = &self.saver {
+            saver.enqueue_batch(jobs);
+        }
+        pages.iter().map(|&page_idx| (page_idx, Ok(()))).collect()
     }
 
     /// ASYNC targeted effects update for a SINGLE raster: when the background saver is enabled,
@@ -4514,5 +4556,48 @@ mod tests {
         );
         doc.shutdown_saver();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `enqueue_pages_text_save` hands every resident page to the saver as ONE message, so the whole
+    /// batch lands in one drain pass: one staging manifest write for K pages, all pages persisted.
+    #[test]
+    fn batched_text_save_is_one_manifest_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let committed = tmp.path().join("ch").join("layers");
+        let staging = tmp.path().join("ch_unsaved").join("layers");
+        fs::create_dir_all(&committed).expect("mkdir");
+        let committed_doc = ms_docstore::DocRef::new(committed.join("layers.json"), ms_docstore::DocKind::Layers).with_new_format(ms_docstore::DocFormat::Json);
+        ms_docstore::write_value(&committed_doc, &serde_json::json!({"schema_version": 4, "pages": []}), ms_docstore::WriteOptions::default()).expect("seed");
+
+        let mut doc = LayerDoc::new();
+        let pages: Vec<usize> = (0..6).collect();
+        for &p in &pages {
+            doc.pages.insert(p, DocPage { nodes: vec![text_node_with_payload(&format!("t{p}"))], groups: Vec::new() });
+        }
+        doc.enable_background_saver();
+        let results = doc.enqueue_pages_text_save(&pages, &staging, Some(&committed));
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+        assert_eq!(results.iter().map(|(p, _)| *p).collect::<Vec<_>>(), pages);
+        let handle = doc.saver_handle().expect("saver");
+        assert!(handle.barrier_blocking().is_empty());
+        let writes = ms_docstore::recorded_steps(&staging.join("layers.json")).iter().filter(|s| **s == ms_docstore::WriteStep::Renamed).count();
+        assert_eq!(writes, 1, "six pages sent as one batch must be one manifest write");
+        for &p in &pages {
+            let uids: Vec<String> = persist::load_page_text_nodes(&staging, None, p).expect("load").into_iter().map(|n| n.uid).collect();
+            assert_eq!(uids, vec![format!("t{p}")]);
+        }
+        doc.shutdown_saver();
+    }
+
+    /// Without a saver the batch falls back to one synchronous flush per page, reporting each result.
+    #[test]
+    fn batched_text_save_without_saver_flushes_each_page() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(2, DocPage { nodes: vec![text_node_with_payload("t")], groups: Vec::new() });
+        let results = doc.enqueue_pages_text_save(&[2, 7], tmp.path(), None);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "a non-resident page is a no-op, not an error");
+        assert_eq!(persist::load_page_text_nodes(tmp.path(), None, 2).expect("load").len(), 1);
     }
 }

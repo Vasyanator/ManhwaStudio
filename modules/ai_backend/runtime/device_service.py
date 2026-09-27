@@ -17,12 +17,12 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
-    from ai_device import AIDevice
+    from ai_device import AIDevice, set_config_path
 except Exception:
-    from modules.ai_device import AIDevice
+    from modules.ai_device import AIDevice, set_config_path
 
 try:
     from config import UserConfig
@@ -46,11 +46,35 @@ from .model_manager import LoadedModelManager, clamp_max_loaded_models
 
 
 class _MemoryUserConfig:
+    """In-memory stand-in for `config.UserConfig` when the settings module is unavailable (and in tests)."""
+
     def __init__(self) -> None:
         self.config = {"General": {}}
 
-    def save(self) -> None:
-        return
+    def update(self, mutator: Callable[[dict], None]) -> None:
+        """Applies `mutator` to the in-memory document; nothing is persisted."""
+        mutator(self.config)
+
+
+def _persist_best_effort(user_config: Any, mutator: Callable[[dict], None], what: str) -> None:
+    """Persists an AUTOMATIC (not user-requested) config change; a store failure is logged, not raised.
+
+    Used for fallbacks/normalizations computed while answering a state query, where failing
+    the whole query because the settings document is unavailable would be worse than
+    re-computing the same value next time.
+    """
+    try:
+        _update_user_config(user_config, mutator)
+    except Exception as exc:  # docstore.DocStoreError or an I/O error of the store
+        _device_log(f"config_persist_failed what={what} error={type(exc).__name__}: {exc}")
+
+
+def _update_user_config(user_config: Any, mutator: Callable[[dict], None]) -> None:
+    """Runs `user_config.update(mutator)`; raises TypeError when the object has no `update`."""
+    update = getattr(user_config, "update", None)
+    if not callable(update):
+        raise TypeError("user_config must provide an 'update(mutator)' method")
+    update(mutator)
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -162,6 +186,7 @@ class _OnnxDeviceSelector:
                     self.PROVIDER_CONFIG_PATH,
                     fallback,
                     mark_configured=True,
+                    best_effort=True,
                 )
             return fallback
         return self.DEFAULT_PROVIDER
@@ -179,6 +204,7 @@ class _OnnxDeviceSelector:
                     self.DEVICE_ID_CONFIG_PATH,
                     fallback,
                     mark_configured=True,
+                    best_effort=True,
                 )
             return fallback
         return self.DEFAULT_DEVICE_ID
@@ -565,27 +591,28 @@ class _OnnxDeviceSelector:
         value: str,
         *,
         mark_configured: bool = False,
+        best_effort: bool = False,
     ) -> None:
-        node = getattr(self._user_config, "config", None)
-        if not isinstance(node, dict):
-            raise TypeError("user_config must provide dict-like 'config' attribute")
+        """Persists `path = value` (and its `*_configured` flag when `mark_configured`).
 
-        current = node
-        for key in path[:-1]:
-            nested = current.get(key)
-            if not isinstance(nested, dict):
-                nested = {}
-                current[key] = nested
-            current = nested
-        current[path[-1]] = value
+        Only these keys of the settings document are touched. With `best_effort` a store
+        failure is logged instead of raised (automatic fallbacks, not user choices).
+        """
+        configured_key: Optional[str] = None
         if mark_configured and path == self.PROVIDER_CONFIG_PATH:
-            current[self.PROVIDER_CONFIGURED_PATH[-1]] = True
+            configured_key = self.PROVIDER_CONFIGURED_PATH[-1]
         if mark_configured and path == self.DEVICE_ID_CONFIG_PATH:
-            current[self.DEVICE_ID_CONFIGURED_PATH[-1]] = True
+            configured_key = self.DEVICE_ID_CONFIGURED_PATH[-1]
 
-        save = getattr(self._user_config, "save", None)
-        if callable(save):
-            save()
+        def mutate(document: dict) -> None:
+            set_config_path(document, path, value)
+            if configured_key is not None:
+                set_config_path(document, path[:-1] + (configured_key,), True)
+
+        if best_effort:
+            _persist_best_effort(self._user_config, mutate, f"onnx:{'.'.join(path)}")
+        else:
+            _update_user_config(self._user_config, mutate)
 
     def _normalize_provider(self, value: Any) -> str:
         normalized = str(value or "").strip()
@@ -787,10 +814,21 @@ class AiDeviceService:
         return normalized
 
     def _ensure_model_limit_config_locked(self) -> None:
-        normalized = clamp_max_loaded_models(
-            self._get_config_value(self.MAX_LOADED_MODELS_CONFIG_PATH)
-        )
-        self._set_config_value(self.MAX_LOADED_MODELS_CONFIG_PATH, str(normalized))
+        """Applies the configured model limit; persists it only when the stored text differs.
+
+        Runs at service construction, so an unchanged document is never rewritten and a
+        store failure is logged instead of aborting backend startup.
+        """
+        stored = self._get_config_value(self.MAX_LOADED_MODELS_CONFIG_PATH)
+        normalized = clamp_max_loaded_models(stored)
+        if stored != str(normalized):
+            path = self.MAX_LOADED_MODELS_CONFIG_PATH
+            text = str(normalized)
+            _persist_best_effort(
+                self._user_config,
+                lambda document: set_config_path(document, path, text),
+                "max_loaded_models",
+            )
         self._model_manager.set_max_loaded_models(normalized)
 
     def _get_config_value(self, path: tuple[str, ...]) -> Optional[str]:
@@ -810,19 +848,8 @@ class AiDeviceService:
         return None
 
     def _set_config_value(self, path: tuple[str, ...], value: str) -> None:
-        node = getattr(self._user_config, "config", None)
-        if not isinstance(node, dict):
-            raise TypeError("user_config must provide dict-like 'config' attribute")
-
-        current = node
-        for key in path[:-1]:
-            nested = current.get(key)
-            if not isinstance(nested, dict):
-                nested = {}
-                current[key] = nested
-            current = nested
-        current[path[-1]] = value
-
-        save = getattr(self._user_config, "save", None)
-        if callable(save):
-            save()
+        """Persists `path = value` (only that key); store failures propagate to the IPC caller."""
+        _update_user_config(
+            self._user_config,
+            lambda document: set_config_path(document, path, value),
+        )

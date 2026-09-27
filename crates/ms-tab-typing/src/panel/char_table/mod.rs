@@ -12,7 +12,8 @@ Main responsibilities:
   cell size, expanded character, star-popup target);
 - own the two favorite stores and expose membership/toggle operations;
 - drive the background coverage job (spawn on a font-list change, poll, query);
-- load and persist the window's two `TextTab` settings off the GUI thread.
+- load and persist the window's two `TextTab` settings off the GUI thread
+  (read through `ms_docstore`, written through `config::update_user_config_file`).
 
 Key types:
 - `CharTableState` (the whole window state)
@@ -281,6 +282,13 @@ impl SnapshotTarget for UserConfigSnapshot {
     }
 }
 
+/// The member `key` of the `TextTab` section of a parsed `user_config.json` root, if both
+/// exist.
+#[must_use]
+fn text_tab_value<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
+    root.get("TextTab").and_then(|text_tab| text_tab.get(key))
+}
+
 /// Writes one complete character-table settings snapshot in one serialized
 /// user-config transaction.
 ///
@@ -443,8 +451,12 @@ impl CharTableState {
         let config_path = config::user_config_path();
         // One bounded local read supplies all three values; project storage may
         // be network-backed and is therefore handled by `ProjectFavorites`.
-        let cfg = match config::JsonConfig::new(&config_path, Value::Object(Map::new())) {
-            Ok(cfg) => Some(cfg),
+        let config_doc = ms_docstore::DocRef::new(&config_path, ms_docstore::DocKind::UserConfig);
+        let cfg = match ms_docstore::read_value(&config_doc) {
+            // An absent file (first run) or a non-object root reads as "nothing stored",
+            // exactly like the empty-defaults config load this replaces: all three values
+            // keep their defaults and the list is writable.
+            Ok(value) => Some(value.filter(Value::is_object).unwrap_or_else(|| Value::Object(Map::new()))),
             Err(err) => {
                 // The file may be perfectly valid and merely unreadable right now
                 // (permissions, descriptor exhaustion, a network-backed home).
@@ -453,7 +465,7 @@ impl CharTableState {
                 self.global_favorites_writable = false;
                 ms_log::runtime_log::log_warn(format!(
                     "typing: char table: cannot read settings; using defaults and keeping the \
-                     stored global favorites untouched for this session. Path: {} Error: {err:#}",
+                     stored global favorites untouched for this session. Path: {} Error: {err}",
                     config_path.display()
                 ));
                 None
@@ -461,7 +473,7 @@ impl CharTableState {
         };
         if let Some(size) = cfg
             .as_ref()
-            .and_then(|cfg| cfg.get_path(&["TextTab", TEXT_TAB_FONT_SIZE_KEY]))
+            .and_then(|cfg| text_tab_value(cfg, TEXT_TAB_FONT_SIZE_KEY))
             .and_then(Value::as_f64)
         {
             // A stored value outside the selectable range (hand-edited config or
@@ -477,7 +489,7 @@ impl CharTableState {
         }
         if let Some(group) = cfg
             .as_ref()
-            .and_then(|cfg| cfg.get_path(&["TextTab", TEXT_TAB_LAST_GROUP_KEY]))
+            .and_then(|cfg| text_tab_value(cfg, TEXT_TAB_LAST_GROUP_KEY))
             .and_then(Value::as_str)
             .map(str::to_owned)
             && is_known_tab(&group)
@@ -487,8 +499,7 @@ impl CharTableState {
             self.selected_group = group;
         }
         let global_values = cfg.as_ref().and_then(|cfg| {
-            cfg.get_path(&["TextTab", favorites::TEXT_TAB_GLOBAL_FAVORITES_KEY])
-                .and_then(Value::as_array)
+            text_tab_value(cfg, favorites::TEXT_TAB_GLOBAL_FAVORITES_KEY).and_then(Value::as_array)
         });
         self.global_favorites
             .load_from_values(global_values, &config_path);

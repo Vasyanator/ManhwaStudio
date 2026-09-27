@@ -7,13 +7,15 @@ Dark theme styling helpers for the Rust launcher test UI.
 Main responsibilities:
 - configure egui visuals for the launcher overlay;
 - define shared colors, button states, and card surfaces;
-- keep typography helpers and explicit launcher button rendering consistent with launcher.py.
+- keep typography helpers and explicit launcher button rendering consistent with launcher.py;
+- draw the amber notice banner (`notice_banner`) shared by every launcher notice that offers
+  one action (the open page's unsaved-session recovery and chapter-format conversion).
 */
 
 use egui::style::StyleModifier;
 use egui::{
-    Button, Color32, Context, CornerRadius, Frame, Margin, Response, RichText, Stroke, Style, Ui,
-    Vec2,
+    Align, Button, Color32, Context, CornerRadius, Frame, Label, Layout, Margin, Response,
+    RichText, Stroke, Style, Ui, Vec2,
 };
 
 pub const CARD_FILL: Color32 = Color32::from_rgba_premultiplied(24, 24, 28, 135);
@@ -41,6 +43,14 @@ pub const COMBO_PRESSED: Color32 = Color32::from_rgba_premultiplied(42, 42, 50, 
 pub const COMBO_POPUP_FILL: Color32 = Color32::from_rgb(24, 24, 28);
 pub const VEIL_TINT: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 112);
 pub const STATUS_SUCCESS: Color32 = Color32::from_rgb(56, 168, 72);
+/// Status colour of an error line (failed checks, failed operations).
+pub const STATUS_ERROR: Color32 = Color32::from_rgb(220, 120, 120);
+/// Fill of a notice banner (dark amber).
+pub const NOTICE_FILL: Color32 = Color32::from_rgb(72, 58, 0);
+/// Text colour of a notice banner (amber on `NOTICE_FILL`).
+pub const NOTICE_TEXT: Color32 = Color32::from_rgb(255, 210, 40);
+/// Size of the action button of a notice banner.
+const NOTICE_BUTTON_SIZE: Vec2 = Vec2::new(130.0, 26.0);
 
 pub fn configure_context(ctx: &Context) {
     let mut style = (*ctx.global_style()).clone();
@@ -132,6 +142,48 @@ pub fn launcher_button(ui: &mut Ui, label: &str, size: Vec2, enabled: bool) -> R
                 .stroke(Stroke::new(1.0, BUTTON_STROKE))
                 .corner_radius(CornerRadius::same(10)),
         )
+    })
+    .inner
+}
+
+/// The single action button of a [`notice_banner`].
+#[derive(Debug, Clone, Copy)]
+pub struct NoticeButton<'a> {
+    /// Localized button caption.
+    pub label: &'a str,
+    /// Whether the button can be clicked (a disabled button is drawn inactive).
+    pub enabled: bool,
+}
+
+/// Draws an amber notice banner `width` points wide: `text` on the left (wrapping when it
+/// does not fit beside the button) and, when `button` is `Some`, one action button on the
+/// right. Returns whether that button was clicked this frame (always `false` without one).
+///
+/// `id_salt` must be stable and distinct per banner on a page: the banner's widgets are
+/// scoped under it, so the ids never depend on the (localized) text.
+pub fn notice_banner(ui: &mut Ui, id_salt: &str, width: f32, text: &str, button: Option<NoticeButton<'_>>) -> bool {
+    ui.push_id(id_salt, |ui| {
+        Frame::new()
+            .fill(NOTICE_FILL)
+            .inner_margin(Margin::symmetric(10, 8))
+            .corner_radius(CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.set_width(width);
+                // Right-to-left first so the button claims its slot before the text; the
+                // text then lays out left-to-right in the remaining width and wraps there.
+                // A horizontal `Align::Center` layout fills the height it is GIVEN, so the row
+                // is allocated with zero desired height: it then grows to its content only,
+                // whatever free vertical space the caller has.
+                ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::right_to_left(Align::Center), |ui| {
+                    let clicked = button.is_some_and(|button| launcher_button(ui, button.label, NOTICE_BUTTON_SIZE, button.enabled).clicked());
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(Label::new(RichText::new(text).color(NOTICE_TEXT)).wrap());
+                    });
+                    clicked
+                })
+                .inner
+            })
+            .inner
     })
     .inner
 }

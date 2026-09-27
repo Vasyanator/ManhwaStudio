@@ -227,6 +227,10 @@ pub struct SharedSectionOutcome {
     pub projects_dir_saved: Option<PathBuf>,
     /// Set to the new profile when the memory-profile selection changed.
     pub memory_profile_changed: Option<MemoryProfile>,
+    /// Set to the target mode when a storage-mode switch started from this surface
+    /// finished converting. The launcher re-validates its open page; the studio needs
+    /// nothing (the driver already switched the process-global docstore default).
+    pub storage_mode_changed: Option<ms_config::StorageMode>,
 }
 
 /// Owns the three shared "double-interface" panel states so each surface embeds ONE
@@ -306,6 +310,7 @@ impl SharedSettingsPanels {
                 SharedSectionOutcome {
                     projects_dir_saved: outcome.projects_dir_saved,
                     memory_profile_changed: outcome.memory_profile_changed,
+                    storage_mode_changed: outcome.storage_mode_changed,
                 }
             }
             SettingsSectionId::AiBackend => {

@@ -16,14 +16,12 @@ edition = "2024"
 ms-log = { path = "../ms-log" }
 # `General.memory_profile` is persisted as `MemoryProfile::as_config_str()`.
 ms-memory = { path = "../ms-memory" }
-# The storage seam for the WHOLE-DOCUMENT config paths: `Config::load` / `Config::save`
-# and `update_user_config_file` go through the process-wide backend
-# (`ms_storage::global::storage()`) so the web build can serve `user_config.json` from its
-# in-memory/IndexedDB store. That seam is the only reason for this dependency — the
-# single-setting savers (`save_text_language`, `save_ai_runtime`, `save_onnx_build`, …),
-# `load_raw_user_settings_for_startup` and the directory creation in `ensure_model_dirs`
-# still call `std::fs` directly and are desktop-only paths.
-ms-storage = { path = "../ms-storage" }
+# The document store: every read / read-modify-write / write of `user_config.json` and
+# of a title's `settings.json` (`JsonConfig`) goes through `ms_docstore` (per-document
+# lock, atomic temp+rename writes, malformed documents never overwritten). It reads via
+# the `ms-storage` seam on every target, so the web build still serves `user_config.json`
+# from its in-memory/IndexedDB store.
+ms-docstore = { path = "../ms-docstore" }
 # `TextTab` defaults name `text_punctuation::DEFAULT_HANGING_PUNCTUATION` and
 # `language::TextLanguage::Ru.tag()`.
 ms-text-util = { path = "../ms-text-util" }
@@ -53,6 +51,9 @@ thiserror.workspace = true
 test-support = []
 
 [dev-dependencies]
+# `recorded_steps` lets the ORT load-guard tests assert that a marker write made its
+# directory entry durable (`WriteStep::DirectoryDurable`).
+ms-docstore = { path = "../ms-docstore", features = ["test-support"] }
 # Isolated on-disk fixtures for the `JsonConfig` / `update_user_config_file` tests,
 # which write real files through the storage backend.
 tempfile.workspace = true

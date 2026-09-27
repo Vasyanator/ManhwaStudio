@@ -23,17 +23,20 @@ See the parent `MODULE_README.md` for the full per-file catalog
 here for panel state/UI, font loading, and coverage; edit `render_next/` for the renderer.
 
 ## Per-font settings persistence (`fonts_data.rs` + `font_settings_store.rs`)
-- App-level per-font settings live in `fonts/fonts_data.json` (`resolve_fonts_dir()`),
+- App-level per-font settings live in `fonts/fonts_data.json` (`ms_config::storage_mode::app_fonts_dir()`),
   a versioned document. `fonts_data.rs` owns its serde schema; `load_outcome` returns a typed
   `LoadOutcome` (`Missing` / `Loaded { data, fingerprint }` / `Invalid`) so a corrupt file is
   NEVER silently degraded to empty (which the next mutation would then overwrite, destroying
   imported fonts + overrides); a NEWER version still parses best-effort as `Loaded`.
-  `save_checked` is atomic AND crash-durable through the SHARED recipe `doc_store::write_atomic`
-  (temp sibling written via explicit `File` + `write_all` + `sync_all`, handle CLOSED, then
-  rename), asking for `Durability::Contents` — no directory fsync, because nothing deletes a
-  data source after this write and it happens on every debounced profile edit. `doc_store` also
-  owns `DocumentFingerprint` / `SaveBaseline`, which `fonts_data` re-exports under their
-  historical names and `presets_store` uses for the same guard.
+  `save_checked` is atomic AND crash-durable through the `ms-docstore` crate (`DocKind::FontsData`;
+  temp sibling + `write_all` + `sync_all`, handle CLOSED, then rename), asking for
+  `Durability::Contents` — no directory fsync, because nothing deletes a data source after this
+  write and it happens on every debounced profile edit. The newer-version guard and the write
+  run as ONE `ms_docstore::with_lock` critical section; the baseline is checked by the store's
+  write itself (`DocStoreError::Conflict { found }`). `ms_docstore` also owns `Fingerprint` /
+  `SaveBaseline`, which `fonts_data` re-exports and `presets_store` uses for the same guard.
+  Both loaders parse the exact BYTES into the typed serde mirror (`ms_docstore::read::<T>`),
+  never via a `Value`, so a duplicated document-level field stays `Invalid`.
 - **THE VERSION IS DECIDED BY CONTENT WHEN THE FIELD IS ABSENT.** A document carrying
   `system_fonts`/`fonts` but no `version` is v2. Serde's `0` default made it "≤ 1" i.e. legacy,
   and the legacy decoder read only v1 keys — so such a document came back EMPTY and the next
@@ -361,8 +364,10 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   after applying preset A silently made A's parameters the font's default and every fresh,
   preset-less panel opened with them. Deselecting the preset ("Без пресета") ends the preset
   context: the parameters on screen then belong to the font again, by the same rule.
-- SAVING is atomic and CRASH-DURABLE through the shared `doc_store::write_atomic` with
-  `Durability::ContentsAndDirectory`: the containing DIRECTORY is fsynced before `save` returns,
+- SAVING is atomic and CRASH-DURABLE through `ms_docstore` (`DocKind::Presets`) with
+  `Durability::ContentsAndDirectory`, as ONE `with_lock` critical section per save (the
+  per-path ticket/baseline/blocked bookkeeping is only touched inside that lock; `set_baseline`
+  and the persistence block take it too): the containing DIRECTORY is fsynced before `save` returns,
   because the caller deletes `TextTab.create_presets` from `user_config.json` right afterwards —
   without the directory flush a power loss in that window could leave the presets in NEITHER
   document. It reports a TYPED `PresetsStoreError`; the failure is logged AND pushed as a
@@ -374,7 +379,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   Only on `Failed` is the corrupt file still the sole copy of the user's presets, and the
   atomic write ends in a `rename` over it; the same rule `fonts_data.json` follows.
 - TWO RUNNING APP INSTANCES cannot clobber each other: the save is guarded by the SAME
-  optimistic concurrency `fonts_data.json` uses (`doc_store::DocumentFingerprint` /
+  optimistic concurrency `fonts_data.json` uses (`ms_docstore::Fingerprint` /
   `SaveBaseline`, one baseline per target path). A document from a NEWER schema is refused; a
   document that changed since this process read it is parsed, MERGED into the snapshot
   (additive — theirs is added, ours is kept) and the write is retried ONCE. What was merged in
@@ -1061,8 +1066,9 @@ session long before this call.
   unmultiplied `[u8; 4]` of `settings.json`'s `bubble_status` rules.
 - Persistence discipline mirrors `char_table/favorites.rs` and is documented there: typed
   `Missing`/`Loaded`/`NewerVersion`/`Invalid`/`Unreadable` load outcome, quarantine of a
-  MALFORMED document to the first free `color_presets.json.bad*` name, temp+rename,
-  everything through `ms_storage::global::storage()` (never `std::fs`), background load +
+  MALFORMED document to the first free `color_presets.json.bad*` name, reads and atomic
+  writes through `ms_docstore` (never `std::fs`; the quarantine is `ms_docstore::quarantine`
+  under the document lock), background load +
   per-frame `poll`, and the SHARED `char_table::SnapshotWriter` for writes. Exactly one
   document state — `Ready` — permits a write; `Loading`, `Quarantining`, `NewerVersion`,
   `Unreadable` and `QuarantineFailed` REFUSE the save and log why: replacing a document this
@@ -1083,12 +1089,11 @@ session long before this call.
   target is discarded. `favorites.rs` is NOT the reference here: its `toggle` still
   quarantines synchronously on the GUI thread. The `*.bad` naming race the two quarantines
   share is listed under "Contracts and invariants".
-- **Durability is temp+rename only, and is documented as such.** A reader never sees a
-  half-written document and a dying process leaves the previous set intact, but nothing is
-  fsynced (`Storage` exposes no such primitive), so a power loss can still cost the last
-  write — one preset edit, which the user redoes. The durable recipe of `doc_store.rs`
-  (`write_all` + `sync_all` + rename + directory fsync) is deliberately not used: it is built
-  on `std::fs` and would take this document off the wasm virtual store.
+- **Writes go through `ms_docstore` with contents-only durability** (`DocKind::ColorPresets`,
+  same for `char_favorites.json`): on native a reader never sees a half-written document and
+  the temp file is fsynced before the rename; the directory is not fsynced (a lost write costs
+  one preset edit, which the user redoes). On wasm the store writes through the `ms-storage`
+  seam, so the document stays on the virtual store.
 - A missing document is not an error and is NOT written: the set starts from the built-in
   palette (`PresetDefaults::Palette`), and the file appears only when the user confirms a
   cell.
@@ -1404,12 +1409,10 @@ session long before this call.
   recipe: seeded at startup by `main.rs::seed_advanced_form_search_from_config`, written by
   `ms_config::save_advanced_form_search_params` on a named thread. The
   GUI thread never reads the config file. The write goes through
-  `config::update_user_config_file`, NOT the raw `fs::` read-modify-write its settings-tab
-  siblings still use: that helper takes `config::lock_user_config_write()` itself (so the
-  saver must not), REPORTS a malformed `user_config.json` instead of replacing it with an
-  empty object — the sibling recipe silently destroys every unrelated setting when the file
-  fails to parse — and goes through the `storage()` abstraction, so it is wasm-portable.
-  Rewriting the siblings the same way is a separate decision. **The field NAMES belong to
+  `config::update_user_config_file`: that helper takes the `user_config.json` document lock
+  itself (so the saver must not hold it), REPORTS a malformed `user_config.json` instead of
+  replacing it with an empty object, and goes through `ms_docstore`, so it is wasm-portable.
+  **The field NAMES belong to
   this module**
   (`to_config_value` / `from_config_value`) so the writer and the reader cannot drift, and a
   PARTIAL object is a supported input: every missing or invalid field keeps its compiled-in
@@ -1591,7 +1594,7 @@ session long before this call.
   loss window is a crash (or an app exit that does not close the window) inside those 600 ms,
   with the value still in effect for the session.
 - **THE WRITES ARE ORDER-SAFE, NOT ONLY SERIALIZED.** Each save is its own detached thread;
-  `config::lock_user_config_write()` orders the WRITES but not the SPAWNS, so two saves could
+  the `user_config.json` document lock orders the WRITES but not the SPAWNS, so two saves could
   take the lock in the reverse order and leave the OLDER snapshot on disk — the knob would
   silently revert at the next launch. `create_advanced::AdvancedFormParamsSaveGate` stamps a
   monotonic generation at spawn time and admits only the newest one, checking it under the
@@ -1639,8 +1642,8 @@ of the comic type.
 
 ## Editing map
 - To change the create-preset FILE (a key, the version, the save guard), see
-  `presets_store.rs`; to change the WRITE RECIPE or the concurrency vocabulary of EITHER panel
-  document, see `doc_store.rs` — and only there; to change what a preset CAPTURES, how it is
+  `presets_store.rs`; to change the WRITE RECIPE or the concurrency vocabulary of ANY panel
+  document, see the `ms-docstore` crate — and only there; to change what a preset CAPTURES, how it is
   seeded off-thread or how a legacy one is converted, see `create_presets.rs`
   (`save_current_preset`, `read_presets_seed`, `migrate_legacy_presets`).
 - To change WHICH owner a parameter edit is written to, see

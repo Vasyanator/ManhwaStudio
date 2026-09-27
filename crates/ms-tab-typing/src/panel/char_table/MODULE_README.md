@@ -67,9 +67,11 @@ and the favorites stores), never on the GUI thread.
   (`ProjectPaths::char_favorites_file`, computed in `project.rs::load_internal` next to
   `notes_file`). Every chapter of one manga therefore sees the same list — a fixed user
   decision, see `dev-docs/char_table_plan.md` §2.
-- **All filesystem access to the project document goes through `ms_storage::global::storage()`,
-  never `std::fs`.** `ms-project` and everything below it must keep working on the wasm
-  virtual store. (`coverage.rs` is the deliberate exception: it reads APP font files, like
+- **The project document is read and written only through `ms_docstore`
+  (`DocKind::CharFavorites`), never `std::fs`**; the store reads through the `ms-storage` seam,
+  so `ms-project` and everything below it keep working on the wasm virtual store. The `.bad*`
+  quarantine (existence probes + rename) is `ms_docstore::quarantine`, under the same
+  document lock. (`coverage.rs` is the deliberate exception: it reads APP font files, like
   `fonts.rs`, not project files.)
 - A project document that cannot be used is NEVER silently replaced, and "corrupt" and
   "could not be read" are DIFFERENT: `load_project_document` returns `Missing` / `Loaded` /
@@ -96,8 +98,9 @@ and the favorites stores), never on the GUI thread.
   `characters` array is decoded element-wise: one junk element is skipped, it does not
   condemn the document.
 - The global list lives in `user_config.json` (`TextTab.char_table_global_favorites`), read
-  through `config::JsonConfig` with an EMPTY default tree (so a read can never rewrite the
-  file) and written through `config::update_user_config_file`.
+  read-only through `ms_docstore::read_value` (a read can never rewrite the file; a failed
+  read forbids writing the favorites key for the session) and written through
+  `config::update_user_config_file`.
 - **Every save goes through ONE coalescing writer per store, never a thread per change**
   (`mod.rs::SnapshotWriter`, shared infrastructure of the whole `panel` module — the typing
   tab's color presets use it too, which is why its log messages name the writer's thread

@@ -11,16 +11,17 @@ Re-exported by the binary from `src/tabs/mod.rs` as
 
 ## Architecture
 Layer: near the top of the library stack. It may depend on `ms-project`, `ms-widgets`,
-`ms-storage`, `ms-sysprobe`, `ms-thread` and `ms-i18n`, and it may NOT depend on `app`,
+`ms-storage`, `ms-docstore`, `ms-log`, `ms-sysprobe`, `ms-thread` and `ms-i18n`, and it may NOT depend on `app`,
 `launcher` or another tab crate. Above it sit `app.rs` and `launcher/app.rs` (which own the
 tab states) and `ms-tab-translation`, which reads this crate's note entries to build the MT
 glossary.
 
 The four tabs are independent of each other except for `notes`, which aggregates the entries
-`characters` and `terms` expose. Every JSON / markdown / image read and write goes through
-the `ms_storage::global::storage()` seam so the web build can swap the backend; every
-non-trivial load (portraits, note aggregation, wiki scan and markdown parse, image decode)
-runs on an `ms_thread` worker and reaches the GUI through an mpsc channel.
+`characters` and `terms` expose. The owned title documents `characters.json` and `terms.json`
+are read, written (atomically) and change-probed ONLY through `ms_docstore`; every other
+markdown / text / image read and write goes through the `ms_storage::global::storage()` seam
+so the web build can swap the backend. Portraits, note aggregation, wiki scan/markdown parse
+and image decode run on an `ms_thread` worker and reach the GUI through an mpsc channel.
 
 ## Files and submodules
 - `lib.rs`: crate root — mounts the `ms-i18n` macros and declares the four modules.
@@ -36,8 +37,17 @@ runs on an `ms_thread` worker and reaches the GUI through an mpsc channel.
 
 ## Contracts and invariants
 - No literal user-visible strings: every label goes through `t!` / `tf!` / `tp!`.
-- The GUI thread never does file I/O or image decode; all of it is worker-driven.
-- File access goes through the storage seam, never `std::fs` directly.
+- Image decode and the heavy loads above are worker-driven. Known gap (AGENTS.md §5): the
+  characters/terms tabs still load and save their roster on the GUI thread
+  (`dev-docs/known_gaps.md`); those saves use `Durability::None` (atomic, no fsync).
+- `characters.json` / `terms.json` go through `ms_docstore` only; other file access goes
+  through the storage seam, never `std::fs` directly.
+- A malformed `characters.json` / `terms.json` is reported and NEVER overwritten: not on
+  load, and not by a later save — after a failed load the tab refuses every save/delete
+  (`load_error`) until a successful reload, and the store-level save re-reads the existing
+  document under its lock and refuses an unreadable or malformed one. The legacy
+  `characters/*.txt` migration runs only when `characters.json` is absent, and its write is
+  directory-fsynced before the `*.txt` sources are deleted.
 - The wiki's remote-image loader is native-only (`ureq`); the wasm build compiles an error
   stub in its place.
 - Tests that assert a `t!` / `tf!` / `tp!` rendering must install a catalog under

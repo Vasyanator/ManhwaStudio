@@ -9,6 +9,10 @@ Data sources:
 - Characters: loaded through `tabs::characters::load_characters_for_notes`.
 - Terms: loaded through `tabs::terms::load_terms_for_notes`.
 
+Change watch:
+- `characters.json` / `terms.json` are probed with `ms_docstore::signature`; the plain-text
+  template keeps a storage-seam stat (`read_file_signature`).
+
 Performance:
 - Prompt assembly and file reads are executed in a background worker thread.
 - GUI thread only renders state and polls worker results.
@@ -47,8 +51,8 @@ struct ComposeResult {
     template_text: String,
     warnings: Vec<String>,
     template_sig: FileSignature,
-    chars_sig: FileSignature,
-    terms_sig: FileSignature,
+    chars_sig: Option<ms_docstore::Signature>,
+    terms_sig: Option<ms_docstore::Signature>,
 }
 
 #[derive(Debug)]
@@ -71,8 +75,8 @@ pub struct NotesTabState {
     saved_at: Option<Instant>,
     loaded_notes_path: Option<PathBuf>,
     template_sig: FileSignature,
-    chars_sig: FileSignature,
-    terms_sig: FileSignature,
+    chars_sig: Option<ms_docstore::Signature>,
+    terms_sig: Option<ms_docstore::Signature>,
     last_watch_poll: Option<Instant>,
 }
 
@@ -97,8 +101,8 @@ impl Default for NotesTabState {
             saved_at: None,
             loaded_notes_path: None,
             template_sig: FileSignature::default(),
-            chars_sig: FileSignature::default(),
-            terms_sig: FileSignature::default(),
+            chars_sig: None,
+            terms_sig: None,
             last_watch_poll: None,
         }
     }
@@ -305,8 +309,8 @@ impl NotesTabState {
         self.copied_at = None;
         self.saved_at = None;
         self.template_sig = read_file_signature(&project.paths.notes_file);
-        self.chars_sig = read_file_signature(&project.paths.characters_dir.join("characters.json"));
-        self.terms_sig = read_file_signature(&project.paths.terms_file);
+        self.chars_sig = read_doc_signature(&project.paths.characters_dir.join("characters.json"), ms_docstore::DocKind::Characters);
+        self.terms_sig = read_doc_signature(&project.paths.terms_file, ms_docstore::DocKind::Terms);
         self.last_watch_poll = None;
     }
 
@@ -358,8 +362,8 @@ impl NotesTabState {
                 template_text,
                 warnings,
                 template_sig: read_file_signature(&template_path),
-                chars_sig: read_file_signature(&chars_path),
-                terms_sig: read_file_signature(&terms_path),
+                chars_sig: read_doc_signature(&chars_path, ms_docstore::DocKind::Characters),
+                terms_sig: read_doc_signature(&terms_path, ms_docstore::DocKind::Terms),
             });
         });
     }
@@ -376,8 +380,8 @@ impl NotesTabState {
                 template_text: String::new(),
                 warnings: vec![t!("notes.compose.thread_interrupted").to_string()],
                 template_sig: FileSignature::default(),
-                chars_sig: FileSignature::default(),
-                terms_sig: FileSignature::default(),
+                chars_sig: None,
+                terms_sig: None,
             }),
         };
         let Some(result) = result else {
@@ -412,9 +416,8 @@ impl NotesTabState {
         self.last_watch_poll = Some(now);
 
         let template_sig_now = read_file_signature(&project.paths.notes_file);
-        let chars_sig_now =
-            read_file_signature(&project.paths.characters_dir.join("characters.json"));
-        let terms_sig_now = read_file_signature(&project.paths.terms_file);
+        let chars_sig_now = read_doc_signature(&project.paths.characters_dir.join("characters.json"), ms_docstore::DocKind::Characters);
+        let terms_sig_now = read_doc_signature(&project.paths.terms_file, ms_docstore::DocKind::Terms);
 
         let template_changed = template_sig_now != self.template_sig;
         let chars_changed = chars_sig_now != self.chars_sig;
@@ -621,6 +624,20 @@ fn decode_cp1251(bytes: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Change probe of an owned title document (`characters.json` / `terms.json`) through the
+/// document store; `None` when absent or when the probe fails (the failure is logged).
+fn read_doc_signature(path: &Path, kind: ms_docstore::DocKind) -> Option<ms_docstore::Signature> {
+    match ms_docstore::signature(&ms_docstore::DocRef::new(path, kind)) {
+        Ok(signature) => signature,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!("[notes::watch] failed to probe document; path={} error={err}", path.display()));
+            None
+        }
+    }
+}
+
+/// Change probe of the plain-text notes template (not a docstore document) through the
+/// storage seam; a failed stat reads as "absent".
 fn read_file_signature(path: &Path) -> FileSignature {
     let path_str = path.to_string_lossy();
     let Ok(meta) = ms_storage::global::storage().metadata(path_str.as_ref()) else {

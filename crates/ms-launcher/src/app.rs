@@ -556,6 +556,9 @@ impl LauncherApp {
             PageNavAction::ProjectsRootChanged(projects_root) => {
                 self.apply_projects_root(ctx, projects_root);
             }
+            PageNavAction::StorageModeChanged(mode) => {
+                self.apply_storage_mode(ctx, mode);
+            }
             PageNavAction::AiInstallTypeChanged(install_type) => {
                 self.ai_install_type = install_type;
                 self.settings_page.set_ai_install_type(install_type);
@@ -606,6 +609,16 @@ impl LauncherApp {
         self.background_pending_slots.clear();
         self.pending_images.clear();
         self.background_column_heights = [0.0; BACKGROUND_COLUMNS];
+        ctx.request_repaint();
+    }
+
+    /// Hook run after a storage-mode switch from the settings page finished converting the
+    /// global and title documents (the docstore default already equals `mode`). Pages that
+    /// show format-dependent state refresh here: the open page re-probes the selected
+    /// chapter so its format banner compares against the new mode.
+    fn apply_storage_mode(&mut self, ctx: &egui::Context, mode: config::StorageMode) {
+        ms_log::runtime_log::log_info(format!("[launcher] storage mode is now '{}'; refreshing format-dependent pages", mode.as_config_str()));
+        self.open_page.revalidate_selection();
         ctx.request_repaint();
     }
 

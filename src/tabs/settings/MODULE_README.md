@@ -61,8 +61,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   aborted-attempt marker survives an uncatchable SIGILL during onnxruntime load (and the marker write
   also fsyncs the parent directory on a first-ever create, Unix-only); all are synchronous
   read-modify-write helpers meant to run off the GUI thread. EVERY `user_config.json` RMW writer of
-  the settings surfaces (`save_*` + `write_ort_load_state`) serializes on the process-wide
-  `config::lock_user_config_write()`, so concurrent background/GUI-thread savers cannot interleave
+  the settings surfaces (`save_*` + `write_ort_load_state`) serializes on the `ms_docstore`
+  document lock of `user_config.json`, so concurrent background/GUI-thread savers cannot interleave
   read/write and lose an update (which could drop the just-written `attempted:true` SIGILL marker or
   clobber settings). `save_ai_runtime` is wired to the
   "Рантайм ИИ" selector in `ai_backend_panel`; the guard writers are wired to `native_runtime`'s ORT
@@ -72,11 +72,14 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   object). Unlike its `TextTab` siblings this one is NOT driven from a settings pane: the knobs live
   in the typing tab's advanced-form window, which spawns the write on its own named thread. Only the
   placement of the object lives here; its SHAPE belongs to `tabs::typing::advanced_form_params`.
-  It is also the ONE saver here that does NOT hand-roll the read-modify-write: it delegates to
-  `config::update_user_config_file`, which takes `config::lock_user_config_write()` itself (so this
-  saver must not — the lock is not reentrant), REPORTS a malformed `user_config.json` instead of
-  degrading it to an empty object, and goes through `storage()` rather than raw `fs::`. Its siblings
-  still carry the degrade-and-clobber recipe; migrating them is a separate task (README_AGENT.md).
+  Every `user_config.json` writer of this surface — the `ms-config` savers AND this module's own
+  `save_font_name_display_mode` / `save_typing_panel_layout` / `save_rotation_ctrl_wheel_mode`
+  (one shared `upsert_user_config_string` helper in `mod.rs`) — is ONE call to
+  `config::update_user_config_file` (serialized `ms_docstore::update`, atomic replace). Callers
+  must not hold that document lock (`ms_docstore::with_lock`) themselves: it is taken inside and
+  is not reentrant. A malformed `user_config.json` is REPORTED and left untouched, never degraded to an
+  empty object. The matching readers go through `config::ort_load_guard::read_user_config_root`
+  and fall back to their defaults on a missing or malformed document.
 - `general.rs`: thin studio wrapper for the general section. Enforces the studio-only vertical
   typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then renders the shared
   General section through `SettingsTabState.shared.draw(General, ..)` (projects-directory editor,
@@ -174,6 +177,12 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
 - Do not block the GUI thread with file writes, Python process work, backend probes, or command
   output reads. Use the existing workers and command channels.
 - Runtime path and Python command construction must go through `config` and `python_manager`.
+- The canvas-settings save request carries a spellcheck word list only when the editor's text
+  differs from what it last loaded or sent (`words_to_send`); the spellcheck context menu writes the
+  same lists through its own worker, and re-sending an unchanged copy would drop its words. A
+  failed word-list write is reported back by the saver and makes the baseline unknown, so the
+  next save retries it. A shutdown/rebind signal (`None`) found while coalescing queued requests
+  stops the saver only after the coalesced request was written.
 - Shared canvas settings changes must update the local snapshot, publish to bound shared models,
   and persist through the settings save worker.
 - Memory profile changes must update the shared `MemoryManager` immediately and persist

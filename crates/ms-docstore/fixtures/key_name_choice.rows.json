@@ -1,0 +1,93 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/both",
+    "parent": "",
+    "seg": "both",
+    "kind": "arr_id",
+    "payload": "[\"x\",\"y\"]"
+  },
+  {
+    "path": "/both/\"x\"",
+    "parent": "/both",
+    "seg": "\"x\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"x\",\"uid\":\"u1\"}"
+  },
+  {
+    "path": "/both/\"y\"",
+    "parent": "/both",
+    "seg": "\"y\"",
+    "kind": "ent",
+    "payload": "{\"id\":\"y\",\"uid\":\"u2\"}"
+  },
+  {
+    "path": "/id_first_missing_later",
+    "parent": "",
+    "seg": "id_first_missing_later",
+    "kind": "arr",
+    "payload": "2"
+  },
+  {
+    "path": "/id_first_missing_later/0",
+    "parent": "/id_first_missing_later",
+    "seg": "0",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/id_first_missing_later/0/id",
+    "parent": "/id_first_missing_later/0",
+    "seg": "id",
+    "kind": "leaf",
+    "payload": "\"x\""
+  },
+  {
+    "path": "/id_first_missing_later/0/uid",
+    "parent": "/id_first_missing_later/0",
+    "seg": "uid",
+    "kind": "leaf",
+    "payload": "\"u1\""
+  },
+  {
+    "path": "/id_first_missing_later/1",
+    "parent": "/id_first_missing_later",
+    "seg": "1",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/id_first_missing_later/1/uid",
+    "parent": "/id_first_missing_later/1",
+    "seg": "uid",
+    "kind": "leaf",
+    "payload": "\"u2\""
+  },
+  {
+    "path": "/uid_first",
+    "parent": "",
+    "seg": "uid_first",
+    "kind": "arr_id",
+    "payload": "[\"u1\",\"u2\"]"
+  },
+  {
+    "path": "/uid_first/\"u1\"",
+    "parent": "/uid_first",
+    "seg": "\"u1\"",
+    "kind": "ent",
+    "payload": "{\"uid\":\"u1\"}"
+  },
+  {
+    "path": "/uid_first/\"u2\"",
+    "parent": "/uid_first",
+    "seg": "\"u2\"",
+    "kind": "ent",
+    "payload": "{\"id\":5,\"uid\":\"u2\"}"
+  }
+]

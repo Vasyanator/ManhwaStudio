@@ -26,6 +26,11 @@ ms-widgets = { path = "../ms-widgets" }
 # The storage seam every JSON/markdown/image read and write goes through, so the web
 # build can swap the backend.
 ms-storage = { path = "../ms-storage" }
+# The owned title documents `characters.json` / `terms.json` are read, written and
+# change-probed ONLY through the document store (atomic writes, malformed never overwritten).
+ms-docstore = { path = "../ms-docstore" }
+# Structured diagnostics (`runtime_log`) for document load failures and probe errors.
+ms-log = { path = "../ms-log" }
 # `paste_image`: the system clipboard image reader behind the character portrait paste.
 ms-sysprobe = { path = "../ms-sysprobe" }
 # Background loaders (character portraits, note aggregation, wiki markdown parsing) go
@@ -59,3 +64,5 @@ ureq.workspace = true
 # The wiki's plural-form test is the only user, which is why `ms-config` is absent from
 # `[dependencies]` entirely.
 ms-config = { path = "../ms-config", features = ["test-support"] }
+# Temp directories for the characters/terms persistence tests.
+tempfile.workspace = true

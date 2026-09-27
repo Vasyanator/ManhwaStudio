@@ -1,0 +1,16 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/characters",
+    "parent": "",
+    "seg": "characters",
+    "kind": "leaf",
+    "payload": "[\"α\",\"β\",\"→\",\"…\",\"!?\"]"
+  }
+]

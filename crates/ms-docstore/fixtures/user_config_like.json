@@ -1,0 +1,30 @@
+{
+  "General": {
+    "storage_mode": "prod",
+    "theme": "dark",
+    "projects_dir": "/home/u/Documents/manhwastudio_projects",
+    "ai_device": "cuda:0",
+    "ai_device_configured": true,
+    "ai_max_loaded_models": 3,
+    "enabled_tabs": {
+      "Перевод": true,
+      "Клининг": false
+    }
+  },
+  "Canvas": {
+    "visible_page_radius": 2,
+    "load_all_bubbles": false,
+    "zoom": 1.0,
+    "recent": [
+      "a",
+      "b"
+    ]
+  },
+  "TextTab": {
+    "use_system_fonts": false,
+    "params": {
+      "font size multiplier": 1.5,
+      "empty": {}
+    }
+  }
+}

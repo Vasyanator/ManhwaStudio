@@ -152,6 +152,33 @@ no compat-only concerns, so migrating a legacy field can never corrupt a current
 version: bump `LAYERS_SCHEMA_VERSION`, add a `migrate_vN_to_vN1` step, chain it, then drop the
 now-retired `#[serde(default)]` from the canonical struct (the migration is its only reader).
 
+## Document ownership (`ms-docstore`)
+`layers.json` is an owned document of `ms-docstore` (`DocKind::Layers`): `compat::read_manifest`
+reads it with `ms_docstore::read_value` (unlocked), and `persist::write_manifest` replaces it whole
+with `ms_docstore::write` (atomic temp+rename on native; pretty, struct field order, no trailing
+newline — byte-identical to the historical writer; the parent dir must already exist). The manifest
+may be `layers.json` or `layers.db`: an existing one keeps its format, and a NEW one (either tree)
+is created in the chapter's format — `write_manifest` names it through
+`ms_page_ops::chapter_docs::chapter_doc_for_write` (docstore rule B.3). The save-to-project merge
+(`merge_unsaved_layers_into_committed`) therefore reads staging in its format and writes committed
+in committed's format; it never copies files. Never open `layers.json` with `std::fs`/the storage
+seam directly. `MANIFEST_LOCK` still wraps every multi-step
+per-page RMW; the document lock is taken inside `write_manifest`, so the fixed order is
+**`MANIFEST_LOCK` → document lock** — never the reverse.
+
+**One transaction, many pages (`persist::ManifestTxn`).** Every docstore write is a durable commit
+(~100-170 ms of fsyncs on an HDD for a `.db`), so the page writers are expressed as operations on a
+`ManifestTxn`: `begin` takes `MANIFEST_LOCK` and reads the manifest once; `save_page_rasters` /
+`write_page_text_payload` / `update_raster_effects` edit the in-memory manifest (each atomic: an `Err`
+restores its page from a checkpoint); `commit` writes ONCE (skipped when nothing changed). The free
+functions of the same names are one-operation transactions. File ordering invariant: a PNG is written
+BEFORE any manifest names it (during the operation), and a file that became unreferenced (raster orphan
+prune, a replaced `_fx` render) is deleted only AFTER the commit, keeping every file the committed page
+still references (so a page's live `_text.png` renders survive a raster save). A failed commit deletes
+nothing. Durability: `write_manifest` asks `ms_page_ops::chapter_docs::chapter_doc_durability` — a
+`{chapter}_unsaved` staging manifest is not fsynced (JSON; `.db` ignores durability), a committed one
+keeps `Contents`.
+
 ## Files
 - `manifest.rs` — serde schema (`LayersManifest`, `PageLayers`, `LayerRec`, `LayerKindRec`,
   `TransformRec`, `DeformRec`, `TextCentersRec`, `CenteringFrameRec`, `GroupRec`, `PayloadRef`).
@@ -172,6 +199,15 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     `removed_uids` (rasters the PS editor explicitly deleted/merged-away this session) are dropped and
     pruned. This is what stops a "save to project" whole-page flush from wiping the typing tab's
     rasters and their non-destructive effects.
+    STAGING SEED + KEEP-PRESENT (same rule as the text writer): `ManifestTxn::save_page_rasters(..,
+    fallback_dir)` (used by the saver and `LayerDoc::flush_page*`) first seeds a page staging has no
+    record of from the committed manifest, so committed text / unowned rasters are carried and a
+    committed deletion is expressible; an emptied page that existed (staged or committed) stays
+    PRESENT-but-EMPTY — the explicit "empty" override of committed for loader and merge. Absent keeps
+    meaning "fall back to committed", which is why removing an emptied page resurrected deleted rasters
+    (and a staged text tombstone's committed text). A seeded page the write leaves unchanged (tree
+    compared order-insensitively, no PNG written) is elided. The free `save_page_rasters` has no
+    committed dir and never seeds (callers with a staging dir should use the transaction form).
   - Targeted single-raster ops (both tabs, e.g. the typing tab adding/moving/effecting an external
     image as a raster without rewriting the whole page): `add_page_raster` (append one node + PNG on
     top), `update_raster_geometry` (transform + deform mesh together, no PNG — the ONE targeted
@@ -187,7 +223,8 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     raster does not resurrect — `save_page_rasters` otherwise preserves an unowned manifest raster).
   - Save-to-project layers merge: `merge_unsaved_layers_into_committed(committed_dir, unsaved_dir,
     owned_text_pages)` merges the unsaved staging `layers.json` INTO the committed one PER PAGE, and
-    `app::merge_unsaved_into_project` calls it instead of a file-level overwrite of `layers.json`.
+    `ms_project::save_merge::merge_unsaved_into_project` calls it (the binary injects it as the
+    `merge_layers` closure) instead of a file-level overwrite of `layers.json`.
     OWNERSHIP, two axes: (1) a committed-only page (absent from unsaved) is PRESERVED entirely (**ВВД/13
     truncation fix** — the doc session's unsaved manifest only holds the pages the user visited, while
     the committed manifest may carry MORE pages e.g. all of them written by the eager migration; a blind
@@ -199,7 +236,9 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     text-less staging page — without the ownership guard the whole-page replace would DROP the committed
     text; a naive "preserve absent text" would RESURRECT a legitimately-deleted text. The owned set
     comes from `TypingTabState::flush_text_layers`, which now flushes text for EVERY doc-resident page
-    (`LayerDoc::resident_pages`) — making staging text-complete for owned pages — then subtracts pages
+    (`LayerDoc::resident_pages`) — so every owned page's EFFECTIVE text (staging page, else committed
+  page) equals the doc's; the saver may elide an owned page's write when it would not change that
+  effective page (see the saver below), which leaves the merge result identical — then subtracts pages
     whose latest TEXT saver write FAILED at the merge barrier, so committed text is preserved fail-safe
     without coupling text ownership to raster/effects outcomes.
   - **Non-destructive raster effects model**: a raster keeps `base_file` (original), an `effects`
@@ -260,14 +299,21 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
 - `effects.rs` — the "render type 2" seam: `apply_effects_to_color_image(&ColorImage, effects_json)`
   bridges egui `ColorImage` to the typing tab's pure `apply_effects_to_image`. Straight alpha both
   ways; effects may enlarge the canvas (shadow/glow), so center-placed callers must recenter.
-- `saver.rs` — OFF-THREAD coalescing persistence for the doc (additive; does not change any persist
-  write logic). `LayerSaver` owns a worker thread (`recv` + `try_recv` drain) that BUCKETS jobs per
+- `saver.rs` — OFF-THREAD coalescing persistence for the doc. `LayerSaver` owns a worker thread
+  (`recv` + `try_recv` drain) that BUCKETS jobs per
   `page_idx`, keeping the LATEST data PER KIND (rasters / text / per-uid effects) — so a Full + a
   TextOnly job for the same page MERGE without dropping either kind. A `PageSaveJob` carries OWNED data
   (`OwnedRasterLayer` / `OwnedTextNode` mirror the `persist::RasterLayerOut` / `TextPayloadOut` inputs
   but own their `ColorImage`s; `EffectsSaveItem` mirrors `persist::update_raster_effects`), so the
-  worker holds no doc lock; its `run` replays the EXACT `persist::save_page_rasters` →
-  `write_page_text_payload` → `update_raster_effects` sequence of `LayerDoc::flush_page`.
+  worker holds no doc lock. **One manifest commit per drain pass**: the pass's jobs are grouped by
+  `layers_dir`; per group, each job's text PNGs are encoded first (outside the lock; a failure fails
+  only that page's text), then ONE `ManifestTxn` applies every job in the EXACT `save_page_rasters` →
+  `write_page_text_payload` → `update_raster_effects` order of `LayerDoc::flush_page` (a failing or
+  panicking job is rolled back and fails alone), then ONE commit. A failed commit reports EVERY job of
+  the pass failed for every kind it carried. A text write whose page would come out identical to the
+  page effective on disk (staging page, else the committed page it would be seeded from), and that
+  wrote no text PNG, is ELIDED — an unchanged save stages nothing; loader and merge resolve pages per
+  page, so they see the same page either way.
   - The `effects` half is a TARGETED per-raster effects-only update (`Vec<EffectsSaveItem>`, latest
     wins per uid on coalesce). It never rewrites the page raster set and is the ONLY path that can
     express the CLEAR case (empty chain + `display_image: None`) — the whole-page raster reconcile loop
@@ -278,7 +324,9 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     `Sender` wrapper for a merge worker / app-close drain.
   WIRING: the doc enables the saver via `enable_background_saver` (called ONCE in `app.rs` on the
   shared doc at startup) and feeds it through `enqueue_page_save` / `enqueue_page_text_save` /
-  `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). PS per-edit/raster flushes
+  `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). A caller saving MANY pages
+  at once uses `enqueue_pages_text_save`, which sends them as ONE `SaverMsg::Jobs` message: separate
+  sends with work in between can wake the worker into one pass (one commit) per page, a batch cannot. PS per-edit/raster flushes
   and typing text flushes ENQUEUE. Dirty flags clear only after the frame-loop poll consumes a
   successful acknowledgement whose per-kind epoch still matches the latest edit/enqueue; failed or
   stale completions leave that kind dirty for retry. The save-to-project merge worker and the eframe `on_exit` /

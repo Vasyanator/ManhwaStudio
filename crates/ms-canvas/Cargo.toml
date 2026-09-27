@@ -31,6 +31,9 @@ ms-i18n = { path = "../ms-i18n" }
 ms-log = { path = "../ms-log" }
 # Canvas settings are read from and written to `user_config.json` / the project config.
 ms-config = { path = "../ms-config" }
+# The title `settings.json` canvas section is persisted through the document store's
+# serialized read-modify-write (`ms_docstore::update`), never a bare `fs::write`.
+ms-docstore = { path = "../ms-docstore" }
 # Image-cache budgets consulted before a source page or overlay is uploaded.
 ms-memory = { path = "../ms-memory" }
 # Undo/redo of bubble and overlay edits (`ActionHistory`, `RasterDiff`).
@@ -57,3 +60,7 @@ image.workspace = true
 # on wasm, where the call sites are compiled out.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 arboard.workspace = true
+
+[dev-dependencies]
+# Temp directories for the `settings.json` persistence tests.
+tempfile.workspace = true

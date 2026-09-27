@@ -38,26 +38,22 @@ Notes:
 - NOT ONE filesystem operation may happen inside a frame (CLAUDE.md §5). The load,
   the quarantine and the write all run on workers; `save` only records intent and
   `poll` only starts and collects workers.
-- EVERY filesystem operation goes through `ms_storage::global::storage()`, never
-  `std::fs`: everything reading the project tree must keep working on the wasm
-  virtual store. This is also why `doc_store::write_atomic` — the panel's durable
-  (`sync_all` + directory fsync) write recipe — is deliberately NOT used here: it
-  is built on `std::fs` and would take this document off the virtual store. The
-  price is stated where it is paid, on `save_document`.
-- The load/quarantine/atomic-write discipline mirrors
-  `char_table/favorites.rs` — the project's one existing contract for a
-  per-title user document — and the writer is literally the same type
-  (`char_table::SnapshotWriter`). The two documents deliberately share no code
-  beyond it, so `favorites.rs` stays the reference implementation; extracting the
-  quarantine + atomic-write recipe into one shared owner is a worthwhile
-  follow-up, not part of this change. It is NOT mirrored in one respect:
-  `favorites.rs` quarantines synchronously from its GUI-thread `toggle`, which
-  this store must not do.
+- The document is read and written ONLY through `ms_docstore`
+  (`DocKind::ColorPresets`): native writes are atomic (sibling temp + `sync_all`
+  + rename) under the per-document lock, reads go through the `ms-storage` seam,
+  so everything reading the project tree keeps working on the wasm virtual
+  store (where the store's write is a plain seam write). The quarantine (rename
+  to a free `.bad*` name) is `ms_docstore::quarantine`, under the same document
+  lock.
+- The load/quarantine discipline mirrors `char_table/favorites.rs` — the
+  project's one existing contract for a per-title user document — and the writer
+  is literally the same type (`char_table::SnapshotWriter`). It is NOT mirrored
+  in one respect: `favorites.rs` quarantines synchronously from its GUI-thread
+  `toggle`, which this store must not do.
 */
 
 use super::char_table::{SnapshotTarget, SnapshotWriter};
 use ms_config as config;
-use ms_storage::global::storage;
 use ms_widgets::{ColorPresets, PRESET_COUNT, PresetDefaults};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -222,13 +218,17 @@ fn colors_to_json(colors: &[[u8; 4]; PRESET_COUNT]) -> Vec<Value> {
 /// best-effort and rewritten by the next save. Never panics.
 #[must_use]
 fn load_document(path: &Path) -> LoadOutcome {
-    let store = storage();
-    let path_str = path.to_string_lossy();
-    if !store.exists(path_str.as_ref()) {
-        return LoadOutcome::Missing;
-    }
-    let raw = match store.read_to_string(path_str.as_ref()) {
-        Ok(raw) => raw,
+    let file: ColorPresetsFile = match ms_docstore::read(&document(path)) {
+        Ok(Some(file)) => file,
+        Ok(None) => return LoadOutcome::Missing,
+        Err(ms_docstore::DocStoreError::Malformed { cause, .. }) => {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: malformed {COLOR_PRESETS_FILE_NAME}; treating as corrupt (will \
+                 quarantine). Path: {} Error: {cause}",
+                path.display()
+            ));
+            return LoadOutcome::Invalid;
+        }
         Err(err) => {
             // NOT `Invalid`: the document may be perfectly valid and merely
             // unreadable right now, and quarantining it would rename a good file
@@ -239,17 +239,6 @@ fn load_document(path: &Path) -> LoadOutcome {
                 path.display()
             ));
             return LoadOutcome::Unreadable;
-        }
-    };
-    let file: ColorPresetsFile = match serde_json::from_str(&raw) {
-        Ok(file) => file,
-        Err(err) => {
-            ms_log::runtime_log::log_warn(format!(
-                "typing: malformed {COLOR_PRESETS_FILE_NAME}; treating as corrupt (will \
-                 quarantine). Path: {} Error: {err}",
-                path.display()
-            ));
-            return LoadOutcome::Invalid;
         }
     };
     let presets = presets_from_json_array(&file.colors, &path.to_string_lossy());
@@ -289,61 +278,18 @@ fn load_document(path: &Path) -> LoadOutcome {
 /// this code cannot fix; refusing is better than looping.
 const MAX_QUARANTINE_CANDIDATES: u32 = 100;
 
-/// Picks a quarantine destination that does not exist yet.
-///
-/// `{file}.bad` first, then `{file}.bad.1`, `{file}.bad.2`, … The rename used
-/// underneath REPLACES an existing destination, so reusing one name would destroy
-/// the previously quarantined copy — the very content quarantine exists to
-/// preserve.
-///
-/// The probe and the rename are separate operations, so two app instances that
-/// quarantine the SAME title's document at the same instant can pick one name
-/// twice and the second rename replaces the first copy. Accepted, not overlooked:
-/// closing it needs a rename-without-replace primitive that `Storage` does not
-/// have, and it costs a copy of an already-corrupt file in a race that requires
-/// two instances open on one title at the same millisecond.
-///
-/// # Errors
-/// [`ColorPresetsError::Quarantine`] when every probed name is taken.
-fn free_quarantine_path(path: &Path) -> Result<PathBuf, ColorPresetsError> {
-    let store = storage();
-    let file_name = document_file_name(path);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    for attempt in 0..MAX_QUARANTINE_CANDIDATES {
-        let candidate = if attempt == 0 {
-            parent.join(format!("{file_name}.bad"))
-        } else {
-            parent.join(format!("{file_name}.bad.{attempt}"))
-        };
-        if !store.exists(candidate.to_string_lossy().as_ref()) {
-            return Ok(candidate);
-        }
-    }
-    Err(ColorPresetsError::Quarantine {
-        path: path.display().to_string(),
-        destination: parent.join(format!("{file_name}.bad")).display().to_string(),
-        reason: format!(
-            "no free destination among {MAX_QUARANTINE_CANDIDATES} candidates; earlier \
-             quarantined copies must be removed first"
-        ),
-    })
-}
-
-/// File name of `path`, falling back to the canonical document name for a path
-/// that has none (which no real document path has).
-#[must_use]
-fn document_file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| COLOR_PRESETS_FILE_NAME.to_owned())
-}
-
 /// Moves a MALFORMED document aside before replacement is permitted.
 ///
-/// The destination is the first free `{file}.bad`/`{file}.bad.N` name, so an
-/// earlier quarantined copy is never overwritten (single-instance; see
-/// [`free_quarantine_path`]). Only a document known to be malformed may be passed
-/// here — an unread one may be perfectly good.
+/// `ms_docstore::quarantine` under the document lock: the destination is the first free
+/// `{file}.bad`/`{file}.bad.N` name, so an earlier quarantined copy is never overwritten
+/// (the rename underneath REPLACES an existing destination). The probe and the rename are
+/// atomic against this process's writers (document lock) but not against a second app
+/// instance quarantining the SAME title's document at the same instant — both could pick
+/// one name and the second rename replace the first copy. Accepted: closing it needs a
+/// rename-without-replace primitive, and it costs a copy of an already-corrupt file in a
+/// race that needs two instances on one title at the same millisecond. Only a document
+/// known to be malformed may be passed here — an unread one may be perfectly good. A
+/// document that has vanished meanwhile needs no quarantine.
 ///
 /// Blocking, and therefore FORBIDDEN on the GUI thread: it performs up to
 /// [`MAX_QUARANTINE_CANDIDATES`] existence probes plus a rename. The only caller is
@@ -351,24 +297,36 @@ fn document_file_name(path: &Path) -> String {
 ///
 /// # Errors
 /// [`ColorPresetsError::Quarantine`] when the recoverable original could not be
-/// moved; callers must then leave the file alone and refuse to save.
+/// moved (or every probed name is taken); callers must then leave the file alone and
+/// refuse to save.
 fn quarantine_bad_document(path: &Path) -> Result<(), ColorPresetsError> {
-    let bad = free_quarantine_path(path)?;
-    storage()
-        .rename(
-            path.to_string_lossy().as_ref(),
-            bad.to_string_lossy().as_ref(),
-        )
-        .map_err(|err| ColorPresetsError::Quarantine {
+    let doc = document(path);
+    let naming = ms_docstore::QuarantineNaming::FirstFree { max_candidates: MAX_QUARANTINE_CANDIDATES };
+    match ms_docstore::quarantine(&doc, "bad", naming, ms_docstore::QuarantineFallback::RenameOnly) {
+        // The store logs the move (WARN). `Absent`: nothing left to preserve; `Copied`
+        // cannot happen with `RenameOnly`.
+        Ok(ms_docstore::Quarantined::Moved(_) | ms_docstore::Quarantined::Absent | ms_docstore::Quarantined::Copied { .. }) => Ok(()),
+        Err(ms_docstore::DocStoreError::Quarantine { path, destination, rename_error, .. }) => Err(ColorPresetsError::Quarantine {
             path: path.display().to_string(),
-            destination: bad.display().to_string(),
-            reason: err.to_string(),
-        })?;
-    ms_log::runtime_log::log_warn(format!(
-        "typing: quarantined corrupt {COLOR_PRESETS_FILE_NAME} to {}",
-        bad.display()
-    ));
-    Ok(())
+            destination: destination.display().to_string(),
+            reason: rename_error,
+        }),
+        Err(other) => {
+            let source = doc.path_for(ms_docstore::DocFormat::Json);
+            Err(ColorPresetsError::Quarantine {
+                path: source.display().to_string(),
+                destination: format!("{}.bad", source.display()),
+                reason: other.to_string(),
+            })
+        }
+    }
+}
+
+/// The document-store name of the presets document at `path` (a `….json` path, as
+/// `ProjectPaths::color_presets_file` builds it).
+#[must_use]
+fn document(path: &Path) -> ms_docstore::DocRef {
+    ms_docstore::DocRef::new(path, ms_docstore::DocKind::ColorPresets)
 }
 
 /// Writes `colors` to the document at `path`, creating the parent directory if
@@ -376,73 +334,49 @@ fn quarantine_bad_document(path: &Path) -> Result<(), ColorPresetsError> {
 ///
 /// `colors` holds PREMULTIPLIED sRGBA bytes in cell order.
 ///
-/// # Durability — exactly what temp+rename buys
-/// A sibling temp file is written first and then renamed over the target, so a
-/// reader never observes a half-written document and a process that dies mid-write
-/// leaves the previous set intact. That is protection against a PARTIAL WRITE, not
-/// against power loss: neither the temp file's contents nor the containing
-/// directory is fsynced, so after a host crash the new name may be missing or its
-/// contents may not have reached the disk. Buying that would require the durable
-/// recipe of `doc_store::write_atomic`, which is built on `std::fs` and therefore
-/// unavailable to a document that must also live on the wasm virtual store
-/// (`Storage` exposes no fsync). The cost of a lost write here is one preset edit,
-/// which the user can simply redo.
+/// # Durability
+/// The write goes through `ms_docstore` with contents-only durability: on native a
+/// sibling temp file is written, fsynced and renamed over the target, so a reader
+/// never observes a half-written document and a crash leaves either the previous
+/// or the new set. The containing directory is not fsynced — nothing deletes a
+/// data source after this write, and a lost write costs one preset edit, which the
+/// user can simply redo. On wasm the store writes through the seam (no fsync
+/// exists there). Layout: 2-space pretty JSON plus a trailing newline.
 ///
 /// # Errors
 /// [`ColorPresetsError`] on directory creation, serialization, write, or rename
 /// failure. Callers persist off the GUI thread.
 fn save_document(path: &Path, colors: &[[u8; 4]; PRESET_COUNT]) -> Result<(), ColorPresetsError> {
-    let store = storage();
-    if let Some(parent) = path.parent() {
-        let parent_str = parent.to_string_lossy();
-        store
-            .create_dir_all(parent_str.as_ref())
-            .map_err(|err| ColorPresetsError::CreateDir {
-                dir: parent.display().to_string(),
-                reason: err.to_string(),
-            })?;
-    }
     let file = ColorPresetsFile {
         version: COLOR_PRESETS_VERSION,
         colors: colors_to_json(colors),
     };
-    let mut text =
-        serde_json::to_string_pretty(&file).map_err(|err| ColorPresetsError::Serialize {
-            reason: err.to_string(),
-        })?;
-    text.push('\n');
-
-    // Temp sibling + rename: the target is replaced in one step, so a process that
-    // dies between the two leaves the previous set intact. No fsync is involved —
-    // see the "Durability" section above for what that does and does not cover. The
-    // temp name is per-process so two processes cannot collide on it.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        document_file_name(path),
-        std::process::id()
-    ));
-    let temp_str = temp.to_string_lossy().into_owned();
-    store
-        .write(temp_str.as_str(), text.as_bytes())
-        .map_err(|err| ColorPresetsError::Write {
-            path: temp.display().to_string(),
-            reason: err.to_string(),
-        })?;
-    store
-        .rename(temp_str.as_str(), path.to_string_lossy().as_ref())
-        .map_err(|err| {
-            // Best-effort cleanup of the orphaned temp file; the rename failure is
-            // the error we report (a failed cleanup must not mask it).
-            if let Err(cleanup_err) = store.remove_file(temp_str.as_str()) {
-                ms_log::runtime_log::log_warn(format!(
-                    "typing: could not remove orphaned temp file {temp_str}: {cleanup_err}"
-                ));
+    let options = ms_docstore::WriteOptions {
+        trailing_newline: true,
+        ..ms_docstore::WriteOptions::default()
+    };
+    ms_docstore::write(&document(path), &file, options)
+        .map(|_fingerprint| ())
+        .map_err(|err| match err {
+            // The only `Io` of the write path is the parent-directory creation.
+            ms_docstore::DocStoreError::Io { path: dir, source } => ColorPresetsError::CreateDir {
+                dir: dir.display().to_string(),
+                reason: source.to_string(),
+            },
+            ms_docstore::DocStoreError::Serialize { cause, .. } => {
+                ColorPresetsError::Serialize { reason: cause }
             }
-            ColorPresetsError::Rename {
+            ms_docstore::DocStoreError::Write(ms_docstore::AtomicWriteError::Rename {
+                path,
+                reason,
+            }) => ColorPresetsError::Rename {
                 path: path.display().to_string(),
-                reason: err.to_string(),
-            }
+                reason,
+            },
+            other => ColorPresetsError::Write {
+                path: path.display().to_string(),
+                reason: other.to_string(),
+            },
         })
 }
 
@@ -887,6 +821,7 @@ impl ColorPresetsStore {
 
 #[cfg(test)]
 mod tests {
+    use ms_storage::global::storage;
     use super::*;
     use eframe::egui::Color32;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -950,6 +885,26 @@ mod tests {
         save_document(&path, &presets.to_stored()).expect("save must succeed");
         let loaded = expect_loaded(load_document(&path));
         assert_eq!(loaded, presets);
+        cleanup(&path);
+    }
+
+    /// The store write keeps the historical layout (pretty JSON, version first, a
+    /// trailing newline) and leaves no sibling temp file behind.
+    #[test]
+    fn document_bytes_end_with_a_newline_and_leave_no_temp_file() {
+        let path = unique_temp_path("bytes");
+        let presets = ColorPresets::from_defaults(PresetDefaults::Palette);
+        save_document(&path, &presets.to_stored()).expect("save must succeed");
+        let raw = storage()
+            .read_to_string(path.to_string_lossy().as_ref())
+            .expect("read back");
+        assert!(raw.starts_with("{\n  \"version\": 1,\n  \"colors\": ["), "{raw}");
+        assert!(raw.ends_with("]\n}\n"), "{raw}");
+        let temp = ms_docstore::temp_path_for(&path);
+        assert!(
+            !storage().exists(temp.to_string_lossy().as_ref()),
+            "the atomic write must not leave its temp file behind"
+        );
         cleanup(&path);
     }
 

@@ -41,7 +41,11 @@ use serde_json::{Map, Value, json};
 /// `python_protocol_version_matches_rust` below guards the mirror — but nothing can detect
 /// a bump that was never made: a client and a backend from different builds then agree on
 /// a contract that does not exist and fail at runtime instead of being refused in `hello`.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// The contract also covers state the two processes SHARE on disk: the `user_config`
+/// document's storage semantics (`ms-docstore` / `docstore.py`, `.json` or SQLite `.db`).
+/// A backend payload that reads/writes it differently must be refused here.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ============================================================================
 // FRAME SIZE GUARDS

@@ -18,13 +18,14 @@ Key types:
 Notes:
 - Defaults stay in Rust code; only user overrides are stored on disk.
 - Persistence helpers here are intentionally small and JSON-based to keep GUI wiring simple.
+- Overrides are read through `ms_docstore::read_value` and written through
+  `ms_config::update_user_config_file` (serialized RMW); never `std::fs` directly.
 */
 
 use ms_config::app_tab::AppTab;
 use eframe::egui;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
 pub const HOTKEYS_CONFIG_SECTION: &str = "Hotkeys";
@@ -371,12 +372,21 @@ fn load_hotkey_overrides(user_settings_file: &Path) -> HashMap<String, HotkeyBin
         .unwrap_or_default()
 }
 
+/// Reads the whole `user_config.json` at `user_settings_file` through the document store.
+/// An absent, unreadable or malformed document yields an empty object (default hotkeys);
+/// the latter two are logged.
 fn load_root_json(user_settings_file: &Path) -> Value {
-    match fs::read_to_string(user_settings_file) {
-        Ok(raw) => {
-            serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+    let doc = ms_docstore::DocRef::new(user_settings_file, ms_docstore::DocKind::UserConfig);
+    match ms_docstore::read_value(&doc) {
+        Ok(Some(root)) => root,
+        Ok(None) => Value::Object(Map::new()),
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[widgets::input_manager_v2] failed to read hotkey overrides; using defaults. path={} error={err}",
+                user_settings_file.display()
+            ));
+            Value::Object(Map::new())
         }
-        Err(_) => Value::Object(Map::new()),
     }
 }
 

@@ -16,7 +16,9 @@ notification.
 ## Files and submodules
 - `mod.rs`: launcher window setup, app metadata, and public run functions.
 - `app.rs`: root app state, worker polling, page routing, detached viewport handling.
-- `main_page.rs`: central menu, update notification overlay, and AI install-type notices.
+- `main_page.rs`: central menu, update notification overlay, AI install-type notices, and the
+  storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
+  dismissable failure notice).
 - `state.rs`: page enum, shared UI state, and typed launcher outcomes.
 - `background.rs`: background image plan and decode workers.
 - `first_run_language.rs`: first-run interface/typesetting language-selection modal
@@ -50,7 +52,8 @@ notification.
   and `psb` exists nowhere outside this module; (2) the font-card import filter stays `psd`-only
   (`src/tabs/settings/typesetting/font_groups.rs`, the rfd `add_filter` for the font card), even
   though `ag-psd` would read a `.psb` there. Both are scope decisions; widen them only on request.
-- `theme.rs`: launcher visual style helpers.
+- `theme.rs`: launcher visual style helpers, including `notice_banner` (the amber one-action
+  notice used by the open page's recovery and chapter-format banners).
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
 

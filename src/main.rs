@@ -72,6 +72,7 @@ pub use ms_tools as tools;
 // call site.
 pub use ms_settings_ui::{
     ai_backend_panel, ai_backend_supervisor, general_settings_panel, settings_shared,
+    storage_mode_job,
 };
 
 // The launcher shell — project catalogue, the detached "New Project" window with every
@@ -346,6 +347,14 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The AI backend's deferred-autostart gate: open once the process-wide storage-mode job
+/// slot holds nothing pending or running and no chapter conversion is registered. Polled on
+/// the supervisor worker (a brief mutex read, never on the GUI thread).
+#[cfg(not(target_arch = "wasm32"))]
+fn storage_conversion_autostart_gate() -> ai_backend_supervisor::AutostartGate {
+    Box::new(|| !storage_mode_job::backend_autostart_blocked())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main() -> anyhow::Result<()> {
     init_startup_logging_best_effort();
@@ -409,6 +418,11 @@ fn run_main() -> anyhow::Result<()> {
     }
 
     runtime_log::log_info("starting main application flow");
+    // The FIRST document access of the process: reads the Dev/Prod storage mode out of the
+    // user config (whichever format it is stored in) and seeds `ms_docstore`'s default
+    // format with it. The store's "both files exist" rule resolves by that default, so it
+    // must be set before any other read or write, including the first-run marker below.
+    let storage_probe = config::storage_mode::init_storage_mode_at_startup();
     // MUST be the first startup call: every following call that touches
     // `load_user_config()` (AI install-type detection, language/effect seeding) persists
     // the full defaults tree, which materializes `General.ui_language` /
@@ -436,6 +450,13 @@ fn run_main() -> anyhow::Result<()> {
     // embedded catalog without failing startup (see `locale_store` failure policy).
     locale_store::reconcile_disk_catalog();
     let user_settings = config::load_user_settings_for_startup()?;
+    // The user config (converted last by the driver) is still in the other format: an
+    // upgrade from the JSON-only era or an unfinished switch. Converting may take a while
+    // (every title), so it runs on a worker started when the first window is up: before
+    // the launcher (see the loop below) or after the studio's project load.
+    if storage_probe.reconciliation_pending {
+        storage_mode_job::set_pending_reconciliation(storage_mode_job::ConversionRequest::for_current_install(storage_probe.mode, &user_settings));
+    }
     // Install the active UI locale from disk (or the embedded catalog on failure),
     // now that `General.ui_language` is available in the loaded settings.
     locale_store::install_ui_locale(&user_settings);
@@ -476,7 +497,8 @@ fn run_main() -> anyhow::Result<()> {
 
     if cli.test_launcher {
         init_runtime_logging();
-        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start(!cli.no_ai);
+        storage_mode_job::start_pending_reconciliation();
+        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(!cli.no_ai, Some(storage_conversion_autostart_gate()));
         return launcher::run_test_launcher(
             &user_settings,
             startup_update_check_receiver(&cli),
@@ -488,11 +510,19 @@ fn run_main() -> anyhow::Result<()> {
     // The single Python AI backend is owned here, above the launcher/studio loop, so it
     // starts in the launcher (per the autostart toggle) and survives transitions between
     // the launcher and the studio. Dropped (which stops the process + probe) on any return.
-    let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start(ai_enabled);
+    // The autostart waits (on the supervisor worker) until no storage-mode conversion is
+    // pending or running: the backend writes `user_config` itself (KG-016). With `--project`
+    // the reconciliation stays pending until the project is loaded, so the autostart does too.
+    let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_enabled, Some(storage_conversion_autostart_gate()));
     let ai_backend = ai_backend_supervisor.handle();
 
     // Main loop: re-enters the launcher when the user chooses "Выйти в лаунчер".
     loop {
+        // The launcher shows the reconciliation's progress; a direct `--project` start
+        // defers it to the studio shell, after the project load (`studio_bootstrap`).
+        if cli.project.is_none() {
+            storage_mode_job::start_pending_reconciliation();
+        }
         let project_dir = resolve_startup_project_dir(&cli, &user_settings, &ai_backend)?;
         let Some(project_dir) = project_dir else {
             return Ok(());

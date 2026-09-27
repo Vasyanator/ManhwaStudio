@@ -98,6 +98,17 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   partitioning of a split, and the survival test + dropping of a crop.
 - `fs_exec.rs`: chapter scanning, journal I/O, phase A/B execution, recovery,
   durability helpers, integration + crash-recovery tests.
+- `chapter_docs.rs` (`pub`): the chapter's two owned documents as
+  `ms_docstore::DocRef`s and docstore rule B.3 — `chapter_doc_for_write` gives
+  every WRITER of a chapter's `layers` / bubbles document a `DocRef` whose NEW
+  document joins the chapter's format (first existing sibling: committed
+  bubbles, committed layers, staging bubbles, staging layers; none →
+  `default_format()`). `chapter_doc_durability` is the ONE staging-vs-committed
+  durability decision for those writes: a `{chapter}_unsaved` document gets
+  `Durability::None` (atomic, not fsynced — JSON only, `.db` ignores it), any
+  other the caller's committed durability. Used by the save merge (`ms-project`)
+  and the staging savers (`ms-models`); here because `ProjectPaths` owns the
+  chapter layout.
 
 ## What is remapped (and what deliberately is not)
 Remapped, in committed AND unsaved trees unless noted:
@@ -110,10 +121,10 @@ Remapped, in committed AND unsaved trees unless noted:
   prefix is load-bearing: `layer_model/persist.rs::prune_orphan_pngs` prunes
   by it, so a stale prefix would let a save of the page now holding the old
   index delete another page's PNGs.
-- `layers/layers.json` — `PageLayers.img_idx` remapped, `base_file` /
+- `layers/layers.json` (or `layers.db`) — `PageLayers.img_idx` remapped, `base_file` /
   `rendered_file` references rewritten by each NAME's embedded index, pages
   kept sorted by `img_idx`.
-- `translation_bubbles.json` — `img_idx` remapped; bubbles of deleted pages
+- `translation_bubbles.json` (or `.db`) — `img_idx` remapped; bubbles of deleted pages
   removed (archived); page-crop `crop_page_idx` remapped, and when the crop
   TARGET page is deleted the `crop_page_idx`/`crop_rect` keys are removed so
   the bubble degrades to a plain image bubble instead of cropping a wrong page.
@@ -469,6 +480,27 @@ Deliberately NOT touched (each with the reason):
   needs fsync and same-volume rename semantics the seam does not model. The
   feature is native-desktop; on wasm the journal never exists and recovery is
   an inert no-op. A web port of page ops requires extending the seam first.
+- The two OWNED chapter documents (`layers/layers`, the bubbles document) are
+  `.json` or `.db` (`ms_docstore`), and a chapter KEEPS its format — each tree
+  independently (a mixed chapter stays mixed). `fs_exec::read_owned_doc`
+  resolves and reads each under the store's document lock (finishing an
+  interrupted conversion, rule B.4; two DIFFERENT formats → `Json` error) and
+  records the ACTUAL format in `TreeSnapshot::{layers_manifest,bubbles}_format`.
+  The plan discards that actual file and journals `PlannedJsonWrite { target,
+  format, content }` with `content` = the LOGICAL JSON body; phase B writes a
+  `.json` with `atomic_write` and a `.db` with `ms_docstore::write_whole_atomic`
+  (whole rebuild, validated temp, stale `-journal` removed, atomic rename).
+  `validate_plan` refuses a `.db` write to any other file name.
+- The store keeps no connection open between calls, and the scan's reads
+  return before phase A, so no handle is open while phase A renames a `.db`.
+  A `.db`'s only sidecar is a transient `<name>.db-journal`; the scan's
+  read-write open rolls a hot one back, the engine never renames it, and no
+  page-keyed pattern (`ps_p…png`, `mask_page_…png`, detection names) can
+  match it or a docstore temp (`.{name}.{pid}.tmp`).
+- NOT owned documents, deliberately plain JSON read/written here:
+  `text_info.json`, `text_detection/{idx:05}_blocks.json` (stays JSON in both
+  storage modes — a scope decision; its `mask_file` rewrite relies on it),
+  the journals and the trash archives (`deleted_*.json`).
 - Windows: phase-B rename targets are guaranteed free (phase A vacated them),
   and A -> B uses distinct journal names, so no rename-over-existing is relied
   upon. Directory fsync is Unix-only best-effort (same policy as
@@ -486,9 +518,14 @@ Deliberately NOT touched (each with the reason):
   + a `plan_*` function in `plan.rs`, scanning in `fs_exec::scan_tree`, and a
   rewrite in `json_remap.rs` if it is a JSON document.
 - Journal format / crash-safety behavior: `fs_exec.rs` (bump
-  `JOURNAL_SCHEMA_VERSION` on incompatible plan changes; it is at 3, raised from
-  2 when `ComposeSource::rotation` was added for the crop, and from 1 when
-  `NewPageContent::ComposedPng` was added for the stitch).
+  `JOURNAL_SCHEMA_VERSION` on incompatible plan changes; it is at 4 —
+  `PlannedJsonWrite::format` for `.db` documents; 3 added
+  `ComposeSource::rotation`, 2 `NewPageContent::ComposedPng`). A pending v3
+  journal of the previous release is still recovered (`upgrade_v3_journal`:
+  every v3 write is plain JSON); any other version fails the project load and
+  is left in place.
+- New chapter document format rule / chapter layout / write durability of the
+  owned documents: `chapter_docs.rs`.
 - Stitch / split geometry: `plan.rs` (`PlacementMap` is the single affine —
   never re-derive the formula at a call site; `SplitGeometry::part_for_*` is the
   single routing decision) + `json_remap.rs` for the per-document application.

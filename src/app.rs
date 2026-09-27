@@ -279,6 +279,9 @@ pub struct MangaApp {
     save_to_project_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Status text shown next to the "save to project" button.
     save_to_project_status: Option<(String, f64)>,
+    /// Id of the storage-mode reconciliation whose failure notice the user dismissed in the
+    /// top bar (see `draw_storage_reconcile_notice`).
+    storage_notice_dismissed_job: Option<u64>,
     /// Which action should happen after a successful "save then close" flow.
     pending_save_completion_action: Option<PendingCloseAction>,
     /// A project save requested while the typing tab's whole-project LAYER preload was still
@@ -771,6 +774,7 @@ impl MangaApp {
             overlay_autosave_shutdown,
             save_to_project_rx: None,
             save_to_project_status: None,
+            storage_notice_dismissed_job: None,
             pending_save_completion_action: None,
             pending_save_after_preload: false,
             exit_dialog: None,
@@ -1349,7 +1353,11 @@ impl MangaApp {
                 }
                 return;
             }
-            let result = merge_unsaved_into_project(&unsaved_dir, &project_dir, &effective_owned_text_pages);
+            // The generic chapter merge lives in `ms_project::save_merge`; the binary injects the
+            // per-page layer-manifest merge because only it knows which pages' text it owns.
+            let result = crate::project::save_merge::merge_unsaved_into_project(&unsaved_dir, &project_dir, |committed, staging| {
+                crate::models::layer_model::persist::merge_unsaved_layers_into_committed(committed, staging, &effective_owned_text_pages).map(|_wrote| ())
+            });
             // Resume before reporting completion, then issue a second barrier so any edit accepted
             // during the merge is on fresh staging before the GUI clears/recomputes dirty state.
             drop(bubbles_barrier);
@@ -1660,9 +1668,13 @@ impl MangaApp {
             self.canvas.state.separate_pages = separate_pages;
         }
 
-        if let Err(err) =
-            save_comic_type_to_project_file(&self.project.paths.settings_file, comic_type)
-        {
+        // GUI thread: an atomic replace WITHOUT fsync (AGENTS.md §5); the synchronous I/O
+        // itself is a recorded gap (`dev-docs/known_gaps.md`).
+        if let Err(err) = save_comic_type_to_project_file(
+            &self.project.paths.settings_file,
+            comic_type,
+            ms_docstore::Durability::None,
+        ) {
             let user_message = t!("app.comic_type.save_error");
             self.comic_type_prompt_error = Some(user_message.to_string());
             runtime_log::log_error(format!(
@@ -2780,8 +2792,43 @@ impl MangaApp {
                 if let Some((status, _)) = &self.save_to_project_status {
                     ui.label(status.as_str());
                 }
+                self.draw_storage_reconcile_notice(ui);
             });
         });
+    }
+
+    /// Top-bar notice of a startup storage-mode reconciliation that ended incomplete (a
+    /// direct `--project` start runs it inside the studio, where the launcher's notice is
+    /// never shown). Error-coloured, lists the failed files on hover (the shared list of the
+    /// General pane), and stays until clicked. A user switch reports in the General pane
+    /// itself, so only `JobOrigin::StartupReconciliation` is surfaced here. Per frame this
+    /// reads the job slot only (no I/O).
+    fn draw_storage_reconcile_notice(&mut self, ui: &mut egui::Ui) {
+        use crate::storage_mode_job::{self as job, JobOrigin};
+        if job::conversion_job_state().is_running() {
+            // The worker finishes without an input event; poll for its end.
+            ui.ctx().request_repaint_after(web_time::Duration::from_millis(500));
+            return;
+        }
+        let Some(finished) = job::last_finished_job() else { return };
+        if finished.origin != JobOrigin::StartupReconciliation || finished.outcome.is_complete() || self.storage_notice_dismissed_job == Some(finished.id) {
+            return;
+        }
+        let text = if finished.outcome.mode_persisted {
+            tf!("app.storage_mode.reconcile_failed", count = finished.outcome.failed.len())
+        } else {
+            t!("app.storage_mode.reconcile_not_switched").to_string()
+        };
+        let color = ui.visuals().error_fg_color;
+        let response = ui
+            .add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()))
+            .on_hover_ui(|ui| {
+                ms_settings_ui::storage_mode_setting::draw_conversion_failures(ui, &finished.outcome);
+                ui.small(t!("app.storage_mode.dismiss_hint"));
+            });
+        if response.clicked() {
+            self.storage_notice_dismissed_job = Some(finished.id);
+        }
     }
 }
 
@@ -3694,7 +3741,7 @@ fn build_typing_hint_rows() -> Vec<CanvasHintRow> {
 /// keys. Cleaning has no bottom-hint, so no cleaning flag is written; any stale
 /// `cleaning_hint_collapsed` key is left untouched.
 ///
-/// Pure and side-effect-free (the disk write is done by the caller under the config write lock), so
+/// Pure and side-effect-free (the caller runs it inside `update_user_config_file`), so
 /// the read-modify-merge contract is unit-testable without touching the filesystem. A non-object
 /// `root` is replaced with a fresh object so the flags are never silently dropped.
 fn apply_hint_collapsed_to_config_root(root: &mut Value, translation: bool, typing: bool) {
@@ -3726,55 +3773,19 @@ fn apply_hint_collapsed_to_config_root(root: &mut Value, translation: bool, typi
 /// Persists the per-tab canvas bottom-hint collapsed flags (Translation, Typing) to
 /// `user_config.json`.
 ///
-/// Called once from [`MangaApp::on_exit`]. Serialized with all other `user_config.json` writers via
-/// [`crate::config::lock_user_config_write`] and done as a single read-modify-write so unrelated keys
-/// survive. Teardown-only: on any read/parse/write failure it logs and returns without panicking, so
-/// a failed write never blocks shutdown.
+/// Called once from [`MangaApp::on_exit`]. Routes through [`crate::config::update_user_config_file`],
+/// the canonical serialized read-modify-write (atomic replace), so unrelated keys survive. A malformed
+/// existing document is NOT overwritten: the error is logged and the file is left as is.
+/// Teardown-only: on any read/parse/write failure it logs and returns without panicking, so a failed
+/// write never blocks shutdown.
 fn persist_canvas_hint_collapsed_state(translation: bool, typing: bool) {
-    let _guard = crate::config::lock_user_config_write();
     let path = crate::config::user_config_path();
-    let mut root = if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|err| {
-                runtime_log::log_warn(format!(
-                    "[app::canvas_hint] user_config.json is not valid JSON, rewriting from empty; path={}; cause={err}",
-                    path.display()
-                ));
-                Value::Object(Map::new())
-            }),
-            Err(err) => {
-                runtime_log::log_warn(format!(
-                    "[app::canvas_hint] failed to read user_config.json, rewriting from empty; path={}; cause={err}",
-                    path.display()
-                ));
-                Value::Object(Map::new())
-            }
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    apply_hint_collapsed_to_config_root(&mut root, translation, typing);
-    let payload = match serde_json::to_string_pretty(&root) {
-        Ok(payload) => payload,
-        Err(err) => {
-            runtime_log::log_error(format!(
-                "[app::canvas_hint] failed to serialize user_config.json canvas hint state; cause={err}"
-            ));
-            return;
-        }
-    };
-    if let Some(parent) = path.parent()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
+    if let Err(err) = crate::config::update_user_config_file(&path, |root| {
+        apply_hint_collapsed_to_config_root(root, translation, typing);
+        Ok(())
+    }) {
         runtime_log::log_error(format!(
-            "[app::canvas_hint] failed to create user_config.json parent dir; path={}; cause={err}",
-            parent.display()
-        ));
-        return;
-    }
-    if let Err(err) = fs::write(&path, payload) {
-        runtime_log::log_error(format!(
-            "[app::canvas_hint] failed to write user_config.json canvas hint state; path={}; cause={err}",
+            "[app::canvas_hint] failed to persist canvas hint collapsed state; file left unchanged; path={}; cause={err:#}",
             path.display()
         ));
     }
@@ -3785,7 +3796,7 @@ fn persist_canvas_hint_collapsed_state(translation: bool, typing: bool) {
 /// keys. A non-object `root` or a non-object `TextTab` value is replaced with a fresh object so the
 /// flags are never silently dropped. The bound-center KIND is session-only and is not written.
 ///
-/// Pure and side-effect-free (the disk write is done by the caller under the config write lock), so
+/// Pure and side-effect-free (the caller runs it inside `update_user_config_file`), so
 /// the read-modify-merge contract is unit-testable without touching the filesystem.
 fn apply_centering_assist_to_config_root(root: &mut Value, enabled: bool, show_center: bool) {
     if !root.is_object() {
@@ -4491,69 +4502,6 @@ fn copy_rgba_tile_rows(
     }
 
     out
-}
-
-/// Recursively copies every file from `unsaved_dir` into `project_dir` (overwriting), then removes
-/// `unsaved_dir`. Called from a background thread by `start_save_to_project`.
-///
-/// `layers/layers.json` is SPECIAL-CASED: it is merged PER PAGE (not file-overwritten), because the
-/// unsaved staging manifest only holds the pages the doc session actually visited, while the committed
-/// manifest may carry MORE pages (e.g. all of them, written by the eager text migration). A blind
-/// overwrite would DROP the committed-only pages — the ВВД/13 truncation. `owned_text_pages` is the set
-/// of pages whose TEXT the doc loaded this session (from `flush_text_layers`); the merge replaces those
-/// pages' text wholesale (authoritative, incl. deletions) and PRESERVES committed text for pages NOT in
-/// it (a raster-only PS edit must not drop the committed text of a page whose text was never loaded).
-/// Every other file (PNGs, the `text_info.json` legacy/`.bak`, bubbles, …) is copied verbatim as before.
-fn merge_unsaved_into_project(
-    unsaved_dir: &Path,
-    project_dir: &Path,
-    owned_text_pages: &std::collections::HashSet<usize>,
-) -> Result<(), String> {
-    if !unsaved_dir.is_dir() {
-        // Nothing to merge — treat as success.
-        return Ok(());
-    }
-    let committed_layers = project_dir.join(crate::config::LAYERS_DIR);
-    let unsaved_layers = unsaved_dir.join(crate::config::LAYERS_DIR);
-    // Copy everything EXCEPT the staging `layers/layers.json` (merged below).
-    let layers_manifest = unsaved_layers.join("layers.json");
-    copy_dir_overwrite_except(unsaved_dir, project_dir, &layers_manifest)?;
-    // Merge the layers manifest per-page (committed-only pages preserved; unowned-page text preserved).
-    crate::models::layer_model::persist::merge_unsaved_layers_into_committed(
-        &committed_layers,
-        &unsaved_layers,
-        owned_text_pages,
-    )
-    .map_err(|e| tf!("app.merge.layers_merge_error", e = e))?;
-    fs::remove_dir_all(unsaved_dir).map_err(|e| {
-        tf!("app.merge.remove_temp_error", unsaved_dir = unsaved_dir.display(), e = e)
-    })?;
-    Ok(())
-}
-
-/// Recursively copies files from `src` into `dst`, creating subdirectories as needed. Existing files
-/// in `dst` are overwritten. The file at the absolute path `skip` is NOT copied (handled separately).
-fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst)
-        .map_err(|e| tf!("app.merge.create_dir_error", dst = dst.display(), e = e))?;
-    let entries = fs::read_dir(src)
-        .map_err(|e| tf!("app.merge.read_dir_error", src = src.display(), e = e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| tf!("app.merge.read_entry_error", src = src.display(), e = e))?;
-        let src_path = entry.path();
-        if src_path == skip {
-            continue;
-        }
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_overwrite_except(&src_path, &dst_path, skip)?;
-        } else {
-            fs::copy(&src_path, &dst_path).map_err(|e| {
-                tf!("app.merge.copy_error", src_path = src_path.display(), dst_path = dst_path.display(), e = e)
-            })?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

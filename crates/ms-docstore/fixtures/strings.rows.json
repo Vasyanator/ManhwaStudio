@@ -1,0 +1,30 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/empty",
+    "parent": "",
+    "seg": "empty",
+    "kind": "leaf",
+    "payload": "\"\""
+  },
+  {
+    "path": "/s",
+    "parent": "",
+    "seg": "s",
+    "kind": "leaf",
+    "payload": "\"line\\nbreak\\t\\\"q\\\" \\\\ \\u0001 \\u001f  é 😀\""
+  },
+  {
+    "path": "/slash",
+    "parent": "",
+    "seg": "slash",
+    "kind": "leaf",
+    "payload": "\"a/b\""
+  }
+]

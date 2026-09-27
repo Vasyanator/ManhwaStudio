@@ -130,7 +130,7 @@ pub struct FontAdminLists {
 /// HEAVY (directory walk plus a parse per imported file); run off the GUI thread.
 #[must_use]
 pub fn load_font_lists() -> FontAdminLists {
-    let fonts_dir = fonts::resolve_fonts_dir();
+    let fonts_dir = ms_config::storage_mode::app_fonts_dir();
     let refs = font_settings_store::imported_system_font_refs();
     let combined = fonts::build_combined_font_list(&fonts_dir, &refs);
     // A folder font is one whose representative FILE lives under the fonts dir. After the
@@ -459,7 +459,7 @@ pub fn virtual_groups_for_font(identity: &str) -> Vec<(String, Option<String>)> 
 /// their existing off-thread font loads, not per frame on the GUI thread.
 #[must_use]
 pub fn list_folder_group_names() -> Vec<String> {
-    fonts::load_font_groups(&fonts::resolve_fonts_dir())
+    fonts::load_font_groups(&ms_config::storage_mode::app_fonts_dir())
 }
 
 /// Serializes every test that touches the PROCESS-GLOBAL font-settings store, across ALL

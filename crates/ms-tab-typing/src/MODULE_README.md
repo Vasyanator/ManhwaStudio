@@ -136,13 +136,16 @@ The main data flow is:
    only; `text_info.json` is never rewritten. Persistence is owned by the shared `LayerDoc`: overlays
    become **text nodes** in `layers.json` with their FULL inline payload via the doc's text flush.
    Persistence is now OFF-THREAD: the placement autosave, `flush_text_layers` (save-to-project), and
-   per-page text saves call `doc.enqueue_page_text_save` (the doc's background saver, coalescing PNG
+   per-page text saves call `doc.enqueue_pages_text_save` / `enqueue_page_text_save` (the doc's
+   background saver — multi-page flushes send ONE batch so they share one manifest commit — coalescing PNG
    encode off-thread; sync-flush fallback when no saver). EXCEPTION: `flush_target_page_text_to_staging`
    (right before a raster-create worker reads the page's on-disk staging) stays SYNCHRONOUS — an async
    enqueue would race that read and resurrect a deleted-last-text overlay, and we cannot barrier on the
    GUI thread. `flush_text_layers` still returns the OWNED page set on a successful enqueue; the
    save-to-project merge worker barriers the saver before reading staging, so enqueued text is on disk
-   first. `text_info.json` is READ-ONLY legacy and is ignored once the page has migrated to inline. **Text order is FULLY MANUAL** (auto-Y retired): every text is
+   first. It enqueues EVERY resident page on purpose (the doc has no complete per-page text-dirty
+   signal); skipping unchanged pages is the saver's job, decided against the manifest on disk
+   (`layer_model` saver: one commit per pass, unchanged pages elided). `text_info.json` is READ-ONLY legacy and is ignored once the page has migrated to inline. **Text order is FULLY MANUAL** (auto-Y retired): every text is
    pinned-with-explicit-Z on one unified axis with rasters (text may sit BELOW a raster). Legacy
    `TextGroup`s are flattened into per-text bands ON READ by `layer_doc::ensure_page_loaded`, preserving
    the current page-Y visual order; the writers (`write_page_text_payload`) always emit text pinned and
@@ -588,12 +591,15 @@ saving, and export.
     migrated `TextTab` keys. Preset NAMES are stored verbatim (never trimmed, so two names that
     differ only in spaces stay two presets). Holds no font knowledge: resolution lives in
     `create_presets`.
-  - `doc_store.rs`: the ONE crash-safe write recipe (`write_atomic`: sibling temp + `write_all`
-    + `sync_all` + CLOSE + `rename`, plus an optional parent-DIRECTORY fsync) and the ONE
-    optimistic-concurrency vocabulary (`DocumentFingerprint` / `SaveBaseline`), shared by
-    `fonts_data.rs` and `presets_store.rs`. Both used to carry their own copy, and the copies
-    had drifted. `Durability::ContentsAndDirectory` is mandatory for any document whose
-    previous home is DELETED once the write returned `Ok`.
+  - Every JSON document the panel persists (`fonts_data.json`, `presets.json`, the title's
+    `char_favorites.json` / `color_presets.json`) and every `user_config.json` read here go
+    through the `ms-docstore` crate — the ONE crash-safe write recipe (sibling temp +
+    `write_all` + `sync_all` + CLOSE + `rename`, optional parent-DIRECTORY fsync), the
+    per-document write lock and the optimistic-concurrency vocabulary (`Fingerprint` /
+    `SaveBaseline`). No file here opens one of those documents with `std::fs`; the `.bad`
+    quarantines are `ms_docstore::quarantine` (under the document lock), and a conflict's
+    document + fingerprint come from ONE read (`LockedDoc::read_typed_snapshot`). `Durability::ContentsAndDirectory` is mandatory
+    for any document whose previous home is DELETED once the write returned `Ok`.
   - `fonts_data.rs`: serde schema + disk I/O for the app-level per-font settings document
     `fonts/fonts_data.json` (`version: 3`: `system_fonts` = imported fonts by PostScript NAME with a
     `last_path` hint, `fonts` = per-font `display_name` override + default `profile` +
@@ -603,9 +609,9 @@ saving, and export.
     path-keyed `version: 1` form is READ FOREVER and decoded verbatim with
     `FontsData.pending_migration` set (see `font_settings_store`); it is never written back. Load
     returns a typed `LoadOutcome` (a corrupt file is quarantined, never degraded to empty) and
-    best-effort parses a newer version; save writes a full snapshot through the shared
-    `doc_store::write_atomic` (contents-only durability — nothing deletes a source after it)
-    and creates the fonts dir if missing.
+    best-effort parses a newer version; save writes a full snapshot through `ms_docstore`
+    (guard + write in ONE `with_lock` section; contents-only durability — nothing deletes a
+    source after it) and creates the fonts dir if missing.
     Independent of `FontEntry.label` — a display override never touches rendering.
   - `font_settings_store.rs`: single process-global runtime store backed by `fonts_data.json`
     (`OnceLock<RwLock<StoreState>>` = imported system fonts + per-font records + virtual groups +

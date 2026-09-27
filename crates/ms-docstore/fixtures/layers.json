@@ -1,0 +1,69 @@
+{
+  "version": 2,
+  "pages": [
+    {
+      "page": 0,
+      "size": [
+        800,
+        1200
+      ],
+      "tree": [
+        {
+          "uid": "a1",
+          "kind": "group",
+          "name": "Group",
+          "children": [
+            "t1"
+          ],
+          "effects": [
+            {
+              "type": "shadow",
+              "offset": [
+                1,
+                2
+              ],
+              "color": [
+                0,
+                0,
+                0,
+                128
+              ]
+            }
+          ],
+          "render_data": {
+            "cache": {
+              "w": 10,
+              "h": 20
+            },
+            "hash": "ff00"
+          }
+        },
+        {
+          "uid": "t1",
+          "kind": "text",
+          "name": "Text 1",
+          "effects": [],
+          "render_data": null
+        }
+      ],
+      "groups": [
+        {
+          "uid": "g1",
+          "members": [
+            "a1",
+            "t1"
+          ]
+        }
+      ]
+    },
+    {
+      "page": 1,
+      "size": [
+        800,
+        900
+      ],
+      "tree": [],
+      "groups": []
+    }
+  ]
+}

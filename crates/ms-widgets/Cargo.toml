@@ -26,6 +26,9 @@ ms-log = { path = "../ms-log" }
 # writes it through `ms_config::config_saver`; `spellchecked_line.rs` resolves its
 # dictionary folder under `ms_config::data_dir()`.
 ms-config = { path = "../ms-config" }
+# Owned-document access: `spellchecked_line.rs` reads/updates/probes the title
+# `settings.json` and `input_manager_v2.rs` reads `user_config.json` through it.
+ms-docstore = { path = "../ms-docstore" }
 # `spellchecked_line.rs` picks its dictionary by the typesetting language
 # (`ms_text_util::language`); `hangul_keyboard.rs` uses `ms_text_util::hangul`.
 ms-text-util = { path = "../ms-text-util" }

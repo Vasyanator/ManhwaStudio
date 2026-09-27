@@ -20,6 +20,9 @@ ms-config = { path = "../ms-config" }
 # Progress / rollback / roll-forward diagnostics (`ms_log::runtime_log`). A page
 # operation is not observable in the UI while it runs, so the log is the record.
 ms-log = { path = "../ms-log" }
+# Owner of the chapter documents the scan reads (`layers.json`, the bubbles file):
+# lossless `Value` reads, format-independent.
+ms-docstore = { path = "../ms-docstore" }
 # The on-disk journal and every page-keyed document the remap pass rewrites.
 serde.workspace = true
 serde_json.workspace = true

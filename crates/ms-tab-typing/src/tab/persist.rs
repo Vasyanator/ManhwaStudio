@@ -483,13 +483,15 @@ impl TypingTextOverlayLayer {
         thread::spawn(move || {
             let result = (|| {
                 let mut guard = doc.lock().map_err(|_| "doc lock poisoned".to_string())?;
-                for page_idx in pages {
-                    // ASYNC: enqueue to the coalescing saver (falls back to sync flush when no saver).
-                    // This is the placement autosave; no reader depends on it landing synchronously,
-                    // and the save-to-project / app-close barriers guarantee durability.
-                    guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref())?;
-                }
-                Ok(())
+                // ASYNC: enqueue to the coalescing saver as ONE batch, so all pages share one drain
+                // pass and one manifest commit (falls back to sync flushes when no saver). This is the
+                // placement autosave; no reader depends on it landing synchronously, and the
+                // save-to-project / app-close barriers guarantee durability. The first per-page
+                // fallback error is reported (every page was still attempted).
+                guard
+                    .enqueue_pages_text_save(&pages, &layers_dir, fallback_dir.as_deref())
+                    .into_iter()
+                    .try_for_each(|(_page_idx, result)| result)
             })();
             let _ = tx.send(result);
         });
@@ -497,9 +499,13 @@ impl TypingTextOverlayLayer {
     }
 
     /// Synchronously flushes text into the staging `layers/` dir for EVERY page the shared doc has
-    /// resident (not just pages with typing-tab overlays), so staging is text-complete for every page
-    /// the session loaded — including deletions and pages only PS visited (which load text into the doc
-    /// too). `outcome.owned_pages` is the set of OWNED text pages (the doc-resident pages flushed) and
+    /// resident (not just pages with typing-tab overlays), so every page the session loaded — including
+    /// deletions and pages only PS visited (which load text into the doc too) — ends up with its doc
+    /// text as its effective on-disk text (staging page, else committed page). Every resident page is
+    /// ENQUEUED on purpose: the doc has no complete per-page text-dirty signal, so the "unchanged?"
+    /// decision is made by the layer saver against the manifest actually on disk (it elides a write
+    /// that would not change the effective page, at no commit cost), never by an in-memory guess here.
+    /// `outcome.owned_pages` is the set of OWNED text pages (the doc-resident pages flushed) and
     /// keeps its exact meaning: the save-to-project merge replaces those pages wholesale (authoritative,
     /// incl. deletions) and PRESERVES committed text for pages NOT in this set (never loaded this
     /// session → the session doesn't own their text, so a raster-only PS edit must not drop their
@@ -552,15 +558,17 @@ impl TypingTextOverlayLayer {
         let Ok(mut guard) = doc.lock() else {
             return Err(TypingTextFlushError::DocLockPoisoned);
         };
-        for page_idx in guard.resident_pages() {
-            // ASYNC: enqueue each resident page's text to the coalescing saver (PNG encode off the GUI
-            // thread). The save-to-project merge worker barriers the saver BEFORE reading the staging
-            // `layers.json`, so every enqueued page is on disk before the merge — the FIFO channel +
-            // barrier give the same ordering the old synchronous flush did. A page is marked OWNED on a
-            // successful ENQUEUE; save-to-project removes barrier-reported write failures before the
-            // merge, so they preserve committed text. An enqueue failure leaves it unowned. With no
-            // saver, `enqueue_page_text_save` falls back to a synchronous flush, also correct.
-            match guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref()) {
+        let resident = guard.resident_pages();
+        // ASYNC: enqueue every resident page's text to the coalescing saver as ONE batch (PNG encode
+        // off the GUI thread; one message ⇒ one drain pass ⇒ one manifest commit). The save-to-project
+        // merge worker barriers the saver BEFORE reading the staging `layers.json`, so every enqueued
+        // page is on disk before the merge — the FIFO channel + barrier give the same ordering the old
+        // synchronous flush did. A page is marked OWNED on a successful ENQUEUE; save-to-project
+        // removes barrier-reported write failures before the merge, so they preserve committed text.
+        // An enqueue failure leaves it unowned. With no saver, `enqueue_pages_text_save` falls back to
+        // a synchronous per-page flush, also correct.
+        for (page_idx, result) in guard.enqueue_pages_text_save(&resident, &layers_dir, fallback_dir.as_deref()) {
+            match result {
                 Ok(()) => {
                     outcome.owned_pages.insert(page_idx);
                 }

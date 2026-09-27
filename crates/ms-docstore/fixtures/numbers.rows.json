@@ -1,0 +1,100 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/arr",
+    "parent": "",
+    "seg": "arr",
+    "kind": "leaf",
+    "payload": "[1,1.0,2]"
+  },
+  {
+    "path": "/big",
+    "parent": "",
+    "seg": "big",
+    "kind": "leaf",
+    "payload": "9007199254740993"
+  },
+  {
+    "path": "/float",
+    "parent": "",
+    "seg": "float",
+    "kind": "leaf",
+    "payload": "1.0"
+  },
+  {
+    "path": "/half",
+    "parent": "",
+    "seg": "half",
+    "kind": "leaf",
+    "payload": "0.5"
+  },
+  {
+    "path": "/i64_min",
+    "parent": "",
+    "seg": "i64_min",
+    "kind": "leaf",
+    "payload": "-9223372036854775808"
+  },
+  {
+    "path": "/int",
+    "parent": "",
+    "seg": "int",
+    "kind": "leaf",
+    "payload": "1"
+  },
+  {
+    "path": "/large_float",
+    "parent": "",
+    "seg": "large_float",
+    "kind": "leaf",
+    "payload": "123456789012345.6"
+  },
+  {
+    "path": "/neg",
+    "parent": "",
+    "seg": "neg",
+    "kind": "leaf",
+    "payload": "-3"
+  },
+  {
+    "path": "/neg_zero",
+    "parent": "",
+    "seg": "neg_zero",
+    "kind": "leaf",
+    "payload": "-0.0"
+  },
+  {
+    "path": "/negf",
+    "parent": "",
+    "seg": "negf",
+    "kind": "leaf",
+    "payload": "-2.25"
+  },
+  {
+    "path": "/small",
+    "parent": "",
+    "seg": "small",
+    "kind": "leaf",
+    "payload": "0.0001"
+  },
+  {
+    "path": "/tenth",
+    "parent": "",
+    "seg": "tenth",
+    "kind": "leaf",
+    "payload": "0.1"
+  },
+  {
+    "path": "/u64_max",
+    "parent": "",
+    "seg": "u64_max",
+    "kind": "leaf",
+    "payload": "18446744073709551615"
+  }
+]

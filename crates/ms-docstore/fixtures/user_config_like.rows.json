@@ -1,0 +1,149 @@
+[
+  {
+    "path": "",
+    "parent": null,
+    "seg": null,
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/Canvas",
+    "parent": "",
+    "seg": "Canvas",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/Canvas/load_all_bubbles",
+    "parent": "/Canvas",
+    "seg": "load_all_bubbles",
+    "kind": "leaf",
+    "payload": "false"
+  },
+  {
+    "path": "/Canvas/recent",
+    "parent": "/Canvas",
+    "seg": "recent",
+    "kind": "leaf",
+    "payload": "[\"a\",\"b\"]"
+  },
+  {
+    "path": "/Canvas/visible_page_radius",
+    "parent": "/Canvas",
+    "seg": "visible_page_radius",
+    "kind": "leaf",
+    "payload": "2"
+  },
+  {
+    "path": "/Canvas/zoom",
+    "parent": "/Canvas",
+    "seg": "zoom",
+    "kind": "leaf",
+    "payload": "1.0"
+  },
+  {
+    "path": "/General",
+    "parent": "",
+    "seg": "General",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/General/ai_device",
+    "parent": "/General",
+    "seg": "ai_device",
+    "kind": "leaf",
+    "payload": "\"cuda:0\""
+  },
+  {
+    "path": "/General/ai_device_configured",
+    "parent": "/General",
+    "seg": "ai_device_configured",
+    "kind": "leaf",
+    "payload": "true"
+  },
+  {
+    "path": "/General/ai_max_loaded_models",
+    "parent": "/General",
+    "seg": "ai_max_loaded_models",
+    "kind": "leaf",
+    "payload": "3"
+  },
+  {
+    "path": "/General/enabled_tabs",
+    "parent": "/General",
+    "seg": "enabled_tabs",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/General/enabled_tabs/Клининг",
+    "parent": "/General/enabled_tabs",
+    "seg": "Клининг",
+    "kind": "leaf",
+    "payload": "false"
+  },
+  {
+    "path": "/General/enabled_tabs/Перевод",
+    "parent": "/General/enabled_tabs",
+    "seg": "Перевод",
+    "kind": "leaf",
+    "payload": "true"
+  },
+  {
+    "path": "/General/projects_dir",
+    "parent": "/General",
+    "seg": "projects_dir",
+    "kind": "leaf",
+    "payload": "\"/home/u/Documents/manhwastudio_projects\""
+  },
+  {
+    "path": "/General/storage_mode",
+    "parent": "/General",
+    "seg": "storage_mode",
+    "kind": "leaf",
+    "payload": "\"prod\""
+  },
+  {
+    "path": "/General/theme",
+    "parent": "/General",
+    "seg": "theme",
+    "kind": "leaf",
+    "payload": "\"dark\""
+  },
+  {
+    "path": "/TextTab",
+    "parent": "",
+    "seg": "TextTab",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/TextTab/params",
+    "parent": "/TextTab",
+    "seg": "params",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/TextTab/params/empty",
+    "parent": "/TextTab/params",
+    "seg": "empty",
+    "kind": "obj",
+    "payload": null
+  },
+  {
+    "path": "/TextTab/params/font size multiplier",
+    "parent": "/TextTab/params",
+    "seg": "font size multiplier",
+    "kind": "leaf",
+    "payload": "1.5"
+  },
+  {
+    "path": "/TextTab/use_system_fonts",
+    "parent": "/TextTab",
+    "seg": "use_system_fonts",
+    "kind": "leaf",
+    "payload": "false"
+  }
+]

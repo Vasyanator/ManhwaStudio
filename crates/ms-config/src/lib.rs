@@ -10,9 +10,12 @@ Main items:
   writable runtime data, with executable directory fallback.
 - `default_projects_root` / `projects_root_from_user_settings`: resolve projects directory
   (default `{Documents}/manhwastudio_projects`, override from `user_config.json`).
-- `JsonConfig`: load/merge/save wrapper for JSON configs with default backfilling that
-  preserves an already-complete file without rewriting it.
-- `update_user_config_file`: serialized read-modify-write boundary for `user_config.json`.
+- `JsonConfig`: load/merge/set wrapper for JSON configs with default backfilling that
+  preserves an already-complete file without rewriting it (all I/O via `ms_docstore`).
+- `user_config_doc` / `project_settings_doc`: the `ms_docstore::DocRef`s of the two documents.
+- `update_user_config_file`: serialized read-modify-write boundary for `user_config.json`
+  (`ms_docstore::update` under the per-document lock).
+- `merge_missing`: the default-backfill rule (insert absent keys, never replace values).
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
@@ -25,6 +28,8 @@ Main items:
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
   decision logic (state persisted under `General.ort_load_state`).
 - `MemoryProfile`: persisted global image-cache memory policy recorded under `General`.
+- `StorageMode` (module `storage_mode`): Dev (`.json`) / Prod (`.db`) document storage mode
+  under `General.storage_mode`, plus the startup probe seeding the docstore default format.
 - `ui_scale_percent_from_user_settings` / `clamp_ui_scale_percent` / `ui_scale_factor_from_percent`:
   global interface scale (`General.ui_scale_percent`) and its conversion to the egui zoom factor.
 - `load_user_config`: canonical entry-point for `user_config.json` with persistence.
@@ -63,6 +68,12 @@ pub mod ort_load_guard;
 // depend on each other; the binary re-exports it from `settings_shared.rs`.
 pub mod settings_deep_link;
 
+// The global Dev/Prod document storage mode (`General.storage_mode`) and its startup
+// probe. The conversion driver lives in `ms-project` (it enumerates titles); this crate
+// owns the key, the typed value, and the seed of `ms_docstore::set_default_format`.
+pub mod storage_mode;
+pub use storage_mode::{GENERAL_STORAGE_MODE_KEY, StorageMode, storage_mode_from_user_settings};
+
 // The debouncing, retrying writer thread every self-owned section of `user_config.json`
 // is written through. It sits here because its write step IS this crate's
 // `update_user_config_file` border; its feeders (window geometry, panel-dock layout)
@@ -87,11 +98,10 @@ use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
 use ms_log::runtime_log;
 use ms_memory::MemoryProfile;
+use ms_docstore::{DocKind, DocRef, DocStoreError, WriteOptions};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 #[allow(dead_code)]
 pub const VERSION: &str = "2.11.1";
@@ -119,6 +129,8 @@ pub const TEXT_IMAGES_DIR: &str = "text_images";
 pub const LAYERS_DIR: &str = "layers";
 pub const TEXT_DETECTION_DIR: &str = "text_detection";
 pub const CHARACTERS_DIR: &str = "characters";
+/// The title's characters document inside [`CHARACTERS_DIR`].
+pub const CHARACTERS_FILE: &str = "characters.json";
 pub const TERMS_FILE: &str = "terms.json";
 pub const PROJECT_SETTINGS_FILE: &str = "settings.json";
 pub const USER_CONFIG_FILE: &str = "user_config.json";
@@ -1072,10 +1084,19 @@ pub fn ensure_model_dirs() -> Result<()> {
     Ok(())
 }
 
+/// A JSON configuration document with a defaults tree: `user_config.json` of a data root,
+/// or a title's `settings.json`.
+///
+/// Every disk access goes through `ms_docstore` (atomic temp+rename writes under the
+/// per-document lock). `data` is this instance's in-memory snapshot; `set` / `set_path`
+/// re-read the document under the lock and edit only the named key, so a stale snapshot
+/// never overwrites another writer's keys. The per-document lock is the ONLY lock of the
+/// document: every writer of it, in this crate and above, serializes on it.
 #[derive(Debug, Clone)]
 pub struct JsonConfig {
     pub path: PathBuf,
-    is_user_config: bool,
+    /// The document `path` names (kind: see [`JsonConfig::with_kind`]).
+    doc: DocRef,
     defaults: Value,
     pub data: Value,
 }
@@ -1084,79 +1105,64 @@ pub struct JsonConfig {
 impl JsonConfig {
     /// Loads `path`, backfills missing defaults, and persists only a semantic change.
     ///
-    /// When `path` is [`user_config_path`], the user-config write lock covers the
-    /// complete load/decide/write transaction so a concurrent full-file update cannot
-    /// be lost. Formatting-only differences are intentionally not normalized.
+    /// The document kind is inferred from the file name: [`PROJECT_SETTINGS_FILE`] is
+    /// [`DocKind::ProjectSettings`], anything else [`DocKind::UserConfig`]; use
+    /// [`JsonConfig::with_kind`] to name it explicitly. See `with_kind` for the contract.
+    ///
+    /// # Errors
+    /// As [`JsonConfig::with_kind`].
     pub fn new(path: impl Into<PathBuf>, defaults: Value) -> Result<Self> {
         let path = path.into();
+        let kind = if path.file_name().is_some_and(|name| name == PROJECT_SETTINGS_FILE) {
+            DocKind::ProjectSettings
+        } else {
+            DocKind::UserConfig
+        };
+        Self::with_kind(path, kind, defaults)
+    }
+
+    /// Loads the document at `path` of kind `kind`, backfills missing defaults, and writes
+    /// it back ONLY when a default was genuinely missing: a semantically complete document
+    /// is left byte-identical (formatting-only differences are never normalized).
+    ///
+    /// The read / decide / write transaction runs under the document lock, so a concurrent update cannot be lost.
+    /// A non-object root is treated as `{}` (and rewritten when defaults are non-empty).
+    ///
+    /// # Errors
+    /// Fails when the existing document cannot be read, does not parse (it is then left
+    /// untouched), or the backfilled document cannot be written.
+    pub fn with_kind(path: impl Into<PathBuf>, kind: DocKind, defaults: Value) -> Result<Self> {
+        let path = path.into();
         let mut cfg = Self {
-            is_user_config: path == user_config_path(),
+            doc: DocRef::new(&path, kind),
             path,
             defaults,
             data: Value::Object(Map::new()),
         };
-        if cfg.is_user_config {
-            let _write_guard = lock_user_config_write();
-            cfg.load()?;
+        ms_docstore::with_lock(&cfg.doc.clone(), |locked| -> Result<()> {
+            cfg.data = config_root_or_empty(locked.read_value(), &cfg.path)?;
             if cfg.apply_defaults() {
-                cfg.save_unlocked()?;
+                locked
+                    .write_value(&cfg.data, WriteOptions::default())
+                    .with_context(|| format!("failed to write config {}", cfg.path.display()))?;
             }
-            return Ok(cfg);
-        }
-        cfg.load()?;
-        if cfg.apply_defaults() {
-            cfg.save()?;
-        }
+            Ok(())
+        })?;
         Ok(cfg)
     }
 
-    pub fn load(&mut self) -> Result<()> {
-        // Routed through the storage seam so the web build reads config from its
-        // in-memory/IndexedDB store instead of the desktop filesystem.
-        let store = ms_storage::global::storage();
-        let path_str = self.path.to_string_lossy();
-        if !store.exists(path_str.as_ref()) {
-            self.data = Value::Object(Map::new());
-            return Ok(());
-        }
-        let raw = store
-            .read_to_string(path_str.as_ref())
-            .with_context(|| format!("failed to read config {}", self.path.display()))?;
-        self.data = serde_json::from_str::<Value>(&raw)
-            .with_context(|| format!("failed to parse config {}", self.path.display()))?;
-        if !self.data.is_object() {
-            self.data = Value::Object(Map::new());
-        }
-        Ok(())
+    /// The document this config reads and writes.
+    #[must_use]
+    pub fn doc(&self) -> &DocRef {
+        &self.doc
     }
 
-    pub fn save(&self) -> Result<()> {
-        if self.is_user_config {
-            let _write_guard = lock_user_config_write();
-            return self.save_unlocked();
-        }
-        self.save_unlocked()
-    }
-
-    /// Serializes and writes the current value without acquiring the user-config lock.
+    /// Replaces `data` with the document on disk (`{}` when absent or not an object).
     ///
-    /// Callers must use [`JsonConfig::save`]; this split keeps its path-aware lock held
-    /// across directory creation, serialization, and the final full-file write.
-    fn save_unlocked(&self) -> Result<()> {
-        let store = ms_storage::global::storage();
-        if let Some(parent) = self.path.parent() {
-            let parent_str = parent.to_string_lossy();
-            store.create_dir_all(parent_str.as_ref()).with_context(|| {
-                format!(
-                    "failed to create config parent directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let raw = serde_json::to_string_pretty(&self.data).context("failed to serialize config")?;
-        store
-            .write(self.path.to_string_lossy().as_ref(), raw.as_bytes())
-            .with_context(|| format!("failed to write config {}", self.path.display()))?;
+    /// # Errors
+    /// Fails when the existing document cannot be read or does not parse.
+    pub fn load(&mut self) -> Result<()> {
+        self.data = config_root_or_empty(ms_docstore::read_value(&self.doc), &self.path)?;
         Ok(())
     }
 
@@ -1180,63 +1186,108 @@ impl JsonConfig {
         Some(cur)
     }
 
+    /// Sets one top-level `key` in ONE serialized read-modify-write of the document and
+    /// refreshes `data` from the result. Every other key on disk survives.
+    ///
+    /// # Errors
+    /// As [`JsonConfig::set_path`].
     pub fn set(&mut self, key: &str, value: Value) -> Result<()> {
-        if self.is_user_config {
-            let _write_guard = lock_user_config_write();
-            self.load()?;
-            self.set_in_memory(key, value);
-            return self.save_unlocked();
-        }
-        self.set_in_memory(key, value);
-        self.save()
+        self.set_path(&[key], value)
     }
 
-    /// Changes one top-level value without persistence; the caller owns serialization.
-    fn set_in_memory(&mut self, key: &str, value: Value) {
-        let Some(obj) = self.data.as_object_mut() else {
-            self.data = Value::Object(Map::new());
-            self.set_in_memory(key, value);
-            return;
-        };
-        obj.insert(key.to_owned(), value);
-    }
-
+    /// Sets the value at `path` (intermediate non-objects are replaced by objects; an
+    /// empty `path` replaces the root) in ONE serialized read-modify-write of the
+    /// document, then refreshes `data` from what was written. A non-object root on disk is
+    /// treated as `{}`.
+    ///
+    /// # Errors
+    /// Fails when the existing document cannot be read or does not parse (it is then left
+    /// untouched), or the result cannot be written.
     pub fn set_path(&mut self, path: &[&str], value: Value) -> Result<()> {
-        if self.is_user_config {
-            let _write_guard = lock_user_config_write();
-            self.load()?;
-            self.set_path_in_memory(path, value);
-            return self.save_unlocked();
-        }
-        self.set_path_in_memory(path, value);
-        self.save()
-    }
-
-    /// Changes one nested value without persistence; the caller owns serialization.
-    fn set_path_in_memory(&mut self, path: &[&str], value: Value) {
-        if path.is_empty() {
-            self.data = value;
-            return;
-        }
-        if !self.data.is_object() {
-            self.data = Value::Object(Map::new());
-        }
-        let mut cur = self.data.as_object_mut().expect("object ensured");
-        for part in &path[..path.len() - 1] {
-            let entry = cur
-                .entry((*part).to_owned())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if !entry.is_object() {
-                *entry = Value::Object(Map::new());
+        let written = ms_docstore::update(&self.doc, WriteOptions::default(), |root| {
+            if !root.is_object() {
+                *root = Value::Object(Map::new());
             }
-            cur = entry.as_object_mut().expect("object ensured");
-        }
-        cur.insert(path[path.len() - 1].to_owned(), value);
+            set_value_at_path(root, path, value);
+            Ok(root.clone())
+        })
+        .with_context(|| format!("failed to update config {}", self.path.display()))?;
+        self.data = written;
+        Ok(())
     }
 }
 
-/// Inserts defaults absent from `dst`, returning whether at least one value changed.
-fn merge_missing(dst: &mut Value, defaults: &Value) -> bool {
+/// Places `value` at `path` inside `root`, replacing any non-object on the way by an empty
+/// object. An empty `path` replaces `root` itself.
+fn set_value_at_path(root: &mut Value, path: &[&str], value: Value) {
+    let Some((last, parents)) = path.split_last() else {
+        *root = value;
+        return;
+    };
+    let mut cur = root;
+    for part in parents {
+        if !cur.is_object() {
+            *cur = Value::Object(Map::new());
+        }
+        let Value::Object(obj) = cur else { return };
+        cur = obj.entry((*part).to_owned()).or_insert_with(|| Value::Object(Map::new()));
+    }
+    if !cur.is_object() {
+        *cur = Value::Object(Map::new());
+    }
+    // `cur` was made an object on the line above, so this branch always inserts.
+    if let Value::Object(obj) = cur {
+        obj.insert((*last).to_owned(), value);
+    }
+}
+
+/// Converts a docstore read of a config document into its object root: absent or
+/// non-object ⇒ `{}`; read/parse failures become `anyhow` errors naming `path`.
+fn config_root_or_empty(read: ms_docstore::Result<Option<Value>>, path: &Path) -> Result<Value> {
+    match read {
+        Ok(Some(value)) if value.is_object() => Ok(value),
+        Ok(Some(_) | None) => Ok(Value::Object(Map::new())),
+        Err(err) => Err(config_read_error(err, path)),
+    }
+}
+
+/// Wraps a failed docstore READ of the config document at `path` in the historical
+/// `anyhow` context: "failed to parse config …" for a malformed document, "failed to read
+/// config …" otherwise.
+fn config_read_error(err: DocStoreError, path: &Path) -> anyhow::Error {
+    let step = match &err {
+        DocStoreError::Malformed { .. } => "parse",
+        DocStoreError::Io { .. }
+        | DocStoreError::Storage(_)
+        | DocStoreError::Write(_)
+        | DocStoreError::Serialize { .. }
+        | DocStoreError::Conflict { .. }
+        | DocStoreError::Ambiguous { .. }
+        | DocStoreError::Unsupported { .. }
+        | DocStoreError::Mutator(_)
+        | DocStoreError::Quarantine { .. } => "read",
+    };
+    anyhow::Error::new(err).context(format!("failed to {step} config {}", path.display()))
+}
+
+/// The current data root's `user_config.json` document.
+#[must_use]
+pub fn user_config_doc() -> DocRef {
+    DocRef::new(user_config_path(), DocKind::UserConfig)
+}
+
+/// The `settings.json` document of the title directory `title_dir`.
+#[must_use]
+pub fn project_settings_doc(title_dir: &Path) -> DocRef {
+    DocRef::new(title_dir.join(PROJECT_SETTINGS_FILE), DocKind::ProjectSettings)
+}
+
+/// Inserts every key of `defaults` absent from `dst`, recursing into objects present on
+/// both sides; existing values (including non-object values where `defaults` has an object)
+/// are never replaced. Returns whether at least one value was inserted. This is THE
+/// default-backfill rule of `JsonConfig` and of every other writer that must produce the
+/// same document shape (the installer's install-target config).
+pub fn merge_missing(dst: &mut Value, defaults: &Value) -> bool {
     let mut changed = false;
     if let (Value::Object(dst_obj), Value::Object(def_obj)) = (dst, defaults) {
         for (k, v) in def_obj {
@@ -1291,6 +1342,7 @@ pub fn user_config_defaults() -> Value {
             "ai_runtime_configured": false,
             "ort_load_state": {},
             "memory_profile": MemoryProfile::default().as_config_str(),
+            "storage_mode": StorageMode::default().as_config_str(),
             "typing_panel_layout": "vertical",
             // Built above from `AppTab::key()`. Older configs may still carry the
             // legacy Russian keys next to these; see the `enabled_tabs` note in
@@ -1553,66 +1605,117 @@ pub fn project_config_defaults() -> Value {
     })
 }
 
-/// Process-wide lock serializing every `user_config.json` read-modify-write across
-/// the whole crate.
+/// Updates one `user_config.json` document in ONE serialized read-modify-write
+/// (`ms_docstore::update`: document lock, atomic replace).
 ///
-/// The various full-file writers (settings-tab `save_*` helpers, the ORT SIGILL
-/// load-guard writers, and the shared general-settings widget) re-read the file,
-/// mutate one key, then rewrite the whole file. Without serialization, two
-/// concurrent writers (background threads and GUI-thread savers) can interleave
-/// their read/write and lose an update — dropping the just-written SIGILL
-/// `attempted:true` marker (weakening the crash guard) or clobbering user settings.
-/// The static stays private to `config`; every writer serializes through
-/// [`lock_user_config_write`].
-static USER_CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-/// Acquires [`USER_CONFIG_WRITE_LOCK`], recovering from poisoning (a prior panic
-/// while holding it leaves the `()` payload usable). Hold the returned guard across
-/// the whole read-modify-write (and any fsync) of `user_config.json`.
-pub fn lock_user_config_write() -> MutexGuard<'static, ()> {
-    USER_CONFIG_WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Updates one `user_config.json` file while holding the process-wide write lock
-/// across the complete read-modify-write transaction.
+/// A missing file starts as an empty object; a non-object root is replaced by `{}` before
+/// the mutator runs. Existing malformed JSON is returned as an error and is never
+/// overwritten. The mutator's own error is returned unchanged and nothing is written. The
+/// mutator must not call another user-config writer: the document lock is non-reentrant.
 ///
-/// A missing file starts as an empty object. Existing malformed JSON is returned as
-/// an error and is never overwritten. The mutator runs while the lock is held and
-/// may change any part of the object root; it must not call another user-config
-/// writer because [`USER_CONFIG_WRITE_LOCK`] is intentionally non-reentrant.
+/// # Errors
+/// The mutator's error, or a read/parse/write failure with the path in its context.
 pub fn update_user_config_file(
     path: &Path,
     mutator: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<()> {
-    let _write_guard = lock_user_config_write();
-    let store = ms_storage::global::storage();
-    let path_str = path.to_string_lossy();
-    let mut root = if store.exists(path_str.as_ref()) {
-        let raw = store
-            .read_to_string(path_str.as_ref())
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-        serde_json::from_str::<Value>(&raw)
-            .with_context(|| format!("failed to parse config {}", path.display()))?
-    } else {
-        Value::Object(Map::new())
+    let doc = DocRef::new(path, DocKind::UserConfig);
+    // The docstore mutator speaks `String`; the caller's typed `anyhow` error is kept
+    // aside so it can be returned unchanged (context chain and downcasts intact).
+    let mut mutator_error: Option<anyhow::Error> = None;
+    let outcome = ms_docstore::update(&doc, WriteOptions::default(), |root| {
+        if !root.is_object() {
+            *root = Value::Object(Map::new());
+        }
+        mutator(root).map_err(|err| {
+            let message = format!("{err:#}");
+            mutator_error = Some(err);
+            message
+        })
+    });
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(DocStoreError::Mutator(message)) => Err(mutator_error.take().unwrap_or_else(|| anyhow::anyhow!(message))),
+        Err(err @ DocStoreError::Malformed { .. }) => Err(anyhow::Error::new(err).context(format!("failed to parse config {}", path.display()))),
+        Err(err @ DocStoreError::Storage(_)) => Err(anyhow::Error::new(err).context(format!("failed to read config {}", path.display()))),
+        Err(
+            err @ (DocStoreError::Io { .. }
+            | DocStoreError::Write(_)
+            | DocStoreError::Serialize { .. }
+            | DocStoreError::Conflict { .. }
+            | DocStoreError::Ambiguous { .. }
+            | DocStoreError::Unsupported { .. }
+            | DocStoreError::Quarantine { .. }),
+        ) => Err(anyhow::Error::new(err).context(format!("failed to write config {}", path.display()))),
+    }
+}
+
+/// Section-writer core: ONE serialized read-modify-write of the user-config document at
+/// `user_settings_file` with `durability`. A missing document starts as `{}`, a non-object root is replaced by
+/// `{}`, and `edit` receives the root object. Every key `edit` does not touch survives.
+///
+/// # Errors
+/// The raw [`DocStoreError`]: `Malformed` (file untouched), read or write failures.
+/// Callers turn it into their message with [`user_config_error_message`].
+pub(crate) fn update_user_config_root(
+    user_settings_file: &Path,
+    durability: ms_docstore::Durability,
+    edit: impl FnOnce(&mut Map<String, Value>),
+) -> ms_docstore::Result<()> {
+    let doc = DocRef::new(user_settings_file, DocKind::UserConfig);
+    let opts = WriteOptions { durability, ..WriteOptions::default() };
+    ms_docstore::update(&doc, opts, |root| {
+        if !root.is_object() {
+            *root = Value::Object(Map::new());
+        }
+        let Value::Object(root_obj) = root else {
+            return Err(t!("settings.config_io.prepare_root_error").to_string());
+        };
+        edit(root_obj);
+        Ok(())
+    })
+}
+
+/// Runs `edit` on the object stored under `root_obj[section]` (a missing or non-object
+/// value starts as `{}`) and stores the result back. Every other key survives.
+pub(crate) fn edit_section(root_obj: &mut Map<String, Value>, section: &str, edit: impl FnOnce(&mut Map<String, Value>)) {
+    let mut section_obj = match root_obj.remove(section) {
+        Some(Value::Object(obj)) => obj,
+        Some(_) | None => Map::new(),
     };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
+    edit(&mut section_obj);
+    root_obj.insert(section.to_owned(), Value::Object(section_obj));
+}
+
+/// User-facing message (and a structured log line) for a failed user-config section
+/// write. Read/parse failures use the localized `settings.config_io.*` texts; write
+/// failures keep the technical text the savers always returned (the store has already
+/// logged them with path and cause).
+pub(crate) fn user_config_error_message(user_settings_file: &Path, err: &DocStoreError) -> String {
+    match err {
+        DocStoreError::Malformed { cause, .. } => {
+            runtime_log::log_warn(format!(
+                "[config] user_config.json is malformed; left untouched, update not applied. Path: {}; Error: {cause}",
+                user_settings_file.display()
+            ));
+            tf!("settings.config_io.parse_error", user_settings_file = user_settings_file.display(), err = cause)
+        }
+        DocStoreError::Storage(source) => {
+            runtime_log::log_warn(format!(
+                "[config] cannot read user_config.json; update not applied. Path: {}; Error: {source}",
+                user_settings_file.display()
+            ));
+            tf!("settings.config_io.read_error", user_settings_file = user_settings_file.display(), err = source)
+        }
+        DocStoreError::Mutator(message) => message.clone(),
+        DocStoreError::Io { .. }
+        | DocStoreError::Write(_)
+        | DocStoreError::Serialize { .. }
+        | DocStoreError::Conflict { .. }
+        | DocStoreError::Ambiguous { .. }
+        | DocStoreError::Unsupported { .. }
+        | DocStoreError::Quarantine { .. } => err.to_string(),
     }
-    mutator(&mut root)?;
-    if let Some(parent) = path.parent() {
-        let parent_str = parent.to_string_lossy();
-        store.create_dir_all(parent_str.as_ref()).with_context(|| {
-            format!("failed to create config parent directory {}", parent.display())
-        })?;
-    }
-    let payload = serde_json::to_string_pretty(&root).context("failed to serialize config")?;
-    store.write(path_str.as_ref(), payload.as_bytes())
-        .with_context(|| format!("failed to write config {}", path.display()))?;
-    Ok(())
 }
 
 /// Persists the advanced text-form search knobs under `TextTab.advanced_form_search`
@@ -1625,9 +1728,9 @@ pub fn update_user_config_file(
 /// depending on the binary's settings tab, where this placement used to live.
 ///
 /// File I/O — meant to run OFF the GUI thread (the advanced-form window spawns it on a
-/// named thread). It goes through [`update_user_config_file`], which takes
-/// [`lock_user_config_write`] itself, so the caller must NOT hold that lock: it is not
-/// reentrant.
+/// named thread). It goes through [`update_user_config_file`], which takes the document
+/// lock itself, so the caller must NOT hold it (`ms_docstore::with_lock` on the user
+/// config): it is not reentrant.
 ///
 /// # Errors
 /// Returns the user-facing failure of reading, parsing, serializing or writing
@@ -1666,138 +1769,91 @@ pub fn save_advanced_form_search_params(
 // launcher's settings page. `crate::tabs::settings` re-exports each one, so the
 // settings tab's own call sites are unchanged.
 //
-// Shape of every writer below: take `lock_user_config_write()`, read the file fresh,
-// insert into one section, rewrite the whole document. That preserves every unrelated
-// key and keeps a background saver from clobbering the ORT load-guard marker. No
-// fsync: these are ordinary preferences with no crash-durability requirement. All of
-// them do synchronous disk I/O, so they must run OFF the GUI thread.
+// Shape of every writer below: ONE `update_user_config_root` transaction (serialized
+// read-modify-write, atomic replace) that edits ONE section, so every unrelated key
+// survives and a background saver never clobbers the ORT load-guard marker. A malformed
+// document is reported, never overwritten. Contents-only durability: these are ordinary
+// preferences. All of them do synchronous disk I/O, so they must run OFF the GUI thread.
 // ---------------------------------------------------------------------------
 
-use crate::ort_load_guard::read_user_config_root;
-
+/// Persists the hanging-punctuation set under `TextTab.hanging_punctuation`.
+///
+/// One serialized read-modify-write of the `TextTab` section; every other key survives.
+/// Synchronous disk I/O: do not call from the GUI thread.
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 pub fn save_hanging_punctuation(
     user_settings_file: &Path,
     punctuation: &str,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        TEXT_TAB_HANGING_PUNCTUATION_KEY.to_string(),
-        Value::String(punctuation.to_string()),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "TextTab", |text_tab_obj| {
+            text_tab_obj.insert(
+                TEXT_TAB_HANGING_PUNCTUATION_KEY.to_string(),
+                Value::String(punctuation.to_string()),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 /// Persists the selected typesetting language tag under `TextTab.text_language`.
 ///
 /// `tag` must be a stable `TextLanguage` tag (`ms_text_util::language::TextLanguage::tag`).
-/// Serialized on the process-wide `lock_user_config_write()` so a
-/// background/GUI-thread saver never clobbers the ORT load-guard marker; a
-/// targeted read-modify-write preserves every unrelated key. Meant to run off the
-/// GUI thread; spawned from the "Тайп" pane and from the shared
+/// One serialized read-modify-write of the `TextTab` section, so a background/GUI-thread
+/// saver never clobbers the ORT load-guard marker and every unrelated key survives. Meant
+/// to run off the GUI thread; spawned from the "Тайп" pane and from the shared
 /// `crate::general_settings_panel` widget, which offers the same selector.
-/// Returns a user-facing error string.
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 pub fn save_text_language(user_settings_file: &Path, tag: &str) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        TEXT_TAB_TEXT_LANGUAGE_KEY.to_string(),
-        Value::String(tag.to_string()),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "TextTab", |text_tab_obj| {
+            text_tab_obj.insert(
+                TEXT_TAB_TEXT_LANGUAGE_KEY.to_string(),
+                Value::String(tag.to_string()),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 /// Persists the selected AI runtime under `General.ai_runtime` in
 /// `user_config.json`.
 ///
-/// Re-reads the file fresh, inserts the `ai_runtime` token, and rewrites the whole
-/// file (like the other `General` writers in this module). Also sets the
-/// `ai_runtime_configured` boolean to `true`, recording that the runtime is now an
-/// EXPLICIT user choice so [`AiRuntime::from_user_settings`] honors the
-/// stored token instead of applying the native default. No fsync: this is an
-/// ordinary preference with no crash-durability requirement. Safe to call from a
-/// background thread; the caller must not invoke it on the GUI thread since it
-/// does synchronous disk I/O.
+/// Also sets the `ai_runtime_configured` boolean to `true`, recording that the runtime is
+/// now an EXPLICIT user choice so [`AiRuntime::from_user_settings`] honors the stored
+/// token instead of applying the native default. One serialized read-modify-write of the
+/// `General` section. Safe to call from a background thread; never on the GUI thread
+/// (synchronous disk I/O).
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 // Wired into the AI runtime selector in `ai_backend_panel`.
 pub fn save_ai_runtime(
     user_settings_file: &Path,
     runtime: AiRuntime,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = read_user_config_root(user_settings_file)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.config_io.prepare_root_error").to_string());
-    };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        GENERAL_AI_RUNTIME_KEY.to_string(),
-        Value::String(runtime.as_key().to_string()),
-    );
-    // Mark the runtime as an explicit user decision so the effective-runtime
-    // resolver stops applying the native default and honors this token.
-    general_obj.insert(
-        GENERAL_AI_RUNTIME_CONFIGURED_KEY.to_string(),
-        Value::Bool(true),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "General", |general_obj| {
+            general_obj.insert(
+                GENERAL_AI_RUNTIME_KEY.to_string(),
+                Value::String(runtime.as_key().to_string()),
+            );
+            // Mark the runtime as an explicit user decision so the effective-runtime
+            // resolver stops applying the native default and honors this token.
+            general_obj.insert(
+                GENERAL_AI_RUNTIME_CONFIGURED_KEY.to_string(),
+                Value::Bool(true),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 /// Persists the UNIFIED ONNX selection (`General.ai_onnx_provider` ORT token +
@@ -1809,48 +1865,39 @@ pub fn save_ai_runtime(
 /// backend's own `device.set` write, so an offline selection is honored once the
 /// backend later starts instead of being treated as "not chosen".
 ///
-/// Re-reads the file fresh, inserts only these keys, and rewrites the whole file
-/// (mirroring [`save_ai_runtime`]). No fsync: an ordinary preference. Synchronous
-/// disk I/O: do not call from the GUI thread.
+/// One serialized read-modify-write of the `General` section (mirroring
+/// [`save_ai_runtime`]). Synchronous disk I/O: do not call from the GUI thread.
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 // Wired into the ONNX provider/device selector in `ai_backend_panel`.
 pub fn save_onnx_provider_device(
     user_settings_file: &Path,
     provider_token: &str,
     device_id: &str,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = read_user_config_root(user_settings_file)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.config_io.prepare_root_error").to_string());
-    };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        GENERAL_AI_ONNX_PROVIDER_KEY.to_string(),
-        Value::String(provider_token.to_string()),
-    );
-    general_obj.insert(
-        GENERAL_AI_ONNX_DEVICE_ID_KEY.to_string(),
-        Value::String(device_id.to_string()),
-    );
-    general_obj.insert(
-        GENERAL_AI_ONNX_PROVIDER_CONFIGURED_KEY.to_string(),
-        Value::Bool(true),
-    );
-    general_obj.insert(
-        GENERAL_AI_ONNX_DEVICE_ID_CONFIGURED_KEY.to_string(),
-        Value::Bool(true),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "General", |general_obj| {
+            general_obj.insert(
+                GENERAL_AI_ONNX_PROVIDER_KEY.to_string(),
+                Value::String(provider_token.to_string()),
+            );
+            general_obj.insert(
+                GENERAL_AI_ONNX_DEVICE_ID_KEY.to_string(),
+                Value::String(device_id.to_string()),
+            );
+            general_obj.insert(
+                GENERAL_AI_ONNX_PROVIDER_CONFIGURED_KEY.to_string(),
+                Value::Bool(true),
+            );
+            general_obj.insert(
+                GENERAL_AI_ONNX_DEVICE_ID_CONFIGURED_KEY.to_string(),
+                Value::Bool(true),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 /// Persists the selected ONNX Runtime BUILD slug under `General.ai_onnx_build` in
@@ -1859,32 +1906,23 @@ pub fn save_onnx_provider_device(
 /// `build_slug` is a stable slug from the `onnx_runtime::builds` catalog (e.g. `"cpu"`,
 /// `"cuda13"`). It selects which onnxruntime binary the native runtime downloads/loads;
 /// the native path validates it against the catalog on load (unknown → per-OS default).
-/// Re-reads the file fresh, inserts only this key, and rewrites the whole file
-/// (mirroring [`save_ai_runtime`]). No fsync: an ordinary preference. Synchronous disk
-/// I/O: do not call from the GUI thread.
+/// One serialized read-modify-write of the `General` section. Synchronous disk I/O: do
+/// not call from the GUI thread.
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 // Wired into the "Билд" selector in `ai_backend_panel` (native runtime only).
 pub fn save_onnx_build(user_settings_file: &Path, build_slug: &str) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = read_user_config_root(user_settings_file)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.config_io.prepare_root_error").to_string());
-    };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        GENERAL_AI_ONNX_BUILD_KEY.to_string(),
-        Value::String(build_slug.to_string()),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "General", |general_obj| {
+            general_obj.insert(
+                GENERAL_AI_ONNX_BUILD_KEY.to_string(),
+                Value::String(build_slug.to_string()),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 /// Persists the maximum-loaded-models limit under `General.ai_max_loaded_models` in
@@ -1892,35 +1930,27 @@ pub fn save_onnx_build(user_settings_file: &Path, build_slug: &str) -> Result<()
 ///
 /// Stored as a JSON integer (matching the config default and the native LRU reader).
 /// The value is clamped to `1..=10` by the caller/UI; the backend picks it up via
-/// `device.set` when connected and from config on the next start. Re-reads fresh,
-/// inserts only this key, rewrites the whole file. Synchronous disk I/O: do not call
-/// from the GUI thread.
+/// `device.set` when connected and from config on the next start. One serialized
+/// read-modify-write of the `General` section. Synchronous disk I/O: do not call from
+/// the GUI thread.
+///
+/// # Errors
+/// A user-facing message when the document cannot be read, does not parse (it is then
+/// left untouched) or cannot be written.
 // Wired into the model-limit slider in `ai_backend_panel`.
 pub fn save_max_loaded_models(
     user_settings_file: &Path,
     max_loaded_models: u32,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = read_user_config_root(user_settings_file)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(t!("settings.config_io.prepare_root_error").to_string());
-    };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        GENERAL_AI_MAX_LOADED_MODELS_KEY.to_string(),
-        Value::Number(max_loaded_models.into()),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    update_user_config_root(user_settings_file, ms_docstore::Durability::Contents, |root_obj| {
+        edit_section(root_obj, "General", |general_obj| {
+            general_obj.insert(
+                GENERAL_AI_MAX_LOADED_MODELS_KEY.to_string(),
+                Value::Number(max_loaded_models.into()),
+            );
+        });
+    })
+    .map_err(|err| user_config_error_message(user_settings_file, &err))
 }
 
 #[cfg(test)]
@@ -2051,37 +2081,53 @@ mod settings_writer_tests {
 
 /// Loads the canonical user config and persists only required migrations/defaults.
 ///
-/// The user-config lock remains held from the initial read through the conditional
-/// write, preventing a concurrent full-file update from being lost.
+/// The read, the migration/backfill decision and the conditional write run as one
+/// transaction under the user-config document lock, so a concurrent
+/// full-file update cannot be lost. A document that already holds every default and needs
+/// no migration is not rewritten.
+///
+/// # Errors
+/// Fails when the document cannot be read, does not parse (it is then left untouched), or
+/// the migrated/backfilled document cannot be written.
 pub fn load_user_config() -> Result<JsonConfig> {
-    let _write_guard = lock_user_config_write();
     let mut cfg = JsonConfig {
         path: user_config_path(),
-        is_user_config: true,
+        doc: user_config_doc(),
         defaults: user_config_defaults(),
         data: Value::Object(Map::new()),
     };
-    cfg.load()?;
-    let migrated = migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
-    let defaults_applied = cfg.apply_defaults();
-    if migrated || defaults_applied {
-        cfg.save_unlocked()?;
-    }
+    ms_docstore::with_lock(&cfg.doc.clone(), |locked| -> Result<()> {
+        cfg.data = config_root_or_empty(locked.read_value(), &cfg.path)?;
+        let migrated = migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
+        let defaults_applied = cfg.apply_defaults();
+        if migrated || defaults_applied {
+            locked
+                .write_value(&cfg.data, WriteOptions::default())
+                .with_context(|| format!("failed to write config {}", cfg.path.display()))?;
+        }
+        Ok(())
+    })?;
     Ok(cfg)
 }
 
+/// Reads the current `user_config.json` exactly as stored (no defaults, no migration, no
+/// root coercion, never writes). An absent document reads as `{}`.
+///
+/// # Errors
+/// Fails when the document exists but cannot be read or does not parse.
 pub fn load_raw_user_settings_for_startup() -> Result<Value> {
-    let user_config_path = user_config_path();
-    let data = match fs::read_to_string(&user_config_path) {
-        Ok(raw) => serde_json::from_str::<Value>(&raw)
-            .with_context(|| format!("failed to parse config {}", user_config_path.display()))?,
-        Err(err) if err.kind() == ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read config {}", user_config_path.display()));
-        }
-    };
-    Ok(data)
+    read_raw_user_config(&user_config_doc())
+}
+
+/// Body of [`load_raw_user_settings_for_startup`] for an explicit document (tests use a
+/// temp directory).
+fn read_raw_user_config(doc: &DocRef) -> Result<Value> {
+    let path = doc.path_for(ms_docstore::DocFormat::Json);
+    match ms_docstore::read_value(doc) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(Value::Object(Map::new())),
+        Err(err) => Err(config_read_error(err, &path)),
+    }
 }
 
 #[must_use]
@@ -2331,86 +2377,166 @@ mod tests {
     }
 
     #[test]
-    fn user_config_update_holds_lock_while_mutating() -> Result<()> {
+    fn user_config_writers_and_direct_docstore_updates_lose_no_increment() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join(USER_CONFIG_FILE);
+        const THREADS: u64 = 6;
+        const ROUNDS: u64 = 15;
 
-        update_user_config_file(&path, |root| {
-            let lock = USER_CONFIG_WRITE_LOCK.get_or_init(|| Mutex::new(()));
-            assert!(matches!(
-                lock.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ));
-            let Some(root_obj) = root.as_object_mut() else {
-                return Err(anyhow::anyhow!("update root must be an object"));
-            };
-            root_obj.insert("held".to_string(), Value::Bool(true));
-            Ok(())
-        })?;
+        fn increment(root: &mut Value) {
+            let current = root.get("counter").and_then(Value::as_u64).unwrap_or(0);
+            root["counter"] = json!(current + 1);
+        }
 
-        let saved: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-        assert_eq!(saved.get("held"), Some(&Value::Bool(true)));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread_index| {
+                let path = path.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    for _ in 0..ROUNDS {
+                        // Half of the writers use this crate's wrapper, half call the
+                        // store directly: the shared document lock must serialize both.
+                        if thread_index % 2 == 0 {
+                            update_user_config_file(&path, |root| {
+                                increment(root);
+                                Ok(())
+                            })?;
+                        } else {
+                            let doc = DocRef::new(&path, DocKind::UserConfig);
+                            ms_docstore::update(&doc, WriteOptions::default(), |root| {
+                                increment(root);
+                                Ok(())
+                            })?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().map_err(|_| anyhow::anyhow!("writer panicked"))??;
+        }
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(saved.get("counter").and_then(Value::as_u64), Some(THREADS * ROUNDS));
         Ok(())
     }
 
     #[test]
-    fn serialized_updates_preserve_ort_marker_after_stale_canvas_window() -> Result<()> {
+    fn section_writer_rejects_malformed_document_and_leaves_it() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join(USER_CONFIG_FILE);
-        fs::write(&path, serde_json::to_vec_pretty(&json!({"General": {"other": 1}}))?)?;
-        let (canvas_read_tx, canvas_read_rx) = std::sync::mpsc::channel();
-        let (release_canvas_tx, release_canvas_rx) = std::sync::mpsc::channel();
-        let canvas_path = path.clone();
-        let canvas_thread = std::thread::spawn(move || -> Result<()> {
-            update_user_config_file(&canvas_path, |root| {
-                canvas_read_tx.send(())?;
-                release_canvas_rx.recv()?;
-                let Some(root_obj) = root.as_object_mut() else {
-                    return Err(anyhow::anyhow!("canvas update root must be an object"));
-                };
-                root_obj.insert("Canvas".to_string(), json!({"cache_pages": true}));
-                Ok(())
-            })
-        });
-        canvas_read_rx.recv()?;
+        let corrupt = "not json";
+        fs::write(&path, corrupt)?;
 
-        let (marker_started_tx, marker_started_rx) = std::sync::mpsc::channel();
-        let marker_path = path.clone();
-        let marker_thread = std::thread::spawn(move || -> Result<()> {
-            marker_started_tx.send(())?;
-            update_user_config_file(&marker_path, |root| {
-                let Some(root_obj) = root.as_object_mut() else {
-                    return Err(anyhow::anyhow!("marker update root must be an object"));
-                };
-                let general = root_obj
-                    .entry("General".to_string())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                let Some(general_obj) = general.as_object_mut() else {
-                    return Err(anyhow::anyhow!("General must be an object"));
-                };
-                general_obj.insert(
-                    GENERAL_ORT_LOAD_STATE_KEY.to_string(),
-                    json!({"cpu@1.20.1": {"attempted": true, "succeeded": false}}),
-                );
-                Ok(())
-            })
-        });
-        marker_started_rx.recv()?;
-        release_canvas_tx.send(())?;
-        canvas_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("canvas updater panicked"))??;
-        marker_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("marker updater panicked"))??;
+        assert!(save_text_language(&path, "en").is_err());
+        assert!(save_hanging_punctuation(&path, "«»").is_err());
+        assert!(save_ai_runtime(&path, AiRuntime::Native).is_err());
 
-        let saved: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-        assert_eq!(saved.pointer("/Canvas/cache_pages"), Some(&Value::Bool(true)));
-        assert_eq!(
-            saved.pointer("/General/ort_load_state/cpu@1.20.1/attempted"),
-            Some(&Value::Bool(true))
-        );
+        assert_eq!(fs::read_to_string(&path)?, corrupt);
         Ok(())
+    }
+
+    #[test]
+    fn section_writer_replaces_document_atomically_in_historical_layout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(USER_CONFIG_FILE);
+        fs::write(&path, "{\"General\":{\"other\":1},\"Canvas\":{\"zoom\":2}}")?;
+
+        save_onnx_build(&path, "cpu").map_err(anyhow::Error::msg)?;
+
+        let expected = json!({"General": {"other": 1, "ai_onnx_build": "cpu"}, "Canvas": {"zoom": 2}});
+        // Pretty, no trailing newline: the bytes the std::fs savers always wrote.
+        assert_eq!(fs::read_to_string(&path)?, serde_json::to_string_pretty(&expected)?);
+        // Atomic replace leaves no sibling temp file behind.
+        let names: Vec<_> = fs::read_dir(temp.path())?.map(|entry| entry.map(|entry| entry.file_name())).collect::<std::io::Result<_>>()?;
+        assert_eq!(names, vec![std::ffi::OsString::from(USER_CONFIG_FILE)]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_user_config_root_tolerates_absent_and_non_object_but_not_malformed() -> Result<()> {
+        use crate::ort_load_guard::read_user_config_root;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(USER_CONFIG_FILE);
+
+        assert_eq!(read_user_config_root(&path).map_err(anyhow::Error::msg)?, json!({}));
+        fs::write(&path, "42")?;
+        assert_eq!(read_user_config_root(&path).map_err(anyhow::Error::msg)?, json!({}));
+        fs::write(&path, "{\"a\":1}")?;
+        assert_eq!(read_user_config_root(&path).map_err(anyhow::Error::msg)?, json!({"a": 1}));
+        fs::write(&path, "{broken")?;
+        assert!(read_user_config_root(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_user_config_read_is_verbatim_and_absent_is_empty_object() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(USER_CONFIG_FILE);
+        let doc = DocRef::new(&path, DocKind::UserConfig);
+
+        assert_eq!(read_raw_user_config(&doc)?, json!({}));
+        // No root coercion and no defaults: the startup read is the document as stored.
+        fs::write(&path, "[1]")?;
+        assert_eq!(read_raw_user_config(&doc)?, json!([1]));
+        fs::write(&path, "{broken")?;
+        let err = read_raw_user_config(&doc).expect_err("malformed must fail");
+        assert!(format!("{err:#}").contains("failed to parse config"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn json_config_kind_follows_file_name_or_explicit_kind() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let settings = JsonConfig::new(temp.path().join(PROJECT_SETTINGS_FILE), json!({}))?;
+        assert_eq!(settings.doc().kind(), DocKind::ProjectSettings);
+        let user = JsonConfig::new(temp.path().join(USER_CONFIG_FILE), json!({}))?;
+        assert_eq!(user.doc().kind(), DocKind::UserConfig);
+        let explicit = JsonConfig::with_kind(temp.path().join("other.json"), DocKind::ProjectSettings, json!({}))?;
+        assert_eq!(explicit.doc().kind(), DocKind::ProjectSettings);
+        // Nothing to backfill: none of the three constructions created a file.
+        assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn json_config_set_path_rereads_the_document_and_keeps_foreign_keys() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(PROJECT_SETTINGS_FILE);
+        let mut config = JsonConfig::new(&path, json!({"Canvas": {"zoom": 1}}))?;
+        // Another writer adds a key after this snapshot was taken.
+        fs::write(&path, "{\"Canvas\":{\"zoom\":1},\"OCR\":{\"engine\":\"x\"}}")?;
+
+        config.set_path(&["Canvas", "zoom"], json!(3))?;
+        config.set("comic_type", json!("ribbon"))?;
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        let expected = json!({"Canvas": {"zoom": 3}, "OCR": {"engine": "x"}, "comic_type": "ribbon"});
+        assert_eq!(saved, expected);
+        assert_eq!(config.data, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn json_config_new_leaves_malformed_document_untouched() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(PROJECT_SETTINGS_FILE);
+        fs::write(&path, "{oops")?;
+
+        assert!(JsonConfig::new(&path, json!({"Canvas": {"zoom": 1}})).is_err());
+        assert_eq!(fs::read_to_string(&path)?, "{oops");
+        Ok(())
+    }
+
+    #[test]
+    fn document_helpers_name_the_expected_files() {
+        let title = Path::new("/titles/one");
+        let settings = project_settings_doc(title);
+        assert_eq!(settings.kind(), DocKind::ProjectSettings);
+        assert_eq!(settings.path_for(ms_docstore::DocFormat::Json), title.join(PROJECT_SETTINGS_FILE));
+        let user = user_config_doc();
+        assert_eq!(user.kind(), DocKind::UserConfig);
+        assert_eq!(user.path_for(ms_docstore::DocFormat::Json), user_config_path());
     }
 
     #[test]

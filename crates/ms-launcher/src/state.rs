@@ -9,7 +9,8 @@ Main responsibilities:
 - keep small page-independent labels used by the main menu UI;
 - hold non-blocking page transition state for animated page navigation;
 - track detached launcher windows that live outside the page stack.
-- carry launcher exit intent back to the startup flow.
+- carry launcher exit intent back to the startup flow;
+- remember which storage-conversion failure notice the main page already dismissed.
 */
 
 use crate::pages::base::PageTransition;
@@ -55,6 +56,9 @@ pub struct LauncherState {
     pub import_popup_open: bool,
     pub main_page_message: Option<String>,
     pub footer_label: String,
+    /// Id of the finished storage-conversion job whose failure notice the user dismissed
+    /// on the main page (`storage_mode_job` ids are unique per process).
+    pub storage_notice_dismissed_job: Option<u64>,
 }
 
 impl LauncherState {
@@ -67,6 +71,7 @@ impl LauncherState {
             import_popup_open: false,
             main_page_message: None,
             footer_label: t!("launcher.about.credits").to_string(),
+            storage_notice_dismissed_job: None,
         }
     }
 

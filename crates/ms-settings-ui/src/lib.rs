@@ -10,9 +10,11 @@ Main modules:
 - `settings_shared`: the menu-level layer — the section registry
   (`SettingsSectionId` / `sections_for` / `title_key`) and `SharedSettingsPanels`, the
   container owning the three double-interface panels below.
-- `general_settings_panel`: the "Общие" pane (projects root, memory profile, UI language,
-  UI scale, typesetting language, startup monitor) plus the process-wide UI-scale slot
-  every `eframe::run_native` creator applies.
+- `general_settings_panel`: the "Общие" pane (projects root, storage mode, memory profile,
+  UI language, UI scale, typesetting language, startup monitor) plus the process-wide
+  UI-scale slot every `eframe::run_native` creator applies.
+- `storage_mode_job` / `storage_mode_setting`: the process-wide Dev/Prod conversion job
+  (named worker running `ms_project::storage_mode::convert_globals`) and its pane row.
 - `ai_backend_panel`: the AI-backend pane (runtime selection, ONNX provider/device/build,
   model limit, health readout, ORT crash-guard reset).
 - `ai_backend_supervisor`: the app-global handle both shells drive the Python AI backend
@@ -36,6 +38,10 @@ pub mod ai_backend_panel;
 pub mod ai_backend_supervisor;
 pub mod general_settings_panel;
 pub mod settings_shared;
+// The process-wide Dev/Prod storage conversion job (startup reconciliation and the
+// General pane's switch share it) and the pane row that drives it.
+pub mod storage_mode_job;
+pub mod storage_mode_setting;
 
 // The onboarding tutorial subsystem, behind the `tutorial` feature exactly as in the
 // binary (off by default: the controller and its `mark` sites stay compiled but inert,

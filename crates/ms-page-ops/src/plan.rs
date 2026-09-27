@@ -14,6 +14,9 @@ Key structures:
   on disk (built by `fs_exec::scan_chapter`; tests build it directly).
 - PageOpPlan / PlannedMove / PlannedCreate / PlannedJsonWrite /
   PlannedTrashWrite: the action plan persisted verbatim into the journal.
+- OwnedDocFormat / PlannedWriteFormat: the on-disk format (`.json` / `.db`) of
+  the two OWNED chapter documents (layers manifest, bubbles) as found by the
+  scan, and how phase B writes a journaled body (plain file vs. `ms_docstore`).
 
 - PlacementMap: the affine of ONE page onto ONE output canvas — a rotation
   (`crop_geometry::RotatedPage`), then a crop, then a uniform scale and a
@@ -2048,14 +2051,20 @@ pub(crate) struct TreeSnapshot {
     /// that one page), because a TEXT layer record stores no `image_size` and
     /// the split's area rule cannot be evaluated without it. Empty otherwise.
     pub layer_png_sizes: std::collections::BTreeMap<String, [u32; 2]>,
-    /// Parsed `layers/layers.json`, when present.
+    /// Parsed `layers/layers` manifest (either format), when present.
     pub layers_manifest: Option<Value>,
+    /// The file format `layers_manifest` was read from (meaningful only when
+    /// it is `Some`); its phase-B rewrite targets that same file.
+    pub layers_manifest_format: OwnedDocFormat,
     /// Every file name in `text_images/`.
     pub text_images_files: BTreeSet<String>,
     /// Parsed `text_info.json` files found in this tree.
     pub text_info: Vec<TextInfoFile>,
-    /// Parsed `translation_bubbles.json` entries, when the file exists.
+    /// Parsed bubbles document entries (either format), when it exists.
     pub bubbles: Option<Vec<Value>>,
+    /// The file format `bubbles` was read from (meaningful only when it is
+    /// `Some`); its phase-B rewrite targets that same file.
+    pub bubbles_format: OwnedDocFormat,
 }
 
 /// Parsed state of a text-detection blocks file.
@@ -2132,12 +2141,105 @@ pub(crate) struct PlannedCreate {
     pub content: NewPageContent,
 }
 
+/// On-disk format of an OWNED chapter document (`layers/layers`, the bubbles
+/// document) as the scan found it. A serializable mirror of
+/// `ms_docstore::DocFormat`, which carries no serde and is not a journal type.
+/// The default (`Json`) is what a test-built snapshot without a stored document
+/// means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum OwnedDocFormat {
+    /// `<stem>.json`.
+    #[default]
+    #[serde(rename = "json")]
+    Json,
+    /// `<stem>.db` (`SQLite` fragment store of `ms_docstore`).
+    #[serde(rename = "db")]
+    Db,
+}
+
+impl OwnedDocFormat {
+    /// The scan-side conversion from the store's format.
+    #[must_use]
+    pub(crate) fn from_docstore(format: ms_docstore::DocFormat) -> Self {
+        match format {
+            ms_docstore::DocFormat::Json => Self::Json,
+            ms_docstore::DocFormat::Db => Self::Db,
+        }
+    }
+
+    /// File extension without the dot (`json` / `db`).
+    #[must_use]
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Db => "db",
+        }
+    }
+}
+
+/// Which owned chapter document a `.db` write materializes (recorded as the
+/// `.db` file's `meta.doc_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum OwnedDocKind {
+    /// `layers/layers.db`.
+    #[serde(rename = "layers")]
+    Layers,
+    /// The bubbles document (`translation_bubbles.db`).
+    #[serde(rename = "bubbles")]
+    Bubbles,
+}
+
+impl OwnedDocKind {
+    /// The store's kind of this document.
+    #[must_use]
+    pub(crate) fn to_docstore(self) -> ms_docstore::DocKind {
+        match self {
+            Self::Layers => ms_docstore::DocKind::Layers,
+            Self::Bubbles => ms_docstore::DocKind::Bubbles,
+        }
+    }
+
+    /// Extension-less file name of the document inside its directory
+    /// (`layers` inside `layers/`, `translation_bubbles` inside the tree).
+    #[must_use]
+    pub(crate) fn file_stem(self) -> &'static str {
+        match self {
+            Self::Layers => LAYERS_MANIFEST_STEM,
+            Self::Bubbles => config::BUBBLES_FILE.strip_suffix(".json").unwrap_or(config::BUBBLES_FILE),
+        }
+    }
+}
+
+/// Extension-less file name of the layer manifest inside `layers/`.
+const LAYERS_MANIFEST_STEM: &str = "layers";
+
+/// How phase B materializes a journaled document body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PlannedWriteFormat {
+    /// `content` IS the file text; `fs_exec::atomic_write` writes it verbatim.
+    /// Every non-owned document (`text_info.json`, detection blocks) and an
+    /// owned document the scan found as `.json`.
+    #[serde(rename = "json")]
+    Json,
+    /// `content` is the logical JSON body of an owned document the scan found
+    /// as `.db`; `target` is that `.db` file and phase B rebuilds it whole
+    /// through `ms_docstore::write_whole_atomic`.
+    #[serde(rename = "db")]
+    Db {
+        /// The document's kind (its `meta.doc_kind`).
+        kind: OwnedDocKind,
+    },
+}
+
 /// One JSON document rewritten by the transaction. `content` is the complete
-/// new file body, computed at plan time and journaled so recovery can re-apply
-/// it without re-reading (possibly already-moved) inputs.
+/// new LOGICAL body (pretty JSON text), computed at plan time and journaled so
+/// recovery can re-apply it without re-reading (possibly already-moved)
+/// inputs; `format` says whether `target` is a plain JSON file or an owned
+/// `.db` document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PlannedJsonWrite {
     pub target: String,
+    pub format: PlannedWriteFormat,
     pub content: String,
 }
 
@@ -2272,14 +2374,33 @@ impl PlanBuilder {
         });
     }
 
-    /// Plans rewriting the JSON document at `target` with `content`; when the
-    /// file currently exists (`had_original`) its original is discarded at
-    /// commit (the remapped content supersedes it).
+    /// Plans rewriting the plain JSON document at `target` with `content`;
+    /// when the file currently exists (`had_original`) its original is
+    /// discarded at commit (the remapped content supersedes it).
     fn rewrite_json(&mut self, target: String, content: String, had_original: bool) {
         if had_original {
             self.discard(target.clone());
         }
-        self.json_writes.push(PlannedJsonWrite { target, content });
+        self.json_writes.push(PlannedJsonWrite { target, format: PlannedWriteFormat::Json, content });
+    }
+
+    /// Plans rewriting the EXISTING owned document `kind` in directory `dir`
+    /// (title-relative) in the format the scan found it in: its ACTUAL file
+    /// (`.json` or `.db`) is discarded at commit and replaced by `content`
+    /// materialized in that same format, so the chapter keeps its format.
+    fn rewrite_owned_doc(&mut self, dir: &str, kind: OwnedDocKind, format: OwnedDocFormat, content: String) {
+        let target = format!("{dir}/{}.{}", kind.file_stem(), format.extension());
+        self.discard(target.clone());
+        let format = match format {
+            OwnedDocFormat::Json => PlannedWriteFormat::Json,
+            OwnedDocFormat::Db => PlannedWriteFormat::Db { kind },
+        };
+        self.json_writes.push(PlannedJsonWrite { target, format, content });
+    }
+
+    /// Plans writing a NEW plain JSON document (no original to discard).
+    fn write_json(&mut self, target: String, content: String) {
+        self.json_writes.push(PlannedJsonWrite { target, format: PlannedWriteFormat::Json, content });
     }
 
     /// Plans creating a new file at `target` from `content` (staged in phase A
@@ -2304,7 +2425,8 @@ impl PlanBuilder {
 }
 
 /// Serializes a JSON value the way the app writes its project documents
-/// (pretty, matching `ProjectData::autosave_bubbles` / layer-manifest writes).
+/// (pretty, no trailing newline — matching the `ms_docstore` writes of the bubbles document
+/// (`ms_models::bubbles_model::write_bubbles_snapshot_to`) and of the layer manifest).
 fn to_pretty(value: &Value) -> Result<String, PageOpError> {
     serde_json::to_string_pretty(value)
         .map_err(|err| PageOpError::Json(format!("serialize remapped document: {err}")))
@@ -3252,8 +3374,8 @@ fn plan_layers_manifest(
         );
     }
     if remap.changed {
-        let target = format!("{}/{}/layers.json", tree.tree_rel, config::LAYERS_DIR);
-        b.rewrite_json(target, to_pretty(&remap.manifest)?, true);
+        let dir = format!("{}/{}", tree.tree_rel, config::LAYERS_DIR);
+        b.rewrite_owned_doc(&dir, OwnedDocKind::Layers, tree.layers_manifest_format, to_pretty(&remap.manifest)?);
     }
     Ok(())
 }
@@ -3490,8 +3612,7 @@ fn plan_bubbles(
         );
     }
     if remap.changed {
-        let target = format!("{}/{}", tree.tree_rel, config::BUBBLES_FILE);
-        b.rewrite_json(target, to_pretty(&Value::Array(remap.kept))?, true);
+        b.rewrite_owned_doc(&tree.tree_rel, OwnedDocKind::Bubbles, tree.bubbles_format, to_pretty(&Value::Array(remap.kept))?);
     }
     Ok(())
 }
@@ -3565,10 +3686,7 @@ fn plan_detection(
                             // superseded original.
                             let content = to_pretty(&remapped)?;
                             b.discard(blocks_from);
-                            b.json_writes.push(PlannedJsonWrite {
-                                target: blocks_target,
-                                content,
-                            });
+                            b.write_json(blocks_target, content);
                         } else if blocks_from != blocks_target {
                             b.rename(blocks_from, blocks_target);
                         }
@@ -3720,10 +3838,7 @@ fn plan_stitch_detection(
         );
     }
     let merged = json_remap::merge_detection_blocks(&mergeable, geo, mask_name.as_deref())?;
-    b.json_writes.push(PlannedJsonWrite {
-        target: format!("{dir}/{}", detection_blocks_file_name(geo.primary_new)),
-        content: to_pretty(&merged)?,
-    });
+    b.write_json(format!("{dir}/{}", detection_blocks_file_name(geo.primary_new)), to_pretty(&merged)?);
     Ok(())
 }
 
@@ -3830,10 +3945,7 @@ fn plan_split_detection(
             new_idx,
             mask_name.as_deref(),
         )?;
-        b.json_writes.push(PlannedJsonWrite {
-            target: format!("{dir}/{}", detection_blocks_file_name(new_idx)),
-            content: to_pretty(&cut)?,
-        });
+        b.write_json(format!("{dir}/{}", detection_blocks_file_name(new_idx)), to_pretty(&cut)?);
     }
     Ok(())
 }
@@ -3965,10 +4077,7 @@ fn plan_crop_detection(
     // not change the page index), so the original is discarded rather than
     // renamed.
     b.discard(blocks_from);
-    b.json_writes.push(PlannedJsonWrite {
-        target: format!("{dir}/{}", detection_blocks_file_name(old_idx)),
-        content: to_pretty(&remapped)?,
-    });
+    b.write_json(format!("{dir}/{}", detection_blocks_file_name(old_idx)), to_pretty(&remapped)?);
     Ok(())
 }
 
@@ -4210,6 +4319,7 @@ mod tests {
                 "id": 1, "img_idx": 3, "img_u": 0.5, "img_v": 0.5,
                 "side": "left", "text": "t", "original_text": "o"
             })]),
+            ..TreeSnapshot::default()
         };
         let unsaved = TreeSnapshot {
             tree_rel: "ch1_unsaved".to_string(),

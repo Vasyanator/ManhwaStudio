@@ -35,10 +35,31 @@ joined onto a chapter or title directory.
 ## Files and submodules
 - `project_scan.rs`: the catalogue scan of the projects ROOT (as opposed to the chapter LOAD
   the rest of the crate performs): `list_titles`, `list_chapters`,
-  `validate_project_dir_for_startup` (`ProjectValidationState`), `find_unsaved_chapter`. Plain
+  `validate_project_dir_for_startup` (`ProjectValidationState`), `find_unsaved_chapter`, and the
+  chapter storage-format probe/conversion `chapter_storage_report` / `convert_chapter_storage`
+  (both trees; document names from `ms_page_ops::chapter_docs`, never re-derived), plus the
+  unsaved-session parse probe `damaged_unsaved_documents` (staging tree only; `Malformed`
+  counts as damage) used by the launcher banner and by `load_resume_unsaved`, which refuses a
+  damaged session with `damaged_unsaved_session_message` instead of loading it. Plain
   filesystem I/O, no UI and no app state. Read by the launcher and by startup. NOTE: unlike the
   load path it uses `std::fs` DIRECTLY, not the `ms_storage` seam — it browses a real projects
   root on a native desktop, which has no web analogue.
+- `save_merge.rs`: the "save to project" merge (`merge_unsaved_into_project`): byte-copies the
+  `{chapter}_unsaved/` tree over the committed chapter EXCEPT the owned documents (skipped by
+  stem: `.json`, `.db` and a `.db`'s `-journal`, which would be replayed into the committed
+  database) and docstore temps, copies the staged bubbles (either format) through
+  `ms_docstore::copy_document` INTO the committed document's format (a missing committed
+  document takes the chapter's format, `ms_page_ops::chapter_docs`), so a committed chapter
+  never ends with both `X.json` and `X.db`; runs the
+  caller-injected per-page layer merge (`ms-models` sits above this crate, so the binary passes
+  `persist::merge_unsaved_layers_into_committed` as a closure), then removes the staging dir.
+  Native `std::fs`, blocking, worker thread only; errors are localized `app.merge.*` texts.
+- `storage_mode.rs`: the Dev/Prod storage-mode conversion driver (`convert_globals`):
+  (a) persists `General.storage_mode` in user_config's current format and switches the
+  docstore default, (b) converts `fonts_data`/`presets`, (c) the five title-level documents of
+  every `list_titles` title, (d) user_config LAST and only after a clean (b)+(c) — user_config
+  is the startup sentinel. Idempotent, per-document failures collected; chapters are never
+  touched. Blocking; the only caller is `ms-settings-ui`'s process-wide job (worker thread).
 - `lib.rs`: the rest of the crate. `Bubble`, `CanvasSettings`, `ComicType`, `Side`,
   `ProjectData` and its load/reconcile/normalize passes, `LegacyRibbonGeometry`
   (migration of the very old absolute-coordinate Tkinter ribbon bubbles), the
@@ -50,7 +71,7 @@ joined onto a chapter or title directory.
   transaction owns the page keying of every artifact, so a reconcile pass running
   first can mis-pair half-renamed pages with their overlays and bubbles. A failed
   recovery ABORTS the load; it never proceeds on a best-effort basis.
-- **Storage seam.** Every read, write, rename, directory listing and existence check
+- **Storage seam.** Every read, write, rename, directory listing and existence check of the LOAD path
   goes through `ms_storage::global::storage()`, not `std::fs`, so the same pipeline
   serves the native filesystem and the in-memory web store. Images are decoded from
   in-memory bytes and encoded to a buffer before being handed to the seam; there is
@@ -63,6 +84,13 @@ joined onto a chapter or title directory.
   `SharedCanvasSettings::default` and `CanvasState::default` in the binary) plus the
   JSON copies in `ms_config`. The test that guards their agreement lives in
   `crates/ms-models/src/bubbles_model.rs` because two of the mirrors are binary-only types.
+- **Owned documents.** `settings.json` (`DocKind::ProjectSettings`) and the bubbles document
+  (`DocKind::Bubbles`) are read/written through `ms_docstore`, never the seam directly:
+  `load_bubbles` reads, `persist_migrated_bubbles` writes (its `*_legacy_xy.json` backup is a
+  plain seam file, not an owned document: a byte copy of a `.json` source, the pretty JSON of
+  a `.db` source's value; backup + rewrite run in one `ms_docstore::with_lock` section), `save_comic_type_to_project_file` is ONE
+  `ms_docstore::update` that edits only `comic_type` and returns an error — leaving the file
+  untouched — when `settings.json` is malformed.
 - Legacy formats are read FOREVER. A reconcile or migration pass may only act on an
   unambiguous match, and `persist_migrated_bubbles` backs the original up to
   `*_legacy_xy.json` before rewriting.
@@ -75,5 +103,7 @@ joined onto a chapter or title directory.
   `overlays_already_canonical` and `convert_jpegs_to_png` in `lib.rs`.
 - To change the bubble document shape or its legacy migration, see `Bubble`,
   `load_bubbles` and `LegacyRibbonGeometry`.
+- To change which global/title documents a storage-mode switch converts, or its order, see
+  `storage_mode.rs` (keep user_config last: it is the sentinel `ms-config`'s startup probe reads).
 - To change canvas presets or defaults, see `CanvasSettings` / `ComicType` here AND
   the two binary mirrors named above — the test will fail if they drift.

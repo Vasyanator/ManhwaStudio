@@ -540,26 +540,6 @@ pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
     }
 }
 
-pub(crate) fn resolve_fonts_dir() -> PathBuf {
-    if let Ok(cwd) = env::current_dir() {
-        let candidate = cwd.join("fonts");
-        if candidate.is_dir() {
-            return candidate;
-        }
-    }
-
-    if let Ok(exe_path) = env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        let candidate = exe_dir.join("fonts");
-        if candidate.is_dir() {
-            return candidate;
-        }
-    }
-
-    PathBuf::from("fonts")
-}
-
 /// Everything the font list needs out of ONE font FILE, produced by a SINGLE
 /// `fs::read` and a SINGLE `fontdb` parse of the resulting bytes.
 ///

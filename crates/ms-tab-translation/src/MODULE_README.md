@@ -162,7 +162,10 @@ is an author note addressed to the translator, not a replica.
   hint structs.
 - `tab.rs`: main tab state, canvas hooks, panel routing, OCR region selection, advanced-recognition
   integration, footer metadata sync, text-detection mask/line editing, detector result storage,
-  MT dispatch, and coalesced translation settings persistence.
+  MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
+  written only via `ms_docstore::update` touching the tab's four sections (`OCR`,
+  `machine_translation`, `composition`, `text_detector`); a malformed file makes the save fail
+  and is left untouched. The `characters.json` watch uses `ms_docstore::signature`.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR via `genai`,
   credential-store API key commands, crop encoding, page image LRU cache, and
