@@ -91,6 +91,18 @@ they project `src/` and `clean_layers/`, and a `Клин` edit is persisted by t
 model's own autosave / save-to-project path instead. See `models/layer_model/` for the on-disk schema and the unified
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
+DISK READS AND STRUCTURAL WRITES: PS reads a page's layers from disk exactly ONCE — the page loader's
+off-thread decode, inserted into the doc; every later state (rasters, text, and the PS-owned text pin
+meta `LayerNode.text_pinned` / `text_pinned_by_group`) comes from the doc (`materialize_text_runtime_from_doc`
++ `sync_view_from_doc`). Band / grouping / pin writes are saver jobs: `apply_structural_edit` is the single
+funnel (used by `move_band_one`, `move_group_block`, `persist_grouping` and the pin toggle) and, inside ONE
+`edit_doc_node` doc edit, enqueues `enqueue_page_band_order` / `enqueue_page_grouping`, mirrors the model
+change and pushes the resulting pin meta via `set_text_pin_meta`. The saver applies a structural job
+after the page's earlier raster + text + effects parts (FIFO), so `persist_current_page` before it is
+enough — no synchronous `flush_page`, no disk re-read. Without a doc (or with the page not resident)
+it falls back to the synchronous `persist::save_page_band_order` / `save_page_grouping`; a saver-less
+doc falls back inside the enqueue.
+
 ## Files and submodules
 - `mod.rs`: `PsEditorTabState` orchestration — the seven dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
@@ -108,7 +120,7 @@ layer-model roadmap (groups, text layers, effects, typing-tab sync).
     stack. Collapsible/movable groups may mix rasters and texts; text overlays are interleaved by Z in
     the same tree (no separate bottom section). Multi-select: plain = replace, Ctrl/Cmd = toggle,
     Shift = range (`select_row`). A right-click menu groups the selection (`GroupOp` → `apply_group_op`
-    → `persist::save_page_grouping`): create / move-to-existing / ungroup / delete. Per-row detail
+    → `persist_grouping` → structural grouping job): create / move-to-existing / ungroup / delete. Per-row detail
     (opacity, fx, merge, delete, pin, rasterize) lives in the **active-layer controls strip** at the
     bottom (`draw_active_controls`, keyed on `panel_primary`). The body has NO scroll area and no
     hand-computed height reserve of its own: the dock already draws every tab body inside a bounded
@@ -123,9 +135,9 @@ layer-model roadmap (groups, text layers, effects, typing-tab sync).
   (image↔screen mapping). Independent of the shared canvas engine.
 - `text_layers.rs`: `PsTextLayer` — display of the typing tab's overlays, projected from the shared
   `LayerDoc` (the source of truth). `sync_view_from_doc` builds/reconciles one text layer per doc Text
-  node (image + geometry + group from the node); `load_page_text_layer_meta` seeds PS-owned pin /
-  pinned_by_group / text-group `layer_idx` from the `layers.json` text nodes (NOT `text_info.json`).
-  PS reads NO `text_info.json` (the doc owns text). Rendering mirrors the typing tab: a deformed
+  node (image + geometry + group from the node); `materialize_text_runtime_from_doc` (in `lib.rs`)
+  creates / refreshes the runtimes with the doc-owned pin / pinned_by_group / text-group `layer_idx`
+  (`PsTextLayer::meta_from_node`). PS reads NO `text_info.json` and no `layers.json` text meta. Rendering mirrors the typing tab: a deformed
   overlay draws its textured `cols`×`rows` mesh (absolute page-pixel control points mapped through the
   viewport), otherwise a plain affine quad. Deformed overlays are skipped by PS affine drag (edit them
   in typing). With the Transform tool the user can drag a text layer (translate); on release the new
@@ -135,14 +147,16 @@ layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
 Cross-tab sync: both tabs hold the shared in-memory `LayerDoc` (`set_layer_doc`, created in `app.rs`),
 the source of truth for per-page layer MODEL state. Raster/text MODEL edits route through it
-(`route_to_doc` / `edit_doc_node`). The band-order / grouping / pin ops persist their band order to
-disk (legitimate persistence) and ALSO mirror the same change onto the doc in-memory — group
+(`route_to_doc` / `edit_doc_node`). The band-order / grouping / pin ops enqueue their structural edit
+(`apply_structural_edit`, see «DISK READS AND STRUCTURAL WRITES») and mirror the same change onto the
+doc in-memory — group
 create/assign/ungroup/delete via `add_group`/`set_group`/`remove_group`, a single-band intra-group
 move via `reorder_node_one`, a group-block move via `reorder_group_block`, and any wider reorder
 (ungrouped block-hop, grouping reorder, pin/unpin) via `set_z_order` over the expanded node order
 (`expand_order_to_node_uids`). Either way the doc's monotonic `version` is bumped (no disk round-trip
 needed for cross-tab sync). Each frame `refresh_view_if_doc_version_changed` re-projects the current page (via
-`sync_view_from_doc`, preceded by `reload_overlays_view` to pick up the disk-truth text-layer runtime)
+`sync_view_from_doc`, preceded by `materialize_text_runtime_from_doc` so a text node created in the
+typing tab has a runtime)
 when the version advanced. The old disk-revision counter / app bridge are gone. Limitation: editing is
 tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited live in both tabs at once.
 - `layers.rs`: `LayerStack`, `Layer`, `LayerKind`, `LayerTransform` (center/rotation/scale + local↔
@@ -379,9 +393,9 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - **Not yet undoable** (deferred): cut/clip (including cut-from-`Клин`), merge-down (need a Batch op
   — a later part), base-layer visibility (view-only state, deliberately not recorded), and z-reorder
   / grouping, and the active row / `panel_primary` (view-only state, like base-layer visibility)
-  (`move_band_one` / `apply_group_op` write the band order to disk synchronously with a
-  "band order written LAST" requirement that the unified persist tail cannot reproduce without a
-  dedicated per-op persistence hook). Rename has no UI, so no `LayerFieldPatch::Name`.
+  (`move_band_one` / `apply_group_op` enqueue a structural band-order job that must land AFTER the
+  raster save, an ordering the unified persist tail cannot reproduce without a dedicated per-op
+  persistence hook). Rename has no UI, so no `LayerFieldPatch::Name`.
 - Hotkeys (`handle_hotkeys`): Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y = redo (respecting the
   existing focus early-return). `handle_hotkeys` takes `&ProjectData` so undo/redo can persist.
 
@@ -670,7 +684,8 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /
   `draw_group_row` / `draw_leaf_row` in `mod.rs`. To change grouping ops, edit `apply_group_op` +
   `persist::save_page_grouping`. To change reorder behavior, edit `build_unified_order` /
-  `move_band_one` / `move_group_block`. To change multi-select, edit `select_row`.
+  `move_band_one` / `move_group_block`. To change how a structural edit is persisted or mirrored
+  (saver job, doc mirror, text pin meta), edit `apply_structural_edit` / `text_pin_meta_after`. To change multi-select, edit `select_row`.
 - To change which row is the active one, or how it is highlighted, edit `normalize_panel_primary` /
   `active_row_sel` / `row_exists` and the pure `row_is_selected` / `group_row_is_selected` /
   `selectable_row_order` helpers in `mod.rs`. To change what the strip offers a base layer, edit the

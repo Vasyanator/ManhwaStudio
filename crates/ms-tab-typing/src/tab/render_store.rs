@@ -12,11 +12,13 @@ the doc's text flush writes the uid-keyed `ps_p{page:04}_{uid}_text.png` via the
 coalescing saver). Writing them here too produced a byte-identical duplicate under a
 name no reader consults. The `_layout.png` (`save_drawn_lines_layout_image_if_needed`)
 is the EXCEPTION and still written: for `CustomRasterLines` the disk is its only store.
-IMAGE-overlay effects and created rasters DO still write their own PNGs here.
+IMAGE-overlay effects still write their own PNGs here. A created RASTER does not:
+its worker only decodes, and the GUI thread adds it to the shared doc and enqueues the
+page save (the saver writes the PNG); only the doc-less fallback persists it here.
 
 Main responsibilities:
-- render newly created text/image overlays and created rasters, persisting the
-  layer nodes (and, for images/rasters, their PNGs);
+- render newly created text/image overlays and decode created rasters (a raster is
+  persisted here only in the doc-less fallback);
 - re-render edited text overlays and image-effect overlays;
 - render a raster's non-destructive effects chain from its base PNG;
 - compute shape-variant grid geometry, paint its checkerboard, render its preview
@@ -170,9 +172,17 @@ pub(super) fn default_render_data_for_image() -> Value {
     json!({ "effects": [] })
 }
 
-/// Worker: loads an external image (clipboard/file) and persists it as a NEW raster layer node in
-/// `layers.json` (via `persist::add_page_raster`), centered at `center_page_px`. Returns the page +
-/// uid so the tab reloads its raster cache from disk and selects it. No text/image overlay is made.
+/// Worker: loads an external image (clipboard/file) for a NEW raster layer centered at
+/// `center_page_px`, minting its uid. No text/image overlay is made.
+///
+/// Doc-first (`request.disk_target == None`, the normal path): performs NO disk write and returns the
+/// decoded layer ([`TypingCreatedRasterBody::Decoded`]); the GUI thread adds it to the shared doc and
+/// enqueues the page save. Doc-less fallback (`Some(target)`): persists the node + PNG itself via
+/// `persist::add_page_raster` and returns [`TypingCreatedRasterBody::Persisted`].
+///
+/// # Errors
+/// A localized message when the image cannot be read, is zero-sized or has an inconsistent RGBA
+/// buffer, or (fallback only) when `add_page_raster` fails.
 pub(super) fn render_and_store_created_raster(
     request: TypingCreateRasterRequest,
 ) -> Result<TypingCreatedRaster, String> {
@@ -202,9 +212,20 @@ pub(super) fn render_and_store_created_raster(
         rotation: 0.0,
         scale: 1.0,
     };
+    let Some(target) = request.disk_target else {
+        return Ok(TypingCreatedRaster {
+            page_idx: request.page_idx,
+            uid,
+            body: TypingCreatedRasterBody::Decoded {
+                name,
+                transform,
+                image,
+            },
+        });
+    };
     ms_models::layer_model::persist::add_page_raster(
-        &request.layers_dir,
-        request.fallback_dir.as_deref(),
+        &target.layers_dir,
+        target.fallback_dir.as_deref(),
         request.page_idx,
         &uid,
         &name,
@@ -216,6 +237,7 @@ pub(super) fn render_and_store_created_raster(
     Ok(TypingCreatedRaster {
         page_idx: request.page_idx,
         uid,
+        body: TypingCreatedRasterBody::Persisted,
     })
 }
 

@@ -76,6 +76,11 @@ that defines the type.
 - `rotation_ctrl_wheel.rs`: the process-global Ctrl+wheel rotation mode of the typing tab
   (`Vector`/`Raster`) and its `DEFAULT_ROTATION_CTRL_WHEEL_MODE`, which the `TextTab` default
   tree reads. The module itself reads no config; the app seeds it at startup.
+- `autosave_policy.rs`: the process-global autosave policy (`AutosavePolicy`: interval since the
+  FIRST pending action + action threshold), with clamping setters and the startup seed. Same shape
+  as `rotation_ctrl_wheel.rs`: it reads no config itself; `lib.rs` owns the `General` keys, bounds,
+  defaults and the pure reader `autosave_policy_from_user_settings`. `ms_models::autosave_gate`
+  reads it on every call, so a settings change applies live with no channel to the writers.
 - `config_saver.rs`: the ONE debouncing, retrying writer thread every self-owned section of
   `user_config.json` is written through (today `ms-widgets`' `PanelLayout` section and the
   binary's `Window` section). It sits in this crate because its write step IS `lib.rs`'s
@@ -162,6 +167,8 @@ binary that installs a UI locale). Those crates enable `test-support` from their
 - A new path root, model directory or config file name: `lib.rs`, next to its neighbours.
 - A new user or project setting's default: the corresponding tree in `lib.rs`. Remember that
   `merge_missing` adds but never removes — a renamed key leaves the old one on disk.
+- Autosave interval/threshold bounds or defaults: the `AUTOSAVE_*` consts in `lib.rs`; the
+  runtime global in `autosave_policy.rs`; the flush decision itself in `ms_models::autosave_gate`.
 - A new editor tab: `app_tab.rs` (`ALL`, `key()`, `title()`), then the `enabled_tabs` default
   in `lib.rs` and the tab's own module in `src/tabs/`.
 - A new bubble status condition or border kind: `bubble_status.rs` for the model, and

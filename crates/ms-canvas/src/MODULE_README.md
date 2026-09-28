@@ -411,8 +411,15 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content.
 - Bubble persistence is routed through `BubblesModel` saver tasks; canvas runtime should keep
   unsaved runtime edits explicit until they are flushed to the model.
-- The periodic overlay autosave has an explicit shutdown flag and is joined before structural page
-  operations or app teardown; no autosave writer may survive a page-index transaction.
+- The overlay autosave pass schedule is the project's `AutosaveGate` when one is passed to
+  `spawn_overlay_autosave_thread(.., Some(gate))` (a pass when the gate epoch moves, checked on each
+  ≤1 s control slice; the model's dirty set is the held state), else a fixed 30 s interval.
+- The overlay autosave is driven by `OverlayAutosaveControl` (`workers.rs`): a pass is
+  admitted and marked `writing` under the control lock, `pause_blocking()` waits out an in-flight pass
+  and blocks new ones until its guard drops, `request_stop_now()` exits without writing (a cancelled
+  pass restores its snapshots), `request_flush_and_stop()` runs one final pass then exits. The owner
+  joins the thread before structural page operations, the discard delete, and teardown; no autosave
+  writer may survive a page-index transaction or a staging delete. Never block on it from the GUI.
 - Bubble undo/redo is delegated to the generic `ms-actions` engine
   (`bubble_runtime.rs::bubble_history: ActionHistory<BubbleSnapshotOp>`; the op lives in
   `bubble_action.rs`). It is a behavior-preserving FULL snapshot op, not a field-level patch:

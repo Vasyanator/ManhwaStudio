@@ -72,9 +72,13 @@ Architecture:
   and the pixel-grid pass — and it never touches layer pixels, the doc or the saved project. Its GL
   objects are built lazily inside the callback and freed from `MangaApp::on_exit`.
 
+- layer persistence: a page is read from disk ONCE (the page loader's decode, inserted into the
+  shared `LayerDoc`); afterwards the doc is the only source, text pin meta included
+  (`materialize_text_runtime_from_doc`). Every `layers.json` write is a doc saver job (sync only
+  without a saver / without a doc); band / grouping / pin edits go through `apply_structural_edit`.
+
 Notes:
-Base layers mirror existing models read-only and are never written back. User raster layers are
-session-scoped in memory (kept per page); on-disk persistence is a future phase.
+Base layers mirror existing models read-only and are never written back.
 */
 
 #![warn(clippy::all)]
@@ -1108,23 +1112,57 @@ impl PsEditorTabState {
         out
     }
 
-    /// Seeds the PS-owned text-node METADATA (pin / group / text-group) from `layers.json` for
-    /// `page_idx`, plus the unified band order. The skeletal text layers are filled with image +
-    /// geometry by the subsequent `sync_view_from_doc` projection from the shared doc. Reads NO
-    /// `text_info.json` — the doc is the source of truth for text (the typing tab no longer writes that
-    /// legacy file). A page whose text still lives only in legacy `text_info.json` yields no metadata
-    /// here; the doc projection then materializes those nodes (with default pins).
-    fn reload_overlays_view(&mut self, project: &ProjectData, page_idx: usize) {
-        self.text_layers = text_layers::load_page_text_layer_meta(
-            &project.paths.unsaved_layers_dir,
-            &project.paths.layers_dir,
-            page_idx,
-        );
-        self.bands = persist::load_page_bands(
-            &project.paths.unsaved_layers_dir,
-            Some(&project.paths.layers_dir),
-            page_idx,
-        );
+    /// Materializes the PS text-layer RUNTIMES (`PsTextLayer`) for `page_idx` from the shared
+    /// `LayerDoc`, reading NO disk: PS reads disk exactly once per page (the page loader's decoded
+    /// payload); every later state — including the PS-owned pin / text-group metadata the doc node
+    /// carries (`text_pinned`, `text_pinned_by_group`, `text_layer_idx`, `group_uid`) — comes from
+    /// the doc.
+    ///
+    /// Every doc Text node gets a runtime: an existing one (matched by uid) keeps its GPU texture and
+    /// has its metadata refreshed from the node; a missing one is created skeletal via
+    /// `PsTextLayer::meta_from_node`. Runtimes whose uid left the doc are dropped. Image, geometry
+    /// and bands are then filled by the subsequent `sync_view_from_doc` projection. When no doc is
+    /// wired or the page is not resident the runtimes are cleared (nothing to project), so a page
+    /// switch never leaks the previous page's text layers.
+    fn materialize_text_runtime_from_doc(&mut self, page_idx: usize) {
+        use ms_models::layer_model::layer_doc::NodeKind;
+        let doc = self.layer_doc.clone();
+        let guard = doc.as_ref().and_then(|doc| doc.lock().ok());
+        let Some(page) = guard.as_ref().and_then(|guard| guard.page(page_idx)) else {
+            self.text_layers.clear();
+            self.bands.clear();
+            return;
+        };
+        let mut prev: HashMap<String, PsTextLayer> = self
+            .text_layers
+            .drain(..)
+            .map(|t| (t.uid.clone(), t))
+            .collect();
+        let mut runtimes: Vec<PsTextLayer> = Vec::new();
+        for node in page.nodes.iter().filter(|n| n.kind == NodeKind::Text) {
+            let layer_idx = node.text_layer_idx.unwrap_or(0);
+            let runtime = match prev.remove(&node.uid) {
+                Some(mut existing) => {
+                    // The doc owns this metadata now (PS mirrors every pin / grouping edit into it
+                    // via `set_text_pin_meta`), so refresh it exactly like the former disk re-read did.
+                    existing.layer_idx = layer_idx;
+                    existing.group_uid = node.group_uid.clone();
+                    existing.pinned = node.text_pinned;
+                    existing.pinned_by_group = node.text_pinned_by_group;
+                    existing
+                }
+                None => PsTextLayer::meta_from_node(
+                    node.uid.clone(),
+                    node.name.clone(),
+                    layer_idx,
+                    node.group_uid.clone(),
+                    node.text_pinned,
+                    node.text_pinned_by_group,
+                ),
+            };
+            runtimes.push(runtime);
+        }
+        self.text_layers = runtimes;
     }
 
     /// Rebuilds this tab's per-page projections (`stack` raster layers + groups, `text_layers`,
@@ -1142,8 +1180,8 @@ impl PsEditorTabState {
     /// - Text layers: each doc Text node is reconciled onto the existing `PsTextLayer` with the same
     ///   uid — MODEL fields (transform/deform/visible/image/group) are updated while pin / text-group
     ///   (`layer_idx`) metadata and the GPU texture are preserved (the texture re-uploads only on a
-    ///   generation change). Text nodes without a local runtime are skipped (the disk-loaded
-    ///   `reload_overlays_view` owns runtime creation; this preserves projected indices).
+    ///   generation change). A text node without a local runtime (normally created beforehand by
+    ///   `materialize_text_runtime_from_doc`) is built here with the node's own doc-owned pin meta.
     /// - Bands: one `Raster`/`PinnedText` band per node, z taken directly from the node.
     ///
     /// Replaces the disk-reload path: callers load the doc page (page-load / bridge) then project here.
@@ -1333,19 +1371,15 @@ impl PsEditorTabState {
             let gen_changed =
                 self.node_generations.get(&cache_key).copied() != Some(node.generation);
             // Reconcile onto the prior runtime when one exists (preserving pin / text-group / texture);
-            // otherwise BUILD a fresh PsTextLayer from the doc node. The doc is now the source of truth
-            // for text (typing no longer writes `text_info.json`), so PS must materialize a text node it
-            // has not seen before — e.g. an overlay just created in the typing tab. Pin / pinned_by_group
-            // and the text-group (`layer_idx`) come from the prior runtime when present, else from the
-            // node (`text_layer_idx`) with pins defaulting false (the bands carry the live Z).
+            // otherwise BUILD a fresh PsTextLayer from the doc node. The doc is the source of truth for
+            // text AND for its PS pin meta (`text_pinned` / `text_pinned_by_group`, mirrored by every PS
+            // band / grouping / pin edit), so a runtime-less node takes its meta from the node. The
+            // prior runtime already carries the same values (`materialize_text_runtime_from_doc`
+            // refreshes them from the node, and PS pin edits update both sides together).
             let prev = prev_text.remove(&node.uid);
-            // Text is fully-manual pinned-with-explicit-Z now: a freshly-projected text node defaults to
-            // PINNED so it gets its own unified band (its Z comes from the page's `PinnedText` band; a
-            // not-yet-resaved legacy chapter still falls back to its group band Z until the first save
-            // flattens it). Was `false`, which would have made every text look unpinned (a `TextGroup`).
             let (layer_idx, pinned, pinned_by_group) = match &prev {
                 Some(p) => (p.layer_idx, p.pinned, p.pinned_by_group),
-                None => (node.text_layer_idx.unwrap_or(0), true, false),
+                None => (node.text_layer_idx.unwrap_or(0), node.text_pinned, node.text_pinned_by_group),
             };
             // Preserve the GPU texture unless the node's pixels changed (only possible with a prior).
             let texture = match prev {
@@ -2121,7 +2155,7 @@ impl PsEditorTabState {
     /// (its `version` advanced) since this tab last projected. Any edit in the typing tab (or our own
     /// that routed through the doc) bumps the doc version; this is the in-memory cross-tab path
     /// (replacing the old disk-revision bridge).
-    fn refresh_view_if_doc_version_changed(&mut self, project: &ProjectData) {
+    fn refresh_view_if_doc_version_changed(&mut self) {
         let Some(doc) = self.layer_doc.clone() else {
             return;
         };
@@ -2147,11 +2181,11 @@ impl PsEditorTabState {
             current,
             page_idx
         );
-        // Reload the disk-truth text-layer RUNTIME (so a text layer the typing tab just created has a
-        // local `PsTextLayer` for the projection to reconcile onto), then project the shared doc over
-        // the stack rasters / text model / bands. `sync_view_from_doc` updates `last_doc_version` and
-        // preserves uncommitted in-memory edits (pixels_dirty layers).
-        self.reload_overlays_view(project, page_idx);
+        // Materialize the text-layer RUNTIMES from the doc (so a text layer the typing tab just created
+        // has a local `PsTextLayer` for the projection to reconcile onto — no disk read), then project
+        // the shared doc over the stack rasters / text model / bands. `sync_view_from_doc` updates
+        // `last_doc_version` and preserves uncommitted in-memory edits (pixels_dirty layers).
+        self.materialize_text_runtime_from_doc(page_idx);
         self.sync_view_from_doc(page_idx);
     }
 
@@ -2368,7 +2402,10 @@ impl PsEditorTabState {
                 group_uid: layer
                     .group
                     .and_then(|gid| stack.group(gid).map(|g| g.uid.to_string())),
-                base_image: layer.image.clone(),
+                // Always carried: PS clears its dirty flags at enqueue, so a failed write could not be
+                // retried from them (bound: one active page per PS persist).
+                base_image: Some(layer.image.clone()),
+                image_size: layer.image.size,
                 pixels_dirty: layer.pixels_dirty,
                 mask_clip: None,
                 display_image: None,
@@ -2418,7 +2455,21 @@ impl PsEditorTabState {
                 text: None,
                 text_epoch: None,
                 effects: Vec::new(),
+                structural: Vec::new(),
+                structural_epoch: None,
             });
+            // This raw-handle enqueue bypasses the doc's funnels, so it reports its own autosave
+            // action — AFTER the send, like the funnels (the saver polls the gate before draining).
+            if let Some(doc) = &self.layer_doc {
+                match doc.lock() {
+                    Ok(guard) => guard.note_autosave_action(),
+                    // The job is queued regardless; an unreported action only delays the autosave
+                    // to the gate's interval / next action (barriers still force it out).
+                    Err(_) => ms_log::runtime_log::log_error(format!(
+                        "[ps_editor] page {page_idx}: shared layer doc lock poisoned; autosave action not reported"
+                    )),
+                }
+            }
             Ok(())
         } else {
             // No saver: synchronous fallback. Same transaction shape as the saver job, including the
@@ -2505,7 +2556,7 @@ impl PsEditorTabState {
     }
 
     /// Drains finished load jobs, building a fresh stack for the matching page.
-    fn poll_loader(&mut self, project: &ProjectData) {
+    fn poll_loader(&mut self) {
         let Some(loader) = &self.loader else {
             return;
         };
@@ -2564,10 +2615,10 @@ impl PsEditorTabState {
                         result.page_idx
                     ));
                 }
-                // Load the disk-truth text-layer metadata + bands (pin / text-group axis the doc node
-                // does not carry), then project the doc over the stack rasters / text / bands so both
-                // tabs read one model.
-                self.reload_overlays_view(project, result.page_idx);
+                // Materialize the text-layer runtimes (pin / text-group metadata included) from the doc
+                // page just inserted — the page loader's payload is PS's only disk read for this page —
+                // then project the doc over the stack rasters / text / bands so both tabs read one model.
+                self.materialize_text_runtime_from_doc(result.page_idx);
                 self.active_page_idx = Some(result.page_idx);
                 self.selection = None;
                 // Panel selection keys on session ids that the new page's stack reuses; reset it.
@@ -2692,7 +2743,7 @@ impl PsEditorTabState {
         // (page load, doc-version change, tool activity) so an idle frame stays quiet.
         let _frame = ms_log::trace_scope!(cat::FRAME, "ps_draw page={:?}", self.active_page_idx);
         self.ensure_loader();
-        self.poll_loader(project);
+        self.poll_loader();
         // Consume every TOOL-owned worker channel, next to the loader poll and for the same reason:
         // a tool that computes anything expensive must never block `interact` (`AGENTS.md` §5), so
         // its results arrive on a channel and are drained here. The pixel writes such a result asks
@@ -2704,7 +2755,7 @@ impl PsEditorTabState {
         if self.poll_ps_raster_effects_jobs(project) {
             ctx.request_repaint();
         }
-        self.refresh_view_if_doc_version_changed(project);
+        self.refresh_view_if_doc_version_changed();
         // A synced camera waits here until its page finishes loading (the load refits otherwise).
         self.apply_pending_camera();
 
@@ -3653,7 +3704,7 @@ impl PsEditorTabState {
                     }
                     // Every text is pinned-with-explicit-Z now (fully-manual unified Z), so the ⬆/⬇
                     // band-move is ALWAYS available — same path as rasters (`move_band` → `move_band_one`
-                    // → `save_page_band_order` + `doc.set_z_order`), so the typing tab reflects it live.
+                    // → structural band-order job + `doc.set_z_order`), so the typing tab reflects it live.
                     if ui.add(egui::Button::new("▲").small()).clicked() {
                         actions.move_band = Some((RowSel::Text(uid.clone()), true));
                     }
@@ -4202,10 +4253,10 @@ impl PsEditorTabState {
     /// Moves a single raster or pinned-text band one step in Z. A grouped band reorders only within
     /// its group's run; an ungrouped band hops over the whole neighbouring block (group or band).
     ///
-    // Z-reorder undo is a LATER part, not B1: this path writes the band order to disk synchronously
-    // (`save_page_band_order`, which must run LAST so it wins over the raster save) in addition to the
-    // doc — a dual-persistence ordering the unified undo/redo persist tail cannot reproduce without a
-    // dedicated per-op persistence hook. So no `PsEditOp` is recorded here yet.
+    // Z-reorder undo is a LATER part, not B1: this path enqueues a structural band-order saver job
+    // (which must land AFTER the raster save so it wins) in addition to the doc mirror — a persistence
+    // ordering the unified undo/redo persist tail cannot reproduce without a dedicated per-op
+    // persistence hook. So no `PsEditOp` is recorded here yet.
     fn move_band_one(&mut self, sel: RowSel, up: bool, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
@@ -4227,24 +4278,9 @@ impl PsEditorTabState {
             // a group moves as a block through `move_group_block`, not here.
             RowSel::Base(_) | RowSel::Group(_) => return,
         };
-        // Ensure the page's rasters are on disk BEFORE the synchronous band-order write below:
-        // `persist_current_page` now ENQUEUES (async) so it cannot guarantee the raster nodes are
-        // written in time, and `apply_band_order` SILENTLY SKIPS a `BandRef::Raster` missing from the
-        // manifest (dropping its new Z → the reorder is lost on reload). A synchronous `flush_page`
-        // writes them now; `persist_current_page` still runs for the deletion (`removed_uids`)
-        // bookkeeping, and its later job preserves the band Z set here (z is read back from disk).
-        if let Some(doc) = self.layer_doc.clone()
-            && let Ok(mut guard) = doc.lock()
-            && let Err(err) = guard.flush_page(
-                page_idx,
-                &project.paths.unsaved_layers_dir,
-                Some(&project.paths.layers_dir),
-            )
-        {
-            ms_log::runtime_log::log_warn(format!(
-                "[ps_editor] sync flush before band reorder (page {page_idx}): {err}"
-            ));
-        }
+        // Persist the stack's rasters (incl. the deletion `removed_uids`) BEFORE the band order: both
+        // are saver jobs applied FIFO, and a pass applies rasters → text → effects → structural, so a
+        // freshly-added raster already has its manifest node when the order lands (no sync flush).
         self.persist_current_page(project);
         let (group_of, pinned) = self.current_membership();
         let order = self.build_unified_order(&group_of, &pinned);
@@ -4290,33 +4326,31 @@ impl PsEditorTabState {
             bands.insert(insert_at.min(bands.len()), item);
         }
         let order_refs: Vec<persist::BandRef> = bands.into_iter().map(|(b, _)| b).collect();
-        match persist::save_page_band_order(
-            &project.paths.unsaved_layers_dir,
+        // Apply the SAME reorder in-memory so the doc (and, via its version bump, the typing tab)
+        // re-project without a disk round-trip. A grouped intra-run move is one adjacent node swap; an
+        // ungrouped block-hop reassigns the whole order.
+        let node_order = self.expand_order_to_node_uids(&order_refs);
+        let result = self.apply_structural_edit(
             page_idx,
-            &order_refs,
-        ) {
-            Ok(()) => {
-                self.reload_overlays_view(project, page_idx);
-                // Apply the SAME reorder in-memory so the doc (and, via its version bump, the typing
-                // tab) re-project without a disk round-trip. A grouped intra-run move is one adjacent
-                // node swap; an ungrouped block-hop reassigns the whole order.
-                let node_order = self.expand_order_to_node_uids(&order_refs);
-                self.edit_doc_node(page_idx, |doc| {
-                    if grouped_swap && let Some(uid) = &target_uid {
-                        doc.reorder_node_one(page_idx, uid, up);
-                    } else {
-                        doc.set_z_order(page_idx, &node_order);
-                    }
-                });
-            }
-            Err(err) => ms_log::runtime_log::log_warn(format!("[ps_editor] move band: {err}")),
+            project,
+            saver::StructuralEdit::BandOrder(order_refs),
+            |doc| {
+                if grouped_swap && let Some(uid) = &target_uid {
+                    doc.reorder_node_one(page_idx, uid, up);
+                } else {
+                    doc.set_z_order(page_idx, &node_order);
+                }
+            },
+        );
+        if let Err(err) = result {
+            ms_log::runtime_log::log_warn(format!("[ps_editor] move band: {err}"));
         }
     }
 
     /// Resolves a `GroupOp` into a `persist::GroupingEdit`, mirrors the raster-side changes into the
-    /// in-memory stack, persists, and reloads the overlays/bands view.
+    /// in-memory stack, and persists it through `persist_grouping` (structural saver job + doc mirror).
     ///
-    // Group ops are OUT of scope for undo Part B1 (they share the same disk-band-order dual write as
+    // Group ops are OUT of scope for undo Part B1 (they share the same structural band-order job as
     // `move_band_one`); no `PsEditOp` is recorded here. Deferred to a later part.
     fn apply_group_op(&mut self, op: GroupOp, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
@@ -4509,24 +4543,9 @@ impl PsEditorTabState {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
-        // Ensure the page's rasters are on disk BEFORE the synchronous band-order write below:
-        // `persist_current_page` now ENQUEUES (async) so it cannot guarantee the raster nodes are
-        // written in time, and `apply_band_order` SILENTLY SKIPS a `BandRef::Raster` missing from the
-        // manifest (dropping its new Z → the reorder is lost on reload). A synchronous `flush_page`
-        // writes them now; `persist_current_page` still runs for the deletion (`removed_uids`)
-        // bookkeeping, and its later job preserves the band Z set here (z is read back from disk).
-        if let Some(doc) = self.layer_doc.clone()
-            && let Ok(mut guard) = doc.lock()
-            && let Err(err) = guard.flush_page(
-                page_idx,
-                &project.paths.unsaved_layers_dir,
-                Some(&project.paths.layers_dir),
-            )
-        {
-            ms_log::runtime_log::log_warn(format!(
-                "[ps_editor] sync flush before band reorder (page {page_idx}): {err}"
-            ));
-        }
+        // Persist the stack's rasters (incl. the deletion `removed_uids`) BEFORE the band order: both
+        // are saver jobs applied FIFO, and a pass applies rasters → text → effects → structural, so a
+        // freshly-added raster already has its manifest node when the order lands (no sync flush).
         self.persist_current_page(project);
         let (group_of, pinned) = self.current_membership();
         let bands = self.build_unified_order(&group_of, &pinned);
@@ -4549,27 +4568,27 @@ impl PsEditorTabState {
         order_blocks.swap(bi, target);
         let order_refs: Vec<persist::BandRef> =
             order_blocks.into_iter().flatten().map(|(b, _)| b).collect();
-        match persist::save_page_band_order(
-            &project.paths.unsaved_layers_dir,
+        // Apply the same group-block move in-memory so the doc (and, via its version bump, the typing
+        // tab) re-project without a disk round-trip.
+        let result = self.apply_structural_edit(
             page_idx,
-            &order_refs,
-        ) {
-            Ok(()) => {
-                self.reload_overlays_view(project, page_idx);
-                // Apply the same group-block move in-memory so the doc (and, via its version bump, the
-                // typing tab) re-project without a disk round-trip.
-                self.edit_doc_node(page_idx, |doc| {
-                    doc.reorder_group_block(page_idx, &uid, up);
-                });
-            }
-            Err(err) => ms_log::runtime_log::log_warn(format!("[ps_editor] move group: {err}")),
+            project,
+            saver::StructuralEdit::BandOrder(order_refs),
+            |doc| {
+                // `false` (the doc found no block to move) is tolerated exactly as before: the view
+                // re-projects from the doc either way.
+                doc.reorder_group_block(page_idx, &uid, up);
+            },
+        );
+        if let Err(err) = result {
+            ms_log::runtime_log::log_warn(format!("[ps_editor] move group: {err}"));
         }
     }
 
-    /// Writes a grouping edit to the unsaved layers dir, then reloads the overlays/bands view and
-    /// mirrors the SAME edit onto the shared doc in-memory (so it and the typing tab re-project
-    /// without a disk round-trip). Flushes the page's rasters first so freshly-added raster layers
-    /// already have manifest nodes for the edit's membership / order to land on.
+    /// Persists a grouping edit and mirrors the SAME edit onto the shared doc in-memory (so it and the
+    /// typing tab re-project without a disk round-trip). The stack's rasters are persisted first so
+    /// freshly-added raster layers already have manifest nodes for the edit's membership / order to
+    /// land on (FIFO saver jobs; see `apply_structural_edit`).
     fn persist_grouping(
         &mut self,
         edit: persist::GroupingEdit,
@@ -4577,34 +4596,163 @@ impl PsEditorTabState {
         project: &ProjectData,
     ) {
         self.persist_current_page(project);
-        // Snapshot the in-memory doc effect of `edit` BEFORE it is moved into the disk write. The band
-        // order expansion uses the current text-layer page-Y order (unchanged by membership), matching
-        // what `save_page_grouping`'s `apply_band_order` records on disk.
+        // Snapshot the in-memory doc effect of `edit` BEFORE it is moved into the structural job. The
+        // band order expansion uses the current text-layer page-Y order (unchanged by membership),
+        // matching what `save_page_grouping`'s `apply_band_order` records on disk.
         let node_order = self.expand_order_to_node_uids(&edit.order);
         let new_groups = edit.new_groups.clone();
         let remove_groups = edit.remove_groups.clone();
         let set_membership = edit.set_membership.clone();
-        match persist::save_page_grouping(&project.paths.unsaved_layers_dir, page_idx, &edit) {
-            Ok(()) => {
-                self.reload_overlays_view(project, page_idx);
-                // Apply removes → creates → membership → order, mirroring `save_page_grouping`.
-                self.edit_doc_node(page_idx, |doc| {
-                    for g in &remove_groups {
-                        doc.remove_group(page_idx, g);
-                    }
-                    for g in new_groups {
-                        doc.add_group(page_idx, g);
-                    }
-                    for (node_uid, group_uid) in &set_membership {
-                        doc.set_group(page_idx, node_uid, group_uid.clone());
-                    }
-                    if !node_order.is_empty() {
-                        doc.set_z_order(page_idx, &node_order);
-                    }
-                });
-            }
-            Err(err) => ms_log::runtime_log::log_warn(format!("[ps_editor] grouping: {err}")),
+        // Apply removes → creates → membership → order, mirroring `save_page_grouping`.
+        let result = self.apply_structural_edit(
+            page_idx,
+            project,
+            saver::StructuralEdit::Grouping(edit),
+            |doc| {
+                for g in &remove_groups {
+                    doc.remove_group(page_idx, g);
+                }
+                for g in new_groups {
+                    doc.add_group(page_idx, g);
+                }
+                for (node_uid, group_uid) in &set_membership {
+                    doc.set_group(page_idx, node_uid, group_uid.clone());
+                }
+                if !node_order.is_empty() {
+                    doc.set_z_order(page_idx, &node_order);
+                }
+            },
+        );
+        if let Err(err) = result {
+            ms_log::runtime_log::log_warn(format!("[ps_editor] grouping: {err}"));
         }
+    }
+
+    /// Text pin meta `(uid, pinned, pinned_by_group)` of every local text runtime AFTER `edit` is
+    /// applied, mirroring the manifest rules exactly: a band order re-derives every text's `pinned`
+    /// from whether a `PinnedText` band names it (`persist::apply_band_order`; a grouping edit only
+    /// when its `order` is non-empty), then a grouping edit sets `pinned_by_group` for
+    /// `pin_for_group` and clears it for `unpin_for_group` (clear wins, as it is applied second).
+    fn text_pin_meta_after(&self, edit: &saver::StructuralEdit) -> Vec<(String, bool, bool)> {
+        let empty: &[String] = &[];
+        let (order, pin_for_group, unpin_for_group): (Option<&[persist::BandRef]>, &[String], &[String]) =
+            match edit {
+                saver::StructuralEdit::BandOrder(order) => (Some(order.as_slice()), empty, empty),
+                saver::StructuralEdit::Grouping(g) => (
+                    (!g.order.is_empty()).then_some(g.order.as_slice()),
+                    g.pin_for_group.as_slice(),
+                    g.unpin_for_group.as_slice(),
+                ),
+            };
+        self.text_layers
+            .iter()
+            .map(|t| {
+                let pinned = order.map_or(t.pinned, |order| {
+                    order
+                        .iter()
+                        .any(|b| matches!(b, persist::BandRef::PinnedText(u) if *u == t.uid))
+                });
+                let mut pinned_by_group = t.pinned_by_group;
+                if pin_for_group.contains(&t.uid) {
+                    pinned_by_group = true;
+                }
+                if unpin_for_group.contains(&t.uid) {
+                    pinned_by_group = false;
+                }
+                (t.uid.clone(), pinned, pinned_by_group)
+            })
+            .collect()
+    }
+
+    /// The single funnel for PS STRUCTURAL page edits (band order / grouping; band moves, group-block
+    /// moves, grouping ops and the pin toggle). Inside ONE `edit_doc_node` doc edit it enqueues the
+    /// structural saver job (`enqueue_page_band_order` / `enqueue_page_grouping` — applied after the
+    /// page's earlier raster / text / effects parts; a saver-less doc writes synchronously there) and,
+    /// only when that succeeded, runs `mirror` (the in-memory model change) and pushes the resulting
+    /// text pin meta into the doc (`set_text_pin_meta`), so the doc — the owner of that meta — stays
+    /// equal to what the job writes. The local text runtimes get the same pin meta afterwards. There
+    /// is NO disk read and, with a saver, no synchronous write.
+    ///
+    /// Without a doc (or with the page not resident) it falls back to the synchronous
+    /// `persist::save_page_band_order` / `save_page_grouping` and updates only the local runtimes.
+    ///
+    /// # Errors
+    /// Only a synchronous write (saver-less doc or no doc) can fail; the message is returned for the
+    /// caller to log, and neither the doc nor the local pin meta changes.
+    fn apply_structural_edit<F>(
+        &mut self,
+        page_idx: usize,
+        project: &ProjectData,
+        edit: saver::StructuralEdit,
+        mirror: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&mut ms_models::layer_model::layer_doc::LayerDoc),
+    {
+        let pin_meta = self.text_pin_meta_after(&edit);
+        let layers_dir = project.paths.unsaved_layers_dir.clone();
+        let committed_dir = project.paths.layers_dir.clone();
+        // `Some` until the doc closure consumes it: a closure that never ran (no doc / page not
+        // resident) leaves it here for the synchronous fallback.
+        let mut pending = Some(edit);
+        let mut result: Result<(), String> = Ok(());
+        self.edit_doc_node(page_idx, |doc| {
+            let Some(edit) = pending.take() else {
+                return;
+            };
+            result = match edit {
+                saver::StructuralEdit::BandOrder(order) => {
+                    doc.enqueue_page_band_order(page_idx, &layers_dir, Some(&committed_dir), order)
+                }
+                saver::StructuralEdit::Grouping(grouping) => {
+                    doc.enqueue_page_grouping(page_idx, &layers_dir, Some(&committed_dir), grouping)
+                }
+            };
+            if result.is_ok() {
+                mirror(doc);
+                for (uid, pinned, pinned_by_group) in &pin_meta {
+                    if !doc.set_text_pin_meta(page_idx, uid, *pinned, *pinned_by_group) {
+                        // A local runtime without a doc text node: the runtimes are materialized
+                        // from this very page, so this only means the node left the doc concurrently.
+                        ms_log::trace_log!(
+                            cat::SYNC,
+                            "structural edit: no doc text node for pin meta page={} uid={}",
+                            page_idx,
+                            uid
+                        );
+                    }
+                }
+            }
+        });
+        if let Some(edit) = pending.take() {
+            // Doc-less or non-resident page (PS decode failure): the edit is written synchronously and
+            // bypasses the saver FIFO — logged so a stale-ordering report can be traced to this path.
+            ms_log::trace_log!(
+                cat::SYNC,
+                "structural edit: sync fallback write (no resident doc page) page={}",
+                page_idx
+            );
+            result = match edit {
+                saver::StructuralEdit::BandOrder(order) => {
+                    persist::save_page_band_order(&layers_dir, page_idx, &order)
+                }
+                saver::StructuralEdit::Grouping(grouping) => {
+                    persist::save_page_grouping(&layers_dir, page_idx, &grouping)
+                }
+            };
+        }
+        result?;
+        let by_uid: HashMap<String, (bool, bool)> = pin_meta
+            .into_iter()
+            .map(|(uid, pinned, pinned_by_group)| (uid, (pinned, pinned_by_group)))
+            .collect();
+        for text in &mut self.text_layers {
+            if let Some(&(pinned, pinned_by_group)) = by_uid.get(&text.uid) {
+                text.pinned = pinned;
+                text.pinned_by_group = pinned_by_group;
+            }
+        }
+        Ok(())
     }
 
     /// Floating editor for a raster layer's effects chain (non-destructive: applying renders the
@@ -4963,26 +5111,19 @@ impl PsEditorTabState {
                         .map_or(order.len(), |p| p + 1);
                     order.insert(after, persist::BandRef::PinnedText(uid));
                 }
-                match persist::save_page_band_order(
-                    &project.paths.unsaved_layers_dir,
+                // In the unified doc, pinning is a Z-order change plus the node's doc-owned pin meta
+                // (`text_pinned`, pushed by `apply_structural_edit`). The z effect is exactly the new
+                // band order — applied in-memory so the doc (and, via its version bump, the typing
+                // tab) re-project without a disk round-trip.
+                let node_order = self.expand_order_to_node_uids(&order);
+                let result = self.apply_structural_edit(
                     page_idx,
-                    &order,
-                ) {
-                    Ok(()) => {
-                        self.reload_overlays_view(project, page_idx);
-                        // In the unified doc, pinning is purely a Z-order change: text nodes carry an
-                        // explicit per-node `z` and no pin axis (the `pinned` flag is a disk-only
-                        // concept for re-deriving Z on load). So the doc effect is exactly the new band
-                        // order — applied in-memory so it (and, via its version bump, the typing tab)
-                        // re-project without a disk round-trip.
-                        let node_order = self.expand_order_to_node_uids(&order);
-                        self.edit_doc_node(page_idx, |doc| {
-                            doc.set_z_order(page_idx, &node_order);
-                        });
-                    }
-                    Err(err) => {
-                        ms_log::runtime_log::log_warn(format!("[ps_editor] pin text: {err}"))
-                    }
+                    project,
+                    saver::StructuralEdit::BandOrder(order),
+                    |doc| doc.set_z_order(page_idx, &node_order),
+                );
+                if let Err(err) = result {
+                    ms_log::runtime_log::log_warn(format!("[ps_editor] pin text: {err}"));
                 }
             }
             TextLayerOp::Rasterize => {
@@ -7389,6 +7530,8 @@ fn layer_to_raster_node(layer: &Layer) -> ms_models::layer_model::layer_doc::Lay
         opacity: layer.opacity,
         group_uid: None,
         text_layer_idx: None,
+        text_pinned: false,
+        text_pinned_by_group: false,
         transform: transform_to_rec(layer.transform),
         deform: None,
         generation: 0,
@@ -9842,5 +9985,252 @@ mod tests {
                 "tool {idx} unexpectedly asks for a dock panel"
             );
         }
+    }
+
+
+    // ---------------------------------------------------------------------------------------
+    // Structural edits (band order / pin) through the shared doc: doc-owned text pin meta.
+    // ---------------------------------------------------------------------------------------
+
+    use ms_models::layer_model::layer_doc::{
+        DecodedPagePayload, LayerDoc, LayerNode, NodeBody, NodeKind,
+    };
+
+    // Node uids must be real UUIDs: the stack projection parses them (`sync_view_from_doc`).
+    const R1: &str = "00000000-0000-4000-8000-000000000001";
+    const R2: &str = "00000000-0000-4000-8000-000000000002";
+    const T: &str = "00000000-0000-4000-8000-0000000000aa";
+
+    /// A unique, fresh scratch directory under the system temp dir (the crate has no `tempfile`
+    /// dev-dependency). Removed by [`ScratchDir`]'s drop.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ms_ps_editor_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // Best-effort cleanup of a test scratch dir; a leftover temp dir fails nothing.
+            if let Err(err) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("scratch cleanup {}: {err}", self.0.display());
+            }
+        }
+    }
+
+    /// `empty_project` with real staging (`unsaved_layers_dir`) and committed (`layers_dir`) dirs.
+    fn project_in(dir: &ScratchDir) -> ProjectData {
+        let mut project = empty_project();
+        project.paths.unsaved_layers_dir = dir.0.join("unsaved_layers");
+        project.paths.layers_dir = dir.0.join("layers");
+        project
+    }
+
+    /// A 2x2 doc node of `kind` at unified `z`; a text node carries the given doc-owned pin meta.
+    fn doc_node(uid: &str, kind: NodeKind, z: u32, pinned: bool) -> LayerNode {
+        let image = filled([2, 2], Color32::RED);
+        let body = match kind {
+            NodeKind::Raster => NodeBody::Raster {
+                base_image: image.clone(),
+                display_image: image,
+                effects: Vec::new(),
+                base_file: format!("{uid}.png"),
+                mask_clip: None,
+            },
+            NodeKind::Text => NodeBody::Text {
+                render_data: serde_json::json!({"text_params": {"text": uid}}),
+                image,
+                is_image: false,
+                payload_uid: uid.to_string(),
+                mask_clip: None,
+                extra_centers: Default::default(),
+                centering_frame: None,
+            },
+        };
+        LayerNode {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind,
+            z,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            text_layer_idx: (kind == NodeKind::Text).then_some(0),
+            text_pinned: kind == NodeKind::Text && pinned,
+            text_pinned_by_group: false,
+            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            generation: 0,
+            pixels_dirty: kind == NodeKind::Raster,
+            body,
+        }
+    }
+
+    /// A PS tab on page 0 wired to a doc holding raster `R1` (z0), raster `R2` (z1) and pinned text
+    /// `T` (z2), projected exactly like a page load (`materialize_text_runtime_from_doc` then
+    /// `sync_view_from_doc`). The page is flushed synchronously to staging first, so the manifest the
+    /// structural edits address exists. `with_saver` enables the background saver AFTER that flush.
+    fn ps_on_doc_page(project: &ProjectData, with_saver: bool) -> (PsEditorTabState, Arc<Mutex<LayerDoc>>) {
+        let mut doc = LayerDoc::new();
+        doc.insert_decoded_page(
+            0,
+            DecodedPagePayload {
+                nodes: vec![
+                    doc_node(R1, NodeKind::Raster, 0, false),
+                    doc_node(R2, NodeKind::Raster, 1, false),
+                    doc_node(T, NodeKind::Text, 2, true),
+                ],
+                groups: Vec::new(),
+            },
+        );
+        doc.flush_page(0, &project.paths.unsaved_layers_dir, None).expect("seed staging manifest");
+        if with_saver {
+            doc.enable_background_saver(None);
+        }
+        let doc = Arc::new(Mutex::new(doc));
+        let (stack, _clean) = base_stack_with_clean();
+        let mut ps = PsEditorTabState {
+            stack: Some(stack),
+            active_page_idx: Some(0),
+            ..Default::default()
+        };
+        ps.set_layer_doc(Arc::clone(&doc));
+        ps.materialize_text_runtime_from_doc(0);
+        ps.sync_view_from_doc(0);
+        (ps, doc)
+    }
+
+    /// Doc node `uid` of page 0.
+    fn find_node<'a>(doc: &'a LayerDoc, uid: &str) -> Option<&'a LayerNode> {
+        doc.page(0).and_then(|page| page.nodes.iter().find(|n| n.uid == uid))
+    }
+
+    /// The staging manifest's pinned flag of text `uid` on page 0.
+    fn disk_text_pinned(project: &ProjectData, uid: &str) -> Option<bool> {
+        persist::load_page_text_nodes(&project.paths.unsaved_layers_dir, None, 0)
+            .expect("read staging text nodes")
+            .into_iter()
+            .find(|n| n.uid == uid)
+            .map(|n| n.pinned)
+    }
+
+    /// The staging manifest's unified band order of page 0, as node uids (bottom-to-top).
+    fn disk_band_uids(project: &ProjectData) -> Vec<String> {
+        persist::load_page_bands(&project.paths.unsaved_layers_dir, None, 0)
+            .iter()
+            .filter_map(|b| match b {
+                Band::Raster { uid, .. } | Band::PinnedText { uid, .. } => Some(uid.clone()),
+                Band::TextGroup { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Text runtimes are materialized from the doc's pin meta with NO disk read, and a runtime whose
+    /// uid left the doc is dropped; with no doc the runtimes clear instead of leaking a prior page.
+    #[test]
+    fn text_runtimes_are_materialized_from_the_doc_pin_meta() {
+        let dir = ScratchDir::new("materialize");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, false);
+        assert_eq!(ps.text_layers.len(), 1);
+        assert!(ps.text_layers[0].pinned, "pin meta comes from the doc node");
+
+        // A doc-side pin edit (another path) is picked up by the next materialization.
+        assert!(doc.lock().expect("doc lock").set_text_pin_meta(0, T, false, true));
+        ps.materialize_text_runtime_from_doc(0);
+        assert!(!ps.text_layers[0].pinned);
+        assert!(ps.text_layers[0].pinned_by_group);
+
+        // The node leaves the doc: its runtime is dropped.
+        assert!(doc.lock().expect("doc lock").remove_node(0, T));
+        ps.materialize_text_runtime_from_doc(0);
+        assert!(ps.text_layers.is_empty());
+
+        // No doc page at all (not resident): nothing to materialize.
+        ps.text_layers.push(PsTextLayer::meta_from_node("stale".into(), "stale".into(), 0, None, true, false));
+        ps.materialize_text_runtime_from_doc(7);
+        assert!(ps.text_layers.is_empty(), "a non-resident page leaves no stale runtimes");
+    }
+
+    /// Saver-less doc: a band move and a pin toggle take the synchronous fallback — the manifest is
+    /// written immediately, the doc z / pin meta and the local runtime agree with it.
+    #[test]
+    fn a_band_move_and_pin_toggle_without_a_saver_write_synchronously() {
+        let dir = ScratchDir::new("sync_band");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, false);
+
+        // Text `T` (top) one step down: it hops below `R2`.
+        ps.move_band_one(RowSel::Text(T.into()), false, &project);
+        assert_eq!(disk_band_uids(&project), [R1, T, R2]);
+        {
+            let guard = doc.lock().expect("doc lock");
+            let z = |uid: &str| find_node(&guard, uid).map(|n| n.z);
+            assert!(z(R1) < z(T) && z(T) < z(R2), "doc mirrors the move");
+            assert!(find_node(&guard, T).is_some_and(|n| n.text_pinned));
+        }
+        assert!(ps.text_layers[0].pinned);
+
+        // Unpin: the order drops its `PinnedText` band → unpinned on disk, in the doc and locally.
+        ps.apply_text_layer_op(0, TextLayerOp::TogglePin, &project);
+        assert_eq!(disk_text_pinned(&project, T), Some(false));
+        assert!(find_node(&doc.lock().expect("doc lock"), T).is_some_and(|n| !n.text_pinned));
+        assert!(!ps.text_layers[0].pinned);
+    }
+
+    /// With a saver: the pin toggle enqueues ONE structural job and updates the doc + local pin meta
+    /// at once; the manifest changes only when the saver runs (observed after a barrier).
+    #[test]
+    fn a_pin_toggle_with_a_saver_enqueues_a_structural_job() {
+        let dir = ScratchDir::new("saver_pin");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, true);
+        assert!(!doc.lock().expect("doc lock").has_pending_saves());
+
+        ps.apply_text_layer_op(0, TextLayerOp::TogglePin, &project);
+        // In memory: immediately consistent, and the page now has a pending (structural) save.
+        assert!(!ps.text_layers[0].pinned);
+        {
+            let guard = doc.lock().expect("doc lock");
+            assert!(find_node(&guard, T).is_some_and(|n| !n.text_pinned));
+            assert!(guard.page_has_pending_save(0), "the structural job holds a pending epoch");
+        }
+
+        let handle = doc.lock().expect("doc lock").saver_handle().expect("saver enabled");
+        assert!(handle.barrier_blocking().is_empty(), "no failed page");
+        assert_eq!(disk_text_pinned(&project, T), Some(false), "the job landed");
+        doc.lock().expect("doc lock").poll_save_acks();
+        assert!(!doc.lock().expect("doc lock").has_pending_saves(), "the ack retired the epoch");
+    }
+
+    /// With a saver: a band move persists the rasters and the order as saver jobs applied in FIFO
+    /// order (no synchronous `flush_page`), and the doc + local state update immediately.
+    #[test]
+    fn a_band_move_with_a_saver_lands_after_the_barrier() {
+        let dir = ScratchDir::new("saver_band");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, true);
+
+        ps.move_band_one(RowSel::Text(T.into()), false, &project);
+        {
+            let guard = doc.lock().expect("doc lock");
+            let z = |uid: &str| find_node(&guard, uid).map(|n| n.z);
+            assert!(z(R1) < z(T) && z(T) < z(R2), "doc mirrors the move at once");
+            assert!(guard.page_has_pending_save(0));
+        }
+        assert!(ps.text_layers[0].pinned, "a pinned band move keeps the text pinned");
+
+        let handle = doc.lock().expect("doc lock").saver_handle().expect("saver enabled");
+        assert!(handle.barrier_blocking().is_empty(), "no failed page");
+        assert_eq!(disk_band_uids(&project), [R1, T, R2]);
+        assert_eq!(disk_text_pinned(&project, T), Some(true));
     }
 }

@@ -1371,6 +1371,8 @@ fn the_band_order_a_duplicate_writes_carries_a_not_yet_flushed_raster() {
                 opacity: 1.0,
                 group_uid: None,
                 text_layer_idx: None,
+                text_pinned: false,
+                text_pinned_by_group: false,
                 transform: ms_models::layer_model::manifest::TransformRec {
                     cx: 1.0,
                     cy: 1.0,
@@ -3621,7 +3623,7 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
     let mut doc = LayerDoc::new();
     doc.ensure_page_loaded(0, &dir, None, None, &page_sizes)
         .unwrap_or_else(|err| panic!("could not load deferred-raster test layer: {err}"));
-    doc.enable_background_saver();
+    doc.enable_background_saver(None);
     let doc = Arc::new(Mutex::new(doc));
     let mut layer = TypingTextOverlayLayer {
         layers_primary_dir: Some(dir.clone()),
@@ -6508,4 +6510,286 @@ fn a_panicking_compose_worker_on_the_last_page_writes_no_document() {
     assert!(!pdf_path.exists(), "the sink is never finished for a failed run, so no file is left behind");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes one committed TEXT node `uid` (pinned, at band `z`) on `page` into `dir`, with its rendered PNG.
+fn write_committed_text_node(dir: &std::path::Path, page: usize, uid: &str, z: u32) {
+    use ms_models::layer_model::persist;
+    std::fs::create_dir_all(dir).unwrap();
+    let file = persist::write_text_image(dir, page, uid, &ColorImage::filled([2, 2], Color32::GREEN)).unwrap();
+    let out = persist::TextPayloadOut {
+        uid: uid.into(),
+        name: uid.into(),
+        z,
+        layer_idx: 0,
+        pinned: true,
+        visible: true,
+        opacity: 1.0,
+        group_uid: None,
+        pinned_by_group: false,
+        payload_uid: uid.into(),
+        render_data: json!({ "text": uid }),
+        is_image: false,
+        transform: ms_models::layer_model::manifest::TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+        deform: None,
+        rendered_file: Some(file),
+        mask_clip: None,
+        text_centers: None,
+        centering_frame: None,
+    };
+    persist::write_page_text_payload(dir, None, page, &[out]).unwrap();
+}
+
+/// What creating raster `img1` on committed page 3 (one text `t3` at band `text_z`) leaves behind: the
+/// staged manifest (as JSON), the staged PNGs, and the committed text count after the save-to-project
+/// merge. `doc_first` drives the typing tab's doc-first create (`add_created_raster_to_doc` through a
+/// real background saver + barrier); otherwise the historical path (synchronous pre-flush of the page
+/// text, `persist::add_page_raster`, doc reload). `delete_text` first deletes `t3` in the doc only.
+fn typing_raster_create_outcome(root: &std::path::Path, doc_first: bool, delete_text: bool, text_z: u32) -> (serde_json::Value, Vec<(String, Vec<u8>)>, usize) {
+    use ms_models::layer_model::layer_doc::LayerDoc;
+    use ms_models::layer_model::persist;
+
+    remove_fixture_dir(root);
+    let committed = root.join("ch").join("layers");
+    let unsaved = root.join("ch_unsaved").join("layers");
+    write_committed_text_node(&committed, 3, "t3", text_z);
+    let sizes: HashMap<usize, [usize; 2]> = (0..=3).map(|p| (p, [2, 2])).collect();
+    let pic = ColorImage::filled([2, 2], Color32::BLUE);
+    let transform = ms_models::layer_model::manifest::TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 };
+    let mut doc = LayerDoc::new();
+    doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).unwrap();
+    if delete_text {
+        assert!(doc.remove_node(3, "t3"));
+    }
+    let doc = if doc_first {
+        doc.enable_background_saver(None);
+        let mut layer = TypingTextOverlayLayer {
+            layers_primary_dir: Some(unsaved.clone()),
+            layers_fallback_dir: Some(committed.clone()),
+            page_sizes_px: sizes.clone(),
+            ..Default::default()
+        };
+        layer.sync_from_doc(3, &doc);
+        let doc = Arc::new(Mutex::new(doc));
+        layer.set_layer_doc(doc.clone());
+        layer.add_created_raster_to_doc(3, "img1", "Картинка".to_string(), transform, pic).unwrap();
+        assert_eq!(
+            (layer.selected_raster_page, layer.pending_select_raster_uid.clone()),
+            (Some(3), None),
+            "the new raster is selected by the projection that follows the doc add"
+        );
+        let selected_uid = layer
+            .selected_raster_idx
+            .and_then(|idx| layer.raster_layers_by_page.get(&3).and_then(|ls| ls.get(idx)))
+            .map(|l| l.uid.clone());
+        assert_eq!(selected_uid.as_deref(), Some("img1"));
+        let handle = doc.lock().unwrap().saver_handle().expect("saver");
+        assert!(handle.barrier_blocking().is_empty(), "the saver wrote every queued job");
+        let mut guard = doc.lock().unwrap();
+        guard.poll_save_acks();
+        assert!(!guard.has_pending_saves(), "every job of the create was acknowledged");
+        // On-disk Z equals the doc Z for every node (the alignment the create enqueues).
+        let disk: HashMap<String, u32> = ms_models::layer_model::compat::read_manifest(&unsaved.join("layers.json"))
+            .unwrap()
+            .unwrap()
+            .page(3)
+            .unwrap()
+            .tree
+            .iter()
+            .map(|r| (r.uid.clone(), r.z))
+            .collect();
+        for node in &guard.page(3).unwrap().nodes {
+            assert_eq!(disk.get(&node.uid), Some(&node.z), "disk z == doc z for {}", node.uid);
+        }
+        drop(guard);
+        drop(layer);
+        match Arc::try_unwrap(doc) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(_) => panic!("the test layer still shares the doc"),
+        }
+    } else {
+        // The historical `flush_target_page_text_to_staging`: reconcile the tab's overlay state into
+        // the doc (the tab materializes a runtime per doc text), then flush the page text synchronously.
+        let mut layer = TypingTextOverlayLayer {
+            layers_primary_dir: Some(unsaved.clone()),
+            layers_fallback_dir: Some(committed.clone()),
+            page_sizes_px: sizes.clone(),
+            ..Default::default()
+        };
+        layer.sync_from_doc(3, &doc);
+        let shared = Arc::new(Mutex::new(doc));
+        layer.set_layer_doc(shared.clone());
+        let _: std::collections::BTreeSet<usize> = layer.sync_overlay_state_into_doc();
+        drop(layer);
+        let mut doc = match Arc::try_unwrap(shared) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(_) => panic!("the test layer still shares the doc"),
+        };
+        doc.flush_page_text(3, &unsaved, Some(&committed)).unwrap();
+        persist::add_page_raster(&unsaved, Some(&committed), 3, "img1", "Картинка", true, 1.0, transform, &pic).unwrap();
+        doc.evict_page(3);
+        doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).unwrap();
+        doc
+    };
+    let mut doc = doc;
+    // Save-to-project's text flush, then the merge.
+    doc.flush_page_text(3, &unsaved, Some(&committed)).unwrap();
+    doc.shutdown_saver();
+    let manifest = ms_models::layer_model::compat::read_manifest(&unsaved.join("layers.json")).unwrap().unwrap();
+    let mut pngs: Vec<(String, Vec<u8>)> = std::fs::read_dir(&unsaved)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "png"))
+        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+        .collect();
+    pngs.sort();
+    let owned: std::collections::HashSet<usize> = [3].into_iter().collect();
+    persist::merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).unwrap();
+    let committed_texts = persist::load_page_text_nodes(&committed, None, 3).unwrap().len();
+    (serde_json::to_value(&manifest).unwrap(), pngs, committed_texts)
+}
+
+/// Bottom-to-top `(uid, kind)` of page 3 in a staged manifest JSON.
+fn staged_page3_order(manifest: &serde_json::Value) -> Vec<(String, String)> {
+    let page = manifest["pages"].as_array().unwrap().iter().find(|p| p["img_idx"] == 3).expect("page 3 staged");
+    let mut tree: Vec<(u64, String, String)> = page["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["z"].as_u64().unwrap(), r["uid"].as_str().unwrap().to_string(), r["kind"].to_string()))
+        .collect();
+    tree.sort();
+    tree.into_iter().map(|(_, uid, kind)| (uid, kind)).collect()
+}
+
+#[test]
+fn doc_first_raster_create_writes_what_add_page_raster_wrote() {
+    // A2-TY: raster creation no longer writes staging on a worker and evicts the doc page to re-read
+    // it; it adds the node to the doc and enqueues the page save. The staged bytes must match the
+    // historical path on a typeset page (text kept) and on a page whose last text was deleted in the
+    // session (deletion stays durable — no resurrection from the committed seed).
+    let base = std::env::temp_dir().join(format!("typ_docfirst_create_{}", std::process::id()));
+    for delete_text in [false, true] {
+        let (old_manifest, old_pngs, old_texts) = typing_raster_create_outcome(&base.join("old"), false, delete_text, 0);
+        let (new_manifest, new_pngs, new_texts) = typing_raster_create_outcome(&base.join("new"), true, delete_text, 0);
+        assert_eq!(old_manifest, new_manifest, "delete_text={delete_text}: identical staged manifest");
+        assert_eq!(old_pngs, new_pngs, "delete_text={delete_text}: identical staged PNGs");
+        let expected_texts = usize::from(!delete_text);
+        assert_eq!((old_texts, new_texts), (expected_texts, expected_texts), "delete_text={delete_text}: committed text count after the merge");
+    }
+    remove_fixture_dir(&base);
+}
+
+#[test]
+fn doc_first_raster_create_aligns_disk_z_with_the_doc_when_a_deleted_text_is_still_on_disk() {
+    // REGRESSION GUARD for the Z divergence of doc-first creation: the saver writes rasters before text,
+    // so a new raster's disk Z is placed above a text the doc already deleted (still seeded on disk at
+    // that moment) — Z 2 on disk vs 0 in the doc. A text created later takes its Z from the doc and
+    // would sort below the raster after a reload. The create therefore enqueues the doc's band order,
+    // making disk Z == doc Z (asserted inside the outcome helper) and matching the historical bytes.
+    let base = std::env::temp_dir().join(format!("typ_docfirst_z_{}", std::process::id()));
+    let (old_manifest, old_pngs, old_texts) = typing_raster_create_outcome(&base.join("old"), false, true, 1);
+    let (new_manifest, new_pngs, new_texts) = typing_raster_create_outcome(&base.join("new"), true, true, 1);
+    assert_eq!(old_manifest, new_manifest, "deleted-last-text page: identical staged manifest, raster at z 0");
+    assert_eq!(old_pngs, new_pngs);
+    assert_eq!((old_texts, new_texts), (0, 0), "the deleted text is not resurrected");
+
+    // A typeset page whose text sits at a non-zero Z: same bottom-to-top order; the doc-first path
+    // renumbers the page to the doc's order (like a ▲▼ reorder), so only the absolute Z may differ.
+    let (old_manifest, _, old_texts) = typing_raster_create_outcome(&base.join("old"), false, false, 1);
+    let (new_manifest, _, new_texts) = typing_raster_create_outcome(&base.join("new"), true, false, 1);
+    assert_eq!(staged_page3_order(&old_manifest), staged_page3_order(&new_manifest));
+    assert_eq!((old_texts, new_texts), (1, 1));
+    remove_fixture_dir(&base);
+}
+
+#[test]
+fn raster_delete_is_enqueued_and_removed_on_disk_after_the_barrier() {
+    use ms_models::layer_model::layer_doc::LayerDoc;
+    use ms_models::layer_model::persist;
+
+    let dir = std::env::temp_dir().join(format!("typ_enqueue_delete_{}", std::process::id()));
+    remove_fixture_dir(&dir);
+    let tf = ms_models::layer_model::manifest::TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 };
+    let pic = ColorImage::filled([2, 2], Color32::WHITE);
+    persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
+    persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+    let sizes: HashMap<usize, [usize; 2]> = [(0, [100, 100])].into_iter().collect();
+    let mut doc = LayerDoc::new();
+    doc.ensure_page_loaded(0, &dir, None, None, &sizes).unwrap();
+    doc.enable_background_saver(None);
+    let mut layer = TypingTextOverlayLayer {
+        layers_primary_dir: Some(dir.clone()),
+        page_sizes_px: sizes,
+        ..Default::default()
+    };
+    layer.sync_from_doc(0, &doc);
+    let doc = Arc::new(Mutex::new(doc));
+    layer.set_layer_doc(doc.clone());
+    let idx = layer.raster_layers_by_page[&0].iter().position(|l| l.uid == "r0").unwrap();
+
+    layer.remove_raster(0, idx);
+    assert!(doc.lock().unwrap().page_has_pending_save(0), "the deletion was enqueued, not written inline");
+    let handle = doc.lock().unwrap().saver_handle().expect("saver");
+    assert!(handle.barrier_blocking().is_empty());
+    doc.lock().unwrap().poll_save_acks();
+    let on_disk: Vec<String> = persist::load_page_rasters(&dir, None, 0).unwrap().layers.into_iter().map(|l| l.uid).collect();
+    assert_eq!(on_disk, vec!["r1".to_string()], "the deleted raster is gone from disk after the barrier");
+    assert!(!dir.join(persist::base_file_name(0, "r0")).exists(), "and its PNG was pruned");
+    doc.lock().unwrap().shutdown_saver();
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn a_band_move_enqueues_a_structural_job_and_mirrors_order_and_pins_into_the_doc() {
+    let dir = std::env::temp_dir().join(format!("typ_enqueue_band_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta", "tb"]);
+    doc.lock().unwrap().enable_background_saver(None);
+    let ta = layer.overlays.iter().position(|o| o.uid == "ta").unwrap();
+
+    layer.move_overlay_in_unified_z(0, ta, true);
+    {
+        let guard = doc.lock().unwrap();
+        assert!(guard.page_has_pending_save(0), "the band order is a queued save job");
+        let order: Vec<&str> = guard.page(0).unwrap().nodes.iter().map(|n| n.uid.as_str()).collect();
+        assert_eq!(order, vec!["tb", "ta"], "the doc took the new order immediately");
+        assert!(guard.page(0).unwrap().nodes.iter().all(|n| n.text_pinned), "the doc mirrors the pins the band order writes");
+    }
+    let handle = doc.lock().unwrap().saver_handle().expect("saver");
+    assert!(handle.barrier_blocking().is_empty());
+    let mut guard = doc.lock().unwrap();
+    guard.poll_save_acks();
+    assert!(!guard.has_pending_saves());
+    guard.shutdown_saver();
+    drop(guard);
+    let bands = ms_models::layer_model::persist::load_page_bands(&dir, None, 0);
+    let mut sorted: Vec<&ms_models::layer_model::ordering::Band> = bands.iter().collect();
+    sorted.sort_by_key(|b| b.z());
+    let uids: Vec<String> = sorted
+        .iter()
+        .filter_map(|b| match b {
+            ms_models::layer_model::ordering::Band::PinnedText { uid, .. }
+            | ms_models::layer_model::ordering::Band::Raster { uid, .. } => Some(uid.clone()),
+            ms_models::layer_model::ordering::Band::TextGroup { .. } => None,
+        })
+        .collect();
+    assert_eq!(uids, vec!["tb".to_string(), "ta".to_string()], "the saver wrote the order");
+    remove_fixture_dir(&dir);
+}
+
+#[test]
+fn a_text_node_created_by_the_typing_tab_is_pinned_for_the_ps_editor() {
+    // The PS editor reads text pin meta from the doc; the text writer always emits text pinned, so a
+    // text node the typing tab creates (here via the create path a duplicate shares) must carry
+    // `text_pinned = true, text_pinned_by_group = false`, or PS would draw it unpinned (on top).
+    let dir = std::env::temp_dir().join(format!("typ_new_text_pinned_{}", std::process::id()));
+    let (mut layer, doc) = layer_with_doc_text_nodes(&dir, &["ta"]);
+    let new_idx = layer.duplicate_overlay(0).expect("a text overlay duplicates");
+    let copy_uid = layer.overlays[new_idx].uid.clone();
+    let guard = doc.lock().unwrap();
+    let node = guard.page(0).unwrap().nodes.iter().find(|n| n.uid == copy_uid).expect("the copy is a doc node");
+    assert!(node.text_pinned && !node.text_pinned_by_group);
+    drop(guard);
+    remove_fixture_dir(&dir);
 }

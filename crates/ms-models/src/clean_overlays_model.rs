@@ -30,6 +30,9 @@ Core behavior:
   undo/redo entries and bumps the page's detach generation; `OverlaySaveSnapshot` carries the
   generation so lock-free save writers (`save_overlay_snapshots_guarded`, the overlay autosave)
   discard in-flight snapshots of a detached page instead of resurrecting its PNG.
+- `set_autosave_gate` installs the project's `AutosaveGate`; every save-dirtying edit (`mark_dirty`:
+  one committed region / clear / snapshot apply / undo step) reports ONE action. The dirty set is
+  the held state — the overlay autosave thread writes it only when the gate is due.
 - Supports "cache pages immediately" mode via `cache_pages_enabled`; when disabled, page cache can
   still be populated lazily for specific pages when needed by tools.
 
@@ -53,6 +56,8 @@ use std::fmt;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::autosave_gate::AutosaveGate;
 
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -262,10 +267,19 @@ pub struct CleanOverlaysModel {
     /// delta; bounded by `OVERLAY_HISTORY_LIMIT` steps and a per-profile
     /// compressed byte budget (see `set_memory_profile`).
     history: ActionHistory<CleanOverlayDiffOp>,
+    /// The project's autosave gate (`None` until `set_autosave_gate`): every save-dirtying edit
+    /// reports one action to it; the overlay autosave thread polls it to decide when to write.
+    autosave_gate: Option<Arc<AutosaveGate>>,
 }
 
 #[allow(dead_code)]
 impl CleanOverlaysModel {
+    /// Installs (or clears) the project's autosave gate. Afterwards every edit that marks a page
+    /// save-dirty (one committed region / clear / snapshot apply / undo step) reports one action.
+    pub fn set_autosave_gate(&mut self, gate: Option<Arc<AutosaveGate>>) {
+        self.autosave_gate = gate;
+    }
+
     pub fn new_from_pages(pages: &[PathBuf]) -> Self {
         let mut sorted_pages = pages.to_vec();
         sorted_pages.sort_by_key(|a| numeric_first_key(a));
@@ -305,6 +319,7 @@ impl CleanOverlaysModel {
                 OVERLAY_HISTORY_LIMIT,
                 MemoryBudget::for_profile(MemoryProfile::default()).clean_overlay_undo_bytes_usize(),
             ),
+            autosave_gate: None,
         }
     }
 
@@ -1139,11 +1154,17 @@ impl CleanOverlaysModel {
         self.save_dirty_indexes.extend(current);
     }
 
+    /// Marks page `idx` changed for the canvas AND for the next save, and reports one autosave action.
+    /// Called once per committed edit (a stroke's scratch commit, a clear, a snapshot apply, an undo
+    /// step) — each also records one undo entry — never per rendered frame of an uncommitted stroke.
     fn mark_dirty(&mut self, idx: usize) {
         self.dirty_indexes.insert(idx);
         self.save_dirty_indexes.insert(idx);
         self.has_project_unsaved_changes = true;
         self.bump_revision_unless_locked();
+        if let Some(gate) = &self.autosave_gate {
+            gate.note_action();
+        }
     }
 
     fn mark_runtime_changed(&mut self, idx: usize) {

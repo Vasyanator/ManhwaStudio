@@ -32,6 +32,9 @@ Main items:
   under `General.storage_mode`, plus the startup probe seeding the docstore default format.
 - `ui_scale_percent_from_user_settings` / `clamp_ui_scale_percent` / `ui_scale_factor_from_percent`:
   global interface scale (`General.ui_scale_percent`) and its conversion to the egui zoom factor.
+- `autosave_policy_from_user_settings`: the clamped autosave interval / action threshold
+  (`General.autosave_interval_minutes` / `General.autosave_action_threshold`); the runtime
+  global lives in module `autosave_policy`.
 - `load_user_config`: canonical entry-point for `user_config.json` with persistence.
 - `mark_first_run_languages_if_needed` / `user_settings_first_run_languages_pending`:
   fresh-install detection and gate for the launcher's first-run language modal via the
@@ -56,6 +59,11 @@ pub mod bubble_status;
 // Runtime selection for the typing tab's Ctrl+wheel rotation. It lives here because
 // the `TextTab` default names `DEFAULT_ROTATION_CTRL_WHEEL_MODE`.
 pub mod rotation_ctrl_wheel;
+// Process-global autosave policy (interval + action threshold) read live by
+// `ms_models::autosave_gate`. It lives here because its keys and defaults are part of the
+// `General` default tree, and both its seeder (the binary) and its editor (the shared
+// general-settings pane) already depend on this crate.
+pub mod autosave_policy;
 
 // The crash-safe `General.ort_load_state` guard writers. They live here because the
 // WRITER is the native ONNX Runtime loader (crate `ms-native-runtime`) and the READER
@@ -199,6 +207,26 @@ pub const UI_SCALE_PERCENT_MIN: u32 = 50;
 pub const UI_SCALE_PERCENT_MAX: u32 = 200;
 /// Default interface scale: native size, i.e. `zoom_factor == 1.0`.
 pub const UI_SCALE_PERCENT_DEFAULT: u32 = 100;
+/// `General.autosave_interval_minutes`: how long, in minutes, pending edits may stay in
+/// memory — counted from the FIRST pending action — before the background writers flush
+/// them to the chapter's `_unsaved` folder. Read by [`autosave_policy_from_user_settings`].
+pub const GENERAL_AUTOSAVE_INTERVAL_MINUTES_KEY: &str = "autosave_interval_minutes";
+/// `General.autosave_action_threshold`: number of pending save gestures that forces a
+/// flush before the interval elapses. `1` flushes on every action (immediate mode); there
+/// is deliberately no `0` meaning.
+pub const GENERAL_AUTOSAVE_ACTION_THRESHOLD_KEY: &str = "autosave_action_threshold";
+/// Smallest selectable autosave interval, in minutes.
+pub const AUTOSAVE_INTERVAL_MINUTES_MIN: u32 = 1;
+/// Largest selectable autosave interval, in minutes.
+pub const AUTOSAVE_INTERVAL_MINUTES_MAX: u32 = 60;
+/// Default autosave interval, in minutes.
+pub const AUTOSAVE_INTERVAL_MINUTES_DEFAULT: u32 = 3;
+/// Smallest selectable autosave action threshold (`1` = flush on every action).
+pub const AUTOSAVE_ACTION_THRESHOLD_MIN: u32 = 1;
+/// Largest selectable autosave action threshold.
+pub const AUTOSAVE_ACTION_THRESHOLD_MAX: u32 = 500;
+/// Default autosave action threshold.
+pub const AUTOSAVE_ACTION_THRESHOLD_DEFAULT: u32 = 30;
 /// `General.first_run_languages_confirmed`: tri-state marker gating the launcher's
 /// first-run language modal.
 ///
@@ -787,6 +815,53 @@ pub fn ui_scale_factor_from_percent(percent: u32) -> f32 {
     f32::from(u16::try_from(percent).unwrap_or(100)) / 100.0
 }
 
+/// Reads the autosave policy from `General.autosave_interval_minutes` and
+/// `General.autosave_action_threshold`, each clamped into its `AUTOSAVE_*_MIN..=MAX`
+/// range.
+///
+/// A missing or non-numeric value resolves to its `AUTOSAVE_*_DEFAULT`; an out-of-range
+/// one (including negative) to the nearest bound; a float is rounded. Pure: the runtime
+/// global is seeded by `autosave_policy::seed_autosave_policy_from_user_settings`.
+#[must_use]
+pub fn autosave_policy_from_user_settings(user_settings: &Value) -> autosave_policy::AutosavePolicy {
+    let general = user_settings.get("General").and_then(Value::as_object);
+    let read = |key: &str, min: u32, max: u32, default: u32| -> u32 {
+        general.and_then(|general| general.get(key)).map_or(default, |value| clamp_u32_setting(value, min, max, default))
+    };
+    let minutes = read(GENERAL_AUTOSAVE_INTERVAL_MINUTES_KEY, AUTOSAVE_INTERVAL_MINUTES_MIN, AUTOSAVE_INTERVAL_MINUTES_MAX, AUTOSAVE_INTERVAL_MINUTES_DEFAULT);
+    let threshold = read(GENERAL_AUTOSAVE_ACTION_THRESHOLD_KEY, AUTOSAVE_ACTION_THRESHOLD_MIN, AUTOSAVE_ACTION_THRESHOLD_MAX, AUTOSAVE_ACTION_THRESHOLD_DEFAULT);
+    autosave_policy::AutosavePolicy { interval: std::time::Duration::from_secs(u64::from(minutes) * 60), action_threshold: threshold }
+}
+
+/// Clamps a JSON number into `min..=max` (`min <= max`); a non-number or non-finite value
+/// yields `default`. Integers are compared exactly; a float is rounded first.
+fn clamp_u32_setting(value: &Value, min: u32, max: u32, default: u32) -> u32 {
+    if let Some(unsigned) = value.as_u64() {
+        return u32::try_from(unsigned.clamp(u64::from(min), u64::from(max))).unwrap_or(max);
+    }
+    if value.as_i64().is_some() {
+        // `as_u64` failed, so this integer is negative: below every bound.
+        return min;
+    }
+    let Some(raw) = value.as_f64().filter(|raw| raw.is_finite()) else {
+        return default;
+    };
+    let rounded = raw.round();
+    if rounded <= f64::from(min) {
+        return min;
+    }
+    if rounded >= f64::from(max) {
+        return max;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite, integral and strictly inside min..max by the guards above"
+    )]
+    let clamped = rounded as u32;
+    clamped
+}
+
 #[must_use]
 pub fn memory_profile_from_user_settings(user_settings: &Value) -> MemoryProfile {
     user_settings
@@ -1330,6 +1405,8 @@ pub fn user_config_defaults() -> Value {
             "style": "default",
             "ui_language": "ru",
             "ui_scale_percent": UI_SCALE_PERCENT_DEFAULT,
+            "autosave_interval_minutes": AUTOSAVE_INTERVAL_MINUTES_DEFAULT,
+            "autosave_action_threshold": AUTOSAVE_ACTION_THRESHOLD_DEFAULT,
             "projects_dir": default_projects_root.to_string_lossy().to_string(),
             "ai_backend_autostart": true,
             "ai_device": "not-selected",

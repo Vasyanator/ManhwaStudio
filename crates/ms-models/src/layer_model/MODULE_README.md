@@ -171,7 +171,10 @@ per-page RMW; the document lock is taken inside `write_manifest`, so the fixed o
 `ManifestTxn`: `begin` takes `MANIFEST_LOCK` and reads the manifest once; `save_page_rasters` /
 `write_page_text_payload` / `update_raster_effects` edit the in-memory manifest (each atomic: an `Err`
 restores its page from a checkpoint); `commit` writes ONCE (skipped when nothing changed). The free
-functions of the same names are one-operation transactions. File ordering invariant: a PNG is written
+functions of the same names are one-operation transactions. The STRUCTURAL ops `save_page_band_order` /
+`save_page_grouping` are transaction operations too (no PNG IO); with a committed `fallback_dir` they seed a
+committed-only page (undoing the seed when the edit changes nothing), while the free functions pass none
+and keep the historical "page absent ⇒ no-op, page present ⇒ rewrite" bytes. File ordering invariant: a PNG is written
 BEFORE any manifest names it (during the operation), and a file that became unreferenced (raster orphan
 prune, a replaced `_fx` render) is deleted only AFTER the commit, keeping every file the committed page
 still references (so a page's live `_text.png` renders survive a raster save). A failed commit deletes
@@ -219,8 +222,10 @@ keeps `Contents`.
     A raster's `mask_clip` flag (typing tab; **rasters default OFF**) round-trips through `LayerRec.mask_clip`
     and `RasterLayerOut`/`RasterLayerIn`; `save_page_rasters` PRESERVES an existing on-disk `mask_clip`
     when the writer passes `None` (e.g. the PS editor, which has no mask-clip), so it is never clobbered.
-    `LayerDoc::flush_page_dropping_raster` flushes the page DROPPING a removed raster uid (so a deleted
-    raster does not resurrect — `save_page_rasters` otherwise preserves an unowned manifest raster).
+    `LayerDoc::flush_page_dropping_raster` (sync) / `enqueue_page_save_dropping_raster` (queued) save the
+    page DROPPING a removed raster uid (so a deleted raster does not resurrect — `save_page_rasters`
+    otherwise preserves an unowned manifest raster). `base_file_name(page, uid)` is public so a tab
+    building a doc raster node names its PNG exactly as the writers do.
   - Save-to-project layers merge: `merge_unsaved_layers_into_committed(committed_dir, unsaved_dir,
     owned_text_pages)` merges the unsaved staging `layers.json` INTO the committed one PER PAGE, and
     `ms_project::save_merge::merge_unsaved_into_project` calls it (the binary injects it as the
@@ -247,6 +252,8 @@ keeps `Contents`.
     `save_page_rasters` takes a `pixels_dirty` flag per `RasterLayerOut`: a non-dirty raster preserves
     its base PNG + `rendered_file` + `effects` (so a PS whole-page save never wipes another tab's
     effects); a dirty one (PS paint/cut/merge/bake) rewrites the base and drops the chain (bakes it in).
+    `RasterLayerOut.image` is `Option`: pixels are load-bearing only for a dirty or not-yet-recorded
+    raster, and such a raster WITHOUT pixels fails that page's raster write (the txn guard rolls it back).
   - Text nodes (single writer, schema v3): `write_page_text_payload(layers_dir, fallback_dir, page_idx,
     &[TextPayloadOut])` writes each text node's FULL payload (`render_data` + canonical
     `transform`/`deform` + the rendered PNG name in `rendered_file` + `mask_clip` + the optional
@@ -262,7 +269,8 @@ keeps `Contents`.
     TEXT Z: `write_page_text_payload` now ALWAYS emits text `pinned`-with-explicit-Z and NEVER creates a
     `TextGroup` band (`rebuild_text_groups` retired; legacy groups are dropped on write, their members
     already flattened to per-text bands on read by `layer_doc::ensure_page_loaded`). `merge_preserved_text_fields`
-    carries PS-owned `group_uid` / `pinned_by_group` across a typing-side rewrite, and preserves the
+    carries the PS-owned `group_uid` across a typing-side rewrite (the incoming `pinned_by_group` is
+    written as given: the doc node owns it, see "PS text pin meta" below), and preserves the
     explicit `z` ONLY from an already-pinned disk node (a PS/typing reorder authority) so a legacy
     unpinned node never clobbers the doc's freshly-flattened per-text Z — that is what makes the per-text
     reorder survive a later text flush and keeps existing chapters' visual order on first save. The reference-only writers
@@ -294,15 +302,26 @@ keeps `Contents`.
     group visibility/opacity, applies a complete band `order` (reusing `apply_band_order`), records
     group-owned pins (`pinned_by_group`), and prunes emptied text-group bands. A text put into a PS
     group is auto-pinned so it owns a `Band::PinnedText` Z and can sit anywhere in the group's
-    contiguous run. The PS editor flushes rasters (`save_page_rasters`) before this so freshly-added
-    raster layers already have nodes for the edit to land on.
+    contiguous run. A doc-wired caller enqueues it (`LayerDoc::enqueue_page_grouping` /
+    `enqueue_page_band_order`) as a saver `StructuralEdit`, which runs after every earlier raster/text
+    part of the page, so a freshly added raster already has its node for the edit to land on.
+  - PS text pin meta: a TEXT `LayerNode` carries `text_pinned` / `text_pinned_by_group` (always `false`
+    on rasters), decoded from the node's record (a legacy `text_info.json` overlay takes them from its
+    v2 node when it has one, else `false`), edited by `LayerDoc::set_text_pin_meta` alongside each PS
+    band / grouping / pin edit, and `text_pinned_by_group` is written by the text flush. The PS editor
+    reads its pin state from the doc, never from disk after the page load. `text_pinned` is not
+    written: the text writer always emits `pinned = true`.
 - `effects.rs` — the "render type 2" seam: `apply_effects_to_color_image(&ColorImage, effects_json)`
   bridges egui `ColorImage` to the typing tab's pure `apply_effects_to_image`. Straight alpha both
   ways; effects may enlarge the canvas (shadow/glow), so center-placed callers must recenter.
 - `saver.rs` — OFF-THREAD coalescing persistence for the doc. `LayerSaver` owns a worker thread
   (`recv` + `try_recv` drain) that BUCKETS jobs per
-  `page_idx`, keeping the LATEST data PER KIND (rasters / text / per-uid effects) — so a Full + a
-  TextOnly job for the same page MERGE without dropping either kind. A `PageSaveJob` carries OWNED data
+  `page_idx`, keeping the LATEST data PER KIND (text / per-uid effects) — so a Full + a
+  TextOnly job for the same page MERGE without dropping either kind. The raster half merges
+  LOSSLESSLY (`merge_raster_parts`): `removed_uids` is the union minus uids the newer job carries, and
+  an earlier DIRTY layer keeps its dirty flag + pixels over a newer clean one, so one coalesced write
+  equals the jobs written in sequence. The doc's builder carries raster pixels only when
+  `pixels_dirty` (bounds a queued job's memory); the sync flush and the PS persist always carry them. A `PageSaveJob` carries OWNED data
   (`OwnedRasterLayer` / `OwnedTextNode` mirror the `persist::RasterLayerOut` / `TextPayloadOut` inputs
   but own their `ColorImage`s; `EffectsSaveItem` mirrors `persist::update_raster_effects`), so the
   worker holds no doc lock. **One manifest commit per drain pass**: the pass's jobs are grouped by
@@ -319,17 +338,39 @@ keeps `Contents`.
     express the CLEAR case (empty chain + `display_image: None`) — the whole-page raster reconcile loop
     skips empty chains. The PS/typing effects polls route through it via
     `LayerDoc::enqueue_raster_effects`.
+  - The `structural` half (`Vec<StructuralEdit>`: `BandOrder` / `Grouping`) is APPENDED on coalesce
+    (edits compose, so none is dropped) and applied LAST in the pass's per-job order rasters → text →
+    effects → structural, as its own rollback unit, inside the transaction and WITHOUT taking the doc
+    lock (lock order stays `MANIFEST_LOCK` → document lock). It is acknowledged as its own
+    `SaveKind::Structural` epoch: a raster ack clears the page's raster `pixels_dirty`, which a
+    pixel-less structural job must never do. `LayerDoc::enqueue_page_band_order` /
+    `enqueue_page_grouping` enqueue it (sync free-fn fallback without a saver);
+    `enqueue_page_save_dropping_raster` is the queued raster delete (its `removed_uids` survive
+    coalescing).
+  - Raster merge keeps a layer the EARLIER job carried that the newer job neither carries nor removes
+    (placed before the newer job's layers, matching the writer's preserved-first tree order and its
+    new-raster Z order), so a coalesced write is byte-identical to the sequential writes.
   - `Barrier` (via `barrier_blocking`) waits until all prior jobs complete and returns a snapshot of
-    pages whose latest TEXT write FAILED; `Shutdown` drains then stops. `LayerSaverHandle` is a cheap-clone
+    pages whose latest TEXT write FAILED; `Shutdown { discard: false }` drains then stops,
+    `Shutdown { discard: true }` (`LayerSaver::shutdown_discarding`) drops the queued jobs unwritten. `LayerSaverHandle` is a cheap-clone
     `Sender` wrapper for a merge worker / app-close drain.
-  WIRING: the doc enables the saver via `enable_background_saver` (called ONCE in `app.rs` on the
+  - AUTOSAVE HOLD: `LayerSaver::new(Some(gate))` keeps the bucket across drains (FIFO + coalescing
+    unchanged) and writes it only when the `AutosaveGate` epoch — polled BEFORE each drain — moves;
+    `Barrier` / `Shutdown { discard: false }` always force it out, discard drops it. While holding, the
+    wait is `recv_timeout(min(gate.wait_deadline(), 1 s))`. Every async funnel of the doc (and the PS
+    raw-handle page save via `LayerDoc::note_autosave_action`) reports ONE action AFTER its send;
+    `bump_dirty_epoch` never does. `None` = write after every drain.
+  WIRING: the doc enables the saver via `enable_background_saver(gate)` (called ONCE in `app.rs` on the
   shared doc at startup) and feeds it through `enqueue_page_save` / `enqueue_page_text_save` /
   `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). A caller saving MANY pages
   at once uses `enqueue_pages_text_save`, which sends them as ONE `SaverMsg::Jobs` message: separate
   sends with work in between can wake the worker into one pass (one commit) per page, a batch cannot. PS per-edit/raster flushes
   and typing text flushes ENQUEUE. Dirty flags clear only after the frame-loop poll consumes a
   successful acknowledgement whose per-kind epoch still matches the latest edit/enqueue; failed or
-  stale completions leave that kind dirty for retry. The save-to-project merge worker and the eframe `on_exit` /
+  stale completions leave that kind dirty for retry, and a FAILED current raster ack re-dirties every
+  resident raster of the page (so the retry carries pixels). A current SUCCESSFUL ack retires its epoch
+  even for a non-resident page (a disk-targeted structural / effects save must not read as pending forever). `LayerDoc::has_pending_saves` is the
+  doc-wide "an unacknowledged save exists" signal. The save-to-project merge worker and the eframe `on_exit` /
   exit-cleanup paths `barrier_blocking` (and shut down) the saver so no enqueued write is lost. The
   barrier reports only latest text-write failures, so raster/effects failures do not revoke text
   ownership. NO

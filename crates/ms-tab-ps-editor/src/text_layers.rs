@@ -3,15 +3,16 @@ File: tabs/ps_editor/text_layers.rs
 
 Purpose:
 Read-only display of the typing tab's text/image overlays inside the PS editor, as "text layers".
-The overlays are nodes in the shared `layers.json` (kind = text), with their pixels + geometry in
-`text_info.json`. This module loads those nodes, resolves each payload, and renders the overlay
-image at its page-space placement through the PS viewport.
+The overlays are Text nodes of the shared `LayerDoc`; this module holds their PS-side runtime
+(`PsTextLayer`: projected image + geometry, the doc-owned pin / text-group metadata, and the GPU
+texture) and renders each overlay at its page-space placement through the PS viewport. It reads no
+disk: runtimes are built from the doc by `lib.rs` (`materialize_text_runtime_from_doc`,
+`sync_view_from_doc`).
 
 Why separate from `LayerStack`:
 These layers are owned by the typing tab; here they are display-only. Keeping them out of
 `LayerStack` means the raster invariants and tools (paint/cut/merge/reorder/stash) are untouched.
-Moving/transforming them from the PS side (which must write geometry back to `text_info.json` and
-signal the typing tab to reload) is a later step.
+Model edits from the PS side route through the shared doc (`lib.rs`), never through this module.
 
 Notes:
 An overlay's GPU handle is stored together with the `TextureOptions` it was uploaded with, so the
@@ -22,9 +23,7 @@ handle that survives a re-projection (`take_texture` / `from_doc_node`).
 use super::layers::LayerTransform;
 use super::viewport::ViewTransform;
 use ms_models::layer_model::manifest::DeformRec;
-use ms_models::layer_model::persist;
 use eframe::egui::{self, Color32, ColorImage, Pos2, Vec2};
-use std::path::Path;
 
 /// A typing-tab overlay shown read-only in the PS editor.
 pub struct PsTextLayer {
@@ -61,8 +60,8 @@ pub struct PsTextLayer {
 
 impl PsTextLayer {
     /// Builds a `PsTextLayer` directly from a `LayerDoc` Text node's projected fields. Pin / text-group
-    /// (`layer_idx`) metadata is not carried by the doc node, so the caller supplies it (preserved from
-    /// the prior projection or derived from the bands); `texture` is supplied so the GPU handle can be
+    /// (`layer_idx`) metadata is supplied by the caller (preserved from the prior runtime, else the
+    /// node's doc-owned `text_pinned` / `text_pinned_by_group` / `text_layer_idx`); `texture` is supplied so the GPU handle can be
     /// reused across re-projections when the node's pixels are unchanged. `text_content` is the overlay's
     /// raw text (from the node's `render_data`), used to build the panel row preview; empty when absent.
     #[allow(clippy::too_many_arguments)]
@@ -96,10 +95,10 @@ impl PsTextLayer {
         }
     }
 
-    /// Builds a skeletal `PsTextLayer` carrying only the PS-owned metadata read from a `layers.json`
-    /// text node (pin / pinned_by_group / text-group `layer_idx` / unified `group_uid`). The image and
-    /// geometry are placeholders, filled by the subsequent `sync_view_from_doc` projection from the doc
-    /// (the source of truth). Used so PS gets pin metadata on page-load WITHOUT reading `text_info.json`.
+    /// Builds a skeletal `PsTextLayer` carrying only the PS-owned metadata of a doc Text node (pin /
+    /// pinned_by_group / text-group `layer_idx` / unified `group_uid`). The image and geometry are
+    /// placeholders, filled by the subsequent `sync_view_from_doc` projection from the doc (the source
+    /// of truth). Used by `materialize_text_runtime_from_doc`; no disk is read.
     /// `text_content` starts empty (render_data is not available on this skeletal path); the projection
     /// fills it from the doc node.
     pub fn meta_from_node(
@@ -335,43 +334,10 @@ impl PsTextLayer {
     }
 }
 
-/// Loads the typing tab's overlays to display for one page, driven by `text_info.json` (the actual
-/// overlays) so text shows even before any `layers.json` text nodes exist (fresh open / legacy
-/// chapter). The PS-owned pin state is taken from the `layers.json` nodes when present; band Z /
-/// group come from the unified bands at composite time. Directories are tried in order (unsaved
-/// staging, committed `layers/`, legacy `text_images/`) for both the JSON and the PNGs.
-/// Loads PS-owned text-node METADATA for a page from `layers.json` ONLY (no `text_info.json`): one
-/// skeletal `PsTextLayer` per text node carrying pin / pinned_by_group / text-group `layer_idx` /
-/// unified `group_uid`. The image + geometry are placeholders that `sync_view_from_doc` fills from the
-/// shared doc (the source of truth for text now that the typing tab no longer writes `text_info.json`).
-/// Returns an empty list for a chapter whose text still lives only in legacy `text_info.json` (no
-/// layers.json text nodes yet) — those nodes are materialized by the doc projection with default pins.
-pub fn load_page_text_layer_meta(
-    unsaved_layers_dir: &Path,
-    layers_dir: &Path,
-    page_idx: usize,
-) -> Vec<PsTextLayer> {
-    persist::load_page_text_nodes(unsaved_layers_dir, Some(layers_dir), page_idx)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|n| {
-            PsTextLayer::meta_from_node(
-                n.uid,
-                n.name,
-                n.layer_idx,
-                n.group_uid,
-                n.pinned,
-                n.pinned_by_group,
-            )
-        })
-        .collect()
-}
-
-
-// NOTE: PS no longer reads or writes `text_info.json`. Text layers are projected from the shared
-// `LayerDoc` (`sync_view_from_doc`), with PS-owned pin/group metadata seeded from `layers.json` text
-// nodes via `load_page_text_layer_meta`. The former `text_info.json` readers/writers
-// (`read_text_info_array` / `load_png` / `persist_overlay_transform` / `delete_overlay`) were removed
+// NOTE: PS no longer reads or writes `text_info.json`, and reads no `layers.json` text metadata either.
+// Text layers are projected from the shared `LayerDoc` (`sync_view_from_doc`), with the PS-owned
+// pin/group metadata taken from the doc node (`materialize_text_runtime_from_doc` in `lib.rs`). The
+// former `text_info.json` readers/writers (`read_text_info_array` / `load_png` / `persist_overlay_transform` / `delete_overlay`) were removed
 // across Phases A4–A5 and D. The doc's `decode_page_payload` is the only reader of the legacy file, and
 // only for un-migrated chapters.
 

@@ -58,6 +58,8 @@ anyhow.workspace = true
 # Stable overlay identities in the layer document's text payload: a v5 UUID derived
 # from a fixed namespace, so the same overlay name always yields the same id.
 uuid.workspace = true
+# `Instant` of the autosave gate's time window; `std::time::Instant` panics on wasm32.
+web-time.workspace = true
 
 [features]
 # Exposes this crate's test-only accessors (`LayerDoc::ensure_page_loaded` / `node`,

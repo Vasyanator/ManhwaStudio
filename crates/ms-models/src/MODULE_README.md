@@ -34,6 +34,12 @@ model revision to refresh local mask caches. Autoclean reads `blocks` to build a
 candidate.
 
 ## Files and submodules
+- `autosave_gate.rs`: `AutosaveGate`, the per-project (`Arc`) decision of WHEN held autosave work
+  is flushed to `_unsaved`. A monotonic `flush_epoch` advances when the policy interval has passed
+  since the FIRST pending action, when the action count reaches the threshold, or on
+  `force_flush`; each writer keeps its own `seen_epoch` and is due iff `poll() != seen_epoch`. The
+  policy is read from `ms_config::autosave_policy` on every call (live settings); tests inject one
+  with `AutosaveGate::with_policy_fn` instead of touching the process globals.
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
   coalesced background saving. The bubbles document is written only through
   `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
@@ -80,14 +86,15 @@ it from its `[dev-dependencies]`, so no production build carries them.
   - `barrier_and_hold_blocking` — flush + HOLD, for save-to-project (taken before the merge, so the
     merge cannot copy a staging file the saver has not written yet, and the saver cannot re-create
     staging after the merge deleted it). Holds are **reference-counted**: each guard's `Resume`
-    releases exactly one level and the held snapshot is written at zero. A boolean hold was broken
+    releases exactly one level; at zero the held snapshot returns to the normal (gate) decision. The
+    barrier itself first force-writes whatever the autosave gate was holding, then acks. A boolean hold was broken
     by a second concurrent holder releasing someone else's. Shutdown during a hold waits for every
     holder, then persists the held snapshot — it must never drop it silently.
     Never call it on the GUI thread; the one exception is `shutdown_saver`, which uses it internally
     on the exit path where the drain is bounded and the process is ending anyway. Its "flushes
     everything enqueued before this call" guarantee is exact only for the FIRST holder: a barrier
     nested inside an active hold acks immediately while pre-barrier snapshots still sit in
-    `held_snapshot`. Safe today (only `shutdown_saver` nests, and Shutdown waits + persists), but do
+    the worker's `pending` snapshot. Safe today (only `shutdown_saver` nests, and Shutdown waits + persists), but do
     not build a new caller on the flush semantic under concurrency without fixing that.
   - `pause_saver_for_page_op` — PERMANENT pause: waits for the in-flight write, then drops all later
     publications and makes shutdown drain-and-join **without writing**. Safe for page-ops only
@@ -105,6 +112,23 @@ it from its `[dev-dependencies]`, so no production build carries them.
 - The saver is not respawned on demand (the model owns its handle). If the thread ever dies, each
   dropped publication is logged and persistence stops until `shutdown_saver` surfaces the error at
   exit.
+- **An autosave "action" is one enqueued save gesture** (stroke commit, text edit, bubble change),
+  reported via `AutosaveGate::note_action` at the enqueue funnel — never per pixel mark or per
+  frame, or the action threshold would degenerate into immediate mode. The gate does no I/O and
+  holds its lock only for counter updates.
+- **Autosave hold — the three writers** (each takes `Option<Arc<AutosaveGate>>`; `None` = immediate
+  mode, today's write-on-drain, used by tests/tools): the layer saver (`LayerDoc::enable_background_saver`)
+  keeps its coalescing bucket across drains; the bubbles saver (`BubblesModel::new(.., gate)`) keeps
+  its latest snapshot; the clean-overlay autosave keeps the model's dirty set
+  (`CleanOverlaysModel::set_autosave_gate` + `ms_canvas::spawn_overlay_autosave_thread(.., gate)`).
+  Each writes when the gate epoch moves past the epoch it last acted on. ORDER CONTRACT: an action
+  is reported AFTER its job/snapshot is sent (or its dirty mark inserted), and a writer polls the
+  gate BEFORE draining — so a flush epoch never covers work the pass does not contain (reversing
+  either side can strand a job with no open window). Barriers, `BarrierAndHold`, non-discarding
+  shutdown and `FlushAndStop` always write what is held; discard drops it. Held layer jobs keep
+  their epochs unacknowledged, so `has_pending_saves()` stays true. Memory: held layer jobs carry
+  pixels only for `pixels_dirty` rasters + dirty/missing text renders of pending pages (which stay
+  resident) + the PS active page's raster set; bubbles hold one `Arc`; clean holds nothing extra.
 - Model revisions and dirty sets are the synchronization contract with canvas/runtime
   subscribers; update them whenever visible shared state changes.
 - Bubble ids are the stable identity for updates. Maintain the id index whenever the stored bubble

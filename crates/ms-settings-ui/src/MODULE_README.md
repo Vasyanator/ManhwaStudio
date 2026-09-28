@@ -54,7 +54,8 @@ dependency list.
   progress, failure list — the list is reused by the launcher main page). The shown mode is
   `ms_docstore::default_format()`; web builds show an explanation only (Dev-only store).
 - `general_settings_panel.rs`: projects root, storage mode, memory profile, UI language, UI scale,
-  typesetting language, startup monitor. Also owns the process-wide UI-scale slot
+  autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
+  language, startup monitor. Also owns the process-wide UI-scale slot
   (`ui_scale_percent` / `apply_ui_scale`) every `eframe::run_native` creator applies, and
   the locale-catalog helpers the launcher's first-run language modal reuses.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,

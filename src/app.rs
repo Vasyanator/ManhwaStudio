@@ -53,8 +53,8 @@ use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleTextField, BubbleType,
     CanvasBottomHint, CanvasDrawParams, CanvasHintHelp, CanvasHintRow, CanvasUiStatus, CanvasView,
-    CanvasViewportSnapshot, OnTopFocusMode, SourceTextureUploadBudget, TranslationStatusDisplay,
-    spawn_overlay_autosave_thread,
+    CanvasViewportSnapshot, OnTopFocusMode, OverlayAutosaveControl, SourceTextureUploadBudget,
+    TranslationStatusDisplay, spawn_overlay_autosave_thread,
 };
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, InputManagerV2};
 use serde_json::{Map, Value};
@@ -63,6 +63,7 @@ use crate::memory_manager::{
     CacheResourceKind, MemoryManager, MemoryPressure, classify_memory_pressure,
     current_memory_availability, select_eviction_candidates,
 };
+use crate::models::autosave_gate::AutosaveGate;
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings, write_bubbles_snapshot_to};
 use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snapshots_guarded};
 use crate::models::text_mask_model::TextMaskModel;
@@ -271,10 +272,15 @@ pub struct MangaApp {
     ai_device_prompt_directml_device_id: String,
     ai_device_prompt_applying: bool,
     ai_device_prompt_error: Option<String>,
-    /// Background thread that autosaves dirty overlays every 30 s.
+    /// Background thread that writes dirty клин overlays into staging when the autosave gate is due.
     overlay_autosave_thread: Option<JoinHandle<()>>,
-    /// Signals the overlay autosave worker before it is joined for a page operation or teardown.
-    overlay_autosave_shutdown: Arc<AtomicBool>,
+    /// The project instance's autosave write gate, shared by all three staging writers (layer saver,
+    /// bubbles saver, клин autosave). Lives as long as this `MangaApp`; a project reload builds a new
+    /// app and therefore a fresh gate. Forced on save-to-project success and before a page operation.
+    autosave_gate: Arc<AutosaveGate>,
+    /// Quiescence handle of the overlay autosave worker: stop-now before a page operation or a
+    /// discard, flush-and-stop at non-discard teardown, pause held by the save-to-project worker.
+    overlay_autosave_control: Arc<OverlayAutosaveControl>,
     /// Active "save to project" merge job.
     save_to_project_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Status text shown next to the "save to project" button.
@@ -610,11 +616,17 @@ impl MangaApp {
                 .to_string(),
             hint_show_outside_default: canvas.state.hint_show_outside_default,
         };
+        // ONE autosave gate per project instance, shared by every `{chapter}_unsaved` writer: each
+        // writer holds its changes in memory and writes them when the gate is due (interval since the
+        // first pending change, or the action count, from the live global policy). Force points
+        // (barriers, shutdown, `force_flush`) bypass it; see README_AGENT «Autosave write buffer».
+        let autosave_gate = Arc::new(AutosaveGate::new());
         let bubbles_model = Arc::new(Mutex::new(BubblesModel::new(
             project.bubbles.as_ref().clone(),
             project.paths.bubbles_file.clone(),
             project.paths.unsaved_bubbles_file.clone(),
             shared_canvas_settings,
+            Some(Arc::clone(&autosave_gate)),
         )));
         canvas.set_scroll_area_id_salt("translation_canvas_scroll");
         canvas.set_bubbles_model(Arc::clone(&bubbles_model));
@@ -643,6 +655,12 @@ impl MangaApp {
         if let Ok(mut overlays) = clean_overlays_model.lock() {
             overlays.set_cache_pages_enabled(canvas.state.cache_pages);
             overlays.set_memory_profile(memory_manager.profile());
+            overlays.set_autosave_gate(Some(Arc::clone(&autosave_gate)));
+        } else {
+            runtime_log::log_error(
+                "[app] clean-overlay model lock poisoned at startup: autosave gate not attached, so клин \
+                 edits report no autosave actions (they still reach staging at every force point)",
+            );
         }
         cleaning_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut typing_tab = TypingTabState::default();
@@ -671,8 +689,10 @@ impl MangaApp {
         // text) then enqueue PNG-encode + manifest RMW off the GUI thread; the save-to-project merge
         // worker and app-close drain barrier the queue so no write is lost. With no saver the doc's
         // enqueue_page_* methods fall back to a synchronous flush, so wiring is safe either way.
+        // With the autosave gate the saver HOLDS enqueued jobs until the gate is due; barriers and
+        // shutdown still force every held job out.
         if let Ok(mut doc) = layer_doc.lock() {
-            doc.enable_background_saver();
+            doc.enable_background_saver(Some(Arc::clone(&autosave_gate)));
         } else {
             runtime_log::log_error(
                 "[app] could not enable background layer saver: shared doc lock poisoned at startup",
@@ -699,12 +719,13 @@ impl MangaApp {
         let comic_type_prompt_open = project.comic_type.is_none();
         let has_unsaved_changes_cached = project.paths.unsaved_dir.exists();
 
-        // Start the 30-second overlay autosave background thread.
-        let overlay_autosave_shutdown = Arc::new(AtomicBool::new(false));
+        // Start the клин overlay autosave thread; it writes the dirty pages when the gate is due.
+        let overlay_autosave_control = OverlayAutosaveControl::new();
         let overlay_autosave_thread = Some(spawn_overlay_autosave_thread(
             Arc::clone(&clean_overlays_model),
             project.paths.unsaved_clean_layers_dir.clone(),
-            Arc::clone(&overlay_autosave_shutdown),
+            Arc::clone(&overlay_autosave_control),
+            Some(Arc::clone(&autosave_gate)),
         ));
         let mut page_manager_tab = PageManagerTabState::default();
         page_manager_tab.set_bubbles_model(Arc::clone(&bubbles_model));
@@ -771,7 +792,8 @@ impl MangaApp {
             ai_device_prompt_applying: false,
             ai_device_prompt_error: None,
             overlay_autosave_thread,
-            overlay_autosave_shutdown,
+            overlay_autosave_control,
+            autosave_gate,
             save_to_project_rx: None,
             save_to_project_status: None,
             storage_notice_dismissed_job: None,
@@ -817,10 +839,20 @@ impl MangaApp {
 
     /// Stops and joins the periodic overlay writer during final application teardown.
     ///
-    /// This may block for the current per-page PNG encode. That is acceptable only from
-    /// `on_exit`; structural operations transfer the handle to their worker instead.
+    /// Non-discard exit: requests one final pass so every dirty клин page reaches the staging dir
+    /// before the process ends (the exit dialog already offered to save; staging is what a later
+    /// session recovers). Discard exit: stops without writing — `start_exit_cleanup` normally took
+    /// the handle already and joins it in the delete job.
+    ///
+    /// Blocks for the final pass (one PNG encode per dirty page), or for a save-to-project merge
+    /// that still holds a pause. That is acceptable only from `on_exit`, the same class as the
+    /// layer-saver barrier there; structural operations transfer the handle to their worker.
     fn stop_overlay_autosave(&mut self) {
-        self.overlay_autosave_shutdown.store(true, AtomicOrdering::Release);
+        if self.discarding_unsaved_changes {
+            self.overlay_autosave_control.request_stop_now();
+        } else {
+            self.overlay_autosave_control.request_flush_and_stop();
+        }
         if let Some(handle) = self.overlay_autosave_thread.take()
             && handle.join().is_err()
         {
@@ -901,10 +933,19 @@ impl MangaApp {
             }
         }
 
-        self.overlay_autosave_shutdown
-            .store(true, AtomicOrdering::Release);
+        // Every change the autosave gate is still holding must reach `_unsaved` (NOT the committed
+        // tree) before the transaction remaps it; the reload behind the op then builds a fresh app and
+        // gate. The worker below is that force point for all three writers: the layer saver barrier
+        // writes its held bucket, the bubbles snapshot is the model's CURRENT state (pause returns it,
+        // the worker writes it), and the клин dirty set — the клин writer's held state — is taken and
+        // written after the autosave thread joined. `force_flush` closes the gate's window so a writer
+        // that wakes before being quiesced writes rather than keeps holding (and records the intent).
+        self.autosave_gate.force_flush();
+        // Stop-now (not flush): stop-now leaves the dirty клин set in the model, and the transaction
+        // below takes and writes it into `_unsaved` itself after the join, so an autosave pass must
+        // not race it. Joined in the worker, never here.
+        self.overlay_autosave_control.request_stop_now();
         let overlay_autosave_thread = self.overlay_autosave_thread.take();
-        let overlay_autosave_shutdown = Arc::clone(&self.overlay_autosave_shutdown);
 
         let saver_handle = self.layer_doc.lock().ok().and_then(|guard| guard.saver_handle());
         let overlays_model = Arc::clone(&self.clean_overlays_model);
@@ -913,7 +954,6 @@ impl MangaApp {
         let pages = self.project.pages.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            overlay_autosave_shutdown.store(true, AtomicOrdering::Release);
             if let Some(handle) = overlay_autosave_thread
                 && handle.join().is_err()
             {
@@ -1067,14 +1107,26 @@ impl MangaApp {
             self.has_unsaved_changes_cached = true;
             return;
         }
+        // Layer writes enqueued to the background saver but not yet acknowledged are unsaved work the
+        // staging-dir probe may not see yet. A stale positive (acked, not yet polled) is harmless: an
+        // acked write means staging exists, so the probe would answer true as well.
+        if let Ok(doc) = self.layer_doc.lock()
+            && doc.has_pending_saves()
+        {
+            self.has_unsaved_changes_cached = true;
+            return;
+        }
         if let Ok(model) = self.bubbles_model.lock()
             && model.has_unsaved_changes()
         {
             self.has_unsaved_changes_cached = true;
             return;
         }
+        // `has_unsaved_overlay_changes` covers клин pages the autosave gate still HOLDS after a
+        // save-to-project cleared the project flag (edits made during the merge): they are unsaved
+        // work, but staging may not exist yet.
         if let Ok(model) = self.clean_overlays_model.lock()
-            && model.has_project_unsaved_changes()
+            && (model.has_project_unsaved_changes() || model.has_unsaved_overlay_changes())
         {
             self.has_unsaved_changes_cached = true;
             return;
@@ -1273,10 +1325,10 @@ impl MangaApp {
         let project_dir = self.project.paths.project_dir.clone();
         let unsaved_clean_layers_dir = self.project.paths.unsaved_clean_layers_dir.clone();
         let clean_overlays_model = Arc::clone(&self.clean_overlays_model);
-        let dirty_overlay_snapshots = match self.clean_overlays_model.lock() {
-            Ok(mut overlays) => overlays.take_dirty_save_snapshots(),
-            Err(_) => Vec::new(),
-        };
+        // The dirty клин snapshots are taken INSIDE the worker, under an autosave pause: taking them
+        // here, with the autosave running, let a pass that had just taken the dirty set land its pages
+        // in a staging dir re-created after the merge deleted it, while the app reported "saved".
+        let overlay_autosave_control = Arc::clone(&self.overlay_autosave_control);
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
             // Hold later bubble snapshots until every destructive staging operation below is done.
@@ -1284,9 +1336,6 @@ impl MangaApp {
             let bubbles_barrier = match bubbles_saver_handle.barrier_and_hold_blocking() {
                 Ok(guard) => guard,
                 Err(err) => {
-                    if let Ok(mut overlays) = clean_overlays_model.lock() {
-                        overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
-                    }
                     runtime_log::log_error(format!(
                         "[save_to_project] aborted: bubbles saver barrier failed: {err}. Nothing was merged and '{}' is intact",
                         unsaved_dir.display()
@@ -1313,11 +1362,6 @@ impl MangaApp {
                 owned_text_pages.intersection(&failed_pages).copied().collect();
             unwritten_owned.sort_unstable();
             if !unwritten_owned.is_empty() {
-                // This thread TOOK the clean-overlay dirty snapshots from the model and is not going to
-                // write them; without the restore their dirty state would be lost with the abort.
-                if let Ok(mut overlays) = clean_overlays_model.lock() {
-                    overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
-                }
                 runtime_log::log_error(format!(
                     "[save_to_project] aborted: the layer saver barrier reported a FAILED text write \
                      for {} owned page(s): {unwritten_owned:?} (cause logged per page by the saver). \
@@ -1335,6 +1379,26 @@ impl MangaApp {
             }
             // Every owned page's text is on disk: the set is authoritative for the merge as it stands.
             let effective_owned_text_pages: HashSet<usize> = owned_text_pages;
+            // Quiesce the клин autosave (waits out an in-flight pass) and keep it paused until the
+            // merge has finished, so no autosave write can land in staging during or after the merge.
+            // Blocking is fine: this is the save worker thread. The guard drops on every return path.
+            let overlay_autosave_pause = overlay_autosave_control.pause_blocking();
+            let dirty_overlay_snapshots = match clean_overlays_model.lock() {
+                Ok(mut overlays) => overlays.take_dirty_save_snapshots(),
+                Err(_) => {
+                    runtime_log::log_error(format!(
+                        "[save_to_project] aborted: clean-overlay model lock poisoned; dirty клин pages \
+                         cannot be captured. Nothing was merged and '{}' is intact",
+                        unsaved_dir.display()
+                    ));
+                    if tx.send(Err(t!("app.save.thread_crashed").to_string())).is_err() {
+                        runtime_log::log_error(
+                            "[save_to_project] result receiver dropped before the overlay lock failure could be reported",
+                        );
+                    }
+                    return;
+                }
+            };
             if let Err(err) = save_overlay_snapshots_guarded(
                 &unsaved_clean_layers_dir,
                 &dirty_overlay_snapshots,
@@ -1358,6 +1422,9 @@ impl MangaApp {
             let result = crate::project::save_merge::merge_unsaved_into_project(&unsaved_dir, &project_dir, |committed, staging| {
                 crate::models::layer_model::persist::merge_unsaved_layers_into_committed(committed, staging, &effective_owned_text_pages).map(|_wrote| ())
             });
+            // The merge is done: клин edits made meanwhile stayed dirty in the model and the resumed
+            // autosave writes them to fresh staging.
+            drop(overlay_autosave_pause);
             // Resume before reporting completion, then issue a second barrier so any edit accepted
             // during the merge is on fresh staging before the GUI clears/recomputes dirty state.
             drop(bubbles_barrier);
@@ -1393,6 +1460,9 @@ impl MangaApp {
         match rx.try_recv() {
             Ok(Ok(())) => {
                 self.save_to_project_rx = None;
+                // Everything held was forced out and merged: close the gate's window so the interval
+                // and action count restart from the next edit. Abort paths leave the gate alone.
+                self.autosave_gate.force_flush();
                 if let Ok(mut model) = self.bubbles_model.lock() {
                     model.mark_saved_to_project();
                 }
@@ -1423,11 +1493,21 @@ impl MangaApp {
     }
 
     /// Delete the unsaved staging folder in a background thread and report the result.
+    ///
+    /// `overlay_autosave_thread` (already told to stop-now by the caller) is joined on the job
+    /// thread BEFORE the delete, so a finishing autosave pass cannot re-create the staging dir
+    /// after it was removed, and the GUI thread never waits on it.
     fn spawn_unsaved_delete_job(
         unsaved_dir: PathBuf,
+        overlay_autosave_thread: Option<JoinHandle<()>>,
     ) -> std::sync::mpsc::Receiver<Result<(), String>> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
+            if let Some(handle) = overlay_autosave_thread
+                && handle.join().is_err()
+            {
+                runtime_log::log_error("[exit] overlay autosave worker panicked during discard");
+            }
             let result = if unsaved_dir.exists() {
                 fs::remove_dir_all(&unsaved_dir).map_err(|err| {
                     tf!("app.save.remove_temp_error", unsaved_dir = unsaved_dir.display(), err = err)
@@ -1440,6 +1520,9 @@ impl MangaApp {
         rx
     }
 
+    /// Starts the DISCARD exit: drops pending edits, quiesces every staging writer (layer saver,
+    /// bubbles saver, клин autosave) and spawns the staging-dir delete job; `action` runs once the
+    /// delete succeeds (`poll_pending_exit_cleanup`).
     fn start_exit_cleanup(&mut self, action: PendingCloseAction) {
         if self.pending_exit_cleanup.is_some() {
             return;
@@ -1458,13 +1541,13 @@ impl MangaApp {
         self.typing_tab.discard_pending_text_edits();
         // Stop the layer saver BEFORE deleting the unsaved dir. The discard path removes the staging
         // folder the saver writes into; a still-running saver could recreate files mid/post deletion,
-        // leaving the staging dir partially present. `shutdown_saver` drains the queue then JOINS the
+        // leaving the staging dir partially present. `shutdown_saver_discarding` stops the saver then JOINS the
         // worker, guaranteeing it is no longer writing before the delete job spawns — closing that
-        // race. We do not barrier on the GUI thread here: this is the DISCARD path (the user chose not
-        // to save), so the queued writes target the dir being deleted; only the join matters. The
-        // join (drain of a small queue) is bounded and runs only at teardown.
+        // race. The shutdown DROPS queued and gate-held jobs instead of writing them: this is the
+        // DISCARD path (the user chose not to save), so they target the dir being deleted; only the
+        // join matters. The join waits at most for one in-progress write and runs only at teardown.
         if let Ok(mut guard) = self.layer_doc.lock() {
-            guard.shutdown_saver();
+            guard.shutdown_saver_discarding();
         }
         // Quiesce bubble persistence before removing staging. The pause gate waits for any selected
         // write to finish, drops all later publications, and makes shutdown drain-and-join without
@@ -1477,7 +1560,13 @@ impl MangaApp {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pause_saver_for_page_op();
-        let rx = Self::spawn_unsaved_delete_job(self.project.paths.unsaved_dir.clone());
+        // Stop the клин autosave without writing (discard) and join it on the delete job before the
+        // delete; left running, a pass could re-create the staging dir after its removal.
+        self.overlay_autosave_control.request_stop_now();
+        let rx = Self::spawn_unsaved_delete_job(
+            self.project.paths.unsaved_dir.clone(),
+            self.overlay_autosave_thread.take(),
+        );
         self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
         self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
     }
@@ -1500,18 +1589,36 @@ impl MangaApp {
     /// that hides the exit dialog. Being sticky-unsaved is the conservative, correct direction: the
     /// next close offers save/discard again.
     ///
-    /// Known degradation this does NOT undo: `start_exit_cleanup` also shut the layer saver down, so
-    /// later text writes take `enqueue_page_text_save`'s synchronous fallback. Writes still land; only
-    /// the coalescing is gone, and restarting the saver is out of scope for a failed-teardown path.
+    /// Every `_unsaved` writer the discard stopped is restarted on the app's autosave gate: the layer
+    /// saver (`shutdown_saver_discarding` left the doc without one, so every later layer write would
+    /// take the synchronous fallback and bypass the gate), the bubbles saver and the клин autosave.
     fn abort_discard_after_failed_cleanup(&mut self) {
         self.discarding_unsaved_changes = false;
         self.has_unsaved_changes_cached = true;
+        // Same call as `MangaApp::new`. Consumers never cache a `LayerSaverHandle` across frames
+        // (typing/PS go through the doc funnels or take `saver_handle()` per use), so they all pick
+        // the new saver up. Poison is RECOVERED: a doc without a saver would silently fall back to
+        // synchronous, ungated writes for the rest of the session.
+        self.layer_doc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .enable_background_saver(Some(Arc::clone(&self.autosave_gate)));
         // Poison is RECOVERED, not reported: leaving the saver paused in a session that keeps running
         // would silently drop every later bubble edit for the rest of the process.
         self.bubbles_model
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .resume_saver_after_failed_discard();
+        // The discard stopped the клин autosave; restart it with a fresh control so the running
+        // session keeps autosaving (dirty pages stayed in the model: stop-now never takes them).
+        // The old worker was joined by the delete job before it reported.
+        self.overlay_autosave_control = OverlayAutosaveControl::new();
+        self.overlay_autosave_thread = Some(spawn_overlay_autosave_thread(
+            Arc::clone(&self.clean_overlays_model),
+            self.project.paths.unsaved_clean_layers_dir.clone(),
+            Arc::clone(&self.overlay_autosave_control),
+            Some(Arc::clone(&self.autosave_gate)),
+        ));
     }
 
     fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {

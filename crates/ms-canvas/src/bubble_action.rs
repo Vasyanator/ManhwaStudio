@@ -140,6 +140,7 @@ mod tests {
             unsaved.with_extension("saved.json"),
             unsaved,
             SharedCanvasSettings::default(),
+            None,
         )
     }
 

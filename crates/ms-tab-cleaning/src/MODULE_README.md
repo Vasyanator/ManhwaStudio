@@ -2,7 +2,7 @@
 
 ## Purpose
 This directory implements the Cleaning tab. It provides the canvas-facing UI for editing
-per-page clean overlays, quick text-mask cleanup, save/history controls, and the tool picker
+per-page clean overlays, quick text-mask cleanup, history controls, and the tool picker
 backed by reusable cleaning tools. All of that UI lives in dock tabs; the tab owns no floating
 surface of its own.
 
@@ -31,14 +31,17 @@ disk.
 
 Quick text cleanup builds per-page jobs from source pages plus text masks, runs page processing in
 workers, and applies prepared `ColorImage` patches into `CleanOverlaysModel` as results arrive.
-Save operations collect overlay snapshots from the shared model and write `clean_layers/` in a
-worker thread.
+The tab has NO save action of its own. Clean edits mark pages dirty in `CleanOverlaysModel`; the
+app-level overlay autosave (`ms-canvas` workers) writes them to the chapter's unsaved staging
+`clean_layers/`, and «Сохранить проект» (`app.rs`) flushes the remaining dirty pages there and
+merges the staging tree into the committed chapter. Nothing in this crate writes the committed
+`clean_layers/` directly, so staging/discard semantics hold.
 
 This tab HOSTS the shared panel dock (`crates/ms-widgets/src/panel_dock`), and every floating surface it has
 is a dock tab. It declares SEVEN: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
 `CanvasView::draw_ribbon_tab_body`, declared through `canvas::declare_ribbon_tab` — the canvas' one
-declaration of it) plus six of its own — «Клин» (`cleaning.clean`: layer visibility, clear/save,
-the quick-clean toggle and the save status), «Инструменты клина» (`cleaning.tools`: the tool picker,
+declaration of it) plus six of its own — «Клин» (`cleaning.clean`: layer visibility, clear current
+layer and the quick-clean toggle), «Инструменты клина» (`cleaning.tools`: the tool picker,
 rows wrapping to the panel width), «Выбранный инструмент» (`cleaning.active_tool`:
 `CleaningTool::draw_ui`), «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
 quick-clean parameters, its two run buttons and its progress), «Редактор области»
@@ -63,7 +66,7 @@ active tool would paint under a panel. `PanelDockOutput::drawn_panels` reports M
 only, so a panel the user detached into a sub-window cannot enter that list — its rect is in that
 window's own frame and would blank out this window's top-left corner.
 
-Long-running AI, image processing, mask loading, and save work runs on worker threads.
+Long-running AI, image processing and mask loading work runs on worker threads.
 The GUI thread polls job receivers and applies already prepared results.
 AI-backed tools receive backend health/Torch availability from the tab, then run model checks and
 backend requests inside tool worker paths. App-managed inpaint weights must be resolved through
@@ -71,7 +74,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 
 ## Files and submodules
 - `tab.rs`: tab state, canvas orchestration, the dock tabs and their default arrangement, mask
-  loading, save jobs, quick text-clean job orchestration, and history hotkeys.
+  loading, quick text-clean job orchestration, and history hotkeys.
 - `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
   clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
   (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->
@@ -239,7 +242,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 - A dock tab body runs INSIDE `CanvasView::draw`. It edits the state its own widgets own — the
   active tool's UI mutates that tool, exactly as it did inside the tool window — but it may not
   perform, or invalidate the inputs of, anything the tab defers: the canvas' overlay edits, the job
-  starters (`start_save_job`, `start_text_mask_load_job_if_needed`, `start_quick_text_clean_job`)
+  starters (`start_text_mask_load_job_if_needed`, `start_quick_text_clean_job`)
   and the tool switch (`activate_tool`) all need `&mut CleaningTabState` and would land
   mid-canvas-frame. Those are raised as flags on `CleaningDockOut` and run by `apply_dock_out`
   after the canvas draw returns, in the order the surfaces they came from ran them. The worker/job
@@ -248,10 +251,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   chapter catalog, the canvas or a worker leaves as a `LibraryPanelRequest` that the tool's
   `draw_overlay_ui` runs later in the same frame.
 - Anything a tab body READS is polled BEFORE `canvas.draw`, not after it: `CleaningHooks` snapshots
-  the save state and the active tool index when it is built, so `poll_save_job` and
-  `ensure_active_tool_available` run at the top of `CleaningTabState::draw`. Polling after the draw
-  showed the previous frame's answer for one frame — a spinner outliving its save, a tool that had
-  just become unavailable still drawn selected — with nothing requesting the correcting repaint.
+  the active tool index when it is built, so `ensure_active_tool_available` runs at the top of
+  `CleaningTabState::draw`. Polling after the draw showed the previous frame's answer for one
+  frame — a tool that had just become unavailable still drawn selected — with nothing requesting
+  the correcting repaint.
 - The tool buttons' captions are resolved at DRAW time from `CleaningTool::title()`, never cached in
   the tab state: a cached caption keeps the language the app started in.
 - Every tab whose width is caption-driven («Инструменты клина», «Клин», «Быстрый клин найденного
@@ -270,7 +273,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   знаков…» buttons toggle it and are drawn `selected` while it is open.
 
 ## Editing map
-- To change top-level cleaning UI, save behavior, history, or quick-clean orchestration,
+- To change top-level cleaning UI, history, or quick-clean orchestration,
   edit `tab.rs`.
 - To change which dock tabs this program tab declares or how big they start, edit
   `CleaningHooks::draw_canvas_overlay_top_left` in `tab.rs`; where their panels sit by default is

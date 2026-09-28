@@ -25,6 +25,9 @@ Extracted verbatim from `tab.rs`. Free fns and methods are `pub(super)` so `tab.
 and sibling submodules of `tab` can use them. `use super::*;` pulls in the parent
 module's types and imports. Some export helpers (compositing/deform variants) remain
 in `tab.rs` and are reused from here as descendants of module `tab`.
+The export worker barriers the shared layer saver before composing: under the autosave
+gate the saver holds enqueued writes, and the page flatten can fall back to the staging
+`layers.json`.
 */
 
 use super::*;
@@ -1369,6 +1372,9 @@ impl TypingTextOverlayLayer {
     /// running, when the project has no pages, or when the request itself is impossible
     /// (see `resolve_export_route`) — the last one is checked HERE, on the GUI thread, so an
     /// invalid pairing never costs a spawned thread.
+    ///
+    /// The spawned worker first barriers the layer saver (forcing every held staging write out)
+    /// so no disk fallback of the page flatten reads a stale `layers.json`.
     pub(super) fn request_export(
         &mut self,
         ctx: &egui::Context,
@@ -1523,8 +1529,28 @@ impl TypingTextOverlayLayer {
             done: 0,
             total: total_pages,
         };
+        // The page flatten can fall back to the staging `layers.json` (text band-Z when a page has
+        // no raster snapshot, rasters when the doc projection is empty). The layer saver may HOLD
+        // enqueued writes for minutes under the autosave gate, so the worker barriers it first —
+        // writing every held job into staging — before any page reads it. Cheap `Sender` clone here;
+        // the barrier blocks the export worker, never the GUI thread. `None` = no saver (every
+        // write was synchronous, nothing to wait for).
+        let saver_handle = self
+            .layer_doc
+            .as_ref()
+            .and_then(|doc| doc.lock().ok().and_then(|guard| guard.saver_handle()));
         let (tx, rx) = mpsc::channel::<TypingExportEvent>();
         thread::spawn(move || {
+            if let Some(handle) = saver_handle {
+                let failed_pages = handle.barrier_blocking();
+                if !failed_pages.is_empty() {
+                    ms_log::runtime_log::log_warn(format!(
+                        "[typing] export: the layer saver reported failed staging text writes for pages \
+                         {failed_pages:?}; a page that falls back to the staging manifest may export its \
+                         previous layer order"
+                    ));
+                }
+            }
             let result = export_typing_pages(jobs, request, clean_overlays_model, tx.clone());
             // The receiver is gone only when the tab dropped this export; there is nobody left
             // to hand the result to, so the send result is deliberately ignored.

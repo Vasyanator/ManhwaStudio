@@ -286,7 +286,7 @@ pub use self::view_transform::ViewTransform;
 
 pub use self::settings::{save_canvas_settings_to_project_file, save_canvas_settings_to_user_file};
 
-pub use self::workers::spawn_overlay_autosave_thread;
+pub use self::workers::{OverlayAutosaveControl, OverlayAutosavePauseGuard, spawn_overlay_autosave_thread};
 
 // Image-bubble text-area parsing is shared with the typing tab, which seeds created text overlays
 // from the per-area text of read-only image bubbles.

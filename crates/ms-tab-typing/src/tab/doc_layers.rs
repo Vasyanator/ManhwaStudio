@@ -83,10 +83,10 @@ impl TypingTextOverlayLayer {
     ///
     /// Routed exactly like the PS editor's band move: the page's bands are flattened so the target owns
     /// its own pinned band (a text inside a group is pinned OUT of the group's page-Y auto-order for
-    /// this page only), the target is swapped one step, the new order is persisted via
-    /// `persist::save_page_band_order` (the disk authority for pin + Z — which a later `flush_page_text`
-    /// then PRESERVES via `merge_preserved_text_fields`, so the reorder is never clobbered), and the
-    /// SAME order is mirrored into the shared doc via `set_z_order` so both tabs re-project in step.
+    /// this page only), the target is swapped one step, the new order is persisted as a band-order
+    /// save job (`LayerDoc::enqueue_page_band_order`; pin + Z on disk — which a later text write then
+    /// PRESERVES via `merge_preserved_text_fields`, so the reorder is never clobbered), and the SAME
+    /// order is mirrored into the shared doc via `set_z_order` so both tabs re-project in step.
     pub(super) fn move_overlay_in_unified_z(
         &mut self,
         page_idx: usize,
@@ -128,21 +128,20 @@ impl TypingTextOverlayLayer {
 
     /// Uid-based core: moves the node `uid` (a raster or a text/image overlay) one step in the page's
     /// unified band-Z order. Flattens the page's bands to per-node refs, swaps the target one step with
-    /// its neighbour, persists the new band order via `save_page_band_order` (the disk authority both
-    /// tabs read back), and mirrors the SAME order into the shared doc via `set_z_order`. Shared by the
-    /// overlay and raster reorder entry points.
+    /// its neighbour, persists the new band order (see [`Self::persist_unified_band_order`]), and
+    /// mirrors the SAME order into the shared doc via `set_z_order`. Shared by the overlay and raster
+    /// reorder entry points.
     pub(super) fn move_node_in_unified_z(&mut self, page_idx: usize, uid: &str, up: bool) {
         use ms_models::layer_model::persist;
         let Some(primary) = self.layers_primary_dir.clone() else {
             return;
         };
 
-        // Ensure the page's rasters have on-disk manifest nodes BEFORE `save_page_band_order`:
-        // `apply_band_order` silently SKIPS a `BandRef::Raster` whose node is not yet in the manifest,
-        // and the typing tab otherwise only flushes TEXT — so a raster's new Z would never reach disk
-        // (the doc move below would show it moved, then it would revert on the next reload). Mirrors
-        // the PS editor's pre-reorder flush; `persist_current_page_rasters` uses the SYNCHRONOUS
-        // `doc.flush_page`, so the raster is on disk before the band-order write reassigns its Z.
+        // Ensure every node the order names has a manifest record BEFORE the band order is applied:
+        // `apply_band_order` silently SKIPS a band whose node is not yet in the manifest, so a raster's
+        // (or a not-yet-written text's) new Z would never reach disk and would revert on the next
+        // reload. Enqueueing the whole-page save first is sufficient: the saver applies the page's jobs
+        // in FIFO order and runs the band order (a structural edit) after the raster and text parts.
         self.persist_current_page_rasters(page_idx);
 
         // Flatten to per-node bands, then swap the target one step with its neighbour.
@@ -186,16 +185,22 @@ impl TypingTextOverlayLayer {
     }
 
     /// Persists `order` (bottom-to-top) as the page's unified band order and mirrors it into every place
-    /// this tab reads Z from. The shared tail of the band-order writers.
+    /// this tab reads Z from. The shared tail of the band-order writers (and of the doc-first raster
+    /// create, which uses it to align the on-disk Z with the doc's).
     ///
-    /// `persist::save_page_band_order` writes pin + Z into `layers.json` — the disk authority both tabs
-    /// read back. On success the cached bands for `page_idx` are dropped so the next projection reloads
-    /// the new pinned-band order, and the SAME order is mirrored into the shared doc via `set_z_order`,
-    /// so the doc (and, through its version bump, the PS tab) re-projects without a disk round-trip. When
-    /// no doc is wired or the page is not resident, the cached rasters are dropped too so they reload
-    /// from disk instead. A write failure is logged and leaves both the disk order and the projections
-    /// untouched. `uid` names the node the reorder was about and only feeds the trace log.
-    fn persist_unified_band_order(
+    /// With a shared doc the write is a band-order save job (`LayerDoc::enqueue_page_band_order`, applied
+    /// by the background saver after the page's earlier raster / text parts; synchronous
+    /// `persist::save_page_band_order` only when no saver is enabled). Without a doc it is the
+    /// synchronous `persist::save_page_band_order`. On success the cached bands for `page_idx` are
+    /// dropped and the SAME order is mirrored into the shared doc via `set_z_order` — together with the
+    /// pin state `apply_band_order` writes (every listed text pinned, every other text unpinned, the
+    /// group-owned flag untouched) via `set_text_pin_meta`, because the PS editor reads its pin meta
+    /// from the doc — so the doc (and, through its version bump, the PS tab) re-projects without a disk
+    /// round-trip. When no doc is wired or the page is not resident, the cached rasters are dropped too
+    /// so they reload from disk instead. A write failure is logged and leaves both the disk order and
+    /// the projections untouched. `uid` names the node the reorder was about and only feeds the trace
+    /// log.
+    pub(super) fn persist_unified_band_order(
         &mut self,
         page_idx: usize,
         primary: &Path,
@@ -203,9 +208,17 @@ impl TypingTextOverlayLayer {
         uid: &str,
     ) {
         use ms_models::layer_model::persist;
-        match persist::save_page_band_order(primary, page_idx, order) {
+        let fallback = self.layers_fallback_dir.clone();
+        let written = match self.layer_doc.clone() {
+            Some(doc) => match doc.lock() {
+                Ok(mut guard) => guard.enqueue_page_band_order(page_idx, primary, fallback.as_deref(), order.to_vec()),
+                Err(_) => Err("the shared layer document lock is poisoned".to_string()),
+            },
+            None => persist::save_page_band_order(primary, page_idx, order),
+        };
+        match written {
             Ok(()) => {
-                // Drop the cached bands so the next projection reloads the new pinned-band order.
+                // Drop the cached bands so the next projection rebuilds the new pinned-band order.
                 self.bands_by_page.remove(&page_idx);
                 // Mirror the SAME order into the shared doc so it (and, via its version bump, the PS
                 // tab) re-projects without a disk round-trip.
@@ -218,8 +231,33 @@ impl TypingTextOverlayLayer {
                         persist::BandRef::TextGroup(_) => None,
                     })
                     .collect();
+                let pinned_texts: std::collections::HashSet<&str> = order
+                    .iter()
+                    .filter_map(|b| match b {
+                        persist::BandRef::PinnedText(u) => Some(u.as_str()),
+                        persist::BandRef::Raster(_) | persist::BandRef::TextGroup(_) => None,
+                    })
+                    .collect();
                 let routed = self.route_to_doc(page_idx, |doc| {
                     doc.set_z_order(page_idx, &node_order);
+                    // Mirror `apply_band_order`'s pin rewrite: it unpins every text node on the page and
+                    // re-pins exactly the listed ones, leaving `pinned_by_group` as it was.
+                    let text_pins: Vec<(String, bool)> = doc
+                        .page(page_idx)
+                        .map(|page| {
+                            page.nodes
+                                .iter()
+                                .filter(|n| {
+                                    matches!(n.kind, ms_models::layer_model::layer_doc::NodeKind::Text)
+                                })
+                                .map(|n| (n.uid.clone(), n.text_pinned_by_group))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (text_uid, by_group) in text_pins {
+                        let pinned = pinned_texts.contains(text_uid.as_str());
+                        doc.set_text_pin_meta(page_idx, &text_uid, pinned, by_group);
+                    }
                 });
                 ms_log::trace_log!(
                     cat::TYPING,
@@ -243,13 +281,13 @@ impl TypingTextOverlayLayer {
     /// leaving every other band's relative order untouched. Used by layer duplication, where the copy is
     /// added on TOP of the stack and must drop back to just above its source.
     ///
-    /// The WHOLE page — rasters AND text — is flushed to the staging manifest first
-    /// ([`Self::persist_current_page_rasters`], i.e. the doc's `flush_page`), and that is load-bearing
-    /// for BOTH kinds: `persist::apply_band_order` resolves every band against the ON-DISK node list and
-    /// silently leaves a node it cannot find at its stale `z`. The order written here is the FLATTENED
-    /// page, so it renumbers rasters as well as text; flushing only the text would renumber the text
-    /// around rasters whose `z` never moved, desyncing the two on disk (correct on canvas via the doc
-    /// mirror, snapped back on the next reload). Same pre-flush, same reason, as
+    /// A save of the WHOLE page — rasters AND text — is enqueued first
+    /// ([`Self::persist_current_page_rasters`]), ahead of the band order in the saver's FIFO, and that
+    /// is load-bearing for BOTH kinds: `persist::apply_band_order` resolves every band against the
+    /// ON-DISK node list and silently leaves a node it cannot find at its stale `z`. The order written
+    /// here is the FLATTENED page, so it renumbers rasters as well as text; saving only the text would
+    /// renumber the text around rasters whose `z` never moved, desyncing the two on disk (correct on
+    /// canvas via the doc mirror, snapped back on the next reload). Same pre-save, same reason, as
     /// [`Self::move_node_in_unified_z`].
     ///
     /// **Pinning side effect** (shared with the ▲▼ reorder, and NOT specific to this helper):
@@ -260,12 +298,9 @@ impl TypingTextOverlayLayer {
     /// pinned-with-explicit-Z anyway (`write_page_text_payload` forces `pinned` on every write), so the
     /// visual order is unchanged either way.
     ///
-    /// **GUI thread**: the pre-flush is SYNCHRONOUS on the GUI thread. That is deliberate, not an
-    /// oversight — it is the identical write the «Порядок ▲▼» menu action already performs (and that one
-    /// re-encodes raster PNGs, strictly heavier), on the same kind of one-shot explicit user action.
-    /// Deferring it would invert the documented contract that the on-disk band order is the authority
-    /// both tabs read back: the order would be written against a manifest that does not yet contain the
-    /// node it is ordering.
+    /// **GUI thread**: nothing here writes synchronously while a background saver is enabled — the page
+    /// save and the band order are both saver jobs, and the saver applies them in enqueue order, so the
+    /// order is always applied against a manifest that already contains the node it is ordering.
     ///
     /// A no-op when no staging dir is wired (logged — the copy then keeps the top of the stack), when
     /// either uid has no band on the page, or when the node already sits directly above the anchor —
@@ -285,8 +320,9 @@ impl TypingTextOverlayLayer {
             return;
         };
         // See the doc comment: EVERY node this order names — the new text node included — must already
-        // exist in the manifest, or `apply_band_order` leaves it at its stale z. `flush_page` writes both
-        // rasters and text, which is exactly the set `flatten_page_bands_to_refs` emits bands for.
+        // exist in the manifest when the order is applied, or `apply_band_order` leaves it at its stale
+        // z. The whole-page save writes both rasters and text, which is exactly the set
+        // `flatten_page_bands_to_refs` emits bands for, and it is enqueued ahead of the band order.
         self.persist_current_page_rasters(page_idx);
 
         let mut order = self.flatten_page_bands_to_refs(page_idx);

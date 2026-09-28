@@ -17,17 +17,21 @@ Threading:
 All filesystem and image work is performed by the dedicated worker. Model
 locks are taken only after decoding has completed. Detach mutates the model
 BEFORE trashing files so the detach generation invalidates in-flight autosave
-snapshots (see clean_overlays_model.rs).
+snapshots (see clean_overlays_model.rs). Attach is NOT buffered by the autosave
+gate: `run_attach` writes the attached page to `_unsaved/clean_layers` through
+the guarded writer BEFORE the source is trashed, and keeps the source when that
+write fails.
 */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 use ms_thread as thread;
 use eframe::egui;
 
 use ms_models::clean_assign::{self, AttachFit, CleanFileLocation, OrphanClean, OrphanReason};
-use ms_models::clean_overlays_model::CleanOverlaysModel;
+use ms_log::runtime_log;
+use ms_models::clean_overlays_model::{save_overlay_snapshots_guarded, CleanOverlaysModel};
 use ms_project::{Page, ProjectPaths};
 use ms_models::page_view::PageImageInfo;
 
@@ -128,6 +132,9 @@ pub(super) enum CleanOpError {
     Failed(String),
     /// The overlay WAS replaced in the model, but the source file could not be removed.
     AttachSourceCleanupFailed(String),
+    /// The overlay WAS replaced in the model (and stays held for autosave), but writing it to
+    /// `_unsaved/clean_layers` failed, so the source file was deliberately KEPT.
+    AttachPersistFailed(String),
     /// The model overlay WAS detached, but at least one backing file was not trashed.
     DetachFilesIncomplete(String),
 }
@@ -150,6 +157,57 @@ pub(super) enum CleanEvent {
         outcome: Result<AttachFit, ProbeAttachError>,
     },
     Finished(Result<(), CleanOpError>),
+}
+
+/// Attaches the clean file at `path` to page `page_idx` and, unlike the gesture-driven клин edits,
+/// persists that page to `paths.unsaved_clean_layers_dir` IMMEDIATELY (attach is an explicit
+/// command, outside the autosave gate's buffering) before `remove_source` trashes the source. The
+/// source is removed only after a successful write, so a crash can never leave the clean neither on
+/// disk nor in memory. Runs on the clean worker; the model lock is held only for the in-memory
+/// replace and snapshot capture, never across decode or disk I/O.
+///
+/// Concurrency with the gate-driven клин autosave: the snapshot is captured WITHOUT removing the
+/// page from the model's dirty set (take + immediate restore under the same lock as the replace), so
+/// the next autosave pass writes the page again from the then-current pixels. A pass that captured
+/// an OLDER snapshot before this replace and finishes its write after ours can briefly leave stale
+/// pixels on disk, but it can never win permanently: the page is still dirty and is rewritten on the
+/// next due pass. The write goes through `save_overlay_snapshots_guarded`, so a detach racing this
+/// write removes the file again instead of resurrecting the clean.
+///
+/// # Errors
+/// `Failed` when nothing was applied (unreadable/incompatible file, poisoned model, the model
+/// rejected the page); `AttachPersistFailed` when the overlay is applied in memory but its write
+/// failed (source kept); `AttachSourceCleanupFailed` when the write succeeded but trashing failed.
+fn run_attach(path: &Path, page_idx: usize, page_size: [u32; 2], remove_source: bool, paths: &ProjectPaths, model: &Mutex<CleanOverlaysModel>) -> Result<(), CleanOpError> {
+    let image = clean_assign::load_clean_for_attach(path, page_size).map_err(CleanOpError::Failed)?;
+    let snapshot = {
+        let mut guard = model.lock().map_err(|_| CleanOpError::Failed("clean overlay model is unavailable".to_string()))?;
+        guard.replace_from_rgba(page_idx, image);
+        // `take_dirty_save_snapshots` drains the WHOLE dirty set; restoring it at once, under the
+        // same lock, leaves the set exactly as the replace left it (every snapshot was captured under
+        // this lock, so all of them are current and restored) while handing us this page's pixels.
+        let snapshots = guard.take_dirty_save_snapshots();
+        guard.restore_dirty_save_snapshots(&snapshots);
+        snapshots.into_iter().find(|snapshot| snapshot.page_idx == page_idx)
+    };
+    // `replace_from_rgba` ignores an out-of-range page or an empty image; the source must then stay.
+    let snapshot = snapshot.ok_or_else(|| CleanOpError::Failed(format!("page {page_idx} did not accept the clean layer")))?;
+    let written = paths.unsaved_clean_layers_dir.join(format!("{}.png", snapshot.stem));
+    save_overlay_snapshots_guarded(&paths.unsaved_clean_layers_dir, std::slice::from_ref(&snapshot), model).map_err(|error| {
+        runtime_log::log_error(format!(
+            "[page-manager::clean] attach could not persist the clean layer; source kept; page={page_idx}; source={}; target={}; error={error:#}",
+            path.display(),
+            written.display()
+        ));
+        CleanOpError::AttachPersistFailed(format!("{error:#}"))
+    })?;
+    // The source may BE the file just written (a staged clean re-attached to its own page, e.g. a
+    // size-mismatch orphan rescaled in place): trashing it would delete the only copy.
+    if !remove_source || path == written {
+        return Ok(());
+    }
+    // The overlay is applied and persisted; a failed source removal is a PARTIAL success.
+    clean_assign::trash_clean_file(paths, path).map_err(|error| CleanOpError::AttachSourceCleanupFailed(error.to_string()))
 }
 
 /// Single-worker runtime; serializing clean operations makes their disk/model
@@ -182,26 +240,7 @@ impl Default for CleanRuntime {
                         CleanEvent::AttachProbed { path, page_idx, page_size, outcome }
                     }
                     CleanJob::Attach { path, page_idx, page_size, remove_source, paths, model } => {
-                        let result = match clean_assign::load_clean_for_attach(&path, page_size) {
-                            Err(error) => Err(CleanOpError::Failed(error)),
-                            Ok(image) => match model.lock() {
-                                Err(_) => Err(CleanOpError::Failed("clean overlay model is unavailable".to_string())),
-                                Ok(mut guard) => {
-                                    guard.replace_from_rgba(page_idx, image);
-                                    drop(guard);
-                                    if remove_source {
-                                        // The overlay is already applied; a failed source
-                                        // removal is a PARTIAL success, not a plain failure.
-                                        clean_assign::trash_clean_file(&paths, &path).map_err(|error| {
-                                            CleanOpError::AttachSourceCleanupFailed(error.to_string())
-                                        })
-                                    } else {
-                                        Ok(())
-                                    }
-                                }
-                            },
-                        };
-                        CleanEvent::Finished(result)
+                        CleanEvent::Finished(run_attach(&path, page_idx, page_size, remove_source, &paths, &model))
                     }
                     CleanJob::Delete { path, paths } => CleanEvent::Finished(
                         clean_assign::trash_clean_file(&paths, &path)
@@ -332,6 +371,9 @@ impl PageManagerTabState {
                         }
                         Err(CleanOpError::AttachSourceCleanupFailed(error)) => {
                             self.error_message = Some(tf!("page_manager.clean_attach_partial", error = error));
+                        }
+                        Err(CleanOpError::AttachPersistFailed(error)) => {
+                            self.error_message = Some(tf!("page_manager.clean_attach_persist_failed", error = error));
                         }
                         Err(CleanOpError::DetachFilesIncomplete(error)) => {
                             self.error_message = Some(tf!("page_manager.clean_detach_partial", error = error));
@@ -525,11 +567,89 @@ mod tests {
         assert_eq!(candidates[2].fit, AttachFit::ScaleSameAspect);
     }
 
+    /// Project paths with only the two clean trees set (everything else empty).
+    fn clean_only_paths(clean: PathBuf, unsaved_clean: PathBuf) -> ProjectPaths {
+        ProjectPaths {
+            project_dir: PathBuf::new(), title_dir: PathBuf::new(), notes_file: PathBuf::new(), char_favorites_file: PathBuf::new(), color_presets_file: PathBuf::new(), bubbles_file: PathBuf::new(), src_dir: PathBuf::new(), clean_layers_dir: clean, cleaned_dir: PathBuf::new(), alt_vers_dir: PathBuf::new(), saved_dir: PathBuf::new(), image_bubbles_dir: PathBuf::new(), text_images_dir: PathBuf::new(), layers_dir: PathBuf::new(), text_detection_dir: PathBuf::new(), characters_dir: PathBuf::new(), terms_file: PathBuf::new(), settings_file: PathBuf::new(), unsaved_dir: PathBuf::new(), unsaved_bubbles_file: PathBuf::new(), unsaved_clean_layers_dir: unsaved_clean, unsaved_image_bubbles_dir: PathBuf::new(), unsaved_text_images_dir: PathBuf::new(), unsaved_layers_dir: PathBuf::new(),
+        }
+    }
+
+    /// A fresh, empty directory under the system temp dir, unique per test and process.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ms_page_manager_clean_{tag}_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).expect("clear stale test dir");
+        }
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// Writes an opaque 4x4 PNG to `path` (a valid attach source for a 4x4 page).
+    fn write_clean_png(path: &Path) {
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255])).save(path).expect("write source png");
+    }
+
+    fn one_page_model() -> Mutex<CleanOverlaysModel> {
+        Mutex::new(CleanOverlaysModel::new_from_pages(&[PathBuf::from("001.png")]))
+    }
+
+    /// Attach with `remove_source` writes the page to `_unsaved/clean_layers` BEFORE trashing the
+    /// staged source, and leaves the page dirty so the gate-driven autosave rewrites current pixels.
+    #[test]
+    fn attach_persists_the_page_before_removing_the_staged_source() {
+        let dir = unique_temp_dir("attach_persist");
+        let unsaved = dir.join("unsaved_clean");
+        std::fs::create_dir_all(&unsaved).expect("create unsaved dir");
+        let source = unsaved.join("orphan.png");
+        write_clean_png(&source);
+        let paths = clean_only_paths(dir.join("clean"), unsaved.clone());
+        let model = one_page_model();
+        assert!(run_attach(&source, 0, [4, 4], true, &paths, &model).is_ok());
+        let written = image::open(unsaved.join("001.png")).expect("attached page written").to_rgba8();
+        assert_eq!(written.get_pixel(0, 0), &image::Rgba([10, 20, 30, 255]));
+        assert!(!source.exists(), "the staged source must be removed after the write");
+        assert!(model.lock().expect("model lock").has_unsaved_overlay_changes(), "the page stays dirty for the autosave");
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
+    }
+
+    /// A failed write keeps the source (the clean must never exist only in memory) and reports the
+    /// distinct persist-failure outcome.
+    #[test]
+    fn attach_keeps_the_source_when_the_write_fails() {
+        let dir = unique_temp_dir("attach_write_fails");
+        let unsaved = dir.join("unsaved_clean");
+        std::fs::create_dir_all(&unsaved).expect("create unsaved dir");
+        let source = unsaved.join("orphan.png");
+        write_clean_png(&source);
+        // The target "directory" is a regular file, so creating it fails.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a dir").expect("write blocker file");
+        let paths = clean_only_paths(dir.join("clean"), blocked.join("clean_layers"));
+        let model = one_page_model();
+        let result = run_attach(&source, 0, [4, 4], true, &paths, &model);
+        assert!(matches!(result, Err(CleanOpError::AttachPersistFailed(_))));
+        assert!(source.exists(), "the source must be kept when the attached page was not written");
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
+    }
+
+    /// A staged clean attached to its own page is the file just written: it must not be trashed.
+    #[test]
+    fn attach_does_not_trash_a_source_that_is_the_written_file() {
+        let dir = unique_temp_dir("attach_in_place");
+        let unsaved = dir.join("unsaved_clean");
+        std::fs::create_dir_all(&unsaved).expect("create unsaved dir");
+        let source = unsaved.join("001.png");
+        write_clean_png(&source);
+        let paths = clean_only_paths(dir.join("clean"), unsaved);
+        let model = one_page_model();
+        assert!(run_attach(&source, 0, [4, 4], true, &paths, &model).is_ok());
+        assert!(source.exists(), "the in-place source is the persisted clean");
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
+    }
+
     #[test]
     fn clean_paths_use_page_stem_in_both_trees() {
-        let paths = ProjectPaths {
-            project_dir: PathBuf::new(), title_dir: PathBuf::new(), notes_file: PathBuf::new(), char_favorites_file: PathBuf::new(), color_presets_file: PathBuf::new(), bubbles_file: PathBuf::new(), src_dir: PathBuf::new(), clean_layers_dir: PathBuf::from("clean"), cleaned_dir: PathBuf::new(), alt_vers_dir: PathBuf::new(), saved_dir: PathBuf::new(), image_bubbles_dir: PathBuf::new(), text_images_dir: PathBuf::new(), layers_dir: PathBuf::new(), text_detection_dir: PathBuf::new(), characters_dir: PathBuf::new(), terms_file: PathBuf::new(), settings_file: PathBuf::new(), unsaved_dir: PathBuf::new(), unsaved_bubbles_file: PathBuf::new(), unsaved_clean_layers_dir: PathBuf::from("unsaved_clean"), unsaved_image_bubbles_dir: PathBuf::new(), unsaved_text_images_dir: PathBuf::new(), unsaved_layers_dir: PathBuf::new(),
-        };
+        let paths = clean_only_paths(PathBuf::from("clean"), PathBuf::from("unsaved_clean"));
         let page = Page { idx: 0, path: PathBuf::from("src/001.jpg") };
         assert_eq!(clean_paths_for_page(&paths, &page), Some([PathBuf::from("clean/001.png"), PathBuf::from("unsaved_clean/001.png")]));
     }

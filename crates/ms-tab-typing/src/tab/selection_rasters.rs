@@ -12,9 +12,11 @@ with its context menu.
 NOT here — a whole-layer MOVE, by pointer or by arrow keys, for either layer kind:
 that is the shared move session in `tab/move_layer.rs`. `interact_page_rasters`
 delegates its move drag to it and only keeps the non-move gestures, and the arrow
-nudge has ONE merged entry point there. Geometry writes from this file are
-DEFERRED (`persist_raster_transform_deferred` / `persist_raster_deform_deferred`)
-except the perspective-handle drag end, which still writes synchronously.
+nudge has ONE merged entry point there. Every layer write from this file is
+ENQUEUED on the shared doc's background saver (`persist_raster_transform_deferred`,
+`persist_raster_deform_deferred`, `persist_current_page_rasters`, and the raster
+delete's `enqueue_page_save_dropping_raster`); none writes `layers.json` on the GUI
+thread while a saver is enabled.
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
@@ -536,20 +538,28 @@ impl TypingTextOverlayLayer {
                 self.raster_drag_state = Some(state);
             }
         }
-        // Persist: flush the page, explicitly DROPPING the removed raster from the manifest (otherwise
-        // `save_page_rasters` would preserve it as another tab's, and it would resurrect on disk).
+        // Persist: enqueue a whole-page save that explicitly DROPS the removed raster from the manifest
+        // (otherwise `save_page_rasters` would preserve it as another tab's, and it would resurrect on
+        // disk). Without a background saver this falls back to the synchronous flush.
         if let Some(primary) = self.layers_primary_dir.clone() {
             let fallback = self.layers_fallback_dir.clone();
             if let Some(doc) = self.layer_doc.clone()
                 && let Ok(mut guard) = doc.lock()
-                && let Err(err) =
-                    guard.flush_page_dropping_raster(page_idx, &primary, fallback.as_deref(), &uid)
+                && let Err(err) = guard.enqueue_page_save_dropping_raster(
+                    page_idx,
+                    &primary,
+                    fallback.as_deref(),
+                    &uid,
+                )
             {
                 ms_log::runtime_log::log_warn(format!("[typing] persist raster delete: {err}"));
             }
         }
-        // STRUCTURAL — stays EAGER (see `remove_overlay`): anti-resurrection durability must not wait
-        // on a flush point. This also persists the live text state, settling any deferred edit.
+        // STRUCTURAL — stays EAGER (see `remove_overlay`): the deletion is ENQUEUED immediately, never
+        // parked until a flush point. The job's `removed_uids` survive coalescing with later jobs for
+        // the page (the saver unions them), so the drop cannot be lost; durability on disk still comes
+        // only from the saver's barrier, like every other layer write. This also persists the live text
+        // state, settling any deferred edit.
         self.dispatch_structural_placement_save("raster delete");
     }
 
@@ -994,8 +1004,8 @@ impl TypingTextOverlayLayer {
     /// thread with file I/O (CLAUDE.md §5). The in-memory doc is updated LIVE (so the transform is
     /// visible immediately and the PS tab re-projects); only the disk persist is deferred.
     ///
-    /// This is the async counterpart of `persist_current_page_rasters`' synchronous `flush_page`: a
-    /// transform-only change marks no pixels dirty, so the enqueued job re-encodes no PNGs.
+    /// Like `persist_current_page_rasters` it enqueues a whole-page save: a transform-only change marks
+    /// no pixels dirty, so the enqueued job re-encodes no PNGs.
     /// `enqueue_page_save` itself falls back to a synchronous `flush_page` when no saver is enabled.
     ///
     /// Returns whether the DISK write was scheduled ([`RasterPersistDispatch`]). A caller that
@@ -1158,10 +1168,14 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Flushes the doc page to disk (whole-page `save_page_rasters` + the doc's text write), used after a
-    /// raster mask-clip toggle (routed through the doc) so the flag survives a reload / save-to-project,
-    /// and as the pre-flush of the two band-order writers. `save_page_rasters` carries each raster's
-    /// `mask_clip`. No-op if the doc/page is not resident.
+    /// Enqueues a whole-page save of the doc page (rasters via `save_page_rasters` + the doc's text
+    /// write) on the doc's background saver — synchronous `flush_page` fallback only when no saver is
+    /// enabled. Used after a raster mask-clip toggle (routed through the doc) so the flag survives a
+    /// reload / save-to-project (`save_page_rasters` carries each raster's `mask_clip`), and ahead of
+    /// the two band-order writers so every node the order names has a manifest record. That ordering
+    /// needs no synchronous write any more: the saver applies a page's jobs FIFO and runs a band order
+    /// (a structural edit) after the page's raster and text parts, so enqueueing is enough. No-op if the
+    /// doc/page is not resident.
     ///
     /// The page's live text geometry is reconciled into the doc first, for the same reason
     /// `route_to_doc_reporting` does it (`reconcile_page_text_geometry_into_doc`): this writes the DOC to
@@ -1181,49 +1195,20 @@ impl TypingTextOverlayLayer {
             return;
         };
         doc_layers::reconcile_page_text_geometry_into_doc(&self.overlays, page_idx, &mut guard);
-        if let Err(err) = guard.flush_page(page_idx, &primary, fallback.as_deref()) {
-            ms_log::runtime_log::log_warn(format!("[typing] persist raster mask-clip: {err}"));
+        if let Err(err) = guard.enqueue_page_save(page_idx, &primary, fallback.as_deref()) {
+            ms_log::runtime_log::log_warn(format!("[typing] persist page layers: {err}"));
         }
     }
 
-    /// Routes a raster's deform mesh (+ its affine transform) to the shared doc and persists both to
-    /// disk. Used by the raster perspective transform mode and by "Сбросить трансформацию" (deform =
-    /// None). The doc is the source of truth, so the PS tab re-projects via its version watch.
-    pub(super) fn persist_raster_deform(
-        &mut self,
-        page_idx: usize,
-        uid: &str,
-        transform: ms_models::layer_model::manifest::TransformRec,
-        deform: Option<ms_models::layer_model::manifest::DeformRec>,
-    ) {
-        let Some(dir) = self.layers_primary_dir.clone() else {
-            return;
-        };
-        let fallback = self.layers_fallback_dir.clone();
-        let uid_owned = uid.to_string();
-        let deform_for_doc = deform.clone();
-        self.route_to_doc(page_idx, |doc| {
-            doc.set_transform(page_idx, &uid_owned, transform);
-            doc.set_deform(page_idx, &uid_owned, deform_for_doc);
-        });
-        if let Err(err) = ms_models::layer_model::persist::update_raster_geometry(
-            &dir,
-            page_idx,
-            uid,
-            transform,
-            deform,
-            fallback.as_deref(),
-        ) {
-            ms_log::runtime_log::log_warn(format!("[typing] persist raster deform: {err}"));
-        }
-    }
-
-    /// Like [`persist_raster_deform`] but enqueues the whole-page persistence through the shared
-    /// document saver. The saver captures both the affine transform and the full deform mesh, so
-    /// rapid keyboard nudges update the live doc immediately without rewriting `layers.json` on the
-    /// GUI thread. As with [`persist_raster_transform_deferred`], no saver keeps the existing
-    /// synchronous `flush_page` fallback, and the return value reports whether the DISK write was
-    /// scheduled — a caller that forgets the edit afterwards must not treat `NotEnqueued` as success.
+    /// Routes a raster's deform mesh (+ its affine transform) to the shared doc and enqueues the
+    /// whole-page persistence through the shared document saver — the ONLY deform-persist path of this
+    /// tab (perspective transform mode's enter/reset actions, its handle-drag end, and a settled move of
+    /// a deformed raster; `deform = None` is "Сбросить трансформацию"). The saver captures both the
+    /// affine transform and the full deform mesh, so the live doc updates immediately without
+    /// rewriting `layers.json` on the GUI thread. As with [`Self::persist_raster_transform_deferred`],
+    /// no saver keeps the synchronous `flush_page` fallback, and the return value reports whether the
+    /// DISK write was scheduled — a caller that forgets the edit afterwards must not treat
+    /// `NotEnqueued` as success.
     #[must_use]
     pub(super) fn persist_raster_deform_deferred(
         &mut self,
@@ -1355,7 +1340,10 @@ impl TypingTextOverlayLayer {
                 let (uid, transform, deform) =
                     (layer.uid.clone(), layer.transform, layer.deform.clone());
                 if matches!(state.mode, TypingRasterDragMode::PerspectiveHandle(_)) {
-                    self.persist_raster_deform(state.page_idx, &uid, transform, deform);
+                    // Informational dispatch: nothing is retired on it, and a failure is logged (and
+                    // queued for retry when it is a write failure) inside.
+                    let _: RasterPersistDispatch =
+                        self.persist_raster_deform_deferred(state.page_idx, &uid, transform, deform);
                 } else {
                     // Rotation DEFERS its write like every other rapid raster gesture (Ctrl+wheel
                     // rotate already did), so no manifest rewrite runs on the GUI thread. The
@@ -1925,7 +1913,9 @@ impl TypingTextOverlayLayer {
                 {
                     let (uid, transform, deform) =
                         (layer.uid.clone(), layer.transform, layer.deform.clone());
-                    self.persist_raster_deform(page_idx, &uid, transform, deform);
+                    // Informational dispatch — see the handle-drag end above.
+                    let _: RasterPersistDispatch =
+                        self.persist_raster_deform_deferred(page_idx, &uid, transform, deform);
                 }
             }
         }
@@ -1949,7 +1939,9 @@ impl TypingTextOverlayLayer {
                 .and_then(|v| v.get(idx))
             {
                 let (uid, transform) = (layer.uid.clone(), layer.transform);
-                self.persist_raster_deform(page_idx, &uid, transform, None);
+                // Informational dispatch — see the handle-drag end above.
+                let _: RasterPersistDispatch =
+                    self.persist_raster_deform_deferred(page_idx, &uid, transform, None);
             }
             self.transform_mode_raster_idx = None;
             self.raster_drag_state = None;

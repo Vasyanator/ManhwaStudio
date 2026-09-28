@@ -411,40 +411,6 @@ impl TypingTextOverlayLayer {
         pages_with_text
     }
 
-    /// Synchronously flushes ONE page's CURRENT doc text to the staging `layers/` dir. Used right before
-    /// creating a raster on `page_idx` so the staged page reflects the doc (including a deleted-last-text
-    /// page → present-but-empty), preventing `add_page_raster`/`ensure_page_staged` from re-seeding stale
-    /// committed text. A no-op if no doc/dir is wired or the page is not resident. The page is flushed
-    /// even when it has zero text — `write_page_text_payload` keeps a previously-existing page
-    /// present-but-empty, making the deletion durable. (`flush_page_text` for an empty page does no PNG
-    /// IO, so this is cheap on the UI thread.)
-    pub(super) fn flush_target_page_text_to_staging(&mut self, page_idx: usize) {
-        let Some(layers_dir) = self.layers_primary_dir.clone() else {
-            return;
-        };
-        let fallback_dir = self.layers_fallback_dir.clone();
-        // Reconcile the local overlay placement into the doc first (so the flush writes current state),
-        // then flush only the target page.
-        self.sync_overlay_state_into_doc();
-        let Some(doc) = self.layer_doc.clone() else {
-            return;
-        };
-        let Ok(mut guard) = doc.lock() else {
-            return;
-        };
-        // INTENTIONALLY SYNCHRONOUS (not enqueued): the caller spawns a worker that immediately reads
-        // this page's on-disk staging `layers.json` via `add_page_raster`. The anti-resurrection
-        // contract requires the page to be PRESENT (possibly empty) on disk BEFORE that read. An async
-        // enqueue would race the worker (it could read stale committed text before the enqueued write
-        // lands), resurrecting a deleted-last-text overlay. We cannot barrier on the GUI thread, and
-        // the empty-page case does no PNG IO, so a direct synchronous flush is both correct and cheap.
-        if let Err(err) = guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref()) {
-            ms_log::runtime_log::log_warn(format!(
-                "[typing] flush target page {page_idx} text before raster create: {err}"
-            ));
-        }
-    }
-
     /// Spawns the detached placement-save worker for the current live state.
     ///
     /// Callers must have established that persistence is wired (`text_persistence_wired`) — the

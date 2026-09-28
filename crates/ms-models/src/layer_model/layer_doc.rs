@@ -23,7 +23,17 @@ tests and read-back paths) and an ADDITIVE async path: with an optional `LayerSa
 (via `build_page_save_job`, cloning the same data the sync flush gathers) and hand it to the
 coalescing background saver in `saver.rs`; without a saver they fall back to the synchronous flush.
 The saver runs the identical `persist::*` write sequence off-thread, so on-disk bytes match the sync
-flush. `Drop` shuts the saver down (flush queue + join).
+flush (the async job carries a raster's pixels only when it is dirty; a failed raster ack re-dirties
+the page's rasters so the retry carries them). `Drop` shuts the saver down (flush queue + join).
+With an `AutosaveGate` passed to `enable_background_saver`, the saver HOLDS jobs until the gate is
+due; every async funnel call reports ONE action to the gate (`note_autosave_action`), never a
+per-frame dirty mark.
+
+Structural edits (PS band order / grouping) and raster deletions are saver jobs too
+(`enqueue_page_band_order` / `enqueue_page_grouping` / `enqueue_page_save_dropping_raster`), so every
+`layers.json` write of a doc-wired tab is FIFO-ordered behind the page's earlier content saves. The PS
+text pin meta (`LayerNode.text_pinned` / `text_pinned_by_group`) lives on the node
+(`set_text_pin_meta`), so the PS editor never re-reads it from disk after the page load.
 */
 
 use std::collections::HashMap;
@@ -36,12 +46,13 @@ use serde_json::Value;
 
 use super::manifest::{CenteringFrameRec, DeformRec, TextCentersRec, TransformRec};
 use super::ordering::Band;
-use super::persist::{self, GroupMeta, RasterLayerOut};
+use super::persist::{self, BandRef, GroupMeta, GroupingEdit, RasterLayerOut};
 use super::saver::{
     EffectsSaveItem, LayerSaver, LayerSaverHandle, OwnedRasterLayer, OwnedTextNode, PageSaveJob,
-    RasterSavePart, SaveAckMap, SaveKind, TextSavePart,
+    RasterSavePart, SaveAckMap, SaveKind, StructuralEdit, TextSavePart,
 };
 use super::text_payload;
+use crate::autosave_gate::AutosaveGate;
 use ms_log::trace::cat;
 
 /// Decodes a PNG at `path` into an unmultiplied `ColorImage`, mirroring the raster load path's
@@ -171,6 +182,14 @@ pub struct LayerNode {
     /// it for existing nodes). `None` for rasters and for text nodes whose grouping is unknown (flush
     /// then defaults to the persisted value, else 0). Orthogonal to the PS `group_uid`.
     pub text_layer_idx: Option<u32>,
+    /// TEXT node only (always `false` on a raster): the PS editor's explicit-pin flag, decoded from
+    /// the node's `layers.json` record and updated by [`LayerDoc::set_text_pin_meta`], so the PS
+    /// editor reads its pin state from the doc instead of re-reading disk. Not written by the text
+    /// flush — the writer always emits text pinned-with-explicit-Z.
+    pub text_pinned: bool,
+    /// TEXT node only (always `false` on a raster): the pin is owned by PS grouping (vs. an explicit
+    /// user pin). Doc-owned and written verbatim by the text flush (`pinned_by_group`).
+    pub text_pinned_by_group: bool,
     pub transform: TransformRec,
     pub deform: Option<DeformRec>,
     /// Bumped whenever pixels change, so the GPU texture cache can invalidate.
@@ -444,6 +463,8 @@ impl LayerDoc {
                 opacity: layer.opacity,
                 group_uid: layer.group_uid,
                 text_layer_idx: None,
+                text_pinned: false,
+                text_pinned_by_group: false,
                 transform: layer.transform,
                 deform: layer.deform,
                 generation: 0,
@@ -582,6 +603,8 @@ impl LayerDoc {
                 opacity: meta.opacity,
                 group_uid: meta.group_uid.clone(),
                 text_layer_idx: Some(layer_idx),
+                text_pinned: meta.pinned,
+                text_pinned_by_group: meta.pinned_by_group,
                 transform,
                 deform: inline.deform.clone(),
                 generation: 0,
@@ -680,6 +703,10 @@ impl LayerDoc {
             let visible = meta.is_none_or(|m| m.visible);
             let opacity = meta.map_or(1.0, |m| m.opacity);
             let group_uid = meta.and_then(|m| m.group_uid.clone());
+            // PS pin meta from the overlay's v2 `layers.json` node when it has one (exactly what the PS
+            // editor used to read back from disk). An overlay with no node is pinned but not by a group:
+            // the text writer always emits text pinned-with-explicit-Z, so that is what PS saw on disk.
+            let (text_pinned, text_pinned_by_group) = meta.map_or((true, false), |m| (m.pinned, m.pinned_by_group));
             // Decode legacy geometry through the shared codec (page-relative uv → page px needs the
             // PAGE size, not the overlay PNG size). `_image` size is only used as the render image.
             let placement = text_payload::decode_overlay_placement(obj, page_size);
@@ -697,6 +724,8 @@ impl LayerDoc {
                 opacity,
                 group_uid,
                 text_layer_idx: Some(layer_idx),
+                text_pinned,
+                text_pinned_by_group,
                 transform: placement.transform,
                 deform: placement.deform,
                 generation: 0,
@@ -774,7 +803,7 @@ impl LayerDoc {
     /// Returns whether `page_idx` has ANY persistence that is enqueued/edited but not yet
     /// acknowledged-durable — the correct "do not evict, an edit could be lost" signal.
     ///
-    /// True iff `latest_epoch` holds an entry for `(page_idx, Raster)` or `(page_idx, Text)`, OR the
+    /// True iff `latest_epoch` holds an entry for `(page_idx, Raster | Text | Structural)`, OR the
     /// resident page still has a `pixels_dirty` node. A `latest_epoch` entry is created the moment a
     /// page is touched — by a pixel edit (`bump_dirty_epoch`) OR by ANY persisting enqueue
     /// (`next_save_epoch`, which every whole-page/text/effects save reserves, so GEOMETRY-only edits
@@ -784,16 +813,21 @@ impl LayerDoc {
     /// between a pixel edit and its enqueue. Lock-free and cheap: only `HashMap`/slice lookups.
     #[must_use]
     pub fn page_has_pending_save(&self, page_idx: usize) -> bool {
-        if self
-            .latest_epoch
-            .contains_key(&(page_idx, SaveKind::Raster))
-            || self.latest_epoch.contains_key(&(page_idx, SaveKind::Text))
-        {
+        if [SaveKind::Raster, SaveKind::Text, SaveKind::Structural].iter().any(|kind| self.latest_epoch.contains_key(&(page_idx, *kind))) {
             return true;
         }
         self.pages
             .get(&page_idx)
             .is_some_and(|page| page.nodes.iter().any(|node| node.pixels_dirty))
+    }
+
+    /// Whether ANY page has a persisting save that is enqueued or edited but not yet acknowledged
+    /// durable (a `latest_epoch` entry exists). Document-wide counterpart of
+    /// [`Self::page_has_pending_save`] without its per-page `pixels_dirty` fallback; cheap (no I/O,
+    /// no ack-map lock — call [`Self::poll_save_acks`] first for a fresh answer).
+    #[must_use]
+    pub fn has_pending_saves(&self) -> bool {
+        !self.latest_epoch.is_empty()
     }
 
     /// Page indices currently resident (loaded) in the doc. A resident page had its text loaded by
@@ -818,6 +852,7 @@ impl LayerDoc {
         // session of page visits.
         self.latest_epoch.remove(&(page_idx, SaveKind::Raster));
         self.latest_epoch.remove(&(page_idx, SaveKind::Text));
+        self.latest_epoch.remove(&(page_idx, SaveKind::Structural));
         ms_log::trace_log!(
             cat::LAYER_MODEL,
             "evict_page page={} evicted={}",
@@ -1110,6 +1145,33 @@ impl LayerDoc {
             node.group_uid = group_uid;
             self.bump_version();
         }
+    }
+
+    /// Sets a TEXT node's PS pin meta (`text_pinned` / `text_pinned_by_group`), bumping the version
+    /// when either value changed. The PS editor calls this alongside each band-order / grouping /
+    /// pin edit so the doc mirrors what the enqueued structural edit writes to disk. Persistence is
+    /// NOT triggered here (the structural job writes the on-disk flags; a later text flush writes the
+    /// doc's `text_pinned_by_group`). Returns `false` when the page, the node, or a TEXT node with that
+    /// uid is absent (nothing changed).
+    pub fn set_text_pin_meta(&mut self, page_idx: usize, uid: &str, pinned: bool, pinned_by_group: bool) -> bool {
+        ms_log::trace_log!(
+            cat::LAYER_MODEL,
+            "set_text_pin_meta page={} uid={} pinned={} pinned_by_group={}",
+            page_idx,
+            uid,
+            pinned,
+            pinned_by_group
+        );
+        let Some(node) = self.node_mut(page_idx, uid).filter(|node| matches!(node.kind, NodeKind::Text)) else {
+            return false;
+        };
+        let changed = node.text_pinned != pinned || node.text_pinned_by_group != pinned_by_group;
+        node.text_pinned = pinned;
+        node.text_pinned_by_group = pinned_by_group;
+        if changed {
+            self.bump_version();
+        }
+        true
     }
 
     /// Adds a `GroupMeta` to a resident page, ignoring it if a group with the same uid already exists.
@@ -1494,7 +1556,10 @@ impl LayerDoc {
                 transform: node.transform,
                 deform: node.deform.clone(),
                 group_uid: node.group_uid.clone(),
-                image: base_image,
+                // The synchronous flush always carries the pixels (borrowed, so free), which keeps a
+                // clean raster whose PNG went missing writable without a retry.
+                image: Some(base_image),
+                image_size: base_image.size,
                 pixels_dirty: node.pixels_dirty,
                 mask_clip: *mask_clip,
             });
@@ -1646,7 +1711,8 @@ impl LayerDoc {
                 visible: node.visible,
                 opacity: node.opacity,
                 group_uid: node.group_uid.clone(),
-                pinned_by_group: false,
+                // Doc-owned (mirrored from every PS grouping edit), so the node's value is written.
+                pinned_by_group: node.text_pinned_by_group,
                 payload_uid: payload_uid.clone(),
                 render_data: render_data.clone(),
                 is_image: *is_image,
@@ -1678,9 +1744,13 @@ impl LayerDoc {
     /// Enables the background (coalescing) saver on this doc, if not already enabled. After this,
     /// `enqueue_page_save` / `enqueue_page_text_save` route persistence off-thread. Idempotent:
     /// a second call is a no-op (the existing saver + its worker thread are kept).
-    pub fn enable_background_saver(&mut self) {
+    ///
+    /// `gate` is the project's autosave gate: with `Some`, the saver HOLDS jobs until the gate is due
+    /// (barriers and shutdown still force every held job out); `None` writes after every drain
+    /// (immediate mode). Every async funnel below reports one action to it per call.
+    pub fn enable_background_saver(&mut self, gate: Option<Arc<AutosaveGate>>) {
         if self.saver.is_none() {
-            let saver = LayerSaver::new();
+            let saver = LayerSaver::new(gate);
             self.save_acks = Some(saver.ack_map());
             self.saver = Some(saver);
             ms_log::trace_log!(cat::PERSIST, "enable_background_saver: saver enabled");
@@ -1701,6 +1771,28 @@ impl LayerDoc {
             saver.shutdown();
         }
         self.save_acks = None;
+    }
+
+    /// Shuts the background saver down WITHOUT writing: jobs still queued or held by the autosave gate
+    /// are dropped, then the worker is joined (a write already in progress completes first). For the
+    /// discard path only, which deletes the staging dir those jobs target. A no-op without a saver.
+    pub fn shutdown_saver_discarding(&mut self) {
+        if let Some(saver) = self.saver.take() {
+            saver.shutdown_discarding();
+        }
+        self.save_acks = None;
+    }
+
+    /// Reports one save gesture to the saver's autosave gate. A no-op without a saver or in immediate
+    /// mode. The async funnels call it themselves; a caller that enqueues through a raw
+    /// [`LayerSaverHandle`] (the PS editor's page save) calls it once per enqueue, AFTER sending (see
+    /// `LayerSaver::note_action` for why the order matters).
+    /// Deliberately NOT called from dirty-marking (`bump_dirty_epoch`): pixel marks can fire per frame,
+    /// the enqueue is the gesture.
+    pub fn note_autosave_action(&self) {
+        if let Some(saver) = &self.saver {
+            saver.note_action();
+        }
     }
 
     /// Reserves the current page-kind generation for a background job and returns its epoch.
@@ -1727,11 +1819,25 @@ impl LayerDoc {
             }
         }).unwrap_or_default();
         for (page_idx, kind, ack_epoch, ok) in completions {
-            if ok && self.latest_epoch.get(&(page_idx, kind)) == Some(&ack_epoch) && self.pages.contains_key(&page_idx) {
-                match kind {
-                    SaveKind::Raster => self.clear_page_dirty(page_idx),
-                    SaveKind::Text => self.clear_page_text_dirty(page_idx),
+            if self.latest_epoch.get(&(page_idx, kind)) != Some(&ack_epoch) {
+                continue;
+            }
+            // A page that is not resident has no dirty flags to settle, but a current SUCCESSFUL ack
+            // still retires its epoch — otherwise a disk-targeted save for a never-loaded page (a
+            // structural edit, an effects-only update) would read as pending forever.
+            if self.pages.contains_key(&page_idx) {
+                match (kind, ok) {
+                    (SaveKind::Raster, true) => self.clear_page_dirty(page_idx),
+                    (SaveKind::Text, true) => self.clear_page_text_dirty(page_idx),
+                    // A failed raster write may have been the "pixels not carried" case (a clean raster
+                    // whose PNG the manifest no longer records), so the retry must carry every raster's
+                    // pixels. The epoch stays pending, so the page still reports an unsaved change.
+                    (SaveKind::Raster, false) => self.mark_page_rasters_dirty(page_idx),
+                    // Structural edits carry no dirty flags; a failure stays pending (an unsaved change).
+                    (SaveKind::Text | SaveKind::Structural, false) | (SaveKind::Structural, true) => {}
                 }
+            }
+            if ok {
                 self.latest_epoch.remove(&(page_idx, kind));
             }
         }
@@ -1759,6 +1865,7 @@ impl LayerDoc {
                 job.text_epoch = Some(self.next_save_epoch(page_idx, SaveKind::Text));
                 if let Some(saver) = &self.saver {
                     saver.enqueue(job);
+                    saver.note_action();
                 }
             }
             Ok(())
@@ -1791,9 +1898,12 @@ impl LayerDoc {
                     text: Some(text),
                     text_epoch: Some(text_epoch),
                     effects: Vec::new(),
+                    structural: Vec::new(),
+                    structural_epoch: None,
                 };
                 if let Some(saver) = &self.saver {
                     saver.enqueue(job);
+                    saver.note_action();
                 }
             }
             Ok(())
@@ -1835,10 +1945,16 @@ impl LayerDoc {
                 text: Some(text),
                 text_epoch: Some(text_epoch),
                 effects: Vec::new(),
+                structural: Vec::new(),
+                structural_epoch: None,
             });
         }
-        if let Some(saver) = &self.saver {
+        if let Some(saver) = &self.saver
+            && !jobs.is_empty()
+        {
+            // The whole batch is one gesture (e.g. a tab-leave text flush).
             saver.enqueue_batch(jobs);
+            saver.note_action();
         }
         pages.iter().map(|&page_idx| (page_idx, Ok(()))).collect()
     }
@@ -1869,7 +1985,7 @@ impl LayerDoc {
             let Some(saver) = &self.saver else {
                 return Ok(());
             };
-            saver.enqueue(PageSaveJob {
+                        saver.enqueue(PageSaveJob {
                 page_idx,
                 layers_dir: layers_dir.to_path_buf(),
                 fallback_dir: fallback_dir.map(Path::to_path_buf),
@@ -1882,7 +1998,10 @@ impl LayerDoc {
                     effects: effects.to_vec(),
                     display_image: display.cloned(),
                 }],
+                structural: Vec::new(),
+                structural_epoch: None,
             });
+            saver.note_action();
             Ok(())
         } else {
             persist::update_raster_effects(
@@ -1893,6 +2012,104 @@ impl LayerDoc {
                 display,
                 fallback_dir,
             )
+        }
+    }
+
+    /// ASYNC whole-page save that also DROPS `removed_uid` from the manifest — the queued counterpart
+    /// of [`Self::flush_page_dropping_raster`]. The job's `removed_uids` survive coalescing with later
+    /// jobs for the page (`saver::merge_raster_parts` unions them), so the deletion is enqueued eagerly
+    /// and becomes durable at the saver's next pass / barrier. Without a saver, falls back to the
+    /// synchronous `flush_page_dropping_raster`. No-op (`Ok`) if the page is not resident.
+    ///
+    /// # Errors
+    /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
+    pub fn enqueue_page_save_dropping_raster(
+        &mut self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+        removed_uid: &str,
+    ) -> Result<(), String> {
+        if self.saver.is_none() {
+            return self.flush_page_dropping_raster(page_idx, layers_dir, fallback_dir, removed_uid);
+        }
+        let Some(mut job) = self.build_page_save_job(page_idx, layers_dir, fallback_dir, &[removed_uid.to_string()]) else {
+            return Ok(());
+        };
+        job.raster_epoch = Some(self.next_save_epoch(page_idx, SaveKind::Raster));
+        job.text_epoch = Some(self.next_save_epoch(page_idx, SaveKind::Text));
+        if let Some(saver) = &self.saver {
+            saver.enqueue(job);
+            saver.note_action();
+        }
+        Ok(())
+    }
+
+    /// ASYNC unified band reorder of a page (`order` bottom-to-top): enqueues a structural-only job
+    /// that the saver applies AFTER every earlier-enqueued raster / text / effects part of the page
+    /// (same pass or an earlier one), so a raster added just before has its node when the order lands.
+    /// Does not require the page to be resident (it targets the manifest record). The caller mirrors
+    /// the order into the doc separately (`set_z_order` / `set_text_pin_meta`). Reserves a
+    /// [`SaveKind::Structural`] epoch, so the page reads as having a pending save until acknowledged.
+    /// Without a saver, falls back to the synchronous `persist::save_page_band_order` (no committed
+    /// seeding — the historical behaviour).
+    ///
+    /// # Errors
+    /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
+    pub fn enqueue_page_band_order(
+        &mut self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+        order: Vec<BandRef>,
+    ) -> Result<(), String> {
+        if self.saver.is_none() {
+            return persist::save_page_band_order(layers_dir, page_idx, &order);
+        }
+        self.enqueue_structural(page_idx, layers_dir, fallback_dir, StructuralEdit::BandOrder(order));
+        Ok(())
+    }
+
+    /// ASYNC group-structure edit of a page: like [`Self::enqueue_page_band_order`] but for a
+    /// [`GroupingEdit`] (membership, group create/remove, collapse, visibility, opacity, order, and
+    /// group-owned pins). Because it is applied after the page's earlier raster part, a freshly added
+    /// raster's membership can no longer be silently skipped. Without a saver, falls back to the
+    /// synchronous `persist::save_page_grouping`.
+    ///
+    /// # Errors
+    /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
+    pub fn enqueue_page_grouping(
+        &mut self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+        edit: GroupingEdit,
+    ) -> Result<(), String> {
+        if self.saver.is_none() {
+            return persist::save_page_grouping(layers_dir, page_idx, &edit);
+        }
+        self.enqueue_structural(page_idx, layers_dir, fallback_dir, StructuralEdit::Grouping(edit));
+        Ok(())
+    }
+
+    /// Enqueues a job carrying only `edit`, with a fresh [`SaveKind::Structural`] epoch. Callers have
+    /// checked that a saver is enabled.
+    fn enqueue_structural(&mut self, page_idx: usize, layers_dir: &Path, fallback_dir: Option<&Path>, edit: StructuralEdit) {
+        let structural_epoch = self.next_save_epoch(page_idx, SaveKind::Structural);
+        if let Some(saver) = &self.saver {
+                        saver.enqueue(PageSaveJob {
+                page_idx,
+                layers_dir: layers_dir.to_path_buf(),
+                fallback_dir: fallback_dir.map(Path::to_path_buf),
+                raster: None,
+                raster_epoch: None,
+                text: None,
+                text_epoch: None,
+                effects: Vec::new(),
+                structural: vec![edit],
+                structural_epoch: Some(structural_epoch),
+            });
+            saver.note_action();
         }
     }
 
@@ -1922,6 +2139,8 @@ impl LayerDoc {
             text: Some(text),
             text_epoch: None,
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         })
     }
 
@@ -1935,7 +2154,8 @@ impl LayerDoc {
 
     /// Gathers the owned RASTER part of a page save, mirroring `flush_page_inner`'s `outs` build
     /// (bottom-to-top by `z`; base image + `pixels_dirty` + mask-clip; the effects chain + display
-    /// image so the worker can reconcile effects exactly like the sync flush).
+    /// image so the worker can reconcile effects exactly like the sync flush). Unlike the sync flush,
+    /// base pixels are carried only for `pixels_dirty` rasters.
     #[must_use]
     fn build_raster_save_part(page: &DocPage, removed_raster_uids: &[String]) -> RasterSavePart {
         let mut raster_indices: Vec<usize> = page
@@ -1976,7 +2196,12 @@ impl LayerDoc {
                 transform: node.transform,
                 deform: node.deform.clone(),
                 group_uid: node.group_uid.clone(),
-                base_image: base_image.clone(),
+                // Pixels are carried only when they must be written: a clean raster's PNG is already
+                // recorded, so cloning it would only grow the queued job (a held job may wait long).
+                // If the write finds no record after all, it fails the raster kind and
+                // `poll_save_acks` re-dirties the page so the retry carries the pixels.
+                base_image: node.pixels_dirty.then(|| base_image.clone()),
+                image_size: base_image.size,
                 pixels_dirty: node.pixels_dirty,
                 mask_clip: *mask_clip,
                 display_image: display,
@@ -2036,11 +2261,25 @@ impl LayerDoc {
                 mask_clip: *mask_clip,
                 text_centers: text_centers_rec_from(extra_centers),
                 centering_frame: *centering_frame,
+                pinned_by_group: node.text_pinned_by_group,
                 image: image.clone(),
                 pixels_dirty: node.pixels_dirty,
             });
         }
         TextSavePart { nodes }
+    }
+
+    /// Sets `pixels_dirty` on every RASTER node of a resident page after its current raster epoch
+    /// FAILED, so the next save carries (and rewrites) every raster's pixels. Does not bump the
+    /// version: nothing visible changed.
+    fn mark_page_rasters_dirty(&mut self, page_idx: usize) {
+        if let Some(page) = self.pages.get_mut(&page_idx) {
+            for node in &mut page.nodes {
+                if matches!(node.kind, NodeKind::Raster) {
+                    node.pixels_dirty = true;
+                }
+            }
+        }
     }
 
     /// Clears `pixels_dirty` on every RASTER node of a resident page after its current raster epoch
@@ -2196,7 +2435,7 @@ mod tests {
         // via a whole-page enqueue that reserves a `latest_epoch`. Driving that enqueue is the smallest
         // public API that exercises the `latest_epoch` gate (Gap-1 regression: the old pixel-only helper
         // classified this page "clean" and evicted it, losing the rotation).
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         doc.set_transform(0, "r", tf(5.0, 7.0, 1.0));
         doc.enqueue_page_save(0, &dir, None).unwrap();
         if let Some(handle) = doc.saver_handle() {
@@ -2976,6 +3215,8 @@ mod tests {
             opacity: 1.0,
             group_uid: None,
             text_layer_idx: Some(0),
+            text_pinned: false,
+            text_pinned_by_group: false,
             transform: TransformRec {
                 cx: 5.0,
                 cy: 1.0,
@@ -3322,6 +3563,8 @@ mod tests {
             opacity: 0.5,
             group_uid: None,
             text_layer_idx: Some(0),
+            text_pinned: false,
+            text_pinned_by_group: false,
             transform: TransformRec {
                 cx: 111.0,
                 cy: 222.0,
@@ -3893,6 +4136,8 @@ mod tests {
             opacity: 1.0,
             group_uid: None,
             text_layer_idx: Some(0),
+            text_pinned: false,
+            text_pinned_by_group: false,
             transform: tf(0.0, 0.0, 1.0),
             deform: None,
             generation: 0,
@@ -3939,6 +4184,8 @@ mod tests {
             opacity: 1.0,
             group_uid: None,
             text_layer_idx: None,
+            text_pinned: false,
+            text_pinned_by_group: false,
             transform: tf(0.0, 0.0, 1.0),
             deform: None,
             generation: 0,
@@ -3964,6 +4211,8 @@ mod tests {
             opacity: 1.0,
             group_uid: None,
             text_layer_idx: Some(0),
+            text_pinned: false,
+            text_pinned_by_group: false,
             transform: tf(0.0, 0.0, 1.0),
             deform: None,
             generation: 0,
@@ -4438,7 +4687,7 @@ mod tests {
             nodes: vec![text_node_with_payload("t")],
             groups: Vec::new(),
         });
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         doc.set_text_render(
             0,
             "t",
@@ -4476,7 +4725,7 @@ mod tests {
             nodes: vec![text_node_with_payload("t")],
             groups: Vec::new(),
         });
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         doc.set_text_render(
             0,
             "t",
@@ -4503,7 +4752,7 @@ mod tests {
             nodes: vec![text_node_with_payload("t")],
             groups: Vec::new(),
         });
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         // Reserve a text epoch and run the real save so an OK ack for it lands in the shared map.
         doc.enqueue_page_text_save(0, &dir, None).unwrap();
         let handle = doc.saver_handle().expect("background saver enabled");
@@ -4538,7 +4787,7 @@ mod tests {
             nodes: vec![text_node_with_payload("t")],
             groups: Vec::new(),
         });
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         // Reserve e1 and run the real save for the existing text; its OK ack lands in the map.
         doc.enqueue_page_text_save(0, &dir, None).unwrap();
         let handle = doc.saver_handle().expect("background saver enabled");
@@ -4574,7 +4823,7 @@ mod tests {
         for &p in &pages {
             doc.pages.insert(p, DocPage { nodes: vec![text_node_with_payload(&format!("t{p}"))], groups: Vec::new() });
         }
-        doc.enable_background_saver();
+        doc.enable_background_saver(None);
         let results = doc.enqueue_pages_text_save(&pages, &staging, Some(&committed));
         assert!(results.iter().all(|(_, r)| r.is_ok()));
         assert_eq!(results.iter().map(|(p, _)| *p).collect::<Vec<_>>(), pages);
@@ -4599,5 +4848,324 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|(_, r)| r.is_ok()), "a non-resident page is a no-op, not an error");
         assert_eq!(persist::load_page_text_nodes(tmp.path(), None, 2).expect("load").len(), 1);
+    }
+
+    /// A FAILED raster acknowledgement for the page's current epoch re-dirties every resident raster
+    /// (the retry must carry pixels, which a clean raster's job omits) and keeps the page pending; a
+    /// stale failure does nothing, and the current success settles both.
+    #[test]
+    fn failed_raster_ack_redirties_rasters_and_keeps_pending() {
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage {
+            nodes: vec![raster_node("r", [2, 2], Color32::RED), text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.node_mut(0, "t").expect("text node").pixels_dirty = false;
+        let acks = Arc::new(Mutex::new(SaveAckMap::default()));
+        doc.save_acks = Some(Arc::clone(&acks));
+        assert!(!doc.has_pending_saves(), "a fresh doc has nothing pending");
+
+        let stale = doc.next_save_epoch(0, SaveKind::Raster);
+        let current = doc.next_save_epoch(0, SaveKind::Raster);
+        assert!(doc.has_pending_saves());
+        acks.lock().expect("acks").record(0, SaveKind::Raster, stale, false);
+        doc.poll_save_acks();
+        assert!(!doc.node(0, "r").expect("raster").pixels_dirty, "a stale failure does not re-dirty");
+
+        acks.lock().expect("acks").record(0, SaveKind::Raster, current, false);
+        doc.poll_save_acks();
+        assert!(doc.node(0, "r").expect("raster").pixels_dirty, "current failure re-dirties the raster");
+        assert!(!doc.node(0, "t").expect("text").pixels_dirty, "text nodes are untouched");
+        assert!(doc.has_pending_saves(), "a failed save stays pending");
+
+        acks.lock().expect("acks").record(0, SaveKind::Raster, current, true);
+        doc.poll_save_acks();
+        assert!(!doc.node(0, "r").expect("raster").pixels_dirty, "the current success settles the raster");
+        assert!(!doc.has_pending_saves(), "nothing pending after the success");
+    }
+
+    /// The background job builder carries base pixels only for a dirty raster (a clean one's PNG is
+    /// already recorded), but always its size.
+    #[test]
+    fn raster_save_part_carries_pixels_only_when_dirty() {
+        let mut page = DocPage { nodes: vec![raster_node("clean", [2, 2], Color32::RED), raster_node("dirty", [2, 2], Color32::BLUE)], groups: Vec::new() };
+        page.nodes[1].pixels_dirty = true;
+        let part = LayerDoc::build_raster_save_part(&page, &[]);
+        let carried: Vec<(&str, bool, [usize; 2])> = part.layers.iter().map(|l| (l.uid.as_str(), l.base_image.is_some(), l.image_size)).collect();
+        assert_eq!(carried, vec![("clean", false, [2, 2]), ("dirty", true, [2, 2])]);
+    }
+
+    // ---- Structural edits as saver jobs + doc-owned PS text pin meta -------------------------------
+
+    /// Writes a committed text node `uid` on `page` (with its rendered PNG) whose PS pin meta says the
+    /// pin is owned by grouping.
+    fn write_committed_text(dir: &Path, page: usize, uid: &str, z: u32, pinned_by_group: bool) {
+        fs::create_dir_all(dir).expect("mkdir");
+        let file = persist::write_text_image(dir, page, uid, &img([2, 2], Color32::GREEN)).expect("text png");
+        let out = persist::TextPayloadOut {
+            uid: uid.into(),
+            name: uid.into(),
+            z,
+            layer_idx: 0,
+            pinned: true,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            pinned_by_group,
+            payload_uid: uid.into(),
+            render_data: serde_json::json!({ "text": uid }),
+            is_image: false,
+            transform: tf(1.0, 1.0, 1.0),
+            deform: None,
+            rendered_file: Some(file),
+            mask_clip: None,
+            text_centers: None,
+            centering_frame: None,
+        };
+        persist::write_page_text_payload(dir, None, page, &[out]).expect("write committed text");
+    }
+
+    fn disk_pin_meta(dir: &Path, page: usize, uid: &str) -> Option<(bool, bool)> {
+        persist::load_page_text_nodes(dir, None, page).expect("load").into_iter().find(|n| n.uid == uid).map(|n| (n.pinned, n.pinned_by_group))
+    }
+
+    /// The PS pin meta round-trips disk → doc node → disk: decode fills `text_pinned` /
+    /// `text_pinned_by_group` from the record, `set_text_pin_meta` edits them (bumping the version
+    /// only on a change, refusing a raster), and the text flush writes the node's `pinned_by_group`.
+    #[test]
+    fn text_pin_meta_round_trips_decode_node_write() {
+        let dir = temp_dir("pin_meta");
+        write_committed_text(&dir, 0, "t", 1, true);
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("load");
+        let node = doc.node(0, "t").expect("text node");
+        assert_eq!((node.text_pinned, node.text_pinned_by_group), (true, true), "decoded from the record");
+
+        let v0 = doc.version();
+        assert!(doc.set_text_pin_meta(0, "t", true, true));
+        assert_eq!(doc.version(), v0, "an unchanged pin meta does not bump the version");
+        assert!(doc.set_text_pin_meta(0, "t", true, false));
+        assert!(doc.version() > v0, "a changed pin meta bumps the version");
+        assert!(!doc.set_text_pin_meta(0, "missing", true, true));
+        assert!(doc.add_node(0, raster_node("r", [2, 2], Color32::RED)));
+        assert!(!doc.set_text_pin_meta(0, "r", true, true), "a raster carries no pin meta");
+
+        doc.flush_page_text(0, &dir, None).expect("flush");
+        assert_eq!(disk_pin_meta(&dir, 0, "t"), Some((true, false)), "the doc's by-group flag was written");
+        let mut reloaded = LayerDoc::new();
+        reloaded.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("reload");
+        let node = reloaded.node(0, "t").expect("text node");
+        assert_eq!((node.text_pinned, node.text_pinned_by_group), (true, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The queued raster delete removes the uid on disk (mirror of the synchronous
+    /// `flush_page_dropping_raster_removes_it_from_disk`), and survives a later coalesced save.
+    #[test]
+    fn enqueue_page_save_dropping_raster_removes_it_from_disk() {
+        let dir = temp_dir("enqueue_drop_raster");
+        for (uid, c) in [("r0", Color32::RED), ("r1", Color32::BLUE)] {
+            persist::add_page_raster(&dir, None, 0, uid, uid, true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], c)).expect("seed raster");
+        }
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("load");
+        doc.enable_background_saver(None);
+        assert!(doc.remove_node(0, "r0"));
+        doc.enqueue_page_save_dropping_raster(0, &dir, None, "r0").expect("enqueue");
+        doc.enqueue_page_save(0, &dir, None).expect("later save of the page");
+        assert!(doc.saver_handle().expect("saver").barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(!doc.has_pending_saves(), "both saves acknowledged");
+
+        let mut reloaded = LayerDoc::new();
+        reloaded.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("reload");
+        assert!(reloaded.node(0, "r0").is_none(), "the deleted raster did not resurrect on disk");
+        assert!(reloaded.node(0, "r1").is_some(), "the other raster survives");
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A structural-only job reserves its OWN epoch kind: its successful acknowledgement retires the
+    /// structural epoch but never settles a raster that was dirtied and not yet written (a raster ack
+    /// would have cleared its `pixels_dirty`). The band order itself lands on disk.
+    #[test]
+    fn structural_ack_does_not_settle_unwritten_raster_pixels() {
+        let dir = temp_dir("structural_ack");
+        for uid in ["a", "b"] {
+            persist::add_page_raster(&dir, None, 0, uid, uid, true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::RED)).expect("seed raster");
+        }
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("load");
+        doc.enable_background_saver(None);
+        doc.node_mut(0, "a").expect("raster").pixels_dirty = true;
+        doc.bump_dirty_epoch(0, SaveKind::Raster);
+
+        doc.enqueue_page_band_order(0, &dir, None, vec![BandRef::Raster("b".into()), BandRef::Raster("a".into())]).expect("enqueue");
+        assert!(doc.page_has_pending_save(0));
+        assert!(doc.saver_handle().expect("saver").barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(doc.node(0, "a").expect("raster").pixels_dirty, "unwritten pixels stay dirty");
+        assert!(doc.latest_epoch.contains_key(&(0, SaveKind::Raster)), "the raster edit is still pending");
+        assert!(!doc.latest_epoch.contains_key(&(0, SaveKind::Structural)), "the structural edit is acknowledged");
+        let order: Vec<String> = persist::load_page_rasters(&dir, None, 0).expect("load").layers.into_iter().map(|l| l.uid).collect();
+        assert_eq!(order, vec!["b", "a"], "the band order was written");
+
+        // A structural edit for a page the doc never loaded is acknowledged too, so it cannot read as
+        // pending forever.
+        doc.enqueue_page_grouping(7, &dir, None, GroupingEdit::default()).expect("enqueue");
+        assert!(doc.saver_handle().expect("saver").barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(!doc.latest_epoch.contains_key(&(7, SaveKind::Structural)), "a non-resident page's structural epoch retires");
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Final staging manifest + staged PNGs of creating raster `img1` on committed-typeset page 3,
+    /// either the historical way (flush the doc text, `persist::add_page_raster`, reload, flush text)
+    /// or doc-first (`add_node` a dirty raster, `enqueue_page_save` through the saver, flush text).
+    /// `delete_text` first deletes the page's only text in the doc. Also returns the committed text
+    /// count after the save-to-project merge.
+    fn create_raster_outcome(root: &Path, doc_first: bool, delete_text: bool) -> (super::super::manifest::LayersManifest, Vec<(String, Vec<u8>)>, usize) {
+        let committed = root.join("ch").join("layers");
+        let unsaved = root.join("ch_unsaved").join("layers");
+        write_committed_text(&committed, 3, "t3", 1, false);
+        let sizes: HashMap<usize, [usize; 2]> = (0..=3).map(|p| (p, [2, 2])).collect();
+        let pic = img([2, 2], Color32::BLUE);
+        let transform = tf(1.0, 1.0, 1.0);
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).expect("load");
+        if delete_text {
+            assert!(doc.remove_node(3, "t3"));
+        }
+        if doc_first {
+            doc.enable_background_saver(None);
+            let node = LayerNode {
+                pixels_dirty: true,
+                transform,
+                name: "Картинка".into(),
+                body: NodeBody::Raster {
+                    base_image: pic.clone(),
+                    display_image: pic,
+                    effects: Vec::new(),
+                    base_file: persist::base_file_name(3, "img1"),
+                    mask_clip: None,
+                },
+                ..raster_node("img1", [2, 2], Color32::BLUE)
+            };
+            assert!(doc.add_node(3, node));
+            let top = doc.page(3).expect("page").nodes.last().map(|n| n.uid.clone());
+            assert_eq!(top.as_deref(), Some("img1"), "the new raster lands on top");
+            doc.enqueue_page_save(3, &unsaved, Some(&committed)).expect("enqueue");
+            assert!(doc.saver_handle().expect("saver").barrier_blocking().is_empty());
+            doc.poll_save_acks();
+            assert!(!doc.has_pending_saves());
+        } else {
+            doc.flush_page_text(3, &unsaved, Some(&committed)).expect("pre-flush text");
+            persist::add_page_raster(&unsaved, Some(&committed), 3, "img1", "Картинка", true, 1.0, transform, &pic).expect("add raster");
+            doc.evict_page(3);
+            doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).expect("reload");
+        }
+        doc.flush_page_text(3, &unsaved, Some(&committed)).expect("save-to-project text flush");
+        doc.shutdown_saver();
+        let manifest = super::super::compat::read_manifest(&unsaved.join("layers.json")).expect("read").expect("staged manifest");
+        let mut pngs: Vec<(String, Vec<u8>)> = fs::read_dir(&unsaved)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "png"))
+            .map(|p| (p.file_name().expect("name").to_string_lossy().into_owned(), fs::read(&p).expect("png")))
+            .collect();
+        pngs.sort();
+        let owned: std::collections::HashSet<usize> = [3].into_iter().collect();
+        persist::merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).expect("merge");
+        let committed_texts = persist::load_page_text_nodes(&committed, None, 3).expect("load").len();
+        (manifest, pngs, committed_texts)
+    }
+
+    /// Doc-first raster creation (the typing create path after A2-TY) persists what
+    /// `persist::add_page_raster` did: on a typeset page the staged manifest and PNGs are IDENTICAL and
+    /// the committed text survives the merge; on a page whose last text was deleted the deletion stays
+    /// durable and the page holds exactly the new raster. (There the raster's absolute `z` differs —
+    /// the doc-first job writes rasters before text, so the raster is placed above the still-seeded
+    /// committed text before the text half empties it — which is only a rank, not an order change.)
+    #[test]
+    fn doc_first_raster_create_matches_add_page_raster() {
+        use super::super::manifest::{LayerKindRec, LayersManifest};
+        let old = tempfile::tempdir().expect("tempdir");
+        let new = tempfile::tempdir().expect("tempdir");
+        let (old_manifest, old_pngs, old_texts) = create_raster_outcome(old.path(), false, false);
+        let (new_manifest, new_pngs, new_texts) = create_raster_outcome(new.path(), true, false);
+        assert_eq!(serde_json::to_value(&old_manifest).expect("json"), serde_json::to_value(&new_manifest).expect("json"), "typeset page: identical staged manifest");
+        assert_eq!(old_pngs, new_pngs, "typeset page: identical staged PNGs");
+        assert_eq!((old_texts, new_texts), (1, 1), "committed text survives both paths");
+
+        let old = tempfile::tempdir().expect("tempdir");
+        let new = tempfile::tempdir().expect("tempdir");
+        let (old_manifest, old_pngs, old_texts) = create_raster_outcome(old.path(), false, true);
+        let (new_manifest, new_pngs, new_texts) = create_raster_outcome(new.path(), true, true);
+        let shape = |m: &LayersManifest| -> Vec<(String, LayerKindRec)> {
+            let mut tree: Vec<_> = m.page(3).expect("page 3 staged").tree.iter().map(|r| (r.z, r.uid.clone(), r.kind)).collect();
+            tree.sort_by_key(|(z, _, _)| *z);
+            tree.into_iter().map(|(_, uid, kind)| (uid, kind)).collect()
+        };
+        assert_eq!(shape(&old_manifest), shape(&new_manifest), "deleted-last-text page: same nodes in the same order");
+        assert_eq!(shape(&new_manifest), vec![("img1".to_string(), LayerKindRec::Raster)]);
+        assert_eq!(old_pngs, new_pngs, "deleted-last-text page: identical staged PNGs");
+        assert_eq!((old_texts, new_texts), (0, 0), "the deleted text is not resurrected by either path");
+    }
+
+    // ---- Autosave gate --------------------------------------------------------------------------
+
+    fn autosave_test_gate(action_threshold: u32) -> Arc<AutosaveGate> {
+        let interval = std::time::Duration::from_secs(3600);
+        Arc::new(AutosaveGate::with_policy_fn(move || ms_config::autosave_policy::AutosavePolicy { interval, action_threshold }))
+    }
+
+    /// A text save held by the gate keeps the page pending (the exit dialog must see it) until a
+    /// barrier forces it out and the acknowledgement settles it.
+    #[test]
+    fn held_save_stays_pending_until_the_barrier_writes_it() {
+        let dir = temp_dir("autosave_held_pending");
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage { nodes: vec![text_node_with_payload("t")], groups: Vec::new() });
+        doc.enable_background_saver(Some(autosave_test_gate(1000)));
+        doc.set_text_render(0, "t", serde_json::json!({"text": "held"}), img([2, 2], Color32::RED), RenderedTextExtraInfo::default());
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        doc.poll_save_acks();
+        assert!(doc.has_pending_saves(), "a held job must read as pending");
+        assert!(doc.node(0, "t").unwrap().pixels_dirty);
+        let handle = doc.saver_handle().expect("background saver enabled");
+        assert!(handle.barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(!doc.has_pending_saves(), "the barrier wrote and acknowledged the held job");
+        assert!(!doc.node(0, "t").unwrap().pixels_dirty);
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every funnel call is ONE gesture: with a threshold of 2, one enqueue is held and the second
+    /// (a different funnel) closes the window, so both land without a barrier.
+    #[test]
+    fn each_funnel_call_reports_one_autosave_action() {
+        let dir = temp_dir("autosave_funnel_actions");
+        let gate = autosave_test_gate(2);
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage { nodes: vec![text_node_with_payload("t")], groups: Vec::new() });
+        doc.enable_background_saver(Some(Arc::clone(&gate)));
+        let start_epoch = gate.poll();
+        doc.set_text_render(0, "t", serde_json::json!({"text": "a"}), img([2, 2], Color32::RED), RenderedTextExtraInfo::default());
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        assert_eq!(gate.poll(), start_epoch, "one action of two does not close the window");
+        doc.note_autosave_action();
+        assert_eq!(gate.poll(), start_epoch + 1, "the second action closes the window");
+        let written = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            doc.poll_save_acks();
+            !doc.has_pending_saves()
+        });
+        assert!(written, "the due window must write the held job without a barrier");
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

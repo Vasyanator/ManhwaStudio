@@ -437,26 +437,43 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Drops the cached raster layers + bands for `page_idx` so they reload from disk (authoritative)
-    /// on the next `ensure_raster_layers_for_page`.
+    /// Drops the cached raster layers + bands for `page_idx` so they reload from disk on the next
+    /// `ensure_raster_layers_for_page`. Used ONLY by the doc-less raster-create fallback, whose worker
+    /// wrote the new raster straight into the staging manifest (disk is the authority there).
+    ///
+    /// If a shared doc happens to hold the page, it is evicted too so the reload re-reads it — but
+    /// NEVER while the page has an unacknowledged save (`page_has_pending_save`): evicting then would
+    /// drop edits the saver has not written yet and reload the page from a stale disk state. In that
+    /// case the doc page is kept and simply re-projected on the next `ensure_raster_layers_for_page`.
     pub(super) fn invalidate_raster_cache_for_page(&mut self, page_idx: usize) {
         self.raster_layers_by_page.remove(&page_idx);
         self.bands_by_page.remove(&page_idx);
-        // Evict the page from the shared doc too, so the next `ensure_raster_layers_for_page`
-        // reloads it from disk (where a worker just wrote a new raster) and re-projects.
         if let Some(doc) = &self.layer_doc
             && let Ok(mut guard) = doc.lock()
         {
-            guard.evict_page(page_idx);
+            if guard.page_has_pending_save(page_idx) {
+                ms_log::runtime_log::log_warn(format!(
+                    "[typing] raster cache invalidation: page {page_idx} has unsaved layer edits queued, \
+                     so it is NOT evicted from the shared document (its in-memory state stays the \
+                     authority; a raster written straight to disk may only appear after a reload)."
+                ));
+            } else {
+                guard.evict_page(page_idx);
+            }
         }
         // Drop this page's raster texture-generation cache so re-projected nodes re-upload cleanly.
         self.raster_texture_generations
             .retain(|(p, _), _| *p != page_idx);
     }
 
-    /// Polls the "create raster from external image" worker. On success the page's raster cache is
-    /// reloaded from disk and the new raster is selected; the cross-tab revision is bumped (PS picks
-    /// it up). Mirrors `poll_create_overlay_jobs`.
+    /// Polls the "create raster from external image" worker.
+    ///
+    /// Doc-first result ([`TypingCreatedRasterBody::Decoded`]): the layer is added to the shared doc
+    /// on top of the page's stack and its page save is ENQUEUED (see
+    /// [`Self::add_created_raster_to_doc`]) — nothing is written or re-read on this thread. Doc-less
+    /// result ([`TypingCreatedRasterBody::Persisted`]): the worker already wrote it, so the page's
+    /// raster cache reloads from disk. Either way the new raster is selected once its page projects
+    /// (`pending_select_raster_uid`), and the cross-tab doc version moves so the PS tab picks it up.
     pub(super) fn poll_create_raster_jobs(&mut self, ctx: &egui::Context) -> bool {
         let recv_result = {
             let Some(state) = self.create_raster_state.as_ref() else {
@@ -475,9 +492,31 @@ impl TypingTextOverlayLayer {
         };
         self.create_raster_state = None;
         match recv_result {
-            Ok(created) => {
-                self.invalidate_raster_cache_for_page(created.page_idx);
-                self.pending_select_raster_uid = Some((created.page_idx, created.uid));
+            Ok(TypingCreatedRaster {
+                page_idx,
+                uid,
+                body: TypingCreatedRasterBody::Decoded { name, transform, image },
+            }) => {
+                if let Err(reason) = self.add_created_raster_to_doc(page_idx, &uid, name, transform, image) {
+                    ms_log::runtime_log::log_error(format!(
+                        "[typing] creating a raster layer from an image FAILED.\n\
+                         Page: {page_idx}\nLayer uid: {uid}\nCause: {reason}\n\
+                         Effect: the image was not added to the page and nothing was written."
+                    ));
+                    self.set_create_error(
+                        ctx,
+                        tf!("typing.errors.save_page_error", job = page_idx + 1, err = reason),
+                    );
+                }
+                true
+            }
+            Ok(TypingCreatedRaster {
+                page_idx,
+                uid,
+                body: TypingCreatedRasterBody::Persisted,
+            }) => {
+                self.invalidate_raster_cache_for_page(page_idx);
+                self.pending_select_raster_uid = Some((page_idx, uid));
                 true
             }
             Err(err) => {
@@ -485,6 +524,103 @@ impl TypingTextOverlayLayer {
                 true
             }
         }
+    }
+
+    /// Doc-first half of raster creation (GUI thread, no disk I/O on the normal path): adds the decoded
+    /// image as a NEW `pixels_dirty` raster node on top of `page_idx` in the shared doc, enqueues the
+    /// page's whole save (the saver writes the base PNG + record, and the page's CURRENT doc text in the
+    /// same transaction — so a page whose last text was deleted this session is written present-but-
+    /// empty instead of re-seeding stale committed text), then aligns the on-disk Z with the doc's.
+    ///
+    /// Z alignment: the saver gives a NEW raster `max(on-disk Z) + 1`, and the on-disk page can still
+    /// hold nodes the doc already dropped (a deleted text whose removal is written by the same job's
+    /// text half, after the raster half), so the raster's disk Z can exceed its doc Z. A text created
+    /// later takes its Z from the doc, so it would sort BELOW (or tie with) the raster after a reload.
+    /// Enqueueing the doc's own full band order right after the page save (applied after it by the
+    /// saver) renumbers the page to the doc's order on both sides, exactly like a ▲▼ reorder.
+    ///
+    /// `pending_select_raster_uid` is set BEFORE the node is routed, so the projection that follows
+    /// selects the new raster (same contract as the disk path).
+    ///
+    /// # Errors
+    /// A technical reason (for the log and the status line) when persistence is not wired, the page
+    /// cannot be made resident in the doc, or the synchronous no-saver fallback write failed. In the
+    /// first two cases nothing was added; in the last the layer IS in the doc and is written by the
+    /// next save of the page.
+    pub(super) fn add_created_raster_to_doc(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        name: String,
+        transform: ms_models::layer_model::manifest::TransformRec,
+        image: ColorImage,
+    ) -> Result<(), String> {
+        use ms_models::layer_model::layer_doc::{LayerNode, NodeBody, NodeKind};
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            return Err("no staging layers directory is wired for this chapter".to_string());
+        };
+        if self.layer_doc.is_none() {
+            return Err("no shared layer document is wired".to_string());
+        }
+        let fallback = self.layers_fallback_dir.clone();
+        // The page save below writes the doc's text, so the live overlay placement (a settled but not
+        // yet saved drag, grouping, mask clip) must reach the doc first — otherwise the save would put
+        // the stale node on disk.
+        self.sync_overlay_state_into_doc();
+        // A local projection can outlive its doc page (the doc evicts pages the shared page index moved
+        // away from); drop it then, so `ensure_raster_layers_for_page` makes the page resident again
+        // instead of returning early on the stale cache.
+        let resident = self
+            .layer_doc
+            .as_ref()
+            .and_then(|doc| doc.lock().ok().map(|guard| guard.page(page_idx).is_some()))
+            .unwrap_or(false);
+        if !resident {
+            self.raster_layers_by_page.remove(&page_idx);
+            self.bands_by_page.remove(&page_idx);
+        }
+        self.ensure_raster_layers_for_page(page_idx);
+        let node = LayerNode {
+            uid: uid.to_string(),
+            name,
+            kind: NodeKind::Raster,
+            z: 0, // `add_node` places it on top.
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            text_layer_idx: None,
+            text_pinned: false,
+            text_pinned_by_group: false,
+            transform,
+            deform: None,
+            generation: 0,
+            // Never written yet: the page save must encode its base PNG.
+            pixels_dirty: true,
+            body: NodeBody::Raster {
+                base_image: image.clone(),
+                display_image: image,
+                effects: Vec::new(),
+                base_file: ms_models::layer_model::persist::base_file_name(page_idx, uid),
+                // Rasters default to no mask clip; `None` writes exactly what `add_page_raster` did.
+                mask_clip: None,
+            },
+        };
+        let previous_pending_select = self.pending_select_raster_uid.replace((page_idx, uid.to_string()));
+        if !self.route_to_doc_reporting(page_idx, |doc| doc.add_node(page_idx, node)) {
+            self.pending_select_raster_uid = previous_pending_select;
+            return Err(format!("page {page_idx} could not be loaded into the shared layer document"));
+        }
+        let enqueued = match self.layer_doc.clone() {
+            Some(doc) => match doc.lock() {
+                Ok(mut guard) => guard.enqueue_page_save(page_idx, &primary, fallback.as_deref()),
+                Err(_) => Err("the shared layer document lock is poisoned".to_string()),
+            },
+            None => Err("no shared layer document is wired".to_string()),
+        };
+        enqueued.map_err(|err| format!("the page save could not be enqueued: {err}"))?;
+        let order = self.flatten_page_bands_to_refs(page_idx);
+        self.persist_unified_band_order(page_idx, &primary, &order, uid);
+        Ok(())
     }
 
     /// Applies a scale/rotation edit from the image panel to a raster layer (by uid), enqueueing its

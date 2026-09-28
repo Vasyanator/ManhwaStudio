@@ -2227,22 +2227,46 @@ struct TypingCreateRasterState {
     rx: Receiver<Result<TypingCreatedRaster, String>>,
 }
 
-/// Worker request to load an external image and persist it as a raster node in `layers.json`.
+/// Worker request to load an external image for a NEW raster layer.
 struct TypingCreateRasterRequest {
-    layers_dir: PathBuf,
-    /// Committed `layers/` dir; the new staged page is seeded from it so a typeset page keeps its
-    /// committed TEXT (data-safety — see `persist::add_page_raster`).
-    fallback_dir: Option<PathBuf>,
+    /// `Some` only in the DOC-LESS fallback (no shared `LayerDoc` wired): the worker then persists the
+    /// raster itself via `persist::add_page_raster`. `None` (the normal, doc-first path): the worker only
+    /// decodes, and the GUI thread adds the node to the shared doc and ENQUEUES the page save, so no
+    /// staging write bypasses the doc's background saver.
+    disk_target: Option<TypingCreateRasterDiskTarget>,
     page_idx: usize,
     center_page_px: [f32; 2],
     source: TypingCreateImageSource,
 }
 
-/// Worker result: the new raster layer was written to disk; the tab reloads the page's raster cache
-/// from disk (authoritative) and selects this uid.
+/// Where the doc-less raster-create fallback writes (see [`TypingCreateRasterRequest::disk_target`]).
+struct TypingCreateRasterDiskTarget {
+    layers_dir: PathBuf,
+    /// Committed `layers/` dir; the new staged page is seeded from it so a typeset page keeps its
+    /// committed TEXT (data-safety — see `persist::add_page_raster`).
+    fallback_dir: Option<PathBuf>,
+}
+
+/// Worker result of a raster-create job: the target page, the freshly minted layer uid, and what the
+/// worker did with the pixels.
 struct TypingCreatedRaster {
     page_idx: usize,
     uid: String,
+    body: TypingCreatedRasterBody,
+}
+
+/// What a raster-create worker produced (mirrors which [`TypingCreateRasterRequest::disk_target`] it got).
+enum TypingCreatedRasterBody {
+    /// Doc-first: the decoded layer, not yet anywhere on disk. The GUI thread adds it to the shared
+    /// doc as a `pixels_dirty` raster node and enqueues the page save (the saver writes the PNG).
+    Decoded {
+        name: String,
+        transform: ms_models::layer_model::manifest::TransformRec,
+        image: ColorImage,
+    },
+    /// Doc-less fallback: the worker already wrote the node + PNG into the staging manifest; the tab
+    /// reloads the page's raster cache from disk (the only authority without a doc).
+    Persisted,
 }
 
 /// Worker result for a non-destructive raster effects render: the display image to show (the

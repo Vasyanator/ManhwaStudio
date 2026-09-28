@@ -14,7 +14,6 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `text_mask_textures`: tile-кэш текстовой маски для оверлея в cleaning-canvas with LRU metadata
     for memory-pressure eviction.
   - `text_mask_load_*`: асинхронная подзагрузка масок из `text_detection`, если в shared-модели ещё нет данных.
-  - `save_job_*`: фоновое сохранение clean_layers без блокировки GUI.
 - `quick_clean_*`: состояние быстрого клина по маске текста (UI-параметры, фоновые job-события, прогресс).
 - `overlays_model`: shared clean-overlay model; committed edits land there and use its diff-based undo/redo history.
 - Ключевые методы:
@@ -79,7 +78,7 @@ use ms_widgets::panel_dock::{
 };
 use ms_widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
-use egui::{Align, Color32, Layout, Pos2, Rect, Vec2};
+use egui::{Color32, Pos2, Rect, Vec2};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -89,17 +88,13 @@ use ms_thread as thread;
 const STROKE_OVERLAY_UPLOAD_MIN_INTERVAL_S: f64 = 1.0 / 30.0;
 const TEXT_MASK_TILE_SIDE: usize = 1024;
 const TEXT_MASK_VISUAL_ALPHA_MAX: u8 = 96;
-/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
-#[must_use]
-fn save_hint_text() -> &'static str {
-    t!("cleaning.tab.saving_status")
-}
 
 // Dock tabs of the «Клининг» program tab. Every id is a stable, non-localised
 // literal: it is the identity the persisted layout and every egui id of the
 // owning panel derive from (`dev-docs/i18n_exclusions.md` §A9).
-/// «Клин» — clean-layer visibility, the clear/save actions, the quick-clean entry
-/// point and the save status.
+/// «Клин» — clean-layer visibility, the clear-layer action and the quick-clean
+/// entry point. Clean edits have no save button of their own: they are autosaved to
+/// the chapter's unsaved session and committed by «Сохранить проект».
 const CLEANING_CLEAN_TAB: TabId = TabId::new("cleaning.clean");
 /// «Инструменты клина» — the tool picker alone.
 const CLEANING_TOOLS_TAB: TabId = TabId::new("cleaning.tools");
@@ -129,7 +124,7 @@ const CLEANING_AI_TOOL_MARKER: &str = "Torch";
 /// ([`cleaning_clean_tab_size_bounds`]).
 const CLEANING_CLEAN_TAB_MIN_HEIGHT_PX: f32 = 110.0;
 /// Outer HEIGHT, in points, the «Клин» panel starts at: two control rows, the two
-/// hint lines and the save status.
+/// hint lines, with room to spare.
 const CLEANING_CLEAN_TAB_INITIAL_HEIGHT_PX: f32 = 150.0;
 
 /// Smallest outer HEIGHT, in points, the dock may shrink the «Инструменты клина»
@@ -561,7 +556,7 @@ fn cleaning_combo_width(ctx: &egui::Context, style: &egui::Style, selected_text:
 /// user drags it, and a fixed number sized for Russian opens the French panel on a
 /// permanent horizontal scrollbar.
 ///
-/// - the MINIMUM is the widest SINGLE control, because the three controls of the
+/// - the MINIMUM is the widest SINGLE control, because the two controls of the
 ///   first row wrap ([`draw_clean_tab_body`]); the second row does not wrap, so its
 ///   button counts as a single control here too;
 /// - the START is the widest natural ROW, so the first frame shows the first row
@@ -576,7 +571,6 @@ fn cleaning_clean_tab_size_bounds(ctx: &egui::Context, style: &egui::Style) -> (
             t!("cleaning.tab.clear_current_layer_button"),
             false,
         ),
-        cleaning_tool_button_width(ctx, style, t!("cleaning.tab.save_clean_button"), false),
     ];
     let quick_clean = cleaning_tool_button_width(
         ctx,
@@ -777,9 +771,6 @@ pub struct CleaningTabState {
     text_mask_load_rx: Option<Receiver<Result<TextMaskLoadResult, String>>>,
     text_mask_load_status: Option<String>,
     overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
-    save_job_in_progress: bool,
-    save_job_rx: Option<Receiver<Result<(), String>>>,
-    save_status_text: Option<String>,
     quick_clean_spread_radius_px: i32,
     quick_clean_uneven_background_tool: UnevenBackgroundTool,
     quick_clean_job_in_progress: bool,
@@ -824,9 +815,6 @@ impl Default for CleaningTabState {
             text_mask_load_rx: None,
             text_mask_load_status: None,
             overlays_model: None,
-            save_job_in_progress: false,
-            save_job_rx: None,
-            save_status_text: None,
             quick_clean_spread_radius_px: 48,
             quick_clean_uneven_background_tool: UnevenBackgroundTool::NoProcessing,
             quick_clean_job_in_progress: false,
@@ -978,19 +966,12 @@ impl CleaningTabState {
         if ctx.input(|i| i.pointer.primary_released()) {
             self.finish_stroke();
         }
-        // Both of these ran between `canvas.draw` and the two floating surfaces that
-        // are dock tabs now, and both feed values those tabs READ. The dock runs
-        // inside `canvas.draw`, so they have to move ahead of it or the tabs would
-        // show last frame's answer: the «Клин» spinner would outlive the save by a
-        // frame (and only self-heal because `egui::Spinner` asks for a repaint,
-        // which it does not do while the panel is clipped out of view), and
-        // «Инструменты клина» would show a tool that is no longer available as
-        // selected. Both are safe here: `poll_save_job` touches only the save
-        // receiver and its two status fields, and `ensure_active_tool_available`
-        // does what the frame's own `primary_released` branch above already may do
-        // — commit the stroke in flight and swap the active tool — before anything
-        // has been drawn.
-        self.poll_save_job();
+        // This feeds a value a dock tab READS, and the dock runs inside
+        // `canvas.draw`, so it has to run ahead of it or «Инструменты клина» would
+        // show a tool that is no longer available as selected for one frame. It is
+        // safe here: it does what the frame's own `primary_released` branch above
+        // already may do — commit the stroke in flight and swap the active tool —
+        // before anything has been drawn.
         self.ensure_active_tool_available();
         let canvas_rect = ui.max_rect();
         let history_hotkeys_handled = self.handle_history_hotkeys(ctx);
@@ -1061,8 +1042,6 @@ impl CleaningTabState {
             dock_panel_rects: Vec::new(),
             tools: &mut self.tools,
             active_tool_idx: self.active_tool_idx,
-            save_job_in_progress: self.save_job_in_progress,
-            save_status_text: self.save_status_text.as_deref(),
             quick_clean_spread_radius_px: &mut self.quick_clean_spread_radius_px,
             quick_clean_uneven_background_tool: &mut self.quick_clean_uneven_background_tool,
             quick_clean_job_in_progress: self.quick_clean_job_in_progress,
@@ -1123,8 +1102,7 @@ impl CleaningTabState {
         // must not force 60 fps: egui already repaints on panel interaction (drag,
         // resize, hover), and its spinners/progress are gated on the in-progress
         // flags below, so an idle open panel has nothing to animate.
-        if self.save_job_in_progress
-            || hotkeys_handled
+        if hotkeys_handled
             || history_hotkeys_handled
             || self.text_mask_load_in_progress
             || self.quick_clean_job_in_progress
@@ -1234,10 +1212,6 @@ impl CleaningTabState {
                 .clear_overlay_index(self.canvas.current_page_idx());
         }
 
-        if out.request_save {
-            self.start_save_job(project);
-        }
-
         if out.toggle_quick_clean_panel {
             let next_open = !self.quick_text_mask_panel_open;
             self.quick_text_mask_panel_open = next_open;
@@ -1344,61 +1318,6 @@ impl CleaningTabState {
             }
             Err(error) => {
                 self.text_mask_load_status = Some(tf!("cleaning.tab.mask_load_error", error = error));
-            }
-        }
-    }
-
-    fn start_save_job(&mut self, project: &ProjectData) {
-        if self.save_job_in_progress {
-            return;
-        }
-        let Some(model) = self.overlays_model.as_ref().cloned() else {
-            self.save_status_text =
-                Some(t!("cleaning.tab.save_unavailable_no_model_error").to_string());
-            return;
-        };
-        let save_dir = project.paths.clean_layers_dir.clone();
-        let overlay_snapshots = match model.lock() {
-            Ok(locked) => locked.save_snapshots(),
-            Err(_) => {
-                self.save_job_in_progress = false;
-                self.save_job_rx = None;
-                self.save_status_text =
-                    Some(t!("cleaning.tab.overlay_model_lock_error").to_string());
-                return;
-            }
-        };
-        let (tx, rx) = mpsc::channel::<Result<(), String>>();
-        self.save_job_rx = Some(rx);
-        self.save_job_in_progress = true;
-        self.save_status_text = Some(t!("cleaning.tab.saving_clean_status").to_string());
-
-        thread::spawn(move || {
-            let result = save_clean_overlay_snapshots(&save_dir, &overlay_snapshots);
-            let _ = tx.send(result);
-        });
-    }
-
-    fn poll_save_job(&mut self) {
-        let Some(rx) = self.save_job_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(())) => {
-                self.save_job_in_progress = false;
-                self.save_job_rx = None;
-                self.save_status_text = Some(t!("cleaning.tab.clean_saved_status").to_string());
-            }
-            Ok(Err(err)) => {
-                self.save_job_in_progress = false;
-                self.save_job_rx = None;
-                self.save_status_text = Some(tf!("cleaning.tab.save_clean_error", err = err));
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.save_job_in_progress = false;
-                self.save_job_rx = None;
-                self.save_status_text = Some(t!("cleaning.tab.save_aborted_status").to_string());
             }
         }
     }
@@ -1934,8 +1853,8 @@ impl CleaningTabState {
 /// [`CleaningTabState::apply_dock_out`] once `CanvasView::draw` has returned.
 ///
 /// The bodies cannot mutate the tab: they run inside the canvas draw, behind the
-/// dock's per-frame context, and the calls they stand for (`start_save_job`,
-/// `start_text_mask_load_job_if_needed`, `activate_tool`, the canvas' own overlay
+/// dock's per-frame context, and the calls they stand for
+/// (`start_text_mask_load_job_if_needed`, `activate_tool`, the canvas' own overlay
 /// edits) all need `&mut CleaningTabState` and must not land mid-canvas-frame.
 /// Every field is therefore a REQUEST, applied later in the frame in the order the
 /// migrated floating surfaces applied theirs.
@@ -1946,8 +1865,6 @@ struct CleaningDockOut {
     set_overlays_visible: Option<bool>,
     /// «Очистить текущий слой» was pressed.
     clear_current_layer: bool,
-    /// «Сохранить клин» was pressed.
-    request_save: bool,
     /// «Быстрый клин найденного текста» was pressed: flip the quick-clean window
     /// and, when it opens, start the mask load.
     toggle_quick_clean_panel: bool,
@@ -1964,7 +1881,7 @@ struct CleaningDockOut {
 ///
 /// The bodies capture nothing of their own: «Лента» needs the shared `CanvasView`,
 /// «Инструменты клина» and «Выбранный инструмент» both need the tool list (the
-/// second one mutably), and «Клин» needs the save state. Closures capturing those
+/// second one mutably), and «Клин» needs the canvas and the quick-clean flag. Closures capturing those
 /// borrows directly could not coexist in the dock's queue; exclusive, sequential
 /// access through this context lets every body reach exactly what it needs.
 ///
@@ -1983,11 +1900,6 @@ struct CleaningDockCx<'a> {
     /// Index of the tool that is active as this frame's dock runs. The tools tab
     /// starts its own optimistic selection from it (see [`CleaningDockOut`]).
     active_tool_idx: usize,
-    /// Whether a clean save is in flight: disables «Сохранить клин» and drives the
-    /// spinner next to it.
-    save_job_in_progress: bool,
-    /// Last save status line, shown by «Клин» while no save is running.
-    save_status_text: Option<&'a str>,
     /// Whether the quick-clean tab is open. Read by «Клин», whose button is the one
     /// affordance that toggles it, so the button can show itself as pressed.
     quick_clean_panel_open: bool,
@@ -2011,16 +1923,15 @@ struct CleaningDockCx<'a> {
     out: &'a mut CleaningDockOut,
 }
 
-/// Draws the «Клин» tab body: clean-layer visibility, the clear/save actions, the
-/// quick-clean entry point, the in-flight save spinner and the two hint lines.
+/// Draws the «Клин» tab body: clean-layer visibility, the clear-layer action, the
+/// quick-clean entry point and the two hint lines.
 ///
 /// Mutates nothing but [`CleaningDockOut`] — see there for why.
 ///
-/// The first row WRAPS, on the same rule as the tool rows: three controls side by
-/// side are ~460 pt in Russian and ~490 in French, and a panel the user narrows
-/// below that must break the row rather than hide a button behind a horizontal
-/// scrollbar. The second row is one button plus a status strip that fills whatever
-/// is left, so it has nothing to wrap.
+/// The first row WRAPS, on the same rule as the tool rows: a panel the user narrows
+/// below its two controls must break the row rather than hide a control behind a
+/// horizontal scrollbar. The second row is a single button, so it has nothing to
+/// wrap.
 fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
     let mut overlays_visible = cx.canvas.clean_overlays_visible();
     ui.vertical(|ui| {
@@ -2042,15 +1953,6 @@ fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
             {
                 cx.out.clear_current_layer = true;
             }
-            if ui
-                .add_enabled(
-                    !cx.save_job_in_progress,
-                    egui::Button::new(t!("cleaning.tab.save_clean_button")),
-                )
-                .clicked()
-            {
-                cx.out.request_save = true;
-            }
         });
         ui.horizontal(|ui| {
             // Shown PRESSED while the quick-clean tab is open. That look is this
@@ -2067,27 +1969,10 @@ fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
             {
                 cx.out.toggle_quick_clean_panel = true;
             }
-            let status_height = ui.spacing().interact_size.y;
-            let status_width = ui.available_width().max(0.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(status_width, status_height),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    if cx.save_job_in_progress {
-                        ui.spinner();
-                        ui.label(save_hint_text());
-                    }
-                },
-            );
         });
 
         ui.small(t!("cleaning.tab.paint_erase_hint"));
         ui.small(t!("cleaning.tab.scroll_brush_hint"));
-        if !cx.save_job_in_progress
-            && let Some(status) = cx.save_status_text
-        {
-            ui.small(status);
-        }
     });
 }
 
@@ -2321,10 +2206,6 @@ struct CleaningHooks<'a> {
     tools: &'a mut [Box<dyn CleaningTool>],
     /// Active tool index as of the start of this frame.
     active_tool_idx: usize,
-    /// Whether a clean save is in flight, read by the «Клин» body.
-    save_job_in_progress: bool,
-    /// Last save status line, read by the «Клин» body.
-    save_status_text: Option<&'a str>,
     /// Quick-clean parameters, lent to the «Быстрый клин найденного текста» body.
     quick_clean_spread_radius_px: &'a mut i32,
     quick_clean_uneven_background_tool: &'a mut UnevenBackgroundTool,
@@ -2477,8 +2358,6 @@ impl CanvasHooks for CleaningHooks<'_> {
             total_pages: status.total_pages,
             tools: &mut *self.tools,
             active_tool_idx: self.active_tool_idx,
-            save_job_in_progress: self.save_job_in_progress,
-            save_status_text: self.save_status_text,
             quick_clean_panel_open,
             quick_clean_spread_radius_px: &mut *self.quick_clean_spread_radius_px,
             quick_clean_uneven_background_tool: &mut *self.quick_clean_uneven_background_tool,
@@ -2956,21 +2835,6 @@ fn load_text_masks_from_storage(
         missing,
         failed,
     })
-}
-
-fn save_clean_overlay_snapshots(
-    save_dir: &std::path::Path,
-    snapshots: &[(String, Arc<image::RgbaImage>)],
-) -> Result<(), String> {
-    std::fs::create_dir_all(save_dir)
-        .map_err(|err| tf!("cleaning.tab.create_dir_error", dir = save_dir.display(), err = err))?;
-    for (stem, image) in snapshots {
-        let dst = save_dir.join(format!("{stem}.png"));
-        image
-            .save(&dst)
-            .map_err(|err| tf!("cleaning.tab.save_clean_file_error", path = dst.display(), err = err))?;
-    }
-    Ok(())
 }
 
 fn text_detection_mask_file_path(dir: &Path, page_idx: usize) -> PathBuf {

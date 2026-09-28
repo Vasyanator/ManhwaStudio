@@ -579,21 +579,23 @@ impl TypingTextOverlayLayer {
             TypingCreateImageRequest::FromClipboard => TypingCreateImageSource::Clipboard,
             TypingCreateImageRequest::FromFile(path) => TypingCreateImageSource::File(path),
         };
-        // DATA-SAFETY (anti-resurrection): the worker's `add_page_raster` seeds an unstaged page from the
-        // COMMITTED manifest (so a typeset page keeps its text — the drop fix). But committed is STALE
-        // w.r.t. an in-session deletion: when the user deleted the page's LAST text, the placement-save
-        // skipped the now-empty page (`pages_with_text` no longer lists it), so the deletion lived only
-        // in the doc. Seeding committed would RESURRECT it. Fix: flush the target page's CURRENT doc text
-        // to staging NOW (main thread, has the doc) — for a deleted-last-text page this writes it
-        // PRESENT-but-EMPTY, so `ensure_page_staged` sees the page present and does NOT seed stale text;
-        // for a typeset page it writes the current text, which the new raster is then added on top of.
-        self.flush_target_page_text_to_staging(target_page_idx);
-
-        // External images now become RASTER layers (in layers.json), not text/image overlays, so
-        // they are first-class in both the typing and PS editor tabs.
+        // External images become RASTER layers (in layers.json), not text/image overlays, so they are
+        // first-class in both the typing and PS editor tabs. DOC-FIRST: the worker only decodes; the
+        // poll (`poll_create_raster_jobs`) adds the node to the shared doc and ENQUEUES the page save,
+        // whose text half writes the doc's CURRENT text in the same manifest transaction — so a page
+        // whose last text was deleted this session stays deleted (the anti-resurrection guarantee the
+        // former synchronous pre-flush of the page text provided). Only without a shared doc does the
+        // worker persist the raster itself (`persist::add_page_raster`).
+        let disk_target = if self.layer_doc.is_some() && self.layers_primary_dir.is_some() {
+            None
+        } else {
+            Some(TypingCreateRasterDiskTarget {
+                layers_dir: project.paths.unsaved_layers_dir.clone(),
+                fallback_dir: Some(project.paths.layers_dir.clone()),
+            })
+        };
         let create_request = TypingCreateRasterRequest {
-            layers_dir: project.paths.unsaved_layers_dir.clone(),
-            fallback_dir: Some(project.paths.layers_dir.clone()),
+            disk_target,
             page_idx: target_page_idx,
             center_page_px,
             source,
@@ -725,6 +727,11 @@ impl TypingTextOverlayLayer {
                 group_uid: None,
                 // The typing tab's «Группа текста N» axis — carried so the doc flush persists it.
                 text_layer_idx: u32::try_from(decoded.layer_idx).ok(),
+                // PS pin meta: the text writer always emits text pinned-with-explicit-Z, and the PS
+                // editor reads its pin state from this node — an unpinned text would render there as
+                // a TextGroup member drawn on top. So a new text is pinned, never group-owned.
+                text_pinned: true,
+                text_pinned_by_group: false,
                 transform,
                 deform,
                 generation: 0,

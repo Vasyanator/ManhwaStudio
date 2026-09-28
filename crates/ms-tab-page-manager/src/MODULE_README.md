@@ -54,7 +54,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   and destructive clean-file operations. It receives immutable project snapshots, locks
   `CleanOverlaysModel` only after decode, reports completion through `mpsc`, and triggers a
   fresh orphan scan after each operation. The GUI only does candidate arithmetic from known
-  page dimensions; it never reads clean files or decodes images.
+  page dimensions; it never reads clean files or decodes images. Attach and detach are explicit
+  commands outside the autosave gate: attach writes the attached page to `_unsaved/clean_layers`
+  through `save_overlay_snapshots_guarded` (page left dirty so the gated клин autosave rewrites
+  current pixels) and trashes the source only after that write succeeded; detach mutates the
+  model, then trashes the files.
 
 ## Files and submodules
 - `mod.rs`: public contract (`PageManagerTabState`, `PageManagerAction`),

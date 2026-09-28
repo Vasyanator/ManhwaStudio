@@ -8,12 +8,21 @@ holder never blocks on PNG encode + manifest read-modify-write, and never holds 
 I/O.
 
 The worker mirrors the EXACT persist sequence of `LayerDoc::flush_page` / `flush_page_text`
-(rasters → text → effects per page). Jobs are bucketed per page index and the LATEST data for each
-kind (rasters / text / per-uid effects) is kept (coalesced), so a burst of edits to one page collapses
-into a single write while a Full + a TextOnly job for the same page MERGE (neither kind's data is
+(rasters → text → effects per page), followed by the page's STRUCTURAL edits (band order / grouping,
+`StructuralEdit`), which run last so FIFO enqueue order alone guarantees a freshly added raster has
+its node before an edit targets it. Jobs are bucketed per page index and coalesced: the LATEST text
+and per-uid effects win, and raster halves merge losslessly (union of removals, an unwritten dirty
+layer keeps its pixels), so a burst of edits to one page collapses into a single write that equals the
+jobs written in sequence, while a Full + a TextOnly job for the same page MERGE (neither kind's data is
 dropped). Every drain pass then writes each target manifest ONCE: all its pages are applied to one
 `persist::ManifestTxn` and committed together (one docstore commit per pass, not per page), and a
 text write that would not change the page effective on disk is elided.
+
+Autosave hold: with an `AutosaveGate` (`LayerSaver::new(Some(gate))`) the coalescing bucket PERSISTS
+across drains and is written only when the gate's flush epoch moves (interval / action threshold /
+`force_flush`) or a `Barrier` / non-discarding `Shutdown` forces it; `Shutdown { discard: true }`
+drops it. Held jobs keep their reserved epochs unacknowledged, so the doc keeps reporting pending
+saves. `None` is immediate mode: the bucket is written after every drain (the historical behaviour).
 
 Error contract: a per-page failure (PNG encode, raster write, seeding) fails only that page's kind; a
 failed commit fails EVERY job of the pass. Results feed the barrier's failed-text set and the
@@ -23,14 +32,20 @@ Key types:
 - `OwnedRasterLayer` / `RasterSavePart` / `TextSavePart` — owned mirrors of the inputs to
   `persist::save_page_rasters` / `persist::update_raster_effects` / `persist::write_page_text_payload`,
   so the worker holds no borrow into the doc.
-- `PageSaveJob` — one page's owned save payload (its dirs + optional raster part + optional text part).
-- `SaverMsg` — the worker mailbox protocol (`Job` / `Jobs` (one-pass batch) / `Barrier` / `Shutdown`).
+- `PageSaveJob` — one page's owned save payload (its dirs + optional raster part + optional text part
+  + effects items + structural edits).
+- `StructuralEdit` — an owned band-order / grouping edit (appended, never coalesced).
+- `SaverMsg` — the worker mailbox protocol (`Job` / `Jobs` (one-pass batch) / `Barrier` /
+  `Shutdown { discard }`).
 - `LayerSaver` — owns the worker thread + its `Sender` and `JoinHandle`.
 - `LayerSaverHandle` — a cheap-clone `Sender` wrapper so a merge worker can enqueue / barrier without
   locking the doc.
 
 Key functions:
-- `worker_loop` → `run_bucket` (group a pass by manifest) → `run_manifest_pass` (prepare text PNGs,
+- `PageSaveJob::merge_in_place` / `merge_raster_parts` — per-page coalescing.
+- `LayerSaver::shutdown` / `shutdown_discarding` — drain-then-stop vs. drop-queued-then-stop.
+- `LayerSaver::note_action` — reports one save gesture to the gate (called before its enqueue).
+- `worker_loop` (hold / due decision, `next_message` bounded wait) → `run_bucket` (group a pass by manifest) → `run_manifest_pass` (prepare text PNGs,
   apply every job to one transaction, commit once).
 
 Notes:
@@ -41,22 +56,28 @@ the real `persist::*` write path while the doc is free for the GUI thread.
 use ms_thread::{self as thread, JoinHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::ColorImage;
 use serde_json::Value;
 
 use super::manifest::{CenteringFrameRec, DeformRec, TextCentersRec, TransformRec};
-use super::persist::{self, GroupMeta, RasterLayerOut};
+use super::persist::{self, BandRef, GroupMeta, GroupingEdit, RasterLayerOut};
+use crate::autosave_gate::AutosaveGate;
 use ms_log::runtime_log;
 use ms_log::trace::cat;
 
 /// The independently acknowledged persistence kinds. Effects are part of the raster contract.
+/// `Structural` acknowledges a job's band-order / grouping edits: it is separate from `Raster`
+/// because a successful raster ack clears the page's raster `pixels_dirty`, which a structural-only
+/// job (carrying no pixels) must never do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SaveKind {
     Raster,
     Text,
+    Structural,
 }
 
 /// Latest completed worker epoch per page and save kind, shared with the document for acknowledgement.
@@ -97,8 +118,13 @@ pub struct OwnedRasterLayer {
     pub deform: Option<DeformRec>,
     pub group_uid: Option<String>,
     /// Pre-effects base pixels (owned). Written as the base PNG only when `pixels_dirty` — same rule
-    /// as the synchronous flush.
-    pub base_image: ColorImage,
+    /// as the synchronous flush. `None` when the builder carried no pixels (a clean raster whose PNG is
+    /// already persisted): the writer then keeps the recorded PNG, and fails this page's raster kind
+    /// if the layer turns out to need pixels (dirty or not yet recorded).
+    pub base_image: Option<ColorImage>,
+    /// Size of the base pixels in px (`[width, height]`), carried even when `base_image` is `None`
+    /// so the writer can record `image_size` for a record that has none.
+    pub image_size: [usize; 2],
     pub pixels_dirty: bool,
     pub mask_clip: Option<bool>,
     /// The post-effects display image, present only when `effects` is non-empty (so the worker can run
@@ -122,7 +148,8 @@ impl OwnedRasterLayer {
             transform: self.transform,
             deform: self.deform.clone(),
             group_uid: self.group_uid.clone(),
-            image: &self.base_image,
+            image: self.base_image.as_ref(),
+            image_size: self.image_size,
             pixels_dirty: self.pixels_dirty,
             mask_clip: self.mask_clip,
         }
@@ -163,6 +190,8 @@ pub struct OwnedTextNode {
     pub text_centers: Option<TextCentersRec>,
     /// Schema v4: the centering-assist guide rectangle bound to this node.
     pub centering_frame: Option<CenteringFrameRec>,
+    /// PS grouping owns this text's pin (`LayerNode.text_pinned_by_group`, doc-owned); written as-is.
+    pub pinned_by_group: bool,
     /// The rendered text image (owned). Encoded to `ps_p{page:04}_{uid}_text.png` only when
     /// `pixels_dirty` or the deterministic file is missing — same rule as the sync flush.
     pub image: ColorImage,
@@ -189,10 +218,23 @@ pub struct EffectsSaveItem {
     pub display_image: Option<ColorImage>,
 }
 
+/// One STRUCTURAL page edit (no pixels): a PS band reorder or a grouping edit, applied to the page
+/// record by `persist::ManifestTxn::save_page_band_order` / `save_page_grouping`. Structural edits
+/// compose (each is relative to the state the previous one left), so jobs never coalesce them: they
+/// are appended and applied in enqueue order, after the page's raster / text / effects parts.
+#[derive(Debug, Clone)]
+pub enum StructuralEdit {
+    /// A complete unified band order (bottom-to-top).
+    BandOrder(Vec<BandRef>),
+    /// A batched group-structure edit.
+    Grouping(GroupingEdit),
+}
+
 /// One page's owned save payload. Either or both halves may be present: a whole-page flush sets both,
-/// a text-only flush sets only `text`. When two jobs for the same page are coalesced, each present
-/// half REPLACES the corresponding half of the queued job (latest wins per kind) while the other
-/// half is preserved — so a Full then TextOnly (or vice-versa) never drops a kind's data.
+/// a text-only flush sets only `text`. When two jobs for the same page are coalesced, the text half
+/// is replaced (latest wins), the raster half is MERGED losslessly (see
+/// [`merge_raster_parts`]), structural edits are APPENDED, and an absent half never erases the queued
+/// one — so a Full then TextOnly (or vice-versa) never drops a kind's data.
 #[derive(Debug, Clone)]
 pub struct PageSaveJob {
     pub page_idx: usize,
@@ -206,13 +248,19 @@ pub struct PageSaveJob {
     /// a per-uid list so two effects updates to DIFFERENT rasters in one coalescing pass both survive
     /// (latest-per-uid wins). Empty for jobs that carry no effects-only update.
     pub effects: Vec<EffectsSaveItem>,
+    /// Structural edits (band order / grouping), applied LAST and in order. Empty for most jobs.
+    pub structural: Vec<StructuralEdit>,
+    /// Epoch acknowledged as [`SaveKind::Structural`]; `Some` whenever `structural` is non-empty.
+    pub structural_epoch: Option<u64>,
 }
 
 impl PageSaveJob {
-    /// Merges `next` (a newer job for the SAME page) into `self`: each present half of `next` replaces
-    /// the corresponding half of `self`, the other half is kept, and the dirs adopt `next`'s (the
-    /// freshest target). This is the per-kind coalescing that keeps a Full + a TextOnly job from
-    /// dropping either kind. `debug_assert`s the page indices match.
+    /// Merges `next` (a newer job for the SAME page) into `self`: a present text half of `next`
+    /// replaces `self`'s, a present raster half is merged into `self`'s via [`merge_raster_parts`]
+    /// (so an earlier job's removals and dirty pixels are never lost), an absent half keeps `self`'s,
+    /// `next`'s structural edits are appended after `self`'s, and the dirs adopt `next`'s (the
+    /// freshest target). Coalescing therefore writes the same bytes as running the jobs one after the
+    /// other. `debug_assert`s the page indices match.
     fn merge_in_place(&mut self, next: PageSaveJob) {
         debug_assert_eq!(
             self.page_idx, next.page_idx,
@@ -220,8 +268,11 @@ impl PageSaveJob {
         );
         self.layers_dir = next.layers_dir;
         self.fallback_dir = next.fallback_dir;
-        if next.raster.is_some() {
-            self.raster = next.raster;
+        if let Some(next_raster) = next.raster {
+            self.raster = Some(match self.raster.take() {
+                Some(prev) => merge_raster_parts(prev, next_raster),
+                None => next_raster,
+            });
             self.raster_epoch = next.raster_epoch;
         }
         if next.text.is_some() {
@@ -245,6 +296,11 @@ impl PageSaveJob {
             } else {
                 self.effects.push(item);
             }
+        }
+        // Structural edits compose, so they are never coalesced: keep both, in enqueue order.
+        self.structural.extend(next.structural);
+        if next.structural_epoch.is_some() {
+            self.structural_epoch = next.structural_epoch;
         }
     }
 
@@ -281,7 +337,7 @@ impl PageSaveJob {
                     visible: node.visible,
                     opacity: node.opacity,
                     group_uid: node.group_uid.clone(),
-                    pinned_by_group: false,
+                    pinned_by_group: node.pinned_by_group,
                     payload_uid: node.payload_uid.clone(),
                     render_data: node.render_data.clone(),
                     is_image: node.is_image,
@@ -304,7 +360,11 @@ impl PageSaveJob {
     ///    elided when it would not change the page (and no text PNG was written for it),
     /// 3. effects reconcile via `ManifestTxn::update_raster_effects` for every raster with a non-empty
     ///    chain, then the targeted effects-only items — as ONE unit that is rolled back as a whole
-    ///    when any item fails.
+    ///    when any item fails;
+    /// 4. structural edits (band order / grouping) in enqueue order, as ONE unit rolled back as a
+    ///    whole when any edit fails. They run LAST so a raster this job (or an earlier job of the
+    ///    pass) added already has its node for the edit to land on. No doc lock is taken here (lock
+    ///    order is `MANIFEST_LOCK` → document lock, never the doc lock inside a transaction).
     ///
     /// Each kind is atomic within the transaction, so a failing kind never leaves a partial page
     /// edit for the others' commit. Nothing is on disk until the pass commits.
@@ -342,7 +402,19 @@ impl PageSaveJob {
         if effects.is_err() {
             txn.rollback(checkpoint);
         }
-        KindResults { raster, text, effects }
+
+        let checkpoint = txn.checkpoint(page);
+        let structural = self.structural.iter().try_for_each(|edit| {
+            match edit {
+                StructuralEdit::BandOrder(order) => txn.save_page_band_order(page, order, fallback_dir),
+                StructuralEdit::Grouping(edit) => txn.save_page_grouping(page, edit, fallback_dir),
+            }
+            .map(|_changed| ())
+        });
+        if structural.is_err() {
+            txn.rollback(checkpoint);
+        }
+        KindResults { raster, text, effects, structural }
     }
 
     /// All present kinds failed with `err` (a panic, or a transaction that could not begin).
@@ -351,8 +423,46 @@ impl PageSaveJob {
             raster: self.raster.as_ref().map(|_| Err(err.to_string())),
             text: self.text.as_ref().map(|_| Err(err.to_string())),
             effects: if self.effects.is_empty() { Ok(()) } else { Err(err.to_string()) },
+            structural: if self.structural.is_empty() { Ok(()) } else { Err(err.to_string()) },
         }
     }
+}
+
+/// Merges a newer raster half `next` into the queued `prev` for the same page so that one write of
+/// the result equals writing `prev` then `next`:
+/// - `removed_uids` is the order-stable, de-duplicated union of both, minus every uid `next` carries
+///   in `layers` (a raster re-added after its removal must not be dropped);
+/// - `groups` are `next`'s, and so is every layer `next` carries — it is the authoritative current
+///   set — except that a layer `prev` carried DIRTY and `next` carries clean keeps
+///   `pixels_dirty = true` together with `prev`'s pixels and size: those pixels were never written,
+///   and running the jobs in sequence would have written exactly them before `next` preserved the file;
+/// - a layer `prev` carried that `next` neither carries nor removes is KEPT (dirty flag, pixels and
+///   all): written in sequence, `prev` would have recorded it and `next` would have preserved that
+///   record as unowned. It goes BEFORE `next`'s layers because the writer lists preserved rasters
+///   before the saved ones and hands out new-raster Z in iteration order, so this reproduces both the
+///   sequential tree order and the Z `prev` would have assigned first.
+fn merge_raster_parts(prev: RasterSavePart, next: RasterSavePart) -> RasterSavePart {
+    let RasterSavePart { layers: prev_layers, removed_uids: prev_removed, .. } = prev;
+    let RasterSavePart { layers: next_layers, groups, removed_uids: next_removed } = next;
+    let next_owned: HashSet<String> = next_layers.iter().map(|layer| layer.uid.clone()).chain(next_removed.iter().cloned()).collect();
+    let (mut layers, mut earlier): (Vec<OwnedRasterLayer>, Vec<OwnedRasterLayer>) =
+        prev_layers.into_iter().partition(|layer| !next_owned.contains(&layer.uid));
+    layers.extend(next_layers);
+    for layer in layers.iter_mut().filter(|layer| !layer.pixels_dirty) {
+        if let Some(prior) = earlier.iter_mut().find(|prior| prior.uid == layer.uid && prior.pixels_dirty) {
+            layer.pixels_dirty = true;
+            layer.base_image = prior.base_image.take();
+            layer.image_size = prior.image_size;
+        }
+    }
+    let carried: HashSet<&str> = layers.iter().map(|layer| layer.uid.as_str()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let removed_uids = prev_removed
+        .into_iter()
+        .chain(next_removed)
+        .filter(|uid| !carried.contains(uid.as_str()) && seen.insert(uid.clone()))
+        .collect();
+    RasterSavePart { layers, groups, removed_uids }
 }
 
 /// A job's text payload after its PNGs were encoded; `wrote_png` records whether any PNG was written.
@@ -363,21 +473,37 @@ struct PreparedText {
 }
 
 /// Independent persist results for one job within a pass. Effects contribute to the raster
-/// acknowledgement.
+/// acknowledgement; structural edits are acknowledged on their own ([`SaveKind::Structural`]).
 #[derive(Debug)]
 struct KindResults {
     raster: Option<Result<(), String>>,
     text: Option<Result<(), String>>,
     effects: Result<(), String>,
+    structural: Result<(), String>,
+}
+
+/// Per-job acknowledgement outcome of one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobAcks {
+    raster_ok: bool,
+    text_ok: bool,
+    structural_ok: bool,
+}
+
+impl JobAcks {
+    /// Every kind failed (a pass that could not begin or commit).
+    const FAILED: JobAcks = JobAcks { raster_ok: false, text_ok: false, structural_ok: false };
 }
 
 impl KindResults {
-    /// `(raster_ok, text_ok)` once the pass's single manifest commit returned `commit_ok`: a failed
-    /// commit persisted nothing, so every kind the job carried is reported failed.
-    fn acks(&self, commit_ok: bool) -> (bool, bool) {
-        let raster_ok = commit_ok && self.raster.as_ref().is_none_or(Result::is_ok) && self.effects.is_ok();
-        let text_ok = commit_ok && self.text.as_ref().is_none_or(Result::is_ok);
-        (raster_ok, text_ok)
+    /// Per-kind outcome once the pass's single manifest commit returned `commit_ok`: a failed commit
+    /// persisted nothing, so every kind the job carried is reported failed.
+    fn acks(&self, commit_ok: bool) -> JobAcks {
+        JobAcks {
+            raster_ok: commit_ok && self.raster.as_ref().is_none_or(Result::is_ok) && self.effects.is_ok(),
+            text_ok: commit_ok && self.text.as_ref().is_none_or(Result::is_ok),
+            structural_ok: commit_ok && self.structural.is_ok(),
+        }
     }
 
     fn log_errors(&self, page: usize) {
@@ -389,6 +515,9 @@ impl KindResults {
         }
         if let Err(err) = &self.effects {
             runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} effects: {err}"));
+        }
+        if let Err(err) = &self.structural {
+            runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} band order / grouping: {err}"));
         }
     }
 }
@@ -415,8 +544,10 @@ pub enum SaverMsg {
     /// save-to-project merge reads the staging files). The reply reports pages whose latest write
     /// TEXT write failed, so a merge can preserve their committed text without raster coupling.
     Barrier(Sender<HashSet<usize>>),
-    /// Drain any remaining queued jobs, then stop the worker.
-    Shutdown,
+    /// Stop the worker after the current drain pass. `discard: false` writes every queued job first
+    /// (the normal shutdown); `discard: true` drops them unwritten (the user chose to discard unsaved
+    /// changes) — barriers released by that pass report the discarded text pages as failed.
+    Shutdown { discard: bool },
 }
 
 /// A cheap-clone handle to the background saver's `Sender`. Lets a merge worker enqueue jobs and run a
@@ -479,30 +610,49 @@ impl LayerSaverHandle {
 }
 
 /// Owns the background saver thread, its `Sender`, and its `JoinHandle`. Created with
-/// [`LayerSaver::new`]; shut down explicitly with [`LayerSaver::shutdown`] (sentinel + join) or
-/// implicitly via the holder's `Drop`.
+/// [`LayerSaver::new`]; shut down explicitly with [`LayerSaver::shutdown`] /
+/// [`LayerSaver::shutdown_discarding`] (sentinel + join) or implicitly via the holder's `Drop`
+/// (a draining shutdown).
 pub struct LayerSaver {
     tx: Sender<SaverMsg>,
     handle: Option<JoinHandle<()>>,
     ack_map: Arc<Mutex<SaveAckMap>>,
+    /// The project's autosave gate, shared with the worker; `None` = immediate mode.
+    gate: Option<Arc<AutosaveGate>>,
 }
 
 impl LayerSaver {
     /// Spawns the background saver thread and returns the owner.
     ///
-    /// The worker loop blocks on `recv`, then drains every immediately-available message with
-    /// `try_recv`, BUCKETING `Job`s per `page_idx` (coalescing — the latest data per kind wins). A
-    /// `Barrier` flushes the current bucket then replies; a `Shutdown` flushes the bucket then breaks.
+    /// The worker drains every immediately-available message with `try_recv`, BUCKETING `Job`s per
+    /// `page_idx` (coalescing — the latest data per kind wins). With `gate: None` (immediate mode,
+    /// used by tests and tools) the bucket is written after every drain. With a gate the bucket is
+    /// HELD across drains until the gate's flush epoch moves (interval since the first action elapsed,
+    /// action threshold reached, or `force_flush`). A `Barrier` always writes the bucket then replies;
+    /// a `Shutdown` writes (or, with `discard`, drops) the bucket then stops.
     #[must_use]
-    pub fn new() -> LayerSaver {
+    pub fn new(gate: Option<Arc<AutosaveGate>>) -> LayerSaver {
         let (tx, rx) = mpsc::channel::<SaverMsg>();
         let ack_map = Arc::new(Mutex::new(SaveAckMap::default()));
         let worker_ack_map = Arc::clone(&ack_map);
-        let handle = thread::spawn(move || worker_loop(&rx, &worker_ack_map));
+        let worker_gate = gate.clone();
+        let initial_epoch = gate.as_deref().map_or(0, AutosaveGate::poll);
+        let handle = thread::spawn(move || worker_loop(&rx, &worker_ack_map, worker_gate.as_deref(), initial_epoch));
         LayerSaver {
             tx,
             handle: Some(handle),
             ack_map,
+            gate,
+        }
+    }
+
+    /// Reports one save gesture to the autosave gate (no-op in immediate mode). Call it AFTER the
+    /// gesture's enqueue: the worker polls the gate before draining its channel, so an action is
+    /// never counted into a flush whose pass cannot contain its job. (A threshold trip is therefore
+    /// written at the worker's next hold wake, at most about a second later.)
+    pub fn note_action(&self) {
+        if let Some(gate) = &self.gate {
+            gate.note_action();
         }
     }
 
@@ -547,21 +697,29 @@ impl LayerSaver {
     /// Shuts the worker down: sends `Shutdown` (so the worker drains its queue first) and joins the
     /// thread. A send/join failure is logged, never panicked.
     pub fn shutdown(mut self) {
-        self.shutdown_inner();
+        self.shutdown_inner(false);
+    }
+
+    /// Shuts the worker down WITHOUT writing the jobs still queued: every job enqueued before this call
+    /// that the worker has not started is dropped (a pass already running completes). Joins the thread;
+    /// a send/join failure is logged, never panicked. For the "discard unsaved changes" path.
+    pub fn shutdown_discarding(mut self) {
+        self.shutdown_inner(true);
     }
 
     /// Sends the shutdown sentinel and joins the worker. Idempotent: a second call (e.g. `Drop` after
     /// an explicit `shutdown`) finds no handle and is a no-op.
-    fn shutdown_inner(&mut self) {
-        if self.tx.send(SaverMsg::Shutdown).is_err() {
+    fn shutdown_inner(&mut self, discard: bool) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if self.tx.send(SaverMsg::Shutdown { discard }).is_err() {
             // The worker already stopped; nothing queued can be lost beyond what it already drained.
             runtime_log::log_warn(
                 "[layer_model::saver] shutdown: background saver thread already gone",
             );
         }
-        if let Some(handle) = self.handle.take()
-            && handle.join().is_err()
-        {
+        if handle.join().is_err() {
             runtime_log::log_error(
                 "[layer_model::saver] background saver thread panicked during shutdown",
             );
@@ -570,33 +728,66 @@ impl LayerSaver {
 }
 
 impl Default for LayerSaver {
+    /// An immediate-mode saver (no autosave gate).
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl Drop for LayerSaver {
     fn drop(&mut self) {
-        self.shutdown_inner();
+        self.shutdown_inner(false);
     }
 }
 
-/// The background worker body: `recv` then `try_recv`-drain, bucketing `Job`s per page (latest data
-/// per kind), running each bucket, honoring `Barrier`/`Shutdown`. A persist error is logged and tracked
-/// (the next page still runs) — a single bad page must not stall the saver.
-fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
+/// Upper bound of one wait while the saver HOLDS jobs, so a gate epoch moved by another writer's
+/// action (or a live policy change) is noticed within about a second.
+const MAX_HOLD_WAIT: Duration = Duration::from_secs(1);
+
+/// The background worker body: wait, then `try_recv`-drain, bucketing `Job`s per page (latest data per
+/// kind) into a bucket that PERSISTS across iterations, and run the bucket when a write is due.
+///
+/// With no gate (`None`, immediate mode) a write is due after every drain — the historical behaviour.
+/// With a gate, the bucket is held until the gate's flush epoch (polled BEFORE each drain) moves past
+/// the epoch this worker last acted on; a `Barrier` or a non-discarding `Shutdown` ALWAYS writes whatever is held (they are the
+/// force points), a discarding `Shutdown` drops it. While holding, the wait is
+/// `recv_timeout(min(gate.wait_deadline(), 1 s))` — never a busy loop. A persist error is logged and
+/// tracked (the next page still runs) — a single bad page must not stall the saver.
+fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>, gate: Option<&AutosaveGate>, initial_epoch: u64) {
     let mut failed_raster_pages = HashSet::new();
     let mut failed_text_pages = HashSet::new();
-    while let Ok(first) = rx.recv() {
-        // Per-page coalescing bucket for this drain pass. Insertion order is preserved by tracking the
-        // page sequence so writes happen in a deterministic order.
-        let mut bucket: HashMap<usize, PageSaveJob> = HashMap::new();
-        let mut order: Vec<usize> = Vec::new();
+    // Per-page coalescing bucket, held across iterations while no write is due. Insertion order is
+    // preserved by tracking the page sequence so writes happen in a deterministic (FIFO) order.
+    let mut bucket: HashMap<usize, PageSaveJob> = HashMap::new();
+    let mut order: Vec<usize> = Vec::new();
+    // The gate epoch this worker last acted on (polled on the spawning thread for the first value, so
+    // a late thread start cannot swallow an advance). A stale value can only make the next write
+    // EARLIER than strictly needed, never later.
+    let mut seen_epoch = initial_epoch;
+    loop {
+        let first = match next_message(rx, gate, bucket.is_empty()) {
+            Ok(msg) => Some(msg),
+            // The hold wait elapsed with no message: re-check the gate.
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                // Every sender is gone (the owner always sends `Shutdown` first, so this is only a
+                // defensive path): write what is held rather than lose it, then stop.
+                if !bucket.is_empty() {
+                    run_bucket(&bucket, &order, &mut failed_raster_pages, &mut failed_text_pages, ack_map);
+                }
+                break;
+            }
+        };
+        // Poll BEFORE draining. Senders report a gesture's action AFTER its send, so every job whose
+        // action is reflected in this epoch is already in the channel, and the drain below empties the
+        // channel: a due epoch therefore never covers a job this pass does not contain.
+        let epoch = gate.map(AutosaveGate::poll);
         let mut pending_barriers: Vec<Sender<HashSet<usize>>> = Vec::new();
         let mut shutdown = false;
+        let mut discard = false;
 
-        // Fold the first message, then drain everything immediately available.
-        let mut msg = Some(first);
+        // Fold the first message (if any), then drain everything immediately available.
+        let mut msg = first;
         let mut fold = |job: PageSaveJob| {
             let page = job.page_idx;
             match bucket.get_mut(&page) {
@@ -612,9 +803,11 @@ fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
                 Some(SaverMsg::Job(job)) => fold(job),
                 Some(SaverMsg::Jobs(jobs)) => jobs.into_iter().for_each(&mut fold),
                 Some(SaverMsg::Barrier(done)) => pending_barriers.push(done),
-                Some(SaverMsg::Shutdown) => {
+                Some(SaverMsg::Shutdown { discard: drop_queued }) => {
                     shutdown = true;
-                    // Keep draining queued jobs after a shutdown so nothing already enqueued is lost.
+                    discard |= drop_queued;
+                    // Keep draining queued jobs after a shutdown so nothing already enqueued is lost
+                    // (or, when discarding, so nothing queued behind the sentinel is written either).
                 }
                 None => {}
             }
@@ -624,8 +817,30 @@ fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
             }
         }
 
-        // Run every coalesced page in insertion order, then release any barriers waiting on this pass.
-        run_bucket(&bucket, &order, &mut failed_raster_pages, &mut failed_text_pages, ack_map);
+        if discard {
+            // Nothing held reaches disk. A barrier waiting on it must not read "written", so the
+            // dropped text pages are reported failed; no acknowledgement is recorded (the owning
+            // document is being torn down with its unsaved state).
+            runtime_log::log_warn(format!("[layer_model::saver] shutdown discarded {} queued page save(s): {order:?}", order.len()));
+            failed_text_pages.extend(bucket.values().filter(|job| job.text.is_some()).map(|job| job.page_idx));
+            bucket.clear();
+            order.clear();
+        } else {
+            // Barriers and shutdown force the write; otherwise the gate decides (no gate = always).
+            let due = shutdown || !pending_barriers.is_empty() || epoch.is_none_or(|epoch| epoch != seen_epoch);
+            if due {
+                if !bucket.is_empty() {
+                    run_bucket(&bucket, &order, &mut failed_raster_pages, &mut failed_text_pages, ack_map);
+                    bucket.clear();
+                    order.clear();
+                }
+                if let Some(epoch) = epoch {
+                    seen_epoch = epoch;
+                }
+            } else if !bucket.is_empty() {
+                ms_log::trace_log!(cat::PERSIST, "saver holding {} page save(s) until the autosave gate is due", order.len());
+            }
+        }
         for done in pending_barriers {
             // The waiter may have given up (timed out / dropped); ignore a closed receiver.
             done.send(failed_text_pages.clone()).ok();
@@ -634,6 +849,17 @@ fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
             break;
         }
     }
+}
+
+/// Waits for the next message: a plain blocking `recv` when nothing is held (or in immediate mode),
+/// else a `recv_timeout` bounded by the gate's remaining window and [`MAX_HOLD_WAIT`]. `Timeout`
+/// means "re-check the gate"; `Disconnected` means every sender is gone.
+fn next_message(rx: &Receiver<SaverMsg>, gate: Option<&AutosaveGate>, bucket_empty: bool) -> Result<SaverMsg, RecvTimeoutError> {
+    let Some(gate) = gate.filter(|_| !bucket_empty) else {
+        return rx.recv().map_err(|_| RecvTimeoutError::Disconnected);
+    };
+    let wait = gate.wait_deadline().map_or(MAX_HOLD_WAIT, |deadline| deadline.min(MAX_HOLD_WAIT));
+    rx.recv_timeout(wait)
 }
 
 /// Runs every job in `bucket` following `order` (deterministic write order). Jobs are grouped by
@@ -656,16 +882,16 @@ fn run_bucket(
         }
     }
     for (layers_dir, jobs) in groups {
-        for (job, (raster_ok, text_ok)) in jobs.iter().zip(run_manifest_pass(layers_dir, &jobs)) {
-            update_failed_set(failed_raster_pages, job.page_idx, job.raster_epoch.is_some(), raster_ok);
-            update_failed_set(failed_text_pages, job.page_idx, job.text_epoch.is_some(), text_ok);
-            record_job_acks(ack_map, job, raster_ok, text_ok);
+        for (job, acks) in jobs.iter().zip(run_manifest_pass(layers_dir, &jobs)) {
+            update_failed_set(failed_raster_pages, job.page_idx, job.raster_epoch.is_some(), acks.raster_ok);
+            update_failed_set(failed_text_pages, job.page_idx, job.text_epoch.is_some(), acks.text_ok);
+            record_job_acks(ack_map, job, acks);
         }
     }
 }
 
 /// Persists `jobs` (all targeting the manifest in `layers_dir`) with ONE manifest write and returns
-/// `(raster_ok, text_ok)` per job, in order.
+/// each job's per-kind [`JobAcks`], in order.
 ///
 /// 1. Per-page preparation outside the manifest lock: each job's text PNGs are encoded. A failure
 ///    (or panic) there fails only THAT page's text.
@@ -677,7 +903,7 @@ fn run_bucket(
 /// Panics are caught at each step (`catch_unwind`): a panic must not unwind out of the worker loop
 /// and kill the saver thread — that would silently drop all later enqueues and leave every future
 /// `barrier_blocking` unable to complete.
-fn run_manifest_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob]) -> Vec<(bool, bool)> {
+fn run_manifest_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob]) -> Vec<JobAcks> {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     // `AssertUnwindSafe` throughout: jobs are read-only, and the transaction's page state is restored
     // from its checkpoint after a caught panic, so no observer ever sees a half-mutated value.
@@ -736,9 +962,9 @@ fn run_manifest_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob]) -> Vec
 }
 
 /// Logs a pass-wide failure (every job in it lost its writes) and reports all jobs failed.
-fn fail_whole_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob], err: &str) -> Vec<(bool, bool)> {
+fn fail_whole_pass(layers_dir: &std::path::Path, jobs: &[&PageSaveJob], err: &str) -> Vec<JobAcks> {
     log_pass_failure(layers_dir, jobs, err);
-    vec![(false, false); jobs.len()]
+    vec![JobAcks::FAILED; jobs.len()]
 }
 
 fn log_pass_failure(layers_dir: &std::path::Path, jobs: &[&PageSaveJob], err: &str) {
@@ -757,16 +983,19 @@ fn update_failed_set(failed: &mut HashSet<usize>, page: usize, present: bool, ok
     }
 }
 
-fn record_job_acks(ack_map: &Arc<Mutex<SaveAckMap>>, job: &PageSaveJob, raster_ok: bool, text_ok: bool) {
+fn record_job_acks(ack_map: &Arc<Mutex<SaveAckMap>>, job: &PageSaveJob, acks: JobAcks) {
     let Ok(mut ack) = ack_map.lock() else {
         runtime_log::log_error("[layer_model::saver] acknowledgement map lock poisoned");
         return;
     };
     if let Some(epoch) = job.raster_epoch {
-        ack.record(job.page_idx, SaveKind::Raster, epoch, raster_ok);
+        ack.record(job.page_idx, SaveKind::Raster, epoch, acks.raster_ok);
     }
     if let Some(epoch) = job.text_epoch {
-        ack.record(job.page_idx, SaveKind::Text, epoch, text_ok);
+        ack.record(job.page_idx, SaveKind::Text, epoch, acks.text_ok);
+    }
+    if let Some(epoch) = job.structural_epoch {
+        ack.record(job.page_idx, SaveKind::Structural, epoch, acks.structural_ok);
     }
 }
 
@@ -809,7 +1038,8 @@ mod tests {
             transform: tf(1.0, 1.0),
             deform: None,
             group_uid: None,
-            base_image: img([2, 2], c),
+            base_image: Some(img([2, 2], c)),
+            image_size: [2, 2],
             pixels_dirty: true,
             mask_clip: None,
             display_image: None,
@@ -842,6 +1072,7 @@ mod tests {
             mask_clip: None,
             text_centers: None,
             centering_frame: None,
+            pinned_by_group: false,
             image: img([2, 2], c),
             pixels_dirty: true,
         }
@@ -857,6 +1088,8 @@ mod tests {
             text: None,
             text_epoch: None,
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         }
     }
 
@@ -871,20 +1104,27 @@ mod tests {
         assert!(acks.take().is_empty(), "take clears consumed acknowledgements");
     }
 
-    /// Three Full jobs for the same page coalesce to the LATEST on-disk state (last writer wins per
-    /// kind). The final manifest must reflect only the third job's layers.
+    /// Three Full jobs for the same page reach the same on-disk state whether the worker coalesces
+    /// them or writes them one by one: the latest job's set wins, and the rasters earlier jobs added
+    /// are gone only because the latest job REMOVES them (an earlier raster the latest job neither
+    /// carries nor removes would be preserved, exactly as sequential writes preserve it).
     #[test]
     fn per_page_coalescing_keeps_latest() {
         let dir = temp_dir("coalesce");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         // Three distinct raster sets for page 5; only the last must survive.
         saver.enqueue(full_job(5, &dir, vec![raster("a", Color32::RED)]));
-        saver.enqueue(full_job(5, &dir, vec![raster("b", Color32::GREEN)]));
-        saver.enqueue(full_job(
-            5,
-            &dir,
-            vec![raster("c", Color32::BLUE), raster("d", Color32::WHITE)],
-        ));
+        saver.enqueue(PageSaveJob {
+            raster: Some(RasterSavePart { removed_uids: vec!["a".into()], ..raster_part(vec![raster("b", Color32::GREEN)]) }),
+            ..full_job(5, &dir, Vec::new())
+        });
+        saver.enqueue(PageSaveJob {
+            raster: Some(RasterSavePart {
+                removed_uids: vec!["b".into()],
+                ..raster_part(vec![raster("c", Color32::BLUE), raster("d", Color32::WHITE)])
+            }),
+            ..full_job(5, &dir, Vec::new())
+        });
         assert!(saver.barrier_blocking().is_empty());
 
         let page = persist::load_page_rasters(&dir, None, 5).unwrap();
@@ -905,7 +1145,7 @@ mod tests {
     #[test]
     fn barrier_blocks_until_written() {
         let dir = temp_dir("barrier");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         saver.enqueue(full_job(0, &dir, vec![raster("r", Color32::RED)]));
         assert!(saver.barrier_blocking().is_empty());
 
@@ -927,7 +1167,7 @@ mod tests {
     #[test]
     fn shutdown_drains_pending_job() {
         let dir = temp_dir("shutdown");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         saver.enqueue(full_job(3, &dir, vec![raster("z", Color32::GREEN)]));
         // No barrier: rely on Shutdown draining the queue.
         saver.shutdown();
@@ -944,7 +1184,7 @@ mod tests {
     #[test]
     fn full_and_text_coalesce_without_dropping_either() {
         let dir = temp_dir("merge");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         // Full job: a raster, no text.
         saver.enqueue(full_job(2, &dir, vec![raster("rast", Color32::RED)]));
         // TextOnly job for the same page: text, no raster part.
@@ -959,6 +1199,8 @@ mod tests {
             }),
             text_epoch: Some(1),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty());
 
@@ -987,7 +1229,7 @@ mod tests {
     #[test]
     fn text_then_full_coalesce_without_dropping_either() {
         let dir = temp_dir("merge_rev");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         saver.enqueue(PageSaveJob {
             page_idx: 7,
             layers_dir: dir.clone(),
@@ -999,6 +1241,8 @@ mod tests {
             }),
             text_epoch: Some(1),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         saver.enqueue(full_job(7, &dir, vec![raster("r", Color32::RED)]));
         assert!(saver.barrier_blocking().is_empty());
@@ -1021,7 +1265,7 @@ mod tests {
     #[test]
     fn text_job_persists_centering_state_through_the_saver() {
         let dir = temp_dir("centering");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         let centers = TextCentersRec {
             mean: Some([12.5, -3.25]),
             median: Some([11.0, -2.5]),
@@ -1048,6 +1292,8 @@ mod tests {
             text: Some(TextSavePart { nodes: vec![node] }),
             text_epoch: Some(1),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty());
 
@@ -1079,7 +1325,7 @@ mod tests {
     #[test]
     fn effects_only_job_sets_then_clears_without_touching_rasters() {
         let dir = temp_dir("fx_only");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         // Seed two rasters on the page (whole-page save, no effects).
         saver.enqueue(full_job(
             4,
@@ -1101,6 +1347,8 @@ mod tests {
                 effects: chain.clone(),
                 display_image: Some(img([2, 2], Color32::BLUE)),
             }],
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty());
 
@@ -1133,6 +1381,8 @@ mod tests {
                 effects: Vec::new(),
                 display_image: None,
             }],
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty());
 
@@ -1149,7 +1399,7 @@ mod tests {
     #[test]
     fn effects_only_coalesces_per_uid() {
         let dir = temp_dir("fx_coalesce");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         saver.enqueue(full_job(
             1,
             &dir,
@@ -1170,6 +1420,8 @@ mod tests {
                 effects: cx.clone(),
                 display_image: Some(img([2, 2], Color32::BLUE)),
             }],
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         saver.enqueue(PageSaveJob {
             page_idx: 1,
@@ -1184,6 +1436,8 @@ mod tests {
                 effects: cy.clone(),
                 display_image: Some(img([2, 2], Color32::WHITE)),
             }],
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty());
 
@@ -1207,7 +1461,7 @@ mod tests {
         let invalid_parent = temp_dir("barrier_failed_parent");
         std::fs::write(&invalid_parent, b"not a directory").unwrap();
         let valid_dir = temp_dir("barrier_failed_recovery");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         saver.enqueue(PageSaveJob {
             page_idx: 9,
             layers_dir: invalid_parent.join("layers"),
@@ -1217,6 +1471,8 @@ mod tests {
             text: Some(TextSavePart { nodes: vec![text_node("t", Color32::RED)] }),
             text_epoch: Some(1),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
 
         assert!(
@@ -1233,6 +1489,8 @@ mod tests {
             text: Some(TextSavePart { nodes: vec![text_node("t", Color32::GREEN)] }),
             text_epoch: Some(2),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(
             !saver.barrier_blocking().contains(&9),
@@ -1247,9 +1505,9 @@ mod tests {
     #[test]
     fn raster_failure_does_not_report_successful_text_as_failed() {
         let dir = temp_dir("per_kind_failure");
-        let saver = LayerSaver::new();
+        let saver = LayerSaver::new(None);
         let mut broken_raster = raster("r", Color32::RED);
-        broken_raster.base_image.pixels.truncate(1);
+        broken_raster.base_image.as_mut().expect("helper carries pixels").pixels.truncate(1);
         saver.enqueue(PageSaveJob {
             page_idx: 6,
             layers_dir: dir.clone(),
@@ -1259,6 +1517,8 @@ mod tests {
             text: Some(TextSavePart { nodes: vec![text_node("t", Color32::WHITE)] }),
             text_epoch: Some(11),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         });
         assert!(saver.barrier_blocking().is_empty(), "raster failure does not contaminate text barrier");
         let ack_map = saver.ack_map();
@@ -1266,6 +1526,7 @@ mod tests {
         completions.sort_by_key(|(_, kind, _, _)| match kind {
             SaveKind::Raster => 0,
             SaveKind::Text => 1,
+            SaveKind::Structural => 2,
         });
         assert_eq!(completions, vec![
             (6, SaveKind::Raster, 10, false),
@@ -1308,6 +1569,8 @@ mod tests {
             text: Some(TextSavePart { nodes }),
             text_epoch: Some(epoch),
             effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
         }
     }
 
@@ -1413,7 +1676,7 @@ mod tests {
         let mut broken_text = text_at("bad", 0, 1.0, 1.0, true);
         broken_text.image.pixels.truncate(1);
         let mut broken_raster = raster("bad_r", Color32::RED);
-        broken_raster.base_image.pixels.truncate(1);
+        broken_raster.base_image.as_mut().expect("helper carries pixels").pixels.truncate(1);
         let jobs = vec![
             text_job(0, &staging, Some(&committed), vec![text_at("t0", 0, 1.0, 1.0, true)], 1),
             text_job(1, &staging, Some(&committed), vec![broken_text], 2),
@@ -1514,6 +1777,8 @@ mod tests {
                 text: with_text_half.then(|| TextSavePart { nodes: Vec::new() }),
                 text_epoch: with_text_half.then_some(1),
                 effects: Vec::new(),
+                structural: Vec::new(),
+                structural_epoch: None,
             };
             let (failed_raster, failed_text, _) = run_pass(vec![job]);
             assert!(failed_raster.is_empty() && failed_text.is_empty(), "text half {with_text_half}");
@@ -1523,5 +1788,378 @@ mod tests {
             persist::merge_unsaved_layers_into_committed(&committed, &staging, &owned).expect("merge");
             assert!(rasters(&committed, None).is_empty(), "text half {with_text_half}: the deleted rasters must not come back");
         }
+    }
+
+    // ---- Lossless raster coalescing, pixel-less clean rasters, discarding shutdown ----------------
+
+    /// A raster-only job (the PS editor's shape) for `page` with explicit `removed_uids`.
+    fn raster_job(page: usize, dir: &Path, fallback: Option<&Path>, layers: Vec<OwnedRasterLayer>, removed: &[&str], epoch: u64) -> PageSaveJob {
+        PageSaveJob {
+            page_idx: page,
+            layers_dir: dir.to_path_buf(),
+            fallback_dir: fallback.map(Path::to_path_buf),
+            raster: Some(RasterSavePart { layers, groups: Vec::new(), removed_uids: removed.iter().map(ToString::to_string).collect() }),
+            raster_epoch: Some(epoch),
+            text: None,
+            text_epoch: None,
+            effects: Vec::new(),
+            structural: Vec::new(),
+            structural_epoch: None,
+        }
+    }
+
+    /// A clean raster that carries no pixels (the doc's shape for an already-persisted raster).
+    fn clean_pixelless(uid: &str) -> OwnedRasterLayer {
+        OwnedRasterLayer { base_image: None, pixels_dirty: false, ..raster(uid, Color32::TRANSPARENT) }
+    }
+
+    fn raster_uids(dir: &Path, fallback: Option<&Path>, page: usize) -> Vec<String> {
+        persist::load_page_rasters(dir, fallback, page).expect("load").layers.into_iter().map(|l| l.uid).collect()
+    }
+
+    /// Two coalesced jobs keep BOTH removal sets: the union reaches the writer, and the rasters the
+    /// earlier job removed stay removed on disk.
+    #[test]
+    fn coalesced_jobs_union_removed_uids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let seed = vec![raster("a", Color32::RED), raster("b", Color32::GREEN), raster("c", Color32::BLUE)];
+        assert!(run_pass(vec![full_job(0, &committed, seed)]).0.is_empty());
+
+        let mut job = raster_job(0, &staging, Some(&committed), vec![clean_pixelless("b"), clean_pixelless("c")], &["a"], 1);
+        job.merge_in_place(raster_job(0, &staging, Some(&committed), vec![clean_pixelless("c")], &["b", "a"], 2));
+        let part = job.raster.as_ref().expect("raster half");
+        assert_eq!(part.removed_uids, vec!["a".to_string(), "b".to_string()], "order-stable, de-duplicated union");
+        assert_eq!(job.raster_epoch, Some(2), "the newer epoch acknowledges the merged write");
+
+        let (failed_raster, _, _) = run_pass(vec![job]);
+        assert!(failed_raster.is_empty());
+        assert_eq!(raster_uids(&staging, Some(&committed), 0), vec!["c"], "both removals persisted");
+    }
+
+    /// A uid removed by an earlier job and re-added by a later one is carried, not removed.
+    #[test]
+    fn coalesced_readded_uid_is_not_removed() {
+        let dir = temp_dir("readd");
+        let mut job = raster_job(0, &dir, None, Vec::new(), &["a", "x"], 1);
+        job.merge_in_place(raster_job(0, &dir, None, vec![raster("a", Color32::RED)], &[], 2));
+        let part = job.raster.as_ref().expect("raster half");
+        assert_eq!(part.removed_uids, vec!["x".to_string()], "the re-added uid left the removal set");
+
+        let (failed_raster, _, _) = run_pass(vec![job]);
+        assert!(failed_raster.is_empty());
+        assert_eq!(raster_uids(&dir, None, 0), vec!["a"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dirty pixels of an earlier job survive a later CLEAN job for the same uid (the later job's
+    /// flags were cleared at enqueue): the merged write still writes the earlier pixels, exactly as
+    /// running the two jobs in sequence would.
+    #[test]
+    fn coalesced_dirty_pixels_survive_a_later_clean_job() {
+        let dir = temp_dir("dirty_survives");
+        let mut job = raster_job(0, &dir, None, vec![raster("a", Color32::RED)], &[], 1);
+        let later_clean = OwnedRasterLayer { transform: tf(7.0, 7.0), base_image: Some(img([2, 2], Color32::BLUE)), pixels_dirty: false, ..raster("a", Color32::BLUE) };
+        job.merge_in_place(raster_job(0, &dir, None, vec![later_clean], &[], 2));
+        let layer = &job.raster.as_ref().expect("raster half").layers[0];
+        assert!(layer.pixels_dirty, "dirty flag kept");
+        assert_eq!(layer.base_image.as_ref().map(|i| i.pixels[0]), Some(Color32::RED), "the unwritten pixels are kept");
+        assert_eq!(layer.transform.cx, 7.0, "the later job's metadata wins");
+
+        assert!(run_pass(vec![job]).0.is_empty());
+        let page = persist::load_page_rasters(&dir, None, 0).expect("load");
+        assert_eq!(page.layers.len(), 1);
+        assert_eq!(page.layers[0].image.pixels[0], Color32::RED, "the dirty pixels reached disk");
+        assert_eq!(page.layers[0].transform.cx, 7.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clean raster whose PNG is recorded writes the SAME manifest whether or not its pixels are
+    /// carried: carrying them was never load-bearing for that case.
+    #[test]
+    fn pixelless_clean_raster_writes_identical_manifest() {
+        let manifests: Vec<Vec<u8>> = [true, false]
+            .into_iter()
+            .map(|carry| {
+                let dir = temp_dir(if carry { "carry_pixels" } else { "no_pixels" });
+                assert!(run_pass(vec![raster_job(0, &dir, None, vec![raster("a", Color32::RED)], &[], 1)]).0.is_empty());
+                let moved = OwnedRasterLayer {
+                    transform: tf(9.0, 4.0),
+                    pixels_dirty: false,
+                    base_image: carry.then(|| img([2, 2], Color32::RED)),
+                    ..raster("a", Color32::RED)
+                };
+                assert!(run_pass(vec![raster_job(0, &dir, None, vec![moved], &[], 2)]).0.is_empty(), "carry={carry}");
+                let bytes = std::fs::read(dir.join("layers.json")).expect("manifest");
+                let _ = std::fs::remove_dir_all(&dir);
+                bytes
+            })
+            .collect();
+        assert_eq!(manifests[0], manifests[1], "manifest bytes identical with and without carried pixels");
+    }
+
+    /// A pixel-less raster that turns out to need its PNG written (no record) fails ONLY that page's
+    /// raster kind: the text half of the same job still persists, and no partial raster record lands.
+    #[test]
+    fn pixelless_raster_without_png_fails_only_the_raster_kind() {
+        let dir = temp_dir("no_png");
+        let job = PageSaveJob {
+            text: Some(TextSavePart { nodes: vec![text_at("t", 0, 1.0, 1.0, true)] }),
+            text_epoch: Some(6),
+            ..raster_job(3, &dir, None, vec![clean_pixelless("ghost")], &[], 5)
+        };
+        let (failed_raster, failed_text, acks) = run_pass(vec![job]);
+        assert_eq!(failed_raster, HashSet::from([3]));
+        assert!(failed_text.is_empty());
+        assert_eq!(acks, vec![(3, SaveKind::Raster, 5, false), (3, SaveKind::Text, 6, true)]);
+        assert!(raster_uids(&dir, None, 3).is_empty(), "the failed raster write left no record");
+        assert_eq!(persist::load_page_text_nodes(&dir, None, 3).expect("load").len(), 1, "text persisted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A discarding shutdown drops every job queued with it: nothing is written, no acknowledgement
+    /// is recorded, and a barrier released by that pass reports the dropped text page as failed.
+    /// Driven through `worker_loop` on this thread so the whole mailbox is queued before the worker
+    /// looks at it (deterministic, unlike racing a live worker).
+    #[test]
+    fn discarding_shutdown_writes_nothing() {
+        let dir = temp_dir("discard");
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        tx.send(SaverMsg::Job(full_job(0, &dir, vec![raster("r", Color32::RED)]))).expect("send");
+        tx.send(SaverMsg::Job(text_job(1, &dir, None, vec![text_at("t", 0, 1.0, 1.0, true)], 1))).expect("send");
+        tx.send(SaverMsg::Barrier(done_tx)).expect("send");
+        tx.send(SaverMsg::Shutdown { discard: true }).expect("send");
+        let ack_map = Arc::new(Mutex::new(SaveAckMap::default()));
+        worker_loop(&rx, &ack_map, None, 0);
+
+        assert!(!dir.exists(), "a discarded pass writes nothing");
+        assert!(ack_map.lock().expect("ack map").take().is_empty(), "no acknowledgement for dropped jobs");
+        assert_eq!(done_rx.recv().expect("barrier reply"), HashSet::from([1]), "the dropped text page reads as failed");
+
+        // The public entry point joins the worker without writing a queued job.
+        let saver = LayerSaver::new(None);
+        saver.shutdown_discarding();
+    }
+
+    /// Every `ps_p*.png` in `dir` with its bytes, sorted by name.
+    fn png_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "png"))
+            .map(|p| (p.file_name().expect("file name").to_string_lossy().into_owned(), std::fs::read(&p).expect("read png")))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A raster the EARLIER job carried that the newer job neither carries nor removes is kept by the
+    /// merge, and the merged single write equals the two jobs written one after the other: identical
+    /// manifest bytes (tree order + Z included) and identical PNGs.
+    #[test]
+    fn merged_write_keeps_an_earlier_only_raster_and_equals_sequential_writes() {
+        let seed = |dir: &Path| assert!(run_pass(vec![raster_job(0, dir, None, vec![raster("s", Color32::WHITE)], &[], 1)]).0.is_empty());
+        let prev = |dir: &Path| raster_job(0, dir, None, vec![clean_pixelless("s"), raster("a", Color32::RED)], &[], 2);
+        let next = |dir: &Path| {
+            let moved = OwnedRasterLayer { transform: tf(5.0, 6.0), ..clean_pixelless("s") };
+            raster_job(0, dir, None, vec![moved, raster("b", Color32::BLUE)], &[], 3)
+        };
+
+        let seq = temp_dir("seq_writes");
+        seed(&seq);
+        assert!(run_pass(vec![prev(&seq)]).0.is_empty());
+        assert!(run_pass(vec![next(&seq)]).0.is_empty());
+
+        let merged = temp_dir("merged_write");
+        seed(&merged);
+        let mut job = prev(&merged);
+        job.merge_in_place(next(&merged));
+        let uids: Vec<&str> = job.raster.as_ref().expect("raster half").layers.iter().map(|l| l.uid.as_str()).collect();
+        assert_eq!(uids, vec!["a", "s", "b"], "the earlier-only raster is kept, ahead of the newer job's layers");
+        assert!(run_pass(vec![job]).0.is_empty());
+
+        assert_eq!(raster_uids(&merged, None, 0), vec!["s", "a", "b"], "bottom-to-top by Z");
+        assert_eq!(std::fs::read(seq.join("layers.json")).expect("seq manifest"), std::fs::read(merged.join("layers.json")).expect("merged manifest"), "identical manifest bytes");
+        assert_eq!(png_files(&seq), png_files(&merged), "identical PNG set and bytes");
+        let _ = std::fs::remove_dir_all(&seq);
+        let _ = std::fs::remove_dir_all(&merged);
+    }
+
+    /// A raster the newer job REMOVES is not resurrected by the earlier job that still carried it.
+    #[test]
+    fn merged_write_drops_an_earlier_raster_the_newer_job_removed() {
+        let dir = temp_dir("merged_removed");
+        let mut job = raster_job(0, &dir, None, vec![raster("a", Color32::RED), raster("b", Color32::BLUE)], &[], 1);
+        job.merge_in_place(raster_job(0, &dir, None, vec![raster("b", Color32::BLUE)], &["a"], 2));
+        let part = job.raster.as_ref().expect("raster half");
+        assert_eq!(part.layers.iter().map(|l| l.uid.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(part.removed_uids, vec!["a".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn group(uid: &str) -> GroupMeta {
+        GroupMeta { uid: uid.to_string(), name: uid.to_string(), visible: true, opacity: 1.0, collapsed: false }
+    }
+
+    /// A structural edit runs AFTER the raster part of the same pass: a raster added by that part
+    /// already has its node when a grouping edit sets its membership and band Z (the race the old
+    /// "grouping written before the enqueued raster save" order could lose).
+    #[test]
+    fn structural_edit_lands_on_a_raster_added_in_the_same_pass() {
+        let dir = temp_dir("structural_after_raster");
+        assert!(run_pass(vec![raster_job(0, &dir, None, vec![raster("s", Color32::WHITE)], &[], 1)]).0.is_empty());
+
+        let mut job = raster_job(0, &dir, None, vec![clean_pixelless("s")], &[], 2);
+        job.merge_in_place(raster_job(0, &dir, None, vec![clean_pixelless("s"), raster("n", Color32::RED)], &[], 3));
+        job.merge_in_place(PageSaveJob {
+            raster: None,
+            raster_epoch: None,
+            structural: vec![StructuralEdit::Grouping(GroupingEdit {
+                new_groups: vec![group("g")],
+                set_membership: vec![("n".to_string(), Some("g".to_string()))],
+                order: vec![BandRef::Raster("n".to_string()), BandRef::Raster("s".to_string())],
+                ..GroupingEdit::default()
+            })],
+            structural_epoch: Some(4),
+            ..raster_job(0, &dir, None, Vec::new(), &[], 0)
+        });
+        let (failed_raster, failed_text, acks) = run_pass(vec![job]);
+        assert!(failed_raster.is_empty() && failed_text.is_empty());
+        assert!(acks.contains(&(0, SaveKind::Structural, 4, true)), "structural ack recorded: {acks:?}");
+
+        let page = persist::load_page_rasters(&dir, None, 0).expect("load");
+        assert_eq!(page.layers.iter().map(|l| l.uid.as_str()).collect::<Vec<_>>(), vec!["n", "s"], "the band order reached the fresh raster");
+        assert_eq!(page.layers[0].group_uid.as_deref(), Some("g"), "the fresh raster's membership landed");
+        assert_eq!(page.groups.iter().map(|g| g.uid.as_str()).collect::<Vec<_>>(), vec!["g"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two band orders coalesced into one job are both kept and applied in enqueue order, so the
+    /// later order wins; the merged job acknowledges the later structural epoch only.
+    #[test]
+    fn two_band_orders_in_one_pass_apply_in_order() {
+        let dir = temp_dir("two_orders");
+        assert!(run_pass(vec![raster_job(0, &dir, None, vec![raster("a", Color32::RED), raster("b", Color32::BLUE)], &[], 1)]).0.is_empty());
+        let order_job = |order: [&str; 2], epoch: u64| PageSaveJob {
+            raster: None,
+            raster_epoch: None,
+            structural: vec![StructuralEdit::BandOrder(order.iter().map(|u| BandRef::Raster((*u).to_string())).collect())],
+            structural_epoch: Some(epoch),
+            ..raster_job(0, &dir, None, Vec::new(), &[], 0)
+        };
+        let mut job = order_job(["b", "a"], 5);
+        job.merge_in_place(order_job(["a", "b"], 6));
+        assert_eq!(job.structural.len(), 2, "structural edits are appended, never coalesced");
+        assert_eq!(job.structural_epoch, Some(6));
+
+        let (_, _, acks) = run_pass(vec![job]);
+        assert_eq!(acks, vec![(0, SaveKind::Structural, 6, true)], "a structural-only job acknowledges no raster/text kind");
+        assert_eq!(raster_uids(&dir, None, 0), vec!["a", "b"], "the later order won");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Autosave gate: holding across drains, forcing, discarding ---------------------------------
+
+    fn test_gate(interval: Duration, action_threshold: u32) -> Arc<AutosaveGate> {
+        Arc::new(AutosaveGate::with_policy_fn(move || ms_config::autosave_policy::AutosavePolicy { interval, action_threshold }))
+    }
+
+    /// Polls `cond` every 10 ms until it holds or `timeout` elapses.
+    fn wait_until(timeout: Duration, cond: impl Fn() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// Enqueues one text job for `page` as one gesture (send, then the action, as the doc funnels do).
+    fn gesture(saver: &LayerSaver, page: usize, staging: &Path, committed: &Path) {
+        saver.enqueue(text_job(page, staging, Some(committed), vec![text_at("t", 0, 1.0, 1.0, true)], 1));
+        saver.note_action();
+    }
+
+    /// Two gestures enqueued in separate drains are HELD (nothing written) until the gate's interval
+    /// elapses, then written together in ONE manifest write.
+    #[test]
+    fn gated_saver_holds_jobs_across_drains_and_writes_once_when_due() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let saver = LayerSaver::new(Some(test_gate(Duration::from_millis(400), 1000)));
+        gesture(&saver, 0, &staging, &committed);
+        std::thread::sleep(Duration::from_millis(50));
+        gesture(&saver, 1, &staging, &committed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(json_writes(&staging), 0, "held jobs must not be written before the gate is due");
+        assert!(wait_until(Duration::from_secs(5), || json_writes(&staging) >= 1), "held jobs never written");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(json_writes(&staging), 1, "both held jobs land in one pass");
+        assert!(page_transform_cx(&staging, None, 0, "t").is_some() && page_transform_cx(&staging, None, 1, "t").is_some());
+        saver.shutdown();
+    }
+
+    /// Reaching the action threshold writes the held jobs without waiting for the interval.
+    #[test]
+    fn gated_saver_writes_when_the_action_threshold_is_reached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let saver = LayerSaver::new(Some(test_gate(Duration::from_secs(3600), 2)));
+        gesture(&saver, 0, &staging, &committed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(json_writes(&staging), 0, "one action of two must be held");
+        gesture(&saver, 1, &staging, &committed);
+        assert!(wait_until(Duration::from_secs(5), || json_writes(&staging) == 1), "threshold did not flush");
+        saver.shutdown();
+    }
+
+    /// A barrier force-writes a held bucket immediately and only then replies.
+    #[test]
+    fn barrier_flushes_a_held_bucket_immediately() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let saver = LayerSaver::new(Some(test_gate(Duration::from_secs(3600), 1000)));
+        gesture(&saver, 0, &staging, &committed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(json_writes(&staging), 0, "held before the barrier");
+        assert!(saver.barrier_blocking().is_empty());
+        assert_eq!(json_writes(&staging), 1, "the barrier wrote the held job before replying");
+        let acks = saver.ack_map().lock().expect("ack map").take();
+        assert_eq!(acks, vec![(0, SaveKind::Text, 1, true)]);
+        saver.shutdown();
+    }
+
+    /// A normal shutdown writes what is held; a discarding shutdown drops it unwritten.
+    #[test]
+    fn gated_shutdown_writes_held_and_discard_drops_it() {
+        for discard in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+            let saver = LayerSaver::new(Some(test_gate(Duration::from_secs(3600), 1000)));
+            gesture(&saver, 0, &staging, &committed);
+            std::thread::sleep(Duration::from_millis(50));
+            if discard {
+                saver.shutdown_discarding();
+                assert!(!staging.join("layers.json").exists(), "discard must write nothing");
+            } else {
+                saver.shutdown();
+                assert_eq!(json_writes(&staging), 1, "shutdown must write the held job");
+            }
+        }
+    }
+
+    /// Immediate mode (`None`) is unchanged: a job is written without any barrier.
+    #[test]
+    fn ungated_saver_writes_without_a_barrier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (committed, staging) = chapter(tmp.path(), ms_docstore::DocFormat::Json);
+        let saver = LayerSaver::new(None);
+        gesture(&saver, 0, &staging, &committed);
+        assert!(wait_until(Duration::from_secs(5), || json_writes(&staging) == 1), "immediate mode must write on drain");
+        saver.shutdown();
     }
 }

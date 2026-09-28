@@ -1441,6 +1441,29 @@ leave the working tree exactly as it found it.
     очистки `abort_discard_after_failed_cleanup` обязан вернуть сейвер в работу
     (`resume_saver_after_failed_discard`) — это единственный resume, и он существует только для
     этого пути; page-op'овская пауза остаётся ПЕРМАНЕНТНОЙ (её спасает reload проекта).
+- **Autosave write buffer (`ms_models::autosave_gate::AutosaveGate`)** — ONE `Arc` gate per project
+  instance (created in `MangaApp::new`, rebuilt with the app on reload) governs ALL three
+  `{chapter}_unsaved` writers: the layer saver (held bucket of `PageSaveJob`s), the bubbles saver (held
+  latest snapshot) and the клин autosave (the model's dirty set). Writers hold changes in memory and
+  write when the gate is due: `ms_config::autosave_policy` interval since the FIRST pending action OR
+  the action threshold (live global policy, General settings). An action is one save gesture — a layer
+  enqueue funnel call, one bubbles snapshot send, one клин `mark_dirty` (= one undo step) — never a
+  per-frame mark. Nothing pending → nothing written. Force points bypass the gate: save-to-project
+  (layer barrier, bubbles `BarrierAndHold`, клин pause+take; `force_flush` on success), a page op
+  (everything into `_unsaved`, never the committed tree, before the op worker runs), typing export
+  (layer barrier on its worker) and exit (barrier/shutdown/`FlushAndStop`). DISCARD drops pending
+  state of all three unwritten (`LayerDoc::shutdown_saver_discarding`, bubbles pause, клин
+  `request_stop_now`). Immediate class, not buffered (explicit commands / single-file adds):
+  page-manager clean attach writes its page to `_unsaved` at once and only then trashes the source,
+  detach removes the files at once, and image-bubble PNGs are written on creation. A crash loses at most the open window — by design. Memory
+  bound: held layer jobs keep pixels only for `pixels_dirty` rasters / dirty text renders of pending
+  pages (which stay resident via `page_has_pending_save`); bubbles hold one `Arc`, клин nothing extra.
+- **Clean overlays (клин autosave)** — the gate-driven writer is quiesced through
+  `ms_canvas::OverlayAutosaveControl`, never a bare flag. Save-to-project takes the dirty snapshots
+  INSIDE its worker under `pause_blocking()` (held until the merge ends), otherwise a pass that took the
+  dirty set just before lands pages in a staging dir re-created after the merge. Page op and DISCARD:
+  `request_stop_now()` + join (discard joins on the delete job, before the delete; a failed discard
+  respawns the worker); non-discard exit: `request_flush_and_stop()` + join in `on_exit`.
 - **Слои (layer_model)** — запись на диск асинхронна и коалесцируется через `layer_model/saver.rs`
   (`LayerDoc::enable_background_saver`, включается один раз в `app.rs`). PS per-edit/raster и typing
   text/effects flush'и ENQUEUE'ят задания (`enqueue_page_save` / `enqueue_page_text_save` /
@@ -1452,8 +1475,11 @@ leave the working tree exactly as it found it.
   и drain (`barrier_blocking` + `shutdown_saver`) в eframe `on_exit` и на exit-cleanup. БАРЬЕР НИКОГДА
   не выполняется в GUI-потоке. Контракт удаления растров (`removed_uids` в `persist_current_page`) и
   ownership owned-page merge не менять — async меняет ТОЛЬКО где/когда происходит запись, не сами байты.
-  Исключение, остающееся синхронным: `flush_target_page_text_to_staging` (воркер raster-create читает
-  staging сразу — async race resurrect'ил бы удалённый текст).
+  With a doc+saver wired, NO PS/typing write of `layers.json` or its PNGs is synchronous: band order,
+  grouping and pin edits are `StructuralEdit` saver jobs applied after the page's raster+text parts,
+  raster create is doc-first (`add_node` + `enqueue_page_save`), and after page load the `LayerDoc` is
+  the only source PS/typing read from (text pin meta lives on the node). Sync free fns remain only as
+  the doc-less fallback.
   Правки ГЕОМЕТРИИ растра из typing (перемещение, поворот, масштаб, панельные трансформации) тоже
   идут только через очередь док-сейвера (`persist_raster_transform_deferred` /
   `persist_raster_deform_deferred` → `enqueue_page_save`), одна постановка на ЖЕСТ: синхронной записи

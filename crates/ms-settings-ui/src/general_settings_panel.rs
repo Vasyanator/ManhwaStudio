@@ -40,8 +40,10 @@ Key items:
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
-  (`storage_mode_setting`) + memory-profile combo + interface-scale slider + UI-language
+  (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy + UI-language
   selector + typesetting-language selector.
+- `draw_autosave_settings`: the global autosave policy (interval minutes + action
+  threshold); applied live to `ms_config::autosave_policy` first, then persisted.
 - `apply_ui_scale` / `apply_ui_scale_from_user_settings`: apply `General.ui_scale_percent`
   to an egui context (called by each `run_native` constructor closure).
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
@@ -106,6 +108,12 @@ pub struct GeneralSettingsPanelState {
     /// [`Self::ui_scale_percent`] only while the user is still dragging the slider;
     /// see the apply rule in [`draw_general_settings_panel`].
     pub applied_ui_scale_percent: u32,
+    /// Autosave write interval in minutes as shown by the slider. Persisted to
+    /// `General.autosave_interval_minutes`; the live value is `ms_config::autosave_policy`.
+    pub autosave_interval_minutes: u32,
+    /// Autosave action-count threshold as shown by the slider. Persisted to
+    /// `General.autosave_action_threshold`; the live value is `ms_config::autosave_policy`.
+    pub autosave_action_threshold: u32,
     /// The user's explicit primary-monitor choice (`Window.monitor`), or `None` for "auto",
     /// which means the largest connected monitor. Native-only: there are no OS monitors in a
     /// web build.
@@ -192,6 +200,9 @@ impl GeneralSettingsPanelState {
         // what this surface's context actually renders at, and it stays right even if a
         // persist failed earlier in the session.
         let ui_scale_percent = ui_scale_percent();
+        // Same reasoning for the autosave policy: the process-global policy is what the
+        // save workers obey right now, seeded from disk at startup.
+        let autosave_policy = ms_config::autosave_policy::autosave_policy();
         Self {
             projects_dir_input: projects_dir.clone(),
             saved_projects_dir: projects_dir,
@@ -201,6 +212,8 @@ impl GeneralSettingsPanelState {
             // The surface applied this same value to its egui context when the window
             // was created (`apply_ui_scale_to_context`), so nothing is pending.
             applied_ui_scale_percent: ui_scale_percent,
+            autosave_interval_minutes: autosave_policy.interval_minutes(),
+            autosave_action_threshold: autosave_policy.action_threshold,
             #[cfg(not(target_arch = "wasm32"))]
             preferred_monitor: seed_preferred_monitor(),
             // Filesystem scan happens once here, at construction — never per frame.
@@ -332,6 +345,10 @@ pub fn draw_general_settings_panel(
     ui.separator();
 
     draw_ui_scale_setting(ui, state);
+
+    ui.separator();
+
+    draw_autosave_settings(ui, state);
 
     ui.separator();
 
@@ -618,6 +635,70 @@ fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelStat
             state.status =
                 GeneralSettingsStatus::Error(t!("settings.general.ui_scale_save_error").to_string());
         }
+    }
+}
+
+/// Renders the global autosave policy: the write interval (minutes) and the action-count
+/// threshold after which pending edits are written to the chapter's unsaved session.
+///
+/// Both values live in the process-global `ms_config::autosave_policy`, which the save
+/// workers re-read on every wait, so a settled change is applied live FIRST (it takes
+/// effect even if the disk write fails) and then persisted to `General.*`. Like the
+/// interface scale, a change settles only once the slider is no longer dragged, so a drag
+/// does not write the config on every frame. A persist failure is logged and shown in the
+/// panel status line. Shared by the studio settings tab and the launcher settings page.
+fn draw_autosave_settings(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    // Stable id scope: the sliders' ids must not depend on the localized labels above them.
+    ui.push_id("settings_general_autosave", |ui| {
+        ui.strong(t!("settings.general.autosave_heading"));
+
+        let policy = ms_config::autosave_policy::autosave_policy();
+
+        ui.label(t!("settings.general.autosave_interval_label"));
+        let interval_slider = ui.add(
+            WheelSlider::new(
+                &mut state.autosave_interval_minutes,
+                ms_config::AUTOSAVE_INTERVAL_MINUTES_MIN..=ms_config::AUTOSAVE_INTERVAL_MINUTES_MAX,
+            )
+            .suffix(t!("settings.general.autosave_interval_suffix"))
+            // A half-typed number ("15" passing through "1") must not be applied and
+            // persisted per keystroke; typed input applies on Enter/focus loss.
+            .update_while_editing(false),
+        );
+        if state.autosave_interval_minutes != policy.interval_minutes() && !interval_slider.dragged() {
+            ms_config::autosave_policy::set_autosave_interval_minutes(state.autosave_interval_minutes);
+            // Mirror the stored (clamped) value so a clamp can never make this branch fire
+            // again on every frame.
+            state.autosave_interval_minutes = ms_config::autosave_policy::autosave_policy().interval_minutes();
+            persist_autosave_key(state, ms_config::GENERAL_AUTOSAVE_INTERVAL_MINUTES_KEY, state.autosave_interval_minutes);
+        }
+
+        ui.label(t!("settings.general.autosave_threshold_label"));
+        let threshold_slider = ui.add(
+            WheelSlider::new(
+                &mut state.autosave_action_threshold,
+                ms_config::AUTOSAVE_ACTION_THRESHOLD_MIN..=ms_config::AUTOSAVE_ACTION_THRESHOLD_MAX,
+            )
+            .update_while_editing(false),
+        );
+        if state.autosave_action_threshold != policy.action_threshold && !threshold_slider.dragged() {
+            ms_config::autosave_policy::set_autosave_action_threshold(state.autosave_action_threshold);
+            state.autosave_action_threshold = ms_config::autosave_policy::autosave_policy().action_threshold;
+            persist_autosave_key(state, ms_config::GENERAL_AUTOSAVE_ACTION_THRESHOLD_KEY, state.autosave_action_threshold);
+        }
+
+        ui.small(t!("settings.general.autosave_hint"));
+    });
+}
+
+/// Persists one `General.<key>` autosave value; on failure logs it and sets the panel's
+/// error status (the live value stays applied for the rest of the session).
+fn persist_autosave_key(state: &mut GeneralSettingsPanelState, key: &str, value: u32) {
+    if let Err(err) = persist_general_key(key, serde_json::Value::from(value)) {
+        runtime_log::log_error(format!(
+            "[general-settings] failed to persist autosave setting '{key}'={value}; error={err}"
+        ));
+        state.status = GeneralSettingsStatus::Error(tf!("settings.general.autosave_save_error", err = err));
     }
 }
 

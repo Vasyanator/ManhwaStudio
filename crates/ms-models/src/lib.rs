@@ -13,6 +13,8 @@ the layers above.
 
 #![warn(clippy::all)]
 
+// Per-project autosave flush gate shared by the layer, bubbles and clean-overlay writers.
+pub mod autosave_gate;
 pub mod bubbles_model;
 pub mod clean_assign;
 pub mod clean_overlays_model;

@@ -15,8 +15,10 @@ the main dir (both for the manifest and for each PNG), mirroring how `text_image
 
 Transactions:
 `ManifestTxn` is the one read-modify-write of a manifest under `MANIFEST_LOCK`; the page writers
-(`save_page_rasters`, `write_page_text_payload`, `update_raster_effects`) are operations on it, so a
-caller that saves many pages (the layer saver) commits once. PNGs are written before the manifest
+(`save_page_rasters`, `write_page_text_payload`, `update_raster_effects`, and the structural
+`save_page_band_order` / `save_page_grouping`) are operations on it, so a caller that saves many
+pages (the layer saver) commits once; the free functions of the same names are one-operation
+transactions. PNGs are written before the manifest
 names them; unreferenced PNGs are deleted only after the commit. Staging manifests are written
 without fsync (`chapter_docs::chapter_doc_durability`).
 
@@ -65,10 +67,14 @@ pub struct RasterLayerOut<'a> {
     /// Stable uid of the group this layer belongs to, if any.
     pub group_uid: Option<String>,
     /// The display image. Written as the base PNG only when `pixels_dirty` (the layer's *base* pixels
-    /// actually changed); otherwise the on-disk base PNG, `rendered_file` and `effects` chain are
-    /// preserved from the manifest so a non-destructive effects chain set by another tab survives a
-    /// whole-page save.
-    pub image: &'a ColorImage,
+    /// actually changed) or the layer has no recorded base PNG yet; otherwise the on-disk base PNG,
+    /// `rendered_file` and `effects` chain are preserved from the manifest so a non-destructive effects
+    /// chain set by another tab survives a whole-page save. `None` = pixels not carried (legal only for
+    /// a clean layer whose PNG is recorded); a layer that needs its PNG written fails the write.
+    pub image: Option<&'a ColorImage>,
+    /// Size of the base pixels in px (`[width, height]`); recorded as `image_size` when a preserved
+    /// record has none. Equals `image.size` whenever `image` is `Some`.
+    pub image_size: [usize; 2],
     /// True when this layer's *base* pixels were edited (paint/cut/merge/effects-bake), so the base
     /// PNG must be rewritten and any non-destructive effects chain dropped (baked in).
     pub pixels_dirty: bool,
@@ -119,8 +125,10 @@ pub struct PageRasters {
     pub layers: Vec<RasterLayerIn>,
 }
 
-/// Per-page base-PNG filename: `ps_p{page:04}_{uid}.png`.
-fn base_file_name(page_idx: usize, uid: &str) -> String {
+/// Per-page base-PNG filename: `ps_p{page:04}_{uid}.png`. Public so a tab building a doc raster node
+/// (`LayerNode.base_file`) names it exactly as `save_page_rasters` / `add_page_raster` write it.
+#[must_use]
+pub fn base_file_name(page_idx: usize, uid: &str) -> String {
     format!("ps_p{page_idx:04}_{uid}.png")
 }
 
@@ -348,15 +356,20 @@ fn apply_save_page_rasters(
                     base.clone(),
                     rendered.clone(),
                     eff.clone(),
-                    size.unwrap_or(layer.image.size),
+                    size.unwrap_or(layer.image_size),
                 )
             }
             _ => {
                 // Dirty or new: (re)write the base PNG from the (display==base) image; effects bake in.
+                // Without carried pixels there is nothing to write; failing (the transaction's guard
+                // rolls the page back) keeps the caller's dirty state so its next save carries them.
+                let Some(image) = layer.image else {
+                    return Err(format!("raster {}: base pixels not carried and no persisted PNG", layer.uid));
+                };
                 let file = base_file_name(page_idx, &layer.uid);
-                write_png(&layers_dir.join(&file), layer.image)?;
+                write_png(&layers_dir.join(&file), image)?;
                 wrote_png = true;
-                (file, None, Vec::new(), layer.image.size)
+                (file, None, Vec::new(), image.size)
             }
         };
         recs.push(LayerRec {
@@ -910,9 +923,10 @@ pub struct TextInlineIn {
 /// page — otherwise the owned-page merge would whole-page-replace the committed page with a text-only
 /// one and DROP the rasters.
 ///
-/// PS-owned fields (`pinned` / `pinned_by_group` / `z` / `group_uid`) on an existing text node are
-/// carried onto the incoming node by [`merge_preserved_text_fields`] (same as the typing rewrite), so
-/// a doc flush does not clobber a pin / Z / PS group set in the PS editor. Does NO PNG IO: it only
+/// PS-owned fields (`pinned` / `z` / `group_uid`) on an existing text node are carried onto the
+/// incoming node by [`merge_preserved_text_fields`] (same as the typing rewrite), so a doc flush does
+/// not clobber a pin / Z / PS group set in the PS editor; the incoming `pinned_by_group` (doc-owned)
+/// is written as given. Does NO PNG IO: it only
 /// records each node's rendered-PNG NAME in `rendered_file` and writes the manifest. Writing those
 /// pixels is the CALLER's job — `LayerDoc::flush_page` / `flush_page_text` (and the saver worker that
 /// replays them) call [`write_text_image`] for every text node whose in-memory render is dirty or
@@ -1119,7 +1133,7 @@ fn text_payload_rec(payload: &TextPayloadOut, ident: &TextIdent) -> LayerRec {
 }
 
 /// One band in a desired unified order (bottom-to-top), as edited in the PS unified layer panel.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BandRef {
     /// A raster layer, by node uid.
     Raster(String),
@@ -1156,26 +1170,20 @@ pub fn load_page_bands(
 /// Rewrites a page's unified band Z from `order` (bottom-to-top): each raster node's Z, each text
 /// group's band Z, and each pinned text's Z become the band index. Texts in a `TextGroup` band are
 /// marked unpinned; a `PinnedText` band marks that text pinned at its Z (its `layer_idx` is kept, so
-/// unpinning later returns it to its group). PS owns this ordering.
+/// unpinning later returns it to its group). PS owns this ordering. A one-operation
+/// [`ManifestTxn`] without a committed fallback: a page absent from `layers_dir`'s manifest is a
+/// no-op (nothing written).
+///
+/// # Errors
+/// The manifest could not be read or written.
 pub fn save_page_band_order(
     layers_dir: &Path,
     page_idx: usize,
     order: &[BandRef],
 ) -> Result<(), String> {
-    let _span = ms_log::trace_scope!(
-        cat::PERSIST,
-        "save_page_band_order page={} bands={}",
-        page_idx,
-        order.len()
-    );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
-    let Some(page) = manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
-        return Ok(());
-    };
-    apply_band_order(page, order);
-    write_manifest(&manifest_path, &manifest)
+    let mut txn = ManifestTxn::begin(layers_dir)?;
+    txn.save_page_band_order(page_idx, order, None)?;
+    txn.commit().map(|_wrote| ())
 }
 
 /// Reassigns every band's Z to its index in `order` (bottom-to-top) and (un)pins text nodes: every
@@ -1236,7 +1244,8 @@ fn apply_band_order(page: &mut PageLayers, order: &[BandRef]) {
 /// `GroupRec`s, toggles collapse, sets the unified band order, and records which texts were pinned
 /// *implicitly* by grouping (so ungrouping can restore page-Y order). Fields are applied in this
 /// order: remove groups → create groups → membership → collapse → band order → pin flags.
-#[derive(Default)]
+/// `Clone` so the doc can hand an owned copy to the background saver (`saver::StructuralEdit`).
+#[derive(Debug, Clone, Default)]
 pub struct GroupingEdit {
     /// Groups to create (members reference these by `uid`).
     pub new_groups: Vec<GroupMeta>,
@@ -1260,26 +1269,24 @@ pub struct GroupingEdit {
 
 /// Applies a [`GroupingEdit`] to one page's manifest in a single locked read-modify-write. Does not
 /// touch PNGs; the PS editor mirrors the same membership/group changes into its in-memory stack so a
-/// later `save_page_rasters` stays consistent. Returns `Ok(())` (a no-op) if the page is absent.
+/// later `save_page_rasters` stays consistent. A one-operation [`ManifestTxn`] without a committed
+/// fallback: returns `Ok(())` (a no-op, nothing written) if the page is absent.
+///
+/// # Errors
+/// The manifest could not be read or written.
 pub fn save_page_grouping(
     layers_dir: &Path,
     page_idx: usize,
     edit: &GroupingEdit,
 ) -> Result<(), String> {
-    let _span = ms_log::trace_scope!(
-        cat::PERSIST,
-        "save_page_grouping page={} new_groups={} remove_groups={}",
-        page_idx,
-        edit.new_groups.len(),
-        edit.remove_groups.len()
-    );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
-    let Some(page) = manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
-        return Ok(());
-    };
+    let mut txn = ManifestTxn::begin(layers_dir)?;
+    txn.save_page_grouping(page_idx, edit, None)?;
+    txn.commit().map(|_wrote| ())
+}
 
+/// Applies `edit` to one page record in place, in the documented [`GroupingEdit`] field order. Pure
+/// (no IO); shared by [`ManifestTxn::save_page_grouping`].
+fn apply_grouping_edit(page: &mut PageLayers, edit: &GroupingEdit) {
     // Remove groups, ungrouping their members.
     if !edit.remove_groups.is_empty() {
         page.groups.retain(|g| !edit.remove_groups.contains(&g.uid));
@@ -1361,14 +1368,50 @@ pub fn save_page_grouping(
     page.text_groups
         .retain(|g| live_text_groups.contains(&g.layer_idx));
 
-    write_manifest(&manifest_path, &manifest)
 }
 
-/// Carries each existing text node's PS-owned fields (`pinned`, `pinned_by_group`, `z`, and the
-/// unified-tree `group_uid`) onto the matching incoming node, so a typing-side rewrite (which only
-/// knows overlay properties and always sends `group_uid: None`) does not clobber a pin / Z / PS
-/// group membership set in the PS editor. Without preserving `group_uid` here, every typing autosave
-/// would silently ungroup texts that the PS tree put into a group.
+/// Applies one STRUCTURAL page edit (band order / grouping) to an open transaction: no PNG IO, only
+/// the page record changes.
+///
+/// `fallback_dir` (the committed layers dir, when `txn` edits a staging manifest) seeds a page staging
+/// has no record of, so the edit is not silently lost on a committed-only page; the seed is undone
+/// when the edit leaves the seeded page unchanged, so a no-op stages nothing. A page absent from both
+/// is a no-op (`Ok(false)`). A page that was already staged always counts as modified (`Ok(true)`),
+/// matching the historical free functions, which rewrote the manifest whenever the page existed.
+///
+/// # Errors
+/// The committed fallback manifest could not be read for seeding.
+fn apply_structural_page_edit(
+    txn: &mut ManifestTxn,
+    page_idx: usize,
+    fallback_dir: Option<&Path>,
+    edit: impl FnOnce(&mut PageLayers),
+) -> Result<bool, String> {
+    let staged_before = txn.manifest.page(page_idx).is_some();
+    txn.ensure_page_staged(page_idx, fallback_dir)?;
+    let seeded_before = (!staged_before).then(|| PageSnapshot::of(&txn.manifest, page_idx));
+    let Some(page) = txn.manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
+        return Ok(false);
+    };
+    edit(page);
+    if let Some(before) = seeded_before
+        && before.same_as(&PageSnapshot::of(&txn.manifest, page_idx))
+    {
+        // The seeded committed page is unchanged: undo the seed so a no-op edit stages nothing.
+        txn.manifest.remove_page(page_idx);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Carries each existing text node's PS-owned fields (`pinned`, `z`, and the unified-tree
+/// `group_uid`) onto the matching incoming node, so a typing-side rewrite (which only knows overlay
+/// properties and always sends `group_uid: None`) does not clobber a pin / Z / PS group membership
+/// set in the PS editor. Without preserving `group_uid` here, every typing autosave would silently
+/// ungroup texts that the PS tree put into a group. `pinned_by_group` is NOT carried: the doc node
+/// owns it (`LayerNode.text_pinned_by_group`, decoded from disk and updated by
+/// `LayerDoc::set_text_pin_meta` alongside every grouping edit), so the incoming value is
+/// authoritative.
 fn merge_preserved_text_fields(existing_text: &[LayerRec], nodes: &[TextIdent]) -> Vec<TextIdent> {
     let existing: HashMap<&str, &LayerRec> =
         existing_text.iter().map(|r| (r.uid.as_str(), r)).collect();
@@ -1379,7 +1422,6 @@ fn merge_preserved_text_fields(existing_text: &[LayerRec], nodes: &[TextIdent]) 
             if let Some(rec) = existing.get(n.uid.as_str()) {
                 // Carry the PS-owned `group_uid` (PS-tree membership) regardless.
                 node.group_uid = rec.group_uid.clone();
-                node.pinned_by_group = rec.pinned_by_group;
                 // Preserve the explicit band Z ONLY from an already-PINNED disk node (a PS/typing reorder
                 // authority). A legacy UNPINNED (text-group) disk node must NOT clobber the incoming
                 // (doc) Z — that doc Z is the per-text flattened order computed on read, and clobbering it
@@ -1751,6 +1793,34 @@ impl ManifestTxn {
         self.guarded(page_idx, |txn| apply_update_raster_effects(txn, page_idx, uid, effects, rendered, fallback_dir)).map(|_changed| ())
     }
 
+    /// [`save_page_band_order`] within this transaction. `fallback_dir` seeds a committed-only page
+    /// (see `apply_structural_page_edit`); `None` keeps the free function's "absent page ⇒ no-op".
+    /// Returns whether the manifest was modified.
+    ///
+    /// # Errors
+    /// The committed fallback manifest could not be read for seeding; the page is left as it was.
+    pub fn save_page_band_order(&mut self, page_idx: usize, order: &[BandRef], fallback_dir: Option<&Path>) -> Result<bool, String> {
+        let _span = ms_log::trace_scope!(cat::PERSIST, "save_page_band_order page={} bands={}", page_idx, order.len());
+        self.guarded(page_idx, |txn| apply_structural_page_edit(txn, page_idx, fallback_dir, |page| apply_band_order(page, order)))
+    }
+
+    /// [`save_page_grouping`] within this transaction. `fallback_dir` seeds a committed-only page
+    /// (see `apply_structural_page_edit`); `None` keeps the free function's "absent page ⇒ no-op".
+    /// Returns whether the manifest was modified.
+    ///
+    /// # Errors
+    /// The committed fallback manifest could not be read for seeding; the page is left as it was.
+    pub fn save_page_grouping(&mut self, page_idx: usize, edit: &GroupingEdit, fallback_dir: Option<&Path>) -> Result<bool, String> {
+        let _span = ms_log::trace_scope!(
+            cat::PERSIST,
+            "save_page_grouping page={} new_groups={} remove_groups={}",
+            page_idx,
+            edit.new_groups.len(),
+            edit.remove_groups.len()
+        );
+        self.guarded(page_idx, |txn| apply_structural_page_edit(txn, page_idx, fallback_dir, |page| apply_grouping_edit(page, edit)))
+    }
+
     /// Records `page_idx`'s current state so a multi-operation unit (e.g. a page's whole effects
     /// list, or code that may panic) can be undone with [`rollback`](Self::rollback).
     #[must_use]
@@ -2013,7 +2083,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: Some("grp-1".into()),
-                image: &red,
+                image: Some(&red),
+                image_size: red.size,
                 pixels_dirty: true,
                 mask_clip: None,
             },
@@ -2030,7 +2101,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &blue,
+                image: Some(&blue),
+                image_size: blue.size,
                 pixels_dirty: true,
                 mask_clip: None,
             },
@@ -2105,7 +2177,8 @@ mod tests {
             },
             deform: Some(mesh.clone()),
             group_uid: None,
-            image: &red,
+            image: Some(&red),
+            image_size: red.size,
             pixels_dirty: true,
             mask_clip: None,
         }];
@@ -2139,7 +2212,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &blue,
+                image: Some(&blue),
+                image_size: blue.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -2179,7 +2253,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &pic,
+                image: Some(&pic),
+                image_size: pic.size,
                 pixels_dirty: true,
                 mask_clip: Some(true),
             }],
@@ -2211,7 +2286,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &pic,
+                image: Some(&pic),
+                image_size: pic.size,
                 pixels_dirty: false,
                 mask_clip: None,
             }],
@@ -2243,7 +2319,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &pic,
+                image: Some(&pic),
+                image_size: pic.size,
                 pixels_dirty: false,
                 mask_clip: Some(false),
             }],
@@ -2280,7 +2357,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &img,
+            image: Some(&img),
+            image_size: img.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -2330,7 +2408,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &pic,
+                image: Some(&pic),
+                image_size: pic.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -2575,7 +2654,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &img,
+                image: Some(&img),
+                image_size: img.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -2664,7 +2744,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &pic,
+                image: Some(&pic),
+                image_size: pic.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -2768,7 +2849,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -2846,7 +2928,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -2907,7 +2990,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -2969,7 +3053,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -3041,7 +3126,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -3440,7 +3526,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -3703,7 +3790,8 @@ mod tests {
             },
             deform: None,
             group_uid: None,
-            image: &pic,
+            image: Some(&pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -3844,7 +3932,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &img,
+                image: Some(&img),
+                image_size: img.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -3898,7 +3987,10 @@ mod tests {
         assert!(matches!(bands.last(), Some(Band::PinnedText { uid, .. }) if uid == "t1"));
 
         // A typing-side rewrite (the inline text flush, group_uid: None) must NOT drop PS membership/pin.
-        write_page_text_payload(&dir, None, 0, &[text_payload_out("t1", 0, 0, false)]).unwrap();
+        // `pinned_by_group` is doc-owned (`LayerNode.text_pinned_by_group`, mirrored from every grouping
+        // edit), so the doc's flush carries the grouped value and the writer takes it as given.
+        let doc_flush = TextPayloadOut { pinned_by_group: true, ..text_payload_out("t1", 0, 0, false) };
+        write_page_text_payload(&dir, None, 0, &[doc_flush]).unwrap();
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
         assert_eq!(
             texts[0].group_uid.as_deref(),
@@ -3909,6 +4001,9 @@ mod tests {
             texts[0].pinned && texts[0].pinned_by_group,
             "pin survived typing save"
         );
+        // The incoming flag is authoritative: a doc that says "not group-owned" is written as such.
+        write_page_text_payload(&dir, None, 0, &[text_payload_out("t1", 0, 0, false)]).unwrap();
+        assert!(!load_page_text_nodes(&dir, None, 0).unwrap()[0].pinned_by_group, "the doc-owned flag is written verbatim");
 
         // Ungroup the text: clears membership + group-owned pin.
         save_page_grouping(
@@ -3954,7 +4049,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &img([2, 2], Color32::RED),
+                image: Some(&img([2, 2], Color32::RED)),
+                image_size: [2, 2],
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -4085,7 +4181,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &img([4, 4], Color32::BLUE), // PS holds the display image
+                image: Some(&img([4, 4], Color32::BLUE)), // PS holds the display image
+                image_size: [4, 4],
                 pixels_dirty: false,
                 mask_clip: None,
             }],
@@ -4139,7 +4236,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &img([4, 4], Color32::GREEN),
+                image: Some(&img([4, 4], Color32::GREEN)),
+                image_size: [4, 4],
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -4187,7 +4285,8 @@ mod tests {
                     transform: tf(1.0),
                     deform: None,
                     group_uid: None,
-                    image: &base_a,
+                    image: Some(&base_a),
+                    image_size: base_a.size,
                     pixels_dirty: dirty,
                     mask_clip: None,
                 },
@@ -4199,7 +4298,8 @@ mod tests {
                     transform: tf(5.0),
                     deform: None,
                     group_uid: None,
-                    image: &base_b,
+                    image: Some(&base_b),
+                    image_size: base_b.size,
                     pixels_dirty: dirty,
                     mask_clip: None,
                 },
@@ -4344,7 +4444,8 @@ mod tests {
                 },
                 deform: None,
                 group_uid: None,
-                image: &red,
+                image: Some(&red),
+                image_size: red.size,
                 pixels_dirty: true,
                 mask_clip: None,
             }],
@@ -4480,7 +4581,8 @@ mod tests {
             transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
             deform: None,
             group_uid: None,
-            image: pic,
+            image: Some(pic),
+            image_size: pic.size,
             pixels_dirty: true,
             mask_clip: None,
         }
@@ -4660,7 +4762,8 @@ mod tests {
             transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
             deform: None,
             group_uid: None,
-            image: &PNG_2X2,
+            image: Some(&PNG_2X2),
+            image_size: PNG_2X2.size,
             pixels_dirty: true,
             mask_clip: None,
         };
@@ -4691,7 +4794,8 @@ mod tests {
                 transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
                 deform: None,
                 group_uid: None,
-                image: &PNG_2X2,
+                image: Some(&PNG_2X2),
+                image_size: PNG_2X2.size,
                 pixels_dirty: true,
                 mask_clip: None,
             })
@@ -4784,4 +4888,48 @@ mod tests {
     }
 
     static PNG_2X2: std::sync::LazyLock<ColorImage> = std::sync::LazyLock::new(|| ColorImage::filled([2, 2], Color32::RED));
+
+    /// The structural transaction ops: without a fallback a page absent from the manifest is a no-op
+    /// (the free functions' historical contract); with the committed fallback a committed-only page is
+    /// seeded and the edit staged, while an edit that changes nothing stages nothing.
+    #[test]
+    fn structural_txn_ops_seed_a_committed_only_page_and_elide_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let committed = tmp.path().join("ch").join("layers");
+        let staging = tmp.path().join("ch_unsaved").join("layers");
+        fs::create_dir_all(&committed).expect("mkdir committed");
+        fs::create_dir_all(&staging).expect("mkdir staging");
+        let pic = img([2, 2], Color32::RED);
+        save_page_rasters(&committed, 0, &[fixture_raster("a", &pic), fixture_raster("b", &pic)], &[], &[]).expect("seed committed");
+        let order = |uids: [&str; 2]| uids.iter().map(|u| BandRef::Raster((*u).to_string())).collect::<Vec<_>>();
+        let staged_uids = || load_page_rasters(&staging, Some(committed.as_path()), 0).expect("load").layers.into_iter().map(|l| l.uid).collect::<Vec<_>>();
+
+        // Free function / no fallback: the page is absent from staging, so nothing is written.
+        save_page_band_order(&staging, 0, &order(["b", "a"])).expect("free fn");
+        assert!(!staging.join(MANIFEST_FILE).exists(), "absent page without fallback is a no-op");
+
+        // Same order as committed, with fallback: seeded, unchanged, seed undone.
+        let mut txn = ManifestTxn::begin(&staging).expect("txn");
+        assert!(!txn.save_page_band_order(0, &order(["a", "b"]), Some(committed.as_path())).expect("no-op"));
+        assert!(!txn.is_dirty(), "a no-op structural edit stages nothing");
+        drop(txn);
+
+        // A real reorder with fallback: seeded and staged.
+        let mut txn = ManifestTxn::begin(&staging).expect("txn");
+        assert!(txn.save_page_band_order(0, &order(["b", "a"]), Some(committed.as_path())).expect("reorder"));
+        assert!(txn.commit().expect("commit"));
+        assert_eq!(staged_uids(), vec!["b", "a"]);
+
+        // A grouping edit on the now-staged page through the free function (no fallback needed).
+        let edit = GroupingEdit {
+            new_groups: vec![GroupMeta { uid: "g".into(), name: "G".into(), visible: true, opacity: 1.0, collapsed: false }],
+            set_membership: vec![("a".into(), Some("g".into()))],
+            ..GroupingEdit::default()
+        };
+        save_page_grouping(&staging, 0, &edit).expect("grouping");
+        // The seeded page references the committed PNGs, so the load needs the committed fallback.
+        let page = load_page_rasters(&staging, Some(committed.as_path()), 0).expect("load");
+        assert_eq!(page.groups.iter().map(|g| g.uid.as_str()).collect::<Vec<_>>(), vec!["g"]);
+        assert_eq!(page.layers.iter().find(|l| l.uid == "a").and_then(|l| l.group_uid.as_deref()), Some("g"));
+    }
 }

@@ -14,7 +14,8 @@ Starting from 2.7, the structure has changed. The cleaning is now stored in the 
 - `Clear layer` - clears everything that was drawn
 - `Show layer` - toggles the visibility of the drawing overlay. Lets you see what has just been painted and what was already on the source image.
 - `Quick clean` - available if text detection was run, full description below.
-- `Save cleaning` - saves the images into the project's cleaning folder
+
+There is no separate button to save the cleaning: clean edits are autosaved to the chapter's unsaved session and committed to the project by **Save project**.
 
 ## **The Paint tool**
 ![image](../images/Вкладка-Клининг/2.png)

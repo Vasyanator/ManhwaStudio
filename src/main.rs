@@ -464,6 +464,9 @@ fn run_main() -> anyhow::Result<()> {
     // the global (not this snapshot), so a scale changed in the launcher is honored by the
     // studio opened afterwards and vice versa.
     general_settings_panel::seed_ui_scale_from_user_settings(&user_settings);
+    // Seed the process-global autosave policy (interval + action threshold) the save workers
+    // re-read on every wait; the General settings pane changes it live afterwards.
+    ms_config::autosave_policy::seed_autosave_policy_from_user_settings(&user_settings);
 
     // Environment check mode terminates the process: it must never fall through into the
     // launcher, the studio, or the AI backend supervisor. `process::exit` is used instead

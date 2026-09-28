@@ -92,7 +92,14 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   drawing tab, poll for persistence, keep the detached windows alive while no host tab draws). The
   dock hosts are the three CANVAS tabs — translation, cleaning and typing — each of which runs the
   dock inside `CanvasHooks::draw_canvas_overlay_top_left`; the state reaches them through
-  `CanvasDrawParams::panel_dock`, which the canvas only carries.
+  `CanvasDrawParams::panel_dock`, which the canvas only carries. It also owns the clean-overlay
+  autosave thread and its `OverlayAutosaveControl`: save-to-project pauses it and takes the dirty
+  клин snapshots on its worker, page ops and discard stop it without writing (joined off the GUI
+  thread), `on_exit` flushes and stops it; `refresh_unsaved_changes_cache` also reports enqueued but
+  unacknowledged layer-saver writes (`LayerDoc::has_pending_saves`) and клин pages still held dirty.
+  It creates and owns the project's single `AutosaveGate` and hands it to all three staging writers
+  (layer saver, bubbles model, клин model + autosave thread); it forces the gate on save-to-project
+  success and before a page operation (see README_AGENT «Autosave write buffer»).
 - `app_tab` (crate `ms-config`): declaration of the `AppTab` tab selector with BOTH its persistence
   half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `main.rs` as
   `crate::app_tab` and again by `tabs/mod.rs`, so `crate::tabs::AppTab` stays the path everything

@@ -3766,6 +3766,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+ "web-time",
  "windows-sys 0.59.0",
 ]
 

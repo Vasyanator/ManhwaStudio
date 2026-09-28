@@ -138,10 +138,9 @@ The main data flow is:
    Persistence is now OFF-THREAD: the placement autosave, `flush_text_layers` (save-to-project), and
    per-page text saves call `doc.enqueue_pages_text_save` / `enqueue_page_text_save` (the doc's
    background saver — multi-page flushes send ONE batch so they share one manifest commit — coalescing PNG
-   encode off-thread; sync-flush fallback when no saver). EXCEPTION: `flush_target_page_text_to_staging`
-   (right before a raster-create worker reads the page's on-disk staging) stays SYNCHRONOUS — an async
-   enqueue would race that read and resurrect a deleted-last-text overlay, and we cannot barrier on the
-   GUI thread. `flush_text_layers` still returns the OWNED page set on a successful enqueue; the
+   encode off-thread; sync-flush fallback when no saver). EVERY typing `layers.json` write is a saver
+   job while a doc + saver exist — there is no synchronous exception left, and no typing code re-reads
+   staging to refresh in-memory state after a page load (the doc is the only source). `flush_text_layers` still returns the OWNED page set on a successful enqueue; the
    save-to-project merge worker barriers the saver before reading staging, so enqueued text is on disk
    first. It enqueues EVERY resident page on purpose (the doc has no complete per-page text-dirty
    signal); skipping unchanged pages is the saver's job, decided against the manifest on disk
@@ -150,7 +149,7 @@ The main data flow is:
    `TextGroup`s are flattened into per-text bands ON READ by `layer_doc::ensure_page_loaded`, preserving
    the current page-Y visual order; the writers (`write_page_text_payload`) always emit text pinned and
    never create new groups; new text lands on TOP (`doc.add_node` → max Z + 1). Per-text ⬆/⬇ reorder
-   routes through the doc + the shared `save_page_band_order`, exactly like the PS editor's band move, so
+   routes through the doc + a band-order save job (`enqueue_page_band_order`), exactly like the PS editor's band move, so
    a later flush never clobbers it (`merge_preserved_text_fields` keeps the pinned Z). Draw order,
    interaction, and export all sort by this unified band-Z (the old `overlay_stack_cmp` is gone).
    `sync_from_doc` is doc-authoritative for
@@ -187,9 +186,8 @@ The main data flow is:
    move of a DEFORMED raster through `persist_raster_deform_deferred`. Both route the geometry to the
    doc live, then call `doc.enqueue_page_save` inline so the coalescing background saver and its later
    durability barriers cover the edit instead of performing a per-event synchronous manifest rewrite.
-   The only remaining SYNCHRONOUS raster writer is `persist_raster_deform`
-   (`persist::update_raster_geometry`), used by perspective transform mode's enter/reset menu actions
-   and its handle-drag end — a separate gesture, out of the move primitive's scope.
+   Perspective transform mode's enter/reset menu actions and its handle-drag end use the same
+   `persist_raster_deform_deferred`; no raster writer of this tab is synchronous while a saver runs.
    Selecting a raster opens the **same right-side edit panel that image
    overlays use** (scale + rotation + the effects cards, no text params): `selected_item_for_edit`
    builds an `Image`-kind `TypingSelectedOverlayForEdit` carrying a `TypingEditTarget::Raster{page,uid}`,
@@ -223,8 +221,7 @@ The main data flow is:
    items: "Войти в режим трансформации"
    (perspective DEFORM mode — `ensure_raster_deform_mesh` seeds an identity grid from the affine
    transform if absent, `transform_mode_raster_idx` gates the canvas drag to edit the mesh's 4 corner
-   handles via the shared `apply_perspective_corner_drag`, persisted by `persist_raster_deform` /
-   `persist::update_raster_geometry`), paired "Выйти" / "Сбросить трансформацию" (`doc.set_deform(None)`);
+   handles via the shared `apply_perspective_corner_drag`, persisted by `persist_raster_deform_deferred`), paired "Выйти" / "Сбросить трансформацию" (`doc.set_deform(None)`);
    "Включить/Выключить обрезание маской" (raster mask-clip, **DEFAULT OFF** — `NodeBody::Raster.mask_clip`
    round-trips through `LayerRec.mask_clip`; `set_raster_mask_clip` bumps generation so
    `prepare_raster_mask_clips` re-clips via `mask_layer::clip_overlay_color_image_in_place` — which
@@ -232,7 +229,8 @@ The main data flow is:
    mask-clipped raster is moved — and re-uploads);
    "Порядок" ▲▼ (`move_raster_in_unified_z` → the shared uid-based band-Z core `move_node_in_unified_z`,
    reused with the overlay reorder); "Удалить слой" (`remove_raster` → `doc.remove_node` +
-   `flush_page_dropping_raster` so the deleted raster does not resurrect on disk). Everything routes
+   `enqueue_page_save_dropping_raster`, enqueued eagerly; its `removed_uids` survive saver coalescing, so
+   the deleted raster does not resurrect on disk). Everything routes
    through the shared doc; the PS tab sees it via the version watch. The LAYERS list is the «Слои» dock
    tab (`typing.layers`), sharing a panel with «Действия»; its body is
    `TypingTextOverlayLayer::draw_layers_tab_body(ui, page_idx)`, because the layer state lives on
@@ -261,15 +259,20 @@ The main data flow is:
    the version advanced. (The old disk-revision counter / app bridge are gone.)
 
    **External images are raster layers**, not overlays: the "вставить/выбрать картинку" buttons now
-   route through `request_create_image_overlay` → `render_and_store_created_raster` (worker) →
-   `persist::add_page_raster` (a `kind:Raster` node + PNG), then the cache reloads and the new raster
-   is selected. Existing `overlay_type:image` overlays are untouched (back-compat). DATA-SAFETY:
-   `add_page_raster` seeds an unstaged page from the committed manifest (`ensure_page_staged`) so a
-   typeset page keeps its text (drop fix); but committed is stale w.r.t. an in-session deletion of the
-   page's LAST text (that empty page is skipped by the placement-save, so the deletion lives only in the
-   doc). To avoid RE-SEEDING the deleted text, `request_create_image_overlay` first calls
-   `flush_target_page_text_to_staging(page)` — flushing the doc's CURRENT text present-but-empty — so
-   `ensure_page_staged` finds the page present and does not seed stale committed text.
+   route through `request_create_image_overlay` → `render_and_store_created_raster` (worker: DECODE
+   ONLY) → `poll_create_raster_jobs` → `add_created_raster_to_doc` (GUI thread, no disk I/O): a
+   `pixels_dirty` raster node goes on top of the doc page, the WHOLE page save is enqueued, and the new
+   raster is selected via `pending_select_raster_uid`. Existing `overlay_type:image` overlays are
+   untouched (back-compat). DATA-SAFETY: the page job seeds an unstaged page from the committed manifest
+   so a typeset page keeps its text, and its text half writes the doc's CURRENT text in the same
+   transaction, so a page whose LAST text was deleted this session stays present-but-empty (no stale
+   committed text is resurrected). Z-ALIGNMENT: the saver gives a new raster `max(disk Z) + 1`, which
+   exceeds its doc Z whenever the disk page still holds a node the doc already dropped; a text created
+   later takes its Z from the doc and would sort under the raster after a reload. The create therefore
+   also enqueues the doc's own band order (`persist_unified_band_order`), so disk Z == doc Z. Only
+   without a shared doc does the worker persist the raster itself (`persist::add_page_raster`) and the
+   page cache reload from disk (`invalidate_raster_cache_for_page`, which never evicts a doc page that
+   has a pending save).
 4. Create/edit panel changes are converted to `TextRenderParams` and rendered by
    `render_next::render_text_to_image` in background workers. Fonts reach the renderer
    BY NAME, not by path: `TextRenderParams.font_name` and inline `<font=...>` tags are
@@ -320,6 +323,8 @@ The main data flow is:
    carrying the post-effects display RGBA + transform/deform + band-Z), so the bake matches the canvas
    exactly; it falls back to a disk read of `layers.json` only when the job carries no snapshot. (A pure
    disk re-read silently DROPPED rasters whose `_fx.png` render or staging manifest was missing/stale.)
+   Before composing, the export worker (never the GUI thread) barriers the layer saver, because the
+   autosave gate lets it HOLD staging writes and that disk fallback must not read a stale manifest.
    Alpha note: `color_image_to_rgba` returns STRAIGHT (un-premultiplied) RGBA via `to_srgba_unmultiplied`
    — egui `Color32` is premultiplied, so `to_array()` would premultiply text TWICE and gray antialiased
    stroke edges. Every `source_rgba` consumer (display upload, mask-clip, effects, export composite)
@@ -862,8 +867,7 @@ saving, and export.
     `on_exit`'s layer-saver barrier — see the quiescence note below.
   - Eager, deliberately NOT deferred: `remove_overlay` / `remove_raster` (anti-resurrection durability
     must not depend on reaching a flush point; both go through `dispatch_structural_placement_save`),
-    the internal `save_requested_while_busy` re-fire, `flush_target_page_text_to_staging`,
-    `save_page_band_order`, and `exit_layout_editor` (leaving the editor IS a focus loss, so it flushes
+    the internal `save_requested_while_busy` re-fire, the band-order save job, and `exit_layout_editor` (leaving the editor IS a focus loss, so it flushes
     rather than defers).
   - NOT a flush point at all — the DISCARD path (`app.rs::start_exit_cleanup`) calls
     `TypingTabState::discard_pending_text_edits`, which DROPS everything unwritten, including the
@@ -940,13 +944,12 @@ saving, and export.
   clamped move math a drag uses, and a deform mesh is translated by the same delta (its points are
   absolute page px). The copy takes the selection, and its band Z is moved from the top of the stack to
   DIRECTLY ABOVE its source (`doc_layers.rs::place_node_directly_above_in_unified_z`), which REQUIRES a
-  synchronous WHOLE-PAGE flush first (`persist_current_page_rasters` → the doc's `flush_page`, rasters
+  WHOLE-PAGE save enqueued first (`persist_current_page_rasters` → the doc's `enqueue_page_save`, rasters
   AND text): the order written is the flattened page, and `persist::apply_band_order` leaves any band
-  whose uid is not in the on-disk tree at its stale Z — flushing only the text would renumber text
-  around unmoved rasters. Two consequences ride along, both shared with the ▲▼ reorder rather than new
-  here: the flush is synchronous on the GUI thread (accepted — ▲▼ already does the identical, heavier
-  write on a one-shot user action, and deferring it would invert the "disk band order is the authority"
-  contract), and `apply_band_order` PINS every text node on the page at an explicit Z, dissolving any
+  whose uid is not in the on-disk tree at its stale Z — saving only the text would renumber text
+  around unmoved rasters. The saver applies the page's jobs FIFO and runs the band order (a structural
+  edit) after the raster and text parts, so nothing is written on the GUI thread. One consequence rides
+  along, shared with the ▲▼ reorder rather than new here: `apply_band_order` PINS every text node on the page at an explicit Z, dissolving any
   remaining legacy text-group auto-order on it (harmless: `write_page_text_payload` forces `pinned` on
   every write anyway). Like a deletion, the save is STRUCTURAL and eager
   (`dispatch_structural_placement_save`), never deferred.

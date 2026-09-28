@@ -14,6 +14,10 @@ Threading/persistence:
 - Bubble writes are coalesced through `spawn_bubbles_saver_thread` so GUI thread only
   publishes snapshots and does not block on filesystem I/O. The saver channel carries
   shared `Arc<Vec<Bubble>>` snapshots, so publishing a save never deep-clones the list.
+- With an `AutosaveGate` (`BubblesModel::new(.., Some(gate))`) every mutation reports one
+  action and the saver HOLDS its latest snapshot until the gate is due; `BarrierAndHold`
+  and `Shutdown` always write the held snapshot first (dropped only while paused).
+  `None` = immediate mode (write as soon as the channel drains).
 - `with_bubble`/`extra_of` let callers read a single bubble (or its `extra` map) by id
   without cloning the whole list via `snapshot()`.
 - The saver always writes to the unsaved staging folder (`unsaved_bubbles_path`).
@@ -31,9 +35,11 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use ms_thread::{self as thread, JoinHandle};
+use crate::autosave_gate::AutosaveGate;
 
 /// Commands accepted by the bubbles saver worker.
 #[derive(Debug)]
@@ -171,6 +177,9 @@ pub struct BubblesModel {
     saver_thread: Option<JoinHandle<()>>,
     /// Serializes saver writes with a structural page operation's final synchronous snapshot.
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
+    /// The project's autosave gate (`None` = immediate mode): every mutation reports one action and
+    /// the saver holds its latest snapshot until the gate is due.
+    autosave_gate: Option<Arc<AutosaveGate>>,
 }
 
 #[derive(Clone)]
@@ -180,9 +189,12 @@ pub struct BubblesSaveTask {
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
     unsaved_bubbles_path: PathBuf,
     bubbles_path: PathBuf,
+    autosave_gate: Option<Arc<AutosaveGate>>,
 }
 
 impl BubblesSaveTask {
+    /// Sends the snapshot to the saver and reports one autosave action (see
+    /// `send_snapshot_to_bubbles_saver`).
     pub fn persist(&self) {
         send_snapshot_to_bubbles_saver(
             &self.saver_tx,
@@ -190,6 +202,7 @@ impl BubblesSaveTask {
             &self.bubbles_path,
             &self.snapshot,
             &self.saver_gate,
+            self.autosave_gate.as_deref(),
         );
     }
 }
@@ -207,11 +220,13 @@ impl BubblesModel {
         bubbles_path: PathBuf,
         unsaved_bubbles_path: PathBuf,
         canvas_settings: SharedCanvasSettings,
+        autosave_gate: Option<Arc<AutosaveGate>>,
     ) -> Self {
         let saver_gate = Arc::new(Mutex::new(BubblesSaverGate::default()));
         let (saver_sender, saver_thread) = spawn_bubbles_saver_thread(
             unsaved_bubbles_path.clone(),
             Arc::clone(&saver_gate),
+            autosave_gate.clone(),
         );
         let saver_tx = Arc::new(Mutex::new(saver_sender));
         let bubble_index_by_id = build_bubble_index(&bubbles);
@@ -231,6 +246,7 @@ impl BubblesModel {
             saver_tx,
             saver_thread: Some(saver_thread),
             saver_gate,
+            autosave_gate,
         }
     }
 
@@ -320,6 +336,7 @@ impl BubblesModel {
             &self.bubbles_path,
             &self.bubbles,
             &self.saver_gate,
+            self.autosave_gate.as_deref(),
         );
     }
 
@@ -520,6 +537,10 @@ impl BubblesModel {
         Ok(())
     }
 
+    /// Bumps the revision, marks unsaved changes and returns the save task. The task's `persist`
+    /// reports the gesture's ONE autosave action, right after its snapshot is sent (a deferred task
+    /// may be persisted long after this touch; the saver polls the gate before draining, so the
+    /// action must never precede the send).
     fn touch_and_prepare_save_task(&mut self) -> BubblesSaveTask {
         self.revision = self.revision.saturating_add(1);
         self.has_unsaved_changes = true;
@@ -529,160 +550,196 @@ impl BubblesModel {
             saver_gate: Arc::clone(&self.saver_gate),
             unsaved_bubbles_path: self.unsaved_bubbles_path.clone(),
             bubbles_path: self.bubbles_path.clone(),
+            autosave_gate: self.autosave_gate.clone(),
         }
     }
 }
 
+/// Upper bound of one saver wait while a snapshot is held, so a gate epoch moved by another
+/// writer's action (or a live policy change) is noticed within about a second.
+const MAX_HOLD_WAIT: Duration = Duration::from_secs(1);
+
+/// Spawns the coalescing bubbles saver.
+///
+/// The worker keeps the LATEST unwritten snapshot (`pending`, one `Arc` — superseded snapshots are
+/// dropped by refcount, never deep-cloned) across iterations. With `autosave_gate: None` (immediate
+/// mode) it is written as soon as the channel drains; with a gate it is held until the gate's flush
+/// epoch moves. `BarrierAndHold` and `Shutdown` ALWAYS write what is held first (they are the force
+/// points), unless the saver is paused for a page operation / discard — then it is dropped.
 fn spawn_bubbles_saver_thread(
     bubbles_path: PathBuf,
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
+    autosave_gate: Option<Arc<AutosaveGate>>,
 ) -> (Sender<BubblesSaverMessage>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<BubblesSaverMessage>();
+    // Polled on the spawning thread so a late thread start cannot swallow an epoch advance.
+    let initial_epoch = autosave_gate.as_deref().map_or(0, AutosaveGate::poll);
     let handle = thread::spawn(move || {
-        // Coalesce queued snapshots and persist only the latest one. The channel now carries
-        // shared `Arc<Vec<Bubble>>` snapshots, so superseded snapshots are dropped (refcount
-        // decrement) without an extra deep clone of the bubble list.
-        let mut held_snapshot = None;
-        let mut last_write_error = None;
-        while let Ok(message) = rx.recv() {
-            let BubblesSaverMessage::Snapshot(first) = message else {
-                if process_bubbles_saver_control(
-                    message,
-                    &rx,
-                    &bubbles_path,
-                    &saver_gate,
-                    &mut held_snapshot,
-                    &mut last_write_error,
-                ) {
+        let autosave_gate = autosave_gate.as_deref();
+        let mut worker = BubblesSaverWorker {
+            bubbles_path,
+            saver_gate,
+            pending: None,
+            last_write_error: None,
+            seen_epoch: initial_epoch,
+        };
+        loop {
+            let message = match wait_bubbles_message(&rx, autosave_gate, worker.pending.is_some()) {
+                Ok(message) => Some(message),
+                // The hold wait elapsed with no message: re-check the gate.
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Defensive: every sender is gone. Write what is held rather than lose it.
+                    worker.write_pending();
                     break;
                 }
-                continue;
             };
-            let mut latest = first;
+            // Poll BEFORE draining: a snapshot's action is reported after its send, so every snapshot
+            // whose action this epoch reflects is already queued.
+            let epoch = autosave_gate.map(AutosaveGate::poll);
+            // Coalesce every immediately queued snapshot; stop at the first control message, which
+            // is then processed AFTER the snapshots that preceded it (FIFO).
             let mut control = None;
-            while let Ok(next) = rx.try_recv() {
-                match next {
-                    BubblesSaverMessage::Snapshot(snapshot) => latest = snapshot,
+            let mut next = message;
+            while let Some(message) = next.take() {
+                match message {
+                    BubblesSaverMessage::Snapshot(snapshot) => worker.pending = Some(snapshot),
                     other => {
                         control = Some(other);
                         break;
                     }
                 }
+                next = rx.try_recv().ok();
             }
-            let gate = match saver_gate.lock() {
-                Ok(gate) => gate,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if !gate.paused {
-                // Keep the gate locked through the filesystem write. `pause_saver_for_page_op`
-                // therefore returns only after any already-selected coalesced snapshot is done.
-                last_write_error = write_bubbles_snapshot_to(&bubbles_path, latest.as_slice())
-                    .map_err(|err| {
-                        let message = format!(
-                            "failed to persist bubbles {}: {err:#}",
-                            bubbles_path.display()
-                        );
-                        eprintln!("{message}");
-                        message
-                    })
-                    .err();
-            }
-            drop(gate);
-            if control.is_some_and(|message| {
-                process_bubbles_saver_control(
-                    message,
-                    &rx,
-                    &bubbles_path,
-                    &saver_gate,
-                    &mut held_snapshot,
-                    &mut last_write_error,
-                )
-            }) {
+            let stopped_at_control = control.is_some();
+            if let Some(message) = control
+                && worker.process_control(message, &rx)
+            {
                 break;
+            }
+            match epoch {
+                // Immediate mode: write as soon as the channel drains (or a hold ends).
+                None => worker.write_pending(),
+                // A drain that stopped at a control message may have left snapshots sent before the
+                // poll in the channel, so `epoch` cannot be marked seen yet; the next wait (bounded
+                // while holding) re-polls. Otherwise the channel was emptied: act on `epoch`.
+                Some(epoch) if !stopped_at_control && epoch != worker.seen_epoch => {
+                    worker.write_pending();
+                    worker.seen_epoch = epoch;
+                }
+                Some(_) => {}
             }
         }
     });
     (tx, handle)
 }
 
-/// Processes a saver control message. Returns true when the worker must exit.
-fn process_bubbles_saver_control(
-    message: BubblesSaverMessage,
-    rx: &Receiver<BubblesSaverMessage>,
-    bubbles_path: &Path,
-    saver_gate: &Arc<Mutex<BubblesSaverGate>>,
-    held_snapshot: &mut Option<Arc<Vec<Bubble>>>,
-    last_write_error: &mut Option<String>,
-) -> bool {
-    match message {
-        BubblesSaverMessage::Snapshot(snapshot) => *held_snapshot = Some(snapshot),
-        BubblesSaverMessage::BarrierAndHold(ack) => {
-            let outcome = last_write_error.clone().map_or(Ok(()), Err);
-            if ack.send(outcome).is_err() {
-                eprintln!("ERROR bubbles saver barrier requester dropped before acknowledgement");
-            }
-            let mut hold_depth = 1_usize;
-            let mut shutdown_ack = None;
-            while hold_depth > 0 {
-                let Ok(message) = rx.recv() else {
-                    eprintln!("ERROR bubbles saver channel disconnected while snapshots were held");
-                    break;
-                };
-                match message {
-                    BubblesSaverMessage::Snapshot(snapshot) => *held_snapshot = Some(snapshot),
-                    BubblesSaverMessage::Resume => hold_depth -= 1,
-                    BubblesSaverMessage::BarrierAndHold(nested_ack) => {
-                        hold_depth = hold_depth.saturating_add(1);
-                        let outcome = last_write_error.clone().map_or(Ok(()), Err);
-                        if nested_ack.send(outcome).is_err() {
-                            eprintln!("ERROR nested bubbles saver barrier requester dropped");
+/// Waits for the next saver message: a blocking `recv` when nothing is held (or in immediate mode),
+/// else a `recv_timeout` bounded by the gate's remaining window and [`MAX_HOLD_WAIT`]. `Timeout`
+/// means "re-check the gate"; `Disconnected` means every sender is gone.
+fn wait_bubbles_message(rx: &Receiver<BubblesSaverMessage>, gate: Option<&AutosaveGate>, holding: bool) -> Result<BubblesSaverMessage, RecvTimeoutError> {
+    let Some(gate) = gate.filter(|_| holding) else {
+        return rx.recv().map_err(|_| RecvTimeoutError::Disconnected);
+    };
+    let wait = gate.wait_deadline().map_or(MAX_HOLD_WAIT, |deadline| deadline.min(MAX_HOLD_WAIT));
+    rx.recv_timeout(wait)
+}
+
+/// Worker-thread state of the bubbles saver.
+struct BubblesSaverWorker {
+    bubbles_path: PathBuf,
+    saver_gate: Arc<Mutex<BubblesSaverGate>>,
+    /// The latest snapshot not yet written (held for the autosave gate or a barrier hold).
+    pending: Option<Arc<Vec<Bubble>>>,
+    /// Outcome of the last write, reported to the next barrier.
+    last_write_error: Option<String>,
+    /// Autosave gate epoch this worker last acted on (forced writes never change it).
+    seen_epoch: u64,
+}
+
+impl BubblesSaverWorker {
+    /// Writes and clears `pending`, if any. While paused (a page operation or discard owns the staging
+    /// folder) the snapshot is dropped instead. The pause lock is held through the write, so
+    /// `pause_saver_for_page_op` returns only after an in-progress write has finished.
+    fn write_pending(&mut self) {
+        let Some(snapshot) = self.pending.take() else {
+            return;
+        };
+        let gate = match self.saver_gate.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if gate.paused {
+            eprintln!("INFO bubbles saver intentionally dropped a held snapshot while paused");
+            return;
+        }
+        self.last_write_error = write_bubbles_snapshot_to(&self.bubbles_path, snapshot.as_slice())
+            .map_err(|err| {
+                let message = format!("failed to persist bubbles {}: {err:#}", self.bubbles_path.display());
+                eprintln!("{message}");
+                message
+            })
+            .err();
+    }
+
+    /// Processes a saver control message. Returns true when the worker must exit.
+    ///
+    /// `BarrierAndHold` first force-writes the held snapshot, acknowledges with the last write outcome,
+    /// then holds every later snapshot (nested holds counted) until each guard resumes; a `Shutdown`
+    /// received during the hold force-writes and exits once the hold ends. After a hold without a
+    /// shutdown, the held snapshot stays `pending` for the normal gate decision.
+    fn process_control(&mut self, message: BubblesSaverMessage, rx: &Receiver<BubblesSaverMessage>) -> bool {
+        match message {
+            BubblesSaverMessage::Snapshot(snapshot) => self.pending = Some(snapshot),
+            BubblesSaverMessage::BarrierAndHold(ack) => {
+                self.write_pending();
+                let outcome = self.last_write_error.clone().map_or(Ok(()), Err);
+                if ack.send(outcome).is_err() {
+                    eprintln!("ERROR bubbles saver barrier requester dropped before acknowledgement");
+                }
+                let mut hold_depth = 1_usize;
+                let mut shutdown_ack = None;
+                while hold_depth > 0 {
+                    let Ok(message) = rx.recv() else {
+                        eprintln!("ERROR bubbles saver channel disconnected while snapshots were held");
+                        break;
+                    };
+                    match message {
+                        BubblesSaverMessage::Snapshot(snapshot) => self.pending = Some(snapshot),
+                        BubblesSaverMessage::Resume => hold_depth -= 1,
+                        BubblesSaverMessage::BarrierAndHold(nested_ack) => {
+                            hold_depth = hold_depth.saturating_add(1);
+                            let outcome = self.last_write_error.clone().map_or(Ok(()), Err);
+                            if nested_ack.send(outcome).is_err() {
+                                eprintln!("ERROR nested bubbles saver barrier requester dropped");
+                            }
                         }
-                    }
-                    BubblesSaverMessage::Shutdown(ack) => {
-                        if shutdown_ack.replace(ack).is_some() {
-                            eprintln!("ERROR bubbles saver received duplicate shutdown requests");
+                        BubblesSaverMessage::Shutdown(ack) => {
+                            if shutdown_ack.replace(ack).is_some() {
+                                eprintln!("ERROR bubbles saver received duplicate shutdown requests");
+                            }
                         }
                     }
                 }
-            }
-            if let Some(snapshot) = held_snapshot.take() {
-                let gate = match saver_gate.lock() {
-                    Ok(gate) => gate,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if !gate.paused {
-                    *last_write_error = write_bubbles_snapshot_to(bubbles_path, snapshot.as_slice())
-                        .map_err(|err| {
-                            let message = format!(
-                                "failed to persist bubbles {}: {err:#}",
-                                bubbles_path.display()
-                            );
-                            eprintln!("{message}");
-                            message
-                        })
-                        .err();
-                } else {
-                    eprintln!(
-                        "INFO bubbles saver intentionally dropped a held snapshot while paused"
-                    );
+                if let Some(ack) = shutdown_ack {
+                    self.write_pending();
+                    if ack.send(()).is_err() {
+                        eprintln!("ERROR bubbles saver shutdown requester dropped");
+                    }
+                    return true;
                 }
             }
-            if let Some(ack) = shutdown_ack {
+            BubblesSaverMessage::Resume => {}
+            BubblesSaverMessage::Shutdown(ack) => {
+                self.write_pending();
                 if ack.send(()).is_err() {
                     eprintln!("ERROR bubbles saver shutdown requester dropped");
                 }
                 return true;
             }
         }
-        BubblesSaverMessage::Resume => {}
-        BubblesSaverMessage::Shutdown(ack) => {
-            if ack.send(()).is_err() {
-                eprintln!("ERROR bubbles saver shutdown requester dropped");
-            }
-            return true;
-        }
+        false
     }
-    false
 }
 
 /// Synchronously persists a bubbles snapshot to the supplied unsaved staging path.
@@ -749,7 +806,8 @@ fn rebuild_bubble_index(index_by_id: &mut HashMap<i64, usize>, bubbles: &[Bubble
     *index_by_id = build_bubble_index(bubbles);
 }
 
-/// Sends a shared bubble snapshot to the coalescing saver thread.
+/// Sends a shared bubble snapshot to the coalescing saver thread, then reports one action to
+/// `autosave_gate` (if any). Nothing is sent or reported while the saver is paused.
 ///
 /// The snapshot is shared (`Arc<Vec<Bubble>>`); only the `Arc` is cloned, never the
 /// underlying bubble list. A stopped saver is reported; it cannot be replaced without also
@@ -760,6 +818,7 @@ fn send_snapshot_to_bubbles_saver(
     bubbles_path: &Path,
     snapshot: &Arc<Vec<Bubble>>,
     saver_gate: &Arc<Mutex<BubblesSaverGate>>,
+    autosave_gate: Option<&AutosaveGate>,
 ) {
     let paused = match saver_gate.lock() {
         Ok(gate) => gate.paused,
@@ -776,6 +835,11 @@ fn send_snapshot_to_bubbles_saver(
         .send(BubblesSaverMessage::Snapshot(Arc::clone(snapshot)))
         .is_ok()
     {
+        // One published snapshot = one gesture. Reported AFTER the send: the saver polls the gate
+        // before draining, so an action must never be counted before its snapshot is queued.
+        if let Some(gate) = autosave_gate {
+            gate.note_action();
+        }
         return;
     }
 
@@ -825,6 +889,7 @@ mod tests {
             unsaved.with_extension("saved.json"),
             unsaved,
             SharedCanvasSettings::default(),
+            None,
         )
     }
 
@@ -935,6 +1000,7 @@ mod tests {
             staging_dir.join("committed.json"),
             staging_path.clone(),
             SharedCanvasSettings::default(),
+            None,
         );
         let Ok(barrier) = model.saver_handle().barrier_and_hold_blocking() else {
             panic!("initial barrier failed");
@@ -978,5 +1044,81 @@ mod tests {
         assert!(staging_path.exists(), "final resume did not persist the held snapshot");
         assert!(model.shutdown_saver().is_ok());
         assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    // ---- Autosave gate ------------------------------------------------------------------------
+
+    fn gated_model(interval: std::time::Duration, action_threshold: u32) -> BubblesModel {
+        let gate = Arc::new(AutosaveGate::with_policy_fn(move || ms_config::autosave_policy::AutosavePolicy { interval, action_threshold }));
+        let unsaved = unique_unsaved_path();
+        // The path is unique per process only; a file left by an earlier aborted run must not read
+        // as "written by this test".
+        if unsaved.exists() {
+            assert!(std::fs::remove_file(&unsaved).is_ok(), "stale test staging file could not be removed");
+        }
+        BubblesModel::new(Vec::new(), unsaved.with_extension("saved.json"), unsaved, SharedCanvasSettings::default(), Some(gate))
+    }
+
+    fn saved_ids(path: &Path) -> Option<Vec<i64>> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let saved = serde_json::from_str::<Vec<Bubble>>(&raw).ok()?;
+        Some(saved.iter().map(|bubble| bubble.id).collect())
+    }
+
+    /// With a gate, mutations are held (nothing written) until the gate is due, then the LATEST
+    /// snapshot is written.
+    #[test]
+    fn gated_saver_holds_until_the_interval_elapses() {
+        let mut model = gated_model(std::time::Duration::from_millis(400), 1000);
+        let staging_path = model.unsaved_bubbles_path.clone();
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "a")).is_ok());
+        assert!(model.create_or_replace(bubble_with_extra(2, "k", "b")).is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!staging_path.exists(), "held snapshot written before the gate was due");
+        let written = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            saved_ids(&staging_path).is_some_and(|ids| ids == vec![1, 2])
+        });
+        assert!(written, "the held latest snapshot was never written");
+        assert!(model.shutdown_saver().is_ok());
+        assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    /// `BarrierAndHold` force-writes the held snapshot before acknowledging.
+    #[test]
+    fn barrier_and_hold_writes_the_held_snapshot() {
+        let mut model = gated_model(std::time::Duration::from_secs(3600), 1000);
+        let staging_path = model.unsaved_bubbles_path.clone();
+        assert!(model.create_or_replace(bubble_with_extra(7, "k", "held")).is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!staging_path.exists(), "held before the barrier");
+        let Ok(barrier) = model.saver_handle().barrier_and_hold_blocking() else {
+            panic!("barrier failed");
+        };
+        assert_eq!(saved_ids(&staging_path), Some(vec![7]), "barrier acknowledged before writing the held snapshot");
+        drop(barrier);
+        assert!(model.shutdown_saver().is_ok());
+        assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    /// Shutdown writes a held snapshot; after a discard pause it is dropped instead.
+    #[test]
+    fn gated_shutdown_writes_held_unless_paused() {
+        for paused in [false, true] {
+            let mut model = gated_model(std::time::Duration::from_secs(3600), 1000);
+            let staging_path = model.unsaved_bubbles_path.clone();
+            assert!(model.create_or_replace(bubble_with_extra(3, "k", "held")).is_ok());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if paused {
+                let _snapshot = model.pause_saver_for_page_op();
+            }
+            assert!(model.shutdown_saver().is_ok());
+            if paused {
+                assert!(!staging_path.exists(), "a paused shutdown wrote the held snapshot");
+            } else {
+                assert_eq!(saved_ids(&staging_path), Some(vec![3]), "shutdown lost the held snapshot");
+                assert!(std::fs::remove_file(staging_path).is_ok());
+            }
+        }
     }
 }
