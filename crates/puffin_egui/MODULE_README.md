@@ -2,8 +2,8 @@
 
 ## Purpose
 Vendored fork of the upstream crate `puffin_egui` 0.30.0 (EmbarkStudios/puffin), ported to
-egui 0.35. It renders the in-app puffin profiler flamegraph/stats window. ManhwaStudio keeps a
-local copy because upstream has no egui-0.34/0.35 release; the main crate depends on it by `path`
+egui 0.36. It renders the in-app puffin profiler flamegraph/stats window. ManhwaStudio keeps a
+local copy because upstream had no egui-0.34/0.35 release when it was vendored; the main crate depends on it by `path`
 (`crates/puffin_egui`) and only behind the optional `profiling` feature.
 
 ## Architecture
@@ -22,8 +22,11 @@ ManhwaStudio owns.
   `ctx = ui.ctx().clone()`); `ViewportClass::Embedded` → `EmbeddedWindow`;
   `CentralPanel::show(ctx,…)` → `show(ui,…)`; `InputState::raw_scroll_delta` → `smooth_scroll_delta`.
   egui_extras `TableBuilder`/`Column` API was unchanged between 0.33 and 0.35.
+- egui-0.36 port delta applied: the `ui.visuals_mut().clip_rect_margin = 0.0` line in
+  `flamegraph.rs` was dropped (`Visuals::clip_rect_margin` is deprecated and has no effect in 0.36,
+  `egui-0.36.2/src/style.rs:1086-1087`).
 
 ## Editing map
 - To re-sync with a newer upstream: replace `src/` from the upstream release and re-apply the
-  version-bump deltas above (or drop the fork entirely once upstream targets egui 0.35+).
-- Cargo pins (egui/egui_extras = 0.35) live in `Cargo.toml`.
+  version-bump deltas above (or drop the fork entirely once upstream targets the egui version the workspace uses).
+- Cargo pins (egui/egui_extras = 0.36.2) live in `Cargo.toml`.

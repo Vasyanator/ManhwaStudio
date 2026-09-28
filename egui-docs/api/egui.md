@@ -1,18 +1,18 @@
-# API index: `egui` 0.35.0
+# API index: `egui` 0.36.2
 
 GENERATED FILE — do not edit by hand. Regenerate with `tools/egui_docs/build.sh`. Extracted from rustdoc JSON of the exact crate source in the local cargo registry, so every signature and line number below is real.
 
 **If a name is not in this file, it does not exist in our version of the crate.** Grep here before writing egui code from memory.
 
-Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.35.0/src/…`.
+Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.36.2/src/…`.
 
 ## `egui`
 
-### `NUM_POINTER_BUTTONS` (constant) — `egui-0.35.0/src/data/input/pointer_button.rs:23`
+### `NUM_POINTER_BUTTONS` (constant) — `egui-0.36.2/src/data/input/pointer_button.rs:23`
 
 Number of pointer buttons supported by egui, i.e. the number of possible states of [`PointerButton`].
 
-### `Align` (enum) — `emath-0.35.0/src/align.rs:8`
+### `Align` (enum) — `emath-0.36.2/src/align.rs:8`
 
 left/center/right or top/center/bottom alignment for e.g. anchors and layouts.
 
@@ -24,18 +24,18 @@ Variants:
 
 Methods:
 
-- `fn align_size_within_range(self, size: f32, range: impl Into<Rangef>) -> Rangef` — `emath-0.35.0/src/align.rs:123`
+- `fn align_size_within_range(self, size: f32, range: impl Into<Rangef>) -> Rangef` — `emath-0.36.2/src/align.rs:123`
   Returns a range of given size within a specified range.
-- `fn flip(self) -> Self` — `emath-0.35.0/src/align.rs:55`
+- `fn flip(self) -> Self` — `emath-0.36.2/src/align.rs:55`
   Returns the inverse alignment. `Min` becomes `Max`, `Center` stays the same, `Max` becomes `Min`.
-- `fn to_factor(self) -> f32` — `emath-0.35.0/src/align.rs:35`
+- `fn to_factor(self) -> f32` — `emath-0.36.2/src/align.rs:35`
   Convert `Min => 0.0`, `Center => 0.5` or `Max => 1.0`.
-- `fn to_sign(self) -> f32` — `emath-0.35.0/src/align.rs:45`
+- `fn to_sign(self) -> f32` — `emath-0.36.2/src/align.rs:45`
   Convert `Min => -1.0`, `Center => 0.0` or `Max => 1.0`.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `AtomKind` (enum) — `egui-0.35.0/src/atomics/atom_kind.rs:26`
+### `AtomKind` (enum) — `egui-0.36.2/src/atomics/atom_kind.rs:26`
 
 The different kinds of [`crate::Atom`]s.
 
@@ -49,18 +49,18 @@ Variants:
 
 Methods:
 
-- `fn closure(func: impl FnOnce(&Ui, IntoSizedArgs) -> IntoSizedResult<'static> + 'a) -> Self` — `egui-0.35.0/src/atomics/atom_kind.rs:116`
+- `fn closure(func: impl FnOnce(&Ui, IntoSizedArgs) -> IntoSizedResult<'static> + 'a) -> Self` — `egui-0.36.2/src/atomics/atom_kind.rs:116`
   See [`Self::Closure`]
-- `fn image(image: impl Into<Image<'a>>) -> Self` — `egui-0.35.0/src/atomics/atom_kind.rs:111`
+- `fn image(image: impl Into<Image<'a>>) -> Self` — `egui-0.36.2/src/atomics/atom_kind.rs:111`
   See [`Self::Image`]
-- `fn into_sized(self, ui: &Ui, _: IntoSizedArgs) -> IntoSizedResult<'a>` — `egui-0.35.0/src/atomics/atom_kind.rs:124`
+- `fn into_sized(self, ui: &Ui, _: IntoSizedArgs) -> IntoSizedResult<'a>` — `egui-0.36.2/src/atomics/atom_kind.rs:124`
   Turn this [`AtomKind`] into a [`SizedAtomKind`].
-- `fn text(text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/atomics/atom_kind.rs:106`
+- `fn text(text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/atomics/atom_kind.rs:106`
   See [`Self::Text`]
 
 Implements: `Clone`, `Debug`, `Default`, `From<AtomLayout<'a>>`, `From<Image<'a>>`, `From<ImageSource<'a>>`, `From<T>`
 
-### `CursorGrab` (enum) — `egui-0.35.0/src/viewport.rs:1046`
+### `CursorGrab` (enum) — `egui-0.36.2/src/viewport.rs:1045`
 
 Variants:
 
@@ -70,7 +70,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `CursorIcon` (enum) — `egui-0.35.0/src/data/output.rs:322`
+### `CursorIcon` (enum) — `egui-0.36.2/src/data/output.rs:347`
 
 A mouse cursor icon.
 
@@ -114,7 +114,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Direction` (enum) — `epaint-0.35.0/src/direction.rs:4`
+### `Direction` (enum) — `epaint-0.36.2/src/direction.rs:4`
 
 A cardinal direction, one of [`LeftToRight`](Direction::LeftToRight), [`RightToLeft`](Direction::RightToLeft), [`TopDown`](Direction::TopDown), [`BottomUp`](Direction::B…
 
@@ -127,12 +127,12 @@ Variants:
 
 Methods:
 
-- `fn is_horizontal(self) -> bool` — `epaint-0.35.0/src/direction.rs:13`
-- `fn is_vertical(self) -> bool` — `epaint-0.35.0/src/direction.rs:21`
+- `fn is_horizontal(self) -> bool` — `epaint-0.36.2/src/direction.rs:13`
+- `fn is_vertical(self) -> bool` — `epaint-0.36.2/src/direction.rs:21`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Event` (enum) — `egui-0.35.0/src/data/input/event.rs:17`
+### `Event` (enum) — `egui-0.36.2/src/data/input/event.rs:17`
 
 An input event generated by the integration.
 
@@ -143,6 +143,7 @@ Variants:
 - `Event::Paste` — The integration detected a "paste" event (e.g. Cmd+V).
 - `Event::Text` — Text input, e.g. via keyboard.
 - `Event::Key` — A key was pressed or released.
+- `Event::ModifiersChanged` — The set of held modifier keys changed.
 - `Event::PointerMoved` — The mouse or touch moved to a new place.
 - `Event::MouseMoved` — The mouse moved, the units are unspecified. Represents the actual movement of the mouse, without ac…
 - `Event::PointerButton` — A mouse button was pressed or released (or a touch started or stopped).
@@ -158,7 +159,7 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FocusDirection` (enum) — `egui-0.35.0/src/memory/mod.rs:151`
+### `FocusDirection` (enum) — `egui-0.36.2/src/memory/mod.rs:151`
 
 A direction in which to move the keyboard focus.
 
@@ -174,7 +175,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `FontFamily` (enum) — `epaint-0.35.0/src/text/fonts.rs:80`
+### `FontFamily` (enum) — `epaint-0.36.2/src/text/fonts.rs:74`
 
 Font of unknown size.
 
@@ -186,7 +187,7 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `FontSelection` (enum) — `egui-0.35.0/src/style.rs:126`
+### `FontSelection` (enum) — `egui-0.36.2/src/style.rs:127`
 
 A way to select [`FontId`], either by picking one directly or by using a [`TextStyle`].
 
@@ -198,14 +199,14 @@ Variants:
 
 Methods:
 
-- `fn resolve(self, style: &Style) -> FontId` — `egui-0.35.0/src/style.rs:150`
+- `fn resolve(self, style: &Style) -> FontId` — `egui-0.36.2/src/style.rs:151`
   Resolve to a [`FontId`].
-- `fn resolve_with_fallback(self, style: &Style, fallback: Self) -> FontId` — `egui-0.35.0/src/style.rs:157`
+- `fn resolve_with_fallback(self, style: &Style, fallback: Self) -> FontId` — `egui-0.36.2/src/style.rs:158`
   Resolve with a final fallback.
 
 Implements: `Clone`, `Debug`, `Default`, `From<FontId>`, `From<TextStyle>`
 
-### `IMEPurpose` (enum) — `egui-0.35.0/src/viewport.rs:1028`
+### `IMEPurpose` (enum) — `egui-0.36.2/src/viewport.rs:1027`
 
 Variants:
 
@@ -215,7 +216,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `IdSource` (enum) — `egui-0.35.0/src/ui_builder.rs:36`
+### `IdSource` (enum) — `egui-0.36.2/src/ui_builder.rs:36`
 
 Is this [`Ui`] a root or a child of another [`Ui`]?
 
@@ -226,7 +227,7 @@ Variants:
 
 Implements: `Clone`
 
-### `ImageData` (enum) — `epaint-0.35.0/src/image.rs:16`
+### `ImageData` (enum) — `epaint-0.36.2/src/image.rs:16`
 
 An image stored in RAM.
 
@@ -236,14 +237,14 @@ Variants:
 
 Methods:
 
-- `fn bytes_per_pixel(&self) -> usize` — `epaint-0.35.0/src/image.rs:36`
-- `fn height(&self) -> usize` — `epaint-0.35.0/src/image.rs:32`
-- `fn size(&self) -> [usize; 2]` — `epaint-0.35.0/src/image.rs:22`
-- `fn width(&self) -> usize` — `epaint-0.35.0/src/image.rs:28`
+- `fn bytes_per_pixel(&self) -> usize` — `epaint-0.36.2/src/image.rs:36`
+- `fn height(&self) -> usize` — `epaint-0.36.2/src/image.rs:32`
+- `fn size(&self) -> [usize; 2]` — `epaint-0.36.2/src/image.rs:22`
+- `fn width(&self) -> usize` — `epaint-0.36.2/src/image.rs:28`
 
 Implements: `Clone`, `Deserialize<'de>`, `Eq`, `From<Arc<ColorImage>>`, `From<ColorImage>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ImageFit` (enum) — `egui-0.35.0/src/widgets/image.rs:453`
+### `ImageFit` (enum) — `egui-0.36.2/src/widgets/image.rs:454`
 
 This type determines how the image should try to fit within the UI.
 
@@ -255,11 +256,11 @@ Variants:
 
 Methods:
 
-- `fn resolve(self, available_size: Vec2, image_size: Vec2) -> Vec2` — `egui-0.35.0/src/widgets/image.rs:472`
+- `fn resolve(self, available_size: Vec2, image_size: Vec2) -> Vec2` — `egui-0.36.2/src/widgets/image.rs:473`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Serialize`
 
-### `ImageSource` (enum) — `egui-0.35.0/src/widgets/image.rs:570`
+### `ImageSource` (enum) — `egui-0.36.2/src/widgets/image.rs:571`
 
 This type tells the [`Ui`] how to load an image.
 
@@ -271,16 +272,16 @@ Variants:
 
 Methods:
 
-- `fn load(self, ctx: &Context, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.35.0/src/widgets/image.rs:631`
+- `fn load(self, ctx: &Context, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.36.2/src/widgets/image.rs:632`
   # Errors Failure to load the texture.
-- `fn texture_size(&self) -> Option<Vec2>` — `egui-0.35.0/src/widgets/image.rs:622`
+- `fn texture_size(&self) -> Option<Vec2>` — `egui-0.36.2/src/widgets/image.rs:623`
   Size of the texture, if known.
-- `fn uri(&self) -> Option<&str>` — `egui-0.35.0/src/widgets/image.rs:650`
+- `fn uri(&self) -> Option<&str>` — `egui-0.36.2/src/widgets/image.rs:651`
   Get the `uri` that this image was constructed from.
 
 Implements: `Clone`, `Debug`, `From<&'a Cow<'a, str>>`, `From<&'a String>`, `From<&'a str>`, `From<(&'static str, T)>`, `From<(Cow<'static, str>, T)>`, `From<(String, T)>`, `From<Cow<'a, str>>`, `From<ImageSource<'a>>`, `From<String>`, `From<T>`
 
-### `ImeEvent` (enum) — `egui-0.35.0/src/data/input/ime_event.rs:6`
+### `ImeEvent` (enum) — `egui-0.36.2/src/data/input/ime_event.rs:6`
 
 IME event.
 
@@ -289,11 +290,12 @@ Variants:
 - `ImeEvent::Enabled` — Notifies when the IME was enabled.
 - `ImeEvent::Preedit` — A new IME candidate is being suggested.
 - `ImeEvent::Commit` — IME composition ended with this final result.
+- `ImeEvent::DeleteSurrounding` — Notifies when the text surrounding the cursor should be deleted.
 - `ImeEvent::Disabled` — Notifies when the IME was disabled.
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Key` (enum) — `egui-0.35.0/src/data/key.rs:7`
+### `Key` (enum) — `egui-0.36.2/src/data/key.rs:7`
 
 Keyboard keys.
 
@@ -419,16 +421,16 @@ Variants:
 
 Methods:
 
-- `fn from_name(key: &str) -> Option<Self>` — `egui-0.35.0/src/data/key.rs:377`
+- `fn from_name(key: &str) -> Option<Self>` — `egui-0.36.2/src/data/key.rs:377`
   Converts `"A"` to `Key::A`, `Space` to `Key::Space`, etc.
-- `fn name(self) -> &'static str` — `egui-0.35.0/src/data/key.rs:545`
+- `fn name(self) -> &'static str` — `egui-0.36.2/src/data/key.rs:546`
   Human-readable English name.
-- `fn symbol_or_name(self) -> &'static str` — `egui-0.35.0/src/data/key.rs:512`
+- `fn symbol_or_name(self) -> &'static str` — `egui-0.36.2/src/data/key.rs:513`
   Emoji or name representing the key
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `MouseWheelUnit` (enum) — `egui-0.35.0/src/data/input/mouse_wheel_unit.rs:4`
+### `MouseWheelUnit` (enum) — `egui-0.36.2/src/data/input/mouse_wheel_unit.rs:4`
 
 The unit associated with the numeric value of a mouse wheel event
 
@@ -440,7 +442,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Order` (enum) — `egui-0.35.0/src/layers.rs:10`
+### `Order` (enum) — `egui-0.36.2/src/layers.rs:10`
 
 Different layer categories
 
@@ -454,13 +456,13 @@ Variants:
 
 Methods:
 
-- `fn allow_interaction(&self) -> bool` — `egui-0.35.0/src/layers.rs:41`
-- `fn short_debug_format(&self) -> &'static str` — `egui-0.35.0/src/layers.rs:50`
+- `fn allow_interaction(&self) -> bool` — `egui-0.36.2/src/layers.rs:41`
+- `fn short_debug_format(&self) -> &'static str` — `egui-0.36.2/src/layers.rs:50`
   Short and readable summary
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `OutputCommand` (enum) — `egui-0.35.0/src/data/output.rs:96`
+### `OutputCommand` (enum) — `egui-0.36.2/src/data/output.rs:121`
 
 Commands that the egui integration should execute at the end of a frame.
 
@@ -472,7 +474,7 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PointerButton` (enum) — `egui-0.35.0/src/data/input/pointer_button.rs:4`
+### `PointerButton` (enum) — `egui-0.36.2/src/data/input/pointer_button.rs:4`
 
 Mouse button (or similar for touch input)
 
@@ -486,7 +488,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PopupAnchor` (enum) — `egui-0.35.0/src/containers/popup.rs:24`
+### `PopupAnchor` (enum) — `egui-0.36.2/src/containers/popup.rs:24`
 
 What should we anchor the popup to?
 
@@ -499,12 +501,12 @@ Variants:
 
 Methods:
 
-- `fn rect(self, popup_id: Id, ctx: &Context) -> Option<Rect>` — `egui-0.35.0/src/containers/popup.rs:65`
+- `fn rect(self, popup_id: Id, ctx: &Context) -> Option<Rect>` — `egui-0.36.2/src/containers/popup.rs:65`
   Get the rect the popup should be shown relative to. Returns `Rect::from_pos` for [`PopupAnchor::Pointer`], [`…
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<&Response>`, `From<Pos2>`, `From<Rect>`, `PartialEq`, `StructuralPartialEq`
 
-### `PopupCloseBehavior` (enum) — `egui-0.35.0/src/containers/popup.rs:77`
+### `PopupCloseBehavior` (enum) — `egui-0.36.2/src/containers/popup.rs:77`
 
 Determines popup's close behavior
 
@@ -516,7 +518,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `PopupKind` (enum) — `egui-0.35.0/src/containers/popup.rs:137`
+### `PopupKind` (enum) — `egui-0.36.2/src/containers/popup.rs:137`
 
 Is the popup a popup, tooltip or menu?
 
@@ -528,12 +530,12 @@ Variants:
 
 Methods:
 
-- `fn order(self) -> Order` — `egui-0.35.0/src/containers/popup.rs:145`
+- `fn order(self) -> Order` — `egui-0.36.2/src/containers/popup.rs:145`
   Returns the order to be used with this kind.
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<PopupKind>`, `PartialEq`, `StructuralPartialEq`
 
-### `ResizeDirection` (enum) — `egui-0.35.0/src/viewport.rs:1055`
+### `ResizeDirection` (enum) — `egui-0.36.2/src/viewport.rs:1054`
 
 Variants:
 
@@ -548,7 +550,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `SetOpenCommand` (enum) — `egui-0.35.0/src/containers/popup.rs:94`
+### `SetOpenCommand` (enum) — `egui-0.36.2/src/containers/popup.rs:94`
 
 Variants:
 
@@ -557,7 +559,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<bool>`, `PartialEq`, `StructuralPartialEq`
 
-### `Shape` (enum) — `epaint-0.35.0/src/shapes/shape.rs:27`
+### `Shape` (enum) — `epaint-0.36.2/src/shapes/shape.rs:27`
 
 A paint primitive such as a circle or a piece of text. Coordinates are all screen space points (not physical pixels).
 
@@ -578,59 +580,59 @@ Variants:
 
 Methods:
 
-- `fn circle_filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:260`
-- `fn circle_stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:265`
-- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:153`
+- `fn circle_filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:260`
+- `fn circle_stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:265`
+- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:153`
   A line that closes back to the start point again.
-- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:251`
+- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:251`
   A convex polygon with a fill and optional stroke.
-- `fn dashed_line(path: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:170`
+- `fn dashed_line(path: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:170`
   Turn a line into dashes.
-- `fn dashed_line_many(points: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32, shapes: &mut Vec<Self>)` — `epaint-0.35.0/src/shapes/shape.rs:210`
+- `fn dashed_line_many(points: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32, shapes: &mut Vec<Self>)` — `epaint-0.36.2/src/shapes/shape.rs:210`
   Turn a line into dashes. If you need to create many dashed lines use this instead of [`Self::dashed_line`].
-- `fn dashed_line_many_with_offset(points: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32, shapes: &mut Vec<Self>)` — `epaint-0.35.0/src/shapes/shape.rs:229`
+- `fn dashed_line_many_with_offset(points: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32, shapes: &mut Vec<Self>)` — `epaint-0.36.2/src/shapes/shape.rs:229`
   Turn a line into dashes with different dash/gap lengths and a start offset. If you need to create many dashed…
-- `fn dashed_line_with_offset(path: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:189`
+- `fn dashed_line_with_offset(path: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:189`
   Turn a line into dashes with different dash/gap lengths and a start offset.
-- `fn dotted_line(path: &[Pos2], color: impl Into<Color32>, spacing: f32, radius: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:158`
+- `fn dotted_line(path: &[Pos2], color: impl Into<Color32>, spacing: f32, radius: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:158`
   Turn a line into equally spaced dots.
-- `fn ellipse_filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:270`
-- `fn ellipse_stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:275`
-- `fn galley(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:344`
+- `fn ellipse_filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:270`
+- `fn ellipse_stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:275`
+- `fn galley(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:344`
   Any uncolored parts of the [`Galley`] (using [`Color32::PLACEHOLDER`]) will be replaced with the given color.
-- `fn galley_with_override_text_color(pos: Pos2, galley: Arc<Galley>, text_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:350`
+- `fn galley_with_override_text_color(pos: Pos2, galley: Arc<Galley>, text_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:350`
   All text color in the [`Galley`] will be replaced with the given color.
-- `fn gradient_rect(rect: Rect, direction: Direction, [from, to]: [Color32; 2]) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:306`
+- `fn gradient_rect(rect: Rect, direction: Direction, [from, to]: [Color32; 2]) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:306`
   Paints a gradient rectangle that transitions from `color_from` to `color_to` along the given `direction`.
-- `fn hline(x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:126`
+- `fn hline(x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:126`
   A horizontal line.
-- `fn image(texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:373`
+- `fn image(texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:373`
   An image at the given position.
-- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:147`
+- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:147`
   A line through many points.
-- `fn line_segment(points: [Pos2; 2], stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:118`
+- `fn line_segment(points: [Pos2; 2], stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:118`
   A line between two points. More efficient than calling [`Self::line`].
-- `fn mesh(mesh: impl Into<Arc<Mesh>>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:361`
-- `fn rect_filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:281`
+- `fn mesh(mesh: impl Into<Arc<Mesh>>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:361`
+- `fn rect_filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:281`
   See also [`Self::rect_stroke`].
-- `fn rect_stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:291`
+- `fn rect_stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:291`
   See also [`Self::rect_filled`].
-- `fn scale(&mut self, factor: f32)` — `epaint-0.35.0/src/shapes/shape.rs:427`
+- `fn scale(&mut self, factor: f32)` — `epaint-0.36.2/src/shapes/shape.rs:427`
   Scale the shape by `factor`, in-place.
-- `fn text(fonts: &mut FontsView<'_>, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:327`
-- `fn texture_id(&self) -> TextureId` — `epaint-0.35.0/src/shapes/shape.rs:413`
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/shapes/shape.rs:443`
+- `fn text(fonts: &mut FontsView<'_>, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:327`
+- `fn texture_id(&self) -> TextureId` — `epaint-0.36.2/src/shapes/shape.rs:413`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/shapes/shape.rs:443`
   Transform (move/scale) the shape in-place.
-- `fn translate(&mut self, delta: Vec2)` — `epaint-0.35.0/src/shapes/shape.rs:435`
+- `fn translate(&mut self, delta: Vec2)` — `epaint-0.36.2/src/shapes/shape.rs:435`
   Move the shape by `delta`, in-place.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/shape.rs:380`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/shape.rs:380`
   The visual bounding rectangle (includes stroke widths)
-- `fn vline(x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:135`
+- `fn vline(x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:135`
   A vertical line.
 
 Implements: `Clone`, `Debug`, `From<Arc<Mesh>>`, `From<CircleShape>`, `From<CubicBezierShape>`, `From<EllipseShape>`, `From<Mesh>`, `From<PaintCallback>`, `From<PathShape>`, `From<QuadraticBezierShape>`, `From<RectShape>`, `From<TextShape>`, `From<Vec<Shape>>`, `PartialEq`, `StructuralPartialEq`
 
-### `SizeHint` (enum) — `egui-0.35.0/src/load.rs:148`
+### `SizeHint` (enum) — `egui-0.36.2/src/load.rs:147`
 
 Given as a hint for image loading requests.
 
@@ -643,12 +645,12 @@ Variants:
 
 Methods:
 
-- `fn scale_by(self, factor: f32) -> Self` — `egui-0.35.0/src/load.rs:177`
+- `fn scale_by(self, factor: f32) -> Self` — `egui-0.36.2/src/load.rs:176`
   Multiply size hint by a factor.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `StructuralPartialEq`
 
-### `SizedAtomKind` (enum) — `egui-0.35.0/src/atomics/sized_atom_kind.rs:8`
+### `SizedAtomKind` (enum) — `egui-0.36.2/src/atomics/sized_atom_kind.rs:8`
 
 A sized [`crate::AtomKind`].
 
@@ -661,12 +663,12 @@ Variants:
 
 Methods:
 
-- `fn size(&self) -> Vec2` — `egui-0.35.0/src/atomics/sized_atom_kind.rs:23`
+- `fn size(&self) -> Vec2` — `egui-0.36.2/src/atomics/sized_atom_kind.rs:23`
   Get the calculated size.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `SliderClamping` (enum) — `egui-0.35.0/src/widgets/slider.rs:59`
+### `SliderClamping` (enum) — `egui-0.36.2/src/widgets/slider.rs:59`
 
 Specifies how values in a [`Slider`] are clamped.
 
@@ -678,7 +680,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `SliderOrientation` (enum) — `egui-0.35.0/src/widgets/slider.rs:51`
+### `SliderOrientation` (enum) — `egui-0.36.2/src/widgets/slider.rs:51`
 
 Specifies the orientation of a [`Slider`].
 
@@ -689,7 +691,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `StrokeKind` (enum) — `epaint-0.35.0/src/stroke.rs:101`
+### `StrokeKind` (enum) — `epaint-0.36.2/src/stroke.rs:102`
 
 Describes how the stroke of a shape should be painted.
 
@@ -701,7 +703,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `SurrenderFocusOn` (enum) — `egui-0.35.0/src/input_state/mod.rs:27`
+### `SurrenderFocusOn` (enum) — `egui-0.36.2/src/input_state/mod.rs:25`
 
 Variants:
 
@@ -711,11 +713,11 @@ Variants:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/input_state/mod.rs:40`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/input_state/mod.rs:38`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `SystemTheme` (enum) — `egui-0.35.0/src/viewport.rs:1037`
+### `SystemTheme` (enum) — `egui-0.36.2/src/viewport.rs:1036`
 
 Variants:
 
@@ -725,7 +727,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextStyle` (enum) — `egui-0.35.0/src/style.rs:71`
+### `TextStyle` (enum) — `egui-0.36.2/src/style.rs:72`
 
 Alias for a [`FontId`] (font of a certain size).
 
@@ -740,12 +742,12 @@ Variants:
 
 Methods:
 
-- `fn resolve(&self, style: &Style) -> FontId` — `egui-0.35.0/src/style.rs:111`
+- `fn resolve(&self, style: &Style) -> FontId` — `egui-0.36.2/src/style.rs:112`
   Look up this [`TextStyle`] in [`Style::text_styles`].
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Display`, `Eq`, `From<TextStyle>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `TextWrapMode` (enum) — `epaint-0.35.0/src/text/text_layout_types.rs:587`
+### `TextWrapMode` (enum) — `epaint-0.36.2/src/text/text_layout_types.rs:594`
 
 How to wrap and elide text.
 
@@ -757,7 +759,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureFilter` (enum) — `epaint-0.35.0/src/textures.rs:241`
+### `TextureFilter` (enum) — `epaint-0.36.2/src/textures.rs:248`
 
 How the texture texels are filtered.
 
@@ -768,7 +770,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureId` (enum) — `epaint-0.35.0/src/lib.rs:95`
+### `TextureId` (enum) — `epaint-0.36.2/src/lib.rs:95`
 
 What texture to use in a [`Mesh`] mesh.
 
@@ -779,7 +781,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<&TextureHandle>`, `From<&mut TextureHandle>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `TextureWrapMode` (enum) — `epaint-0.35.0/src/textures.rs:255`
+### `TextureWrapMode` (enum) — `epaint-0.36.2/src/textures.rs:262`
 
 Defines how textures are wrapped around objects when texture coordinates fall outside the [0, 1] range.
 
@@ -791,7 +793,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Theme` (enum) — `egui-0.35.0/src/memory/theme.rs:6`
+### `Theme` (enum) — `egui-0.36.2/src/memory/theme.rs:6`
 
 Dark or Light theme.
 
@@ -802,16 +804,16 @@ Variants:
 
 Methods:
 
-- `fn default_style(self) -> Style` — `egui-0.35.0/src/memory/theme.rs:24`
+- `fn default_style(self) -> Style` — `egui-0.36.2/src/memory/theme.rs:24`
   Default style for this theme.
-- `fn default_visuals(self) -> Visuals` — `egui-0.35.0/src/memory/theme.rs:16`
+- `fn default_visuals(self) -> Visuals` — `egui-0.36.2/src/memory/theme.rs:16`
   Default visuals for this theme.
-- `fn from_dark_mode(dark_mode: bool) -> Self` — `egui-0.35.0/src/memory/theme.rs:32`
+- `fn from_dark_mode(dark_mode: bool) -> Self` — `egui-0.36.2/src/memory/theme.rs:32`
   Chooses between [`Self::Dark`] or [`Self::Light`] based on a boolean value.
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `From<Theme>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ThemePreference` (enum) — `egui-0.35.0/src/memory/theme.rs:67`
+### `ThemePreference` (enum) — `egui-0.36.2/src/memory/theme.rs:67`
 
 The user's theme preference.
 
@@ -823,12 +825,12 @@ Variants:
 
 Methods:
 
-- `fn radio_buttons(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/memory/theme.rs:90`
+- `fn radio_buttons(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/memory/theme.rs:90`
   Show radio-buttons to switch between light mode, dark mode and following the system theme.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Theme>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TouchPhase` (enum) — `egui-0.35.0/src/data/input/touch.rs:16`
+### `TouchPhase` (enum) — `egui-0.36.2/src/data/input/touch.rs:16`
 
 In what phase a touch event is in.
 
@@ -841,7 +843,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `UiKind` (enum) — `egui-0.35.0/src/ui_stack.rs:11`
+### `UiKind` (enum) — `egui-0.36.2/src/ui_stack.rs:11`
 
 What kind is this [`crate::Ui`]?
 
@@ -867,14 +869,14 @@ Variants:
 
 Methods:
 
-- `fn is_area(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:80`
+- `fn is_area(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:80`
   Is this any kind of [`crate::Area`]?
-- `fn is_panel(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:67`
+- `fn is_panel(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:67`
   Is this any kind of panel?
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<PopupKind>`, `PartialEq`, `StructuralPartialEq`
 
-### `UserAttentionType` (enum) — `egui-0.35.0/src/data/output.rs:271`
+### `UserAttentionType` (enum) — `egui-0.36.2/src/data/output.rs:296`
 
 Types of attention to request from a user when a native window is not in focus.
 
@@ -886,7 +888,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportClass` (enum) — `egui-0.35.0/src/viewport.rs:83`
+### `ViewportClass` (enum) — `egui-0.36.2/src/viewport.rs:82`
 
 The different types of viewports supported by egui.
 
@@ -899,7 +901,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportCommand` (enum) — `egui-0.35.0/src/viewport.rs:1080`
+### `ViewportCommand` (enum) — `egui-0.36.2/src/viewport.rs:1079`
 
 An output [viewport](crate::viewport)-command from egui to the backend, e.g. to change the window title or size.
 
@@ -944,14 +946,14 @@ Variants:
 
 Methods:
 
-- `fn center_on_screen(ctx: &Context) -> Option<Self>` — `egui-0.35.0/src/viewport.rs:1220`
+- `fn center_on_screen(ctx: &Context) -> Option<Self>` — `egui-0.36.2/src/viewport.rs:1219`
   Construct a command to center the viewport on the monitor, if possible.
-- `fn requires_parent_repaint(&self) -> bool` — `egui-0.35.0/src/viewport.rs:1236`
+- `fn requires_parent_repaint(&self) -> bool` — `egui-0.36.2/src/viewport.rs:1235`
   This command requires the parent viewport to repaint.
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportEvent` (enum) — `egui-0.35.0/src/data/input/viewport_info.rs:6`
+### `ViewportEvent` (enum) — `egui-0.36.2/src/data/input/viewport_info.rs:6`
 
 An input event from the backend into egui, about a specific [viewport](crate::viewport).
 
@@ -961,7 +963,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WidgetText` (enum) — `egui-0.35.0/src/widget_text.rs:509`
+### `WidgetText` (enum) — `egui-0.36.2/src/widget_text.rs:509`
 
 This is how you specify text for a widget.
 
@@ -974,46 +976,48 @@ Variants:
 
 Methods:
 
-- `fn background_color(self, background_color: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widget_text.rs:690`
+- `fn background_color(self, background_color: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widget_text.rs:709`
   Prefer using [`RichText`] directly!
-- `fn code(self) -> Self` — `egui-0.35.0/src/widget_text.rs:636`
+- `fn code(self) -> Self` — `egui-0.36.2/src/widget_text.rs:655`
   Prefer using [`RichText`] directly!
-- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widget_text.rs:618`
+- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widget_text.rs:637`
   Override text color if, and only if, this is a [`RichText`].
-- `fn fallback_text_style(self, text_style: TextStyle) -> Self` — `egui-0.35.0/src/widget_text.rs:610`
+- `fn fallback_text_style(self, text_style: TextStyle) -> Self` — `egui-0.36.2/src/widget_text.rs:629`
   Set the [`TextStyle`] unless it has already been set
-- `fn heading(self) -> Self` — `egui-0.35.0/src/widget_text.rs:624`
+- `fn heading(self) -> Self` — `egui-0.36.2/src/widget_text.rs:643`
   Prefer using [`RichText`] directly!
-- `fn into_galley(self, ui: &Ui, wrap_mode: Option<TextWrapMode>, available_width: f32, fallback_font: impl Into<FontSelection>) -> Arc<Galley>` — `egui-0.35.0/src/widget_text.rs:723`
+- `fn into_galley(self, ui: &Ui, wrap_mode: Option<TextWrapMode>, available_width: f32, fallback_font: impl Into<FontSelection>) -> Arc<Galley>` — `egui-0.36.2/src/widget_text.rs:742`
   Layout with wrap mode based on the containing [`Ui`].
-- `fn into_galley_impl(self, ctx: &Context, style: &Style, text_wrapping: TextWrapping, fallback_font: FontSelection, default_valign: Align) -> Arc<Galley>` — `egui-0.35.0/src/widget_text.rs:739`
-- `fn into_layout_job(self, style: &Style, fallback_font: FontSelection, default_valign: Align) -> Arc<LayoutJob>` — `egui-0.35.0/src/widget_text.rs:694`
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/widget_text.rs:562`
-- `fn italics(self) -> Self` — `egui-0.35.0/src/widget_text.rs:666`
+- `fn into_galley_impl(self, ctx: &Context, style: &Style, text_wrapping: TextWrapping, fallback_font: FontSelection, default_valign: Align) -> Arc<Galley>` — `egui-0.36.2/src/widget_text.rs:758`
+- `fn into_layout_job(self, style: &Style, fallback_font: FontSelection, default_valign: Align) -> Arc<LayoutJob>` — `egui-0.36.2/src/widget_text.rs:713`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/widget_text.rs:581`
+- `fn italics(self) -> Self` — `egui-0.36.2/src/widget_text.rs:685`
   Prefer using [`RichText`] directly!
-- `fn monospace(self) -> Self` — `egui-0.35.0/src/widget_text.rs:630`
+- `fn monospace(self) -> Self` — `egui-0.36.2/src/widget_text.rs:649`
   Prefer using [`RichText`] directly!
-- `fn raised(self) -> Self` — `egui-0.35.0/src/widget_text.rs:684`
+- `fn raised(self) -> Self` — `egui-0.36.2/src/widget_text.rs:703`
   Prefer using [`RichText`] directly!
-- `fn small(self) -> Self` — `egui-0.35.0/src/widget_text.rs:672`
+- `fn size(self, size: f32) -> Self` — `egui-0.36.2/src/widget_text.rs:565`
+  Override the font size.
+- `fn small(self) -> Self` — `egui-0.36.2/src/widget_text.rs:691`
   Prefer using [`RichText`] directly!
-- `fn small_raised(self) -> Self` — `egui-0.35.0/src/widget_text.rs:678`
+- `fn small_raised(self) -> Self` — `egui-0.36.2/src/widget_text.rs:697`
   Prefer using [`RichText`] directly!
-- `fn strikethrough(self) -> Self` — `egui-0.35.0/src/widget_text.rs:660`
+- `fn strikethrough(self) -> Self` — `egui-0.36.2/src/widget_text.rs:679`
   Prefer using [`RichText`] directly!
-- `fn strong(self) -> Self` — `egui-0.35.0/src/widget_text.rs:642`
+- `fn strong(self) -> Self` — `egui-0.36.2/src/widget_text.rs:661`
   Prefer using [`RichText`] directly!
-- `fn text(&self) -> &str` — `egui-0.35.0/src/widget_text.rs:572`
-- `fn text_style(self, text_style: TextStyle) -> Self` — `egui-0.35.0/src/widget_text.rs:602`
+- `fn text(&self) -> &str` — `egui-0.36.2/src/widget_text.rs:591`
+- `fn text_style(self, text_style: TextStyle) -> Self` — `egui-0.36.2/src/widget_text.rs:621`
   Override the [`TextStyle`] if, and only if, this is a [`RichText`].
-- `fn underline(self) -> Self` — `egui-0.35.0/src/widget_text.rs:654`
+- `fn underline(self) -> Self` — `egui-0.36.2/src/widget_text.rs:673`
   Prefer using [`RichText`] directly!
-- `fn weak(self) -> Self` — `egui-0.35.0/src/widget_text.rs:648`
+- `fn weak(self) -> Self` — `egui-0.36.2/src/widget_text.rs:667`
   Prefer using [`RichText`] directly!
 
 Implements: `Clone`, `Debug`, `Default`, `From<&Box<str>>`, `From<&String>`, `From<&str>`, `From<Arc<Galley>>`, `From<Arc<LayoutJob>>`, `From<Arc<RichText>>`, `From<Box<str>>`, `From<Cow<'_, str>>`, `From<LayoutJob>`, `From<RichText>`, `From<String>`
 
-### `WidgetType` (enum) — `egui-0.35.0/src/lib.rs:623`
+### `WidgetType` (enum) — `egui-0.36.2/src/lib.rs:623`
 
 The different types of built-in widgets in egui
 
@@ -1042,7 +1046,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WindowDrag` (enum) — `egui-0.35.0/src/containers/window.rs:17`
+### `WindowDrag` (enum) — `egui-0.36.2/src/containers/window.rs:17`
 
 Where the user can drag to move a [`Window`].
 
@@ -1055,7 +1059,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WindowLevel` (enum) — `egui-0.35.0/src/viewport.rs:964`
+### `WindowLevel` (enum) — `egui-0.36.2/src/viewport.rs:963`
 
 For winit platform compatibility, see [`winit::WindowLevel` documentation](https://docs.rs/winit/latest/winit/window/enum.WindowLevel.html#platform-specific)
 
@@ -1067,7 +1071,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `X11WindowType` (enum) — `egui-0.35.0/src/viewport.rs:973`
+### `X11WindowType` (enum) — `egui-0.36.2/src/viewport.rs:972`
 
 Variants:
 
@@ -1088,7 +1092,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `__run_test_ctx` — `egui-0.35.0/src/lib.rs:673`
+### `__run_test_ctx` — `egui-0.36.2/src/lib.rs:673`
 
 ```rust
 fn __run_test_ctx(run_ui: impl FnMut(&Context))
@@ -1096,7 +1100,7 @@ fn __run_test_ctx(run_ui: impl FnMut(&Context))
 
 For use in tests; especially doctests.
 
-### `__run_test_ui` — `egui-0.35.0/src/lib.rs:682`
+### `__run_test_ui` — `egui-0.36.2/src/lib.rs:683`
 
 ```rust
 fn __run_test_ui(add_contents: impl FnMut(&mut Ui))
@@ -1104,13 +1108,13 @@ fn __run_test_ui(add_contents: impl FnMut(&mut Ui))
 
 For use in tests; especially doctests.
 
-### `accesskit_root_id` — `egui-0.35.0/src/lib.rs:690`
+### `accesskit_root_id` — `egui-0.36.2/src/lib.rs:692`
 
 ```rust
 fn accesskit_root_id() -> Id
 ```
 
-### `decode_animated_image_uri` — `egui-0.35.0/src/widgets/image.rs:898`
+### `decode_animated_image_uri` — `egui-0.36.2/src/widgets/image.rs:899`
 
 ```rust
 fn decode_animated_image_uri(uri: &str) -> Result<(&str, usize), String>
@@ -1118,7 +1122,7 @@ fn decode_animated_image_uri(uri: &str) -> Result<(&str, usize), String>
 
 Extracts uri and frame index # Errors Will return `Err` if `uri` does not match pattern {uri}-{frame_index}
 
-### `global_theme_preference_buttons` — `egui-0.35.0/src/widgets/mod.rs:131`
+### `global_theme_preference_buttons` — `egui-0.36.2/src/widgets/mod.rs:151`
 
 ```rust
 fn global_theme_preference_buttons(ui: &mut Ui)
@@ -1126,7 +1130,7 @@ fn global_theme_preference_buttons(ui: &mut Ui)
 
 Show larger buttons for switching between light and dark mode (globally).
 
-### `global_theme_preference_switch` — `egui-0.35.0/src/widgets/mod.rs:124`
+### `global_theme_preference_switch` — `egui-0.36.2/src/widgets/mod.rs:144`
 
 ```rust
 fn global_theme_preference_switch(ui: &mut Ui)
@@ -1134,7 +1138,7 @@ fn global_theme_preference_switch(ui: &mut Ui)
 
 Show a small button to switch to/from dark/light mode (globally).
 
-### `has_gif_magic_header` — `egui-0.35.0/src/widgets/image.rs:940`
+### `has_gif_magic_header` — `egui-0.36.2/src/widgets/image.rs:941`
 
 ```rust
 fn has_gif_magic_header(bytes: &[u8]) -> bool
@@ -1142,7 +1146,7 @@ fn has_gif_magic_header(bytes: &[u8]) -> bool
 
 Checks if bytes are gifs
 
-### `has_webp_header` — `egui-0.35.0/src/widgets/image.rs:950`
+### `has_webp_header` — `egui-0.36.2/src/widgets/image.rs:951`
 
 ```rust
 fn has_webp_header(bytes: &[u8]) -> bool
@@ -1150,7 +1154,7 @@ fn has_webp_header(bytes: &[u8]) -> bool
 
 Checks if bytes are webp
 
-### `lerp` — `emath-0.35.0/src/lib.rs:106`
+### `lerp` — `emath-0.36.2/src/lib.rs:106`
 
 ```rust
 fn lerp<R, T>(range: impl Into<RangeInclusive<R>>, t: T) -> R
@@ -1158,13 +1162,13 @@ fn lerp<R, T>(range: impl Into<RangeInclusive<R>>, t: T) -> R
 
 Linear interpolation.
 
-### `paint_texture_at` — `egui-0.35.0/src/widgets/image.rs:839`
+### `paint_texture_at` — `egui-0.36.2/src/widgets/image.rs:840`
 
 ```rust
 fn paint_texture_at(painter: &Painter, rect: Rect, options: &ImageOptions, texture: &SizedTexture)
 ```
 
-### `pos2` — `emath-0.35.0/src/pos2.rs:29`
+### `pos2` — `emath-0.36.2/src/pos2.rs:29`
 
 ```rust
 const fn pos2(x: f32, y: f32) -> Pos2
@@ -1172,7 +1176,7 @@ const fn pos2(x: f32, y: f32) -> Pos2
 
 `pos2(x, y) == Pos2::new(x, y)`
 
-### `remap` — `emath-0.35.0/src/lib.rs:161`
+### `remap` — `emath-0.36.2/src/lib.rs:161`
 
 ```rust
 fn remap<T>(x: T, from: impl Into<RangeInclusive<T>>, to: impl Into<RangeInclusive<T>>) -> T
@@ -1180,7 +1184,7 @@ fn remap<T>(x: T, from: impl Into<RangeInclusive<T>>, to: impl Into<RangeInclusi
 
 Linearly remap a value from one range to another, so that when `x == from.start()` returns `to.start()` and when `x == from.end()` returns `to.end()`.
 
-### `remap_clamp` — `emath-0.35.0/src/lib.rs:176`
+### `remap_clamp` — `emath-0.36.2/src/lib.rs:176`
 
 ```rust
 fn remap_clamp<T>(x: T, from: impl Into<RangeInclusive<T>>, to: impl Into<RangeInclusive<T>>) -> T
@@ -1188,7 +1192,7 @@ fn remap_clamp<T>(x: T, from: impl Into<RangeInclusive<T>>, to: impl Into<RangeI
 
 Like [`remap`], but also clamps the value so that the returned value is always in the `to` range.
 
-### `reset_button` — `egui-0.35.0/src/widgets/mod.rs:104`
+### `reset_button` — `egui-0.36.2/src/widgets/mod.rs:124`
 
 ```rust
 fn reset_button<T>(ui: &mut Ui, value: &mut T, text: &str)
@@ -1196,7 +1200,7 @@ fn reset_button<T>(ui: &mut Ui, value: &mut T, text: &str)
 
 Show a button to reset a value to its default. The button is only enabled if the value does not already have its original value.
 
-### `reset_button_with` — `egui-0.35.0/src/widgets/mod.rs:112`
+### `reset_button_with` — `egui-0.36.2/src/widgets/mod.rs:132`
 
 ```rust
 fn reset_button_with<T>(ui: &mut Ui, value: &mut T, text: &str, reset_value: T)
@@ -1204,7 +1208,7 @@ fn reset_button_with<T>(ui: &mut Ui, value: &mut T, text: &str, reset_value: T)
 
 Show a button to reset a value to its default. The button is only enabled if the value does not already have its original value.
 
-### `vec2` — `emath-0.35.0/src/vec2.rs:26`
+### `vec2` — `emath-0.36.2/src/vec2.rs:26`
 
 ```rust
 const fn vec2(x: f32, y: f32) -> Vec2
@@ -1212,7 +1216,7 @@ const fn vec2(x: f32, y: f32) -> Vec2
 
 `vec2(x, y) == Vec2::new(x, y)`
 
-### `warn_if_debug_build` — `egui-0.35.0/src/lib.rs:502`
+### `warn_if_debug_build` — `egui-0.36.2/src/lib.rs:502`
 
 ```rust
 fn warn_if_debug_build(ui: &mut Ui)
@@ -1220,52 +1224,52 @@ fn warn_if_debug_build(ui: &mut Ui)
 
 Helper function that adds a label when compiling with debug assertions enabled.
 
-### `generate_loader_id` (macro) — `egui-0.35.0/src/load.rs:303`
+### `generate_loader_id` (macro) — `egui-0.36.2/src/load.rs:302`
 
 Used to get a unique ID when implementing one of the loader traits: [`BytesLoader::id`], [`ImageLoader::id`], and [`TextureLoader::id`].
 
-### `github_link_file` (macro) — `egui-0.35.0/src/lib.rs:567`
+### `github_link_file` (macro) — `egui-0.36.2/src/lib.rs:567`
 
 Create a [`Hyperlink`] to the current [`file!()`] on github.
 
-### `github_link_file_line` (macro) — `egui-0.35.0/src/lib.rs:552`
+### `github_link_file_line` (macro) — `egui-0.36.2/src/lib.rs:552`
 
 Create a [`Hyperlink`] to the current [`file!()`] (and line) on Github
 
-### `include_image` (macro) — `egui-0.35.0/src/lib.rs:535`
+### `include_image` (macro) — `egui-0.36.2/src/lib.rs:535`
 
 Include an image in the binary.
 
-### `Align2` (struct) — `emath-0.35.0/src/align.rs:151`
+### `Align2` (struct) — `emath-0.36.2/src/align.rs:151`
 
 Two-dimension alignment, e.g. [`Align2::LEFT_TOP`].
 
 Methods:
 
-- `fn align_size_within_rect(self, size: Vec2, frame: Rect) -> Rect` — `emath-0.35.0/src/align.rs:235`
+- `fn align_size_within_rect(self, size: Vec2, frame: Rect) -> Rect` — `emath-0.36.2/src/align.rs:235`
   e.g. center a size within a given frame
-- `fn anchor_rect(self, rect: Rect) -> Rect` — `emath-0.35.0/src/align.rs:203`
+- `fn anchor_rect(self, rect: Rect) -> Rect` — `emath-0.36.2/src/align.rs:203`
   Used e.g. to anchor a piece of text to a part of the rectangle. Give a position within the rect, specified by…
-- `fn anchor_size(self, pos: Pos2, size: Vec2) -> Rect` — `emath-0.35.0/src/align.rs:220`
+- `fn anchor_size(self, pos: Pos2, size: Vec2) -> Rect` — `emath-0.36.2/src/align.rs:220`
   Use this anchor to position something around `pos`, e.g. [`Self::RIGHT_TOP`] means the right-top of the rect…
-- `fn flip(self) -> Self` — `emath-0.35.0/src/align.rs:197`
+- `fn flip(self) -> Self` — `emath-0.36.2/src/align.rs:197`
   Flip on both axes e.g. `TOP_LEFT` -> `BOTTOM_RIGHT`
-- `fn flip_x(self) -> Self` — `emath-0.35.0/src/align.rs:185`
+- `fn flip_x(self) -> Self` — `emath-0.36.2/src/align.rs:185`
   Flip on the x-axis e.g. `TOP_LEFT` -> `TOP_RIGHT`
-- `fn flip_y(self) -> Self` — `emath-0.35.0/src/align.rs:191`
+- `fn flip_y(self) -> Self` — `emath-0.36.2/src/align.rs:191`
   Flip on the y-axis e.g. `TOP_LEFT` -> `BOTTOM_LEFT`
-- `fn pos_in_rect(self, frame: &Rect) -> Pos2` — `emath-0.35.0/src/align.rs:261`
+- `fn pos_in_rect(self, frame: &Rect) -> Pos2` — `emath-0.36.2/src/align.rs:261`
   Returns the point on the rect's frame or in the center of a rect according to the alignments of this object.
-- `fn to_sign(self) -> Vec2` — `emath-0.35.0/src/align.rs:179`
+- `fn to_sign(self) -> Vec2` — `emath-0.36.2/src/align.rs:179`
   -1, 0, or +1 for each axis
-- `fn x(self) -> Align` — `emath-0.35.0/src/align.rs:168`
+- `fn x(self) -> Align` — `emath-0.36.2/src/align.rs:168`
   Returns an alignment by the X (horizontal) axis
-- `fn y(self) -> Align` — `emath-0.35.0/src/align.rs:174`
+- `fn y(self) -> Align` — `emath-0.36.2/src/align.rs:174`
   Returns an alignment by the Y (vertical) axis
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `Index<usize>`, `IndexMut<usize>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `AllocatedAtomLayout` (struct) — `egui-0.35.0/src/atomics/atom_layout.rs:499`
+### `AllocatedAtomLayout` (struct) — `egui-0.36.2/src/atomics/atom_layout.rs:499`
 
 Instructions for painting an [`AtomLayout`].
 
@@ -1276,68 +1280,68 @@ Public fields:
 
 Methods:
 
-- `fn paint(self, ui: &Ui) -> AtomLayoutResponse` — `egui-0.35.0/src/atomics/atom_layout.rs:691`
+- `fn paint(self, ui: &Ui) -> AtomLayoutResponse` — `egui-0.36.2/src/atomics/atom_layout.rs:691`
   Paint the [`Frame`] and individual [`crate::Atom`]s at the allocated [`Response`]'s rect.
 
 Implements: `Clone`, `Debug`, `Deref`, `DerefMut`
 
-### `Area` (struct) — `egui-0.35.0/src/containers/area.rs:107`
+### `Area` (struct) — `egui-0.36.2/src/containers/area.rs:107`
 
 An area on the screen that can be moved by dragging.
 
 Methods:
 
-- `fn anchor(self, align: Align2, offset: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/area.rs:334`
+- `fn anchor(self, align: Align2, offset: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/area.rs:334`
   Set anchor and distance.
-- `fn constrain(self, constrain: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:287`
+- `fn constrain(self, constrain: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:287`
   Constrains this area to [`Context::content_rect`]?
-- `fn constrain_to(self, constrain_rect: Rect) -> Self` — `egui-0.35.0/src/containers/area.rs:296`
+- `fn constrain_to(self, constrain_rect: Rect) -> Self` — `egui-0.36.2/src/containers/area.rs:296`
   Constrain the movement of the window to the given rectangle.
-- `fn current_pos(self, current_pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/area.rs:317`
+- `fn current_pos(self, current_pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/area.rs:317`
   Positions the window but you can still move it.
-- `fn default_height(self, default_height: f32) -> Self` — `egui-0.35.0/src/containers/area.rs:270`
+- `fn default_height(self, default_height: f32) -> Self` — `egui-0.36.2/src/containers/area.rs:270`
   See [`Self::default_size`].
-- `fn default_pos(self, default_pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/area.rs:241`
-- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/area.rs:256`
+- `fn default_pos(self, default_pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/area.rs:241`
+- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/area.rs:256`
   The size used for the [`Ui::max_rect`] the first frame.
-- `fn default_width(self, default_width: f32) -> Self` — `egui-0.35.0/src/containers/area.rs:263`
+- `fn default_width(self, default_width: f32) -> Self` — `egui-0.36.2/src/containers/area.rs:263`
   See [`Self::default_size`].
-- `fn enabled(self, enabled: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:191`
+- `fn enabled(self, enabled: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:191`
   If false, no content responds to click and widgets will be shown grayed out. You won't be able to move the wi…
-- `fn fade_in(self, fade_in: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:351`
+- `fn fade_in(self, fade_in: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:351`
   If `true`, quickly fade in the area.
-- `fn fixed_pos(self, fixed_pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/area.rs:277`
+- `fn fixed_pos(self, fixed_pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/area.rs:277`
   Positions the window and prevents it from being moved
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/containers/area.rs:159`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/containers/area.rs:159`
   Let's you change the `id` that you assigned in [`Self::new`].
-- `fn info(self, info: UiStackInfo) -> Self` — `egui-0.35.0/src/containers/area.rs:177`
+- `fn info(self, info: UiStackInfo) -> Self` — `egui-0.36.2/src/containers/area.rs:177`
   Set the [`UiStackInfo`] of the area's [`Ui`].
-- `fn interactable(self, interactable: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:218`
+- `fn interactable(self, interactable: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:218`
   If false, clicks goes straight through to what is behind us.
-- `fn is_enabled(&self) -> bool` — `egui-0.35.0/src/containers/area.rs:204`
-- `fn is_movable(&self) -> bool` — `egui-0.35.0/src/containers/area.rs:208`
-- `fn kind(self, kind: UiKind) -> Self` — `egui-0.35.0/src/containers/area.rs:168`
+- `fn is_enabled(&self) -> bool` — `egui-0.36.2/src/containers/area.rs:204`
+- `fn is_movable(&self) -> bool` — `egui-0.36.2/src/containers/area.rs:208`
+- `fn kind(self, kind: UiKind) -> Self` — `egui-0.36.2/src/containers/area.rs:168`
   Change the [`UiKind`] of the arena.
-- `fn layer(&self) -> LayerId` — `egui-0.35.0/src/containers/area.rs:182`
-- `fn layout(self, layout: Layout) -> Self` — `egui-0.35.0/src/containers/area.rs:358`
+- `fn layer(&self) -> LayerId` — `egui-0.36.2/src/containers/area.rs:182`
+- `fn layout(self, layout: Layout) -> Self` — `egui-0.36.2/src/containers/area.rs:358`
   Set the layout for the child Ui.
-- `fn movable(self, movable: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:198`
+- `fn movable(self, movable: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:198`
   Moveable by dragging the area?
-- `fn new(id: Id) -> Self` — `egui-0.35.0/src/containers/area.rs:133`
+- `fn new(id: Id) -> Self` — `egui-0.36.2/src/containers/area.rs:133`
   The `id` must be globally unique.
-- `fn order(self, order: Order) -> Self` — `egui-0.35.0/src/containers/area.rs:235`
+- `fn order(self, order: Order) -> Self` — `egui-0.36.2/src/containers/area.rs:235`
   `order(Order::Foreground)` for an Area that should always be on top
-- `fn pivot(self, pivot: Align2) -> Self` — `egui-0.35.0/src/containers/area.rs:310`
+- `fn pivot(self, pivot: Align2) -> Self` — `egui-0.36.2/src/containers/area.rs:310`
   Where the "root" of the area is.
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/containers/area.rs:228`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/containers/area.rs:228`
   Explicitly set a sense.
-- `fn show<R>(self, ctx: &Context, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/area.rs:406`
-- `fn sizing_pass(self, resize: bool) -> Self` — `egui-0.35.0/src/containers/area.rs:379`
+- `fn show<R>(self, ctx: &Context, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/area.rs:406`
+- `fn sizing_pass(self, resize: bool) -> Self` — `egui-0.36.2/src/containers/area.rs:379`
   While true, a sizing pass will be done. This means the area will be invisible and the contents will be laid o…
 
 Implements: `Clone`, `Debug`, `WidgetWithState`
 
-### `AreaState` (struct) — `egui-0.35.0/src/containers/area.rs:18`
+### `AreaState` (struct) — `egui-0.36.2/src/containers/area.rs:18`
 
 State of an [`Area`] that is persisted between frames.
 
@@ -1351,18 +1355,18 @@ Public fields:
 
 Methods:
 
-- `fn left_top_pos(&self) -> Pos2` — `egui-0.35.0/src/containers/area.rs:64`
+- `fn left_top_pos(&self) -> Pos2` — `egui-0.36.2/src/containers/area.rs:64`
   The left top positions of the area.
-- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.35.0/src/containers/area.rs:58`
+- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.36.2/src/containers/area.rs:58`
   Load the state of an [`Area`] from memory.
-- `fn rect(&self) -> Rect` — `egui-0.35.0/src/containers/area.rs:84`
+- `fn rect(&self) -> Rect` — `egui-0.36.2/src/containers/area.rs:84`
   Where the area is on screen.
-- `fn set_left_top_pos(&mut self, pos: Pos2)` — `egui-0.35.0/src/containers/area.rs:75`
+- `fn set_left_top_pos(&mut self, pos: Pos2)` — `egui-0.36.2/src/containers/area.rs:75`
   Move the left top positions of the area.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
-### `Atom` (struct) — `egui-0.35.0/src/atomics/atom.rs:32`
+### `Atom` (struct) — `egui-0.36.2/src/atomics/atom.rs:32`
 
 A low-level ui building block.
 
@@ -1378,18 +1382,18 @@ Public fields:
 
 Methods:
 
-- `fn custom(id: Id, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/atomics/atom.rs:97`
+- `fn custom(id: Id, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/atomics/atom.rs:97`
   Create an [`AtomKind::Empty`] with a specific size.
-- `fn grow() -> Self` — `egui-0.35.0/src/atomics/atom.rs:74`
+- `fn grow() -> Self` — `egui-0.36.2/src/atomics/atom.rs:74`
   Create an empty [`Atom`] marked as `grow`.
-- `fn into_sized(self, ui: &Ui, available_size: Vec2, wrap_mode: Option<TextWrapMode>, fallback_font: FontSelection) -> SizedAtom<'a>` — `egui-0.35.0/src/atomics/atom.rs:118`
+- `fn into_sized(self, ui: &Ui, available_size: Vec2, wrap_mode: Option<TextWrapMode>, fallback_font: FontSelection) -> SizedAtom<'a>` — `egui-0.36.2/src/atomics/atom.rs:118`
   Turn this into a [`SizedAtom`].
-- `fn layout(layout: AtomLayout<'a>) -> Self` — `egui-0.35.0/src/atomics/atom.rs:110`
+- `fn layout(layout: AtomLayout<'a>) -> Self` — `egui-0.36.2/src/atomics/atom.rs:110`
   Nest an [`AtomLayout`] (e.g. an atom-based widget) as a single atom.
 
 Implements: `Clone`, `Debug`, `Default`, `From<T>`
 
-### `AtomLayout` (struct) — `egui-0.35.0/src/atomics/atom_layout.rs:60`
+### `AtomLayout` (struct) — `egui-0.36.2/src/atomics/atom_layout.rs:60`
 
 Intra-widget layout utility.
 
@@ -1399,45 +1403,45 @@ Public fields:
 
 Methods:
 
-- `fn align2(self, align2: Align2) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:215`
+- `fn align2(self, align2: Align2) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:215`
   Set the [`Align2`].
-- `fn allocate(self, ui: &mut Ui) -> AllocatedAtomLayout<'a>` — `egui-0.35.0/src/atomics/atom_layout.rs:434`
+- `fn allocate(self, ui: &mut Ui) -> AllocatedAtomLayout<'a>` — `egui-0.36.2/src/atomics/atom_layout.rs:434`
   Calculate sizes, create [`Galley`]s and allocate a [`Response`].
-- `fn direction(self, direction: Direction) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:229`
+- `fn direction(self, direction: Direction) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:229`
   Set the [`Direction`] the [`crate::Atom`]s are laid out along.
-- `fn fallback_font(self, font: impl Into<FontSelection>) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:147`
+- `fn fallback_font(self, font: impl Into<FontSelection>) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:147`
   Set the fallback (default) font.
-- `fn fallback_text_color(self, color: Color32) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:140`
+- `fn fallback_text_color(self, color: Color32) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:140`
   Set the fallback (default) text color.
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:112`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:112`
   Set the [`Frame`].
-- `fn gap(self, gap: f32) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:105`
+- `fn gap(self, gap: f32) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:105`
   Set the gap between atoms.
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:191`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:191`
   Set the [`Id`] used to allocate a [`Response`].
-- `fn max_height(self, height: f32) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:184`
+- `fn max_height(self, height: f32) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:184`
   Set the maximum height of the Widget.
-- `fn max_size(self, size: Vec2) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:166`
+- `fn max_size(self, size: Vec2) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:166`
   Set the maximum size of the Widget.
-- `fn max_width(self, width: f32) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:175`
+- `fn max_width(self, width: f32) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:175`
   Set the maximum width of the Widget.
-- `fn measure(self, ui: &Ui, available_size: Vec2) -> SizedAtomLayout<'a>` — `egui-0.35.0/src/atomics/atom_layout.rs:250`
+- `fn measure(self, ui: &Ui, available_size: Vec2) -> SizedAtomLayout<'a>` — `egui-0.36.2/src/atomics/atom_layout.rs:250`
   Measure the atoms (sizing only), without allocating space or interacting.
-- `fn min_size(self, size: Vec2) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:157`
+- `fn min_size(self, size: Vec2) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:157`
   Set the minimum size of the Widget.
-- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:83`
-- `fn selectable(self, selectable: bool) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:131`
+- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:83`
+- `fn selectable(self, selectable: bool) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:131`
   Make the text in this layout selectable with the mouse.
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:119`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:119`
   Set the [`Sense`] used when allocating the [`Response`].
-- `fn show(self, ui: &mut Ui) -> AtomLayoutResponse` — `egui-0.35.0/src/atomics/atom_layout.rs:235`
+- `fn show(self, ui: &mut Ui) -> AtomLayoutResponse` — `egui-0.36.2/src/atomics/atom_layout.rs:235`
   [`AtomLayout::allocate`] and [`AllocatedAtomLayout::paint`] in one go.
-- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:202`
+- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:202`
   Set the [`TextWrapMode`] for the [`crate::Atom`] marked as `shrink`.
 
 Implements: `Clone`, `Default`, `Deref`, `DerefMut`, `From<AtomLayout<'a>>`, `Widget`
 
-### `AtomLayoutResponse` (struct) — `egui-0.35.0/src/atomics/atom_layout.rs:701`
+### `AtomLayoutResponse` (struct) — `egui-0.36.2/src/atomics/atom_layout.rs:701`
 
 Response from a [`AtomLayout::show`] or [`AllocatedAtomLayout::paint`].
 
@@ -1447,137 +1451,137 @@ Public fields:
 
 Methods:
 
-- `fn custom_rects(&self) -> impl Iterator<Item = (Id, Rect)> + '_` — `egui-0.35.0/src/atomics/atom_layout.rs:715`
-- `fn empty(response: Response) -> Self` — `egui-0.35.0/src/atomics/atom_layout.rs:708`
-- `fn rect(&self, id: Id) -> Option<Rect>` — `egui-0.35.0/src/atomics/atom_layout.rs:722`
+- `fn custom_rects(&self) -> impl Iterator<Item = (Id, Rect)> + '_` — `egui-0.36.2/src/atomics/atom_layout.rs:715`
+- `fn empty(response: Response) -> Self` — `egui-0.36.2/src/atomics/atom_layout.rs:708`
+- `fn rect(&self, id: Id) -> Option<Rect>` — `egui-0.36.2/src/atomics/atom_layout.rs:722`
   Use this together with [`crate::Atom::custom`] to add custom painting / child widgets.
 
 Implements: `Clone`, `Debug`, `Deref`, `DerefMut`
 
-### `Atoms` (struct) — `egui-0.35.0/src/atomics/atoms.rs:16`
+### `Atoms` (struct) — `egui-0.36.2/src/atomics/atoms.rs:16`
 
 A list of [`Atom`]s.
 
 Methods:
 
-- `fn any_shrink(&self) -> bool` — `egui-0.35.0/src/atomics/atoms.rs:77`
+- `fn any_shrink(&self) -> bool` — `egui-0.36.2/src/atomics/atoms.rs:77`
   Do any of the atoms have shrink set to `true`?
-- `fn extend_left(&mut self, atoms: Self)` — `egui-0.35.0/src/atomics/atoms.rs:43`
+- `fn extend_left(&mut self, atoms: Self)` — `egui-0.36.2/src/atomics/atoms.rs:43`
   Extend the list of atoms by prepending more atoms to the left side.
-- `fn extend_right(&mut self, atoms: Self)` — `egui-0.35.0/src/atomics/atoms.rs:31`
+- `fn extend_right(&mut self, atoms: Self)` — `egui-0.36.2/src/atomics/atoms.rs:31`
   Extend the list of atoms by appending more atoms to the right side.
-- `fn iter_images(&self) -> impl Iterator<Item = &Image<'a>>` — `egui-0.35.0/src/atomics/atoms.rs:89`
-- `fn iter_images_mut(&mut self) -> impl Iterator<Item = &mut Image<'a>>` — `egui-0.35.0/src/atomics/atoms.rs:99`
-- `fn iter_kinds(&self) -> impl Iterator<Item = &AtomKind<'a>>` — `egui-0.35.0/src/atomics/atoms.rs:81`
-- `fn iter_kinds_mut(&mut self) -> impl Iterator<Item = &mut AtomKind<'a>>` — `egui-0.35.0/src/atomics/atoms.rs:85`
-- `fn iter_texts(&self) -> impl Iterator<Item = &WidgetText> + ?` — `egui-0.35.0/src/atomics/atoms.rs:109`
-- `fn iter_texts_mut(&mut self) -> impl Iterator<Item = &mut WidgetText> + ?` — `egui-0.35.0/src/atomics/atoms.rs:119`
-- `fn map_atoms(&mut self, f: impl FnMut(Atom<'a>) -> Atom<'a>)` — `egui-0.35.0/src/atomics/atoms.rs:129`
-- `fn map_images<F>(&mut self, f: F)` — `egui-0.35.0/src/atomics/atoms.rs:143`
-- `fn map_kind<F>(&mut self, f: F)` — `egui-0.35.0/src/atomics/atoms.rs:134`
-- `fn map_texts<F>(&mut self, f: F)` — `egui-0.35.0/src/atomics/atoms.rs:156`
-- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/atomics/atoms.rs:19`
-- `fn push_left(&mut self, atom: impl Into<Atom<'a>>)` — `egui-0.35.0/src/atomics/atoms.rs:36`
+- `fn iter_images(&self) -> impl Iterator<Item = &Image<'a>>` — `egui-0.36.2/src/atomics/atoms.rs:89`
+- `fn iter_images_mut(&mut self) -> impl Iterator<Item = &mut Image<'a>>` — `egui-0.36.2/src/atomics/atoms.rs:99`
+- `fn iter_kinds(&self) -> impl Iterator<Item = &AtomKind<'a>>` — `egui-0.36.2/src/atomics/atoms.rs:81`
+- `fn iter_kinds_mut(&mut self) -> impl Iterator<Item = &mut AtomKind<'a>>` — `egui-0.36.2/src/atomics/atoms.rs:85`
+- `fn iter_texts(&self) -> impl Iterator<Item = &WidgetText> + ?` — `egui-0.36.2/src/atomics/atoms.rs:109`
+- `fn iter_texts_mut(&mut self) -> impl Iterator<Item = &mut WidgetText> + ?` — `egui-0.36.2/src/atomics/atoms.rs:119`
+- `fn map_atoms(&mut self, f: impl FnMut(Atom<'a>) -> Atom<'a>)` — `egui-0.36.2/src/atomics/atoms.rs:129`
+- `fn map_images<F>(&mut self, f: F)` — `egui-0.36.2/src/atomics/atoms.rs:143`
+- `fn map_kind<F>(&mut self, f: F)` — `egui-0.36.2/src/atomics/atoms.rs:134`
+- `fn map_texts<F>(&mut self, f: F)` — `egui-0.36.2/src/atomics/atoms.rs:156`
+- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/atomics/atoms.rs:19`
+- `fn push_left(&mut self, atom: impl Into<Atom<'a>>)` — `egui-0.36.2/src/atomics/atoms.rs:36`
   Insert a new [`Atom`] at the beginning of the list (left side).
-- `fn push_right(&mut self, atom: impl Into<Atom<'a>>)` — `egui-0.35.0/src/atomics/atoms.rs:24`
+- `fn push_right(&mut self, atom: impl Into<Atom<'a>>)` — `egui-0.36.2/src/atomics/atoms.rs:24`
   Insert a new [`Atom`] at the end of the list (right side).
-- `fn text(&self) -> Option<Cow<'_, str>>` — `egui-0.35.0/src/atomics/atoms.rs:51`
+- `fn text(&self) -> Option<Cow<'_, str>>` — `egui-0.36.2/src/atomics/atoms.rs:51`
   Concatenate and return the text contents.
 
 Implements: `Clone`, `Debug`, `Default`, `Deref`, `DerefMut`, `From<&[T]>`, `From<Vec<T>>`, `FromIterator<Item>`, `IntoAtoms<'a>`, `IntoIterator`
 
-### `Button` (struct) — `egui-0.35.0/src/widgets/button.rs:29`
+### `Button` (struct) — `egui-0.36.2/src/widgets/button.rs:29`
 
 Clickable button with text.
 
 Methods:
 
-- `fn atom_ui(self, ui: &mut Ui) -> AtomLayoutResponse` — `egui-0.35.0/src/widgets/button.rs:290`
+- `fn atom_ui(self, ui: &mut Ui) -> AtomLayoutResponse` — `egui-0.36.2/src/widgets/button.rs:290`
   Show the button and return a [`AtomLayoutResponse`] for painting custom contents.
-- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.35.0/src/widgets/button.rs:285`
+- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.36.2/src/widgets/button.rs:285`
   Output the button's [`Atoms`].
-- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.35.0/src/widgets/button.rs:200`
+- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.36.2/src/widgets/button.rs:200`
   Set the rounding of the button.
-- `fn fill(self, fill: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widgets/button.rs:143`
+- `fn fill(self, fill: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widgets/button.rs:143`
   Override background fill color. Note that this will override any on-hover effects. Calling this will also tur…
-- `fn frame(self, frame: bool) -> Self` — `egui-0.35.0/src/widgets/button.rs:166`
+- `fn frame(self, frame: bool) -> Self` — `egui-0.36.2/src/widgets/button.rs:166`
   Turn off the frame
-- `fn frame_when_inactive(self, frame_when_inactive: bool) -> Self` — `egui-0.35.0/src/widgets/button.rs:178`
+- `fn frame_when_inactive(self, frame_when_inactive: bool) -> Self` — `egui-0.36.2/src/widgets/button.rs:178`
   If `false`, the button will not have a frame when inactive.
-- `fn gap(self, gap: f32) -> Self` — `egui-0.35.0/src/widgets/button.rs:277`
+- `fn gap(self, gap: f32) -> Self` — `egui-0.36.2/src/widgets/button.rs:277`
   Set the gap between atoms.
-- `fn image(image: impl Into<Image<'a>>) -> Self` — `egui-0.35.0/src/widgets/button.rs:89`
+- `fn image(image: impl Into<Image<'a>>) -> Self` — `egui-0.36.2/src/widgets/button.rs:89`
   Creates a button with an image. The size of the image as displayed is defined by the provided size.
-- `fn image_and_text(image: impl Into<Image<'a>>, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/button.rs:97`
+- `fn image_and_text(image: impl Into<Image<'a>>, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/button.rs:97`
   Creates a button with an image to the left of the text.
-- `fn image_tint_follows_text_color(self, image_tint_follows_text_color: bool) -> Self` — `egui-0.35.0/src/widgets/button.rs:212`
+- `fn image_tint_follows_text_color(self, image_tint_follows_text_color: bool) -> Self` — `egui-0.36.2/src/widgets/button.rs:212`
   If true, the tint of the image is multiplied by the widget text color.
-- `fn left_text(self, left_text: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/button.rs:241`
+- `fn left_text(self, left_text: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/button.rs:241`
   Show some text on the left side of the button.
-- `fn min_size(self, min_size: Vec2) -> Self` — `egui-0.35.0/src/widgets/button.rs:193`
+- `fn min_size(self, min_size: Vec2) -> Self` — `egui-0.36.2/src/widgets/button.rs:193`
   Set the minimum size of the button.
-- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/button.rs:45`
-- `fn opt_image_and_text(image: Option<Image<'a>>, text: Option<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/button.rs:105`
+- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/button.rs:45`
+- `fn opt_image_and_text(image: Option<Image<'a>>, text: Option<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/button.rs:105`
   Create a button with an optional image and optional text.
-- `fn right_text(self, right_text: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/button.rs:253`
+- `fn right_text(self, right_text: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/button.rs:253`
   Show some text on the right side of the button.
-- `fn selectable(selected: bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/button.rs:78`
+- `fn selectable(selected: bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/button.rs:78`
   Show a selectable button.
-- `fn selected(self, selected: bool) -> Self` — `egui-0.35.0/src/widgets/button.rs:270`
+- `fn selected(self, selected: bool) -> Self` — `egui-0.36.2/src/widgets/button.rs:270`
   If `true`, mark this button as "selected".
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/widgets/button.rs:186`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/widgets/button.rs:186`
   By default, buttons senses clicks. Change this to a drag-button with `Sense::drag()`.
-- `fn shortcut_text(self, shortcut_text: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/button.rs:225`
+- `fn shortcut_text(self, shortcut_text: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/button.rs:225`
   Show some text on the right side of the button, in weak color.
-- `fn small(self) -> Self` — `egui-0.35.0/src/widgets/button.rs:159`
+- `fn small(self) -> Self` — `egui-0.36.2/src/widgets/button.rs:159`
   Make this a small button, suitable for embedding into text.
-- `fn stroke(self, stroke: impl Into<Stroke>) -> Self` — `egui-0.35.0/src/widgets/button.rs:151`
+- `fn stroke(self, stroke: impl Into<Stroke>) -> Self` — `egui-0.36.2/src/widgets/button.rs:151`
   Override button stroke. Note that this will override any on-hover effects. Calling this will also turn on the…
-- `fn truncate(self) -> Self` — `egui-0.35.0/src/widgets/button.rs:136`
+- `fn truncate(self) -> Self` — `egui-0.36.2/src/widgets/button.rs:136`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Truncate`].
-- `fn wrap(self) -> Self` — `egui-0.35.0/src/widgets/button.rs:130`
+- `fn wrap(self) -> Self` — `egui-0.36.2/src/widgets/button.rs:130`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Wrap`].
-- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.35.0/src/widgets/button.rs:123`
+- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.36.2/src/widgets/button.rs:123`
   Set the wrap mode for the text.
 
 Implements: `HasClasses`, `Widget`
 
-### `CentralPanel` (struct) — `egui-0.35.0/src/containers/panel.rs:1039`
+### `CentralPanel` (struct) — `egui-0.36.2/src/containers/panel.rs:1187`
 
 A panel that covers the remainder of the screen, i.e. whatever area is left after adding other panels.
 
 Methods:
 
-- `fn default_margins() -> Self` — `egui-0.35.0/src/containers/panel.rs:1052`
+- `fn default_margins() -> Self` — `egui-0.36.2/src/containers/panel.rs:1200`
   A central panel with a background color and some inner margins
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/containers/panel.rs:1058`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/panel.rs:1206`
   Change the background color, margins, etc.
-- `fn no_frame() -> Self` — `egui-0.35.0/src/containers/panel.rs:1045`
+- `fn no_frame() -> Self` — `egui-0.36.2/src/containers/panel.rs:1193`
   A central panel with no margin or background color
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:1064`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:1212`
   Show the panel inside a [`Ui`].
-- `fn show_inside<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:1070`
+- `fn show_inside<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:1218`
   Renamed to [`Self::show`].
   **DEPRECATED**: Renamed to `show`
 
 Implements: `Default`
 
-### `Checkbox` (struct) — `egui-0.35.0/src/widgets/checkbox.rs:23`
+### `Checkbox` (struct) — `egui-0.36.2/src/widgets/checkbox.rs:23`
 
 Boolean on/off control with text label.
 
 Methods:
 
-- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.35.0/src/widgets/checkbox.rs:47`
+- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.36.2/src/widgets/checkbox.rs:47`
   Output the checkbox's [`Atoms`].
-- `fn indeterminate(self, indeterminate: bool) -> Self` — `egui-0.35.0/src/widgets/checkbox.rs:56`
+- `fn indeterminate(self, indeterminate: bool) -> Self` — `egui-0.36.2/src/widgets/checkbox.rs:56`
   Display an indeterminate state (neither checked nor unchecked)
-- `fn new(checked: &'a mut bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/checkbox.rs:31`
-- `fn without_text(checked: &'a mut bool) -> Self` — `egui-0.35.0/src/widgets/checkbox.rs:40`
+- `fn new(checked: &'a mut bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/checkbox.rs:31`
+- `fn without_text(checked: &'a mut bool) -> Self` — `egui-0.36.2/src/widgets/checkbox.rs:40`
 
 Implements: `HasClasses`, `Widget`
 
-### `ClippedPrimitive` (struct) — `epaint-0.35.0/src/lib.rs:142`
+### `ClippedPrimitive` (struct) — `epaint-0.36.2/src/lib.rs:142`
 
 A [`Mesh`] or [`PaintCallback`] within a clip rectangle.
 
@@ -1588,7 +1592,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`
 
-### `ClosableTag` (struct) — `egui-0.35.0/src/containers/close_tag.rs:12`
+### `ClosableTag` (struct) — `egui-0.36.2/src/containers/close_tag.rs:12`
 
 A tag to mark a container as closable.
 
@@ -1598,37 +1602,37 @@ Public fields:
 
 Methods:
 
-- `fn set_close(&self)` — `egui-0.35.0/src/containers/close_tag.rs:20`
+- `fn set_close(&self)` — `egui-0.36.2/src/containers/close_tag.rs:20`
   Set close to `true`
-- `fn should_close(&self) -> bool` — `egui-0.35.0/src/containers/close_tag.rs:25`
+- `fn should_close(&self) -> bool` — `egui-0.36.2/src/containers/close_tag.rs:26`
   Returns `true` if [`ClosableTag::set_close`] has been called.
 
 Implements: `Debug`, `Default`
 
-### `CollapsingHeader` (struct) — `egui-0.35.0/src/containers/collapsing_header.rs:377`
+### `CollapsingHeader` (struct) — `egui-0.36.2/src/containers/collapsing_header.rs:377`
 
 A header which can be collapsed/expanded, revealing a contained [`Ui`] region.
 
 Methods:
 
-- `fn default_open(self, open: bool) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:415`
+- `fn default_open(self, open: bool) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:415`
   By default, the [`CollapsingHeader`] is collapsed. Call `.default_open(true)` to change this.
-- `fn enabled(self, enabled: bool) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:443`
+- `fn enabled(self, enabled: bool) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:443`
   If you set this to `false`, the [`CollapsingHeader`] will be grayed out and un-clickable.
-- `fn icon(self, icon_fn: impl FnOnce(&mut Ui, f32, &Response) + 'static) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:480`
+- `fn icon(self, icon_fn: impl FnOnce(&mut Ui, f32, &Response) + 'static) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:480`
   Use the provided function to render a different [`CollapsingHeader`] icon. Defaults to a triangle that animat…
-- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:434`
+- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:434`
   Explicitly set the source of the [`Id`] of this widget, instead of using title label. This is useful if the t…
-- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:396`
+- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:396`
   The [`CollapsingHeader`] starts out collapsed unless you call `default_open`.
-- `fn open(self, open: Option<bool>) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:426`
+- `fn open(self, open: Option<bool>) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:426`
   Calling `.open(Some(true))` will make the collapsing header open this frame (or stay open).
-- `fn show<R>(self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.35.0/src/containers/collapsing_header.rs:609`
-- `fn show_background(self, show_background: bool) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:457`
+- `fn show<R>(self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.36.2/src/containers/collapsing_header.rs:609`
+- `fn show_background(self, show_background: bool) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:457`
   Should the [`CollapsingHeader`] show a background behind it? Default: `false`.
-- `fn show_unindented<R>(self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.35.0/src/containers/collapsing_header.rs:618`
+- `fn show_unindented<R>(self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.36.2/src/containers/collapsing_header.rs:618`
 
-### `CollapsingResponse` (struct) — `egui-0.35.0/src/containers/collapsing_header.rs:672`
+### `CollapsingResponse` (struct) — `egui-0.36.2/src/containers/collapsing_header.rs:672`
 
 The response from showing a [`CollapsingHeader`].
 
@@ -1641,78 +1645,78 @@ Public fields:
 
 Methods:
 
-- `fn fully_closed(&self) -> bool` — `egui-0.35.0/src/containers/collapsing_header.rs:688`
+- `fn fully_closed(&self) -> bool` — `egui-0.36.2/src/containers/collapsing_header.rs:688`
   Was the [`CollapsingHeader`] fully closed (and not being animated)?
-- `fn fully_open(&self) -> bool` — `egui-0.35.0/src/containers/collapsing_header.rs:693`
+- `fn fully_open(&self) -> bool` — `egui-0.36.2/src/containers/collapsing_header.rs:693`
   Was the [`CollapsingHeader`] fully open (and not being animated)?
 
-### `Color32` (struct) — `ecolor-0.35.0/src/color32.rs:31`
+### `Color32` (struct) — `ecolor-0.36.2/src/color32.rs:31`
 
 This format is used for space-efficient color representation (32 bits).
 
 Methods:
 
-- `const fn a(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:231`
+- `const fn a(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:206`
   Alpha (opacity).
-- `const fn additive(self) -> Self` — `ecolor-0.35.0/src/color32.rs:243`
+- `const fn additive(self) -> Self` — `ecolor-0.36.2/src/color32.rs:218`
   Returns an additive version of self
-- `const fn b(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:225`
+- `const fn b(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:200`
   Blue component multiplied by alpha.
-- `const fn from_additive_luminance(l: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:202`
+- `const fn from_additive_luminance(l: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:177`
   Additive white.
-- `const fn from_black_alpha(a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:190`
+- `const fn from_black_alpha(a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:165`
   Black with the given opacity.
-- `const fn from_gray(l: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:184`
+- `const fn from_gray(l: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:159`
   Opaque gray.
-- `const fn from_rgb(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:108`
+- `const fn from_rgb(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:108`
   From RGB with alpha of 255 (opaque).
-- `const fn from_rgb_additive(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:114`
+- `const fn from_rgb_additive(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:114`
   From RGB into an additive color (will make everything it blend with brighter).
-- `const fn from_rgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:122`
+- `const fn from_rgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:122`
   From `sRGBA` with premultiplied alpha.
-- `const fn from_rgba_unmultiplied_const(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:164`
-  Same as [`Self::from_rgba_unmultiplied`], but can be used in a const context.
-- `const fn g(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:219`
+- `const fn from_rgba_unmultiplied_const(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:139`
+  This is the same as [`Self::from_rgba_unmultiplied`], but for const contexts.
+- `const fn g(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:194`
   Green component multiplied by alpha.
-- `const fn is_opaque(&self) -> bool` — `ecolor-0.35.0/src/color32.rs:207`
-- `const fn r(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:213`
+- `const fn is_opaque(&self) -> bool` — `ecolor-0.36.2/src/color32.rs:182`
+- `const fn r(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:188`
   Red component multiplied by alpha.
-- `const fn to_array(&self) -> [u8; 4]` — `ecolor-0.35.0/src/color32.rs:256`
+- `const fn to_array(&self) -> [u8; 4]` — `ecolor-0.36.2/src/color32.rs:231`
   Premultiplied RGBA
-- `const fn to_tuple(&self) -> (u8, u8, u8, u8)` — `ecolor-0.35.0/src/color32.rs:262`
+- `const fn to_tuple(&self) -> (u8, u8, u8, u8)` — `ecolor-0.36.2/src/color32.rs:237`
   Premultiplied RGBA
-- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.35.0/src/color32.rs:368`
+- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.36.2/src/color32.rs:343`
   Blend two colors in gamma space, so that `self` is behind the argument.
-- `fn from_hex(hex: &str) -> Result<Self, ParseHexColorError>` — `ecolor-0.35.0/src/hex_color_runtime.rs:143`
+- `fn from_hex(hex: &str) -> Result<Self, ParseHexColorError>` — `ecolor-0.36.2/src/hex_color_runtime.rs:143`
   Parses a color from a hex string.
-- `fn from_rgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:133`
+- `fn from_rgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:133`
   From `sRGBA` with separate alpha.
-- `fn from_white_alpha(a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:196`
+- `fn from_white_alpha(a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:171`
   White with the given opacity.
-- `fn gamma_multiply(self, factor: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:294`
+- `fn gamma_multiply(self, factor: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:269`
   Multiply with 0.5 to make color half as opaque, perceptually.
-- `fn gamma_multiply_u8(self, factor: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:314`
+- `fn gamma_multiply_u8(self, factor: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:289`
   Multiply with 127 to make color half as opaque, perceptually.
-- `fn intensity(&self) -> f32` — `ecolor-0.35.0/src/color32.rs:376`
+- `fn intensity(&self) -> f32` — `ecolor-0.36.2/src/color32.rs:351`
   Intensity of the color.
-- `fn is_additive(self) -> bool` — `ecolor-0.35.0/src/color32.rs:250`
+- `fn is_additive(self) -> bool` — `ecolor-0.36.2/src/color32.rs:225`
   Is the alpha=0 ?
-- `fn lerp_to_gamma(&self, other: Self, t: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:356`
+- `fn lerp_to_gamma(&self, other: Self, t: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:331`
   Lerp this color towards `other` by `t` in gamma space.
-- `fn linear_multiply(self, factor: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:330`
+- `fn linear_multiply(self, factor: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:305`
   Multiply with 0.5 to make color half as opaque in linear space.
-- `fn to_hex(&self) -> String` — `ecolor-0.35.0/src/hex_color_runtime.rs:162`
+- `fn to_hex(&self) -> String` — `ecolor-0.36.2/src/hex_color_runtime.rs:162`
   Formats the color as a hex string.
-- `fn to_normalized_gamma_f32(self) -> [f32; 4]` — `ecolor-0.35.0/src/color32.rs:345`
+- `fn to_normalized_gamma_f32(self) -> [f32; 4]` — `ecolor-0.36.2/src/color32.rs:320`
   Converts to floating point values in the range 0-1 without any gamma space conversion.
-- `fn to_opaque(self) -> Self` — `ecolor-0.35.0/src/color32.rs:237`
+- `fn to_opaque(self) -> Self` — `ecolor-0.36.2/src/color32.rs:212`
   Returns an opaque version of self
-- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/color32.rs:273`
+- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/color32.rs:248`
   Convert to a normal "unmultiplied" RGBA color (i.e. with separate alpha).
 
 Implements: `Add`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `Hash`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `ColorImage` (struct) — `epaint-0.35.0/src/image.rs:48`
+### `ColorImage` (struct) — `epaint-0.36.2/src/image.rs:48`
 
 A 2D RGBA color image in RAM.
 
@@ -1724,399 +1728,401 @@ Public fields:
 
 Methods:
 
-- `fn as_raw(&self) -> &[u8]` — `epaint-0.35.0/src/image.rs:177`
+- `fn as_raw(&self) -> &[u8]` — `epaint-0.36.2/src/image.rs:177`
   A view of the underlying data as `&[u8]`
-- `fn as_raw_mut(&mut self) -> &mut [u8]` — `epaint-0.35.0/src/image.rs:183`
+- `fn as_raw_mut(&mut self) -> &mut [u8]` — `epaint-0.36.2/src/image.rs:183`
   A view of the underlying data as `&mut [u8]`
-- `fn example() -> Self` — `epaint-0.35.0/src/image.rs:209`
+- `fn example() -> Self` — `epaint-0.36.2/src/image.rs:209`
   An example color image, useful for tests.
-- `fn filled(size: [usize; 2], color: Color32) -> Self` — `epaint-0.35.0/src/image.rs:75`
+- `fn filled(size: [usize; 2], color: Color32) -> Self` — `epaint-0.36.2/src/image.rs:75`
   Create an image filled with the given color.
-- `fn from_gray(size: [usize; 2], gray: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:146`
+- `fn from_gray(size: [usize; 2], gray: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:146`
   Create a [`ColorImage`] from flat opaque gray data.
-- `fn from_gray_iter(size: [usize; 2], gray_iter: impl Iterator<Item = u8>) -> Self` — `epaint-0.35.0/src/image.rs:163`
+- `fn from_gray_iter(size: [usize; 2], gray_iter: impl Iterator<Item = u8>) -> Self` — `epaint-0.36.2/src/image.rs:163`
   Alternative method to `from_gray`. Create a [`ColorImage`] from iterator over flat opaque gray data.
-- `fn from_rgb(size: [usize; 2], rgb: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:193`
+- `fn from_rgb(size: [usize; 2], rgb: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:193`
   Create a [`ColorImage`] from flat RGB data.
-- `fn from_rgba_premultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:128`
-- `fn from_rgba_unmultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:113`
+- `fn from_rgba_premultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:128`
+- `fn from_rgba_unmultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:113`
   Create a [`ColorImage`] from flat un-multiplied RGBA data.
-- `fn height(&self) -> usize` — `epaint-0.35.0/src/image.rs:238`
-- `fn new(size: [usize; 2], pixels: Vec<Color32>) -> Self` — `epaint-0.35.0/src/image.rs:61`
+- `fn height(&self) -> usize` — `epaint-0.36.2/src/image.rs:238`
+- `fn new(size: [usize; 2], pixels: Vec<Color32>) -> Self` — `epaint-0.36.2/src/image.rs:61`
   Create an image filled with the given color.
-- `fn region(&self, region: &Rect, pixels_per_point: Option<f32>) -> Self` — `epaint-0.35.0/src/image.rs:249`
+- `fn region(&self, region: &Rect, pixels_per_point: Option<f32>) -> Self` — `epaint-0.36.2/src/image.rs:249`
   Create a new image from a patch of the current image.
-- `fn region_by_pixels(&self, [x, y]: [usize; 2], [w, h]: [usize; 2]) -> Self` — `epaint-0.35.0/src/image.rs:273`
+- `fn region_by_pixels(&self, [x, y]: [usize; 2], [w, h]: [usize; 2]) -> Self` — `epaint-0.36.2/src/image.rs:273`
   Clone a sub-region as a new image.
-- `fn width(&self) -> usize` — `epaint-0.35.0/src/image.rs:233`
-- `fn with_source_size(self, source_size: Vec2) -> Self` — `epaint-0.35.0/src/image.rs:227`
+- `fn width(&self) -> usize` — `epaint-0.36.2/src/image.rs:233`
+- `fn with_source_size(self, source_size: Vec2) -> Self` — `epaint-0.36.2/src/image.rs:227`
   Set the source size of e.g. the original SVG image.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<ColorImage>`, `Index<(usize, usize)>`, `IndexMut<(usize, usize)>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ComboBox` (struct) — `egui-0.35.0/src/containers/combo_box.rs:40`
+### `ComboBox` (struct) — `egui-0.36.2/src/containers/combo_box.rs:40`
 
 A drop-down selection menu with a descriptive label.
 
 Methods:
 
-- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:189`
+- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:189`
   Controls the close behavior for the popup.
-- `fn from_id_salt(id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:85`
+- `fn from_id_salt(id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:85`
   Without label.
-- `fn from_label(label: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:69`
+- `fn from_label(label: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:69`
   Label shown next to the combo box
-- `fn height(self, height: f32) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:112`
+- `fn height(self, height: f32) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:112`
   Set the maximum outer height of the menu.
-- `fn icon(self, icon_fn: impl FnOnce(&Ui, Rect, &WidgetVisuals, bool) + 'static) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:155`
+- `fn icon(self, icon_fn: impl FnOnce(&Ui, Rect, &WidgetVisuals, bool) + 'static) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:155`
   Use the provided function to render a different [`ComboBox`] icon. Defaults to a triangle that expands when t…
-- `fn is_open(ctx: &Context, id: Id) -> bool` — `egui-0.35.0/src/containers/combo_box.rs:309`
+- `fn is_open(ctx: &Context, id: Id) -> bool` — `egui-0.36.2/src/containers/combo_box.rs:309`
   Check if the [`ComboBox`] with the given id has its popup menu currently opened.
-- `fn new(id_salt: impl AsIdSalt, label: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:54`
+- `fn new(id_salt: impl AsIdSalt, label: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:54`
   Create new [`ComboBox`] with id and label
-- `fn popup_style(self, popup_style: StyleModifier) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:199`
+- `fn popup_style(self, popup_style: StyleModifier) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:199`
   Set the style of the popup menu.
-- `fn selected_text(self, selected_text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:119`
+- `fn selected_text(self, selected_text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:119`
   What we show as the currently selected value
-- `fn show_index<Text>(self, ui: &mut Ui, selected: &mut usize, len: usize, get: impl Fn(usize) -> Text) -> Response` — `egui-0.35.0/src/containers/combo_box.rs:280`
+- `fn show_index<Text>(self, ui: &mut Ui, selected: &mut usize, len: usize, get: impl Fn(usize) -> Text) -> Response` — `egui-0.36.2/src/containers/combo_box.rs:280`
   Show a list of items with the given selected index.
-- `fn show_ui<R>(self, ui: &mut Ui, menu_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.35.0/src/containers/combo_box.rs:207`
+- `fn show_ui<R>(self, ui: &mut Ui, menu_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.36.2/src/containers/combo_box.rs:207`
   Show the combo box, with the given ui code for the menu contents.
-- `fn truncate(self) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:180`
+- `fn truncate(self) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:180`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Truncate`].
-- `fn width(self, width: f32) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:103`
+- `fn width(self, width: f32) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:103`
   Set the outer width of the button and menu.
-- `fn wrap(self) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:173`
+- `fn wrap(self) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:173`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Wrap`].
-- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.35.0/src/containers/combo_box.rs:166`
+- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.36.2/src/containers/combo_box.rs:166`
   Controls the wrap mode used for the selected text.
 
-### `Context` (struct) — `egui-0.35.0/src/context.rs:710`
+### `Context` (struct) — `egui-0.36.2/src/context.rs:723`
 
 Your handle to egui.
 
 Methods:
 
-- `fn accesskit_node_builder<R>(&self, id: Id, writer: impl FnOnce(&mut Node) -> R) -> Option<R>` — `egui-0.35.0/src/context.rs:3582`
+- `fn accesskit_node_builder<R>(&self, id: Id, writer: impl FnOnce(&mut Node) -> R) -> Option<R>` — `egui-0.36.2/src/context.rs:3684`
   If AccessKit support is active for the current frame, get or create a node builder with the specified ID and…
-- `fn add_bytes_loader(&self, loader: Arc<dyn BytesLoader + Send + Sync + 'static>)` — `egui-0.35.0/src/context.rs:3636`
+- `fn add_bytes_loader(&self, loader: Arc<dyn BytesLoader + Send + Sync + 'static>)` — `egui-0.36.2/src/context.rs:3738`
   Add a new bytes loader.
-- `fn add_font(&self, new_font: FontInsert)` — `egui-0.35.0/src/context.rs:2061`
+- `fn add_font(&self, new_font: FontInsert)` — `egui-0.36.2/src/context.rs:2129`
   Tell `egui` which fonts to use.
-- `fn add_image_loader(&self, loader: Arc<dyn ImageLoader + Send + Sync + 'static>)` — `egui-0.35.0/src/context.rs:3645`
+- `fn add_image_loader(&self, loader: Arc<dyn ImageLoader + Send + Sync + 'static>)` — `egui-0.36.2/src/context.rs:3747`
   Add a new image loader.
-- `fn add_plugin(&self, plugin: impl Plugin + 'static)` — `egui-0.35.0/src/context.rs:1979`
+- `fn add_plugin(&self, plugin: impl Plugin + 'static)` — `egui-0.36.2/src/context.rs:2047`
   Register a [`Plugin`](plugin::Plugin)
-- `fn add_texture_loader(&self, loader: Arc<dyn TextureLoader + Send + Sync + 'static>)` — `egui-0.35.0/src/context.rs:3654`
+- `fn add_texture_loader(&self, loader: Arc<dyn TextureLoader + Send + Sync + 'static>)` — `egui-0.36.2/src/context.rs:3756`
   Add a new texture loader.
-- `fn all_styles_mut(&self, mutate_style: impl FnMut(&mut Style))` — `egui-0.35.0/src/context.rs:2145`
+- `fn all_styles_mut(&self, mutate_style: impl FnMut(&mut Style))` — `egui-0.36.2/src/context.rs:2213`
   Mutate the [`Style`]s used by all subsequent popups, menus, etc. in both dark and light mode.
-- `fn animate_bool(&self, id: Id, value: bool) -> f32` — `egui-0.35.0/src/context.rs:3089`
+- `fn animate_bool(&self, id: Id, value: bool) -> f32` — `egui-0.36.2/src/context.rs:3191`
   Returns a value in the range [0, 1], to indicate "how on" this thing is.
-- `fn animate_bool_responsive(&self, id: Id, value: bool) -> f32` — `egui-0.35.0/src/context.rs:3099`
+- `fn animate_bool_responsive(&self, id: Id, value: bool) -> f32` — `egui-0.36.2/src/context.rs:3201`
   Like [`Self::animate_bool`], but uses an easing function that makes the value move quickly in the beginning a…
-- `fn animate_bool_with_easing(&self, id: Id, value: bool, easing: fn(f32) -> f32) -> f32` — `egui-0.35.0/src/context.rs:3105`
+- `fn animate_bool_with_easing(&self, id: Id, value: bool, easing: fn(f32) -> f32) -> f32` — `egui-0.36.2/src/context.rs:3207`
   Like [`Self::animate_bool`] but allows you to control the easing function.
-- `fn animate_bool_with_time(&self, id: Id, target_value: bool, animation_time: f32) -> f32` — `egui-0.35.0/src/context.rs:3112`
+- `fn animate_bool_with_time(&self, id: Id, target_value: bool, animation_time: f32) -> f32` — `egui-0.36.2/src/context.rs:3214`
   Like [`Self::animate_bool`] but allows you to control the animation time.
-- `fn animate_bool_with_time_and_easing(&self, id: Id, target_value: bool, animation_time: f32, easing: fn(f32) -> f32) -> f32` — `egui-0.35.0/src/context.rs:3129`
+- `fn animate_bool_with_time_and_easing(&self, id: Id, target_value: bool, animation_time: f32, easing: fn(f32) -> f32) -> f32` — `egui-0.36.2/src/context.rs:3231`
   Like [`Self::animate_bool`] but allows you to control the animation time and easing function.
-- `fn animate_value_with_time(&self, id: Id, target_value: f32, animation_time: f32) -> f32` — `egui-0.35.0/src/context.rs:3162`
+- `fn animate_value_with_time(&self, id: Id, target_value: f32, animation_time: f32) -> f32` — `egui-0.36.2/src/context.rs:3264`
   Smoothly animate an `f32` value.
-- `fn any_popup_open(&self) -> bool` — `egui-0.35.0/src/context.rs:2910`
+- `fn any_popup_open(&self) -> bool` — `egui-0.36.2/src/context.rs:3012`
   Is a popup or (context) menu open?
-- `fn begin_pass(&self, new_input: RawInput)` — `egui-0.35.0/src/context.rs:896`
+- `fn begin_pass(&self, new_input: RawInput)` — `egui-0.36.2/src/context.rs:962`
   An alternative to calling [`Self::run_ui`].
-- `fn check_for_id_clash(&self, id: Id, new_rect: Rect, what: &str)` — `egui-0.35.0/src/context.rs:1097`
+- `fn check_for_id_clash(&self, id: Id, new_rect: Rect, what: &str)` — `egui-0.36.2/src/context.rs:1163`
   If the given [`Id`] has been used previously the same pass at different position, then an error will be print…
-- `fn clear_animations(&self)` — `egui-0.35.0/src/context.rs:3180`
+- `fn clear_animations(&self)` — `egui-0.36.2/src/context.rs:3282`
   Clear memory of any animations.
-- `fn content_rect(&self) -> Rect` — `egui-0.35.0/src/context.rs:2805`
+- `fn content_rect(&self) -> Rect` — `egui-0.36.2/src/context.rs:2907`
   Returns the position and size of the egui area that is safe for content rendering.
-- `fn copy_image(&self, image: ColorImage)` — `egui-0.35.0/src/context.rs:1627`
+- `fn copy_image(&self, image: ColorImage)` — `egui-0.36.2/src/context.rs:1695`
   Copy the given image to the system clipboard.
-- `fn copy_text(&self, text: String)` — `egui-0.35.0/src/context.rs:1618`
+- `fn copy_text(&self, text: String)` — `egui-0.36.2/src/context.rs:1686`
   Copy the given text to the system clipboard.
-- `fn cumulative_frame_nr(&self) -> u64` — `egui-0.35.0/src/context.rs:1683`
+- `fn cumulative_frame_nr(&self) -> u64` — `egui-0.36.2/src/context.rs:1751`
   The total number of completed frames.
-- `fn cumulative_frame_nr_for(&self, id: ViewportId) -> u64` — `egui-0.35.0/src/context.rs:1692`
+- `fn cumulative_frame_nr_for(&self, id: ViewportId) -> u64` — `egui-0.36.2/src/context.rs:1760`
   The total number of completed frames.
-- `fn cumulative_pass_nr(&self) -> u64` — `egui-0.35.0/src/context.rs:1713`
+- `fn cumulative_pass_nr(&self) -> u64` — `egui-0.36.2/src/context.rs:1781`
   The total number of completed passes (usually there is one pass per rendered frame).
-- `fn cumulative_pass_nr_for(&self, id: ViewportId) -> u64` — `egui-0.35.0/src/context.rs:1720`
+- `fn cumulative_pass_nr_for(&self, id: ViewportId) -> u64` — `egui-0.36.2/src/context.rs:1788`
   The total number of completed passes (usually there is one pass per rendered frame).
-- `fn current_pass_index(&self) -> usize` — `egui-0.35.0/src/context.rs:1736`
+- `fn current_pass_index(&self) -> usize` — `egui-0.36.2/src/context.rs:1804`
   The index of the current pass in the current frame, starting at zero.
-- `fn data<R>(&self, reader: impl FnOnce(&IdTypeMap) -> R) -> R` — `egui-0.35.0/src/context.rs:961`
+- `fn data<R>(&self, reader: impl FnOnce(&IdTypeMap) -> R) -> R` — `egui-0.36.2/src/context.rs:1027`
   Read-only access to [`IdTypeMap`], which stores superficial widget state.
-- `fn data_mut<R>(&self, writer: impl FnOnce(&mut IdTypeMap) -> R) -> R` — `egui-0.35.0/src/context.rs:967`
+- `fn data_mut<R>(&self, writer: impl FnOnce(&mut IdTypeMap) -> R) -> R` — `egui-0.36.2/src/context.rs:1033`
   Read-write access to [`IdTypeMap`], which stores superficial widget state.
-- `fn debug_on_hover(&self) -> bool` — `egui-0.35.0/src/context.rs:3066`
+- `fn debug_on_hover(&self) -> bool` — `egui-0.36.2/src/context.rs:3168`
   Whether or not to debug widget layout on hover.
-- `fn debug_painter(&self) -> Painter` — `egui-0.35.0/src/context.rs:1525`
+- `fn debug_painter(&self) -> Painter` — `egui-0.36.2/src/context.rs:1593`
   Paint on top of _everything_ else (even on top of tooltips and popups).
-- `fn debug_text(&self, text: impl Into<WidgetText>)` — `egui-0.35.0/src/context.rs:1543`
+- `fn debug_text(&self, text: impl Into<WidgetText>)` — `egui-0.36.2/src/context.rs:1611`
   Print this text next to the cursor at the end of the pass.
-- `fn disable_accesskit(&self)` — `egui-0.35.0/src/context.rs:3604`
+- `fn disable_accesskit(&self)` — `egui-0.36.2/src/context.rs:3706`
   Disable generation of AccessKit tree updates in all future frames.
-- `fn drag_started_id(&self) -> Option<Id>` — `egui-0.35.0/src/context.rs:4118`
+- `fn drag_started_id(&self) -> Option<Id>` — `egui-0.36.2/src/context.rs:4220`
   This widget just started being dragged this pass.
-- `fn drag_stopped_id(&self) -> Option<Id>` — `egui-0.35.0/src/context.rs:4123`
+- `fn drag_stopped_id(&self) -> Option<Id>` — `egui-0.36.2/src/context.rs:4225`
   This widget was being dragged, but was released this pass.
-- `fn dragged_id(&self) -> Option<Id>` — `egui-0.35.0/src/context.rs:4101`
+- `fn dragged_id(&self) -> Option<Id>` — `egui-0.36.2/src/context.rs:4203`
   The widget currently being dragged, if any.
-- `fn dragging_something_else(&self, not_this: Id) -> bool` — `egui-0.35.0/src/context.rs:4160`
+- `fn dragging_something_else(&self, not_this: Id) -> bool` — `egui-0.36.2/src/context.rs:4262`
   Is something else being dragged?
-- `fn egui_is_using_pointer(&self) -> bool` — `egui-0.35.0/src/context.rs:2879`
+- `fn egui_is_using_pointer(&self) -> bool` — `egui-0.36.2/src/context.rs:2981`
   Is egui currently using the pointer position (e.g. dragging a slider)?
-- `fn egui_wants_keyboard_input(&self) -> bool` — `egui-0.35.0/src/context.rs:2884`
+- `fn egui_wants_keyboard_input(&self) -> bool` — `egui-0.36.2/src/context.rs:2986`
   If `true`, egui is currently listening on text input (e.g. typing text in a [`crate::TextEdit`]).
-- `fn egui_wants_pointer_input(&self) -> bool` — `egui-0.35.0/src/context.rs:2871`
+- `fn egui_wants_pointer_input(&self) -> bool` — `egui-0.36.2/src/context.rs:2973`
   True if egui is currently interested in the pointer (mouse or touch).
-- `fn embed_viewports(&self) -> bool` — `egui-0.35.0/src/context.rs:3899`
+- `fn embed_viewports(&self) -> bool` — `egui-0.36.2/src/context.rs:4001`
   If `true`, [`Self::show_viewport_deferred`] and [`Self::show_viewport_immediate`] will embed the new viewport…
-- `fn enable_accesskit(&self)` — `egui-0.35.0/src/context.rs:3599`
+- `fn enable_accesskit(&self)` — `egui-0.36.2/src/context.rs:3701`
   Enable generation of AccessKit tree updates in all future frames.
-- `fn end_pass(&self) -> FullOutput` — `egui-0.35.0/src/context.rs:2375`
+- `fn end_pass(&self) -> FullOutput` — `egui-0.36.2/src/context.rs:2443`
   Call at the end of each frame if you called [`Context::begin_pass`].
-- `fn fonts<R>(&self, reader: impl FnOnce(&FontsView<'_>) -> R) -> R` — `egui-0.35.0/src/context.rs:1031`
+- `fn fonts<R>(&self, reader: impl FnOnce(&FontsView<'_>) -> R) -> R` — `egui-0.36.2/src/context.rs:1097`
   Read-only access to [`Fonts`].
-- `fn fonts_mut<R>(&self, reader: impl FnOnce(&mut FontsView<'_>) -> R) -> R` — `egui-0.35.0/src/context.rs:1048`
+- `fn fonts_mut<R>(&self, reader: impl FnOnce(&mut FontsView<'_>) -> R) -> R` — `egui-0.36.2/src/context.rs:1114`
   Read-write access to [`Fonts`].
-- `fn forget_all_images(&self)` — `egui-0.35.0/src/context.rs:3684`
+- `fn forget_all_images(&self)` — `egui-0.36.2/src/context.rs:3786`
   Release all memory and textures related to images used in [`Ui::image`] or [`crate::Image`].
-- `fn forget_image(&self, uri: &str)` — `egui-0.35.0/src/context.rs:3662`
+- `fn forget_image(&self, uri: &str)` — `egui-0.36.2/src/context.rs:3764`
   Release all memory and textures related to the given image URI.
-- `fn format_modifiers(&self, modifiers: Modifiers) -> String` — `egui-0.35.0/src/context.rs:1651`
+- `fn format_modifiers(&self, modifiers: Modifiers) -> String` — `egui-0.36.2/src/context.rs:1719`
   Format the given modifiers in a human-readable way (e.g. `Ctrl+Shift+X`).
-- `fn format_shortcut(&self, shortcut: &KeyboardShortcut) -> String` — `egui-0.35.0/src/context.rs:1666`
+- `fn format_shortcut(&self, shortcut: &KeyboardShortcut) -> String` — `egui-0.36.2/src/context.rs:1734`
   Format the given shortcut in a human-readable way (e.g. `Ctrl+Shift+X`).
-- `fn global_style(&self) -> Arc<Style>` — `egui-0.35.0/src/context.rs:2107`
+- `fn global_style(&self) -> Arc<Style>` — `egui-0.36.2/src/context.rs:2175`
   The currently active [`Style`] used by all subsequent popups, menus, etc.
-- `fn global_style_mut(&self, mutate_style: impl FnOnce(&mut Style))` — `egui-0.35.0/src/context.rs:2121`
+- `fn global_style_mut(&self, mutate_style: impl FnOnce(&mut Style))` — `egui-0.36.2/src/context.rs:2189`
   Mutate the currently active [`Style`] used by all subsequent popups, menus, etc. Use [`Self::all_styles_mut`]…
-- `fn globally_used_rect(&self) -> Rect` — `egui-0.35.0/src/context.rs:2824`
+- `fn globally_used_rect(&self) -> Rect` — `egui-0.36.2/src/context.rs:2926`
   How much space is used by windows and the top-level [`Ui`].
-- `fn graphics<R>(&self, reader: impl FnOnce(&GraphicLayers) -> R) -> R` — `egui-0.35.0/src/context.rs:979`
+- `fn graphics<R>(&self, reader: impl FnOnce(&GraphicLayers) -> R) -> R` — `egui-0.36.2/src/context.rs:1045`
   Read-only access to [`GraphicLayers`], where painted [`crate::Shape`]s are written to.
-- `fn graphics_mut<R>(&self, writer: impl FnOnce(&mut GraphicLayers) -> R) -> R` — `egui-0.35.0/src/context.rs:973`
+- `fn graphics_mut<R>(&self, writer: impl FnOnce(&mut GraphicLayers) -> R) -> R` — `egui-0.36.2/src/context.rs:1039`
   Read-write access to [`GraphicLayers`], where painted [`crate::Shape`]s are written to.
-- `fn has_pending_images(&self) -> bool` — `egui-0.35.0/src/context.rs:3832`
+- `fn has_pending_images(&self) -> bool` — `egui-0.36.2/src/context.rs:3934`
   Returns `true` if any image is currently being loaded.
-- `fn has_requested_repaint(&self) -> bool` — `egui-0.35.0/src/context.rs:1866`
+- `fn has_requested_repaint(&self) -> bool` — `egui-0.36.2/src/context.rs:1934`
   Has a repaint been requested for the current viewport?
-- `fn has_requested_repaint_for(&self, viewport_id: &ViewportId) -> bool` — `egui-0.35.0/src/context.rs:1872`
+- `fn has_requested_repaint_for(&self, viewport_id: &ViewportId) -> bool` — `egui-0.36.2/src/context.rs:1940`
   Has a repaint been requested for the given viewport?
-- `fn highlight_widget(&self, id: Id)` — `egui-0.35.0/src/context.rs:2903`
+- `fn highlight_widget(&self, id: Id)` — `egui-0.36.2/src/context.rs:3005`
   Highlight this widget, to make it look like it is hovered, even if it isn't.
-- `fn include_bytes(&self, uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>)` — `egui-0.35.0/src/context.rs:3617`
+- `fn include_bytes(&self, uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>)` — `egui-0.36.2/src/context.rs:3719`
   Associate some static bytes with a `uri`.
-- `fn input<R>(&self, reader: impl FnOnce(&InputState) -> R) -> R` — `egui-0.35.0/src/context.rs:925`
+- `fn input<R>(&self, reader: impl FnOnce(&InputState) -> R) -> R` — `egui-0.36.2/src/context.rs:991`
   Read-only access to [`InputState`].
-- `fn input_for<R>(&self, id: ViewportId, reader: impl FnOnce(&InputState) -> R) -> R` — `egui-0.35.0/src/context.rs:931`
+- `fn input_for<R>(&self, id: ViewportId, reader: impl FnOnce(&InputState) -> R) -> R` — `egui-0.36.2/src/context.rs:997`
   This will create a `InputState::default()` if there is no input state for that viewport
-- `fn input_mut<R>(&self, writer: impl FnOnce(&mut InputState) -> R) -> R` — `egui-0.35.0/src/context.rs:937`
+- `fn input_mut<R>(&self, writer: impl FnOnce(&mut InputState) -> R) -> R` — `egui-0.36.2/src/context.rs:1003`
   Read-write access to [`InputState`].
-- `fn input_mut_for<R>(&self, id: ViewportId, writer: impl FnOnce(&mut InputState) -> R) -> R` — `egui-0.35.0/src/context.rs:943`
+- `fn input_mut_for<R>(&self, id: ViewportId, writer: impl FnOnce(&mut InputState) -> R) -> R` — `egui-0.36.2/src/context.rs:1009`
   This will create a `InputState::default()` if there is no input state for that viewport
-- `fn inspection_ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/context.rs:3223`
+- `fn inspection_ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/context.rs:3325`
   Show the state of egui, including its input and output.
-- `fn interaction_snapshot<R>(&self, reader: impl FnOnce(&InteractionSnapshot) -> R) -> R` — `egui-0.35.0/src/context.rs:4090`
+- `fn interaction_snapshot<R>(&self, reader: impl FnOnce(&InteractionSnapshot) -> R) -> R` — `egui-0.36.2/src/context.rs:4192`
   Read which widgets are currently being interacted with.
-- `fn interactive_rects_last_pass(&self) -> Vec<Rect>` — `egui-0.35.0/src/context.rs:1321`
+- `fn interactive_rects_last_pass(&self) -> Vec<Rect>` — `egui-0.36.2/src/context.rs:1389`
   Rectangles that could receive pointer input in the last completed pass.
-- `fn is_being_dragged(&self, id: Id) -> bool` — `egui-0.35.0/src/context.rs:4111`
+- `fn is_being_dragged(&self, id: Id) -> bool` — `egui-0.36.2/src/context.rs:4213`
   Is this specific widget being dragged?
-- `fn is_loader_installed(&self, id: &str) -> bool` — `egui-0.35.0/src/context.rs:3623`
+- `fn is_loader_installed(&self, id: &str) -> bool` — `egui-0.36.2/src/context.rs:3725`
   Returns `true` if the chain of bytes, image, or texture loaders contains a loader with the given `id`.
-- `fn is_pointer_over_egui(&self) -> bool` — `egui-0.35.0/src/context.rs:2841`
+- `fn is_pointer_over_egui(&self) -> bool` — `egui-0.36.2/src/context.rs:2943`
   Is the pointer (mouse/touch) over any egui area?
-- `fn layer_id_at(&self, pos: Pos2) -> Option<LayerId>` — `egui-0.35.0/src/context.rs:3002`
+- `fn layer_id_at(&self, pos: Pos2) -> Option<LayerId>` — `egui-0.36.2/src/context.rs:3104`
   Top-most layer at the given position.
-- `fn layer_painter(&self, layer_id: LayerId) -> Painter` — `egui-0.35.0/src/context.rs:1519`
+- `fn layer_painter(&self, layer_id: LayerId) -> Painter` — `egui-0.36.2/src/context.rs:1587`
   Get a full-screen painter for a new or existing layer
-- `fn layer_transform_from_global(&self, layer_id: LayerId) -> Option<TSTransform>` — `egui-0.35.0/src/context.rs:2983`
+- `fn layer_transform_from_global(&self, layer_id: LayerId) -> Option<TSTransform>` — `egui-0.36.2/src/context.rs:3085`
   Return how to transform the graphics of the global coordinate system into the local coordinate system of the…
-- `fn layer_transform_to_global(&self, layer_id: LayerId) -> Option<TSTransform>` — `egui-0.35.0/src/context.rs:2976`
+- `fn layer_transform_to_global(&self, layer_id: LayerId) -> Option<TSTransform>` — `egui-0.36.2/src/context.rs:3078`
   Return how to transform the graphics of the given layer into the global coordinate system.
-- `fn load_texture(&self, name: impl Into<String>, image: impl Into<ImageData>, options: TextureOptions) -> TextureHandle` — `egui-0.35.0/src/context.rs:2322`
+- `fn load_texture(&self, name: impl Into<String>, image: impl Into<ImageData>, options: TextureOptions) -> TextureHandle` — `egui-0.36.2/src/context.rs:2390`
   Allocate a texture.
-- `fn loaders(&self) -> Arc<Loaders>` — `egui-0.35.0/src/context.rs:3827`
+- `fn loaders(&self) -> Arc<Loaders>` — `egui-0.36.2/src/context.rs:3929`
   The loaders of bytes, images, and textures.
-- `fn loaders_ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/context.rs:3410`
+- `fn loaders_ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/context.rs:3512`
   Show stats about different image loaders.
-- `fn memory<R>(&self, reader: impl FnOnce(&Memory) -> R) -> R` — `egui-0.35.0/src/context.rs:949`
+- `fn memory<R>(&self, reader: impl FnOnce(&Memory) -> R) -> R` — `egui-0.36.2/src/context.rs:1015`
   Read-only access to [`Memory`].
-- `fn memory_mut<R>(&self, writer: impl FnOnce(&mut Memory) -> R) -> R` — `egui-0.35.0/src/context.rs:955`
+- `fn memory_mut<R>(&self, writer: impl FnOnce(&mut Memory) -> R) -> R` — `egui-0.36.2/src/context.rs:1021`
   Read-write access to [`Memory`].
-- `fn memory_ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/context.rs:3477`
+- `fn memory_ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/context.rs:3579`
   Shows the contents of [`Self::memory`].
-- `fn move_to_top(&self, layer_id: LayerId)` — `egui-0.35.0/src/context.rs:3009`
+- `fn move_to_top(&self, layer_id: LayerId)` — `egui-0.36.2/src/context.rs:3111`
   Moves the given area to the top in its [`Order`].
-- `fn multi_touch(&self) -> Option<MultiTouchInfo>` — `egui-0.35.0/src/context.rs:2946`
+- `fn multi_touch(&self) -> Option<MultiTouchInfo>` — `egui-0.36.2/src/context.rs:3048`
   Calls [`InputState::multi_touch`].
-- `fn native_pixels_per_point(&self) -> Option<f32>` — `egui-0.35.0/src/context.rs:2239`
+- `fn native_pixels_per_point(&self) -> Option<f32>` — `egui-0.36.2/src/context.rs:2307`
   The number of physical pixels for each logical point on this monitor.
-- `fn on_begin_pass(&self, debug_name: &'static str, cb: ContextCallback)` — `egui-0.35.0/src/context.rs:1958`
+- `fn on_begin_pass(&self, debug_name: &'static str, cb: ContextCallback)` — `egui-0.36.2/src/context.rs:2026`
   Call the given callback at the start of each pass of each viewport.
-- `fn on_end_pass(&self, debug_name: &'static str, cb: ContextCallback)` — `egui-0.35.0/src/context.rs:1967`
+- `fn on_end_pass(&self, debug_name: &'static str, cb: ContextCallback)` — `egui-0.36.2/src/context.rs:2035`
   Call the given callback at the end of each pass of each viewport.
-- `fn open_url(&self, open_url: OpenUrl)` — `egui-0.35.0/src/context.rs:1609`
+- `fn open_url(&self, open_url: OpenUrl)` — `egui-0.36.2/src/context.rs:1677`
   Open an URL in a browser.
-- `fn options<R>(&self, reader: impl FnOnce(&Options) -> R) -> R` — `egui-0.35.0/src/context.rs:1063`
+- `fn options<R>(&self, reader: impl FnOnce(&Options) -> R) -> R` — `egui-0.36.2/src/context.rs:1129`
   Read-only access to [`Options`].
-- `fn options_mut<R>(&self, writer: impl FnOnce(&mut Options) -> R) -> R` — `egui-0.35.0/src/context.rs:1069`
+- `fn options_mut<R>(&self, writer: impl FnOnce(&mut Options) -> R) -> R` — `egui-0.36.2/src/context.rs:1135`
   Read-write access to [`Options`].
-- `fn os(&self) -> OperatingSystem` — `egui-0.35.0/src/context.rs:1559`
+- `fn os(&self) -> OperatingSystem` — `egui-0.36.2/src/context.rs:1627`
   What operating system are we running on?
-- `fn output<R>(&self, reader: impl FnOnce(&PlatformOutput) -> R) -> R` — `egui-0.35.0/src/context.rs:992`
+- `fn output<R>(&self, reader: impl FnOnce(&PlatformOutput) -> R) -> R` — `egui-0.36.2/src/context.rs:1058`
   Read-only access to [`PlatformOutput`].
-- `fn output_mut<R>(&self, writer: impl FnOnce(&mut PlatformOutput) -> R) -> R` — `egui-0.35.0/src/context.rs:998`
+- `fn output_mut<R>(&self, writer: impl FnOnce(&mut PlatformOutput) -> R) -> R` — `egui-0.36.2/src/context.rs:1064`
   Read-write access to [`PlatformOutput`].
-- `fn parent_viewport_id(&self) -> ViewportId` — `egui-0.35.0/src/context.rs:3856`
+- `fn parent_viewport_id(&self) -> ViewportId` — `egui-0.36.2/src/context.rs:3958`
   Return the `ViewportId` of his parent.
-- `fn pixels_per_point(&self) -> f32` — `egui-0.35.0/src/context.rs:2220`
+- `fn pixels_per_point(&self) -> f32` — `egui-0.36.2/src/context.rs:2288`
   The number of physical pixels for each logical point.
-- `fn plugin<T>(&self) -> TypedPluginHandle<T>` — `egui-0.35.0/src/context.rs:2004`
+- `fn plugin<T>(&self) -> TypedPluginHandle<T>` — `egui-0.36.2/src/context.rs:2072`
   Get a handle to the plugin of type `T`.
-- `fn plugin_opt<T>(&self) -> Option<TypedPluginHandle<T>>` — `egui-0.35.0/src/context.rs:2013`
+- `fn plugin_opt<T>(&self) -> Option<TypedPluginHandle<T>>` — `egui-0.36.2/src/context.rs:2081`
   Get a handle to the plugin of type `T`, if it was registered.
-- `fn plugin_or_default<T>(&self) -> TypedPluginHandle<T>` — `egui-0.35.0/src/context.rs:2019`
+- `fn plugin_or_default<T>(&self) -> TypedPluginHandle<T>` — `egui-0.36.2/src/context.rs:2087`
   Get a handle to the plugin of type `T`, or insert its default.
-- `fn pointer_hover_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/context.rs:2931`
+- `fn pointer_hover_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/context.rs:3033`
   If it is a good idea to show a tooltip, where is pointer?
-- `fn pointer_interact_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/context.rs:2941`
+- `fn pointer_interact_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/context.rs:3043`
   If you detect a click or drag and want to know where it happened, use this.
-- `fn pointer_latest_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/context.rs:2925`
+- `fn pointer_latest_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/context.rs:3027`
   Latest reported pointer position.
-- `fn read_response(&self, id: Id) -> Option<Response>` — `egui-0.35.0/src/context.rs:1287`
+- `fn read_response(&self, id: Id) -> Option<Response>` — `egui-0.36.2/src/context.rs:1355`
   Read the response of some widget, which may be called _before_ creating the widget (!).
-- `fn rect_contains_pointer(&self, layer_id: LayerId, rect: Rect) -> bool` — `egui-0.35.0/src/context.rs:3036`
+- `fn rect_contains_pointer(&self, layer_id: LayerId, rect: Rect) -> bool` — `egui-0.36.2/src/context.rs:3138`
   Does the given rectangle contain the mouse pointer?
-- `fn register_widget_info(&self, id: Id, make_info: impl Fn() -> WidgetInfo)` — `egui-0.35.0/src/context.rs:1504`
+- `fn register_widget_info(&self, id: Id, make_info: impl Fn() -> WidgetInfo)` — `egui-0.36.2/src/context.rs:1572`
   This is called by [`Response::widget_info`], but can also be called directly.
-- `fn repaint_causes(&self) -> Vec<RepaintCause>` — `egui-0.35.0/src/context.rs:1879`
+- `fn repaint_causes(&self) -> Vec<RepaintCause>` — `egui-0.36.2/src/context.rs:1947`
   Why are we repainting?
-- `fn request_discard(&self, reason: impl Into<Cow<'static, str>>)` — `egui-0.35.0/src/context.rs:1924`
+- `fn request_discard(&self, reason: impl Into<Cow<'static, str>>)` — `egui-0.36.2/src/context.rs:1992`
   Request to discard the visual output of this pass, and to immediately do another one.
-- `fn request_repaint(&self)` — `egui-0.35.0/src/context.rs:1753`
+- `fn request_repaint(&self)` — `egui-0.36.2/src/context.rs:1821`
   Call this if there is need to repaint the UI, i.e. if you are showing an animation.
-- `fn request_repaint_after(&self, duration: Duration)` — `egui-0.35.0/src/context.rs:1804`
+- `fn request_repaint_after(&self, duration: Duration)` — `egui-0.36.2/src/context.rs:1872`
   Request repaint after at most the specified duration elapses.
-- `fn request_repaint_after_for(&self, duration: Duration, id: ViewportId)` — `egui-0.35.0/src/context.rs:1847`
+- `fn request_repaint_after_for(&self, duration: Duration, id: ViewportId)` — `egui-0.36.2/src/context.rs:1915`
   Request repaint after at most the specified duration elapses.
-- `fn request_repaint_after_secs(&self, seconds: f32)` — `egui-0.35.0/src/context.rs:1812`
+- `fn request_repaint_after_secs(&self, seconds: f32)` — `egui-0.36.2/src/context.rs:1880`
   Repaint after this many seconds.
-- `fn request_repaint_of(&self, id: ViewportId)` — `egui-0.35.0/src/context.rs:1770`
+- `fn request_repaint_of(&self, id: ViewportId)` — `egui-0.36.2/src/context.rs:1838`
   Call this if there is need to repaint the UI, i.e. if you are showing an animation.
-- `fn requested_repaint_last_pass(&self) -> bool` — `egui-0.35.0/src/context.rs:1854`
+- `fn requested_repaint_last_pass(&self) -> bool` — `egui-0.36.2/src/context.rs:1922`
   Was a repaint requested last pass for the current viewport?
-- `fn requested_repaint_last_pass_for(&self, viewport_id: &ViewportId) -> bool` — `egui-0.35.0/src/context.rs:1860`
+- `fn requested_repaint_last_pass_for(&self, viewport_id: &ViewportId) -> bool` — `egui-0.36.2/src/context.rs:1928`
   Was a repaint requested last pass for the given viewport?
-- `fn run_ui(&self, new_input: RawInput, run_ui: impl FnMut(&mut Ui)) -> FullOutput` — `egui-0.35.0/src/context.rs:780`
+- `fn run_logic(&self, new_input: &RawInput, logic: impl FnOnce(&Self)) -> LogicOutput` — `egui-0.36.2/src/context.rs:913`
+  Run app logic without showing any ui.
+- `fn run_ui(&self, new_input: RawInput, run_ui: impl FnMut(&mut Ui)) -> FullOutput` — `egui-0.36.2/src/context.rs:794`
   Run the ui code for one frame.
-- `fn send_cmd(&self, cmd: OutputCommand)` — `egui-0.35.0/src/context.rs:1597`
+- `fn send_cmd(&self, cmd: OutputCommand)` — `egui-0.36.2/src/context.rs:1665`
   Add a command to [`PlatformOutput::commands`], for the integration to execute at the end of the frame.
-- `fn send_viewport_cmd(&self, command: ViewportCommand)` — `egui-0.35.0/src/context.rs:3914`
+- `fn send_viewport_cmd(&self, command: ViewportCommand)` — `egui-0.36.2/src/context.rs:4016`
   Send a command to the current viewport.
-- `fn send_viewport_cmd_to(&self, id: ViewportId, command: ViewportCommand)` — `egui-0.35.0/src/context.rs:3921`
+- `fn send_viewport_cmd_to(&self, id: ViewportId, command: ViewportCommand)` — `egui-0.36.2/src/context.rs:4023`
   Send a command to a specific viewport.
-- `fn set_cursor_icon(&self, cursor_icon: CursorIcon)` — `egui-0.35.0/src/context.rs:1578`
+- `fn set_cursor_icon(&self, cursor_icon: CursorIcon)` — `egui-0.36.2/src/context.rs:1646`
   Set the cursor icon.
-- `fn set_cursor_image(&self, image: Option<CustomCursorImage>)` — `egui-0.35.0/src/context.rs:1591`
+- `fn set_cursor_image(&self, image: Option<CustomCursorImage>)` — `egui-0.36.2/src/context.rs:1659`
   Request that the integration display this RGBA bitmap as the OS cursor for the next frame, instead of the sta…
-- `fn set_debug_on_hover(&self, debug_on_hover: bool)` — `egui-0.35.0/src/context.rs:3072`
+- `fn set_debug_on_hover(&self, debug_on_hover: bool)` — `egui-0.36.2/src/context.rs:3174`
   Turn on/off whether or not to debug widget layout on hover.
-- `fn set_dragged_id(&self, id: Id)` — `egui-0.35.0/src/context.rs:4128`
+- `fn set_dragged_id(&self, id: Id)` — `egui-0.36.2/src/context.rs:4230`
   Set which widget is being dragged.
-- `fn set_embed_viewports(&self, value: bool)` — `egui-0.35.0/src/context.rs:3907`
+- `fn set_embed_viewports(&self, value: bool)` — `egui-0.36.2/src/context.rs:4009`
   If `true`, [`Self::show_viewport_deferred`] and [`Self::show_viewport_immediate`] will embed the new viewport…
-- `fn set_fonts(&self, font_definitions: FontDefinitions)` — `egui-0.35.0/src/context.rs:2038`
+- `fn set_fonts(&self, font_definitions: FontDefinitions)` — `egui-0.36.2/src/context.rs:2106`
   Tell `egui` which fonts to use.
-- `fn set_global_style(&self, style: impl Into<Arc<Style>>)` — `egui-0.35.0/src/context.rs:2132`
+- `fn set_global_style(&self, style: impl Into<Arc<Style>>)` — `egui-0.36.2/src/context.rs:2200`
   The currently active [`Style`] used by all new popups, menus, etc.
-- `fn set_immediate_viewport_renderer(callback: impl Fn(&Self, ImmediateViewport<'a>) + 'static)` — `egui-0.35.0/src/context.rs:3886`
+- `fn set_immediate_viewport_renderer(callback: impl Fn(&Self, ImmediateViewport<'a>) + 'static)` — `egui-0.36.2/src/context.rs:3988`
   For integrations: Set this to render a sync viewport.
-- `fn set_os(&self, os: OperatingSystem)` — `egui-0.35.0/src/context.rs:1567`
+- `fn set_os(&self, os: OperatingSystem)` — `egui-0.36.2/src/context.rs:1635`
   Set the operating system we are running on.
-- `fn set_pixels_per_point(&self, pixels_per_point: f32)` — `egui-0.35.0/src/context.rs:2228`
+- `fn set_pixels_per_point(&self, pixels_per_point: f32)` — `egui-0.36.2/src/context.rs:2296`
   Set the number of physical pixels for each logical point. Will become active at the start of the next pass.
-- `fn set_request_repaint_callback(&self, callback: impl Fn(RequestRepaintInfo) + Send + Sync + 'static)` — `egui-0.35.0/src/context.rs:1893`
+- `fn set_request_repaint_callback(&self, callback: impl Fn(RequestRepaintInfo) + Send + Sync + 'static)` — `egui-0.36.2/src/context.rs:1961`
   For integrations: this callback will be called when an egui user calls [`Self::request_repaint`] or [`Self::r…
-- `fn set_style_of(&self, theme: Theme, style: impl Into<Arc<Style>>)` — `egui-0.35.0/src/context.rs:2182`
+- `fn set_style_of(&self, theme: Theme, style: impl Into<Arc<Style>>)` — `egui-0.36.2/src/context.rs:2250`
   The [`Style`] used by all new popups, menus, etc. Use [`Self::set_theme`] to choose between dark and light mo…
-- `fn set_sublayer(&self, parent: LayerId, child: LayerId)` — `egui-0.35.0/src/context.rs:3020`
+- `fn set_sublayer(&self, parent: LayerId, child: LayerId)` — `egui-0.36.2/src/context.rs:3122`
   Mark the `child` layer as a sublayer of `parent`.
-- `fn set_theme(&self, theme_preference: impl Into<ThemePreference>)` — `egui-0.35.0/src/context.rs:2102`
+- `fn set_theme(&self, theme_preference: impl Into<ThemePreference>)` — `egui-0.36.2/src/context.rs:2170`
   The [`Theme`] used to select between dark and light [`Self::global_style`] as the active style used by all su…
-- `fn set_transform_layer(&self, layer_id: LayerId, transform: TSTransform)` — `egui-0.35.0/src/context.rs:2963`
+- `fn set_transform_layer(&self, layer_id: LayerId, transform: TSTransform)` — `egui-0.36.2/src/context.rs:3065`
   Transform the graphics of the given layer.
-- `fn set_visuals(&self, visuals: Visuals)` — `egui-0.35.0/src/context.rs:2212`
+- `fn set_visuals(&self, visuals: Visuals)` — `egui-0.36.2/src/context.rs:2280`
   The [`crate::Visuals`] used by all subsequent popups, menus, etc.
-- `fn set_visuals_of(&self, theme: Theme, visuals: Visuals)` — `egui-0.35.0/src/context.rs:2199`
+- `fn set_visuals_of(&self, theme: Theme, visuals: Visuals)` — `egui-0.36.2/src/context.rs:2267`
   The [`crate::Visuals`] used by all subsequent popups, menus, etc.
-- `fn set_zoom_factor(&self, zoom_factor: f32)` — `egui-0.35.0/src/context.rs:2269`
+- `fn set_zoom_factor(&self, zoom_factor: f32)` — `egui-0.36.2/src/context.rs:2337`
   Sets zoom factor of the UI. Will become active at the start of the next pass.
-- `fn settings_ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/context.rs:3187`
+- `fn settings_ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/context.rs:3289`
   Show a ui for settings (style and tessellation options).
-- `fn show_viewport_deferred(&self, new_viewport_id: ViewportId, viewport_builder: ViewportBuilder, viewport_ui_cb: impl Fn(&mut Ui, ViewportClass) + Send + Sync + 'static)` — `egui-0.35.0/src/context.rs:3960`
+- `fn show_viewport_deferred(&self, new_viewport_id: ViewportId, viewport_builder: ViewportBuilder, viewport_ui_cb: impl Fn(&mut Ui, ViewportClass) + Send + Sync + 'static)` — `egui-0.36.2/src/context.rs:4062`
   Show a deferred viewport, creating a new native window, if possible.
-- `fn show_viewport_immediate<T>(&self, new_viewport_id: ViewportId, builder: ViewportBuilder, viewport_ui_cb: impl FnMut(&mut Ui, ViewportClass) -> T) -> T` — `egui-0.35.0/src/context.rs:4014`
+- `fn show_viewport_immediate<T>(&self, new_viewport_id: ViewportId, builder: ViewportBuilder, viewport_ui_cb: impl FnMut(&mut Ui, ViewportClass) -> T) -> T` — `egui-0.36.2/src/context.rs:4116`
   Show an immediate viewport, creating a new native window, if possible.
-- `fn stop_dragging(&self)` — `egui-0.35.0/src/context.rs:4143`
+- `fn stop_dragging(&self)` — `egui-0.36.2/src/context.rs:4245`
   Stop dragging any widget.
-- `fn style_mut_of(&self, theme: Theme, mutate_style: impl FnOnce(&mut Style))` — `egui-0.35.0/src/context.rs:2169`
+- `fn style_mut_of(&self, theme: Theme, mutate_style: impl FnOnce(&mut Style))` — `egui-0.36.2/src/context.rs:2237`
   Mutate the [`Style`] used by all subsequent popups, menus, etc.
-- `fn style_of(&self, theme: Theme) -> Arc<Style>` — `egui-0.35.0/src/context.rs:2153`
+- `fn style_of(&self, theme: Theme) -> Arc<Style>` — `egui-0.36.2/src/context.rs:2221`
   The [`Style`] used by all subsequent popups, menus, etc.
-- `fn style_ui(&self, ui: &mut Ui, theme: Theme)` — `egui-0.35.0/src/context.rs:3564`
+- `fn style_ui(&self, ui: &mut Ui, theme: Theme)` — `egui-0.36.2/src/context.rs:3666`
   Edit the [`Style`].
-- `fn system_theme(&self) -> Option<Theme>` — `egui-0.35.0/src/context.rs:2084`
+- `fn system_theme(&self) -> Option<Theme>` — `egui-0.36.2/src/context.rs:2152`
   Does the OS use dark or light mode? This is used when the theme preference is set to [`crate::ThemePreference…
-- `fn tessellate(&self, shapes: Vec<ClippedShape>, pixels_per_point: f32) -> Vec<ClippedPrimitive>` — `egui-0.35.0/src/context.rs:2757`
+- `fn tessellate(&self, shapes: Vec<ClippedShape>, pixels_per_point: f32) -> Vec<ClippedPrimitive>` — `egui-0.36.2/src/context.rs:2859`
   Tessellate the given shapes into triangle meshes.
-- `fn tessellation_options<R>(&self, reader: impl FnOnce(&TessellationOptions) -> R) -> R` — `egui-0.35.0/src/context.rs:1075`
+- `fn tessellation_options<R>(&self, reader: impl FnOnce(&TessellationOptions) -> R) -> R` — `egui-0.36.2/src/context.rs:1141`
   Read-only access to [`TessellationOptions`].
-- `fn tessellation_options_mut<R>(&self, writer: impl FnOnce(&mut TessellationOptions) -> R) -> R` — `egui-0.35.0/src/context.rs:1081`
+- `fn tessellation_options_mut<R>(&self, writer: impl FnOnce(&mut TessellationOptions) -> R) -> R` — `egui-0.36.2/src/context.rs:1147`
   Read-write access to [`TessellationOptions`].
-- `fn tex_manager(&self) -> Arc<RwLock<TextureManager>>` — `egui-0.35.0/src/context.rs:2349`
+- `fn tex_manager(&self) -> Arc<RwLock<TextureManager>>` — `egui-0.36.2/src/context.rs:2417`
   Low-level texture manager.
-- `fn text_edit_focused(&self) -> bool` — `egui-0.35.0/src/context.rs:2889`
+- `fn text_edit_focused(&self) -> bool` — `egui-0.36.2/src/context.rs:2991`
   Is the currently focused widget a text edit?
-- `fn texture_ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/context.rs:3349`
+- `fn texture_ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/context.rs:3451`
   Show stats about the allocated textures.
-- `fn theme(&self) -> Theme` — `egui-0.35.0/src/context.rs:2090`
+- `fn theme(&self) -> Theme` — `egui-0.36.2/src/context.rs:2158`
   The [`Theme`] used to select the appropriate [`Style`] (dark or light) used by all subsequent popups, menus,…
-- `fn time(&self) -> f64` — `egui-0.35.0/src/context.rs:1548`
+- `fn time(&self) -> f64` — `egui-0.36.2/src/context.rs:1616`
   Current time in seconds, relative to some unknown epoch.
-- `fn top_layer_id(&self) -> Option<LayerId>` — `egui-0.35.0/src/context.rs:3025`
+- `fn top_layer_id(&self) -> Option<LayerId>` — `egui-0.36.2/src/context.rs:3127`
   Retrieve the [`LayerId`] of the top level windows.
-- `fn transform_layer_shapes(&self, layer_id: LayerId, transform: TSTransform)` — `egui-0.35.0/src/context.rs:2995`
+- `fn transform_layer_shapes(&self, layer_id: LayerId, transform: TSTransform)` — `egui-0.36.2/src/context.rs:3097`
   Transform all the graphics at the given layer.
-- `fn try_load_bytes(&self, uri: &str) -> BytesLoadResult` — `egui-0.35.0/src/context.rs:3721`
+- `fn try_load_bytes(&self, uri: &str) -> BytesLoadResult` — `egui-0.36.2/src/context.rs:3823`
   Try loading the bytes from the given uri using any available bytes loaders.
-- `fn try_load_image(&self, uri: &str, size_hint: SizeHint) -> ImageLoadResult` — `egui-0.35.0/src/context.rs:3759`
+- `fn try_load_image(&self, uri: &str, size_hint: SizeHint) -> ImageLoadResult` — `egui-0.36.2/src/context.rs:3861`
   Try loading the image from the given uri using any available image loaders.
-- `fn try_load_texture(&self, uri: &str, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.35.0/src/context.rs:3804`
+- `fn try_load_texture(&self, uri: &str, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.36.2/src/context.rs:3906`
   Try loading the texture from the given uri using any available texture loaders.
-- `fn viewport<R>(&self, reader: impl FnOnce(&ViewportState) -> R) -> R` — `egui-0.35.0/src/context.rs:3861`
+- `fn viewport<R>(&self, reader: impl FnOnce(&ViewportState) -> R) -> R` — `egui-0.36.2/src/context.rs:3963`
   Read the state of the current viewport.
-- `fn viewport_for<R>(&self, viewport_id: ViewportId, reader: impl FnOnce(&ViewportState) -> R) -> R` — `egui-0.35.0/src/context.rs:3866`
+- `fn viewport_for<R>(&self, viewport_id: ViewportId, reader: impl FnOnce(&ViewportState) -> R) -> R` — `egui-0.36.2/src/context.rs:3968`
   Read the state of a specific current viewport.
-- `fn viewport_id(&self) -> ViewportId` — `egui-0.35.0/src/context.rs:3847`
+- `fn viewport_id(&self) -> ViewportId` — `egui-0.36.2/src/context.rs:3949`
   Return the `ViewportId` of the current viewport.
-- `fn viewport_rect(&self) -> Rect` — `egui-0.35.0/src/context.rs:2819`
+- `fn viewport_rect(&self) -> Rect` — `egui-0.36.2/src/context.rs:2921`
   Returns the position and size of the full area available to egui
-- `fn will_discard(&self) -> bool` — `egui-0.35.0/src/context.rs:1943`
+- `fn will_discard(&self) -> bool` — `egui-0.36.2/src/context.rs:2011`
   Will the visual output of this pass be discarded?
-- `fn with_plugin<T, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R>` — `egui-0.35.0/src/context.rs:1992`
+- `fn with_plugin<T, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R>` — `egui-0.36.2/src/context.rs:2060`
   Call the provided closure with the plugin of type `T`, if it was registered.
-- `fn zoom_factor(&self) -> f32` — `egui-0.35.0/src/context.rs:2251`
+- `fn zoom_factor(&self) -> f32` — `egui-0.36.2/src/context.rs:2319`
   Global zoom factor of the UI.
 
 Implements: `Clone`, `Debug`, `Default`, `PartialEq`
 
-### `CornerRadius` (struct) — `epaint-0.35.0/src/corner_radius.rs:13`
+### `CornerRadius` (struct) — `epaint-0.36.2/src/corner_radius.rs:13`
 
 How rounded the corners of things should be.
 
@@ -2129,20 +2135,20 @@ Public fields:
 
 Methods:
 
-- `const fn same(radius: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:59`
+- `const fn same(radius: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:59`
   Same rounding on all four corners.
-- `fn at_least(self, min: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:76`
+- `fn at_least(self, min: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:76`
   Make sure each corner has a rounding of at least this.
-- `fn at_most(self, max: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:87`
+- `fn at_most(self, max: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:87`
   Make sure each corner has a rounding of at most this.
-- `fn average(&self) -> f32` — `epaint-0.35.0/src/corner_radius.rs:97`
+- `fn average(&self) -> f32` — `epaint-0.36.2/src/corner_radius.rs:97`
   Average rounding of the corners.
-- `fn is_same(self) -> bool` — `epaint-0.35.0/src/corner_radius.rs:70`
+- `fn is_same(self) -> bool` — `epaint-0.36.2/src/corner_radius.rs:70`
   Do all corners have the same rounding?
 
 Implements: `Add`, `Add<u8>`, `AddAssign`, `AddAssign<u8>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<CornerRadius>`, `From<CornerRadiusF32>`, `From<f32>`, `From<u8>`, `Hash`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<u8>`, `SubAssign`, `SubAssign<u8>`
 
-### `CustomCursorImage` (struct) — `egui-0.35.0/src/data/output.rs:299`
+### `CustomCursorImage` (struct) — `egui-0.36.2/src/data/output.rs:324`
 
 A bitmap cursor pushed to the integration via [`PlatformOutput::cursor_image`].
 
@@ -2154,137 +2160,123 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `DragAndDrop` (struct) — `egui-0.35.0/src/drag_and_drop.rs:22`
+### `DragAndDrop` (struct) — `egui-0.36.2/src/drag_and_drop.rs:23`
 
 Plugin for tracking drag-and-drop payload.
 
 Methods:
 
-- `fn clear_payload(ctx: &Context)` — `egui-0.35.0/src/drag_and_drop.rs:86`
+- `fn clear_payload(ctx: &Context)` — `egui-0.36.2/src/drag_and_drop.rs:87`
   Clears the payload, setting it to `None`.
-- `fn has_any_payload(ctx: &Context) -> bool` — `egui-0.35.0/src/drag_and_drop.rs:133`
+- `fn has_any_payload(ctx: &Context) -> bool` — `egui-0.36.2/src/drag_and_drop.rs:134`
   Are we carrying a payload?
-- `fn has_payload_of_type<Payload>(ctx: &Context) -> bool` — `egui-0.35.0/src/drag_and_drop.rs:122`
+- `fn has_payload_of_type<Payload>(ctx: &Context) -> bool` — `egui-0.36.2/src/drag_and_drop.rs:123`
   Are we carrying a payload of the given type?
-- `fn payload<Payload>(ctx: &Context) -> Option<Arc<Payload>>` — `egui-0.35.0/src/drag_and_drop.rs:96`
+- `fn payload<Payload>(ctx: &Context) -> Option<Arc<Payload>>` — `egui-0.36.2/src/drag_and_drop.rs:97`
   Retrieve the payload, if any.
-- `fn set_payload<Payload>(ctx: &Context, payload: Payload)` — `egui-0.35.0/src/drag_and_drop.rs:78`
+- `fn set_payload<Payload>(ctx: &Context, payload: Payload)` — `egui-0.36.2/src/drag_and_drop.rs:79`
   Set a drag-and-drop payload.
-- `fn take_payload<Payload>(ctx: &Context) -> Option<Arc<Payload>>` — `egui-0.35.0/src/drag_and_drop.rs:111`
+- `fn take_payload<Payload>(ctx: &Context) -> Option<Arc<Payload>>` — `egui-0.36.2/src/drag_and_drop.rs:112`
   Retrieve and clear the payload, if any.
 
 Implements: `Clone`, `Default`, `Plugin`
 
-### `DragPanButtons` (struct) — `egui-0.35.0/src/containers/scene.rs:55`
+### `DragPanButtons` (struct) — `egui-0.36.2/src/containers/scene.rs:55`
 
 Specifies which pointer buttons can be used to pan the scene by dragging.
 
 Methods:
 
-- `const fn all() -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn all() -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   Get a flags value with all known bits set.
-- `const fn bits(&self) -> u8` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn bits(&self) -> u8` — `egui-0.36.2/src/containers/scene.rs:57`
   Get the underlying bits value.
-- `const fn complement(self) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn complement(self) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise negation (`!`) of the bits in `self`, truncating the result.
-- `const fn contains(&self, other: Self) -> bool` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn contains(&self, other: Self) -> bool` — `egui-0.36.2/src/containers/scene.rs:57`
   Whether all set bits in `other` are also set in `self`.
-- `const fn difference(self, other: Self) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn difference(self, other: Self) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   The intersection of `self` with the complement of `other` (`&!`).
-- `const fn empty() -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn empty() -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   Get a flags value with all bits unset.
-- `const fn from_bits(bits: u8) -> Option<Self>` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn from_bits(bits: u8) -> Option<Self>` — `egui-0.36.2/src/containers/scene.rs:57`
   Convert from a bits value.
-- `const fn from_bits_retain(bits: u8) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn from_bits_retain(bits: u8) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   Convert from a bits value exactly.
-- `const fn from_bits_truncate(bits: u8) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn from_bits_truncate(bits: u8) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   Convert from a bits value, unsetting any unknown bits.
-- `const fn intersection(self, other: Self) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn intersection(self, other: Self) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise and (`&`) of the bits in `self` and `other`.
-- `const fn intersects(&self, other: Self) -> bool` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn intersects(&self, other: Self) -> bool` — `egui-0.36.2/src/containers/scene.rs:57`
   Whether any set bits in `other` are also set in `self`.
-- `const fn is_all(&self) -> bool` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn is_all(&self) -> bool` — `egui-0.36.2/src/containers/scene.rs:57`
   Whether all known bits in this flags value are set.
-- `const fn is_empty(&self) -> bool` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn is_empty(&self) -> bool` — `egui-0.36.2/src/containers/scene.rs:57`
   Whether all bits in `self` are unset.
-- `const fn iter(&self) -> Iter<DragPanButtons>` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn iter(&self) -> Iter<DragPanButtons>` — `egui-0.36.2/src/containers/scene.rs:57`
   Yield a set of contained flags values.
-- `const fn iter_names(&self) -> IterNames<DragPanButtons>` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn iter_names(&self) -> IterNames<DragPanButtons>` — `egui-0.36.2/src/containers/scene.rs:57`
   Yield a set of contained named flags values.
-- `const fn symmetric_difference(self, other: Self) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn symmetric_difference(self, other: Self) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise exclusive-or (`^`) of the bits in `self` and `other`.
-- `const fn union(self, other: Self) -> Self` — `egui-0.35.0/src/containers/scene.rs:57`
+- `const fn union(self, other: Self) -> Self` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise or (`|`) of the bits in `self` and `other`.
-- `fn from_name(name: &str) -> Option<Self>` — `egui-0.35.0/src/containers/scene.rs:57`
+- `fn from_name(name: &str) -> Option<Self>` — `egui-0.36.2/src/containers/scene.rs:57`
   Get a flags value with the bits of a flag with the given name set.
-- `fn insert(&mut self, other: Self)` — `egui-0.35.0/src/containers/scene.rs:57`
+- `fn insert(&mut self, other: Self)` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise or (`|`) of the bits in `self` and `other`.
-- `fn remove(&mut self, other: Self)` — `egui-0.35.0/src/containers/scene.rs:57`
+- `fn remove(&mut self, other: Self)` — `egui-0.36.2/src/containers/scene.rs:57`
   The intersection of `self` with the complement of `other` (`&!`).
-- `fn set(&mut self, other: Self, value: bool)` — `egui-0.35.0/src/containers/scene.rs:57`
+- `fn set(&mut self, other: Self, value: bool)` — `egui-0.36.2/src/containers/scene.rs:57`
   Call `insert` when `value` is `true` or `remove` when `value` is `false`.
-- `fn toggle(&mut self, other: Self)` — `egui-0.35.0/src/containers/scene.rs:57`
+- `fn toggle(&mut self, other: Self)` — `egui-0.36.2/src/containers/scene.rs:57`
   The bitwise exclusive-or (`^`) of the bits in `self` and `other`.
 
 Implements: `Binary`, `BitAnd`, `BitAndAssign`, `BitOr`, `BitOrAssign`, `BitXor`, `BitXorAssign`, `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Extend<DragPanButtons>`, `Flags`, `FromIterator<DragPanButtons>`, `IntoIterator`, `LowerHex`, `Not`, `Octal`, `PartialEq`, `StructuralPartialEq`, `Sub`, `SubAssign`, `UpperHex`
 
-### `DragValue` (struct) — `egui-0.35.0/src/widgets/drag_value.rs:37`
+### `DragValue` (struct) — `egui-0.36.2/src/widgets/drag_value.rs:55`
 
 A numeric value that you can change by dragging the number. More compact than a [`crate::Slider`].
 
 Methods:
 
-- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.35.0/src/widgets/drag_value.rs:416`
+- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.36.2/src/widgets/drag_value.rs:434`
   Output the [`DragValue`]'s [`Atoms`].
-- `fn binary(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:309`
+- `fn binary(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:327`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as binary integers. Floating point nu…
-- `fn clamp_existing_to_range(self, clamp_existing_to_range: bool) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:145`
+- `fn clamp_existing_to_range(self, clamp_existing_to_range: bool) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:163`
   If set to `true`, existing values will be clamped to [`Self::range`].
-- `fn custom_formatter(self, formatter: impl 'a + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:240`
+- `fn custom_formatter(self, formatter: impl 'a + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:258`
   Set custom formatter defining how numbers are converted into text.
-- `fn custom_parser(self, parser: impl 'a + Fn(&str) -> Option<f64>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:285`
+- `fn custom_parser(self, parser: impl 'a + Fn(&str) -> Option<f64>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:303`
   Set custom parser defining how the text input is parsed into a number.
-- `fn fixed_decimals(self, num_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:196`
+- `fn fixed_decimals(self, num_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:214`
   Set an exact number of decimals to display. Values will also be rounded to this number of decimals. Normally…
-- `fn from_get_set(get_set_value: impl 'a + FnMut(Option<f64>) -> f64) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:68`
-- `fn hexadecimal(self, min_width: usize, twos_complement: bool, upper: bool) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:379`
+- `fn from_get_set(get_set_value: impl 'a + FnMut(Option<f64>) -> f64) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:86`
+- `fn hexadecimal(self, min_width: usize, twos_complement: bool, upper: bool) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:397`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as hexadecimal integers. Floating poi…
-- `fn max_decimals(self, max_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:180`
+- `fn max_decimals(self, max_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:198`
   Set a maximum number of decimals to display. Values will also be rounded to this number of decimals. Normally…
-- `fn max_decimals_opt(self, max_decimals: Option<usize>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:186`
-- `fn min_decimals(self, min_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:169`
+- `fn max_decimals_opt(self, max_decimals: Option<usize>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:204`
+- `fn min_decimals(self, min_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:187`
   Set a minimum number of decimals to display. Normally you don't need to pick a precision, as the slider will…
-- `fn new<Num>(value: &'a mut Num) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:53`
-- `fn octal(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:344`
+- `fn new<Num>(value: &'a mut Num) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:71`
+- `fn octal(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:362`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as octal integers. Floating point num…
-- `fn prefix(self, prefix: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:152`
+- `fn prefix(self, prefix: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:170`
   Show a prefix before the number, e.g. "x: "
-- `fn range<Num>(self, range: RangeInclusive<Num>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:99`
+- `fn range<Num>(self, range: RangeInclusive<Num>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:117`
   Sets valid range for dragging the value.
-- `fn speed(self, speed: impl Into<f64>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:89`
+- `fn speed(self, speed: impl Into<f64>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:107`
   How much the value changes when dragged one point (logical pixel).
-- `fn suffix(self, suffix: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:159`
+- `fn suffix(self, suffix: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:177`
   Add a suffix to the number, this can be e.g. a unit ("°" or " m")
-- `fn update_while_editing(self, update: bool) -> Self` — `egui-0.35.0/src/widgets/drag_value.rs:408`
+- `fn update_while_editing(self, update: bool) -> Self` — `egui-0.36.2/src/widgets/drag_value.rs:426`
   Update the value on each key press when text-editing the value.
 
 Implements: `Widget`
 
-### `DroppedFile` (struct) — `egui-0.35.0/src/data/input/dropped_file.rs:4`
-
-A file dropped into egui.
-
-Public fields:
-
-- `path: Option<PathBuf>` — Set by the `egui-winit` backend.
-- `name: String` — Name of the file. Set by the `eframe` web backend.
-- `mime: String` — With the `eframe` web backend, this is set to the mime-type of the file (if available).
-- `last_modified: Option<SystemTime>` — Set by the `eframe` web backend.
-- `bytes: Option<Arc<[u8]>>` — Set by the `eframe` web backend.
-
-Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
-
-### `EventFilter` (struct) — `egui-0.35.0/src/data/input/event_filter.rs:11`
+### `EventFilter` (struct) — `egui-0.36.2/src/data/input/event_filter.rs:11`
 
 Controls which events that a focused widget will have exclusive access to.
 
@@ -2297,11 +2289,11 @@ Public fields:
 
 Methods:
 
-- `fn matches(&self, event: &Event) -> bool` — `egui-0.35.0/src/data/input/event_filter.rs:50`
+- `fn matches(&self, event: &Event) -> bool` — `egui-0.36.2/src/data/input/event_filter.rs:50`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`
 
-### `FontData` (struct) — `epaint-0.35.0/src/text/fonts.rs:118`
+### `FontData` (struct) — `epaint-0.36.2/src/text/fonts.rs:112`
 
 A `.ttf` or `.otf` file and a font face index.
 
@@ -2313,15 +2305,15 @@ Public fields:
 
 Methods:
 
-- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.35.0/src/text/fonts.rs:139`
-- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.35.0/src/text/fonts.rs:131`
-- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.35.0/src/text/fonts.rs:147`
-- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.35.0/src/text/fonts.rs:159`
+- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.36.2/src/text/fonts.rs:133`
+- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.36.2/src/text/fonts.rs:125`
+- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.36.2/src/text/fonts.rs:141`
+- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.36.2/src/text/fonts.rs:153`
   The variation axes of this font, e.g. `wght` (weight) and `wdth` (width).
 
 Implements: `AsRef<[u8]>`, `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontDefinitions` (struct) — `epaint-0.35.0/src/text/fonts.rs:437`
+### `FontDefinitions` (struct) — `epaint-0.36.2/src/text/fonts.rs:431`
 
 Describes the font data and the sizes to use.
 
@@ -2332,14 +2324,14 @@ Public fields:
 
 Methods:
 
-- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.35.0/src/text/fonts.rs:580`
+- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.36.2/src/text/fonts.rs:574`
   List of all the builtin font names used by `epaint`.
-- `fn empty() -> Self` — `epaint-0.35.0/src/text/fonts.rs:567`
+- `fn empty() -> Self` — `epaint-0.36.2/src/text/fonts.rs:561`
   No fonts.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontId` (struct) — `epaint-0.35.0/src/text/fonts.rs:27`
+### `FontId` (struct) — `epaint-0.36.2/src/text/fonts.rs:21`
 
 How to select a sized font.
 
@@ -2350,13 +2342,13 @@ Public fields:
 
 Methods:
 
-- `const fn monospace(size: f32) -> Self` — `epaint-0.35.0/src/text/fonts.rs:58`
-- `const fn new(size: f32, family: FontFamily) -> Self` — `epaint-0.35.0/src/text/fonts.rs:48`
-- `const fn proportional(size: f32) -> Self` — `epaint-0.35.0/src/text/fonts.rs:53`
+- `const fn monospace(size: f32) -> Self` — `epaint-0.36.2/src/text/fonts.rs:52`
+- `const fn new(size: f32, family: FontFamily) -> Self` — `epaint-0.36.2/src/text/fonts.rs:42`
+- `const fn proportional(size: f32) -> Self` — `epaint-0.36.2/src/text/fonts.rs:47`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontTweak` (struct) — `epaint-0.35.0/src/text/fonts.rs:214`
+### `FontTweak` (struct) — `epaint-0.36.2/src/text/fonts.rs:208`
 
 Extra scale and vertical tweak to apply to all text of a certain font.
 
@@ -2374,7 +2366,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Frame` (struct) — `egui-0.35.0/src/containers/frame.rs:96`
+### `Frame` (struct) — `egui-0.36.2/src/containers/frame.rs:96`
 
 A frame around some content, including margin, colors, etc.
 
@@ -2389,65 +2381,65 @@ Public fields:
 
 Methods:
 
-- `const fn new() -> Self` — `egui-0.35.0/src/containers/frame.rs:173`
+- `const fn new() -> Self` — `egui-0.36.2/src/containers/frame.rs:173`
   No colors, no margins, no border.
-- `fn begin(self, ui: &mut Ui) -> Prepared` — `egui-0.35.0/src/containers/frame.rs:378`
+- `fn begin(self, ui: &mut Ui) -> Prepared` — `egui-0.36.2/src/containers/frame.rs:378`
   Begin a dynamically colored frame.
-- `fn canvas(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:227`
+- `fn canvas(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:227`
   A canvas to draw on.
-- `fn central_panel(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:191`
-- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.35.0/src/containers/frame.rs:277`
+- `fn central_panel(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:191`
+- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.36.2/src/containers/frame.rs:277`
   The rounding of the _outer_ corner of the [`Self::stroke`] (or, if there is no stroke, the outer corner of [`…
-- `fn dark_canvas(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:236`
+- `fn dark_canvas(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:236`
   A dark canvas to draw on.
-- `fn fill(self, fill: Color32) -> Self` — `egui-0.35.0/src/containers/frame.rs:258`
+- `fn fill(self, fill: Color32) -> Self` — `egui-0.36.2/src/containers/frame.rs:258`
   The background fill color of the frame, within the [`Self::stroke`].
-- `fn fill_rect(&self, content_rect: Rect) -> Rect` — `egui-0.35.0/src/containers/frame.rs:336`
+- `fn fill_rect(&self, content_rect: Rect) -> Rect` — `egui-0.36.2/src/containers/frame.rs:336`
   Calculate the `fill_rect` from the `content_rect`.
-- `fn group(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:178`
+- `fn group(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:178`
   For when you want to group a few widgets together within a frame.
-- `fn inner_margin(self, inner_margin: impl Into<Margin>) -> Self` — `egui-0.35.0/src/containers/frame.rs:248`
+- `fn inner_margin(self, inner_margin: impl Into<Margin>) -> Self` — `egui-0.36.2/src/containers/frame.rs:248`
   Margin within the painted frame.
-- `fn menu(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:205`
-- `fn multiply_with_opacity(self, opacity: f32) -> Self` — `egui-0.35.0/src/containers/frame.rs:313`
+- `fn menu(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:205`
+- `fn multiply_with_opacity(self, opacity: f32) -> Self` — `egui-0.36.2/src/containers/frame.rs:313`
   Opacity multiplier in gamma space.
-- `fn outer_margin(self, outer_margin: impl Into<Margin>) -> Self` — `egui-0.35.0/src/containers/frame.rs:296`
+- `fn outer_margin(self, outer_margin: impl Into<Margin>) -> Self` — `egui-0.36.2/src/containers/frame.rs:296`
   Margin outside the painted frame.
-- `fn outer_rect(&self, content_rect: Rect) -> Rect` — `egui-0.35.0/src/containers/frame.rs:350`
+- `fn outer_rect(&self, content_rect: Rect) -> Rect` — `egui-0.36.2/src/containers/frame.rs:350`
   Calculate the `outer_rect` from the `content_rect`.
-- `fn paint(&self, content_rect: Rect) -> Shape` — `egui-0.35.0/src/containers/frame.rs:423`
+- `fn paint(&self, content_rect: Rect) -> Shape` — `egui-0.36.2/src/containers/frame.rs:423`
   Paint this frame as a shape.
-- `fn popup(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:214`
-- `fn shadow(self, shadow: Shadow) -> Self` — `egui-0.35.0/src/containers/frame.rs:303`
+- `fn popup(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:214`
+- `fn shadow(self, shadow: Shadow) -> Self` — `egui-0.36.2/src/containers/frame.rs:303`
   Optional drop-shadow behind the frame.
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/frame.rs:404`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/frame.rs:404`
   Show the given ui surrounded by this frame.
-- `fn show_dyn<R>(self, ui: &mut Ui, add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>) -> InnerResponse<R>` — `egui-0.35.0/src/containers/frame.rs:411`
+- `fn show_dyn<R>(self, ui: &mut Ui, add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>) -> InnerResponse<R>` — `egui-0.36.2/src/containers/frame.rs:411`
   Show using dynamic dispatch.
-- `fn side_top_panel(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:185`
-- `fn stroke(self, stroke: impl Into<Stroke>) -> Self` — `egui-0.35.0/src/containers/frame.rs:267`
+- `fn side_top_panel(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:185`
+- `fn stroke(self, stroke: impl Into<Stroke>) -> Self` — `egui-0.36.2/src/containers/frame.rs:267`
   The width and color of the outline around the frame.
-- `fn total_margin(&self) -> MarginF32` — `egui-0.35.0/src/containers/frame.rs:327`
+- `fn total_margin(&self) -> MarginF32` — `egui-0.36.2/src/containers/frame.rs:327`
   How much extra space the frame uses up compared to the content.
-- `fn widget_rect(&self, content_rect: Rect) -> Rect` — `egui-0.35.0/src/containers/frame.rs:343`
+- `fn widget_rect(&self, content_rect: Rect) -> Rect` — `egui-0.36.2/src/containers/frame.rs:343`
   Calculate the `widget_rect` from the `content_rect`.
-- `fn window(style: &Style) -> Self` — `egui-0.35.0/src/containers/frame.rs:196`
+- `fn window(style: &Style) -> Self` — `egui-0.36.2/src/containers/frame.rs:196`
   The default frame for an [`crate::Window`].
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Widget`
 
-### `FrameDurations` (struct) — `egui-0.35.0/src/widgets/image.rs:878`
+### `FrameDurations` (struct) — `egui-0.36.2/src/widgets/image.rs:879`
 
 Stores the durations between each frame of an animated image
 
 Methods:
 
-- `fn all(&self) -> Iter<'_, Duration>` — `egui-0.35.0/src/widgets/image.rs:885`
-- `fn new(durations: Vec<Duration>) -> Self` — `egui-0.35.0/src/widgets/image.rs:881`
+- `fn all(&self) -> Iter<'_, Duration>` — `egui-0.36.2/src/widgets/image.rs:886`
+- `fn new(durations: Vec<Duration>) -> Self` — `egui-0.36.2/src/widgets/image.rs:882`
 
 Implements: `Clone`, `Debug`, `Default`, `Eq`, `Hash`, `PartialEq`, `StructuralPartialEq`
 
-### `FullOutput` (struct) — `egui-0.35.0/src/data/output.rs:13`
+### `FullOutput` (struct) — `egui-0.36.2/src/data/output.rs:13`
 
 What egui emits each frame from [`crate::Context::run_ui`].
 
@@ -2461,12 +2453,14 @@ Public fields:
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `egui-0.35.0/src/data/output.rs:44`
+- `fn append(&mut self, newer: Self)` — `egui-0.36.2/src/data/output.rs:44`
   Add on new output.
+- `fn drop_without_applying_deltas(self)` — `egui-0.36.2/src/data/output.rs:74`
+  [`epaint::textures::TexturesDelta`] will panic when dropped with still unapplied deltas, this is a helper to…
 
 Implements: `Clone`, `Default`
 
-### `Galley` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:729`
+### `Galley` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:736`
 
 Text that has been laid out, ready for painting.
 
@@ -2483,64 +2477,64 @@ Public fields:
 
 Methods:
 
-- `fn begin(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1228`
+- `fn begin(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1235`
   Cursor to the first character.
-- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1335`
-- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:1058`
+- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1342`
+- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:1065`
   Append each galley under the previous one.
-- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1406`
-- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1390`
-- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1364`
-- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1431`
-- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1398`
-- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1174`
+- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1413`
+- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1397`
+- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1371`
+- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1438`
+- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1405`
+- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1181`
   Cursor at the given position within the galley.
-- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1317`
-- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1328`
-- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1339`
-- `fn end(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1233`
+- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1324`
+- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1335`
+- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1346`
+- `fn end(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1240`
   Cursor to one-past last character.
-- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1019`
+- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1026`
   This is the size that a non-wrapped, non-truncated, non-justified version of the text would have.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/text/text_layout_types.rs:999`
-- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1252`
-- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1163`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/text/text_layout_types.rs:1006`
+- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1259`
+- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1170`
   Returns a 0-width Rect.
-- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1153`
+- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1160`
   Returns a 0-width Rect.
-- `fn size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1010`
-- `fn text(&self) -> &str` — `epaint-0.35.0/src/text/text_layout_types.rs:1005`
+- `fn size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1017`
+- `fn text(&self) -> &str` — `epaint-0.36.2/src/text/text_layout_types.rs:1012`
   The full, non-elided text of the input job.
 
 Implements: `AsRef<str>`, `Borrow<str>`, `Clone`, `Debug`, `Deref`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Grid` (struct) — `egui-0.35.0/src/grid.rs:314`
+### `Grid` (struct) — `egui-0.36.2/src/grid.rs:328`
 
 A simple grid layout.
 
 Methods:
 
-- `fn max_col_width(self, max_col_width: f32) -> Self` — `egui-0.35.0/src/grid.rs:390`
+- `fn max_col_width(self, max_col_width: f32) -> Self` — `egui-0.36.2/src/grid.rs:404`
   Set soft maximum width (wrapping width) of each column.
-- `fn min_col_width(self, min_col_width: f32) -> Self` — `egui-0.35.0/src/grid.rs:375`
+- `fn min_col_width(self, min_col_width: f32) -> Self` — `egui-0.36.2/src/grid.rs:389`
   Set minimum width of each column. Default: [`crate::style::Spacing::interact_size`]`.x`.
-- `fn min_row_height(self, min_row_height: f32) -> Self` — `egui-0.35.0/src/grid.rs:383`
+- `fn min_row_height(self, min_row_height: f32) -> Self` — `egui-0.36.2/src/grid.rs:397`
   Set minimum height of each row. Default: [`crate::style::Spacing::interact_size`]`.y`.
-- `fn new(id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/grid.rs:327`
+- `fn new(id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/grid.rs:341`
   Create a new [`Grid`] with a locally unique identifier.
-- `fn num_columns(self, num_columns: usize) -> Self` — `egui-0.35.0/src/grid.rs:352`
+- `fn num_columns(self, num_columns: usize) -> Self` — `egui-0.36.2/src/grid.rs:366`
   Setting this will allow the last column to expand to take up the rest of the space of the parent [`Ui`].
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/grid.rs:413`
-- `fn spacing(self, spacing: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/grid.rs:398`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/grid.rs:427`
+- `fn spacing(self, spacing: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/grid.rs:412`
   Set spacing between columns/rows. Default: [`crate::style::Spacing::item_spacing`].
-- `fn start_row(self, start_row: usize) -> Self` — `egui-0.35.0/src/grid.rs:406`
+- `fn start_row(self, start_row: usize) -> Self` — `egui-0.36.2/src/grid.rs:420`
   Change which row number the grid starts on. This can be useful when you have a large [`crate::Grid`] inside o…
-- `fn striped(self, striped: bool) -> Self` — `egui-0.35.0/src/grid.rs:361`
+- `fn striped(self, striped: bool) -> Self` — `egui-0.36.2/src/grid.rs:375`
   If `true`, add a subtle background color to every other row.
-- `fn with_row_color<F>(self, color_picker: F) -> Self` — `egui-0.35.0/src/grid.rs:342`
+- `fn with_row_color<F>(self, color_picker: F) -> Self` — `egui-0.36.2/src/grid.rs:356`
   Setting this will allow for dynamic coloring of rows of the grid object
 
-### `HoveredFile` (struct) — `egui-0.35.0/src/data/input/hovered_file.rs:4`
+### `HoveredFile` (struct) — `egui-0.36.2/src/data/input/hovered_file.rs:4`
 
 A file about to be dropped into egui.
 
@@ -2551,20 +2545,20 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Hyperlink` (struct) — `egui-0.35.0/src/widgets/hyperlink.rs:92`
+### `Hyperlink` (struct) — `egui-0.36.2/src/widgets/hyperlink.rs:92`
 
 A clickable hyperlink, e.g. to `"https://github.com/emilk/egui"`.
 
 Methods:
 
-- `fn from_label_and_url(text: impl Into<WidgetText>, url: impl ToString) -> Self` — `egui-0.35.0/src/widgets/hyperlink.rs:110`
-- `fn new(url: impl ToString) -> Self` — `egui-0.35.0/src/widgets/hyperlink.rs:100`
-- `fn open_in_new_tab(self, new_tab: bool) -> Self` — `egui-0.35.0/src/widgets/hyperlink.rs:120`
+- `fn from_label_and_url(text: impl Into<WidgetText>, url: impl ToString) -> Self` — `egui-0.36.2/src/widgets/hyperlink.rs:110`
+- `fn new(url: impl ToString) -> Self` — `egui-0.36.2/src/widgets/hyperlink.rs:100`
+- `fn open_in_new_tab(self, new_tab: bool) -> Self` — `egui-0.36.2/src/widgets/hyperlink.rs:120`
   Always open this hyperlink in a new browser tab.
 
 Implements: `Widget`
 
-### `IconData` (struct) — `egui-0.35.0/src/viewport.rs:184`
+### `IconData` (struct) — `egui-0.36.2/src/viewport.rs:183`
 
 Image data for an application icon.
 
@@ -2576,105 +2570,105 @@ Public fields:
 
 Methods:
 
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/viewport.rs:197`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/viewport.rs:196`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<&IconData>`, `From<IconData>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Id` (struct) — `egui-0.35.0/src/id.rs:44`
+### `Id` (struct) — `egui-0.36.2/src/id.rs:44`
 
 egui tracks widgets frame-to-frame using [`Id`]s.
 
 Methods:
 
-- `fn accesskit_id(&self) -> NodeId` — `egui-0.35.0/src/id.rs:103`
-- `fn new(source: impl AsId) -> Self` — `egui-0.35.0/src/id.rs:67`
+- `fn accesskit_id(&self) -> NodeId` — `egui-0.36.2/src/id.rs:103`
+- `fn new(source: impl AsId) -> Self` — `egui-0.36.2/src/id.rs:67`
   Generate a new root [`Id`] by hashing some source (e.g. a string or integer).
-- `fn short_debug_format(&self) -> String` — `egui-0.35.0/src/id.rs:91`
+- `fn short_debug_format(&self) -> String` — `egui-0.36.2/src/id.rs:91`
   Short and readable summary
-- `fn value(&self) -> u64` — `egui-0.35.0/src/id.rs:99`
+- `fn value(&self) -> u64` — `egui-0.36.2/src/id.rs:99`
   The inner value of the [`Id`].
-- `fn with(self, salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/id.rs:77`
+- `fn with(self, salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/id.rs:77`
   Generate a child [`Id`] by salting the parent [`Id`] with the given argument.
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `From<&'static str>`, `From<String>`, `From<ViewportId>`, `Hash`, `IsEnabled`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `IdSalt` (struct) — `egui-0.35.0/src/id_salt.rs:26`
+### `IdSalt` (struct) — `egui-0.36.2/src/id_salt.rs:26`
 
 Uniquely identifies a child widget within a parent widget.
 
 Methods:
 
-- `fn new(source: impl AsIdSalt) -> Self` — `egui-0.35.0/src/id_salt.rs:32`
+- `fn new(source: impl AsIdSalt) -> Self` — `egui-0.36.2/src/id_salt.rs:32`
   Create a new [`IdSalt`] by hashing some source (e.g. a string or integer).
-- `fn value(&self) -> u64` — `egui-0.35.0/src/id_salt.rs:55`
+- `fn value(&self) -> u64` — `egui-0.36.2/src/id_salt.rs:55`
   The inner value of the [`IdSalt`].
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `IsEnabled`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Image` (struct) — `egui-0.35.0/src/widgets/image.rs:51`
+### `Image` (struct) — `egui-0.36.2/src/widgets/image.rs:52`
 
 A widget which displays an image.
 
 Methods:
 
-- `fn alt_text(self, label: impl Into<String>) -> Self` — `egui-0.35.0/src/widgets/image.rs:272`
+- `fn alt_text(self, label: impl Into<String>) -> Self` — `egui-0.36.2/src/widgets/image.rs:273`
   Set alt text for the image. This will be shown when the image fails to load.
-- `fn bg_fill(self, bg_fill: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widgets/image.rs:216`
+- `fn bg_fill(self, bg_fill: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widgets/image.rs:217`
   A solid color to put behind the image. Useful for transparent images.
-- `fn calc_size(&self, available_size: Vec2, image_source_size: Option<Vec2>) -> Vec2` — `egui-0.35.0/src/widgets/image.rs:287`
+- `fn calc_size(&self, available_size: Vec2, image_source_size: Option<Vec2>) -> Vec2` — `egui-0.36.2/src/widgets/image.rs:288`
   Returns the size the image will occupy in the final UI.
-- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.35.0/src/widgets/image.rs:251`
+- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.36.2/src/widgets/image.rs:252`
   Round the corners of the image.
-- `fn fit_to_exact_size(self, size: Vec2) -> Self` — `egui-0.35.0/src/widgets/image.rs:176`
+- `fn fit_to_exact_size(self, size: Vec2) -> Self` — `egui-0.36.2/src/widgets/image.rs:177`
   Fit the image to an exact size.
-- `fn fit_to_fraction(self, fraction: Vec2) -> Self` — `egui-0.35.0/src/widgets/image.rs:185`
+- `fn fit_to_fraction(self, fraction: Vec2) -> Self` — `egui-0.36.2/src/widgets/image.rs:186`
   Fit the image to a fraction of the available space.
-- `fn fit_to_original_size(self, scale: f32) -> Self` — `egui-0.35.0/src/widgets/image.rs:167`
+- `fn fit_to_original_size(self, scale: f32) -> Self` — `egui-0.36.2/src/widgets/image.rs:168`
   Fit the image to its original size with some scaling.
-- `fn from_bytes(uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>) -> Self` — `egui-0.35.0/src/widgets/image.rs:110`
+- `fn from_bytes(uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>) -> Self` — `egui-0.36.2/src/widgets/image.rs:111`
   Load the image from some raw bytes.
-- `fn from_texture(texture: impl Into<SizedTexture>) -> Self` — `egui-0.35.0/src/widgets/image.rs:101`
+- `fn from_texture(texture: impl Into<SizedTexture>) -> Self` — `egui-0.36.2/src/widgets/image.rs:102`
   Load the image from an existing texture.
-- `fn from_uri(uri: impl Into<Cow<'a, str>>) -> Self` — `egui-0.35.0/src/widgets/image.rs:94`
+- `fn from_uri(uri: impl Into<Cow<'a, str>>) -> Self` — `egui-0.36.2/src/widgets/image.rs:95`
   Load the image from a URI.
-- `fn image_options(&self) -> &ImageOptions` — `egui-0.35.0/src/widgets/image.rs:320`
-- `fn load_and_calc_size(&self, ui: &Ui, available_size: Vec2) -> Option<Vec2>` — `egui-0.35.0/src/widgets/image.rs:292`
-- `fn load_for_size(&self, ctx: &Context, available_size: Vec2) -> TextureLoadResult` — `egui-0.35.0/src/widgets/image.rs:349`
+- `fn image_options(&self) -> &ImageOptions` — `egui-0.36.2/src/widgets/image.rs:321`
+- `fn load_and_calc_size(&self, ui: &Ui, available_size: Vec2) -> Option<Vec2>` — `egui-0.36.2/src/widgets/image.rs:293`
+- `fn load_for_size(&self, ctx: &Context, available_size: Vec2) -> TextureLoadResult` — `egui-0.36.2/src/widgets/image.rs:350`
   Load the image from its [`Image::source`], returning the resulting [`SizedTexture`].
-- `fn maintain_aspect_ratio(self, value: bool) -> Self` — `egui-0.35.0/src/widgets/image.rs:153`
+- `fn maintain_aspect_ratio(self, value: bool) -> Self` — `egui-0.36.2/src/widgets/image.rs:154`
   Whether or not the [`ImageFit`] should maintain the image's original aspect ratio.
-- `fn max_height(self, height: f32) -> Self` — `egui-0.35.0/src/widgets/image.rs:137`
+- `fn max_height(self, height: f32) -> Self` — `egui-0.36.2/src/widgets/image.rs:138`
   Set the max height of the image.
-- `fn max_size(self, size: Vec2) -> Self` — `egui-0.35.0/src/widgets/image.rs:146`
+- `fn max_size(self, size: Vec2) -> Self` — `egui-0.36.2/src/widgets/image.rs:147`
   Set the max size of the image.
-- `fn max_width(self, width: f32) -> Self` — `egui-0.35.0/src/widgets/image.rs:128`
+- `fn max_width(self, width: f32) -> Self` — `egui-0.36.2/src/widgets/image.rs:129`
   Set the max width of the image.
-- `fn new(source: impl Into<ImageSource<'a>>) -> Self` — `egui-0.35.0/src/widgets/image.rs:63`
+- `fn new(source: impl Into<ImageSource<'a>>) -> Self` — `egui-0.36.2/src/widgets/image.rs:64`
   Load the image from some source.
-- `fn paint_at(&self, ui: &Ui, rect: Rect)` — `egui-0.35.0/src/widgets/image.rs:368`
+- `fn paint_at(&self, ui: &Ui, rect: Rect)` — `egui-0.36.2/src/widgets/image.rs:369`
   Paint the image in the given rectangle.
-- `fn rotate(self, angle: f32, origin: Vec2) -> Self` — `egui-0.35.0/src/widgets/image.rs:238`
+- `fn rotate(self, angle: f32, origin: Vec2) -> Self` — `egui-0.36.2/src/widgets/image.rs:239`
   Rotate the image about an origin by some angle
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/widgets/image.rs:202`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/widgets/image.rs:203`
   Make the image respond to clicks and/or drags.
-- `fn show_loading_spinner(self, show: bool) -> Self` — `egui-0.35.0/src/widgets/image.rs:263`
+- `fn show_loading_spinner(self, show: bool) -> Self` — `egui-0.36.2/src/widgets/image.rs:264`
   Show a spinner when the image is loading.
-- `fn shrink_to_fit(self) -> Self` — `egui-0.35.0/src/widgets/image.rs:196`
+- `fn shrink_to_fit(self) -> Self` — `egui-0.36.2/src/widgets/image.rs:197`
   Fit the image to 100% of its available size, shrinking it if necessary.
-- `fn size(&self) -> Option<Vec2>` — `egui-0.35.0/src/widgets/image.rs:298`
-- `fn source(&'a self, ctx: &Context) -> ImageSource<'a>` — `egui-0.35.0/src/widgets/image.rs:325`
-- `fn texture_options(self, texture_options: TextureOptions) -> Self` — `egui-0.35.0/src/widgets/image.rs:119`
+- `fn size(&self) -> Option<Vec2>` — `egui-0.36.2/src/widgets/image.rs:299`
+- `fn source(&'a self, ctx: &Context) -> ImageSource<'a>` — `egui-0.36.2/src/widgets/image.rs:326`
+- `fn texture_options(self, texture_options: TextureOptions) -> Self` — `egui-0.36.2/src/widgets/image.rs:120`
   Texture options used when creating the texture.
-- `fn tint(self, tint: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widgets/image.rs:223`
+- `fn tint(self, tint: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widgets/image.rs:224`
   Multiply image color with this. Default is WHITE (no tint).
-- `fn uri(&self) -> Option<&str>` — `egui-0.35.0/src/widgets/image.rs:309`
+- `fn uri(&self) -> Option<&str>` — `egui-0.36.2/src/widgets/image.rs:310`
   Returns the URI of the image.
-- `fn uv(self, uv: impl Into<Rect>) -> Self` — `egui-0.35.0/src/widgets/image.rs:209`
+- `fn uv(self, uv: impl Into<Rect>) -> Self` — `egui-0.36.2/src/widgets/image.rs:210`
   Select UV range. Default is (0,0) in top-left, (1,1) bottom right.
 
 Implements: `Clone`, `Debug`, `From<Image<'a>>`, `From<T>`, `Widget`
 
-### `ImageOptions` (struct) — `egui-0.35.0/src/widgets/image.rs:797`
+### `ImageOptions` (struct) — `egui-0.36.2/src/widgets/image.rs:798`
 
 Public fields:
 
@@ -2686,7 +2680,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
-### `ImageSize` (struct) — `egui-0.35.0/src/widgets/image.rs:427`
+### `ImageSize` (struct) — `egui-0.36.2/src/widgets/image.rs:428`
 
 This type determines the constraints on how the size of an image should be calculated.
 
@@ -2698,14 +2692,14 @@ Public fields:
 
 Methods:
 
-- `fn calc_size(&self, available_size: Vec2, image_source_size: Vec2) -> Vec2` — `egui-0.35.0/src/widgets/image.rs:515`
+- `fn calc_size(&self, available_size: Vec2, image_source_size: Vec2) -> Vec2` — `egui-0.36.2/src/widgets/image.rs:516`
   Calculate the final on-screen size in points.
-- `fn hint(&self, available_size: Vec2, pixels_per_point: f32) -> SizeHint` — `egui-0.35.0/src/widgets/image.rs:483`
+- `fn hint(&self, available_size: Vec2, pixels_per_point: f32) -> SizeHint` — `egui-0.36.2/src/widgets/image.rs:484`
   Size hint for e.g. rasterizing an svg.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`
 
-### `ImmediateViewport` (struct) — `egui-0.35.0/src/viewport.rs:1304`
+### `ImmediateViewport` (struct) — `egui-0.36.2/src/viewport.rs:1303`
 
 Viewport for immediate rendering.
 
@@ -2715,7 +2709,7 @@ Public fields:
 - `builder: ViewportBuilder`
 - `viewport_ui_cb: Box<dyn FnMut(&mut Ui) + 'a>` — The user-code that shows the GUI.
 
-### `InnerResponse` (struct) — `egui-0.35.0/src/response.rs:1139`
+### `InnerResponse` (struct) — `egui-0.36.2/src/response.rs:1159`
 
 Returned when we wrap some ui-code and want to return both the results of the inner function and the ui as a whole, e.g.:
 
@@ -2726,11 +2720,11 @@ Public fields:
 
 Methods:
 
-- `fn new(inner: R, response: Response) -> Self` — `egui-0.35.0/src/response.rs:1149`
+- `fn new(inner: R, response: Response) -> Self` — `egui-0.36.2/src/response.rs:1169`
 
 Implements: `Debug`
 
-### `InputOptions` (struct) — `egui-0.35.0/src/input_state/mod.rs:59`
+### `InputOptions` (struct) — `egui-0.36.2/src/input_state/mod.rs:57`
 
 Options for input state handling.
 
@@ -2748,12 +2742,12 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/input_state/mod.rs:128`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/input_state/mod.rs:126`
   Show the options in the ui.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `InputState` (struct) — `egui-0.35.0/src/input_state/mod.rs:215`
+### `InputState` (struct) — `egui-0.36.2/src/input_state/mod.rs:213`
 
 Input state that egui updates each frame.
 
@@ -2775,66 +2769,66 @@ Public fields:
 
 Methods:
 
-- `fn accesskit_action_requests(&self, id: Id, action: Action) -> impl Iterator<Item = &ActionRequest>` — `egui-0.35.0/src/input_state/mod.rs:858`
-- `fn aim_radius(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:799`
+- `fn accesskit_action_requests(&self, id: Id, action: Action) -> impl Iterator<Item = &ActionRequest>` — `egui-0.36.2/src/input_state/mod.rs:861`
+- `fn aim_radius(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:802`
   How imprecise do we expect the mouse/touch input to be? Returns imprecision in points.
-- `fn any_touches(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:837`
+- `fn any_touches(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:840`
   True if there currently are any fingers touching egui.
-- `fn begin_pass(self, new: RawInput, requested_immediate_repaint_prev_frame: bool, pixels_per_point: f32, options: InputOptions) -> Self` — `egui-0.35.0/src/input_state/mod.rs:367`
-- `fn consume_accesskit_action_requests(&mut self, id: Id, consume: impl FnMut(&ActionRequest) -> bool)` — `egui-0.35.0/src/input_state/mod.rs:876`
-- `fn consume_key(&mut self, modifiers: Modifiers, logical_key: Key) -> bool` — `egui-0.35.0/src/input_state/mod.rs:719`
+- `fn begin_pass(self, new: RawInput, requested_immediate_repaint_prev_frame: bool, pixels_per_point: f32, options: InputOptions) -> Self` — `egui-0.36.2/src/input_state/mod.rs:365`
+- `fn consume_accesskit_action_requests(&mut self, id: Id, consume: impl FnMut(&ActionRequest) -> bool)` — `egui-0.36.2/src/input_state/mod.rs:879`
+- `fn consume_key(&mut self, modifiers: Modifiers, logical_key: Key) -> bool` — `egui-0.36.2/src/input_state/mod.rs:722`
   Check for a key press. If found, `true` is returned and the key pressed is consumed, so that this will only r…
-- `fn consume_shortcut(&mut self, shortcut: &KeyboardShortcut) -> bool` — `egui-0.35.0/src/input_state/mod.rs:732`
+- `fn consume_shortcut(&mut self, shortcut: &KeyboardShortcut) -> bool` — `egui-0.36.2/src/input_state/mod.rs:735`
   Check if the given shortcut has been pressed.
-- `fn content_rect(&self) -> Rect` — `egui-0.35.0/src/input_state/mod.rs:507`
+- `fn content_rect(&self) -> Rect` — `egui-0.36.2/src/input_state/mod.rs:510`
   Returns the region of the screen that is safe for content rendering
-- `fn count_and_consume_key(&mut self, modifiers: Modifiers, logical_key: Key) -> usize` — `egui-0.35.0/src/input_state/mod.rs:688`
+- `fn count_and_consume_key(&mut self, modifiers: Modifiers, logical_key: Key) -> usize` — `egui-0.36.2/src/input_state/mod.rs:691`
   Count presses of a key. If non-zero, the presses are consumed, so that this will only return non-zero once.
-- `fn filtered_events(&self, filter: &EventFilter) -> Vec<Event>` — `egui-0.35.0/src/input_state/mod.rs:902`
+- `fn filtered_events(&self, filter: &EventFilter) -> Vec<Event>` — `egui-0.36.2/src/input_state/mod.rs:905`
   Get all events that matches the given filter.
-- `fn has_accesskit_action_request(&self, id: Id, action: Action) -> bool` — `egui-0.35.0/src/input_state/mod.rs:893`
-- `fn has_touch_screen(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:842`
+- `fn has_accesskit_action_request(&self, id: Id, action: Action) -> bool` — `egui-0.36.2/src/input_state/mod.rs:896`
+- `fn has_touch_screen(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:845`
   True if we have ever received a touch event.
-- `fn is_scrolling(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:635`
+- `fn is_scrolling(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:638`
   True if there is an active scroll action that might scroll more when using [`Self::smooth_scroll_delta`].
-- `fn key_down(&self, desired_key: Key) -> bool` — `egui-0.35.0/src/input_state/mod.rs:766`
+- `fn key_down(&self, desired_key: Key) -> bool` — `egui-0.36.2/src/input_state/mod.rs:769`
   Is the given key currently held down?
-- `fn key_pressed(&self, desired_key: Key) -> bool` — `egui-0.35.0/src/input_state/mod.rs:743`
+- `fn key_pressed(&self, desired_key: Key) -> bool` — `egui-0.36.2/src/input_state/mod.rs:746`
   Was the given key pressed this frame?
-- `fn key_released(&self, desired_key: Key) -> bool` — `egui-0.35.0/src/input_state/mod.rs:771`
+- `fn key_released(&self, desired_key: Key) -> bool` — `egui-0.36.2/src/input_state/mod.rs:774`
   Was the given key released this frame?
-- `fn multi_touch(&self) -> Option<MultiTouchInfo>` — `egui-0.35.0/src/input_state/mod.rs:831`
+- `fn multi_touch(&self) -> Option<MultiTouchInfo>` — `egui-0.36.2/src/input_state/mod.rs:834`
   Returns details about the currently ongoing multi-touch gesture, if any. Note that this method returns `None`…
-- `fn num_accesskit_action_requests(&self, id: Id, action: Action) -> usize` — `egui-0.35.0/src/input_state/mod.rs:897`
-- `fn num_presses(&self, desired_key: Key) -> usize` — `egui-0.35.0/src/input_state/mod.rs:750`
+- `fn num_accesskit_action_requests(&self, id: Id, action: Action) -> usize` — `egui-0.36.2/src/input_state/mod.rs:900`
+- `fn num_presses(&self, desired_key: Key) -> usize` — `egui-0.36.2/src/input_state/mod.rs:753`
   How many times was the given key pressed this frame?
-- `fn physical_pixel_size(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:792`
+- `fn physical_pixel_size(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:795`
   Size of a physical pixel in logical gui coordinates (points).
-- `fn pixels_per_point(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:786`
+- `fn pixels_per_point(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:789`
   Also known as device pixel ratio, > 1 for high resolution screens.
-- `fn rotation_delta(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:614`
+- `fn rotation_delta(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:617`
   Rotation in radians this frame, measuring clockwise (e.g. from a rotation gesture).
-- `fn safe_area_insets(&self) -> SafeAreaInsets` — `egui-0.35.0/src/input_state/mod.rs:531`
+- `fn safe_area_insets(&self) -> SafeAreaInsets` — `egui-0.36.2/src/input_state/mod.rs:534`
   Get the safe area insets.
-- `fn smooth_scroll_delta(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:547`
+- `fn smooth_scroll_delta(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:550`
   How many points the user scrolled, smoothed over a few frames.
-- `fn time_since_last_scroll(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:641`
+- `fn time_since_last_scroll(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:644`
   How long has it been (in seconds) since the last scroll event?
-- `fn translation_delta(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:627`
+- `fn translation_delta(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:630`
   Panning translation in pixels this frame (e.g. from scrolling or a pan gesture)
-- `fn ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/input_state/mod.rs:1573`
-- `fn viewport(&self) -> &ViewportInfo` — `egui-0.35.0/src/input_state/mod.rs:495`
+- `fn ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/input_state/mod.rs:1576`
+- `fn viewport(&self) -> &ViewportInfo` — `egui-0.36.2/src/input_state/mod.rs:498`
   Info about the active viewport
-- `fn viewport_rect(&self) -> Rect` — `egui-0.35.0/src/input_state/mod.rs:521`
+- `fn viewport_rect(&self) -> Rect` — `egui-0.36.2/src/input_state/mod.rs:524`
   Returns the full area available to egui, including parts that might be partially covered, for example, by the…
-- `fn zoom_delta(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:559`
+- `fn zoom_delta(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:562`
   Uniform zoom scale factor this frame (e.g. from ctrl-scroll or pinch gesture). * `zoom = 1`: no change * `zoo…
-- `fn zoom_delta_2d(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:582`
+- `fn zoom_delta_2d(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:585`
   2D non-proportional zoom scale factor this frame (e.g. from ctrl-scroll or pinch gesture).
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
-### `InteractOptions` (struct) — `egui-0.35.0/src/widget_rect.rs:76`
+### `InteractOptions` (struct) — `egui-0.36.2/src/widget_rect.rs:76`
 
 How to handle multiple calls to [`crate::Response::interact`] and [`crate::Ui::interact_opt`].
 
@@ -2844,7 +2838,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `IntoSizedArgs` (struct) — `egui-0.35.0/src/atomics/atom_kind.rs:7`
+### `IntoSizedArgs` (struct) — `egui-0.36.2/src/atomics/atom_kind.rs:7`
 
 Args passed when sizing an [`super::Atom`]
 
@@ -2854,7 +2848,7 @@ Public fields:
 - `wrap_mode: TextWrapMode`
 - `fallback_font: FontSelection`
 
-### `IntoSizedResult` (struct) — `egui-0.35.0/src/atomics/atom_kind.rs:14`
+### `IntoSizedResult` (struct) — `egui-0.36.2/src/atomics/atom_kind.rs:14`
 
 Result returned when sizing an [`super::Atom`]
 
@@ -2863,7 +2857,7 @@ Public fields:
 - `intrinsic_size: Vec2`
 - `sized: SizedAtomKind<'a>`
 
-### `KeyboardShortcut` (struct) — `egui-0.35.0/src/data/input/keyboard_shortcut.rs:11`
+### `KeyboardShortcut` (struct) — `egui-0.36.2/src/data/input/keyboard_shortcut.rs:11`
 
 A keyboard shortcut, e.g. `Ctrl+Alt+W`.
 
@@ -2874,41 +2868,41 @@ Public fields:
 
 Methods:
 
-- `const fn new(modifiers: Modifiers, logical_key: Key) -> Self` — `egui-0.35.0/src/data/input/keyboard_shortcut.rs:18`
-- `fn format(&self, names: &ModifierNames<'_>, is_mac: bool) -> String` — `egui-0.35.0/src/data/input/keyboard_shortcut.rs:25`
+- `const fn new(modifiers: Modifiers, logical_key: Key) -> Self` — `egui-0.36.2/src/data/input/keyboard_shortcut.rs:18`
+- `fn format(&self, names: &ModifierNames<'_>, is_mac: bool) -> String` — `egui-0.36.2/src/data/input/keyboard_shortcut.rs:25`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Label` (struct) — `egui-0.35.0/src/widgets/label.rs:25`
+### `Label` (struct) — `egui-0.36.2/src/widgets/label.rs:25`
 
 Static text.
 
 Methods:
 
-- `fn extend(self) -> Self` — `egui-0.35.0/src/widgets/label.rs:79`
+- `fn extend(self) -> Self` — `egui-0.36.2/src/widgets/label.rs:79`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Extend`], disabling wrapping and truncating, and instead expanding…
-- `fn halign(self, align: Align) -> Self` — `egui-0.35.0/src/widgets/label.rs:86`
+- `fn halign(self, align: Align) -> Self` — `egui-0.36.2/src/widgets/label.rs:86`
   Sets the horizontal alignment of the Label to the given `Align` value.
-- `fn layout_in_ui(self, ui: &mut Ui) -> (Pos2, Arc<Galley>, Response)` — `egui-0.35.0/src/widgets/label.rs:140`
+- `fn layout_in_ui(self, ui: &mut Ui) -> (Pos2, Arc<Galley>, Response)` — `egui-0.36.2/src/widgets/label.rs:140`
   Do layout and position the galley in the ui, without painting it or adding widget info.
-- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/label.rs:35`
-- `fn selectable(self, selectable: bool) -> Self` — `egui-0.35.0/src/widgets/label.rs:95`
+- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/label.rs:35`
+- `fn selectable(self, selectable: bool) -> Self` — `egui-0.36.2/src/widgets/label.rs:95`
   Can the user select the text with the mouse?
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/widgets/label.rs:115`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/widgets/label.rs:115`
   Make the label respond to clicks and/or drags.
-- `fn show_tooltip_when_elided(self, show: bool) -> Self` — `egui-0.35.0/src/widgets/label.rs:132`
+- `fn show_tooltip_when_elided(self, show: bool) -> Self` — `egui-0.36.2/src/widgets/label.rs:132`
   Show the full text when hovered, if the text was elided.
-- `fn text(&self) -> &str` — `egui-0.35.0/src/widgets/label.rs:46`
-- `fn truncate(self) -> Self` — `egui-0.35.0/src/widgets/label.rs:71`
+- `fn text(&self) -> &str` — `egui-0.36.2/src/widgets/label.rs:46`
+- `fn truncate(self) -> Self` — `egui-0.36.2/src/widgets/label.rs:71`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Truncate`].
-- `fn wrap(self) -> Self` — `egui-0.35.0/src/widgets/label.rs:63`
+- `fn wrap(self) -> Self` — `egui-0.36.2/src/widgets/label.rs:63`
   Set [`Self::wrap_mode`] to [`TextWrapMode::Wrap`].
-- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.35.0/src/widgets/label.rs:56`
+- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.36.2/src/widgets/label.rs:56`
   Set the wrap mode for the text.
 
 Implements: `Widget`
 
-### `LayerId` (struct) — `egui-0.35.0/src/layers.rs:65`
+### `LayerId` (struct) — `egui-0.36.2/src/layers.rs:65`
 
 An identifier for a paint layer. Also acts as an identifier for [`crate::Area`]:s.
 
@@ -2919,15 +2913,15 @@ Public fields:
 
 Methods:
 
-- `fn background() -> Self` — `egui-0.35.0/src/layers.rs:82`
-- `fn debug() -> Self` — `egui-0.35.0/src/layers.rs:75`
-- `fn new(order: Order, id: Id) -> Self` — `egui-0.35.0/src/layers.rs:71`
-- `fn short_debug_format(&self) -> String` — `egui-0.35.0/src/layers.rs:90`
+- `fn background() -> Self` — `egui-0.36.2/src/layers.rs:82`
+- `fn debug() -> Self` — `egui-0.36.2/src/layers.rs:75`
+- `fn new(order: Order, id: Id) -> Self` — `egui-0.36.2/src/layers.rs:71`
+- `fn short_debug_format(&self) -> String` — `egui-0.36.2/src/layers.rs:90`
   Short and readable summary
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Layout` (struct) — `egui-0.35.0/src/layout.rs:102`
+### `Layout` (struct) — `egui-0.36.2/src/layout.rs:102`
 
 The layout of a [`Ui`][`crate::Ui`], e.g. "vertical & centered".
 
@@ -2942,59 +2936,70 @@ Public fields:
 
 Methods:
 
-- `fn align_size_within_rect(&self, size: Vec2, outer: Rect) -> Rect` — `egui-0.35.0/src/layout.rs:374`
-- `fn bottom_up(halign: Align) -> Self` — `egui-0.35.0/src/layout.rs:192`
+- `fn align_size_within_rect(&self, size: Vec2, outer: Rect) -> Rect` — `egui-0.36.2/src/layout.rs:374`
+- `fn bottom_up(halign: Align) -> Self` — `egui-0.36.2/src/layout.rs:192`
   Place elements vertically, bottom up.
-- `fn centered_and_justified(main_dir: Direction) -> Self` — `egui-0.35.0/src/layout.rs:220`
+- `fn centered_and_justified(main_dir: Direction) -> Self` — `egui-0.36.2/src/layout.rs:220`
   For when you want to add a single widget to a layout, and that widget should use up all available space.
-- `fn cross_align(&self) -> Align` — `egui-0.35.0/src/layout.rs:297`
-- `fn cross_justify(&self) -> bool` — `egui-0.35.0/src/layout.rs:302`
-- `fn from_main_dir_and_cross_align(main_dir: Direction, cross_align: Align) -> Self` — `egui-0.35.0/src/layout.rs:204`
-- `fn horizontal_align(&self) -> Align` — `egui-0.35.0/src/layout.rs:333`
+- `fn cross_align(&self) -> Align` — `egui-0.36.2/src/layout.rs:297`
+- `fn cross_justify(&self) -> bool` — `egui-0.36.2/src/layout.rs:302`
+- `fn from_main_dir_and_cross_align(main_dir: Direction, cross_align: Align) -> Self` — `egui-0.36.2/src/layout.rs:204`
+- `fn horizontal_align(&self) -> Align` — `egui-0.36.2/src/layout.rs:333`
   e.g. for when aligning text within a button.
-- `fn horizontal_justify(&self) -> bool` — `egui-0.35.0/src/layout.rs:355`
-- `fn horizontal_placement(&self) -> Align` — `egui-0.35.0/src/layout.rs:324`
+- `fn horizontal_justify(&self) -> bool` — `egui-0.36.2/src/layout.rs:355`
+- `fn horizontal_placement(&self) -> Align` — `egui-0.36.2/src/layout.rs:324`
   e.g. for adjusting the placement of something. * in horizontal layout: left or right? * in vertical layout: s…
-- `fn is_horizontal(&self) -> bool` — `egui-0.35.0/src/layout.rs:307`
-- `fn is_vertical(&self) -> bool` — `egui-0.35.0/src/layout.rs:312`
-- `fn left_to_right(valign: Align) -> Self` — `egui-0.35.0/src/layout.rs:141`
+- `fn is_horizontal(&self) -> bool` — `egui-0.36.2/src/layout.rs:307`
+- `fn is_vertical(&self) -> bool` — `egui-0.36.2/src/layout.rs:312`
+- `fn left_to_right(valign: Align) -> Self` — `egui-0.36.2/src/layout.rs:141`
   Place elements horizontally, left to right.
-- `fn main_dir(&self) -> Direction` — `egui-0.35.0/src/layout.rs:287`
-- `fn main_wrap(&self) -> bool` — `egui-0.35.0/src/layout.rs:292`
-- `fn prefer_right_to_left(&self) -> bool` — `egui-0.35.0/src/layout.rs:316`
-- `fn right_to_left(valign: Align) -> Self` — `egui-0.35.0/src/layout.rs:156`
+- `fn main_dir(&self) -> Direction` — `egui-0.36.2/src/layout.rs:287`
+- `fn main_wrap(&self) -> bool` — `egui-0.36.2/src/layout.rs:292`
+- `fn prefer_right_to_left(&self) -> bool` — `egui-0.36.2/src/layout.rs:316`
+- `fn right_to_left(valign: Align) -> Self` — `egui-0.36.2/src/layout.rs:156`
   Place elements horizontally, right to left.
-- `fn top_down(halign: Align) -> Self` — `egui-0.35.0/src/layout.rs:171`
+- `fn top_down(halign: Align) -> Self` — `egui-0.36.2/src/layout.rs:171`
   Place elements vertically, top to bottom.
-- `fn top_down_justified(halign: Align) -> Self` — `egui-0.35.0/src/layout.rs:184`
+- `fn top_down_justified(halign: Align) -> Self` — `egui-0.36.2/src/layout.rs:184`
   Top-down layout justified so that buttons etc fill the full available width.
-- `fn vertical_align(&self) -> Align` — `egui-0.35.0/src/layout.rs:342`
+- `fn vertical_align(&self) -> Align` — `egui-0.36.2/src/layout.rs:342`
   e.g. for when aligning text within a button.
-- `fn vertical_justify(&self) -> bool` — `egui-0.35.0/src/layout.rs:363`
-- `fn with_cross_align(self, cross_align: Align) -> Self` — `egui-0.35.0/src/layout.rs:251`
+- `fn vertical_justify(&self) -> bool` — `egui-0.36.2/src/layout.rs:363`
+- `fn with_cross_align(self, cross_align: Align) -> Self` — `egui-0.36.2/src/layout.rs:251`
   The alignment to use on the cross axis.
-- `fn with_cross_justify(self, cross_justify: bool) -> Self` — `egui-0.35.0/src/layout.rs:276`
+- `fn with_cross_justify(self, cross_justify: bool) -> Self` — `egui-0.36.2/src/layout.rs:276`
   Justify widgets along the cross axis?
-- `fn with_main_align(self, main_align: Align) -> Self` — `egui-0.35.0/src/layout.rs:242`
+- `fn with_main_align(self, main_align: Align) -> Self` — `egui-0.36.2/src/layout.rs:242`
   The alignment to use on the main axis.
-- `fn with_main_justify(self, main_justify: bool) -> Self` — `egui-0.35.0/src/layout.rs:262`
+- `fn with_main_justify(self, main_justify: bool) -> Self` — `egui-0.36.2/src/layout.rs:262`
   Justify widgets on the main axis?
-- `fn with_main_wrap(self, main_wrap: bool) -> Self` — `egui-0.35.0/src/layout.rs:236`
+- `fn with_main_wrap(self, main_wrap: bool) -> Self` — `egui-0.36.2/src/layout.rs:236`
   Wrap widgets when we overflow the main axis?
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `Link` (struct) — `egui-0.35.0/src/widgets/hyperlink.rs:27`
+### `Link` (struct) — `egui-0.36.2/src/widgets/hyperlink.rs:27`
 
 Clickable text, that looks like a hyperlink.
 
 Methods:
 
-- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/hyperlink.rs:32`
+- `fn new(text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/hyperlink.rs:32`
 
 Implements: `Widget`
 
-### `Margin` (struct) — `epaint-0.35.0/src/margin.rs:15`
+### `LogicOutput` (struct) — `egui-0.36.2/src/data/output.rs:84`
+
+What egui emits from [`crate::Context::run_logic`], i.e. from a tick where no ui was shown.
+
+Public fields:
+
+- `platform_output: PlatformOutput` — Non-rendering related output.
+- `viewport_commands: OrderedViewportIdMap<Vec<ViewportCommand>>` — The commands sent with [`crate::Context::send_viewport_cmd`] and friends.
+
+Implements: `Clone`, `Default`
+
+### `Margin` (struct) — `epaint-0.36.2/src/margin.rs:15`
 
 A value for all four sides of a rectangle, often used to express padding or spacing.
 
@@ -3007,28 +3012,28 @@ Public fields:
 
 Methods:
 
-- `const fn bottomf(self) -> f32` — `epaint-0.35.0/src/margin.rs:73`
+- `const fn bottomf(self) -> f32` — `epaint-0.36.2/src/margin.rs:73`
   Bottom margin, as `f32`
-- `const fn is_same(self) -> bool` — `epaint-0.35.0/src/margin.rs:96`
+- `const fn is_same(self) -> bool` — `epaint-0.36.2/src/margin.rs:96`
   Are the margin on every side the same?
-- `const fn left_top(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:84`
-- `const fn leftf(self) -> f32` — `epaint-0.35.0/src/margin.rs:55`
+- `const fn left_top(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:84`
+- `const fn leftf(self) -> f32` — `epaint-0.36.2/src/margin.rs:55`
   Left margin, as `f32`
-- `const fn right_bottom(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:89`
-- `const fn rightf(self) -> f32` — `epaint-0.35.0/src/margin.rs:61`
+- `const fn right_bottom(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:89`
+- `const fn rightf(self) -> f32` — `epaint-0.36.2/src/margin.rs:61`
   Right margin, as `f32`
-- `const fn same(margin: i8) -> Self` — `epaint-0.35.0/src/margin.rs:33`
+- `const fn same(margin: i8) -> Self` — `epaint-0.36.2/src/margin.rs:33`
   The same margin on every side.
-- `const fn symmetric(x: i8, y: i8) -> Self` — `epaint-0.35.0/src/margin.rs:44`
+- `const fn symmetric(x: i8, y: i8) -> Self` — `epaint-0.36.2/src/margin.rs:44`
   Margins with the same size on opposing sides
-- `const fn topf(self) -> f32` — `epaint-0.35.0/src/margin.rs:67`
+- `const fn topf(self) -> f32` — `epaint-0.36.2/src/margin.rs:67`
   Top margin, as `f32`
-- `fn sum(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:79`
+- `fn sum(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:79`
   Total margins on both sides
 
 Implements: `Add`, `Add<Margin>`, `Add<i8>`, `AddAssign<Margin>`, `AddAssign<i8>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<Margin>`, `From<MarginF32>`, `From<Vec2>`, `From<f32>`, `From<i8>`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Margin>`, `Sub<i8>`, `SubAssign<Margin>`, `SubAssign<i8>`
 
-### `Memory` (struct) — `egui-0.35.0/src/memory/mod.rs:30`
+### `Memory` (struct) — `egui-0.36.2/src/memory/mod.rs:30`
 
 The data that egui persists between frames.
 
@@ -3041,72 +3046,72 @@ Public fields:
 
 Methods:
 
-- `fn allows_interaction(&self, layer_id: LayerId) -> bool` — `egui-0.35.0/src/memory/mod.rs:940`
+- `fn allows_interaction(&self, layer_id: LayerId) -> bool` — `egui-0.36.2/src/memory/mod.rs:956`
   Does this layer allow interaction? Returns true if - the layer is not behind a modal layer - the [`Order`] al…
-- `fn area_rect(&self, id: impl Into<Id>) -> Option<Rect>` — `egui-0.35.0/src/memory/mod.rs:999`
+- `fn area_rect(&self, id: impl Into<Id>) -> Option<Rect>` — `egui-0.36.2/src/memory/mod.rs:1015`
   Obtain the previous rectangle of an area.
-- `fn areas(&self) -> &Areas` — `egui-0.35.0/src/memory/mod.rs:810`
+- `fn areas(&self) -> &Areas` — `egui-0.36.2/src/memory/mod.rs:826`
   Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
-- `fn areas_mut(&mut self) -> &mut Areas` — `egui-0.35.0/src/memory/mod.rs:817`
+- `fn areas_mut(&mut self) -> &mut Areas` — `egui-0.36.2/src/memory/mod.rs:833`
   Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
-- `fn everything_is_visible(&self) -> bool` — `egui-0.35.0/src/memory/mod.rs:1132`
+- `fn everything_is_visible(&self) -> bool` — `egui-0.36.2/src/memory/mod.rs:1148`
   If true, all windows, menus, tooltips, etc., will be visible at once.
-- `fn focused(&self) -> Option<Id>` — `egui-0.35.0/src/memory/mod.rs:877`
+- `fn focused(&self) -> Option<Id>` — `egui-0.36.2/src/memory/mod.rs:893`
   Which widget has keyboard focus?
-- `fn had_focus_last_frame(&self, id: Id) -> bool` — `egui-0.35.0/src/memory/mod.rs:838`
+- `fn had_focus_last_frame(&self, id: Id) -> bool` — `egui-0.36.2/src/memory/mod.rs:854`
   Check if the layer had focus last frame. returns `true` if the layer had focus last frame, but not this one.
-- `fn has_focus(&self, id: Id) -> bool` — `egui-0.35.0/src/memory/mod.rs:872`
+- `fn has_focus(&self, id: Id) -> bool` — `egui-0.36.2/src/memory/mod.rs:888`
   Does this widget have keyboard focus?
-- `fn interested_in_focus(&mut self, id: Id, layer_id: LayerId)` — `egui-0.35.0/src/memory/mod.rs:956`
+- `fn interested_in_focus(&mut self, id: Id, layer_id: LayerId)` — `egui-0.36.2/src/memory/mod.rs:972`
   Register this widget as being interested in getting keyboard focus. This will allow the user to select it wit…
-- `fn interrupt_ime(&mut self)` — `egui-0.35.0/src/memory/mod.rs:1035`
+- `fn interrupt_ime(&mut self)` — `egui-0.36.2/src/memory/mod.rs:1051`
   Interrupt the current IME composition, if any.
-- `fn is_above_modal_layer(&self, layer_id: LayerId) -> bool` — `egui-0.35.0/src/memory/mod.rs:925`
+- `fn is_above_modal_layer(&self, layer_id: LayerId) -> bool` — `egui-0.36.2/src/memory/mod.rs:941`
   Returns true if - this layer is the top-most modal layer or above it - there is no modal layer
-- `fn layer_id_at(&self, pos: Pos2) -> Option<LayerId>` — `egui-0.35.0/src/memory/mod.rs:822`
+- `fn layer_id_at(&self, pos: Pos2) -> Option<LayerId>` — `egui-0.36.2/src/memory/mod.rs:838`
   Top-most layer at the given position.
-- `fn layer_ids(&self) -> impl ExactSizeIterator<Item = LayerId> + '_` — `egui-0.35.0/src/memory/mod.rs:832`
+- `fn layer_ids(&self) -> impl ExactSizeIterator<Item = LayerId> + '_` — `egui-0.36.2/src/memory/mod.rs:848`
   An iterator over all layers. Back-to-front, top is last.
-- `fn move_focus(&mut self, direction: FocusDirection)` — `egui-0.35.0/src/memory/mod.rs:918`
+- `fn move_focus(&mut self, direction: FocusDirection)` — `egui-0.36.2/src/memory/mod.rs:934`
   Move keyboard focus in a specific direction.
-- `fn owns_ime_events(&self, id: Id) -> bool` — `egui-0.35.0/src/memory/mod.rs:1026`
+- `fn owns_ime_events(&self, id: Id) -> bool` — `egui-0.36.2/src/memory/mod.rs:1042`
   Check if the widget owns IME events.
-- `fn request_focus(&mut self, id: Id)` — `egui-0.35.0/src/memory/mod.rs:902`
+- `fn request_focus(&mut self, id: Id)` — `egui-0.36.2/src/memory/mod.rs:918`
   Give keyboard focus to a specific widget. See also [`crate::Response::request_focus`].
-- `fn reset_areas(&mut self)` — `egui-0.35.0/src/memory/mod.rs:991`
+- `fn reset_areas(&mut self)` — `egui-0.36.2/src/memory/mod.rs:1007`
   Forget window positions, sizes etc. Can be used to auto-layout windows.
-- `fn set_everything_is_visible(&mut self, value: bool)` — `egui-0.35.0/src/memory/mod.rs:1141`
+- `fn set_everything_is_visible(&mut self, value: bool)` — `egui-0.36.2/src/memory/mod.rs:1157`
   If true, all windows, menus, tooltips etc are to be visible at once.
-- `fn set_focus_lock_filter(&mut self, id: Id, event_filter: EventFilter)` — `egui-0.35.0/src/memory/mod.rs:887`
+- `fn set_focus_lock_filter(&mut self, id: Id, event_filter: EventFilter)` — `egui-0.36.2/src/memory/mod.rs:903`
   Set an event filter for a widget.
-- `fn set_modal_layer(&mut self, layer_id: LayerId)` — `egui-0.35.0/src/memory/mod.rs:965`
+- `fn set_modal_layer(&mut self, layer_id: LayerId)` — `egui-0.36.2/src/memory/mod.rs:981`
   Limit focus to widgets on the given layer and above. If this is called multiple times per frame, the top laye…
-- `fn stop_text_input(&mut self)` — `egui-0.35.0/src/memory/mod.rs:985`
+- `fn stop_text_input(&mut self)` — `egui-0.36.2/src/memory/mod.rs:1001`
   Stop editing the active [`TextEdit`](crate::TextEdit) (if any).
-- `fn surrender_focus(&mut self, id: Id)` — `egui-0.35.0/src/memory/mod.rs:910`
+- `fn surrender_focus(&mut self, id: Id)` — `egui-0.36.2/src/memory/mod.rs:926`
   Surrender keyboard focus for a specific widget. See also [`crate::Response::surrender_focus`].
-- `fn top_modal_layer(&self) -> Option<LayerId>` — `egui-0.35.0/src/memory/mod.rs:979`
+- `fn top_modal_layer(&self) -> Option<LayerId>` — `egui-0.36.2/src/memory/mod.rs:995`
   Get the top modal layer (from the previous frame).
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `MenuBar` (struct) — `egui-0.35.0/src/containers/menu.rs:217`
+### `MenuBar` (struct) — `egui-0.36.2/src/containers/menu.rs:217`
 
 Horizontal menu bar where you can add [`MenuButton`]s.
 
 Methods:
 
-- `fn config(self, config: MenuConfig) -> Self` — `egui-0.35.0/src/containers/menu.rs:250`
+- `fn config(self, config: MenuConfig) -> Self` — `egui-0.36.2/src/containers/menu.rs:250`
   Set the config for submenus.
-- `fn new() -> Self` — `egui-0.35.0/src/containers/menu.rs:232`
-- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.35.0/src/containers/menu.rs:241`
+- `fn new() -> Self` — `egui-0.36.2/src/containers/menu.rs:232`
+- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.36.2/src/containers/menu.rs:241`
   Set the style for buttons in the menu bar.
-- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/menu.rs:257`
+- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/menu.rs:257`
   Show the menu bar.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `Mesh` (struct) — `epaint-0.35.0/src/mesh.rs:60`
+### `Mesh` (struct) — `epaint-0.36.2/src/mesh.rs:60`
 
 Textured triangles in two dimensions.
 
@@ -3118,46 +3123,46 @@ Public fields:
 
 Methods:
 
-- `fn add_colored_rect(&mut self, rect: Rect, color: Color32)` — `epaint-0.35.0/src/mesh.rs:231`
+- `fn add_colored_rect(&mut self, rect: Rect, color: Color32)` — `epaint-0.36.2/src/mesh.rs:231`
   Uniformly colored rectangle.
-- `fn add_rect_with_uv(&mut self, rect: Rect, uv: Rect, color: Color32)` — `epaint-0.35.0/src/mesh.rs:199`
+- `fn add_rect_with_uv(&mut self, rect: Rect, uv: Rect, color: Color32)` — `epaint-0.36.2/src/mesh.rs:199`
   Rectangle with a texture and color.
-- `fn add_triangle(&mut self, a: u32, b: u32, c: u32)` — `epaint-0.35.0/src/mesh.rs:179`
+- `fn add_triangle(&mut self, a: u32, b: u32, c: u32)` — `epaint-0.36.2/src/mesh.rs:179`
   Add a triangle.
-- `fn append(&mut self, other: Self)` — `epaint-0.35.0/src/mesh.rs:132`
+- `fn append(&mut self, other: Self)` — `epaint-0.36.2/src/mesh.rs:132`
   Append all the indices and vertices of `other` to `self`.
-- `fn append_ref(&mut self, other: &Self)` — `epaint-0.35.0/src/mesh.rs:147`
+- `fn append_ref(&mut self, other: &Self)` — `epaint-0.36.2/src/mesh.rs:147`
   Append all the indices and vertices of `other` to `self` without taking ownership.
-- `fn bytes_used(&self) -> usize` — `epaint-0.35.0/src/mesh.rs:92`
+- `fn bytes_used(&self) -> usize` — `epaint-0.36.2/src/mesh.rs:92`
   Returns the amount of memory used by the vertices and indices.
-- `fn calc_bounds(&self) -> Rect` — `epaint-0.35.0/src/mesh.rs:121`
+- `fn calc_bounds(&self) -> Rect` — `epaint-0.36.2/src/mesh.rs:121`
   Calculate a bounding rectangle.
-- `fn clear(&mut self)` — `epaint-0.35.0/src/mesh.rs:85`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/mesh.rs:85`
   Restore to default state, but without freeing memory.
-- `fn colored_vertex(&mut self, pos: Pos2, color: Color32)` — `epaint-0.35.0/src/mesh.rs:169`
+- `fn colored_vertex(&mut self, pos: Pos2, color: Color32)` — `epaint-0.36.2/src/mesh.rs:169`
   Add a colored vertex.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/mesh.rs:109`
-- `fn is_valid(&self) -> bool` — `epaint-0.35.0/src/mesh.rs:99`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/mesh.rs:109`
+- `fn is_valid(&self) -> bool` — `epaint-0.36.2/src/mesh.rs:99`
   Are all indices within the bounds of the contained vertices?
-- `fn reserve_triangles(&mut self, additional_triangles: usize)` — `epaint-0.35.0/src/mesh.rs:186`
+- `fn reserve_triangles(&mut self, additional_triangles: usize)` — `epaint-0.36.2/src/mesh.rs:186`
   Make room for this many additional triangles (will reserve 3x as many indices). See also `reserve_vertices`.
-- `fn reserve_vertices(&mut self, additional: usize)` — `epaint-0.35.0/src/mesh.rs:193`
+- `fn reserve_vertices(&mut self, additional: usize)` — `epaint-0.36.2/src/mesh.rs:193`
   Make room for this many additional vertices. See also `reserve_triangles`.
-- `fn rotate(&mut self, rot: Rot2, origin: Pos2)` — `epaint-0.35.0/src/mesh.rs:325`
+- `fn rotate(&mut self, rot: Rot2, origin: Pos2)` — `epaint-0.36.2/src/mesh.rs:325`
   Rotate by some angle about an origin, in-place.
-- `fn split_to_u16(self) -> Vec<Mesh16>` — `epaint-0.35.0/src/mesh.rs:243`
+- `fn split_to_u16(self) -> Vec<Mesh16>` — `epaint-0.36.2/src/mesh.rs:243`
   This is for platforms that only support 16-bit index buffers.
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/mesh.rs:316`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/mesh.rs:316`
   Transform the mesh in-place with the given transform.
-- `fn translate(&mut self, delta: Vec2)` — `epaint-0.35.0/src/mesh.rs:309`
+- `fn translate(&mut self, delta: Vec2)` — `epaint-0.36.2/src/mesh.rs:309`
   Translate location by this much, in-place
-- `fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_` — `epaint-0.35.0/src/mesh.rs:114`
+- `fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_` — `epaint-0.36.2/src/mesh.rs:114`
   Iterate over the triangles of this mesh, returning vertex indices.
-- `fn with_texture(texture_id: TextureId) -> Self` — `epaint-0.35.0/src/mesh.rs:77`
+- `fn with_texture(texture_id: TextureId) -> Self` — `epaint-0.36.2/src/mesh.rs:77`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Mesh>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Modal` (struct) — `egui-0.35.0/src/containers/modal.rs:16`
+### `Modal` (struct) — `egui-0.36.2/src/containers/modal.rs:16`
 
 A modal dialog.
 
@@ -3169,20 +3174,20 @@ Public fields:
 
 Methods:
 
-- `fn area(self, area: Area) -> Self` — `egui-0.35.0/src/containers/modal.rs:71`
+- `fn area(self, area: Area) -> Self` — `egui-0.36.2/src/containers/modal.rs:71`
   Set the area of the modal.
-- `fn backdrop_color(self, color: Color32) -> Self` — `egui-0.35.0/src/containers/modal.rs:62`
+- `fn backdrop_color(self, color: Color32) -> Self` — `egui-0.36.2/src/containers/modal.rs:62`
   Set the backdrop color of the modal.
-- `fn default_area(id: Id) -> Area` — `egui-0.35.0/src/containers/modal.rs:40`
+- `fn default_area(id: Id) -> Area` — `egui-0.36.2/src/containers/modal.rs:40`
   Returns an area customized for a modal.
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/containers/modal.rs:53`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/modal.rs:53`
   Set the frame of the modal.
-- `fn new(id: Id) -> Self` — `egui-0.35.0/src/containers/modal.rs:26`
+- `fn new(id: Id) -> Self` — `egui-0.36.2/src/containers/modal.rs:26`
   Create a new Modal.
-- `fn show<T>(self, ctx: &Context, content: impl FnOnce(&mut Ui) -> T) -> ModalResponse<T>` — `egui-0.35.0/src/containers/modal.rs:77`
+- `fn show<T>(self, ctx: &Context, content: impl FnOnce(&mut Ui) -> T) -> ModalResponse<T>` — `egui-0.36.2/src/containers/modal.rs:77`
   Show the modal.
 
-### `ModalResponse` (struct) — `egui-0.35.0/src/containers/modal.rs:124`
+### `ModalResponse` (struct) — `egui-0.36.2/src/containers/modal.rs:124`
 
 The response of a modal dialog.
 
@@ -3196,10 +3201,10 @@ Public fields:
 
 Methods:
 
-- `fn should_close(&self) -> bool` — `egui-0.35.0/src/containers/modal.rs:151`
+- `fn should_close(&self) -> bool` — `egui-0.36.2/src/containers/modal.rs:151`
   Should the modal be closed? Returns true if: - the backdrop was clicked - this is the topmost modal, no popup…
 
-### `ModifierNames` (struct) — `egui-0.35.0/src/data/input/modifier_names.rs:7`
+### `ModifierNames` (struct) — `egui-0.36.2/src/data/input/modifier_names.rs:7`
 
 Names of different modifier keys.
 
@@ -3215,11 +3220,11 @@ Public fields:
 
 Methods:
 
-- `fn format(&self, modifiers: &Modifiers, is_mac: bool) -> String` — `egui-0.35.0/src/data/input/modifier_names.rs:45`
+- `fn format(&self, modifiers: &Modifiers, is_mac: bool) -> String` — `egui-0.36.2/src/data/input/modifier_names.rs:45`
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `Modifiers` (struct) — `egui-0.35.0/src/data/input/modifiers.rs:19`
+### `Modifiers` (struct) — `egui-0.36.2/src/data/input/modifiers.rs:19`
 
 State of the modifier keys. These must be fed to egui.
 
@@ -3233,30 +3238,30 @@ Public fields:
 
 Methods:
 
-- `const fn plus(self, rhs: Self) -> Self` — `egui-0.35.0/src/data/input/modifiers.rs:139`
+- `const fn plus(self, rhs: Self) -> Self` — `egui-0.36.2/src/data/input/modifiers.rs:139`
   ``` # use egui::Modifiers; assert_eq!( Modifiers::CTRL | Modifiers::ALT, Modifiers { ctrl: true, alt: true, .…
-- `fn all(&self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:160`
-- `fn any(&self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:155`
-- `fn cmd_ctrl_matches(&self, pattern: Self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:300`
+- `fn all(&self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:160`
+- `fn any(&self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:155`
+- `fn cmd_ctrl_matches(&self, pattern: Self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:300`
   Checks only cmd/ctrl, not alt/shift.
-- `fn command_only(&self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:172`
+- `fn command_only(&self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:172`
   true if only [`Self::ctrl`] or only [`Self::mac_cmd`] is pressed.
-- `fn contains(&self, query: Self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:345`
+- `fn contains(&self, query: Self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:345`
   Whether another set of modifiers is contained in this set of modifiers with proper handling of [`Self::comman…
-- `fn is_none(&self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:150`
-- `fn matches_any(&self, pattern: Self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:274`
+- `fn is_none(&self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:150`
+- `fn matches_any(&self, pattern: Self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:274`
   Check if any of the modifiers match exactly.
-- `fn matches_exact(&self, pattern: Self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:253`
+- `fn matches_exact(&self, pattern: Self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:253`
   Check for equality but with proper handling of [`Self::command`].
-- `fn matches_logically(&self, pattern: Self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:211`
+- `fn matches_logically(&self, pattern: Self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:211`
   Checks that the `ctrl/cmd` matches, and that the `shift/alt` of the argument is a subset of the pressed key (…
-- `fn shift_only(&self) -> bool` — `egui-0.35.0/src/data/input/modifiers.rs:166`
+- `fn shift_only(&self) -> bool` — `egui-0.36.2/src/data/input/modifiers.rs:166`
   Is shift the only pressed button?
-- `fn ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/data/input/modifiers.rs:407`
+- `fn ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/data/input/modifiers.rs:407`
 
 Implements: `BitOr`, `BitOrAssign`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `MultiTouchInfo` (struct) — `egui-0.35.0/src/input_state/touch_state.rs:11`
+### `MultiTouchInfo` (struct) — `egui-0.36.2/src/input_state/touch_state.rs:12`
 
 All you probably need to know about a multi-touch gesture.
 
@@ -3274,7 +3279,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `PartialEq`, `StructuralPartialEq`
 
-### `OpenUrl` (struct) — `egui-0.35.0/src/data/output.rs:237`
+### `OpenUrl` (struct) — `egui-0.36.2/src/data/output.rs:262`
 
 What URL to open, and how.
 
@@ -3285,12 +3290,12 @@ Public fields:
 
 Methods:
 
-- `fn new_tab(url: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:256`
-- `fn same_tab(url: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:248`
+- `fn new_tab(url: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:281`
+- `fn same_tab(url: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:273`
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Options` (struct) — `egui-0.35.0/src/memory/mod.rs:193`
+### `Options` (struct) — `egui-0.36.2/src/memory/mod.rs:193`
 
 Some global options that you can read and write.
 
@@ -3300,6 +3305,7 @@ Public fields:
 - `light_style: Arc<Style>` — The default style for new [`Ui`](crate::Ui):s in light mode.
 - `theme_preference: ThemePreference` — Preference for selection between dark and light [`crate::Context::global_style`] as the a…
 - `fallback_theme: Theme` — Which theme to use in case [`Self::theme_preference`] is [`ThemePreference::System`] and…
+- `sync_window_theme: bool` — If `true`, egui will keep the native window theme in sync with [`Self::theme_preference`]…
 - `zoom_factor: f32` — Global zoom factor of the UI.
 - `zoom_with_keyboard: bool` — If `true`, egui will change the scale of the ui ([`crate::Context::zoom_factor`]) when th…
 - `quit_shortcuts: Vec<KeyboardShortcut>` — Keyboard shortcuts to close the application.
@@ -3313,12 +3319,12 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/memory/mod.rs:375`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/memory/mod.rs:388`
   Show the options in the ui.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PaintCallback` (struct) — `epaint-0.35.0/src/shapes/paint_callback.rs:59`
+### `PaintCallback` (struct) — `epaint-0.36.2/src/shapes/paint_callback.rs:60`
 
 If you want to paint some 3D shapes inside an egui region, you can use this.
 
@@ -3329,7 +3335,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `From<PaintCallback>`, `PartialEq`
 
-### `PaintCallbackInfo` (struct) — `epaint-0.35.0/src/shapes/paint_callback.rs:6`
+### `PaintCallbackInfo` (struct) — `epaint-0.36.2/src/shapes/paint_callback.rs:7`
 
 Information passed along with [`PaintCallback`] ([`Shape::Callback`]).
 
@@ -3342,146 +3348,148 @@ Public fields:
 
 Methods:
 
-- `fn clip_rect_in_pixels(&self) -> ViewportInPixels` — `epaint-0.35.0/src/shapes/paint_callback.rs:50`
+- `fn clip_rect_in_pixels(&self) -> ViewportInPixels` — `epaint-0.36.2/src/shapes/paint_callback.rs:51`
   The "scissor" or "clip" rectangle. This is what you would use in e.g. `glScissor`.
-- `fn viewport_in_pixels(&self) -> ViewportInPixels` — `epaint-0.35.0/src/shapes/paint_callback.rs:45`
+- `fn viewport_in_pixels(&self) -> ViewportInPixels` — `epaint-0.36.2/src/shapes/paint_callback.rs:46`
   The viewport rectangle. This is what you would use in e.g. `glViewport`.
 
-### `Painter` (struct) — `egui-0.35.0/src/painter.rs:21`
+### `Painter` (struct) — `egui-0.36.2/src/painter.rs:21`
 
 Helper to paint shapes and text to a specific region on a specific layer.
 
 Methods:
 
-- `fn add(&self, shape: impl Into<Shape>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:213`
+- `fn add(&self, shape: impl Into<Shape>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:213`
   It is up to the caller to make sure there is room for this. Can be used for free painting. NOTE: all coordina…
-- `fn arrow(&self, origin: Pos2, vec: Vec2, stroke: impl Into<Stroke>)` — `egui-0.35.0/src/painter.rs:417`
+- `fn arrow(&self, origin: Pos2, vec: Vec2, stroke: impl Into<Stroke>)` — `egui-0.36.2/src/painter.rs:417`
   Show an arrow starting at `origin` and going in the direction of `vec`, with the length `vec.length()`.
-- `fn circle(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:341`
-- `fn circle_filled(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:356`
-- `fn circle_stroke(&self, center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:370`
-- `fn clip_rect(&self) -> Rect` — `egui-0.35.0/src/painter.rs:163`
+- `fn circle(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:341`
+- `fn circle_filled(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:356`
+- `fn circle_stroke(&self, center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:370`
+- `fn clip_rect(&self) -> Rect` — `egui-0.36.2/src/painter.rs:163`
   Everything painted in this [`Painter`] will be clipped against this. This means nothing outside of this recta…
-- `fn ctx(&self) -> &Context` — `egui-0.35.0/src/painter.rs:128`
+- `fn ctx(&self) -> &Context` — `egui-0.36.2/src/painter.rs:128`
   Get a reference to the parent [`Context`].
-- `fn debug_rect(&self, rect: Rect, color: Color32, text: impl ToString)` — `egui-0.35.0/src/painter.rs:266`
-- `fn debug_text(&self, pos: Pos2, anchor: Align2, color: Color32, text: impl ToString) -> Rect` — `egui-0.35.0/src/painter.rs:292`
+- `fn debug_rect(&self, rect: Rect, color: Color32, text: impl ToString)` — `egui-0.36.2/src/painter.rs:266`
+- `fn debug_text(&self, pos: Pos2, anchor: Align2, color: Color32, text: impl ToString) -> Rect` — `egui-0.36.2/src/painter.rs:292`
   Text with a background.
-- `fn error(&self, pos: Pos2, text: impl Display) -> Rect` — `egui-0.35.0/src/painter.rs:283`
-- `fn extend<I>(&self, shapes: I)` — `egui-0.35.0/src/painter.rs:226`
+- `fn error(&self, pos: Pos2, text: impl Display) -> Rect` — `egui-0.36.2/src/painter.rs:283`
+- `fn extend<I>(&self, shapes: I)` — `egui-0.36.2/src/painter.rs:226`
   Add many shapes at once.
-- `fn fonts<R>(&self, reader: impl FnOnce(&FontsView<'_>) -> R) -> R` — `egui-0.35.0/src/painter.rs:142`
+- `fn fonts<R>(&self, reader: impl FnOnce(&FontsView<'_>) -> R) -> R` — `egui-0.36.2/src/painter.rs:142`
   Read-only access to the shared [`FontsView`].
-- `fn fonts_mut<R>(&self, reader: impl FnOnce(&mut FontsView<'_>) -> R) -> R` — `egui-0.35.0/src/painter.rs:150`
+- `fn fonts_mut<R>(&self, reader: impl FnOnce(&mut FontsView<'_>) -> R) -> R` — `egui-0.36.2/src/painter.rs:150`
   Read-write access to the shared [`FontsView`].
-- `fn for_each_shape(&self, reader: impl FnMut(&ClippedShape))` — `egui-0.35.0/src/painter.rs:252`
+- `fn for_each_shape(&self, reader: impl FnMut(&ClippedShape))` — `egui-0.36.2/src/painter.rs:252`
   Access all shapes added this frame.
-- `fn galley(&self, pos: Pos2, galley: Arc<Galley>, fallback_color: Color32)` — `egui-0.35.0/src/painter.rs:529`
+- `fn galley(&self, pos: Pos2, galley: Arc<Galley>, fallback_color: Color32)` — `egui-0.36.2/src/painter.rs:529`
   Paint text that has already been laid out in a [`Galley`].
-- `fn galley_with_override_text_color(&self, pos: Pos2, galley: Arc<Galley>, text_color: Color32)` — `egui-0.35.0/src/painter.rs:541`
+- `fn galley_with_override_text_color(&self, pos: Pos2, galley: Arc<Galley>, text_color: Color32)` — `egui-0.36.2/src/painter.rs:541`
   Paint text that has already been laid out in a [`Galley`].
-- `fn hline(&self, x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:332`
+- `fn hline(&self, x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:332`
   Paints a horizontal line.
-- `fn image(&self, texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:447`
+- `fn image(&self, texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:447`
   An image at the given position.
-- `fn is_visible(&self) -> bool` — `egui-0.35.0/src/painter.rs:117`
+- `fn is_visible(&self) -> bool` — `egui-0.36.2/src/painter.rs:117`
   If `false`, nothing you paint will show up.
-- `fn layer_id(&self) -> LayerId` — `egui-0.35.0/src/painter.rs:156`
+- `fn layer_id(&self) -> LayerId` — `egui-0.36.2/src/painter.rs:156`
   Where we paint
-- `fn layout(&self, text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Arc<Galley>` — `egui-0.35.0/src/painter.rs:488`
+- `fn layout(&self, text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Arc<Galley>` — `egui-0.36.2/src/painter.rs:488`
   Will wrap text at the given width and line break at `\n`.
-- `fn layout_job(&self, layout_job: LayoutJob) -> Arc<Galley>` — `egui-0.35.0/src/painter.rs:517`
+- `fn layout_job(&self, layout_job: LayoutJob) -> Arc<Galley>` — `egui-0.36.2/src/painter.rs:517`
   Lay out this text layut job in a galley.
-- `fn layout_no_wrap(&self, text: String, font_id: FontId, color: Color32) -> Arc<Galley>` — `egui-0.35.0/src/painter.rs:503`
+- `fn layout_no_wrap(&self, text: String, font_id: FontId, color: Color32) -> Arc<Galley>` — `egui-0.36.2/src/painter.rs:503`
   Will line break at `\n`.
-- `fn line(&self, points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:327`
+- `fn line(&self, points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:327`
   Paints a line connecting the points. NOTE: all coordinates are screen coordinates!
-- `fn line_segment(&self, points: [Pos2; 2], stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:318`
+- `fn line_segment(&self, points: [Pos2; 2], stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:318`
   Paints a line from the first point to the second.
-- `fn multiply_opacity(&mut self, opacity: f32)` — `egui-0.35.0/src/painter.rs:100`
+- `fn multiply_opacity(&mut self, opacity: f32)` — `egui-0.36.2/src/painter.rs:100`
   Like [`Self::set_opacity`], but multiplies the given value with the current opacity.
-- `fn new(ctx: Context, layer_id: LayerId, clip_rect: Rect) -> Self` — `egui-0.35.0/src/painter.rs:47`
+- `fn new(ctx: Context, layer_id: LayerId, clip_rect: Rect) -> Self` — `egui-0.36.2/src/painter.rs:47`
   Create a painter to a specific layer within a certain clip rectangle.
-- `fn opacity(&self) -> f32` — `egui-0.35.0/src/painter.rs:110`
+- `fn opacity(&self) -> f32` — `egui-0.36.2/src/painter.rs:110`
   Read the current opacity of the underlying painter.
-- `fn pixels_per_point(&self) -> f32` — `egui-0.35.0/src/painter.rs:134`
+- `fn pixels_per_point(&self) -> f32` — `egui-0.36.2/src/painter.rs:134`
   Number of physical pixels for each logical UI point.
-- `fn rect(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:380`
+- `fn rect(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:380`
   See also [`Self::rect_filled`] and [`Self::rect_stroke`].
-- `fn rect_filled(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:397`
-- `fn rect_stroke(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:406`
-- `fn round_to_pixel_center(&self, point: f32) -> f32` — `egui-0.35.0/src/painter.rs:189`
+- `fn rect_filled(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:397`
+- `fn rect_stroke(&self, rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:406`
+- `fn round_to_pixel_center(&self, point: f32) -> f32` — `egui-0.36.2/src/painter.rs:189`
   Useful for pixel-perfect rendering of lines that are one pixel wide (or any odd number of pixels).
-- `fn set(&self, idx: ShapeIdx, shape: impl Into<Shape>)` — `egui-0.35.0/src/painter.rs:242`
+- `fn set(&self, idx: ShapeIdx, shape: impl Into<Shape>)` — `egui-0.36.2/src/painter.rs:242`
   Modify an existing [`Shape`].
-- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `egui-0.35.0/src/painter.rs:183`
+- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `egui-0.36.2/src/painter.rs:183`
   Everything painted in this [`Painter`] will be clipped against this. This means nothing outside of this recta…
-- `fn set_invisible(&mut self)` — `egui-0.35.0/src/painter.rs:122`
+- `fn set_invisible(&mut self)` — `egui-0.36.2/src/painter.rs:122`
   If `false`, nothing added to the painter will be visible
-- `fn set_layer_id(&mut self, layer_id: LayerId)` — `egui-0.35.0/src/painter.rs:81`
+- `fn set_layer_id(&mut self, layer_id: LayerId)` — `egui-0.36.2/src/painter.rs:81`
   Redirect where you are painting.
-- `fn set_opacity(&mut self, opacity: f32)` — `egui-0.35.0/src/painter.rs:91`
+- `fn set_opacity(&mut self, opacity: f32)` — `egui-0.36.2/src/painter.rs:91`
   Set the opacity (alpha multiplier) of everything painted by this painter from this point forward.
-- `fn shrink_clip_rect(&mut self, new_clip_rect: Rect)` — `egui-0.35.0/src/painter.rs:173`
+- `fn shrink_clip_rect(&mut self, new_clip_rect: Rect)` — `egui-0.36.2/src/painter.rs:173`
   Constrain the rectangle in which we can paint.
-- `fn text(&self, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, text_color: Color32) -> Rect` — `egui-0.35.0/src/painter.rs:469`
+- `fn text(&self, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, text_color: Color32) -> Rect` — `egui-0.36.2/src/painter.rs:469`
   Lay out and paint some text.
-- `fn vline(&self, x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.35.0/src/painter.rs:337`
+- `fn vline(&self, x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> ShapeIdx` — `egui-0.36.2/src/painter.rs:337`
   Paints a vertical line.
-- `fn with_clip_rect(&self, rect: Rect) -> Self` — `egui-0.35.0/src/painter.rs:71`
+- `fn with_clip_rect(&self, rect: Rect) -> Self` — `egui-0.36.2/src/painter.rs:71`
   Create a painter for a sub-region of this [`Painter`].
-- `fn with_layer_id(self, layer_id: LayerId) -> Self` — `egui-0.35.0/src/painter.rs:62`
+- `fn with_layer_id(self, layer_id: LayerId) -> Self` — `egui-0.36.2/src/painter.rs:62`
   Redirect where you are painting.
 
 Implements: `Clone`
 
-### `Panel` (struct) — `egui-0.35.0/src/containers/panel.rs:180`
+### `Panel` (struct) — `egui-0.36.2/src/containers/panel.rs:206`
 
 A panel that covers an entire side ([`left`](Panel::left), [`right`](Panel::right), [`top`](Panel::top) or [`bottom`](Panel::bottom)) of a [`Ui`] or screen.
 
 Methods:
 
-- `fn bottom(id: impl Into<Id>) -> Self` — `egui-0.35.0/src/containers/panel.rs:247`
+- `fn bottom(id: impl Into<Id>) -> Self` — `egui-0.36.2/src/containers/panel.rs:274`
   Create a bottom panel.
-- `fn default_size(self, default_size: f32) -> Self` — `egui-0.35.0/src/containers/panel.rs:310`
+- `fn default_size(self, default_size: f32) -> Self` — `egui-0.36.2/src/containers/panel.rs:369`
   The initial wrapping width of the [`Panel`], including margins.
-- `fn exact_size(self, size: f32) -> Self` — `egui-0.35.0/src/containers/panel.rs:346`
+- `fn drag_to_open(self, drag_to_open: bool) -> Self` — `egui-0.36.2/src/containers/panel.rs:340`
+  Can a fully collapsed panel be dragged back open?
+- `fn exact_size(self, size: f32) -> Self` — `egui-0.36.2/src/containers/panel.rs:405`
   Enforce this exact size, including margins.
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/containers/panel.rs:354`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/panel.rs:413`
   Change the background color, margins, etc.
-- `fn left(id: impl Into<Id>) -> Self` — `egui-0.35.0/src/containers/panel.rs:222`
+- `fn left(id: impl Into<Id>) -> Self` — `egui-0.36.2/src/containers/panel.rs:249`
   Create a left panel.
-- `fn max_size(self, max_size: f32) -> Self` — `egui-0.35.0/src/containers/panel.rs:328`
+- `fn max_size(self, max_size: f32) -> Self` — `egui-0.36.2/src/containers/panel.rs:387`
   Maximum size of the panel, including margins.
-- `fn min_size(self, min_size: f32) -> Self` — `egui-0.35.0/src/containers/panel.rs:321`
+- `fn min_size(self, min_size: f32) -> Self` — `egui-0.36.2/src/containers/panel.rs:380`
   Minimum size of the panel, including margins.
-- `fn resizable(self, resizable: bool) -> Self` — `egui-0.35.0/src/containers/panel.rs:294`
+- `fn resizable(self, resizable: bool) -> Self` — `egui-0.36.2/src/containers/panel.rs:322`
   Can panel be resized by dragging the edge of it?
-- `fn right(id: impl Into<Id>) -> Self` — `egui-0.35.0/src/containers/panel.rs:229`
+- `fn right(id: impl Into<Id>) -> Self` — `egui-0.36.2/src/containers/panel.rs:256`
   Create a right panel.
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:363`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:422`
   Show the panel inside a [`Ui`].
-- `fn show_animated_between_inside<R>(ui: &mut Ui, is_expanded: bool, collapsed_panel: Self, expanded_panel: Self, add_contents: impl FnOnce(&mut Ui, f32) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:594`
+- `fn show_animated_between_inside<R>(ui: &mut Ui, is_expanded: bool, collapsed_panel: Self, expanded_panel: Self, add_contents: impl FnOnce(&mut Ui, f32) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:660`
   Renamed to [`Self::show_switched`].
   **DEPRECATED**: Renamed to `show_switched`
-- `fn show_animated_inside<R>(self, ui: &mut Ui, is_expanded: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/panel.rs:434`
+- `fn show_animated_inside<R>(self, ui: &mut Ui, is_expanded: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/panel.rs:497`
   Renamed to [`Self::show_collapsible`].
   **DEPRECATED**: Renamed to `show_collapsible`
-- `fn show_collapsible<R>(self, ui: &mut Ui, is_expanded: &mut bool, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/panel.rs:389`
+- `fn show_collapsible<R>(self, ui: &mut Ui, is_expanded: &mut bool, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/panel.rs:451`
   Show the panel if `*is_expanded` is `true`, otherwise hide it, with a slide animation in between.
-- `fn show_inside<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:369`
+- `fn show_inside<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:428`
   Renamed to [`Self::show`].
   **DEPRECATED**: Renamed to `show`
-- `fn show_separator_line(self, show_separator_line: bool) -> Self` — `egui-0.35.0/src/containers/panel.rs:303`
+- `fn show_separator_line(self, show_separator_line: bool) -> Self` — `egui-0.36.2/src/containers/panel.rs:362`
   Show a separator line, even when not interacting with it?
-- `fn show_switched<R>(ui: &mut Ui, is_expanded: &mut bool, collapsed_panel: Self, expanded_panel: Self, add_contents: impl FnOnce(&mut Ui, bool) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/panel.rs:500`
+- `fn show_switched<R>(ui: &mut Ui, is_expanded: &mut bool, collapsed_panel: Self, expanded_panel: Self, add_contents: impl FnOnce(&mut Ui, bool) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/panel.rs:563`
   Show either a collapsed or expanded panel, with a nice slide animation between.
-- `fn size_range(self, size_range: impl Into<Rangef>) -> Self` — `egui-0.35.0/src/containers/panel.rs:335`
+- `fn size_range(self, size_range: impl Into<Rangef>) -> Self` — `egui-0.36.2/src/containers/panel.rs:394`
   The allowable size range for the panel, including margins.
-- `fn top(id: impl Into<Id>) -> Self` — `egui-0.35.0/src/containers/panel.rs:238`
+- `fn top(id: impl Into<Id>) -> Self` — `egui-0.36.2/src/containers/panel.rs:265`
   Create a top panel.
 
-### `PanelState` (struct) — `egui-0.35.0/src/containers/panel.rs:32`
+### `PanelState` (struct) — `egui-0.36.2/src/containers/panel.rs:42`
 
 State regarding panels.
 
@@ -3491,13 +3499,13 @@ Public fields:
 
 Methods:
 
-- `fn load(ctx: &Context, bar_id: Id) -> Option<Self>` — `egui-0.35.0/src/containers/panel.rs:42`
-- `fn size(&self) -> Vec2` — `egui-0.35.0/src/containers/panel.rs:48`
+- `fn load(ctx: &Context, bar_id: Id) -> Option<Self>` — `egui-0.36.2/src/containers/panel.rs:52`
+- `fn size(&self) -> Vec2` — `egui-0.36.2/src/containers/panel.rs:58`
   The _outer_ size of the panel (from previous frame), i.e. including the [`Frame`] margin & border.
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Serialize`
 
-### `PlatformOutput` (struct) — `egui-0.35.0/src/data/output.rs:116`
+### `PlatformOutput` (struct) — `egui-0.36.2/src/data/output.rs:141`
 
 The non-rendering part of what egui emits each frame.
 
@@ -3515,191 +3523,193 @@ Public fields:
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `egui-0.35.0/src/data/output.rs:190`
+- `fn append(&mut self, newer: Self)` — `egui-0.36.2/src/data/output.rs:215`
   Add on new output.
-- `fn events_description(&self) -> String` — `egui-0.35.0/src/data/output.rs:172`
+- `fn events_description(&self) -> String` — `egui-0.36.2/src/data/output.rs:197`
   This can be used by a text-to-speech system to describe the events (if any).
-- `fn requested_discard(&self) -> bool` — `egui-0.35.0/src/data/output.rs:227`
+- `fn requested_discard(&self) -> bool` — `egui-0.36.2/src/data/output.rs:252`
   Was [`crate::Context::request_discard`] called?
-- `fn take(&mut self) -> Self` — `egui-0.35.0/src/data/output.rs:219`
+- `fn take(&mut self) -> Self` — `egui-0.36.2/src/data/output.rs:244`
   Take everything ephemeral (everything except `cursor_icon` and `cursor_image` currently)
 
 Implements: `Clone`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PointerState` (struct) — `egui-0.35.0/src/input_state/mod.rs:984`
+### `PointerState` (struct) — `egui-0.36.2/src/input_state/mod.rs:987`
 
 Mouse or touch state.
 
 Methods:
 
-- `fn any_click(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1416`
+- `fn any_click(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1419`
   Were there any type of click this frame?
-- `fn any_down(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1411`
+- `fn any_down(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1414`
   Is any pointer button currently down?
-- `fn any_pressed(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1365`
+- `fn any_pressed(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1368`
   Was any pointer button pressed (`!down -> down`) this frame?
-- `fn any_released(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1370`
+- `fn any_released(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1373`
   Was any pointer button released (`down -> !down`) this frame?
-- `fn button_clicked(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1426`
+- `fn button_clicked(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1429`
   Was the given pointer button given clicked this frame?
-- `fn button_double_clicked(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1433`
+- `fn button_double_clicked(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1436`
   Was the button given double clicked this frame?
-- `fn button_down(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1478`
+- `fn button_down(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1481`
   Is this button currently down?
-- `fn button_pressed(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1375`
+- `fn button_pressed(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1378`
   Was the button given pressed this frame?
-- `fn button_released(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1382`
+- `fn button_released(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1385`
   Was the button given released this frame?
-- `fn button_triple_clicked(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1446`
+- `fn button_triple_clicked(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1449`
   Was the button given triple clicked this frame?
-- `fn could_any_button_be_click(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1485`
+- `fn could_any_button_be_click(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1488`
   If the pointer button is down, will it register as a click when released?
-- `fn delta(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:1256`
+- `fn delta(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:1259`
   How much the pointer moved compared to last frame, in points.
-- `fn direction(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:1281`
+- `fn direction(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:1284`
   Current direction of the pointer.
-- `fn has_pointer(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1331`
+- `fn has_pointer(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1334`
   Do we have a pointer?
-- `fn hover_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/input_state/mod.rs:1313`
+- `fn hover_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/input_state/mod.rs:1316`
   If it is a good idea to show a tooltip, where is pointer?
-- `fn interact_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/input_state/mod.rs:1323`
+- `fn interact_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/input_state/mod.rs:1326`
   If you detect a click or drag and wants to know where it happened, use this.
-- `fn is_decidedly_dragging(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1512`
+- `fn is_decidedly_dragging(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1515`
   Just because the mouse is down doesn't mean we are dragging. We could be at the start of a click. But if the…
-- `fn is_moving(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1345`
+- `fn is_moving(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1348`
   Is the pointer currently moving? This is smoothed so a few frames of stillness is required before this return…
-- `fn is_moving_towards_rect(&self, rect: &Rect) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1557`
+- `fn is_moving_towards_rect(&self, rect: &Rect) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1560`
   Is the mouse moving in the direction of the given rect?
-- `fn is_still(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1338`
+- `fn is_still(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1341`
   Is the pointer currently still? This is smoothed so a few frames of stillness is required before this returns…
-- `fn latest_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/input_state/mod.rs:1307`
+- `fn latest_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/input_state/mod.rs:1310`
   Latest reported pointer position. When tapping a touch screen, this will be `None`.
-- `fn middle_down(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1552`
+- `fn middle_down(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1555`
   Is the middle button currently down?
-- `fn motion(&self) -> Option<Vec2>` — `egui-0.35.0/src/input_state/mod.rs:1264`
+- `fn motion(&self) -> Option<Vec2>` — `egui-0.36.2/src/input_state/mod.rs:1267`
   How much the mouse moved since the last frame, in unspecified units. Represents the actual movement of the mo…
-- `fn press_origin(&self) -> Option<Pos2>` — `egui-0.35.0/src/input_state/mod.rs:1288`
+- `fn press_origin(&self) -> Option<Pos2>` — `egui-0.36.2/src/input_state/mod.rs:1291`
   Where did the current click/drag originate? `None` if no mouse button is down.
-- `fn press_start_time(&self) -> Option<f64>` — `egui-0.35.0/src/input_state/mod.rs:1300`
+- `fn press_start_time(&self) -> Option<f64>` — `egui-0.36.2/src/input_state/mod.rs:1303`
   When did the current click/drag originate? `None` if no mouse button is down.
-- `fn primary_clicked(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1462`
+- `fn primary_clicked(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1465`
   Was the primary button clicked this frame?
-- `fn primary_down(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1536`
+- `fn primary_down(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1539`
   Is the primary button currently down?
-- `fn primary_pressed(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1389`
+- `fn primary_pressed(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1392`
   Was the primary button pressed this frame?
-- `fn primary_released(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1399`
+- `fn primary_released(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1402`
   Was the primary button released this frame?
-- `fn secondary_clicked(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1470`
+- `fn secondary_clicked(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1473`
   Was the secondary button clicked this frame?
-- `fn secondary_down(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1544`
+- `fn secondary_down(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1547`
   Is the secondary button currently down?
-- `fn secondary_pressed(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1394`
+- `fn secondary_pressed(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1397`
   Was the secondary button pressed this frame?
-- `fn secondary_released(&self) -> bool` — `egui-0.35.0/src/input_state/mod.rs:1404`
+- `fn secondary_released(&self) -> bool` — `egui-0.36.2/src/input_state/mod.rs:1407`
   Was the secondary button released this frame?
-- `fn time_since_last_click(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:1357`
+- `fn time_since_last_click(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:1360`
   How long has it been (in seconds) since the pointer was clicked?
-- `fn time_since_last_movement(&self) -> f32` — `egui-0.35.0/src/input_state/mod.rs:1351`
+- `fn time_since_last_movement(&self) -> f32` — `egui-0.36.2/src/input_state/mod.rs:1354`
   How long has it been (in seconds) since the pointer was last moved?
-- `fn total_drag_delta(&self) -> Option<Vec2>` — `egui-0.35.0/src/input_state/mod.rs:1293`
+- `fn total_drag_delta(&self) -> Option<Vec2>` — `egui-0.36.2/src/input_state/mod.rs:1296`
   How far has the pointer moved since the start of the drag (if any)?
-- `fn ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/input_state/mod.rs:1652`
-- `fn velocity(&self) -> Vec2` — `egui-0.35.0/src/input_state/mod.rs:1273`
+- `fn ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/input_state/mod.rs:1655`
+- `fn velocity(&self) -> Vec2` — `egui-0.36.2/src/input_state/mod.rs:1276`
   Current velocity of pointer.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
-### `Popup` (struct) — `egui-0.35.0/src/containers/popup.rs:165`
+### `Popup` (struct) — `egui-0.36.2/src/containers/popup.rs:165`
 
 A popup container.
 
 Methods:
 
-- `fn align(self, position_align: RectAlign) -> Self` — `egui-0.35.0/src/containers/popup.rs:278`
+- `fn align(self, position_align: RectAlign) -> Self` — `egui-0.36.2/src/containers/popup.rs:280`
   Set the [`RectAlign`] of the popup relative to the [`PopupAnchor`]. This is the default position, and will be…
-- `fn align_alternatives(self, alternatives: &'a [RectAlign]) -> Self` — `egui-0.35.0/src/containers/popup.rs:287`
+- `fn align_alternatives(self, alternatives: &'a [RectAlign]) -> Self` — `egui-0.36.2/src/containers/popup.rs:289`
   Set alternative positions to try if the default one doesn't fit. Set to an empty slice to always use the posi…
-- `fn anchor(self, anchor: impl Into<PopupAnchor>) -> Self` — `egui-0.35.0/src/containers/popup.rs:353`
+- `fn anchor(self, anchor: impl Into<PopupAnchor>) -> Self` — `egui-0.36.2/src/containers/popup.rs:355`
   Show the popup relative to the given [`PopupAnchor`].
-- `fn at_pointer(self) -> Self` — `egui-0.35.0/src/containers/popup.rs:331`
+- `fn at_pointer(self) -> Self` — `egui-0.36.2/src/containers/popup.rs:333`
   Show the popup relative to the pointer.
-- `fn at_pointer_fixed(self) -> Self` — `egui-0.35.0/src/containers/popup.rs:339`
+- `fn at_pointer_fixed(self) -> Self` — `egui-0.36.2/src/containers/popup.rs:341`
   Remember the pointer position at the time of opening the popup, and show the popup relative to that.
-- `fn at_position(self, position: Pos2) -> Self` — `egui-0.35.0/src/containers/popup.rs:346`
+- `fn at_position(self, position: Pos2) -> Self` — `egui-0.36.2/src/containers/popup.rs:348`
   Show the popup relative to a specific position.
-- `fn close_all(ctx: &Context)` — `egui-0.35.0/src/containers/popup.rs:677`
+- `fn close_all(ctx: &Context)` — `egui-0.36.2/src/containers/popup.rs:691`
   Close all currently open popups.
-- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.35.0/src/containers/popup.rs:324`
+- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.36.2/src/containers/popup.rs:326`
   Set the close behavior of the popup.
-- `fn close_id(ctx: &Context, popup_id: Id)` — `egui-0.35.0/src/containers/popup.rs:684`
+- `fn close_id(ctx: &Context, popup_id: Id)` — `egui-0.36.2/src/containers/popup.rs:698`
   Close the given popup, if it is open.
-- `fn context_menu(response: &Response) -> Self` — `egui-0.35.0/src/containers/popup.rs:246`
+- `fn context_menu(response: &Response) -> Self` — `egui-0.36.2/src/containers/popup.rs:248`
   Show a context menu when the widget was secondary clicked. Sets the layout to `Layout::top_down_justified(Ali…
-- `fn ctx(&self) -> &Context` — `egui-0.35.0/src/containers/popup.rs:412`
+- `fn ctx(&self) -> &Context` — `egui-0.36.2/src/containers/popup.rs:423`
   Get the [`Context`]
-- `fn default_response_id(response: &Response) -> Id` — `egui-0.35.0/src/containers/popup.rs:639`
+- `fn default_response_id(response: &Response) -> Id` — `egui-0.36.2/src/containers/popup.rs:653`
   The default ID when constructing a popup from the [`Response`] of e.g. a button.
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/containers/popup.rs:367`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/popup.rs:369`
   Set the frame of the popup.
-- `fn from_response(response: &Response) -> Self` — `egui-0.35.0/src/containers/popup.rs:215`
+- `fn from_response(response: &Response) -> Self` — `egui-0.36.2/src/containers/popup.rs:217`
   Show a popup relative to some widget. The popup will be always open.
-- `fn from_toggle_button_response(button_response: &Response) -> Self` — `egui-0.35.0/src/containers/popup.rs:228`
+- `fn from_toggle_button_response(button_response: &Response) -> Self` — `egui-0.36.2/src/containers/popup.rs:230`
   Show a popup relative to some widget, toggling the open state based on the widget's click state.
-- `fn gap(self, gap: f32) -> Self` — `egui-0.35.0/src/containers/popup.rs:360`
+- `fn gap(self, gap: f32) -> Self` — `egui-0.36.2/src/containers/popup.rs:362`
   Set the gap between the anchor and the popup.
-- `fn get_anchor(&self) -> PopupAnchor` — `egui-0.35.0/src/containers/popup.rs:417`
+- `fn get_anchor(&self) -> PopupAnchor` — `egui-0.36.2/src/containers/popup.rs:428`
   Return the [`PopupAnchor`] of the popup.
-- `fn get_anchor_rect(&self) -> Option<Rect>` — `egui-0.35.0/src/containers/popup.rs:424`
+- `fn get_anchor_rect(&self) -> Option<Rect>` — `egui-0.36.2/src/containers/popup.rs:435`
   Return the anchor rect of the popup.
-- `fn get_best_align(&self) -> RectAlign` — `egui-0.35.0/src/containers/popup.rs:463`
+- `fn get_best_align(&self) -> RectAlign` — `egui-0.36.2/src/containers/popup.rs:474`
   Calculate the best alignment for the popup, based on the last size and screen rect.
-- `fn get_expected_size(&self) -> Option<Vec2>` — `egui-0.35.0/src/containers/popup.rs:458`
+- `fn get_expected_size(&self) -> Option<Vec2>` — `egui-0.36.2/src/containers/popup.rs:469`
   Get the expected size of the popup.
-- `fn get_id(&self) -> Id` — `egui-0.35.0/src/containers/popup.rs:443`
+- `fn get_id(&self) -> Id` — `egui-0.36.2/src/containers/popup.rs:454`
   Get the id of the popup.
-- `fn get_popup_rect(&self) -> Option<Rect>` — `egui-0.35.0/src/containers/popup.rs:432`
+- `fn get_popup_rect(&self) -> Option<Rect>` — `egui-0.36.2/src/containers/popup.rs:443`
   Get the expected rect the popup will be shown in.
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/containers/popup.rs:395`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/containers/popup.rs:406`
   Set the id of the Area.
-- `fn info(self, info: UiStackInfo) -> Self` — `egui-0.35.0/src/containers/popup.rs:269`
+- `fn info(self, info: UiStackInfo) -> Self` — `egui-0.36.2/src/containers/popup.rs:271`
   Set the [`UiStackInfo`] of the popup's [`Ui`].
-- `fn is_any_open(ctx: &Context) -> bool` — `egui-0.35.0/src/containers/popup.rs:660`
+- `fn interactable(self, interactable: bool) -> Self` — `egui-0.36.2/src/containers/popup.rs:378`
+  If `false`, the pointer goes straight through the popup and it's widgets to whatever is behind it.
+- `fn is_any_open(ctx: &Context) -> bool` — `egui-0.36.2/src/containers/popup.rs:674`
   Is any popup open?
-- `fn is_id_open(ctx: &Context, popup_id: Id) -> bool` — `egui-0.35.0/src/containers/popup.rs:653`
+- `fn is_id_open(ctx: &Context, popup_id: Id) -> bool` — `egui-0.36.2/src/containers/popup.rs:667`
   Is the given popup open?
-- `fn is_open(&self) -> bool` — `egui-0.35.0/src/containers/popup.rs:448`
+- `fn is_open(&self) -> bool` — `egui-0.36.2/src/containers/popup.rs:459`
   Is the popup open?
-- `fn kind(self, kind: PopupKind) -> Self` — `egui-0.35.0/src/containers/popup.rs:262`
+- `fn kind(self, kind: PopupKind) -> Self` — `egui-0.36.2/src/containers/popup.rs:264`
   Set the kind of the popup. Used for [`Area::kind`] and [`Area::order`].
-- `fn layout(self, layout: Layout) -> Self` — `egui-0.35.0/src/containers/popup.rs:381`
+- `fn layout(self, layout: Layout) -> Self` — `egui-0.36.2/src/containers/popup.rs:392`
   Set the layout of the popup.
-- `fn menu(button_response: &Response) -> Self` — `egui-0.35.0/src/containers/popup.rs:235`
+- `fn menu(button_response: &Response) -> Self` — `egui-0.36.2/src/containers/popup.rs:237`
   Show a popup when the widget was clicked. Sets the layout to `Layout::top_down_justified(Align::Min)`.
-- `fn new(id: Id, ctx: Context, anchor: impl Into<PopupAnchor>, layer_id: LayerId) -> Self` — `egui-0.35.0/src/containers/popup.rs:190`
+- `fn new(id: Id, ctx: Context, anchor: impl Into<PopupAnchor>, layer_id: LayerId) -> Self` — `egui-0.36.2/src/containers/popup.rs:191`
   Create a new popup
-- `fn open(self, open: bool) -> Self` — `egui-0.35.0/src/containers/popup.rs:294`
+- `fn open(self, open: bool) -> Self` — `egui-0.36.2/src/containers/popup.rs:296`
   Force the popup to be open or closed.
-- `fn open_bool(self, open: &'a mut bool) -> Self` — `egui-0.35.0/src/containers/popup.rs:315`
+- `fn open_bool(self, open: &'a mut bool) -> Self` — `egui-0.36.2/src/containers/popup.rs:317`
   Store the open state via a mutable bool.
-- `fn open_id(ctx: &Context, popup_id: Id)` — `egui-0.35.0/src/containers/popup.rs:665`
+- `fn open_id(ctx: &Context, popup_id: Id)` — `egui-0.36.2/src/containers/popup.rs:679`
   Open the given popup and close all others.
-- `fn open_memory(self, set_state: impl Into<Option<SetOpenCommand>>) -> Self` — `egui-0.35.0/src/containers/popup.rs:306`
+- `fn open_memory(self, set_state: impl Into<Option<SetOpenCommand>>) -> Self` — `egui-0.36.2/src/containers/popup.rs:308`
   Store the open state via [`crate::Memory`]. You can set the state via the first [`SetOpenCommand`] param.
-- `fn position_of_id(ctx: &Context, popup_id: Id) -> Option<Pos2>` — `egui-0.35.0/src/containers/popup.rs:689`
+- `fn position_of_id(ctx: &Context, popup_id: Id) -> Option<Pos2>` — `egui-0.36.2/src/containers/popup.rs:703`
   Get the position for this popup, if it is open.
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/containers/popup.rs:374`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/containers/popup.rs:385`
   Set the sense of the popup.
-- `fn show<R>(self, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/popup.rs:497`
+- `fn show<R>(self, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/popup.rs:508`
   Show the popup.
-- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.35.0/src/containers/popup.rs:406`
+- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.36.2/src/containers/popup.rs:417`
   Set the style for the popup contents.
-- `fn toggle_id(ctx: &Context, popup_id: Id)` — `egui-0.35.0/src/containers/popup.rs:672`
+- `fn toggle_id(ctx: &Context, popup_id: Id)` — `egui-0.36.2/src/containers/popup.rs:686`
   Toggle the given popup between closed and open.
-- `fn width(self, width: f32) -> Self` — `egui-0.35.0/src/containers/popup.rs:388`
+- `fn width(self, width: f32) -> Self` — `egui-0.36.2/src/containers/popup.rs:399`
   The width that will be passed to [`Area::default_width`].
 
-### `Pos2` (struct) — `emath-0.35.0/src/pos2.rs:18`
+### `Pos2` (struct) — `emath-0.36.2/src/pos2.rs:18`
 
 A position on screen.
 
@@ -3710,64 +3720,64 @@ Public fields:
 
 Methods:
 
-- `const fn new(x: f32, y: f32) -> Self` — `emath-0.35.0/src/pos2.rs:128`
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/pos2.rs:175`
+- `const fn new(x: f32, y: f32) -> Self` — `emath-0.36.2/src/pos2.rs:128`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/pos2.rs:175`
   True if any member is NaN.
-- `fn ceil(self) -> Self` — `emath-0.35.0/src/pos2.rs:163`
-- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.35.0/src/pos2.rs:193`
-- `fn distance(self, other: Self) -> f32` — `emath-0.35.0/src/pos2.rs:143`
-- `fn distance_sq(self, other: Self) -> f32` — `emath-0.35.0/src/pos2.rs:148`
-- `fn floor(self) -> Self` — `emath-0.35.0/src/pos2.rs:153`
-- `fn is_finite(self) -> bool` — `emath-0.35.0/src/pos2.rs:169`
+- `fn ceil(self) -> Self` — `emath-0.36.2/src/pos2.rs:163`
+- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.36.2/src/pos2.rs:193`
+- `fn distance(self, other: Self) -> f32` — `emath-0.36.2/src/pos2.rs:143`
+- `fn distance_sq(self, other: Self) -> f32` — `emath-0.36.2/src/pos2.rs:148`
+- `fn floor(self) -> Self` — `emath-0.36.2/src/pos2.rs:153`
+- `fn is_finite(self) -> bool` — `emath-0.36.2/src/pos2.rs:169`
   True if all members are also finite.
-- `fn lerp(&self, other: Self, t: f32) -> Self` — `emath-0.35.0/src/pos2.rs:201`
+- `fn lerp(&self, other: Self, t: f32) -> Self` — `emath-0.36.2/src/pos2.rs:201`
   Linearly interpolate towards another point, so that `0.0 => self, 1.0 => other`.
-- `fn max(self, other: Self) -> Self` — `emath-0.35.0/src/pos2.rs:187`
-- `fn min(self, other: Self) -> Self` — `emath-0.35.0/src/pos2.rs:181`
-- `fn round(self) -> Self` — `emath-0.35.0/src/pos2.rs:158`
-- `fn to_vec2(self) -> Vec2` — `emath-0.35.0/src/pos2.rs:135`
+- `fn max(self, other: Self) -> Self` — `emath-0.36.2/src/pos2.rs:187`
+- `fn min(self, other: Self) -> Self` — `emath-0.36.2/src/pos2.rs:181`
+- `fn round(self) -> Self` — `emath-0.36.2/src/pos2.rs:158`
+- `fn to_vec2(self) -> Vec2` — `emath-0.36.2/src/pos2.rs:135`
   The vector from origin to this position. `p.to_vec2()` is equivalent to `p - Pos2::default()`.
 
-Implements: `Add<Vec2>`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Pos2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Pos2>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul<Pos2>`, `Mul<f32>`, `MulAssign<f32>`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Vec2>`, `SubAssign<Vec2>`, `Zeroable`
+Implements: `Add<Vec2>`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Pos2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Pos2>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul<Pos2>`, `Mul<f32>`, `MulAssign<f32>`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `Sub`, `Sub<Vec2>`, `SubAssign<Vec2>`, `Zeroable`
 
-### `ProgressBar` (struct) — `egui-0.35.0/src/widgets/progress_bar.rs:15`
+### `ProgressBar` (struct) — `egui-0.36.2/src/widgets/progress_bar.rs:15`
 
 A simple progress bar.
 
 Methods:
 
-- `fn animate(self, animate: bool) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:82`
+- `fn animate(self, animate: bool) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:82`
   Whether to display a loading animation when progress `< 1`. Note that this will cause the UI to be redrawn. D…
-- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:93`
+- `fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:93`
   Set the rounding of the progress bar.
-- `fn desired_height(self, desired_height: f32) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:48`
+- `fn desired_height(self, desired_height: f32) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:48`
   The desired height of the bar. Will use the default interaction size if not set.
-- `fn desired_width(self, desired_width: f32) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:41`
+- `fn desired_width(self, desired_width: f32) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:41`
   The desired width of the bar. Will use all horizontal space if not set.
-- `fn fill(self, color: Color32) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:55`
+- `fn fill(self, color: Color32) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:55`
   The fill color of the bar.
-- `fn new(progress: f32) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:27`
+- `fn new(progress: f32) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:27`
   Progress in the `[0, 1]` range, where `1` means "completed".
-- `fn show_percentage(self) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:69`
+- `fn show_percentage(self) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:69`
   Show the progress in percent on the progress bar.
-- `fn text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/progress_bar.rs:62`
+- `fn text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/progress_bar.rs:62`
   A custom text to display on the progress bar.
 
 Implements: `Widget`
 
-### `RadioButton` (struct) — `egui-0.35.0/src/widgets/radio_button.rs:26`
+### `RadioButton` (struct) — `egui-0.36.2/src/widgets/radio_button.rs:26`
 
 One out of several alternatives, either selected or not.
 
 Methods:
 
-- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.35.0/src/widgets/radio_button.rs:42`
+- `fn atoms(&self) -> &Atoms<'a>` — `egui-0.36.2/src/widgets/radio_button.rs:42`
   Output the [`RadioButton`]'s [`Atoms`].
-- `fn new(checked: bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/widgets/radio_button.rs:32`
+- `fn new(checked: bool, atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/widgets/radio_button.rs:32`
 
 Implements: `Widget`
 
-### `Rangef` (struct) — `emath-0.35.0/src/range.rs:8`
+### `Rangef` (struct) — `emath-0.36.2/src/range.rs:10`
 
 Inclusive range of floats, i.e. `min..=max`, but more ergonomic than [`RangeInclusive`].
 
@@ -3778,31 +3788,31 @@ Public fields:
 
 Methods:
 
-- `fn as_positive(self) -> Self` — `emath-0.35.0/src/range.rs:73`
+- `fn as_positive(self) -> Self` — `emath-0.36.2/src/range.rs:75`
   Flip `min` and `max` if needed, so that `min <= max` after.
-- `fn center(self) -> f32` — `emath-0.35.0/src/range.rs:54`
+- `fn center(self) -> f32` — `emath-0.36.2/src/range.rs:56`
   The center of the range
-- `fn clamp(self, x: f32) -> f32` — `emath-0.35.0/src/range.rs:67`
+- `fn clamp(self, x: f32) -> f32` — `emath-0.36.2/src/range.rs:69`
   Equivalent to `x.clamp(min, max)`
-- `fn contains(self, x: f32) -> bool` — `emath-0.35.0/src/range.rs:60`
-- `fn expand(self, amnt: f32) -> Self` — `emath-0.35.0/src/range.rs:93`
+- `fn contains(self, x: f32) -> bool` — `emath-0.36.2/src/range.rs:62`
+- `fn expand(self, amnt: f32) -> Self` — `emath-0.36.2/src/range.rs:95`
   Expand by this much on each side, keeping the center
-- `fn flip(self) -> Self` — `emath-0.35.0/src/range.rs:103`
+- `fn flip(self) -> Self` — `emath-0.36.2/src/range.rs:105`
   Flip the min and the max
-- `fn intersection(self, other: Self) -> Self` — `emath-0.35.0/src/range.rs:122`
+- `fn intersection(self, other: Self) -> Self` — `emath-0.36.2/src/range.rs:124`
   The overlap of two ranges, i.e. the range that is contained by both.
-- `fn intersects(self, other: Self) -> bool` — `emath-0.35.0/src/range.rs:140`
+- `fn intersects(self, other: Self) -> bool` — `emath-0.36.2/src/range.rs:142`
   Do the two ranges intersect?
-- `fn new(min: f32, max: f32) -> Self` — `emath-0.35.0/src/range.rs:34`
-- `fn point(min_and_max: f32) -> Self` — `emath-0.35.0/src/range.rs:39`
-- `fn shrink(self, amnt: f32) -> Self` — `emath-0.35.0/src/range.rs:83`
+- `fn new(min: f32, max: f32) -> Self` — `emath-0.36.2/src/range.rs:36`
+- `fn point(min_and_max: f32) -> Self` — `emath-0.36.2/src/range.rs:41`
+- `fn shrink(self, amnt: f32) -> Self` — `emath-0.36.2/src/range.rs:85`
   Shrink by this much on each side, keeping the center
-- `fn span(self) -> f32` — `emath-0.35.0/src/range.rs:48`
+- `fn span(self) -> f32` — `emath-0.36.2/src/range.rs:50`
   The length of the range, i.e. `max - min`.
 
-Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `From<&RangeFrom<f32>>`, `From<&RangeFull>`, `From<&RangeInclusive<f32>>`, `From<&Rangef>`, `From<RangeFrom<f32>>`, `From<RangeFull>`, `From<RangeInclusive<f32>>`, `From<RangeToInclusive<f32>>`, `From<Rangef>`, `PartialEq`, `PartialEq<RangeInclusive<f32>>`, `PartialEq<Rangef>`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
+Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `From<&RangeFrom<f32>>`, `From<&RangeFull>`, `From<&RangeInclusive<f32>>`, `From<&Rangef>`, `From<RangeFrom<f32>>`, `From<RangeFull>`, `From<RangeInclusive<f32>>`, `From<RangeInclusive<i32>>`, `From<RangeToInclusive<f32>>`, `From<Rangef>`, `PartialEq`, `PartialEq<RangeInclusive<f32>>`, `PartialEq<Rangef>`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `RawInput` (struct) — `egui-0.35.0/src/data/input/raw_input.rs:18`
+### `RawInput` (struct) — `egui-0.36.2/src/data/input/raw_input.rs:18`
 
 What the integrations provides to egui at the start of each frame.
 
@@ -3815,26 +3825,25 @@ Public fields:
 - `max_texture_side: Option<usize>` — Maximum size of one side of the font texture.
 - `time: Option<f64>` — Monotonically increasing time, in seconds. Relative to whatever. Used for animations. If…
 - `predicted_dt: f32` — Should be set to the expected time between frames when painting at vsync speeds. The defa…
-- `modifiers: Modifiers` — Which modifier keys are down at the start of the frame?
 - `events: Vec<Event>` — In-order events received this frame.
 - `hovered_files: Vec<HoveredFile>` — Dragged files hovering over egui.
-- `dropped_files: Vec<DroppedFile>` — Dragged files dropped into egui.
+- `dropped_files: Vec<DroppedFileHandle>` — Dragged files dropped into egui.
 - `focused: bool` — The native window has the keyboard focus (i.e. is receiving key presses).
 - `system_theme: Option<Theme>` — Does the OS use dark or light mode?
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `egui-0.35.0/src/data/input/raw_input.rs:140`
+- `fn append(&mut self, newer: Self)` — `egui-0.36.2/src/data/input/raw_input.rs:146`
   Add on new input.
-- `fn take(&mut self) -> Self` — `egui-0.35.0/src/data/input/raw_input.rs:117`
+- `fn take(&mut self) -> Self` — `egui-0.36.2/src/data/input/raw_input.rs:124`
   Helper: move volatile (deltas and events), clone the rest.
-- `fn ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/data/input/raw_input.rs:174`
-- `fn viewport(&self) -> &ViewportInfo` — `egui-0.35.0/src/data/input/raw_input.rs:109`
+- `fn ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/data/input/raw_input.rs:178`
+- `fn viewport(&self) -> &ViewportInfo` — `egui-0.36.2/src/data/input/raw_input.rs:116`
   Info about the active viewport
 
-Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
+Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
-### `Rect` (struct) — `emath-0.35.0/src/rect.rs:25`
+### `Rect` (struct) — `emath-0.36.2/src/rect.rs:25`
 
 A rectangular region of space.
 
@@ -3845,150 +3854,150 @@ Public fields:
 
 Methods:
 
-- `const fn from_min_max(min: Pos2, max: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:73`
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/rect.rs:530`
+- `const fn from_min_max(min: Pos2, max: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:73`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/rect.rs:530`
   True if any member is NaN.
-- `fn area(&self) -> f32` — `emath-0.35.0/src/rect.rs:381`
+- `fn area(&self) -> f32` — `emath-0.36.2/src/rect.rs:381`
   This is never negative, and instead returns zero for negative rectangles.
-- `fn aspect_ratio(&self) -> f32` — `emath-0.35.0/src/rect.rs:362`
+- `fn aspect_ratio(&self) -> f32` — `emath-0.36.2/src/rect.rs:362`
   Width / height
-- `fn bottom(&self) -> f32` — `emath-0.35.0/src/rect.rs:593`
+- `fn bottom(&self) -> f32` — `emath-0.36.2/src/rect.rs:593`
   `max.y`
-- `fn bottom_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:599`
+- `fn bottom_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:599`
   `max.y`
-- `fn bottom_up_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:506`
-- `fn center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:332`
-- `fn center_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:643`
-- `fn center_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:616`
-- `fn clamp(&self, p: Pos2) -> Pos2` — `emath-0.35.0/src/rect.rs:286`
+- `fn bottom_up_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:506`
+- `fn center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:332`
+- `fn center_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:643`
+- `fn center_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:616`
+- `fn clamp(&self, p: Pos2) -> Pos2` — `emath-0.36.2/src/rect.rs:286`
   Return the given points clamped to be inside the rectangle Panics if [`Self::is_negative`].
-- `fn contains(&self, p: Pos2) -> bool` — `emath-0.35.0/src/rect.rs:274`
-- `fn contains_rect(&self, other: Self) -> bool` — `emath-0.35.0/src/rect.rs:279`
-- `fn distance_sq_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:401`
+- `fn contains(&self, p: Pos2) -> bool` — `emath-0.36.2/src/rect.rs:274`
+- `fn contains_rect(&self, other: Self) -> bool` — `emath-0.36.2/src/rect.rs:279`
+- `fn distance_sq_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:401`
   The distance from the rect to the position, squared.
-- `fn distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:391`
+- `fn distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:391`
   The distance from the rect to the position.
-- `fn everything_above(bottom_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:157`
+- `fn everything_above(bottom_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:157`
   A [`Rect`] that contains every point above a certain y coordinate
-- `fn everything_below(top_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:149`
+- `fn everything_below(top_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:149`
   A [`Rect`] that contains every point below a certain y coordinate
-- `fn everything_left_of(right_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:141`
+- `fn everything_left_of(right_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:141`
   A [`Rect`] that contains every point to the left of the given X coordinate.
-- `fn everything_right_of(left_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:133`
+- `fn everything_right_of(left_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:133`
   A [`Rect`] that contains every point to the right of the given X coordinate.
-- `fn expand(self, amnt: f32) -> Self` — `emath-0.35.0/src/rect.rs:193`
+- `fn expand(self, amnt: f32) -> Self` — `emath-0.36.2/src/rect.rs:193`
   Expand by this much in each direction, keeping the center
-- `fn expand2(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:199`
+- `fn expand2(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:199`
   Expand by this much in each direction, keeping the center
-- `fn extend_with(&mut self, p: Pos2)` — `emath-0.35.0/src/rect.rs:291`
-- `fn extend_with_x(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:298`
+- `fn extend_with(&mut self, p: Pos2)` — `emath-0.36.2/src/rect.rs:291`
+- `fn extend_with_x(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:298`
   Expand to include the given x coordinate
-- `fn extend_with_y(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:305`
+- `fn extend_with_y(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:305`
   Expand to include the given y coordinate
-- `fn from_center_size(center: Pos2, size: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:87`
-- `fn from_min_size(min: Pos2, size: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:79`
+- `fn from_center_size(center: Pos2, size: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:87`
+- `fn from_min_size(min: Pos2, size: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:79`
   left-top corner plus a size (stretching right-down).
-- `fn from_points(points: &[Pos2]) -> Self` — `emath-0.35.0/src/rect.rs:123`
+- `fn from_points(points: &[Pos2]) -> Self` — `emath-0.36.2/src/rect.rs:123`
   Bounding-box around the points.
-- `fn from_pos(point: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:115`
+- `fn from_pos(point: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:115`
   A zero-sized rect at a specific point.
-- `fn from_two_pos(a: Pos2, b: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:106`
+- `fn from_two_pos(a: Pos2, b: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:106`
   Returns the bounding rectangle of the two points.
-- `fn from_x_y_ranges(x_range: impl Into<Rangef>, y_range: impl Into<Rangef>) -> Self` — `emath-0.35.0/src/rect.rs:95`
-- `fn height(&self) -> f32` — `emath-0.35.0/src/rect.rs:353`
+- `fn from_x_y_ranges(x_range: impl Into<Rangef>, y_range: impl Into<Rangef>) -> Self` — `emath-0.36.2/src/rect.rs:95`
+- `fn height(&self) -> f32` — `emath-0.36.2/src/rect.rs:353`
   Note: this can be negative.
-- `fn intersect(self, other: Self) -> Self` — `emath-0.35.0/src/rect.rs:324`
+- `fn intersect(self, other: Self) -> Self` — `emath-0.36.2/src/rect.rs:324`
   The intersection of two [`Rect`], i.e. the area covered by both.
-- `fn intersects(self, other: Self) -> bool` — `emath-0.35.0/src/rect.rs:250`
-- `fn intersects_ray(&self, o: Pos2, d: Vec2) -> bool` — `emath-0.35.0/src/rect.rs:682`
+- `fn intersects(self, other: Self) -> bool` — `emath-0.36.2/src/rect.rs:250`
+- `fn intersects_ray(&self, o: Pos2, d: Vec2) -> bool` — `emath-0.36.2/src/rect.rs:682`
   Does this Rect intersect the given ray (where `d` is normalized)?
-- `fn intersects_ray_from_center(&self, d: Vec2) -> Pos2` — `emath-0.35.0/src/rect.rs:714`
+- `fn intersects_ray_from_center(&self, d: Vec2) -> Pos2` — `emath-0.36.2/src/rect.rs:714`
   Where does a ray from the center intersect the rectangle?
-- `fn is_finite(&self) -> bool` — `emath-0.35.0/src/rect.rs:524`
+- `fn is_finite(&self) -> bool` — `emath-0.36.2/src/rect.rs:524`
   True if all members are also finite.
-- `fn is_negative(&self) -> bool` — `emath-0.35.0/src/rect.rs:512`
+- `fn is_negative(&self) -> bool` — `emath-0.36.2/src/rect.rs:512`
   `width < 0 || height < 0`
-- `fn is_positive(&self) -> bool` — `emath-0.35.0/src/rect.rs:518`
+- `fn is_positive(&self) -> bool` — `emath-0.36.2/src/rect.rs:518`
   `width > 0 && height > 0`
-- `fn left(&self) -> f32` — `emath-0.35.0/src/rect.rs:539`
+- `fn left(&self) -> f32` — `emath-0.36.2/src/rect.rs:539`
   `min.x`
-- `fn left_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:638`
-- `fn left_center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:627`
-- `fn left_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:545`
+- `fn left_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:638`
+- `fn left_center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:627`
+- `fn left_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:545`
   `min.x`
-- `fn left_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:611`
-- `fn lerp_inside(&self, t: impl Into<Vec2>) -> Pos2` — `emath-0.35.0/src/rect.rs:452`
+- `fn left_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:611`
+- `fn lerp_inside(&self, t: impl Into<Vec2>) -> Pos2` — `emath-0.36.2/src/rect.rs:452`
   Linearly interpolate so that `[0, 0]` is [`Self::min`] and `[1, 1]` is [`Self::max`].
-- `fn lerp_towards(&self, other: &Self, t: f32) -> Self` — `emath-0.35.0/src/rect.rs:462`
+- `fn lerp_towards(&self, other: &Self, t: f32) -> Self` — `emath-0.36.2/src/rect.rs:462`
   Linearly self towards other rect.
-- `fn range_along(&self, axis: usize) -> Rangef` — `emath-0.35.0/src/rect.rs:486`
+- `fn range_along(&self, axis: usize) -> Rangef` — `emath-0.36.2/src/rect.rs:486`
   The extent along the given axis: `0` for x, `1` for y.
-- `fn right(&self) -> f32` — `emath-0.35.0/src/rect.rs:557`
+- `fn right(&self) -> f32` — `emath-0.36.2/src/rect.rs:557`
   `max.x`
-- `fn right_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:649`
-- `fn right_center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:632`
-- `fn right_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:563`
+- `fn right_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:649`
+- `fn right_center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:632`
+- `fn right_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:563`
   `max.x`
-- `fn right_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:622`
-- `fn rotate_bb(self, rot: Rot2) -> Self` — `emath-0.35.0/src/rect.rs:236`
+- `fn right_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:622`
+- `fn rotate_bb(self, rot: Rot2) -> Self` — `emath-0.36.2/src/rect.rs:236`
   Rotate the bounds (will expand the [`Rect`])
-- `fn scale_from_center(self, scale_factor: f32) -> Self` — `emath-0.35.0/src/rect.rs:205`
+- `fn scale_from_center(self, scale_factor: f32) -> Self` — `emath-0.36.2/src/rect.rs:205`
   Scale up by this factor in each direction, keeping the center
-- `fn scale_from_center2(self, scale_factor: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:211`
+- `fn scale_from_center2(self, scale_factor: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:211`
   Scale up by this factor in each direction, keeping the center
-- `fn set_bottom(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:605`
+- `fn set_bottom(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:605`
   `max.y`
-- `fn set_center(&mut self, center: Pos2)` — `emath-0.35.0/src/rect.rs:268`
+- `fn set_center(&mut self, center: Pos2)` — `emath-0.36.2/src/rect.rs:268`
   Keep size
-- `fn set_height(&mut self, h: f32)` — `emath-0.35.0/src/rect.rs:263`
+- `fn set_height(&mut self, h: f32)` — `emath-0.36.2/src/rect.rs:263`
   keep min
-- `fn set_left(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:551`
+- `fn set_left(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:551`
   `min.x`
-- `fn set_right(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:569`
+- `fn set_right(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:569`
   `max.x`
-- `fn set_top(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:587`
+- `fn set_top(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:587`
   `min.y`
-- `fn set_width(&mut self, w: f32)` — `emath-0.35.0/src/rect.rs:258`
+- `fn set_width(&mut self, w: f32)` — `emath-0.36.2/src/rect.rs:258`
   keep min
-- `fn shrink(self, amnt: f32) -> Self` — `emath-0.35.0/src/rect.rs:217`
+- `fn shrink(self, amnt: f32) -> Self` — `emath-0.36.2/src/rect.rs:217`
   Shrink by this much in each direction, keeping the center
-- `fn shrink2(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:223`
+- `fn shrink2(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:223`
   Shrink by this much in each direction, keeping the center
-- `fn signed_distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:438`
+- `fn signed_distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:438`
   Signed distance to the edge of the box.
-- `fn size(&self) -> Vec2` — `emath-0.35.0/src/rect.rs:341`
+- `fn size(&self) -> Vec2` — `emath-0.36.2/src/rect.rs:341`
   `rect.size() == Vec2 { x: rect.width(), y: rect.height() }`
-- `fn size_along(&self, axis: usize) -> f32` — `emath-0.35.0/src/rect.rs:501`
+- `fn size_along(&self, axis: usize) -> f32` — `emath-0.36.2/src/rect.rs:501`
   The size along the given axis: `0` for x (width), `1` for y (height).
-- `fn split_left_right_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:654`
+- `fn split_left_right_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:654`
   Split rectangle in left and right halves. `t` is expected to be in the (0,1) range.
-- `fn split_left_right_at_x(&self, split_x: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:659`
+- `fn split_left_right_at_x(&self, split_x: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:659`
   Split rectangle in left and right halves at the given `x` coordinate.
-- `fn split_top_bottom_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:666`
+- `fn split_top_bottom_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:666`
   Split rectangle in top and bottom halves. `t` is expected to be in the (0,1) range.
-- `fn split_top_bottom_at_y(&self, split_y: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:671`
+- `fn split_top_bottom_at_y(&self, split_y: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:671`
   Split rectangle in top and bottom halves at the given `y` coordinate.
-- `fn square_proportions(&self) -> Vec2` — `emath-0.35.0/src/rect.rs:369`
+- `fn square_proportions(&self) -> Vec2` — `emath-0.36.2/src/rect.rs:369`
   `[2, 1]` for wide screen, and `[1, 2]` for portrait, etc. At least one dimension = 1, the other >= 1 Returns…
-- `fn top(&self) -> f32` — `emath-0.35.0/src/rect.rs:575`
+- `fn top(&self) -> f32` — `emath-0.36.2/src/rect.rs:575`
   `min.y`
-- `fn top_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:581`
+- `fn top_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:581`
   `min.y`
-- `fn translate(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:229`
-- `fn union(self, other: Self) -> Self` — `emath-0.35.0/src/rect.rs:314`
+- `fn translate(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:229`
+- `fn union(self, other: Self) -> Self` — `emath-0.36.2/src/rect.rs:314`
   The union of two bounding rectangle, i.e. the minimum [`Rect`] that contains both input rectangles.
-- `fn width(&self) -> f32` — `emath-0.35.0/src/rect.rs:347`
+- `fn width(&self) -> f32` — `emath-0.36.2/src/rect.rs:347`
   Note: this can be negative.
-- `fn with_max_x(self, max_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:179`
-- `fn with_max_y(self, max_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:186`
-- `fn with_min_x(self, min_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:165`
-- `fn with_min_y(self, min_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:172`
-- `fn x_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:470`
-- `fn y_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:475`
+- `fn with_max_x(self, max_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:179`
+- `fn with_max_y(self, max_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:186`
+- `fn with_min_x(self, min_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:165`
+- `fn with_min_y(self, min_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:172`
+- `fn x_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:470`
+- `fn y_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:475`
 
 Implements: `BitOr`, `BitOrAssign`, `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<[Pos2; 2]>`, `GuiRounding`, `Mul<Rect>`, `Mul<f32>`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `RectAlign` (struct) — `emath-0.35.0/src/rect_align.rs:30`
+### `RectAlign` (struct) — `emath-0.36.2/src/rect_align.rs:30`
 
 Position a child [`Rect`] relative to a parent [`Rect`].
 
@@ -3999,38 +4008,38 @@ Public fields:
 
 Methods:
 
-- `fn align_rect(&self, parent_rect: &Rect, size: Vec2, gap: f32) -> Rect` — `emath-0.35.0/src/rect_align.rs:169`
+- `fn align_rect(&self, parent_rect: &Rect, size: Vec2, gap: f32) -> Rect` — `emath-0.36.2/src/rect_align.rs:169`
   Calculate the child rect based on a size and some optional gap.
-- `fn anchor(&self, parent_rect: &Rect, gap: f32) -> Pos2` — `emath-0.35.0/src/rect_align.rs:200`
+- `fn anchor(&self, parent_rect: &Rect, gap: f32) -> Pos2` — `emath-0.36.2/src/rect_align.rs:200`
   Calculator the anchor point for the child rect, based on the parent rect and an optional gap.
-- `fn child(&self) -> Align2` — `emath-0.35.0/src/rect_align.rs:140`
+- `fn child(&self) -> Align2` — `emath-0.36.2/src/rect_align.rs:140`
   Align in the child rect.
-- `fn find_best_align(values_to_try: impl Iterator<Item = Self>, content_rect: Rect, parent_rect: Rect, gap: f32, expected_size: Vec2) -> Option<Self>` — `emath-0.35.0/src/rect_align.rs:247`
+- `fn find_best_align(values_to_try: impl Iterator<Item = Self>, content_rect: Rect, parent_rect: Rect, gap: f32, expected_size: Vec2) -> Option<Self>` — `emath-0.36.2/src/rect_align.rs:247`
   Look for the first alternative [`RectAlign`] that allows the child rect to fit inside the `content_rect`.
-- `fn flip(self) -> Self` — `emath-0.35.0/src/rect_align.rs:225`
+- `fn flip(self) -> Self` — `emath-0.36.2/src/rect_align.rs:225`
   Flip the alignment on both axes.
-- `fn flip_x(self) -> Self` — `emath-0.35.0/src/rect_align.rs:209`
+- `fn flip_x(self) -> Self` — `emath-0.36.2/src/rect_align.rs:209`
   Flip the alignment on the x-axis.
-- `fn flip_y(self) -> Self` — `emath-0.35.0/src/rect_align.rs:217`
+- `fn flip_y(self) -> Self` — `emath-0.36.2/src/rect_align.rs:217`
   Flip the alignment on the y-axis.
-- `fn from_align2(align: Align2) -> Self` — `emath-0.35.0/src/rect_align.rs:145`
+- `fn from_align2(align: Align2) -> Self` — `emath-0.36.2/src/rect_align.rs:145`
   Convert an [`Align2`] to an [`RectAlign`], positioning the child rect inside the parent.
-- `fn gap_vector(&self) -> Vec2` — `emath-0.35.0/src/rect_align.rs:182`
+- `fn gap_vector(&self) -> Vec2` — `emath-0.36.2/src/rect_align.rs:182`
   Returns a sign vector (-1, 0 or 1 in each direction) that can be used as an offset to the child rect, creatin…
-- `fn outside(align: Align2) -> Self` — `emath-0.35.0/src/rect_align.rs:161`
+- `fn outside(align: Align2) -> Self` — `emath-0.36.2/src/rect_align.rs:161`
   Position the child rect outside the parent rect.
-- `fn over_corner(align: Align2) -> Self` — `emath-0.35.0/src/rect_align.rs:153`
+- `fn over_corner(align: Align2) -> Self` — `emath-0.36.2/src/rect_align.rs:153`
   The center of the child rect will be aligned to a corner of the parent rect.
-- `fn parent(&self) -> Align2` — `emath-0.35.0/src/rect_align.rs:135`
+- `fn parent(&self) -> Align2` — `emath-0.36.2/src/rect_align.rs:135`
   Align in the parent rect.
-- `fn pivot_pos(&self, parent_rect: &Rect, gap: f32) -> (Align2, Pos2)` — `emath-0.35.0/src/rect_align.rs:176`
+- `fn pivot_pos(&self, parent_rect: &Rect, gap: f32) -> (Align2, Pos2)` — `emath-0.36.2/src/rect_align.rs:176`
   Returns a [`Align2`] and a [`Pos2`] that you can e.g. use with `Area::fixed_pos` and `Area::pivot` to align a…
-- `fn symmetries(self) -> [Self; 3]` — `emath-0.35.0/src/rect_align.rs:234`
+- `fn symmetries(self) -> [Self; 3]` — `emath-0.36.2/src/rect_align.rs:234`
   Returns the 3 alternative [`RectAlign`]s that are flipped in various ways, for use with [`RectAlign::find_bes…
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `RepaintCause` (struct) — `egui-0.35.0/src/context.rs:250`
+### `RepaintCause` (struct) — `egui-0.36.2/src/context.rs:257`
 
 What called [`Context::request_repaint`] or [`Context::request_discard`]?
 
@@ -4042,14 +4051,14 @@ Public fields:
 
 Methods:
 
-- `fn new() -> Self` — `egui-0.35.0/src/context.rs:277`
+- `fn new() -> Self` — `egui-0.36.2/src/context.rs:284`
   Capture the file and line number of the call site.
-- `fn new_reason(reason: impl Into<Cow<'static, str>>) -> Self` — `egui-0.35.0/src/context.rs:289`
+- `fn new_reason(reason: impl Into<Cow<'static, str>>) -> Self` — `egui-0.36.2/src/context.rs:296`
   Capture the file and line number of the call site, as well as add a reason.
 
 Implements: `Clone`, `Debug`, `Display`, `Eq`, `Hash`, `PartialEq`, `StructuralPartialEq`
 
-### `RequestRepaintInfo` (struct) — `egui-0.35.0/src/context.rs:49`
+### `RequestRepaintInfo` (struct) — `egui-0.36.2/src/context.rs:50`
 
 Information given to the backend about when it is time to repaint the ui.
 
@@ -4061,45 +4070,45 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`
 
-### `Resize` (struct) — `egui-0.35.0/src/containers/resize.rs:42`
+### `Resize` (struct) — `egui-0.36.2/src/containers/resize.rs:42`
 
 A region that can be resized by dragging the bottom right corner.
 
 Methods:
 
-- `fn auto_sized(self) -> Self` — `egui-0.35.0/src/containers/resize.rs:177`
+- `fn auto_sized(self) -> Self` — `egui-0.36.2/src/containers/resize.rs:177`
   Not manually resizable, just takes the size of its contents. Text will not wrap, but will instead make your w…
-- `fn default_height(self, height: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:106`
+- `fn default_height(self, height: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:106`
   Preferred / suggested height. Actual height will depend on contents.
-- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/resize.rs:112`
-- `fn default_width(self, width: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:93`
+- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/resize.rs:112`
+- `fn default_width(self, width: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:93`
   Preferred / suggested width. Actual width will depend on contents.
-- `fn fixed_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/resize.rs:184`
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/containers/resize.rs:74`
+- `fn fixed_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/resize.rs:184`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/containers/resize.rs:74`
   Assign an explicit and globally unique id.
-- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/containers/resize.rs:81`
+- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/containers/resize.rs:81`
   A source for the unique [`Id`], e.g. `.id_salt("second_resize_area")` or `.id_salt(loop_index)`.
-- `fn is_resizable(&self) -> Vec2b` — `egui-0.35.0/src/containers/resize.rs:171`
-- `fn max_height(self, max_height: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:154`
+- `fn is_resizable(&self) -> Vec2b` — `egui-0.36.2/src/containers/resize.rs:171`
+- `fn max_height(self, max_height: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:154`
   Won't expand to larger than this
-- `fn max_size(self, max_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/resize.rs:140`
+- `fn max_size(self, max_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/resize.rs:140`
   Won't expand to larger than this
-- `fn max_width(self, max_width: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:147`
+- `fn max_width(self, max_width: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:147`
   Won't expand to larger than this
-- `fn min_height(self, min_height: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:133`
+- `fn min_height(self, min_height: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:133`
   Won't shrink to smaller than this
-- `fn min_size(self, min_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/resize.rs:119`
+- `fn min_size(self, min_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/resize.rs:119`
   Won't shrink to smaller than this
-- `fn min_width(self, min_width: f32) -> Self` — `egui-0.35.0/src/containers/resize.rs:126`
+- `fn min_width(self, min_width: f32) -> Self` — `egui-0.36.2/src/containers/resize.rs:126`
   Won't shrink to smaller than this
-- `fn resizable(self, resizable: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/resize.rs:165`
+- `fn resizable(self, resizable: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/resize.rs:165`
   Can you resize it with the mouse?
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R` — `egui-0.35.0/src/containers/resize.rs:323`
-- `fn with_stroke(self, with_stroke: bool) -> Self` — `egui-0.35.0/src/containers/resize.rs:194`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R` — `egui-0.36.2/src/containers/resize.rs:323`
+- `fn with_stroke(self, with_stroke: bool) -> Self` — `egui-0.36.2/src/containers/resize.rs:194`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`
 
-### `Response` (struct) — `egui-0.35.0/src/response.rs:23`
+### `Response` (struct) — `egui-0.36.2/src/response.rs:24`
 
 The result of adding a widget to a [`Ui`].
 
@@ -4114,426 +4123,426 @@ Public fields:
 
 Methods:
 
-- `fn changed(&self) -> bool` — `egui-0.35.0/src/response.rs:593`
+- `fn changed(&self) -> bool` — `egui-0.36.2/src/response.rs:613`
   Was the underlying data changed?
-- `fn clicked(&self) -> bool` — `egui-0.35.0/src/response.rs:183`
+- `fn clicked(&self) -> bool` — `egui-0.36.2/src/response.rs:184`
   Returns true if this widget was clicked this frame by the primary button.
-- `fn clicked_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:196`
+- `fn clicked_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:197`
   Returns true if this widget was clicked this frame by the given mouse button.
-- `fn clicked_elsewhere(&self) -> bool` — `egui-0.35.0/src/response.rs:274`
+- `fn clicked_elsewhere(&self) -> bool` — `egui-0.36.2/src/response.rs:275`
   `true` if there was a click *outside* the rect of this widget.
-- `fn clicked_with_open_in_background(&self) -> bool` — `egui-0.35.0/src/response.rs:264`
+- `fn clicked_with_open_in_background(&self) -> bool` — `egui-0.36.2/src/response.rs:265`
   Was this widget middle-clicked or clicked while holding down a modifier key?
-- `fn contains_pointer(&self) -> bool` — `egui-0.35.0/src/response.rs:326`
+- `fn contains_pointer(&self) -> bool` — `egui-0.36.2/src/response.rs:333`
   Returns true if the pointer is contained by the response rect, and no other widget is covering it.
-- `fn context_menu(&self, add_contents: impl FnOnce(&mut Ui)) -> Option<InnerResponse<()>>` — `egui-0.35.0/src/response.rs:1008`
+- `fn context_menu(&self, add_contents: impl FnOnce(&mut Ui)) -> Option<InnerResponse<()>>` — `egui-0.36.2/src/response.rs:1028`
   Response to secondary clicks (right-clicks) by showing the given menu.
-- `fn context_menu_opened(&self) -> bool` — `egui-0.35.0/src/response.rs:1015`
+- `fn context_menu_opened(&self) -> bool` — `egui-0.36.2/src/response.rs:1035`
   Returns whether a context menu is currently open for this widget.
-- `fn dnd_hover_payload<Payload>(&self) -> Option<Arc<Payload>>` — `egui-0.35.0/src/response.rs:499`
+- `fn dnd_hover_payload<Payload>(&self) -> Option<Arc<Payload>>` — `egui-0.36.2/src/response.rs:516`
   Drag-and-Drop: Return what is being held over this widget, if any.
-- `fn dnd_release_payload<Payload>(&self) -> Option<Arc<Payload>>` — `egui-0.35.0/src/response.rs:515`
+- `fn dnd_release_payload<Payload>(&self) -> Option<Arc<Payload>>` — `egui-0.36.2/src/response.rs:532`
   Drag-and-Drop: Return what is being dropped onto this widget, if any.
-- `fn dnd_set_drag_payload<Payload>(&self, payload: Payload)` — `egui-0.35.0/src/response.rs:482`
+- `fn dnd_set_drag_payload<Payload>(&self, payload: Payload)` — `egui-0.36.2/src/response.rs:499`
   If the user started dragging this widget this frame, store the payload for drag-and-drop.
-- `fn double_clicked(&self) -> bool` — `egui-0.35.0/src/response.rs:236`
+- `fn double_clicked(&self) -> bool` — `egui-0.36.2/src/response.rs:237`
   Returns true if this widget was double-clicked this frame by the primary button.
-- `fn double_clicked_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:248`
+- `fn double_clicked_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:249`
   Returns true if this widget was double-clicked this frame by the given button.
-- `fn drag_delta(&self) -> Vec2` — `egui-0.35.0/src/response.rs:439`
+- `fn drag_delta(&self) -> Vec2` — `egui-0.36.2/src/response.rs:456`
   If dragged, how many points were we dragged in since last frame?
-- `fn drag_motion(&self) -> Vec2` — `egui-0.35.0/src/response.rs:471`
+- `fn drag_motion(&self) -> Vec2` — `egui-0.36.2/src/response.rs:488`
   If dragged, how far did the mouse move since last frame?
-- `fn drag_started(&self) -> bool` — `egui-0.35.0/src/response.rs:386`
+- `fn drag_started(&self) -> bool` — `egui-0.36.2/src/response.rs:393`
   Did a drag on this widget begin this frame?
-- `fn drag_started_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:397`
+- `fn drag_started_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:404`
   Did a drag on this widget by the button begin this frame?
-- `fn drag_stopped(&self) -> bool` — `egui-0.35.0/src/response.rs:428`
+- `fn drag_stopped(&self) -> bool` — `egui-0.36.2/src/response.rs:445`
   The widget was being dragged, but now it has been released.
-- `fn drag_stopped_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:433`
+- `fn drag_stopped_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:450`
   The widget was being dragged by the button, but now it has been released.
-- `fn dragged(&self) -> bool` — `egui-0.35.0/src/response.rs:416`
+- `fn dragged(&self) -> bool` — `egui-0.36.2/src/response.rs:433`
   The widget is being dragged.
-- `fn dragged_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:422`
+- `fn dragged_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:439`
   See [`Self::dragged`].
-- `fn enabled(&self) -> bool` — `egui-0.35.0/src/response.rs:304`
+- `fn enabled(&self) -> bool` — `egui-0.36.2/src/response.rs:305`
   Was the widget enabled? If false, there was no interaction attempted and the widget should be drawn in a gray…
-- `fn gained_focus(&self) -> bool` — `egui-0.35.0/src/response.rs:347`
+- `fn gained_focus(&self) -> bool` — `egui-0.36.2/src/response.rs:354`
   True if this widget has keyboard focus this frame, but didn't last frame.
-- `fn has_focus(&self) -> bool` — `egui-0.35.0/src/response.rs:342`
+- `fn has_focus(&self) -> bool` — `egui-0.36.2/src/response.rs:349`
   This widget has the keyboard focus (i.e. is receiving key presses).
-- `fn highlight(self) -> Self` — `egui-0.35.0/src/response.rs:723`
+- `fn highlight(self) -> Self` — `egui-0.36.2/src/response.rs:743`
   Highlight this widget, to make it look like it is hovered, even if it isn't.
-- `fn hover_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/response.rs:556`
+- `fn hover_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/response.rs:573`
   If it is a good idea to show a tooltip, where is pointer?
-- `fn hovered(&self) -> bool` — `egui-0.35.0/src/response.rs:313`
+- `fn hovered(&self) -> bool` — `egui-0.36.2/src/response.rs:320`
   The pointer is hovering above this widget or the widget was clicked/tapped this frame.
-- `fn interact(&self, sense: Sense) -> Self` — `egui-0.35.0/src/response.rs:783`
+- `fn interact(&self, sense: Sense) -> Self` — `egui-0.36.2/src/response.rs:803`
   Sense more interactions (e.g. sense clicks on a [`Response`] returned from a label).
-- `fn interact_pointer_pos(&self) -> Option<Pos2>` — `egui-0.35.0/src/response.rs:529`
+- `fn interact_pointer_pos(&self) -> Option<Pos2>` — `egui-0.36.2/src/response.rs:546`
   Where the pointer (mouse/touch) were when this widget was clicked or dragged.
-- `fn intrinsic_size(&self) -> Option<Vec2>` — `egui-0.35.0/src/response.rs:541`
+- `fn intrinsic_size(&self) -> Option<Vec2>` — `egui-0.36.2/src/response.rs:558`
   The intrinsic / desired size of the widget.
-- `fn is_pointer_button_down_on(&self) -> bool` — `egui-0.35.0/src/response.rs:575`
+- `fn is_pointer_button_down_on(&self) -> bool` — `egui-0.36.2/src/response.rs:595`
   Is the pointer button currently down on this widget?
-- `fn is_tooltip_open(&self) -> bool` — `egui-0.35.0/src/response.rs:684`
+- `fn is_tooltip_open(&self) -> bool` — `egui-0.36.2/src/response.rs:704`
   Was the tooltip open last frame?
-- `fn labelled_by(self, id: Id) -> Self` — `egui-0.35.0/src/response.rs:983`
+- `fn labelled_by(self, id: Id) -> Self` — `egui-0.36.2/src/response.rs:1003`
   Associate a label with a control for accessibility.
-- `fn long_touched(&self) -> bool` — `egui-0.35.0/src/response.rs:218`
+- `fn long_touched(&self) -> bool` — `egui-0.36.2/src/response.rs:219`
   Was this long-pressed on a touch screen?
-- `fn lost_focus(&self) -> bool` — `egui-0.35.0/src/response.rs:365`
+- `fn lost_focus(&self) -> bool` — `egui-0.36.2/src/response.rs:372`
   The widget had keyboard focus and lost it, either because the user pressed tab or clicked somewhere else, or…
-- `fn mark_changed(&mut self)` — `egui-0.35.0/src/response.rs:605`
+- `fn mark_changed(&mut self)` — `egui-0.36.2/src/response.rs:625`
   Report the data shown by this widget changed.
-- `fn middle_clicked(&self) -> bool` — `egui-0.35.0/src/response.rs:230`
+- `fn middle_clicked(&self) -> bool` — `egui-0.36.2/src/response.rs:231`
   Returns true if this widget was clicked this frame by the middle mouse button.
-- `fn on_disabled_hover_text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/response.rs:730`
+- `fn on_disabled_hover_text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/response.rs:750`
   Show this text when hovering if the widget is disabled.
-- `fn on_disabled_hover_ui(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.35.0/src/response.rs:651`
+- `fn on_disabled_hover_ui(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.36.2/src/response.rs:671`
   Show this UI when hovering if the widget is disabled.
-- `fn on_hover_and_drag_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.35.0/src/response.rs:751`
+- `fn on_hover_and_drag_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.36.2/src/response.rs:771`
   When hovered or dragged, use this icon for the mouse cursor.
-- `fn on_hover_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.35.0/src/response.rs:742`
+- `fn on_hover_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.36.2/src/response.rs:762`
   When hovered, use this icon for the mouse cursor.
-- `fn on_hover_text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/response.rs:707`
+- `fn on_hover_text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/response.rs:727`
   Show this text if the widget was hovered (i.e. a tooltip).
-- `fn on_hover_text_at_pointer(self, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/response.rs:690`
+- `fn on_hover_text_at_pointer(self, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/response.rs:710`
   Like `on_hover_text`, but show the text next to cursor.
-- `fn on_hover_ui(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.35.0/src/response.rs:645`
+- `fn on_hover_ui(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.36.2/src/response.rs:665`
   Show this UI if the widget was hovered (i.e. a tooltip).
-- `fn on_hover_ui_at_pointer(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.35.0/src/response.rs:657`
+- `fn on_hover_ui_at_pointer(self, add_contents: impl FnOnce(&mut Ui)) -> Self` — `egui-0.36.2/src/response.rs:677`
   Like `on_hover_ui`, but show the ui next to cursor.
-- `fn output_event(&self, event: OutputEvent)` — `egui-0.35.0/src/response.rs:877`
-- `fn paint_debug_info(&self)` — `egui-0.35.0/src/response.rs:1029`
+- `fn output_event(&self, event: OutputEvent)` — `egui-0.36.2/src/response.rs:897`
+- `fn paint_debug_info(&self)` — `egui-0.36.2/src/response.rs:1049`
   Draw a debug rectangle over the response displaying the response's id and whether it is enabled and/or hovere…
-- `fn parent_id(&self) -> Id` — `egui-0.35.0/src/response.rs:157`
+- `fn parent_id(&self) -> Id` — `egui-0.36.2/src/response.rs:158`
   The [`Id`] of the parent [`crate::Ui`] that hosts this widget.
-- `fn request_focus(&self)` — `egui-0.35.0/src/response.rs:370`
+- `fn request_focus(&self)` — `egui-0.36.2/src/response.rs:377`
   Request that this widget get keyboard focus.
-- `fn scroll_to_me(&self, align: Option<Align>)` — `egui-0.35.0/src/response.rs:822`
+- `fn scroll_to_me(&self, align: Option<Align>)` — `egui-0.36.2/src/response.rs:842`
   Adjust the scroll position until this UI becomes visible.
-- `fn scroll_to_me_animation(&self, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.35.0/src/response.rs:827`
+- `fn scroll_to_me_animation(&self, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.36.2/src/response.rs:847`
   Like [`Self::scroll_to_me`], but allows you to specify the [`crate::style::ScrollAnimation`].
-- `fn secondary_clicked(&self) -> bool` — `egui-0.35.0/src/response.rs:210`
+- `fn secondary_clicked(&self) -> bool` — `egui-0.36.2/src/response.rs:211`
   Returns true if this widget was clicked this frame by the secondary mouse button (e.g. the right mouse button…
-- `fn set_close(&mut self)` — `egui-0.35.0/src/response.rs:620`
+- `fn set_close(&mut self)` — `egui-0.36.2/src/response.rs:640`
   Set the [`Flags::CLOSE`] flag.
-- `fn set_intrinsic_size(&mut self, size: Vec2)` — `egui-0.35.0/src/response.rs:548`
+- `fn set_intrinsic_size(&mut self, size: Vec2)` — `egui-0.36.2/src/response.rs:565`
   Set the intrinsic / desired size of the widget.
-- `fn should_close(&self) -> bool` — `egui-0.35.0/src/response.rs:613`
+- `fn should_close(&self) -> bool` — `egui-0.36.2/src/response.rs:633`
   Should the container be closed?
-- `fn show_tooltip_text(&self, text: impl Into<WidgetText>)` — `egui-0.35.0/src/response.rs:677`
+- `fn show_tooltip_text(&self, text: impl Into<WidgetText>)` — `egui-0.36.2/src/response.rs:697`
   Always show this tooltip, even if disabled and the user isn't hovering it.
-- `fn show_tooltip_ui(&self, add_contents: impl FnOnce(&mut Ui))` — `egui-0.35.0/src/response.rs:668`
+- `fn show_tooltip_ui(&self, add_contents: impl FnOnce(&mut Ui))` — `egui-0.36.2/src/response.rs:688`
   Always show this tooltip, even if disabled and the user isn't hovering it.
-- `fn surrender_focus(&self)` — `egui-0.35.0/src/response.rs:375`
+- `fn surrender_focus(&self)` — `egui-0.36.2/src/response.rs:382`
   Surrender keyboard focus for this widget.
-- `fn total_drag_delta(&self) -> Option<Vec2>` — `egui-0.35.0/src/response.rs:453`
+- `fn total_drag_delta(&self) -> Option<Vec2>` — `egui-0.36.2/src/response.rs:470`
   If dragged, how many points have we been dragged since the start of the drag?
-- `fn triple_clicked(&self) -> bool` — `egui-0.35.0/src/response.rs:242`
+- `fn triple_clicked(&self) -> bool` — `egui-0.36.2/src/response.rs:243`
   Returns true if this widget was triple-clicked this frame by the primary button.
-- `fn triple_clicked_by(&self, button: PointerButton) -> bool` — `egui-0.35.0/src/response.rs:255`
+- `fn triple_clicked_by(&self, button: PointerButton) -> bool` — `egui-0.36.2/src/response.rs:256`
   Returns true if this widget was triple-clicked this frame by the given button.
-- `fn union(&self, other: Self) -> Self` — `egui-0.35.0/src/response.rs:1051`
+- `fn union(&self, other: Self) -> Self` — `egui-0.36.2/src/response.rs:1071`
   A logical "or" operation. For instance `a.union(b).hovered` means "was either a or b hovered?".
-- `fn widget_info(&self, make_info: impl Fn() -> WidgetInfo)` — `egui-0.35.0/src/response.rs:849`
+- `fn widget_info(&self, make_info: impl Fn() -> WidgetInfo)` — `egui-0.36.2/src/response.rs:869`
   For accessibility.
-- `fn widget_state(&self) -> WidgetState` — `egui-0.35.0/src/widget_style.rs:105`
-- `fn with_new_rect(self, rect: Rect) -> Self` — `egui-0.35.0/src/response.rs:1079`
+- `fn widget_state(&self) -> WidgetState` — `egui-0.36.2/src/widget_style.rs:105`
+- `fn with_new_rect(self, rect: Rect) -> Self` — `egui-0.36.2/src/response.rs:1099`
   Returns a response with a modified [`Self::rect`].
 
 Implements: `BitOr`, `BitOrAssign`, `Clone`, `Debug`, `From<&Response>`
 
-### `Rgba` (struct) — `ecolor-0.35.0/src/rgba.rs:10`
+### `Rgba` (struct) — `ecolor-0.36.2/src/rgba.rs:10`
 
 0-1 linear space `RGBA` color with premultiplied alpha.
 
 Methods:
 
-- `const fn from_gray(l: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:86`
-- `const fn from_rgb(r: f32, g: f32, b: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:80`
-- `const fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:60`
-- `fn a(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:160`
-- `fn additive(self) -> Self` — `ecolor-0.35.0/src/rgba.rs:122`
+- `const fn from_gray(l: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:86`
+- `const fn from_rgb(r: f32, g: f32, b: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:80`
+- `const fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:60`
+- `fn a(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:160`
+- `fn additive(self) -> Self` — `ecolor-0.36.2/src/rgba.rs:122`
   Return an additive version of this color (alpha = 0)
-- `fn b(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:155`
-- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.35.0/src/rgba.rs:217`
+- `fn b(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:155`
+- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.36.2/src/rgba.rs:217`
   Blend two colors in linear space, so that `self` is behind the argument.
-- `fn from_black_alpha(a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:105`
+- `fn from_black_alpha(a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:105`
   Transparent black
-- `fn from_luminance_alpha(l: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:91`
-- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:65`
-- `fn from_srgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/rgba.rs:70`
-- `fn from_srgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/rgba.rs:75`
-- `fn from_white_alpha(a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:115`
+- `fn from_luminance_alpha(l: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:91`
+- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:65`
+- `fn from_srgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/rgba.rs:70`
+- `fn from_srgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/rgba.rs:75`
+- `fn from_white_alpha(a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:115`
   Transparent white
-- `fn g(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:150`
-- `fn intensity(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:166`
+- `fn g(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:150`
+- `fn intensity(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:166`
   How perceptually intense (bright) is the color?
-- `fn is_additive(self) -> bool` — `ecolor-0.35.0/src/rgba.rs:129`
+- `fn is_additive(self) -> bool` — `ecolor-0.36.2/src/rgba.rs:129`
   Is the alpha=0 ?
-- `fn multiply(self, alpha: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:135`
+- `fn multiply(self, alpha: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:135`
   Multiply with e.g. 0.5 to make us half transparent
-- `fn r(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:145`
-- `fn to_array(&self) -> [f32; 4]` — `ecolor-0.35.0/src/rgba.rs:188`
+- `fn r(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:145`
+- `fn to_array(&self) -> [f32; 4]` — `ecolor-0.36.2/src/rgba.rs:188`
   Premultiplied RGBA
-- `fn to_opaque(&self) -> Self` — `ecolor-0.35.0/src/rgba.rs:172`
+- `fn to_opaque(&self) -> Self` — `ecolor-0.36.2/src/rgba.rs:172`
   Returns an opaque version of self
-- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.35.0/src/rgba.rs:200`
+- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.36.2/src/rgba.rs:200`
   unmultiply the alpha
-- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/rgba.rs:212`
+- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/rgba.rs:212`
   unmultiply the alpha
-- `fn to_tuple(&self) -> (f32, f32, f32, f32)` — `ecolor-0.35.0/src/rgba.rs:194`
+- `fn to_tuple(&self) -> (f32, f32, f32, f32)` — `ecolor-0.36.2/src/rgba.rs:194`
   Premultiplied RGBA
 
 Implements: `Add`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `Hash`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Rgba>`, `Mul<f32>`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `RichText` (struct) — `egui-0.35.0/src/widget_text.rs:26`
+### `RichText` (struct) — `egui-0.36.2/src/widget_text.rs:26`
 
 Text and optional style choices for it.
 
 Methods:
 
-- `fn append_to(self, layout_job: &mut LayoutJob, style: &Style, fallback_font: FontSelection, default_valign: Align)` — `egui-0.35.0/src/widget_text.rs:372`
+- `fn append_to(self, layout_job: &mut LayoutJob, style: &Style, fallback_font: FontSelection, default_valign: Align)` — `egui-0.36.2/src/widget_text.rs:372`
   Append to an existing [`LayoutJob`]
-- `fn background_color(self, background_color: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widget_text.rs:310`
+- `fn background_color(self, background_color: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widget_text.rs:310`
   Fill-color behind the text.
-- `fn code(self) -> Self` — `egui-0.35.0/src/widget_text.rs:245`
+- `fn code(self) -> Self` — `egui-0.36.2/src/widget_text.rs:245`
   Monospace label with different background color.
-- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widget_text.rs:320`
+- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widget_text.rs:320`
   Override text color.
-- `fn extra_letter_spacing(self, extra_letter_spacing: f32) -> Self` — `egui-0.35.0/src/widget_text.rs:160`
+- `fn extra_letter_spacing(self, extra_letter_spacing: f32) -> Self` — `egui-0.36.2/src/widget_text.rs:160`
   Extra spacing between letters, in points.
-- `fn fallback_text_style(self, text_style: TextStyle) -> Self` — `egui-0.35.0/src/widget_text.rs:226`
+- `fn fallback_text_style(self, text_style: TextStyle) -> Self` — `egui-0.36.2/src/widget_text.rs:226`
   Set the [`TextStyle`] unless it has already been set
-- `fn family(self, family: FontFamily) -> Self` — `egui-0.35.0/src/widget_text.rs:185`
+- `fn family(self, family: FontFamily) -> Self` — `egui-0.36.2/src/widget_text.rs:185`
   Select the font family.
-- `fn font(self, font_id: FontId) -> Self` — `egui-0.35.0/src/widget_text.rs:193`
+- `fn font(self, font_id: FontId) -> Self` — `egui-0.36.2/src/widget_text.rs:193`
   Select the font and size. This overrides the value from [`Self::text_style`].
-- `fn font_height(&self, fonts: &mut FontsView<'_>, style: &Style) -> f32` — `egui-0.35.0/src/widget_text.rs:328`
+- `fn font_height(&self, fonts: &mut FontsView<'_>, style: &Style) -> f32` — `egui-0.36.2/src/widget_text.rs:328`
   Read the font height of the selected text style.
-- `fn heading(self) -> Self` — `egui-0.35.0/src/widget_text.rs:233`
+- `fn heading(self) -> Self` — `egui-0.36.2/src/widget_text.rs:233`
   Use [`TextStyle::Heading`].
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/widget_text.rs:136`
-- `fn italics(self) -> Self` — `egui-0.35.0/src/widget_text.rs:284`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/widget_text.rs:136`
+- `fn italics(self) -> Self` — `egui-0.36.2/src/widget_text.rs:284`
   Tilt the characters to the right.
-- `fn line_height(self, line_height: Option<f32>) -> Self` — `egui-0.35.0/src/widget_text.rs:174`
+- `fn line_height(self, line_height: Option<f32>) -> Self` — `egui-0.36.2/src/widget_text.rs:174`
   Explicit line height of the text in points.
-- `fn monospace(self) -> Self` — `egui-0.35.0/src/widget_text.rs:239`
+- `fn monospace(self) -> Self` — `egui-0.36.2/src/widget_text.rs:239`
   Use [`TextStyle::Monospace`].
-- `fn new(text: impl Into<String>) -> Self` — `egui-0.35.0/src/widget_text.rs:128`
-- `fn raised(self) -> Self` — `egui-0.35.0/src/widget_text.rs:303`
+- `fn new(text: impl Into<String>) -> Self` — `egui-0.36.2/src/widget_text.rs:128`
+- `fn raised(self) -> Self` — `egui-0.36.2/src/widget_text.rs:303`
   Align text to top. Only applicable together with [`Self::small()`].
-- `fn size(self, size: f32) -> Self` — `egui-0.35.0/src/widget_text.rs:148`
+- `fn size(self, size: f32) -> Self` — `egui-0.36.2/src/widget_text.rs:148`
   Select the font size (in points). This overrides the value from [`Self::text_style`].
-- `fn small(self) -> Self` — `egui-0.35.0/src/widget_text.rs:291`
+- `fn small(self) -> Self` — `egui-0.36.2/src/widget_text.rs:291`
   Smaller text.
-- `fn small_raised(self) -> Self` — `egui-0.35.0/src/widget_text.rs:297`
+- `fn small_raised(self) -> Self` — `egui-0.36.2/src/widget_text.rs:297`
   For e.g. exponents.
-- `fn strikethrough(self) -> Self` — `egui-0.35.0/src/widget_text.rs:277`
+- `fn strikethrough(self) -> Self` — `egui-0.36.2/src/widget_text.rs:277`
   Draw a line through the text, crossing it out.
-- `fn strong(self) -> Self` — `egui-0.35.0/src/widget_text.rs:252`
+- `fn strong(self) -> Self` — `egui-0.36.2/src/widget_text.rs:252`
   Extra strong text (stronger color).
-- `fn text(&self) -> &str` — `egui-0.35.0/src/widget_text.rs:141`
-- `fn text_style(self, text_style: TextStyle) -> Self` — `egui-0.35.0/src/widget_text.rs:219`
+- `fn text(&self) -> &str` — `egui-0.36.2/src/widget_text.rs:141`
+- `fn text_style(self, text_style: TextStyle) -> Self` — `egui-0.36.2/src/widget_text.rs:219`
   Override the [`TextStyle`].
-- `fn underline(self) -> Self` — `egui-0.35.0/src/widget_text.rs:268`
+- `fn underline(self) -> Self` — `egui-0.36.2/src/widget_text.rs:268`
   Draw a line under the text.
-- `fn variation(self, tag: impl IntoTag, coord: f32) -> Self` — `egui-0.35.0/src/widget_text.rs:202`
+- `fn variation(self, tag: impl IntoTag, coord: f32) -> Self` — `egui-0.36.2/src/widget_text.rs:202`
   Add a variation coordinate.
-- `fn variations<T>(self, variations: impl IntoIterator<Item = (T, f32)>) -> Self` — `egui-0.35.0/src/widget_text.rs:209`
+- `fn variations<T>(self, variations: impl IntoIterator<Item = (T, f32)>) -> Self` — `egui-0.36.2/src/widget_text.rs:209`
   Override the variation coordinates completely.
-- `fn weak(self) -> Self` — `egui-0.35.0/src/widget_text.rs:259`
+- `fn weak(self) -> Self` — `egui-0.36.2/src/widget_text.rs:259`
   Extra weak text (fainter color).
 
 Implements: `Clone`, `Debug`, `Default`, `From<&Box<str>>`, `From<&String>`, `From<&mut Box<str>>`, `From<&mut String>`, `From<&str>`, `From<Box<str>>`, `From<Cow<'_, str>>`, `From<RichText>`, `From<String>`, `PartialEq`, `StructuralPartialEq`
 
-### `SafeAreaInsets` (struct) — `egui-0.35.0/src/data/input/safe_area_insets.rs:11`
+### `SafeAreaInsets` (struct) — `egui-0.36.2/src/data/input/safe_area_insets.rs:11`
 
 The 'safe area' insets of the screen
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub<SafeAreaInsets>`
 
-### `Scene` (struct) — `egui-0.35.0/src/containers/scene.rs:46`
+### `Scene` (struct) — `egui-0.36.2/src/containers/scene.rs:46`
 
 A container that allows you to zoom and pan.
 
 Methods:
 
-- `fn drag_pan_buttons(self, flags: DragPanButtons) -> Self` — `egui-0.35.0/src/containers/scene.rs:128`
+- `fn drag_pan_buttons(self, flags: DragPanButtons) -> Self` — `egui-0.36.2/src/containers/scene.rs:128`
   Specify which pointer buttons can be used to pan by clicking and dragging.
-- `fn max_inner_size(self, max_inner_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/scene.rs:119`
+- `fn max_inner_size(self, max_inner_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/scene.rs:119`
   Set the maximum size of the inner [`Ui`] that will be created.
-- `fn new() -> Self` — `egui-0.35.0/src/containers/scene.rs:89`
-- `fn register_pan_and_zoom(&self, ui: &Ui, resp: &mut Response, to_global: &mut TSTransform)` — `egui-0.35.0/src/containers/scene.rs:229`
+- `fn new() -> Self` — `egui-0.36.2/src/containers/scene.rs:89`
+- `fn register_pan_and_zoom(&self, ui: &Ui, resp: &mut Response, to_global: &mut TSTransform)` — `egui-0.36.2/src/containers/scene.rs:229`
   Helper function to handle pan and zoom interactions on a response.
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/containers/scene.rs:99`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/containers/scene.rs:99`
   Specify what type of input the scene should respond to.
-- `fn show<R>(&self, parent_ui: &mut Ui, scene_rect: &mut Rect, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/containers/scene.rs:140`
+- `fn show<R>(&self, parent_ui: &mut Ui, scene_rect: &mut Rect, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/containers/scene.rs:140`
   `scene_rect` contains the view bounds of the inner [`Ui`].
-- `fn zoom_range(self, zoom_range: impl Into<Rangef>) -> Self` — `egui-0.35.0/src/containers/scene.rs:112`
+- `fn zoom_range(self, zoom_range: impl Into<Rangef>) -> Self` — `egui-0.36.2/src/containers/scene.rs:112`
   Set the allowed zoom range.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `ScrollArea` (struct) — `egui-0.35.0/src/containers/scroll_area.rs:338`
+### `ScrollArea` (struct) — `egui-0.36.2/src/containers/scroll_area.rs:338`
 
 Add vertical and/or horizontal scrolling to a contained [`Ui`].
 
 Methods:
 
-- `fn animated(self, animated: bool) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:614`
+- `fn animated(self, animated: bool) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:614`
   Should the scroll area animate `scroll_to_*` functions?
-- `fn auto_shrink(self, auto_shrink: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:605`
+- `fn auto_shrink(self, auto_shrink: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:605`
   For each axis, should the containing area shrink if the content is small?
-- `fn both() -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:381`
+- `fn both() -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:381`
   Create a bi-directional (horizontal and vertical) scroll area.
-- `fn content_margin(self, margin: impl Into<Margin>) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:631`
+- `fn content_margin(self, margin: impl Into<Margin>) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:631`
   Extra margin added around the contents.
-- `fn horizontal() -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:369`
+- `fn horizontal() -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:369`
   Create a horizontal scroll area.
-- `fn horizontal_scroll_offset(self, offset: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:520`
+- `fn horizontal_scroll_offset(self, offset: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:520`
   Set the horizontal scroll offset position.
-- `fn hscroll(self, hscroll: bool) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:551`
+- `fn hscroll(self, hscroll: bool) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:551`
   Turn on/off scrolling on the horizontal axis.
-- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:482`
+- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:482`
   A source for the unique [`Id`], e.g. `.id_salt("second_scroll_area")` or `.id_salt(loop_index)`.
-- `fn max_height(self, max_height: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:432`
+- `fn max_height(self, max_height: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:432`
   The maximum height of the outer frame of the scroll area.
-- `fn max_width(self, max_width: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:421`
+- `fn max_width(self, max_width: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:421`
   The maximum width of the outer frame of the scroll area.
-- `fn min_scrolled_height(self, min_scrolled_height: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:456`
+- `fn min_scrolled_height(self, min_scrolled_height: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:456`
   The minimum height of a vertical scroll area which requires scroll bars.
-- `fn min_scrolled_width(self, min_scrolled_width: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:444`
+- `fn min_scrolled_width(self, min_scrolled_width: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:444`
   The minimum width of a horizontal scroll area which requires scroll bars.
-- `fn neither() -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:388`
+- `fn neither() -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:388`
   Create a scroll area where both direction of scrolling is disabled. It's unclear why you would want to do thi…
-- `fn new(direction_enabled: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:394`
+- `fn new(direction_enabled: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:394`
   Create a scroll area where you decide which axis has scrolling enabled. For instance, `ScrollArea::new([true,…
-- `fn on_drag_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:544`
+- `fn on_drag_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:544`
   Set the cursor used when the [`ScrollArea`] is being dragged.
-- `fn on_hover_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:532`
+- `fn on_hover_cursor(self, cursor: CursorIcon) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:532`
   Set the cursor used when the mouse pointer is hovering over the [`ScrollArea`].
-- `fn scroll(self, direction_enabled: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:567`
+- `fn scroll(self, direction_enabled: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:567`
   Turn on/off scrolling on the horizontal/vertical axes.
-- `fn scroll_bar_rect(self, scroll_bar_rect: Rect) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:475`
+- `fn scroll_bar_rect(self, scroll_bar_rect: Rect) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:475`
   Specify within which screen-space rectangle to show the scroll bars.
-- `fn scroll_bar_visibility(self, scroll_bar_visibility: ScrollBarVisibility) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:465`
+- `fn scroll_bar_visibility(self, scroll_bar_visibility: ScrollBarVisibility) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:465`
   Set the visibility of both horizontal and vertical scroll bars.
-- `fn scroll_offset(self, offset: Vec2) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:495`
+- `fn scroll_offset(self, offset: Vec2) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:495`
   Set the horizontal and vertical scroll offset position.
-- `fn scroll_source(self, scroll_source: ScrollSource) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:582`
+- `fn scroll_source(self, scroll_source: ScrollSource) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:582`
   Control the scrolling behavior.
-- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> ScrollAreaOutput<R>` — `egui-0.35.0/src/containers/scroll_area.rs:960`
+- `fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> ScrollAreaOutput<R>` — `egui-0.36.2/src/containers/scroll_area.rs:959`
   Show the [`ScrollArea`], and add the contents to the viewport.
-- `fn show_rows<R>(self, ui: &mut Ui, row_height_sans_spacing: f32, total_rows: usize, add_contents: impl FnOnce(&mut Ui, Range<usize>) -> R) -> ScrollAreaOutput<R>` — `egui-0.35.0/src/containers/scroll_area.rs:984`
+- `fn show_rows<R>(self, ui: &mut Ui, row_height_sans_spacing: f32, total_rows: usize, add_contents: impl FnOnce(&mut Ui, Range<usize>) -> R) -> ScrollAreaOutput<R>` — `egui-0.36.2/src/containers/scroll_area.rs:983`
   Efficiently show only the visible part of a large number of rows.
-- `fn show_viewport<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Rect) -> R) -> ScrollAreaOutput<R>` — `egui-0.35.0/src/containers/scroll_area.rs:1021`
+- `fn show_viewport<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui, Rect) -> R) -> ScrollAreaOutput<R>` — `egui-0.36.2/src/containers/scroll_area.rs:1020`
   This can be used to only paint the visible part of the contents.
-- `fn stick_to_bottom(self, stick: bool) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:655`
+- `fn stick_to_bottom(self, stick: bool) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:655`
   The scroll handle will stick to the bottom position even while the content size changes dynamically. This can…
-- `fn stick_to_right(self, stick: bool) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:643`
+- `fn stick_to_right(self, stick: bool) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:643`
   The scroll handle will stick to the rightmost position even while the content size changes dynamically. This…
-- `fn vertical() -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:375`
+- `fn vertical() -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:375`
   Create a vertical scroll area.
-- `fn vertical_scroll_offset(self, offset: f32) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:508`
+- `fn vertical_scroll_offset(self, offset: f32) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:508`
   Set the vertical scroll offset position.
-- `fn vscroll(self, vscroll: bool) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:558`
+- `fn vscroll(self, vscroll: bool) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:558`
   Turn on/off scrolling on the vertical axis.
-- `fn wheel_scroll_multiplier(self, multiplier: Vec2) -> Self` — `egui-0.35.0/src/containers/scroll_area.rs:593`
+- `fn wheel_scroll_multiplier(self, multiplier: Vec2) -> Self` — `egui-0.36.2/src/containers/scroll_area.rs:593`
   The scroll amount caused by a mouse wheel scroll is multiplied by this amount.
 
 Implements: `Clone`, `Debug`
 
-### `Sense` (struct) — `egui-0.35.0/src/sense.rs:4`
+### `Sense` (struct) — `egui-0.36.2/src/sense.rs:4`
 
 What sort of interaction is a widget sensitive to?
 
 Methods:
 
-- `const fn all() -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn all() -> Self` — `egui-0.36.2/src/sense.rs:6`
   Get a flags value with all known bits set.
-- `const fn bits(&self) -> u8` — `egui-0.35.0/src/sense.rs:6`
+- `const fn bits(&self) -> u8` — `egui-0.36.2/src/sense.rs:6`
   Get the underlying bits value.
-- `const fn complement(self) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn complement(self) -> Self` — `egui-0.36.2/src/sense.rs:6`
   The bitwise negation (`!`) of the bits in `self`, truncating the result.
-- `const fn contains(&self, other: Self) -> bool` — `egui-0.35.0/src/sense.rs:6`
+- `const fn contains(&self, other: Self) -> bool` — `egui-0.36.2/src/sense.rs:6`
   Whether all set bits in `other` are also set in `self`.
-- `const fn difference(self, other: Self) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn difference(self, other: Self) -> Self` — `egui-0.36.2/src/sense.rs:6`
   The intersection of `self` with the complement of `other` (`&!`).
-- `const fn empty() -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn empty() -> Self` — `egui-0.36.2/src/sense.rs:6`
   Get a flags value with all bits unset.
-- `const fn from_bits(bits: u8) -> Option<Self>` — `egui-0.35.0/src/sense.rs:6`
+- `const fn from_bits(bits: u8) -> Option<Self>` — `egui-0.36.2/src/sense.rs:6`
   Convert from a bits value.
-- `const fn from_bits_retain(bits: u8) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn from_bits_retain(bits: u8) -> Self` — `egui-0.36.2/src/sense.rs:6`
   Convert from a bits value exactly.
-- `const fn from_bits_truncate(bits: u8) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn from_bits_truncate(bits: u8) -> Self` — `egui-0.36.2/src/sense.rs:6`
   Convert from a bits value, unsetting any unknown bits.
-- `const fn intersection(self, other: Self) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn intersection(self, other: Self) -> Self` — `egui-0.36.2/src/sense.rs:6`
   The bitwise and (`&`) of the bits in `self` and `other`.
-- `const fn intersects(&self, other: Self) -> bool` — `egui-0.35.0/src/sense.rs:6`
+- `const fn intersects(&self, other: Self) -> bool` — `egui-0.36.2/src/sense.rs:6`
   Whether any set bits in `other` are also set in `self`.
-- `const fn is_all(&self) -> bool` — `egui-0.35.0/src/sense.rs:6`
+- `const fn is_all(&self) -> bool` — `egui-0.36.2/src/sense.rs:6`
   Whether all known bits in this flags value are set.
-- `const fn is_empty(&self) -> bool` — `egui-0.35.0/src/sense.rs:6`
+- `const fn is_empty(&self) -> bool` — `egui-0.36.2/src/sense.rs:6`
   Whether all bits in `self` are unset.
-- `const fn iter(&self) -> Iter<Sense>` — `egui-0.35.0/src/sense.rs:6`
+- `const fn iter(&self) -> Iter<Sense>` — `egui-0.36.2/src/sense.rs:6`
   Yield a set of contained flags values.
-- `const fn iter_names(&self) -> IterNames<Sense>` — `egui-0.35.0/src/sense.rs:6`
+- `const fn iter_names(&self) -> IterNames<Sense>` — `egui-0.36.2/src/sense.rs:6`
   Yield a set of contained named flags values.
-- `const fn symmetric_difference(self, other: Self) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn symmetric_difference(self, other: Self) -> Self` — `egui-0.36.2/src/sense.rs:6`
   The bitwise exclusive-or (`^`) of the bits in `self` and `other`.
-- `const fn union(self, other: Self) -> Self` — `egui-0.35.0/src/sense.rs:6`
+- `const fn union(self, other: Self) -> Self` — `egui-0.36.2/src/sense.rs:6`
   The bitwise or (`|`) of the bits in `self` and `other`.
-- `fn click() -> Self` — `egui-0.35.0/src/sense.rs:60`
+- `fn click() -> Self` — `egui-0.36.2/src/sense.rs:60`
   Sense clicks and hover, but not drags, and make the widget focusable.
-- `fn click_and_drag() -> Self` — `egui-0.35.0/src/sense.rs:81`
+- `fn click_and_drag() -> Self` — `egui-0.36.2/src/sense.rs:81`
   Sense both clicks, drags and hover (e.g. a slider or window), and make the widget focusable.
-- `fn drag() -> Self` — `egui-0.35.0/src/sense.rs:68`
+- `fn drag() -> Self` — `egui-0.36.2/src/sense.rs:68`
   Sense drags and hover, but not clicks. Make the widget focusable.
-- `fn focusable_noninteractive() -> Self` — `egui-0.35.0/src/sense.rs:52`
+- `fn focusable_noninteractive() -> Self` — `egui-0.36.2/src/sense.rs:52`
   Senses no clicks or drags, but can be focused with the keyboard. Used for labels that can be focused for the…
-- `fn from_name(name: &str) -> Option<Self>` — `egui-0.35.0/src/sense.rs:6`
+- `fn from_name(name: &str) -> Option<Self>` — `egui-0.36.2/src/sense.rs:6`
   Get a flags value with the bits of a flag with the given name set.
-- `fn hover() -> Self` — `egui-0.35.0/src/sense.rs:45`
+- `fn hover() -> Self` — `egui-0.36.2/src/sense.rs:45`
   Senses no clicks or drags. Only senses mouse hover.
-- `fn insert(&mut self, other: Self)` — `egui-0.35.0/src/sense.rs:6`
+- `fn insert(&mut self, other: Self)` — `egui-0.36.2/src/sense.rs:6`
   The bitwise or (`|`) of the bits in `self` and `other`.
-- `fn interactive(&self) -> bool` — `egui-0.35.0/src/sense.rs:87`
+- `fn interactive(&self) -> bool` — `egui-0.36.2/src/sense.rs:87`
   Returns true if we sense either clicks or drags.
-- `fn is_focusable(&self) -> bool` — `egui-0.35.0/src/sense.rs:102`
-- `fn remove(&mut self, other: Self)` — `egui-0.35.0/src/sense.rs:6`
+- `fn is_focusable(&self) -> bool` — `egui-0.36.2/src/sense.rs:102`
+- `fn remove(&mut self, other: Self)` — `egui-0.36.2/src/sense.rs:6`
   The intersection of `self` with the complement of `other` (`&!`).
-- `fn senses_click(&self) -> bool` — `egui-0.35.0/src/sense.rs:92`
-- `fn senses_drag(&self) -> bool` — `egui-0.35.0/src/sense.rs:97`
-- `fn set(&mut self, other: Self, value: bool)` — `egui-0.35.0/src/sense.rs:6`
+- `fn senses_click(&self) -> bool` — `egui-0.36.2/src/sense.rs:92`
+- `fn senses_drag(&self) -> bool` — `egui-0.36.2/src/sense.rs:97`
+- `fn set(&mut self, other: Self, value: bool)` — `egui-0.36.2/src/sense.rs:6`
   Call `insert` when `value` is `true` or `remove` when `value` is `false`.
-- `fn toggle(&mut self, other: Self)` — `egui-0.35.0/src/sense.rs:6`
+- `fn toggle(&mut self, other: Self)` — `egui-0.36.2/src/sense.rs:6`
   The bitwise exclusive-or (`^`) of the bits in `self` and `other`.
 
 Implements: `Binary`, `BitAnd`, `BitAndAssign`, `BitOr`, `BitOrAssign`, `BitXor`, `BitXorAssign`, `Clone`, `Copy`, `Debug`, `Eq`, `Extend<Sense>`, `Flags`, `FromIterator<Sense>`, `IntoIterator`, `LowerHex`, `Not`, `Octal`, `PartialEq`, `StructuralPartialEq`, `Sub`, `SubAssign`, `UpperHex`
 
-### `Separator` (struct) — `egui-0.35.0/src/widgets/separator.rs:18`
+### `Separator` (struct) — `egui-0.36.2/src/widgets/separator.rs:18`
 
 A visual separator. A horizontal or vertical line (depending on [`crate::Layout`]).
 
 Methods:
 
-- `fn grow(self, extra: f32) -> Self` — `egui-0.35.0/src/widgets/separator.rs:76`
+- `fn grow(self, extra: f32) -> Self` — `egui-0.36.2/src/widgets/separator.rs:76`
   Extend each end of the separator line by this much.
-- `fn horizontal(self) -> Self` — `egui-0.35.0/src/widgets/separator.rs:55`
+- `fn horizontal(self) -> Self` — `egui-0.36.2/src/widgets/separator.rs:55`
   Explicitly ask for a horizontal line.
-- `fn shrink(self, shrink: f32) -> Self` — `egui-0.35.0/src/widgets/separator.rs:87`
+- `fn shrink(self, shrink: f32) -> Self` — `egui-0.36.2/src/widgets/separator.rs:87`
   Contract each end of the separator line by this much.
-- `fn spacing(self, spacing: f32) -> Self` — `egui-0.35.0/src/widgets/separator.rs:45`
+- `fn spacing(self, spacing: f32) -> Self` — `egui-0.36.2/src/widgets/separator.rs:45`
   How much space we take up. The line is painted in the middle of this.
-- `fn vertical(self) -> Self` — `egui-0.35.0/src/widgets/separator.rs:65`
+- `fn vertical(self) -> Self` — `egui-0.36.2/src/widgets/separator.rs:65`
   Explicitly ask for a vertical line.
 
 Implements: `Default`, `HasClasses`, `Widget`
 
-### `Shadow` (struct) — `epaint-0.35.0/src/shadow.rs:10`
+### `Shadow` (struct) — `epaint-0.36.2/src/shadow.rs:10`
 
 The color and fuzziness of a fuzzy shape.
 
@@ -4546,41 +4555,41 @@ Public fields:
 
 Methods:
 
-- `fn as_shape(&self, rect: Rect, corner_radius: impl Into<CornerRadius>) -> RectShape` — `epaint-0.35.0/src/shadow.rs:48`
+- `fn as_shape(&self, rect: Rect, corner_radius: impl Into<CornerRadius>) -> RectShape` — `epaint-0.36.2/src/shadow.rs:48`
   The argument is the rectangle of the shadow caster.
-- `fn margin(&self) -> MarginF32` — `epaint-0.35.0/src/shadow.rs:68`
+- `fn margin(&self) -> MarginF32` — `epaint-0.36.2/src/shadow.rs:68`
   How much larger than the parent rect are we in each direction?
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Sides` (struct) — `egui-0.35.0/src/containers/sides.rs:45`
+### `Sides` (struct) — `egui-0.36.2/src/containers/sides.rs:45`
 
 Put some widgets on the left and right sides of a ui.
 
 Methods:
 
-- `fn extend(self) -> Self` — `egui-0.35.0/src/containers/sides.rs:111`
+- `fn extend(self) -> Self` — `egui-0.36.2/src/containers/sides.rs:111`
   Extend the left and right sides to fill the available space.
-- `fn height(self, height: f32) -> Self` — `egui-0.35.0/src/containers/sides.rs:71`
+- `fn height(self, height: f32) -> Self` — `egui-0.36.2/src/containers/sides.rs:71`
   The minimum height of the sides.
-- `fn new() -> Self` — `egui-0.35.0/src/containers/sides.rs:62`
-- `fn show<RetL, RetR>(self, ui: &mut Ui, add_left: impl FnOnce(&mut Ui) -> RetL, add_right: impl FnOnce(&mut Ui) -> RetR) -> (RetL, RetR)` — `egui-0.35.0/src/containers/sides.rs:145`
-- `fn shrink_left(self) -> Self` — `egui-0.35.0/src/containers/sides.rs:91`
+- `fn new() -> Self` — `egui-0.36.2/src/containers/sides.rs:62`
+- `fn show<RetL, RetR>(self, ui: &mut Ui, add_left: impl FnOnce(&mut Ui) -> RetL, add_right: impl FnOnce(&mut Ui) -> RetR) -> (RetL, RetR)` — `egui-0.36.2/src/containers/sides.rs:145`
+- `fn shrink_left(self) -> Self` — `egui-0.36.2/src/containers/sides.rs:91`
   Try to shrink widgets on the left side.
-- `fn shrink_right(self) -> Self` — `egui-0.35.0/src/containers/sides.rs:101`
+- `fn shrink_right(self) -> Self` — `egui-0.36.2/src/containers/sides.rs:101`
   Try to shrink widgets on the right side.
-- `fn spacing(self, spacing: f32) -> Self` — `egui-0.35.0/src/containers/sides.rs:81`
+- `fn spacing(self, spacing: f32) -> Self` — `egui-0.36.2/src/containers/sides.rs:81`
   The horizontal spacing between the left and right UIs.
-- `fn truncate(self) -> Self` — `egui-0.35.0/src/containers/sides.rs:130`
+- `fn truncate(self) -> Self` — `egui-0.36.2/src/containers/sides.rs:130`
   Truncate the text on the shrinking side.
-- `fn wrap(self) -> Self` — `egui-0.35.0/src/containers/sides.rs:140`
+- `fn wrap(self) -> Self` — `egui-0.36.2/src/containers/sides.rs:140`
   Wrap the text on the shrinking side.
-- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.35.0/src/containers/sides.rs:120`
+- `fn wrap_mode(self, wrap_mode: TextWrapMode) -> Self` — `egui-0.36.2/src/containers/sides.rs:120`
   The text wrap mode for the shrinking side.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`
 
-### `SizedAtom` (struct) — `egui-0.35.0/src/atomics/sized_atom.rs:6`
+### `SizedAtom` (struct) — `egui-0.36.2/src/atomics/sized_atom.rs:6`
 
 A [`crate::Atom`] which has been sized.
 
@@ -4594,12 +4603,12 @@ Public fields:
 
 Methods:
 
-- `fn is_grow(&self) -> bool` — `egui-0.35.0/src/atomics/sized_atom.rs:28`
+- `fn is_grow(&self) -> bool` — `egui-0.36.2/src/atomics/sized_atom.rs:28`
   Was this [`crate::Atom`] marked as `grow`?
 
 Implements: `Clone`, `Debug`
 
-### `SizedAtomLayout` (struct) — `egui-0.35.0/src/atomics/atom_layout.rs:451`
+### `SizedAtomLayout` (struct) — `egui-0.36.2/src/atomics/atom_layout.rs:451`
 
 A measured [`AtomLayout`], ready to be painted at a [`Rect`].
 
@@ -4610,84 +4619,84 @@ Public fields:
 
 Methods:
 
-- `fn iter_images(&self) -> impl Iterator<Item = &Image<'atom>>` — `egui-0.35.0/src/atomics/atom_layout.rs:515`
-- `fn iter_images_mut(&mut self) -> impl Iterator<Item = &mut Image<'atom>>` — `egui-0.35.0/src/atomics/atom_layout.rs:525`
-- `fn iter_kinds(&self) -> impl Iterator<Item = &SizedAtomKind<'atom>>` — `egui-0.35.0/src/atomics/atom_layout.rs:507`
-- `fn iter_kinds_mut(&mut self) -> impl Iterator<Item = &mut SizedAtomKind<'atom>>` — `egui-0.35.0/src/atomics/atom_layout.rs:511`
-- `fn iter_texts(&self) -> impl Iterator<Item = &Arc<Galley>> + ?` — `egui-0.35.0/src/atomics/atom_layout.rs:535`
-- `fn iter_texts_mut(&mut self) -> impl Iterator<Item = &mut Arc<Galley>> + ?` — `egui-0.35.0/src/atomics/atom_layout.rs:545`
-- `fn map_images<F>(&mut self, f: F)` — `egui-0.35.0/src/atomics/atom_layout.rs:564`
-- `fn map_kind<F>(&mut self, f: F)` — `egui-0.35.0/src/atomics/atom_layout.rs:555`
-- `fn paint_at(self, ui: &Ui, rect: Rect, response: Response) -> AtomLayoutResponse` — `egui-0.35.0/src/atomics/atom_layout.rs:585`
+- `fn iter_images(&self) -> impl Iterator<Item = &Image<'atom>>` — `egui-0.36.2/src/atomics/atom_layout.rs:515`
+- `fn iter_images_mut(&mut self) -> impl Iterator<Item = &mut Image<'atom>>` — `egui-0.36.2/src/atomics/atom_layout.rs:525`
+- `fn iter_kinds(&self) -> impl Iterator<Item = &SizedAtomKind<'atom>>` — `egui-0.36.2/src/atomics/atom_layout.rs:507`
+- `fn iter_kinds_mut(&mut self) -> impl Iterator<Item = &mut SizedAtomKind<'atom>>` — `egui-0.36.2/src/atomics/atom_layout.rs:511`
+- `fn iter_texts(&self) -> impl Iterator<Item = &Arc<Galley>> + ?` — `egui-0.36.2/src/atomics/atom_layout.rs:535`
+- `fn iter_texts_mut(&mut self) -> impl Iterator<Item = &mut Arc<Galley>> + ?` — `egui-0.36.2/src/atomics/atom_layout.rs:545`
+- `fn map_images<F>(&mut self, f: F)` — `egui-0.36.2/src/atomics/atom_layout.rs:564`
+- `fn map_kind<F>(&mut self, f: F)` — `egui-0.36.2/src/atomics/atom_layout.rs:555`
+- `fn paint_at(self, ui: &Ui, rect: Rect, response: Response) -> AtomLayoutResponse` — `egui-0.36.2/src/atomics/atom_layout.rs:585`
   Paint the [`Frame`] and individual [`crate::Atom`]s within `rect`.
 
 Implements: `Clone`, `Debug`, `Deref`, `DerefMut`
 
-### `Slider` (struct) — `egui-0.35.0/src/widgets/slider.rs:98`
+### `Slider` (struct) — `egui-0.36.2/src/widgets/slider.rs:98`
 
 Control a number with a slider.
 
 Methods:
 
-- `fn binary(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:497`
+- `fn binary(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:497`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as binary integers. Floating point nu…
-- `fn clamping(self, clamping: SliderClamping) -> Self` — `egui-0.35.0/src/widgets/slider.rs:290`
+- `fn clamping(self, clamping: SliderClamping) -> Self` — `egui-0.36.2/src/widgets/slider.rs:290`
   Controls when the values will be clamped to the range.
-- `fn custom_formatter(self, formatter: impl 'a + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.35.0/src/widgets/slider.rs:429`
+- `fn custom_formatter(self, formatter: impl 'a + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.36.2/src/widgets/slider.rs:429`
   Set custom formatter defining how numbers are converted into text.
-- `fn custom_parser(self, parser: impl 'a + Fn(&str) -> Option<f64>) -> Self` — `egui-0.35.0/src/widgets/slider.rs:473`
+- `fn custom_parser(self, parser: impl 'a + Fn(&str) -> Option<f64>) -> Self` — `egui-0.36.2/src/widgets/slider.rs:473`
   Set custom parser defining how the text input is parsed into a number.
-- `fn drag_value_speed(self, drag_value_speed: f64) -> Self` — `egui-0.35.0/src/widgets/slider.rs:324`
+- `fn drag_value_speed(self, drag_value_speed: f64) -> Self` — `egui-0.36.2/src/widgets/slider.rs:324`
   When dragging the value, how fast does it move?
-- `fn fixed_decimals(self, num_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/slider.rs:364`
+- `fn fixed_decimals(self, num_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/slider.rs:364`
   Set an exact number of decimals to display.
-- `fn from_get_set(range: RangeInclusive<f64>, get_set_value: impl 'a + FnMut(Option<f64>) -> f64) -> Self` — `egui-0.35.0/src/widgets/slider.rs:144`
-- `fn handle_shape(self, handle_shape: HandleShape) -> Self` — `egui-0.35.0/src/widgets/slider.rs:387`
+- `fn from_get_set(range: RangeInclusive<f64>, get_set_value: impl 'a + FnMut(Option<f64>) -> f64) -> Self` — `egui-0.36.2/src/widgets/slider.rs:144`
+- `fn handle_shape(self, handle_shape: HandleShape) -> Self` — `egui-0.36.2/src/widgets/slider.rs:387`
   Change the shape of the slider handle
-- `fn hexadecimal(self, min_width: usize, twos_complement: bool, upper: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:567`
+- `fn hexadecimal(self, min_width: usize, twos_complement: bool, upper: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:567`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as hexadecimal integers. Floating poi…
-- `fn integer(self) -> Self` — `egui-0.35.0/src/widgets/slider.rs:594`
+- `fn integer(self) -> Self` — `egui-0.36.2/src/widgets/slider.rs:594`
   Helper: equivalent to `self.precision(0).smallest_positive(1.0)`. If you use one of the integer constructors…
-- `fn largest_finite(self, largest_finite: f64) -> Self` — `egui-0.35.0/src/widgets/slider.rs:247`
+- `fn largest_finite(self, largest_finite: f64) -> Self` — `egui-0.36.2/src/widgets/slider.rs:247`
   For logarithmic sliders, the largest positive value we are interested in before the slider switches to `INFIN…
-- `fn logarithmic(self, logarithmic: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:229`
+- `fn logarithmic(self, logarithmic: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:229`
   Make this a logarithmic slider. This is great for when the slider spans a huge range, e.g. from one to a mill…
-- `fn max_decimals(self, max_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/slider.rs:347`
+- `fn max_decimals(self, max_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/slider.rs:347`
   Set a maximum number of decimals to display.
-- `fn max_decimals_opt(self, max_decimals: Option<usize>) -> Self` — `egui-0.35.0/src/widgets/slider.rs:353`
-- `fn min_decimals(self, min_decimals: usize) -> Self` — `egui-0.35.0/src/widgets/slider.rs:335`
+- `fn max_decimals_opt(self, max_decimals: Option<usize>) -> Self` — `egui-0.36.2/src/widgets/slider.rs:353`
+- `fn min_decimals(self, min_decimals: usize) -> Self` — `egui-0.36.2/src/widgets/slider.rs:335`
   Set a minimum number of decimals to display.
-- `fn new<Num>(value: &'a mut Num, range: impl Into<RangeInclusive<Num>>) -> Self` — `egui-0.35.0/src/widgets/slider.rs:128`
+- `fn new<Num>(value: &'a mut Num, range: impl Into<RangeInclusive<Num>>) -> Self` — `egui-0.36.2/src/widgets/slider.rs:128`
   Creates a new horizontal slider.
-- `fn octal(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:532`
+- `fn octal(self, min_width: usize, twos_complement: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:532`
   Set `custom_formatter` and `custom_parser` to display and parse numbers as octal integers. Floating point num…
-- `fn orientation(self, orientation: SliderOrientation) -> Self` — `egui-0.35.0/src/widgets/slider.rs:212`
+- `fn orientation(self, orientation: SliderOrientation) -> Self` — `egui-0.36.2/src/widgets/slider.rs:212`
   Vertical or horizontal slider? The default is horizontal.
-- `fn prefix(self, prefix: impl ToString) -> Self` — `egui-0.35.0/src/widgets/slider.rs:185`
+- `fn prefix(self, prefix: impl ToString) -> Self` — `egui-0.36.2/src/widgets/slider.rs:185`
   Show a prefix before the number, e.g. "x: "
-- `fn show_value(self, show_value: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:178`
+- `fn show_value(self, show_value: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:178`
   Control whether or not the slider shows the current value. Default: `true`.
-- `fn smallest_positive(self, smallest_positive: f64) -> Self` — `egui-0.35.0/src/widgets/slider.rs:238`
+- `fn smallest_positive(self, smallest_positive: f64) -> Self` — `egui-0.36.2/src/widgets/slider.rs:238`
   For logarithmic sliders that includes zero: what is the smallest positive value you want to be able to select…
-- `fn smart_aim(self, smart_aim: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:298`
+- `fn smart_aim(self, smart_aim: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:298`
   Turn smart aim on/off. Default is ON. There is almost no point in turning this off.
-- `fn step_by(self, step: f64) -> Self` — `egui-0.35.0/src/widgets/slider.rs:310`
+- `fn step_by(self, step: f64) -> Self` — `egui-0.36.2/src/widgets/slider.rs:310`
   Sets the minimal change of the value.
-- `fn suffix(self, suffix: impl ToString) -> Self` — `egui-0.35.0/src/widgets/slider.rs:192`
+- `fn suffix(self, suffix: impl ToString) -> Self` — `egui-0.36.2/src/widgets/slider.rs:192`
   Add a suffix to the number, this can be e.g. a unit ("°" or " m")
-- `fn text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.35.0/src/widgets/slider.rs:199`
+- `fn text(self, text: impl Into<WidgetText>) -> Self` — `egui-0.36.2/src/widgets/slider.rs:199`
   Show a text next to the slider (e.g. explaining what the slider controls).
-- `fn text_color(self, text_color: Color32) -> Self` — `egui-0.35.0/src/widgets/slider.rs:205`
-- `fn trailing_fill(self, trailing_fill: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:377`
+- `fn text_color(self, text_color: Color32) -> Self` — `egui-0.36.2/src/widgets/slider.rs:205`
+- `fn trailing_fill(self, trailing_fill: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:377`
   Display trailing color behind the slider's circle. Default is OFF.
-- `fn update_while_editing(self, update: bool) -> Self` — `egui-0.35.0/src/widgets/slider.rs:642`
+- `fn update_while_editing(self, update: bool) -> Self` — `egui-0.36.2/src/widgets/slider.rs:642`
   Update the value on each key press when text-editing the value.
-- `fn vertical(self) -> Self` — `egui-0.35.0/src/widgets/slider.rs:219`
+- `fn vertical(self) -> Self` — `egui-0.36.2/src/widgets/slider.rs:219`
   Make this a vertical slider.
 
 Implements: `Widget`
 
-### `Spacing` (struct) — `egui-0.35.0/src/style.rs:384`
+### `Spacing` (struct) — `egui-0.36.2/src/style.rs:385`
 
 Controls the sizes and distances between widgets.
 
@@ -4703,6 +4712,7 @@ Public fields:
 - `slider_rail_height: f32` — Default rail height of a [`Slider`].
 - `combo_width: f32` — Default (minimum) width of a [`ComboBox`].
 - `text_edit_width: f32` — Default width of a [`crate::TextEdit`].
+- `extra_text_line_spacing: f32` — Additional vertical spacing between lines of text.
 - `icon_width: f32` — Checkboxes, radio button and collapsing headers have an icon at the start. This is the wi…
 - `icon_width_inner: f32` — Checkboxes, radio button and collapsing headers have an icon at the start. This is the wi…
 - `icon_spacing: f32` — Checkboxes, radio button and collapsing headers have an icon at the start. This is the sp…
@@ -4716,30 +4726,30 @@ Public fields:
 
 Methods:
 
-- `fn icon_rectangles(&self, rect: Rect) -> (Rect, Rect)` — `egui-0.35.0/src/style.rs:466`
+- `fn icon_rectangles(&self, rect: Rect) -> (Rect, Rect)` — `egui-0.36.2/src/style.rs:470`
   Returns small icon rectangle and big icon rectangle
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:1936`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:1944`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Spinner` (struct) — `egui-0.35.0/src/widgets/spinner.rs:10`
+### `Spinner` (struct) — `egui-0.36.2/src/widgets/spinner.rs:10`
 
 A spinner widget used to indicate loading.
 
 Methods:
 
-- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.35.0/src/widgets/spinner.rs:32`
+- `fn color(self, color: impl Into<Color32>) -> Self` — `egui-0.36.2/src/widgets/spinner.rs:32`
   Sets the spinner's color.
-- `fn new() -> Self` — `egui-0.35.0/src/widgets/spinner.rs:18`
+- `fn new() -> Self` — `egui-0.36.2/src/widgets/spinner.rs:18`
   Create a new spinner that uses the style's `interact_size` unless changed.
-- `fn paint_at(&self, ui: &Ui, rect: Rect)` — `egui-0.35.0/src/widgets/spinner.rs:38`
+- `fn paint_at(&self, ui: &Ui, rect: Rect)` — `egui-0.36.2/src/widgets/spinner.rs:38`
   Paint the spinner in the given rectangle.
-- `fn size(self, size: f32) -> Self` — `egui-0.35.0/src/widgets/spinner.rs:25`
+- `fn size(self, size: f32) -> Self` — `egui-0.36.2/src/widgets/spinner.rs:25`
   Sets the spinner's size. The size sets both the height and width, as the spinner is always square. If the siz…
 
 Implements: `Default`, `Widget`
 
-### `Stroke` (struct) — `epaint-0.35.0/src/stroke.rs:12`
+### `Stroke` (struct) — `epaint-0.36.2/src/stroke.rs:13`
 
 Describes the width and color of a line.
 
@@ -4750,15 +4760,15 @@ Public fields:
 
 Methods:
 
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/stroke.rs:34`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/stroke.rs:35`
   True if width is zero or color is transparent
-- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/stroke.rs:25`
-- `fn round_center_to_pixel(&self, pixels_per_point: f32, coord: &mut f32)` — `epaint-0.35.0/src/stroke.rs:40`
+- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/stroke.rs:26`
+- `fn round_center_to_pixel(&self, pixels_per_point: f32, coord: &mut f32)` — `epaint-0.36.2/src/stroke.rs:41`
   For vertical or horizontal lines: round the stroke center to produce a sharp, pixel-aligned line.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<(f32, Color)>`, `From<Stroke>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Style` (struct) — `egui-0.35.0/src/style.rs:243`
+### `Style` (struct) — `egui-0.36.2/src/style.rs:244`
 
 Specifies the look and feel of egui.
 
@@ -4784,95 +4794,97 @@ Public fields:
 
 Methods:
 
-- `fn button_style(&self, classes: &Classes, state: WidgetState) -> ButtonStyle` — `egui-0.35.0/src/widget_style.rs:146`
+- `fn button_style(&self, classes: &Classes, state: WidgetState) -> ButtonStyle` — `egui-0.36.2/src/widget_style.rs:146`
   The dedicated button style. The style is computed according to the classes and state of the widget. It depend…
-- `fn checkbox_style(&self, classes: &Classes, state: WidgetState) -> CheckboxStyle` — `egui-0.35.0/src/widget_style.rs:174`
+- `fn checkbox_style(&self, classes: &Classes, state: WidgetState) -> CheckboxStyle` — `egui-0.36.2/src/widget_style.rs:174`
   The dedicated checkbox style. The style is computed according to the classes and state of the widget. It depe…
-- `fn interact(&self, response: &Response) -> &WidgetVisuals` — `egui-0.35.0/src/style.rs:354`
+- `fn interact(&self, response: &Response) -> &WidgetVisuals` — `egui-0.36.2/src/style.rs:355`
   Use this style for interactive things. Note that you must already have a response, i.e. you must allocate spa…
-- `fn interact_selectable(&self, response: &Response, selected: bool) -> WidgetVisuals` — `egui-0.35.0/src/style.rs:358`
-- `fn label_style(&self, classes: &Classes, state: WidgetState) -> LabelStyle` — `egui-0.35.0/src/widget_style.rs:194`
+- `fn interact_selectable(&self, response: &Response, selected: bool) -> WidgetVisuals` — `egui-0.36.2/src/style.rs:359`
+- `fn label_style(&self, classes: &Classes, state: WidgetState) -> LabelStyle` — `egui-0.36.2/src/widget_style.rs:194`
   The dedicated label style. The style is computed according to the classes and state of the widget. It depend…
-- `fn noninteractive(&self) -> &WidgetVisuals` — `egui-0.35.0/src/style.rs:370`
+- `fn noninteractive(&self) -> &WidgetVisuals` — `egui-0.36.2/src/style.rs:371`
   Style to use for non-interactive widgets.
-- `fn separator_style(&self, _classes: &Classes, _state: WidgetState) -> SeparatorStyle` — `egui-0.35.0/src/widget_style.rs:212`
+- `fn separator_style(&self, _classes: &Classes, _state: WidgetState) -> SeparatorStyle` — `egui-0.36.2/src/widget_style.rs:212`
   The dedicated separator style. The style is computed according to the classes and state of the widget. It dep…
-- `fn text_styles(&self) -> Vec<TextStyle>` — `egui-0.35.0/src/style.rs:375`
+- `fn text_styles(&self) -> Vec<TextStyle>` — `egui-0.36.2/src/style.rs:376`
   All known text styles.
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:1778`
-- `fn widget_style(&self, _classes: &Classes, state: WidgetState) -> WidgetStyle` — `egui-0.35.0/src/widget_style.rs:120`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:1786`
+- `fn widget_style(&self, _classes: &Classes, state: WidgetState) -> WidgetStyle` — `egui-0.36.2/src/widget_style.rs:120`
   The general widget style. The style is computed according to the classes and state of the widget.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `From<Style>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextEdit` (struct) — `egui-0.35.0/src/widgets/text_edit/builder.rs:69`
+### `TextEdit` (struct) — `egui-0.36.2/src/widgets/text_edit/builder.rs:70`
 
 A text region that the user can edit the contents of.
 
 Methods:
 
-- `fn background_color(self, color: Color32) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:230`
+- `fn background_color(self, color: Color32) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:231`
   Set the background color of the [`TextEdit`]. The default is [`crate::Visuals::text_edit_bg_color`].
-- `fn char_limit(self, limit: usize) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:372`
+- `fn char_limit(self, limit: usize) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:389`
   Sets the limit for the amount of characters can be entered
-- `fn clip_text(self, b: bool) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:360`
+- `fn clip_text(self, b: bool) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:377`
   When `true` (default), overflowing text will be clipped.
-- `fn code_editor(self) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:161`
+- `fn code_editor(self) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:162`
   Build a [`TextEdit`] focused on code editing. By default it comes with: - monospaced font - focus lock (tab w…
-- `fn cursor_at_end(self, b: bool) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:349`
+- `fn cursor_at_end(self, b: bool) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:366`
   When `true` (default), the cursor will initially be placed at the end of the text.
-- `fn desired_rows(self, desired_height_rows: usize) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:329`
+- `fn desired_rows(self, desired_height_rows: usize) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:330`
   Set the number of rows to show by default. The default for singleline text is `1`. The default for multiline…
-- `fn desired_width(self, desired_width: f32) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:320`
+- `fn desired_width(self, desired_width: f32) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:321`
   Set to 0.0 to keep as small as possible. Set to [`f32::INFINITY`] to take up all available space (i.e. disabl…
-- `fn font(self, font_selection: impl Into<FontSelection>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:244`
+- `fn event_filter(self, event_filter: EventFilter) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:357`
+  Set which key presses this [`TextEdit`] captures while it has focus.
+- `fn font(self, font_selection: impl Into<FontSelection>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:245`
   Pick a [`crate::FontId`] or [`TextStyle`].
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:305`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:306`
   Customize the [`Frame`] around the text edit.
-- `fn hint_text(self, hint_text: impl IntoAtoms<'static>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:208`
+- `fn hint_text(self, hint_text: impl IntoAtoms<'static>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:209`
   Show a faint hint text when the text field is empty.
-- `fn horizontal_align(self, align: Align) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:379`
+- `fn horizontal_align(self, align: Align) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:396`
   Set the horizontal align of the inner text.
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:167`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:168`
   Use if you want to set an explicit [`Id`] for this widget.
-- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:180`
+- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:181`
   A source for the unique [`Id`], e.g. `.id_salt("second_text_edit_field")` or `.id_salt(loop_index)`.
-- `fn id_source(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:174`
+- `fn id_source(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:175`
   A source for the unique [`Id`], e.g. `.id_source("second_text_edit_field")` or `.id_source(loop_index)`.
-- `fn interactive(self, interactive: bool) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:298`
+- `fn interactive(self, interactive: bool) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:299`
   Default is `true`. If set to `false` then you cannot interact with the text (neither edit or select it).
-- `fn layouter(self, layouter: &'t mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:285`
+- `fn layouter(self, layouter: &'t mut dyn FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:286`
   Override how text is being shown inside the [`TextEdit`].
-- `fn load_state(ctx: &Context, id: Id) -> Option<TextEditState>` — `egui-0.35.0/src/widgets/text_edit/builder.rs:101`
-- `fn lock_focus(self, tab_will_indent: bool) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:340`
+- `fn load_state(ctx: &Context, id: Id) -> Option<TextEditState>` — `egui-0.36.2/src/widgets/text_edit/builder.rs:102`
+- `fn lock_focus(self, tab_will_indent: bool) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:341`
   When `false` (default), pressing TAB will move focus to the next widget.
-- `fn margin(self, margin: impl Into<Margin>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:312`
+- `fn margin(self, margin: impl Into<Margin>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:313`
   Set margin of text. Default is `Margin::symmetric(4.0, 2.0)`
-- `fn min_size(self, min_size: Vec2) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:393`
+- `fn min_size(self, min_size: Vec2) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:410`
   Set the minimum size of the [`TextEdit`].
-- `fn multiline(text: &'t mut dyn TextBuffer) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:122`
+- `fn multiline(text: &'t mut dyn TextBuffer) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:123`
   A [`TextEdit`] for multiple lines. Pressing enter key will create a new line by default (can be changed with…
-- `fn password(self, password: bool) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:237`
+- `fn password(self, password: bool) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:238`
   If true, hide the letters from view and prevent copying from the field.
-- `fn prefix(self, prefix: impl IntoAtoms<'static>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:215`
+- `fn prefix(self, prefix: impl IntoAtoms<'static>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:216`
   Add a prefix to the text edit. This will always be shown before the editable text.
-- `fn return_key(self, return_key: impl Into<Option<KeyboardShortcut>>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:405`
+- `fn return_key(self, return_key: impl Into<Option<KeyboardShortcut>>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:422`
   Set the return key combination.
-- `fn show(self, ui: &mut Ui) -> TextEditOutput` — `egui-0.35.0/src/widgets/text_edit/builder.rs:435`
+- `fn show(self, ui: &mut Ui) -> TextEditOutput` — `egui-0.36.2/src/widgets/text_edit/builder.rs:452`
   Show the [`TextEdit`], returning a rich [`TextEditOutput`].
-- `fn singleline(text: &'t mut dyn TextBuffer) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:112`
+- `fn singleline(text: &'t mut dyn TextBuffer) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:113`
   No newlines (`\n`) allowed. Pressing enter key will result in the [`TextEdit`] losing focus (`response.lost_f…
-- `fn store_state(ctx: &Context, id: Id, state: TextEditState)` — `egui-0.35.0/src/widgets/text_edit/builder.rs:105`
-- `fn suffix(self, suffix: impl IntoAtoms<'static>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:222`
+- `fn store_state(ctx: &Context, id: Id, state: TextEditState)` — `egui-0.36.2/src/widgets/text_edit/builder.rs:106`
+- `fn suffix(self, suffix: impl IntoAtoms<'static>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:223`
   Add a suffix to the text edit. This will always be shown after the editable text.
-- `fn text_color(self, text_color: Color32) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:250`
-- `fn text_color_opt(self, text_color: Option<Color32>) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:256`
-- `fn vertical_align(self, align: Align) -> Self` — `egui-0.35.0/src/widgets/text_edit/builder.rs:386`
+- `fn text_color(self, text_color: Color32) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:251`
+- `fn text_color_opt(self, text_color: Option<Color32>) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:257`
+- `fn vertical_align(self, align: Align) -> Self` — `egui-0.36.2/src/widgets/text_edit/builder.rs:403`
   Set the vertical align of the inner text.
 
 Implements: `Widget`, `WidgetWithState`
 
-### `TextFormat` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:471`
+### `TextFormat` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:478`
 
 Formatting option for a section of text.
 
@@ -4892,37 +4904,37 @@ Public fields:
 
 Methods:
 
-- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:571`
+- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:578`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureHandle` (struct) — `epaint-0.35.0/src/texture_handle.rs:20`
+### `TextureHandle` (struct) — `epaint-0.36.2/src/texture_handle.rs:20`
 
 Used to paint images.
 
 Methods:
 
-- `fn aspect_ratio(&self) -> f32` — `epaint-0.35.0/src/texture_handle.rs:112`
+- `fn aspect_ratio(&self) -> f32` — `epaint-0.36.2/src/texture_handle.rs:112`
   width / height
-- `fn byte_size(&self) -> usize` — `epaint-0.35.0/src/texture_handle.rs:104`
+- `fn byte_size(&self) -> usize` — `epaint-0.36.2/src/texture_handle.rs:104`
   `width x height x bytes_per_pixel`
-- `fn id(&self) -> TextureId` — `epaint-0.35.0/src/texture_handle.rs:64`
-- `fn name(&self) -> String` — `epaint-0.35.0/src/texture_handle.rs:118`
+- `fn id(&self) -> TextureId` — `epaint-0.36.2/src/texture_handle.rs:64`
+- `fn name(&self) -> String` — `epaint-0.36.2/src/texture_handle.rs:118`
   Debug-name.
-- `fn new(tex_mngr: Arc<RwLock<TextureManager>>, id: TextureId) -> Self` — `epaint-0.35.0/src/texture_handle.rs:59`
+- `fn new(tex_mngr: Arc<RwLock<TextureManager>>, id: TextureId) -> Self` — `epaint-0.36.2/src/texture_handle.rs:59`
   If you are using egui, use `egui::Context::load_texture` instead.
-- `fn set(&mut self, image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.35.0/src/texture_handle.rs:70`
+- `fn set(&mut self, image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.36.2/src/texture_handle.rs:70`
   Assign a new image to an existing texture.
-- `fn set_partial(&mut self, pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.35.0/src/texture_handle.rs:78`
+- `fn set_partial(&mut self, pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.36.2/src/texture_handle.rs:78`
   Assign a new image to a subregion of the whole texture.
-- `fn size(&self) -> [usize; 2]` — `epaint-0.35.0/src/texture_handle.rs:90`
+- `fn size(&self) -> [usize; 2]` — `epaint-0.36.2/src/texture_handle.rs:90`
   width x height
-- `fn size_vec2(&self) -> Vec2` — `epaint-0.35.0/src/texture_handle.rs:98`
+- `fn size_vec2(&self) -> Vec2` — `epaint-0.36.2/src/texture_handle.rs:98`
   width x height
 
 Implements: `Clone`, `Drop`, `Eq`, `From<&TextureHandle>`, `From<&mut TextureHandle>`, `Hash`, `PartialEq`
 
-### `TextureOptions` (struct) — `epaint-0.35.0/src/textures.rs:153`
+### `TextureOptions` (struct) — `epaint-0.36.2/src/textures.rs:160`
 
 How the texture texels are filtered.
 
@@ -4935,28 +4947,31 @@ Public fields:
 
 Methods:
 
-- `const fn with_mipmap_mode(self, mipmap_mode: Option<TextureFilter>) -> Self` — `epaint-0.35.0/src/textures.rs:223`
+- `const fn with_mipmap_mode(self, mipmap_mode: Option<TextureFilter>) -> Self` — `epaint-0.36.2/src/textures.rs:230`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TexturesDelta` (struct) — `epaint-0.35.0/src/textures.rs:277`
+### `TexturesDelta` (struct) — `epaint-0.36.2/src/textures.rs:284`
 
 What has been allocated and freed during the last period.
 
 Public fields:
 
-- `set: Vec<(TextureId, ImageDelta)>` — New or changed textures. Apply before painting.
-- `free: Vec<TextureId>` — Textures to free after painting.
+- `set: HashMap<TextureId, SmallVec<[ImageDelta; 1]>>` — New or changed textures. Apply before painting.
+- `free: HashSet<TextureId>` — Textures to free after painting.
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `epaint-0.35.0/src/textures.rs:290`
-- `fn clear(&mut self)` — `epaint-0.35.0/src/textures.rs:295`
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/textures.rs:286`
+- `fn append(&mut self, newer: Self)` — `epaint-0.36.2/src/textures.rs:315`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/textures.rs:329`
+- `fn free(&mut self, id: TextureId)` — `epaint-0.36.2/src/textures.rs:310`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/textures.rs:293`
+- `fn push(&mut self, id: TextureId, delta: ImageDelta)` — `epaint-0.36.2/src/textures.rs:301`
+  Inserts a [`ImageDelta`].
 
-Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
+Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Drop`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Tooltip` (struct) — `egui-0.35.0/src/containers/tooltip.rs:8`
+### `Tooltip` (struct) — `egui-0.36.2/src/containers/tooltip.rs:8`
 
 Public fields:
 
@@ -4964,377 +4979,377 @@ Public fields:
 
 Methods:
 
-- `fn always_open(ctx: Context, parent_layer: LayerId, parent_widget: Id, anchor: impl Into<PopupAnchor>) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:20`
+- `fn always_open(ctx: Context, parent_layer: LayerId, parent_widget: Id, anchor: impl Into<PopupAnchor>) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:20`
   Show a tooltip that is always open.
-- `fn at_pointer(self) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:72`
+- `fn at_pointer(self) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:72`
   Show the tooltip at the pointer position.
-- `fn for_disabled(response: &Response) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:62`
+- `fn for_disabled(response: &Response) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:62`
   Show a tooltip when hovering a disabled widget.
-- `fn for_enabled(response: &Response) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:53`
+- `fn for_enabled(response: &Response) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:53`
   Show a tooltip when hovering an enabled widget.
-- `fn for_widget(response: &Response) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:39`
+- `fn for_widget(response: &Response) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:39`
   Show a tooltip for a widget. Always open (as long as this function is called).
-- `fn gap(self, gap: f32) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:81`
+- `fn gap(self, gap: f32) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:81`
   Set the gap between the tooltip and the anchor
-- `fn layout(self, layout: Layout) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:88`
+- `fn layout(self, layout: Layout) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:88`
   Set the layout of the tooltip
-- `fn next_tooltip_id(ctx: &Context, widget_id: Id) -> Id` — `egui-0.35.0/src/containers/tooltip.rs:181`
+- `fn next_tooltip_id(ctx: &Context, widget_id: Id) -> Id` — `egui-0.36.2/src/containers/tooltip.rs:189`
   What is the id of the next tooltip for this widget?
-- `fn seconds_since_last_tooltip(ctx: &Context) -> f32` — `egui-0.35.0/src/containers/tooltip.rs:163`
-- `fn should_show_tooltip(response: &Response, allow_interactive_tooltip: bool) -> bool` — `egui-0.35.0/src/containers/tooltip.rs:199`
+- `fn seconds_since_last_tooltip(ctx: &Context) -> f32` — `egui-0.36.2/src/containers/tooltip.rs:171`
+- `fn should_show_tooltip(response: &Response, allow_interactive_tooltip: bool) -> bool` — `egui-0.36.2/src/containers/tooltip.rs:221`
   Should we show a tooltip for this response?
-- `fn show<R>(self, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/tooltip.rs:101`
+- `fn show<R>(self, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/tooltip.rs:101`
   Show the tooltip
-- `fn tooltip_id(widget_id: Id, tooltip_count: usize) -> Id` — `egui-0.35.0/src/containers/tooltip.rs:191`
-- `fn was_tooltip_open_last_frame(ctx: &Context, widget_id: Id) -> bool` — `egui-0.35.0/src/containers/tooltip.rs:378`
+- `fn tooltip_id(widget_id: Id, tooltip_count: usize) -> Id` — `egui-0.36.2/src/containers/tooltip.rs:199`
+- `fn was_tooltip_open_last_frame(ctx: &Context, widget_id: Id) -> bool` — `egui-0.36.2/src/containers/tooltip.rs:394`
   Was this tooltip visible last frame?
-- `fn width(self, width: f32) -> Self` — `egui-0.35.0/src/containers/tooltip.rs:95`
+- `fn width(self, width: f32) -> Self` — `egui-0.36.2/src/containers/tooltip.rs:95`
   Set the width of the tooltip
 
-### `TouchDeviceId` (struct) — `egui-0.35.0/src/data/input/touch.rs:4`
+### `TouchDeviceId` (struct) — `egui-0.36.2/src/data/input/touch.rs:4`
 
 this is a `u64` as values of this kind can always be obtained by hashing
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `TouchId` (struct) — `egui-0.35.0/src/data/input/touch.rs:11`
+### `TouchId` (struct) — `egui-0.36.2/src/data/input/touch.rs:11`
 
 Unique identification of a touch occurrence (finger or pen or …). A Touch ID is valid until the finger is lifted. A new ID is used for the next touch.
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `From<i32>`, `From<u32>`, `From<u64>`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `Ui` (struct) — `egui-0.35.0/src/ui.rs:29`
+### `Ui` (struct) — `egui-0.36.2/src/ui.rs:30`
 
 This is what you use to place widgets.
 
 Methods:
 
-- `fn add(&mut self, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1520`
+- `fn add(&mut self, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1521`
   Add a [`Widget`] to this [`Ui`] at a location dependent on the current [`Layout`].
-- `fn add_enabled(&mut self, enabled: bool, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1587`
+- `fn add_enabled(&mut self, enabled: bool, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1588`
   Add a single [`Widget`] that is possibly disabled, i.e. greyed out and non-interactive.
-- `fn add_enabled_ui<R>(&mut self, enabled: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:1619`
+- `fn add_enabled_ui<R>(&mut self, enabled: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:1620`
   Add a section that is possibly disabled, i.e. greyed out and non-interactive.
-- `fn add_sized(&mut self, max_size: impl Into<Vec2>, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1537`
+- `fn add_sized(&mut self, max_size: impl Into<Vec2>, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1538`
   Add a [`Widget`] to this [`Ui`] with a given size. The widget will attempt to fit within the given size, but…
-- `fn add_space(&mut self, amount: f32)` — `egui-0.35.0/src/ui.rs:1674`
+- `fn add_space(&mut self, amount: f32)` — `egui-0.36.2/src/ui.rs:1675`
   Add extra space before the next widget.
-- `fn add_visible(&mut self, visible: bool, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1646`
+- `fn add_visible(&mut self, visible: bool, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1647`
   Add a single [`Widget`] that is possibly invisible.
-- `fn advance_cursor_after_rect(&mut self, rect: Rect) -> Id` — `egui-0.35.0/src/ui.rs:1263`
+- `fn advance_cursor_after_rect(&mut self, rect: Rect) -> Id` — `egui-0.36.2/src/ui.rs:1264`
   Allocate a rect without interacting with it.
-- `fn allocate_at_least(&mut self, desired_size: Vec2, sense: Sense) -> (Rect, Response)` — `egui-0.35.0/src/ui.rs:1161`
+- `fn allocate_at_least(&mut self, desired_size: Vec2, sense: Sense) -> (Rect, Response)` — `egui-0.36.2/src/ui.rs:1162`
   Allocate at least as much space as needed, and interact with that rect.
-- `fn allocate_exact_size(&mut self, desired_size: Vec2, sense: Sense) -> (Rect, Response)` — `egui-0.35.0/src/ui.rs:1150`
+- `fn allocate_exact_size(&mut self, desired_size: Vec2, sense: Sense) -> (Rect, Response)` — `egui-0.36.2/src/ui.rs:1151`
   Returns a [`Rect`] with exactly what you asked for.
-- `fn allocate_painter(&mut self, desired_size: Vec2, sense: Sense) -> (Response, Painter)` — `egui-0.35.0/src/ui.rs:1370`
+- `fn allocate_painter(&mut self, desired_size: Vec2, sense: Sense) -> (Response, Painter)` — `egui-0.36.2/src/ui.rs:1371`
   Convenience function to get a region to paint on.
-- `fn allocate_rect(&mut self, rect: Rect, sense: Sense) -> Response` — `egui-0.35.0/src/ui.rs:1256`
+- `fn allocate_rect(&mut self, rect: Rect, sense: Sense) -> Response` — `egui-0.36.2/src/ui.rs:1257`
   Allocate a specific part of the [`Ui`].
-- `fn allocate_response(&mut self, desired_size: Vec2, sense: Sense) -> Response` — `egui-0.35.0/src/ui.rs:1138`
+- `fn allocate_response(&mut self, desired_size: Vec2, sense: Sense) -> Response` — `egui-0.36.2/src/ui.rs:1139`
   Allocate space for a widget and check for interaction in the space. Returns a [`Response`] which contains a r…
-- `fn allocate_space(&mut self, desired_size: Vec2) -> (Id, Rect)` — `egui-0.35.0/src/ui.rs:1187`
+- `fn allocate_space(&mut self, desired_size: Vec2) -> (Id, Rect)` — `egui-0.36.2/src/ui.rs:1188`
   Reserve this much space and move the cursor. Returns where to put the widget.
-- `fn allocate_ui<R>(&mut self, desired_size: Vec2, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:1308`
+- `fn allocate_ui<R>(&mut self, desired_size: Vec2, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:1309`
   Allocated the given space and then adds content to that space. If the contents overflow, more space will be a…
-- `fn allocate_ui_with_layout<R>(&mut self, desired_size: Vec2, layout: Layout, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:1321`
+- `fn allocate_ui_with_layout<R>(&mut self, desired_size: Vec2, layout: Layout, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:1322`
   Allocated the given space and then adds content to that space. If the contents overflow, more space will be a…
-- `fn auto_id_with(&self, id_salt: impl AsIdSalt) -> Id` — `egui-0.35.0/src/ui.rs:893`
+- `fn auto_id_with(&self, id_salt: impl AsIdSalt) -> Id` — `egui-0.36.2/src/ui.rs:894`
   Same as `ui.next_auto_id().with(id_salt)`
-- `fn available_height(&self) -> f32` — `egui-0.35.0/src/ui.rs:861`
+- `fn available_height(&self) -> f32` — `egui-0.36.2/src/ui.rs:862`
   The available height at the moment, given the current cursor.
-- `fn available_rect_before_wrap(&self) -> Rect` — `egui-0.35.0/src/ui.rs:875`
+- `fn available_rect_before_wrap(&self) -> Rect` — `egui-0.36.2/src/ui.rs:876`
   In case of a wrapping layout, how much space is left on this row/column?
-- `fn available_size(&self) -> Vec2` — `egui-0.35.0/src/ui.rs:847`
+- `fn available_size(&self) -> Vec2` — `egui-0.36.2/src/ui.rs:848`
   The available space at the moment, given the current cursor.
-- `fn available_size_before_wrap(&self) -> Vec2` — `egui-0.35.0/src/ui.rs:868`
+- `fn available_size_before_wrap(&self) -> Vec2` — `egui-0.36.2/src/ui.rs:869`
   In case of a wrapping layout, how much space is left on this row/column?
-- `fn available_width(&self) -> f32` — `egui-0.35.0/src/ui.rs:854`
+- `fn available_width(&self) -> f32` — `egui-0.36.2/src/ui.rs:855`
   The available width at the moment, given the current cursor.
-- `fn button(&mut self, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1847`
+- `fn button(&mut self, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1848`
   Usage: `if ui.button("Click me").clicked() { … }`
-- `fn centered_and_justified<R>(&mut self, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2480`
+- `fn centered_and_justified<R>(&mut self, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2481`
   This will make the next added widget centered and justified in the available space.
-- `fn checkbox(&mut self, checked: &'a mut bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1865`
+- `fn checkbox(&mut self, checked: &'a mut bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1866`
   Show a checkbox.
-- `fn clip_rect(&self) -> Rect` — `egui-0.35.0/src/ui.rs:639`
+- `fn clip_rect(&self) -> Rect` — `egui-0.36.2/src/ui.rs:640`
   Screen-space rectangle for clipping what we paint in this ui. This is used, for instance, to avoid painting o…
-- `fn close(&self)` — `egui-0.35.0/src/ui.rs:1039`
+- `fn close(&self)` — `egui-0.36.2/src/ui.rs:1040`
   Find and close the first closable parent.
-- `fn close_kind(&self, ui_kind: UiKind)` — `egui-0.35.0/src/ui.rs:1063`
+- `fn close_kind(&self, ui_kind: UiKind)` — `egui-0.36.2/src/ui.rs:1064`
   Find and close the first closable parent of a specific [`UiKind`].
-- `fn code(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1727`
+- `fn code(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1728`
   Show text as monospace with a gray background.
-- `fn code_editor<S>(&mut self, text: &mut S) -> Response` — `egui-0.35.0/src/ui.rs:1823`
+- `fn code_editor<S>(&mut self, text: &mut S) -> Response` — `egui-0.36.2/src/ui.rs:1824`
   A [`TextEdit`] for code editing.
-- `fn collapsing<R>(&mut self, heading: impl Into<WidgetText>, add_contents: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.35.0/src/ui.rs:2220`
+- `fn collapsing<R>(&mut self, heading: impl Into<WidgetText>, add_contents: impl FnOnce(&mut Ui) -> R) -> CollapsingResponse<R>` — `egui-0.36.2/src/ui.rs:2221`
   A [`CollapsingHeader`] that starts out collapsed.
-- `fn color_edit_button_hsva(&mut self, hsva: &mut Hsva) -> Response` — `egui-0.35.0/src/ui.rs:2050`
+- `fn color_edit_button_hsva(&mut self, hsva: &mut Hsva) -> Response` — `egui-0.36.2/src/ui.rs:2051`
   Shows a button with the given color.
-- `fn color_edit_button_rgb(&mut self, rgb: &mut [f32; 3]) -> Response` — `egui-0.35.0/src/ui.rs:2066`
+- `fn color_edit_button_rgb(&mut self, rgb: &mut [f32; 3]) -> Response` — `egui-0.36.2/src/ui.rs:2067`
   Shows a button with the given color.
-- `fn color_edit_button_rgba_premultiplied(&mut self, rgba_premul: &mut [f32; 4]) -> Response` — `egui-0.35.0/src/ui.rs:2098`
+- `fn color_edit_button_rgba_premultiplied(&mut self, rgba_premul: &mut [f32; 4]) -> Response` — `egui-0.36.2/src/ui.rs:2099`
   Shows a button with the given color.
-- `fn color_edit_button_rgba_unmultiplied(&mut self, rgba_unmul: &mut [f32; 4]) -> Response` — `egui-0.35.0/src/ui.rs:2119`
+- `fn color_edit_button_rgba_unmultiplied(&mut self, rgba_unmul: &mut [f32; 4]) -> Response` — `egui-0.36.2/src/ui.rs:2120`
   Shows a button with the given color.
-- `fn color_edit_button_srgb(&mut self, srgb: &mut [u8; 3]) -> Response` — `egui-0.35.0/src/ui.rs:2058`
+- `fn color_edit_button_srgb(&mut self, srgb: &mut [u8; 3]) -> Response` — `egui-0.36.2/src/ui.rs:2059`
   Shows a button with the given color.
-- `fn color_edit_button_srgba(&mut self, srgba: &mut Color32) -> Response` — `egui-0.35.0/src/ui.rs:2043`
+- `fn color_edit_button_srgba(&mut self, srgba: &mut Color32) -> Response` — `egui-0.36.2/src/ui.rs:2044`
   Shows a button with the given color.
-- `fn color_edit_button_srgba_premultiplied(&mut self, srgba: &mut [u8; 4]) -> Response` — `egui-0.35.0/src/ui.rs:2074`
+- `fn color_edit_button_srgba_premultiplied(&mut self, srgba: &mut [u8; 4]) -> Response` — `egui-0.36.2/src/ui.rs:2075`
   Shows a button with the given color.
-- `fn color_edit_button_srgba_unmultiplied(&mut self, srgba: &mut [u8; 4]) -> Response` — `egui-0.35.0/src/ui.rs:2086`
+- `fn color_edit_button_srgba_unmultiplied(&mut self, srgba: &mut [u8; 4]) -> Response` — `egui-0.36.2/src/ui.rs:2087`
   Shows a button with the given color.
-- `fn colored_label(&mut self, color: impl Into<Color32>, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1702`
+- `fn colored_label(&mut self, color: impl Into<Color32>, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1703`
   Show colored text.
-- `fn columns<R>(&mut self, num_columns: usize, add_contents: impl FnOnce(&mut [Self]) -> R) -> R` — `egui-0.35.0/src/ui.rs:2525`
+- `fn columns<R>(&mut self, num_columns: usize, add_contents: impl FnOnce(&mut [Self]) -> R) -> R` — `egui-0.36.2/src/ui.rs:2526`
   Temporarily split a [`Ui`] into several columns.
-- `fn columns_const<NUM_COL, R>(&mut self, add_contents: impl FnOnce(&mut [Self; NUM_COL]) -> R) -> R` — `egui-0.35.0/src/ui.rs:2592`
+- `fn columns_const<NUM_COL, R>(&mut self, add_contents: impl FnOnce(&mut [Self; NUM_COL]) -> R) -> R` — `egui-0.36.2/src/ui.rs:2593`
   Temporarily split a [`Ui`] into several columns.
-- `fn ctx(&self) -> &Context` — `egui-0.35.0/src/ui.rs:451`
+- `fn ctx(&self) -> &Context` — `egui-0.36.2/src/ui.rs:452`
   Get a reference to the parent [`Context`].
-- `fn cursor(&self) -> Rect` — `egui-0.35.0/src/ui.rs:1290`
+- `fn cursor(&self) -> Rect` — `egui-0.36.2/src/ui.rs:1291`
   Where the next widget will be put.
-- `fn debug_paint_cursor(&self)` — `egui-0.35.0/src/ui.rs:2883`
+- `fn debug_paint_cursor(&self)` — `egui-0.36.2/src/ui.rs:2884`
   Shows where the next widget is going to be placed
-- `fn disable(&mut self)` — `egui-0.35.0/src/ui.rs:496`
+- `fn disable(&mut self)` — `egui-0.36.2/src/ui.rs:497`
   Calling `disable()` will cause the [`Ui`] to deny all future interaction and all the widgets will draw with a…
-- `fn dnd_drag_source<Payload, R>(&mut self, id: Id, payload: Payload, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2641`
+- `fn dnd_drag_source<Payload, R>(&mut self, id: Id, payload: Payload, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2642`
   Create something that can be drag-and-dropped.
-- `fn dnd_drop_zone<Payload, R>(&mut self, frame: Frame, add_contents: impl FnOnce(&mut Ui) -> R) -> (InnerResponse<R>, Option<Arc<Payload>>)` — `egui-0.35.0/src/ui.rs:2693`
+- `fn dnd_drop_zone<Payload, R>(&mut self, frame: Frame, add_contents: impl FnOnce(&mut Ui) -> R) -> (InnerResponse<R>, Option<Arc<Payload>>)` — `egui-0.36.2/src/ui.rs:2694`
   Surround the given ui with a frame which changes colors when you can drop something onto it.
-- `fn drag_angle(&mut self, radians: &mut f32) -> Response` — `egui-0.35.0/src/ui.rs:1970`
+- `fn drag_angle(&mut self, radians: &mut f32) -> Response` — `egui-0.36.2/src/ui.rs:1971`
   Modify an angle. The given angle should be in radians, but is shown to the user in degrees. The angle is NOT…
-- `fn drag_angle_tau(&mut self, radians: &mut f32) -> Response` — `egui-0.35.0/src/ui.rs:1986`
+- `fn drag_angle_tau(&mut self, radians: &mut f32) -> Response` — `egui-0.36.2/src/ui.rs:1987`
   Modify an angle. The given angle should be in radians, but is shown to the user in fractions of one Tau (i.e.…
-- `fn end_row(&mut self)` — `egui-0.35.0/src/ui.rs:2504`
+- `fn end_row(&mut self)` — `egui-0.36.2/src/ui.rs:2505`
   Move to the next row in a grid layout or wrapping layout. Otherwise does nothing.
-- `fn expand_to_include_rect(&mut self, rect: Rect)` — `egui-0.35.0/src/ui.rs:796`
+- `fn expand_to_include_rect(&mut self, rect: Rect)` — `egui-0.36.2/src/ui.rs:797`
   Expand the `min_rect` and `max_rect` of this ui to include a child at the given rect.
-- `fn expand_to_include_x(&mut self, x: f32)` — `egui-0.35.0/src/ui.rs:828`
+- `fn expand_to_include_x(&mut self, x: f32)` — `egui-0.36.2/src/ui.rs:829`
   Ensure we are big enough to contain the given x-coordinate. This is sometimes useful to expand a ui to stretc…
-- `fn expand_to_include_y(&mut self, y: f32)` — `egui-0.35.0/src/ui.rs:834`
+- `fn expand_to_include_y(&mut self, y: f32)` — `egui-0.36.2/src/ui.rs:835`
   Ensure we are big enough to contain the given y-coordinate. This is sometimes useful to expand a ui to stretc…
-- `fn group<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2146`
+- `fn group<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2147`
   Put into a [`Frame::group`], visually grouping the contents together
-- `fn heading(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1713`
+- `fn heading(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1714`
   Show large text.
-- `fn horizontal<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2314`
+- `fn horizontal<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2315`
   Start a ui with horizontal layout. After you have called this, the function registers the contents as any oth…
-- `fn horizontal_centered<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2319`
+- `fn horizontal_centered<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2320`
   Like [`Self::horizontal`], but allocates the full vertical height and then centers elements vertically.
-- `fn horizontal_top<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2334`
+- `fn horizontal_top<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2335`
   Like [`Self::horizontal`], but aligns content with top.
-- `fn horizontal_wrapped<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2363`
+- `fn horizontal_wrapped<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2364`
   Start a ui with horizontal layout that wraps to a new row when it reaches the right edge of the `max_size`. A…
-- `fn hyperlink(&mut self, url: impl ToString) -> Response` — `egui-0.35.0/src/ui.rs:1781`
+- `fn hyperlink(&mut self, url: impl ToString) -> Response` — `egui-0.36.2/src/ui.rs:1782`
   Link to a web page.
-- `fn hyperlink_to(&mut self, label: impl Into<WidgetText>, url: impl ToString) -> Response` — `egui-0.35.0/src/ui.rs:1794`
+- `fn hyperlink_to(&mut self, label: impl Into<WidgetText>, url: impl ToString) -> Response` — `egui-0.36.2/src/ui.rs:1795`
   Shortcut for `add(Hyperlink::from_label_and_url(label, url))`.
-- `fn id(&self) -> Id` — `egui-0.35.0/src/ui.rs:344`
+- `fn id(&self) -> Id` — `egui-0.36.2/src/ui.rs:345`
   Generated based on id of parent ui together with an optional id salt.
-- `fn image(&mut self, source: impl Into<ImageSource<'a>>) -> Response` — `egui-0.35.0/src/ui.rs:2033`
+- `fn image(&mut self, source: impl Into<ImageSource<'a>>) -> Response` — `egui-0.36.2/src/ui.rs:2034`
   Show an image available at the given `uri`.
-- `fn indent<R>(&mut self, id_salt: impl AsIdSalt, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2233`
+- `fn indent<R>(&mut self, id_salt: impl AsIdSalt, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2234`
   Create a child ui which is indented to the right.
-- `fn interact(&self, rect: Rect, id: Id, sense: Sense) -> Response` — `egui-0.35.0/src/ui.rs:906`
+- `fn interact(&self, rect: Rect, id: Id, sense: Sense) -> Response` — `egui-0.36.2/src/ui.rs:907`
   Check for clicks, drags and/or hover on a specific region of this [`Ui`].
-- `fn interact_opt(&self, rect: Rect, id: Id, sense: Sense, options: InteractOptions) -> Response` — `egui-0.35.0/src/ui.rs:911`
+- `fn interact_opt(&self, rect: Rect, id: Id, sense: Sense, options: InteractOptions) -> Response` — `egui-0.36.2/src/ui.rs:912`
   Check for clicks, drags and/or hover on a specific region of this [`Ui`].
-- `fn is_enabled(&self) -> bool` — `egui-0.35.0/src/ui.rs:470`
+- `fn is_enabled(&self) -> bool` — `egui-0.36.2/src/ui.rs:471`
   If `false`, the [`Ui`] does not allow any interaction and the widgets in it will draw with a gray look.
-- `fn is_rect_visible(&self, rect: Rect) -> bool` — `egui-0.35.0/src/ui.rs:666`
+- `fn is_rect_visible(&self, rect: Rect) -> bool` — `egui-0.36.2/src/ui.rs:667`
   Can be used for culling: if `false`, then no part of `rect` will be visible on screen.
-- `fn is_sizing_pass(&self) -> bool` — `egui-0.35.0/src/ui.rs:327`
+- `fn is_sizing_pass(&self) -> bool` — `egui-0.36.2/src/ui.rs:328`
   Set to true in special cases where we do one frame where we size up the contents of the Ui, without actually…
-- `fn is_tooltip(&self) -> bool` — `egui-0.35.0/src/ui.rs:439`
+- `fn is_tooltip(&self) -> bool` — `egui-0.36.2/src/ui.rs:440`
   Is this [`Ui`] in a tooltip?
-- `fn is_visible(&self) -> bool` — `egui-0.35.0/src/ui.rs:509`
+- `fn is_visible(&self) -> bool` — `egui-0.36.2/src/ui.rs:510`
   If `false`, any widgets added to the [`Ui`] will be invisible and non-interactive.
-- `fn label(&mut self, text: impl Into<WidgetText>) -> Response` — `egui-0.35.0/src/ui.rs:1695`
+- `fn label(&mut self, text: impl Into<WidgetText>) -> Response` — `egui-0.36.2/src/ui.rs:1696`
   Show some text.
-- `fn layer_id(&self) -> LayerId` — `egui-0.35.0/src/ui.rs:625`
+- `fn layer_id(&self) -> LayerId` — `egui-0.36.2/src/ui.rs:626`
   Use this to paint stuff within this [`Ui`].
-- `fn layout(&self) -> &Layout` — `egui-0.35.0/src/ui.rs:581`
+- `fn layout(&self) -> &Layout` — `egui-0.36.2/src/ui.rs:582`
   Read the [`Layout`].
-- `fn link(&mut self, text: impl Into<WidgetText>) -> Response` — `egui-0.35.0/src/ui.rs:1766`
+- `fn link(&mut self, text: impl Into<WidgetText>) -> Response` — `egui-0.36.2/src/ui.rs:1767`
   Looks like a hyperlink.
-- `fn make_persistent_id(&self, id_salt: impl AsIdSalt) -> Id` — `egui-0.35.0/src/ui.rs:883`
+- `fn make_persistent_id(&self, id_salt: impl AsIdSalt) -> Id` — `egui-0.36.2/src/ui.rs:884`
   Use this to generate widget ids for widgets that have persistent state in [`Memory`].
-- `fn max_rect(&self) -> Rect` — `egui-0.35.0/src/ui.rs:697`
+- `fn max_rect(&self) -> Rect` — `egui-0.36.2/src/ui.rs:698`
   New widgets will *try* to fit within this rectangle.
-- `fn menu_button<R>(&mut self, atoms: impl IntoAtoms<'a>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.35.0/src/ui.rs:2787`
+- `fn menu_button<R>(&mut self, atoms: impl IntoAtoms<'a>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.36.2/src/ui.rs:2788`
   Create a menu button that when clicked will show the given menu.
-- `fn menu_image_button<R>(&mut self, image: impl Into<Image<'a>>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.35.0/src/ui.rs:2821`
+- `fn menu_image_button<R>(&mut self, image: impl Into<Image<'a>>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.36.2/src/ui.rs:2822`
   Create a menu button with an image that when clicked will show the given menu.
-- `fn menu_image_text_button<R>(&mut self, image: impl Into<Image<'a>>, title: impl Into<WidgetText>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.35.0/src/ui.rs:2858`
+- `fn menu_image_text_button<R>(&mut self, image: impl Into<Image<'a>>, title: impl Into<WidgetText>, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>>` — `egui-0.36.2/src/ui.rs:2859`
   Create a menu button with an image and a text that when clicked will show the given menu.
-- `fn min_rect(&self) -> Rect` — `egui-0.35.0/src/ui.rs:681`
+- `fn min_rect(&self) -> Rect` — `egui-0.36.2/src/ui.rs:682`
   Where and how large the [`Ui`] is already. All widgets that have been added to this [`Ui`] fits within this r…
-- `fn min_size(&self) -> Vec2` — `egui-0.35.0/src/ui.rs:686`
+- `fn min_size(&self) -> Vec2` — `egui-0.36.2/src/ui.rs:687`
   Size of content; same as `min_rect().size()`
-- `fn monospace(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1720`
+- `fn monospace(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1721`
   Show monospace (fixed width) text.
-- `fn multiply_opacity(&mut self, opacity: f32)` — `egui-0.35.0/src/ui.rs:567`
+- `fn multiply_opacity(&mut self, opacity: f32)` — `egui-0.36.2/src/ui.rs:568`
   Like [`Self::set_opacity`], but multiplies the given value with the current opacity.
-- `fn new(ctx: Context, id: Id, ui_builder: UiBuilder) -> Self` — `egui-0.35.0/src/ui.rs:108`
+- `fn new(ctx: Context, id: Id, ui_builder: UiBuilder) -> Self` — `egui-0.36.2/src/ui.rs:109`
   Create a new top-level [`Ui`].
-- `fn new_child(&mut self, ui_builder: UiBuilder) -> Self` — `egui-0.35.0/src/ui.rs:208`
+- `fn new_child(&mut self, ui_builder: UiBuilder) -> Self` — `egui-0.36.2/src/ui.rs:209`
   Create a child `Ui` with the properties of the given builder.
-- `fn next_auto_id(&self) -> Id` — `egui-0.35.0/src/ui.rs:888`
+- `fn next_auto_id(&self) -> Id` — `egui-0.36.2/src/ui.rs:889`
   This is the `Id` that will be assigned to the next widget added to this `Ui`.
-- `fn next_widget_position(&self) -> Pos2` — `egui-0.35.0/src/ui.rs:1299`
+- `fn next_widget_position(&self) -> Pos2` — `egui-0.36.2/src/ui.rs:1300`
   Where do we expect a zero-sized widget to be placed?
-- `fn opacity(&self) -> f32` — `egui-0.35.0/src/ui.rs:575`
+- `fn opacity(&self) -> f32` — `egui-0.36.2/src/ui.rs:576`
   Read the current opacity of the underlying painter.
-- `fn painter(&self) -> &Painter` — `egui-0.35.0/src/ui.rs:457`
+- `fn painter(&self) -> &Painter` — `egui-0.36.2/src/ui.rs:458`
   Use this to paint stuff within this [`Ui`].
-- `fn painter_at(&self, rect: Rect) -> Painter` — `egui-0.35.0/src/ui.rs:619`
+- `fn painter_at(&self, rect: Rect) -> Painter` — `egui-0.36.2/src/ui.rs:620`
   Create a painter for a sub-region of this Ui.
-- `fn pixels_per_point(&self) -> f32` — `egui-0.35.0/src/ui.rs:463`
+- `fn pixels_per_point(&self) -> f32` — `egui-0.36.2/src/ui.rs:464`
   Number of physical pixels for each logical UI point.
-- `fn place(&mut self, max_rect: Rect, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1552`
+- `fn place(&mut self, max_rect: Rect, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1553`
   Add a [`Widget`] to this [`Ui`] at a specific location (manual layout) without affecting this [`Ui`]s cursor.
-- `fn push_id<R>(&mut self, id_salt: impl AsIdSalt, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2163`
+- `fn push_id<R>(&mut self, id_salt: impl AsIdSalt, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2164`
   Create a child Ui with an explicit [`Id`].
-- `fn put(&mut self, max_rect: Rect, widget: impl Widget) -> Response` — `egui-0.35.0/src/ui.rs:1565`
+- `fn put(&mut self, max_rect: Rect, widget: impl Widget) -> Response` — `egui-0.36.2/src/ui.rs:1566`
   Add a [`Widget`] to this [`Ui`] at a specific location (manual layout) and advance the cursor after the widge…
-- `fn radio(&mut self, selected: bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1887`
+- `fn radio(&mut self, selected: bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1888`
   Show a [`RadioButton`]. Often you want to use [`Self::radio_value`] instead.
-- `fn radio_value<Value>(&mut self, current_value: &mut Value, alternative: Value, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1910`
+- `fn radio_value<Value>(&mut self, current_value: &mut Value, alternative: Value, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1911`
   Show a [`RadioButton`]. It is selected if `*current_value == selected_value`. If clicked, `selected_value` is…
-- `fn rect_contains_pointer(&self, rect: Rect) -> bool` — `egui-0.35.0/src/ui.rs:1003`
+- `fn rect_contains_pointer(&self, rect: Rect) -> bool` — `egui-0.36.2/src/ui.rs:1004`
   Is the pointer (mouse/touch) above this rectangle in this [`Ui`]?
-- `fn reset_style(&mut self)` — `egui-0.35.0/src/ui.rs:391`
+- `fn reset_style(&mut self)` — `egui-0.36.2/src/ui.rs:392`
   Reset to the default style set in [`Context`].
-- `fn response(&self) -> Response` — `egui-0.35.0/src/ui.rs:943`
+- `fn response(&self) -> Response` — `egui-0.36.2/src/ui.rs:944`
   Read the [`Ui`]'s background [`Response`]. Its [`Sense`] will be based on the [`UiBuilder::sense`] used to cr…
-- `fn scope<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2185`
+- `fn scope<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2186`
   Create a scoped child ui.
-- `fn scope_builder<R>(&mut self, ui_builder: UiBuilder, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2193`
+- `fn scope_builder<R>(&mut self, ui_builder: UiBuilder, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2194`
   Create a scoped child ui, inheriting properties from the parent as specified by the [`UiBuilder`]. In contras…
-- `fn scope_dyn<R>(&mut self, ui_builder: UiBuilder, add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2202`
+- `fn scope_dyn<R>(&mut self, ui_builder: UiBuilder, add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2203`
   [`Self::scope_builder`] but with dynamic dispatch.
-- `fn scroll_to_cursor(&self, align: Option<Align>)` — `egui-0.35.0/src/ui.rs:1441`
+- `fn scroll_to_cursor(&self, align: Option<Align>)` — `egui-0.36.2/src/ui.rs:1442`
   Adjust the scroll position of any parent [`crate::ScrollArea`] so that the cursor (where the next widget goes…
-- `fn scroll_to_cursor_animation(&self, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.35.0/src/ui.rs:1446`
+- `fn scroll_to_cursor_animation(&self, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.36.2/src/ui.rs:1447`
   Same as [`Self::scroll_to_cursor`], but allows you to specify the [`style::ScrollAnimation`].
-- `fn scroll_to_rect(&self, rect: Rect, align: Option<Align>)` — `egui-0.35.0/src/ui.rs:1399`
+- `fn scroll_to_rect(&self, rect: Rect, align: Option<Align>)` — `egui-0.36.2/src/ui.rs:1400`
   Adjust the scroll position of any parent [`crate::ScrollArea`] so that the given [`Rect`] becomes visible.
-- `fn scroll_to_rect_animation(&self, rect: Rect, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.35.0/src/ui.rs:1404`
+- `fn scroll_to_rect_animation(&self, rect: Rect, align: Option<Align>, animation: ScrollAnimation)` — `egui-0.36.2/src/ui.rs:1405`
   Same as [`Self::scroll_to_rect`], but allows you to specify the [`style::ScrollAnimation`].
-- `fn scroll_with_delta(&self, delta: Vec2)` — `egui-0.35.0/src/ui.rs:1490`
+- `fn scroll_with_delta(&self, delta: Vec2)` — `egui-0.36.2/src/ui.rs:1491`
   Scroll this many points in the given direction, in the parent [`crate::ScrollArea`].
-- `fn scroll_with_delta_animation(&self, delta: Vec2, animation: ScrollAnimation)` — `egui-0.35.0/src/ui.rs:1495`
+- `fn scroll_with_delta_animation(&self, delta: Vec2, animation: ScrollAnimation)` — `egui-0.36.2/src/ui.rs:1496`
   Same as [`Self::scroll_with_delta`], but allows you to specify the [`style::ScrollAnimation`].
-- `fn selectable_label(&mut self, checked: bool, text: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1928`
+- `fn selectable_label(&mut self, checked: bool, text: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1929`
   Show a label which can be selected or not.
-- `fn selectable_value<Value>(&mut self, current_value: &mut Value, selected_value: Value, text: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1938`
+- `fn selectable_value<Value>(&mut self, current_value: &mut Value, selected_value: Value, text: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1939`
   Show selectable text. It is selected if `*current_value == selected_value`. If clicked, `selected_value` is a…
-- `fn separator(&mut self) -> Response` — `egui-0.35.0/src/ui.rs:1956`
+- `fn separator(&mut self) -> Response` — `egui-0.36.2/src/ui.rs:1957`
   Shortcut for `add(Separator::default())`
-- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `egui-0.35.0/src/ui.rs:658`
+- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `egui-0.36.2/src/ui.rs:659`
   Screen-space rectangle for clipping what we paint in this ui. This is used, for instance, to avoid painting o…
-- `fn set_height(&mut self, height: f32)` — `egui-0.35.0/src/ui.rs:821`
+- `fn set_height(&mut self, height: f32)` — `egui-0.36.2/src/ui.rs:822`
   Set both the minimum and maximum height.
-- `fn set_height_range(&mut self, height: impl Into<Rangef>)` — `egui-0.35.0/src/ui.rs:808`
+- `fn set_height_range(&mut self, height: impl Into<Rangef>)` — `egui-0.36.2/src/ui.rs:809`
   `ui.set_height_range(min..=max);` is equivalent to `ui.set_min_height(min); ui.set_max_height(max);`.
-- `fn set_invisible(&mut self)` — `egui-0.35.0/src/ui.rs:537`
+- `fn set_invisible(&mut self)` — `egui-0.36.2/src/ui.rs:538`
   Calling `set_invisible()` will cause all further widgets to be invisible, yet still allocate space.
-- `fn set_max_height(&mut self, height: f32)` — `egui-0.35.0/src/ui.rs:723`
+- `fn set_max_height(&mut self, height: f32)` — `egui-0.36.2/src/ui.rs:724`
   Set the maximum height of the ui. You won't be able to shrink it below the current minimum size.
-- `fn set_max_size(&mut self, size: Vec2)` — `egui-0.35.0/src/ui.rs:710`
+- `fn set_max_size(&mut self, size: Vec2)` — `egui-0.36.2/src/ui.rs:711`
   Set the maximum size of the ui. You won't be able to shrink it below the current minimum size.
-- `fn set_max_width(&mut self, width: f32)` — `egui-0.35.0/src/ui.rs:717`
+- `fn set_max_width(&mut self, width: f32)` — `egui-0.36.2/src/ui.rs:718`
   Set the maximum width of the ui. You won't be able to shrink it below the current minimum size.
-- `fn set_min_height(&mut self, height: f32)` — `egui-0.35.0/src/ui.rs:748`
+- `fn set_min_height(&mut self, height: f32)` — `egui-0.36.2/src/ui.rs:749`
   Set the minimum height of the ui. This can't shrink the ui, only make it larger.
-- `fn set_min_size(&mut self, size: Vec2)` — `egui-0.35.0/src/ui.rs:731`
+- `fn set_min_size(&mut self, size: Vec2)` — `egui-0.36.2/src/ui.rs:732`
   Set the minimum size of the ui. This can't shrink the ui, only make it larger.
-- `fn set_min_width(&mut self, width: f32)` — `egui-0.35.0/src/ui.rs:738`
+- `fn set_min_width(&mut self, width: f32)` — `egui-0.36.2/src/ui.rs:739`
   Set the minimum width of the ui. This can't shrink the ui, only make it larger.
-- `fn set_opacity(&mut self, opacity: f32)` — `egui-0.35.0/src/ui.rs:560`
+- `fn set_opacity(&mut self, opacity: f32)` — `egui-0.36.2/src/ui.rs:561`
   Make the widget in this [`Ui`] semi-transparent.
-- `fn set_row_height(&mut self, height: f32)` — `egui-0.35.0/src/ui.rs:2510`
+- `fn set_row_height(&mut self, height: f32)` — `egui-0.36.2/src/ui.rs:2511`
   Set row height in horizontal wrapping layout.
-- `fn set_style(&mut self, style: impl Into<Arc<Style>>)` — `egui-0.35.0/src/ui.rs:386`
+- `fn set_style(&mut self, style: impl Into<Arc<Style>>)` — `egui-0.36.2/src/ui.rs:387`
   Changes apply to this [`Ui`] and its subsequent children.
-- `fn set_width(&mut self, width: f32)` — `egui-0.35.0/src/ui.rs:815`
+- `fn set_width(&mut self, width: f32)` — `egui-0.36.2/src/ui.rs:816`
   Set both the minimum and maximum width.
-- `fn set_width_range(&mut self, width: impl Into<Rangef>)` — `egui-0.35.0/src/ui.rs:801`
+- `fn set_width_range(&mut self, width: impl Into<Rangef>)` — `egui-0.36.2/src/ui.rs:802`
   `ui.set_width_range(min..=max);` is equivalent to `ui.set_min_width(min); ui.set_max_width(max);`.
-- `fn should_close(&self) -> bool` — `egui-0.35.0/src/ui.rs:1091`
+- `fn should_close(&self) -> bool` — `egui-0.36.2/src/ui.rs:1092`
   Was [`Ui::close`] called on this [`Ui`] or any of its children? Only works if the [`Ui`] was created with [`U…
-- `fn shrink_clip_rect(&mut self, new_clip_rect: Rect)` — `egui-0.35.0/src/ui.rs:649`
+- `fn shrink_clip_rect(&mut self, new_clip_rect: Rect)` — `egui-0.36.2/src/ui.rs:650`
   Constrain the rectangle in which we can paint.
-- `fn shrink_height_to_current(&mut self)` — `egui-0.35.0/src/ui.rs:791`
+- `fn shrink_height_to_current(&mut self)` — `egui-0.36.2/src/ui.rs:792`
   Helper: shrinks the max height to the current height, so further widgets will try not to be taller than previ…
-- `fn shrink_width_to_current(&mut self)` — `egui-0.35.0/src/ui.rs:785`
+- `fn shrink_width_to_current(&mut self)` — `egui-0.36.2/src/ui.rs:786`
   Helper: shrinks the max width to the current width, so further widgets will try not to be wider than previous…
-- `fn skip_ahead_auto_ids(&mut self, count: usize)` — `egui-0.35.0/src/ui.rs:898`
+- `fn skip_ahead_auto_ids(&mut self, count: usize)` — `egui-0.36.2/src/ui.rs:899`
   Pretend like `count` widgets have been allocated.
-- `fn small(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1734`
+- `fn small(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1735`
   Show small text.
-- `fn small_button(&mut self, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1857`
+- `fn small_button(&mut self, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1858`
   A button as small as normal body text.
-- `fn spacing(&self) -> &Spacing` — `egui-0.35.0/src/ui.rs:398`
+- `fn spacing(&self) -> &Spacing` — `egui-0.36.2/src/ui.rs:399`
   The current spacing options for this [`Ui`]. Short for `ui.style().spacing`.
-- `fn spacing_mut(&mut self) -> &mut Spacing` — `egui-0.35.0/src/ui.rs:411`
+- `fn spacing_mut(&mut self) -> &mut Spacing` — `egui-0.36.2/src/ui.rs:412`
   Mutably borrow internal [`Spacing`]. Changes apply to this [`Ui`] and its subsequent children.
-- `fn spinner(&mut self) -> Response` — `egui-0.35.0/src/ui.rs:1964`
+- `fn spinner(&mut self) -> Response` — `egui-0.36.2/src/ui.rs:1965`
   Shortcut for `add(Spinner::new())`
-- `fn stack(&self) -> &Arc<UiStack>` — `egui-0.35.0/src/ui.rs:445`
+- `fn stack(&self) -> &Arc<UiStack>` — `egui-0.36.2/src/ui.rs:446`
   Get a reference to this [`Ui`]'s [`UiStack`].
-- `fn strong(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1741`
+- `fn strong(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1742`
   Show text that stand out a bit (e.g. slightly brighter).
-- `fn style(&self) -> &Arc<Style>` — `egui-0.35.0/src/ui.rs:364`
+- `fn style(&self) -> &Arc<Style>` — `egui-0.36.2/src/ui.rs:365`
   Style options for this [`Ui`] and its children.
-- `fn style_mut(&mut self) -> &mut Style` — `egui-0.35.0/src/ui.rs:379`
+- `fn style_mut(&mut self) -> &mut Style` — `egui-0.36.2/src/ui.rs:380`
   Mutably borrow internal [`Style`]. Changes apply to this [`Ui`] and its subsequent children.
-- `fn take_available_height(&mut self)` — `egui-0.35.0/src/ui.rs:776`
+- `fn take_available_height(&mut self)` — `egui-0.36.2/src/ui.rs:777`
   Makes the ui always fill up the available space in the y axis.
-- `fn take_available_space(&mut self)` — `egui-0.35.0/src/ui.rs:760`
+- `fn take_available_space(&mut self)` — `egui-0.36.2/src/ui.rs:761`
   Makes the ui always fill up the available space.
-- `fn take_available_width(&mut self)` — `egui-0.35.0/src/ui.rs:768`
+- `fn take_available_width(&mut self)` — `egui-0.36.2/src/ui.rs:769`
   Makes the ui always fill up the available space in the x axis.
-- `fn text_edit_multiline<S>(&mut self, text: &mut S) -> Response` — `egui-0.35.0/src/ui.rs:1811`
+- `fn text_edit_multiline<S>(&mut self, text: &mut S) -> Response` — `egui-0.36.2/src/ui.rs:1812`
   A [`TextEdit`] for multiple lines. Pressing enter key will create a new line.
-- `fn text_edit_singleline<S>(&mut self, text: &mut S) -> Response` — `egui-0.35.0/src/ui.rs:1801`
+- `fn text_edit_singleline<S>(&mut self, text: &mut S) -> Response` — `egui-0.36.2/src/ui.rs:1802`
   No newlines (`\n`) allowed. Pressing enter key will result in the [`TextEdit`] losing focus (`response.lost_f…
-- `fn text_style_height(&self, style: &TextStyle) -> f32` — `egui-0.35.0/src/ui.rs:632`
+- `fn text_style_height(&self, style: &TextStyle) -> f32` — `egui-0.36.2/src/ui.rs:633`
   The height of text of this text style.
-- `fn text_valign(&self) -> Align` — `egui-0.35.0/src/ui.rs:609`
+- `fn text_valign(&self) -> Align` — `egui-0.36.2/src/ui.rs:610`
   How to vertically align text
-- `fn toggle_value(&mut self, selected: &mut bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.35.0/src/ui.rs:1874`
+- `fn toggle_value(&mut self, selected: &mut bool, atoms: impl IntoAtoms<'a>) -> Response` — `egui-0.36.2/src/ui.rs:1875`
   Acts like a checkbox, but looks like a [`Button::selectable`].
-- `fn ui_contains_pointer(&self) -> bool` — `egui-0.35.0/src/ui.rs:1015`
+- `fn ui_contains_pointer(&self) -> bool` — `egui-0.36.2/src/ui.rs:1016`
   Is the pointer (mouse/touch) above the current [`Ui`]?
-- `fn unique_id(&self) -> Id` — `egui-0.35.0/src/ui.rs:356`
+- `fn unique_id(&self) -> Id` — `egui-0.36.2/src/ui.rs:357`
   This is a globally unique ID of this `Ui`, based on where in the hierarchy of widgets this Ui is in.
-- `fn vertical<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2404`
+- `fn vertical<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2405`
   Start a ui with vertical layout. Widgets will be left-justified.
-- `fn vertical_centered<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2423`
+- `fn vertical_centered<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2424`
   Start a ui with vertical layout. Widgets will be horizontally centered.
-- `fn vertical_centered_justified<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2444`
+- `fn vertical_centered_justified<R>(&mut self, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2445`
   Start a ui with vertical layout. Widgets will be horizontally centered and justified (fill full width).
-- `fn visuals(&self) -> &Visuals` — `egui-0.35.0/src/ui.rs:418`
+- `fn visuals(&self) -> &Visuals` — `egui-0.36.2/src/ui.rs:419`
   The current visuals settings of this [`Ui`]. Short for `ui.style().visuals`.
-- `fn visuals_mut(&mut self) -> &mut Visuals` — `egui-0.35.0/src/ui.rs:433`
+- `fn visuals_mut(&mut self) -> &mut Visuals` — `egui-0.36.2/src/ui.rs:434`
   Mutably borrow internal `visuals`. Changes apply to this [`Ui`] and its subsequent children.
-- `fn weak(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.35.0/src/ui.rs:1748`
+- `fn weak(&mut self, text: impl Into<RichText>) -> Response` — `egui-0.36.2/src/ui.rs:1749`
   Show text that is weaker (fainter color).
-- `fn will_parent_close(&self) -> bool` — `egui-0.35.0/src/ui.rs:1105`
+- `fn will_parent_close(&self) -> bool` — `egui-0.36.2/src/ui.rs:1106`
   Will this [`Ui`] or any of its parents close this frame?
-- `fn with_layout<R>(&mut self, layout: Layout, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2469`
+- `fn with_layout<R>(&mut self, layout: Layout, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2470`
   The new layout will take up all available space.
-- `fn with_visual_transform<R>(&mut self, transform: TSTransform, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.35.0/src/ui.rs:2745`
+- `fn with_visual_transform<R>(&mut self, transform: TSTransform, add_contents: impl FnOnce(&mut Self) -> R) -> InnerResponse<R>` — `egui-0.36.2/src/ui.rs:2746`
   Create a new Scope and transform its contents via a [`emath::TSTransform`]. This only affects visuals, inputs…
-- `fn wrap_mode(&self) -> TextWrapMode` — `egui-0.35.0/src/ui.rs:588`
+- `fn wrap_mode(&self) -> TextWrapMode` — `egui-0.36.2/src/ui.rs:589`
   Which wrap mode should the text use in this [`Ui`]?
 
 Implements: `Deref`, `Drop`
 
-### `UiBuilder` (struct) — `egui-0.35.0/src/ui_builder.rs:19`
+### `UiBuilder` (struct) — `egui-0.36.2/src/ui_builder.rs:19`
 
 The properties specified when creating a top-level or child [`Ui`].
 
@@ -5355,37 +5370,37 @@ Public fields:
 
 Methods:
 
-- `fn accessibility_parent(self, parent_id: Id) -> Self` — `egui-0.35.0/src/ui_builder.rs:193`
+- `fn accessibility_parent(self, parent_id: Id) -> Self` — `egui-0.36.2/src/ui_builder.rs:193`
   Set the accessibility parent for this [`Ui`].
-- `fn closable(self) -> Self` — `egui-0.35.0/src/ui_builder.rs:181`
+- `fn closable(self) -> Self` — `egui-0.36.2/src/ui_builder.rs:181`
   Make this [`Ui`] closable.
-- `fn disabled(self) -> Self` — `egui-0.35.0/src/ui_builder.rs:123`
+- `fn disabled(self) -> Self` — `egui-0.36.2/src/ui_builder.rs:123`
   Make the new `Ui` disabled, i.e. grayed-out and non-interactive.
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/ui_builder.rs:71`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/ui_builder.rs:71`
   Set an id of the new `Ui` that is independent of the parent `Ui`. This way child widgets can be moved in the…
-- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.35.0/src/ui_builder.rs:56`
+- `fn id_salt(self, id_salt: impl AsIdSalt) -> Self` — `egui-0.36.2/src/ui_builder.rs:56`
   Seed the child `Ui` with this `id_salt`, which will be mixed with the [`Ui::id`] of the parent.
-- `fn invisible(self) -> Self` — `egui-0.35.0/src/ui_builder.rs:134`
+- `fn invisible(self) -> Self` — `egui-0.36.2/src/ui_builder.rs:134`
   Make the contents invisible.
-- `fn layer_id(self, layer_id: LayerId) -> Self` — `egui-0.35.0/src/ui_builder.rs:85`
+- `fn layer_id(self, layer_id: LayerId) -> Self` — `egui-0.36.2/src/ui_builder.rs:85`
   Show the [`Ui`] in a different [`LayerId`] from its parent.
-- `fn layout(self, layout: Layout) -> Self` — `egui-0.35.0/src/ui_builder.rs:112`
+- `fn layout(self, layout: Layout) -> Self` — `egui-0.36.2/src/ui_builder.rs:112`
   Override the layout.
-- `fn max_rect(self, max_rect: Rect) -> Self` — `egui-0.35.0/src/ui_builder.rs:103`
+- `fn max_rect(self, max_rect: Rect) -> Self` — `egui-0.36.2/src/ui_builder.rs:103`
   Set the max rectangle, within which widgets will go.
-- `fn new() -> Self` — `egui-0.35.0/src/ui_builder.rs:46`
-- `fn sense(self, sense: Sense) -> Self` — `egui-0.35.0/src/ui_builder.rs:168`
+- `fn new() -> Self` — `egui-0.36.2/src/ui_builder.rs:46`
+- `fn sense(self, sense: Sense) -> Self` — `egui-0.36.2/src/ui_builder.rs:168`
   Set if you want sense clicks and/or drags. Default is [`Sense::hover`].
-- `fn sizing_pass(self) -> Self` — `egui-0.35.0/src/ui_builder.rs:146`
+- `fn sizing_pass(self) -> Self` — `egui-0.36.2/src/ui_builder.rs:146`
   Set to true in special cases where we do one frame where we size up the contents of the Ui, without actually…
-- `fn style(self, style: impl Into<Arc<Style>>) -> Self` — `egui-0.35.0/src/ui_builder.rs:155`
+- `fn style(self, style: impl Into<Arc<Style>>) -> Self` — `egui-0.36.2/src/ui_builder.rs:155`
   Override the style.
-- `fn ui_stack_info(self, ui_stack_info: UiStackInfo) -> Self` — `egui-0.35.0/src/ui_builder.rs:78`
+- `fn ui_stack_info(self, ui_stack_info: UiStackInfo) -> Self` — `egui-0.36.2/src/ui_builder.rs:78`
   Provide some information about the new `Ui` being built.
 
 Implements: `Clone`, `Default`, `HasClasses`
 
-### `UiStack` (struct) — `egui-0.35.0/src/ui_stack.rs:208`
+### `UiStack` (struct) — `egui-0.36.2/src/ui_stack.rs:208`
 
 Information about a [`crate::Ui`] and its parents.
 
@@ -5401,28 +5416,28 @@ Public fields:
 
 Methods:
 
-- `fn bg_color(&self) -> Color32` — `egui-0.35.0/src/ui_stack.rs:266`
+- `fn bg_color(&self) -> Color32` — `egui-0.36.2/src/ui_stack.rs:266`
   The background color of this [`crate::Ui`].
-- `fn contained_in(&self, kind: UiKind) -> bool` — `egui-0.35.0/src/ui_stack.rs:290`
+- `fn contained_in(&self, kind: UiKind) -> bool` — `egui-0.36.2/src/ui_stack.rs:290`
   Check if this node is or is contained in a [`crate::Ui`] of a specific kind.
-- `fn frame(&self) -> &Frame` — `egui-0.35.0/src/ui_stack.rs:227`
-- `fn has_visible_frame(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:257`
+- `fn frame(&self) -> &Frame` — `egui-0.36.2/src/ui_stack.rs:227`
+- `fn has_visible_frame(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:257`
   This this [`crate::Ui`] a [`crate::Frame`] with a visible stroke?
-- `fn is_area_ui(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:245`
+- `fn is_area_ui(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:245`
   Is this [`crate::Ui`] an [`crate::Area`]?
-- `fn is_panel_ui(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:239`
+- `fn is_panel_ui(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:239`
   Is this [`crate::Ui`] a panel?
-- `fn is_root_ui(&self) -> bool` — `egui-0.35.0/src/ui_stack.rs:251`
+- `fn is_root_ui(&self) -> bool` — `egui-0.36.2/src/ui_stack.rs:251`
   Is this a root [`crate::Ui`], i.e. created with [`crate::Ui::new()`]?
-- `fn iter(&self) -> UiStackIterator<'_>` — `egui-0.35.0/src/ui_stack.rs:285`
+- `fn iter(&self) -> UiStackIterator<'_>` — `egui-0.36.2/src/ui_stack.rs:285`
   Return an iterator that walks the stack from this node to the root.
-- `fn kind(&self) -> Option<UiKind>` — `egui-0.35.0/src/ui_stack.rs:222`
-- `fn tags(&self) -> &UiTags` — `egui-0.35.0/src/ui_stack.rs:233`
+- `fn kind(&self) -> Option<UiKind>` — `egui-0.36.2/src/ui_stack.rs:222`
+- `fn tags(&self) -> &UiTags` — `egui-0.36.2/src/ui_stack.rs:233`
   User tags.
 
 Implements: `Debug`
 
-### `UiStackInfo` (struct) — `egui-0.35.0/src/ui_stack.rs:108`
+### `UiStackInfo` (struct) — `egui-0.36.2/src/ui_stack.rs:108`
 
 Information about a [`crate::Ui`] to be included in the corresponding [`UiStack`].
 
@@ -5434,38 +5449,38 @@ Public fields:
 
 Methods:
 
-- `fn new(kind: UiKind) -> Self` — `egui-0.35.0/src/ui_stack.rs:117`
+- `fn new(kind: UiKind) -> Self` — `egui-0.36.2/src/ui_stack.rs:117`
   Create a new [`UiStackInfo`] with the given kind and an empty frame.
-- `fn with_frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/ui_stack.rs:125`
-- `fn with_tag(self, key: impl Into<String>) -> Self` — `egui-0.35.0/src/ui_stack.rs:132`
+- `fn with_frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/ui_stack.rs:125`
+- `fn with_tag(self, key: impl Into<String>) -> Self` — `egui-0.36.2/src/ui_stack.rs:132`
   Insert a tag with no value.
-- `fn with_tag_value(self, key: impl Into<String>, value: impl Any + Send + Sync + 'static) -> Self` — `egui-0.35.0/src/ui_stack.rs:139`
+- `fn with_tag_value(self, key: impl Into<String>, value: impl Any + Send + Sync + 'static) -> Self` — `egui-0.36.2/src/ui_stack.rs:139`
   Insert a tag with some value.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `UiStackIterator` (struct) — `egui-0.35.0/src/ui_stack.rs:300`
+### `UiStackIterator` (struct) — `egui-0.36.2/src/ui_stack.rs:300`
 
 Iterator that walks up a stack of `StackFrame`s.
 
 Implements: `FusedIterator`, `Iterator`
 
-### `UiTags` (struct) — `egui-0.35.0/src/ui_stack.rs:161`
+### `UiTags` (struct) — `egui-0.36.2/src/ui_stack.rs:161`
 
 User-chosen tags.
 
 Methods:
 
-- `fn contains(&self, key: &str) -> bool` — `egui-0.35.0/src/ui_stack.rs:174`
-- `fn get_any(&self, key: &str) -> Option<&Arc<dyn Any + Send + Sync + 'static>>` — `egui-0.35.0/src/ui_stack.rs:183`
+- `fn contains(&self, key: &str) -> bool` — `egui-0.36.2/src/ui_stack.rs:174`
+- `fn get_any(&self, key: &str) -> Option<&Arc<dyn Any + Send + Sync + 'static>>` — `egui-0.36.2/src/ui_stack.rs:183`
   Get the value of a tag.
-- `fn get_downcast<T>(&self, key: &str) -> Option<&T>` — `egui-0.35.0/src/ui_stack.rs:191`
+- `fn get_downcast<T>(&self, key: &str) -> Option<&T>` — `egui-0.36.2/src/ui_stack.rs:191`
   Get the value of a tag.
-- `fn insert(&mut self, key: impl Into<String>, value: Option<Arc<dyn Any + Send + Sync + 'static>>)` — `egui-0.35.0/src/ui_stack.rs:165`
+- `fn insert(&mut self, key: impl Into<String>, value: Option<Arc<dyn Any + Send + Sync + 'static>>)` — `egui-0.36.2/src/ui_stack.rs:165`
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `UserData` (struct) — `egui-0.35.0/src/data/user_data.rs:6`
+### `UserData` (struct) — `egui-0.36.2/src/data/user_data.rs:7`
 
 A wrapper around `dyn Any`, used for passing custom user data to [`crate::ViewportCommand::Screenshot`].
 
@@ -5475,12 +5490,12 @@ Public fields:
 
 Methods:
 
-- `fn new(user_info: impl Any + Send + Sync) -> Self` — `egui-0.35.0/src/data/user_data.rs:14`
+- `fn new(user_info: impl Any + Send + Sync) -> Self` — `egui-0.36.2/src/data/user_data.rs:15`
   You can also use [`Self::default`].
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`
 
-### `Vec2` (struct) — `emath-0.35.0/src/vec2.rs:16`
+### `Vec2` (struct) — `emath-0.36.2/src/vec2.rs:16`
 
 A vector has a direction and length. A [`Vec2`] is often used to represent a size.
 
@@ -5491,46 +5506,46 @@ Public fields:
 
 Methods:
 
-- `const fn new(x: f32, y: f32) -> Self` — `emath-0.35.0/src/vec2.rs:148`
-- `const fn splat(v: f32) -> Self` — `emath-0.35.0/src/vec2.rs:154`
+- `const fn new(x: f32, y: f32) -> Self` — `emath-0.36.2/src/vec2.rs:148`
+- `const fn splat(v: f32) -> Self` — `emath-0.36.2/src/vec2.rs:154`
   Set both `x` and `y` to the same value.
-- `fn abs(self) -> Self` — `emath-0.35.0/src/vec2.rs:257`
-- `fn angle(self) -> f32` — `emath-0.35.0/src/vec2.rs:216`
+- `fn abs(self) -> Self` — `emath-0.36.2/src/vec2.rs:257`
+- `fn angle(self) -> f32` — `emath-0.36.2/src/vec2.rs:216`
   Measures the angle of the vector.
-- `fn angled(angle: f32) -> Self` — `emath-0.35.0/src/vec2.rs:232`
+- `fn angled(angle: f32) -> Self` — `emath-0.36.2/src/vec2.rs:232`
   Create a unit vector with the given CW angle (in radians). * An angle of zero gives the unit X axis. * An ang…
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/vec2.rs:269`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/vec2.rs:269`
   True if any member is NaN.
-- `fn ceil(self) -> Self` — `emath-0.35.0/src/vec2.rs:251`
-- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.35.0/src/vec2.rs:317`
-- `fn dot(self, other: Self) -> f32` — `emath-0.35.0/src/vec2.rs:287`
+- `fn ceil(self) -> Self` — `emath-0.36.2/src/vec2.rs:251`
+- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.36.2/src/vec2.rs:317`
+- `fn dot(self, other: Self) -> f32` — `emath-0.36.2/src/vec2.rs:287`
   The dot-product of two vectors.
-- `fn floor(self) -> Self` — `emath-0.35.0/src/vec2.rs:239`
-- `fn is_finite(self) -> bool` — `emath-0.35.0/src/vec2.rs:263`
+- `fn floor(self) -> Self` — `emath-0.36.2/src/vec2.rs:239`
+- `fn is_finite(self) -> bool` — `emath-0.36.2/src/vec2.rs:263`
   True if all members are also finite.
-- `fn is_normalized(self) -> bool` — `emath-0.35.0/src/vec2.rs:178`
+- `fn is_normalized(self) -> bool` — `emath-0.36.2/src/vec2.rs:178`
   Checks if `self` has length `1.0` up to a precision of `1e-6`.
-- `fn length(self) -> f32` — `emath-0.35.0/src/vec2.rs:190`
-- `fn length_sq(self) -> f32` — `emath-0.35.0/src/vec2.rs:195`
-- `fn max(self, other: Self) -> Self` — `emath-0.35.0/src/vec2.rs:281`
-- `fn max_elem(self) -> f32` — `emath-0.35.0/src/vec2.rs:301`
+- `fn length(self) -> f32` — `emath-0.36.2/src/vec2.rs:190`
+- `fn length_sq(self) -> f32` — `emath-0.36.2/src/vec2.rs:195`
+- `fn max(self, other: Self) -> Self` — `emath-0.36.2/src/vec2.rs:281`
+- `fn max_elem(self) -> f32` — `emath-0.36.2/src/vec2.rs:301`
   Returns the maximum of `self.x` and `self.y`.
-- `fn min(self, other: Self) -> Self` — `emath-0.35.0/src/vec2.rs:275`
-- `fn min_elem(self) -> f32` — `emath-0.35.0/src/vec2.rs:294`
+- `fn min(self, other: Self) -> Self` — `emath-0.36.2/src/vec2.rs:275`
+- `fn min_elem(self) -> f32` — `emath-0.36.2/src/vec2.rs:294`
   Returns the minimum of `self.x` and `self.y`.
-- `fn normalized(self) -> Self` — `emath-0.35.0/src/vec2.rs:171`
+- `fn normalized(self) -> Self` — `emath-0.36.2/src/vec2.rs:171`
   Safe normalize: returns zero if input is zero.
-- `fn rot90(self) -> Self` — `emath-0.35.0/src/vec2.rs:185`
+- `fn rot90(self) -> Self` — `emath-0.36.2/src/vec2.rs:185`
   Rotates the vector by 90°, i.e positive X to positive Y (clockwise in egui coordinates).
-- `fn round(self) -> Self` — `emath-0.35.0/src/vec2.rs:245`
-- `fn to_pos2(self) -> Pos2` — `emath-0.35.0/src/vec2.rs:161`
+- `fn round(self) -> Self` — `emath-0.36.2/src/vec2.rs:245`
+- `fn to_pos2(self) -> Pos2` — `emath-0.36.2/src/vec2.rs:161`
   Treat this vector as a position. `v.to_pos2()` is equivalent to `Pos2::default() + v`.
-- `fn yx(self) -> Self` — `emath-0.35.0/src/vec2.rs:308`
+- `fn yx(self) -> Self` — `emath-0.36.2/src/vec2.rs:308`
   Swizzle the axes.
 
-Implements: `Add`, `Add<Vec2>`, `AddAssign`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Vec2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Vec2>`, `From<Vec2b>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Vec2>`, `Mul<f32>`, `MulAssign<f32>`, `Neg`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Vec2>`, `SubAssign`, `SubAssign<Vec2>`, `Zeroable`
+Implements: `Add`, `Add<Vec2>`, `AddAssign`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Vec2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Vec2>`, `From<Vec2b>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Vec2>`, `Mul<f32>`, `MulAssign<f32>`, `Neg`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `Sub`, `Sub<Vec2>`, `SubAssign`, `SubAssign<Vec2>`, `Zeroable`
 
-### `Vec2b` (struct) — `emath-0.35.0/src/vec2b.rs:6`
+### `Vec2b` (struct) — `emath-0.36.2/src/vec2b.rs:6`
 
 Two bools, one for each axis (X and Y).
 
@@ -5541,18 +5556,18 @@ Public fields:
 
 Methods:
 
-- `fn all(&self) -> bool` — `emath-0.35.0/src/vec2b.rs:27`
+- `fn all(&self) -> bool` — `emath-0.36.2/src/vec2b.rs:27`
   Are both `x` and `y` true?
-- `fn and(&self, other: impl Into<Self>) -> Self` — `emath-0.35.0/src/vec2b.rs:32`
-- `fn any(&self) -> bool` — `emath-0.35.0/src/vec2b.rs:21`
-- `fn new(x: bool, y: bool) -> Self` — `emath-0.35.0/src/vec2b.rs:16`
-- `fn or(&self, other: impl Into<Self>) -> Self` — `emath-0.35.0/src/vec2b.rs:41`
-- `fn to_vec2(self) -> Vec2` — `emath-0.35.0/src/vec2b.rs:51`
+- `fn and(&self, other: impl Into<Self>) -> Self` — `emath-0.36.2/src/vec2b.rs:32`
+- `fn any(&self) -> bool` — `emath-0.36.2/src/vec2b.rs:21`
+- `fn new(x: bool, y: bool) -> Self` — `emath-0.36.2/src/vec2b.rs:16`
+- `fn or(&self, other: impl Into<Self>) -> Self` — `emath-0.36.2/src/vec2b.rs:41`
+- `fn to_vec2(self) -> Vec2` — `emath-0.36.2/src/vec2b.rs:51`
   Convert to a float `Vec2` where the components are 1.0 for `true` and 0.0 for `false`.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Vec2b>`, `From<[bool; 2]>`, `From<bool>`, `Index<usize>`, `IndexMut<usize>`, `Not`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportBuilder` (struct) — `egui-0.35.0/src/viewport.rs:285`
+### `ViewportBuilder` (struct) — `egui-0.36.2/src/viewport.rs:284`
 
 Control the building of a new egui viewport (i.e. native window).
 
@@ -5592,86 +5607,86 @@ Public fields:
 
 Methods:
 
-- `fn patch(&mut self, new_vp_builder: Self) -> (Vec<ViewportCommand>, bool)` — `egui-0.35.0/src/viewport.rs:713`
+- `fn patch(&mut self, new_vp_builder: Self) -> (Vec<ViewportCommand>, bool)` — `egui-0.36.2/src/viewport.rs:712`
   Update this `ViewportBuilder` with a delta, returning a list of commands and a bool indicating if the window…
-- `fn with_active(self, active: bool) -> Self` — `egui-0.35.0/src/viewport.rs:450`
+- `fn with_active(self, active: bool) -> Self` — `egui-0.36.2/src/viewport.rs:449`
   Whether the window will be initially focused or not.
-- `fn with_always_on_top(self) -> Self` — `egui-0.35.0/src/viewport.rs:664`
+- `fn with_always_on_top(self) -> Self` — `egui-0.36.2/src/viewport.rs:663`
   This window is always on top
-- `fn with_app_id(self, app_id: impl Into<String>) -> Self` — `egui-0.35.0/src/viewport.rs:646`
+- `fn with_app_id(self, app_id: impl Into<String>) -> Self` — `egui-0.36.2/src/viewport.rs:645`
   ### On Wayland On Wayland this sets the Application ID for the window.
-- `fn with_clamp_size_to_monitor_size(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:567`
+- `fn with_clamp_size_to_monitor_size(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:566`
   Sets whether clamp the window's size to monitor's size. The default is `true` on linux, otherwise it is `fals…
-- `fn with_close_button(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:574`
+- `fn with_close_button(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:573`
   Does not work on X11.
-- `fn with_decorations(self, decorations: bool) -> Self` — `egui-0.35.0/src/viewport.rs:367`
+- `fn with_decorations(self, decorations: bool) -> Self` — `egui-0.36.2/src/viewport.rs:366`
   Sets whether the window should have a border, a title bar, etc.
-- `fn with_drag_and_drop(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:601`
+- `fn with_drag_and_drop(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:600`
   On Windows: enable drag and drop support. Drag and drop can not be disabled on other platforms.
-- `fn with_fullscreen(self, fullscreen: bool) -> Self` — `egui-0.35.0/src/viewport.rs:379`
+- `fn with_fullscreen(self, fullscreen: bool) -> Self` — `egui-0.36.2/src/viewport.rs:378`
   Sets whether the window should be put into fullscreen upon creation.
-- `fn with_fullsize_content_view(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:471`
+- `fn with_fullsize_content_view(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:470`
   macOS: Makes the window content appear behind the titlebar.
-- `fn with_has_shadow(self, has_shadow: bool) -> Self` — `egui-0.35.0/src/viewport.rs:513`
+- `fn with_has_shadow(self, has_shadow: bool) -> Self` — `egui-0.36.2/src/viewport.rs:512`
   macOS: Set to `false` to make the window render without a drop shadow.
-- `fn with_icon(self, icon: impl Into<Arc<IconData>>) -> Self` — `egui-0.35.0/src/viewport.rs:435`
+- `fn with_icon(self, icon: impl Into<Arc<IconData>>) -> Self` — `egui-0.36.2/src/viewport.rs:434`
   The application icon, e.g. in the Windows task bar or the alt-tab menu.
-- `fn with_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/viewport.rs:532`
+- `fn with_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/viewport.rs:531`
   Requests the window to be of specific dimensions.
-- `fn with_max_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/viewport.rs:558`
+- `fn with_max_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/viewport.rs:557`
   Sets the maximum dimensions a window can have.
-- `fn with_maximize_button(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:588`
+- `fn with_maximize_button(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:587`
   Does not work on X11.
-- `fn with_maximized(self, maximized: bool) -> Self` — `egui-0.35.0/src/viewport.rs:390`
+- `fn with_maximized(self, maximized: bool) -> Self` — `egui-0.36.2/src/viewport.rs:389`
   Request that the window is maximized upon creation.
-- `fn with_min_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/viewport.rs:545`
+- `fn with_min_inner_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/viewport.rs:544`
   Sets the minimum dimensions a window can have.
-- `fn with_minimize_button(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:581`
+- `fn with_minimize_button(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:580`
   Does not work on X11.
-- `fn with_monitor(self, index: usize) -> Self` — `egui-0.35.0/src/viewport.rs:705`
+- `fn with_monitor(self, index: usize) -> Self` — `egui-0.36.2/src/viewport.rs:704`
   Place the window in borderless fullscreen on the monitor at `index`.
-- `fn with_mouse_passthrough(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:673`
+- `fn with_mouse_passthrough(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:672`
   On desktop: mouse clicks pass through the window, used for non-interactable overlays.
-- `fn with_movable_by_background(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:479`
+- `fn with_movable_by_background(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:478`
   macOS: Set to `true` to allow the window to be moved by dragging the background. Enabling this feature can re…
-- `fn with_override_redirect(self, value: bool) -> Self` — `egui-0.35.0/src/viewport.rs:691`
+- `fn with_override_redirect(self, value: bool) -> Self` — `egui-0.36.2/src/viewport.rs:690`
   ### On X11 This sets the override-redirect flag. When this is set to true the window type should be specified…
-- `fn with_position(self, pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/viewport.rs:618`
+- `fn with_position(self, pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/viewport.rs:617`
   The initial "outer" position of the window, i.e. where the top-left corner of the frame/chrome should be.
-- `fn with_resizable(self, resizable: bool) -> Self` — `egui-0.35.0/src/viewport.rs:401`
+- `fn with_resizable(self, resizable: bool) -> Self` — `egui-0.36.2/src/viewport.rs:400`
   Sets whether the window is resizable or not.
-- `fn with_taskbar(self, show: bool) -> Self` — `egui-0.35.0/src/viewport.rs:520`
+- `fn with_taskbar(self, show: bool) -> Self` — `egui-0.36.2/src/viewport.rs:519`
   windows: Whether show or hide the window icon in the taskbar.
-- `fn with_title(self, title: impl Into<String>) -> Self` — `egui-0.35.0/src/viewport.rs:356`
+- `fn with_title(self, title: impl Into<String>) -> Self` — `egui-0.36.2/src/viewport.rs:355`
   Sets the initial title of the window in the title bar.
-- `fn with_title_shown(self, title_shown: bool) -> Self` — `egui-0.35.0/src/viewport.rs:486`
+- `fn with_title_shown(self, title_shown: bool) -> Self` — `egui-0.36.2/src/viewport.rs:485`
   macOS: Set to `false` to hide the window title.
-- `fn with_titlebar_buttons_shown(self, titlebar_buttons_shown: bool) -> Self` — `egui-0.35.0/src/viewport.rs:493`
+- `fn with_titlebar_buttons_shown(self, titlebar_buttons_shown: bool) -> Self` — `egui-0.36.2/src/viewport.rs:492`
   macOS: Set to `false` to hide the titlebar button (close, minimize, maximize)
-- `fn with_titlebar_shown(self, shown: bool) -> Self` — `egui-0.35.0/src/viewport.rs:500`
+- `fn with_titlebar_shown(self, shown: bool) -> Self` — `egui-0.36.2/src/viewport.rs:499`
   macOS: Set to `false` to make the titlebar transparent, allowing the content to appear behind it.
-- `fn with_transparent(self, transparent: bool) -> Self` — `egui-0.35.0/src/viewport.rs:425`
+- `fn with_transparent(self, transparent: bool) -> Self` — `egui-0.36.2/src/viewport.rs:424`
   Sets whether the background of the window should be transparent.
-- `fn with_visible(self, visible: bool) -> Self` — `egui-0.35.0/src/viewport.rs:461`
+- `fn with_visible(self, visible: bool) -> Self` — `egui-0.36.2/src/viewport.rs:460`
   Sets whether the window will be initially visible or hidden.
-- `fn with_window_level(self, level: WindowLevel) -> Self` — `egui-0.35.0/src/viewport.rs:655`
+- `fn with_window_level(self, level: WindowLevel) -> Self` — `egui-0.36.2/src/viewport.rs:654`
   Control if window is always-on-top, always-on-bottom, or neither.
-- `fn with_window_type(self, value: X11WindowType) -> Self` — `egui-0.35.0/src/viewport.rs:682`
+- `fn with_window_type(self, value: X11WindowType) -> Self` — `egui-0.36.2/src/viewport.rs:681`
   ### On X11 This sets the window type. Maps directly to [`_NET_WM_WINDOW_TYPE`](https://specifications.freedes…
 
 Implements: `Clone`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `ViewportId` (struct) — `egui-0.35.0/src/viewport.rs:119`
+### `ViewportId` (struct) — `egui-0.36.2/src/viewport.rs:118`
 
 A unique identifier of a viewport.
 
 Methods:
 
-- `fn from_hash_of(source: impl AsId) -> Self` — `egui-0.35.0/src/viewport.rs:153`
+- `fn from_hash_of(source: impl AsId) -> Self` — `egui-0.36.2/src/viewport.rs:152`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<ViewportId>`, `Hash`, `IsEnabled`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportIdPair` (struct) — `egui-0.35.0/src/viewport.rs:240`
+### `ViewportIdPair` (struct) — `egui-0.36.2/src/viewport.rs:239`
 
 A pair of [`ViewportId`], used to identify a viewport and its parent.
 
@@ -5682,11 +5697,11 @@ Public fields:
 
 Methods:
 
-- `fn from_self_and_parent(this: ViewportId, parent: ViewportId) -> Self` — `egui-0.35.0/src/viewport.rs:260`
+- `fn from_self_and_parent(this: ViewportId, parent: ViewportId) -> Self` — `egui-0.36.2/src/viewport.rs:259`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportInfo` (struct) — `egui-0.35.0/src/data/input/viewport_info.rs:28`
+### `ViewportInfo` (struct) — `egui-0.36.2/src/data/input/viewport_info.rs:28`
 
 Information about the current viewport, given as input each frame.
 
@@ -5707,17 +5722,17 @@ Public fields:
 
 Methods:
 
-- `fn close_requested(&self) -> bool` — `egui-0.35.0/src/data/input/viewport_info.rs:111`
+- `fn close_requested(&self) -> bool` — `egui-0.36.2/src/data/input/viewport_info.rs:111`
   This viewport has been told to close.
-- `fn take(&mut self) -> Self` — `egui-0.35.0/src/data/input/viewport_info.rs:116`
+- `fn take(&mut self) -> Self` — `egui-0.36.2/src/data/input/viewport_info.rs:116`
   Helper: move [`Self::events`], clone the other fields.
-- `fn ui(&self, ui: &mut Ui)` — `egui-0.35.0/src/data/input/viewport_info.rs:133`
-- `fn visible(&self) -> Option<bool>` — `egui-0.35.0/src/data/input/viewport_info.rs:95`
+- `fn ui(&self, ui: &mut Ui)` — `egui-0.36.2/src/data/input/viewport_info.rs:133`
+- `fn visible(&self) -> Option<bool>` — `egui-0.36.2/src/data/input/viewport_info.rs:95`
   Is the window considered visible for rendering purposes?
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ViewportOutput` (struct) — `egui-0.35.0/src/viewport.rs:1248`
+### `ViewportOutput` (struct) — `egui-0.36.2/src/viewport.rs:1247`
 
 Describes a viewport, i.e. a native window.
 
@@ -5732,12 +5747,12 @@ Public fields:
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `egui-0.35.0/src/viewport.rs:1284`
+- `fn append(&mut self, newer: Self)` — `egui-0.36.2/src/viewport.rs:1283`
   Add on new output.
 
 Implements: `Clone`
 
-### `Visuals` (struct) — `egui-0.35.0/src/style.rs:985`
+### `Visuals` (struct) — `egui-0.36.2/src/style.rs:989`
 
 Controls the visual style (colors etc) of egui.
 
@@ -5768,7 +5783,7 @@ Public fields:
 - `popup_shadow: Shadow`
 - `resize_corner_size: f32`
 - `text_cursor: TextCursorStyle` — How the text cursor acts.
-- `clip_rect_margin: f32` — Allow widgets to paint this much outside the scroll area rect.
+- `clip_rect_margin: f32` — Unused. Kept only for backwards compatibility.
 - `button_frame: bool` — Show a background behind buttons.
 - `collapsing_header_frame: bool` — Show a background behind collapsing headers.
 - `indent_has_left_vline: bool` — Draw a vertical line left of indented region, in e.g. [`crate::CollapsingHeader`].
@@ -5782,30 +5797,30 @@ Public fields:
 
 Methods:
 
-- `fn dark() -> Self` — `egui-0.35.0/src/style.rs:1490`
+- `fn dark() -> Self` — `egui-0.36.2/src/style.rs:1498`
   Default dark theme.
-- `fn disable(&self, color: Color32) -> Color32` — `egui-0.35.0/src/style.rs:1172`
+- `fn disable(&self, color: Color32) -> Color32` — `egui-0.36.2/src/style.rs:1178`
   Returns a "disabled" version of the given color.
-- `fn disabled_alpha(&self) -> f32` — `egui-0.35.0/src/style.rs:1163`
+- `fn disabled_alpha(&self) -> f32` — `egui-0.36.2/src/style.rs:1169`
   Disabled widgets have their alpha modified by this.
-- `fn gray_out(&self, color: Color32) -> Color32` — `egui-0.35.0/src/style.rs:1179`
+- `fn gray_out(&self, color: Color32) -> Color32` — `egui-0.36.2/src/style.rs:1185`
   Returns a "grayed out" version of the given color.
-- `fn light() -> Self` — `egui-0.35.0/src/style.rs:1557`
+- `fn light() -> Self` — `egui-0.36.2/src/style.rs:1565`
   Default light theme.
-- `fn noninteractive(&self) -> &WidgetVisuals` — `egui-0.35.0/src/style.rs:1125`
-- `fn strong_text_color(&self) -> Color32` — `egui-0.35.0/src/style.rs:1141`
-- `fn text_color(&self) -> Color32` — `egui-0.35.0/src/style.rs:1130`
-- `fn text_edit_bg_color(&self) -> Color32` — `egui-0.35.0/src/style.rs:1146`
+- `fn noninteractive(&self) -> &WidgetVisuals` — `egui-0.36.2/src/style.rs:1131`
+- `fn strong_text_color(&self) -> Color32` — `egui-0.36.2/src/style.rs:1147`
+- `fn text_color(&self) -> Color32` — `egui-0.36.2/src/style.rs:1136`
+- `fn text_edit_bg_color(&self) -> Color32` — `egui-0.36.2/src/style.rs:1152`
   The background color of [`crate::TextEdit`].
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2266`
-- `fn weak_text_color(&self) -> Color32` — `egui-0.35.0/src/style.rs:1135`
-- `fn window_fill(&self) -> Color32` — `egui-0.35.0/src/style.rs:1152`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2280`
+- `fn weak_text_color(&self) -> Color32` — `egui-0.36.2/src/style.rs:1141`
+- `fn window_fill(&self) -> Color32` — `egui-0.36.2/src/style.rs:1158`
   Window background color.
-- `fn window_stroke(&self) -> Stroke` — `egui-0.35.0/src/style.rs:1157`
+- `fn window_stroke(&self) -> Stroke` — `egui-0.36.2/src/style.rs:1163`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WidgetInfo` (struct) — `egui-0.35.0/src/data/output.rs:538`
+### `WidgetInfo` (struct) — `egui-0.36.2/src/data/output.rs:563`
 
 Describes a widget such as a [`crate::Button`] or a [`crate::TextEdit`].
 
@@ -5823,20 +5838,20 @@ Public fields:
 
 Methods:
 
-- `fn description(&self) -> String` — `egui-0.35.0/src/data/output.rs:710`
+- `fn description(&self) -> String` — `egui-0.36.2/src/data/output.rs:735`
   This can be used by a text-to-speech system to describe the widget.
-- `fn drag_value(enabled: bool, value: f64) -> Self` — `egui-0.35.0/src/data/output.rs:652`
-- `fn labeled(typ: WidgetType, enabled: bool, label: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:633`
-- `fn new(typ: WidgetType) -> Self` — `egui-0.35.0/src/data/output.rs:618`
-- `fn selected(typ: WidgetType, enabled: bool, selected: bool, label: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:643`
+- `fn drag_value(enabled: bool, value: f64) -> Self` — `egui-0.36.2/src/data/output.rs:677`
+- `fn labeled(typ: WidgetType, enabled: bool, label: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:658`
+- `fn new(typ: WidgetType) -> Self` — `egui-0.36.2/src/data/output.rs:643`
+- `fn selected(typ: WidgetType, enabled: bool, selected: bool, label: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:668`
   checkboxes, radio-buttons etc
-- `fn slider(enabled: bool, value: f64, label: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:661`
-- `fn text_edit(enabled: bool, prev_text_value: impl ToString, text_value: impl ToString, hint_text: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:672`
-- `fn text_selection_changed(enabled: bool, text_selection: Range<CharIndex>, current_text_value: impl ToString) -> Self` — `egui-0.35.0/src/data/output.rs:696`
+- `fn slider(enabled: bool, value: f64, label: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:686`
+- `fn text_edit(enabled: bool, prev_text_value: impl ToString, text_value: impl ToString, hint_text: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:697`
+- `fn text_selection_changed(enabled: bool, text_selection: Range<CharIndex>, current_text_value: impl ToString) -> Self` — `egui-0.36.2/src/data/output.rs:721`
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WidgetRect` (struct) — `egui-0.35.0/src/widget_rect.rs:9`
+### `WidgetRect` (struct) — `egui-0.36.2/src/widget_rect.rs:9`
 
 Used to store each widget's [Id], [Rect] and [Sense] each frame.
 
@@ -5852,366 +5867,391 @@ Public fields:
 
 Methods:
 
-- `fn transform(self, transform: TSTransform) -> Self` — `egui-0.35.0/src/widget_rect.rs:52`
+- `fn transform(self, transform: TSTransform) -> Self` — `egui-0.36.2/src/widget_rect.rs:52`
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `WidgetRects` (struct) — `egui-0.35.0/src/widget_rect.rs:94`
+### `WidgetRects` (struct) — `egui-0.36.2/src/widget_rect.rs:94`
 
 Stores the [`WidgetRect`]s of all widgets generated during a single egui update/frame.
 
 Methods:
 
-- `fn clear(&mut self)` — `egui-0.35.0/src/widget_rect.rs:148`
+- `fn clear(&mut self)` — `egui-0.36.2/src/widget_rect.rs:148`
   Clear the contents while retaining allocated memory.
-- `fn contains(&self, id: Id) -> bool` — `egui-0.35.0/src/widget_rect.rs:137`
-- `fn get(&self, id: Id) -> Option<&WidgetRect>` — `egui-0.35.0/src/widget_rect.rs:127`
-- `fn get_layer(&self, layer_id: LayerId) -> impl Iterator<Item = &WidgetRect> + '_` — `egui-0.35.0/src/widget_rect.rs:143`
+- `fn contains(&self, id: Id) -> bool` — `egui-0.36.2/src/widget_rect.rs:137`
+- `fn get(&self, id: Id) -> Option<&WidgetRect>` — `egui-0.36.2/src/widget_rect.rs:127`
+- `fn get_layer(&self, layer_id: LayerId) -> impl Iterator<Item = &WidgetRect> + '_` — `egui-0.36.2/src/widget_rect.rs:143`
   All widgets in this layer, sorted back-to-front.
-- `fn info(&self, id: Id) -> Option<&WidgetInfo>` — `egui-0.35.0/src/widget_rect.rs:230`
-- `fn insert(&mut self, layer_id: LayerId, widget_rect: WidgetRect, options: InteractOptions)` — `egui-0.35.0/src/widget_rect.rs:166`
+- `fn info(&self, id: Id) -> Option<&WidgetInfo>` — `egui-0.36.2/src/widget_rect.rs:230`
+- `fn insert(&mut self, layer_id: LayerId, widget_rect: WidgetRect, options: InteractOptions)` — `egui-0.36.2/src/widget_rect.rs:166`
   Insert the given widget rect in the given layer.
-- `fn layer_ids(&self) -> impl ExactSizeIterator<Item = LayerId> + '_` — `egui-0.35.0/src/widget_rect.rs:116`
+- `fn layer_ids(&self) -> impl ExactSizeIterator<Item = LayerId> + '_` — `egui-0.36.2/src/widget_rect.rs:116`
   All known layers with widgets.
-- `fn layers(&self) -> impl Iterator<Item = (&LayerId, &[WidgetRect])> + '_` — `egui-0.35.0/src/widget_rect.rs:120`
-- `fn order(&self, id: Id) -> Option<(LayerId, usize)>` — `egui-0.35.0/src/widget_rect.rs:132`
+- `fn layers(&self) -> impl Iterator<Item = (&LayerId, &[WidgetRect])> + '_` — `egui-0.36.2/src/widget_rect.rs:120`
+- `fn order(&self, id: Id) -> Option<(LayerId, usize)>` — `egui-0.36.2/src/widget_rect.rs:132`
   In which layer, and in which order in that layer?
-- `fn set_info(&mut self, id: Id, info: WidgetInfo)` — `egui-0.35.0/src/widget_rect.rs:226`
+- `fn set_info(&mut self, id: Id, info: WidgetInfo)` — `egui-0.36.2/src/widget_rect.rs:226`
 
 Implements: `Clone`, `Default`, `PartialEq`
 
-### `Window` (struct) — `egui-0.35.0/src/containers/window.rs:82`
+### `Window` (struct) — `egui-0.36.2/src/containers/window.rs:82`
 
 Builder for a floating window which can be dragged, closed, collapsed, resized and scrolled (off by default).
 
 Methods:
 
-- `fn anchor(self, align: Align2, offset: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/window.rs:383`
+- `fn anchor(self, align: Align2, offset: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/window.rs:392`
   Set anchor and distance.
-- `fn auto_sized(self) -> Self` — `egui-0.35.0/src/containers/window.rs:478`
+- `fn auto_sized(self) -> Self` — `egui-0.36.2/src/containers/window.rs:487`
   Not resizable, just takes the size of its contents. Also disabled scrolling. Text will not wrap, but will ins…
-- `fn collapsible(self, collapsible: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:461`
+- `fn collapsible(self, collapsible: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:470`
   Can the window be collapsed by clicking on its title?
-- `fn constrain(self, constrain: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:344`
+- `fn constrain(self, constrain: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:353`
   Constrains this window to [`Context::content_rect`].
-- `fn constrain_to(self, constrain_rect: Rect) -> Self` — `egui-0.35.0/src/containers/window.rs:353`
+- `fn constrain_to(self, constrain_rect: Rect) -> Self` — `egui-0.36.2/src/containers/window.rs:362`
   Constrain the movement of the window to the given rectangle.
-- `fn current_pos(self, current_pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/window.rs:319`
+- `fn current_pos(self, current_pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/window.rs:328`
   Set current position of the window. If the window is movable it is up to you to keep track of where it moved…
-- `fn default_height(self, default_height: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:417`
+- `fn default_height(self, default_height: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:426`
   Set initial height of the window.
-- `fn default_open(self, default_open: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:390`
+- `fn default_open(self, default_open: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:399`
   Set initial collapsed state of the window
-- `fn default_pos(self, default_pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/window.rs:326`
+- `fn default_pos(self, default_pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/window.rs:335`
   Set initial position of the window.
-- `fn default_rect(self, rect: Rect) -> Self` — `egui-0.35.0/src/containers/window.rs:434`
+- `fn default_rect(self, rect: Rect) -> Self` — `egui-0.36.2/src/containers/window.rs:443`
   Set initial position and size of the window.
-- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/window.rs:400`
+- `fn default_size(self, default_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/window.rs:409`
   Set initial size of the window.
-- `fn default_width(self, default_width: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:409`
+- `fn default_width(self, default_width: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:418`
   Set initial width of the window.
-- `fn drag_area(self, drag_area: WindowDrag) -> Self` — `egui-0.35.0/src/containers/window.rs:213`
+- `fn drag_area(self, drag_area: WindowDrag) -> Self` — `egui-0.36.2/src/containers/window.rs:215`
   Where the user can grab the window to move it.
-- `fn drag_to_scroll(self, drag_to_scroll: DragScroll) -> Self` — `egui-0.35.0/src/containers/window.rs:514`
+- `fn drag_to_scroll(self, drag_to_scroll: DragScroll) -> Self` — `egui-0.36.2/src/containers/window.rs:523`
   Controls scrolling the window by dragging the contents with the pointer.
-- `fn enabled(self, enabled: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:178`
+- `fn enabled(self, enabled: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:180`
   If `false` the window will be grayed out and non-interactive.
-- `fn fade_in(self, fade_in: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:229`
+- `fn fade_in(self, fade_in: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:231`
   If `true`, quickly fade in the `Window` when it first appears.
-- `fn fade_out(self, fade_out: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:240`
+- `fn fade_out(self, fade_out: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:242`
   If `true`, quickly fade out the `Window` when it closes.
-- `fn fixed_pos(self, pos: impl Into<Pos2>) -> Self` — `egui-0.35.0/src/containers/window.rs:333`
+- `fn fixed_pos(self, pos: impl Into<Pos2>) -> Self` — `egui-0.36.2/src/containers/window.rs:342`
   Sets the window position and prevents it from being dragged around.
-- `fn fixed_rect(self, rect: Rect) -> Self` — `egui-0.35.0/src/containers/window.rs:439`
+- `fn fixed_rect(self, rect: Rect) -> Self` — `egui-0.36.2/src/containers/window.rs:448`
   Sets the window pos and size and prevents it from being moved and resized by dragging its edges.
-- `fn fixed_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/window.rs:428`
+- `fn fixed_size(self, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/window.rs:437`
   Sets the window size and prevents it from being resized by dragging its edges.
-- `fn frame(self, frame: Frame) -> Self` — `egui-0.35.0/src/containers/window.rs:263`
+- `fn frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/window.rs:265`
   Change the background color, margins, etc.
-- `fn from_viewport(id: ViewportId, viewport: ViewportBuilder) -> Self` — `egui-0.35.0/src/containers/window.rs:124`
+- `fn from_viewport(id: ViewportId, viewport: ViewportBuilder) -> Self` — `egui-0.36.2/src/containers/window.rs:126`
   Construct a [`Window`] that follows the given viewport.
-- `fn hscroll(self, hscroll: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:496`
+- `fn hscroll(self, hscroll: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:505`
   Enable/disable horizontal scrolling. `false` by default.
-- `fn id(self, id: Id) -> Self` — `egui-0.35.0/src/containers/window.rs:160`
+- `fn id(self, id: Id) -> Self` — `egui-0.36.2/src/containers/window.rs:162`
   Assign a unique id to the Window. Required if the title changes, or is shared with another window.
-- `fn interactable(self, interactable: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:189`
+- `fn interactable(self, interactable: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:191`
   If false, clicks goes straight through to what is behind us.
-- `fn max_height(self, max_height: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:301`
+- `fn max_height(self, max_height: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:310`
   Set maximum height of the window.
-- `fn max_size(self, max_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/window.rs:311`
+- `fn max_size(self, max_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/window.rs:320`
   Set maximum size of the window, equivalent to calling both `max_width` and `max_height`.
-- `fn max_width(self, max_width: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:294`
+- `fn max_width(self, max_width: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:303`
   Set maximum width of the window.
-- `fn min_height(self, min_height: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:277`
+- `fn min_height(self, min_height: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:286`
   Set minimum height of the window.
-- `fn min_size(self, min_size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/containers/window.rs:287`
+- `fn min_size(self, min_size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/containers/window.rs:296`
   Set minimum size of the window, equivalent to calling both `min_width` and `min_height`.
-- `fn min_width(self, min_width: f32) -> Self` — `egui-0.35.0/src/containers/window.rs:270`
+- `fn min_width(self, min_width: f32) -> Self` — `egui-0.36.2/src/containers/window.rs:279`
   Set minimum width of the window.
-- `fn movable(self, movable: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:199`
+- `fn movable(self, movable: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:201`
   If `false` the window will be immovable.
-- `fn mutate(self, mutate: impl Fn(&mut Self)) -> Self` — `egui-0.35.0/src/containers/window.rs:248`
+- `fn mutate(self, mutate: impl Fn(&mut Self)) -> Self` — `egui-0.36.2/src/containers/window.rs:250`
   Usage: `Window::new(…).mutate(|w| w.resize = w.resize.auto_expand_width(true))`
-- `fn new(title: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/containers/window.rs:101`
+- `fn new(title: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/containers/window.rs:102`
   The window title is used as a unique [`Id`] and must be unique, and should not change. This is true even if y…
-- `fn open(self, open: &'a mut bool) -> Self` — `egui-0.35.0/src/containers/window.rs:171`
+- `fn open(self, open: &'a mut bool) -> Self` — `egui-0.36.2/src/containers/window.rs:173`
   Call this to add a close-button to the window title bar.
-- `fn order(self, order: Order) -> Self` — `egui-0.35.0/src/containers/window.rs:220`
+- `fn order(self, order: Order) -> Self` — `egui-0.36.2/src/containers/window.rs:222`
   `order(Order::Foreground)` for a Window that should always be on top
-- `fn pivot(self, pivot: Align2) -> Self` — `egui-0.35.0/src/containers/window.rs:366`
+- `fn pivot(self, pivot: Align2) -> Self` — `egui-0.36.2/src/containers/window.rs:375`
   Where the "root" of the window is.
-- `fn resizable(self, resizable: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/window.rs:453`
+- `fn resizable(self, resizable: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/window.rs:462`
   Can the user resize the window by dragging its edges?
-- `fn resize(self, mutate: impl Fn(Resize) -> Resize) -> Self` — `egui-0.35.0/src/containers/window.rs:256`
+- `fn resize(self, mutate: impl Fn(Resize) -> Resize) -> Self` — `egui-0.36.2/src/containers/window.rs:258`
   Usage: `Window::new(…).resize(|r| r.auto_expand_width(true))`
-- `fn scroll(self, scroll: impl Into<Vec2b>) -> Self` — `egui-0.35.0/src/containers/window.rs:489`
+- `fn scroll(self, scroll: impl Into<Vec2b>) -> Self` — `egui-0.36.2/src/containers/window.rs:498`
   Enable/disable horizontal/vertical scrolling. `false` by default.
-- `fn scroll_bar_visibility(self, visibility: ScrollBarVisibility) -> Self` — `egui-0.35.0/src/containers/window.rs:524`
+- `fn scroll_bar_visibility(self, visibility: ScrollBarVisibility) -> Self` — `egui-0.36.2/src/containers/window.rs:533`
   Sets the [`ScrollBarVisibility`] of the window.
-- `fn show<R>(self, ctx: &Context, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<Option<R>>>` — `egui-0.35.0/src/containers/window.rs:534`
+- `fn show<R>(self, ctx: &Context, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<Option<R>>>` — `egui-0.36.2/src/containers/window.rs:543`
   Returns `None` if the window is not open (if [`Window::open`] was called with `&mut false`). Returns `Some(In…
-- `fn title_bar(self, title_bar: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:469`
+- `fn title_bar(self, title_bar: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:478`
   Show title bar on top of the window? If `false`, the window will not be collapsible nor have a close-button.
-- `fn vscroll(self, vscroll: bool) -> Self` — `egui-0.35.0/src/containers/window.rs:503`
+- `fn title_frame(self, frame: Frame) -> Self` — `egui-0.36.2/src/containers/window.rs:272`
+  Change the background color, margins, etc. of the title
+- `fn vscroll(self, vscroll: bool) -> Self` — `egui-0.36.2/src/containers/window.rs:512`
   Enable/disable vertical scrolling. `false` by default.
 
-### `AsId` (trait) — `egui-0.35.0/src/id.rs:11`
+### `AsId` (trait) — `egui-0.36.2/src/id.rs:11`
 
 Types that can be converted to an [`Id`].
 
 Required/provided items:
 
 
-### `AsIdSalt` (trait) — `egui-0.35.0/src/id_salt.rs:7`
+### `AsIdSalt` (trait) — `egui-0.36.2/src/id_salt.rs:7`
 
 Types that can be converted to an [`IdSalt`].
 
 Required/provided items:
 
 
-### `AtomExt` (trait) — `egui-0.35.0/src/atomics/atom_ext.rs:7`
+### `AtomExt` (trait) — `egui-0.36.2/src/atomics/atom_ext.rs:7`
 
 A trait for conveniently building [`Atom`]s.
 
 Required/provided items:
 
-- `fn atom_id(self, id: Id) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:12`
+- `fn atom_id(self, id: Id) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:12`
   Set the [`Id`] for custom rendering.
-- `fn atom_size(self, size: Vec2) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:23`
+- `fn atom_size(self, size: Vec2) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:23`
   Set the atom to a fixed size.
-- `fn atom_grow(self, grow: bool) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:32`
+- `fn atom_grow(self, grow: bool) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:32`
   Grow this atom to the available space.
-- `fn atom_shrink(self, shrink: bool) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:43`
+- `fn atom_shrink(self, shrink: bool) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:43`
   Shrink this atom if there isn't enough space.
-- `fn atom_max_size(self, max_size: Vec2) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:49`
+- `fn atom_max_size(self, max_size: Vec2) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:49`
   Set the maximum size of this atom.
-- `fn atom_max_width(self, max_width: f32) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:55`
+- `fn atom_max_width(self, max_width: f32) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:55`
   Set the maximum width of this atom.
-- `fn atom_max_height(self, max_height: f32) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:58`
+- `fn atom_max_height(self, max_height: f32) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:58`
   Set the maximum height of this atom.
-- `fn atom_max_height_font_size(self, ui: &Ui) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:63`
+- `fn atom_max_height_font_size(self, ui: &Ui) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:63`
   Set the max height of this atom to match the font size.
-- `fn atom_align(self, align: Align2) -> Atom<'a>` — `egui-0.35.0/src/atomics/atom_ext.rs:76`
+- `fn atom_align(self, align: Align2) -> Atom<'a>` — `egui-0.36.2/src/atomics/atom_ext.rs:76`
   Sets the [`emath::Align2`] of a single atom within its available space.
 
-### `IntoAtoms` (trait) — `egui-0.35.0/src/atomics/atoms.rs:209`
+### `DroppedFile` (trait) — `egui-0.36.2/src/data/input/dropped_file.rs:10`
+
+A file dropped into egui.
+
+Required/provided items:
+
+- `fn path(&self) -> &Path` — `egui-0.36.2/src/data/input/dropped_file.rs:15`
+  The path of the dropped file.
+- `fn bytes(&self) -> Result<Vec<u8>, String>` — `egui-0.36.2/src/data/input/dropped_file.rs:33`
+  Read the file contents.
+
+### `IntoAtoms` (trait) — `egui-0.36.2/src/atomics/atoms.rs:209`
 
 Trait for turning a tuple of [`Atom`]s into [`Atoms`].
 
 Required/provided items:
 
-- `fn collect(self, atoms: &mut Atoms<'a>)` — `egui-0.35.0/src/atomics/atoms.rs:210`
-- `fn into_atoms(self) -> Atoms<'a>` — `egui-0.35.0/src/atomics/atoms.rs:212`
+- `fn collect(self, atoms: &mut Atoms<'a>)` — `egui-0.36.2/src/atomics/atoms.rs:210`
+- `fn into_atoms(self) -> Atoms<'a>` — `egui-0.36.2/src/atomics/atoms.rs:212`
 
-### `NumExt` (trait) — `emath-0.35.0/src/lib.rs:321`
+### `NumExt` (trait) — `emath-0.36.2/src/lib.rs:321`
 
 Extends `f32`, [`Vec2`] etc with `at_least` and `at_most` as aliases for `max` and `min`.
 
 Required/provided items:
 
-- `fn at_least(self, lower_limit: Self) -> Self` — `emath-0.35.0/src/lib.rs:324`
+- `fn at_least(self, lower_limit: Self) -> Self` — `emath-0.36.2/src/lib.rs:324`
   More readable version of `self.max(lower_limit)`
-- `fn at_most(self, upper_limit: Self) -> Self` — `emath-0.35.0/src/lib.rs:328`
+- `fn at_most(self, upper_limit: Self) -> Self` — `emath-0.36.2/src/lib.rs:328`
   More readable version of `self.min(upper_limit)`
 
-### `Plugin` (trait) — `egui-0.35.0/src/plugin.rs:13`
+### `Plugin` (trait) — `egui-0.36.2/src/plugin.rs:13`
 
 A plugin to extend egui.
 
 Required/provided items:
 
-- `fn debug_name(&self) -> &'static str` — `egui-0.35.0/src/plugin.rs:17`
+- `fn debug_name(&self) -> &'static str` — `egui-0.36.2/src/plugin.rs:17`
   Plugin name.
-- `fn setup(&mut self, ctx: &Context)` — `egui-0.35.0/src/plugin.rs:22`
+- `fn setup(&mut self, ctx: &Context)` — `egui-0.36.2/src/plugin.rs:22`
   Called once, when the plugin is registered.
-- `fn on_begin_pass(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/plugin.rs:27`
+- `fn on_begin_pass(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/plugin.rs:27`
   Called at the start of each pass.
-- `fn on_end_pass(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/plugin.rs:32`
+- `fn on_end_pass(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/plugin.rs:32`
   Called at the end of each pass.
-- `fn input_hook(&mut self, ctx: &Context, input: &mut RawInput)` — `egui-0.35.0/src/plugin.rs:38`
+- `fn input_hook(&mut self, ctx: &Context, input: &mut RawInput)` — `egui-0.36.2/src/plugin.rs:38`
   Called just before the input is processed.
-- `fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput)` — `egui-0.35.0/src/plugin.rs:44`
+- `fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput)` — `egui-0.36.2/src/plugin.rs:44`
   Called just before the output is passed to the backend.
-- `fn on_widget_under_pointer(&mut self, ctx: &Context, widget: &WidgetRect)` — `egui-0.35.0/src/plugin.rs:51`
+- `fn on_widget_under_pointer(&mut self, ctx: &Context, widget: &WidgetRect)` — `egui-0.36.2/src/plugin.rs:51`
   Called when a widget is created and is under the pointer.
 
-### `TextBuffer` (trait) — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:25`
+### `TextBuffer` (trait) — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:26`
 
 Trait constraining what types [`crate::TextEdit`] may use as an underlying buffer.
 
 Required/provided items:
 
-- `fn is_mutable(&self) -> bool` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:27`
+- `fn is_mutable(&self) -> bool` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:28`
   Can this text be edited?
-- `fn as_str(&self) -> &str` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:30`
+- `fn as_str(&self) -> &str` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:31`
   Returns this buffer as a `str`.
-- `fn insert_text(&mut self, text: &str, char_index: CharIndex) -> usize` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:39`
+- `fn insert_text(&mut self, text: &str, char_index: CharIndex) -> usize` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:40`
   Inserts text `text` into this buffer at character index `char_index`.
-- `fn delete_char_range(&mut self, char_range: Range<CharIndex>)` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:45`
+- `fn delete_char_range(&mut self, char_range: Range<CharIndex>)` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:46`
   Deletes a range of text `char_range` from this buffer.
-- `fn char_range(&self, char_range: Range<CharIndex>) -> &str` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:48`
+- `fn char_range(&self, char_range: Range<CharIndex>) -> &str` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:49`
   Reads the given character range.
-- `fn byte_index_from_char_index(&self, char_index: CharIndex) -> ByteIndex` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:52`
-- `fn char_index_from_byte_index(&self, byte_index: ByteIndex) -> CharIndex` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:56`
-- `fn clear(&mut self)` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:61`
+- `fn byte_index_from_char_index(&self, char_index: CharIndex) -> ByteIndex` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:53`
+- `fn char_index_from_byte_index(&self, byte_index: ByteIndex) -> CharIndex` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:57`
+- `fn clear(&mut self)` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:62`
   Clears all characters in this buffer
-- `fn replace_with(&mut self, text: &str)` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:66`
+- `fn replace_with(&mut self, text: &str)` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:67`
   Replaces all contents of this string with `text`
-- `fn take(&mut self) -> String` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:72`
+- `fn take(&mut self) -> String` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:73`
   Clears all characters in this buffer and returns a string of the contents.
-- `fn insert_text_at(&mut self, ccursor: &mut CCursor, text_to_insert: &str, char_limit: usize)` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:78`
-- `fn decrease_indentation(&mut self, ccursor: &mut CCursor)` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:95`
-- `fn delete_selected(&mut self, cursor_range: &CCursorRange) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:120`
-- `fn delete_selected_ccursor_range(&mut self, [min, max]: [CCursor; 2]) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:125`
-- `fn delete_previous_char(&mut self, ccursor: CCursor) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:133`
-- `fn delete_next_char(&mut self, ccursor: CCursor) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:143`
-- `fn delete_previous_word(&mut self, max_ccursor: CCursor) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:147`
-- `fn delete_next_word(&mut self, min_ccursor: CCursor) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:152`
-- `fn delete_paragraph_before_cursor(&mut self, galley: &Galley, cursor_range: &CCursorRange) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:157`
-- `fn delete_paragraph_after_cursor(&mut self, galley: &Galley, cursor_range: &CCursorRange) -> CCursor` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:171`
-- `fn type_id(&self) -> TypeId` — `egui-0.35.0/src/widgets/text_edit/text_buffer.rs:216`
+- `fn insert_text_at(&mut self, ccursor: &mut CCursor, text_to_insert: &str, char_limit: usize)` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:79`
+- `fn decrease_indentation(&mut self, ccursor: &mut CCursor)` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:96`
+- `fn delete_selected(&mut self, cursor_range: &CCursorRange) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:121`
+- `fn delete_selected_ccursor_range(&mut self, [min, max]: [CCursor; 2]) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:126`
+- `fn delete_previous_char(&mut self, ccursor: CCursor) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:134`
+- `fn delete_next_char(&mut self, ccursor: CCursor) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:144`
+- `fn delete_previous_word(&mut self, max_ccursor: CCursor) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:148`
+- `fn delete_next_word(&mut self, min_ccursor: CCursor) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:153`
+- `fn delete_surrounding_chars(&mut self, cursor_range: CCursorRange, before_chars: usize, after_chars: usize) -> CCursorRange` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:164`
+  Deletes characters surrounding the current cursor range.
+- `fn delete_paragraph_before_cursor(&mut self, galley: &Galley, cursor_range: &CCursorRange) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:182`
+- `fn delete_paragraph_after_cursor(&mut self, galley: &Galley, cursor_range: &CCursorRange) -> CCursor` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:196`
+- `fn type_id(&self) -> TypeId` — `egui-0.36.2/src/widgets/text_edit/text_buffer.rs:241`
   Returns a unique identifier for the implementing type.
 
-### `Widget` (trait) — `egui-0.35.0/src/widgets/mod.rs:57`
+### `Widget` (trait) — `egui-0.36.2/src/widgets/mod.rs:63`
 
 Anything implementing Widget can be added to a [`Ui`] with [`Ui::add`].
 
 Required/provided items:
 
-- `fn ui(self, ui: &mut Ui) -> Response` — `egui-0.35.0/src/widgets/mod.rs:65`
+- `fn ui(self, ui: &mut Ui) -> Response` — `egui-0.36.2/src/widgets/mod.rs:71`
   Allocate space, interact, paint, and return a [`Response`].
+- `fn boxed(self) -> BoxedWidget<'a>` — `egui-0.36.2/src/widgets/mod.rs:75`
+  Box this widget for dynamic dispatch.
 
-### `WidgetWithState` (trait) — `egui-0.35.0/src/widgets/mod.rs:94`
+### `WidgetWithState` (trait) — `egui-0.36.2/src/widgets/mod.rs:114`
 
 Helper so that you can do e.g. `TextEdit::State::load`.
 
 Required/provided items:
 
 
-### `AtomClosure` (type_alias) — `egui-0.35.0/src/atomics/atom_kind.rs:22`
+### `AtomClosure` (type_alias) — `egui-0.36.2/src/atomics/atom_kind.rs:22`
 
 See [`AtomKind::Closure`]
 
-### `DeferredViewportUiCallback` (type_alias) — `egui-0.35.0/src/viewport.rs:266`
+### `BoxedWidget` (type_alias) — `egui-0.36.2/src/widgets/mod.rs:13`
+
+A dynamically dispatched [`Widget`].
+
+### `DeferredViewportUiCallback` (type_alias) — `egui-0.36.2/src/viewport.rs:265`
 
 The user-code that shows the ui in the viewport, used for deferred viewports.
 
-### `IconPainter` (type_alias) — `egui-0.35.0/src/containers/combo_box.rs:15`
+### `DroppedFileHandle` (type_alias) — `egui-0.36.2/src/data/input/dropped_file.rs:44`
+
+A shared reference to a dropped file.
+
+### `IconPainter` (type_alias) — `egui-0.36.2/src/containers/combo_box.rs:15`
 
 A function that paints the [`ComboBox`] icon
 
-### `IdMap` (type_alias) — `egui-0.35.0/src/id.rs:163`
+### `IdMap` (type_alias) — `egui-0.36.2/src/id.rs:163`
 
 `IdMap<V>` is a `HashMap<Id, V>` optimized by knowing that [`Id`] has good entropy, and doesn't need more hashing.
 
-### `IdSet` (type_alias) — `egui-0.35.0/src/id.rs:160`
+### `IdSet` (type_alias) — `egui-0.36.2/src/id.rs:160`
 
 `IdSet` is a `HashSet<Id>` optimized by knowing that [`Id`] has good entropy, and doesn't need more hashing.
 
-### `ImmediateViewportRendererCallback` (type_alias) — `egui-0.35.0/src/viewport.rs:269`
+### `ImmediateViewportRendererCallback` (type_alias) — `egui-0.36.2/src/viewport.rs:268`
 
 Render the given viewport, calling the given ui callback.
 
-### `OrderedViewportIdMap` (type_alias) — `egui-0.35.0/src/viewport.rs:174`
+### `OrderedViewportIdMap` (type_alias) — `egui-0.36.2/src/viewport.rs:173`
 
 An order map from [`ViewportId`] to `T`.
 
-### `ViewportIdMap` (type_alias) — `egui-0.35.0/src/viewport.rs:171`
+### `ViewportIdMap` (type_alias) — `egui-0.36.2/src/viewport.rs:170`
 
 A fast hash map from [`ViewportId`] to `T`.
 
-### `ViewportIdSet` (type_alias) — `egui-0.35.0/src/viewport.rs:168`
+### `ViewportIdSet` (type_alias) — `egui-0.36.2/src/viewport.rs:167`
 
 A fast hash set of [`ViewportId`].
 
 
 ## `egui::cache`
 
-### `CacheStorage` (struct) — `egui-0.35.0/src/cache/cache_storage.rs:25`
+### `CacheStorage` (struct) — `egui-0.36.2/src/cache/cache_storage.rs:25`
 
 A typemap of many caches, all implemented with [`CacheTrait`].
 
 Methods:
 
-- `fn cache<Cache>(&mut self) -> &mut Cache` — `egui-0.35.0/src/cache/cache_storage.rs:30`
-- `fn update(&mut self)` — `egui-0.35.0/src/cache/cache_storage.rs:48`
+- `fn cache<Cache>(&mut self) -> &mut Cache` — `egui-0.36.2/src/cache/cache_storage.rs:30`
+- `fn update(&mut self)` — `egui-0.36.2/src/cache/cache_storage.rs:48`
   Call once per frame to evict cache.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `FrameCache` (struct) — `egui-0.35.0/src/cache/frame_cache.rs:12`
+### `FrameCache` (struct) — `egui-0.36.2/src/cache/frame_cache.rs:12`
 
 Caches the results of a computation for one frame. If it is still used next frame, it is not recomputed. If it is not used next frame, it is evicted from the cache to sa…
 
 Methods:
 
-- `fn evict_cache(&mut self)` — `egui-0.35.0/src/cache/frame_cache.rs:37`
+- `fn evict_cache(&mut self)` — `egui-0.36.2/src/cache/frame_cache.rs:37`
   Must be called once per frame to clear the cache.
-- `fn get<Key>(&mut self, key: Key) -> &Value` — `egui-0.35.0/src/cache/frame_cache.rs:49`
+- `fn get<Key>(&mut self, key: Key) -> &Value` — `egui-0.36.2/src/cache/frame_cache.rs:49`
   Get from cache (if the same key was used last frame) or recompute and store in the cache.
-- `fn new(computer: Computer) -> Self` — `egui-0.35.0/src/cache/frame_cache.rs:28`
+- `fn new(computer: Computer) -> Self` — `egui-0.36.2/src/cache/frame_cache.rs:28`
 
 Implements: `CacheTrait`, `Default`
 
-### `FramePublisher` (struct) — `egui-0.35.0/src/cache/frame_publisher.rs:6`
+### `FramePublisher` (struct) — `egui-0.36.2/src/cache/frame_publisher.rs:6`
 
 Stores a key:value pair for the duration of this frame and the next.
 
 Methods:
 
-- `fn evict_cache(&mut self)` — `egui-0.35.0/src/cache/frame_publisher.rs:36`
+- `fn evict_cache(&mut self)` — `egui-0.36.2/src/cache/frame_publisher.rs:36`
   Must be called once per frame to clear the cache.
-- `fn get(&self, key: &Key) -> Option<&Value>` — `egui-0.35.0/src/cache/frame_publisher.rs:31`
+- `fn get(&self, key: &Key) -> Option<&Value>` — `egui-0.36.2/src/cache/frame_publisher.rs:31`
   Retrieve a value if it was published this or the previous frame.
-- `fn new() -> Self` — `egui-0.35.0/src/cache/frame_publisher.rs:18`
-- `fn set(&mut self, key: Key, value: Value)` — `egui-0.35.0/src/cache/frame_publisher.rs:26`
+- `fn new() -> Self` — `egui-0.36.2/src/cache/frame_publisher.rs:18`
+- `fn set(&mut self, key: Key, value: Value)` — `egui-0.36.2/src/cache/frame_publisher.rs:26`
   Publish the value. It will be available for the duration of this and the next frame.
 
 Implements: `CacheTrait`, `Default`
 
-### `CacheTrait` (trait) — `egui-0.35.0/src/cache/cache_trait.rs:3`
+### `CacheTrait` (trait) — `egui-0.36.2/src/cache/cache_trait.rs:3`
 
 A cache, storing some value for some length of time.
 
 Required/provided items:
 
-- `fn update(&mut self)` — `egui-0.35.0/src/cache/cache_trait.rs:5`
+- `fn update(&mut self)` — `egui-0.36.2/src/cache/cache_trait.rs:5`
   Call once per frame to evict cache.
-- `fn len(&self) -> usize` — `egui-0.35.0/src/cache/cache_trait.rs:8`
+- `fn len(&self) -> usize` — `egui-0.36.2/src/cache/cache_trait.rs:8`
   Number of values currently in the cache.
 
-### `ComputerMut` (trait) — `egui-0.35.0/src/cache/frame_cache.rs:5`
+### `ComputerMut` (trait) — `egui-0.36.2/src/cache/frame_cache.rs:5`
 
 Something that does an expensive computation that we want to cache to save us from recomputing it each frame.
 
 Required/provided items:
 
-- `fn compute(&mut self, key: Key) -> Value` — `egui-0.35.0/src/cache/frame_cache.rs:6`
+- `fn compute(&mut self, key: Key) -> Value` — `egui-0.36.2/src/cache/frame_cache.rs:6`
 
 
 ## `egui::collapsing_header`
 
-### `paint_default_icon` — `egui-0.35.0/src/containers/collapsing_header.rs:336`
+### `paint_default_icon` — `egui-0.36.2/src/containers/collapsing_header.rs:336`
 
 ```rust
 fn paint_default_icon(ui: &mut Ui, openness: f32, response: &Response)
@@ -6219,55 +6259,55 @@ fn paint_default_icon(ui: &mut Ui, openness: f32, response: &Response)
 
 Paint the arrow icon that indicated if the region is open or not
 
-### `CollapsingState` (struct) — `egui-0.35.0/src/containers/collapsing_header.rs:25`
+### `CollapsingState` (struct) — `egui-0.36.2/src/containers/collapsing_header.rs:25`
 
 This is a a building block for building collapsing regions.
 
 Methods:
 
-- `fn id(&self) -> Id` — `egui-0.35.0/src/containers/collapsing_header.rs:46`
-- `fn is_open(&self) -> bool` — `egui-0.35.0/src/containers/collapsing_header.rs:60`
-- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.35.0/src/containers/collapsing_header.rs:31`
-- `fn load_with_default_open(ctx: &Context, id: Id, default_open: bool) -> Self` — `egui-0.35.0/src/containers/collapsing_header.rs:50`
-- `fn openness(&self, ctx: &Context) -> f32` — `egui-0.35.0/src/containers/collapsing_header.rs:74`
+- `fn id(&self) -> Id` — `egui-0.36.2/src/containers/collapsing_header.rs:46`
+- `fn is_open(&self) -> bool` — `egui-0.36.2/src/containers/collapsing_header.rs:60`
+- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.36.2/src/containers/collapsing_header.rs:31`
+- `fn load_with_default_open(ctx: &Context, id: Id, default_open: bool) -> Self` — `egui-0.36.2/src/containers/collapsing_header.rs:50`
+- `fn openness(&self, ctx: &Context) -> f32` — `egui-0.36.2/src/containers/collapsing_header.rs:74`
   0 for closed, 1 for open, with tweening
-- `fn remove(&self, ctx: &Context)` — `egui-0.35.0/src/containers/collapsing_header.rs:42`
-- `fn set_open(&mut self, open: bool)` — `egui-0.35.0/src/containers/collapsing_header.rs:64`
-- `fn show_body_indented<R>(&mut self, header_response: &Response, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/collapsing_header.rs:156`
+- `fn remove(&self, ctx: &Context)` — `egui-0.36.2/src/containers/collapsing_header.rs:42`
+- `fn set_open(&mut self, open: bool)` — `egui-0.36.2/src/containers/collapsing_header.rs:64`
+- `fn show_body_indented<R>(&mut self, header_response: &Response, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/collapsing_header.rs:156`
   Show body if we are open, with a nice animation between closed and open. Indent the body to show it belongs t…
-- `fn show_body_unindented<R>(&mut self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/collapsing_header.rs:175`
+- `fn show_body_unindented<R>(&mut self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/collapsing_header.rs:175`
   Show body if we are open, with a nice animation between closed and open. Will also store the state.
-- `fn show_header<HeaderRet>(self, ui: &mut Ui, add_header: impl FnOnce(&mut Ui) -> HeaderRet) -> HeaderResponse<'_, HeaderRet>` — `egui-0.35.0/src/containers/collapsing_header.rs:129`
+- `fn show_header<HeaderRet>(self, ui: &mut Ui, add_header: impl FnOnce(&mut Ui) -> HeaderRet) -> HeaderResponse<'_, HeaderRet>` — `egui-0.36.2/src/containers/collapsing_header.rs:129`
   Shows header and body (if expanded).
-- `fn show_toggle_button(&mut self, ui: &mut Ui, icon_fn: impl FnOnce(&mut Ui, f32, &Response) + 'static) -> Response` — `egui-0.35.0/src/containers/collapsing_header.rs:265`
+- `fn show_toggle_button(&mut self, ui: &mut Ui, icon_fn: impl FnOnce(&mut Ui, f32, &Response) + 'static) -> Response` — `egui-0.36.2/src/containers/collapsing_header.rs:265`
   Paint this [`CollapsingState`]'s toggle button. Takes an [`IconPainter`] as the icon. ``` # egui::__run_test_…
-- `fn store(&self, ctx: &Context)` — `egui-0.35.0/src/containers/collapsing_header.rs:38`
-- `fn toggle(&mut self, ui: &Ui)` — `egui-0.35.0/src/containers/collapsing_header.rs:68`
+- `fn store(&self, ctx: &Context)` — `egui-0.36.2/src/containers/collapsing_header.rs:38`
+- `fn toggle(&mut self, ui: &Ui)` — `egui-0.36.2/src/containers/collapsing_header.rs:68`
 
 Implements: `Clone`, `Debug`
 
-### `HeaderResponse` (struct) — `egui-0.35.0/src/containers/collapsing_header.rs:276`
+### `HeaderResponse` (struct) — `egui-0.36.2/src/containers/collapsing_header.rs:276`
 
 From [`CollapsingState::show_header`].
 
 Methods:
 
-- `fn body<BodyRet>(self, add_body: impl FnOnce(&mut Ui) -> BodyRet) -> (Response, InnerResponse<HeaderRet>, Option<InnerResponse<BodyRet>>)` — `egui-0.35.0/src/containers/collapsing_header.rs:297`
+- `fn body<BodyRet>(self, add_body: impl FnOnce(&mut Ui) -> BodyRet) -> (Response, InnerResponse<HeaderRet>, Option<InnerResponse<BodyRet>>)` — `egui-0.36.2/src/containers/collapsing_header.rs:297`
   Returns the response of the collapsing button, the custom header, and the custom body.
-- `fn body_unindented<BodyRet>(self, add_body: impl FnOnce(&mut Ui) -> BodyRet) -> (Response, InnerResponse<HeaderRet>, Option<InnerResponse<BodyRet>>)` — `egui-0.35.0/src/containers/collapsing_header.rs:316`
+- `fn body_unindented<BodyRet>(self, add_body: impl FnOnce(&mut Ui) -> BodyRet) -> (Response, InnerResponse<HeaderRet>, Option<InnerResponse<BodyRet>>)` — `egui-0.36.2/src/containers/collapsing_header.rs:316`
   Returns the response of the collapsing button, the custom header, and the custom body, without indentation.
-- `fn is_open(&self) -> bool` — `egui-0.35.0/src/containers/collapsing_header.rs:284`
-- `fn set_open(&mut self, open: bool)` — `egui-0.35.0/src/containers/collapsing_header.rs:288`
-- `fn toggle(&mut self)` — `egui-0.35.0/src/containers/collapsing_header.rs:292`
+- `fn is_open(&self) -> bool` — `egui-0.36.2/src/containers/collapsing_header.rs:284`
+- `fn set_open(&mut self, open: bool)` — `egui-0.36.2/src/containers/collapsing_header.rs:288`
+- `fn toggle(&mut self)` — `egui-0.36.2/src/containers/collapsing_header.rs:292`
 
-### `IconPainter` (type_alias) — `egui-0.35.0/src/containers/collapsing_header.rs:359`
+### `IconPainter` (type_alias) — `egui-0.36.2/src/containers/collapsing_header.rs:359`
 
 A function that paints an icon indicating if the region is open or not
 
 
 ## `egui::color_picker`
 
-### `Alpha` (enum) — `egui-0.35.0/src/widgets/color_picker.rs:267`
+### `Alpha` (enum) — `egui-0.36.2/src/widgets/color_picker.rs:267`
 
 What options to show for alpha
 
@@ -6279,13 +6319,13 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `color_edit_button_hsva` — `egui-0.35.0/src/widgets/color_picker.rs:518`
+### `color_edit_button_hsva` — `egui-0.36.2/src/widgets/color_picker.rs:518`
 
 ```rust
 fn color_edit_button_hsva(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> Response
 ```
 
-### `color_edit_button_rgb` — `egui-0.35.0/src/widgets/color_picker.rs:575`
+### `color_edit_button_rgb` — `egui-0.36.2/src/widgets/color_picker.rs:575`
 
 ```rust
 fn color_edit_button_rgb(ui: &mut Ui, rgb: &mut [f32; 3]) -> Response
@@ -6293,7 +6333,7 @@ fn color_edit_button_rgb(ui: &mut Ui, rgb: &mut [f32; 3]) -> Response
 
 Shows a button with the given color. If the user clicks the button, a full color picker is shown.
 
-### `color_edit_button_rgba` — `egui-0.35.0/src/widgets/color_picker.rs:565`
+### `color_edit_button_rgba` — `egui-0.36.2/src/widgets/color_picker.rs:565`
 
 ```rust
 fn color_edit_button_rgba(ui: &mut Ui, rgba: &mut Rgba, alpha: Alpha) -> Response
@@ -6301,7 +6341,7 @@ fn color_edit_button_rgba(ui: &mut Ui, rgba: &mut Rgba, alpha: Alpha) -> Respons
 
 Shows a button with the given color. If the user clicks the button, a full color picker is shown.
 
-### `color_edit_button_srgb` — `egui-0.35.0/src/widgets/color_picker.rs:554`
+### `color_edit_button_srgb` — `egui-0.36.2/src/widgets/color_picker.rs:554`
 
 ```rust
 fn color_edit_button_srgb(ui: &mut Ui, srgb: &mut [u8; 3]) -> Response
@@ -6309,7 +6349,7 @@ fn color_edit_button_srgb(ui: &mut Ui, srgb: &mut [u8; 3]) -> Response
 
 Shows a button with the given color. If the user clicks the button, a full color picker is shown. The given color is in `sRGB` space.
 
-### `color_edit_button_srgba` — `egui-0.35.0/src/widgets/color_picker.rs:543`
+### `color_edit_button_srgba` — `egui-0.36.2/src/widgets/color_picker.rs:543`
 
 ```rust
 fn color_edit_button_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Response
@@ -6317,7 +6357,7 @@ fn color_edit_button_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> Re
 
 Shows a button with the given color. If the user clicks the button, a full color picker is shown.
 
-### `color_picker_color32` — `egui-0.35.0/src/widgets/color_picker.rs:510`
+### `color_picker_color32` — `egui-0.36.2/src/widgets/color_picker.rs:510`
 
 ```rust
 fn color_picker_color32(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> bool
@@ -6325,7 +6365,7 @@ fn color_picker_color32(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> bool
 
 Shows a color picker where the user can change the given [`Color32`] color.
 
-### `color_picker_hsva_2d` — `egui-0.35.0/src/widgets/color_picker.rs:493`
+### `color_picker_hsva_2d` — `egui-0.36.2/src/widgets/color_picker.rs:493`
 
 ```rust
 fn color_picker_hsva_2d(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> bool
@@ -6333,7 +6373,7 @@ fn color_picker_hsva_2d(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> bool
 
 Shows a color picker where the user can change the given [`Hsva`] color.
 
-### `show_color` — `egui-0.35.0/src/widgets/color_picker.rs:57`
+### `show_color` — `egui-0.36.2/src/widgets/color_picker.rs:57`
 
 ```rust
 fn show_color(ui: &mut Ui, color: impl Into<Color32>, desired_size: Vec2) -> Response
@@ -6341,7 +6381,7 @@ fn show_color(ui: &mut Ui, color: impl Into<Color32>, desired_size: Vec2) -> Res
 
 Show a color with background checkers to demonstrate transparency (if any).
 
-### `show_color_at` — `egui-0.35.0/src/widgets/color_picker.rs:70`
+### `show_color_at` — `egui-0.36.2/src/widgets/color_picker.rs:70`
 
 ```rust
 fn show_color_at(painter: &Painter, color: Color32, rect: Rect)
@@ -6352,7 +6392,7 @@ Show a color with background checkers to demonstrate transparency (if any).
 
 ## `egui::debug_text`
 
-### `print` — `egui-0.35.0/src/debug_text.rs:24`
+### `print` — `egui-0.36.2/src/debug_text.rs:24`
 
 ```rust
 fn print(ctx: &Context, text: impl Into<WidgetText>)
@@ -6360,7 +6400,7 @@ fn print(ctx: &Context, text: impl Into<WidgetText>)
 
 Print this text next to the cursor at the end of the pass.
 
-### `DebugTextPlugin` (struct) — `egui-0.35.0/src/debug_text.rs:50`
+### `DebugTextPlugin` (struct) — `egui-0.36.2/src/debug_text.rs:50`
 
 A plugin for easily showing debug-text on-screen.
 
@@ -6369,7 +6409,7 @@ Implements: `Clone`, `Default`, `Plugin`
 
 ## `egui::frame`
 
-### `Prepared` (struct) — `egui-0.35.0/src/containers/frame.rs:357`
+### `Prepared` (struct) — `egui-0.36.2/src/containers/frame.rs:357`
 
 Public fields:
 
@@ -6378,17 +6418,17 @@ Public fields:
 
 Methods:
 
-- `fn allocate_space(&self, ui: &mut Ui) -> Response` — `egui-0.35.0/src/containers/frame.rs:466`
+- `fn allocate_space(&self, ui: &mut Ui) -> Response` — `egui-0.36.2/src/containers/frame.rs:466`
   Allocate the space that was used by [`Self::content_ui`].
-- `fn end(self, ui: &mut Ui) -> Response` — `egui-0.35.0/src/containers/frame.rs:486`
+- `fn end(self, ui: &mut Ui) -> Response` — `egui-0.36.2/src/containers/frame.rs:486`
   Convenience for calling [`Self::allocate_space`] and [`Self::paint`].
-- `fn paint(&self, ui: &Ui)` — `egui-0.35.0/src/containers/frame.rs:473`
+- `fn paint(&self, ui: &Ui)` — `egui-0.36.2/src/containers/frame.rs:473`
   Paint the frame.
 
 
 ## `egui::gui_zoom`
 
-### `zoom_in` — `egui-0.35.0/src/gui_zoom.rs:52`
+### `zoom_in` — `egui-0.36.2/src/gui_zoom.rs:52`
 
 ```rust
 fn zoom_in(ctx: &Context)
@@ -6396,7 +6436,7 @@ fn zoom_in(ctx: &Context)
 
 Make everything larger by increasing [`Context::zoom_factor`].
 
-### `zoom_menu_buttons` — `egui-0.35.0/src/gui_zoom.rs:72`
+### `zoom_menu_buttons` — `egui-0.36.2/src/gui_zoom.rs:72`
 
 ```rust
 fn zoom_menu_buttons(ui: &mut Ui)
@@ -6404,7 +6444,7 @@ fn zoom_menu_buttons(ui: &mut Ui)
 
 Show buttons for zooming the ui.
 
-### `zoom_out` — `egui-0.35.0/src/gui_zoom.rs:61`
+### `zoom_out` — `egui-0.36.2/src/gui_zoom.rs:61`
 
 ```rust
 fn zoom_out(ctx: &Context)
@@ -6415,13 +6455,13 @@ Make everything smaller by decreasing [`Context::zoom_factor`].
 
 ## `egui::introspection`
 
-### `font_family_ui` — `egui-0.35.0/src/introspection.rs:7`
+### `font_family_ui` — `egui-0.36.2/src/introspection.rs:7`
 
 ```rust
 fn font_family_ui(ui: &mut Ui, font_family: &mut FontFamily)
 ```
 
-### `font_id_ui` — `egui-0.35.0/src/introspection.rs:17`
+### `font_id_ui` — `egui-0.36.2/src/introspection.rs:17`
 
 ```rust
 fn font_id_ui(ui: &mut Ui, font_id: &mut FontId)
@@ -6430,49 +6470,49 @@ fn font_id_ui(ui: &mut Ui, font_id: &mut FontId)
 
 ## `egui::layers`
 
-### `GraphicLayers` (struct) — `egui-0.35.0/src/layers.rs:193`
+### `GraphicLayers` (struct) — `egui-0.36.2/src/layers.rs:193`
 
 This is where painted [`Shape`]s end up during a frame.
 
 Methods:
 
-- `fn drain(&mut self, area_order: &[LayerId], to_global: &HashMap<LayerId, TSTransform>) -> Vec<ClippedShape>` — `egui-0.35.0/src/layers.rs:213`
-- `fn entry(&mut self, layer_id: LayerId) -> &mut PaintList` — `egui-0.35.0/src/layers.rs:197`
+- `fn drain(&mut self, area_order: &[LayerId], to_global: &HashMap<LayerId, TSTransform>) -> Vec<ClippedShape>` — `egui-0.36.2/src/layers.rs:213`
+- `fn entry(&mut self, layer_id: LayerId) -> &mut PaintList` — `egui-0.36.2/src/layers.rs:197`
   Get or insert the [`PaintList`] for the given [`LayerId`].
-- `fn get(&self, layer_id: LayerId) -> Option<&PaintList>` — `egui-0.35.0/src/layers.rs:204`
+- `fn get(&self, layer_id: LayerId) -> Option<&PaintList>` — `egui-0.36.2/src/layers.rs:204`
   Get the [`PaintList`] for the given [`LayerId`].
-- `fn get_mut(&mut self, layer_id: LayerId) -> Option<&mut PaintList>` — `egui-0.35.0/src/layers.rs:209`
+- `fn get_mut(&mut self, layer_id: LayerId) -> Option<&mut PaintList>` — `egui-0.36.2/src/layers.rs:209`
   Get the [`PaintList`] for the given [`LayerId`].
 
 Implements: `Clone`, `Default`
 
-### `PaintList` (struct) — `egui-0.35.0/src/layers.rs:113`
+### `PaintList` (struct) — `egui-0.36.2/src/layers.rs:113`
 
 A list of [`Shape`]s paired with a clip rectangle.
 
 Methods:
 
-- `fn add(&mut self, clip_rect: Rect, shape: Shape) -> ShapeIdx` — `egui-0.35.0/src/layers.rs:127`
+- `fn add(&mut self, clip_rect: Rect, shape: Shape) -> ShapeIdx` — `egui-0.36.2/src/layers.rs:127`
   Returns the index of the new [`Shape`] that can be used with `PaintList::set`.
-- `fn all_entries(&self) -> impl ExactSizeIterator<Item = &ClippedShape>` — `egui-0.35.0/src/layers.rs:186`
+- `fn all_entries(&self) -> impl ExactSizeIterator<Item = &ClippedShape>` — `egui-0.36.2/src/layers.rs:186`
   Read-only access to all held shapes.
-- `fn extend<I>(&mut self, clip_rect: Rect, shapes: I)` — `egui-0.35.0/src/layers.rs:133`
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/layers.rs:117`
-- `fn mutate_shape(&mut self, idx: ShapeIdx, f: impl FnOnce(&mut ClippedShape))` — `egui-0.35.0/src/layers.rs:165`
+- `fn extend<I>(&mut self, clip_rect: Rect, shapes: I)` — `egui-0.36.2/src/layers.rs:133`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/layers.rs:117`
+- `fn mutate_shape(&mut self, idx: ShapeIdx, f: impl FnOnce(&mut ClippedShape))` — `egui-0.36.2/src/layers.rs:165`
   Mutate the shape at the given index, if any.
-- `fn next_idx(&self) -> ShapeIdx` — `egui-0.35.0/src/layers.rs:121`
-- `fn reset_shape(&mut self, idx: ShapeIdx)` — `egui-0.35.0/src/layers.rs:160`
+- `fn next_idx(&self) -> ShapeIdx` — `egui-0.36.2/src/layers.rs:121`
+- `fn reset_shape(&mut self, idx: ShapeIdx)` — `egui-0.36.2/src/layers.rs:160`
   Set the given shape to be empty (a `Shape::Noop`).
-- `fn set(&mut self, idx: ShapeIdx, clip_rect: Rect, shape: Shape)` — `egui-0.35.0/src/layers.rs:149`
+- `fn set(&mut self, idx: ShapeIdx, clip_rect: Rect, shape: Shape)` — `egui-0.36.2/src/layers.rs:149`
   Modify an existing [`Shape`].
-- `fn transform(&mut self, transform: TSTransform)` — `egui-0.35.0/src/layers.rs:170`
+- `fn transform(&mut self, transform: TSTransform)` — `egui-0.36.2/src/layers.rs:170`
   Transform each [`Shape`] and clip rectangle by this much, in-place
-- `fn transform_range(&mut self, start: ShapeIdx, end: ShapeIdx, transform: TSTransform)` — `egui-0.35.0/src/layers.rs:178`
+- `fn transform_range(&mut self, start: ShapeIdx, end: ShapeIdx, transform: TSTransform)` — `egui-0.36.2/src/layers.rs:178`
   Transform each [`Shape`] and clip rectangle in range by this much, in-place
 
 Implements: `Clone`, `Default`
 
-### `ShapeIdx` (struct) — `egui-0.35.0/src/layers.rs:109`
+### `ShapeIdx` (struct) — `egui-0.36.2/src/layers.rs:109`
 
 A unique identifier of a specific [`Shape`] in a [`PaintList`].
 
@@ -6481,7 +6521,7 @@ Implements: `Clone`, `Copy`, `Debug`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
 ## `egui::load`
 
-### `Bytes` (enum) — `egui-0.35.0/src/load.rs:206`
+### `Bytes` (enum) — `egui-0.36.2/src/load.rs:205`
 
 Represents a byte buffer.
 
@@ -6492,7 +6532,7 @@ Variants:
 
 Implements: `AsRef<[u8]>`, `Clone`, `Debug`, `Deref`, `From<&'static [u8; N]>`, `From<&'static [u8]>`, `From<Arc<[u8]>>`, `From<Vec<u8>>`
 
-### `BytesPoll` (enum) — `egui-0.35.0/src/load.rs:273`
+### `BytesPoll` (enum) — `egui-0.36.2/src/load.rs:272`
 
 Represents bytes which are currently being loaded.
 
@@ -6503,7 +6543,7 @@ Variants:
 
 Implements: `Clone`
 
-### `ImagePoll` (enum) — `egui-0.35.0/src/load.rs:372`
+### `ImagePoll` (enum) — `egui-0.36.2/src/load.rs:384`
 
 Represents an image which is currently being loaded.
 
@@ -6514,7 +6554,7 @@ Variants:
 
 Implements: `Clone`
 
-### `LoadError` (enum) — `egui-0.35.0/src/load.rs:76`
+### `LoadError` (enum) — `egui-0.36.2/src/load.rs:75`
 
 Represents a failed attempt at loading an image.
 
@@ -6530,12 +6570,12 @@ Variants:
 
 Methods:
 
-- `fn byte_size(&self) -> usize` — `egui-0.35.0/src/load.rs:104`
+- `fn byte_size(&self) -> usize` — `egui-0.36.2/src/load.rs:103`
   Returns the (approximate) size of the error message in bytes.
 
 Implements: `Clone`, `Debug`, `Display`, `Eq`, `Error`, `PartialEq`, `StructuralPartialEq`
 
-### `TexturePoll` (enum) — `egui-0.35.0/src/load.rs:490`
+### `TexturePoll` (enum) — `egui-0.36.2/src/load.rs:502`
 
 Represents a texture is currently being loaded.
 
@@ -6546,29 +6586,37 @@ Variants:
 
 Methods:
 
-- `fn is_pending(&self) -> bool` — `egui-0.35.0/src/load.rs:522`
-- `fn is_ready(&self) -> bool` — `egui-0.35.0/src/load.rs:527`
-- `fn size(&self) -> Option<Vec2>` — `egui-0.35.0/src/load.rs:506`
+- `fn is_pending(&self) -> bool` — `egui-0.36.2/src/load.rs:534`
+- `fn is_ready(&self) -> bool` — `egui-0.36.2/src/load.rs:539`
+- `fn size(&self) -> Option<Vec2>` — `egui-0.36.2/src/load.rs:518`
   Point size of the original SVG, or the size of the image in texels.
-- `fn texture_id(&self) -> Option<TextureId>` — `egui-0.35.0/src/load.rs:514`
+- `fn texture_id(&self) -> Option<TextureId>` — `egui-0.36.2/src/load.rs:526`
 
 Implements: `Clone`, `Copy`
 
-### `DefaultBytesLoader` (struct) — `egui-0.35.0/src/load/bytes_loader.rs:10`
+### `has_extension` — `egui-0.36.2/src/load.rs:315`
+
+```rust
+fn has_extension(uri: &str, extension: &str) -> bool
+```
+
+Does the given URI end with the given file extension?
+
+### `DefaultBytesLoader` (struct) — `egui-0.36.2/src/load/bytes_loader.rs:10`
 
 Maps URI:s to [`Bytes`], e.g. found with `include_bytes!`.
 
 Methods:
 
-- `fn insert(&self, uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>)` — `egui-0.35.0/src/load/bytes_loader.rs:15`
+- `fn insert(&self, uri: impl Into<Cow<'static, str>>, bytes: impl Into<Bytes>)` — `egui-0.36.2/src/load/bytes_loader.rs:15`
 
 Implements: `BytesLoader`, `Default`
 
-### `DefaultTextureLoader` (struct) — `egui-0.35.0/src/load/texture_loader.rs:33`
+### `DefaultTextureLoader` (struct) — `egui-0.36.2/src/load/texture_loader.rs:33`
 
 Implements: `Default`, `TextureLoader`
 
-### `Loaders` (struct) — `egui-0.35.0/src/load.rs:601`
+### `Loaders` (struct) — `egui-0.36.2/src/load.rs:613`
 
 The loaders of bytes, images, and textures.
 
@@ -6581,12 +6629,12 @@ Public fields:
 
 Methods:
 
-- `fn end_pass(&self, pass_index: u64)` — `egui-0.35.0/src/load.rs:623`
+- `fn end_pass(&self, pass_index: u64)` — `egui-0.36.2/src/load.rs:635`
   The given pass has just ended.
 
 Implements: `Clone`, `Default`
 
-### `SizedTexture` (struct) — `egui-0.35.0/src/load.rs:444`
+### `SizedTexture` (struct) — `egui-0.36.2/src/load.rs:456`
 
 A texture with a known size.
 
@@ -6597,86 +6645,86 @@ Public fields:
 
 Methods:
 
-- `fn from_handle(handle: &TextureHandle) -> Self` — `egui-0.35.0/src/load.rs:461`
+- `fn from_handle(handle: &TextureHandle) -> Self` — `egui-0.36.2/src/load.rs:473`
   Fetch the [id][`SizedTexture::id`] and [size][`SizedTexture::size`] from a [`TextureHandle`].
-- `fn new(id: impl Into<TextureId>, size: impl Into<Vec2>) -> Self` — `egui-0.35.0/src/load.rs:453`
+- `fn new(id: impl Into<TextureId>, size: impl Into<Vec2>) -> Self` — `egui-0.36.2/src/load.rs:465`
   Create a [`SizedTexture`] from a texture `id` with a specific `size`.
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<&'a TextureHandle>`, `From<(TextureId, Vec2)>`, `PartialEq`, `StructuralPartialEq`
 
-### `BytesLoader` (trait) — `egui-0.35.0/src/load.rs:319`
+### `BytesLoader` (trait) — `egui-0.36.2/src/load.rs:331`
 
 Represents a loader capable of loading raw unstructured bytes from somewhere, e.g. from disk or network.
 
 Required/provided items:
 
-- `fn id(&self) -> &str` — `egui-0.35.0/src/load.rs:323`
+- `fn id(&self) -> &str` — `egui-0.36.2/src/load.rs:335`
   Unique ID of this loader.
-- `fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult` — `egui-0.35.0/src/load.rs:337`
+- `fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult` — `egui-0.36.2/src/load.rs:349`
   Try loading the bytes from the given uri.
-- `fn forget(&self, uri: &str)` — `egui-0.35.0/src/load.rs:343`
+- `fn forget(&self, uri: &str)` — `egui-0.36.2/src/load.rs:355`
   Forget the given `uri`.
-- `fn forget_all(&self)` — `egui-0.35.0/src/load.rs:349`
+- `fn forget_all(&self)` — `egui-0.36.2/src/load.rs:361`
   Forget all URIs ever given to this loader.
-- `fn end_pass(&self, pass_index: u64)` — `egui-0.35.0/src/load.rs:353`
+- `fn end_pass(&self, pass_index: u64)` — `egui-0.36.2/src/load.rs:365`
   Implementations may use this to perform work at the end of a frame, such as evicting unused entries from a ca…
-- `fn byte_size(&self) -> usize` — `egui-0.35.0/src/load.rs:358`
+- `fn byte_size(&self) -> usize` — `egui-0.36.2/src/load.rs:370`
   If the loader caches any data, this should return the size of that cache.
-- `fn has_pending(&self) -> bool` — `egui-0.35.0/src/load.rs:361`
+- `fn has_pending(&self) -> bool` — `egui-0.36.2/src/load.rs:373`
   Returns `true` if some data is currently being loaded.
 
-### `ImageLoader` (trait) — `egui-0.35.0/src/load.rs:390`
+### `ImageLoader` (trait) — `egui-0.36.2/src/load.rs:402`
 
 An `ImageLoader` decodes raw bytes into a [`ColorImage`].
 
 Required/provided items:
 
-- `fn id(&self) -> &str` — `egui-0.35.0/src/load.rs:397`
+- `fn id(&self) -> &str` — `egui-0.36.2/src/load.rs:409`
   Unique ID of this loader.
-- `fn load(&self, ctx: &Context, uri: &str, size_hint: SizeHint) -> ImageLoadResult` — `egui-0.35.0/src/load.rs:411`
+- `fn load(&self, ctx: &Context, uri: &str, size_hint: SizeHint) -> ImageLoadResult` — `egui-0.36.2/src/load.rs:423`
   Try loading the image from the given uri.
-- `fn forget(&self, uri: &str)` — `egui-0.35.0/src/load.rs:417`
+- `fn forget(&self, uri: &str)` — `egui-0.36.2/src/load.rs:429`
   Forget the given `uri`.
-- `fn forget_all(&self)` — `egui-0.35.0/src/load.rs:423`
+- `fn forget_all(&self)` — `egui-0.36.2/src/load.rs:435`
   Forget all URIs ever given to this loader.
-- `fn end_pass(&self, pass_index: u64)` — `egui-0.35.0/src/load.rs:427`
+- `fn end_pass(&self, pass_index: u64)` — `egui-0.36.2/src/load.rs:439`
   Implementations may use this to perform work at the end of a pass, such as evicting unused entries from a cac…
-- `fn byte_size(&self) -> usize` — `egui-0.35.0/src/load.rs:432`
+- `fn byte_size(&self) -> usize` — `egui-0.36.2/src/load.rs:444`
   If the loader caches any data, this should return the size of that cache.
-- `fn has_pending(&self) -> bool` — `egui-0.35.0/src/load.rs:437`
+- `fn has_pending(&self) -> bool` — `egui-0.36.2/src/load.rs:449`
   Returns `true` if some image is currently being loaded.
 
-### `TextureLoader` (trait) — `egui-0.35.0/src/load.rs:544`
+### `TextureLoader` (trait) — `egui-0.36.2/src/load.rs:556`
 
 A `TextureLoader` uploads a [`ColorImage`] to the GPU, returning a [`SizedTexture`].
 
 Required/provided items:
 
-- `fn id(&self) -> &str` — `egui-0.35.0/src/load.rs:551`
+- `fn id(&self) -> &str` — `egui-0.36.2/src/load.rs:563`
   Unique ID of this loader.
-- `fn load(&self, ctx: &Context, uri: &str, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.35.0/src/load.rs:565`
+- `fn load(&self, ctx: &Context, uri: &str, texture_options: TextureOptions, size_hint: SizeHint) -> TextureLoadResult` — `egui-0.36.2/src/load.rs:577`
   Try loading the texture from the given uri.
-- `fn forget(&self, uri: &str)` — `egui-0.35.0/src/load.rs:577`
+- `fn forget(&self, uri: &str)` — `egui-0.36.2/src/load.rs:589`
   Forget the given `uri`.
-- `fn forget_all(&self)` — `egui-0.35.0/src/load.rs:583`
+- `fn forget_all(&self)` — `egui-0.36.2/src/load.rs:595`
   Forget all URIs ever given to this loader.
-- `fn end_pass(&self, pass_index: u64)` — `egui-0.35.0/src/load.rs:587`
+- `fn end_pass(&self, pass_index: u64)` — `egui-0.36.2/src/load.rs:599`
   Implementations may use this to perform work at the end of a pass, such as evicting unused entries from a cac…
-- `fn byte_size(&self) -> usize` — `egui-0.35.0/src/load.rs:592`
+- `fn byte_size(&self) -> usize` — `egui-0.36.2/src/load.rs:604`
   If the loader caches any data, this should return the size of that cache.
 
-### `BytesLoadResult` (type_alias) — `egui-0.35.0/src/load.rs:310`
+### `BytesLoadResult` (type_alias) — `egui-0.36.2/src/load.rs:322`
 
-### `ImageLoadResult` (type_alias) — `egui-0.35.0/src/load.rs:385`
+### `ImageLoadResult` (type_alias) — `egui-0.36.2/src/load.rs:397`
 
-### `Result` (type_alias) — `egui-0.35.0/src/load.rs:141`
+### `Result` (type_alias) — `egui-0.36.2/src/load.rs:140`
 
-### `TextureLoadResult` (type_alias) — `egui-0.35.0/src/load.rs:532`
+### `TextureLoadResult` (type_alias) — `egui-0.36.2/src/load.rs:544`
 
 
 ## `egui::menu`
 
-### `find_menu_root` — `egui-0.35.0/src/containers/menu.rs:32`
+### `find_menu_root` — `egui-0.36.2/src/containers/menu.rs:32`
 
 ```rust
 fn find_menu_root(ui: &Ui) -> &UiStack
@@ -6684,7 +6732,7 @@ fn find_menu_root(ui: &Ui) -> &UiStack
 
 Find the root [`UiStack`] of the menu.
 
-### `is_in_menu` — `egui-0.35.0/src/containers/menu.rs:47`
+### `is_in_menu` — `egui-0.36.2/src/containers/menu.rs:47`
 
 ```rust
 fn is_in_menu(ui: &Ui) -> bool
@@ -6692,7 +6740,7 @@ fn is_in_menu(ui: &Ui) -> bool
 
 Is this Ui part of a menu?
 
-### `menu_style` — `egui-0.35.0/src/containers/menu.rs:22`
+### `menu_style` — `egui-0.36.2/src/containers/menu.rs:22`
 
 ```rust
 fn menu_style(style: &mut Style)
@@ -6700,7 +6748,7 @@ fn menu_style(style: &mut Style)
 
 Apply a menu style to the [`Style`].
 
-### `MenuButton` (struct) — `egui-0.35.0/src/containers/menu.rs:290`
+### `MenuButton` (struct) — `egui-0.36.2/src/containers/menu.rs:290`
 
 A thin wrapper around a [`Button`] that shows a [`Popup::menu`] when clicked.
 
@@ -6711,15 +6759,15 @@ Public fields:
 
 Methods:
 
-- `fn config(self, config: MenuConfig) -> Self` — `egui-0.35.0/src/containers/menu.rs:302`
+- `fn config(self, config: MenuConfig) -> Self` — `egui-0.36.2/src/containers/menu.rs:302`
   Set the config for the menu.
-- `fn from_button(button: Button<'a>) -> Self` — `egui-0.35.0/src/containers/menu.rs:309`
+- `fn from_button(button: Button<'a>) -> Self` — `egui-0.36.2/src/containers/menu.rs:309`
   Create a new menu button from a [`Button`].
-- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/containers/menu.rs:296`
-- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> (Response, Option<InnerResponse<R>>)` — `egui-0.35.0/src/containers/menu.rs:317`
+- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/containers/menu.rs:296`
+- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> (Response, Option<InnerResponse<R>>)` — `egui-0.36.2/src/containers/menu.rs:317`
   Show the menu button.
 
-### `MenuConfig` (struct) — `egui-0.35.0/src/containers/menu.rs:65`
+### `MenuConfig` (struct) — `egui-0.36.2/src/containers/menu.rs:65`
 
 Configuration and style for menus.
 
@@ -6730,17 +6778,17 @@ Public fields:
 
 Methods:
 
-- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.35.0/src/containers/menu.rs:98`
+- `fn close_behavior(self, close_behavior: PopupCloseBehavior) -> Self` — `egui-0.36.2/src/containers/menu.rs:98`
   If the user clicks, should we close the menu?
-- `fn find(ui: &Ui) -> Self` — `egui-0.35.0/src/containers/menu.rs:124`
+- `fn find(ui: &Ui) -> Self` — `egui-0.36.2/src/containers/menu.rs:124`
   Find the config for the current menu.
-- `fn new() -> Self` — `egui-0.35.0/src/containers/menu.rs:92`
-- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.35.0/src/containers/menu.rs:107`
+- `fn new() -> Self` — `egui-0.36.2/src/containers/menu.rs:92`
+- `fn style(self, style: impl Into<StyleModifier>) -> Self` — `egui-0.36.2/src/containers/menu.rs:107`
   Override the menu style.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `MenuState` (struct) — `egui-0.35.0/src/containers/menu.rs:136`
+### `MenuState` (struct) — `egui-0.36.2/src/containers/menu.rs:136`
 
 Holds the state of the menu.
 
@@ -6750,33 +6798,33 @@ Public fields:
 
 Methods:
 
-- `fn from_id<R>(ctx: &Context, id: Id, f: impl FnOnce(&mut Self) -> R) -> R` — `egui-0.35.0/src/containers/menu.rs:152`
+- `fn from_id<R>(ctx: &Context, id: Id, f: impl FnOnce(&mut Self) -> R) -> R` — `egui-0.36.2/src/containers/menu.rs:152`
   Get the state via the menus root [`Ui`] id
-- `fn from_ui<R>(ui: &Ui, f: impl FnOnce(&mut Self, &UiStack) -> R) -> R` — `egui-0.35.0/src/containers/menu.rs:146`
+- `fn from_ui<R>(ui: &Ui, f: impl FnOnce(&mut Self, &UiStack) -> R) -> R` — `egui-0.36.2/src/containers/menu.rs:146`
   Find the root of the menu and get the state
-- `fn is_deepest_open_sub_menu(ctx: &Context, id: Id) -> bool` — `egui-0.35.0/src/containers/menu.rs:188`
+- `fn is_deepest_open_sub_menu(ctx: &Context, id: Id) -> bool` — `egui-0.36.2/src/containers/menu.rs:188`
   Is the menu with this id the deepest sub menu? (-> no child sub menu is open)
-- `fn mark_shown(ctx: &Context, id: Id)` — `egui-0.35.0/src/containers/menu.rs:178`
+- `fn mark_shown(ctx: &Context, id: Id)` — `egui-0.36.2/src/containers/menu.rs:178`
 
 Implements: `Clone`
 
-### `SubMenu` (struct) — `egui-0.35.0/src/containers/menu.rs:399`
+### `SubMenu` (struct) — `egui-0.36.2/src/containers/menu.rs:399`
 
 Show a submenu in a menu.
 
 Methods:
 
-- `fn config(self, config: MenuConfig) -> Self` — `egui-0.35.0/src/containers/menu.rs:412`
+- `fn config(self, config: MenuConfig) -> Self` — `egui-0.36.2/src/containers/menu.rs:412`
   Set the config for the submenu.
-- `fn id_from_widget_id(widget_id: Id) -> Id` — `egui-0.35.0/src/containers/menu.rs:418`
+- `fn id_from_widget_id(widget_id: Id) -> Id` — `egui-0.36.2/src/containers/menu.rs:418`
   Get the id for the submenu from the widget/response id.
-- `fn new() -> Self` — `egui-0.35.0/src/containers/menu.rs:404`
-- `fn show<R>(self, ui: &Ui, button_response: &Response, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.35.0/src/containers/menu.rs:426`
+- `fn new() -> Self` — `egui-0.36.2/src/containers/menu.rs:404`
+- `fn show<R>(self, ui: &Ui, button_response: &Response, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>>` — `egui-0.36.2/src/containers/menu.rs:426`
   Show the submenu.
 
 Implements: `Clone`, `Debug`, `Default`
 
-### `SubMenuButton` (struct) — `egui-0.35.0/src/containers/menu.rs:337`
+### `SubMenuButton` (struct) — `egui-0.36.2/src/containers/menu.rs:337`
 
 A submenu button that shows a [`SubMenu`] if a [`Button`] is hovered.
 
@@ -6787,18 +6835,18 @@ Public fields:
 
 Methods:
 
-- `fn config(self, config: MenuConfig) -> Self` — `egui-0.35.0/src/containers/menu.rs:365`
+- `fn config(self, config: MenuConfig) -> Self` — `egui-0.36.2/src/containers/menu.rs:365`
   Set the config for the submenu.
-- `fn from_button(button: Button<'a>) -> Self` — `egui-0.35.0/src/containers/menu.rs:354`
+- `fn from_button(button: Button<'a>) -> Self` — `egui-0.36.2/src/containers/menu.rs:354`
   Create a new submenu button from a [`Button`].
-- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.35.0/src/containers/menu.rs:346`
-- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> (Response, Option<InnerResponse<R>>)` — `egui-0.35.0/src/containers/menu.rs:371`
+- `fn new(atoms: impl IntoAtoms<'a>) -> Self` — `egui-0.36.2/src/containers/menu.rs:346`
+- `fn ui<R>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> (Response, Option<InnerResponse<R>>)` — `egui-0.36.2/src/containers/menu.rs:371`
   Show the submenu button.
 
 
 ## `egui::os`
 
-### `OperatingSystem` (enum) — `egui-0.35.0/src/os.rs:4`
+### `OperatingSystem` (enum) — `egui-0.36.2/src/os.rs:4`
 
 An `enum` of common operating systems.
 
@@ -6813,11 +6861,11 @@ Variants:
 
 Methods:
 
-- `const fn from_target_os() -> Self` — `egui-0.35.0/src/os.rs:32`
+- `const fn from_target_os() -> Self` — `egui-0.36.2/src/os.rs:32`
   Uses the compile-time `target_arch` to identify the OS.
-- `fn from_user_agent(user_agent: &str) -> Self` — `egui-0.35.0/src/os.rs:56`
+- `fn from_user_agent(user_agent: &str) -> Self` — `egui-0.36.2/src/os.rs:56`
   Helper: try to guess from the user-agent of a browser.
-- `fn is_mac(&self) -> bool` — `egui-0.35.0/src/os.rs:80`
+- `fn is_mac(&self) -> bool` — `egui-0.36.2/src/os.rs:80`
   Are we either macOS or iOS?
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`, `PartialEq`, `StructuralPartialEq`
@@ -6825,7 +6873,7 @@ Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`, `PartialEq`, `Str
 
 ## `egui::output`
 
-### `OutputEvent` (enum) — `egui-0.35.0/src/data/output.rs:489`
+### `OutputEvent` (enum) — `egui-0.36.2/src/data/output.rs:514`
 
 Things that happened during this frame that the integration may be interested in.
 
@@ -6840,16 +6888,17 @@ Variants:
 
 Methods:
 
-- `fn widget_info(&self) -> &WidgetInfo` — `egui-0.35.0/src/data/output.rs:510`
+- `fn widget_info(&self) -> &WidgetInfo` — `egui-0.36.2/src/data/output.rs:535`
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `IMEOutput` (struct) — `egui-0.35.0/src/data/output.rs:78`
+### `IMEOutput` (struct) — `egui-0.36.2/src/data/output.rs:100`
 
 Information about text being edited.
 
 Public fields:
 
+- `purpose: IMEPurpose` — IME's purpose.
 - `rect: Rect` — Where the [`crate::TextEdit`] is located on screen.
 - `cursor_rect: Rect` — Where the primary cursor is.
 - `should_interrupt_composition: bool` — Whether any ongoing IME composition should be interrupted.
@@ -6859,29 +6908,29 @@ Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Se
 
 ## `egui::plugin`
 
-### `TypedPluginGuard` (struct) — `egui-0.35.0/src/plugin.rs:86`
+### `TypedPluginGuard` (struct) — `egui-0.36.2/src/plugin.rs:86`
 
 A guard that provides access to a [`Plugin`].
 
 Implements: `Deref`, `DerefMut`
 
-### `TypedPluginHandle` (struct) — `egui-0.35.0/src/plugin.rs:61`
+### `TypedPluginHandle` (struct) — `egui-0.36.2/src/plugin.rs:61`
 
 A typed handle to a registered [`Plugin`].
 
 Methods:
 
-- `fn lock(&self) -> TypedPluginGuard<'_, P>` — `egui-0.35.0/src/plugin.rs:77`
+- `fn lock(&self) -> TypedPluginGuard<'_, P>` — `egui-0.36.2/src/plugin.rs:77`
   Lock the plugin for access.
 
-### `ContextCallback` (type_alias) — `egui-0.35.0/src/plugin.rs:224`
+### `ContextCallback` (type_alias) — `egui-0.36.2/src/plugin.rs:224`
 
 Generic event callback.
 
 
 ## `egui::scroll_area`
 
-### `DragScroll` (enum) — `egui-0.35.0/src/containers/scroll_area.rs:147`
+### `DragScroll` (enum) — `egui-0.36.2/src/containers/scroll_area.rs:147`
 
 When [`ScrollArea`] should let the user scroll by dragging the content.
 
@@ -6893,12 +6942,12 @@ Variants:
 
 Methods:
 
-- `fn enabled(self, ctx: &Context) -> bool` — `egui-0.35.0/src/containers/scroll_area.rs:165`
+- `fn enabled(self, ctx: &Context) -> bool` — `egui-0.36.2/src/containers/scroll_area.rs:165`
   Whether drag-to-scroll is currently active.
 
 Implements: `BitOr`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ScrollBarVisibility` (enum) — `egui-0.35.0/src/containers/scroll_area.rs:110`
+### `ScrollBarVisibility` (enum) — `egui-0.36.2/src/containers/scroll_area.rs:110`
 
 Indicate whether the horizontal and vertical scroll bars must be always visible, hidden or visible when needed.
 
@@ -6910,7 +6959,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ScrollAreaOutput` (struct) — `egui-0.35.0/src/containers/scroll_area.rs:89`
+### `ScrollAreaOutput` (struct) — `egui-0.36.2/src/containers/scroll_area.rs:89`
 
 Public fields:
 
@@ -6920,7 +6969,7 @@ Public fields:
 - `content_size: Vec2` — The size of the content. If this is larger than [`Self::inner_rect`], then there was need…
 - `inner_rect: Rect` — Where on the screen the content is (excludes scroll bars).
 
-### `ScrollSource` (struct) — `egui-0.35.0/src/containers/scroll_area.rs:192`
+### `ScrollSource` (struct) — `egui-0.36.2/src/containers/scroll_area.rs:192`
 
 What is the source of scrolling for a [`ScrollArea`].
 
@@ -6932,16 +6981,16 @@ Public fields:
 
 Methods:
 
-- `fn any(&self) -> bool` — `egui-0.35.0/src/containers/scroll_area.rs:257`
+- `fn any(&self) -> bool` — `egui-0.36.2/src/containers/scroll_area.rs:257`
   Is anything enabled?
-- `fn is_all(&self) -> bool` — `egui-0.35.0/src/containers/scroll_area.rs:263`
+- `fn is_all(&self) -> bool` — `egui-0.36.2/src/containers/scroll_area.rs:263`
   Is everything enabled?
-- `fn is_none(&self) -> bool` — `egui-0.35.0/src/containers/scroll_area.rs:251`
+- `fn is_none(&self) -> bool` — `egui-0.36.2/src/containers/scroll_area.rs:251`
   Is everything disabled?
 
 Implements: `Add`, `AddAssign`, `BitOr`, `BitOrAssign`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `State` (struct) — `egui-0.35.0/src/containers/scroll_area.rs:26`
+### `State` (struct) — `egui-0.36.2/src/containers/scroll_area.rs:26`
 
 Public fields:
 
@@ -6949,9 +6998,9 @@ Public fields:
 
 Methods:
 
-- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.35.0/src/containers/scroll_area.rs:75`
-- `fn store(self, ctx: &Context, id: Id)` — `egui-0.35.0/src/containers/scroll_area.rs:79`
-- `fn velocity(&self) -> Vec2` — `egui-0.35.0/src/containers/scroll_area.rs:84`
+- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.36.2/src/containers/scroll_area.rs:75`
+- `fn store(self, ctx: &Context, id: Id)` — `egui-0.36.2/src/containers/scroll_area.rs:79`
+- `fn velocity(&self) -> Vec2` — `egui-0.36.2/src/containers/scroll_area.rs:84`
   Get the current kinetic scrolling velocity.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
@@ -6959,34 +7008,34 @@ Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`
 
 ## `egui::special_emojis`
 
-### `GIT` (constant) — `egui-0.35.0/src/lib.rs:615`
+### `GIT` (constant) — `egui-0.36.2/src/lib.rs:615`
 
 The word `git`.
 
-### `GITHUB` (constant) — `egui-0.35.0/src/lib.rs:612`
+### `GITHUB` (constant) — `egui-0.36.2/src/lib.rs:612`
 
 The Github logo.
 
-### `OS_ANDROID` (constant) — `egui-0.35.0/src/lib.rs:606`
+### `OS_ANDROID` (constant) — `egui-0.36.2/src/lib.rs:606`
 
 The Android logo.
 
-### `OS_APPLE` (constant) — `egui-0.35.0/src/lib.rs:609`
+### `OS_APPLE` (constant) — `egui-0.36.2/src/lib.rs:609`
 
 The Apple logo.
 
-### `OS_LINUX` (constant) — `egui-0.35.0/src/lib.rs:600`
+### `OS_LINUX` (constant) — `egui-0.36.2/src/lib.rs:600`
 
 Tux, the Linux penguin.
 
-### `OS_WINDOWS` (constant) — `egui-0.35.0/src/lib.rs:603`
+### `OS_WINDOWS` (constant) — `egui-0.36.2/src/lib.rs:603`
 
 The Windows logo.
 
 
 ## `egui::style`
 
-### `HandleShape` (enum) — `egui-0.35.0/src/style.rs:1229`
+### `HandleShape` (enum) — `egui-0.36.2/src/style.rs:1235`
 
 Shape of the handle for sliders and similar widgets.
 
@@ -6997,11 +7046,11 @@ Variants:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2706`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2718`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `NumericColorSpace` (enum) — `egui-0.35.0/src/style.rs:2726`
+### `NumericColorSpace` (enum) — `egui-0.36.2/src/style.rs:2738`
 
 How to display numeric color values.
 
@@ -7012,11 +7061,11 @@ Variants:
 
 Methods:
 
-- `fn toggle_button_ui(&mut self, ui: &mut Ui) -> Response` — `egui-0.35.0/src/style.rs:2738`
+- `fn toggle_button_ui(&mut self, ui: &mut Ui) -> Response` — `egui-0.36.2/src/style.rs:2750`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Display`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `default_text_styles` — `egui-0.35.0/src/style.rs:1408`
+### `default_text_styles` — `egui-0.36.2/src/style.rs:1414`
 
 ```rust
 fn default_text_styles() -> BTreeMap<TextStyle, FontId>
@@ -7024,7 +7073,7 @@ fn default_text_styles() -> BTreeMap<TextStyle, FontId>
 
 The default text styles of the default egui theme.
 
-### `font_tweak_ui` — `egui-0.35.0/src/style.rs:2999`
+### `font_tweak_ui` — `egui-0.36.2/src/style.rs:3011`
 
 ```rust
 fn font_tweak_ui(ui: &mut Ui, tweak: &mut FontTweak, axes: &[FontVariationAxis]) -> Response
@@ -7032,7 +7081,7 @@ fn font_tweak_ui(ui: &mut Ui, tweak: &mut FontTweak, axes: &[FontVariationAxis])
 
 Show a UI for editing a [`FontTweak`].
 
-### `DebugOptions` (struct) — `egui-0.35.0/src/style.rs:1327`
+### `DebugOptions` (struct) — `egui-0.36.2/src/style.rs:1333`
 
 Options for help debug egui by adding extra visualization
 
@@ -7052,11 +7101,11 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2625`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2637`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ImeComposition` (struct) — `egui-0.35.0/src/style.rs:1200`
+### `ImeComposition` (struct) — `egui-0.36.2/src/style.rs:1206`
 
 Visual style for IME composition.
 
@@ -7068,11 +7117,11 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2192`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2205`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Interaction` (struct) — `egui-0.35.0/src/style.rs:907`
+### `Interaction` (struct) — `egui-0.36.2/src/style.rs:911`
 
 How and when interaction happens.
 
@@ -7089,24 +7138,24 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2067`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2080`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `NumberFormatter` (struct) — `egui-0.35.0/src/style.rs:20`
+### `NumberFormatter` (struct) — `egui-0.36.2/src/style.rs:21`
 
 How to format numbers in e.g. a [`crate::DragValue`].
 
 Methods:
 
-- `fn format(&self, value: f64, decimals: RangeInclusive<usize>) -> String` — `egui-0.35.0/src/style.rs:45`
+- `fn format(&self, value: f64, decimals: RangeInclusive<usize>) -> String` — `egui-0.36.2/src/style.rs:46`
   Format the given number with the given number of decimals.
-- `fn new(formatter: impl 'static + Sync + Send + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.35.0/src/style.rs:30`
+- `fn new(formatter: impl 'static + Sync + Send + Fn(f64, RangeInclusive<usize>) -> String) -> Self` — `egui-0.36.2/src/style.rs:31`
   The first argument is the number to be formatted. The second argument is the range of the number of decimals…
 
 Implements: `Clone`, `Debug`, `PartialEq`
 
-### `ScrollAnimation` (struct) — `egui-0.35.0/src/style.rs:827`
+### `ScrollAnimation` (struct) — `egui-0.36.2/src/style.rs:831`
 
 Scroll animation configuration, used when programmatically scrolling somewhere (e.g. with `[crate::Ui::scroll_to_cursor]`).
 
@@ -7117,17 +7166,17 @@ Public fields:
 
 Methods:
 
-- `fn duration(t: f32) -> Self` — `egui-0.35.0/src/style.rs:862`
+- `fn duration(t: f32) -> Self` — `egui-0.36.2/src/style.rs:866`
   Scroll with a fixed duration, regardless of distance.
-- `fn new(points_per_second: f32, duration: Rangef) -> Self` — `egui-0.35.0/src/style.rs:846`
+- `fn new(points_per_second: f32, duration: Rangef) -> Self` — `egui-0.36.2/src/style.rs:850`
   New scroll animation
-- `fn none() -> Self` — `egui-0.35.0/src/style.rs:854`
+- `fn none() -> Self` — `egui-0.36.2/src/style.rs:858`
   No animation, scroll instantly.
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:869`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:873`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ScrollFadeStyle` (struct) — `egui-0.35.0/src/style.rs:780`
+### `ScrollFadeStyle` (struct) — `egui-0.36.2/src/style.rs:784`
 
 Controls if and how to fade out the sides of a [`crate::ScrollArea`] to indicate there is more there if you scroll.
 
@@ -7138,11 +7187,11 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:801`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:805`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ScrollStyle` (struct) — `egui-0.35.0/src/style.rs:491`
+### `ScrollStyle` (struct) — `egui-0.36.2/src/style.rs:495`
 
 Controls the spacing and visuals of a [`crate::ScrollArea`].
 
@@ -7167,20 +7216,20 @@ Public fields:
 
 Methods:
 
-- `fn allocated_width(&self) -> f32` — `egui-0.35.0/src/style.rs:652`
+- `fn allocated_width(&self) -> f32` — `egui-0.36.2/src/style.rs:656`
   Width of a solid vertical scrollbar, or height of a horizontal scroll bar, when it is at its widest.
-- `fn details_ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:673`
-- `fn floating() -> Self` — `egui-0.35.0/src/style.rs:639`
+- `fn details_ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:677`
+- `fn floating() -> Self` — `egui-0.36.2/src/style.rs:643`
   No scroll bars until you hover the scroll area, at which time they appear faintly, and then expand when you h…
-- `fn solid() -> Self` — `egui-0.35.0/src/style.rs:589`
+- `fn solid() -> Self` — `egui-0.36.2/src/style.rs:593`
   Solid scroll bars that always use up space
-- `fn thin() -> Self` — `egui-0.35.0/src/style.rs:615`
+- `fn thin() -> Self` — `egui-0.36.2/src/style.rs:619`
   Thin scroll bars that expand on hover
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:660`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:664`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Selection` (struct) — `egui-0.35.0/src/style.rs:1188`
+### `Selection` (struct) — `egui-0.36.2/src/style.rs:1194`
 
 Selected text, selected elements etc
 
@@ -7191,24 +7240,24 @@ Public fields:
 
 Methods:
 
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2175`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2188`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `StyleModifier` (struct) — `egui-0.35.0/src/style.rs:193`
+### `StyleModifier` (struct) — `egui-0.36.2/src/style.rs:194`
 
 Utility to modify a [`Style`] in some way. Constructed via [`StyleModifier::from`] from a `Fn(&mut Style)` or a [`Style`].
 
 Methods:
 
-- `fn apply(&self, style: &mut Style)` — `egui-0.35.0/src/style.rs:224`
+- `fn apply(&self, style: &mut Style)` — `egui-0.36.2/src/style.rs:225`
   Apply the modification to the given [`Style`]. Usually used with [`Ui::style_mut`].
-- `fn new(f: impl Fn(&mut Style) + Send + Sync + 'static) -> Self` — `egui-0.35.0/src/style.rs:218`
+- `fn new(f: impl Fn(&mut Style) + Send + Sync + 'static) -> Self` — `egui-0.36.2/src/style.rs:219`
   Create a new [`StyleModifier`] from a function.
 
 Implements: `Clone`, `Debug`, `Default`, `From<Style>`, `From<T>`
 
-### `TextCursorStyle` (struct) — `egui-0.35.0/src/style.rs:947`
+### `TextCursorStyle` (struct) — `egui-0.36.2/src/style.rs:951`
 
 Look and feel of the text cursor.
 
@@ -7222,7 +7271,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `WidgetVisuals` (struct) — `egui-0.35.0/src/style.rs:1284`
+### `WidgetVisuals` (struct) — `egui-0.36.2/src/style.rs:1290`
 
 bg = background, fg = foreground.
 
@@ -7237,12 +7286,12 @@ Public fields:
 
 Methods:
 
-- `fn text_color(&self) -> Color32` — `egui-0.35.0/src/style.rs:1318`
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2220`
+- `fn text_color(&self) -> Color32` — `egui-0.36.2/src/style.rs:1324`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2233`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Widgets` (struct) — `egui-0.35.0/src/style.rs:1244`
+### `Widgets` (struct) — `egui-0.36.2/src/style.rs:1250`
 
 The visuals of widgets for different states of interaction.
 
@@ -7256,19 +7305,19 @@ Public fields:
 
 Methods:
 
-- `fn dark() -> Self` — `egui-0.35.0/src/style.rs:1673`
-- `fn light() -> Self` — `egui-0.35.0/src/style.rs:1718`
-- `fn state(&self, state: WidgetState) -> &WidgetVisuals` — `egui-0.35.0/src/widget_style.rs:94`
+- `fn dark() -> Self` — `egui-0.36.2/src/style.rs:1681`
+- `fn light() -> Self` — `egui-0.36.2/src/style.rs:1726`
+- `fn state(&self, state: WidgetState) -> &WidgetVisuals` — `egui-0.36.2/src/widget_style.rs:94`
   The widget visuals according to the state
-- `fn style(&self, response: &Response) -> &WidgetVisuals` — `egui-0.35.0/src/style.rs:1267`
-- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.35.0/src/style.rs:2138`
+- `fn style(&self, response: &Response) -> &WidgetVisuals` — `egui-0.36.2/src/style.rs:1273`
+- `fn ui(&mut self, ui: &mut Ui)` — `egui-0.36.2/src/style.rs:2151`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
 
 ## `egui::text`
 
-### `FontFamily` (enum) — `epaint-0.35.0/src/text/fonts.rs:80`
+### `FontFamily` (enum) — `epaint-0.36.2/src/text/fonts.rs:74`
 
 Font of unknown size.
 
@@ -7280,20 +7329,20 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `ByteIndex` (struct) — `epaint-0.35.0/src/text/index.rs:19`
+### `ByteIndex` (struct) — `epaint-0.36.2/src/text/index.rs:19`
 
 A byte offset into a UTF-8 string.
 
 Methods:
 
-- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:133`
+- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:133`
   Saturating integer addition.
-- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:133`
+- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:133`
   Saturating integer subtraction.
 
 Implements: `Add`, `Add<usize>`, `AddAssign`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `From<ByteIndex>`, `From<usize>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<usize>`, `SubAssign<usize>`
 
-### `CCursor` (struct) — `epaint-0.35.0/src/text/cursor.rs:10`
+### `CCursor` (struct) — `epaint-0.36.2/src/text/cursor.rs:10`
 
 Character cursor.
 
@@ -7304,11 +7353,11 @@ Public fields:
 
 Methods:
 
-- `fn new(index: impl Into<CharIndex>) -> Self` — `epaint-0.35.0/src/text/cursor.rs:23`
+- `fn new(index: impl Into<CharIndex>) -> Self` — `epaint-0.36.2/src/text/cursor.rs:23`
 
 Implements: `Add<CharIndex>`, `Add<usize>`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `Sub<CharIndex>`, `Sub<usize>`, `SubAssign<usize>`
 
-### `CCursorRange` (struct) — `egui-0.35.0/src/text_selection/cursor_range.rs:12`
+### `CCursorRange` (struct) — `egui-0.36.2/src/text_selection/cursor_range.rs:12`
 
 A selected text range (could be a range of length zero).
 
@@ -7320,44 +7369,44 @@ Public fields:
 
 Methods:
 
-- `fn as_sorted_char_range(&self) -> Range<CharIndex>` — `egui-0.35.0/src/text_selection/cursor_range.rs:52`
+- `fn as_sorted_char_range(&self) -> Range<CharIndex>` — `egui-0.36.2/src/text_selection/cursor_range.rs:52`
   The range of selected character indices.
-- `fn contains(&self, other: Self) -> bool` — `egui-0.35.0/src/text_selection/cursor_range.rs:67`
+- `fn contains(&self, other: Self) -> bool` — `egui-0.36.2/src/text_selection/cursor_range.rs:67`
   Is `self` a super-set of the other range?
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/text_selection/cursor_range.rs:62`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/text_selection/cursor_range.rs:62`
   True if the selected range contains no characters.
-- `fn is_sorted(&self) -> bool` — `egui-0.35.0/src/text_selection/cursor_range.rs:84`
-- `fn on_event(&mut self, os: OperatingSystem, event: &Event, galley: &Galley, _widget_id: Id) -> bool` — `egui-0.35.0/src/text_selection/cursor_range.rs:172`
+- `fn is_sorted(&self) -> bool` — `egui-0.36.2/src/text_selection/cursor_range.rs:84`
+- `fn on_event(&mut self, os: OperatingSystem, event: &Event, galley: &Galley, _widget_id: Id) -> bool` — `egui-0.36.2/src/text_selection/cursor_range.rs:172`
   Check for events that modify the cursor range.
-- `fn on_key_press(&mut self, os: OperatingSystem, galley: &Galley, modifiers: &Modifiers, key: Key) -> bool` — `egui-0.35.0/src/text_selection/cursor_range.rs:108`
+- `fn on_key_press(&mut self, os: OperatingSystem, galley: &Galley, modifiers: &Modifiers, key: Key) -> bool` — `egui-0.36.2/src/text_selection/cursor_range.rs:108`
   Check for key presses that are moving the cursor.
-- `fn one(ccursor: CCursor) -> Self` — `egui-0.35.0/src/text_selection/cursor_range.rs:29`
+- `fn one(ccursor: CCursor) -> Self` — `egui-0.36.2/src/text_selection/cursor_range.rs:29`
   The empty range.
-- `fn select_all(galley: &Galley) -> Self` — `egui-0.35.0/src/text_selection/cursor_range.rs:47`
+- `fn select_all(galley: &Galley) -> Self` — `egui-0.36.2/src/text_selection/cursor_range.rs:47`
   Select all the text in a galley
-- `fn single(&self) -> Option<CCursor>` — `egui-0.35.0/src/text_selection/cursor_range.rs:75`
+- `fn single(&self) -> Option<CCursor>` — `egui-0.36.2/src/text_selection/cursor_range.rs:75`
   If there is a selection, None is returned. If the two ends are the same, that is returned.
-- `fn slice_str(&self, text: &'s str) -> &'s str` — `egui-0.35.0/src/text_selection/cursor_range.rs:100`
-- `fn sorted_cursors(&self) -> [CCursor; 2]` — `egui-0.35.0/src/text_selection/cursor_range.rs:92`
+- `fn slice_str(&self, text: &'s str) -> &'s str` — `egui-0.36.2/src/text_selection/cursor_range.rs:100`
+- `fn sorted_cursors(&self) -> [CCursor; 2]` — `egui-0.36.2/src/text_selection/cursor_range.rs:92`
   returns the two ends ordered
-- `fn two(min: impl Into<CCursor>, max: impl Into<CCursor>) -> Self` — `egui-0.35.0/src/text_selection/cursor_range.rs:38`
+- `fn two(min: impl Into<CCursor>, max: impl Into<CCursor>) -> Self` — `egui-0.36.2/src/text_selection/cursor_range.rs:38`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<CCursorRange>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `CharIndex` (struct) — `epaint-0.35.0/src/text/index.rs:31`
+### `CharIndex` (struct) — `epaint-0.36.2/src/text/index.rs:31`
 
 A character (Unicode scalar) offset into a string.
 
 Methods:
 
-- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:134`
+- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:134`
   Saturating integer addition.
-- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:134`
+- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:134`
   Saturating integer subtraction.
 
 Implements: `Add`, `Add<CharIndex>`, `Add<usize>`, `AddAssign`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `From<CharIndex>`, `From<usize>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<CharIndex>`, `Sub<usize>`, `SubAssign<usize>`
 
-### `FontData` (struct) — `epaint-0.35.0/src/text/fonts.rs:118`
+### `FontData` (struct) — `epaint-0.36.2/src/text/fonts.rs:112`
 
 A `.ttf` or `.otf` file and a font face index.
 
@@ -7369,15 +7418,15 @@ Public fields:
 
 Methods:
 
-- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.35.0/src/text/fonts.rs:139`
-- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.35.0/src/text/fonts.rs:131`
-- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.35.0/src/text/fonts.rs:147`
-- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.35.0/src/text/fonts.rs:159`
+- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.36.2/src/text/fonts.rs:133`
+- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.36.2/src/text/fonts.rs:125`
+- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.36.2/src/text/fonts.rs:141`
+- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.36.2/src/text/fonts.rs:153`
   The variation axes of this font, e.g. `wght` (weight) and `wdth` (width).
 
 Implements: `AsRef<[u8]>`, `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontDefinitions` (struct) — `epaint-0.35.0/src/text/fonts.rs:437`
+### `FontDefinitions` (struct) — `epaint-0.36.2/src/text/fonts.rs:431`
 
 Describes the font data and the sizes to use.
 
@@ -7388,14 +7437,14 @@ Public fields:
 
 Methods:
 
-- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.35.0/src/text/fonts.rs:580`
+- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.36.2/src/text/fonts.rs:574`
   List of all the builtin font names used by `epaint`.
-- `fn empty() -> Self` — `epaint-0.35.0/src/text/fonts.rs:567`
+- `fn empty() -> Self` — `epaint-0.36.2/src/text/fonts.rs:561`
   No fonts.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Fonts` (struct) — `epaint-0.35.0/src/text/fonts.rs:713`
+### `Fonts` (struct) — `epaint-0.36.2/src/text/fonts.rs:707`
 
 The collection of fonts used by `epaint`.
 
@@ -7405,31 +7454,31 @@ Public fields:
 
 Methods:
 
-- `fn begin_pass(&mut self, options: TextOptions)` — `epaint-0.35.0/src/text/fonts.rs:734`
+- `fn begin_pass(&mut self, options: TextOptions)` — `epaint-0.36.2/src/text/fonts.rs:728`
   Call at the start of each frame with the latest known [`TextOptions`].
-- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.35.0/src/text/fonts.rs:762`
-- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.35.0/src/text/fonts.rs:802`
+- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.36.2/src/text/fonts.rs:756`
+- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.36.2/src/text/fonts.rs:796`
   How full is the font atlas?
-- `fn font_image_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.35.0/src/text/fonts.rs:752`
+- `fn font_image_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.36.2/src/text/fonts.rs:746`
   Call at the end of each frame (before painting) to get the change to the font texture since last call.
-- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.35.0/src/text/fonts.rs:780`
+- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.36.2/src/text/fonts.rs:774`
   Current size of the font image. Pass this to [`crate::Tessellator`].
-- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.35.0/src/text/fonts.rs:785`
+- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.36.2/src/text/fonts.rs:779`
   Can we display this glyph?
-- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.35.0/src/text/fonts.rs:790`
+- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.36.2/src/text/fonts.rs:784`
   Can we display all the glyphs in this text?
-- `fn image(&self) -> ColorImage` — `epaint-0.35.0/src/text/fonts.rs:774`
+- `fn image(&self) -> ColorImage` — `epaint-0.36.2/src/text/fonts.rs:768`
   The full font atlas image.
-- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.35.0/src/text/fonts.rs:721`
+- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.36.2/src/text/fonts.rs:715`
   Create a new [`Fonts`] for text layout. This call is expensive, so only create one [`Fonts`] and then reuse i…
-- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.35.0/src/text/fonts.rs:794`
-- `fn options(&self) -> &TextOptions` — `epaint-0.35.0/src/text/fonts.rs:757`
-- `fn texture_atlas(&self) -> &TextureAtlas` — `epaint-0.35.0/src/text/fonts.rs:768`
+- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.36.2/src/text/fonts.rs:788`
+- `fn options(&self) -> &TextOptions` — `epaint-0.36.2/src/text/fonts.rs:751`
+- `fn texture_atlas(&self) -> &TextureAtlas` — `epaint-0.36.2/src/text/fonts.rs:762`
   The font atlas. Pass this to [`crate::Tessellator`].
-- `fn with_pixels_per_point(&mut self, pixels_per_point: f32) -> FontsView<'_>` — `epaint-0.35.0/src/text/fonts.rs:807`
+- `fn with_pixels_per_point(&mut self, pixels_per_point: f32) -> FontsView<'_>` — `epaint-0.36.2/src/text/fonts.rs:801`
   Returns a [`FontsView`] with the given `pixels_per_point` that can be used to do text layout.
 
-### `Galley` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:729`
+### `Galley` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:736`
 
 Text that has been laid out, ready for painting.
 
@@ -7446,38 +7495,38 @@ Public fields:
 
 Methods:
 
-- `fn begin(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1228`
+- `fn begin(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1235`
   Cursor to the first character.
-- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1335`
-- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:1058`
+- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1342`
+- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:1065`
   Append each galley under the previous one.
-- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1406`
-- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1390`
-- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1364`
-- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1431`
-- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1398`
-- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1174`
+- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1413`
+- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1397`
+- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1371`
+- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1438`
+- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1405`
+- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1181`
   Cursor at the given position within the galley.
-- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1317`
-- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1328`
-- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1339`
-- `fn end(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1233`
+- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1324`
+- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1335`
+- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1346`
+- `fn end(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1240`
   Cursor to one-past last character.
-- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1019`
+- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1026`
   This is the size that a non-wrapped, non-truncated, non-justified version of the text would have.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/text/text_layout_types.rs:999`
-- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1252`
-- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1163`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/text/text_layout_types.rs:1006`
+- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1259`
+- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1170`
   Returns a 0-width Rect.
-- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1153`
+- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1160`
   Returns a 0-width Rect.
-- `fn size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1010`
-- `fn text(&self) -> &str` — `epaint-0.35.0/src/text/text_layout_types.rs:1005`
+- `fn size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1017`
+- `fn text(&self) -> &str` — `epaint-0.36.2/src/text/text_layout_types.rs:1012`
   The full, non-elided text of the input job.
 
 Implements: `AsRef<str>`, `Borrow<str>`, `Clone`, `Debug`, `Deref`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `LayoutJob` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:49`
+### `LayoutJob` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:49`
 
 Describes the task of laying out text.
 
@@ -7495,28 +7544,30 @@ Public fields:
 
 Methods:
 
-- `fn append(&mut self, text: &str, leading_space: f32, format: TextFormat)` — `epaint-0.35.0/src/text/text_layout_types.rs:193`
+- `fn append(&mut self, text: &str, leading_space: f32, format: TextFormat)` — `epaint-0.36.2/src/text/text_layout_types.rs:200`
   Helper for adding a new section when building a [`LayoutJob`].
-- `fn debug_sanity_check(&self)` — `epaint-0.35.0/src/text/text_layout_types.rs:236`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/text/text_layout_types.rs:119`
+  Clear the text and sections while preserving the layout settings.
+- `fn debug_sanity_check(&self)` — `epaint-0.36.2/src/text/text_layout_types.rs:243`
   Check the [`Self::sections`] invariant: the sections are ordered and together cover the whole of [`Self::text…
-- `fn effective_wrap_width(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:288`
+- `fn effective_wrap_width(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:295`
   The wrap with, with a small margin in some cases.
-- `fn font_height(&self, fonts: &mut FontsView<'_>) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:279`
+- `fn font_height(&self, fonts: &mut FontsView<'_>) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:286`
   The height of the tallest font used in the job.
-- `fn format_at_byte(&self, byte_idx: ByteIndex) -> &TextFormat` — `epaint-0.35.0/src/text/text_layout_types.rs:221`
+- `fn format_at_byte(&self, byte_idx: ByteIndex) -> &TextFormat` — `epaint-0.36.2/src/text/text_layout_types.rs:228`
   The [`TextFormat`] of the section containing the character starting at the given byte index.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/text/text_layout_types.rs:183`
-- `fn simple(text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:119`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/text/text_layout_types.rs:190`
+- `fn simple(text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:126`
   Break on `\n` and at the given wrap width.
-- `fn simple_format(text: String, format: TextFormat) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:138`
+- `fn simple_format(text: String, format: TextFormat) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:145`
   Break on `\n`
-- `fn simple_singleline(text: String, font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:153`
+- `fn simple_singleline(text: String, font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:160`
   Does not break on `\n`, but shows the replacement character instead.
-- `fn single_section(text: String, format: TextFormat) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:168`
+- `fn single_section(text: String, format: TextFormat) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:175`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `LayoutSection` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:340`
+### `LayoutSection` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:347`
 
 A contiguous range of [`LayoutJob::text`] that shares the same [`TextFormat`].
 
@@ -7528,7 +7579,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextFormat` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:471`
+### `TextFormat` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:478`
 
 Formatting option for a section of text.
 
@@ -7548,11 +7599,11 @@ Public fields:
 
 Methods:
 
-- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:571`
+- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:578`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextWrapping` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:603`
+### `TextWrapping` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:610`
 
 Controls the text wrapping and elision of a [`LayoutJob`].
 
@@ -7565,47 +7616,47 @@ Public fields:
 
 Methods:
 
-- `fn from_wrap_mode_and_width(mode: TextWrapMode, max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:676`
+- `fn from_wrap_mode_and_width(mode: TextWrapMode, max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:683`
   Create a [`TextWrapping`] from a [`TextWrapMode`] and an available width.
-- `fn no_max_width() -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:685`
+- `fn no_max_width() -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:692`
   A row can be as long as it need to be.
-- `fn truncate_at_width(max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:701`
+- `fn truncate_at_width(max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:708`
   Elide text that doesn't fit within the given width, replaced with `…`.
-- `fn wrap_at_width(max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:693`
+- `fn wrap_at_width(max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:700`
   A row can be at most `max_width` wide but can wrap in any number of lines.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ByteRange` (type_alias) — `epaint-0.35.0/src/text/index.rs:137`
+### `ByteRange` (type_alias) — `epaint-0.36.2/src/text/index.rs:137`
 
 A range of [`ByteIndex`], i.e. a byte range into a [`str`].
 
-### `CharRange` (type_alias) — `epaint-0.35.0/src/text/index.rs:140`
+### `CharRange` (type_alias) — `epaint-0.36.2/src/text/index.rs:140`
 
 A range of [`CharIndex`], i.e. a character range into a [`str`].
 
 
 ## `egui::text_edit`
 
-### `TextCursorState` (struct) — `egui-0.35.0/src/text_selection/text_cursor_state.rs:16`
+### `TextCursorState` (struct) — `egui-0.36.2/src/text_selection/text_cursor_state.rs:16`
 
 The state of a text cursor selection.
 
 Methods:
 
-- `fn char_range(&self) -> Option<CCursorRange>` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:34`
+- `fn char_range(&self) -> Option<CCursorRange>` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:34`
   The currently selected range of characters.
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:29`
-- `fn pointer_interaction(&mut self, ui: &Ui, response: &Response, cursor_at_pointer: CCursor, galley: &Galley, is_being_dragged: bool) -> bool` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:58`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:29`
+- `fn pointer_interaction(&mut self, ui: &Ui, response: &Response, cursor_at_pointer: CCursor, galley: &Galley, is_being_dragged: bool) -> bool` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:58`
   Handle clicking and/or dragging text.
-- `fn range(&self, galley: &Galley) -> Option<CCursorRange>` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:40`
+- `fn range(&self, galley: &Galley) -> Option<CCursorRange>` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:40`
   The currently selected range of characters, clamped within the character range of the given [`Galley`].
-- `fn set_char_range(&mut self, ccursor_range: Option<CCursorRange>)` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:49`
+- `fn set_char_range(&mut self, ccursor_range: Option<CCursorRange>)` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:49`
   Sets the currently selected range of characters.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<CCursorRange>`, `Serialize`
 
-### `TextEditOutput` (struct) — `egui-0.35.0/src/widgets/text_edit/output.rs:6`
+### `TextEditOutput` (struct) — `egui-0.36.2/src/widgets/text_edit/output.rs:6`
 
 The output from a [`TextEdit`](crate::TextEdit).
 
@@ -7618,7 +7669,7 @@ Public fields:
 - `state: TextEditState` — The state we stored after the run.
 - `cursor_range: Option<CCursorRange>` — Where the text cursor is.
 
-### `TextEditState` (struct) — `egui-0.35.0/src/widgets/text_edit/state.rs:38`
+### `TextEditState` (struct) — `egui-0.36.2/src/widgets/text_edit/state.rs:38`
 
 The text edit state stored between frames.
 
@@ -7628,28 +7679,28 @@ Public fields:
 
 Methods:
 
-- `fn clear_undoer(&mut self)` — `egui-0.35.0/src/widgets/text_edit/state.rs:79`
-- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.35.0/src/widgets/text_edit/state.rs:62`
-- `fn set_undoer(&mut self, undoer: Undoer<(CCursorRange, String)>)` — `egui-0.35.0/src/widgets/text_edit/state.rs:75`
-- `fn store(self, ctx: &Context, id: Id)` — `egui-0.35.0/src/widgets/text_edit/state.rs:66`
-- `fn undoer(&self) -> Undoer<(CCursorRange, String)>` — `egui-0.35.0/src/widgets/text_edit/state.rs:70`
+- `fn clear_undoer(&mut self)` — `egui-0.36.2/src/widgets/text_edit/state.rs:79`
+- `fn load(ctx: &Context, id: Id) -> Option<Self>` — `egui-0.36.2/src/widgets/text_edit/state.rs:62`
+- `fn set_undoer(&mut self, undoer: Undoer<(CCursorRange, String)>)` — `egui-0.36.2/src/widgets/text_edit/state.rs:75`
+- `fn store(self, ctx: &Context, id: Id)` — `egui-0.36.2/src/widgets/text_edit/state.rs:66`
+- `fn undoer(&self) -> Undoer<(CCursorRange, String)>` — `egui-0.36.2/src/widgets/text_edit/state.rs:70`
 
 Implements: `Clone`, `Default`, `Deserialize<'de>`, `Serialize`
 
 
 ## `egui::text_selection`
 
-### `LabelSelectionState` (struct) — `egui-0.35.0/src/text_selection/label_text_selection.rs:85`
+### `LabelSelectionState` (struct) — `egui-0.36.2/src/text_selection/label_text_selection.rs:85`
 
 Handles text selection in labels (NOT in [`crate::TextEdit`])s.
 
 Methods:
 
-- `fn clear_selection(&mut self)` — `egui-0.35.0/src/text_selection/label_text_selection.rs:168`
+- `fn clear_selection(&mut self)` — `egui-0.36.2/src/text_selection/label_text_selection.rs:168`
   Clear all label text selections in all viewports.
-- `fn has_selection(&self) -> bool` — `egui-0.35.0/src/text_selection/label_text_selection.rs:161`
+- `fn has_selection(&self) -> bool` — `egui-0.36.2/src/text_selection/label_text_selection.rs:161`
   Is there a label text selection in any viewport?
-- `fn label_text_selection(ui: &Ui, response: &Response, galley_pos: Pos2, galley: Arc<Galley>, fallback_color: Color32, underline: Stroke)` — `egui-0.35.0/src/text_selection/label_text_selection.rs:174`
+- `fn label_text_selection(ui: &Ui, response: &Response, galley_pos: Pos2, galley: Arc<Galley>, fallback_color: Color32, underline: Stroke)` — `egui-0.36.2/src/text_selection/label_text_selection.rs:174`
   Handle text selection state for a label or similar widget. This also takes care of painting the galley.
 
 Implements: `Clone`, `Debug`, `Default`, `Plugin`
@@ -7657,7 +7708,7 @@ Implements: `Clone`, `Debug`, `Default`, `Plugin`
 
 ## `egui::util`
 
-### `hash` — `epaint-0.35.0/src/util/mod.rs:3`
+### `hash` — `epaint-0.36.2/src/util/mod.rs:3`
 
 ```rust
 fn hash(value: impl Hash) -> u64
@@ -7665,7 +7716,7 @@ fn hash(value: impl Hash) -> u64
 
 Hash the given value with a predictable hasher.
 
-### `hash_with` — `epaint-0.35.0/src/util/mod.rs:9`
+### `hash_with` — `epaint-0.36.2/src/util/mod.rs:9`
 
 ```rust
 fn hash_with(value: impl Hash, hasher: impl Hasher) -> u64
@@ -7673,89 +7724,89 @@ fn hash_with(value: impl Hash, hasher: impl Hasher) -> u64
 
 Hash the given value with the given hasher.
 
-### `History` (struct) — `emath-0.35.0/src/history.rs:20`
+### `History` (struct) — `emath-0.36.2/src/history.rs:20`
 
 This struct tracks recent values of some time series.
 
 Methods:
 
-- `fn add(&mut self, now: f64, value: T)` — `emath-0.35.0/src/history.rs:127`
+- `fn add(&mut self, now: f64, value: T)` — `emath-0.36.2/src/history.rs:127`
   Values must be added with a monotonically increasing time, or at least not decreasing.
-- `fn average(&self) -> Option<T>` — `emath-0.35.0/src/history.rs:188`
-- `fn bandwidth(&self) -> Option<T>` — `emath-0.35.0/src/history.rs:208`
+- `fn average(&self) -> Option<T>` — `emath-0.36.2/src/history.rs:186`
+- `fn bandwidth(&self) -> Option<T>` — `emath-0.36.2/src/history.rs:206`
   Average times rate. If you are keeping track of individual sizes of things (e.g. bytes), this will estimate t…
-- `fn clear(&mut self)` — `emath-0.35.0/src/history.rs:122`
-- `fn duration(&self) -> f32` — `emath-0.35.0/src/history.rs:102`
+- `fn clear(&mut self)` — `emath-0.36.2/src/history.rs:122`
+- `fn duration(&self) -> f32` — `emath-0.36.2/src/history.rs:102`
   Amount of time contained from start to end in this [`History`].
-- `fn flush(&mut self, now: f64)` — `emath-0.35.0/src/history.rs:159`
+- `fn flush(&mut self, now: f64)` — `emath-0.36.2/src/history.rs:159`
   Remove samples that are too old.
-- `fn is_empty(&self) -> bool` — `emath-0.35.0/src/history.rs:76`
-- `fn iter(&self) -> impl ExactSizeIterator<Item = (f64, T)> + '_` — `emath-0.35.0/src/history.rs:113`
+- `fn is_empty(&self) -> bool` — `emath-0.36.2/src/history.rs:76`
+- `fn iter(&self) -> impl ExactSizeIterator<Item = (f64, T)> + '_` — `emath-0.36.2/src/history.rs:113`
   `(time, value)` pairs Time difference between values can be zero, but never negative.
-- `fn latest(&self) -> Option<T>` — `emath-0.35.0/src/history.rs:93`
-- `fn latest_mut(&mut self) -> Option<&mut T>` — `emath-0.35.0/src/history.rs:97`
-- `fn len(&self) -> usize` — `emath-0.35.0/src/history.rs:82`
+- `fn latest(&self) -> Option<T>` — `emath-0.36.2/src/history.rs:93`
+- `fn latest_mut(&mut self) -> Option<&mut T>` — `emath-0.36.2/src/history.rs:97`
+- `fn len(&self) -> usize` — `emath-0.36.2/src/history.rs:82`
   Current number of values kept in history
-- `fn max_age(&self) -> f32` — `emath-0.35.0/src/history.rs:71`
-- `fn max_len(&self) -> usize` — `emath-0.35.0/src/history.rs:66`
-- `fn mean_time_interval(&self) -> Option<f32>` — `emath-0.35.0/src/history.rs:140`
+- `fn max_age(&self) -> f32` — `emath-0.36.2/src/history.rs:71`
+- `fn max_len(&self) -> usize` — `emath-0.36.2/src/history.rs:66`
+- `fn mean_time_interval(&self) -> Option<f32>` — `emath-0.36.2/src/history.rs:140`
   Mean time difference between values in this [`History`].
-- `fn new(length_range: Range<usize>, max_age: f32) -> Self` — `emath-0.35.0/src/history.rs:55`
+- `fn new(length_range: Range<usize>, max_age: f32) -> Self` — `emath-0.36.2/src/history.rs:55`
   Example: ``` # use emath::History; # fn now() -> f64 { 0.0 } // Drop events that are older than one second, /…
-- `fn rate(&self) -> Option<f32>` — `emath-0.35.0/src/history.rs:154`
-- `fn sum(&self) -> T` — `emath-0.35.0/src/history.rs:184`
-- `fn total_count(&self) -> u64` — `emath-0.35.0/src/history.rs:89`
+- `fn rate(&self) -> Option<f32>` — `emath-0.36.2/src/history.rs:154`
+- `fn sum(&self) -> T` — `emath-0.36.2/src/history.rs:182`
+- `fn total_count(&self) -> u64` — `emath-0.36.2/src/history.rs:89`
   Total number of values seen. Includes those that have been discarded due to `max_len` or `max_age`.
-- `fn values(&self) -> impl ExactSizeIterator<Item = T> + '_` — `emath-0.35.0/src/history.rs:117`
-- `fn velocity(&self) -> Option<Vel>` — `emath-0.35.0/src/history.rs:221`
+- `fn values(&self) -> impl ExactSizeIterator<Item = T> + '_` — `emath-0.36.2/src/history.rs:117`
+- `fn velocity(&self) -> Option<Vel>` — `emath-0.36.2/src/history.rs:219`
   Calculate a smooth velocity (per second) over the entire time span. Calculated as the last value minus the fi…
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Serialize`
 
-### `IdTypeMap` (struct) — `egui-0.35.0/src/util/id_type_map.rs:406`
+### `IdTypeMap` (struct) — `egui-0.36.2/src/util/id_type_map.rs:407`
 
 Stores values identified by an [`Id`] AND the [`std::any::TypeId`] of the value.
 
 Methods:
 
-- `fn clear(&mut self)` — `egui-0.35.0/src/util/id_type_map.rs:609`
-- `fn count<T>(&self) -> usize` — `egui-0.35.0/src/util/id_type_map.rs:645`
+- `fn clear(&mut self)` — `egui-0.36.2/src/util/id_type_map.rs:610`
+- `fn count<T>(&self) -> usize` — `egui-0.36.2/src/util/id_type_map.rs:646`
   Count the number of values are stored with the given type.
-- `fn count_serialized(&self) -> usize` — `egui-0.35.0/src/util/id_type_map.rs:637`
+- `fn count_serialized(&self) -> usize` — `egui-0.36.2/src/util/id_type_map.rs:638`
   Count how many values are stored but not yet deserialized.
-- `fn get_persisted<T>(&mut self, id: Id) -> Option<T>` — `egui-0.35.0/src/util/id_type_map.rs:479`
+- `fn get_persisted<T>(&mut self, id: Id) -> Option<T>` — `egui-0.36.2/src/util/id_type_map.rs:480`
   Read a value, optionally deserializing it if available.
-- `fn get_persisted_mut_or<T>(&mut self, id: Id, or_insert: T) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:497`
-- `fn get_persisted_mut_or_default<T>(&mut self, id: Id) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:510`
-- `fn get_persisted_mut_or_insert_with<T>(&mut self, id: Id, insert_with: impl FnOnce() -> T) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:536`
-- `fn get_temp<T>(&self, id: Id) -> Option<T>` — `egui-0.35.0/src/util/id_type_map.rs:447`
+- `fn get_persisted_mut_or<T>(&mut self, id: Id, or_insert: T) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:498`
+- `fn get_persisted_mut_or_default<T>(&mut self, id: Id) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:511`
+- `fn get_persisted_mut_or_insert_with<T>(&mut self, id: Id, insert_with: impl FnOnce() -> T) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:537`
+- `fn get_temp<T>(&self, id: Id) -> Option<T>` — `egui-0.36.2/src/util/id_type_map.rs:448`
   Read a value without trying to deserialize a persisted value.
-- `fn get_temp_mut_or<T>(&mut self, id: Id, or_insert: T) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:488`
-- `fn get_temp_mut_or_default<T>(&mut self, id: Id) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:502`
-- `fn get_temp_mut_or_insert_with<T>(&mut self, id: Id, insert_with: impl FnOnce() -> T) -> &mut T` — `egui-0.35.0/src/util/id_type_map.rs:514`
-- `fn get_temp_raw(&self, raw: RawKey) -> Option<&dyn Any + Send + Sync>` — `egui-0.35.0/src/util/id_type_map.rs:455`
+- `fn get_temp_mut_or<T>(&mut self, id: Id, or_insert: T) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:489`
+- `fn get_temp_mut_or_default<T>(&mut self, id: Id) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:503`
+- `fn get_temp_mut_or_insert_with<T>(&mut self, id: Id, insert_with: impl FnOnce() -> T) -> &mut T` — `egui-0.36.2/src/util/id_type_map.rs:515`
+- `fn get_temp_raw(&self, raw: RawKey) -> Option<&dyn Any + Send + Sync>` — `egui-0.36.2/src/util/id_type_map.rs:456`
   Gets a reference to a value for a given raw key.
-- `fn get_temp_raw_mut(&mut self, raw: RawKey) -> Option<&mut dyn Any + Send + Sync>` — `egui-0.35.0/src/util/id_type_map.rs:465`
+- `fn get_temp_raw_mut(&mut self, raw: RawKey) -> Option<&mut dyn Any + Send + Sync>` — `egui-0.36.2/src/util/id_type_map.rs:466`
   Gets a mutable reference to a value for a given raw key.
-- `fn insert_persisted<T>(&mut self, id: Id, value: T)` — `egui-0.35.0/src/util/id_type_map.rs:436`
+- `fn insert_persisted<T>(&mut self, id: Id, value: T)` — `egui-0.36.2/src/util/id_type_map.rs:437`
   Insert a value that will be persisted next time you start the app.
-- `fn insert_temp<T>(&mut self, id: Id, value: T) -> RawKey` — `egui-0.35.0/src/util/id_type_map.rs:424`
+- `fn insert_temp<T>(&mut self, id: Id, value: T) -> RawKey` — `egui-0.36.2/src/util/id_type_map.rs:425`
   Insert a value that will not be persisted.
-- `fn is_empty(&self) -> bool` — `egui-0.35.0/src/util/id_type_map.rs:614`
-- `fn len(&self) -> usize` — `egui-0.35.0/src/util/id_type_map.rs:619`
-- `fn max_bytes_per_type(&self) -> usize` — `egui-0.35.0/src/util/id_type_map.rs:669`
+- `fn is_empty(&self) -> bool` — `egui-0.36.2/src/util/id_type_map.rs:615`
+- `fn len(&self) -> usize` — `egui-0.36.2/src/util/id_type_map.rs:620`
+- `fn max_bytes_per_type(&self) -> usize` — `egui-0.36.2/src/util/id_type_map.rs:670`
   The maximum number of bytes that will be used to store the persisted state of a single widget type.
-- `fn remove<T>(&mut self, id: Id)` — `egui-0.35.0/src/util/id_type_map.rs:571`
+- `fn remove<T>(&mut self, id: Id)` — `egui-0.36.2/src/util/id_type_map.rs:572`
   Remove the state of this type and id.
-- `fn remove_by_type<T>(&mut self)` — `egui-0.35.0/src/util/id_type_map.rs:600`
+- `fn remove_by_type<T>(&mut self)` — `egui-0.36.2/src/util/id_type_map.rs:601`
   Note all state of the given type.
-- `fn remove_temp<T>(&mut self, id: Id) -> Option<T>` — `egui-0.35.0/src/util/id_type_map.rs:578`
+- `fn remove_temp<T>(&mut self, id: Id) -> Option<T>` — `egui-0.36.2/src/util/id_type_map.rs:579`
   Remove and fetch the state of this type and id.
-- `fn remove_temp_raw(&mut self, raw: RawKey) -> Option<Box<dyn Any + Send + Sync>>` — `egui-0.35.0/src/util/id_type_map.rs:587`
+- `fn remove_temp_raw(&mut self, raw: RawKey) -> Option<Box<dyn Any + Send + Sync>>` — `egui-0.36.2/src/util/id_type_map.rs:588`
   Remove a temporary value given a raw key.
-- `fn set_max_bytes_per_type(&mut self, max_bytes_per_type: usize)` — `egui-0.35.0/src/util/id_type_map.rs:674`
+- `fn set_max_bytes_per_type(&mut self, max_bytes_per_type: usize)` — `egui-0.36.2/src/util/id_type_map.rs:675`
   See [`Self::max_bytes_per_type`].
-- `fn temp_keys(&self) -> impl Iterator<Item = RawKey>` — `egui-0.35.0/src/util/id_type_map.rs:628`
+- `fn temp_keys(&self) -> impl Iterator<Item = RawKey>` — `egui-0.36.2/src/util/id_type_map.rs:629`
   Returns all [`RawKey`]s to values in this map.
 
 Implements: `Clone`, `Debug`, `Default`
@@ -7763,15 +7814,15 @@ Implements: `Clone`, `Debug`, `Default`
 
 ## `egui::widget_style`
 
-### `ROOT_CLASS` (constant) — `egui-0.35.0/src/widget_style.rs:222`
+### `ROOT_CLASS` (constant) — `egui-0.36.2/src/widget_style.rs:222`
 
 The root class is a special class present on every top-level [`crate::Ui`].
 
-### `SELECTED_CLASS` (constant) — `egui-0.35.0/src/widget_style.rs:225`
+### `SELECTED_CLASS` (constant) — `egui-0.36.2/src/widget_style.rs:225`
 
 The selected class is a special class present on selected [`crate::Button`].
 
-### `WidgetState` (enum) — `egui-0.35.0/src/widget_style.rs:84`
+### `WidgetState` (enum) — `egui-0.36.2/src/widget_style.rs:84`
 
 The different state of a widget can be
 
@@ -7784,7 +7835,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `ButtonStyle` (struct) — `egui-0.35.0/src/widget_style.rs:35`
+### `ButtonStyle` (struct) — `egui-0.36.2/src/widget_style.rs:35`
 
 Dedicated button style
 
@@ -7793,7 +7844,7 @@ Public fields:
 - `frame: Frame`
 - `text_style: TextVisuals`
 
-### `CheckboxStyle` (struct) — `egui-0.35.0/src/widget_style.rs:41`
+### `CheckboxStyle` (struct) — `egui-0.36.2/src/widget_style.rs:41`
 
 Dedicated checkbox style
 
@@ -7806,13 +7857,13 @@ Public fields:
 - `checkbox_frame: Frame` — Frame of the checkbox itself
 - `check_stroke: Stroke` — Checkmark stroke
 
-### `Classes` (struct) — `egui-0.35.0/src/widget_style.rs:235`
+### `Classes` (struct) — `egui-0.36.2/src/widget_style.rs:235`
 
 Classes are string identifier that can be set on widget/Ui.
 
 Implements: `Clone`, `Debug`, `Default`, `Display`, `HasClasses`
 
-### `LabelStyle` (struct) — `egui-0.35.0/src/widget_style.rs:62`
+### `LabelStyle` (struct) — `egui-0.36.2/src/widget_style.rs:62`
 
 Dedicated label style
 
@@ -7822,7 +7873,7 @@ Public fields:
 - `text: TextVisuals` — Text style
 - `wrap_mode: TextWrapMode` — Wrap mode used
 
-### `SeparatorStyle` (struct) — `egui-0.35.0/src/widget_style.rs:74`
+### `SeparatorStyle` (struct) — `egui-0.36.2/src/widget_style.rs:74`
 
 Dedicated separator style
 
@@ -7831,7 +7882,7 @@ Public fields:
 - `spacing: f32` — How much space is allocated in the layout direction
 - `stroke: Stroke` — How to paint it
 
-### `TextVisuals` (struct) — `egui-0.35.0/src/widget_style.rs:13`
+### `TextVisuals` (struct) — `egui-0.36.2/src/widget_style.rs:13`
 
 General text style
 
@@ -7842,7 +7893,7 @@ Public fields:
 - `underline: Stroke` — Text decoration
 - `strikethrough: Stroke`
 
-### `WidgetStyle` (struct) — `egui-0.35.0/src/widget_style.rs:26`
+### `WidgetStyle` (struct) — `egui-0.36.2/src/widget_style.rs:26`
 
 General widget style
 
@@ -7852,52 +7903,52 @@ Public fields:
 - `text: TextVisuals`
 - `stroke: Stroke`
 
-### `HasClasses` (trait) — `egui-0.35.0/src/widget_style.rs:269`
+### `HasClasses` (trait) — `egui-0.36.2/src/widget_style.rs:269`
 
 Any widgets supporting [`Classes`] must implement this trait
 
 Required/provided items:
 
-- `fn classes(&self) -> &Classes` — `egui-0.35.0/src/widget_style.rs:270`
-- `fn classes_mut(&mut self) -> &mut Classes` — `egui-0.35.0/src/widget_style.rs:272`
-- `fn with_class(self, class: impl Into<ClassName>) -> Self` — `egui-0.35.0/src/widget_style.rs:276`
+- `fn classes(&self) -> &Classes` — `egui-0.36.2/src/widget_style.rs:270`
+- `fn classes_mut(&mut self) -> &mut Classes` — `egui-0.36.2/src/widget_style.rs:272`
+- `fn with_class(self, class: impl Into<ClassName>) -> Self` — `egui-0.36.2/src/widget_style.rs:276`
   Add the given class by consuming [`self`]
-- `fn with_class_if(self, class: impl Into<ClassName>, condition: bool) -> Self` — `egui-0.35.0/src/widget_style.rs:286`
+- `fn with_class_if(self, class: impl Into<ClassName>, condition: bool) -> Self` — `egui-0.36.2/src/widget_style.rs:286`
   Add the given class by consuming [`self`] if the condition is true
-- `fn add_class(&mut self, class: impl Into<ClassName>) -> &mut Self` — `egui-0.35.0/src/widget_style.rs:296`
+- `fn add_class(&mut self, class: impl Into<ClassName>) -> &mut Self` — `egui-0.36.2/src/widget_style.rs:296`
   Add the given class in-place
-- `fn add_class_if(&mut self, class: impl Into<ClassName>, condition: bool) -> &mut Self` — `egui-0.35.0/src/widget_style.rs:306`
+- `fn add_class_if(&mut self, class: impl Into<ClassName>, condition: bool) -> &mut Self` — `egui-0.36.2/src/widget_style.rs:306`
   Add the given class in-place if the condition is true
-- `fn has(&self, class: impl Into<ClassName>) -> bool` — `egui-0.35.0/src/widget_style.rs:315`
+- `fn has(&self, class: impl Into<ClassName>) -> bool` — `egui-0.36.2/src/widget_style.rs:315`
   True if the class is present
 
-### `ClassName` (type_alias) — `egui-0.35.0/src/widget_style.rs:228`
+### `ClassName` (type_alias) — `egui-0.36.2/src/widget_style.rs:228`
 
 A class is a static string identifier.
 
 
 ## `egui::gui_zoom::kb_shortcuts`
 
-### `ZOOM_IN` (constant) — `egui-0.35.0/src/gui_zoom.rs:10`
+### `ZOOM_IN` (constant) — `egui-0.36.2/src/gui_zoom.rs:10`
 
 Primary keyboard shortcut for zooming in (`Cmd` + `+`).
 
-### `ZOOM_IN_SECONDARY` (constant) — `egui-0.35.0/src/gui_zoom.rs:18`
+### `ZOOM_IN_SECONDARY` (constant) — `egui-0.36.2/src/gui_zoom.rs:18`
 
 Secondary keyboard shortcut for zooming in (`Cmd` + `=`).
 
-### `ZOOM_OUT` (constant) — `egui-0.35.0/src/gui_zoom.rs:22`
+### `ZOOM_OUT` (constant) — `egui-0.36.2/src/gui_zoom.rs:22`
 
 Keyboard shortcut for zooming in (`Cmd` + `-`).
 
-### `ZOOM_RESET` (constant) — `egui-0.35.0/src/gui_zoom.rs:25`
+### `ZOOM_RESET` (constant) — `egui-0.36.2/src/gui_zoom.rs:25`
 
 Keyboard shortcut for resetting zoom in (`Cmd` + `0`).
 
 
 ## `egui::text_selection::accesskit_text`
 
-### `update_accesskit_for_text_widget` — `egui-0.35.0/src/text_selection/accesskit_text.rs:30`
+### `update_accesskit_for_text_widget` — `egui-0.36.2/src/text_selection/accesskit_text.rs:30`
 
 ```rust
 fn update_accesskit_for_text_widget(ctx: &Context, widget_id: Id, cursor_range: Option<CCursorRange>, role: Role, global_from_galley: TSTransform, galley: &Galley)
@@ -7908,31 +7959,31 @@ Update accesskit with the current text state.
 
 ## `egui::text_selection::text_cursor_state`
 
-### `byte_index_from_char_index` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:276`
+### `byte_index_from_char_index` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:276`
 
 ```rust
 fn byte_index_from_char_index(s: &str, char_index: CharIndex) -> ByteIndex
 ```
 
-### `ccursor_next_word` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:166`
+### `ccursor_next_word` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:166`
 
 ```rust
 fn ccursor_next_word(text: &str, ccursor: CCursor) -> CCursor
 ```
 
-### `ccursor_previous_word` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:180`
+### `ccursor_previous_word` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:180`
 
 ```rust
 fn ccursor_previous_word(text: &str, ccursor: CCursor) -> CCursor
 ```
 
-### `char_index_from_byte_index` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:285`
+### `char_index_from_byte_index` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:285`
 
 ```rust
 fn char_index_from_byte_index(input: &str, byte_index: ByteIndex) -> CharIndex
 ```
 
-### `cursor_rect` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:310`
+### `cursor_rect` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:310`
 
 ```rust
 fn cursor_rect(galley: &Galley, cursor: &CCursor, row_height: f32) -> Rect
@@ -7940,7 +7991,7 @@ fn cursor_rect(galley: &Galley, cursor: &CCursor, row_height: f32) -> Rect
 
 The thin rectangle of one end of the selection, e.g. the primary cursor, in local galley coordinates.
 
-### `find_line_start` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:264`
+### `find_line_start` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:264`
 
 ```rust
 fn find_line_start(text: &str, current_index: CCursor) -> CCursor
@@ -7948,13 +7999,13 @@ fn find_line_start(text: &str, current_index: CCursor) -> CCursor
 
 Accepts and returns character offset (NOT byte offset!).
 
-### `is_word_char` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:255`
+### `is_word_char` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:255`
 
 ```rust
 fn is_word_char(c: char) -> bool
 ```
 
-### `slice_char_range` — `egui-0.35.0/src/text_selection/text_cursor_state.rs:297`
+### `slice_char_range` — `egui-0.36.2/src/text_selection/text_cursor_state.rs:297`
 
 ```rust
 fn slice_char_range(s: &str, char_range: Range<CharIndex>) -> &str
@@ -7963,7 +8014,7 @@ fn slice_char_range(s: &str, char_range: Range<CharIndex>) -> &str
 
 ## `egui::text_selection::visuals`
 
-### `paint_cursor_end` — `egui-0.35.0/src/text_selection/visuals.rs:267`
+### `paint_cursor_end` — `egui-0.36.2/src/text_selection/visuals.rs:267`
 
 ```rust
 fn paint_cursor_end(painter: &Painter, visuals: &Visuals, cursor_rect: Rect)
@@ -7971,7 +8022,7 @@ fn paint_cursor_end(painter: &Painter, visuals: &Visuals, cursor_rect: Rect)
 
 Paint one end of the selection, e.g. the primary cursor.
 
-### `paint_text_cursor` — `egui-0.35.0/src/text_selection/visuals.rs:291`
+### `paint_text_cursor` — `egui-0.36.2/src/text_selection/visuals.rs:291`
 
 ```rust
 fn paint_text_cursor(ui: &Ui, painter: &Painter, primary_cursor_rect: Rect, time_since_last_interaction: f64)
@@ -7979,7 +8030,7 @@ fn paint_text_cursor(ui: &Ui, painter: &Painter, primary_cursor_rect: Rect, time
 
 Paint one end of the selection, e.g. the primary cursor, with blinking (if enabled).
 
-### `paint_text_selection` — `egui-0.35.0/src/text_selection/visuals.rs:25`
+### `paint_text_selection` — `egui-0.36.2/src/text_selection/visuals.rs:25`
 
 ```rust
 fn paint_text_selection(galley: &mut Arc<Galley>, visuals: &Visuals, cursor_range: &CCursorRange, new_vertex_indices: Option<&mut Vec<RowVertexIndices>>)
@@ -7987,7 +8038,7 @@ fn paint_text_selection(galley: &mut Arc<Galley>, visuals: &Visuals, cursor_rang
 
 Adds text selection rectangles to the galley.
 
-### `RowVertexIndices` (struct) — `egui-0.35.0/src/text_selection/visuals.rs:19`
+### `RowVertexIndices` (struct) — `egui-0.36.2/src/text_selection/visuals.rs:19`
 
 Public fields:
 
@@ -7999,28 +8050,28 @@ Implements: `Clone`, `Debug`
 
 ## `egui::util::id_type_map`
 
-### `RawKey` (struct) — `egui-0.35.0/src/util/id_type_map.rs:341`
+### `RawKey` (struct) — `egui-0.36.2/src/util/id_type_map.rs:342`
 
 The key used in [`IdTypeMap`], which is a combination of an [`Id`] and a [`TypeId`].
 
 Methods:
 
-- `fn new<T>(id: Id) -> Self` — `egui-0.35.0/src/util/id_type_map.rs:359`
+- `fn new<T>(id: Id) -> Self` — `egui-0.36.2/src/util/id_type_map.rs:360`
   Create a new key for the given type.
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `Hash`, `IsEnabled`, `PartialEq`, `StructuralPartialEq`
 
-### `TypeId` (struct) — `egui-0.35.0/src/util/id_type_map.rs:12`
+### `TypeId` (struct) — `egui-0.36.2/src/util/id_type_map.rs:13`
 
 Like [`std::any::TypeId`], but can be serialized and deserialized.
 
 Methods:
 
-- `fn of<T>() -> Self` — `egui-0.35.0/src/util/id_type_map.rs:16`
+- `fn of<T>() -> Self` — `egui-0.36.2/src/util/id_type_map.rs:17`
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `From<TypeId>`, `Hash`, `IsEnabled`, `PartialEq`, `StructuralPartialEq`
 
-### `SerializableAny` (trait) — `egui-0.35.0/src/util/id_type_map.rs:50`
+### `SerializableAny` (trait) — `egui-0.36.2/src/util/id_type_map.rs:51`
 
 Required/provided items:
 
@@ -8028,7 +8079,7 @@ Required/provided items:
 
 ## `egui::util::undoer`
 
-### `Settings` (struct) — `egui-0.35.0/src/util/undoer.rs:5`
+### `Settings` (struct) — `egui-0.36.2/src/util/undoer.rs:5`
 
 Public fields:
 
@@ -8038,24 +8089,24 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Undoer` (struct) — `egui-0.35.0/src/util/undoer.rs:52`
+### `Undoer` (struct) — `egui-0.36.2/src/util/undoer.rs:52`
 
 Automatic undo system.
 
 Methods:
 
-- `fn add_undo(&mut self, current_state: &State)` — `egui-0.35.0/src/util/undoer.rs:165`
+- `fn add_undo(&mut self, current_state: &State)` — `egui-0.36.2/src/util/undoer.rs:164`
   Add an undo point if, and only if, there has been a change since the latest undo point.
-- `fn feed_state(&mut self, current_time: f64, current_state: &State)` — `egui-0.35.0/src/util/undoer.rs:179`
+- `fn feed_state(&mut self, current_time: f64, current_state: &State)` — `egui-0.36.2/src/util/undoer.rs:178`
   Call this as often as you want (e.g. every frame) and [`Undoer`] will determine if a new undo point should be…
-- `fn has_redo(&self, current_state: &State) -> bool` — `egui-0.35.0/src/util/undoer.rs:124`
-- `fn has_undo(&self, current_state: &State) -> bool` — `egui-0.35.0/src/util/undoer.rs:116`
+- `fn has_redo(&self, current_state: &State) -> bool` — `egui-0.36.2/src/util/undoer.rs:124`
+- `fn has_undo(&self, current_state: &State) -> bool` — `egui-0.36.2/src/util/undoer.rs:116`
   Do we have an undo point different from the given state?
-- `fn is_in_flux(&self) -> bool` — `egui-0.35.0/src/util/undoer.rs:129`
+- `fn is_in_flux(&self) -> bool` — `egui-0.36.2/src/util/undoer.rs:129`
   Return true if the state is currently changing
-- `fn redo(&mut self, current_state: &State) -> Option<&State>` — `egui-0.35.0/src/util/undoer.rs:151`
-- `fn undo(&mut self, current_state: &State) -> Option<&State>` — `egui-0.35.0/src/util/undoer.rs:133`
-- `fn with_settings(settings: Settings) -> Self` — `egui-0.35.0/src/util/undoer.rs:108`
+- `fn redo(&mut self, current_state: &State) -> Option<&State>` — `egui-0.36.2/src/util/undoer.rs:150`
+- `fn undo(&mut self, current_state: &State) -> Option<&State>` — `egui-0.36.2/src/util/undoer.rs:133`
+- `fn with_settings(settings: Settings) -> Self` — `egui-0.36.2/src/util/undoer.rs:108`
   Create a new [`Undoer`] with the given [`Settings`].
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Serialize`

@@ -38,7 +38,7 @@ Agent-facing architecture docs stay where they are (`README_AGENT.md`, per-direc
 
 ## Стек технологий
 
-- **GUI**: `eframe` / `egui` **0.35** (upstream crates.io, без форка и `[patch]`). 0.35 переименовал/удалил значительную часть API, который модели помнят по 0.27–0.31 (`App::update`, `SidePanel`/`TopBottomPanel`, `screen_rect`, `Rounding`, `id_source`, `raw_scroll_delta` — ничего из этого здесь нет). **Перед любой правкой UI: `egui-docs/README.md`**; существование API проверять грепом по `egui-docs/api/symbols.txt`, а не по памяти
+- **GUI**: `eframe` / `egui` **0.36** (upstream crates.io, без форка и `[patch]`). Версии до 0.36 включительно переименовали/удалили значительную часть API, который модели помнят по 0.27–0.31 (`App::update`, `SidePanel`/`TopBottomPanel`, `screen_rect`, `Rounding`, `id_source`, `raw_scroll_delta` — ничего из этого здесь нет). **Перед любой правкой UI: `egui-docs/README.md`**; существование API проверять грепом по `egui-docs/api/symbols.txt`, а не по памяти
 - **Рендер текста**: `cosmic-text` (typing tab)
 - **Изображения**: `image` crate (RGBA), `egui::ColorImage` (GPU upload)
 - **PDF**: `pdf-writer` (низкоуровневый writer, зависимость КРЕЙТА `ms-tab-typing`, не корневого манифеста). Единственный потребитель — экспорт вкладки «Текст» в PDF: одна растровая страница на лист, `/DeviceRGB` + `/FlateDecode` (без потерь, JPEG сознательно не используется). Ничего кроме этого экспорта на нём строить нельзя
@@ -49,7 +49,7 @@ Agent-facing architecture docs stay where they are (`README_AGENT.md`, per-direc
 - **Хранилище документов**: `rusqlite` with `bundled` (SQLite compiled from source; native-only dependency of `ms-docstore` — a C toolchain per target is required, `x86_64-w64-mingw32-gcc` for windows-gnu). Python mirrors the `.db` codec with the stdlib `sqlite3` in the repo-root `docstore.py`. See «Storage mode (Dev/Prod)»
 - **Python AI backend**: a separate `ai_backend.py` process that serves the framed IPC over a pluggable transport — AF_UNIX by default (path from `backend_ipc::backend_socket_path()`), loopback WebSocket fallback on Windows. The `--socket` argument is optional and defaults to the same standard path; the Rust process manager passes it explicitly when starting the backend. Compatibility between the application and the backend is governed by `PROTOCOL_VERSION` ALONE (`crates/ms-backend-ipc/src/protocol.rs` mirrored by `modules/ai_backend/ipc/protocol.py`), hard-compared in the `hello` handshake; a mismatch aborts the connection. It MUST be bumped in BOTH files on ANY change to that contract, not only on one judged breaking — a new method, a new header or payload field, a new topic, a changed meaning of an existing field, a changed blob format. Deciding whether a change "really" breaks anything is exactly the judgement that gets made wrong, and bumping costs nothing because both halves ship and update together. The parity test `backend_ipc::protocol::tests::python_protocol_version_matches_rust` guards the mirror, but nothing can detect a bump that was never made: a client and a backend from different builds then agree on a contract that does not exist and fail at runtime instead of being refused in `hello`. The program version (`config.VERSION` / `CARGO_PKG_VERSION`) is NEVER compared: the backend publishes `backend_version` in the `hello` header and in the health snapshot as DIAGNOSTIC information only (logged at connect), with no UI warning. Backend включает выбор PyTorch device, ONNX provider/device и лимита одновременно резидентных AI-моделей через `/device`; отсутствующий пользовательский выбор хранится как `not-selected`, но backend сразу резолвит его в runtime default (сначала GPU, затем CPU), сообщает Rust UI о незаданном выборе, когда Torch+CUDA впервые становятся доступны, а ONNX на Windows предпочитает DirectML и просит Rust UI выбрать конкретный DirectML adapter, если их несколько. Health snapshot публикует `is_torch_available`, а Rust зеркалит это в глобальный capability-slot для UI и runtime-гейтов. Backend держит общий LRU-style `LoadedModelManager`, который считает и выгружает idle PyTorch-модели и ONNX `InferenceSession` перед загрузкой новых. Модели, управляемые кодом ManhwaStudio, лежат в `ManhwaStudio_AI_Models/Torch` и `ManhwaStudio_AI_Models/ONNX`; Rust-side calls to app-managed backend models must first pass through `crates/ms-sysprobe/src/ai_models.rs`, which lazily downloads only the required files from `Vasyanator2/ManhwaStudio_AI_Models` directly into the app model tree. PaddleOCR OCR/detector выполняются через Python ONNX Runtime и модели из `ManhwaStudio_AI_Models/ONNX/PaddleOCR`; MangaOCR OCR поддерживает два локальных ONNX-export каталога `ManhwaStudio_AI_Models/ONNX/MangaOCR/base` / `ManhwaStudio_AI_Models/ONNX/MangaOCR/2025`, а также отдельный ленивый PyTorch-вариант через пакет `manga_ocr`, который импортируется только при явном выборе этого режима. EasyOCR, Surya и PaddleOCR-VL используют model-cache своих библиотек (PaddleOCR-VL — Hugging Face hub cache, грузится через Transformers с `trust_remote_code`, только при выборе этого движка). Если Torch недоступен, torch-dependent backend endpoints отвечают ошибкой, а ONNX-маршруты продолжают работать. Compiled ONNX cache хранится в `ManhwaStudio_AI_Models/.cache`. Ограничение: при выборе `MIGraphXExecutionProvider` detection-модель принудительно запускается на CPU, а MiGraphX-специфичные width-bucket/fixed-batch обходы применяются только к recognizer.
 - **Цели**: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`
-- **MSRV**: `rust-version` в корневом `Cargo.toml` (сейчас **1.92**, потолок задаёт `egui`/`eframe` 0.35). Это единственный источник правды: скрипты `tools/run-dev/` парсят это поле и отказываются собирать на более старом тулчейне. Поднимать только когда зависимость реально этого требует; дублировать число куда-либо нельзя
+- **MSRV**: `rust-version` в корневом `Cargo.toml` (сейчас **1.95**, потолок задаёт `egui`/`eframe` 0.36). Это единственный источник правды: скрипты `tools/run-dev/` парсят это поле и отказываются собирать на более старом тулчейне. Поднимать только когда зависимость реально этого требует; дублировать число куда-либо нельзя
 - **Запуск из исходников**: `run-dev.{Linux.sh,MacOS.command,Windows.bat}` в корне — тонкие лаунчеры к `tools/run-dev/`. Скрипт обновляет рабочую копию из git (включая копию, распакованную из ZIP без `.git`), ставит изолированный Rust в `installer_files/rust` и проходит Stage 3 в три строго последовательных шага: `--check-venv --ignore-installed` (проверка/починка Python-окружения, код возврата 0/1; этот же шаг и собирает проект), затем публикация собранного бинарника в корень проекта, затем запуск уже этого файла с `--ignore-installed`. Путь к бинарнику берётся из JSON-вывода `cargo build --message-format=json-render-diagnostics`, а не угадывается по `target/`; копирование атомарное и пропускается, если в корне уже лежит та же сборка. Публикация — удобство, а не предусловие: любая её ошибка это предупреждение, и запуск откатывается на `cargo run`. Смысл шага в том, что после успешной сборки `manhwastudio_rs[.exe]` в корне запускается сам по себе — без скрипта и без обновления. Контракт и все ветки алгоритма — `dev-docs/run_dev_plan.md`
 
 ---
@@ -295,9 +295,9 @@ bin (main.rs, app.rs, tabs/settings/)
   потребитель `winit`).
 
 - **`puffin_egui`** (`crates/puffin_egui`) — vendored fork of upstream `puffin_egui` 0.30.0,
-  ported to egui 0.35 (upstream has no egui-0.34/0.35 release). Only compiled behind the optional
-  `profiling` feature; provides the in-app flamegraph window. Keep changes minimal and re-sync from
-  upstream when an egui-0.35 release ships.
+  ported to egui 0.36 (upstream had no egui-0.34/0.35 release when it was vendored). Only compiled
+  behind the optional `profiling` feature; provides the in-app flamegraph window. Keep changes minimal
+  and re-sync from upstream when it ships a release for the egui version the workspace builds against.
 
 ---
 
@@ -425,7 +425,7 @@ re-run the script on every source change, so a Windows-target build or check wit
 Владелец каталога и байт — крейт `ms-fonts`: `ui_fonts` берёт манифест (`ms_fonts::stack()`)
 и байты (`ms_fonts::bytes()`) у него и ставит их через `FontData::from_static`. `from_owned`
 хранил бы байты ДВАЖДЫ (копия в `FontDefinitions::font_data` + глубокий клон в `Blob` фейса,
-`epaint-0.35.0/src/text/fonts.rs:397-402`) — на нынешнем наборе это ≈99 МБ лишней резидентной
+`epaint-0.36.2/src/text/fonts.rs:391-396`) — на нынешнем наборе это ≈99 МБ лишней резидентной
 памяти. Побочно снимается и повторное чтение с диска: лаунчер и студия — два последовательных
 `run_native` в ОДНОМ процессе, а `ms_fonts::bytes()` читает файл один раз за процесс.
 
@@ -504,18 +504,18 @@ The window a user sees first is placed from the self-versioned `Window` section 
   degrades to the largest one **with a logged reason**; the choice itself is kept in case the
   monitor comes back.
 * `ViewportBuilder::with_monitor(idx)` is NOT placement — it is borderless fullscreen
-  (`egui-winit-0.35.0/src/lib.rs:1952-1956`). Placement is `with_position`.
+  (`egui-winit-0.36.2/src/lib.rs:2003-2007`). Placement is `with_position`.
 * **New direct dependency `winit = "0.30"`** (`default-features = false`, same version eframe
   resolves, so the types unify): egui/eframe expose no monitor list at all. This is the only
   reason it is a direct dependency; nothing else may build UI on it.
 * **Units.** Everything persisted is *logical pixels* (physical / monitor DPI scale),
   independent of `General.ui_scale_percent`. That is what `with_position`/`with_inner_size`
   consume, because egui-winit multiplies them by `Context::zoom_factor()`
-  (`egui-winit-0.35.0/src/lib.rs:2063-2087`) and the builder is consumed while the context is
+  (`egui-winit-0.36.2/src/lib.rs:2111-2135`) and the builder is consumed while the context is
   still at zoom 1.0 — the `run_native` creator closure applies the UI scale only afterwards.
   At runtime the same numbers come back out of `ViewportInfo` (points) × `zoom_factor()`.
 * **Wayland is honestly unsupported**: `with_position` is ignored and `ViewportInfo::outer_rect`
-  is always `None` there (`egui-0.35.0/src/data/input/viewport_info.rs:52-66`). The tracker
+  is always `None` there (`egui-0.36.2/src/data/input/viewport_info.rs:52-66`). The tracker
   detects it (`Window::outer_position()` errors), persists no geometry, never relocates, logs
   the reason once, and the settings selector says so instead of pretending.
 * **Who tracks what.** The studio window owns the geometry: `StudioBootstrapApp` holds a

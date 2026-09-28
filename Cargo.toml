@@ -3,14 +3,14 @@ name = "manhwastudio_rs"
 version = "3.6.0"
 edition = "2024"
 # Minimum supported Rust version. Derived from the dependency graph, not chosen:
-# egui/eframe 0.35 declare `rust-version = "1.92"`, the highest floor here (next
+# egui/eframe 0.36 declare `rust-version = "1.95"`, the highest floor here (next
 # are image 0.25.10 at 1.88 and the edition-2024 floor at 1.85). Raise it only
 # when a dependency actually forces it.
 #
 # This is the SINGLE SOURCE OF TRUTH for the toolchain check in
 # `tools/run-dev/` — both run-dev scripts parse this field and refuse to run on
 # an older toolchain. Do not duplicate the number into them.
-rust-version = "1.92"
+rust-version = "1.95"
 
 [workspace]
 members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
@@ -38,12 +38,12 @@ anyhow = "1"
 arboard = "3"
 chrono = "0.4"
 cosmic-text = "0.14"
-# egui 0.35 changed the eframe default renderer to wgpu; ManhwaStudio uses the glow renderer
+# Since egui 0.35 the eframe default renderer is wgpu; ManhwaStudio uses the glow renderer
 # (`App::on_exit` takes an `Option<&glow::Context>`), so glow is pinned explicitly with
 # default features (incl. wgpu) turned off. Every eframe user in the workspace shares this
 # exact feature set, so no second copy of the backend is ever built.
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
-egui = "0.35"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
+egui = "0.36.2"
 flate2 = "1"
 genai = "0.6"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
@@ -104,7 +104,7 @@ web = []
 # Enable with `cargo run --features profiling` to record per-frame puffin scopes
 # and show the puffin_egui profiler window inside the editor.
 profiling = ["dep:puffin", "dep:puffin_egui"]
-# Dev/debug: enable egui 0.35's inspection protocol so an external inspector
+# Dev/debug: enable egui's inspection protocol so an external inspector
 # (e.g. the `egui_mcp` MCP server) can attach over TCP and read the widget tree,
 # inject input, and capture screenshots. Active only when the `EGUI_INSPECTION`
 # env var is set at runtime; off by default so production builds are unaffected.
@@ -283,8 +283,8 @@ sha2.workspace = true
 # build nothing beyond the derive it already needs.
 thiserror.workspace = true
 puffin = { version = "0.20.0", optional = true }
-# Vendored & ported to egui 0.35 (crates/puffin_egui); upstream has no 0.34/0.35
-# release. See crates/puffin_egui/Cargo.toml.
+# Vendored & ported to egui 0.36 (crates/puffin_egui); upstream had no egui-0.34/0.35
+# release when it was vendored. See crates/puffin_egui/Cargo.toml.
 puffin_egui = { path = "crates/puffin_egui", optional = true }
 
 # Native-only dependencies: native sockets / blocking HTTP (ureq, hf-hub,

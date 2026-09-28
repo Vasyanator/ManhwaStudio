@@ -25,8 +25,8 @@ MangaApp::on_exit   -> ColorFilter::destroy(gl)
 
 ### Why a GPU pass and not an egui tint
 egui's fragment stage is a component-wise multiply in gamma space
-(`egui_glow-0.35.0/src/shader/fragment.glsl:52`) and its blend stage is a fixed `FUNC_ADD` with
-`(ONE, ONE_MINUS_SRC_ALPHA)` (`egui_glow-0.35.0/src/painter.rs:314-324`). Every composition egui
+(`egui_glow-0.36.2/src/shader/fragment.glsl:52`) and its blend stage is a fixed `FUNC_ADD` with
+`(ONE, ONE_MINUS_SRC_ALPHA)` (`egui_glow-0.36.2/src/painter.rs:314-324`). Every composition egui
 can reach is therefore `out = M*c + B` with `M >= 0` and `B >= 0`. Contrast pivoted on mid-grey
 needs a **negative** offset, so it is unreachable by any number of egui draws — a shader is the
 only mechanism, and it is the mechanism the user chose.

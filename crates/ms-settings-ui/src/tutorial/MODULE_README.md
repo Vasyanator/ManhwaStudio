@@ -33,7 +33,8 @@ tutorial per surface, autoplays unseen tutorials on entry (caller edge-triggers
 
 Input blocking is pure hitbox overlap (one full-viewport `Sense::click_and_drag`
 `Area` on `Order::Middle`), NOT per-widget disabling — see `engine.rs` header for
-the egui-0.35 hit-test rationale and the "widgets must be occlusion-aware" caveat
+the egui hit-test rationale (written against 0.35; the 0.36 hit-test only adds skipping of
+non-interactable areas, `egui-0.36.2/src/context.rs:476-482`) and the "widgets must be occlusion-aware" caveat
 (a widget reading the raw pointer, like the old `WheelSlider`, leaks under the
 dim; fix it to use `Response::contains_pointer`/`hovered`).
 

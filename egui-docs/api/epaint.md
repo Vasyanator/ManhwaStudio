@@ -1,22 +1,22 @@
-# API index: `epaint` 0.35.0
+# API index: `epaint` 0.36.2
 
 GENERATED FILE — do not edit by hand. Regenerate with `tools/egui_docs/build.sh`. Extracted from rustdoc JSON of the exact crate source in the local cargo registry, so every signature and line number below is real.
 
 **If a name is not in this file, it does not exist in our version of the crate.** Grep here before writing egui code from memory.
 
-Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.35.0/src/…`.
+Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.36.2/src/…`.
 
 ## `epaint`
 
-### `HAS_RAYON` (constant) — `epaint-0.35.0/src/lib.rs:161`
+### `HAS_RAYON` (constant) — `epaint-0.36.2/src/lib.rs:161`
 
 Was epaint compiled with the `rayon` feature?
 
-### `WHITE_UV` (constant) — `epaint-0.35.0/src/lib.rs:88`
+### `WHITE_UV` (constant) — `epaint-0.36.2/src/lib.rs:88`
 
 The UV coordinate of a white region of the texture mesh.
 
-### `ColorMode` (enum) — `epaint-0.35.0/src/color.rs:9`
+### `ColorMode` (enum) — `epaint-0.36.2/src/color.rs:10`
 
 How paths will be colored.
 
@@ -27,7 +27,7 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`
 
-### `Direction` (enum) — `epaint-0.35.0/src/direction.rs:4`
+### `Direction` (enum) — `epaint-0.36.2/src/direction.rs:4`
 
 A cardinal direction, one of [`LeftToRight`](Direction::LeftToRight), [`RightToLeft`](Direction::RightToLeft), [`TopDown`](Direction::TopDown), [`BottomUp`](Direction::B…
 
@@ -40,12 +40,12 @@ Variants:
 
 Methods:
 
-- `fn is_horizontal(self) -> bool` — `epaint-0.35.0/src/direction.rs:13`
-- `fn is_vertical(self) -> bool` — `epaint-0.35.0/src/direction.rs:21`
+- `fn is_horizontal(self) -> bool` — `epaint-0.36.2/src/direction.rs:13`
+- `fn is_vertical(self) -> bool` — `epaint-0.36.2/src/direction.rs:21`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontColorTransferFunction` (enum) — `epaint-0.35.0/src/image.rs:370`
+### `FontColorTransferFunction` (enum) — `epaint-0.36.2/src/image.rs:370`
 
 How to convert font coverage values into alpha and color values.
 
@@ -57,17 +57,17 @@ Variants:
 
 Methods:
 
-- `fn alpha_from_coverage(self, coverage: f32) -> f32` — `epaint-0.35.0/src/image.rs:423`
+- `fn alpha_from_coverage(self, coverage: f32) -> f32` — `epaint-0.36.2/src/image.rs:423`
   Convert coverage to alpha.
-- `fn color_from_coverage(self, coverage: f32) -> Color32` — `epaint-0.35.0/src/image.rs:433`
-- `fn to_atlas_color(self, input_color: Color32) -> Color32` — `epaint-0.35.0/src/image.rs:403`
+- `fn color_from_coverage(self, coverage: f32) -> Color32` — `epaint-0.36.2/src/image.rs:433`
+- `fn to_atlas_color(self, input_color: Color32) -> Color32` — `epaint-0.36.2/src/image.rs:403`
   How to convert a white color written by the font rasterizer into a color to be written into the font atlas.
-- `fn to_gamma(self) -> f32` — `epaint-0.35.0/src/image.rs:439`
+- `fn to_gamma(self) -> f32` — `epaint-0.36.2/src/image.rs:439`
   Convert this into the closest gamma exponent
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontFamily` (enum) — `epaint-0.35.0/src/text/fonts.rs:80`
+### `FontFamily` (enum) — `epaint-0.36.2/src/text/fonts.rs:74`
 
 Font of unknown size.
 
@@ -79,7 +79,7 @@ Variants:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `ImageData` (enum) — `epaint-0.35.0/src/image.rs:16`
+### `ImageData` (enum) — `epaint-0.36.2/src/image.rs:16`
 
 An image stored in RAM.
 
@@ -89,14 +89,14 @@ Variants:
 
 Methods:
 
-- `fn bytes_per_pixel(&self) -> usize` — `epaint-0.35.0/src/image.rs:36`
-- `fn height(&self) -> usize` — `epaint-0.35.0/src/image.rs:32`
-- `fn size(&self) -> [usize; 2]` — `epaint-0.35.0/src/image.rs:22`
-- `fn width(&self) -> usize` — `epaint-0.35.0/src/image.rs:28`
+- `fn bytes_per_pixel(&self) -> usize` — `epaint-0.36.2/src/image.rs:36`
+- `fn height(&self) -> usize` — `epaint-0.36.2/src/image.rs:32`
+- `fn size(&self) -> [usize; 2]` — `epaint-0.36.2/src/image.rs:22`
+- `fn width(&self) -> usize` — `epaint-0.36.2/src/image.rs:28`
 
 Implements: `Clone`, `Deserialize<'de>`, `Eq`, `From<Arc<ColorImage>>`, `From<ColorImage>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Primitive` (enum) — `epaint-0.35.0/src/lib.rs:153`
+### `Primitive` (enum) — `epaint-0.36.2/src/lib.rs:153`
 
 A rendering primitive - either a [`Mesh`] or a [`PaintCallback`].
 
@@ -107,7 +107,7 @@ Variants:
 
 Implements: `Clone`, `Debug`
 
-### `Shape` (enum) — `epaint-0.35.0/src/shapes/shape.rs:27`
+### `Shape` (enum) — `epaint-0.36.2/src/shapes/shape.rs:27`
 
 A paint primitive such as a circle or a piece of text. Coordinates are all screen space points (not physical pixels).
 
@@ -128,59 +128,59 @@ Variants:
 
 Methods:
 
-- `fn circle_filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:260`
-- `fn circle_stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:265`
-- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:153`
+- `fn circle_filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:260`
+- `fn circle_stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:265`
+- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:153`
   A line that closes back to the start point again.
-- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:251`
+- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:251`
   A convex polygon with a fill and optional stroke.
-- `fn dashed_line(path: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:170`
+- `fn dashed_line(path: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:170`
   Turn a line into dashes.
-- `fn dashed_line_many(points: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32, shapes: &mut Vec<Self>)` — `epaint-0.35.0/src/shapes/shape.rs:210`
+- `fn dashed_line_many(points: &[Pos2], stroke: impl Into<Stroke>, dash_length: f32, gap_length: f32, shapes: &mut Vec<Self>)` — `epaint-0.36.2/src/shapes/shape.rs:210`
   Turn a line into dashes. If you need to create many dashed lines use this instead of [`Self::dashed_line`].
-- `fn dashed_line_many_with_offset(points: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32, shapes: &mut Vec<Self>)` — `epaint-0.35.0/src/shapes/shape.rs:229`
+- `fn dashed_line_many_with_offset(points: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32, shapes: &mut Vec<Self>)` — `epaint-0.36.2/src/shapes/shape.rs:229`
   Turn a line into dashes with different dash/gap lengths and a start offset. If you need to create many dashed…
-- `fn dashed_line_with_offset(path: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:189`
+- `fn dashed_line_with_offset(path: &[Pos2], stroke: impl Into<Stroke>, dash_lengths: &[f32], gap_lengths: &[f32], dash_offset: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:189`
   Turn a line into dashes with different dash/gap lengths and a start offset.
-- `fn dotted_line(path: &[Pos2], color: impl Into<Color32>, spacing: f32, radius: f32) -> Vec<Self>` — `epaint-0.35.0/src/shapes/shape.rs:158`
+- `fn dotted_line(path: &[Pos2], color: impl Into<Color32>, spacing: f32, radius: f32) -> Vec<Self>` — `epaint-0.36.2/src/shapes/shape.rs:158`
   Turn a line into equally spaced dots.
-- `fn ellipse_filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:270`
-- `fn ellipse_stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:275`
-- `fn galley(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:344`
+- `fn ellipse_filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:270`
+- `fn ellipse_stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:275`
+- `fn galley(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:344`
   Any uncolored parts of the [`Galley`] (using [`Color32::PLACEHOLDER`]) will be replaced with the given color.
-- `fn galley_with_override_text_color(pos: Pos2, galley: Arc<Galley>, text_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:350`
+- `fn galley_with_override_text_color(pos: Pos2, galley: Arc<Galley>, text_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:350`
   All text color in the [`Galley`] will be replaced with the given color.
-- `fn gradient_rect(rect: Rect, direction: Direction, [from, to]: [Color32; 2]) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:306`
+- `fn gradient_rect(rect: Rect, direction: Direction, [from, to]: [Color32; 2]) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:306`
   Paints a gradient rectangle that transitions from `color_from` to `color_to` along the given `direction`.
-- `fn hline(x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:126`
+- `fn hline(x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:126`
   A horizontal line.
-- `fn image(texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:373`
+- `fn image(texture_id: TextureId, rect: Rect, uv: Rect, tint: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:373`
   An image at the given position.
-- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:147`
+- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:147`
   A line through many points.
-- `fn line_segment(points: [Pos2; 2], stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:118`
+- `fn line_segment(points: [Pos2; 2], stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:118`
   A line between two points. More efficient than calling [`Self::line`].
-- `fn mesh(mesh: impl Into<Arc<Mesh>>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:361`
-- `fn rect_filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:281`
+- `fn mesh(mesh: impl Into<Arc<Mesh>>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:361`
+- `fn rect_filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:281`
   See also [`Self::rect_stroke`].
-- `fn rect_stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:291`
+- `fn rect_stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:291`
   See also [`Self::rect_filled`].
-- `fn scale(&mut self, factor: f32)` — `epaint-0.35.0/src/shapes/shape.rs:427`
+- `fn scale(&mut self, factor: f32)` — `epaint-0.36.2/src/shapes/shape.rs:427`
   Scale the shape by `factor`, in-place.
-- `fn text(fonts: &mut FontsView<'_>, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:327`
-- `fn texture_id(&self) -> TextureId` — `epaint-0.35.0/src/shapes/shape.rs:413`
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/shapes/shape.rs:443`
+- `fn text(fonts: &mut FontsView<'_>, pos: Pos2, anchor: Align2, text: impl ToString, font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:327`
+- `fn texture_id(&self) -> TextureId` — `epaint-0.36.2/src/shapes/shape.rs:413`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/shapes/shape.rs:443`
   Transform (move/scale) the shape in-place.
-- `fn translate(&mut self, delta: Vec2)` — `epaint-0.35.0/src/shapes/shape.rs:435`
+- `fn translate(&mut self, delta: Vec2)` — `epaint-0.36.2/src/shapes/shape.rs:435`
   Move the shape by `delta`, in-place.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/shape.rs:380`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/shape.rs:380`
   The visual bounding rectangle (includes stroke widths)
-- `fn vline(x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/shape.rs:135`
+- `fn vline(x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/shape.rs:135`
   A vertical line.
 
 Implements: `Clone`, `Debug`, `From<Arc<Mesh>>`, `From<CircleShape>`, `From<CubicBezierShape>`, `From<EllipseShape>`, `From<Mesh>`, `From<PaintCallback>`, `From<PathShape>`, `From<QuadraticBezierShape>`, `From<RectShape>`, `From<TextShape>`, `From<Vec<Shape>>`, `PartialEq`, `StructuralPartialEq`
 
-### `StrokeKind` (enum) — `epaint-0.35.0/src/stroke.rs:101`
+### `StrokeKind` (enum) — `epaint-0.36.2/src/stroke.rs:102`
 
 Describes how the stroke of a shape should be painted.
 
@@ -192,7 +192,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureId` (enum) — `epaint-0.35.0/src/lib.rs:95`
+### `TextureId` (enum) — `epaint-0.36.2/src/lib.rs:95`
 
 What texture to use in a [`Mesh`] mesh.
 
@@ -203,7 +203,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<&TextureHandle>`, `From<&mut TextureHandle>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`
 
-### `pos2` — `emath-0.35.0/src/pos2.rs:29`
+### `pos2` — `emath-0.36.2/src/pos2.rs:29`
 
 ```rust
 const fn pos2(x: f32, y: f32) -> Pos2
@@ -211,7 +211,7 @@ const fn pos2(x: f32, y: f32) -> Pos2
 
 `pos2(x, y) == Pos2::new(x, y)`
 
-### `vec2` — `emath-0.35.0/src/vec2.rs:26`
+### `vec2` — `emath-0.36.2/src/vec2.rs:26`
 
 ```rust
 const fn vec2(x: f32, y: f32) -> Vec2
@@ -219,7 +219,7 @@ const fn vec2(x: f32, y: f32) -> Vec2
 
 `vec2(x, y) == Vec2::new(x, y)`
 
-### `Brush` (struct) — `epaint-0.35.0/src/brush.rs:6`
+### `Brush` (struct) — `epaint-0.36.2/src/brush.rs:6`
 
 Controls texturing of a [`crate::RectShape`].
 
@@ -230,7 +230,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `CircleShape` (struct) — `epaint-0.35.0/src/shapes/circle_shape.rs:6`
+### `CircleShape` (struct) — `epaint-0.36.2/src/shapes/circle_shape.rs:6`
 
 How to paint a circle.
 
@@ -243,14 +243,14 @@ Public fields:
 
 Methods:
 
-- `fn filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/circle_shape.rs:15`
-- `fn stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/circle_shape.rs:25`
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/circle_shape.rs:35`
+- `fn filled(center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/circle_shape.rs:15`
+- `fn stroke(center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/circle_shape.rs:25`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/circle_shape.rs:35`
   The visual bounding rectangle (includes stroke width)
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `From<CircleShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ClippedPrimitive` (struct) — `epaint-0.35.0/src/lib.rs:142`
+### `ClippedPrimitive` (struct) — `epaint-0.36.2/src/lib.rs:142`
 
 A [`Mesh`] or [`PaintCallback`] within a clip rectangle.
 
@@ -261,7 +261,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`
 
-### `ClippedShape` (struct) — `epaint-0.35.0/src/lib.rs:117`
+### `ClippedShape` (struct) — `epaint-0.36.2/src/lib.rs:117`
 
 A [`Shape`] within a clip rectangle.
 
@@ -272,78 +272,78 @@ Public fields:
 
 Methods:
 
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/lib.rs:131`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/lib.rs:131`
   Transform (move/scale) the shape in-place.
 
 Implements: `Clone`, `Debug`, `PartialEq`, `StructuralPartialEq`
 
-### `Color32` (struct) — `ecolor-0.35.0/src/color32.rs:31`
+### `Color32` (struct) — `ecolor-0.36.2/src/color32.rs:31`
 
 This format is used for space-efficient color representation (32 bits).
 
 Methods:
 
-- `const fn a(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:231`
+- `const fn a(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:206`
   Alpha (opacity).
-- `const fn additive(self) -> Self` — `ecolor-0.35.0/src/color32.rs:243`
+- `const fn additive(self) -> Self` — `ecolor-0.36.2/src/color32.rs:218`
   Returns an additive version of self
-- `const fn b(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:225`
+- `const fn b(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:200`
   Blue component multiplied by alpha.
-- `const fn from_additive_luminance(l: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:202`
+- `const fn from_additive_luminance(l: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:177`
   Additive white.
-- `const fn from_black_alpha(a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:190`
+- `const fn from_black_alpha(a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:165`
   Black with the given opacity.
-- `const fn from_gray(l: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:184`
+- `const fn from_gray(l: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:159`
   Opaque gray.
-- `const fn from_rgb(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:108`
+- `const fn from_rgb(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:108`
   From RGB with alpha of 255 (opaque).
-- `const fn from_rgb_additive(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:114`
+- `const fn from_rgb_additive(r: u8, g: u8, b: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:114`
   From RGB into an additive color (will make everything it blend with brighter).
-- `const fn from_rgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:122`
+- `const fn from_rgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:122`
   From `sRGBA` with premultiplied alpha.
-- `const fn from_rgba_unmultiplied_const(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:164`
-  Same as [`Self::from_rgba_unmultiplied`], but can be used in a const context.
-- `const fn g(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:219`
+- `const fn from_rgba_unmultiplied_const(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:139`
+  This is the same as [`Self::from_rgba_unmultiplied`], but for const contexts.
+- `const fn g(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:194`
   Green component multiplied by alpha.
-- `const fn is_opaque(&self) -> bool` — `ecolor-0.35.0/src/color32.rs:207`
-- `const fn r(&self) -> u8` — `ecolor-0.35.0/src/color32.rs:213`
+- `const fn is_opaque(&self) -> bool` — `ecolor-0.36.2/src/color32.rs:182`
+- `const fn r(&self) -> u8` — `ecolor-0.36.2/src/color32.rs:188`
   Red component multiplied by alpha.
-- `const fn to_array(&self) -> [u8; 4]` — `ecolor-0.35.0/src/color32.rs:256`
+- `const fn to_array(&self) -> [u8; 4]` — `ecolor-0.36.2/src/color32.rs:231`
   Premultiplied RGBA
-- `const fn to_tuple(&self) -> (u8, u8, u8, u8)` — `ecolor-0.35.0/src/color32.rs:262`
+- `const fn to_tuple(&self) -> (u8, u8, u8, u8)` — `ecolor-0.36.2/src/color32.rs:237`
   Premultiplied RGBA
-- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.35.0/src/color32.rs:368`
+- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.36.2/src/color32.rs:343`
   Blend two colors in gamma space, so that `self` is behind the argument.
-- `fn from_hex(hex: &str) -> Result<Self, ParseHexColorError>` — `ecolor-0.35.0/src/hex_color_runtime.rs:143`
+- `fn from_hex(hex: &str) -> Result<Self, ParseHexColorError>` — `ecolor-0.36.2/src/hex_color_runtime.rs:143`
   Parses a color from a hex string.
-- `fn from_rgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:133`
+- `fn from_rgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:133`
   From `sRGBA` with separate alpha.
-- `fn from_white_alpha(a: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:196`
+- `fn from_white_alpha(a: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:171`
   White with the given opacity.
-- `fn gamma_multiply(self, factor: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:294`
+- `fn gamma_multiply(self, factor: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:269`
   Multiply with 0.5 to make color half as opaque, perceptually.
-- `fn gamma_multiply_u8(self, factor: u8) -> Self` — `ecolor-0.35.0/src/color32.rs:314`
+- `fn gamma_multiply_u8(self, factor: u8) -> Self` — `ecolor-0.36.2/src/color32.rs:289`
   Multiply with 127 to make color half as opaque, perceptually.
-- `fn intensity(&self) -> f32` — `ecolor-0.35.0/src/color32.rs:376`
+- `fn intensity(&self) -> f32` — `ecolor-0.36.2/src/color32.rs:351`
   Intensity of the color.
-- `fn is_additive(self) -> bool` — `ecolor-0.35.0/src/color32.rs:250`
+- `fn is_additive(self) -> bool` — `ecolor-0.36.2/src/color32.rs:225`
   Is the alpha=0 ?
-- `fn lerp_to_gamma(&self, other: Self, t: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:356`
+- `fn lerp_to_gamma(&self, other: Self, t: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:331`
   Lerp this color towards `other` by `t` in gamma space.
-- `fn linear_multiply(self, factor: f32) -> Self` — `ecolor-0.35.0/src/color32.rs:330`
+- `fn linear_multiply(self, factor: f32) -> Self` — `ecolor-0.36.2/src/color32.rs:305`
   Multiply with 0.5 to make color half as opaque in linear space.
-- `fn to_hex(&self) -> String` — `ecolor-0.35.0/src/hex_color_runtime.rs:162`
+- `fn to_hex(&self) -> String` — `ecolor-0.36.2/src/hex_color_runtime.rs:162`
   Formats the color as a hex string.
-- `fn to_normalized_gamma_f32(self) -> [f32; 4]` — `ecolor-0.35.0/src/color32.rs:345`
+- `fn to_normalized_gamma_f32(self) -> [f32; 4]` — `ecolor-0.36.2/src/color32.rs:320`
   Converts to floating point values in the range 0-1 without any gamma space conversion.
-- `fn to_opaque(self) -> Self` — `ecolor-0.35.0/src/color32.rs:237`
+- `fn to_opaque(self) -> Self` — `ecolor-0.36.2/src/color32.rs:212`
   Returns an opaque version of self
-- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/color32.rs:273`
+- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/color32.rs:248`
   Convert to a normal "unmultiplied" RGBA color (i.e. with separate alpha).
 
 Implements: `Add`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `Hash`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `ColorImage` (struct) — `epaint-0.35.0/src/image.rs:48`
+### `ColorImage` (struct) — `epaint-0.36.2/src/image.rs:48`
 
 A 2D RGBA color image in RAM.
 
@@ -355,37 +355,37 @@ Public fields:
 
 Methods:
 
-- `fn as_raw(&self) -> &[u8]` — `epaint-0.35.0/src/image.rs:177`
+- `fn as_raw(&self) -> &[u8]` — `epaint-0.36.2/src/image.rs:177`
   A view of the underlying data as `&[u8]`
-- `fn as_raw_mut(&mut self) -> &mut [u8]` — `epaint-0.35.0/src/image.rs:183`
+- `fn as_raw_mut(&mut self) -> &mut [u8]` — `epaint-0.36.2/src/image.rs:183`
   A view of the underlying data as `&mut [u8]`
-- `fn example() -> Self` — `epaint-0.35.0/src/image.rs:209`
+- `fn example() -> Self` — `epaint-0.36.2/src/image.rs:209`
   An example color image, useful for tests.
-- `fn filled(size: [usize; 2], color: Color32) -> Self` — `epaint-0.35.0/src/image.rs:75`
+- `fn filled(size: [usize; 2], color: Color32) -> Self` — `epaint-0.36.2/src/image.rs:75`
   Create an image filled with the given color.
-- `fn from_gray(size: [usize; 2], gray: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:146`
+- `fn from_gray(size: [usize; 2], gray: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:146`
   Create a [`ColorImage`] from flat opaque gray data.
-- `fn from_gray_iter(size: [usize; 2], gray_iter: impl Iterator<Item = u8>) -> Self` — `epaint-0.35.0/src/image.rs:163`
+- `fn from_gray_iter(size: [usize; 2], gray_iter: impl Iterator<Item = u8>) -> Self` — `epaint-0.36.2/src/image.rs:163`
   Alternative method to `from_gray`. Create a [`ColorImage`] from iterator over flat opaque gray data.
-- `fn from_rgb(size: [usize; 2], rgb: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:193`
+- `fn from_rgb(size: [usize; 2], rgb: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:193`
   Create a [`ColorImage`] from flat RGB data.
-- `fn from_rgba_premultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:128`
-- `fn from_rgba_unmultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.35.0/src/image.rs:113`
+- `fn from_rgba_premultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:128`
+- `fn from_rgba_unmultiplied(size: [usize; 2], rgba: &[u8]) -> Self` — `epaint-0.36.2/src/image.rs:113`
   Create a [`ColorImage`] from flat un-multiplied RGBA data.
-- `fn height(&self) -> usize` — `epaint-0.35.0/src/image.rs:238`
-- `fn new(size: [usize; 2], pixels: Vec<Color32>) -> Self` — `epaint-0.35.0/src/image.rs:61`
+- `fn height(&self) -> usize` — `epaint-0.36.2/src/image.rs:238`
+- `fn new(size: [usize; 2], pixels: Vec<Color32>) -> Self` — `epaint-0.36.2/src/image.rs:61`
   Create an image filled with the given color.
-- `fn region(&self, region: &Rect, pixels_per_point: Option<f32>) -> Self` — `epaint-0.35.0/src/image.rs:249`
+- `fn region(&self, region: &Rect, pixels_per_point: Option<f32>) -> Self` — `epaint-0.36.2/src/image.rs:249`
   Create a new image from a patch of the current image.
-- `fn region_by_pixels(&self, [x, y]: [usize; 2], [w, h]: [usize; 2]) -> Self` — `epaint-0.35.0/src/image.rs:273`
+- `fn region_by_pixels(&self, [x, y]: [usize; 2], [w, h]: [usize; 2]) -> Self` — `epaint-0.36.2/src/image.rs:273`
   Clone a sub-region as a new image.
-- `fn width(&self) -> usize` — `epaint-0.35.0/src/image.rs:233`
-- `fn with_source_size(self, source_size: Vec2) -> Self` — `epaint-0.35.0/src/image.rs:227`
+- `fn width(&self) -> usize` — `epaint-0.36.2/src/image.rs:233`
+- `fn with_source_size(self, source_size: Vec2) -> Self` — `epaint-0.36.2/src/image.rs:227`
   Set the source size of e.g. the original SVG image.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<ColorImage>`, `Index<(usize, usize)>`, `IndexMut<(usize, usize)>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `CornerRadius` (struct) — `epaint-0.35.0/src/corner_radius.rs:13`
+### `CornerRadius` (struct) — `epaint-0.36.2/src/corner_radius.rs:13`
 
 How rounded the corners of things should be.
 
@@ -398,20 +398,20 @@ Public fields:
 
 Methods:
 
-- `const fn same(radius: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:59`
+- `const fn same(radius: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:59`
   Same rounding on all four corners.
-- `fn at_least(self, min: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:76`
+- `fn at_least(self, min: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:76`
   Make sure each corner has a rounding of at least this.
-- `fn at_most(self, max: u8) -> Self` — `epaint-0.35.0/src/corner_radius.rs:87`
+- `fn at_most(self, max: u8) -> Self` — `epaint-0.36.2/src/corner_radius.rs:87`
   Make sure each corner has a rounding of at most this.
-- `fn average(&self) -> f32` — `epaint-0.35.0/src/corner_radius.rs:97`
+- `fn average(&self) -> f32` — `epaint-0.36.2/src/corner_radius.rs:97`
   Average rounding of the corners.
-- `fn is_same(self) -> bool` — `epaint-0.35.0/src/corner_radius.rs:70`
+- `fn is_same(self) -> bool` — `epaint-0.36.2/src/corner_radius.rs:70`
   Do all corners have the same rounding?
 
 Implements: `Add`, `Add<u8>`, `AddAssign`, `AddAssign<u8>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<CornerRadius>`, `From<CornerRadiusF32>`, `From<f32>`, `From<u8>`, `Hash`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<u8>`, `SubAssign`, `SubAssign<u8>`
 
-### `CornerRadiusF32` (struct) — `epaint-0.35.0/src/corner_radius_f32.rs:8`
+### `CornerRadiusF32` (struct) — `epaint-0.36.2/src/corner_radius_f32.rs:8`
 
 How rounded the corners of things should be, in `f32`.
 
@@ -424,18 +424,18 @@ Public fields:
 
 Methods:
 
-- `const fn same(radius: f32) -> Self` — `epaint-0.35.0/src/corner_radius_f32.rs:76`
+- `const fn same(radius: f32) -> Self` — `epaint-0.36.2/src/corner_radius_f32.rs:76`
   Same rounding on all four corners.
-- `fn at_least(&self, min: f32) -> Self` — `epaint-0.35.0/src/corner_radius_f32.rs:93`
+- `fn at_least(&self, min: f32) -> Self` — `epaint-0.36.2/src/corner_radius_f32.rs:93`
   Make sure each corner has a rounding of at least this.
-- `fn at_most(&self, max: f32) -> Self` — `epaint-0.35.0/src/corner_radius_f32.rs:104`
+- `fn at_most(&self, max: f32) -> Self` — `epaint-0.36.2/src/corner_radius_f32.rs:104`
   Make sure each corner has a rounding of at most this.
-- `fn is_same(&self) -> bool` — `epaint-0.35.0/src/corner_radius_f32.rs:87`
+- `fn is_same(&self) -> bool` — `epaint-0.36.2/src/corner_radius_f32.rs:87`
   Do all corners have the same rounding?
 
 Implements: `Add`, `AddAssign`, `AddAssign<f32>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `From<CornerRadius>`, `From<CornerRadiusF32>`, `From<f32>`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `SubAssign`, `SubAssign<f32>`
 
-### `CubicBezierShape` (struct) — `epaint-0.35.0/src/shapes/bezier_shape.rs:15`
+### `CubicBezierShape` (struct) — `epaint-0.36.2/src/shapes/bezier_shape.rs:15`
 
 A cubic [Bézier Curve](https://en.wikipedia.org/wiki/B%C3%A9zier_curve).
 
@@ -448,33 +448,33 @@ Public fields:
 
 Methods:
 
-- `fn find_cross_t(&self, epsilon: f32) -> Option<f32>` — `epaint-0.35.0/src/shapes/bezier_shape.rs:232`
+- `fn find_cross_t(&self, epsilon: f32) -> Option<f32>` — `epaint-0.36.2/src/shapes/bezier_shape.rs:232`
   Find out the t value for the point where the curve is intersected with the base line. The base line is the li…
-- `fn flatten(&self, tolerance: Option<f32>) -> Vec<Pos2>` — `epaint-0.35.0/src/shapes/bezier_shape.rs:299`
+- `fn flatten(&self, tolerance: Option<f32>) -> Vec<Pos2>` — `epaint-0.36.2/src/shapes/bezier_shape.rs:299`
   find a set of points that approximate the cubic Bézier curve. the number of points is determined by the toler…
-- `fn flatten_closed(&self, tolerance: Option<f32>, epsilon: Option<f32>) -> Vec<Vec<Pos2>>` — `epaint-0.35.0/src/shapes/bezier_shape.rs:315`
+- `fn flatten_closed(&self, tolerance: Option<f32>, epsilon: Option<f32>) -> Vec<Vec<Pos2>>` — `epaint-0.36.2/src/shapes/bezier_shape.rs:315`
   find a set of points that approximate the cubic Bézier curve. the number of points is determined by the toler…
-- `fn for_each_flattened_with_t<F>(&self, tolerance: f32, callback: &mut F)` — `epaint-0.35.0/src/shapes/bezier_shape.rs:366`
+- `fn for_each_flattened_with_t<F>(&self, tolerance: f32, callback: &mut F)` — `epaint-0.36.2/src/shapes/bezier_shape.rs:366`
   Iterates through the curve invoking a callback at each point.
-- `fn from_points_stroke(points: [Pos2; 4], closed: bool, fill: Color32, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/bezier_shape.rs:30`
+- `fn from_points_stroke(points: [Pos2; 4], closed: bool, fill: Color32, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/bezier_shape.rs:30`
   Creates a cubic Bézier curve based on 4 points and stroke.
-- `fn logical_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/bezier_shape.rs:88`
+- `fn logical_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/bezier_shape.rs:88`
   Logical bounding rectangle (ignoring stroke width)
-- `fn num_quadratics(&self, tolerance: f32) -> u32` — `epaint-0.35.0/src/shapes/bezier_shape.rs:179`
-- `fn sample(&self, t: f32) -> Pos2` — `epaint-0.35.0/src/shapes/bezier_shape.rs:278`
+- `fn num_quadratics(&self, tolerance: f32) -> u32` — `epaint-0.36.2/src/shapes/bezier_shape.rs:179`
+- `fn sample(&self, t: f32) -> Pos2` — `epaint-0.36.2/src/shapes/bezier_shape.rs:278`
   Calculate the point (x,y) at t based on the cubic Bézier curve equation. t is in [0.0,1.0] [Bézier Curve](htt…
-- `fn split_range(&self, t_range: Range<f32>) -> Self` — `epaint-0.35.0/src/shapes/bezier_shape.rs:142`
+- `fn split_range(&self, t_range: Range<f32>) -> Self` — `epaint-0.36.2/src/shapes/bezier_shape.rs:142`
   split the original cubic curve into a new one within a range.
-- `fn to_path_shapes(&self, tolerance: Option<f32>, epsilon: Option<f32>) -> Vec<PathShape>` — `epaint-0.35.0/src/shapes/bezier_shape.rs:63`
+- `fn to_path_shapes(&self, tolerance: Option<f32>, epsilon: Option<f32>) -> Vec<PathShape>` — `epaint-0.36.2/src/shapes/bezier_shape.rs:63`
   Convert the cubic Bézier curve to one or two [`PathShape`]'s. When the curve is closed and it has to intersec…
-- `fn transform(&self, transform: &RectTransform) -> Self` — `epaint-0.35.0/src/shapes/bezier_shape.rs:45`
+- `fn transform(&self, transform: &RectTransform) -> Self` — `epaint-0.36.2/src/shapes/bezier_shape.rs:45`
   Transform the curve with the given transform.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/bezier_shape.rs:79`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/bezier_shape.rs:79`
   The visual bounding rectangle (includes stroke width)
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `From<CubicBezierShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `EllipseShape` (struct) — `epaint-0.35.0/src/shapes/ellipse_shape.rs:6`
+### `EllipseShape` (struct) — `epaint-0.36.2/src/shapes/ellipse_shape.rs:6`
 
 How to paint an ellipse.
 
@@ -488,18 +488,18 @@ Public fields:
 
 Methods:
 
-- `fn filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/ellipse_shape.rs:20`
-- `fn stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.35.0/src/shapes/ellipse_shape.rs:31`
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/ellipse_shape.rs:59`
+- `fn filled(center: Pos2, radius: Vec2, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/ellipse_shape.rs:20`
+- `fn stroke(center: Pos2, radius: Vec2, stroke: impl Into<Stroke>) -> Self` — `epaint-0.36.2/src/shapes/ellipse_shape.rs:31`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/ellipse_shape.rs:59`
   The visual bounding rectangle (includes stroke width)
-- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.35.0/src/shapes/ellipse_shape.rs:44`
+- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.36.2/src/shapes/ellipse_shape.rs:44`
   Set the rotation of the ellipse (in radians, clockwise). The ellipse rotates around its center.
-- `fn with_angle_and_pivot(self, angle: f32, pivot: Pos2) -> Self` — `epaint-0.35.0/src/shapes/ellipse_shape.rs:51`
+- `fn with_angle_and_pivot(self, angle: f32, pivot: Pos2) -> Self` — `epaint-0.36.2/src/shapes/ellipse_shape.rs:51`
   Set the rotation of the ellipse (in radians, clockwise) around a custom pivot point.
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `From<EllipseShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontId` (struct) — `epaint-0.35.0/src/text/fonts.rs:27`
+### `FontId` (struct) — `epaint-0.36.2/src/text/fonts.rs:21`
 
 How to select a sized font.
 
@@ -510,13 +510,13 @@ Public fields:
 
 Methods:
 
-- `const fn monospace(size: f32) -> Self` — `epaint-0.35.0/src/text/fonts.rs:58`
-- `const fn new(size: f32, family: FontFamily) -> Self` — `epaint-0.35.0/src/text/fonts.rs:48`
-- `const fn proportional(size: f32) -> Self` — `epaint-0.35.0/src/text/fonts.rs:53`
+- `const fn monospace(size: f32) -> Self` — `epaint-0.36.2/src/text/fonts.rs:52`
+- `const fn new(size: f32, family: FontFamily) -> Self` — `epaint-0.36.2/src/text/fonts.rs:42`
+- `const fn proportional(size: f32) -> Self` — `epaint-0.36.2/src/text/fonts.rs:47`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Fonts` (struct) — `epaint-0.35.0/src/text/fonts.rs:713`
+### `Fonts` (struct) — `epaint-0.36.2/src/text/fonts.rs:707`
 
 The collection of fonts used by `epaint`.
 
@@ -526,31 +526,31 @@ Public fields:
 
 Methods:
 
-- `fn begin_pass(&mut self, options: TextOptions)` — `epaint-0.35.0/src/text/fonts.rs:734`
+- `fn begin_pass(&mut self, options: TextOptions)` — `epaint-0.36.2/src/text/fonts.rs:728`
   Call at the start of each frame with the latest known [`TextOptions`].
-- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.35.0/src/text/fonts.rs:762`
-- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.35.0/src/text/fonts.rs:802`
+- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.36.2/src/text/fonts.rs:756`
+- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.36.2/src/text/fonts.rs:796`
   How full is the font atlas?
-- `fn font_image_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.35.0/src/text/fonts.rs:752`
+- `fn font_image_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.36.2/src/text/fonts.rs:746`
   Call at the end of each frame (before painting) to get the change to the font texture since last call.
-- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.35.0/src/text/fonts.rs:780`
+- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.36.2/src/text/fonts.rs:774`
   Current size of the font image. Pass this to [`crate::Tessellator`].
-- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.35.0/src/text/fonts.rs:785`
+- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.36.2/src/text/fonts.rs:779`
   Can we display this glyph?
-- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.35.0/src/text/fonts.rs:790`
+- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.36.2/src/text/fonts.rs:784`
   Can we display all the glyphs in this text?
-- `fn image(&self) -> ColorImage` — `epaint-0.35.0/src/text/fonts.rs:774`
+- `fn image(&self) -> ColorImage` — `epaint-0.36.2/src/text/fonts.rs:768`
   The full font atlas image.
-- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.35.0/src/text/fonts.rs:721`
+- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.36.2/src/text/fonts.rs:715`
   Create a new [`Fonts`] for text layout. This call is expensive, so only create one [`Fonts`] and then reuse i…
-- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.35.0/src/text/fonts.rs:794`
-- `fn options(&self) -> &TextOptions` — `epaint-0.35.0/src/text/fonts.rs:757`
-- `fn texture_atlas(&self) -> &TextureAtlas` — `epaint-0.35.0/src/text/fonts.rs:768`
+- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.36.2/src/text/fonts.rs:788`
+- `fn options(&self) -> &TextOptions` — `epaint-0.36.2/src/text/fonts.rs:751`
+- `fn texture_atlas(&self) -> &TextureAtlas` — `epaint-0.36.2/src/text/fonts.rs:762`
   The font atlas. Pass this to [`crate::Tessellator`].
-- `fn with_pixels_per_point(&mut self, pixels_per_point: f32) -> FontsView<'_>` — `epaint-0.35.0/src/text/fonts.rs:807`
+- `fn with_pixels_per_point(&mut self, pixels_per_point: f32) -> FontsView<'_>` — `epaint-0.36.2/src/text/fonts.rs:801`
   Returns a [`FontsView`] with the given `pixels_per_point` that can be used to do text layout.
 
-### `FontsView` (struct) — `epaint-0.35.0/src/text/fonts.rs:819`
+### `FontsView` (struct) — `epaint-0.36.2/src/text/fonts.rs:813`
 
 The context's collection of fonts, with this context's `pixels_per_point`. This is what you use to do text layout.
 
@@ -560,35 +560,35 @@ Public fields:
 
 Methods:
 
-- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.35.0/src/text/fonts.rs:832`
-- `fn families(&self) -> Vec<FontFamily>` — `epaint-0.35.0/src/text/fonts.rs:884`
+- `fn definitions(&self) -> &FontDefinitions` — `epaint-0.36.2/src/text/fonts.rs:826`
+- `fn families(&self) -> Vec<FontFamily>` — `epaint-0.36.2/src/text/fonts.rs:878`
   List of all known font families.
-- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.35.0/src/text/fonts.rs:914`
+- `fn font_atlas_fill_ratio(&self) -> f32` — `epaint-0.36.2/src/text/fonts.rs:908`
   How full is the font atlas?
-- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.35.0/src/text/fonts.rs:844`
+- `fn font_image_size(&self) -> [usize; 2]` — `epaint-0.36.2/src/text/fonts.rs:838`
   Current size of the font image. Pass this to [`crate::Tessellator`].
-- `fn glyph_width(&mut self, font_id: &FontId, c: char) -> f32` — `epaint-0.35.0/src/text/fonts.rs:851`
+- `fn glyph_width(&mut self, font_id: &FontId, c: char) -> f32` — `epaint-0.36.2/src/text/fonts.rs:845`
   Width of this character in points.
-- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.35.0/src/text/fonts.rs:858`
+- `fn has_glyph(&mut self, font_id: &FontId, c: char) -> bool` — `epaint-0.36.2/src/text/fonts.rs:852`
   Can we display this glyph?
-- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.35.0/src/text/fonts.rs:863`
+- `fn has_glyphs(&mut self, font_id: &FontId, s: &str) -> bool` — `epaint-0.36.2/src/text/fonts.rs:857`
   Can we display all the glyphs in this text?
-- `fn image(&self) -> ColorImage` — `epaint-0.35.0/src/text/fonts.rs:838`
+- `fn image(&self) -> ColorImage` — `epaint-0.36.2/src/text/fonts.rs:832`
   The full font atlas image.
-- `fn layout(&mut self, text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Arc<Galley>` — `epaint-0.35.0/src/text/fonts.rs:922`
+- `fn layout(&mut self, text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Arc<Galley>` — `epaint-0.36.2/src/text/fonts.rs:916`
   Will wrap text at the given width and line break at `\n`.
-- `fn layout_delayed_color(&mut self, text: String, font_id: FontId, wrap_width: f32) -> Arc<Galley>` — `epaint-0.35.0/src/text/fonts.rs:951`
+- `fn layout_delayed_color(&mut self, text: String, font_id: FontId, wrap_width: f32) -> Arc<Galley>` — `epaint-0.36.2/src/text/fonts.rs:945`
   Like [`Self::layout`], made for when you want to pick a color for the text later.
-- `fn layout_job(&mut self, job: LayoutJob) -> Arc<Galley>` — `epaint-0.35.0/src/text/fonts.rs:896`
+- `fn layout_job(&mut self, job: LayoutJob) -> Arc<Galley>` — `epaint-0.36.2/src/text/fonts.rs:890`
   Layout some text.
-- `fn layout_no_wrap(&mut self, text: String, font_id: FontId, color: Color32) -> Arc<Galley>` — `epaint-0.35.0/src/text/fonts.rs:937`
+- `fn layout_no_wrap(&mut self, text: String, font_id: FontId, color: Color32) -> Arc<Galley>` — `epaint-0.36.2/src/text/fonts.rs:931`
   Will line break at `\n`.
-- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.35.0/src/text/fonts.rs:906`
-- `fn options(&self) -> &TextOptions` — `epaint-0.35.0/src/text/fonts.rs:827`
-- `fn row_height(&mut self, font_id: &FontId) -> f32` — `epaint-0.35.0/src/text/fonts.rs:871`
+- `fn num_galleys_in_cache(&self) -> usize` — `epaint-0.36.2/src/text/fonts.rs:900`
+- `fn options(&self) -> &TextOptions` — `epaint-0.36.2/src/text/fonts.rs:821`
+- `fn row_height(&mut self, font_id: &FontId) -> f32` — `epaint-0.36.2/src/text/fonts.rs:865`
   Height of one row of text in points.
 
-### `Galley` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:729`
+### `Galley` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:736`
 
 Text that has been laid out, ready for painting.
 
@@ -605,38 +605,38 @@ Public fields:
 
 Methods:
 
-- `fn begin(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1228`
+- `fn begin(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1235`
   Cursor to the first character.
-- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1335`
-- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:1058`
+- `fn clamp_cursor(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1342`
+- `fn concat(job: Arc<LayoutJob>, galleys: &[Arc<Self>], pixels_per_point: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:1065`
   Append each galley under the previous one.
-- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1406`
-- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1390`
-- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1364`
-- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1431`
-- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1398`
-- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1174`
+- `fn cursor_begin_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1413`
+- `fn cursor_begin_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1397`
+- `fn cursor_down_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1371`
+- `fn cursor_end_of_paragraph(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1438`
+- `fn cursor_end_of_row(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1405`
+- `fn cursor_from_pos(&self, pos: Vec2) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1181`
   Cursor at the given position within the galley.
-- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1317`
-- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1328`
-- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.35.0/src/text/text_layout_types.rs:1339`
-- `fn end(&self) -> CCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1233`
+- `fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1324`
+- `fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1335`
+- `fn cursor_up_one_row(&self, cursor: &CCursor, h_pos: Option<f32>) -> (CCursor, Option<f32>)` — `epaint-0.36.2/src/text/text_layout_types.rs:1346`
+- `fn end(&self) -> CCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1240`
   Cursor to one-past last character.
-- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1019`
+- `fn intrinsic_size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1026`
   This is the size that a non-wrapped, non-truncated, non-justified version of the text would have.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/text/text_layout_types.rs:999`
-- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.35.0/src/text/text_layout_types.rs:1252`
-- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1163`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/text/text_layout_types.rs:1006`
+- `fn layout_from_cursor(&self, cursor: CCursor) -> LayoutCursor` — `epaint-0.36.2/src/text/text_layout_types.rs:1259`
+- `fn pos_from_cursor(&self, cursor: CCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1170`
   Returns a 0-width Rect.
-- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:1153`
+- `fn pos_from_layout_cursor(&self, layout_cursor: &LayoutCursor) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:1160`
   Returns a 0-width Rect.
-- `fn size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:1010`
-- `fn text(&self) -> &str` — `epaint-0.35.0/src/text/text_layout_types.rs:1005`
+- `fn size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:1017`
+- `fn text(&self) -> &str` — `epaint-0.36.2/src/text/text_layout_types.rs:1012`
   The full, non-elided text of the input job.
 
 Implements: `AsRef<str>`, `Borrow<str>`, `Clone`, `Debug`, `Deref`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Hsva` (struct) — `ecolor-0.35.0/src/hsva.rs:9`
+### `Hsva` (struct) — `ecolor-0.36.2/src/hsva.rs:9`
 
 Hue, saturation, value, alpha. All in the range [0, 1]. No premultiplied alpha.
 
@@ -649,32 +649,32 @@ Public fields:
 
 Methods:
 
-- `fn from_additive_rgb(rgb: [f32; 3]) -> Self` — `ecolor-0.35.0/src/hsva.rs:66`
-- `fn from_additive_srgb([r, g, b]: [u8; 3]) -> Self` — `ecolor-0.35.0/src/hsva.rs:77`
-- `fn from_rgb(rgb: [f32; 3]) -> Self` — `ecolor-0.35.0/src/hsva.rs:86`
-- `fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/hsva.rs:43`
+- `fn from_additive_rgb(rgb: [f32; 3]) -> Self` — `ecolor-0.36.2/src/hsva.rs:66`
+- `fn from_additive_srgb([r, g, b]: [u8; 3]) -> Self` — `ecolor-0.36.2/src/hsva.rs:77`
+- `fn from_rgb(rgb: [f32; 3]) -> Self` — `ecolor-0.36.2/src/hsva.rs:86`
+- `fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/hsva.rs:43`
   From linear RGBA with premultiplied alpha
-- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/hsva.rs:59`
+- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/hsva.rs:59`
   From linear RGBA without premultiplied alpha
-- `fn from_srgb([r, g, b]: [u8; 3]) -> Self` — `ecolor-0.35.0/src/hsva.rs:92`
-- `fn from_srgba_premultiplied([r, g, b, a]: [u8; 4]) -> Self` — `ecolor-0.35.0/src/hsva.rs:31`
+- `fn from_srgb([r, g, b]: [u8; 3]) -> Self` — `ecolor-0.36.2/src/hsva.rs:92`
+- `fn from_srgba_premultiplied([r, g, b, a]: [u8; 4]) -> Self` — `ecolor-0.36.2/src/hsva.rs:31`
   From `sRGBA` with premultiplied alpha
-- `fn from_srgba_unmultiplied([r, g, b, a]: [u8; 4]) -> Self` — `ecolor-0.35.0/src/hsva.rs:37`
+- `fn from_srgba_unmultiplied([r, g, b, a]: [u8; 4]) -> Self` — `ecolor-0.36.2/src/hsva.rs:37`
   From `sRGBA` without premultiplied alpha
-- `fn new(h: f32, s: f32, v: f32, a: f32) -> Self` — `ecolor-0.35.0/src/hsva.rs:25`
-- `fn to_opaque(self) -> Self` — `ecolor-0.35.0/src/hsva.rs:103`
-- `fn to_rgb(&self) -> [f32; 3]` — `ecolor-0.35.0/src/hsva.rs:108`
-- `fn to_rgba_premultiplied(&self) -> [f32; 4]` — `ecolor-0.35.0/src/hsva.rs:123`
-- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.35.0/src/hsva.rs:137`
+- `fn new(h: f32, s: f32, v: f32, a: f32) -> Self` — `ecolor-0.36.2/src/hsva.rs:25`
+- `fn to_opaque(self) -> Self` — `ecolor-0.36.2/src/hsva.rs:103`
+- `fn to_rgb(&self) -> [f32; 3]` — `ecolor-0.36.2/src/hsva.rs:108`
+- `fn to_rgba_premultiplied(&self) -> [f32; 4]` — `ecolor-0.36.2/src/hsva.rs:123`
+- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.36.2/src/hsva.rs:137`
   To linear space rgba in 0-1 range.
-- `fn to_srgb(&self) -> [u8; 3]` — `ecolor-0.35.0/src/hsva.rs:113`
-- `fn to_srgba_premultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/hsva.rs:144`
-- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/hsva.rs:150`
+- `fn to_srgb(&self) -> [u8; 3]` — `ecolor-0.36.2/src/hsva.rs:113`
+- `fn to_srgba_premultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/hsva.rs:144`
+- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/hsva.rs:150`
   To gamma-space 0-255.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `HsvaGamma` (struct) — `ecolor-0.35.0/src/hsva_gamma.rs:6`
+### `HsvaGamma` (struct) — `ecolor-0.36.2/src/hsva_gamma.rs:6`
 
 Like Hsva but with the `v` value (brightness) being gamma corrected so that it is somewhat perceptually even.
 
@@ -687,7 +687,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `PartialEq`, `StructuralPartialEq`
 
-### `ImageDelta` (struct) — `epaint-0.35.0/src/image.rs:456`
+### `ImageDelta` (struct) — `epaint-0.36.2/src/image.rs:456`
 
 A change to an image.
 
@@ -699,16 +699,16 @@ Public fields:
 
 Methods:
 
-- `fn full(image: impl Into<ImageData>, options: TextureOptions) -> Self` — `epaint-0.35.0/src/image.rs:474`
+- `fn full(image: impl Into<ImageData>, options: TextureOptions) -> Self` — `epaint-0.36.2/src/image.rs:474`
   Update the whole texture.
-- `fn is_whole(&self) -> bool` — `epaint-0.35.0/src/image.rs:493`
+- `fn is_whole(&self) -> bool` — `epaint-0.36.2/src/image.rs:493`
   Is this affecting the whole texture? If `false`, this is a partial (sub-region) update.
-- `fn partial(pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions) -> Self` — `epaint-0.35.0/src/image.rs:483`
+- `fn partial(pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions) -> Self` — `epaint-0.36.2/src/image.rs:483`
   Update a sub-region of an existing texture.
 
 Implements: `Clone`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Margin` (struct) — `epaint-0.35.0/src/margin.rs:15`
+### `Margin` (struct) — `epaint-0.36.2/src/margin.rs:15`
 
 A value for all four sides of a rectangle, often used to express padding or spacing.
 
@@ -721,28 +721,28 @@ Public fields:
 
 Methods:
 
-- `const fn bottomf(self) -> f32` — `epaint-0.35.0/src/margin.rs:73`
+- `const fn bottomf(self) -> f32` — `epaint-0.36.2/src/margin.rs:73`
   Bottom margin, as `f32`
-- `const fn is_same(self) -> bool` — `epaint-0.35.0/src/margin.rs:96`
+- `const fn is_same(self) -> bool` — `epaint-0.36.2/src/margin.rs:96`
   Are the margin on every side the same?
-- `const fn left_top(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:84`
-- `const fn leftf(self) -> f32` — `epaint-0.35.0/src/margin.rs:55`
+- `const fn left_top(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:84`
+- `const fn leftf(self) -> f32` — `epaint-0.36.2/src/margin.rs:55`
   Left margin, as `f32`
-- `const fn right_bottom(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:89`
-- `const fn rightf(self) -> f32` — `epaint-0.35.0/src/margin.rs:61`
+- `const fn right_bottom(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:89`
+- `const fn rightf(self) -> f32` — `epaint-0.36.2/src/margin.rs:61`
   Right margin, as `f32`
-- `const fn same(margin: i8) -> Self` — `epaint-0.35.0/src/margin.rs:33`
+- `const fn same(margin: i8) -> Self` — `epaint-0.36.2/src/margin.rs:33`
   The same margin on every side.
-- `const fn symmetric(x: i8, y: i8) -> Self` — `epaint-0.35.0/src/margin.rs:44`
+- `const fn symmetric(x: i8, y: i8) -> Self` — `epaint-0.36.2/src/margin.rs:44`
   Margins with the same size on opposing sides
-- `const fn topf(self) -> f32` — `epaint-0.35.0/src/margin.rs:67`
+- `const fn topf(self) -> f32` — `epaint-0.36.2/src/margin.rs:67`
   Top margin, as `f32`
-- `fn sum(self) -> Vec2` — `epaint-0.35.0/src/margin.rs:79`
+- `fn sum(self) -> Vec2` — `epaint-0.36.2/src/margin.rs:79`
   Total margins on both sides
 
 Implements: `Add`, `Add<Margin>`, `Add<i8>`, `AddAssign<Margin>`, `AddAssign<i8>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<Margin>`, `From<MarginF32>`, `From<Vec2>`, `From<f32>`, `From<i8>`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Margin>`, `Sub<i8>`, `SubAssign<Margin>`, `SubAssign<i8>`
 
-### `MarginF32` (struct) — `epaint-0.35.0/src/margin_f32.rs:13`
+### `MarginF32` (struct) — `epaint-0.36.2/src/margin_f32.rs:13`
 
 A value for all four sides of a rectangle, often used to express padding or spacing.
 
@@ -755,20 +755,20 @@ Public fields:
 
 Methods:
 
-- `const fn left_top(&self) -> Vec2` — `epaint-0.35.0/src/margin_f32.rs:82`
-- `const fn right_bottom(&self) -> Vec2` — `epaint-0.35.0/src/margin_f32.rs:87`
-- `const fn same(margin: f32) -> Self` — `epaint-0.35.0/src/margin_f32.rs:55`
+- `const fn left_top(&self) -> Vec2` — `epaint-0.36.2/src/margin_f32.rs:82`
+- `const fn right_bottom(&self) -> Vec2` — `epaint-0.36.2/src/margin_f32.rs:87`
+- `const fn same(margin: f32) -> Self` — `epaint-0.36.2/src/margin_f32.rs:55`
   The same margin on every side.
-- `const fn symmetric(x: f32, y: f32) -> Self` — `epaint-0.35.0/src/margin_f32.rs:66`
+- `const fn symmetric(x: f32, y: f32) -> Self` — `epaint-0.36.2/src/margin_f32.rs:66`
   Margins with the same size on opposing sides
-- `fn is_same(&self) -> bool` — `epaint-0.35.0/src/margin_f32.rs:94`
+- `fn is_same(&self) -> bool` — `epaint-0.36.2/src/margin_f32.rs:94`
   Are the margin on every side the same?
-- `fn sum(&self) -> Vec2` — `epaint-0.35.0/src/margin_f32.rs:77`
+- `fn sum(&self) -> Vec2` — `epaint-0.36.2/src/margin_f32.rs:77`
   Total margins on both sides
 
 Implements: `Add`, `Add<MarginF32>`, `Add<f32>`, `AddAssign<MarginF32>`, `AddAssign<f32>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Div<f32>`, `DivAssign<f32>`, `From<Margin>`, `From<MarginF32>`, `From<Vec2>`, `From<f32>`, `Mul<f32>`, `MulAssign<f32>`, `PartialEq`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<MarginF32>`, `Sub<f32>`, `SubAssign<MarginF32>`, `SubAssign<f32>`
 
-### `Mesh` (struct) — `epaint-0.35.0/src/mesh.rs:60`
+### `Mesh` (struct) — `epaint-0.36.2/src/mesh.rs:60`
 
 Textured triangles in two dimensions.
 
@@ -780,46 +780,46 @@ Public fields:
 
 Methods:
 
-- `fn add_colored_rect(&mut self, rect: Rect, color: Color32)` — `epaint-0.35.0/src/mesh.rs:231`
+- `fn add_colored_rect(&mut self, rect: Rect, color: Color32)` — `epaint-0.36.2/src/mesh.rs:231`
   Uniformly colored rectangle.
-- `fn add_rect_with_uv(&mut self, rect: Rect, uv: Rect, color: Color32)` — `epaint-0.35.0/src/mesh.rs:199`
+- `fn add_rect_with_uv(&mut self, rect: Rect, uv: Rect, color: Color32)` — `epaint-0.36.2/src/mesh.rs:199`
   Rectangle with a texture and color.
-- `fn add_triangle(&mut self, a: u32, b: u32, c: u32)` — `epaint-0.35.0/src/mesh.rs:179`
+- `fn add_triangle(&mut self, a: u32, b: u32, c: u32)` — `epaint-0.36.2/src/mesh.rs:179`
   Add a triangle.
-- `fn append(&mut self, other: Self)` — `epaint-0.35.0/src/mesh.rs:132`
+- `fn append(&mut self, other: Self)` — `epaint-0.36.2/src/mesh.rs:132`
   Append all the indices and vertices of `other` to `self`.
-- `fn append_ref(&mut self, other: &Self)` — `epaint-0.35.0/src/mesh.rs:147`
+- `fn append_ref(&mut self, other: &Self)` — `epaint-0.36.2/src/mesh.rs:147`
   Append all the indices and vertices of `other` to `self` without taking ownership.
-- `fn bytes_used(&self) -> usize` — `epaint-0.35.0/src/mesh.rs:92`
+- `fn bytes_used(&self) -> usize` — `epaint-0.36.2/src/mesh.rs:92`
   Returns the amount of memory used by the vertices and indices.
-- `fn calc_bounds(&self) -> Rect` — `epaint-0.35.0/src/mesh.rs:121`
+- `fn calc_bounds(&self) -> Rect` — `epaint-0.36.2/src/mesh.rs:121`
   Calculate a bounding rectangle.
-- `fn clear(&mut self)` — `epaint-0.35.0/src/mesh.rs:85`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/mesh.rs:85`
   Restore to default state, but without freeing memory.
-- `fn colored_vertex(&mut self, pos: Pos2, color: Color32)` — `epaint-0.35.0/src/mesh.rs:169`
+- `fn colored_vertex(&mut self, pos: Pos2, color: Color32)` — `epaint-0.36.2/src/mesh.rs:169`
   Add a colored vertex.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/mesh.rs:109`
-- `fn is_valid(&self) -> bool` — `epaint-0.35.0/src/mesh.rs:99`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/mesh.rs:109`
+- `fn is_valid(&self) -> bool` — `epaint-0.36.2/src/mesh.rs:99`
   Are all indices within the bounds of the contained vertices?
-- `fn reserve_triangles(&mut self, additional_triangles: usize)` — `epaint-0.35.0/src/mesh.rs:186`
+- `fn reserve_triangles(&mut self, additional_triangles: usize)` — `epaint-0.36.2/src/mesh.rs:186`
   Make room for this many additional triangles (will reserve 3x as many indices). See also `reserve_vertices`.
-- `fn reserve_vertices(&mut self, additional: usize)` — `epaint-0.35.0/src/mesh.rs:193`
+- `fn reserve_vertices(&mut self, additional: usize)` — `epaint-0.36.2/src/mesh.rs:193`
   Make room for this many additional vertices. See also `reserve_triangles`.
-- `fn rotate(&mut self, rot: Rot2, origin: Pos2)` — `epaint-0.35.0/src/mesh.rs:325`
+- `fn rotate(&mut self, rot: Rot2, origin: Pos2)` — `epaint-0.36.2/src/mesh.rs:325`
   Rotate by some angle about an origin, in-place.
-- `fn split_to_u16(self) -> Vec<Mesh16>` — `epaint-0.35.0/src/mesh.rs:243`
+- `fn split_to_u16(self) -> Vec<Mesh16>` — `epaint-0.36.2/src/mesh.rs:243`
   This is for platforms that only support 16-bit index buffers.
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/mesh.rs:316`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/mesh.rs:316`
   Transform the mesh in-place with the given transform.
-- `fn translate(&mut self, delta: Vec2)` — `epaint-0.35.0/src/mesh.rs:309`
+- `fn translate(&mut self, delta: Vec2)` — `epaint-0.36.2/src/mesh.rs:309`
   Translate location by this much, in-place
-- `fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_` — `epaint-0.35.0/src/mesh.rs:114`
+- `fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_` — `epaint-0.36.2/src/mesh.rs:114`
   Iterate over the triangles of this mesh, returning vertex indices.
-- `fn with_texture(texture_id: TextureId) -> Self` — `epaint-0.35.0/src/mesh.rs:77`
+- `fn with_texture(texture_id: TextureId) -> Self` — `epaint-0.36.2/src/mesh.rs:77`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<Mesh>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Mesh16` (struct) — `epaint-0.35.0/src/mesh.rs:337`
+### `Mesh16` (struct) — `epaint-0.36.2/src/mesh.rs:337`
 
 A version of [`Mesh`] that uses 16-bit indices.
 
@@ -831,10 +831,10 @@ Public fields:
 
 Methods:
 
-- `fn is_valid(&self) -> bool` — `epaint-0.35.0/src/mesh.rs:352`
+- `fn is_valid(&self) -> bool` — `epaint-0.36.2/src/mesh.rs:352`
   Are all indices within the bounds of the contained vertices?
 
-### `PaintCallback` (struct) — `epaint-0.35.0/src/shapes/paint_callback.rs:59`
+### `PaintCallback` (struct) — `epaint-0.36.2/src/shapes/paint_callback.rs:60`
 
 If you want to paint some 3D shapes inside an egui region, you can use this.
 
@@ -845,7 +845,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `From<PaintCallback>`, `PartialEq`
 
-### `PaintCallbackInfo` (struct) — `epaint-0.35.0/src/shapes/paint_callback.rs:6`
+### `PaintCallbackInfo` (struct) — `epaint-0.36.2/src/shapes/paint_callback.rs:7`
 
 Information passed along with [`PaintCallback`] ([`Shape::Callback`]).
 
@@ -858,12 +858,12 @@ Public fields:
 
 Methods:
 
-- `fn clip_rect_in_pixels(&self) -> ViewportInPixels` — `epaint-0.35.0/src/shapes/paint_callback.rs:50`
+- `fn clip_rect_in_pixels(&self) -> ViewportInPixels` — `epaint-0.36.2/src/shapes/paint_callback.rs:51`
   The "scissor" or "clip" rectangle. This is what you would use in e.g. `glScissor`.
-- `fn viewport_in_pixels(&self) -> ViewportInPixels` — `epaint-0.35.0/src/shapes/paint_callback.rs:45`
+- `fn viewport_in_pixels(&self) -> ViewportInPixels` — `epaint-0.36.2/src/shapes/paint_callback.rs:46`
   The viewport rectangle. This is what you would use in e.g. `glViewport`.
 
-### `PaintStats` (struct) — `epaint-0.35.0/src/stats.rs:160`
+### `PaintStats` (struct) — `epaint-0.36.2/src/stats.rs:160`
 
 Collected allocation statistics for shapes and meshes.
 
@@ -883,12 +883,12 @@ Public fields:
 
 Methods:
 
-- `fn from_shapes(shapes: &[ClippedShape]) -> Self` — `epaint-0.35.0/src/stats.rs:178`
-- `fn with_clipped_primitives(self, clipped_primitives: &[ClippedPrimitive]) -> Self` — `epaint-0.35.0/src/stats.rs:227`
+- `fn from_shapes(shapes: &[ClippedShape]) -> Self` — `epaint-0.36.2/src/stats.rs:178`
+- `fn with_clipped_primitives(self, clipped_primitives: &[ClippedPrimitive]) -> Self` — `epaint-0.36.2/src/stats.rs:227`
 
 Implements: `Clone`, `Copy`, `Default`
 
-### `PathShape` (struct) — `epaint-0.35.0/src/shapes/path_shape.rs:6`
+### `PathShape` (struct) — `epaint-0.36.2/src/shapes/path_shape.rs:6`
 
 A path which can be stroked and/or filled (if closed).
 
@@ -901,18 +901,18 @@ Public fields:
 
 Methods:
 
-- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/path_shape.rs:39`
+- `fn closed_line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/path_shape.rs:39`
   A line that closes back to the start point again.
-- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/path_shape.rs:52`
+- `fn convex_polygon(points: Vec<Pos2>, fill: impl Into<Color32>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/path_shape.rs:52`
   A convex polygon with a fill and optional stroke.
-- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/path_shape.rs:28`
+- `fn line(points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/path_shape.rs:28`
   A line through many points.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/path_shape.rs:67`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/path_shape.rs:67`
   The visual bounding rectangle (includes stroke width)
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `From<PathShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PathStroke` (struct) — `epaint-0.35.0/src/stroke.rs:117`
+### `PathStroke` (struct) — `epaint-0.36.2/src/stroke.rs:118`
 
 Describes the width and color of paths. The color can either be solid or provided by a callback. For more information, see [`ColorMode`]
 
@@ -924,22 +924,22 @@ Public fields:
 
 Methods:
 
-- `fn inside(self) -> Self` — `epaint-0.35.0/src/stroke.rs:187`
+- `fn inside(self) -> Self` — `epaint-0.36.2/src/stroke.rs:188`
   Set the stroke to be painted entirely inside of the shape
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/stroke.rs:196`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/stroke.rs:197`
   True if width is zero or color is solid and transparent
-- `fn middle(self) -> Self` — `epaint-0.35.0/src/stroke.rs:169`
+- `fn middle(self) -> Self` — `epaint-0.36.2/src/stroke.rs:170`
   Set the stroke to be painted right on the edge of the shape, half inside and half outside.
-- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/stroke.rs:139`
-- `fn new_uv(width: f32, callback: impl Fn(Rect, Pos2) -> Color32 + Send + Sync + 'static) -> Self` — `epaint-0.35.0/src/stroke.rs:151`
+- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/stroke.rs:140`
+- `fn new_uv(width: f32, callback: impl Fn(Rect, Pos2) -> Color32 + Send + Sync + 'static) -> Self` — `epaint-0.36.2/src/stroke.rs:152`
   Create a new `PathStroke` with a UV function
-- `fn outside(self) -> Self` — `epaint-0.35.0/src/stroke.rs:178`
+- `fn outside(self) -> Self` — `epaint-0.36.2/src/stroke.rs:179`
   Set the stroke to be painted entirely outside of the shape
-- `fn with_kind(self, kind: StrokeKind) -> Self` — `epaint-0.35.0/src/stroke.rs:163`
+- `fn with_kind(self, kind: StrokeKind) -> Self` — `epaint-0.36.2/src/stroke.rs:164`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `From<(f32, Color)>`, `From<Stroke>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Pos2` (struct) — `emath-0.35.0/src/pos2.rs:18`
+### `Pos2` (struct) — `emath-0.36.2/src/pos2.rs:18`
 
 A position on screen.
 
@@ -950,27 +950,27 @@ Public fields:
 
 Methods:
 
-- `const fn new(x: f32, y: f32) -> Self` — `emath-0.35.0/src/pos2.rs:128`
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/pos2.rs:175`
+- `const fn new(x: f32, y: f32) -> Self` — `emath-0.36.2/src/pos2.rs:128`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/pos2.rs:175`
   True if any member is NaN.
-- `fn ceil(self) -> Self` — `emath-0.35.0/src/pos2.rs:163`
-- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.35.0/src/pos2.rs:193`
-- `fn distance(self, other: Self) -> f32` — `emath-0.35.0/src/pos2.rs:143`
-- `fn distance_sq(self, other: Self) -> f32` — `emath-0.35.0/src/pos2.rs:148`
-- `fn floor(self) -> Self` — `emath-0.35.0/src/pos2.rs:153`
-- `fn is_finite(self) -> bool` — `emath-0.35.0/src/pos2.rs:169`
+- `fn ceil(self) -> Self` — `emath-0.36.2/src/pos2.rs:163`
+- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.36.2/src/pos2.rs:193`
+- `fn distance(self, other: Self) -> f32` — `emath-0.36.2/src/pos2.rs:143`
+- `fn distance_sq(self, other: Self) -> f32` — `emath-0.36.2/src/pos2.rs:148`
+- `fn floor(self) -> Self` — `emath-0.36.2/src/pos2.rs:153`
+- `fn is_finite(self) -> bool` — `emath-0.36.2/src/pos2.rs:169`
   True if all members are also finite.
-- `fn lerp(&self, other: Self, t: f32) -> Self` — `emath-0.35.0/src/pos2.rs:201`
+- `fn lerp(&self, other: Self, t: f32) -> Self` — `emath-0.36.2/src/pos2.rs:201`
   Linearly interpolate towards another point, so that `0.0 => self, 1.0 => other`.
-- `fn max(self, other: Self) -> Self` — `emath-0.35.0/src/pos2.rs:187`
-- `fn min(self, other: Self) -> Self` — `emath-0.35.0/src/pos2.rs:181`
-- `fn round(self) -> Self` — `emath-0.35.0/src/pos2.rs:158`
-- `fn to_vec2(self) -> Vec2` — `emath-0.35.0/src/pos2.rs:135`
+- `fn max(self, other: Self) -> Self` — `emath-0.36.2/src/pos2.rs:187`
+- `fn min(self, other: Self) -> Self` — `emath-0.36.2/src/pos2.rs:181`
+- `fn round(self) -> Self` — `emath-0.36.2/src/pos2.rs:158`
+- `fn to_vec2(self) -> Vec2` — `emath-0.36.2/src/pos2.rs:135`
   The vector from origin to this position. `p.to_vec2()` is equivalent to `p - Pos2::default()`.
 
-Implements: `Add<Vec2>`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Pos2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Pos2>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul<Pos2>`, `Mul<f32>`, `MulAssign<f32>`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Vec2>`, `SubAssign<Vec2>`, `Zeroable`
+Implements: `Add<Vec2>`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Pos2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Pos2>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul<Pos2>`, `Mul<f32>`, `MulAssign<f32>`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `Sub`, `Sub<Vec2>`, `SubAssign<Vec2>`, `Zeroable`
 
-### `QuadraticBezierShape` (struct) — `epaint-0.35.0/src/shapes/bezier_shape.rs:385`
+### `QuadraticBezierShape` (struct) — `epaint-0.36.2/src/shapes/bezier_shape.rs:385`
 
 A quadratic [Bézier Curve](https://en.wikipedia.org/wiki/B%C3%A9zier_curve).
 
@@ -983,26 +983,26 @@ Public fields:
 
 Methods:
 
-- `fn flatten(&self, tolerance: Option<f32>) -> Vec<Pos2>` — `epaint-0.35.0/src/shapes/bezier_shape.rs:522`
+- `fn flatten(&self, tolerance: Option<f32>) -> Vec<Pos2>` — `epaint-0.36.2/src/shapes/bezier_shape.rs:522`
   find a set of points that approximate the quadratic Bézier curve. the number of points is determined by the t…
-- `fn for_each_flattened_with_t<F>(&self, tolerance: f32, callback: &mut F)` — `epaint-0.35.0/src/shapes/bezier_shape.rs:540`
+- `fn for_each_flattened_with_t<F>(&self, tolerance: f32, callback: &mut F)` — `epaint-0.36.2/src/shapes/bezier_shape.rs:540`
   Compute a flattened approximation of the curve, invoking a callback at each step.
-- `fn from_points_stroke(points: [Pos2; 3], closed: bool, fill: Color32, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.35.0/src/shapes/bezier_shape.rs:401`
+- `fn from_points_stroke(points: [Pos2; 3], closed: bool, fill: Color32, stroke: impl Into<PathStroke>) -> Self` — `epaint-0.36.2/src/shapes/bezier_shape.rs:401`
   Create a new quadratic Bézier shape based on the 3 points and stroke.
-- `fn logical_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/bezier_shape.rs:451`
+- `fn logical_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/bezier_shape.rs:451`
   Logical bounding rectangle (ignoring stroke width)
-- `fn sample(&self, t: f32) -> Pos2` — `epaint-0.35.0/src/shapes/bezier_shape.rs:503`
+- `fn sample(&self, t: f32) -> Pos2` — `epaint-0.36.2/src/shapes/bezier_shape.rs:503`
   Calculate the point (x,y) at t based on the quadratic Bézier curve equation. t is in [0.0,1.0] [Bézier Curve]…
-- `fn to_path_shape(&self, tolerance: Option<f32>) -> PathShape` — `epaint-0.35.0/src/shapes/bezier_shape.rs:431`
+- `fn to_path_shape(&self, tolerance: Option<f32>) -> PathShape` — `epaint-0.36.2/src/shapes/bezier_shape.rs:431`
   Convert the quadratic Bézier curve to one [`PathShape`]. The `tolerance` will be used to control the max dist…
-- `fn transform(&self, transform: &RectTransform) -> Self` — `epaint-0.35.0/src/shapes/bezier_shape.rs:416`
+- `fn transform(&self, transform: &RectTransform) -> Self` — `epaint-0.36.2/src/shapes/bezier_shape.rs:416`
   Transform the curve with the given transform.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/bezier_shape.rs:442`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/bezier_shape.rs:442`
   The visual bounding rectangle (includes stroke width)
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `From<QuadraticBezierShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Rect` (struct) — `emath-0.35.0/src/rect.rs:25`
+### `Rect` (struct) — `emath-0.36.2/src/rect.rs:25`
 
 A rectangular region of space.
 
@@ -1013,150 +1013,150 @@ Public fields:
 
 Methods:
 
-- `const fn from_min_max(min: Pos2, max: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:73`
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/rect.rs:530`
+- `const fn from_min_max(min: Pos2, max: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:73`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/rect.rs:530`
   True if any member is NaN.
-- `fn area(&self) -> f32` — `emath-0.35.0/src/rect.rs:381`
+- `fn area(&self) -> f32` — `emath-0.36.2/src/rect.rs:381`
   This is never negative, and instead returns zero for negative rectangles.
-- `fn aspect_ratio(&self) -> f32` — `emath-0.35.0/src/rect.rs:362`
+- `fn aspect_ratio(&self) -> f32` — `emath-0.36.2/src/rect.rs:362`
   Width / height
-- `fn bottom(&self) -> f32` — `emath-0.35.0/src/rect.rs:593`
+- `fn bottom(&self) -> f32` — `emath-0.36.2/src/rect.rs:593`
   `max.y`
-- `fn bottom_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:599`
+- `fn bottom_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:599`
   `max.y`
-- `fn bottom_up_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:506`
-- `fn center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:332`
-- `fn center_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:643`
-- `fn center_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:616`
-- `fn clamp(&self, p: Pos2) -> Pos2` — `emath-0.35.0/src/rect.rs:286`
+- `fn bottom_up_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:506`
+- `fn center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:332`
+- `fn center_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:643`
+- `fn center_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:616`
+- `fn clamp(&self, p: Pos2) -> Pos2` — `emath-0.36.2/src/rect.rs:286`
   Return the given points clamped to be inside the rectangle Panics if [`Self::is_negative`].
-- `fn contains(&self, p: Pos2) -> bool` — `emath-0.35.0/src/rect.rs:274`
-- `fn contains_rect(&self, other: Self) -> bool` — `emath-0.35.0/src/rect.rs:279`
-- `fn distance_sq_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:401`
+- `fn contains(&self, p: Pos2) -> bool` — `emath-0.36.2/src/rect.rs:274`
+- `fn contains_rect(&self, other: Self) -> bool` — `emath-0.36.2/src/rect.rs:279`
+- `fn distance_sq_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:401`
   The distance from the rect to the position, squared.
-- `fn distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:391`
+- `fn distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:391`
   The distance from the rect to the position.
-- `fn everything_above(bottom_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:157`
+- `fn everything_above(bottom_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:157`
   A [`Rect`] that contains every point above a certain y coordinate
-- `fn everything_below(top_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:149`
+- `fn everything_below(top_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:149`
   A [`Rect`] that contains every point below a certain y coordinate
-- `fn everything_left_of(right_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:141`
+- `fn everything_left_of(right_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:141`
   A [`Rect`] that contains every point to the left of the given X coordinate.
-- `fn everything_right_of(left_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:133`
+- `fn everything_right_of(left_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:133`
   A [`Rect`] that contains every point to the right of the given X coordinate.
-- `fn expand(self, amnt: f32) -> Self` — `emath-0.35.0/src/rect.rs:193`
+- `fn expand(self, amnt: f32) -> Self` — `emath-0.36.2/src/rect.rs:193`
   Expand by this much in each direction, keeping the center
-- `fn expand2(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:199`
+- `fn expand2(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:199`
   Expand by this much in each direction, keeping the center
-- `fn extend_with(&mut self, p: Pos2)` — `emath-0.35.0/src/rect.rs:291`
-- `fn extend_with_x(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:298`
+- `fn extend_with(&mut self, p: Pos2)` — `emath-0.36.2/src/rect.rs:291`
+- `fn extend_with_x(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:298`
   Expand to include the given x coordinate
-- `fn extend_with_y(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:305`
+- `fn extend_with_y(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:305`
   Expand to include the given y coordinate
-- `fn from_center_size(center: Pos2, size: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:87`
-- `fn from_min_size(min: Pos2, size: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:79`
+- `fn from_center_size(center: Pos2, size: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:87`
+- `fn from_min_size(min: Pos2, size: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:79`
   left-top corner plus a size (stretching right-down).
-- `fn from_points(points: &[Pos2]) -> Self` — `emath-0.35.0/src/rect.rs:123`
+- `fn from_points(points: &[Pos2]) -> Self` — `emath-0.36.2/src/rect.rs:123`
   Bounding-box around the points.
-- `fn from_pos(point: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:115`
+- `fn from_pos(point: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:115`
   A zero-sized rect at a specific point.
-- `fn from_two_pos(a: Pos2, b: Pos2) -> Self` — `emath-0.35.0/src/rect.rs:106`
+- `fn from_two_pos(a: Pos2, b: Pos2) -> Self` — `emath-0.36.2/src/rect.rs:106`
   Returns the bounding rectangle of the two points.
-- `fn from_x_y_ranges(x_range: impl Into<Rangef>, y_range: impl Into<Rangef>) -> Self` — `emath-0.35.0/src/rect.rs:95`
-- `fn height(&self) -> f32` — `emath-0.35.0/src/rect.rs:353`
+- `fn from_x_y_ranges(x_range: impl Into<Rangef>, y_range: impl Into<Rangef>) -> Self` — `emath-0.36.2/src/rect.rs:95`
+- `fn height(&self) -> f32` — `emath-0.36.2/src/rect.rs:353`
   Note: this can be negative.
-- `fn intersect(self, other: Self) -> Self` — `emath-0.35.0/src/rect.rs:324`
+- `fn intersect(self, other: Self) -> Self` — `emath-0.36.2/src/rect.rs:324`
   The intersection of two [`Rect`], i.e. the area covered by both.
-- `fn intersects(self, other: Self) -> bool` — `emath-0.35.0/src/rect.rs:250`
-- `fn intersects_ray(&self, o: Pos2, d: Vec2) -> bool` — `emath-0.35.0/src/rect.rs:682`
+- `fn intersects(self, other: Self) -> bool` — `emath-0.36.2/src/rect.rs:250`
+- `fn intersects_ray(&self, o: Pos2, d: Vec2) -> bool` — `emath-0.36.2/src/rect.rs:682`
   Does this Rect intersect the given ray (where `d` is normalized)?
-- `fn intersects_ray_from_center(&self, d: Vec2) -> Pos2` — `emath-0.35.0/src/rect.rs:714`
+- `fn intersects_ray_from_center(&self, d: Vec2) -> Pos2` — `emath-0.36.2/src/rect.rs:714`
   Where does a ray from the center intersect the rectangle?
-- `fn is_finite(&self) -> bool` — `emath-0.35.0/src/rect.rs:524`
+- `fn is_finite(&self) -> bool` — `emath-0.36.2/src/rect.rs:524`
   True if all members are also finite.
-- `fn is_negative(&self) -> bool` — `emath-0.35.0/src/rect.rs:512`
+- `fn is_negative(&self) -> bool` — `emath-0.36.2/src/rect.rs:512`
   `width < 0 || height < 0`
-- `fn is_positive(&self) -> bool` — `emath-0.35.0/src/rect.rs:518`
+- `fn is_positive(&self) -> bool` — `emath-0.36.2/src/rect.rs:518`
   `width > 0 && height > 0`
-- `fn left(&self) -> f32` — `emath-0.35.0/src/rect.rs:539`
+- `fn left(&self) -> f32` — `emath-0.36.2/src/rect.rs:539`
   `min.x`
-- `fn left_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:638`
-- `fn left_center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:627`
-- `fn left_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:545`
+- `fn left_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:638`
+- `fn left_center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:627`
+- `fn left_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:545`
   `min.x`
-- `fn left_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:611`
-- `fn lerp_inside(&self, t: impl Into<Vec2>) -> Pos2` — `emath-0.35.0/src/rect.rs:452`
+- `fn left_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:611`
+- `fn lerp_inside(&self, t: impl Into<Vec2>) -> Pos2` — `emath-0.36.2/src/rect.rs:452`
   Linearly interpolate so that `[0, 0]` is [`Self::min`] and `[1, 1]` is [`Self::max`].
-- `fn lerp_towards(&self, other: &Self, t: f32) -> Self` — `emath-0.35.0/src/rect.rs:462`
+- `fn lerp_towards(&self, other: &Self, t: f32) -> Self` — `emath-0.36.2/src/rect.rs:462`
   Linearly self towards other rect.
-- `fn range_along(&self, axis: usize) -> Rangef` — `emath-0.35.0/src/rect.rs:486`
+- `fn range_along(&self, axis: usize) -> Rangef` — `emath-0.36.2/src/rect.rs:486`
   The extent along the given axis: `0` for x, `1` for y.
-- `fn right(&self) -> f32` — `emath-0.35.0/src/rect.rs:557`
+- `fn right(&self) -> f32` — `emath-0.36.2/src/rect.rs:557`
   `max.x`
-- `fn right_bottom(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:649`
-- `fn right_center(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:632`
-- `fn right_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:563`
+- `fn right_bottom(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:649`
+- `fn right_center(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:632`
+- `fn right_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:563`
   `max.x`
-- `fn right_top(&self) -> Pos2` — `emath-0.35.0/src/rect.rs:622`
-- `fn rotate_bb(self, rot: Rot2) -> Self` — `emath-0.35.0/src/rect.rs:236`
+- `fn right_top(&self) -> Pos2` — `emath-0.36.2/src/rect.rs:622`
+- `fn rotate_bb(self, rot: Rot2) -> Self` — `emath-0.36.2/src/rect.rs:236`
   Rotate the bounds (will expand the [`Rect`])
-- `fn scale_from_center(self, scale_factor: f32) -> Self` — `emath-0.35.0/src/rect.rs:205`
+- `fn scale_from_center(self, scale_factor: f32) -> Self` — `emath-0.36.2/src/rect.rs:205`
   Scale up by this factor in each direction, keeping the center
-- `fn scale_from_center2(self, scale_factor: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:211`
+- `fn scale_from_center2(self, scale_factor: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:211`
   Scale up by this factor in each direction, keeping the center
-- `fn set_bottom(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:605`
+- `fn set_bottom(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:605`
   `max.y`
-- `fn set_center(&mut self, center: Pos2)` — `emath-0.35.0/src/rect.rs:268`
+- `fn set_center(&mut self, center: Pos2)` — `emath-0.36.2/src/rect.rs:268`
   Keep size
-- `fn set_height(&mut self, h: f32)` — `emath-0.35.0/src/rect.rs:263`
+- `fn set_height(&mut self, h: f32)` — `emath-0.36.2/src/rect.rs:263`
   keep min
-- `fn set_left(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:551`
+- `fn set_left(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:551`
   `min.x`
-- `fn set_right(&mut self, x: f32)` — `emath-0.35.0/src/rect.rs:569`
+- `fn set_right(&mut self, x: f32)` — `emath-0.36.2/src/rect.rs:569`
   `max.x`
-- `fn set_top(&mut self, y: f32)` — `emath-0.35.0/src/rect.rs:587`
+- `fn set_top(&mut self, y: f32)` — `emath-0.36.2/src/rect.rs:587`
   `min.y`
-- `fn set_width(&mut self, w: f32)` — `emath-0.35.0/src/rect.rs:258`
+- `fn set_width(&mut self, w: f32)` — `emath-0.36.2/src/rect.rs:258`
   keep min
-- `fn shrink(self, amnt: f32) -> Self` — `emath-0.35.0/src/rect.rs:217`
+- `fn shrink(self, amnt: f32) -> Self` — `emath-0.36.2/src/rect.rs:217`
   Shrink by this much in each direction, keeping the center
-- `fn shrink2(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:223`
+- `fn shrink2(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:223`
   Shrink by this much in each direction, keeping the center
-- `fn signed_distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.35.0/src/rect.rs:438`
+- `fn signed_distance_to_pos(&self, pos: Pos2) -> f32` — `emath-0.36.2/src/rect.rs:438`
   Signed distance to the edge of the box.
-- `fn size(&self) -> Vec2` — `emath-0.35.0/src/rect.rs:341`
+- `fn size(&self) -> Vec2` — `emath-0.36.2/src/rect.rs:341`
   `rect.size() == Vec2 { x: rect.width(), y: rect.height() }`
-- `fn size_along(&self, axis: usize) -> f32` — `emath-0.35.0/src/rect.rs:501`
+- `fn size_along(&self, axis: usize) -> f32` — `emath-0.36.2/src/rect.rs:501`
   The size along the given axis: `0` for x (width), `1` for y (height).
-- `fn split_left_right_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:654`
+- `fn split_left_right_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:654`
   Split rectangle in left and right halves. `t` is expected to be in the (0,1) range.
-- `fn split_left_right_at_x(&self, split_x: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:659`
+- `fn split_left_right_at_x(&self, split_x: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:659`
   Split rectangle in left and right halves at the given `x` coordinate.
-- `fn split_top_bottom_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:666`
+- `fn split_top_bottom_at_fraction(&self, t: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:666`
   Split rectangle in top and bottom halves. `t` is expected to be in the (0,1) range.
-- `fn split_top_bottom_at_y(&self, split_y: f32) -> (Self, Self)` — `emath-0.35.0/src/rect.rs:671`
+- `fn split_top_bottom_at_y(&self, split_y: f32) -> (Self, Self)` — `emath-0.36.2/src/rect.rs:671`
   Split rectangle in top and bottom halves at the given `y` coordinate.
-- `fn square_proportions(&self) -> Vec2` — `emath-0.35.0/src/rect.rs:369`
+- `fn square_proportions(&self) -> Vec2` — `emath-0.36.2/src/rect.rs:369`
   `[2, 1]` for wide screen, and `[1, 2]` for portrait, etc. At least one dimension = 1, the other >= 1 Returns…
-- `fn top(&self) -> f32` — `emath-0.35.0/src/rect.rs:575`
+- `fn top(&self) -> f32` — `emath-0.36.2/src/rect.rs:575`
   `min.y`
-- `fn top_mut(&mut self) -> &mut f32` — `emath-0.35.0/src/rect.rs:581`
+- `fn top_mut(&mut self) -> &mut f32` — `emath-0.36.2/src/rect.rs:581`
   `min.y`
-- `fn translate(self, amnt: Vec2) -> Self` — `emath-0.35.0/src/rect.rs:229`
-- `fn union(self, other: Self) -> Self` — `emath-0.35.0/src/rect.rs:314`
+- `fn translate(self, amnt: Vec2) -> Self` — `emath-0.36.2/src/rect.rs:229`
+- `fn union(self, other: Self) -> Self` — `emath-0.36.2/src/rect.rs:314`
   The union of two bounding rectangle, i.e. the minimum [`Rect`] that contains both input rectangles.
-- `fn width(&self) -> f32` — `emath-0.35.0/src/rect.rs:347`
+- `fn width(&self) -> f32` — `emath-0.36.2/src/rect.rs:347`
   Note: this can be negative.
-- `fn with_max_x(self, max_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:179`
-- `fn with_max_y(self, max_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:186`
-- `fn with_min_x(self, min_x: f32) -> Self` — `emath-0.35.0/src/rect.rs:165`
-- `fn with_min_y(self, min_y: f32) -> Self` — `emath-0.35.0/src/rect.rs:172`
-- `fn x_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:470`
-- `fn y_range(&self) -> Rangef` — `emath-0.35.0/src/rect.rs:475`
+- `fn with_max_x(self, max_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:179`
+- `fn with_max_y(self, max_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:186`
+- `fn with_min_x(self, min_x: f32) -> Self` — `emath-0.36.2/src/rect.rs:165`
+- `fn with_min_y(self, min_y: f32) -> Self` — `emath-0.36.2/src/rect.rs:172`
+- `fn x_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:470`
+- `fn y_range(&self) -> Rangef` — `emath-0.36.2/src/rect.rs:475`
 
 Implements: `BitOr`, `BitOrAssign`, `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Display`, `Div<f32>`, `Eq`, `From<[Pos2; 2]>`, `GuiRounding`, `Mul<Rect>`, `Mul<f32>`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `RectShape` (struct) — `epaint-0.35.0/src/shapes/rect_shape.rs:8`
+### `RectShape` (struct) — `epaint-0.36.2/src/shapes/rect_shape.rs:8`
 
 How to paint a rectangle.
 
@@ -1174,74 +1174,74 @@ Public fields:
 
 Methods:
 
-- `fn fill_texture_id(&self) -> TextureId` — `epaint-0.35.0/src/shapes/rect_shape.rs:211`
+- `fn fill_texture_id(&self) -> TextureId` — `epaint-0.36.2/src/shapes/rect_shape.rs:211`
   The texture to use when painting this rectangle, if any.
-- `fn filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:99`
-- `fn new(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:78`
+- `fn filled(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:99`
+- `fn new(rect: Rect, corner_radius: impl Into<CornerRadius>, fill_color: impl Into<Color32>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:78`
   See also [`Self::filled`] and [`Self::stroke`].
-- `fn stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:114`
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/rect_shape.rs:185`
+- `fn stroke(rect: Rect, corner_radius: impl Into<CornerRadius>, stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:114`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/rect_shape.rs:185`
   The visual bounding rectangle (includes stroke width)
-- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:167`
+- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:167`
   Set the rotation of the rectangle (in radians, clockwise). The rectangle rotates around its center.
-- `fn with_angle_and_pivot(self, angle: f32, pivot: Pos2) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:174`
+- `fn with_angle_and_pivot(self, angle: f32, pivot: Pos2) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:174`
   Set the rotation of the rectangle (in radians, clockwise) around a custom pivot point.
-- `fn with_blur_width(self, blur_width: f32) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:149`
+- `fn with_blur_width(self, blur_width: f32) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:149`
   If larger than zero, the edges of the rectangle (for both fill and stroke) will be blurred.
-- `fn with_round_to_pixels(self, round_to_pixels: bool) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:137`
+- `fn with_round_to_pixels(self, round_to_pixels: bool) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:137`
   Snap the rectangle to pixels?
-- `fn with_stroke_kind(self, stroke_kind: StrokeKind) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:126`
+- `fn with_stroke_kind(self, stroke_kind: StrokeKind) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:126`
   Set if the stroke is on the inside, outside, or centered on the rectangle.
-- `fn with_texture(self, fill_texture_id: TextureId, uv: Rect) -> Self` — `epaint-0.35.0/src/shapes/rect_shape.rs:156`
+- `fn with_texture(self, fill_texture_id: TextureId, uv: Rect) -> Self` — `epaint-0.36.2/src/shapes/rect_shape.rs:156`
   Set the texture to use when painting this rectangle, if any.
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `From<RectShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Rgba` (struct) — `ecolor-0.35.0/src/rgba.rs:10`
+### `Rgba` (struct) — `ecolor-0.36.2/src/rgba.rs:10`
 
 0-1 linear space `RGBA` color with premultiplied alpha.
 
 Methods:
 
-- `const fn from_gray(l: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:86`
-- `const fn from_rgb(r: f32, g: f32, b: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:80`
-- `const fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:60`
-- `fn a(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:160`
-- `fn additive(self) -> Self` — `ecolor-0.35.0/src/rgba.rs:122`
+- `const fn from_gray(l: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:86`
+- `const fn from_rgb(r: f32, g: f32, b: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:80`
+- `const fn from_rgba_premultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:60`
+- `fn a(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:160`
+- `fn additive(self) -> Self` — `ecolor-0.36.2/src/rgba.rs:122`
   Return an additive version of this color (alpha = 0)
-- `fn b(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:155`
-- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.35.0/src/rgba.rs:217`
+- `fn b(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:155`
+- `fn blend(self, on_top: Self) -> Self` — `ecolor-0.36.2/src/rgba.rs:217`
   Blend two colors in linear space, so that `self` is behind the argument.
-- `fn from_black_alpha(a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:105`
+- `fn from_black_alpha(a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:105`
   Transparent black
-- `fn from_luminance_alpha(l: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:91`
-- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:65`
-- `fn from_srgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/rgba.rs:70`
-- `fn from_srgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.35.0/src/rgba.rs:75`
-- `fn from_white_alpha(a: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:115`
+- `fn from_luminance_alpha(l: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:91`
+- `fn from_rgba_unmultiplied(r: f32, g: f32, b: f32, a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:65`
+- `fn from_srgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/rgba.rs:70`
+- `fn from_srgba_unmultiplied(r: u8, g: u8, b: u8, a: u8) -> Self` — `ecolor-0.36.2/src/rgba.rs:75`
+- `fn from_white_alpha(a: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:115`
   Transparent white
-- `fn g(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:150`
-- `fn intensity(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:166`
+- `fn g(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:150`
+- `fn intensity(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:166`
   How perceptually intense (bright) is the color?
-- `fn is_additive(self) -> bool` — `ecolor-0.35.0/src/rgba.rs:129`
+- `fn is_additive(self) -> bool` — `ecolor-0.36.2/src/rgba.rs:129`
   Is the alpha=0 ?
-- `fn multiply(self, alpha: f32) -> Self` — `ecolor-0.35.0/src/rgba.rs:135`
+- `fn multiply(self, alpha: f32) -> Self` — `ecolor-0.36.2/src/rgba.rs:135`
   Multiply with e.g. 0.5 to make us half transparent
-- `fn r(&self) -> f32` — `ecolor-0.35.0/src/rgba.rs:145`
-- `fn to_array(&self) -> [f32; 4]` — `ecolor-0.35.0/src/rgba.rs:188`
+- `fn r(&self) -> f32` — `ecolor-0.36.2/src/rgba.rs:145`
+- `fn to_array(&self) -> [f32; 4]` — `ecolor-0.36.2/src/rgba.rs:188`
   Premultiplied RGBA
-- `fn to_opaque(&self) -> Self` — `ecolor-0.35.0/src/rgba.rs:172`
+- `fn to_opaque(&self) -> Self` — `ecolor-0.36.2/src/rgba.rs:172`
   Returns an opaque version of self
-- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.35.0/src/rgba.rs:200`
+- `fn to_rgba_unmultiplied(&self) -> [f32; 4]` — `ecolor-0.36.2/src/rgba.rs:200`
   unmultiply the alpha
-- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.35.0/src/rgba.rs:212`
+- `fn to_srgba_unmultiplied(&self) -> [u8; 4]` — `ecolor-0.36.2/src/rgba.rs:212`
   unmultiply the alpha
-- `fn to_tuple(&self) -> (f32, f32, f32, f32)` — `ecolor-0.35.0/src/rgba.rs:194`
+- `fn to_tuple(&self) -> (f32, f32, f32, f32)` — `ecolor-0.36.2/src/rgba.rs:194`
   Premultiplied RGBA
 
 Implements: `Add`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<Color32>`, `From<Hsva>`, `From<HsvaGamma>`, `From<Rgba>`, `Hash`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Rgba>`, `Mul<f32>`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `Shadow` (struct) — `epaint-0.35.0/src/shadow.rs:10`
+### `Shadow` (struct) — `epaint-0.36.2/src/shadow.rs:10`
 
 The color and fuzziness of a fuzzy shape.
 
@@ -1254,14 +1254,14 @@ Public fields:
 
 Methods:
 
-- `fn as_shape(&self, rect: Rect, corner_radius: impl Into<CornerRadius>) -> RectShape` — `epaint-0.35.0/src/shadow.rs:48`
+- `fn as_shape(&self, rect: Rect, corner_radius: impl Into<CornerRadius>) -> RectShape` — `epaint-0.36.2/src/shadow.rs:48`
   The argument is the rectangle of the shadow caster.
-- `fn margin(&self) -> MarginF32` — `epaint-0.35.0/src/shadow.rs:68`
+- `fn margin(&self) -> MarginF32` — `epaint-0.36.2/src/shadow.rs:68`
   How much larger than the parent rect are we in each direction?
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Stroke` (struct) — `epaint-0.35.0/src/stroke.rs:12`
+### `Stroke` (struct) — `epaint-0.36.2/src/stroke.rs:13`
 
 Describes the width and color of a line.
 
@@ -1272,15 +1272,15 @@ Public fields:
 
 Methods:
 
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/stroke.rs:34`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/stroke.rs:35`
   True if width is zero or color is transparent
-- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.35.0/src/stroke.rs:25`
-- `fn round_center_to_pixel(&self, pixels_per_point: f32, coord: &mut f32)` — `epaint-0.35.0/src/stroke.rs:40`
+- `fn new(width: f32, color: impl Into<Color32>) -> Self` — `epaint-0.36.2/src/stroke.rs:26`
+- `fn round_center_to_pixel(&self, pixels_per_point: f32, coord: &mut f32)` — `epaint-0.36.2/src/stroke.rs:41`
   For vertical or horizontal lines: round the stroke center to produce a sharp, pixel-aligned line.
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `From<(f32, Color)>`, `From<Stroke>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TessellationOptions` (struct) — `epaint-0.35.0/src/tessellator.rs:656`
+### `TessellationOptions` (struct) — `epaint-0.36.2/src/tessellator.rs:658`
 
 Tessellation quality options
 
@@ -1303,44 +1303,44 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Tessellator` (struct) — `epaint-0.35.0/src/tessellator.rs:1301`
+### `Tessellator` (struct) — `epaint-0.36.2/src/tessellator.rs:1303`
 
 Converts [`Shape`]s into triangles ([`Mesh`]).
 
 Methods:
 
-- `fn new(pixels_per_point: f32, options: TessellationOptions, font_tex_size: [usize; 2], prepared_discs: Vec<PreparedDisc>) -> Self` — `epaint-0.35.0/src/tessellator.rs:1327`
+- `fn new(pixels_per_point: f32, options: TessellationOptions, font_tex_size: [usize; 2], prepared_discs: Vec<PreparedDisc>) -> Self` — `epaint-0.36.2/src/tessellator.rs:1329`
   Create a new [`Tessellator`].
-- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `epaint-0.35.0/src/tessellator.rs:1352`
+- `fn set_clip_rect(&mut self, clip_rect: Rect)` — `epaint-0.36.2/src/tessellator.rs:1354`
   Set the [`Rect`] to use for culling.
-- `fn tessellate_circle(&mut self, shape: CircleShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1484`
+- `fn tessellate_circle(&mut self, shape: CircleShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1486`
   Tessellate a single [`CircleShape`] into a [`Mesh`].
-- `fn tessellate_clipped_shape(&mut self, clipped_shape: ClippedShape, out_primitives: &mut Vec<ClippedPrimitive>)` — `epaint-0.35.0/src/tessellator.rs:1357`
+- `fn tessellate_clipped_shape(&mut self, clipped_shape: ClippedShape, out_primitives: &mut Vec<ClippedPrimitive>)` — `epaint-0.36.2/src/tessellator.rs:1359`
   Tessellate a clipped shape into a list of primitives.
-- `fn tessellate_cubic_bezier(&mut self, cubic_shape: &CubicBezierShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:2145`
+- `fn tessellate_cubic_bezier(&mut self, cubic_shape: &CubicBezierShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:2147`
   Tessellate a single [`CubicBezierShape`] into a [`Mesh`].
-- `fn tessellate_ellipse(&mut self, shape: EllipseShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1540`
+- `fn tessellate_ellipse(&mut self, shape: EllipseShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1542`
   Tessellate a single [`EllipseShape`] into a [`Mesh`].
-- `fn tessellate_line_segment(&mut self, points: [Pos2; 2], stroke: impl Into<Stroke>, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1635`
+- `fn tessellate_line_segment(&mut self, points: [Pos2; 2], stroke: impl Into<Stroke>, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1637`
   Tessellate a line segment between the two points with the given stroke into a [`Mesh`].
-- `fn tessellate_mesh(&self, mesh: &Mesh, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1616`
+- `fn tessellate_mesh(&self, mesh: &Mesh, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1618`
   Tessellate a single [`Mesh`] into a [`Mesh`].
-- `fn tessellate_path(&mut self, path_shape: &PathShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1710`
+- `fn tessellate_path(&mut self, path_shape: &PathShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1712`
   Tessellate a single [`PathShape`] into a [`Mesh`].
-- `fn tessellate_quadratic_bezier(&mut self, quadratic_shape: &QuadraticBezierShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:2116`
+- `fn tessellate_quadratic_bezier(&mut self, quadratic_shape: &QuadraticBezierShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:2118`
   Tessellate a single [`QuadraticBezierShape`] into a [`Mesh`].
-- `fn tessellate_rect(&mut self, rect_shape: &RectShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1755`
+- `fn tessellate_rect(&mut self, rect_shape: &RectShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1757`
   Tessellate a single [`Rect`] into a [`Mesh`].
-- `fn tessellate_shape(&mut self, shape: Shape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1420`
+- `fn tessellate_shape(&mut self, shape: Shape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1422`
   Tessellate a single [`Shape`] into a [`Mesh`].
-- `fn tessellate_shapes(&mut self, shapes: Vec<ClippedShape>) -> Vec<ClippedPrimitive>` — `epaint-0.35.0/src/tessellator.rs:2218`
+- `fn tessellate_shapes(&mut self, shapes: Vec<ClippedShape>) -> Vec<ClippedPrimitive>` — `epaint-0.36.2/src/tessellator.rs:2220`
   Turns [`Shape`]:s into sets of triangles.
-- `fn tessellate_text(&mut self, text_shape: &TextShape, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:1991`
+- `fn tessellate_text(&mut self, text_shape: &TextShape, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:1993`
   Tessellate a single [`TextShape`] into a [`Mesh`]. * `text_shape`: the text to tessellate. * `out`: triangles…
 
 Implements: `Clone`
 
-### `TextOptions` (struct) — `epaint-0.35.0/src/text/mod.rs:27`
+### `TextOptions` (struct) — `epaint-0.36.2/src/text/mod.rs:27`
 
 Controls how we render text
 
@@ -1353,7 +1353,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextShape` (struct) — `epaint-0.35.0/src/shapes/text_shape.rs:12`
+### `TextShape` (struct) — `epaint-0.36.2/src/shapes/text_shape.rs:12`
 
 How to paint some text on screen.
 
@@ -1369,100 +1369,100 @@ Public fields:
 
 Methods:
 
-- `fn new(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:49`
+- `fn new(pos: Pos2, galley: Arc<Galley>, fallback_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:49`
   The given fallback color will be used for any uncolored part of the galley (using [`Color32::PLACEHOLDER`]).
-- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.35.0/src/shapes/text_shape.rs:110`
+- `fn transform(&mut self, transform: TSTransform)` — `epaint-0.36.2/src/shapes/text_shape.rs:110`
   Move the shape by this many points, in-place.
-- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.35.0/src/shapes/text_shape.rs:63`
+- `fn visual_bounding_rect(&self) -> Rect` — `epaint-0.36.2/src/shapes/text_shape.rs:63`
   The visual bounding rectangle
-- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:86`
+- `fn with_angle(self, angle: f32) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:86`
   Set text rotation to `angle` radians clockwise. The pivot is `pos` (the upper left corner of the text).
-- `fn with_angle_and_anchor(self, angle: f32, anchor: Align2) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:94`
+- `fn with_angle_and_anchor(self, angle: f32, anchor: Align2) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:94`
   Set the text rotation to the `angle` radians clockwise. The pivot is determined by the given `anchor` point o…
-- `fn with_opacity_factor(self, opacity_factor: f32) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:104`
+- `fn with_opacity_factor(self, opacity_factor: f32) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:104`
   Render text with this opacity in gamma space
-- `fn with_override_text_color(self, override_text_color: Color32) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:78`
+- `fn with_override_text_color(self, override_text_color: Color32) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:78`
   Use the given color for the text, regardless of what color is already in the galley.
-- `fn with_underline(self, underline: Stroke) -> Self` — `epaint-0.35.0/src/shapes/text_shape.rs:71`
+- `fn with_underline(self, underline: Stroke) -> Self` — `epaint-0.36.2/src/shapes/text_shape.rs:71`
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `From<TextShape>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureAtlas` (struct) — `epaint-0.35.0/src/texture_atlas.rs:60`
+### `TextureAtlas` (struct) — `epaint-0.36.2/src/texture_atlas.rs:60`
 
 Contains font data in an atlas, where each character occupied a small rectangle.
 
 Methods:
 
-- `fn allocate(&mut self, (w, h): (usize, usize)) -> ((usize, usize), &mut ColorImage)` — `epaint-0.35.0/src/texture_atlas.rs:220`
+- `fn allocate(&mut self, (w, h): (usize, usize)) -> ((usize, usize), &mut ColorImage)` — `epaint-0.36.2/src/texture_atlas.rs:220`
   Returns the coordinates of where the rect ended up, and invalidates the region.
-- `fn fill_ratio(&self) -> f32` — `epaint-0.35.0/src/texture_atlas.rs:181`
+- `fn fill_ratio(&self) -> f32` — `epaint-0.36.2/src/texture_atlas.rs:181`
   When this get high, it might be time to clear and start over!
-- `fn image(&self) -> &ColorImage` — `epaint-0.35.0/src/texture_atlas.rs:197`
+- `fn image(&self) -> &ColorImage` — `epaint-0.36.2/src/texture_atlas.rs:197`
   The full font atlas image.
-- `fn new(size: [usize; 2], options: TextOptions) -> Self` — `epaint-0.35.0/src/texture_atlas.rs:82`
-- `fn options(&self) -> &TextOptions` — `epaint-0.35.0/src/texture_atlas.rs:142`
-- `fn prepared_discs(&self) -> Vec<PreparedDisc>` — `epaint-0.35.0/src/texture_atlas.rs:151`
+- `fn new(size: [usize; 2], options: TextOptions) -> Self` — `epaint-0.36.2/src/texture_atlas.rs:82`
+- `fn options(&self) -> &TextOptions` — `epaint-0.36.2/src/texture_atlas.rs:142`
+- `fn prepared_discs(&self) -> Vec<PreparedDisc>` — `epaint-0.36.2/src/texture_atlas.rs:151`
   Returns the locations and sizes of pre-rasterized discs (filled circles) in this atlas.
-- `fn size(&self) -> [usize; 2]` — `epaint-0.35.0/src/texture_atlas.rs:146`
-- `fn take_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.35.0/src/texture_atlas.rs:202`
+- `fn size(&self) -> [usize; 2]` — `epaint-0.36.2/src/texture_atlas.rs:146`
+- `fn take_delta(&mut self) -> Option<ImageDelta>` — `epaint-0.36.2/src/texture_atlas.rs:202`
   Call to get the change to the image since last call.
-- `fn texture_options() -> TextureOptions` — `epaint-0.35.0/src/texture_atlas.rs:191`
+- `fn texture_options() -> TextureOptions` — `epaint-0.36.2/src/texture_atlas.rs:191`
   The texture options suitable for a font texture
 
 Implements: `Clone`
 
-### `TextureHandle` (struct) — `epaint-0.35.0/src/texture_handle.rs:20`
+### `TextureHandle` (struct) — `epaint-0.36.2/src/texture_handle.rs:20`
 
 Used to paint images.
 
 Methods:
 
-- `fn aspect_ratio(&self) -> f32` — `epaint-0.35.0/src/texture_handle.rs:112`
+- `fn aspect_ratio(&self) -> f32` — `epaint-0.36.2/src/texture_handle.rs:112`
   width / height
-- `fn byte_size(&self) -> usize` — `epaint-0.35.0/src/texture_handle.rs:104`
+- `fn byte_size(&self) -> usize` — `epaint-0.36.2/src/texture_handle.rs:104`
   `width x height x bytes_per_pixel`
-- `fn id(&self) -> TextureId` — `epaint-0.35.0/src/texture_handle.rs:64`
-- `fn name(&self) -> String` — `epaint-0.35.0/src/texture_handle.rs:118`
+- `fn id(&self) -> TextureId` — `epaint-0.36.2/src/texture_handle.rs:64`
+- `fn name(&self) -> String` — `epaint-0.36.2/src/texture_handle.rs:118`
   Debug-name.
-- `fn new(tex_mngr: Arc<RwLock<TextureManager>>, id: TextureId) -> Self` — `epaint-0.35.0/src/texture_handle.rs:59`
+- `fn new(tex_mngr: Arc<RwLock<TextureManager>>, id: TextureId) -> Self` — `epaint-0.36.2/src/texture_handle.rs:59`
   If you are using egui, use `egui::Context::load_texture` instead.
-- `fn set(&mut self, image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.35.0/src/texture_handle.rs:70`
+- `fn set(&mut self, image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.36.2/src/texture_handle.rs:70`
   Assign a new image to an existing texture.
-- `fn set_partial(&mut self, pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.35.0/src/texture_handle.rs:78`
+- `fn set_partial(&mut self, pos: [usize; 2], image: impl Into<ImageData>, options: TextureOptions)` — `epaint-0.36.2/src/texture_handle.rs:78`
   Assign a new image to a subregion of the whole texture.
-- `fn size(&self) -> [usize; 2]` — `epaint-0.35.0/src/texture_handle.rs:90`
+- `fn size(&self) -> [usize; 2]` — `epaint-0.36.2/src/texture_handle.rs:90`
   width x height
-- `fn size_vec2(&self) -> Vec2` — `epaint-0.35.0/src/texture_handle.rs:98`
+- `fn size_vec2(&self) -> Vec2` — `epaint-0.36.2/src/texture_handle.rs:98`
   width x height
 
 Implements: `Clone`, `Drop`, `Eq`, `From<&TextureHandle>`, `From<&mut TextureHandle>`, `Hash`, `PartialEq`
 
-### `TextureManager` (struct) — `epaint-0.35.0/src/textures.rs:9`
+### `TextureManager` (struct) — `epaint-0.36.2/src/textures.rs:12`
 
 Low-level manager for allocating textures.
 
 Methods:
 
-- `fn alloc(&mut self, name: String, image: ImageData, options: TextureOptions) -> TextureId` — `epaint-0.35.0/src/textures.rs:31`
+- `fn alloc(&mut self, name: String, image: ImageData, options: TextureOptions) -> TextureId` — `epaint-0.36.2/src/textures.rs:34`
   Allocate a new texture.
-- `fn allocated(&self) -> impl ExactSizeIterator<Item = (&TextureId, &TextureMeta)>` — `epaint-0.35.0/src/textures.rs:111`
+- `fn allocated(&self) -> impl ExactSizeIterator<Item = (&TextureId, &TextureMeta)>` — `epaint-0.36.2/src/textures.rs:112`
   Get meta-data about all allocated textures in some arbitrary order.
-- `fn free(&mut self, id: TextureId)` — `epaint-0.35.0/src/textures.rs:71`
+- `fn free(&mut self, id: TextureId)` — `epaint-0.36.2/src/textures.rs:72`
   Free an existing texture.
-- `fn meta(&self, id: TextureId) -> Option<&TextureMeta>` — `epaint-0.35.0/src/textures.rs:106`
+- `fn meta(&self, id: TextureId) -> Option<&TextureMeta>` — `epaint-0.36.2/src/textures.rs:107`
   Get meta-data about a specific texture.
-- `fn num_allocated(&self) -> usize` — `epaint-0.35.0/src/textures.rs:116`
+- `fn num_allocated(&self) -> usize` — `epaint-0.36.2/src/textures.rs:117`
   Total number of allocated textures.
-- `fn retain(&mut self, id: TextureId)` — `epaint-0.35.0/src/textures.rs:87`
+- `fn retain(&mut self, id: TextureId)` — `epaint-0.36.2/src/textures.rs:88`
   Increase the retain-count of the given texture.
-- `fn set(&mut self, id: TextureId, delta: ImageDelta)` — `epaint-0.35.0/src/textures.rs:49`
+- `fn set(&mut self, id: TextureId, delta: ImageDelta)` — `epaint-0.36.2/src/textures.rs:52`
   Assign a new image to an existing texture, or update a region of it.
-- `fn take_delta(&mut self) -> TexturesDelta` — `epaint-0.35.0/src/textures.rs:101`
+- `fn take_delta(&mut self) -> TexturesDelta` — `epaint-0.36.2/src/textures.rs:102`
   Take and reset changes since last frame.
 
-Implements: `Default`
+Implements: `Default`, `Drop`
 
-### `Vec2` (struct) — `emath-0.35.0/src/vec2.rs:16`
+### `Vec2` (struct) — `emath-0.36.2/src/vec2.rs:16`
 
 A vector has a direction and length. A [`Vec2`] is often used to represent a size.
 
@@ -1473,46 +1473,46 @@ Public fields:
 
 Methods:
 
-- `const fn new(x: f32, y: f32) -> Self` — `emath-0.35.0/src/vec2.rs:148`
-- `const fn splat(v: f32) -> Self` — `emath-0.35.0/src/vec2.rs:154`
+- `const fn new(x: f32, y: f32) -> Self` — `emath-0.36.2/src/vec2.rs:148`
+- `const fn splat(v: f32) -> Self` — `emath-0.36.2/src/vec2.rs:154`
   Set both `x` and `y` to the same value.
-- `fn abs(self) -> Self` — `emath-0.35.0/src/vec2.rs:257`
-- `fn angle(self) -> f32` — `emath-0.35.0/src/vec2.rs:216`
+- `fn abs(self) -> Self` — `emath-0.36.2/src/vec2.rs:257`
+- `fn angle(self) -> f32` — `emath-0.36.2/src/vec2.rs:216`
   Measures the angle of the vector.
-- `fn angled(angle: f32) -> Self` — `emath-0.35.0/src/vec2.rs:232`
+- `fn angled(angle: f32) -> Self` — `emath-0.36.2/src/vec2.rs:232`
   Create a unit vector with the given CW angle (in radians). * An angle of zero gives the unit X axis. * An ang…
-- `fn any_nan(self) -> bool` — `emath-0.35.0/src/vec2.rs:269`
+- `fn any_nan(self) -> bool` — `emath-0.36.2/src/vec2.rs:269`
   True if any member is NaN.
-- `fn ceil(self) -> Self` — `emath-0.35.0/src/vec2.rs:251`
-- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.35.0/src/vec2.rs:317`
-- `fn dot(self, other: Self) -> f32` — `emath-0.35.0/src/vec2.rs:287`
+- `fn ceil(self) -> Self` — `emath-0.36.2/src/vec2.rs:251`
+- `fn clamp(self, min: Self, max: Self) -> Self` — `emath-0.36.2/src/vec2.rs:317`
+- `fn dot(self, other: Self) -> f32` — `emath-0.36.2/src/vec2.rs:287`
   The dot-product of two vectors.
-- `fn floor(self) -> Self` — `emath-0.35.0/src/vec2.rs:239`
-- `fn is_finite(self) -> bool` — `emath-0.35.0/src/vec2.rs:263`
+- `fn floor(self) -> Self` — `emath-0.36.2/src/vec2.rs:239`
+- `fn is_finite(self) -> bool` — `emath-0.36.2/src/vec2.rs:263`
   True if all members are also finite.
-- `fn is_normalized(self) -> bool` — `emath-0.35.0/src/vec2.rs:178`
+- `fn is_normalized(self) -> bool` — `emath-0.36.2/src/vec2.rs:178`
   Checks if `self` has length `1.0` up to a precision of `1e-6`.
-- `fn length(self) -> f32` — `emath-0.35.0/src/vec2.rs:190`
-- `fn length_sq(self) -> f32` — `emath-0.35.0/src/vec2.rs:195`
-- `fn max(self, other: Self) -> Self` — `emath-0.35.0/src/vec2.rs:281`
-- `fn max_elem(self) -> f32` — `emath-0.35.0/src/vec2.rs:301`
+- `fn length(self) -> f32` — `emath-0.36.2/src/vec2.rs:190`
+- `fn length_sq(self) -> f32` — `emath-0.36.2/src/vec2.rs:195`
+- `fn max(self, other: Self) -> Self` — `emath-0.36.2/src/vec2.rs:281`
+- `fn max_elem(self) -> f32` — `emath-0.36.2/src/vec2.rs:301`
   Returns the maximum of `self.x` and `self.y`.
-- `fn min(self, other: Self) -> Self` — `emath-0.35.0/src/vec2.rs:275`
-- `fn min_elem(self) -> f32` — `emath-0.35.0/src/vec2.rs:294`
+- `fn min(self, other: Self) -> Self` — `emath-0.36.2/src/vec2.rs:275`
+- `fn min_elem(self) -> f32` — `emath-0.36.2/src/vec2.rs:294`
   Returns the minimum of `self.x` and `self.y`.
-- `fn normalized(self) -> Self` — `emath-0.35.0/src/vec2.rs:171`
+- `fn normalized(self) -> Self` — `emath-0.36.2/src/vec2.rs:171`
   Safe normalize: returns zero if input is zero.
-- `fn rot90(self) -> Self` — `emath-0.35.0/src/vec2.rs:185`
+- `fn rot90(self) -> Self` — `emath-0.36.2/src/vec2.rs:185`
   Rotates the vector by 90°, i.e positive X to positive Y (clockwise in egui coordinates).
-- `fn round(self) -> Self` — `emath-0.35.0/src/vec2.rs:245`
-- `fn to_pos2(self) -> Pos2` — `emath-0.35.0/src/vec2.rs:161`
+- `fn round(self) -> Self` — `emath-0.36.2/src/vec2.rs:245`
+- `fn to_pos2(self) -> Pos2` — `emath-0.36.2/src/vec2.rs:161`
   Treat this vector as a position. `v.to_pos2()` is equivalent to `Pos2::default() + v`.
-- `fn yx(self) -> Self` — `emath-0.35.0/src/vec2.rs:308`
+- `fn yx(self) -> Self` — `emath-0.36.2/src/vec2.rs:308`
   Swizzle the axes.
 
-Implements: `Add`, `Add<Vec2>`, `AddAssign`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Vec2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Vec2>`, `From<Vec2b>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Vec2>`, `Mul<f32>`, `MulAssign<f32>`, `Neg`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<Vec2>`, `SubAssign`, `SubAssign<Vec2>`, `Zeroable`
+Implements: `Add`, `Add<Vec2>`, `AddAssign`, `AddAssign<Vec2>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Div`, `Div<f32>`, `DivAssign<f32>`, `Eq`, `From<&(f32, f32)>`, `From<&Vec2>`, `From<&[f32; 2]>`, `From<(f32, f32)>`, `From<Vec2>`, `From<Vec2b>`, `From<[f32; 2]>`, `GuiRounding`, `Index<usize>`, `IndexMut<usize>`, `Mul`, `Mul<Vec2>`, `Mul<f32>`, `MulAssign<f32>`, `Neg`, `NumExt`, `PartialEq`, `Pod`, `Serialize`, `Sub`, `Sub<Vec2>`, `SubAssign`, `SubAssign<Vec2>`, `Zeroable`
 
-### `Vertex` (struct) — `epaint-0.35.0/src/mesh.rs:12`
+### `Vertex` (struct) — `epaint-0.36.2/src/mesh.rs:12`
 
 The 2D vertex type.
 
@@ -1524,12 +1524,12 @@ Public fields:
 
 Methods:
 
-- `fn untextured(pos: Pos2, color: Color32) -> Self` — `epaint-0.35.0/src/mesh.rs:29`
+- `fn untextured(pos: Pos2, color: Color32) -> Self` — `epaint-0.36.2/src/mesh.rs:29`
   An untextured vertex
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Pod`, `Serialize`, `StructuralPartialEq`, `Zeroable`
 
-### `ViewportInPixels` (struct) — `epaint-0.35.0/src/viewport.rs:4`
+### `ViewportInPixels` (struct) — `epaint-0.36.2/src/viewport.rs:4`
 
 Size of the viewport in whole, physical pixels.
 
@@ -1543,34 +1543,34 @@ Public fields:
 
 Methods:
 
-- `fn from_points(rect: &Rect, pixels_per_point: f32, screen_size_px: [u32; 2]) -> Self` — `epaint-0.35.0/src/viewport.rs:25`
+- `fn from_points(rect: &Rect, pixels_per_point: f32, screen_size_px: [u32; 2]) -> Self` — `epaint-0.36.2/src/viewport.rs:25`
   Convert from ui points.
 
 
 ## `epaint::mutex`
 
-### `Mutex` (struct) — `epaint-0.35.0/src/mutex.rs:15`
+### `Mutex` (struct) — `epaint-0.36.2/src/mutex.rs:15`
 
 Provides interior mutability.
 
 Methods:
 
-- `fn lock(&self) -> MutexGuard<'_, T>` — `epaint-0.35.0/src/mutex.rs:32`
+- `fn lock(&self) -> MutexGuard<'_, T>` — `epaint-0.36.2/src/mutex.rs:32`
   Try to acquire the lock.
-- `fn new(val: T) -> Self` — `epaint-0.35.0/src/mutex.rs:22`
+- `fn new(val: T) -> Self` — `epaint-0.36.2/src/mutex.rs:22`
 
 Implements: `Clone`, `Default`
 
-### `RwLock` (struct) — `epaint-0.35.0/src/mutex.rs:62`
+### `RwLock` (struct) — `epaint-0.36.2/src/mutex.rs:62`
 
 Provides interior mutability.
 
 Methods:
 
-- `fn new(val: T) -> Self` — `epaint-0.35.0/src/mutex.rs:66`
-- `fn read(&self) -> RwLockReadGuard<'_, T>` — `epaint-0.35.0/src/mutex.rs:78`
+- `fn new(val: T) -> Self` — `epaint-0.36.2/src/mutex.rs:66`
+- `fn read(&self) -> RwLockReadGuard<'_, T>` — `epaint-0.36.2/src/mutex.rs:78`
   Try to acquire read-access to the lock.
-- `fn write(&self) -> RwLockWriteGuard<'_, T>` — `epaint-0.35.0/src/mutex.rs:98`
+- `fn write(&self) -> RwLockWriteGuard<'_, T>` — `epaint-0.36.2/src/mutex.rs:98`
   Try to acquire write-access to the lock.
 
 Implements: `Default`
@@ -1578,7 +1578,7 @@ Implements: `Default`
 
 ## `epaint::shape_transform`
 
-### `adjust_colors` — `epaint-0.35.0/src/shape_transform.rs:9`
+### `adjust_colors` — `epaint-0.36.2/src/shape_transform.rs:9`
 
 ```rust
 fn adjust_colors(shape: &mut Shape, adjust_color: impl Fn(&mut Color32) + Send + Sync + Copy + 'static)
@@ -1589,27 +1589,27 @@ Remember to handle [`Color32::PLACEHOLDER`] specially!
 
 ## `epaint::stats`
 
-### `AllocInfo` (struct) — `epaint-0.35.0/src/stats.rs:16`
+### `AllocInfo` (struct) — `epaint-0.36.2/src/stats.rs:16`
 
 Aggregate information about a bunch of allocations.
 
 Methods:
 
-- `fn format(&self, what: &str) -> String` — `epaint-0.35.0/src/stats.rs:128`
-- `fn from_galley(galley: &Galley) -> Self` — `epaint-0.35.0/src/stats.rs:83`
-- `fn from_mesh(mesh: &Mesh) -> Self` — `epaint-0.35.0/src/stats.rs:93`
-- `fn from_slice<T>(slice: &[T]) -> Self` — `epaint-0.35.0/src/stats.rs:97`
-- `fn megabytes(&self) -> String` — `epaint-0.35.0/src/stats.rs:124`
-- `fn num_allocs(&self) -> usize` — `epaint-0.35.0/src/stats.rs:116`
-- `fn num_bytes(&self) -> usize` — `epaint-0.35.0/src/stats.rs:120`
-- `fn num_elements(&self) -> usize` — `epaint-0.35.0/src/stats.rs:108`
+- `fn format(&self, what: &str) -> String` — `epaint-0.36.2/src/stats.rs:128`
+- `fn from_galley(galley: &Galley) -> Self` — `epaint-0.36.2/src/stats.rs:83`
+- `fn from_mesh(mesh: &Mesh) -> Self` — `epaint-0.36.2/src/stats.rs:93`
+- `fn from_slice<T>(slice: &[T]) -> Self` — `epaint-0.36.2/src/stats.rs:97`
+- `fn megabytes(&self) -> String` — `epaint-0.36.2/src/stats.rs:124`
+- `fn num_allocs(&self) -> usize` — `epaint-0.36.2/src/stats.rs:116`
+- `fn num_bytes(&self) -> usize` — `epaint-0.36.2/src/stats.rs:120`
+- `fn num_elements(&self) -> usize` — `epaint-0.36.2/src/stats.rs:108`
 
 Implements: `Add`, `AddAssign`, `Clone`, `Copy`, `Default`, `From<&[T]>`, `PartialEq`, `StructuralPartialEq`, `Sum`
 
 
 ## `epaint::tessellator`
 
-### `PathType` (enum) — `epaint-0.35.0/src/tessellator.rs:647`
+### `PathType` (enum) — `epaint-0.36.2/src/tessellator.rs:649`
 
 Variants:
 
@@ -1618,29 +1618,29 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `Path` (struct) — `epaint-0.35.0/src/tessellator.rs:324`
+### `Path` (struct) — `epaint-0.36.2/src/tessellator.rs:326`
 
 A connected line (without thickness or gaps) which can be tessellated to either to a stroke (with thickness) or a filled convex area. Used as a scratch-pad during tessel…
 
 Methods:
 
-- `fn add_circle(&mut self, center: Pos2, radius: f32)` — `epaint-0.35.0/src/tessellator.rs:342`
-- `fn add_line_loop(&mut self, points: &[Pos2])` — `epaint-0.35.0/src/tessellator.rs:429`
-- `fn add_line_segment(&mut self, points: [Pos2; 2])` — `epaint-0.35.0/src/tessellator.rs:376`
-- `fn add_open_points(&mut self, points: &[Pos2])` — `epaint-0.35.0/src/tessellator.rs:383`
-- `fn add_point(&mut self, pos: Pos2, normal: Vec2)` — `epaint-0.35.0/src/tessellator.rs:338`
-- `fn clear(&mut self)` — `epaint-0.35.0/src/tessellator.rs:328`
-- `fn fill(&mut self, feathering: f32, color: Color32, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:516`
+- `fn add_circle(&mut self, center: Pos2, radius: f32)` — `epaint-0.36.2/src/tessellator.rs:344`
+- `fn add_line_loop(&mut self, points: &[Pos2])` — `epaint-0.36.2/src/tessellator.rs:431`
+- `fn add_line_segment(&mut self, points: [Pos2; 2])` — `epaint-0.36.2/src/tessellator.rs:378`
+- `fn add_open_points(&mut self, points: &[Pos2])` — `epaint-0.36.2/src/tessellator.rs:385`
+- `fn add_point(&mut self, pos: Pos2, normal: Vec2)` — `epaint-0.36.2/src/tessellator.rs:340`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/tessellator.rs:330`
+- `fn fill(&mut self, feathering: f32, color: Color32, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:518`
   The path is taken to be closed (i.e. returning to the start again).
-- `fn fill_and_stroke(&mut self, feathering: f32, fill: Color32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:482`
+- `fn fill_and_stroke(&mut self, feathering: f32, fill: Color32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:484`
   The path is taken to be closed (i.e. returning to the start again).
-- `fn fill_with_uv(&mut self, feathering: f32, color: Color32, texture_id: TextureId, uv_from_pos: impl Fn(Pos2) -> Pos2, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:523`
+- `fn fill_with_uv(&mut self, feathering: f32, color: Color32, texture_id: TextureId, uv_from_pos: impl Fn(Pos2) -> Pos2, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:525`
   Like [`Self::fill`] but with texturing.
-- `fn reserve(&mut self, additional: usize)` — `epaint-0.35.0/src/tessellator.rs:333`
-- `fn stroke(&mut self, feathering: f32, path_type: PathType, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:502`
-- `fn stroke_closed(&mut self, feathering: f32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:498`
+- `fn reserve(&mut self, additional: usize)` — `epaint-0.36.2/src/tessellator.rs:335`
+- `fn stroke(&mut self, feathering: f32, path_type: PathType, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:504`
+- `fn stroke_closed(&mut self, feathering: f32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:500`
   A closed path (returning to the first point).
-- `fn stroke_open(&mut self, feathering: f32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.35.0/src/tessellator.rs:493`
+- `fn stroke_open(&mut self, feathering: f32, stroke: &PathStroke, out: &mut Mesh)` — `epaint-0.36.2/src/tessellator.rs:495`
   Open-ended.
 
 Implements: `Clone`, `Debug`, `Default`
@@ -1648,11 +1648,11 @@ Implements: `Clone`, `Debug`, `Default`
 
 ## `epaint::text`
 
-### `PASSWORD_REPLACEMENT_CHAR` (constant) — `epaint-0.35.0/src/text/mod.rs:22`
+### `PASSWORD_REPLACEMENT_CHAR` (constant) — `epaint-0.36.2/src/text/mod.rs:22`
 
 Suggested character to use to replace those in password text fields.
 
-### `FontPriority` (enum) — `epaint-0.35.0/src/text/fonts.rs:474`
+### `FontPriority` (enum) — `epaint-0.36.2/src/text/fonts.rs:468`
 
 Variants:
 
@@ -1661,7 +1661,7 @@ Variants:
 
 Implements: `Clone`, `Debug`
 
-### `HintingTarget` (enum) — `epaint-0.35.0/src/text/fonts.rs:303`
+### `HintingTarget` (enum) — `epaint-0.36.2/src/text/fonts.rs:297`
 
 How to *hint* glyph outlines, i.e. how aggressively to nudge them onto the pixel grid before rasterizing. Mirrors [`skrifa::outline::Target`].
 
@@ -1672,7 +1672,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `From<HintingTarget>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextWrapMode` (enum) — `epaint-0.35.0/src/text/text_layout_types.rs:587`
+### `TextWrapMode` (enum) — `epaint-0.36.2/src/text/text_layout_types.rs:594`
 
 How to wrap and elide text.
 
@@ -1684,7 +1684,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `layout` — `epaint-0.35.0/src/text/text_layout.rs:101`
+### `layout` — `epaint-0.36.2/src/text/text_layout.rs:101`
 
 ```rust
 fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>) -> Galley
@@ -1692,33 +1692,33 @@ fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>) -> 
 
 Layout text into a [`Galley`].
 
-### `ByteIndex` (struct) — `epaint-0.35.0/src/text/index.rs:19`
+### `ByteIndex` (struct) — `epaint-0.36.2/src/text/index.rs:19`
 
 A byte offset into a UTF-8 string.
 
 Methods:
 
-- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:133`
+- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:133`
   Saturating integer addition.
-- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:133`
+- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:133`
   Saturating integer subtraction.
 
 Implements: `Add`, `Add<usize>`, `AddAssign`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `From<ByteIndex>`, `From<usize>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<usize>`, `SubAssign<usize>`
 
-### `CharIndex` (struct) — `epaint-0.35.0/src/text/index.rs:31`
+### `CharIndex` (struct) — `epaint-0.36.2/src/text/index.rs:31`
 
 A character (Unicode scalar) offset into a string.
 
 Methods:
 
-- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:134`
+- `fn saturating_add(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:134`
   Saturating integer addition.
-- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.35.0/src/text/index.rs:134`
+- `fn saturating_sub(self, rhs: usize) -> Self` — `epaint-0.36.2/src/text/index.rs:134`
   Saturating integer subtraction.
 
 Implements: `Add`, `Add<CharIndex>`, `Add<usize>`, `AddAssign`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Display`, `Eq`, `From<CharIndex>`, `From<usize>`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`, `Serialize`, `StructuralPartialEq`, `Sub`, `Sub<CharIndex>`, `Sub<usize>`, `SubAssign<usize>`
 
-### `FontData` (struct) — `epaint-0.35.0/src/text/fonts.rs:118`
+### `FontData` (struct) — `epaint-0.36.2/src/text/fonts.rs:112`
 
 A `.ttf` or `.otf` file and a font face index.
 
@@ -1730,15 +1730,15 @@ Public fields:
 
 Methods:
 
-- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.35.0/src/text/fonts.rs:139`
-- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.35.0/src/text/fonts.rs:131`
-- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.35.0/src/text/fonts.rs:147`
-- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.35.0/src/text/fonts.rs:159`
+- `fn from_owned(font: Vec<u8>) -> Self` — `epaint-0.36.2/src/text/fonts.rs:133`
+- `fn from_static(font: &'static [u8]) -> Self` — `epaint-0.36.2/src/text/fonts.rs:125`
+- `fn tweak(self, tweak: FontTweak) -> Self` — `epaint-0.36.2/src/text/fonts.rs:141`
+- `fn variation_axes(&self) -> Vec<FontVariationAxis>` — `epaint-0.36.2/src/text/fonts.rs:153`
   The variation axes of this font, e.g. `wght` (weight) and `wdth` (width).
 
 Implements: `AsRef<[u8]>`, `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontDefinitions` (struct) — `epaint-0.35.0/src/text/fonts.rs:437`
+### `FontDefinitions` (struct) — `epaint-0.36.2/src/text/fonts.rs:431`
 
 Describes the font data and the sizes to use.
 
@@ -1749,14 +1749,14 @@ Public fields:
 
 Methods:
 
-- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.35.0/src/text/fonts.rs:580`
+- `fn builtin_font_names() -> &'static [&'static str]` — `epaint-0.36.2/src/text/fonts.rs:574`
   List of all the builtin font names used by `epaint`.
-- `fn empty() -> Self` — `epaint-0.35.0/src/text/fonts.rs:567`
+- `fn empty() -> Self` — `epaint-0.36.2/src/text/fonts.rs:561`
   No fonts.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontInsert` (struct) — `epaint-0.35.0/src/text/fonts.rs:453`
+### `FontInsert` (struct) — `epaint-0.36.2/src/text/fonts.rs:447`
 
 Public fields:
 
@@ -1766,11 +1766,11 @@ Public fields:
 
 Methods:
 
-- `fn new(name: &str, data: FontData, families: Vec<InsertFontFamily>) -> Self` — `epaint-0.35.0/src/text/fonts.rs:487`
+- `fn new(name: &str, data: FontData, families: Vec<InsertFontFamily>) -> Self` — `epaint-0.36.2/src/text/fonts.rs:481`
 
 Implements: `Clone`, `Debug`
 
-### `FontTweak` (struct) — `epaint-0.35.0/src/text/fonts.rs:214`
+### `FontTweak` (struct) — `epaint-0.36.2/src/text/fonts.rs:208`
 
 Extra scale and vertical tweak to apply to all text of a certain font.
 
@@ -1788,7 +1788,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `FontVariationAxis` (struct) — `epaint-0.35.0/src/text/fonts.rs:186`
+### `FontVariationAxis` (struct) — `epaint-0.36.2/src/text/fonts.rs:180`
 
 A single variation axis of a variable font, e.g. weight (`wght`) or width (`wdth`).
 
@@ -1802,23 +1802,23 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `PartialEq`, `StructuralPartialEq`
 
-### `FontsImpl` (struct) — `epaint-0.35.0/src/text/fonts.rs:966`
+### `FontsImpl` (struct) — `epaint-0.36.2/src/text/fonts.rs:960`
 
 The collection of fonts used by `epaint`.
 
 Methods:
 
-- `fn font(&mut self, family: &FontFamily) -> Font<'_>` — `epaint-0.35.0/src/text/fonts.rs:1027`
+- `fn font(&mut self, family: &FontFamily) -> Font<'_>` — `epaint-0.36.2/src/text/fonts.rs:1021`
   Get the right font implementation from [`FontFamily`].
-- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.35.0/src/text/fonts.rs:980`
+- `fn new(options: TextOptions, definitions: FontDefinitions) -> Self` — `epaint-0.36.2/src/text/fonts.rs:974`
   Create a new [`FontsImpl`] for text layout. This call is expensive, so only create one [`FontsImpl`] and then…
-- `fn options(&self) -> &TextOptions` — `epaint-0.35.0/src/text/fonts.rs:1012`
-- `fn return_shape_buffer(&mut self, buffer: UnicodeBuffer)` — `epaint-0.35.0/src/text/fonts.rs:1022`
+- `fn options(&self) -> &TextOptions` — `epaint-0.36.2/src/text/fonts.rs:1006`
+- `fn return_shape_buffer(&mut self, buffer: UnicodeBuffer)` — `epaint-0.36.2/src/text/fonts.rs:1016`
   Return a shaping buffer for reuse.
-- `fn take_shape_buffer(&mut self) -> UnicodeBuffer` — `epaint-0.35.0/src/text/fonts.rs:1017`
+- `fn take_shape_buffer(&mut self) -> UnicodeBuffer` — `epaint-0.36.2/src/text/fonts.rs:1011`
   Take the recycled shaping buffer (or create a new one if already taken).
 
-### `Glyph` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:879`
+### `Glyph` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:886`
 
 Public fields:
 
@@ -1835,14 +1835,14 @@ Public fields:
 
 Methods:
 
-- `fn logical_rect(&self) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:935`
+- `fn logical_rect(&self) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:942`
   Same y range for all characters with the same [`TextFormat`].
-- `fn max_x(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:929`
-- `fn size(&self) -> Vec2` — `epaint-0.35.0/src/text/text_layout_types.rs:924`
+- `fn max_x(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:936`
+- `fn size(&self) -> Vec2` — `epaint-0.36.2/src/text/text_layout_types.rs:931`
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `InsertFontFamily` (struct) — `epaint-0.35.0/src/text/fonts.rs:465`
+### `InsertFontFamily` (struct) — `epaint-0.36.2/src/text/fonts.rs:459`
 
 Public fields:
 
@@ -1851,7 +1851,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`
 
-### `LayoutJob` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:49`
+### `LayoutJob` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:49`
 
 Describes the task of laying out text.
 
@@ -1869,28 +1869,30 @@ Public fields:
 
 Methods:
 
-- `fn append(&mut self, text: &str, leading_space: f32, format: TextFormat)` — `epaint-0.35.0/src/text/text_layout_types.rs:193`
+- `fn append(&mut self, text: &str, leading_space: f32, format: TextFormat)` — `epaint-0.36.2/src/text/text_layout_types.rs:200`
   Helper for adding a new section when building a [`LayoutJob`].
-- `fn debug_sanity_check(&self)` — `epaint-0.35.0/src/text/text_layout_types.rs:236`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/text/text_layout_types.rs:119`
+  Clear the text and sections while preserving the layout settings.
+- `fn debug_sanity_check(&self)` — `epaint-0.36.2/src/text/text_layout_types.rs:243`
   Check the [`Self::sections`] invariant: the sections are ordered and together cover the whole of [`Self::text…
-- `fn effective_wrap_width(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:288`
+- `fn effective_wrap_width(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:295`
   The wrap with, with a small margin in some cases.
-- `fn font_height(&self, fonts: &mut FontsView<'_>) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:279`
+- `fn font_height(&self, fonts: &mut FontsView<'_>) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:286`
   The height of the tallest font used in the job.
-- `fn format_at_byte(&self, byte_idx: ByteIndex) -> &TextFormat` — `epaint-0.35.0/src/text/text_layout_types.rs:221`
+- `fn format_at_byte(&self, byte_idx: ByteIndex) -> &TextFormat` — `epaint-0.36.2/src/text/text_layout_types.rs:228`
   The [`TextFormat`] of the section containing the character starting at the given byte index.
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/text/text_layout_types.rs:183`
-- `fn simple(text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:119`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/text/text_layout_types.rs:190`
+- `fn simple(text: String, font_id: FontId, color: Color32, wrap_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:126`
   Break on `\n` and at the given wrap width.
-- `fn simple_format(text: String, format: TextFormat) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:138`
+- `fn simple_format(text: String, format: TextFormat) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:145`
   Break on `\n`
-- `fn simple_singleline(text: String, font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:153`
+- `fn simple_singleline(text: String, font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:160`
   Does not break on `\n`, but shows the replacement character instead.
-- `fn single_section(text: String, format: TextFormat) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:168`
+- `fn single_section(text: String, format: TextFormat) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:175`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `LayoutSection` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:340`
+### `LayoutSection` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:347`
 
 A contiguous range of [`LayoutJob::text`] that shares the same [`TextFormat`].
 
@@ -1902,7 +1904,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `PlacedRow` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:777`
+### `PlacedRow` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:784`
 
 Public fields:
 
@@ -1912,18 +1914,18 @@ Public fields:
 
 Methods:
 
-- `fn char_count_including_newline(&self) -> CharIndex` — `epaint-0.35.0/src/text/text_layout_types.rs:992`
+- `fn char_count_including_newline(&self) -> CharIndex` — `epaint-0.36.2/src/text/text_layout_types.rs:999`
   Includes the implicit `\n` after the [`PlacedRow`], if any.
-- `fn max_y(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:986`
-- `fn min_y(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:981`
-- `fn rect(&self) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:798`
+- `fn max_y(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:993`
+- `fn min_y(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:988`
+- `fn rect(&self) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:805`
   Logical bounding rectangle on font heights etc.
-- `fn rect_without_leading_space(&self) -> Rect` — `epaint-0.35.0/src/text/text_layout_types.rs:803`
+- `fn rect_without_leading_space(&self) -> Rect` — `epaint-0.36.2/src/text/text_layout_types.rs:810`
   Same as [`Self::rect`] but excluding the `LayoutSection::leading_space`.
 
 Implements: `Clone`, `Debug`, `Deref`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `Row` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:823`
+### `Row` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:830`
 
 Public fields:
 
@@ -1933,18 +1935,18 @@ Public fields:
 
 Methods:
 
-- `fn char_at(&self, desired_x: f32) -> CharIndex` — `epaint-0.35.0/src/text/text_layout_types.rs:956`
+- `fn char_at(&self, desired_x: f32) -> CharIndex` — `epaint-0.36.2/src/text/text_layout_types.rs:963`
   Closest char at the desired x coordinate in row-relative coordinates. Returns something in the range `[0, cha…
-- `fn char_count_excluding_newline(&self) -> CharIndex` — `epaint-0.35.0/src/text/text_layout_types.rs:950`
+- `fn char_count_excluding_newline(&self) -> CharIndex` — `epaint-0.36.2/src/text/text_layout_types.rs:957`
   Excludes the implicit `\n` after the [`Row`], if any.
-- `fn height(&self) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:974`
-- `fn text(&self) -> String` — `epaint-0.35.0/src/text/text_layout_types.rs:944`
+- `fn height(&self) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:981`
+- `fn text(&self) -> String` — `epaint-0.36.2/src/text/text_layout_types.rs:951`
   The text on this row, excluding the implicit `\n` if any.
-- `fn x_offset(&self, column: CharIndex) -> f32` — `epaint-0.35.0/src/text/text_layout_types.rs:965`
+- `fn x_offset(&self, column: CharIndex) -> f32` — `epaint-0.36.2/src/text/text_layout_types.rs:972`
 
 Implements: `Clone`, `Debug`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `RowVisuals` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:845`
+### `RowVisuals` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:852`
 
 The tessellated output of a row.
 
@@ -1957,7 +1959,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `SmoothHinting` (struct) — `epaint-0.35.0/src/text/fonts.rs:347`
+### `SmoothHinting` (struct) — `epaint-0.36.2/src/text/fonts.rs:341`
 
 Tuning for [`HintingTarget::Smooth`], mirroring `skrifa`'s `Target::Smooth`.
 
@@ -1969,7 +1971,7 @@ Public fields:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextFormat` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:471`
+### `TextFormat` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:478`
 
 Formatting option for a section of text.
 
@@ -1989,11 +1991,11 @@ Public fields:
 
 Methods:
 
-- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:571`
+- `fn simple(font_id: FontId, color: Color32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:578`
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextWrapping` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:603`
+### `TextWrapping` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:610`
 
 Controls the text wrapping and elision of a [`LayoutJob`].
 
@@ -2006,75 +2008,75 @@ Public fields:
 
 Methods:
 
-- `fn from_wrap_mode_and_width(mode: TextWrapMode, max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:676`
+- `fn from_wrap_mode_and_width(mode: TextWrapMode, max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:683`
   Create a [`TextWrapping`] from a [`TextWrapMode`] and an available width.
-- `fn no_max_width() -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:685`
+- `fn no_max_width() -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:692`
   A row can be as long as it need to be.
-- `fn truncate_at_width(max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:701`
+- `fn truncate_at_width(max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:708`
   Elide text that doesn't fit within the given width, replaced with `…`.
-- `fn wrap_at_width(max_width: f32) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:693`
+- `fn wrap_at_width(max_width: f32) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:700`
   A row can be at most `max_width` wide but can wrap in any number of lines.
 
 Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `VariationCoords` (struct) — `epaint-0.35.0/src/text/text_layout_types.rs:411`
+### `VariationCoords` (struct) — `epaint-0.36.2/src/text/text_layout_types.rs:418`
 
 List of font variation coordinates by axis tag. If more than one coordinate for a given axis is provided, the last one added is used.
 
 Methods:
 
-- `fn clear(&mut self)` — `epaint-0.35.0/src/text/text_layout_types.rs:440`
-- `fn new<T>(values: impl IntoIterator<Item = (T, f32)>) -> Self` — `epaint-0.35.0/src/text/text_layout_types.rs:425`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/text/text_layout_types.rs:447`
+- `fn new<T>(values: impl IntoIterator<Item = (T, f32)>) -> Self` — `epaint-0.36.2/src/text/text_layout_types.rs:432`
   Create a list of variation coordinates from a sequence of (tag, value) pairs.
-- `fn push(&mut self, tag: impl IntoTag, coord: f32)` — `epaint-0.35.0/src/text/text_layout_types.rs:431`
+- `fn push(&mut self, tag: impl IntoTag, coord: f32)` — `epaint-0.36.2/src/text/text_layout_types.rs:438`
   Add a variation coordinate to the list.
-- `fn remove(&mut self, index: usize)` — `epaint-0.35.0/src/text/text_layout_types.rs:436`
+- `fn remove(&mut self, index: usize)` — `epaint-0.36.2/src/text/text_layout_types.rs:443`
   Remove the coordinate at the given index.
 
 Implements: `AsMut<[(Tag, f32)]>`, `AsRef<[(Tag, f32)]>`, `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `ByteRangeExt` (trait) — `epaint-0.35.0/src/text/index.rs:143`
+### `ByteRangeExt` (trait) — `epaint-0.36.2/src/text/index.rs:143`
 
 Extension methods for a [`ByteRange`].
 
 Required/provided items:
 
-- `fn full(text: &str) -> Self` — `epaint-0.35.0/src/text/index.rs:145`
+- `fn full(text: &str) -> Self` — `epaint-0.36.2/src/text/index.rs:145`
   The full byte range covering `text`, i.e. `0..text.len()`.
-- `fn as_usize(&self) -> Range<usize>` — `epaint-0.35.0/src/text/index.rs:148`
+- `fn as_usize(&self) -> Range<usize>` — `epaint-0.36.2/src/text/index.rs:148`
   The `start..end` byte range as plain `usize`, for slicing a [`str`].
-- `fn slice(&self, text: &'s str) -> &'s str` — `epaint-0.35.0/src/text/index.rs:151`
+- `fn slice(&self, text: &'s str) -> &'s str` — `epaint-0.36.2/src/text/index.rs:151`
   Slice the given string by this byte range.
 
-### `CharRangeExt` (trait) — `epaint-0.35.0/src/text/index.rs:172`
+### `CharRangeExt` (trait) — `epaint-0.36.2/src/text/index.rs:172`
 
 Extension methods for a [`CharRange`].
 
 Required/provided items:
 
-- `fn full(text: &str) -> Self` — `epaint-0.35.0/src/text/index.rs:174`
+- `fn full(text: &str) -> Self` — `epaint-0.36.2/src/text/index.rs:174`
   The full character range covering `text`, i.e. `0..text.chars().count()`.
 
-### `IntoTag` (trait) — `epaint-0.35.0/src/text/text_layout_types.rs:368`
+### `IntoTag` (trait) — `epaint-0.36.2/src/text/text_layout_types.rs:375`
 
 Helper trait for all types that can be parsed as a [`font_types::Tag`].
 
 Required/provided items:
 
-- `fn into_tag(self) -> Tag` — `epaint-0.35.0/src/text/text_layout_types.rs:369`
+- `fn into_tag(self) -> Tag` — `epaint-0.36.2/src/text/text_layout_types.rs:376`
 
-### `ByteRange` (type_alias) — `epaint-0.35.0/src/text/index.rs:137`
+### `ByteRange` (type_alias) — `epaint-0.36.2/src/text/index.rs:137`
 
 A range of [`ByteIndex`], i.e. a byte range into a [`str`].
 
-### `CharRange` (type_alias) — `epaint-0.35.0/src/text/index.rs:140`
+### `CharRange` (type_alias) — `epaint-0.36.2/src/text/index.rs:140`
 
 A range of [`CharIndex`], i.e. a character range into a [`str`].
 
 
 ## `epaint::textures`
 
-### `TextureFilter` (enum) — `epaint-0.35.0/src/textures.rs:241`
+### `TextureFilter` (enum) — `epaint-0.36.2/src/textures.rs:248`
 
 How the texture texels are filtered.
 
@@ -2085,7 +2087,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureWrapMode` (enum) — `epaint-0.35.0/src/textures.rs:255`
+### `TextureWrapMode` (enum) — `epaint-0.36.2/src/textures.rs:262`
 
 Defines how textures are wrapped around objects when texture coordinates fall outside the [0, 1] range.
 
@@ -2097,7 +2099,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TextureMeta` (struct) — `epaint-0.35.0/src/textures.rs:123`
+### `TextureMeta` (struct) — `epaint-0.36.2/src/textures.rs:130`
 
 Meta-data about an allocated texture.
 
@@ -2111,12 +2113,12 @@ Public fields:
 
 Methods:
 
-- `fn bytes_used(&self) -> usize` — `epaint-0.35.0/src/textures.rs:143`
+- `fn bytes_used(&self) -> usize` — `epaint-0.36.2/src/textures.rs:150`
   Size in bytes. width x height x [`Self::bytes_per_pixel`].
 
 Implements: `Clone`, `Debug`, `Eq`, `PartialEq`, `StructuralPartialEq`
 
-### `TextureOptions` (struct) — `epaint-0.35.0/src/textures.rs:153`
+### `TextureOptions` (struct) — `epaint-0.36.2/src/textures.rs:160`
 
 How the texture texels are filtered.
 
@@ -2129,31 +2131,34 @@ Public fields:
 
 Methods:
 
-- `const fn with_mipmap_mode(self, mipmap_mode: Option<TextureFilter>) -> Self` — `epaint-0.35.0/src/textures.rs:223`
+- `const fn with_mipmap_mode(self, mipmap_mode: Option<TextureFilter>) -> Self` — `epaint-0.36.2/src/textures.rs:230`
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `Hash`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
-### `TexturesDelta` (struct) — `epaint-0.35.0/src/textures.rs:277`
+### `TexturesDelta` (struct) — `epaint-0.36.2/src/textures.rs:284`
 
 What has been allocated and freed during the last period.
 
 Public fields:
 
-- `set: Vec<(TextureId, ImageDelta)>` — New or changed textures. Apply before painting.
-- `free: Vec<TextureId>` — Textures to free after painting.
+- `set: HashMap<TextureId, SmallVec<[ImageDelta; 1]>>` — New or changed textures. Apply before painting.
+- `free: HashSet<TextureId>` — Textures to free after painting.
 
 Methods:
 
-- `fn append(&mut self, newer: Self)` — `epaint-0.35.0/src/textures.rs:290`
-- `fn clear(&mut self)` — `epaint-0.35.0/src/textures.rs:295`
-- `fn is_empty(&self) -> bool` — `epaint-0.35.0/src/textures.rs:286`
+- `fn append(&mut self, newer: Self)` — `epaint-0.36.2/src/textures.rs:315`
+- `fn clear(&mut self)` — `epaint-0.36.2/src/textures.rs:329`
+- `fn free(&mut self, id: TextureId)` — `epaint-0.36.2/src/textures.rs:310`
+- `fn is_empty(&self) -> bool` — `epaint-0.36.2/src/textures.rs:293`
+- `fn push(&mut self, id: TextureId, delta: ImageDelta)` — `epaint-0.36.2/src/textures.rs:301`
+  Inserts a [`ImageDelta`].
 
-Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
+Implements: `Clone`, `Debug`, `Default`, `Deserialize<'de>`, `Drop`, `Eq`, `PartialEq`, `Serialize`, `StructuralPartialEq`
 
 
 ## `epaint::util`
 
-### `hash` — `epaint-0.35.0/src/util/mod.rs:3`
+### `hash` — `epaint-0.36.2/src/util/mod.rs:3`
 
 ```rust
 fn hash(value: impl Hash) -> u64
@@ -2161,7 +2166,7 @@ fn hash(value: impl Hash) -> u64
 
 Hash the given value with a predictable hasher.
 
-### `hash_with` — `epaint-0.35.0/src/util/mod.rs:9`
+### `hash_with` — `epaint-0.36.2/src/util/mod.rs:9`
 
 ```rust
 fn hash_with(value: impl Hash, hasher: impl Hasher) -> u64
@@ -2172,7 +2177,7 @@ Hash the given value with the given hasher.
 
 ## `epaint::tessellator::path`
 
-### `add_circle_quadrant` — `epaint-0.35.0/src/tessellator.rs:604`
+### `add_circle_quadrant` — `epaint-0.36.2/src/tessellator.rs:606`
 
 ```rust
 fn add_circle_quadrant(path: &mut Vec<Pos2>, center: Pos2, radius: f32, quadrant: f32)
@@ -2180,7 +2185,7 @@ fn add_circle_quadrant(path: &mut Vec<Pos2>, center: Pos2, radius: f32, quadrant
 
 Add one quadrant of a circle
 
-### `rounded_rectangle` — `epaint-0.35.0/src/tessellator.rs:541`
+### `rounded_rectangle` — `epaint-0.36.2/src/tessellator.rs:543`
 
 ```rust
 fn rounded_rectangle(path: &mut Vec<Pos2>, rect: Rect, cr: CornerRadiusF32)
@@ -2191,7 +2196,7 @@ overwrites existing points
 
 ## `epaint::text::cursor`
 
-### `CCursor` (struct) — `epaint-0.35.0/src/text/cursor.rs:10`
+### `CCursor` (struct) — `epaint-0.36.2/src/text/cursor.rs:10`
 
 Character cursor.
 
@@ -2202,11 +2207,11 @@ Public fields:
 
 Methods:
 
-- `fn new(index: impl Into<CharIndex>) -> Self` — `epaint-0.35.0/src/text/cursor.rs:23`
+- `fn new(index: impl Into<CharIndex>) -> Self` — `epaint-0.36.2/src/text/cursor.rs:23`
 
 Implements: `Add<CharIndex>`, `Add<usize>`, `AddAssign<usize>`, `Clone`, `Copy`, `Debug`, `Default`, `Deserialize<'de>`, `PartialEq`, `Serialize`, `Sub<CharIndex>`, `Sub<usize>`, `SubAssign<usize>`
 
-### `LayoutCursor` (struct) — `epaint-0.35.0/src/text/cursor.rs:101`
+### `LayoutCursor` (struct) — `epaint-0.36.2/src/text/cursor.rs:101`
 
 Row/column cursor.
 

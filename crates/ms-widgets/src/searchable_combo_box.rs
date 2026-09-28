@@ -2579,8 +2579,9 @@ mod tests {
         let mut measured: Vec<(f32, f32, f32)> = Vec::new();
         // A pass is what makes a font atlas exist at all: `Context::fonts_mut` panics before
         // the first one (`egui-0.35.0/src/context.rs:1055`). The frame's paint output has no
-        // window to go to, hence the drop.
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        // renderer to go to, so its texture deltas (the font-atlas upload) are discarded:
+        // egui 0.36 panics when a `TexturesDelta` is dropped unapplied.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let baseline = RowBaselines::measure(ui, 16.0, geometry).primary;
             for family in [FontFamily::Proportional, FontFamily::Name("decorative".into())] {
                 let galley = main_line_galley(ui, geometry, 16.0, family);
@@ -2593,7 +2594,8 @@ mod tests {
                 }
             }
             measured.push((baseline, baseline, baseline));
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(measured.len(), 3, "both faces must produce a measurable row");
         let (interface_height, interface_in_galley, interface_landed) = measured[0];
         let (decorative_height, decorative_in_galley, decorative_landed) = measured[1];
@@ -2652,7 +2654,7 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0))),
             ..egui::RawInput::default()
         };
-        let output = ctx.run_ui(input, |ui| {
+        let mut output = ctx.run_ui(input, |ui| {
             let height = button_row_height(ui, line_height);
             let mut resolve = |_: usize| Some(family.clone());
             let response = draw_button(
@@ -2677,6 +2679,10 @@ mod tests {
                 inner.top() + button_caption_baseline(ui, primary_size, inner.height()),
             ));
         });
+        // Only the shapes are read; no renderer applies the texture uploads, and egui 0.36 panics
+        // when a `TexturesDelta` is dropped unapplied — clear it up front so every `?` exit
+        // below drops a clean output.
+        output.textures_delta.clear();
 
         let (button, text_area_top, expected_baseline) = placement?;
         let mut captions = output.shapes.iter().filter_map(|clipped| match &clipped.shape {
@@ -2753,7 +2759,7 @@ mod tests {
         // every font. The height must carry that padding around the band.
         let ctx = egui::Context::default();
         let mut measured: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let spacing = ui.spacing();
             let (padding, icon_width, interact) = (
                 spacing.button_padding.y,
@@ -2771,7 +2777,8 @@ mod tests {
                     interact,
                 ));
             }
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(measured.len(), 3, "every band must be measured");
         for (line_height, height, padding, icon_width, interact) in measured {
             // The whole content band fits inside the padded text area the caption is drawn in.
@@ -2796,7 +2803,7 @@ mod tests {
         let ctx = egui::Context::default();
         let geometry = RowGeometry::new(16.0, RowLayout::Wide, &MIXED_ITEMS);
         let mut measured: Vec<(f32, f32, f32, f32)> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let baselines = RowBaselines::measure(ui, 16.0, geometry);
             // One text row in `Wide`, so both galleys go on the very same baseline.
             assert!((baselines.primary - baselines.secondary).abs() < f32::EPSILON);
@@ -2821,7 +2828,8 @@ mod tests {
                     galley_top_for_baseline(&second, baseline),
                 ));
             }
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(measured.len(), 1, "both lines must produce a measurable row");
         let (main_landed, second_landed, main_top, second_top) = measured[0];
         // One baseline for both.
@@ -2841,7 +2849,7 @@ mod tests {
         let ctx = context_with_decorative_face(1.6);
         let geometry = RowGeometry::new(16.0, RowLayout::Tall, &MIXED_ITEMS);
         let mut measured: Vec<(f32, f32, f32)> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let baseline = RowBaselines::measure(ui, 16.0, geometry).primary;
             for family in [FontFamily::Proportional, FontFamily::Name("decorative".into())] {
                 let galley = main_line_galley(ui, geometry, 16.0, family);
@@ -2854,7 +2862,8 @@ mod tests {
                 }
             }
             measured.push((baseline, baseline, baseline));
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(measured.len(), 3, "both faces must produce a measurable row");
         let (interface_height, interface_in_galley, interface_landed) = measured[0];
         let (decorative_height, decorative_in_galley, decorative_landed) = measured[1];
@@ -2879,12 +2888,13 @@ mod tests {
         // INTERFACE font at that band's nominal size — 16 pt over 8 pt here.
         let ctx = egui::Context::default();
         let mut measured: Vec<(f32, RowBaselines)> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             for size in [14.0_f32, 16.0] {
                 let geometry = RowGeometry::new(size, RowLayout::Tall, &MIXED_ITEMS);
                 measured.push((size, RowBaselines::measure(ui, size, geometry)));
             }
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(measured.len(), 2, "both sizes must be measured");
 
         // At the widget's default size 14: bands of 22.4 and 8.75; the interface font measures
@@ -2919,7 +2929,7 @@ mod tests {
             highlight,
         };
         let mut sections: Vec<Vec<Color32>> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             for (text, size) in [("Narezka", 16.0), ("NarezkaRegular", geometry.secondary_size)] {
                 let ranges = matching::match_ranges(text, "ez");
                 let galley = layout_line(
@@ -2940,7 +2950,8 @@ mod tests {
                         .collect(),
                 );
             }
-        }));
+        })
+        .drop_without_applying_deltas();
         assert_eq!(sections.len(), 2, "both lines must be laid out");
         for colors in &sections {
             assert_eq!(
@@ -2961,7 +2972,7 @@ mod tests {
         let ctx = egui::Context::default();
         let geometry = RowGeometry::new(16.0, RowLayout::Tall, &MIXED_ITEMS);
         let mut sections: Vec<Color32> = Vec::new();
-        drop(ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let ranges = matching::match_ranges("Narezka", "ez");
             let galley = layout_line(
                 ui,
@@ -2978,7 +2989,8 @@ mod tests {
                 .iter()
                 .map(|section| section.format.color)
                 .collect();
-        }));
+        })
+        .drop_without_applying_deltas();
         sections
     }
 

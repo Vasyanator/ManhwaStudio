@@ -13,20 +13,20 @@ depend on.** Grep before you write.
 
 ```bash
 grep -n 'SidePanel'      egui-docs/api/symbols.txt   # no hits -> it does not exist
-grep -n 'Panel::top'     egui-docs/api/symbols.txt   # -> egui::Panel::top  method  egui-0.35.0/src/containers/panel.rs:238
-grep -rn 'fn rect_stroke' egui-docs/api/epaint.md    # -> exact 0.35 signature
+grep -n 'Panel::top'     egui-docs/api/symbols.txt   # -> egui::Panel::top  method  egui-0.36.2/src/containers/panel.rs:265
+grep -rn 'fn rect_stroke' egui-docs/api/epaint.md    # -> exact 0.36 signature
 ```
 
 ## Contents
 
 | Crate | Version | Index | Items |
 |---|---|---|---|
-| `egui` | 0.35.0 | [`egui.md`](egui.md) | 363 |
-| `eframe` | 0.35.0 | [`eframe.md`](eframe.md) | 23 |
-| `epaint` | 0.35.0 | [`epaint.md`](epaint.md) | 102 |
-| `emath` | 0.35.0 | [`emath.md`](emath.md) | 59 |
-| `ecolor` | 0.35.0 | [`ecolor.md`](ecolor.md) | 15 |
-| `egui_extras` | 0.35.0 | [`egui_extras.md`](egui_extras.md) | 13 |
+| `egui` | 0.36.2 | [`egui.md`](egui.md) | 367 |
+| `eframe` | 0.36.2 | [`eframe.md`](eframe.md) | 23 |
+| `epaint` | 0.36.2 | [`epaint.md`](epaint.md) | 102 |
+| `emath` | 0.36.2 | [`emath.md`](emath.md) | 59 |
+| `ecolor` | 0.36.2 | [`ecolor.md`](ecolor.md) | 15 |
+| `egui_extras` | 0.36.2 | [`egui_extras.md`](egui_extras.md) | 13 |
 
 - `symbols.txt` — flat `path <TAB> kind <TAB> source location` list across all
   crates above. One line per public item and per inherent method. This is the

@@ -45,7 +45,8 @@ it). Because it runs before the UI is built, a step that opens a tab draws that
 tab's highlight target the same frame. The tab-switching widget code is untouched
 — the side effect lives in the tutorial script (`build_steps`).
 
-Overlay mechanics (verified against egui 0.35):
+Overlay mechanics (verified against egui 0.35; the 0.36 hit-test change only skips
+non-interactable areas, `egui-0.36.2/src/context.rs:476-482`):
 - Input blocking is pure hitbox overlap, not per-widget disabling: ONE
   full-viewport `Area` on `Order::Middle` (above panels on `Order::Background`)
   allocates a single `Sense::click_and_drag` rect over the whole screen. egui's
@@ -79,7 +80,7 @@ Overlay mechanics (verified against egui 0.35):
   `crates/ms-settings-ui/src/tutorial/MODULE_README.md`.)
 
 ## Contracts and invariants
-- egui 0.35 specifics: `Context::viewport_rect()` (not the removed
+- egui 0.36 specifics: `Context::viewport_rect()` (not the removed
   `screen_rect()`); `Painter::rect_stroke` takes a `StrokeKind` (this module uses
   `rect_filled` + `dashed_line` instead); close a dashed rect by repeating the
   first corner.

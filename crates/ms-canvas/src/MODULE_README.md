@@ -127,8 +127,8 @@ precomposed syllables and compat jamo are single scalars. The splice goes throug
 `capture_bubble_history_before_mutation` first — which `apply_paste_text` does NOT do — so one
 insert becomes one bubble-history entry. That entry is not what Ctrl+Z hits right after an insert:
 the insert path deliberately restores focus to the `TextEdit` (the right UX), and `handle_shortcuts`
-gates the bubble history on `!ctx.egui_wants_keyboard_input()`, which in egui 0.35 is
-`memory.focused().is_some()`. So while the field is focused Ctrl+Z is consumed by egui's own
+gates the bubble history on `!ctx.egui_wants_keyboard_input()`, which in egui 0.36 is
+`memory.focused().is_some()` (`egui-0.36.2/src/context.rs:2987`). So while the field is focused Ctrl+Z is consumed by egui's own
 `TextEdit` undoer; the bubble-history entry is what applies once focus is elsewhere.
 
 `mod.rs::draw_hangul_keyboard_panel` draws the panel after the scene pass as an `egui::Window` with

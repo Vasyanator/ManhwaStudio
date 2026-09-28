@@ -1,8 +1,8 @@
-# Widgets: what egui 0.35 gives you, and what this project FORBIDS
+# Widgets: what egui 0.36 gives you, and what this project FORBIDS
 
-Target: `egui`/`eframe` **0.35.0** from crates.io. All egui claims below are cited as
-`egui-0.35.0/src/<path>:<line>` against
-`~/.cargo/registry/src/index.crates.io-*/egui-0.35.0/src/`. Do not write egui code from
+Target: `egui`/`eframe` **0.36.2** from crates.io. All egui claims below are cited as
+`egui-0.36.2/src/<path>:<line>` against
+`~/.cargo/registry/src/index.crates.io-*/egui-0.36.2/src/`. Do not write egui code from
 memory of 0.27-0.31 — several APIs on this page did not exist then.
 
 ## 0. The hard project rules (read first)
@@ -100,7 +100,7 @@ Invariant: the guard is valid for **the current frame and the next one only**
 (`saturating_sub(guard.frame_nr) <= 1`). It is never persisted. If you write a new wheel-
 aware widget, wire both calls; if you write a new popup widget, publish both.
 
-Related 0.35 fact used by these widgets: **`InputState::raw_scroll_delta` no longer
+Related egui 0.36 fact used by these widgets: **`InputState::raw_scroll_delta` no longer
 exists**; the unsmoothed per-notch delta is recovered by summing `Event::MouseWheel` events
 (`src/widgets/wheel_slider.rs:431-445`).
 
@@ -136,47 +136,49 @@ its native bars are hidden and the ported bar is painted on top
 (`src/widgets/marked_scroll/MODULE_README.md`).
 
 **Warning:** this is a copy of *private* egui internals from a **different version** (0.33.3)
-than the one the app links (0.35.0). Do not "modernize" it against 0.35's current
+than the one the app links (0.36.2). Do not "modernize" it against 0.36's current
 `scroll_area.rs` on sight. It is an explicit upgrade boundary: change it only with a visual
 check of handle geometry, floating-bar opacity, and drag anchoring.
 
-## 5. egui 0.35: the widget primitives you actually get
+## 5. egui 0.36: the widget primitives you actually get
 
 ### `Widget`
 
 ```rust
-// egui-0.35.0/src/widgets/mod.rs:56-66
+// egui-0.36.2/src/widgets/mod.rs:62-81
 #[must_use = "You should put this widget in a ui with `ui.add(widget);`"]
 pub trait Widget {
     fn ui(self, ui: &mut Ui) -> Response;
+    fn boxed<'a>(self) -> BoxedWidget<'a> where Self: Sized + 'a { … }   // new in 0.36, :75
 }
+// :13 — pub type BoxedWidget<'a> = Box<dyn FnOnce(&mut Ui) -> Response + 'a>;
 ```
 
 Consumes `self` (widgets are builders, not state). `|ui: &mut Ui| -> Response` also
-implements `Widget` (`widgets/mod.rs:55`), and `impl Widget for &mut YourThing` is the
-sanctioned escape hatch for stateful widgets (`widgets/mod.rs:53`).
+implements `Widget` (`widgets/mod.rs:61`), and `impl Widget for &mut YourThing` is the
+sanctioned escape hatch for stateful widgets (`widgets/mod.rs:59`).
 
 ### Adding widgets
 
 | Call | Cite |
 |---|---|
-| `ui.add(widget) -> Response` | `egui-0.35.0/src/ui.rs:1520` |
-| `ui.add_sized(max_size, widget) -> Response` | `egui-0.35.0/src/ui.rs:1537` |
-| `ui.add_enabled(enabled, widget) -> Response` | `egui-0.35.0/src/ui.rs:1587` |
-| `ui.add_enabled_ui(enabled, add_contents)` | `egui-0.35.0/src/ui.rs:1619` |
-| `ui.add_visible(visible, widget)` | `egui-0.35.0/src/ui.rs:1646` |
+| `ui.add(widget) -> Response` | `egui-0.36.2/src/ui.rs:1521` |
+| `ui.add_sized(max_size, widget) -> Response` | `egui-0.36.2/src/ui.rs:1538` |
+| `ui.add_enabled(enabled, widget) -> Response` | `egui-0.36.2/src/ui.rs:1588` |
+| `ui.add_enabled_ui(enabled, add_contents)` | `egui-0.36.2/src/ui.rs:1620` |
+| `ui.add_visible(visible, widget)` | `egui-0.36.2/src/ui.rs:1647` |
 
 ### Layout containers
 
 - `Ui::scope_builder(UiBuilder, add_contents) -> InnerResponse<R>`
-  (`egui-0.35.0/src/ui.rs:2193`). `UiBuilder` carries the id salt
+  (`egui-0.36.2/src/ui.rs:2194`). `UiBuilder` carries the id salt
   (`ui_builder.rs:56`) or an explicit id (`ui_builder.rs:72`); this is the modern
   replacement for the old `Ui::child_ui` style.
-- `Ui::with_layout(Layout, ...)` (`ui.rs:2469`); `Layout::left_to_right(Align)`
+- `Ui::with_layout(Layout, ...)` (`ui.rs:2470`); `Layout::left_to_right(Align)`
   (`layout.rs:141`), `Layout::top_down(Align)` (`layout.rs:171`).
 - `Frame::group(style)` (`containers/frame.rs:178`), `Frame::canvas(style)` (`:227`),
   `Frame::show(ui, add_contents)` (`:404`).
-- `Grid::new(id_salt)` (`grid.rs:327`) — note the parameter is an **id salt**, so a
+- `Grid::new(id_salt)` (`grid.rs:341`) — note the parameter is an **id salt**, so a
   localized string must not be used as it (see `05-ids-and-i18n.md`).
 
 ### `ScrollArea` (has genuinely new API)
@@ -188,12 +190,17 @@ sanctioned escape hatch for stateful widgets (`widgets/mod.rs:53`).
 - **`DragScroll`** (`:147`) — `Never | OnTouch (default) | Always` (`:150-158`).
   `DragScroll::enabled(ctx)` checks `InputState::has_touch_screen` for `OnTouch` (`:165`).
 
-Older models will reach for `ScrollArea::drag_to_scroll(bool)`. In 0.35 the knob is
+- `ScrollArea::content_margin(impl Into<Margin>)` (`:631`), default from
+  `style.spacing.scroll.content_margin` (`style.rs:509`, `Margin::ZERO`). The old
+  `Visuals::clip_rect_margin` is `#[deprecated]` and **has no effect** in 0.36
+  (`style.rs:1086-1087`); scroll areas clip exactly to their inner rect (`scroll_area.rs:816-817`).
+
+Older models will reach for `ScrollArea::drag_to_scroll(bool)`. In 0.36 the knob is
 `scroll_source(ScrollSource { drag: DragScroll::Always, ..Default::default() })`.
 
-## 6. Atoms — the 0.35 system older models have never seen
+## 6. Atoms — the system older models have never seen
 
-egui 0.35 has an **atomics** layer (`egui-0.35.0/src/atomics/`): `atom.rs`, `atoms.rs`,
+egui 0.36 has an **atomics** layer (`egui-0.36.2/src/atomics/`): `atom.rs`, `atoms.rs`,
 `atom_kind.rs`, `atom_layout.rs`, `atom_ext.rs`, `sized_atom.rs`, `sized_atom_kind.rs`.
 
 - `Atom<'a>` (`atomics/atom.rs:32`) — "a low-level ui building block ... a piece of text, an
@@ -206,7 +213,7 @@ egui 0.35 has an **atomics** layer (`egui-0.35.0/src/atomics/`): `atom.rs`, `ato
   **`AtomLayoutResponse`** (`atom_layout.rs:701`), which *wraps* a `Response`:
 
 ```rust
-// egui-0.35.0/src/atomics/atom_layout.rs:701-705
+// egui-0.36.2/src/atomics/atom_layout.rs:701-705
 pub struct AtomLayoutResponse {
     pub response: Response,
     custom_rects: SmallVec<[(Id, Rect); 1]>,
@@ -216,14 +223,14 @@ pub struct AtomLayoutResponse {
 Widgets built on atoms include `Button::new(atoms: impl IntoAtoms<'a>)`
 (`widgets/button.rs:45`), `Checkbox::new(checked, atoms: impl IntoAtoms<'a>)`
 (`widgets/checkbox.rs:31`), `RadioButton`, `DragValue`, `TextEdit`, and even
-`Window::new(title: impl IntoAtoms<'a>)` (`containers/window.rs:101`).
+`Window::new(title: impl IntoAtoms<'a>)` (`containers/window.rs:102`).
 
 ### The practical consequence you WILL hit
 
 `TextEditOutput::response` is **not** a `Response` any more:
 
 ```rust
-// egui-0.35.0/src/widgets/text_edit/output.rs:6-8
+// egui-0.36.2/src/widgets/text_edit/output.rs:6-8
 pub struct TextEditOutput {
     pub response: crate::AtomLayoutResponse,
     ...
@@ -241,6 +248,10 @@ comment inline:
 
 If you add a widget that calls `TextEdit::show`, follow the same pattern and keep the
 comment: the double `.response.response` looks like a typo otherwise.
+
+New in 0.36: `TextEdit::event_filter(EventFilter)` (`widgets/text_edit/builder.rs:357`)
+chooses which keys the focused edit captures (default: arrows yes, tab/escape no) — the
+hook for completion popups that need Tab/Escape themselves.
 
 ## 7. The "double-interface pane" pattern
 
@@ -279,13 +290,13 @@ localized title keys via `title_key`. Do not route a surface-local section throu
 
 `egui_extras` is **not** a dependency of the `manhwastudio_rs` binary. The only reference in
 the workspace is `crates/puffin_egui/Cargo.toml:23`
-(`egui_extras = { version = "0.35", default-features = false, features = ["serde"] }`), and
+(`egui_extras = { version = "0.36.2", default-features = false, features = ["serde"] }`), and
 `puffin_egui` itself is only pulled in behind the `profiling` feature
-(`Cargo.toml:27`).
+(`Cargo.toml:106`).
 
 Therefore **`egui_extras::TableBuilder`, `DatePickerButton`, `Table`, and the `image`
 loaders are not in scope in `src/`**. Building a table means hand-rolling `Grid`
-(`grid.rs:327`) or a custom layout — or getting sign-off to add the dependency, which is an
+(`grid.rs:341`) or a custom layout — or getting sign-off to add the dependency, which is an
 architectural change, not a drive-by.
 
 ## Editing map

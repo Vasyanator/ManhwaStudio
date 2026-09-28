@@ -1073,7 +1073,6 @@ fn apply_zoomed_node_style(ui: &mut Ui, zoom: f32) {
     style.spacing.interact_size *= zoom;
     style.spacing.menu_margin *= zoom;
     style.spacing.slider_width *= zoom;
-    style.visuals.clip_rect_margin *= zoom;
     ui.set_style(style);
 }
 

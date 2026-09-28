@@ -562,7 +562,9 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput::default());
         let outcome = request_font_family(&ctx, &identity, 0xdead_beef, &path, 0);
-        let _output = ctx.end_pass();
+        // No renderer consumes this headless pass's font-atlas upload; egui 0.36 panics on an
+        // unapplied `TexturesDelta` drop, so the deltas are discarded explicitly.
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             matches!(outcome, PreviewFontFamily::Pending),

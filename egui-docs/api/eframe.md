@@ -1,18 +1,18 @@
-# API index: `eframe` 0.35.0
+# API index: `eframe` 0.36.2
 
 GENERATED FILE — do not edit by hand. Regenerate with `tools/egui_docs/build.sh`. Extracted from rustdoc JSON of the exact crate source in the local cargo registry, so every signature and line number below is real.
 
 **If a name is not in this file, it does not exist in our version of the crate.** Grep here before writing egui code from memory.
 
-Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.35.0/src/…`.
+Items are listed under the path callers actually write (the public re-export, e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. Citations point into the crate that owns the item, so a type `egui` re-exports from `epaint` cites `epaint-0.36.2/src/…`.
 
 ## `eframe`
 
-### `APP_KEY` (constant) — `eframe-0.35.0/src/epi.rs:978`
+### `APP_KEY` (constant) — `eframe-0.36.2/src/epi.rs:984`
 
 [`Storage`] key used for app
 
-### `EframePumpStatus` (enum) — `eframe-0.35.0/src/native/run.rs:568`
+### `EframePumpStatus` (enum) — `eframe-0.36.2/src/native/run.rs:580`
 
 Either an exit code or a [`ControlFlow`] from the [`ActiveEventLoop`].
 
@@ -21,7 +21,7 @@ Variants:
 - `EframePumpStatus::Continue` — The final state of the [`ControlFlow`] after all events have been dispatched
 - `EframePumpStatus::Exit` — The exit code for the application
 
-### `Error` (enum) — `eframe-0.35.0/src/lib.rs:504`
+### `Error` (enum) — `eframe-0.36.2/src/lib.rs:504`
 
 The different problems that can occur when trying to run `eframe`.
 
@@ -36,7 +36,7 @@ Variants:
 
 Implements: `Debug`, `Display`, `Error`, `From<Error>`, `From<EventLoopError>`, `From<OsError>`, `From<PainterError>`
 
-### `Renderer` (enum) — `eframe-0.35.0/src/epi.rs:582`
+### `Renderer` (enum) — `eframe-0.36.2/src/epi.rs:588`
 
 What rendering backend to use.
 
@@ -46,7 +46,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Default`, `Display`, `Eq`, `FromStr`, `PartialEq`, `StructuralPartialEq`
 
-### `UserEvent` (enum) — `eframe-0.35.0/src/native/winit_integration.rs:52`
+### `UserEvent` (enum) — `eframe-0.36.2/src/native/winit_integration.rs:64`
 
 The custom even `eframe` uses with the [`winit`] event loop.
 
@@ -57,7 +57,7 @@ Variants:
 
 Implements: `ApplicationHandler<UserEvent>`, `Debug`, `From<Event>`
 
-### `WebGlContextOption` (enum) — `eframe-0.35.0/src/epi.rs:559`
+### `WebGlContextOption` (enum) — `eframe-0.36.2/src/epi.rs:565`
 
 WebGL Context options
 
@@ -70,7 +70,7 @@ Variants:
 
 Implements: `Clone`, `Copy`, `Debug`, `Eq`, `Hash`, `PartialEq`, `StructuralPartialEq`
 
-### `create_native` — `eframe-0.35.0/src/lib.rs:376`
+### `create_native` — `eframe-0.36.2/src/lib.rs:376`
 
 ```rust
 fn create_native(app_name: &str, native_options: NativeOptions, app_creator: AppCreator<'a>, event_loop: &EventLoop<UserEvent>) -> EframeWinitApplication<'a>
@@ -78,7 +78,7 @@ fn create_native(app_name: &str, native_options: NativeOptions, app_creator: App
 
 Provides a proxy for your native eframe application to run on your own event loop.
 
-### `run_native` — `eframe-0.35.0/src/lib.rs:288`
+### `run_native` — `eframe-0.36.2/src/lib.rs:288`
 
 ```rust
 fn run_native(app_name: &str, native_options: NativeOptions, app_creator: AppCreator<'_>) -> Result
@@ -86,7 +86,7 @@ fn run_native(app_name: &str, native_options: NativeOptions, app_creator: AppCre
 
 This is how you start a native (desktop) app.
 
-### `run_native_ext` — `eframe-0.35.0/src/lib.rs:306`
+### `run_native_ext` — `eframe-0.36.2/src/lib.rs:306`
 
 ```rust
 fn run_native_ext(app_name: &str, native_options: NativeOptions, egui_ctx: Option<Context>, app_creator: AppCreator<'_>) -> Result
@@ -94,7 +94,7 @@ fn run_native_ext(app_name: &str, native_options: NativeOptions, egui_ctx: Optio
 
 Like [`run_native`], but lets you supply a pre-existing [`egui::Context`].
 
-### `run_ui_native` — `eframe-0.35.0/src/lib.rs:478`
+### `run_ui_native` — `eframe-0.36.2/src/lib.rs:478`
 
 ```rust
 fn run_ui_native(app_name: &str, native_options: NativeOptions, ui_fun: impl FnMut(&mut Ui, &mut Frame) + 'static) -> Result
@@ -102,7 +102,7 @@ fn run_ui_native(app_name: &str, native_options: NativeOptions, ui_fun: impl FnM
 
 The simplest way to get started when writing a native app.
 
-### `CreationContext` (struct) — `eframe-0.35.0/src/epi.rs:53`
+### `CreationContext` (struct) — `eframe-0.36.2/src/epi.rs:53`
 
 Data that is passed to [`AppCreator`] that can be used to setup and initialize your app.
 
@@ -116,46 +116,46 @@ Public fields:
 
 Methods:
 
-- `fn winit_window(&self) -> Option<&Arc<Window>>` — `eframe-0.35.0/src/epi.rs:144`
+- `fn winit_window(&self) -> Option<&Arc<Window>>` — `eframe-0.36.2/src/epi.rs:144`
   Access to the root [`winit::window::Window`].
 
 Implements: `HasDisplayHandle`, `HasWindowHandle`
 
-### `EframeWinitApplication` (struct) — `eframe-0.35.0/src/native/run.rs:480`
+### `EframeWinitApplication` (struct) — `eframe-0.36.2/src/native/run.rs:492`
 
 A proxy to the eframe application that implements [`ApplicationHandler`].
 
 Methods:
 
-- `fn pump_eframe_app(&mut self, event_loop: &mut EventLoop<UserEvent>, timeout: Option<Duration>) -> EframePumpStatus` — `eframe-0.35.0/src/native/run.rs:550`
+- `fn pump_eframe_app(&mut self, event_loop: &mut EventLoop<UserEvent>, timeout: Option<Duration>) -> EframePumpStatus` — `eframe-0.36.2/src/native/run.rs:562`
   Pump the `EventLoop` to check for and dispatch pending events to this application.
 
 Implements: `ApplicationHandler<UserEvent>`
 
-### `Frame` (struct) — `eframe-0.35.0/src/epi.rs:655`
+### `Frame` (struct) — `eframe-0.36.2/src/epi.rs:661`
 
 Represents the surroundings of your app.
 
 Methods:
 
-- `fn gl(&self) -> Option<&Arc<Context>>` — `eframe-0.35.0/src/epi.rs:777`
+- `fn gl(&self) -> Option<&Arc<Context>>` — `eframe-0.36.2/src/epi.rs:783`
   A reference to the underlying [`glow`] (OpenGL) context.
-- `fn info(&self) -> &IntegrationInfo` — `eframe-0.35.0/src/epi.rs:742`
+- `fn info(&self) -> &IntegrationInfo` — `eframe-0.36.2/src/epi.rs:748`
   Information about the integration.
-- `fn is_web(&self) -> bool` — `eframe-0.35.0/src/epi.rs:737`
+- `fn is_web(&self) -> bool` — `eframe-0.36.2/src/epi.rs:743`
   True if you are in a web environment.
-- `fn register_native_glow_texture(&mut self, native: Texture) -> TextureId` — `eframe-0.35.0/src/epi.rs:786`
+- `fn register_native_glow_texture(&mut self, native: Texture) -> TextureId` — `eframe-0.36.2/src/epi.rs:792`
   Register your own [`glow::Texture`], and then you can use the returned [`egui::TextureId`] to render your tex…
-- `fn storage(&self) -> Option<&dyn Storage>` — `eframe-0.35.0/src/epi.rs:747`
+- `fn storage(&self) -> Option<&dyn Storage>` — `eframe-0.36.2/src/epi.rs:753`
   A place where you can store custom data in a way that persists when you restart the app.
-- `fn storage_mut(&mut self) -> Option<&mut dyn Storage + 'static>` — `eframe-0.35.0/src/epi.rs:752`
+- `fn storage_mut(&mut self) -> Option<&mut dyn Storage + 'static>` — `eframe-0.36.2/src/epi.rs:758`
   A place where you can store custom data in a way that persists when you restart the app.
-- `fn winit_window(&self) -> Option<&Arc<Window>>` — `eframe-0.35.0/src/epi.rs:760`
+- `fn winit_window(&self) -> Option<&Arc<Window>>` — `eframe-0.36.2/src/epi.rs:766`
   Access to the current [`winit::window::Window`] (i.e. the one the active viewport is rendered to).
 
 Implements: `HasDisplayHandle`, `HasWindowHandle`
 
-### `IntegrationInfo` (struct) — `eframe-0.35.0/src/epi.rs:892`
+### `IntegrationInfo` (struct) — `eframe-0.36.2/src/epi.rs:898`
 
 Information about the integration passed to the use app each frame.
 
@@ -165,7 +165,7 @@ Public fields:
 
 Implements: `Clone`, `Debug`
 
-### `NativeOptions` (struct) — `eframe-0.35.0/src/epi.rs:290`
+### `NativeOptions` (struct) — `eframe-0.36.2/src/epi.rs:296`
 
 Options controlling the behavior of a native window.
 
@@ -187,64 +187,64 @@ Public fields:
 
 Implements: `Clone`, `Default`
 
-### `App` (trait) — `eframe-0.35.0/src/epi.rs:152`
+### `App` (trait) — `eframe-0.36.2/src/epi.rs:152`
 
 Implement this trait to write apps that can be compiled for both web/wasm and desktop/native using [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
 
 Required/provided items:
 
-- `fn logic(&mut self, ctx: &Context, frame: &mut Frame)` — `eframe-0.35.0/src/epi.rs:161`
+- `fn logic(&mut self, ctx: &Context, frame: &mut Frame)` — `eframe-0.36.2/src/epi.rs:167`
   Called once before each call to [`Self::ui`], and additionally also called when the UI is hidden, but [`egui:…
-- `fn ui(&mut self, ui: &mut Ui, frame: &mut Frame)` — `eframe-0.35.0/src/epi.rs:176`
+- `fn ui(&mut self, ui: &mut Ui, frame: &mut Frame)` — `eframe-0.36.2/src/epi.rs:182`
   Called each time the UI needs repainting, which may be many times per second.
-- `fn save(&mut self, _storage: &mut dyn Storage)` — `eframe-0.35.0/src/epi.rs:206`
+- `fn save(&mut self, _storage: &mut dyn Storage)` — `eframe-0.36.2/src/epi.rs:212`
   Called on shutdown, and perhaps at regular intervals. Allows you to save state.
-- `fn on_exit(&mut self, _gl: Option<&Context>)` — `eframe-0.35.0/src/epi.rs:216`
+- `fn on_exit(&mut self, _gl: Option<&Context>)` — `eframe-0.36.2/src/epi.rs:222`
   Called once on shutdown, after [`Self::save`].
-- `fn auto_save_interval(&self) -> Duration` — `eframe-0.35.0/src/epi.rs:228`
+- `fn auto_save_interval(&self) -> Duration` — `eframe-0.36.2/src/epi.rs:234`
   Time between automatic calls to [`Self::save`]
-- `fn clear_color(&self, _visuals: &Visuals) -> [f32; 4]` — `eframe-0.35.0/src/epi.rs:242`
+- `fn clear_color(&self, _visuals: &Visuals) -> [f32; 4]` — `eframe-0.36.2/src/epi.rs:248`
   Background color values for the app, e.g. what is sent to `gl.clearColor`.
-- `fn persist_egui_memory(&self) -> bool` — `eframe-0.35.0/src/epi.rs:253`
+- `fn persist_egui_memory(&self) -> bool` — `eframe-0.36.2/src/epi.rs:259`
   Controls whether or not the egui memory (window positions etc) will be persisted (only if the "persistence" f…
-- `fn raw_input_hook(&mut self, _ctx: &Context, _raw_input: &mut RawInput)` — `eframe-0.35.0/src/epi.rs:273`
+- `fn raw_input_hook(&mut self, _ctx: &Context, _raw_input: &mut RawInput)` — `eframe-0.36.2/src/epi.rs:279`
   A hook for manipulating or filtering raw input before it is processed by [`Self::ui`].
 
-### `Storage` (trait) — `eframe-0.35.0/src/epi.rs:938`
+### `Storage` (trait) — `eframe-0.36.2/src/epi.rs:944`
 
 A place where you can store custom data in a way that persists when you restart the app.
 
 Required/provided items:
 
-- `fn get_string(&self, key: &str) -> Option<String>` — `eframe-0.35.0/src/epi.rs:940`
+- `fn get_string(&self, key: &str) -> Option<String>` — `eframe-0.36.2/src/epi.rs:946`
   Get the value for the given key.
-- `fn set_string(&mut self, key: &str, value: String)` — `eframe-0.35.0/src/epi.rs:943`
+- `fn set_string(&mut self, key: &str, value: String)` — `eframe-0.36.2/src/epi.rs:949`
   Set the value for the given key.
-- `fn remove_string(&mut self, key: &str)` — `eframe-0.35.0/src/epi.rs:946`
+- `fn remove_string(&mut self, key: &str)` — `eframe-0.36.2/src/epi.rs:952`
   Remove a given key.
-- `fn flush(&mut self)` — `eframe-0.35.0/src/epi.rs:949`
+- `fn flush(&mut self)` — `eframe-0.36.2/src/epi.rs:955`
   write-to-disk or similar
 
-### `AppCreator` (type_alias) — `eframe-0.35.0/src/epi.rs:49`
+### `AppCreator` (type_alias) — `eframe-0.36.2/src/epi.rs:49`
 
 This is how your app is created.
 
-### `EventLoopBuilderHook` (type_alias) — `eframe-0.35.0/src/epi.rs:34`
+### `EventLoopBuilderHook` (type_alias) — `eframe-0.36.2/src/epi.rs:34`
 
 Hook into the building of an event loop before it is run
 
-### `Result` (type_alias) — `eframe-0.35.0/src/lib.rs:617`
+### `Result` (type_alias) — `eframe-0.36.2/src/lib.rs:617`
 
 Short for `Result<T, eframe::Error>`.
 
-### `WindowBuilderHook` (type_alias) — `eframe-0.35.0/src/epi.rs:42`
+### `WindowBuilderHook` (type_alias) — `eframe-0.36.2/src/epi.rs:42`
 
 Hook into the building of a the native window.
 
 
 ## `eframe::icon_data`
 
-### `from_png_bytes` — `eframe-0.35.0/src/icon_data.rs:24`
+### `from_png_bytes` — `eframe-0.36.2/src/icon_data.rs:24`
 
 ```rust
 fn from_png_bytes(png_bytes: &[u8]) -> Result<IconData, ImageError>
@@ -252,15 +252,15 @@ fn from_png_bytes(png_bytes: &[u8]) -> Result<IconData, ImageError>
 
 Load the contents of .png file.
 
-### `IconDataExt` (trait) — `eframe-0.35.0/src/icon_data.rs:6`
+### `IconDataExt` (trait) — `eframe-0.36.2/src/icon_data.rs:6`
 
 Helpers for working with [`IconData`].
 
 Required/provided items:
 
-- `fn to_image(&self) -> Result<RgbaImage, String>` — `eframe-0.35.0/src/icon_data.rs:11`
+- `fn to_image(&self) -> Result<RgbaImage, String>` — `eframe-0.36.2/src/icon_data.rs:11`
   Convert into [`image::RgbaImage`]
-- `fn to_png_bytes(&self) -> Result<Vec<u8>, String>` — `eframe-0.35.0/src/icon_data.rs:17`
+- `fn to_png_bytes(&self) -> Result<Vec<u8>, String>` — `eframe-0.36.2/src/icon_data.rs:17`
   Encode as PNG.
 
 

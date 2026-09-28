@@ -1,13 +1,13 @@
 # 06 — Overlays: `Area`, `Order`, layers, and z-order input occlusion
 
-Ground truth: `egui-0.35.0/src/` and `epaint-0.35.0/src/` in the crates.io registry, plus this
+Ground truth: `egui-0.36.2/src/` and `epaint-0.36.2/src/` in the crates.io registry, plus this
 repo's overlay code. Every API claim is cited. Read this before painting anything "on top" of the
 UI — the difference between *painting* and *registering a hitbox* is the whole subject.
 
 ## 1. Layers and `Order`
 
 ```rust
-// egui-0.35.0/src/layers.rs:10-27
+// egui-0.36.2/src/layers.rs:10-27
 pub enum Order {
     Background,  // Painted behind all floating windows
     Middle,      // Normal moveable windows that you reorder by click
@@ -30,16 +30,16 @@ that we paint through a `Painter` and never allocate a widget there (§3).
 
 A frequent (and wrong) assumption is "the `Area` created later in the frame wins the pointer".
 It does not. `Areas::order` is a **persistent** list that survives the frame: `set_state` appends a
-layer only the first time it is seen (memory/mod.rs:1215-1221), and `end_pass` re-sorts that list
+layer only the first time it is seen (memory/mod.rs:1236-1242), and `end_pass` re-sorts that list
 with a **stable** `sort_by_key(|layer| (layer.order, wants_to_be_on_top.contains(layer)))`
-(memory/mod.rs:1350). A stable sort keeps the relative order of two layers of the same `Order` as it
+(memory/mod.rs:1371). A stable sort keeps the relative order of two layers of the same `Order` as it
 already was — i.e. from when each was first created — so re-creating an `Area` in a different place
 in the frame changes nothing.
 
 What DOES move a layer up, within its `Order`:
 
 * `Area::begin` calls `move_to_top` when the area was **not visible last frame**, and also when it
-  is dragged, clicked, or the pointer was pressed on it (containers/area.rs:548-552). So an area
+  is dragged, clicked, or the pointer was pressed on it (containers/area.rs:550-554). So an area
   that appears fresh (a capture surface enabled by a mode, a popup) rises above the areas of the
   same `Order` that were already there — and stays above them until *they* are re-created;
 * `Memory::areas_mut().move_to_top(layer_id)` explicitly (that is what the above calls);
@@ -52,7 +52,7 @@ panel rects from it, or by leaving it alone — never by reshuffling the creatio
 
 ## 2. `Area` — the floating container
 
-`Area::new(Id)` (egui-0.35.0/src/containers/area.rs:133); `Area::show(ctx, …)` takes a **`&Context`**
+`Area::new(Id)` (egui-0.36.2/src/containers/area.rs:133); `Area::show(ctx, …)` takes a **`&Context`**
 (area.rs:406), unlike `Panel::show` which takes a `&mut Ui`.
 
 **Scope, before you reach for it:** `Area` is for decoration and transient surfaces the user cannot
@@ -66,27 +66,31 @@ Builders that matter for overlays:
 
 * `.order(Order)` — area.rs:235.
 * `.interactable(bool)` — "If false, clicks goes straight through to what is behind us"
-  (area.rs:212-218). This is the switch for a click-through decoration area.
+  (area.rs:212-218). This is the switch for a click-through decoration area. In 0.36 the frame
+  hit-test drops the layers of non-interactable areas entirely (egui-0.36.2/src/context.rs:476-482),
+  and `layer_id_at` skips them too (egui-0.36.2/src/memory/mod.rs:1255), so widgets inside such an
+  area never get hover/click and occlude nothing. An area is also forced non-interactable during a
+  **sizing pass** (area.rs:485-487).
 * `.enabled(bool)` — content does not respond and is drawn greyed out (area.rs:186-191).
 * `.sense(Sense)` — defaults to `Sense::drag()` if movable, `Sense::click()` if interactable, else
   `Sense::hover()` (area.rs:224-228).
 * `.fixed_pos`, `.movable(false)`, `.constrain(bool)` (area.rs:277, :198, :287) — `constrain(true)`
   (the default) clamps the area into `Context::content_rect`, which will silently move a callout you
   positioned by hand.
-* Full-viewport geometry comes from `ctx.viewport_rect()` (egui-0.35.0/src/context.rs:2819). There is
-  no `screen_rect()` in 0.35.
+* Full-viewport geometry comes from `ctx.viewport_rect()` (egui-0.36.2/src/context.rs:2921). There is
+  no `screen_rect()` in 0.36.
 
 ## 3. Painting vs. registering a hitbox — the core distinction
 
 | API | Layer it paints into | Registers a widget / hitbox? |
 |---|---|---|
-| `Ui::painter()` → `&Painter` (egui-0.35.0/src/ui.rs:457) | the `Ui`'s own layer | **No** — pure paint |
-| `Ui::painter_at(rect)` (ui.rs:619) = `painter().with_clip_rect(rect)` (egui-0.35.0/src/painter.rs:71) | same layer, intersected clip | **No** |
-| `Context::layer_painter(LayerId)` (egui-0.35.0/src/context.rs:1519) | *any* layer you name, clipped to `content_rect` | **No** |
-| `Ui::allocate_rect(rect, sense)` (ui.rs:1256) | — | **Yes**: consumes layout space and creates a `Response` |
-| `Ui::interact(rect, id, sense)` (ui.rs:906) / `interact_opt` (ui.rs:911) | — | **Yes**, without consuming layout space |
+| `Ui::painter()` → `&Painter` (egui-0.36.2/src/ui.rs:458) | the `Ui`'s own layer | **No** — pure paint |
+| `Ui::painter_at(rect)` (ui.rs:620) = `painter().with_clip_rect(rect)` (egui-0.36.2/src/painter.rs:71) | same layer, intersected clip | **No** |
+| `Context::layer_painter(LayerId)` (egui-0.36.2/src/context.rs:1587) | *any* layer you name, clipped to `content_rect` | **No** |
+| `Ui::allocate_rect(rect, sense)` (ui.rs:1257) | — | **Yes**: consumes layout space and creates a `Response` |
+| `Ui::interact(rect, id, sense)` (ui.rs:907) / `interact_opt` (ui.rs:912) | — | **Yes**, without consuming layout space |
 
-There is **no `Context::interact`** in 0.35 — interaction is always claimed through a `Ui`.
+There is **no `Context::interact`** in 0.36 — interaction is always claimed through a `Ui`.
 
 So: *painting never blocks input*. Blocking input requires a sensed rect in a layer above the
 widgets you want to occlude. Conversely, a decoration that must not steal input must be painted with
@@ -147,8 +151,8 @@ painter.arrow(tail, tip - tail, stroke);
 ```
 
 `Shape::dashed_line(path, stroke, dash_length, gap_length) -> Vec<Shape>`
-(epaint-0.35.0/src/shapes/shape.rs:170); `Painter::arrow(origin, vec, stroke)`
-(egui-0.35.0/src/painter.rs:417).
+(epaint-0.36.2/src/shapes/shape.rs:170); `Painter::arrow(origin, vec, stroke)`
+(egui-0.36.2/src/painter.rs:417).
 
 * **The interactive callout** is a separate `Area` on `Order::Foreground` (above the blocker) so its
   buttons are clickable while everything below is inert (src/tutorial/engine.rs:751-757).
@@ -163,7 +167,7 @@ This is documented in the repo at src/tutorial/MODULE_README.md:37 and was a rea
 `WheelSlider`.
 
 Correct pattern — always go through the `Response` produced by `allocate_rect`/`interact`, whose
-`hovered()` (egui-0.35.0/src/response.rs:313) and `contains_pointer()` (response.rs:326) are derived
+`hovered()` (egui-0.36.2/src/response.rs:320) and `contains_pointer()` (response.rs:333) are derived
 from egui's occlusion-aware frame hit-test:
 
 ```rust
@@ -187,26 +191,26 @@ you, or on the layer under the pointer:
 // src/input_util.rs:55-61 — "is the pointer over floating UI rather than bare canvas?"
 pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool {
     let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) else { return false; };
-    ctx.layer_id_at(pos)                       // egui-0.35.0/src/context.rs:3002
+    ctx.layer_id_at(pos)                       // egui-0.36.2/src/context.rs:3104
         .is_some_and(|layer| layer.order != egui::Order::Background)
 }
 ```
 
-Note the warning in that file's doc comment (src/input_util.rs:44-53): 0.35's
-`Context::is_pointer_over_egui` (egui-0.35.0/src/context.rs:2841) is **not** a substitute — a
+Note the warning in that file's doc comment (src/input_util.rs:44-53): egui's
+`Context::is_pointer_over_egui` (egui-0.36.2/src/context.rs:2943) is **not** a substitute — a
 space-filling `CentralPanel` leaves the root ui's available rect empty, so it reports `true`
 everywhere over the central content.
 
 ## 6. Claiming input for a manually painted region
 
-`Sense::hover()` / `click()` / `drag()` / `click_and_drag()` (egui-0.35.0/src/sense.rs:45, :60, :68, :81).
+`Sense::hover()` / `click()` / `drag()` / `click_and_drag()` (egui-0.36.2/src/sense.rs:45, :60, :68, :81).
 
-* Inside a layout: `let r = ui.allocate_rect(rect, Sense::click_and_drag());` (ui.rs:1256) — reserves
+* Inside a layout: `let r = ui.allocate_rect(rect, Sense::click_and_drag());` (ui.rs:1257) — reserves
   the space **and** senses it.
 * Over already-laid-out content (an overlay handle on top of a canvas):
-  `let r = ui.interact(rect, id, Sense::drag());` (ui.rs:906) — senses without consuming layout space;
+  `let r = ui.interact(rect, id, Sense::drag());` (ui.rs:907) — senses without consuming layout space;
   use a stable, unique `Id`.
-* Then branch on `r.clicked()` (response.rs:183), `r.hovered()`, `r.contains_pointer()`,
+* Then branch on `r.clicked()` (response.rs:184), `r.hovered()`, `r.contains_pointer()`,
   `r.drag_delta()` — never on raw pointer maths (§5).
 
 Order of allocation within a layer matters: a later-allocated rect wins over an earlier one covering
@@ -214,20 +218,24 @@ the same point.
 
 ## 7. Popups, menus, tooltips
 
-* `Popup` (egui-0.35.0/src/containers/popup.rs:165): `Popup::new(id, ctx, anchor, layer_id)` (:190),
-  `Popup::from_response(&Response)` (:215), `from_toggle_button_response` (:228), `menu(&Response)`
-  (:235), `context_menu(&Response)` (:246). Anchors accept a `Rect`, a `Pos2` or a `&Response`
+* `Popup` (egui-0.36.2/src/containers/popup.rs:165): `Popup::new(id, ctx, anchor, layer_id)` (:191),
+  `Popup::from_response(&Response)` (:217), `from_toggle_button_response` (:230), `menu(&Response)`
+  (:237), `context_menu(&Response)` (:248). Anchors accept a `Rect`, a `Pos2` or a `&Response`
   (popup.rs:38-50).
 * `PopupKind::order()` decides the layer: `Tooltip => Order::Tooltip`, `Menu | Popup =>
   Order::Foreground` (popup.rs:145-151). So popups and menus sit **above** an `Order::Middle` overlay
   and remain interactive over it — which is exactly what the tutorial callout relies on, and exactly
   what you must remember when you want an overlay to block *everything*.
-* Global helpers: `Popup::is_any_open(ctx)` (popup.rs:660), `Popup::close_all(ctx)` (popup.rs:677).
-* `Response::context_menu(add_contents)` (egui-0.35.0/src/response.rs:1008) and
-  `context_menu_opened()` (:1015) are the convenience wrappers.
-* `Tooltip` (egui-0.35.0/src/containers/tooltip.rs:8): `Tooltip::for_widget(&Response)` (:39),
+* Global helpers: `Popup::is_any_open(ctx)` (popup.rs:674), `Popup::close_all(ctx)` (popup.rs:691).
+* Since 0.36 a popup's **first open frame is a sizing pass** (`.sizing_pass(!was_open_last_frame)`,
+  popup.rs:587), which makes its `Area` non-interactable for that frame (see §2): it neither takes
+  clicks nor shows up in `layer_id_at` until the next frame. `.interactable(false)` (popup.rs:378)
+  makes a popup click-through permanently.
+* `Response::context_menu(add_contents)` (egui-0.36.2/src/response.rs:1028) and
+  `context_menu_opened()` (:1035) are the convenience wrappers.
+* `Tooltip` (egui-0.36.2/src/containers/tooltip.rs:8): `Tooltip::for_widget(&Response)` (:39),
   `for_enabled` (:53), `for_disabled` (:62), `.at_pointer()` (:72), `.show(|ui| …)` (:101);
-  `Response::on_hover_text` (response.rs:707) is the shorthand.
+  `Response::on_hover_text` (response.rs:727) is the shorthand.
 
 ## 8. Canvas overlays (pointer only)
 

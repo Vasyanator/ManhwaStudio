@@ -1,15 +1,15 @@
 # Seeing the running UI: the egui inspection protocol
 
-You do not have to reason about this app's UI from source alone. egui 0.35 ships an
+You do not have to reason about this app's UI from source alone. egui 0.36 ships an
 **inspection protocol**, and this repo is already wired for it: an agent can attach to the
 live process, read the widget tree, synthesize input, and take screenshots.
 
 ## 1. What it is
 
-`eframe` 0.35 has an opt-in `inspection` feature that pulls in the `egui_inspection` crate:
+`eframe` 0.36 has an opt-in `inspection` feature that pulls in the `egui_inspection` crate:
 
 ```toml
-# eframe-0.35.0/Cargo.toml:76-79
+# eframe-0.36.2/Cargo.toml:77-80
 inspection = [
     "dep:egui_inspection",
     "accesskit",
@@ -17,21 +17,25 @@ inspection = [
 ```
 
 `egui_inspection` binds a TCP listener and serves the widget tree + an input sink
-(`egui_inspection-0.35.0/src/plugin.rs:295`). It is armed by an env var and defaults to a
+(`egui_inspection-0.36.2/src/plugin.rs:336`). It is armed by an env var and defaults to a
 fixed address:
 
 ```rust
-// egui_inspection-0.35.0/src/lib.rs:18
+// egui_inspection-0.36.2/src/lib.rs:18
 pub const INSPECTION_ENV_VAR: &str = "EGUI_INSPECTION";
-// egui_inspection-0.35.0/src/lib.rs:24
+// egui_inspection-0.36.2/src/lib.rs:24
 pub const DEFAULT_INSPECTION_ADDR: &str = "127.0.0.1:5719";
 ```
 
+0.36 added a `Request::Settle { max_steps }` → `Response::Settled` pair ("wait until the app goes
+idle") without bumping `PROTOCOL_VERSION` (still `1`; `egui_inspection-0.36.2/src/protocol.rs:26`,
+`:70`, `:108`), so a 0.35-era client still connects.
+
 The app exposes it behind its own cargo feature, off by default so release builds are
-unaffected (`Cargo.toml:28-32`):
+unaffected (`Cargo.toml:107-111`):
 
 ```toml
-# Dev/debug: enable egui 0.35's inspection protocol so an external inspector
+# Dev/debug: enable egui's inspection protocol so an external inspector
 # (e.g. the `egui_mcp` MCP server) can attach over TCP …
 inspection = ["eframe/inspection"]
 ```
@@ -81,10 +85,10 @@ receive `click` on their buttons (close them with `Escape`).
 ## 4. The accessibility tree: label vs value
 
 `query_tree` walks the AccessKit tree egui emits from each widget's `WidgetInfo`
-(`egui-0.35.0/src/data/output.rs:538`). The mapping to AccessKit fields has one trap:
+(`egui-0.36.2/src/data/output.rs:563`). The mapping to AccessKit fields has one trap:
 
 ```rust
-// egui-0.35.0/src/response.rs:942-947
+// egui-0.36.2/src/response.rs:962-967
 if let Some(label) = info.label {
     if matches!(builder.role(), Role::Label) {
         builder.set_value(label);
@@ -95,8 +99,8 @@ if let Some(label) = info.label {
 ```
 
 So a **`Label`'s text lands in `value`, not in `label`** (`WidgetType::Label => Role::Label`,
-`response.rs:916`), while a `Button`'s caption lands in `label`. Text-edit contents also go to
-`value` (`response.rs:950`, from `info.current_text_value`).
+`response.rs:936`), while a `Button`'s caption lands in `label`. Text-edit contents also go to
+`value` (`response.rs:970`, from `info.current_text_value`).
 
 Practical rule for agents: **match with `content_contains`**, which checks both fields.
 `label_contains` alone silently misses every `Label`, monospace readout, and counter.
@@ -126,7 +130,7 @@ Consequences:
 - To change how the app is launched inspection-ready: `.claude/skills/egui-mcp/launch.sh`.
 - To change the agent-facing driving protocol/caveats: `.claude/skills/egui-mcp/SKILL.md`
   (the single source of truth; this page only points at it).
-- To turn the feature on/off in builds: `Cargo.toml:28-32` (`inspection = ["eframe/inspection"]`).
+- To turn the feature on/off in builds: `Cargo.toml:107-111` (`inspection = ["eframe/inspection"]`).
 - To make a widget visible to `query_tree`: give it a real `Response`/`WidgetInfo` instead of
-  raw painter output; see `egui-0.35.0/src/response.rs:900-960` for the field mapping.
+  raw painter output; see `egui-0.36.2/src/response.rs:920-980` for the field mapping.
 - If UI tests ever land: update §5 here and `04-widgets.md`'s verification guidance.

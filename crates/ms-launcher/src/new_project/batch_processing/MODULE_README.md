@@ -119,7 +119,8 @@ startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
   the node pass and filled with `Painter::set` afterwards, once socket positions are known. The
   in-progress rubber-band connection is added after the node pass and therefore stays on top.
 - **Keyboard shortcuts are gated on `Context::egui_wants_keyboard_input()`**, because `TextEdit`
-  consumes no key events in egui 0.35.
+  consumes no key events in egui 0.36 (it reads `InputState::filtered_events` without consuming,
+  `egui-0.36.2/src/widgets/text_edit/builder.rs:1098`).
 - **The canvas owns its ground, and the grid is anchored in graph space.** `visuals.panel_fill`
   is transparent launcher-wide, so the canvas fills its own rect (`COL_GROUND`) before painting
   anything; nothing else supplies a background for it. The grid is then drawn from WORLD-space

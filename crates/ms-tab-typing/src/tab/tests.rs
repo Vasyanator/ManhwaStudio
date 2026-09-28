@@ -2926,9 +2926,11 @@ fn pointer_over_panel_over_canvas_defers_to_foreground_panel_only() {
     let capture_rect = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(120.0, 120.0));
 
     // Two frames: the first registers the areas, the second exposes their rects to the
-    // z-order hit-test that `layer_id_at` reads.
+    // z-order hit-test that `layer_id_at` reads. No renderer applies the headless passes'
+    // texture uploads, and egui 0.36 panics on an unapplied `TexturesDelta` drop, so each pass's
+    // deltas are discarded explicitly.
     for _ in 0..2 {
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let ctx = ui.ctx().clone();
             // A Foreground panel-like area (a real widget covering the whole rect).
             egui::Area::new(egui::Id::new("test_over_canvas_panel"))
@@ -2951,7 +2953,8 @@ fn pointer_over_panel_over_canvas_defers_to_foreground_panel_only() {
                         egui::Sense::click(),
                     );
                 });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     // Over the Foreground panel: the wheel belongs to that panel → defer.

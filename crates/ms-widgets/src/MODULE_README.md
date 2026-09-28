@@ -32,7 +32,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
 ## Files and submodules
 - `lib.rs`: public export surface for reusable widgets.
 - `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
-  "is the pointer over a floating egui layer" test. Both restore semantics egui 0.35 removed.
+  "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
 - `input_manager_v2.rs`: the user-configurable hotkey registry — code-declared `HotkeySpecV2`
   specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
@@ -306,7 +306,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
   replaced by the OWNER (another text layer selected) must not mark a cell dirty, and an index
   chosen in one title must not survive into another title's set. All of that logic lives in a private
   `PresetSelection` that never touches `egui::Ui`, so the interaction is unit-tested without a
-  GUI. Two egui-0.35 facts the drawing depends on: the palette takes its width from
+  GUI. Two egui facts (still true in 0.36) the drawing depends on: the palette takes its width from
   `Spacing::slider_width`, not from an argument, and the popup must be
   `PopupCloseBehavior::CloseOnClickOutside` or the first click on a cell closes it.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume
@@ -342,8 +342,9 @@ crate's `[dev-dependencies]`, so no production build carries them.
   no longer shown. The worker slot is released through an RAII guard, so a panic cannot wedge
   playback. A hint whose open or frame decode fails is logged once and blacklisted for the session.
   Optional action mode: `with_action(label)` adds a clickable button below the tooltip content
-  (the `on_hover_ui` tooltip is interactive in egui 0.35, so it stays open while the pointer moves
-  onto the button). Use `show_with_action`, which returns `HelpHintResponse { response, action_clicked }`;
+  (since egui 0.36 an `on_hover_ui` tooltip is interactable only when it contained interactive
+  widgets last frame, `egui-0.36.2/src/containers/tooltip.rs:135-140`; the button makes it so, and it
+  stays open while the pointer moves onto the button). Use `show_with_action`, which returns `HelpHintResponse { response, action_clicked }`;
   plain `show` still renders the button but discards its click. Callers pass already-localized labels.
 
 ## Contracts and invariants
@@ -381,13 +382,13 @@ crate's `[dev-dependencies]`, so no production build carries them.
   under an open list from being dragged by wheel events aimed at the list.
 - A popup widget must derive "is my popup open?" from an id it CONTROLS.
   `egui::ComboBox::show_ui` re-salts whatever `id_salt` it is given
-  (`egui-0.35.0/src/containers/combo_box.rs:232`), so `ComboBox::is_open(ctx, already_salted_id)`
+  (`egui-0.36.2/src/containers/combo_box.rs:232`), so `ComboBox::is_open(ctx, already_salted_id)`
   answers `false` forever — `wheel_combo_box.rs` carries that defect and survives only because
   its popup closure publishes the guard rect before the check runs. `SearchableComboBox` owns
   a plain `bool` instead; new popup widgets should do the same.
 - A popup whose content can GROW must ask for its height every frame. An `egui::Area` hands
   its body last frame's content size as this frame's `max_rect`
-  (`egui-0.35.0/src/containers/area.rs:610` + `:666`) and a `ScrollArea` can never exceed it
+  (`egui-0.36.2/src/containers/area.rs:612` + `:668`) and a `ScrollArea` can never exceed it
   (`scroll_area.rs:763-765`), so a list that shrank once stays short. `SearchableComboBox`
   calls `Ui::set_min_height` with the row count's natural height before drawing the list. It
   must be `set_min_height` and never `set_max_height`: the latter unions `max_rect` with
@@ -396,7 +397,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
   ended up painted over the first row. `set_min_height` goes through
   `Region::expand_to_include_y` (`placer.rs:274-281` + `layout.rs:67-71`) and only extends
   downward. Salting the popup's id instead would drop the widget's own state and force egui's
-  INVISIBLE sizing pass (`area.rs:444` + `:623-624`) — a blink on every keystroke.
+  INVISIBLE sizing pass (`area.rs:444` + `:625-626`) — a blink on every keystroke.
 - `SearchableComboBox`'s per-item font resolver is called ONLY for the rows drawn in the
   current frame plus the selected row on the closed button. That is a contract, not an
   optimisation: egui's `add_font` never evicts, so a resolver called for every filtered row

@@ -2,8 +2,8 @@
 
 **Read this before writing or changing any UI code.**
 
-This project builds against **egui / eframe 0.35.0** (upstream crates.io, no fork,
-no `[patch]`). egui 0.35 renamed, removed, or restructured a large part of the API
+This project builds against **egui / eframe 0.36.2** (upstream crates.io, no fork,
+no `[patch]`). Recent egui releases (through 0.36) renamed, removed, or restructured a large part of the API
 that a language model has memorised from earlier versions. Writing egui from memory
 here does not produce slightly-old code — it produces code that **does not compile**,
 or worse, code that compiles and behaves subtly wrong (input leaking under overlays,
@@ -18,7 +18,7 @@ This folder exists so that no agent ever has to guess.
 
    ```bash
    grep -P '^egui::SidePanel\t'  egui-docs/api/symbols.txt   # no hits -> does not exist
-   grep -P '^egui::Panel::top\t' egui-docs/api/symbols.txt   # -> egui-0.35.0/src/containers/panel.rs:238
+   grep -P '^egui::Panel::top\t' egui-docs/api/symbols.txt   # -> egui-0.36.2/src/containers/panel.rs:265
    ```
 
 2. **Every API claim in these pages carries a `file:line` citation into the crate
@@ -27,7 +27,7 @@ This folder exists so that no agent ever has to guess.
 
    Two kinds of citation appear, and they age differently:
 
-   - `egui-0.35.0/src/…:LINE`, `epaint-0.35.0/…`, `emath-0.35.0/…` — into the crate
+   - `egui-0.36.2/src/…:LINE`, `epaint-0.36.2/…`, `emath-0.36.2/…` — into the crate
      sources in the local cargo registry. Pinned to an exact published version, so
      these do **not** drift. They are authoritative.
    - `src/…:LINE`, `README_AGENT.md:LINE` — into this repo. These drift as the code
@@ -57,9 +57,9 @@ anything else.
 
 - **`eframe::App` has no `update`.** The entry point is
   `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame)` —
-  `eframe-0.35.0/src/epi.rs:176`. You are handed a `&mut Ui`, not a `&Context`.
+  `eframe-0.36.2/src/epi.rs:182`. You are handed a `&mut Ui`, not a `&Context`.
 - **There is no `SidePanel` / `TopBottomPanel`.** One unified
-  `Panel::left/right/top/bottom(id)` — `egui-0.35.0/src/containers/panel.rs:180`.
+  `Panel::left/right/top/bottom(id)` — `egui-0.36.2/src/containers/panel.rs:206`.
   Panels take a `&mut Ui`, not a `&Context`.
 - **Never read the raw pointer position to decide hover.** Use `Response::hovered()` /
   `contains_pointer()`. Raw-pointer reads leak straight through overlays and modals,
@@ -99,7 +99,7 @@ and still counts as a defect.
 ```
 egui-docs/
   README.md            this file — entry point and routing
-  00-version-map.md    stale-memory API -> real 0.35 API, with removal proofs
+  00-version-map.md    stale-memory API -> real 0.36 API, removal proofs, 0.35->0.36 deltas
   01-app-shell.md      eframe::App, panels (incl. the floating-panel rule), viewports, startup
   02-painting.md       Painter, Shape, Mesh, Color32, ColorImage, textures
   03-input.md          InputState, pointer, Sense, Response, keyboard, hotkeys
@@ -131,5 +131,5 @@ source by hand — `00-version-map.md` first, since it is the page an upgrade is
 likely to silently falsify.
 
 Version described: see [`VERSION`](VERSION). Sources are the exact crates in the local
-cargo registry (`~/.cargo/registry/src/index.crates.io-*/egui-0.35.0/` and siblings);
-upstream commit `6f15dc0e16b26edce1fc2a05212eaf7e749c1d05`.
+cargo registry (`~/.cargo/registry/src/index.crates.io-*/egui-0.36.2/` and siblings);
+upstream commit `49682f8baa058bf49e011035cfbd6e825f88a5ef`.

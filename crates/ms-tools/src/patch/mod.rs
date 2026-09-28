@@ -1872,16 +1872,20 @@ mod tests {
 
         let mut tool = core();
         let mut handled_when_empty = true;
-        let _ = ctx.run_ui(input.clone(), |ui| {
+        // Headless pass: no renderer applies the font-atlas upload, and egui 0.36 panics on an
+        // unapplied `TexturesDelta` drop, so every pass's deltas are discarded explicitly.
+        ctx.run_ui(input.clone(), |ui| {
             handled_when_empty = tool.on_escape(ui.ctx());
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(!handled_when_empty, "Escape must stay available when nothing is selected");
 
         tool.selection = Some(selection(10.0, 10.0, 40.0, 40.0));
         let mut handled = false;
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             handled = tool.on_escape(ui.ctx());
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(handled, "Escape must be consumed when it clears a selection");
         assert!(tool.selection.is_none());
     }
@@ -1911,9 +1915,12 @@ mod tests {
         assert!(tool.busy(), "the fixture is a tool with a job in flight");
 
         let mut handled = false;
-        let _ = ctx.run_ui(input, |ui| {
+        // Headless pass: the unapplied font-atlas upload must be discarded explicitly (egui 0.36
+        // panics when a `TexturesDelta` is dropped with pending deltas).
+        ctx.run_ui(input, |ui| {
             handled = tool.on_escape(ui.ctx());
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(handled, "Escape is consumed when it has something to cancel");
         assert!(tool.selection.is_none());
         assert!(!tool.busy(), "a job the user dismissed must not still be in flight");

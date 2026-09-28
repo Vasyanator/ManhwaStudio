@@ -80,7 +80,7 @@ class RustdocCrate:
         self.paths: dict[int, Any] = {int(k): v for k, v in data["paths"].items()}
         self.root: int = int(data["root"])
         # Source-file prefix to strip, so citations read
-        # `egui-0.35.0/src/containers/panel.rs:238`.
+        # `egui-0.36.2/src/containers/panel.rs:238`.
         self._src_prefix = re.compile(r"^.*/(?=[a-z_0-9]+-\d[^/]*/)")
         # rustdoc's `paths` records where an item is *defined*
         # (`egui::containers::panel::Panel`), but callers write the *re-exported*
@@ -571,7 +571,7 @@ def render_crate(crate: RustdocCrate, entries: list[IndexEntry]) -> str:
         "Items are listed under the path callers actually write (the public re-export, "
         "e.g. `egui::Panel`, `egui::Color32`), not where they happen to be defined. "
         "Citations point into the crate that owns the item, so a type `egui` re-exports "
-        "from `epaint` cites `epaint-0.35.0/src/…`."
+        "from `epaint` cites `epaint-0.36.2/src/…`."
     )
     push("")
 
@@ -894,8 +894,8 @@ depend on.** Grep before you write.
 
 ```bash
 grep -n 'SidePanel'      egui-docs/api/symbols.txt   # no hits -> it does not exist
-grep -n 'Panel::top'     egui-docs/api/symbols.txt   # -> egui::Panel::top  method  egui-0.35.0/src/containers/panel.rs:238
-grep -rn 'fn rect_stroke' egui-docs/api/epaint.md    # -> exact 0.35 signature
+grep -n 'Panel::top'     egui-docs/api/symbols.txt   # -> egui::Panel::top  method  egui-0.36.2/src/containers/panel.rs:265
+grep -rn 'fn rect_stroke' egui-docs/api/epaint.md    # -> exact 0.36 signature
 ```
 
 ## Contents

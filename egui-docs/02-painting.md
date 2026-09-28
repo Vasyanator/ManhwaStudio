@@ -1,18 +1,18 @@
 # 02 — Painting: Painter, Shape, Mesh, textures
 
-Target version: **egui / epaint / emath / ecolor 0.35.0** (`Cargo.toml:63`, `Cargo.lock` `egui 0.35.0`).
+Target version: **egui / epaint / emath / ecolor 0.36.2** (`Cargo.toml:46`, `Cargo.lock` `egui 0.36.2`).
 Every API claim below is cited to the vendored crate source under
-`~/.cargo/registry/src/index.crates.io-*/`. Do not write egui code from memory: 0.32–0.35
+`~/.cargo/registry/src/index.crates.io-*/`. Do not write egui code from memory: 0.32–0.36
 renamed or removed several things older models still emit (`Rounding`, `ColorImage::new(size, color)`,
 `Painter::rect_stroke` without `StrokeKind`).
 
 ## Painter: how to get one
 
 ```rust
-let painter = ui.painter();                 // egui-0.35.0/src/ui.rs:457   -> &Painter (clipped to the ui)
-let painter = ui.painter_at(rect);          // egui-0.35.0/src/ui.rs:619   -> Painter clipped to `rect`
-let painter = painter.with_clip_rect(rect); // egui-0.35.0/src/painter.rs:71 -> new Painter, clip = rect
-painter.set_clip_rect(rect);                // egui-0.35.0/src/painter.rs:183 (&mut self)
+let painter = ui.painter();                 // egui-0.36.2/src/ui.rs:458   -> &Painter (clipped to the ui)
+let painter = ui.painter_at(rect);          // egui-0.36.2/src/ui.rs:620   -> Painter clipped to `rect`
+let painter = painter.with_clip_rect(rect); // egui-0.36.2/src/painter.rs:71 -> new Painter, clip = rect
+painter.set_clip_rect(rect);                // egui-0.36.2/src/painter.rs:183 (&mut self)
 ```
 
 `with_clip_rect` returns a *new* `Painter`; it does not mutate. Repo examples:
@@ -20,75 +20,75 @@ painter.set_clip_rect(rect);                // egui-0.35.0/src/painter.rs:183 (&
 
 All painter coordinates are **screen-space logical points**, not widget-local.
 
-## Painter primitives — exact 0.35 signatures
+## Painter primitives — exact 0.36 signatures
 
 ```rust
-// egui-0.35.0/src/painter.rs:213
+// egui-0.36.2/src/painter.rs:213
 pub fn add(&self, shape: impl Into<Shape>) -> ShapeIdx;
-// egui-0.35.0/src/painter.rs:226
+// egui-0.36.2/src/painter.rs:226
 pub fn extend<I: IntoIterator<Item = Shape>>(&self, shapes: I);
 
-// egui-0.35.0/src/painter.rs:397  — NOTE: CornerRadius, not `Rounding`
+// egui-0.36.2/src/painter.rs:397  — NOTE: CornerRadius, not `Rounding`
 pub fn rect_filled(&self, rect: Rect, corner_radius: impl Into<CornerRadius>,
                    fill_color: impl Into<Color32>) -> ShapeIdx;
-// egui-0.35.0/src/painter.rs:406  — NOTE: extra `StrokeKind` argument
+// egui-0.36.2/src/painter.rs:406  — NOTE: extra `StrokeKind` argument
 pub fn rect_stroke(&self, rect: Rect, corner_radius: impl Into<CornerRadius>,
                    stroke: impl Into<Stroke>, stroke_kind: StrokeKind) -> ShapeIdx;
-// egui-0.35.0/src/painter.rs:380  — fill + stroke in one shape
+// egui-0.36.2/src/painter.rs:380  — fill + stroke in one shape
 pub fn rect(&self, rect: Rect, corner_radius: impl Into<CornerRadius>,
             fill_color: impl Into<Color32>, stroke: impl Into<Stroke>,
             stroke_kind: StrokeKind) -> ShapeIdx;
 
-// egui-0.35.0/src/painter.rs:318
+// egui-0.36.2/src/painter.rs:318
 pub fn line_segment(&self, points: [Pos2; 2], stroke: impl Into<Stroke>) -> ShapeIdx;
-// egui-0.35.0/src/painter.rs:327  — polyline; takes PathStroke, not Stroke
+// egui-0.36.2/src/painter.rs:327  — polyline; takes PathStroke, not Stroke
 pub fn line(&self, points: Vec<Pos2>, stroke: impl Into<PathStroke>) -> ShapeIdx;
-// egui-0.35.0/src/painter.rs:332 / :337
+// egui-0.36.2/src/painter.rs:332 / :337
 pub fn hline(&self, x: impl Into<Rangef>, y: f32, stroke: impl Into<Stroke>) -> ShapeIdx;
 pub fn vline(&self, x: f32, y: impl Into<Rangef>, stroke: impl Into<Stroke>) -> ShapeIdx;
 
-// egui-0.35.0/src/painter.rs:356 / :370 / :341
+// egui-0.36.2/src/painter.rs:356 / :370 / :341
 pub fn circle_filled(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>) -> ShapeIdx;
 pub fn circle_stroke(&self, center: Pos2, radius: f32, stroke: impl Into<Stroke>) -> ShapeIdx;
 pub fn circle(&self, center: Pos2, radius: f32, fill_color: impl Into<Color32>,
               stroke: impl Into<Stroke>) -> ShapeIdx;
 
-// egui-0.35.0/src/painter.rs:417  — returns ()
+// egui-0.36.2/src/painter.rs:417  — returns ()
 pub fn arrow(&self, origin: Pos2, vec: Vec2, stroke: impl Into<Stroke>);
 
-// egui-0.35.0/src/painter.rs:447  — raw textured quad
+// egui-0.36.2/src/painter.rs:447  — raw textured quad
 pub fn image(&self, texture_id: epaint::TextureId, rect: Rect, uv: Rect, tint: Color32) -> ShapeIdx;
 
-// egui-0.35.0/src/painter.rs:469  — lays out + paints, returns the Rect it occupied
+// egui-0.36.2/src/painter.rs:469  — lays out + paints, returns the Rect it occupied
 pub fn text(&self, pos: Pos2, anchor: Align2, text: impl ToString,
             font_id: FontId, text_color: Color32) -> Rect;
-// egui-0.35.0/src/painter.rs:529 / :541
+// egui-0.36.2/src/painter.rs:529 / :541
 pub fn galley(&self, pos: Pos2, galley: Arc<Galley>, fallback_color: Color32);
 pub fn galley_with_override_text_color(&self, pos: Pos2, galley: Arc<Galley>, text_color: Color32);
 // Build the galley first: painter.layout(..) / layout_no_wrap(..) / layout_job(..)
-// egui-0.35.0/src/painter.rs:488 / :503 / :517 -> Arc<Galley>
+// egui-0.36.2/src/painter.rs:488 / :503 / :517 -> Arc<Galley>
 ```
 
 `galley()` only substitutes the fallback color into parts painted with `Color32::PLACEHOLDER`
-(`egui-0.35.0/src/painter.rs:521-528`); any explicitly-colored run keeps its color. Use
+(`egui-0.36.2/src/painter.rs:521-528`); any explicitly-colored run keeps its color. Use
 `galley_with_override_text_color` to force one color.
 
 ### CornerRadius (was `Rounding`)
 
-`epaint-0.35.0/src/corner_radius.rs:13` — struct with `u8` fields `nw, ne, sw, se`;
+`epaint-0.36.2/src/corner_radius.rs:13` — struct with `u8` fields `nw, ne, sw, se`;
 `From<u8>` (:34) and `From<f32>` (:41); `CornerRadius::ZERO` (:50), `CornerRadius::same(radius: u8)` (:59).
 Repo usage: `src/launcher/pages/settings_page.rs:520`.
 
 ### StrokeKind (new required arg)
 
-`epaint-0.35.0/src/stroke.rs:101` — `Inside` / `Middle` / `Outside`: whether the stroke is painted
+`epaint-0.36.2/src/stroke.rs:102` — `Inside` / `Middle` / `Outside`: whether the stroke is painted
 inside the rect, centered on its edge, or outside it. Repo usage:
 `src/launcher/new_project/window.rs:2610` (`Inside`), `src/launcher/pages/settings_page.rs:530` (`Middle`).
-`Stroke::new(width, color)` — `epaint-0.35.0/src/stroke.rs:25`. `PathStroke::new` — same file, :139.
+`Stroke::new(width, color)` — `epaint-0.36.2/src/stroke.rs:26`. `PathStroke::new` — same file, :140.
 
 ## Shape
 
-`epaint-0.35.0/src/shapes/shape.rs:27` — variants:
+`epaint-0.36.2/src/shapes/shape.rs:27` — variants:
 `Noop`, `Vec(Vec<Shape>)` (:33), `Circle(CircleShape)` (:36), `Ellipse` (:39),
 `LineSegment { points: [Pos2; 2], stroke: Stroke }` (:42), `Path(PathShape)` (:46),
 `Rect(RectShape)` (:49), `Text(TextShape)` (:54), **`Mesh(Arc<Mesh>)`** (:61),
@@ -116,18 +116,18 @@ Shape::rect_filled / rect_stroke                                 // :281 / :291 
 
 ## Mesh and Vertex — custom textured geometry
 
-**`Mesh::new` does not exist** (`epaint-0.35.0/src/mesh.rs` has no `fn new`). Construct with
-`Mesh::default()` or `Mesh::with_texture(id)` (`epaint-0.35.0/src/mesh.rs:77`).
+**`Mesh::new` does not exist** (`epaint-0.36.2/src/mesh.rs` has no `fn new`). Construct with
+`Mesh::default()` or `Mesh::with_texture(id)` (`epaint-0.36.2/src/mesh.rs:77`).
 
 ```rust
-// epaint-0.35.0/src/mesh.rs:12 (default build; a `unity` feature reorders the fields, :43)
+// epaint-0.36.2/src/mesh.rs:12 (default build; a `unity` feature reorders the fields, :43)
 pub struct Vertex {
     pub pos: Pos2,      // logical points, screen space, (0,0) = top-left of the screen
     pub uv: Pos2,       // normalized [0,1]^2 texture coords, (0,0) = top-left texel
     pub color: Color32, // sRGBA, PREMULTIPLIED alpha
 }
 
-// epaint-0.35.0/src/mesh.rs:60
+// epaint-0.36.2/src/mesh.rs:60
 pub struct Mesh {
     pub indices: Vec<u32>,   // length must be a multiple of 3; triangle list
     pub vertices: Vec<Vertex>,
@@ -157,17 +157,17 @@ Repo does exactly this for the deformable typing-text overlay and for rotated ra
 
 ## Colors — premultiplied alpha is the contract
 
-`Color32` is **sRGBA u8 with premultiplied alpha** (`ecolor-0.35.0/src/color32.rs:8`, struct at :31).
+`Color32` is **sRGBA u8 with premultiplied alpha** (`ecolor-0.36.2/src/color32.rs:8`, struct at :31).
 
 ```rust
 Color32::from_rgb(r, g, b)                       // color32.rs:108  (const, a = 255)
 Color32::from_rgba_premultiplied(r, g, b, a)     // color32.rs:122  (const) — raw bytes, no math
-Color32::from_rgba_unmultiplied(r, g, b, a)      // color32.rs:133  — multiplies for you (LUT)
-Color32::from_rgba_unmultiplied_const(r,g,b,a)   // color32.rs:164  — const-usable, slower
-Color32::from_white_alpha(a) == [a,a,a,a]        // color32.rs:196  — premultiplied white tint
-color.to_array() -> [u8; 4]                      // color32.rs:256  — PREMULTIPLIED bytes
-color.to_srgba_unmultiplied() -> [u8; 4]         // color32.rs:273  — un-premultiplied (lossy round-trip)
-color.gamma_multiply(f32)                        // color32.rs:294
+Color32::from_rgba_unmultiplied(r, g, b, a)      // color32.rs:133  — multiplies for you (forwards to `_const`)
+Color32::from_rgba_unmultiplied_const(r,g,b,a)   // color32.rs:139  — same result, const-usable
+Color32::from_white_alpha(a) == [a,a,a,a]        // color32.rs:171  — premultiplied white tint
+color.to_array() -> [u8; 4]                      // color32.rs:231  — PREMULTIPLIED bytes
+color.to_srgba_unmultiplied() -> [u8; 4]         // color32.rs:248  — un-premultiplied (lossy round-trip)
+color.gamma_multiply(f32)                        // color32.rs:269
 Color32::PLACEHOLDER                             // color32.rs:104  — "fill in the fallback color here"
 ```
 
@@ -178,10 +178,10 @@ Where premultiplication bites:
 - Any RGBA coming from the `image` crate is **un-premultiplied**, so it must go through
   `ColorImage::from_rgba_unmultiplied` (repo: `src/app.rs:1747`, `src/app.rs:3159`).
 
-`Rgba` (`ecolor-0.35.0/src/rgba.rs:10`) is linear-space `[f32; 4]`, also premultiplied;
-`From<Color32> for Rgba` / `From<Rgba> for Color32` at `ecolor-0.35.0/src/lib.rs:51` and `:74`.
-Scalar helpers: `linear_f32_from_gamma_u8` (`ecolor-0.35.0/src/lib.rs:97`),
-`gamma_u8_from_linear_f32` (:114), `hsv_from_rgb`/`rgb_from_hsv` (`ecolor-0.35.0/src/hsva.rs:191/:215`).
+`Rgba` (`ecolor-0.36.2/src/rgba.rs:10`) is linear-space `[f32; 4]`, also premultiplied;
+`From<Color32> for Rgba` / `From<Rgba> for Color32` at `ecolor-0.36.2/src/lib.rs:51` and `:74`.
+Scalar helpers: `linear_f32_from_gamma_u8` (`ecolor-0.36.2/src/lib.rs:97`),
+`gamma_u8_from_linear_f32` (:114), `hsv_from_rgb`/`rgb_from_hsv` (`ecolor-0.36.2/src/hsva.rs:191/:215`).
 
 ### Which colour to use — project rule
 
@@ -199,9 +199,9 @@ its own palette (`crates/ms-launcher/src/theme.rs`). Contract: `crates/ms-theme/
 Three different tools; picking the wrong one changes geometry or interactivity.
 
 ```rust
-Frame::multiply_with_opacity(t)  // egui-0.35.0/src/containers/frame.rs:313-318
-Ui::set_opacity(t) / Ui::multiply_opacity(t) / Ui::opacity()   // ui.rs:560 / :567 / :575
-Ui::set_invisible()              // ui.rs:537-540
+Frame::multiply_with_opacity(t)  // egui-0.36.2/src/containers/frame.rs:313-318
+Ui::set_opacity(t) / Ui::multiply_opacity(t) / Ui::opacity()   // ui.rs:561 / :568 / :576
+Ui::set_invisible()              // ui.rs:538-541
 ```
 
 - **`Frame::multiply_with_opacity(t)` scales `fill`, `stroke.color` and `shadow.color` — and
@@ -210,7 +210,7 @@ Ui::set_invisible()              // ui.rs:537-540
   with the rest; no separate `Shadow::NONE` is needed.
 - **`Ui::set_opacity(t)` is a property of the `Ui`'s `Painter`, not of its layout.** Everything
   painted after it — including child `Ui`s, which copy the painter — is multiplied by `t`
-  (`egui-0.35.0/src/painter.rs:201-221`); at `t == 0.0` `Painter::add` emits `Shape::Noop`, so a fully faded
+  (`egui-0.36.2/src/painter.rs:201-221`); at `t == 0.0` `Painter::add` emits `Shape::Noop`, so a fully faded
   element costs nothing. Nothing about allocation or the cursor changes, which makes
   `let saved = ui.opacity(); ui.set_opacity(saved * t); …; ui.set_opacity(saved);` the way to fade
   ONE widget of a row without moving anything. `Ui::scope` would also work visually but allocates a
@@ -220,13 +220,13 @@ Ui::set_invisible()              // ui.rs:537-540
 
 A `ScrollArea`'s bars are the exception that neither tool reaches: they are painted by the
 container itself, from the `ScrollStyle` of the `Ui` the area is shown in, one frame-level
-`ui.painter()` call each (`egui-0.35.0/src/containers/scroll_area.rs:1268`, `:1469-1519`). Fading
+`ui.painter()` call each (`egui-0.36.2/src/containers/scroll_area.rs:1270`, `:1469-1519`). Fading
 them means scaling the six floating-bar opacities — `dormant`/`active`/`interact` × handle/background
-(`style.rs:491-579`) — **before** creating the `ScrollArea`, and touching nothing that decides a
-size, or `ScrollStyle::allocated_width()` (`style.rs:652-658`) changes and the bar starts stealing
+(`style.rs:495-583`) — **before** creating the `ScrollArea`, and touching nothing that decides a
+size, or `ScrollStyle::allocated_width()` (`style.rs:656-662`) changes and the bar starts stealing
 room from the content. Note that egui hard-codes both opacities to `1.0` for a SOLID style
 (`scroll_area.rs:1483-1484`, `:1495-1496`), so this only works on a floating one — which is egui's
-default (`style.rs:639-650`). The area's edge-fade gradients need nothing: they are painted from
+default (`style.rs:643-654`). The area's edge-fade gradients need nothing: they are painted from
 `ui.stack().bg_color()` (`scroll_area.rs:1564-1575`), i.e. from the enclosing `Frame`'s fill, which
 `multiply_with_opacity` has already faded.
 
@@ -235,14 +235,14 @@ hides a dock panel's frame, grips and body scroll bars until the pointer is over
 its geometry and every gesture bit-identical to the opaque state.
 
 Crossfading between the two states is `Context::animate_bool_responsive(id, value)`
-(`context.rs:3099`): it requests the repaints the animation needs by itself (`:3145-3148`) and
+(`context.rs:3201`): it requests the repaints the animation needs by itself (`:3247-3250`) and
 returns the TARGET value on the first call for a given id
-(`egui-0.35.0/src/animation_manager.rs:38-46`), so nothing flashes on the frame it first appears.
+(`egui-0.36.2/src/animation_manager.rs:38-46`), so nothing flashes on the frame it first appears.
 
-## ColorImage in 0.35 — the shape changed
+## ColorImage in 0.36 — the shape changed
 
 ```rust
-// epaint-0.35.0/src/image.rs:48
+// epaint-0.36.2/src/image.rs:48
 pub struct ColorImage {
     pub size: [usize; 2],     // [width, height] in texels
     pub source_size: Vec2,    // original SVG size, else texel size  (NEW vs older egui)
@@ -251,7 +251,7 @@ pub struct ColorImage {
 ```
 
 - `ColorImage::new(size, pixels: Vec<Color32>)` — `image.rs:61`. **This is not the old API.** In 0.31 it
-  was `new(size: [usize; 2], color: Color32)` (`epaint-0.31.1/src/image.rs:59`). The 0.35 equivalent of
+  was `new(size: [usize; 2], color: Color32)` (`epaint-0.31.1/src/image.rs:59`). The 0.36 equivalent of
   the old call is `ColorImage::filled(size, color)` (`image.rs:75`, repo: `src/tabs/typing/tab/tests.rs:22`).
 - `from_rgba_unmultiplied(size, &[u8])` — `image.rs:113` (the normal path from `image::RgbaImage`).
 - `from_rgba_premultiplied` (:128), `from_rgb` (:193), `from_gray` (:146), `as_raw`/`as_raw_mut` (:177/:183),
@@ -266,12 +266,12 @@ side silently breaks export. Never "simplify" one away.
 ## Textures: handle lifecycle
 
 ```rust
-// egui-0.35.0/src/context.rs:2322
+// egui-0.36.2/src/context.rs:2390
 pub fn load_texture(&self, name: impl Into<String>, image: impl Into<ImageData>,
                     options: TextureOptions) -> TextureHandle;
 ```
 
-**Trap: `TextureHandle` frees the GPU texture on `Drop`** (`epaint-0.35.0/src/texture_handle.rs:25-29`
+**Trap: `TextureHandle` frees the GPU texture on `Drop`** (`epaint-0.36.2/src/texture_handle.rs:25-29`
 — `impl Drop { self.tex_mngr.write().free(self.id) }`). Store the handle in your app/tab state for as
 long as you paint with it; a handle created inside `fn ui(..)` and dropped at the end of the frame
 produces a blank/garbage texture. Cloning the handle is cheap and refcounts the texture
@@ -280,36 +280,36 @@ produces a blank/garbage texture. Cloning the handle is cheap and refcounts the 
 Other handle methods: `id() -> TextureId` (:64), `set` (:70), `set_partial` (:78), `size()` (:90),
 `byte_size` (:104).
 
-`TextureId` (`epaint-0.35.0/src/lib.rs:95`): `Managed(u64)` (allocated via `load_texture`; `Managed(0)`
+`TextureId` (`epaint-0.36.2/src/lib.rs:95`): `Managed(u64)` (allocated via `load_texture`; `Managed(0)`
 is the font atlas) or `User(u64)` (custom renderer texture).
 
-`TextureOptions` (`epaint-0.35.0/src/textures.rs:153`): fields `magnification`, `minification`,
-`wrap_mode`, `mipmap_mode`. Constants: `LINEAR` (:176), `NEAREST` (:184), `LINEAR_REPEAT` (:192),
-`NEAREST_REPEAT` (:208). Repo: `TextureOptions::LINEAR` for page tiles (`src/app.rs:1755`),
+`TextureOptions` (`epaint-0.36.2/src/textures.rs:160`): fields `magnification`, `minification`,
+`wrap_mode`, `mipmap_mode`. Constants: `LINEAR` (:183), `NEAREST` (:191), `LINEAR_REPEAT` (:199),
+`NEAREST_REPEAT` (:215). Repo: `TextureOptions::LINEAR` for page tiles (`src/app.rs:1755`),
 `NEAREST` for masks (`src/tabs/translation/tab.rs:254`, `src/tabs/cleaning/tab.rs:1591`).
 
 Displaying a texture:
 
 ```rust
-ui.image(source)                       // egui-0.35.0/src/ui.rs:2033 -> Response; = Image::new(source).ui(self)
-egui::Image::new(source)               // egui-0.35.0/src/widgets/image.rs:63
+ui.image(source)                       // egui-0.36.2/src/ui.rs:2034 -> Response; = Image::new(source).ui(self)
+egui::Image::new(source)               // egui-0.36.2/src/widgets/image.rs:64
 ```
-`ImageSource` (`egui-0.35.0/src/widgets/image.rs:570`): `Uri`, `Texture(SizedTexture)`, `Bytes { .. }`.
-`SizedTexture { id, size }` (`egui-0.35.0/src/load.rs:444`), `SizedTexture::from_handle(&TextureHandle)`
-(`load.rs:461`); any `Into<SizedTexture>` converts into `ImageSource` (`widgets/image.rs:789`), so
+`ImageSource` (`egui-0.36.2/src/widgets/image.rs:571`): `Uri`, `Texture(SizedTexture)`, `Bytes { .. }`.
+`SizedTexture { id, size }` (`egui-0.36.2/src/load.rs:456`), `SizedTexture::from_handle(&TextureHandle)`
+(`load.rs:473`); any `Into<SizedTexture>` converts into `ImageSource` (`widgets/image.rs:790`), so
 `ui.image(&texture_handle)` works. For manual placement inside a canvas, prefer
 `painter.image(id, rect, uv, tint)` — that is what the repo does.
 
 ## Getting a Rect to paint into
 
 ```rust
-// egui-0.35.0/src/ui.rs:1150
+// egui-0.36.2/src/ui.rs:1151
 pub fn allocate_exact_size(&mut self, desired_size: Vec2, sense: Sense) -> (Rect, Response);
-// egui-0.35.0/src/ui.rs:1256 — you already know the rect
+// egui-0.36.2/src/ui.rs:1257 — you already know the rect
 pub fn allocate_rect(&mut self, rect: Rect, sense: Sense) -> Response;   // Response::rect == rect
-// egui-0.35.0/src/ui.rs:1138
+// egui-0.36.2/src/ui.rs:1139
 pub fn allocate_response(&mut self, desired_size: Vec2, sense: Sense) -> Response;
-// egui-0.35.0/src/ui.rs:1187 — no interaction
+// egui-0.36.2/src/ui.rs:1188 — no interaction
 pub fn allocate_space(&mut self, desired_size: Vec2) -> (Id, Rect);
 ```
 Repo: `src/launcher/pages/settings_page.rs:511` (`allocate_exact_size`),
@@ -321,10 +321,10 @@ Repo: `src/launcher/pages/settings_page.rs:511` (`allocate_exact_size`),
 Everything in `Painter`/`Shape`/`Vertex`/`Rect` is in **logical points**. Physical pixels =
 points × `pixels_per_point`.
 
-- `Context::pixels_per_point()` — `egui-0.35.0/src/context.rs:2220`; `set_pixels_per_point` (:2228).
-- `InputState::pixels_per_point` field — `egui-0.35.0/src/input_state/mod.rs:265`.
-- `emath::Rect` (`emath-0.35.0/src/rect.rs:25`) — `from_min_max` (:73, const), `from_min_size` (:79),
-  `from_center_size` (:87). `Pos2` (`emath-0.35.0/src/pos2.rs:18`), `Vec2` (`emath-0.35.0/src/vec2.rs:16`).
+- `Context::pixels_per_point()` — `egui-0.36.2/src/context.rs:2288`; `set_pixels_per_point` (:2296).
+- `InputState::pixels_per_point` field — `egui-0.36.2/src/input_state/mod.rs:263`.
+- `emath::Rect` (`emath-0.36.2/src/rect.rs:25`) — `from_min_max` (:73, const), `from_min_size` (:79),
+  `from_center_size` (:87). `Pos2` (`emath-0.36.2/src/pos2.rs:18`), `Vec2` (`emath-0.36.2/src/vec2.rs:16`).
 - Y grows **downwards**; `Rect::min` is top-left.
 - Textures are sized in **texels**; the mapping texel→point is yours (the repo carries an explicit
   page-px ↔ scene-point transform, e.g. `scene_from_page_px` in `src/tabs/typing/tab/doc_layers.rs`).

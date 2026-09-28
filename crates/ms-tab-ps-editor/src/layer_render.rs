@@ -406,9 +406,14 @@ mod tests {
         let painted = ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_page_checkerboard(ui.painter(), &view(1.0), [100, 200]);
         });
+        let (empty_len, painted_len) = (empty.shapes.len(), painted.shapes.len());
+        // Headless: no renderer consumes the font-atlas upload, and egui 0.36 panics when a
+        // `TexturesDelta` is dropped unapplied — discard the deltas before any assert can unwind.
+        empty.drop_without_applying_deltas();
+        painted.drop_without_applying_deltas();
         assert_eq!(
-            painted.shapes.len(),
-            empty.shapes.len() + 1,
+            painted_len,
+            empty_len + 1,
             "a real page adds exactly one textured quad; a zero-sized page adds none"
         );
     }

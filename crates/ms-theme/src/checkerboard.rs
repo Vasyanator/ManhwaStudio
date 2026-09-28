@@ -189,7 +189,12 @@ mod tests {
         let painted = ctx.run_ui(egui::RawInput::default(), |ui| {
             paint(ui.painter(), Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 50.0)));
         });
-        assert_eq!(painted.shapes.len(), empty.shapes.len() + 1);
+        let (empty_len, painted_len) = (empty.shapes.len(), painted.shapes.len());
+        // Headless: no renderer consumes the font-atlas upload, and egui 0.36 panics when a
+        // `TexturesDelta` is dropped unapplied — discard the deltas before any assert can unwind.
+        empty.drop_without_applying_deltas();
+        painted.drop_without_applying_deltas();
+        assert_eq!(painted_len, empty_len + 1);
     }
 
     #[test]

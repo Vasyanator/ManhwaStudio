@@ -1,15 +1,16 @@
 # Vendored fork of puffin_egui 0.30.0 (upstream: EmbarkStudios/puffin), ported
-# to egui 0.35. Upstream has no egui-0.34/0.35 release, so ManhwaStudio keeps a
-# local copy to keep the in-app `profiling` feature (embedded flamegraph window)
-# working. Only egui-API-surface changes were made; the profiler logic is
-# upstream-identical. Re-sync when upstream ships an egui-0.35 release.
+# to egui 0.36. Upstream had no egui-0.34/0.35 release when this was vendored, so
+# ManhwaStudio keeps a local copy to keep the in-app `profiling` feature (embedded
+# flamegraph window) working. Only egui-API-surface changes were made; the profiler
+# logic is upstream-identical. Re-sync when upstream ships a release for the egui
+# version the workspace builds against.
 [package]
 name = "puffin_egui"
 version = "0.30.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.95.0"
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]
-description = "Show puffin profiler flamegraph in-game using egui (vendored, egui 0.35)"
+description = "Show puffin profiler flamegraph in-game using egui (vendored, egui 0.36)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/EmbarkStudios/puffin"
 publish = false
@@ -19,8 +20,8 @@ name = "puffin_egui"
 path = "src/lib.rs"
 
 [dependencies]
-egui = { version = "0.35", default-features = false }
-egui_extras = { version = "0.35", default-features = false, features = ["serde"] }
+egui = { version = "0.36.2", default-features = false }
+egui_extras = { version = "0.36.2", default-features = false, features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
 log = "0.4"
 log-once = "0.4"

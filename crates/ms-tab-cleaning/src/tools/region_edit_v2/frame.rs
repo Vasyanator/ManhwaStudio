@@ -1715,15 +1715,17 @@ mod tests {
             vec![egui::Event::PointerMoved(grab + vec2(40.0, 40.0))],
         ] {
             let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
-            // `Context::run_ui` hands back a `FullOutput` this test has no renderer for; the
-            // state it asserts on lives in `frame` instead.
-            let _output = ctx.run_ui(input, |ui| {
+            // No renderer applies this headless pass's texture uploads (egui 0.36 panics when a
+            // `TexturesDelta` is dropped unapplied), so its deltas are discarded; the state the
+            // test asserts on lives in `frame` instead.
+            ctx.run_ui(input, |ui| {
                 // Same order as the real pass: the occluding hover sensor first, so the
                 // handles allocated after it keep the pointer. Its `Response` exists to
                 // OCCLUDE and is discarded exactly as the real pass discards it.
                 let _ = ui.allocate_rect(hitbox, Sense::hover());
                 frame.sense_handles(ui, body);
-            });
+            })
+            .drop_without_applying_deltas();
         }
         frame.drag.map(|drag| drag.kind)
     }
@@ -1869,7 +1871,9 @@ mod tests {
         let slot_w = split_row(row, keys.len())[0].width();
 
         let ctx = egui::Context::default();
-        let _output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        // Headless pass: the font-atlas upload has no renderer to apply it, and egui 0.36 panics
+        // when a `TexturesDelta` is dropped unapplied, so the deltas are discarded explicitly.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let font_id = egui::TextStyle::Button.resolve(ui.style());
             // A `Button` lays its caption out inside the slot minus its horizontal padding on
             // both sides; anything wider is what `truncate()` elides.
@@ -1889,7 +1893,8 @@ mod tests {
                     );
                 }
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// The chrome must not inherit the frame's SCREEN width. The canvas zooms down to 0.2, so
@@ -2090,15 +2095,22 @@ mod tests {
         let mut frame = placed_frame(body);
         let hitbox = hitbox_rect(body, &chrome());
         let screen_rect = hitbox.expand(200.0);
-        for events in [vec![egui::Event::PointerMoved(pointer)], events] {
-            let input = egui::RawInput { screen_rect: Some(screen_rect), modifiers, events, ..Default::default() };
-            // `run_ui` hands back a `FullOutput` this test has no renderer for; what it asserts
-            // on is the brush radius inside `frame`.
-            let _output = ctx.run_ui(input, |ui| {
+        for pass_events in [vec![egui::Event::PointerMoved(pointer)], events] {
+            // egui 0.36 dropped `RawInput::modifiers`: held modifiers are now input-state that
+            // only an `Event::ModifiersChanged` updates, so it leads every pass's events.
+            let mut events = Vec::with_capacity(pass_events.len() + 1);
+            events.push(egui::Event::ModifiersChanged(modifiers));
+            events.extend(pass_events);
+            let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
+            // No renderer applies this headless pass's texture uploads (egui 0.36 panics when a
+            // `TexturesDelta` is dropped unapplied), so its deltas are discarded; what the test
+            // asserts on is the brush radius inside `frame`.
+            ctx.run_ui(input, |ui| {
                 // The same two lines the real pass runs, in the same order.
                 let over_frame = ui.allocate_rect(hitbox, Sense::hover()).contains_pointer();
                 frame.handle_brush_gestures(ui, over_frame);
-            });
+            })
+            .drop_without_applying_deltas();
         }
         frame.brush.radius_px()
     }

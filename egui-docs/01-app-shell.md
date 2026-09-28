@@ -1,9 +1,9 @@
-# 01 — App shell: how an eframe app is wired in egui/eframe 0.35
+# 01 — App shell: how an eframe app is wired in egui/eframe 0.36
 
 Ground truth: the vendored crates at
-`~/.cargo/registry/src/index.crates.io-*/`{`egui`,`eframe`,`epaint`,`emath`,`ecolor`}`-0.35.0/src/`.
-Every API claim below is cited as `egui-0.35.0/src/<file>:<line>` / `eframe-0.35.0/src/<file>:<line>`.
-Do not write egui code from memory: 0.35 differs from 0.27–0.31 in the trait shape, the
+`~/.cargo/registry/src/index.crates.io-*/`{`egui`,`eframe`,`epaint`,`emath`,`ecolor`}`-0.36.2/src/`.
+Every API claim below is cited as `egui-0.36.2/src/<file>:<line>` / `eframe-0.36.2/src/<file>:<line>`.
+Do not write egui code from memory: 0.36 differs from 0.27–0.31 in the trait shape, the
 panel types, and the style API.
 
 ## 1. The `eframe::App` trait
@@ -12,42 +12,45 @@ The entry point is **`fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame)`**,
 `fn update(&mut self, ctx: &Context, frame: &mut Frame)`. There is no `update` method at all.
 
 ```rust
-// eframe-0.35.0/src/epi.rs:152-230 (trait body, comments trimmed)
+// eframe-0.36.2/src/epi.rs:152-236 (trait body, comments trimmed)
 pub trait App {
     /// Called once before each call to `Self::ui`. May NOT show any ui or paint.
-    fn logic(&mut self, ctx: &egui::Context, frame: &mut Frame) { _ = (ctx, frame); }   // epi.rs:161
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut Frame) { _ = (ctx, frame); }   // epi.rs:167
 
     /// Called each time the UI needs repainting. The `Ui` has no margin or background.
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);                              // epi.rs:176
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);                              // epi.rs:182
 
     /// Only with the "persistence" feature.
-    fn save(&mut self, _storage: &mut dyn Storage) {}                                    // epi.rs:206
+    fn save(&mut self, _storage: &mut dyn Storage) {}                                    // epi.rs:212
 
     #[cfg(feature = "glow")]
-    fn on_exit(&mut self, _gl: Option<&glow::Context>) {}                                // epi.rs:216
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {}                                // epi.rs:222
     #[cfg(not(feature = "glow"))]
-    fn on_exit(&mut self) {}                                                             // epi.rs:222
+    fn on_exit(&mut self) {}                                                             // epi.rs:228
 
-    fn auto_save_interval(&self) -> std::time::Duration { … }                            // epi.rs:228
+    fn auto_save_interval(&self) -> std::time::Duration { … }                            // epi.rs:234
 }
 ```
 
 * `ui()` is called for the **root viewport only** (`ViewportId::ROOT`); extra native windows come
-  from `Context::show_viewport_*` (eframe-0.35.0/src/epi.rs:173-175).
+  from `Context::show_viewport_*` (eframe-0.36.2/src/epi.rs:179-181).
 * `logic()` runs before every `ui()` **and also when the window is hidden** but a repaint was
   requested — put polling of background channels there only if it must run while hidden; painting
-  is forbidden in it (eframe-0.35.0/src/epi.rs:153-156).
+  is forbidden in it (eframe-0.36.2/src/epi.rs:153-156). While hidden, eframe runs **no egui pass**
+  and calls `logic` through `Context::run_logic` (egui-0.36.2/src/context.rs:913): only the window
+  state is refreshed, `ctx.input(..)` (events, time) is still the last shown frame's
+  (eframe-0.36.2/src/epi.rs:158-162).
 * **`on_exit` has a cfg split**: with the `glow` feature it takes `Option<&glow::Context>`, without
-  it takes nothing (epi.rs:215-222). This project pins the **glow** renderer
-  (`Cargo.toml:62`: `eframe = { version = "0.35", default-features = false, features = ["glow", …] }`;
-  0.35's eframe default is wgpu, see the comment at `Cargo.toml:59`), so the `Option<&glow::Context>`
+  it takes nothing (epi.rs:221-228). This project pins the **glow** renderer
+  (`Cargo.toml:45`: `eframe = { version = "0.36.2", default-features = false, features = ["glow", …] }`;
+  eframe's default renderer has been wgpu since 0.35, see the comment at `Cargo.toml:41`), so the `Option<&glow::Context>`
   signature is the one that compiles here.
 
 ## 2. `&mut Ui` in, `&Context` needed: the clone idiom
 
 `ui()` hands you a `&mut Ui`. Almost every context-level call (`request_repaint`, viewports,
 `Window`, `Area`, style, input) needs a `&Context`. `Ui::ctx()` returns `&Context` borrowed **from
-the `Ui`** (egui-0.35.0/src/ui.rs:451), so holding it forbids the mutable borrows the panels need.
+the `Ui`** (egui-0.36.2/src/ui.rs:452), so holding it forbids the mutable borrows the panels need.
 `Context` is an `Arc` handle, so cloning it is cheap and detaches the borrow. The project's idiom:
 
 ```rust
@@ -68,25 +71,30 @@ Rule of thumb: clone once at the top of `ui()`, pass `&Context` down for context
 
 ## 3. Panels
 
-0.35 has **one** `Panel` type with side constructors, not `TopBottomPanel`/`SidePanel`:
+egui 0.36 has **one** `Panel` type with side constructors, not `TopBottomPanel`/`SidePanel`:
 
-* `Panel::left(id)` egui-0.35.0/src/containers/panel.rs:222, `Panel::right` :229,
-  `Panel::top` :238, `Panel::bottom` :247. Top/bottom are **not resizable by default** (panel.rs:237, :245).
-* Builders: `.resizable(bool)` :294, `.show_separator_line(bool)` :303, `.default_size(f32)` :310,
-  `.min_size` :321, `.max_size` :328, `.size_range` :335, `.exact_size(f32)` :346, `.frame(Frame)` :354.
-  All sizes are **outer** sizes, margins included (panel.rs:187-193).
+* `Panel::left(id)` egui-0.36.2/src/containers/panel.rs:249, `Panel::right` :256,
+  `Panel::top` :265, `Panel::bottom` :274. Top/bottom are **not resizable by default** (panel.rs:264, :272).
+* Builders: `.resizable(bool)` :322, `.show_separator_line(bool)` :362, `.default_size(f32)` :369,
+  `.min_size` :380, `.max_size` :387, `.size_range` :394, `.exact_size(f32)` :405, `.frame(Frame)` :413.
+  All sizes are **outer** sizes, margins included (panel.rs:214-220).
   There is no `default_width`/`exact_width` on `Panel`; size means width for left/right and height
   for top/bottom.
 * `show` takes a **`&mut Ui`**, not a `&Context`:
   `pub fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>`
-  (panel.rs:363). `show_inside` is deprecated → renamed to `show` (panel.rs:369).
-* Animated variants: `show_collapsible(ui, &mut is_expanded, add_contents)` (panel.rs:389) and
-  `show_switched(...)` (panel.rs:500) — the latter animates between a collapsed and an expanded panel;
-  give them **distinct ids** (panel.rs:451).
-* `CentralPanel::default()` / `::no_frame()` (panel.rs:1045) / `::default_margins()` (panel.rs:1052);
-  `show(ui, …)` at panel.rs:1064.
+  (panel.rs:422). `show_inside` is deprecated → renamed to `show` (panel.rs:428).
+* Animated variants: `show_collapsible(ui, &mut is_expanded, add_contents)` (panel.rs:451) and
+  `show_switched(...)` (panel.rs:563) — the latter animates between a collapsed and an expanded panel;
+  give them **distinct ids** (panel.rs:514). Since 0.36 a fully collapsed *resizable* panel keeps an
+  invisible grab handle at its fixed edge that drags or double-clicks it back open; opt out with
+  `.drag_to_open(false)` (panel.rs:340, :462-464).
+* Since 0.36 `show_separator_line(true)` (the default, panel.rs:298) adds the separator's stroke width to the
+  frame's **outer margin** on the resizable edge, so the line sits outside the frame outline
+  (panel.rs:947-963).
+* `CentralPanel::default()` / `::no_frame()` (panel.rs:1193) / `::default_margins()` (panel.rs:1200);
+  `show(ui, …)` at panel.rs:1212.
 * **Order matters**: first panel added is outermost; `CentralPanel` must be added **last**
-  (panel.rs:156-159, :1021). Windows and `Area`s always cover the central panel (panel.rs:1023).
+  (panel.rs:182-185, :1169). Windows and `Area`s always cover the central panel (panel.rs:1171).
 
 Real skeleton from this repo:
 
@@ -185,19 +193,19 @@ precedent** — new panels have no exemption.
 ## 4. Startup: `run_native` / `NativeOptions` / `ViewportBuilder` / `CreationContext`
 
 ```rust
-// eframe-0.35.0/src/lib.rs:288-294
+// eframe-0.36.2/src/lib.rs:288-294
 pub fn run_native(
     app_name: &str,
     native_options: NativeOptions,
     app_creator: AppCreator<'_>,
 ) -> Result
-// eframe-0.35.0/src/epi.rs:49-50
+// eframe-0.36.2/src/epi.rs:49-50
 pub type AppCreator<'app> =
     Box<dyn 'app + FnOnce(&CreationContext<'_>) -> Result<Box<dyn 'app + App>, DynError>>;
 ```
 
-`CreationContext` (eframe-0.35.0/src/epi.rs:53) exposes `egui_ctx: egui::Context` — the place to set
-fonts/theme **before the first frame**. `NativeOptions` is at epi.rs:290; its `viewport:
+`CreationContext` (eframe-0.36.2/src/epi.rs:53) exposes `egui_ctx: egui::Context` — the place to set
+fonts/theme **before the first frame**. `NativeOptions` is at epi.rs:296; its `viewport:
 ViewportBuilder` field carries window metadata. The project's studio startup:
 
 ```rust
@@ -228,12 +236,12 @@ update check (src/main.rs:1178), launcher (src/main.rs:1676).
 ## 5. Multi-viewport (extra native windows)
 
 Pattern used for all secondary windows: a stable `ViewportId`, a `ViewportBuilder`, and
-`Context::show_viewport_immediate` (egui-0.35.0/src/context.rs:4014). The child ui callback receives
+`Context::show_viewport_immediate` (egui-0.36.2/src/context.rs:4116). The child ui callback receives
 **`(&mut Ui, ViewportClass)`** — again a `Ui`, not a `Context`.
 
 ```rust
 // src/launcher/app.rs:620-646 (new-project window)
-let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT); // egui-0.35.0/src/viewport.rs:153
+let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT); // egui-0.36.2/src/viewport.rs:152
 let builder = crate::launcher::apply_launcher_window_metadata(
     egui::ViewportBuilder::default()
         .with_title(t!("launcher.new_project.window_title"))
@@ -248,21 +256,21 @@ ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
 ```
 
 Close it with `ctx.send_viewport_cmd(egui::ViewportCommand::Close)`
-(egui-0.35.0/src/context.rs:3914, `ViewportCommand::Close` at egui-0.35.0/src/viewport.rs:1085) —
+(egui-0.36.2/src/context.rs:4016, `ViewportCommand::Close` at egui-0.36.2/src/viewport.rs:1084) —
 see src/launcher/app.rs:662, :721.
 
 Gotchas, all verified in the source docs:
 
 * **Immediate vs deferred.** `show_viewport_immediate` renders the child inline: parent and child
   repaint together, so it is roughly double work per extra viewport; `show_viewport_deferred`
-  (context.rs:3960) avoids that but needs `Send + Sync` state. Immediate must be called **every pass**
-  the window should exist, and **only from the main thread** (context.rs:3988-4005).
+  (context.rs:4062) avoids that but needs `Send + Sync` state. Immediate must be called **every pass**
+  the window should exist, and **only from the main thread** (context.rs:4090-4107).
 * **Embedding fallback.** If `Context::embed_viewports` is true (backend without multi-window
   support, e.g. wasm), the callback is run inside an embedded `Window` and `class ==
-  ViewportClass::EmbeddedWindow` (context.rs:4008-4011, egui-0.35.0/src/viewport.rs:83). Child code
+  ViewportClass::EmbeddedWindow` (context.rs:4110-4113, egui-0.36.2/src/viewport.rs:82). Child code
   must therefore not assume it owns an OS window — that is why the repo passes `class` down.
 * **Per-viewport style/visuals.** Each viewport has its own `Ui` tree but shares the `Context` style;
-  restyle the child from inside its callback (`ui.set_style`, egui-0.35.0/src/ui.rs:386) rather than
+  restyle the child from inside its callback (`ui.set_style`, egui-0.36.2/src/ui.rs:387) rather than
   mutating the global style, or the parent window changes too.
 * **Platform quirk in this repo:** Windows misplaces a window created with `with_maximized(true)`, so
   maximisation is deferred to the first child frame via
@@ -285,9 +293,9 @@ egui repaints on demand. Nothing in `ui()` re-runs by itself.
 * `ctx.request_repaint()` — "if called at least once in a frame, then there will be another frame
   right after this… If called from **outside the UI thread**, the UI thread will wake up and run,
   provided the egui integration has set that up (this works on `eframe`)"
-  (egui-0.35.0/src/context.rs:1740-1753).
-* `ctx.request_repaint_after(Duration)` (context.rs:1804), `request_repaint_after_secs(f32)`
-  (context.rs:1812) — wake after a timeout, i.e. poll.
+  (egui-0.36.2/src/context.rs:1808-1821).
+* `ctx.request_repaint_after(Duration)` (context.rs:1872), `request_repaint_after_secs(f32)`
+  (context.rs:1880) — wake after a timeout, i.e. poll.
 
 **You MUST call one of these** whenever state changes outside the frame that produced it: a worker
 thread finishing, a channel receiving, an animation you drive yourself. Cheap and idempotent per
@@ -297,14 +305,14 @@ viewport command (src/launcher/app.rs:643).
 
 ## 7. Theme and style
 
-* `ctx.set_theme(egui::Theme::Dark)` — takes `impl Into<ThemePreference>` (egui-0.35.0/src/context.rs:2102);
+* `ctx.set_theme(egui::Theme::Dark)` — takes `impl Into<ThemePreference>` (egui-0.36.2/src/context.rs:2170);
   studio windows do not call it directly: they call `ms_theme::apply(&cc.egui_ctx)`
   (`crates/ms-theme/src/lib.rs`), which sets `Theme::Dark` and then overrides
   `error_fg_color`/`warn_fg_color` on the dark style through `style_mut_of`.
-* **There is no `Context::set_style` in 0.35.** The context-level API is
-  `global_style()` / `global_style_mut()` (context.rs:2107, :2121), `all_styles_mut()` (:2145),
-  `style_mut_of(theme, …)` / `set_style_of(theme, …)` (:2169, :2182), `set_visuals` / `set_visuals_of`
-  (:2212, :2199). `set_style` exists only on `Ui` (egui-0.35.0/src/ui.rs:386) and applies to that
+* **There is no `Context::set_style` in 0.36.** The context-level API is
+  `global_style()` / `global_style_mut()` (context.rs:2175, :2189), `all_styles_mut()` (:2213),
+  `style_mut_of(theme, …)` / `set_style_of(theme, …)` (:2237, :2250), `set_visuals` / `set_visuals_of`
+  (:2280, :2267). `set_style` exists only on `Ui` (egui-0.36.2/src/ui.rs:387) and applies to that
   subtree.
 * The launcher's palette lives in `crates/ms-launcher/src/theme.rs`: `configure_context(ctx)` clones
   `ctx.global_style()`, edits `Style`/`Visuals` (spacing, `Visuals::dark()`, widget fills, corner
@@ -315,27 +323,27 @@ viewport command (src/launcher/app.rs:643).
 
 egui has two ways to install fonts, and **only one of them is allowed in this repo**:
 
-* `ctx.set_fonts(FontDefinitions)` (egui-0.35.0/src/context.rs:2038) — **forbidden.** It stores
+* `ctx.set_fonts(FontDefinitions)` (egui-0.36.2/src/context.rs:2106) — **forbidden.** It stores
   `memory.new_font_definitions`, and applying it does `self.fonts = None; self.font_definitions =
-  font_definitions;` (:535-540), i.e. a FULL REPLACEMENT. Any family another subsystem registered
+  font_definitions;` (:548-553), i.e. a FULL REPLACEMENT. Any family another subsystem registered
   at runtime is gone; the typing tab caches its family names without re-checking, so the next use
   panics in epaint (`FontFamily::{family:?} is not bound to any fonts`,
-  epaint-0.35.0/src/text/fonts.rs:1030).
-* `ctx.add_font(FontInsert)` (egui-0.35.0/src/context.rs:2061) — **the one to use.** Purely
+  epaint-0.36.2/src/text/fonts.rs:1024).
+* `ctx.add_font(FontInsert)` (egui-0.36.2/src/context.rs:2129) — **the one to use.** Purely
   additive: it pushes into `memory.add_fonts` and the next pass folds each entry into
-  `font_definitions` (:543-560). Safe from a worker thread and safe before the first frame.
+  `font_definitions` (:556-573). Safe from a worker thread and safe before the first frame.
 
-`FontInsert::new(name, FontData, Vec<InsertFontFamily>)` (epaint-0.35.0/src/text/fonts.rs:487);
-font bytes come from `FontData::from_owned(Vec<u8>)` (:139) or `from_static` (:131). Families are
+`FontInsert::new(name, FontData, Vec<InsertFontFamily>)` (epaint-0.36.2/src/text/fonts.rs:481);
+font bytes come from `FontData::from_owned(Vec<u8>)` (:133) or `from_static` (:125). Families are
 keyed by `FontFamily::{Proportional, Monospace, Name(..)}`.
 
 **Priority is an insertion position, so a loop reverses the chain.** `FontPriority::Highest` is
-`fam.insert(0, ..)` and `Lowest` is `fam.push(..)` (egui-0.35.0/src/context.rs:554-555). Iterating
+`fam.insert(0, ..)` and `Lowest` is `fam.push(..)` (egui-0.36.2/src/context.rs:567-568). Iterating
 files in ascending name order with `Highest` therefore yields the *reverse* order in the final
 fallback chain — walk the sorted list backwards instead.
 
 Never call `ctx.fonts(..)` from a loader: it is `.expect("No fonts available until first call to
-Context::run()")` (egui-0.35.0/src/context.rs:1037), and a loader started from a `run_native`
+Context::run()")` (egui-0.36.2/src/context.rs:1103), and a loader started from a `run_native`
 constructor closure runs before the first frame.
 
 ```rust
@@ -351,7 +359,7 @@ ctx.add_font(egui::epaint::text::FontInsert::new(
 ```
 
 Loading is worker-driven: `ui_fonts::install(&cc.egui_ctx, Tier)` clones the `Context`
-(`Arc<RwLock<..>>`, egui-0.35.0/src/context.rs:710 — Send + Sync), spawns a thread, and returns
+(`Arc<RwLock<..>>`, egui-0.36.2/src/context.rs:723 — Send + Sync), spawns a thread, and returns
 immediately; no channel and no GUI-thread polling. Every `run_native` constructor closure in the
 app must make that call — see the next section for why the work cannot stay on the GUI thread.
 

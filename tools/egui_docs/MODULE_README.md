@@ -12,7 +12,7 @@ extracted from rustdoc JSON built from the exact crate sources cargo compiles ag
 ## Architecture
 
 ```
-Cargo.lock ──pins──> egui/eframe/epaint/emath/ecolor/egui_extras 0.35.0
+Cargo.lock ──pins──> egui/eframe/epaint/emath/ecolor/egui_extras 0.36.2
                           │
    cargo +nightly doc --output-format json   (build.sh)
                           ▼

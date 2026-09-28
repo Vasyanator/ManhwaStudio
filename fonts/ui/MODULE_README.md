@@ -79,10 +79,10 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
   *after* egui's `Hack` (so paths and code keep the monospaced face), and their order among
   themselves is the REVERSE of the `NN-` order — `03`, `02`, `01`, `00`. The loader walks the
   sorted core list backwards because the text families insert at the FRONT
-  (`FontPriority::Highest` is `fam.insert(0, ..)`, egui-0.35.0/src/context.rs:554), and the
-  same single walk also feeds the `Lowest` append into `Monospace` (`fam.push`, :555).
+  (`FontPriority::Highest` is `fam.insert(0, ..)`, egui-0.36.2/src/context.rs:567), and the
+  same single walk also feeds the `Lowest` append into `Monospace` (`fam.push`, :568).
   Un-reversing it would mean registering the core files a second time under different names —
-  a repeated `add_font` with the same name is a no-op (egui-0.35.0/src/context.rs:2065-2076) —
+  a repeated `add_font` with the same name is a no-op (egui-0.36.2/src/context.rs:2133-2144) —
   i.e. a second copy of ~19 MB of font bytes. That is not worth paying: inside `Monospace` the
   core faces overlap on only a handful of geometric symbols (■ ○ ● ◊), so the difference is
   cosmetic. The order is pinned by a unit test in `src/ui_fonts.rs`; change it deliberately or
@@ -91,7 +91,7 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
   yields no core font (`core/`, or the legacy flat layout) is skipped and logged, so an
   existing but empty — or `ext/`-only — folder cannot shadow the healthy bundled directory.
   "Usable" means the file really parses as a font and its family name reads: epaint PANICS on
-  a font it cannot parse (`epaint-0.35.0/src/text/fonts.rs:987-1000`), so a title-local
+  a font it cannot parse (`epaint-0.36.2/src/text/fonts.rs:981-994`), so a title-local
   override — which arrives with untrusted project data — is validated before installation,
   and a file that fails is dropped with a logged reason instead of taking the studio down.
   The probe order is split by owner: the process manifest (`ms-fonts`) probes the working
