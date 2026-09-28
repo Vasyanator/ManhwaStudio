@@ -310,8 +310,13 @@ is an author note addressed to the translator, not a replica.
   mutate canvas state. AI API MT responses must be matched by bubble ID before applying text; for
   ImageBubble results, original text and translation are applied together.
 - A failed AI run whose error matches `is_probable_quota_or_limit_error` (keyword/HTTP-code scan)
-  stops quietly: instead of a red error toast the panel shows the sticky `MtStopNotice` with the
-  full provider error available behind a toggle. Other run failures keep the red toast.
+  stops quietly: instead of an `Error` toast the panel shows the sticky `MtStopNotice` with the
+  full provider error available behind a toggle. Other run failures keep the `Error` toast.
+- Status colours are never hand-typed: canvas toasts (`push_toast`) and the detector status line
+  (`set_text_detector_status`) take an `ms_theme::Severity` chosen by the MEANING of the message
+  (`Info` in progress, `Success`, `Warning` nothing done/partial/retry, `Error` failed); panel
+  status labels use `ms_theme::status::*`; the OCR / advanced-recognition selection rectangles use
+  `ms_theme::canvas::SELECTION`. Detector/debug overlay colours stay local.
 - `build_ai_mt_request_preview` assembles the first AI request (system prompt + first batch user
   message with decoded inline images) without contacting the provider, reusing the exact item sort,
   batch split, and `build_ai_mt_user_parts` ordering as a real run. `tab.rs` runs it on a worker

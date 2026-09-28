@@ -197,13 +197,13 @@ pub fn draw_ai_backend_panel(
 
     if !ai_enabled {
         ui.colored_label(
-            egui::Color32::from_rgb(225, 180, 60),
+            ms_theme::status::WARNING,
             t!("ai_backend.status_disabled_no_ai"),
         );
     } else if snapshot.connected {
-        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), t!("ai_backend.status_connected"));
+        ui.colored_label(ms_theme::status::SUCCESS, t!("ai_backend.status_connected"));
     } else {
-        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), t!("ai_backend.status_unavailable"));
+        ui.colored_label(ms_theme::status::ERROR, t!("ai_backend.status_unavailable"));
     }
 
     ui.label(tf!("ai_backend.status_details", snapshot = snapshot.details));
@@ -267,9 +267,9 @@ pub fn draw_ai_backend_panel(
     }
 
     if process.running() {
-        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), t!("ai_backend.process_running"));
+        ui.colored_label(ms_theme::status::SUCCESS, t!("ai_backend.process_running"));
     } else {
-        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), t!("ai_backend.process_stopped"));
+        ui.colored_label(ms_theme::status::ERROR, t!("ai_backend.process_stopped"));
     }
     ui.small(tf!("ai_backend.process_status_label", process = process.status()));
     if let Some(updated_at) = process.updated_at() {
@@ -442,7 +442,7 @@ fn draw_torch_device_controls(
     }
     ui.small(format!("PyTorch: {}", snapshot.device_details));
     if !torch_available {
-        ui.colored_label(egui::Color32::from_rgb(240, 102, 102), t!("ai_backend.pytorch_not_installed"));
+        ui.colored_label(ms_theme::status::ERROR, t!("ai_backend.pytorch_not_installed"));
     }
 }
 
@@ -1845,7 +1845,7 @@ fn draw_build_action_button(
         }
         OrtBuildAction::RestartNote => {
             ui.colored_label(
-                egui::Color32::from_rgb(225, 180, 60),
+                ms_theme::status::WARNING,
                 t!("ai_backend.restart_required_note"),
             );
         }
@@ -2060,7 +2060,7 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
 
     if let Some(error) = error {
         ui.colored_label(
-            egui::Color32::from_rgb(208, 84, 62),
+            ms_theme::status::ERROR,
             tf!("ai_backend.ort_prepare_error", error = error),
         );
         return;
@@ -2071,7 +2071,7 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
     // progress is also treated as terminal here so the spinner can never persist.
     if done || progress.map(|p| p.stage) == Some(OrtDownloadStage::Done) {
         ui.colored_label(
-            egui::Color32::from_rgb(42, 168, 88),
+            ms_theme::status::SUCCESS,
             t!("ai_backend.ort_ready"),
         );
         return;

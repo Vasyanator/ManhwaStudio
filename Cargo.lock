@@ -3396,6 +3396,7 @@ dependencies = [
  "ms-tabs-simple",
  "ms-text-render",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "ms-tools",
  "ms-widgets",
@@ -3592,6 +3593,7 @@ dependencies = [
  "ms-models",
  "ms-project",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "rayon",
@@ -3671,6 +3673,7 @@ dependencies = [
  "ms-i18n",
  "ms-log",
  "ms-sysprobe",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "rfd",
@@ -3866,6 +3869,7 @@ dependencies = [
  "ms-sysprobe",
  "ms-tab-translation",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "ms-window-geometry",
@@ -3920,6 +3924,7 @@ dependencies = [
  "ms-project",
  "ms-sysprobe",
  "ms-tab-translation",
+ "ms-theme",
  "ms-thread",
  "ms-tools",
  "ms-widgets",
@@ -3947,6 +3952,7 @@ dependencies = [
  "ms-page-ops",
  "ms-project",
  "ms-tab-ps-editor",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "rfd",
@@ -3969,6 +3975,7 @@ dependencies = [
  "ms-models",
  "ms-project",
  "ms-tab-typing",
+ "ms-theme",
  "ms-thread",
  "ms-tools",
  "ms-widgets",
@@ -4001,6 +4008,7 @@ dependencies = [
  "ms-project",
  "ms-sysprobe",
  "ms-tabs-simple",
+ "ms-theme",
  "ms-thread",
  "ms-tools",
  "ms-widgets",
@@ -4041,6 +4049,7 @@ dependencies = [
  "ms-sysprobe",
  "ms-text-render",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "ms-tools",
  "ms-widgets",
@@ -4069,6 +4078,7 @@ dependencies = [
  "ms-project",
  "ms-storage",
  "ms-sysprobe",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "serde",
@@ -4104,6 +4114,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-theme"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "ms-thread"
 version = "0.1.0"
 dependencies = [
@@ -4119,6 +4136,7 @@ dependencies = [
  "ms-canvas",
  "ms-i18n",
  "ms-log",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "rayon",

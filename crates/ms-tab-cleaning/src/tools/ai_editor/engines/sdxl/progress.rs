@@ -271,7 +271,7 @@ mod tests {
             first,
             1,
             4,
-            Some(egui::ColorImage::filled([2, 2], Color32::WHITE)),
+            Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
         );
         let seq_with_preview = {
             let guard = lock_progress(&progress);
@@ -296,7 +296,7 @@ mod tests {
             generation,
             2,
             2,
-            Some(egui::ColorImage::filled([1, 1], Color32::WHITE)),
+            Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
         );
         finish_progress_generation(&progress, generation);
         {

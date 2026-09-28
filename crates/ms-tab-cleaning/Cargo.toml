@@ -54,6 +54,9 @@ ms-tools = { path = "../ms-tools" }
 # Every reusable widget the panels put on screen, the dockable-panel subsystem and
 # `input_util`.
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # The whole tab draws.
 egui.workspace = true
 eframe.workspace = true

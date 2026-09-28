@@ -95,8 +95,9 @@ pub(super) fn flux2_guidance_supported(status: Option<&Flux2Status>) -> bool {
 
 /// The tone a one-line verdict is drawn in.
 ///
-/// The three colours are this file's own ([`FLUX2_STATUS_OK_COLOR`] and friends); naming
-/// the tone rather than the colour keeps the decision testable without a live `Ui`.
+/// The tones render in the studio's shared status colours (`ms_theme::status::SUCCESS` /
+/// `WARNING`, or plain small text); naming the tone rather than the colour keeps the decision
+/// testable without a live `Ui`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Flux2LineTone {
     Ok,

@@ -49,7 +49,8 @@ orchestrates nothing and only says so, in one line at the top of «Устано�
 ## Architecture
 `mod.rs` is the root and holds NO logic: the module header, the module declarations and
 the constants everything below shares (the selection limits, the parameter ranges, the
-mask tint, `FLUX2_DEFAULT_PROMPT` and the three status colours). Every other item lives
+mask tint and `FLUX2_DEFAULT_PROMPT`; status lines use the shared `ms_theme::status` colours).
+Every other item lives
 in a submodule.
 
 The root declares each child as `mod x; use x::*;`, and each child starts with

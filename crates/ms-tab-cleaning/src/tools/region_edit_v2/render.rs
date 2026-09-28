@@ -19,9 +19,10 @@ Key functions:
 - `paint_offscreen_arrow()`: the "the frame is over there" indicator of a locked frame
 
 Notes:
-The colours are named constants with one meaning each, in the style of `FLUX2_STATUS_*` in
-`tools/ai_editor/engines/flux2_klein/`; the red and the green are deliberately the same two
-tones that engine uses, so a status colour means the same thing across the cleaning tools.
+The state colours (outer backing ring, refused red, occupied green) come from
+`ms_theme::canvas` (`OUTLINE_BACKING`, `REFUSED`, `OCCUPIED`), the same tokens the patch tool's
+outline uses, so a state colour means the same thing across the canvas tools (the AI engines'
+status lines are panel text and use `ms_theme::status`). The chrome colours below are local to this frame.
 Design: `dev-docs/region_edit_v2_plan.md` (§1, §2 D6).
 */
 
@@ -31,17 +32,8 @@ use super::input::{HANDLE_RADIUS, HandleKind, handle_arc, handle_points};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 
-/// Outer stroke of the frame: a dark grey ring that separates the coloured inner stroke from
-/// the artwork beneath, so the state colour stays readable over a white or a black page.
-const FRAME_OUTER_COLOR: Color32 = Color32::from_rgb(28, 28, 28);
 /// Inner stroke of a frame that may be moved and resized.
 const FRAME_FREE_COLOR: Color32 = Color32::from_rgb(215, 215, 215);
-/// Inner stroke of a frame whose size violates the active consumer's requirements. Same red
-/// as `FLUX2_STATUS_ERROR_COLOR`.
-const FRAME_INVALID_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
-/// Inner stroke of an occupied frame — a mask is painted, a result waits, or work is running.
-/// Same green as `FLUX2_STATUS_OK_COLOR`.
-const FRAME_OCCUPIED_COLOR: Color32 = Color32::from_rgb(90, 255, 130);
 
 /// Background of the strip above the frame and of the two rows below it. Opaque enough to
 /// read text over any page.
@@ -75,15 +67,15 @@ const HANDLE_ARC_SEGMENTS: usize = 24;
 pub(super) fn visual_color(visual: FrameVisual) -> Color32 {
     match visual {
         FrameVisual::Free => FRAME_FREE_COLOR,
-        FrameVisual::Invalid => FRAME_INVALID_COLOR,
-        FrameVisual::Occupied => FRAME_OCCUPIED_COLOR,
+        FrameVisual::Invalid => ms_theme::canvas::REFUSED,
+        FrameVisual::Occupied => ms_theme::canvas::OCCUPIED,
     }
 }
 
 /// Paints the frame's two-tone border: a dark grey ring OUTSIDE the rect and the
 /// state-coloured stroke INSIDE it, so the two never overdraw each other.
 pub(super) fn paint_frame_border(painter: &Painter, rect: Rect, visual: FrameVisual) {
-    painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(OUTER_STROKE_W, FRAME_OUTER_COLOR), StrokeKind::Outside);
+    painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(OUTER_STROKE_W, ms_theme::canvas::OUTLINE_BACKING), StrokeKind::Outside);
     painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(INNER_STROKE_W, visual_color(visual)), StrokeKind::Inside);
 }
 
@@ -99,7 +91,7 @@ pub(super) fn paint_frame_border(painter: &Painter, rect: Rect, visual: FrameVis
 /// hitbox is registered for them — that decision belongs to `frame.rs`, not here.
 pub(super) fn paint_handles(painter: &Painter, rect: Rect, visual: FrameVisual, enabled: bool) {
     let fill = if enabled { Color32::WHITE } else { visual_color(visual) };
-    let stroke = Stroke::new(1.0, FRAME_OUTER_COLOR);
+    let stroke = Stroke::new(1.0, ms_theme::canvas::OUTLINE_BACKING);
     for (handle, point) in HandleKind::ALL.into_iter().zip(handle_points(rect)) {
         let (start, sweep) = handle_arc(handle);
         painter.add(Shape::convex_polygon(sector_points(point, HANDLE_RADIUS, start, sweep), fill, stroke));
@@ -207,7 +199,7 @@ pub(super) fn paint_status_text(painter: &Painter, rect: Rect, text: &str, visua
 pub(super) fn paint_offscreen_arrow(painter: &Painter, arrow: &OffscreenArrow, visual: FrameVisual) {
     let color = visual_color(visual);
     let tail: Pos2 = arrow.tip - arrow.dir * ARROW_SHAFT;
-    painter.circle_filled(arrow.tip, 5.0, FRAME_OUTER_COLOR);
+    painter.circle_filled(arrow.tip, 5.0, ms_theme::canvas::OUTLINE_BACKING);
     painter.arrow(tail, arrow.dir * ARROW_SHAFT, Stroke::new(2.5, color));
 }
 

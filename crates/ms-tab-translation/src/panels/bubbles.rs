@@ -523,7 +523,7 @@ impl BubblesPanelState {
                         if placed {
                             ui.strong(tf!("translation.bubbles.image_number", bubble = bubble.img_idx.saturating_add(1)));
                         } else {
-                            ui.colored_label(Color32::from_rgb(208, 84, 62), t!("translation.bubbles.not_bound"));
+                            ui.colored_label(ms_theme::status::ERROR, t!("translation.bubbles.not_bound"));
                         }
                         ui.label(format!("#{}", bubble_id));
                     });
@@ -946,7 +946,7 @@ impl BubblesPanelState {
             }
         }
         if let Some(error) = image_error {
-            ui.colored_label(Color32::from_rgb(240, 102, 102), error);
+            ui.colored_label(ms_theme::status::ERROR, error);
         }
         if character_dirty {
             self.visible_cache_dirty = true;

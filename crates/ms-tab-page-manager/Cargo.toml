@@ -37,6 +37,9 @@ ms-tab-ps-editor = { path = "../ms-tab-ps-editor" }
 ms-thread = { path = "../ms-thread" }
 # Every reusable widget the toolbar and dialogs put on screen, plus `input_util`.
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # The whole tab draws.
 egui.workspace = true
 eframe.workspace = true

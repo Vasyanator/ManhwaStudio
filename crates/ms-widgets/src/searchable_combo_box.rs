@@ -2952,7 +2952,7 @@ mod tests {
     }
 
     /// A caller's per-row diagnostic colour — the typing tab's "this font only partly covers
-    /// the language" yellow (`tabs::typing::panel::create_presets::FONT_DIAGNOSTIC_WARNING_COLOR`).
+    /// the language" yellow. A local literal keeps this widget crate free of an `ms-theme` dependency.
     const ITEM_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
 
     /// Lays "Narezka" out the way a popup row's main line is laid out, with `ez` matched, and

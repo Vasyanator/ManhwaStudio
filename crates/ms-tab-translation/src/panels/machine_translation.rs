@@ -371,7 +371,7 @@ fn draw_mt_stop_notice(ui: &mut egui::Ui, stop_notice: &mut Option<MtStopNotice>
     let expanded = notice.expanded;
     ui.separator();
     ui.colored_label(
-        egui::Color32::from_rgb(240, 200, 60),
+        ms_theme::status::WARNING,
         t!("translation.mt_panel.stopped_credits_notice"),
     );
     let mut toggle = false;
@@ -551,7 +551,7 @@ fn draw_ai_api_tab(
 
 fn draw_translation_progress_status(ui: &mut egui::Ui, progress: Option<MtPanelProgress>) {
     ui.colored_label(
-        egui::Color32::from_rgb(255, 172, 66),
+        ms_theme::status::INFO,
         t!("translation.mt_panel.translating_status"),
     );
     if let Some(progress) = progress {

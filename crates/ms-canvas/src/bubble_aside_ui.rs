@@ -1582,7 +1582,7 @@ fn draw_aside_slots(
         };
         let frame = egui::Frame::new()
             .fill(frame_color.gamma_multiply(canvas.state.bubble_opacity))
-            .stroke(Stroke::new(1.0, Color32::from_gray(90)))
+            .stroke(Stroke::new(1.0, ms_theme::canvas::NEUTRAL_BORDER))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(egui::Margin::same(frame_inner_margin));
         let status_stroke = if canvas.editable && canvas.state.show_bubble_status {
@@ -2099,7 +2099,7 @@ fn draw_aside_slots(
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
-                        Stroke::new(3.0, Color32::from_rgb(0, 120, 215)),
+                        Stroke::new(3.0, ms_theme::canvas::SELECTION),
                         egui::StrokeKind::Inside,
                     );
                     let rect_drag_response = ui.interact(

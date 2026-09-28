@@ -368,9 +368,9 @@ fn draw_text_tab(
 
     if let Some(notice) = &state.notice {
         let color = if notice.is_error {
-            egui::Color32::from_rgb(208, 84, 62)
+            ms_theme::status::ERROR
         } else {
-            egui::Color32::from_rgb(42, 168, 88)
+            ms_theme::status::SUCCESS
         };
         ui.colored_label(color, &notice.message);
     }

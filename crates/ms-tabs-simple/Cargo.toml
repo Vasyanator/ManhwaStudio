@@ -23,6 +23,9 @@ ms-project = { path = "../ms-project" }
 # `WheelComboBox` for the character/term category pickers (`egui::ComboBox` is banned in
 # product UI).
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # The storage seam every JSON/markdown/image read and write goes through, so the web
 # build can swap the backend.
 ms-storage = { path = "../ms-storage" }

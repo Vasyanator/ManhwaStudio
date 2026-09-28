@@ -31,6 +31,9 @@ ms-models = { path = "../ms-models" }
 ms-project = { path = "../ms-project" }
 # Every reusable widget the panel puts on screen, plus `input_util` and `ui_fonts`.
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # The reusable mask brush behind the page crop mask.
 ms-tools = { path = "../ms-tools" }
 # The production text renderer, re-exported crate-wide as `render_next`.

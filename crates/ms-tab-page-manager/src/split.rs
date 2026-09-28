@@ -782,9 +782,10 @@ fn draw_cut_lines(
     let axis = state.axis;
     let extent = axis_extent(axis, page_size);
     let painter = ui.painter_at(board);
-    let line_color = egui::Color32::from_rgb(255, 79, 68);
-    let handle_fill = egui::Color32::from_rgb(190, 28, 28);
-    let grip_color = egui::Color32::from_rgb(250, 235, 235);
+    // Canvas chrome from the shared theme: fixed colours that stay readable over any page.
+    let line_color = ms_theme::canvas::CUT_LINE;
+    let handle_fill = ms_theme::canvas::CUT_HANDLE;
+    let grip_color = ms_theme::canvas::CUT_GRIP;
 
     let mut dragged: Option<(usize, u32)> = None;
     let mut to_delete: Vec<usize> = Vec::new();

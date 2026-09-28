@@ -1,0 +1,17 @@
+[package]
+name = "ms-theme"
+version = "0.1.0"
+edition = "2024"
+
+# The single owner of the STUDIO's semantic colours, layered on top of egui's stock dark
+# theme: status/severity text colours, the editing chrome drawn over page images, the modal
+# scrim and the transparency checkerboard. `apply` installs the dark theme plus the two
+# `Visuals` fields it overrides; everything else is plain `const` data.
+#
+# Layer: a LEAF. It depends on egui alone, has no I/O and no state, so any studio crate
+# (canvas, tools, tabs, settings UI, installer, the binary) may depend on it. It must never
+# depend on another workspace crate. The launcher (`crates/ms-launcher`) is deliberately NOT
+# a user: it owns its own palette in `crates/ms-launcher/src/theme.rs`.
+[dependencies]
+# `Color32`, `Visuals`, `Painter`, `ColorImage` and the texture the checkerboard tiles from.
+egui.workspace = true

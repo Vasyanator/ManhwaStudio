@@ -1152,7 +1152,7 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
         "ManhwaStudio",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(MissingPythonEnvPromptApp {
                 output: output_for_app,
@@ -1225,7 +1225,7 @@ impl eframe::App for MissingPythonEnvPromptApp {
                 );
                 if let Some(error_text) = &self.error_text {
                     ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error_text);
+                    ui.colored_label(ms_theme::status::ERROR, error_text);
                 }
                 ui.add_space(14.0);
                 if ui
@@ -1599,12 +1599,12 @@ impl eframe::App for UpdateCheckApp {
                     }
                     UpdateCheckUiState::UpdateAvailable { remote_version } => {
                         ui.colored_label(
-                            egui::Color32::from_rgb(120, 210, 120),
+                            ms_theme::status::SUCCESS,
                             tf!("startup.update_check.new_version_available", remote_version = remote_version),
                         );
                     }
                     UpdateCheckUiState::Error { message } => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 120), message);
+                        ui.colored_label(ms_theme::status::ERROR, message);
                     }
                 }
 
@@ -1659,7 +1659,7 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
         t!("startup.update_check.window_title"),
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(UpdateCheckApp::new(
                 local_version_for_ui.clone(),
@@ -1897,7 +1897,7 @@ fn run_main_window(
         &title,
         native_options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             // First point in the process where monitors can be listed at all (a second winit
             // `EventLoop` cannot exist). Publishes them for the settings UI and refreshes the
             // "largest monitor" fallback the NEXT start places on.
@@ -2140,12 +2140,12 @@ impl eframe::App for BasicLauncherApp {
                     }
                     ChooserUiState::Ready { image_count } => {
                         ui.colored_label(
-                            egui::Color32::from_rgb(120, 210, 120),
+                            ms_theme::status::SUCCESS,
                             tf!("startup.basic_launcher.validation_ok", image_count = image_count),
                         );
                     }
                     ChooserUiState::Invalid { message } => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 120), message);
+                        ui.colored_label(ms_theme::status::ERROR, message);
                     }
                 }
 
@@ -2193,7 +2193,7 @@ fn pick_project_dir_from_basic_launcher_gui(
         t!("startup.basic_launcher.window_title"),
         chooser_options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(BasicLauncherApp::new(
                 projects_root.clone(),

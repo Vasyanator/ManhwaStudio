@@ -21,9 +21,9 @@ instead of keeping a second handle per tile: this cache is not registered with `
 so dual handles would be untracked, unevictable GPU memory.
 Tiles are uploaded with a per-frame budget so the initial upload of a tall page is spread across
 frames and never stalls the GUI thread. Drawing maps each tile's image-space rect through the
-`ViewTransform` and tints by the layer opacity. The checkerboard is ONE textured quad with a
-repeating UV rect, never a per-cell loop: a page can be ~800x19000 px and a loop would emit
-thousands of shapes every frame.
+`ViewTransform` and tints by the layer opacity. The checkerboard is the studio's
+`ms_theme::checkerboard::CANVAS` preset, painted as ONE textured quad, never a per-cell loop: a page
+can be ~800x19000 px and a loop would emit thousands of shapes every frame.
 */
 
 use super::layers::Layer;
@@ -35,32 +35,6 @@ use egui::{Color32, ColorImage, Mesh, Pos2, Rect, Shape, TextureHandle, TextureO
 
 /// Tile side in image pixels. Kept well under common GPU limits.
 const TILE_SIDE: usize = 1024;
-
-/// Light square of the page transparency checkerboard.
-///
-/// The two greys deliberately sit far from both black ink and white paper: over the canvas'
-/// dark ground a fully transparent hole in a layer would otherwise read as a solid ink blob.
-const CHECKER_LIGHT: Color32 = Color32::from_rgb(84, 84, 88);
-
-/// Dark square of the page transparency checkerboard. See [`CHECKER_LIGHT`].
-const CHECKER_DARK: Color32 = Color32::from_rgb(64, 64, 68);
-
-/// Side of one checker square, in SCREEN points.
-///
-/// The board is painted at one texel per screen point, so a square keeps this size at every zoom
-/// level instead of scaling with the page (what every image editor does), and the drawing cost
-/// never depends on the zoom.
-const CHECKER_SQUARE_PTS: u16 = 10;
-
-/// Side of the uploaded checker tile: exactly one 2x2-square period of the pattern.
-const CHECKER_TILE_PTS: u16 = CHECKER_SQUARE_PTS * 2;
-
-/// `egui::Context` data key caching the repeating checker texture for the whole session.
-///
-/// A `TextureHandle` frees its GPU texture on drop, so it must outlive the frame that painted
-/// with it. The tab state cannot own it here, and the context data map is the one store that
-/// lives long enough and is not global mutable state of our own.
-const CHECKER_TEXTURE_KEY: &str = "ps_editor.page_checkerboard";
 
 /// Linear interpolation between `a` and `b` by `t` (used to walk a tile's UV sub-range).
 fn uu_lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -368,44 +342,6 @@ impl TiledTexture {
     }
 }
 
-/// Builds the checker tile uploaded once as a repeating texture.
-///
-/// Exactly one 2x2-square period, `CHECKER_TILE_PTS` texels on a side, with [`CHECKER_LIGHT`]
-/// in the top-left square.
-fn checker_tile_image() -> ColorImage {
-    let side = usize::from(CHECKER_TILE_PTS);
-    let square = usize::from(CHECKER_SQUARE_PTS);
-    let mut pixels = Vec::with_capacity(side * side);
-    for y in 0..side {
-        for x in 0..side {
-            // The parity of the SQUARE index (not of the pixel) picks the colour.
-            let light = (x / square + y / square) % 2 == 0;
-            pixels.push(if light { CHECKER_LIGHT } else { CHECKER_DARK });
-        }
-    }
-    ColorImage::new([side, side], pixels)
-}
-
-/// UV rectangle tiling the checker texture over an area of `painted_size` SCREEN points, at
-/// exactly one texel per point.
-///
-/// The rect starts at the texture origin, so the pattern is anchored to the painted area's
-/// top-left corner and pans with the page while each square stays `CHECKER_SQUARE_PTS` points
-/// across. Returns `Rect::ZERO` for a degenerate or non-finite size, which paints nothing.
-fn checker_uv_rect(painted_size: Vec2) -> Rect {
-    if !(painted_size.x.is_finite() && painted_size.y.is_finite())
-        || painted_size.x <= 0.0
-        || painted_size.y <= 0.0
-    {
-        return Rect::ZERO;
-    }
-    let tile = f32::from(CHECKER_TILE_PTS);
-    Rect::from_min_size(
-        Pos2::ZERO,
-        Vec2::new(painted_size.x / tile, painted_size.y / tile),
-    )
-}
-
 /// Screen-space rect of the whole page, or `Rect::ZERO` when `page_size` (image px) has a zero side.
 fn page_rect_on_screen(view: &ViewTransform, page_size: [usize; 2]) -> Rect {
     if page_size[0] == 0 || page_size[1] == 0 {
@@ -417,55 +353,22 @@ fn page_rect_on_screen(view: &ViewTransform, page_size: [usize; 2]) -> Rect {
     view.world_rect_to_screen(Rect::from_min_size(Pos2::ZERO, size))
 }
 
-/// Returns the repeating checker texture, uploading it on the first call of the session.
-///
-/// The returned handle is a cheap refcounted clone; the clone cached in `ctx`'s data map is what
-/// keeps the GPU texture alive across frames. `NEAREST_REPEAT` is required: the whole board is one
-/// quad whose UV rect is wider than 1, so the pattern must tile in the sampler.
-fn checker_texture(ctx: &egui::Context) -> TextureHandle {
-    let id = egui::Id::new(CHECKER_TEXTURE_KEY);
-    if let Some(handle) = ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
-        return handle;
-    }
-    // The upload must NOT happen inside `data_mut`: both it and `load_texture` lock the same
-    // `Context`, so nesting them deadlocks the GUI thread.
-    let handle = ctx.load_texture(
-        "ps_editor_page_checker",
-        checker_tile_image(),
-        TextureOptions::NEAREST_REPEAT,
-    );
-    ctx.data_mut(|data| data.insert_temp(id, handle.clone()));
-    handle
-}
-
 /// Paints the transparency checkerboard over the page rectangle, under every layer.
 ///
 /// `page_size` is the page in IMAGE pixels (`LayerStack::size`); `view` maps it to screen, so the
 /// board covers exactly the page and nothing of the surrounding canvas ground — no clip rect is
-/// needed. Squares are SCREEN-constant (`CHECKER_SQUARE_PTS` points) and do not zoom with the
-/// page. Paints nothing for a zero-sized page or a degenerate/non-finite screen rect, and never
-/// panics. Call it before drawing the base layers, on the same painter.
-pub(super) fn draw_page_checkerboard(
-    painter: &egui::Painter,
-    ctx: &egui::Context,
-    view: &ViewTransform,
-    page_size: [usize; 2],
-) {
+/// needed. The board is the studio's `ms_theme::checkerboard::CANVAS` preset, anchored at the
+/// page's top-left corner: squares are SCREEN-constant and do not zoom with the page, and the whole
+/// board is one textured quad. Paints nothing for a zero-sized page or a degenerate/non-finite
+/// screen rect, and never panics. Call it before drawing the base layers, on the same painter.
+pub(super) fn draw_page_checkerboard(painter: &egui::Painter, view: &ViewTransform, page_size: [usize; 2]) {
     let rect = page_rect_on_screen(view, page_size);
-    let uv = checker_uv_rect(rect.size());
-    if uv == Rect::ZERO {
-        return;
-    }
-    painter.image(checker_texture(ctx).id(), rect, uv, Color32::WHITE);
+    ms_theme::checkerboard::CANVAS.paint(painter, rect, egui::CornerRadius::ZERO);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CHECKER_DARK, CHECKER_LIGHT, CHECKER_SQUARE_PTS, CHECKER_TILE_PTS, TiledTexture,
-        ViewTransform, checker_tile_image, checker_uv_rect, draw_page_checkerboard,
-        page_rect_on_screen,
-    };
+    use super::{TiledTexture, ViewTransform, draw_page_checkerboard, page_rect_on_screen};
     use eframe::egui;
     use egui::{ColorImage, Pos2, Rect, TextureOptions, Vec2};
 
@@ -479,86 +382,35 @@ mod tests {
     }
 
     #[test]
-    fn checker_tile_alternates_by_square_not_by_pixel() {
-        let image = checker_tile_image();
-        let side = usize::from(CHECKER_TILE_PTS);
-        assert_eq!(image.size, [side, side], "one full 2x2-square period");
-        let square = usize::from(CHECKER_SQUARE_PTS);
-        let at = |x: usize, y: usize| image.pixels[y * side + x];
-        assert_eq!(at(0, 0), CHECKER_LIGHT);
-        assert_eq!(at(square - 1, square - 1), CHECKER_LIGHT);
-        assert_eq!(at(square, 0), CHECKER_DARK);
-        assert_eq!(at(0, square), CHECKER_DARK);
-        assert_eq!(at(square, square), CHECKER_LIGHT);
-    }
-
-    #[test]
-    fn checker_uv_counts_repeats_not_pixels() {
-        let tile = f32::from(CHECKER_TILE_PTS);
-        let uv = checker_uv_rect(Vec2::new(tile * 3.0, tile * 2.5));
-        assert_eq!(uv.min, Pos2::ZERO, "anchored at the page's top-left corner");
-        assert!((uv.width() - 3.0).abs() < 1e-4, "three tiles wide");
-        assert!((uv.height() - 2.5).abs() < 1e-4, "two and a half tiles tall");
-    }
-
-    #[test]
-    fn checker_uv_is_empty_for_degenerate_sizes() {
-        for size in [
-            Vec2::new(0.0, 100.0),
-            Vec2::new(100.0, 0.0),
-            Vec2::new(-10.0, 10.0),
-            Vec2::new(f32::NAN, 10.0),
-            Vec2::new(10.0, f32::INFINITY),
-        ] {
-            assert_eq!(
-                checker_uv_rect(size),
-                Rect::ZERO,
-                "degenerate size {size:?} must paint nothing"
-            );
-        }
-    }
-
-    #[test]
     fn page_rect_is_empty_for_a_zero_sized_page() {
         for size in [[0, 100], [100, 0], [0, 0]] {
             assert_eq!(page_rect_on_screen(&view(1.0), size), Rect::ZERO);
-            assert_eq!(checker_uv_rect(page_rect_on_screen(&view(1.0), size).size()), Rect::ZERO);
         }
     }
 
     #[test]
-    fn checker_squares_stay_screen_constant_when_the_page_is_zoomed() {
-        let repeats =
-            |zoom: f32| checker_uv_rect(page_rect_on_screen(&view(zoom), [100, 100]).size()).width();
-        let tile = f32::from(CHECKER_TILE_PTS);
-        assert!((repeats(1.0) - 100.0 / tile).abs() < 1e-4, "one texel per screen point at 100%");
-        // Twice the on-screen size means twice as many squares, i.e. an unchanged square size.
-        assert!((repeats(2.0) - repeats(1.0) * 2.0).abs() < 1e-4);
-        assert!((repeats(0.5) - repeats(1.0) * 0.5).abs() < 1e-4);
+    fn page_rect_scales_with_zoom() {
+        // The CANVAS board is painted at one texel per SCREEN point over this rect, so a page twice
+        // as large on screen shows twice as many squares, i.e. an unchanged square size.
+        let width = |zoom: f32| page_rect_on_screen(&view(zoom), [100, 100]).width();
+        assert!((width(2.0) - width(1.0) * 2.0).abs() < 1e-3);
+        assert!((width(0.5) - width(1.0) * 0.5).abs() < 1e-3);
     }
 
     #[test]
     fn page_checkerboard_paints_one_quad_and_nothing_for_a_degenerate_page() {
         let ctx = egui::Context::default();
         let empty = ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_page_checkerboard(ui.painter(), ui.ctx(), &view(1.0), [0, 0]);
+            draw_page_checkerboard(ui.painter(), &view(1.0), [0, 0]);
         });
         let painted = ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_page_checkerboard(ui.painter(), ui.ctx(), &view(1.0), [100, 200]);
+            draw_page_checkerboard(ui.painter(), &view(1.0), [100, 200]);
         });
         assert_eq!(
             painted.shapes.len(),
             empty.shapes.len() + 1,
             "a real page adds exactly one textured quad; a zero-sized page adds none"
         );
-    }
-
-    #[test]
-    fn checker_texture_is_uploaded_once_and_reused() {
-        let ctx = egui::Context::default();
-        let first = super::checker_texture(&ctx);
-        let second = super::checker_texture(&ctx);
-        assert_eq!(first.id(), second.id(), "the handle is cached in the context, not re-uploaded");
     }
 
     /// `set_options` must mark tiles dirty ONLY on a real change: it is called once per frame per

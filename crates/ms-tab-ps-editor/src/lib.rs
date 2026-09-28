@@ -2959,7 +2959,7 @@ impl PsEditorTabState {
                 ui.label(t!("ps_editor.top_bar.applying_effects"));
             }
             if let Some(err) = &self.load_error {
-                ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                ui.colored_label(ms_theme::status::ERROR, err);
             }
         });
 
@@ -5287,7 +5287,7 @@ impl PsEditorTabState {
                 egui::Align2::CENTER_CENTER,
                 t!("ps_editor.canvas.no_page"),
                 egui::FontId::proportional(16.0),
-                Color32::from_gray(160),
+                ui.visuals().weak_text_color(),
             );
             return;
         };
@@ -5677,7 +5677,7 @@ impl PsEditorTabState {
         painter.rect_stroke(
             page_rect,
             CornerRadius::ZERO,
-            egui::Stroke::new(1.0, Color32::from_gray(90)),
+            egui::Stroke::new(1.0, ms_theme::canvas::NEUTRAL_BORDER),
             egui::StrokeKind::Outside,
         );
 
@@ -6098,7 +6098,7 @@ impl PsEditorTabState {
             };
             // Transparency checkerboard under the page: a transparent hole must read as a hole,
             // not as the viewport void. Drawn before every layer so it stays the bottom-most mark.
-            layer_render::draw_page_checkerboard(&painter, ctx, view, stack.size());
+            layer_render::draw_page_checkerboard(&painter, view, stack.size());
             for layer in stack.layers() {
                 if !stack.layer_visible(layer) {
                     continue;

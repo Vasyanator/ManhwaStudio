@@ -126,11 +126,11 @@ impl Flux2DownloadState {
     /// The colour the verdict is drawn in; `None` for a neutral line.
     pub(super) fn color(self) -> Option<Color32> {
         match self {
-            Self::Ok => Some(FLUX2_STATUS_OK_COLOR),
+            Self::Ok => Some(ms_theme::status::SUCCESS),
             // Amber, not red: nothing is broken, the user simply has a step left to take.
-            Self::NoToken | Self::NotAccepted => Some(FLUX2_STATUS_WARN_COLOR),
+            Self::NoToken | Self::NotAccepted => Some(ms_theme::status::WARNING),
             Self::InvalidToken | Self::NotFound | Self::NetworkError => {
-                Some(FLUX2_STATUS_ERROR_COLOR)
+                Some(ms_theme::status::ERROR)
             }
         }
     }

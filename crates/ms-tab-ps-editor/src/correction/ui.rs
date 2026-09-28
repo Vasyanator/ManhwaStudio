@@ -39,7 +39,7 @@ pub(crate) fn correction_panel_body(ui: &mut egui::Ui, state: &mut CorrectionSta
         // The pass is dead for this session; say so where the user is looking, in the panel whose
         // controls would otherwise appear to do nothing.
         ui.colored_label(
-            egui::Color32::from_rgb(220, 80, 80),
+            ms_theme::status::ERROR,
             t!("ps_editor.correction.gpu_unavailable_error"),
         );
     }

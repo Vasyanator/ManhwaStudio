@@ -707,7 +707,7 @@ impl eframe::App for ExistingInstallApp {
             ui.label(&self.status_text);
             if let Some(error_text) = &self.error_text {
                 ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error_text);
+                ui.colored_label(ms_theme::status::ERROR, error_text);
             }
             ui.add_space(12.0);
 
@@ -1283,7 +1283,7 @@ impl eframe::App for InstallerApp {
                             }
                             Err(err) => {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(220, 80, 80),
+                                    ms_theme::status::ERROR,
                                     tf!("installer.install.path_error", err = err),
                                 );
                             }
@@ -1758,7 +1758,7 @@ impl eframe::App for UninstallApp {
             ui.small(&self.detail);
             if let Some(err) = &self.error {
                 ui.add_space(10.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                ui.colored_label(ms_theme::status::ERROR, err);
                 ui.add_space(8.0);
                 if ui.button(t!("installer.common.close_button")).clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

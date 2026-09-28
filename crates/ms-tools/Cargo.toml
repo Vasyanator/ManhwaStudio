@@ -19,6 +19,9 @@ eframe.workspace = true
 ms-canvas = { path = "../ms-canvas" }
 # `WheelSlider` for the patch tool's inline parameter controls.
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # Localized patch-tool labels (`t!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
 # Diagnostics on the patch core's failure paths (`runtime_log`).

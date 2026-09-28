@@ -11,7 +11,7 @@ contracts, the OOM recovery, the worker thread and its own progress bar. It impl
 
 This file is the MODULE ROOT and holds no logic at all: this header, the module
 declarations, and the constants shared by everything below — the selection limits, the
-parameter ranges, the mask tint, the default prompt and the three status colours. Every
+parameter ranges, the mask tint and the default prompt (status lines use `ms_theme::status`). Every
 other item was lifted verbatim into the submodules listed below and is re-exported here at
 module level, so the module PATH is unchanged and a submodule may name any item of this
 module regardless of which file it now lives in. `Flux2KleinEngine` is the one `pub` item
@@ -400,19 +400,6 @@ const FLUX2_MASK_TINT: Color32 = Color32::from_rgb(80, 200, 255);
 const FLUX2_DEFAULT_PROMPT: &str =
     "Remove any text and sound effects, and restore the background underneath them";
 
-/// Colour of a status line reporting a good state.
-///
-/// The studio UI has no shared semantic-colour table; the cleaning subtree names its
-/// tones per file, and these three are the ones it already uses — this green is the
-/// mask editor's «sample area» legend colour (`tools/base.rs`), the amber is what the
-/// memory forecast and the watermark tool already warn in, and the red is the shared
-/// error tone of `RegionEditToolBase::draw_ui_hint`. Naming them here keeps one meaning
-/// per colour inside this file instead of four bare literals.
-const FLUX2_STATUS_OK_COLOR: Color32 = Color32::from_rgb(90, 255, 130);
-/// Colour of a status line reporting a state the user should act on.
-const FLUX2_STATUS_WARN_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
-/// Colour of a status line reporting a failure.
-const FLUX2_STATUS_ERROR_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
 
 #[cfg(test)]
 mod tests {

@@ -343,13 +343,13 @@ impl Flux2PanelCtx<'_> {
             Flux2PromptCacheLine::Silent => {}
             Flux2PromptCacheLine::Cached => {
                 ui.colored_label(
-                    FLUX2_STATUS_OK_COLOR,
+                    ms_theme::status::SUCCESS,
                     t!("cleaning.tools.flux2_klein.prompt_cached_status"),
                 );
             }
             Flux2PromptCacheLine::NotCached => {
                 ui.colored_label(
-                    FLUX2_STATUS_WARN_COLOR,
+                    ms_theme::status::WARNING,
                     t!("cleaning.tools.flux2_klein.prompt_not_cached_status"),
                 );
             }
@@ -357,7 +357,7 @@ impl Flux2PanelCtx<'_> {
             // ready caches, and only encoding a new prompt is closed.
             Flux2PromptCacheLine::NoEncoder => {
                 ui.colored_label(
-                    FLUX2_STATUS_WARN_COLOR,
+                    ms_theme::status::WARNING,
                     t!("cleaning.tools.flux2_klein.text_encoder_missing_warning"),
                 );
             }
@@ -484,7 +484,7 @@ impl Flux2PanelCtx<'_> {
         }
         if let Some(error) = self.prompt_cache_list_error {
             ui.colored_label(
-                FLUX2_STATUS_ERROR_COLOR,
+                ms_theme::status::ERROR,
                 tf!(
                     "cleaning.tools.flux2_klein.prompt_cache_list_error",
                     err = error
@@ -495,7 +495,7 @@ impl Flux2PanelCtx<'_> {
             ui.small(status);
         }
         if let Some(warning) = self.prompt_cache_warning {
-            ui.colored_label(FLUX2_STATUS_WARN_COLOR, warning);
+            ui.colored_label(ms_theme::status::WARNING, warning);
         }
     }
 
@@ -619,10 +619,10 @@ impl Flux2PanelCtx<'_> {
         ui.horizontal_wrapped(|ui| {
             match line.tone() {
                 Flux2LineTone::Ok => {
-                    ui.colored_label(FLUX2_STATUS_OK_COLOR, text);
+                    ui.colored_label(ms_theme::status::SUCCESS, text);
                 }
                 Flux2LineTone::Warn => {
-                    ui.colored_label(FLUX2_STATUS_WARN_COLOR, text);
+                    ui.colored_label(ms_theme::status::WARNING, text);
                 }
                 Flux2LineTone::Neutral => {
                     ui.small(text);

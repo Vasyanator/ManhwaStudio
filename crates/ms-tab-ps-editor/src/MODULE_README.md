@@ -201,6 +201,8 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   second `TextureHandle` per tile (the canvas' `app.rs::TextureTile` pattern) is deliberately NOT
   used here: `render_cache` is not registered with `memory_manager`, so dual handles would be
   untracked, unevictable GPU memory (~+122 MB for the two base layers of a tall page).
+  Also `draw_page_checkerboard`: the page's transparency board is the studio's
+  `ms_theme::checkerboard::CANVAS` preset (one textured quad); no board palette lives here.
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
 - `correction/`: the VIEW-ONLY «Коррекция» panel — its model and maths (`model.rs`, GUI-free and
   GL-free), the `egui_glow` shader pass that renders it (`gpu.rs`, the project's ONLY GL code) and

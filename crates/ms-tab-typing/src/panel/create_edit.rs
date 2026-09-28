@@ -53,7 +53,7 @@ impl TypingCreatePanelState {
             ui.vertical(|ui| {
                 if let Some(missing) = self.missing_font.clone() {
                     ui.colored_label(
-                        Color32::from_rgb(240, 110, 110),
+                        ms_theme::status::ERROR,
                         tf!("typing.edit.font_missing_warning", missing = missing),
                     );
                     ui.add_space(4.0);

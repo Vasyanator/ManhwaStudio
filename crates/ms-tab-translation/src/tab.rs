@@ -10,7 +10,8 @@ Main types:
 - `ImageCropDragSelection`: transient ImageBubble crop selection (`Shift+Q+drag`) that writes
   crop metadata instead of dispatching OCR.
 - `AdvancedRecognitionWindow`: floating OCR preview/editor for manual region recognition.
-- `OcrToast`: short-lived foreground notification (`text`, `color`, `hide_at_s`).
+- `OcrToast`: short-lived foreground notification (`text`, `severity`, `hide_at_s`); its colour
+  comes from `ms_theme::Severity` (toasts and detector status never hand-type colours).
 - `OcrPendingBubbleInsert`: deferred bubble-create payload after OCR response.
 - `BuiltOcrRequest`: OCR request + resolved page index for a scene selection.
 - `TextDetectorOcrTask`: OCR task derived from text-detector block (`page_idx`, `uv_rect`, retry).
@@ -31,8 +32,6 @@ Key constants:
 - `TEXT_DETECTOR_MASK_TEXTURE_OPTIONS`: texture sampling for mask tiles.
 - `TEXT_DETECTOR_MASK_VISUAL_ALPHA_MAX`: max overlay alpha used when drawing detector mask.
 - `footer_additional_character_names()`: built-in extra names for footer character picker.
-- `TEXT_DETECTOR_STATUS_OK` / `TEXT_DETECTOR_STATUS_WARN` / `TEXT_DETECTOR_STATUS_ERR`:
-  status colors for detector panel.
 - `TEXT_DETECTOR_OCR_RETRY_DELAY_SECS`: retry delay for failed detector-ocr block.
 
 TranslationPanel helpers:
@@ -179,7 +178,7 @@ Key TranslationTabState field groups:
   `text_detector_options`, `composition_panel_options`, `composition_panel_state`.
 - Detector runtime/cache: `text_detector_results`, `text_detector_mask_textures`,
   shared `text_mask_model`, `text_mask_synced_revision`,
-  `text_detector_status`, `text_detector_status_color`, `text_detector_progress`,
+  `text_detector_status`, `text_detector_status_severity`, `text_detector_progress`,
   `text_detection_storage_*`.
 - OCR interaction runtime: `ocr_selection`, `ocr_toast`, `next_ocr_request_id`,
   `advanced_recognition`, `advanced_recognition_request`, `pending_bubble_inserts`,
@@ -264,6 +263,7 @@ use ms_widgets::{
 };
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use ms_theme::Severity;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -305,9 +305,6 @@ fn footer_additional_character_names() -> [&'static str; 13] {
         t!("translation.tab.footer_character.some_man"),
     ]
 }
-const TEXT_DETECTOR_STATUS_OK: Color32 = Color32::from_rgb(143, 218, 143);
-const TEXT_DETECTOR_STATUS_WARN: Color32 = Color32::from_rgb(247, 201, 72);
-const TEXT_DETECTOR_STATUS_ERR: Color32 = Color32::from_rgb(240, 102, 102);
 const TEXT_DETECTOR_OCR_RETRY_DELAY_SECS: f64 = 3.0;
 const OCR_HEALTH_CHECK_THROTTLE_SECS: f64 = 0.5;
 /// Minimum interval between disk reads of the native-runtime routing inputs
@@ -539,7 +536,8 @@ impl OcrDragSelection {
 #[derive(Debug, Clone)]
 struct OcrToast {
     text: String,
-    color: Color32,
+    /// Meaning of the message; the frame stroke and text colour are `severity.color()`.
+    severity: Severity,
     hide_at_s: f64,
 }
 
@@ -693,7 +691,7 @@ pub struct TranslationTabState {
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
     text_mask_synced_revision: u64,
     text_detector_status: String,
-    text_detector_status_color: Color32,
+    text_detector_status_severity: Severity,
     text_detector_progress: Option<(usize, usize)>,
     text_detector_edit_lines_mode: bool,
     text_detector_edit_mask_mode: bool,
@@ -967,7 +965,7 @@ impl TranslationTabState {
             text_mask_model: None,
             text_mask_synced_revision: 0,
             text_detector_status: t!("translation.tab.ready_status").to_string(),
-            text_detector_status_color: TEXT_DETECTOR_STATUS_OK,
+            text_detector_status_severity: Severity::Success,
             text_detector_progress: None,
             text_detector_edit_lines_mode: false,
             text_detector_edit_mask_mode: false,
@@ -1523,7 +1521,7 @@ impl TranslationTabState {
                     }
                     if actions.request_load && !backend_unavailable {
                         if let Some(error) = self.current_ocr_torch_requirement_error() {
-                            self.push_toast(ctx, error, Color32::RED, 2.8);
+                            self.push_toast(ctx, error, Severity::Error, 2.8);
                         } else {
                             self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
                             self.ocr_controller.request_load(
@@ -1535,7 +1533,7 @@ impl TranslationTabState {
                 } else {
                     ui.separator();
                     ui.colored_label(
-                        Color32::from_rgb(225, 180, 60),
+                        ms_theme::status::WARNING,
                         t!("translation.tab.ocr_disabled_status"),
                     );
                     ui.small(t!("translation.tab.ocr_restart_hint"));
@@ -1599,7 +1597,7 @@ impl TranslationTabState {
                 } else {
                     ui.separator();
                     ui.colored_label(
-                        Color32::from_rgb(225, 180, 60),
+                        ms_theme::status::WARNING,
                         t!("translation.tab.mt_disabled_status"),
                     );
                     ui.small(
@@ -1650,7 +1648,7 @@ impl TranslationTabState {
                     ui,
                     &mut self.text_detector_options,
                     &self.text_detector_status,
-                    self.text_detector_status_color,
+                    self.text_detector_status_severity.color(),
                     self.text_detector_progress,
                     self.text_detector_controller.is_busy(),
                     ocr_busy,
@@ -1680,7 +1678,7 @@ impl TranslationTabState {
                     self.clear_text_mask_model();
                     self.text_detector_progress = None;
                     self.clear_text_detector_line_edit_state();
-                    self.set_text_detector_status(t!("translation.tab.results_cleared_status"), TEXT_DETECTOR_STATUS_OK);
+                    self.set_text_detector_status(t!("translation.tab.results_cleared_status"), Severity::Success);
                 }
                 if actions.detect_current {
                     self.start_text_detection_for_current_page(project, canvas);
@@ -1706,7 +1704,7 @@ impl TranslationTabState {
                 if !self.ai_enabled {
                     ui.separator();
                     ui.colored_label(
-                        Color32::from_rgb(225, 180, 60),
+                        ms_theme::status::WARNING,
                         t!("translation.tab.block_ocr_disabled_status"),
                     );
                 } else if self.ocr_controller.state() != OcrLoadState::Ready {
@@ -2165,7 +2163,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             t!("translation.common.downloading_model_status").to_string(),
-                            Color32::GOLD,
+                            Severity::Info,
                             2.2,
                         );
                     }
@@ -2177,7 +2175,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             t!("translation.tab.engine_loading_status").to_string(),
-                            Color32::GOLD,
+                            Severity::Info,
                             2.2,
                         );
                     }
@@ -2190,7 +2188,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             t!("translation.tab.engine_load_error").to_string(),
-                            Color32::RED,
+                            Severity::Error,
                             3.0,
                         );
                     }
@@ -2250,7 +2248,7 @@ impl TranslationTabState {
                         } else {
                             tf!("translation.tab.quick_ocr_result_status", manual_text = manual_text.trim())
                         };
-                        self.push_toast(ctx, quick_msg, Color32::from_rgb(42, 168, 88), 3.0);
+                        self.push_toast(ctx, quick_msg, Severity::Success, 3.0);
                     }
                     if let Some(pending_insert) = self.pending_bubble_inserts.remove(&request_id) {
                         let original_text =
@@ -2281,7 +2279,7 @@ impl TranslationTabState {
                         }
                         self.set_text_detector_status(
                             t!("translation.tab.block_recognition_status"),
-                            TEXT_DETECTOR_STATUS_WARN,
+                            Severity::Info,
                         );
                     }
                     let msg = if result.lines.is_empty() {
@@ -2289,7 +2287,7 @@ impl TranslationTabState {
                     } else {
                         tf!("translation.tab.recognition_lines_status", lines = result.lines.len())
                     };
-                    self.push_toast(ctx, msg, Color32::from_rgb(42, 168, 88), 2.2);
+                    self.push_toast(ctx, msg, Severity::Success, 2.2);
                 }
                 OcrControllerEvent::RecognizeFailed { request_id, error } => {
                     let manual_target = if self.manual_ocr_active_request_id == Some(request_id) {
@@ -2320,12 +2318,12 @@ impl TranslationTabState {
                                     "translation.tab.recognition_error_retry_status",
                                     sec = format!("{:.0}", TEXT_DETECTOR_OCR_RETRY_DELAY_SECS)
                                 ),
-                                TEXT_DETECTOR_STATUS_WARN,
+                                Severity::Warning,
                             );
                             self.push_toast(
                                 ctx,
                                 t!("translation.tab.recognition_retry_status").to_string(),
-                                Color32::from_rgb(255, 172, 66),
+                                Severity::Warning,
                                 2.8,
                             );
                             continue;
@@ -2336,12 +2334,12 @@ impl TranslationTabState {
                         );
                     }
                     if manual_target == Some(ManualOcrResultTarget::ToastAndClipboard) {
-                        self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Color32::RED, 3.0);
+                        self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Severity::Error, 3.0);
                     } else if !adv_rec_error_applied {
                         self.push_toast(
                             ctx,
                             tf!("translation.tab.recognition_error", error = error),
-                            Color32::RED,
+                            Severity::Error,
                             3.0,
                         );
                     }
@@ -2357,7 +2355,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         tf!("translation.common.api_key_saved_status", service = service.label()),
-                        Color32::from_rgb(42, 168, 88),
+                        Severity::Success,
                         2.2,
                     );
                 }
@@ -2396,7 +2394,7 @@ impl TranslationTabState {
                     if self.ocr_panel_options.ai_api_service == service {
                         self.ocr_panel_options.ai_api_status = error.clone();
                     }
-                    self.push_toast(ctx, format!("AI API: {error}"), Color32::RED, 3.0);
+                    self.push_toast(ctx, format!("AI API: {error}"), Severity::Error, 3.0);
                 }
             }
         }
@@ -2408,7 +2406,7 @@ impl TranslationTabState {
                 TextDetectorControllerEvent::ModelDownloadStarted => {
                     self.set_text_detector_status(
                         t!("translation.common.downloading_model_status"),
-                        TEXT_DETECTOR_STATUS_WARN,
+                        Severity::Info,
                     );
                 }
                 TextDetectorControllerEvent::DetectStarted { total, replace } => {
@@ -2420,7 +2418,7 @@ impl TranslationTabState {
                     self.text_detector_progress = Some((0, total));
                     self.set_text_detector_status(
                         self.text_detector_running_status(),
-                        TEXT_DETECTOR_STATUS_WARN,
+                        Severity::Info,
                     );
                 }
                 TextDetectorControllerEvent::PageDetected { page_idx, result } => {
@@ -2432,7 +2430,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         tf!("translation.tab.detector_page_skipped_status", page_idx = page_idx, error = error),
-                        Color32::from_rgb(255, 172, 66),
+                        Severity::Warning,
                         2.8,
                     );
                 }
@@ -2449,18 +2447,18 @@ impl TranslationTabState {
                     } else {
                         tf!("translation.tab.detector_done_blocks_errors_status", total_blocks = total_blocks, failed_pages = failed_pages)
                     };
-                    let color = if failed_pages == 0 {
-                        TEXT_DETECTOR_STATUS_OK
+                    let severity = if failed_pages == 0 {
+                        Severity::Success
                     } else {
-                        TEXT_DETECTOR_STATUS_WARN
+                        Severity::Warning
                     };
-                    self.set_text_detector_status(status, color);
+                    self.set_text_detector_status(status, severity);
                 }
                 TextDetectorControllerEvent::DetectFailed { error } => {
                     self.text_detector_progress = None;
                     self.set_text_detector_status(
                         tf!("translation.tab.detector_error", error = error),
-                        TEXT_DETECTOR_STATUS_ERR,
+                        Severity::Error,
                     );
                 }
             }
@@ -2496,7 +2494,7 @@ impl TranslationTabState {
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
         self.text_detection_storage_busy = true;
         self.text_detection_storage_rx = Some(rx);
-        self.set_text_detector_status(t!("translation.tab.loading_saved_mask_status"), TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.loading_saved_mask_status"), Severity::Info);
 
         thread::spawn(move || {
             let event = match load_text_detection_storage(&storage_dir, &page_indices) {
@@ -2519,7 +2517,7 @@ impl TranslationTabState {
         if self.text_detector_results.is_empty() {
             self.set_text_detector_status(
                 t!("translation.tab.no_results_to_save_status"),
-                TEXT_DETECTOR_STATUS_ERR,
+                Severity::Error,
             );
             return;
         }
@@ -2533,7 +2531,7 @@ impl TranslationTabState {
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
         self.text_detection_storage_busy = true;
         self.text_detection_storage_rx = Some(rx);
-        self.set_text_detector_status(t!("translation.tab.saving_mask_status"), TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.saving_mask_status"), Severity::Info);
 
         thread::spawn(move || {
             let event = match save_text_detection_storage(&storage_dir, &pages) {
@@ -2560,7 +2558,7 @@ impl TranslationTabState {
                 self.text_detection_storage_busy = false;
                 self.set_text_detector_status(
                     t!("translation.tab.text_detection_aborted_status"),
-                    TEXT_DETECTOR_STATUS_ERR,
+                    Severity::Error,
                 );
                 return;
             }
@@ -2594,12 +2592,12 @@ impl TranslationTabState {
                 } else {
                     tf!("translation.tab.load_progress_status", loaded = loaded, failed = failed)
                 };
-                let color = if failed == 0 {
-                    TEXT_DETECTOR_STATUS_OK
+                let severity = if failed == 0 {
+                    Severity::Success
                 } else {
-                    TEXT_DETECTOR_STATUS_WARN
+                    Severity::Warning
                 };
-                self.set_text_detector_status(status, color);
+                self.set_text_detector_status(status, severity);
             }
             TextDetectionStorageEvent::Saved {
                 project_dir,
@@ -2615,12 +2613,12 @@ impl TranslationTabState {
                 } else {
                     tf!("translation.tab.save_progress_status", saved = saved, failed = failed)
                 };
-                let color = if failed == 0 {
-                    TEXT_DETECTOR_STATUS_OK
+                let severity = if failed == 0 {
+                    Severity::Success
                 } else {
-                    TEXT_DETECTOR_STATUS_WARN
+                    Severity::Warning
                 };
-                self.set_text_detector_status(status, color);
+                self.set_text_detector_status(status, severity);
             }
             TextDetectionStorageEvent::Failed { project_dir, error } => {
                 if project_dir != current_project_dir {
@@ -2629,15 +2627,17 @@ impl TranslationTabState {
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 self.set_text_detector_status(
                     tf!("translation.tab.text_detection_error", error = error),
-                    TEXT_DETECTOR_STATUS_ERR,
+                    Severity::Error,
                 );
             }
         }
     }
 
-    fn set_text_detector_status(&mut self, text: impl Into<String>, color: Color32) {
+    /// Replaces the detector panel status line; `severity` selects its themed colour
+    /// (`Info` for in-progress work, `Warning` for partial results/retries).
+    fn set_text_detector_status(&mut self, text: impl Into<String>, severity: Severity) {
         self.text_detector_status = text.into();
-        self.text_detector_status_color = color;
+        self.text_detector_status_severity = severity;
     }
 
     fn clear_text_detector_line_edit_state(&mut self) {
@@ -3061,13 +3061,13 @@ impl TranslationTabState {
         }
         let page_idx = canvas.current_page_idx();
         let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) else {
-            self.set_text_detector_status(t!("translation.tab.current_page_not_found_status"), TEXT_DETECTOR_STATUS_ERR);
+            self.set_text_detector_status(t!("translation.tab.current_page_not_found_status"), Severity::Error);
             return;
         };
         let mode = match self.text_detector_run_mode() {
             Ok(mode) => mode,
             Err(error) => {
-                self.set_text_detector_status(error, TEXT_DETECTOR_STATUS_ERR);
+                self.set_text_detector_status(error, Severity::Error);
                 return;
             }
         };
@@ -3081,13 +3081,13 @@ impl TranslationTabState {
                 self.text_detector_progress = Some((0, 1));
                 self.set_text_detector_status(
                     self.text_detector_running_status(),
-                    TEXT_DETECTOR_STATUS_WARN,
+                    Severity::Info,
                 );
             }
             Err(error) => {
                 self.set_text_detector_status(
                     tf!("translation.tab.detector_start_error", error = error),
-                    TEXT_DETECTOR_STATUS_ERR,
+                    Severity::Error,
                 );
             }
         }
@@ -3105,7 +3105,7 @@ impl TranslationTabState {
         let mode = match self.text_detector_run_mode() {
             Ok(mode) => mode,
             Err(error) => {
-                self.set_text_detector_status(error, TEXT_DETECTOR_STATUS_ERR);
+                self.set_text_detector_status(error, Severity::Error);
                 return;
             }
         };
@@ -3120,13 +3120,13 @@ impl TranslationTabState {
                 self.text_detector_progress = Some((0, total));
                 self.set_text_detector_status(
                     self.text_detector_running_status(),
-                    TEXT_DETECTOR_STATUS_WARN,
+                    Severity::Info,
                 );
             }
             Err(error) => {
                 self.set_text_detector_status(
                     tf!("translation.tab.detector_start_error", error = error),
-                    TEXT_DETECTOR_STATUS_ERR,
+                    Severity::Error,
                 );
             }
         }
@@ -3142,19 +3142,19 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.ocr_disabled_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.6,
             );
             return;
         }
         if let Some(error) = self.current_ocr_torch_requirement_error() {
-            self.push_toast(ctx, error, Color32::RED, 2.6);
+            self.push_toast(ctx, error, Severity::Error, 2.6);
             return;
         }
         if self.ocr_controller.state() != OcrLoadState::Ready {
             self.set_text_detector_status(
                 t!("translation.tab.engine_not_loaded_status"),
-                TEXT_DETECTOR_STATUS_ERR,
+                Severity::Error,
             );
             return;
         }
@@ -3193,7 +3193,7 @@ impl TranslationTabState {
         }
 
         if tasks.is_empty() {
-            self.set_text_detector_status(t!("translation.tab.no_blocks_status"), TEXT_DETECTOR_STATUS_ERR);
+            self.set_text_detector_status(t!("translation.tab.no_blocks_status"), Severity::Error);
             self.text_detector_progress = None;
             return;
         }
@@ -3206,7 +3206,7 @@ impl TranslationTabState {
         self.textdetector_ocr_done = 0;
         self.textdetector_ocr_recognized = 0;
         self.text_detector_progress = Some((0, self.textdetector_ocr_total));
-        self.set_text_detector_status(t!("translation.tab.block_recognition_status"), TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.block_recognition_status"), Severity::Info);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
     }
 
@@ -3239,7 +3239,7 @@ impl TranslationTabState {
             self.textdetector_ocr_retry_state = None;
             self.pending_textdetector_ocr_tasks
                 .push_front(retry_state.task);
-            self.set_text_detector_status(t!("translation.tab.block_recognition_status"), TEXT_DETECTOR_STATUS_WARN);
+            self.set_text_detector_status(t!("translation.tab.block_recognition_status"), Severity::Info);
         }
 
         if self.ocr_controller.state().is_busy() {
@@ -3302,7 +3302,7 @@ impl TranslationTabState {
                             "translation.tab.recognition_unavailable_retry_status",
                             sec = format!("{:.0}", TEXT_DETECTOR_OCR_RETRY_DELAY_SECS)
                         ),
-                        TEXT_DETECTOR_STATUS_WARN,
+                        Severity::Warning,
                     );
                     break;
                 }
@@ -3348,7 +3348,7 @@ impl TranslationTabState {
         if force_error {
             self.set_text_detector_status(
                 t!("translation.tab.engine_not_loaded_status"),
-                TEXT_DETECTOR_STATUS_ERR,
+                Severity::Error,
             );
             return;
         }
@@ -3356,18 +3356,18 @@ impl TranslationTabState {
         if recognized > 0 {
             self.set_text_detector_status(
                 tf!("translation.tab.recognition_done_blocks_status", recognized = recognized, total = total),
-                TEXT_DETECTOR_STATUS_OK,
+                Severity::Success,
             );
             self.push_toast(
                 ctx,
                 tf!("translation.tab.detector_recognition_progress_status", recognized = recognized, total = total),
-                Color32::from_rgb(42, 168, 88),
+                Severity::Success,
                 2.4,
             );
         } else {
             self.set_text_detector_status(
                 t!("translation.tab.recognition_done_no_text_status"),
-                TEXT_DETECTOR_STATUS_WARN,
+                Severity::Warning,
             );
         }
     }
@@ -3381,7 +3381,7 @@ impl TranslationTabState {
         self.textdetector_ocr_retry_state = None;
         self.pending_textdetector_ocr_tasks.clear();
         self.text_detector_progress = None;
-        self.set_text_detector_status(message, TEXT_DETECTOR_STATUS_ERR);
+        self.set_text_detector_status(message, Severity::Error);
         ctx.request_repaint();
     }
 
@@ -3875,7 +3875,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             tf!("translation.tab.apply_translation_error", bubble_id = bubble_id),
-                            Color32::from_rgb(255, 172, 66),
+                            Severity::Error,
                             2.4,
                         );
                     }
@@ -3885,7 +3885,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             tf!("translation.tab.apply_area_translation_error", bubble_id = bubble_id),
-                            Color32::from_rgb(255, 172, 66),
+                            Severity::Error,
                             2.4,
                         );
                     }
@@ -3898,15 +3898,15 @@ impl TranslationTabState {
                 }
                 MtControllerEvent::RunFinished { translated, errors } => {
                     self.mt_progress = None;
-                    let color = if errors == 0 {
-                        Color32::from_rgb(42, 168, 88)
+                    let severity = if errors == 0 {
+                        Severity::Success
                     } else {
-                        Color32::from_rgb(255, 172, 66)
+                        Severity::Warning
                     };
                     self.push_toast(
                         ctx,
                         tf!("translation.tab.mt_progress_status", translated = translated, translated_2 = translated + errors, errors = errors),
-                        color,
+                        severity,
                         2.8,
                     );
                 }
@@ -3915,7 +3915,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         tf!("translation.tab.mt_cancelled_status", translated = translated, errors = errors),
-                        Color32::from_rgb(255, 172, 66),
+                        Severity::Warning,
                         2.8,
                     );
                 }
@@ -3933,7 +3933,7 @@ impl TranslationTabState {
                         self.push_toast(
                             ctx,
                             tf!("translation.tab.mt_error_status", error = error),
-                            Color32::RED,
+                            Severity::Error,
                             3.2,
                         );
                     }
@@ -3957,7 +3957,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         tf!("translation.tab.ai_mt_progress_status", translated = translated, total = total, errors = errors, used = format_context_chars(context_used_chars), budget = format_context_chars(context_budget_chars), pruned_replicas = pruned_replicas),
-                        Color32::from_rgb(255, 172, 66),
+                        Severity::Info,
                         2.4,
                     );
                 }
@@ -3972,7 +3972,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         tf!("translation.common.api_key_saved_status", service = service.label()),
-                        Color32::from_rgb(42, 168, 88),
+                        Severity::Success,
                         2.2,
                     );
                 }
@@ -4010,7 +4010,7 @@ impl TranslationTabState {
                     if self.mt_panel_options.ai_api_service == service {
                         self.mt_panel_options.ai_api_status = error.clone();
                     }
-                    self.push_toast(ctx, format!("AI API: {error}"), Color32::RED, 3.0);
+                    self.push_toast(ctx, format!("AI API: {error}"), Severity::Error, 3.0);
                 }
             }
         }
@@ -4035,14 +4035,14 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.mt_cancelled_notice").to_string(),
-                Color32::from_rgb(255, 172, 66),
+                Severity::Warning,
                 2.2,
             );
         } else if had_pending {
             self.push_toast(
                 ctx,
                 t!("translation.tab.mt_deferred_cancelled_status").to_string(),
-                Color32::from_rgb(255, 172, 66),
+                Severity::Warning,
                 2.2,
             );
         }
@@ -4081,7 +4081,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.no_bubbles_for_mt_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.3,
             );
             return;
@@ -4284,7 +4284,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.mt_disabled_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.6,
             );
             return;
@@ -4293,7 +4293,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.mt.already_running_status").to_string(),
-                Color32::from_rgb(255, 172, 66),
+                Severity::Warning,
                 2.2,
             );
             return;
@@ -4313,18 +4313,21 @@ impl TranslationTabState {
 
         if let Err(err) = self.mt_controller.start_translation(request) {
             eprintln!("[MT][StartFailed] {}", err.replace('\n', " "));
-            self.push_toast(ctx, tf!("translation.tab.mt_start_error", err = err), Color32::RED, 3.0);
+            self.push_toast(ctx, tf!("translation.tab.mt_start_error", err = err), Severity::Error, 3.0);
         } else {
             // Drop any previous credit/limit notice as soon as a new run is accepted.
             self.mt_stop_notice = None;
         }
     }
 
-    fn push_toast(&mut self, ctx: &egui::Context, text: String, color: Color32, duration_s: f64) {
+    /// Shows `text` as the canvas toast for `duration_s` seconds (at least 0.2 s), replacing any
+    /// current toast. `severity` is chosen by the MEANING of the message (`Info` = in progress,
+    /// `Success`, `Warning` = nothing done / partial, `Error` = failed); it selects the colour.
+    fn push_toast(&mut self, ctx: &egui::Context, text: String, severity: Severity, duration_s: f64) {
         let now = ctx.input(|i| i.time);
         self.ocr_toast = Some(OcrToast {
             text,
-            color,
+            severity,
             hide_at_s: now + duration_s.max(0.2),
         });
     }
@@ -4371,7 +4374,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.mt_disabled_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.6,
             );
             return;
@@ -4381,7 +4384,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.no_bubbles_preview_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.3,
             );
             return;
@@ -4410,7 +4413,7 @@ impl TranslationTabState {
         self.push_toast(
             ctx,
             t!("translation.tab.preparing_request_status").to_string(),
-            Color32::from_rgb(120, 180, 255),
+            Severity::Info,
             1.6,
         );
     }
@@ -4441,7 +4444,7 @@ impl TranslationTabState {
                 self.push_toast(
                     ctx,
                     tf!("translation.tab.build_request_error", error = error),
-                    Color32::RED,
+                    Severity::Error,
                     3.5,
                 );
             }
@@ -4476,7 +4479,7 @@ impl TranslationTabState {
                 ui.label(tf!("translation.tab.request_preview_summary", scope_label = scope_label, batch_total = preview.batch_total, translate = preview.translate_count, context = preview.context_count, items_total = preview.total_item_count, images = preview.image_count, kib = preview.image_bytes / 1024));
                 if preview.batch_total > 1 {
                     ui.colored_label(
-                        Color32::from_rgb(225, 180, 60),
+                        ms_theme::status::WARNING,
                         t!("translation.tab.request_preview_context_hint"),
                     );
                 }
@@ -4573,9 +4576,9 @@ impl TranslationTabState {
             .fixed_pos(canvas_rect.center_top() + egui::vec2(-160.0, top_offset))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .stroke(Stroke::new(1.0, toast.color))
+                    .stroke(Stroke::new(1.0, toast.severity.color()))
                     .show(ui, |ui| {
-                        ui.colored_label(toast.color, toast.text);
+                        ui.colored_label(toast.severity.color(), toast.text);
                     });
             });
     }
@@ -4610,7 +4613,8 @@ impl TranslationTabState {
             .fixed_pos(canvas_rect.center_top() + egui::vec2(-160.0, 16.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(225, 180, 60)))
+                    // In-progress notice: same `Info` severity as the "loading" canvas toasts.
+                    .stroke(Stroke::new(1.0, Severity::Info.color()))
                     .show(ui, |ui| {
                         ui.set_width(320.0);
                         ui.label(
@@ -4866,11 +4870,11 @@ impl TranslationTabState {
                 egui::Order::Foreground,
                 egui::Id::new("translation_ocr_selection_painter"),
             ));
-            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 160, 255, 60));
+            painter.rect_filled(rect, 0.0, ms_theme::canvas::SELECTION.gamma_multiply_u8(60));
             painter.rect_stroke(
                 rect,
                 0.0,
-                Stroke::new(2.0, Color32::from_rgb(0, 160, 255)),
+                Stroke::new(2.0, ms_theme::canvas::SELECTION),
                 egui::StrokeKind::Outside,
             );
         }
@@ -4894,7 +4898,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.selection_no_pages_status").to_string(),
-                Color32::RED,
+                Severity::Warning,
                 2.6,
             );
             return;
@@ -4913,7 +4917,7 @@ impl TranslationTabState {
             }
             Err(error) => {
                 self.advanced_recognition_request = None;
-                self.push_toast(ctx, error, Color32::RED, 3.0);
+                self.push_toast(ctx, error, Severity::Error, 3.0);
             }
         }
     }
@@ -4937,7 +4941,7 @@ impl TranslationTabState {
             self.manual_ocr_active_request_id = None;
             self.manual_ocr_result_target = None;
             self.pending_bubble_inserts.remove(&request_id);
-            self.push_toast(ctx, error, Color32::RED, 2.6);
+            self.push_toast(ctx, error, Severity::Error, 2.6);
             return;
         }
         self.ocr_controller.request_recognize(built_request.request);
@@ -4950,7 +4954,7 @@ impl TranslationTabState {
             self.pending_bubble_inserts.remove(&request_id);
         }
         if !was_ready {
-            self.push_toast(ctx, t!("translation.tab.engine_loading_status").to_string(), Color32::GOLD, 2.2);
+            self.push_toast(ctx, t!("translation.tab.engine_loading_status").to_string(), Severity::Info, 2.2);
         }
     }
 
@@ -4969,7 +4973,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.ocr_disabled_status").to_string(),
-                        Color32::from_rgb(225, 180, 60),
+                        Severity::Warning,
                         2.6,
                     );
                     return;
@@ -4978,13 +4982,13 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.backend_unavailable_status").to_string(),
-                        Color32::from_rgb(240, 102, 102),
+                        Severity::Error,
                         2.6,
                     );
                     return;
                 }
                 if let Some(error) = self.current_ocr_torch_requirement_error() {
-                    self.push_toast(ctx, error, Color32::RED, 2.6);
+                    self.push_toast(ctx, error, Severity::Error, 2.6);
                     return;
                 }
                 if self.manual_ocr_active_request_id.is_some() {
@@ -4994,7 +4998,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.no_selection_status").to_string(),
-                        Color32::RED,
+                        Severity::Warning,
                         2.6,
                     );
                     return;
@@ -5026,7 +5030,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.ocr_disabled_status").to_string(),
-                        Color32::from_rgb(225, 180, 60),
+                        Severity::Warning,
                         2.6,
                     );
                     return;
@@ -5035,13 +5039,13 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.backend_unavailable_status").to_string(),
-                        Color32::from_rgb(240, 102, 102),
+                        Severity::Error,
                         2.6,
                     );
                     return;
                 }
                 if let Some(error) = self.current_ocr_torch_requirement_error() {
-                    self.push_toast(ctx, error, Color32::RED, 2.6);
+                    self.push_toast(ctx, error, Severity::Error, 2.6);
                     return;
                 }
                 if self.manual_ocr_active_request_id.is_some() {
@@ -5051,7 +5055,7 @@ impl TranslationTabState {
                     self.push_toast(
                         ctx,
                         t!("translation.tab.no_selection_status").to_string(),
-                        Color32::RED,
+                        Severity::Warning,
                         2.6,
                     );
                     return;
@@ -5076,7 +5080,7 @@ impl TranslationTabState {
                     let _ = self
                         .advanced_recognition
                         .apply_recognition_error(request_id, error.clone());
-                    self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Color32::RED, 3.0);
+                    self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Severity::Error, 3.0);
                 }
             }
             AdvancedRecognitionAction::CreateBubble {
@@ -5110,7 +5114,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.ocr_disabled_status").to_string(),
-                Color32::from_rgb(225, 180, 60),
+                Severity::Warning,
                 2.6,
             );
             return;
@@ -5119,13 +5123,13 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.backend_unavailable_status").to_string(),
-                Color32::from_rgb(240, 102, 102),
+                Severity::Error,
                 2.6,
             );
             return;
         }
         if let Some(error) = self.current_ocr_torch_requirement_error() {
-            self.push_toast(ctx, error, Color32::RED, 2.6);
+            self.push_toast(ctx, error, Severity::Error, 2.6);
             return;
         }
         let request_id = self.next_ocr_request_id;
@@ -5141,7 +5145,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.selection_no_pages_status").to_string(),
-                Color32::RED,
+                Severity::Warning,
                 2.6,
             );
             return;
@@ -5162,7 +5166,7 @@ impl TranslationTabState {
             self.push_toast(
                 ctx,
                 t!("translation.tab.ocr_already_running_status").to_string(),
-                Color32::from_rgb(255, 172, 66),
+                Severity::Warning,
                 2.0,
             );
             return;
@@ -5242,7 +5246,7 @@ impl TranslationTabState {
                         Value::String(project_relative_path(project, &path)),
                         now_s,
                     ),
-                    Err(err) => self.push_toast(ui.ctx(), err, Color32::RED, 3.0),
+                    Err(err) => self.push_toast(ui.ctx(), err, Severity::Error, 3.0),
                 }
             }
             if ui.small_button(t!("translation.common.choose_file_button")).clicked()
@@ -5255,7 +5259,7 @@ impl TranslationTabState {
                         Value::String(project_relative_path(project, &saved)),
                         now_s,
                     ),
-                    Err(err) => self.push_toast(ui.ctx(), err, Color32::RED, 3.0),
+                    Err(err) => self.push_toast(ui.ctx(), err, Severity::Error, 3.0),
                 }
             }
         }

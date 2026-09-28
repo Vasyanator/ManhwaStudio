@@ -117,9 +117,9 @@ pub(super) fn draw_derived_paths(ui: &mut egui::Ui, settings: &Flux2KleinSetting
             if let Some(component) = component {
                 let mark = if component.present { "✓" } else { "✗" };
                 let color = if component.present {
-                    FLUX2_STATUS_OK_COLOR
+                    ms_theme::status::SUCCESS
                 } else {
-                    FLUX2_STATUS_WARN_COLOR
+                    ms_theme::status::WARNING
                 };
                 ui.colored_label(color, mark);
             }
@@ -215,7 +215,7 @@ pub(super) fn draw_download_block(
         // though it is open — an outdated one. Both halves are said: what the answer means,
         // and the controls that make it actionable.
         ui.colored_label(
-            FLUX2_STATUS_WARN_COLOR,
+            ms_theme::status::WARNING,
             t!("cleaning.tools.flux2_klein.download.token_unexpected_hint"),
         );
         draw_hf_token_row(ui, &mut view, hf_token_action);
@@ -273,7 +273,7 @@ pub(super) fn draw_download_block(
     });
     if let Some(error) = view.check_error {
         ui.colored_label(
-            FLUX2_STATUS_ERROR_COLOR,
+            ms_theme::status::ERROR,
             tf!("cleaning.tools.flux2_klein.download.check_error", err = error),
         );
     }
@@ -308,7 +308,7 @@ pub(super) fn draw_download_block(
         // The localized sentence carries the meaning and the backend's own wording rides on
         // the hover, exactly as a repository `message` does.
         ui.colored_label(
-            FLUX2_STATUS_WARN_COLOR,
+            ms_theme::status::WARNING,
             t!("cleaning.tools.flux2_klein.download.plan_unknown_status"),
         )
         .on_hover_text(check.plan_error.clone());
@@ -359,7 +359,7 @@ pub(super) fn draw_download_block(
     // computed — never through a missing one.
     if readiness == Flux2DownloadReadiness::Complete {
         ui.colored_label(
-            FLUX2_STATUS_OK_COLOR,
+            ms_theme::status::SUCCESS,
             t!("cleaning.tools.flux2_klein.download.complete_status"),
         );
     }

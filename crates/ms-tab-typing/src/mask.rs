@@ -490,7 +490,7 @@ impl TypingMaskLayer {
         }
         if let Some((message, _)) = self.status_error.as_ref() {
             ui.separator();
-            ui.colored_label(Color32::from_rgb(240, 110, 110), message);
+            ui.colored_label(ms_theme::status::ERROR, message);
         }
     }
 

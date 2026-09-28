@@ -536,7 +536,7 @@ fn draw_mask_source_entry(
     } else {
         response.on_disabled_hover_text(
             egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
-                .color(Color32::from_rgb(240, 102, 102)),
+                .color(ms_theme::status::ERROR),
         )
     };
     if response.clicked() {

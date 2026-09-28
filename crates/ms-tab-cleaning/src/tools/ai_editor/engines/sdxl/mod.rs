@@ -82,7 +82,6 @@ use crate::tools::region_edit_v2::geometry::FrameConstraints;
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
 use eframe::egui;
-use egui::Color32;
 use image::{ColorType, ImageEncoder};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
@@ -126,14 +125,6 @@ const SDXL_SELECTION_MULTIPLE: usize = 8;
 /// Shortest accepted side. It is exactly what the grid step already implies: with a multiple
 /// of 8 there is no valid smaller side, so this states the same rule rather than adding one.
 const SDXL_MIN_SELECTION_PX: usize = 8;
-
-/// Preview tint of the engine's single mask layer, i.e. of the area to REGENERATE.
-///
-/// The inpaint yellow of the mask-inpaint editor (`tools/base.rs`, the «Жёлтая: удаление»
-/// legend and its mask preview), so a mask painted here reads the same as it always did.
-/// Opaque on purpose: `MaskStack` scales the alpha itself, and a tint that arrived already
-/// translucent would be darkened twice.
-const SDXL_MASK_TINT: Color32 = Color32::from_rgb(255, 220, 0);
 
 /// Diffusers samplers offered in the panel.
 ///

@@ -405,7 +405,10 @@ impl AiEngine for SdxlEngine {
     /// each request carries exactly one mask.
     fn mask_layers(&self) -> Vec<MaskLayerSpec> {
         vec![MaskLayerSpec {
-            tint: SDXL_MASK_TINT,
+            // The studio's removal-mask tint (`ms_theme::canvas::MASK_TINT`), the same yellow as the
+            // mask-inpaint editor, so the inpainting hole reads the same everywhere. Opaque on purpose:
+            // `MaskStack` scales the alpha itself, and a translucent tint would be darkened twice.
+            tint: ms_theme::canvas::MASK_TINT,
             label_key: "cleaning.tools.sdxl.mask_heading",
         }]
     }
@@ -636,7 +639,7 @@ mod tests {
         );
         let layers = engine.mask_layers();
         assert_eq!(layers.len(), 1, "one mask travels per request");
-        assert_eq!(layers[0].tint, SDXL_MASK_TINT);
+        assert_eq!(layers[0].tint, ms_theme::canvas::MASK_TINT);
         assert!(embedded_en_catalog_has(layers[0].label_key));
         assert!(embedded_en_catalog_has("cleaning.tools.sdxl.engine_title"));
         assert!(embedded_en_catalog_has("cleaning.tools.sdxl.mask_meaning_hint"));
@@ -738,7 +741,7 @@ mod tests {
         let short_mask = EngineRunRequest {
             page_idx: 0,
             rect_px: rect,
-            region: egui::ColorImage::new([8, 8], vec![Color32::BLACK; 64]),
+            region: egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]),
             masks: vec![vec![0u8; 8]],
         };
         assert!(engine.start(short_mask).is_err());
@@ -747,7 +750,7 @@ mod tests {
         let wrong_layer_count = EngineRunRequest {
             page_idx: 0,
             rect_px: rect,
-            region: egui::ColorImage::new([8, 8], vec![Color32::BLACK; 64]),
+            region: egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]),
             masks: vec![vec![0u8; 64], vec![0u8; 64]],
         };
         assert!(engine.start(wrong_layer_count).is_err());
@@ -755,7 +758,7 @@ mod tests {
         let wrong_region = EngineRunRequest {
             page_idx: 0,
             rect_px: rect,
-            region: egui::ColorImage::new([4, 4], vec![Color32::BLACK; 16]),
+            region: egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]),
             masks: vec![vec![0u8; 64]],
         };
         assert!(engine.start(wrong_region).is_err());
@@ -783,7 +786,7 @@ mod tests {
             let request = EngineRunRequest {
                 page_idx: 0,
                 rect_px: OverlayRectPx { x: 0, y: 0, w, h },
-                region: egui::ColorImage::new([w, h], vec![Color32::BLACK; pixels]),
+                region: egui::ColorImage::new([w, h], vec![egui::Color32::BLACK; pixels]),
                 masks: vec![vec![255u8; pixels]],
             };
             assert!(

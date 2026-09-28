@@ -288,7 +288,7 @@ impl LamaEngine {
             }
         });
         if let LamaModelListState::Error(err) = model_list {
-            ui.colored_label(LAMA_STATUS_ERROR_COLOR, err.as_str());
+            ui.colored_label(ms_theme::status::ERROR, err.as_str());
         }
         (changed, refresh_requested)
     }
@@ -394,7 +394,10 @@ impl AiEngine for LamaEngine {
     /// each request carries exactly one mask.
     fn mask_layers(&self) -> Vec<MaskLayerSpec> {
         vec![MaskLayerSpec {
-            tint: LAMA_MASK_TINT,
+            // The studio's removal-mask tint (`ms_theme::canvas::MASK_TINT`), the same yellow as the
+            // mask-inpaint editor, so the inpainting hole reads the same everywhere. Opaque on purpose:
+            // `MaskStack` scales the alpha itself, and a translucent tint would be darkened twice.
+            tint: ms_theme::canvas::MASK_TINT,
             label_key: "cleaning.tools.lama.mask_heading",
         }]
     }
@@ -599,7 +602,7 @@ mod tests {
         );
         let layers = engine.mask_layers();
         assert_eq!(layers.len(), 1, "one mask travels per request");
-        assert_eq!(layers[0].tint, LAMA_MASK_TINT);
+        assert_eq!(layers[0].tint, ms_theme::canvas::MASK_TINT);
         assert!(embedded_en_catalog_has(layers[0].label_key));
     }
 

@@ -1234,7 +1234,7 @@ impl RegionEditToolBase {
             ui.small(t!("cleaning.region.loading_selection_status"));
         }
         if let Some(err) = self.load_error.as_ref() {
-            ui.colored_label(Color32::from_rgb(255, 120, 120), err);
+            ui.colored_label(ms_theme::status::ERROR, err);
         }
     }
 
@@ -2270,8 +2270,8 @@ impl RegionMaskInpaintToolBase {
                         );
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(Color32::from_rgb(255, 220, 0), t!("cleaning.mask_editor.legend_removal"));
-                        ui.colored_label(Color32::from_rgb(90, 255, 130), t!("cleaning.mask_editor.legend_sample"));
+                        ui.colored_label(ms_theme::canvas::MASK_TINT, t!("cleaning.mask_editor.legend_removal"));
+                        ui.colored_label(ms_theme::canvas::OCCUPIED, t!("cleaning.mask_editor.legend_sample"));
                     });
                 }
 
@@ -2555,7 +2555,7 @@ impl RegionMaskInpaintToolBase {
         if editor_state.mask_texture.is_none() {
             let tex = ctx.load_texture(
                 format!("cleaning-region-mask-{}", editor_state.session_scroll_id),
-                build_tinted_mask_preview(&editor_state.mask, [255, 220, 0]),
+                build_tinted_mask_preview(&editor_state.mask, REMOVAL_MASK_PREVIEW_RGB),
                 REGION_EDITOR_TEXTURE_OPTIONS,
             );
             editor_state.mask_texture = Some(tex);
@@ -2564,7 +2564,7 @@ impl RegionMaskInpaintToolBase {
         if editor_state.mask_texture_dirty {
             if let Some(texture) = editor_state.mask_texture.as_mut() {
                 texture.set(
-                    build_tinted_mask_preview(&editor_state.mask, [255, 220, 0]),
+                    build_tinted_mask_preview(&editor_state.mask, REMOVAL_MASK_PREVIEW_RGB),
                     REGION_EDITOR_TEXTURE_OPTIONS,
                 );
             }
@@ -2586,7 +2586,7 @@ impl RegionMaskInpaintToolBase {
                     "cleaning-region-sample-mask-{}",
                     editor_state.session_scroll_id
                 ),
-                build_tinted_mask_preview(sample_mask, [90, 255, 130]),
+                build_tinted_mask_preview(sample_mask, SAMPLE_MASK_PREVIEW_RGB),
                 REGION_EDITOR_TEXTURE_OPTIONS,
             );
             editor_state.sample_mask_texture = Some(tex);
@@ -2598,7 +2598,7 @@ impl RegionMaskInpaintToolBase {
                 editor_state.sample_mask.as_ref(),
             ) {
                 texture.set(
-                    build_tinted_mask_preview(sample_mask, [90, 255, 130]),
+                    build_tinted_mask_preview(sample_mask, SAMPLE_MASK_PREVIEW_RGB),
                     REGION_EDITOR_TEXTURE_OPTIONS,
                 );
             }
@@ -2783,6 +2783,13 @@ impl RegionMaskInpaintToolBase {
     }
 
 }
+
+/// Raster tint of the removal (inpaint) mask preview: `ms_theme::canvas::MASK_TINT` as RGB bytes,
+/// so the preview and its legend swatch can never disagree.
+const REMOVAL_MASK_PREVIEW_RGB: [u8; 3] = [ms_theme::canvas::MASK_TINT.r(), ms_theme::canvas::MASK_TINT.g(), ms_theme::canvas::MASK_TINT.b()];
+/// Raster tint of the sample-area mask preview: `ms_theme::canvas::OCCUPIED` as RGB bytes, the
+/// same colour its legend swatch is drawn in.
+const SAMPLE_MASK_PREVIEW_RGB: [u8; 3] = [ms_theme::canvas::OCCUPIED.r(), ms_theme::canvas::OCCUPIED.g(), ms_theme::canvas::OCCUPIED.b()];
 
 pub(super) fn build_tinted_mask_preview(mask: &egui::ColorImage, rgb: [u8; 3]) -> egui::ColorImage {
     let mut out = egui::ColorImage::filled(mask.size, Color32::TRANSPARENT);

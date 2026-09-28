@@ -1052,7 +1052,7 @@ impl MangaApp {
                 .order(egui::Order::Foreground).fixed_pos(screen.min).constrain(false)
                 .movable(false).interactable(true).show(ctx, |ui| {
                     ui.set_clip_rect(screen);
-                    ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+                    ui.painter().rect_filled(screen, 0.0, ms_theme::canvas::MODAL_SCRIM);
                     ui.allocate_rect(screen, egui::Sense::click_and_drag());
                     ui.vertical_centered(|ui| { ui.add_space(screen.height() * 0.45); ui.spinner(); ui.label(t!("page_manager.op_in_progress")); });
                 });
@@ -1063,7 +1063,7 @@ impl MangaApp {
                 .order(egui::Order::Foreground)
                 .collapsible(false).resizable(false).show(ctx, |ui| {
                     ui.label(t!("page_manager.op_failed_message"));
-                    ui.colored_label(egui::Color32::from_rgb(230, 120, 120), error);
+                    ui.colored_label(ms_theme::status::ERROR, error);
                     if ui.button(t!("page_manager.op_reload_button")).clicked() { reload = true; }
                 });
             if reload { self.page_op_error = None; self.pending_project_reload = true; }
@@ -1878,7 +1878,7 @@ impl MangaApp {
             .movable(false)
             .show(ctx, |ui| {
                 if let Some(message) = self.comic_type_prompt_error.as_ref() {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), message);
+                    ui.colored_label(ms_theme::status::ERROR, message);
                     ui.add_space(8.0);
                 }
                 if ui.button(t!("app.comic_type.pages_option")).clicked() {
@@ -1979,7 +1979,7 @@ impl MangaApp {
                 ui.add_space(8.0);
 
                 if let Some(message) = self.ai_device_prompt_error.as_ref() {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), message);
+                    ui.colored_label(ms_theme::status::ERROR, message);
                     ui.add_space(8.0);
                 }
                 if self.ai_device_prompt_applying {

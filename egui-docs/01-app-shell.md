@@ -216,7 +216,7 @@ eframe::run_native(
     &title,
     native_options,
     Box::new(move |cc| {
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        ms_theme::apply(&cc.egui_ctx); // stock dark + studio status colours
         Ok(Box::new(app::MangaApp::new(project, ai_backend.clone(), flag_for_app)))
     }),
 )
@@ -298,16 +298,18 @@ viewport command (src/launcher/app.rs:643).
 ## 7. Theme and style
 
 * `ctx.set_theme(egui::Theme::Dark)` — takes `impl Into<ThemePreference>` (egui-0.35.0/src/context.rs:2102);
-  used at src/main.rs:1387.
+  studio windows do not call it directly: they call `ms_theme::apply(&cc.egui_ctx)`
+  (`crates/ms-theme/src/lib.rs`), which sets `Theme::Dark` and then overrides
+  `error_fg_color`/`warn_fg_color` on the dark style through `style_mut_of`.
 * **There is no `Context::set_style` in 0.35.** The context-level API is
   `global_style()` / `global_style_mut()` (context.rs:2107, :2121), `all_styles_mut()` (:2145),
   `style_mut_of(theme, …)` / `set_style_of(theme, …)` (:2169, :2182), `set_visuals` / `set_visuals_of`
   (:2212, :2199). `set_style` exists only on `Ui` (egui-0.35.0/src/ui.rs:386) and applies to that
   subtree.
-* The launcher's palette lives in `src/launcher/theme.rs`: `configure_context(ctx)` clones
+* The launcher's palette lives in `crates/ms-launcher/src/theme.rs`: `configure_context(ctx)` clones
   `ctx.global_style()`, edits `Style`/`Visuals` (spacing, `Visuals::dark()`, widget fills, corner
-  radii) and installs it (src/launcher/theme.rs:45-…); `combo_popup_style()` returns a
-  `StyleModifier` (src/launcher/theme.rs:160) for popup-local overrides.
+  radii) and installs it (crates/ms-launcher/src/theme.rs:55-…); `combo_popup_style()` returns a
+  `StyleModifier` (crates/ms-launcher/src/theme.rs:212) for popup-local overrides.
 
 ## 8. Fonts
 
@@ -367,7 +369,8 @@ the result actually happens. The font loader above is the canonical example.
   (`impl eframe::App for MangaApp`, src/app.rs:2337).
 * To change process startup, window size/icon/app-id, or which `run_native` runs: `src/main.rs`.
 * To change the launcher shell and its secondary native windows: `src/launcher/app.rs`.
-* To change the launcher look (Style/Visuals/palette): `src/launcher/theme.rs`.
+* To change the launcher look (Style/Visuals/palette): `crates/ms-launcher/src/theme.rs`.
+* To change a studio semantic colour (status text, canvas chrome, checkerboard): `crates/ms-theme/`.
 * To change fonts (which files load, family names, fallback order): `src/ui_fonts.rs` and
   `fonts/ui/MODULE_README.md`.
 * To change the PS-editor panel layout (top/left/right/central): `src/tabs/ps_editor/mod.rs:1698-1851`.

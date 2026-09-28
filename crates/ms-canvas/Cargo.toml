@@ -24,6 +24,9 @@ ms-models = { path = "../ms-models" }
 # marked scroll bars), plus `ui_fonts` (the bubble text family), `input_util` (raw wheel
 # delta for Ctrl+zoom) and `bubble_status` (the status-border painter).
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # Localized canvas labels (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
 # Diagnostics for the canvas' own failure paths plus the `trace_log!` / `trace_scope!`

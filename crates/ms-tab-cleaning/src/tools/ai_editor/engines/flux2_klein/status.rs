@@ -149,8 +149,8 @@ impl Flux2Residency {
     pub(super) fn color(self) -> Option<Color32> {
         match self {
             Self::NotLoaded => None,
-            Self::Ram | Self::Gpu => Some(FLUX2_STATUS_OK_COLOR),
-            Self::Offloaded | Self::Mixed => Some(FLUX2_STATUS_WARN_COLOR),
+            Self::Ram | Self::Gpu => Some(ms_theme::status::SUCCESS),
+            Self::Offloaded | Self::Mixed => Some(ms_theme::status::WARNING),
         }
     }
 
@@ -856,11 +856,11 @@ mod tests {
     fn only_the_two_states_that_need_explaining_are_amber_and_carry_a_hover() {
         // `ram` must not be amber: the text encoder can never be on the GPU, so RAM is its
         // ideal state rather than a compromise.
-        assert_eq!(Flux2Residency::Ram.color(), Some(FLUX2_STATUS_OK_COLOR));
-        assert_eq!(Flux2Residency::Gpu.color(), Some(FLUX2_STATUS_OK_COLOR));
+        assert_eq!(Flux2Residency::Ram.color(), Some(ms_theme::status::SUCCESS));
+        assert_eq!(Flux2Residency::Gpu.color(), Some(ms_theme::status::SUCCESS));
         assert_eq!(Flux2Residency::NotLoaded.color(), None);
         for state in [Flux2Residency::Offloaded, Flux2Residency::Mixed] {
-            assert_eq!(state.color(), Some(FLUX2_STATUS_WARN_COLOR));
+            assert_eq!(state.color(), Some(ms_theme::status::WARNING));
             assert!(
                 state.hint().is_some(),
                 "{state:?} is not self-explanatory and must carry a hover"

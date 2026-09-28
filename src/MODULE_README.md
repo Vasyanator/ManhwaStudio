@@ -462,6 +462,9 @@ prompts instead of blocking the GUI thread.
   not duplicated canvas state machines.
 - Errors should have user-facing status and diagnostic logging context without secrets or large data
   dumps.
+- Every studio window (and the web launcher→editor swap) installs its theme ONLY through
+  `ms_theme::apply`, never a bare `set_theme`; semantic colours come from `ms-theme` (see
+  `crates/ms-theme/MODULE_README.md`). The launcher keeps its own `crates/ms-launcher/src/theme.rs`.
 - Fonts are installed ONLY through `ms_widgets::ui_fonts`, and only with `egui::Context::add_font`.
   `Context::set_fonts` replaces the whole definition set and would drop the families other
   subsystems add at runtime (typing font previews/editors), which then panics in epaint;

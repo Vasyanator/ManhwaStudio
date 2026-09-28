@@ -164,10 +164,10 @@ impl NotesTabState {
             ui.small(tf!("notes.paths_tooltip", template = project.paths.notes_file.display(), characters = project.paths.characters_dir.join("characters.json").display(), terms = project.paths.terms_file.display()));
 
             if let Some(msg) = &self.info_message {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                ui.colored_label(ms_theme::status::SUCCESS, msg);
             }
             if let Some(err) = &self.error_message {
-                ui.colored_label(egui::Color32::from_rgb(230, 100, 100), err);
+                ui.colored_label(ms_theme::status::ERROR, err);
             }
             if self.compose_in_flight {
                 ui.small(t!("notes.prompt.updating"));
@@ -232,7 +232,7 @@ impl NotesTabState {
                                     egui::RichText::new(
                                         t!("notes.template.no_placeholders_hint"),
                                     )
-                                    .color(egui::Color32::from_rgb(210, 150, 40)),
+                                    .color(ms_theme::status::WARNING),
                                 );
                                 if ui.button(t!("notes.template.insert_charas_button")).clicked() {
                                     insert_placeholder(&mut self.template_editor_text, "{charas}");

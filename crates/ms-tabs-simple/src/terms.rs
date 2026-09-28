@@ -173,10 +173,10 @@ impl TermsTabState {
         ui.vertical(|ui| {
             ui.heading(t!("terms.list.heading"));
             if let Some(msg) = &self.info_message {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                ui.colored_label(ms_theme::status::SUCCESS, msg);
             }
             if let Some(err) = &self.error_message {
-                ui.colored_label(egui::Color32::from_rgb(230, 100, 100), err);
+                ui.colored_label(ms_theme::status::ERROR, err);
             }
 
             ui.horizontal_wrapped(|ui| {
@@ -263,13 +263,13 @@ impl TermsTabState {
                 ui.label(
                     egui::RichText::new(tf!("terms.card.orig_name", orig = orig))
                         .italics()
-                        .color(egui::Color32::GRAY),
+                        .color(ui.visuals().weak_text_color()),
                 );
                 if !entry.tags.is_empty() {
                     ui.label(
                         egui::RichText::new(tf!("terms.card.tags", tags = entry.tags.join(", ")))
                             .italics()
-                            .color(egui::Color32::GRAY),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 }
                 ui.add_space(4.0);

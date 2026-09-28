@@ -57,7 +57,7 @@ Agent-facing architecture docs stay where they are (`README_AGENT.md`, per-direc
 ## Крейты workspace
 
 Проект — cargo workspace: тонкий бинарник `manhwastudio_rs` (`src/`, ~25 тыс. строк) плюс
-33 крейта под `crates/`. Почти весь код живёт в крейтах; в `src/` остались только
+34 крейта под `crates/`. Почти весь код живёт в крейтах; в `src/` остались только
 `main.rs` (CLI и режимы старта), `app.rs` (`MangaApp`), `tabs/settings/`,
 `studio_bootstrap.rs`, `web_entry.rs`, `args.rs`, `i18n_resolve.rs` и `bin/`.
 
@@ -80,7 +80,7 @@ bin (main.rs, app.rs, tabs/settings/)
   ← ms-config / ms-text-render
   ← ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx
   ← ms-log
-  ← ms-actions / ms-gifs / ms-i18n / ms-storage / ms-text-util / ms-thread
+  ← ms-actions / ms-gifs / ms-i18n / ms-storage / ms-text-util / ms-thread / ms-theme
 ```
 
 `←` читается как «зависит от»; уровень может зависеть от ЛЮБОГО уровня ниже, но крейты
@@ -261,6 +261,11 @@ bin (main.rs, app.rs, tabs/settings/)
   `SourcePageLoadState`). egui использует только как формат пикселей (`ColorImage`).
 - **`ms-widgets`** — весь набор собственных виджетов (`panel_dock/`, `Wheel*`, `AiButton`,
   …) плюс `ui_fonts`, `input_util`, `input_manager_v2`, отрисовка `bubble_status`.
+- **`ms-theme`** — sole owner of the studio's semantic colours on top of egui's stock dark
+  theme (status text, canvas chrome, scrim, transparency checkerboard); `ms_theme::apply` runs
+  on studio windows and the installer's update window. Studio UI never hand-types these. The
+  launcher keeps its own `theme.rs` and never calls `apply`; only the shared settings panes it
+  embeds from `ms-settings-ui` use `ms_theme::status`.
 - **`ms-canvas`** — движок холста (сцена, пузыри, overlay, zoom, input) и трейт
   `CanvasHooks`, который реализуют вкладки. Ссылок `canvas → tabs` нет ни одной.
 - **`ms-tools`** — общие инструменты растровой работы (кисть маски, membrane-solve, SOR).

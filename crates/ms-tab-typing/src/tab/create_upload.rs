@@ -638,9 +638,9 @@ impl TypingTextOverlayLayer {
             .fixed_pos(canvas_rect.center_top() + egui::vec2(-220.0, 16.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(240, 110, 110)))
+                    .stroke(Stroke::new(1.0, ms_theme::status::ERROR))
                     .show(ui, |ui| {
-                        ui.colored_label(Color32::from_rgb(240, 110, 110), message);
+                        ui.colored_label(ms_theme::status::ERROR, message);
                     });
             });
     }
@@ -654,9 +654,9 @@ impl TypingTextOverlayLayer {
             .fixed_pos(canvas_rect.center_top() + egui::vec2(-220.0, 52.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(232, 188, 66)))
+                    .stroke(Stroke::new(1.0, ms_theme::status::WARNING))
                     .show(ui, |ui| {
-                        ui.colored_label(Color32::from_rgb(232, 188, 66), message);
+                        ui.colored_label(ms_theme::status::WARNING, message);
                     });
             });
     }

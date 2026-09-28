@@ -76,9 +76,9 @@ pub fn draw_tutorials_pane(ui: &mut egui::Ui, progress: &TutorialProgressHandle)
                     reset_target = Some(id);
                 }
                 if completed {
-                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), t!("tutorial.settings.status_completed"));
+                    ui.colored_label(ms_theme::status::SUCCESS, t!("tutorial.settings.status_completed"));
                 } else {
-                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), t!("tutorial.settings.status_not_completed"));
+                    ui.colored_label(ui.visuals().weak_text_color(), t!("tutorial.settings.status_not_completed"));
                 }
             });
         });

@@ -152,11 +152,12 @@ impl PreviewBackdrop {
     ///
     /// Each is a NEUTRAL grey, so its Rec.709 luminance is exactly this level (the three
     /// coefficients sum to 1) and the contrast arithmetic needs no colour conversion. The
-    /// two extremes are the values the typing tab's transparency checkerboard already uses
-    /// for its light and dark variants, so the preview rows sit in the same visual family.
-    const LIGHT_LEVEL: u8 = 232;
+    /// two extremes are the origin greys of the studio's ink-preview checkerboards
+    /// (`ms_theme::checkerboard::INK_PREVIEW_LIGHT` / `INK_PREVIEW_DARK`), so the preview rows
+    /// sit in the same visual family.
+    const LIGHT_LEVEL: u8 = ms_theme::checkerboard::INK_PREVIEW_LIGHT.origin().r();
     const MEDIUM_LEVEL: u8 = 128;
-    const DARK_LEVEL: u8 = 64;
+    const DARK_LEVEL: u8 = ms_theme::checkerboard::INK_PREVIEW_DARK.origin().r();
 
     /// Every backdrop, in the order [`choose_preview_backdrop`] considers them. Ties are
     /// broken by this order, so the lightest grey wins an exact tie.
@@ -188,13 +189,14 @@ impl PreviewBackdrop {
 
     /// The 1 px border drawn around a preset row, so the row still reads as its own strip
     /// against the popup background. It steps AWAY from the fill: darker under the light
-    /// grey, lighter under the other two.
+    /// grey, lighter under the other two. The two extremes reuse the ink-preview checkerboard
+    /// borders of the same greys.
     #[must_use]
     pub(super) const fn border(self) -> egui::Color32 {
         match self {
-            Self::Light => egui::Color32::from_rgb(150, 150, 150),
+            Self::Light => ms_theme::checkerboard::INK_PREVIEW_LIGHT_BORDER,
             Self::Medium => egui::Color32::from_rgb(176, 176, 176),
-            Self::Dark => egui::Color32::from_rgb(115, 115, 115),
+            Self::Dark => ms_theme::checkerboard::INK_PREVIEW_DARK_BORDER,
         }
     }
 }

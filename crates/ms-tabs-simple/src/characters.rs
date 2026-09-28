@@ -297,10 +297,10 @@ impl CharactersTabState {
         ui.vertical(|ui| {
             ui.heading(t!("characters.list.heading"));
             if let Some(msg) = &self.info_message {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                ui.colored_label(ms_theme::status::SUCCESS, msg);
             }
             if let Some(err) = &self.error_message {
-                ui.colored_label(egui::Color32::from_rgb(230, 100, 100), err);
+                ui.colored_label(ms_theme::status::ERROR, err);
             }
 
             ui.horizontal_wrapped(|ui| {
@@ -457,7 +457,7 @@ impl CharactersTabState {
                             ui.label(
                                 egui::RichText::new(tf!("characters.card.groups", groups = entry.groups.join(", ")))
                                     .italics()
-                                    .color(egui::Color32::GRAY),
+                                    .color(ui.visuals().weak_text_color()),
                             );
                         }
                         ui.add_space(6.0);

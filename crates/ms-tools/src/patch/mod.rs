@@ -82,18 +82,6 @@ const OUTLINE_DASH_COUNT: f32 = 48.0;
 /// Floor for a single dash, in screen points, so a tiny selection still reads as dashed.
 const OUTLINE_MIN_DASH: f32 = 3.0;
 
-/// The dark half of the two-tone outline. Paired with white, the outline survives both black
-/// line art and white paper — the same rule `cleaning/tools/stamp.rs`'s source ring follows.
-const OUTLINE_DARK: Color32 = Color32::from_rgb(20, 20, 20);
-
-/// The light half of an outline whose release would be REFUSED.
-///
-/// The same red the cleaning tab's region editor paints a frame with whose size its consumer
-/// rejects (`FRAME_INVALID_COLOR`, itself `FLUX2_STATUS_ERROR_COLOR`), used the same way: the dark
-/// backing dash stays, only the light half changes colour, so the project keeps ONE meaning for
-/// "this state is refused" on the canvas.
-const OUTLINE_REFUSED: Color32 = Color32::from_rgb(255, 120, 120);
-
 /// Where one page sits on screen, and how many pixels its page-pixel space has.
 ///
 /// The two values travel together because the projection needs both and neither is meaningful
@@ -1402,12 +1390,14 @@ enum OutlineTone {
 }
 
 impl OutlineTone {
-    /// The light half of the two-tone dash. The dark half is `OUTLINE_DARK` either way, so the
-    /// outline stays readable over both black line art and white paper in both states.
+    /// The light half of the two-tone dash. The dark half is `ms_theme::canvas::OUTLINE_BACKING`
+    /// either way, so the outline stays readable over both black line art and white paper in both
+    /// states; a refused drag uses the canvas-wide `ms_theme::canvas::REFUSED`, the one meaning of
+    /// "this state is refused" shared with the cleaning tab's region editor.
     fn light(self) -> Color32 {
         match self {
             Self::Normal => Color32::WHITE,
-            Self::Refused => OUTLINE_REFUSED,
+            Self::Refused => ms_theme::canvas::REFUSED,
         }
     }
 
@@ -1509,7 +1499,7 @@ fn paint_outline(
     let dash = (perimeter / (OUTLINE_DASH_COUNT * 2.0)).max(OUTLINE_MIN_DASH);
     painter.extend(egui::Shape::dashed_line(
         &path,
-        egui::Stroke::new(3.0, OUTLINE_DARK),
+        egui::Stroke::new(3.0, ms_theme::canvas::OUTLINE_BACKING),
         dash,
         dash,
     ));

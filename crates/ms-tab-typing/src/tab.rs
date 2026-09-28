@@ -158,9 +158,10 @@ use codec::*;
 pub(crate) use codec::decode_vector_mesh_warp;
 mod mesh_geometry;
 use mesh_geometry::*;
-// The transparency checkerboard and its light/dark luminance rule live here and are
-// the project's ONLY ones, so the sibling `panel` module reaches them directly (as it
-// already does for `codec`) instead of growing a second copy.
+// The text-preview checkerboard painter (its palettes are `ms_theme::checkerboard`'s
+// INK_PREVIEW presets) and the tab's ONLY light/dark luminance rule live here, so the
+// sibling `panel` module reaches them directly (as it already does for `codec`) instead of
+// growing a second copy.
 pub(crate) mod render_store;
 use render_store::*;
 mod create_upload;
@@ -332,7 +333,6 @@ const TEXT_SHAPE_VARIANT_TILE_MAX_HEIGHT_PX: f32 = 120.0;
 const TEXT_SHAPE_VARIANT_TILE_GAP_PX: f32 = 8.0;
 const TEXT_SHAPE_VARIANT_PANEL_PADDING_PX: f32 = 10.0;
 const TEXT_SHAPE_VARIANT_PANEL_MENU_GAP_PX: f32 = 4.0;
-const TEXT_SHAPE_VARIANT_CHECKER_SIDE_PX: f32 = 14.0;
 const TEXT_LAYOUT_EDITOR_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
 const TEXT_LAYOUT_EDITOR_FRAME_MIN_SIDE_PX: f32 = 24.0;
 /// Centering assist: the guide frame is created this factor larger than the layer footprint.

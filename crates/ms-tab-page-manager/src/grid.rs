@@ -301,7 +301,7 @@ impl PageManagerTabState {
         ui.horizontal_wrapped(|ui| {
             if clean {
                 ui.colored_label(
-                    egui::Color32::from_rgb(110, 200, 110),
+                    ms_theme::status::SUCCESS,
                     t!("page_manager.card.clean_present_badge"),
                 );
             } else {

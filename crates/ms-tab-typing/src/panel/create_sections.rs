@@ -707,28 +707,28 @@ impl TypingCreatePanelState {
                     } => {
                         ui.add_space(4.0);
                         let text = tf!("typing.export.done_pages_status", done = done, total = total);
-                        let rich = egui::RichText::new(text).color(Color32::from_rgb(90, 230, 120));
+                        let rich = egui::RichText::new(text).color(ms_theme::status::SUCCESS);
                         ui.label(rich);
                         ui.add(
                             egui::ProgressBar::new(1.0)
                                 .desired_width(ui.available_width())
                                 .show_percentage()
-                                .fill(Color32::from_rgb(90, 230, 120)),
+                                .fill(ms_theme::status::SUCCESS),
                         );
                         // The export SUCCEEDED, but the format could not express something
                         // (today: a PSD font name claimed by several installed fonts). It
-                        // is drawn in the shared font-diagnostic warning colour, next to
+                        // is drawn in the studio warning colour (as font diagnostics are), next to
                         // the result it qualifies, so an approximation is never silent.
                         for warning in warnings {
                             ui.colored_label(
-                                super::create_presets::FONT_DIAGNOSTIC_WARNING_COLOR,
+                                ms_theme::status::WARNING,
                                 warning,
                             );
                         }
                     }
                     TypingExportUiStatus::Error { message } => {
                         ui.add_space(4.0);
-                        ui.colored_label(Color32::from_rgb(240, 110, 110), message);
+                        ui.colored_label(ms_theme::status::ERROR, message);
                     }
                 }
             }
@@ -810,7 +810,7 @@ fn draw_repaginate_block(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(t!("typing.export.repaginate_pages_warning"))
-                    .color(super::create_presets::FONT_DIAGNOSTIC_WARNING_COLOR),
+                    .color(ms_theme::status::WARNING),
             )
             .wrap(),
         );

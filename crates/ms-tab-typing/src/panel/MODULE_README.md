@@ -604,7 +604,8 @@ THE COMBO ROW OF A LOCAL PRESET IS A PICTURE, NOT A `selectable_label`
 (`create_main_text::draw_local_preset_image_row`). A preview is a TRANSPARENT render, so the
 row paints a FLAT GREY behind it and marks a SELECTED row with an OUTLINE — a
 `selectable_label` would lay its opaque blue fill over the picture. The backdrop is ONE OF
-THREE GREYS (`local_preset_preview::PreviewBackdrop`, levels 232 / 128 / 64), not a
+THREE GREYS (`local_preset_preview::PreviewBackdrop`, levels 232 / 128 / 64 — the extremes are
+the `ms_theme::checkerboard::INK_PREVIEW_*` origin greys), not a
 transparency checkerboard: the row exists to show what the preset looks like, and a pattern
 competes with the preset's own colours instead of setting them off.
 
@@ -1220,10 +1221,9 @@ session long before this call.
   list. Only the create panel has a preview render (`preview_enabled`), so only it
   shows the rows.
 - `create_presets.rs` maps BOTH diagnostics to colors/wording and is the only place
-  that may (`font_coverage_tooltip`, `font_fallback_status_lines`, the shared
-  `FONT_DIAGNOSTIC_WARNING_COLOR`/`FONT_DIAGNOSTIC_ERROR_COLOR` and
-  `MAX_SHOWN_CHARS`). Falling back is INFORMATION and uses the warning color; a tofu
-  character uses the error color.
+  that may (`font_coverage_tooltip`, `font_fallback_status_lines`, `MAX_SHOWN_CHARS`); the
+  colours themselves are the studio's `ms_theme::status::WARNING`/`ERROR`. Falling back is
+  INFORMATION and uses the warning color; a tofu character uses the error color.
 
 ## Coverage cache invalidation
 - `FontEntry.coverage` is computed ONCE per font at LOAD time (in `fonts.rs`,
@@ -1618,7 +1618,7 @@ has exactly ONE owner and is unit-testable without a GUI (`panel/tests.rs`):
   operation. Applied on a format change and on a comic-type change, never per frame.
 - `apply_repaginate_toggle(..)` — the TWO-CLICK guard on a page-based title: the first click
   that would ENABLE re-pagination does not enable it, it raises `repaginate_pages_warning`
-  (drawn under the checkbox in `create_presets::FONT_DIAGNOSTIC_WARNING_COLOR`); the second
+  (drawn under the checkbox in `ms_theme::status::WARNING`); the second
   click enables it. Disabling clears the warning. `Ribbon`/`Custom` titles enable on the first
   click with no warning.
 - `export_dialog_kind(format)` / `export_button_label_key(format)` — one decision drives BOTH the

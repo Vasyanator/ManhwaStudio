@@ -632,50 +632,19 @@ pub(super) fn use_dark_shape_variant_checkerboard(text_color: [u8; 4]) -> bool {
 /// Paints a transparency checkerboard into `rect`, plus a 1 px border of its own value.
 ///
 /// `rounding` is the corner radius in points; `dark` picks the variant, normally from
-/// [`use_dark_shape_variant_checkerboard`]. Alternate cells are clipped to `rect.shrink(1.0)`
-/// so no cell can spill over the border. Painting only — nothing is allocated in the `Ui`,
-/// so the caller owns the layout.
+/// [`use_dark_shape_variant_checkerboard`]: `ms_theme::checkerboard::INK_PREVIEW_DARK` (for light
+/// ink) or `INK_PREVIEW_LIGHT` (for dark ink), anchored at `rect`'s top-left corner. The inside
+/// border is drawn after the board, so it covers the board's outermost pixel ring and no cell can
+/// show past it. Painting only — nothing is allocated in the `Ui`, so the caller owns the layout.
 pub(super) fn paint_shape_variant_checkerboard(
     painter: &egui::Painter,
     rect: Rect,
     rounding: f32,
     dark: bool,
 ) {
-    let (base_color, alternate_color, stroke_color) = if dark {
-        (
-            Color32::from_rgb(64, 64, 64),
-            Color32::from_rgb(88, 88, 88),
-            Color32::from_rgb(115, 115, 115),
-        )
-    } else {
-        (
-            Color32::from_rgb(232, 232, 232),
-            Color32::from_rgb(198, 198, 198),
-            Color32::from_rgb(150, 150, 150),
-        )
-    };
-
-    painter.rect_filled(rect, rounding, base_color);
-    let clip_rect = rect.shrink(1.0);
-    let clipped = painter.with_clip_rect(clip_rect);
-    let side = TEXT_SHAPE_VARIANT_CHECKER_SIDE_PX.max(1.0);
-    let cols = (rect.width() / side).ceil().max(1.0) as usize;
-    let rows = (rect.height() / side).ceil().max(1.0) as usize;
-
-    for row in 0..rows {
-        for col in 0..cols {
-            if (row + col) % 2 == 0 {
-                continue;
-            }
-            let min = Pos2::new(
-                rect.left() + col as f32 * side,
-                rect.top() + row as f32 * side,
-            );
-            let cell = Rect::from_min_size(min, Vec2::splat(side)).intersect(rect);
-            clipped.rect_filled(cell, 0.0, alternate_color);
-        }
-    }
-
+    use ms_theme::checkerboard::{INK_PREVIEW_DARK, INK_PREVIEW_DARK_BORDER, INK_PREVIEW_LIGHT, INK_PREVIEW_LIGHT_BORDER};
+    let (board, stroke_color) = if dark { (INK_PREVIEW_DARK, INK_PREVIEW_DARK_BORDER) } else { (INK_PREVIEW_LIGHT, INK_PREVIEW_LIGHT_BORDER) };
+    board.paint(painter, rect, rounding);
     painter.rect_stroke(
         rect,
         rounding,

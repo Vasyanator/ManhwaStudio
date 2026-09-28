@@ -981,10 +981,10 @@ fn draw_status(ui: &mut egui::Ui, status: &GeneralSettingsStatus) {
             ui.small(message);
         }
         GeneralSettingsStatus::Success(message) => {
-            ui.colored_label(egui::Color32::from_rgb(42, 168, 88), message);
+            ui.colored_label(ms_theme::status::SUCCESS, message);
         }
         GeneralSettingsStatus::Error(message) => {
-            ui.colored_label(egui::Color32::from_rgb(208, 84, 62), message);
+            ui.colored_label(ms_theme::status::ERROR, message);
         }
     }
 }

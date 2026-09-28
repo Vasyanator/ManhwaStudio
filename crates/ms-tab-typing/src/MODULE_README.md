@@ -430,8 +430,9 @@ saving, and export.
     still falls back to `ByLineLength` for a line restored from a project or preset whose JSON
     carries no mode, so existing overlays keep rendering exactly as they were saved.
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
-    Also the project's ONLY transparency checkerboard for text previews
-    (`paint_shape_variant_checkerboard`, used by the shape-variant menu; `pub(super)`) and the
+    Also the text-preview checkerboard painter (`paint_shape_variant_checkerboard`, used by
+    the shape-variant menu; `pub(super)`; palettes are `ms_theme::checkerboard::INK_PREVIEW_*`,
+    only the dark/light CHOICE is typing's) and the
     ONLY luminance rule for judging rendered text against a backdrop:
     `shape_variant_luminance` (Rec.709 over white, 0..255) with its two-way form
     `use_dark_shape_variant_checkerboard`. The VALUE is `pub(crate)` because

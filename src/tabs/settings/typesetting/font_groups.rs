@@ -579,7 +579,7 @@ impl FontGroupsEditorState {
         let button = if armed {
             // Armed state is tinted red so the destructive confirm reads clearly.
             egui::Button::new(t!("typing.font_settings.group_delete_confirm_button"))
-                .fill(egui::Color32::from_rgb(150, 40, 40))
+                .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
         } else {
             egui::Button::new(t!("typing.font_settings.group_delete_button"))
         };

@@ -168,7 +168,7 @@ pub(super) fn draw_on_top_for_page(
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_gray(90)),
+            Stroke::new(1.0, ms_theme::canvas::NEUTRAL_BORDER),
             egui::StrokeKind::Inside,
         );
         if let Some(style) = status_stroke {
@@ -515,7 +515,7 @@ pub(super) fn draw_on_top_for_page(
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                Stroke::new(3.0, Color32::from_rgb(0, 120, 215)),
+                Stroke::new(3.0, ms_theme::canvas::SELECTION),
                 egui::StrokeKind::Inside,
             );
         }
@@ -535,12 +535,13 @@ pub(super) fn draw_on_top_for_page(
                     egui::CursorIcon::Grab
                 });
             }
+            // Resting handle is a slightly translucent selection accent so the page shows through.
             let handle_fill = if handle_active {
-                Color32::from_rgb(0, 120, 215)
+                ms_theme::canvas::SELECTION
             } else if handle_response.hovered() {
-                Color32::from_rgb(38, 153, 251)
+                ms_theme::canvas::SELECTION_HOVER
             } else {
-                Color32::from_rgba_premultiplied(0, 120, 215, 220)
+                ms_theme::canvas::SELECTION.gamma_multiply_u8(220)
             };
             ui.painter().circle_filled(
                 handle_rect.center(),
@@ -685,7 +686,7 @@ pub(super) fn draw_rect_handles(
         ui.painter().circle_stroke(
             *point,
             4.0,
-            Stroke::new(1.0, Color32::from_rgb(0, 120, 215)),
+            Stroke::new(1.0, ms_theme::canvas::SELECTION),
         );
 
         if response.dragged() {

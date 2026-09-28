@@ -171,9 +171,10 @@ const WATERMARK_OVERLAP_MAX: u32 = 256;
 const WATERMARK_THRESHOLD_MIN: f32 = 0.05;
 const WATERMARK_THRESHOLD_MAX: f32 = 0.95;
 const WATERMARK_DILATE_MAX: u32 = 30;
-/// Yellow tint of the predicted-mask overlay, matching the mask editor's
-/// «удаление» colour so the two surfaces read the same.
-const WATERMARK_MASK_PREVIEW_RGB: [u8; 3] = [255, 220, 0];
+/// Yellow tint of the predicted-mask overlay: the raster form of the shared removal-mask tint
+/// `ms_theme::canvas::MASK_TINT`, the mask editor's «удаление» colour, so the two surfaces read
+/// the same.
+const WATERMARK_MASK_PREVIEW_RGB: [u8; 3] = [ms_theme::canvas::MASK_TINT.r(), ms_theme::canvas::MASK_TINT.g(), ms_theme::canvas::MASK_TINT.b()];
 
 /// What the tool does with the selection.
 ///
@@ -3605,7 +3606,7 @@ fn draw_mode_entry(
     } else {
         response.on_disabled_hover_text(
             egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
-                .color(Color32::from_rgb(240, 102, 102)),
+                .color(ms_theme::status::ERROR),
         )
     };
     if response.clicked() {
@@ -3704,7 +3705,7 @@ impl WatermarkEditorCtx<'_> {
             WatermarkMode::MaskOnly => {}
             WatermarkMode::Clean => {
                 ui.colored_label(
-                    Color32::from_rgb(255, 170, 60),
+                    ms_theme::status::WARNING,
                     t!("cleaning.tools.watermark.experimental_warning"),
                 );
             }
@@ -4201,7 +4202,7 @@ impl WatermarkEditorCtx<'_> {
             ui.small(describe_residual(&report.residual));
             if report.failed_patches > 0 {
                 ui.colored_label(
-                    Color32::from_rgb(255, 170, 60),
+                    ms_theme::status::WARNING,
                     tf!(
                         "cleaning.tools.watermark.chapter.apply_failed_patches",
                         count = report.failed_patches

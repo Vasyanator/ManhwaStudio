@@ -521,14 +521,14 @@ pub fn draw_ocr_panel(
     ui.separator();
 
     let (status_color, status_text) = match state {
-        OcrLoadState::NotLoaded => (egui::Color32::GRAY, t!("translation.ocr_panel.status_not_loaded")),
+        OcrLoadState::NotLoaded => (ui.visuals().weak_text_color(), t!("translation.ocr_panel.status_not_loaded")),
         OcrLoadState::DownloadingModel => (
-            egui::Color32::from_rgb(255, 172, 66),
+            ms_theme::status::INFO,
             t!("translation.common.downloading_model_status"),
         ),
-        OcrLoadState::Loading => (egui::Color32::from_rgb(255, 172, 66), t!("translation.ocr_panel.status_loading")),
-        OcrLoadState::Ready => (egui::Color32::from_rgb(42, 168, 88), t!("translation.ocr_panel.status_ready")),
-        OcrLoadState::Error => (egui::Color32::from_rgb(208, 84, 62), t!("translation.ocr_panel.status_error")),
+        OcrLoadState::Loading => (ms_theme::status::INFO, t!("translation.ocr_panel.status_loading")),
+        OcrLoadState::Ready => (ms_theme::status::SUCCESS, t!("translation.ocr_panel.status_ready")),
+        OcrLoadState::Error => (ms_theme::status::ERROR, t!("translation.ocr_panel.status_error")),
     };
     ui.horizontal(|ui| {
         ui.label(t!("translation.ocr_panel.status_label"));
@@ -616,7 +616,7 @@ pub fn draw_ocr_panel(
             actions.request_load = true;
         }
         if let Some(reason) = disabled_reason {
-            ui.colored_label(egui::Color32::from_rgb(240, 102, 102), reason);
+            ui.colored_label(ms_theme::status::ERROR, reason);
         }
     });
 
@@ -859,7 +859,7 @@ fn disabled_manga_model_choice(
     } else {
         response.on_disabled_hover_text(
             egui::RichText::new(pytorch_unavailable_hint())
-                .color(egui::Color32::from_rgb(240, 102, 102)),
+                .color(ms_theme::status::ERROR),
         )
     };
     if response.clicked() {

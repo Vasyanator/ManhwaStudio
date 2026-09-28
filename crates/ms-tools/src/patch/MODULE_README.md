@@ -134,7 +134,7 @@ layer — instead of solving in a plane that does not contain it.
 - **The outline never lies about the source.** It is projected with the UNCLAMPED page-pixel ->
   scene map (`scene_pos_in_page`), not with the clamping `PatchHost::scene_pos_to_page_pos`
   inverted, which would pin a source dragged past the page edge to the border. A drag the release
-  would refuse is stroked in `OUTLINE_REFUSED` instead of white, so the refusal is visible DURING
+  would refuse is stroked in `ms_theme::canvas::REFUSED` instead of white, so the refusal is visible DURING
   the drag rather than after it.
 - The refusal shown on screen and the refusal performed at the release are ONE predicate:
   `PatchToolCore::drag_geometry` (selection bounds -> `PatchHost::page_source_size` -> `roi_for`).

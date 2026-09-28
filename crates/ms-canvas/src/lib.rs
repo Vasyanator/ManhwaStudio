@@ -321,10 +321,6 @@ const HANGUL_KEYBOARD_MARGIN_PX: f32 = 16.0;
 /// Assumed height of the Hangul keyboard used only to seed its default position near the bottom
 /// of the canvas. The window auto-sizes; this never constrains its real height.
 const HANGUL_KEYBOARD_DEFAULT_HEIGHT_PX: f32 = 360.0;
-/// Color of the "no insert target" warning line in the Hangul keyboard panel. Matches the muted
-/// error red used by the settings/status panels (`src/general_settings_panel.rs`,
-/// `src/ai_backend_panel.rs`) rather than the harsh full `Color32::RED`.
-const HANGUL_KEYBOARD_NO_TARGET_COLOR: egui::Color32 = egui::Color32::from_rgb(208, 84, 62);
 /// Floor for the image-bubble preview zoom factor: when zoomed out, the preview
 /// image never shrinks below 20% of its fit-to-bubble size.
 const IMAGE_BUBBLE_PREVIEW_MIN_ZOOM_SCALE: f32 = 0.2;
@@ -1572,7 +1568,7 @@ impl CanvasView {
                 // so the user knows why pressing Insert does nothing.
                 if !has_target {
                     ui.colored_label(
-                        HANGUL_KEYBOARD_NO_TARGET_COLOR,
+                        ms_theme::status::ERROR,
                         t!("canvas.hangul_keyboard.no_target_warning"),
                     );
                     ui.separator();
@@ -2426,7 +2422,7 @@ impl CanvasView {
                 }
             }
         } else if let Some(error) = entry.error.as_ref() {
-            ui.colored_label(egui::Color32::from_rgb(240, 102, 102), error);
+            ui.colored_label(ms_theme::status::ERROR, error);
         }
     }
 

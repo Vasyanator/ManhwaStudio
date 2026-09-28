@@ -87,7 +87,7 @@ fn run_update_window_internal(mode: UpdateMode, host: HostVersion) -> Result<Upd
         t!("installer.update.window_title"),
         native_options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
             Ok(Box::new(UpdateApp::new(mode, output_for_app, host)))
         }),
@@ -407,7 +407,7 @@ impl UpdateApp {
                 }
                 UpdateState::Available { remote_version } => {
                     ui.colored_label(
-                        egui::Color32::from_rgb(120, 220, 120),
+                        ms_theme::status::SUCCESS,
                         tf!("installer.update.new_version_available_status", remote_version = remote_version),
                     );
                     ui.add_space(14.0);
@@ -416,7 +416,7 @@ impl UpdateApp {
                     }
                 }
                 UpdateState::Error { message } => {
-                    ui.colored_label(egui::Color32::from_rgb(235, 125, 125), message);
+                    ui.colored_label(ms_theme::status::ERROR, message);
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         if ui.button(t!("installer.update.retry_check_button")).clicked() {
@@ -449,7 +449,7 @@ impl UpdateApp {
             ui.add_space(12.0);
 
             if let UpdateState::Error { message } = &self.state {
-                ui.colored_label(egui::Color32::from_rgb(235, 125, 125), message);
+                ui.colored_label(ms_theme::status::ERROR, message);
                 ui.add_space(8.0);
                 if ui.button(t!("installer.update.exit_button")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

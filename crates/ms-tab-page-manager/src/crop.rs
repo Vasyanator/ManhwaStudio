@@ -90,15 +90,6 @@ const FINE_ANGLE_DRAG_SPEED: f64 = 0.02;
 /// Decimals shown by the angle widgets, matching [`FINE_ANGLE_STEP_DEG`] exactly.
 const FINE_ANGLE_DECIMALS: usize = 2;
 
-/// Alpha of the veil painted over everything the crop discards.
-const DIM_ALPHA: u8 = 140;
-
-/// Colors of the crop frame and its handles. Fixed rather than taken from the
-/// theme: the frame must stay readable over an arbitrary page image, which the
-/// theme's widget colors are not chosen for.
-const FRAME_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 60);
-const HANDLE_FILL: egui::Color32 = egui::Color32::from_rgb(255, 190, 60);
-const HANDLE_STROKE: egui::Color32 = egui::Color32::from_rgb(40, 30, 10);
 /// Color of the rule-of-thirds guides inside the frame.
 const GUIDE_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(200, 200, 200, 90);
 
@@ -953,7 +944,7 @@ fn paint_textured_quad(
 /// "brighten" pass, so the kept region is the untouched preview and the user
 /// judges the crop on the real pixels.
 fn paint_crop_overlay(painter: &egui::Painter, board: egui::Rect, frame: egui::Rect) {
-    let shade = egui::Color32::from_black_alpha(DIM_ALPHA);
+    let shade = ms_theme::canvas::OUTSIDE_SHADE;
     let kept = frame.intersect(board);
     if !kept.is_positive() {
         // The frame is entirely off-board (the user panned away): nothing is kept
@@ -997,16 +988,16 @@ fn paint_crop_frame(painter: &egui::Painter, frame: ScreenRect) {
     painter.rect_stroke(
         rect,
         egui::CornerRadius::ZERO,
-        egui::Stroke::new(1.5, FRAME_COLOR),
+        egui::Stroke::new(1.5, ms_theme::canvas::CROP_FRAME),
         egui::StrokeKind::Inside,
     );
     for (_, handle_rect) in crop_layout::handle_rects(frame, HANDLE_SIZE_POINTS) {
         let handle = to_egui_rect(handle_rect);
-        painter.rect_filled(handle, egui::CornerRadius::same(2), HANDLE_FILL);
+        painter.rect_filled(handle, egui::CornerRadius::same(2), ms_theme::canvas::CROP_FRAME);
         painter.rect_stroke(
             handle,
             egui::CornerRadius::same(2),
-            egui::Stroke::new(1.0, HANDLE_STROKE),
+            egui::Stroke::new(1.0, ms_theme::canvas::CROP_HANDLE_STROKE),
             egui::StrokeKind::Inside,
         );
     }

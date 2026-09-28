@@ -137,14 +137,6 @@ const SAMPLE_PREVIEW_SIDE: f32 = 48.0;
 const PREVIEW_MAX_PX: u32 = 128;
 /// Width of the name editor, points.
 const NAME_EDIT_WIDTH: f32 = 240.0;
-/// Colour of the "exact" verdict line. Matches the affirmative green used elsewhere in the
-/// cleaning UI rather than introducing a new one.
-const VERDICT_EXACT_RGB: [u8; 3] = [120, 200, 120];
-/// Colour of a graded verdict line — the same amber the experimental-mode warning uses.
-const VERDICT_GRADED_RGB: [u8; 3] = [255, 170, 60];
-/// Colour of the "this crop was refused" line on a pending row. The same red the region base
-/// paints its own selection refusals in, so a refusal reads the same wherever it is shown.
-const REFUSED_RGB: [u8; 3] = [255, 120, 120];
 /// Fill of the button that cancels an armed canvas selection. Red because it is the only
 /// control on this screen that abandons something the user started.
 ///
@@ -1342,7 +1334,7 @@ impl WatermarkLibraryWindow {
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                ui.colored_label(graded_color(), status);
+                ui.colored_label(ms_theme::status::WARNING, status);
                 dismiss = ui
                     .button(t!("cleaning.tools.watermark.chapter.library_status_dismiss_button"))
                     .clicked();
@@ -1727,7 +1719,7 @@ impl WatermarkLibraryWindow {
                                     ring_full_pixels: Some(full),
                                 } if pixels < full => {
                                     ui.colored_label(
-                                        graded_color(),
+                                        ms_theme::status::WARNING,
                                         tf!(
                                             "cleaning.tools.watermark.chapter.library_sample_partial_line",
                                             level = format_level(level),
@@ -1746,7 +1738,7 @@ impl WatermarkLibraryWindow {
                                 }
                                 StoredSampleBackground::Manual { level } => {
                                     ui.colored_label(
-                                        graded_color(),
+                                        ms_theme::status::WARNING,
                                         tf!(
                                             "cleaning.tools.watermark.chapter.library_sample_manual_line",
                                             level = format_level(level)
@@ -1831,7 +1823,7 @@ impl WatermarkLibraryWindow {
                 ui.group(|ui| {
                     let row = &self.capture_refusals[index];
                     ui.colored_label(
-                        Color32::from_rgb(REFUSED_RGB[0], REFUSED_RGB[1], REFUSED_RGB[2]),
+                        ms_theme::status::ERROR,
                         t!("cleaning.tools.watermark.chapter.library_refused_heading"),
                     );
                     ui.small(row.reason.as_str());
@@ -1911,11 +1903,7 @@ impl WatermarkLibraryWindow {
                             // sometimes part of the fix.
                             if let Some(refusal) = self.pending[index].refusal.as_ref() {
                                 ui.colored_label(
-                                    Color32::from_rgb(
-                                        REFUSED_RGB[0],
-                                        REFUSED_RGB[1],
-                                        REFUSED_RGB[2],
-                                    ),
+                                    ms_theme::status::ERROR,
                                     t!("cleaning.tools.watermark.chapter.library_refused_heading"),
                                 );
                                 ui.small(refusal.reason.as_str());
@@ -2121,7 +2109,7 @@ impl WatermarkLibraryWindow {
                                         "cleaning.tools.watermark.chapter.library_entry_empty_icon"
                                     ))
                                     .small()
-                                    .color(graded_color()),
+                                    .color(ms_theme::status::WARNING),
                                 )
                                 .wrap(),
                             );
@@ -2563,19 +2551,15 @@ fn entry_verdict_line(warnings: &EntryWarnings, entry: &EntrySummary) -> Verdict
     let asserted = warnings.rests_on_assertion;
     match warnings.conditioning.as_ref() {
         Some(ModelConditioning::Separable { .. }) if !asserted => VerdictLine {
-            color: Color32::from_rgb(
-                VERDICT_EXACT_RGB[0],
-                VERDICT_EXACT_RGB[1],
-                VERDICT_EXACT_RGB[2],
-            ),
+            color: ms_theme::status::SUCCESS,
             text: t!("cleaning.tools.watermark.chapter.verdict_separable").to_string(),
         },
         Some(ModelConditioning::Separable { .. }) => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: t!("cleaning.tools.watermark.chapter.verdict_separable_asserted").to_string(),
         },
         Some(ModelConditioning::DepositExact { .. }) => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: if asserted {
                 t!("cleaning.tools.watermark.chapter.verdict_deposit_exact_asserted").to_string()
             } else {
@@ -2583,7 +2567,7 @@ fn entry_verdict_line(warnings: &EntryWarnings, entry: &EntrySummary) -> Verdict
             },
         },
         Some(ModelConditioning::NotEnoughSamples { have, need }) => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: tf!(
                 "cleaning.tools.watermark.chapter.verdict_not_enough",
                 have = have,
@@ -2591,7 +2575,7 @@ fn entry_verdict_line(warnings: &EntryWarnings, entry: &EntrySummary) -> Verdict
             ),
         },
         Some(ModelConditioning::DepositUnavailable { samples, spread }) => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: tf!(
                 "cleaning.tools.watermark.chapter.verdict_deposit_unavailable",
                 samples = samples,
@@ -2605,7 +2589,7 @@ fn entry_verdict_line(warnings: &EntryWarnings, entry: &EntrySummary) -> Verdict
             required,
             ..
         }) => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: tf!(
                 "cleaning.tools.watermark.chapter.verdict_underdetermined",
                 pixels = underdetermined_pixels,
@@ -2620,7 +2604,7 @@ fn entry_verdict_line(warnings: &EntryWarnings, entry: &EntrySummary) -> Verdict
         // has one of its own above, so no entry is ever told its build is out of date about a
         // verdict the build renders correctly two screens away.
         None => VerdictLine {
-            color: graded_color(),
+            color: ms_theme::status::WARNING,
             text: tf!(
                 "cleaning.tools.watermark.chapter.library_verdict_unknown",
                 verdict = entry.verdict.clone()
@@ -2679,13 +2663,13 @@ fn draw_entry_report(ui: &mut egui::Ui, entry: &EntrySummary) {
     // read "not enough samples" about a mark the entry does not even have yet.
     if warnings.is_empty {
         ui.colored_label(
-            graded_color(),
+            ms_theme::status::WARNING,
             t!("cleaning.tools.watermark.chapter.library_entry_empty_hint"),
         );
     }
     if warnings.partial_rings > 0 {
         ui.colored_label(
-            graded_color(),
+            ms_theme::status::WARNING,
             tf!(
                 "cleaning.tools.watermark.chapter.library_partial_ring_warning",
                 count = warnings.partial_rings
@@ -2694,7 +2678,7 @@ fn draw_entry_report(ui: &mut egui::Ui, entry: &EntrySummary) {
     }
     if warnings.samples_disagree {
         ui.colored_label(
-            graded_color(),
+            ms_theme::status::WARNING,
             tf!(
                 "cleaning.tools.watermark.chapter.library_samples_disagree_warning",
                 percent = format!("{:.0}", warnings.clamped_share * 100.0)
@@ -2703,7 +2687,7 @@ fn draw_entry_report(ui: &mut egui::Ui, entry: &EntrySummary) {
     }
     if asserted {
         ui.colored_label(
-            graded_color(),
+            ms_theme::status::WARNING,
             tf!(
                 "cleaning.tools.watermark.chapter.library_manual_background_warning",
                 files = warnings
@@ -2779,15 +2763,6 @@ fn draw_entry_report(ui: &mut egui::Ui, entry: &EntrySummary) {
                 .join("; ")
         )
     });
-}
-
-/// The amber used for every line that is a warning rather than an affirmation.
-fn graded_color() -> Color32 {
-    Color32::from_rgb(
-        VERDICT_GRADED_RGB[0],
-        VERDICT_GRADED_RGB[1],
-        VERDICT_GRADED_RGB[2],
-    )
 }
 
 /// Renders one entry's card icon on a worker thread.
@@ -3731,7 +3706,7 @@ mod tests {
             );
             assert_eq!(
                 asserted.color,
-                graded_color(),
+                ms_theme::status::WARNING,
                 "{verdict}: an asserted background is never the affirmative colour"
             );
 

@@ -24,8 +24,8 @@ progress.rs SdxlSharedProgress -> the worker<->panel progress state, its generat
 wire.rs     run_sdxl / unload_sdxl -> the request header, the blob encoding, the streaming call
 ```
 `mod.rs` is the module ROOT and holds no logic: the file header, the module declarations, the
-imports every submodule shares through `use super::*;`, and the constants (timeout, size grid, mask
-tint, sampler list, parameter ranges, the `-1` random-seed sentinel).
+imports every submodule shares through `use super::*;`, and the constants (timeout, size grid,
+sampler list, parameter ranges, the `-1` random-seed sentinel).
 
 TWO MODES, ONE BACKEND METHOD. `inpaint.sdxl` takes a `mode` field and behaves as two pipelines
 behind it, which is why the mode is a PARAMETER of one engine rather than two picker entries:
@@ -40,7 +40,7 @@ subtree and it is one-directional.
 
 ## Files and submodules
 - `mod.rs`: the module root — header, submodule declarations, shared imports and the constants.
-  Edit it to change a limit: the call timeout, the selection grid, the mask tint, the offered
+  Edit it to change a limit: the call timeout, the selection grid, the offered
   sampler list, a parameter range, or the preview width.
 - `settings.rs`: `SdxlMode` and its wire spelling, `SdxlSettings` (one full parameter set per mode)
   with the per-mode defaults, `SdxlPersisted` (the document), `SdxlRunConfig` (the worker snapshot),
@@ -58,8 +58,8 @@ subtree and it is one-directional.
 - **The mask is MANDATORY and means REGENERATE.** `allows_empty_mask()` is unconditionally `false`:
   SDXL inpainting has no whole-region mode the way FLUX.2 klein does, so an empty mask describes no
   work. The host disables «Обработать» and draws no «работает без маски» hint. The single layer
-  carries the inpaint yellow of the mask-inpaint editor (`tools/base.rs`), the same colour
-  `../lama/` uses, because the meaning is the inpainting hole in both.
+  carries the shared removal-mask tint `ms_theme::canvas::MASK_TINT` (the mask-inpaint editor's
+  yellow), the same colour `../lama/` uses, because the meaning is the inpainting hole in both.
 - **The wire is the backend's contract, not this engine's.** One `inpaint.sdxl` method,
   `image_len` / `mask_len` header ints, an `image_png ++ mask_png` request blob, the result PNG in
   the RESPONSE BLOB, `progress` frames (counters in the frame HEADER, latent preview PNG in the
@@ -113,7 +113,7 @@ subtree and it is one-directional.
   derived from a localized caption carries a pinned `id_salt`.
 
 ## Editing map
-- To change a limit (timeout, selection grid, mask tint, sampler list, a parameter range, the
+- To change a limit (timeout, selection grid, sampler list, a parameter range, the
   preview width, the random-seed sentinel): `mod.rs`.
 - To add or re-default a persisted field: `settings.rs` — and keep the field NAME, or an existing
   user's file silently loses that value.

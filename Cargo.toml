@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 
 # Single pin for every third-party crate used by MORE THAN ONE manifest in this workspace.
 # Members write `<dep>.workspace = true` instead of repeating a version, so a version can no
@@ -162,6 +162,11 @@ ms-sysprobe = { path = "crates/ms-sysprobe" }
 # `src/main.rs`. It knows nothing about the project domain, so it sits below
 # `canvas`/`tabs`/`launcher` and may never depend on them.
 ms-widgets = { path = "crates/ms-widgets" }
+# The studio's semantic colours on top of egui's stock dark theme (status text, canvas
+# chrome, modal scrim, transparency checkerboard). A leaf over egui alone; `ms_theme::apply`
+# is installed on the studio windows and the installer's update window at startup. The
+# launcher's own chrome does NOT use it (only the shared `ms-settings-ui` panes it embeds do).
+ms-theme = { path = "crates/ms-theme" }
 # The shared runtime models (bubbles, layer document, clean overlays, text masks) plus
 # the source-page view model, re-exported as `crate::models` / `crate::page_view` from
 # `src/main.rs`. Sits ABOVE `ms-project` and BELOW the canvas and the tabs; egui is a

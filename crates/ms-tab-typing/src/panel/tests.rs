@@ -5288,7 +5288,7 @@ paths change.
         assert_eq!(used.len(), 1);
         assert_eq!(
             used[0].color,
-            create_presets::FONT_DIAGNOSTIC_WARNING_COLOR,
+            ms_theme::status::WARNING,
             "a fallback must not be painted like an error"
         );
         assert!(used[0].text.contains('漢'));
@@ -5300,15 +5300,15 @@ paths change.
             missing: vec!['\u{e000}'],
         });
         assert_eq!(lost.len(), 1);
-        assert_eq!(lost[0].color, create_presets::FONT_DIAGNOSTIC_ERROR_COLOR);
+        assert_eq!(lost[0].color, ms_theme::status::ERROR);
 
         // Both: the informational row comes first, the alarming one last.
         let mut both = fallback_report("Noto Sans Arabic", &['ب']);
         both.missing = vec!['\u{e000}'];
         let rows = create_presets::font_fallback_status_lines(&both);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].color, create_presets::FONT_DIAGNOSTIC_WARNING_COLOR);
-        assert_eq!(rows[1].color, create_presets::FONT_DIAGNOSTIC_ERROR_COLOR);
+        assert_eq!(rows[0].color, ms_theme::status::WARNING);
+        assert_eq!(rows[1].color, ms_theme::status::ERROR);
     }
 
     #[test]

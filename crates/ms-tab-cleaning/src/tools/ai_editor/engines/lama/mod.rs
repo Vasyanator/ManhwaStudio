@@ -18,9 +18,9 @@ The mask means "REMOVE what is under it" — the inpaint meaning, the inverse of
 klein's "you MAY change what is under it". The mask is therefore MANDATORY
 (`allows_empty_mask()` is unconditionally `false`): with nothing painted there is nothing to
 remove, and the host disables «Обработать» rather than sending a request that could only
-answer with the region it was given. The single mask layer is tinted with the inpaint yellow
-of the mask-inpaint editor (`tools/base.rs`), so the colour means the same thing in both
-places.
+answer with the region it was given. The single mask layer is tinted with the shared removal-mask
+tint `ms_theme::canvas::MASK_TINT`, the same yellow as the mask-inpaint editor
+(`tools/base.rs`), so the colour means the same thing in both places.
 
 FOUR MODELS, TWO BACKEND METHODS, ONE BUTTON. `inpaint.lama_v2` and `inpaint.lama_mpe` are
 genuinely different architectures (different generator, different forward arity, different
@@ -84,7 +84,6 @@ use crate::tools::region_edit_v2::geometry::FrameConstraints;
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
-use egui::Color32;
 use image::{ColorType, ImageEncoder};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
@@ -135,18 +134,6 @@ const LAMA_SELECTION_MULTIPLE: usize = 8;
 /// multiple of 8 there is no valid smaller side, so this states the same rule rather than
 /// adding one.
 const LAMA_MIN_SELECTION_PX: usize = 8;
-
-/// Preview tint of the engine's single mask layer, i.e. of the area to REMOVE.
-///
-/// The inpaint yellow of the mask-inpaint editor (`tools/base.rs`, the «Жёлтая: удаление»
-/// legend and its mask preview), so a mask painted here reads the same as it always did.
-/// Opaque on purpose: `MaskStack` scales the alpha itself, and a tint that arrived already
-/// translucent would be darkened twice.
-const LAMA_MASK_TINT: Color32 = Color32::from_rgb(255, 220, 0);
-
-/// Colour of the model-scan failure line. The shared error tone of the cleaning subtree
-/// (`RegionEditToolBase::draw_ui_hint`).
-const LAMA_STATUS_ERROR_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
 
 // Refine parameter ranges of `inpaint.lama_v2`, as offered by the panel.
 const LAMA_N_ITERS_MIN: u8 = 5;

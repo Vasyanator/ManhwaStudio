@@ -183,6 +183,17 @@ Where premultiplication bites:
 Scalar helpers: `linear_f32_from_gamma_u8` (`ecolor-0.35.0/src/lib.rs:97`),
 `gamma_u8_from_linear_f32` (:114), `hsv_from_rgb`/`rgb_from_hsv` (`ecolor-0.35.0/src/hsva.rs:191/:215`).
 
+### Which colour to use — project rule
+
+Semantic colours are not typed at the call site. Status text (error/warning/success/in-progress)
+comes from `ms_theme::Severity::color()` / `ms_theme::status::*` or from `ui.visuals()`
+(`error_fg_color` / `warn_fg_color` carry the same values once `ms_theme::apply` ran, see
+`crates/ms-theme/src/lib.rs`); chrome drawn over page images (selection, crop, split, tool state,
+modal scrim) comes from `ms_theme::canvas::*`; a transparency checkerboard is a
+`ms_theme::checkerboard` preset (`paint` = one textured rect over a cached `NEAREST_REPEAT` tile,
+`color_at` for pixel buffers). Raster colours baked into images/masks stay local. The launcher has
+its own palette (`crates/ms-launcher/src/theme.rs`). Contract: `crates/ms-theme/MODULE_README.md`.
+
 ## Fading things out without touching layout
 
 Three different tools; picking the wrong one changes geometry or interactivity.
@@ -320,6 +331,7 @@ points × `pixels_per_point`.
 
 ## Editing map
 
+- Studio semantic colours and the transparency checkerboard: `crates/ms-theme/`.
 - Custom textured geometry / deform meshes: `src/tabs/typing/tab/mesh_geometry.rs`
   (`build_textured_deform_mesh`, `draw_textured_deform_mesh`).
 - Layer/raster quads on the typing canvas: `src/tabs/typing/tab/doc_layers.rs`.

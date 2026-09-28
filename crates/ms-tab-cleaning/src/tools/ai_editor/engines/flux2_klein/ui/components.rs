@@ -88,10 +88,10 @@ pub(super) fn draw_estimate_ui(
     if estimate.fits {
         ui.small(line).on_hover_text(tooltip);
     } else {
-        ui.colored_label(FLUX2_STATUS_WARN_COLOR, line)
+        ui.colored_label(ms_theme::status::WARNING, line)
             .on_hover_text(tooltip);
         ui.colored_label(
-            FLUX2_STATUS_WARN_COLOR,
+            ms_theme::status::WARNING,
             t!("cleaning.tools.flux2_klein.estimate_does_not_fit_warning"),
         );
     }
@@ -129,7 +129,7 @@ pub(super) fn draw_component_list_ui(
     }
     if let Some(error) = error {
         ui.colored_label(
-            FLUX2_STATUS_ERROR_COLOR,
+            ms_theme::status::ERROR,
             tf!("cleaning.tools.flux2_klein.status_error", err = error),
         );
     }
@@ -138,7 +138,7 @@ pub(super) fn draw_component_list_ui(
         return;
     };
     if !status.available && !status.reason.is_empty() {
-        ui.colored_label(FLUX2_STATUS_WARN_COLOR, status.reason.as_str());
+        ui.colored_label(ms_theme::status::WARNING, status.reason.as_str());
     }
     // The residency half is answered for the whole block at once, so its three
     // non-row outcomes are reported once above the rows instead of five times inside them.

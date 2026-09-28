@@ -133,7 +133,7 @@ impl eframe::App for WebApp {
                 if let Some(sel) = selection {
                     match build_editor_from_selection(&sel) {
                         Ok(editor) => {
-                            ctx.set_theme(egui::Theme::Dark);
+                            ms_theme::apply(ctx);
                             *self = WebApp::Editor(Box::new(editor));
                         }
                         Err(err) => console_error(&format!("open project failed: {err}")),

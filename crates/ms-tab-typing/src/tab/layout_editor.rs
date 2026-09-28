@@ -45,10 +45,13 @@ pub(super) fn draw_layout_editor_vector_lines_tab(
             let mut remove_idx: Option<usize> = None;
             for idx in 0..editor.lines.len() {
                 let selected = editor.active_line_idx == idx;
+                // The active line's card is a SELECTED list row, so it takes the panel's
+                // selection visuals; the idle card keeps its local neutral chrome.
                 let frame = if selected {
+                    let selection = ui.visuals().selection;
                     egui::Frame::default()
-                        .fill(Color32::from_rgb(45, 72, 98))
-                        .stroke(Stroke::new(1.4, Color32::from_rgb(120, 210, 255)))
+                        .fill(selection.bg_fill)
+                        .stroke(Stroke::new(1.4, selection.stroke.color))
                 } else {
                     egui::Frame::default()
                         .fill(Color32::from_rgb(38, 40, 44))

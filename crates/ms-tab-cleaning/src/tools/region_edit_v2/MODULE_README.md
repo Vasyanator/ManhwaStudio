@@ -47,7 +47,8 @@ that owns the context, the canvas and the project at once:
 - `input.rs`: `HandleKind`, the handle hit rects and arcs, and `moved_rect_px` /
   `resized_rect_px`. Every drag is measured from an anchor captured on `drag_started`, never
   accumulated per frame.
-- `render.rs`: the colour constants and every paint call. Registers no hitbox, ever.
+- `render.rs`: the local chrome colour constants and every paint call; the state colours
+  (backing ring, refused red, occupied green) are `ms_theme::canvas` tokens. Registers no hitbox, ever.
 - `frame.rs`: `RegionFrame` and the per-frame pass; `FrameLock`, `FrameVisual`, `FrameHost`,
   `FrameOutcome`, `FrameButtons`.
 - `mod.rs`: submodule declarations. No flattening re-exports — a `pub use` inside a private
@@ -173,7 +174,8 @@ that owns the context, the canvas and the project at once:
 - To change how big a handle is, where it may be grabbed, or how much of a disc it shows:
   `HANDLE_RADIUS`, `handle_hit_rects` and `handle_arc` in `input.rs` — the three agree by
   construction, and `render.rs` only turns the arc into a polygon.
-- To change a colour, a plate, the grip or the arrow: `render.rs` only.
+- To change a chrome colour, a plate, the grip or the arrow: `render.rs` only; the state colours
+  are retuned studio-wide in `crates/ms-theme/src/canvas.rs`.
 - To change the lock rules, the button enablement, the status line or the pass order:
   `frame.rs`.
 - To change how a mask layer stores, previews or uploads its pixels: `layers.rs`.

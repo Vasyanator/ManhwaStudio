@@ -83,6 +83,14 @@ and still counts as a defect.
 - **A localized label requires a stable `id_salt`.** egui derives widget `Id` from the
   label text, so without a salt, switching language resets the widget's state. See
   `05-ids-and-i18n.md` §2.
+- **Do not hand-type semantic colours.** Status text (error / warning / success /
+  in-progress), chrome drawn over page images (selection, crop, split, tool state, modal
+  scrim) and the transparency checkerboard come from `ms-theme` (`ms_theme::status` /
+  `Severity`, `ms_theme::canvas`, `ms_theme::checkerboard`) or from `ui.visuals()`. A
+  studio window starts with `ms_theme::apply`, never a bare `set_theme`. Exceptions: pixel
+  and mask colours baked into image buffers, and the launcher, which has its own
+  `crates/ms-launcher/src/theme.rs`. A new repeated role gets a new token in `ms-theme`.
+  See `02-painting.md` and `crates/ms-theme/MODULE_README.md`.
 - **The GUI thread never blocks.** No I/O, decode, or long compute inside `fn ui`
   (`README_AGENT.md`, "GUI Thread").
 

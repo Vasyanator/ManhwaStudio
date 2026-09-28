@@ -39,7 +39,7 @@ status lines. Nothing here is behind a fold except the parameters, which open by
 ## Files and submodules
 - `mod.rs`: module root — the header, the module declarations, the shared imports every
   submodule pulls in with `use super::*;`, and the constants (call timeout, selection rule,
-  mask tint, parameter ranges). No logic.
+  parameter ranges). No logic. The mask tint is `ms_theme::canvas::MASK_TINT`.
 - `catalog.rs`: `LamaMethod`, `LamaModelSpec`, the four entries, the default, the name → spec
   resolution and the ensure-before-run path. Edit here to offer another checkpoint, to change
   which method one runs, or to change whether it can refine.
@@ -112,7 +112,8 @@ status lines. Nothing here is behind a fold except the parameters, which open by
 - To add or re-range a parameter: the constants in `mod.rs` plus `LamaSettings` in `settings.rs`
   plus `draw_method_parameters` in `engine.rs`.
 - To change the selection rule: `LamaEngine::constraints` and the two constants in `mod.rs`.
-- To change the mask tint or its label: `LamaEngine::mask_layers` and `LAMA_MASK_TINT`.
+- To change the mask label: `LamaEngine::mask_layers`; the tint itself is the shared
+  `ms_theme::canvas::MASK_TINT`.
 - To change where the settings file lives: `config::lama_engine_settings_path`.
 - To change the picker, the panels, the frame or the apply path: the HOST (`../../mod.rs`),
   never here.

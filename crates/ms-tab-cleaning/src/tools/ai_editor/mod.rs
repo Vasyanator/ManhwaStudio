@@ -106,15 +106,6 @@ const ENGINE_SECTIONS: [EngineSection; 2] = [EngineSection::WithoutPrompt, Engin
 /// stay the theme's, so the button reads as emphasised rather than as a different control.
 const PROCESS_BUTTON_EMPHASIS: f32 = 1.5;
 
-/// Colour of a line that reports a state the user may act on and nothing is wrong with.
-///
-/// Deliberately the host's own constant rather than a value borrowed from an engine: the
-/// engines each own their status palette (`FLUX2_STATUS_OK_COLOR` and its siblings), and a
-/// host that reached into one of them would change appearance with the selected engine.
-/// A literal instead of `Visuals`: egui has no "affirmative" role in its palette — the
-/// nearest, `error_fg_color`, means the opposite of this.
-const AREA_EDITOR_HINT_OK_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 255, 130);
-
 /// Why a pending result could not be merged into the clean overlay.
 ///
 /// Both variants exist because `CanvasView::replace_overlay_region_px` would otherwise
@@ -1228,7 +1219,8 @@ impl AiEditorTool {
         }
         ui.small(
             egui::RichText::new(t!("cleaning.tools.area_editor.no_mask_hint"))
-                .color(AREA_EDITOR_HINT_OK_COLOR),
+                // An affirmative hint ("works without a mask"): the shared success tone.
+                .color(ms_theme::status::SUCCESS),
         );
     }
 

@@ -965,7 +965,7 @@ impl TypingCreatePanelState {
 
         if font_missing {
             ui.colored_label(
-                Color32::from_rgb(240, 200, 60),
+                ms_theme::status::WARNING,
                 t!("typing.params.pick_available_font_hint"),
             );
         }

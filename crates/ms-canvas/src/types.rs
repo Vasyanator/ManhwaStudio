@@ -480,7 +480,7 @@ impl ImageTextArea {
 #[must_use]
 pub(crate) fn image_area_palette(index: usize) -> egui::Color32 {
     const PALETTE: [egui::Color32; 6] = [
-        egui::Color32::from_rgb(0, 120, 215),
+        ms_theme::canvas::SELECTION,
         egui::Color32::from_rgb(46, 204, 113),
         egui::Color32::from_rgb(241, 196, 15),
         egui::Color32::from_rgb(230, 126, 34),

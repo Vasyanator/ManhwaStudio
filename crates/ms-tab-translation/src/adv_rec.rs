@@ -797,12 +797,12 @@ fn handle_adv_rec_image_input(
             ui.painter().rect_filled(
                 selection_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(0, 160, 255, 60),
+                ms_theme::canvas::SELECTION.gamma_multiply_u8(60),
             );
             ui.painter().rect_stroke(
                 selection_rect,
                 0.0,
-                egui::Stroke::new(2.0, Color32::from_rgb(0, 160, 255)),
+                egui::Stroke::new(2.0, ms_theme::canvas::SELECTION),
                 egui::StrokeKind::Outside,
             );
         }

@@ -51,6 +51,9 @@ ms-tools = { path = "../ms-tools" }
 # Every reusable widget the panels put on screen, plus `input_util`, `bubble_status` and
 # the configurable-hotkey registry (`input_manager_v2`) this tab registers specs with.
 ms-widgets = { path = "../ms-widgets" }
+# Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
+# hand-typed here. A leaf over egui, so it adds no layering constraint.
+ms-theme = { path = "../ms-theme" }
 # Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
 # The whole tab draws.

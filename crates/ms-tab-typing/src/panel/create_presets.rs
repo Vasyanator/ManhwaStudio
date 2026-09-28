@@ -40,27 +40,20 @@ use ms_widgets::{RowLayout, SearchableComboBox, SearchableComboItem};
 /// the per-render fallback status so a long text can never blow up the panel.
 const MAX_SHOWN_CHARS: usize = 15;
 
-/// "Works, but not the way you asked": a font that only partially covers the
-/// typesetting language, or a character drawn by a fallback font instead of the
-/// selected one. Deliberately not red — both cases still render.
-pub(super) const FONT_DIAGNOSTIC_WARNING_COLOR: egui::Color32 =
-    egui::Color32::from_rgb(240, 200, 60);
-
-/// "This will not be readable": a font that lacks the writing system entirely, or
-/// a character no font in the render base could draw (tofu).
-pub(super) const FONT_DIAGNOSTIC_ERROR_COLOR: egui::Color32 =
-    egui::Color32::from_rgb(230, 96, 92);
+// Font diagnostics use the studio status colours: `ms_theme::status::WARNING` for "works, but
+// not the way you asked" (a font that only partially covers the typesetting language, or a
+// character drawn by a fallback font — deliberately not red, both cases still render) and
+// `ms_theme::status::ERROR` for "this will not be readable" (a font lacking the writing system
+// entirely, or a character no font in the render base could draw).
 
 /// Fill of the global-preset «Удалить» button AT REST.
 ///
 /// The button is red before it is armed too: deleting a preset is destructive whether or not
 /// the confirm step has been reached, and a neutral button that only turns red on the second
-/// click hides that from the first one. Muted, so the ARMED state still reads as an escalation.
+/// click hides that from the first one. Muted, so the ARMED state
+/// (`ms_theme::status::DESTRUCTIVE_ARMED_FILL`, shared with the font-group delete control)
+/// still reads as an escalation.
 const PRESET_DELETE_IDLE_COLOR: egui::Color32 = egui::Color32::from_rgb(105, 38, 38);
-
-/// Fill of the global-preset «Удалить» button once ARMED — the same saturated red the font-group
-/// delete control confirms in (`settings::typesetting::font_groups::draw_delete_control`).
-const PRESET_DELETE_ARMED_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 40, 40);
 
 /// Width, in points, the preset name row keeps for the save and delete buttons that follow the
 /// rename field. Everything else on the row goes to the field itself.
@@ -486,7 +479,7 @@ impl TypingCreatePanelState {
         let armed = self.preset_delete_armed && enabled;
         let button = if armed {
             egui::Button::new(t!("typing.presets.delete_confirm_button"))
-                .fill(PRESET_DELETE_ARMED_COLOR)
+                .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
         } else {
             egui::Button::new(t!("typing.presets.delete_button")).fill(PRESET_DELETE_IDLE_COLOR)
         };
@@ -511,7 +504,7 @@ impl TypingCreatePanelState {
         ui.label(
             egui::RichText::new(t!("typing.presets.unsaved_warning"))
                 .small()
-                .color(FONT_DIAGNOSTIC_WARNING_COLOR),
+                .color(ms_theme::status::WARNING),
         );
     }
 
@@ -1374,8 +1367,8 @@ impl TypingCreatePanelState {
                 // wording lives in `font_coverage_tooltip`, which returns `None` for `Full`.
                 let color = match font.coverage.support {
                     FontLanguageSupport::Full => None,
-                    FontLanguageSupport::Partial => Some(FONT_DIAGNOSTIC_WARNING_COLOR),
-                    FontLanguageSupport::Unsupported => Some(FONT_DIAGNOSTIC_ERROR_COLOR),
+                    FontLanguageSupport::Partial => Some(ms_theme::status::WARNING),
+                    FontLanguageSupport::Unsupported => Some(ms_theme::status::ERROR),
                 };
                 Some(FontComboRow {
                     font_idx,
@@ -1888,7 +1881,7 @@ pub(super) fn font_fallback_status_lines(
             .join("; ");
         lines.push(FontFallbackStatusLine {
             text: tf!("typing.font_fallback.used_status", list = list),
-            color: FONT_DIAGNOSTIC_WARNING_COLOR,
+            color: ms_theme::status::WARNING,
             tooltip: t!("typing.font_fallback.used_tooltip"),
         });
     }
@@ -1898,7 +1891,7 @@ pub(super) fn font_fallback_status_lines(
                 "typing.font_fallback.missing_status",
                 chars = truncated_char_list(report.missing.as_slice())
             ),
-            color: FONT_DIAGNOSTIC_ERROR_COLOR,
+            color: ms_theme::status::ERROR,
             tooltip: t!("typing.font_fallback.missing_tooltip"),
         });
     }

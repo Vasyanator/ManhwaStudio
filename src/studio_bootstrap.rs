@@ -272,7 +272,7 @@ impl StudioBootstrapApp {
             ui.vertical_centered(|ui| {
                 ui.heading(t!("studio_bootstrap.load_failed"));
                 ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 120), error_text);
+                ui.colored_label(ms_theme::status::ERROR, error_text);
                 ui.add_space(14.0);
                 if ui
                     .add_sized(
