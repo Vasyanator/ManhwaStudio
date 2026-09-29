@@ -1906,11 +1906,15 @@ fn run_main_window(
             // Global interface scale (`General.ui_scale_percent`): per-`Context`, so the
             // studio applies it for itself exactly like the launcher does for its window.
             general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);
+            // GPU shader layers (the PS editor's «Коррекция»): needs `cc.gl`, so it can only
+            // happen here; the shell destroys the backend in its `on_exit`.
+            studio_bootstrap::install_shader_layers(cc);
             Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
                 load_rx,
                 user_settings.clone(),
                 ai_backend.clone(),
                 flag_for_app,
+                cc.egui_ctx.clone(),
             )))
         }),
     )

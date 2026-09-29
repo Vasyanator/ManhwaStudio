@@ -3,19 +3,20 @@ File: tabs/ps_editor/correction/model.rs
 
 Purpose:
 The data model and ALL the maths of the PS editor's VIEW-ONLY «Коррекция». Deliberately free of
-egui and of glow: this file is the one place the correction's numbers are defined, and it is unit
-tested. The shader in `gpu.rs` mirrors `apply_channel` line for line, and the panel in `ui.rs`
-edits `Correction` through it.
+egui, of glow and of `egui-shader-layers`: this file is the one place the correction's numbers are
+defined, and it is unit tested. It folds the user's parameters into exactly the two arguments of
+`egui_shader_layers::presets::brightness_contrast` (painted by `shader.rs`); `apply_channel` is the
+Rust statement of that preset's per-channel formula. The panel in `ui.rs` edits `Correction`.
 
 Key structures:
 - `CorrectionKind`: which correction the «Настройка» section is showing («Нет» / «Яркость уровня»).
 - `Correction`: the parameter payload of one correction.
 - `CorrectionState`: the pairing of the two, as the tab stores it.
-- `ColorFilterUniforms`: the two floats the GPU filter is driven by.
+- `BrightnessContrastParams`: the two preset arguments the GPU pass is driven by.
 
 Key functions:
-- `Correction::uniforms`: folds the parameters into `{ gain, bias }`.
-- `apply_channel`: the reference implementation of what the fragment shader computes.
+- `Correction::params`: folds the parameters into `{ brightness_offset, contrast_gain }`.
+- `apply_channel` (test-only): the reference implementation of the preset's per-channel formula.
 
 Notes:
 Nothing here reaches layer pixels, `layers.json`, `CleanOverlaysModel` or the saved project. The
@@ -35,33 +36,37 @@ pub const PARAM_MAX: f32 = 100.0;
 /// instead of blowing the page to black or white halfway through its travel.
 const BRIGHTNESS_FULL_SCALE_SHIFT: f32 = 0.25;
 
-/// The two uniforms the GPU filter is driven by: `out = clamp(gain * c + bias, 0, 1)` per colour
-/// channel, alpha untouched.
+/// The two arguments of `egui_shader_layers::presets::brightness_contrast(brightness, contrast)`,
+/// which computes `out = clamp((c - 0.5) * contrast_gain + 0.5 + brightness_offset, 0, 1)` per
+/// colour channel on unpremultiplied colour, alpha untouched.
 ///
-/// Gamma-encoded space, because that is the space egui's own shader composites in
-/// (`egui_glow-0.35.0/src/shader/fragment.glsl:52`) and therefore the space the canvas is already
-/// in when the filter reads it back out of the framebuffer.
+/// Expanded, that is `contrast_gain * c + (0.5 - 0.5 * contrast_gain + brightness_offset)`: a
+/// mid-grey-pivoted slope plus an offset. The offset term is NEGATIVE for a contrast boost, which is
+/// precisely why the filter cannot be expressed as an egui vertex tint (see this module's
+/// `MODULE_README.md`). Gamma-encoded space, because that is the space egui composites in and
+/// therefore the space the canvas is in when the shader layer reads it back.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ColorFilterUniforms {
-    /// Multiplier applied to every colour channel.
-    pub gain: f32,
-    /// Offset added after the multiply. Negative for a contrast boost — which is precisely why the
-    /// filter cannot be expressed as an egui vertex tint (see this module's `MODULE_README.md`).
-    pub bias: f32,
+pub struct BrightnessContrastParams {
+    /// Shift added after the contrast pivot, in the `0..=1` channel range (the preset's `brightness`).
+    pub brightness_offset: f32,
+    /// Slope around mid-grey, `> 0` (the preset's `contrast`).
+    pub contrast_gain: f32,
 }
 
-impl ColorFilterUniforms {
+impl BrightnessContrastParams {
     /// The pass-through filter: every channel survives unchanged.
     pub const IDENTITY: Self = Self {
-        gain: 1.0,
-        bias: 0.0,
+        brightness_offset: 0.0,
+        contrast_gain: 1.0,
     };
 
-    /// Whether these uniforms leave every channel exactly as it was, so the GPU pass can be skipped
-    /// entirely and the zero-cost default path stays byte-identical to having no correction at all.
+    /// Whether these parameters leave every channel exactly as it was, so the GPU pass can be
+    /// skipped entirely and the zero-cost default path stays byte-identical to having no
+    /// correction at all.
     #[must_use]
     pub fn is_identity(self) -> bool {
-        self.gain == Self::IDENTITY.gain && self.bias == Self::IDENTITY.bias
+        self.brightness_offset == Self::IDENTITY.brightness_offset
+            && self.contrast_gain == Self::IDENTITY.contrast_gain
     }
 }
 
@@ -109,7 +114,8 @@ pub enum Correction {
 }
 
 impl Default for Correction {
-    /// The neutral correction: both parameters at `0.0`, i.e. exactly [`ColorFilterUniforms::IDENTITY`].
+    /// The neutral correction: both parameters at `0.0`, i.e. exactly
+    /// [`BrightnessContrastParams::IDENTITY`].
     fn default() -> Self {
         Self::BrightnessContrast {
             brightness: 0.0,
@@ -119,20 +125,19 @@ impl Default for Correction {
 }
 
 impl Correction {
-    /// Folds this correction's parameters into the two uniforms the GPU filter runs on.
+    /// Folds this correction's parameters into the two arguments of the shader-layer preset.
     ///
     /// The model is the LEGACY-style linear brightness/contrast, not Photoshop's modern CS3+
-    /// highlight-preserving curve, and that is a deliberate choice: the linear form collapses to
-    /// `out = clamp(gain * c + bias, 0, 1)`, so the fragment shader is a one-liner that cannot
-    /// drift away from the Rust the unit tests below cover. A piecewise curve would move the real
-    /// maths into GLSL, where nothing in this repository can test it. The correction is a VIEWING
-    /// AID for spotting small colour differences, not a photo-editing operation, so the extra
-    /// fidelity would buy nothing and cost testability.
+    /// highlight-preserving curve, and that is a deliberate choice: the linear form is exactly what
+    /// `egui_shader_layers::presets::brightness_contrast` computes, so the maths the tests below
+    /// pin through `apply_channel` is the maths on screen. A piecewise curve would need a custom
+    /// WGSL effect nothing in this repository can test, for fidelity a VIEWING AID for spotting
+    /// small colour differences does not need.
     ///
     /// Operates on GAMMA-ENCODED values (the space the canvas is already composited in) and leaves
-    /// alpha untouched. Neutral parameters yield exactly `gain == 1.0, bias == 0.0`.
+    /// alpha untouched. Neutral parameters yield exactly [`BrightnessContrastParams::IDENTITY`].
     #[must_use]
-    pub fn uniforms(self) -> ColorFilterUniforms {
+    pub fn params(self) -> BrightnessContrastParams {
         match self {
             Self::BrightnessContrast {
                 brightness,
@@ -147,12 +152,11 @@ impl Correction {
                 } else {
                     1.0 / (1.0 - contrast / PARAM_MAX)
                 };
-                let brightness_offset = brightness / PARAM_MAX * BRIGHTNESS_FULL_SCALE_SHIFT;
-                // `0.5 - 0.5 * gain` is what pivots the contrast on mid-grey: it is the offset that
-                // keeps `c == 0.5` fixed for any gain.
-                ColorFilterUniforms {
-                    gain,
-                    bias: 0.5 - 0.5 * gain + brightness_offset,
+                // The preset pivots the gain on mid-grey itself (`(c - 0.5) * gain + 0.5`), so the
+                // brightness offset is handed over as-is: `c == 0.5` stays fixed for any gain.
+                BrightnessContrastParams {
+                    brightness_offset: brightness / PARAM_MAX * BRIGHTNESS_FULL_SCALE_SHIFT,
+                    contrast_gain: gain,
                 }
             }
         }
@@ -173,63 +177,64 @@ pub struct CorrectionState {
 }
 
 impl CorrectionState {
-    /// The uniforms the canvas pass must run this frame, or `None` when there is nothing to do.
+    /// The preset parameters the canvas pass must run this frame, or `None` when there is nothing
+    /// to do.
     ///
     /// `None` covers both "«Нет» is selected" and "the parameters are neutral", so an untouched
-    /// panel costs the canvas exactly nothing.
+    /// panel paints no shader layer and costs the canvas exactly nothing.
     #[must_use]
-    pub fn active_uniforms(self) -> Option<ColorFilterUniforms> {
+    pub fn active_params(self) -> Option<BrightnessContrastParams> {
         match self.kind {
             CorrectionKind::None => None,
             CorrectionKind::BrightnessContrast => {
-                let uniforms = self.correction.uniforms();
-                (!uniforms.is_identity()).then_some(uniforms)
+                let params = self.correction.params();
+                (!params.is_identity()).then_some(params)
             }
         }
     }
 }
 
-/// The reference implementation of the fragment shader's per-channel maths.
+/// The reference implementation of the preset's per-channel maths.
 ///
-/// `c` is one gamma-encoded colour channel in `0..=1`; the result is clamped back into that range.
-/// `gpu.rs`'s GLSL mirrors this expression line for line, so the unit tests below are what pins the
-/// shader's behaviour.
+/// `c` is one gamma-encoded, unpremultiplied colour channel in `0..=1`; the result is clamped back
+/// into that range. It restates `egui_shader_layers::presets::brightness_contrast`'s WGSL
+/// (`clamp((c - 0.5) * contrast + 0.5 + brightness, 0, 1)`), so the unit tests below pin what the
+/// model asks the GPU to compute.
 ///
 /// Test-only on purpose: the shipped binary never evaluates the correction on the CPU (the GPU
-/// does), so compiling this into the product would be dead code. Its whole job is to give the
-/// tests an executable statement of what the shader must compute.
+/// does), so compiling this into the product would be dead code.
 #[cfg(test)]
 #[must_use]
-fn apply_channel(uniforms: ColorFilterUniforms, c: f32) -> f32 {
-    (uniforms.gain * c + uniforms.bias).clamp(0.0, 1.0)
+fn apply_channel(params: BrightnessContrastParams, c: f32) -> f32 {
+    ((c - 0.5) * params.contrast_gain + 0.5 + params.brightness_offset).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The default correction must be an EXACT identity: `active_uniforms` skips the GPU pass on
+    /// The default correction must be an EXACT identity: `active_params` skips the GPU pass on
     /// that comparison, so a value merely close to neutral would make an untouched panel pay for a
     /// framebuffer copy and a quad every frame.
     #[test]
     fn neutral_parameters_are_exactly_the_identity() {
-        let uniforms = Correction::default().uniforms();
-        assert_eq!(uniforms.gain, 1.0);
-        assert_eq!(uniforms.bias, 0.0);
-        assert!(uniforms.is_identity());
+        let params = Correction::default().params();
+        assert_eq!(params.contrast_gain, 1.0);
+        assert_eq!(params.brightness_offset, 0.0);
+        assert!(params.is_identity());
         assert!(
             CorrectionState {
                 kind: CorrectionKind::BrightnessContrast,
                 correction: Correction::default(),
             }
-            .active_uniforms()
+            .active_params()
             .is_none()
         );
     }
 
     /// «Нет» never runs the pass, however the parameters are set.
     #[test]
-    fn the_none_kind_never_produces_uniforms() {
+    fn the_none_kind_never_produces_params() {
         let state = CorrectionState {
             kind: CorrectionKind::None,
             correction: Correction::BrightnessContrast {
@@ -237,7 +242,7 @@ mod tests {
                 contrast: -100.0,
             },
         };
-        assert!(state.active_uniforms().is_none());
+        assert!(state.active_params().is_none());
     }
 
     /// The contrast range is multiplicatively symmetric: its ends are exactly 2.0 and 0.5.
@@ -247,15 +252,15 @@ mod tests {
             brightness: 0.0,
             contrast: PARAM_MAX,
         }
-        .uniforms();
+        .params();
         let min = Correction::BrightnessContrast {
             brightness: 0.0,
             contrast: PARAM_MIN,
         }
-        .uniforms();
-        assert_eq!(max.gain, 2.0);
-        assert_eq!(min.gain, 0.5);
-        assert!((max.gain * min.gain - 1.0).abs() < 1e-6, "reciprocal ends");
+        .params();
+        assert_eq!(max.contrast_gain, 2.0);
+        assert_eq!(min.contrast_gain, 0.5);
+        assert!((max.contrast_gain * min.contrast_gain - 1.0).abs() < 1e-6, "reciprocal ends");
     }
 
     /// Mid-grey is the pivot: at zero brightness a 0.5 channel stays 0.5 at ANY contrast, so a
@@ -263,13 +268,13 @@ mod tests {
     #[test]
     fn mid_grey_is_the_contrast_pivot() {
         for contrast in [-100.0_f32, -50.0, -1.0, 0.0, 1.0, 50.0, 100.0] {
-            let uniforms = Correction::BrightnessContrast {
+            let params = Correction::BrightnessContrast {
                 brightness: 0.0,
                 contrast,
             }
-            .uniforms();
+            .params();
             assert_eq!(
-                apply_channel(uniforms, 0.5),
+                apply_channel(params, 0.5),
                 0.5,
                 "contrast {contrast} moved the pivot"
             );
@@ -285,14 +290,14 @@ mod tests {
             (50.0, BRIGHTNESS_FULL_SCALE_SHIFT / 2.0),
             (PARAM_MIN, -BRIGHTNESS_FULL_SCALE_SHIFT),
         ] {
-            let uniforms = Correction::BrightnessContrast {
+            let params = Correction::BrightnessContrast {
                 brightness,
                 contrast: 0.0,
             }
-            .uniforms();
-            assert_eq!(uniforms.gain, 1.0, "brightness must not change the gain");
-            assert!((uniforms.bias - expected).abs() < 1e-6);
-            assert!((apply_channel(uniforms, 0.4) - (0.4 + expected)).abs() < 1e-6);
+            .params();
+            assert_eq!(params.contrast_gain, 1.0, "brightness must not change the gain");
+            assert!((params.brightness_offset - expected).abs() < 1e-6);
+            assert!((apply_channel(params, 0.4) - (0.4 + expected)).abs() < 1e-6);
         }
     }
 
@@ -305,12 +310,12 @@ mod tests {
             brightness: PARAM_MAX,
             contrast: PARAM_MAX,
         }
-        .uniforms();
+        .params();
         let dark = Correction::BrightnessContrast {
             brightness: PARAM_MIN,
             contrast: PARAM_MAX,
         }
-        .uniforms();
+        .params();
         assert_eq!(apply_channel(bright, 1.0), 1.0);
         assert_eq!(apply_channel(dark, 0.0), 0.0);
         for c in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
@@ -327,13 +332,34 @@ mod tests {
             brightness: 1_000.0,
             contrast: 1_000.0,
         }
-        .uniforms();
+        .params();
         let edge = Correction::BrightnessContrast {
             brightness: PARAM_MAX,
             contrast: PARAM_MAX,
         }
-        .uniforms();
+        .params();
         assert_eq!(wild, edge);
+    }
+
+    /// The preset's pivoted form equals the linear `gain * c + bias` model the correction was
+    /// designed as (`bias = 0.5 - 0.5 * gain + brightness_offset`), across the whole parameter
+    /// range: the move onto the shader-layer preset must not change the picture on screen.
+    #[test]
+    fn the_preset_form_equals_the_linear_gain_bias_model() {
+        for brightness in [PARAM_MIN, -37.0, 0.0, 12.5, PARAM_MAX] {
+            for contrast in [PARAM_MIN, -60.0, 0.0, 25.0, PARAM_MAX] {
+                let params = Correction::BrightnessContrast { brightness, contrast }.params();
+                let gain = params.contrast_gain;
+                let bias = 0.5 - 0.5 * gain + params.brightness_offset;
+                for c in [0.0_f32, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+                    let linear = (gain * c + bias).clamp(0.0, 1.0);
+                    assert!(
+                        (apply_channel(params, c) - linear).abs() < 1e-6,
+                        "brightness {brightness}, contrast {contrast}, c {c}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every kind the combo lists has a caption, and no two kinds share one.

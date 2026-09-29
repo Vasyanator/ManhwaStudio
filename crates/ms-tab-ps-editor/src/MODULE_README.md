@@ -10,9 +10,8 @@ This directory is the crate root of `ms-tab-ps-editor`, re-exported by the binar
 `crate::tabs::ps_editor::…` path stays valid. Layer: near the top of the library stack —
 above `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets` and `ms-tab-typing` (the layers
 panel renders typing's text preview label), below `app.rs` and the `page_manager` tab. It
-must never name `app` or `launcher`. `PsEditorTabState::release_gpu_resources` and
-`ps_editor_default_dock_layout` are `pub` because `MangaApp::on_exit` and
-`app.rs::restore_panel_dock` call them from the binary.
+must never name `app` or `launcher`. `ps_editor_default_dock_layout` is `pub` because
+`app.rs::restore_panel_dock` calls it from the binary.
 
 ## Architecture
 Data flow for one page:
@@ -205,8 +204,8 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   `ms_theme::checkerboard::CANVAS` preset (one textured quad); no board palette lives here.
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
 - `correction/`: the VIEW-ONLY «Коррекция» panel — its model and maths (`model.rs`, GUI-free and
-  GL-free), the `egui_glow` shader pass that renders it (`gpu.rs`, the project's ONLY GL code) and
-  the panel body plus its reusable parameter card (`ui.rs`). Own `MODULE_README.md`; it never writes
+  GL-free), the `egui-shader-layers` preset layer that renders it (`shader.rs`, no GL of its own)
+  and the panel body plus its reusable parameter card (`ui.rs`). Own `MODULE_README.md`; it never writes
   pixels, the doc or the saved project.
 - `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
   `ReversibleAction<Ctx = PsEditorTabState>` with four variants (real `match`, no `_ =>`, so every
@@ -458,20 +457,16 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `smoothing_enabled` / `pixel_grid_enabled` and is likewise NOT persisted; no code path in it
   writes a layer buffer, the shared `LayerDoc`, `layers.json` or `CleanOverlaysModel`.
   - **Draw order.** `draw_correction_pass` runs in `draw_canvas` BETWEEN `draw_composite` and the
-    pixel-grid pass, clipped to `page_rect ∩ canvas rect`. So it corrects the page composite and
-    the checkerboard under it, and never the pixel grid, the selection marquee, the selection menu
-    or the tool cursor — those are deliberate legibility devices.
+    pixel-grid pass, on a painter clipped to `page_rect ∩ canvas rect`. So it corrects the page
+    composite and the checkerboard under it, and never the pixel grid, the selection marquee, the
+    selection menu or the tool cursor — those are deliberate legibility devices.
   - **Why a shader.** egui's fragment stage is a multiply and its blend stage is fixed
     `(ONE, ONE_MINUS_SRC_ALPHA)`, so every egui-reachable composition is `out = M*c + B` with
-    `M >= 0, B >= 0`; contrast pivoted on mid-grey needs a NEGATIVE offset. An `egui_glow` paint
-    callback is the only mechanism that can express it.
-  - **GL resource lifetime.** The program, VAO/VBO and scratch texture are created LAZILY inside the
-    first paint callback (the only place a `&glow::Context` exists) and held behind
-    `Arc<Mutex<ColorFilter>>` because `CallbackFn` demands a `Send + Sync` closure. They are freed by
-    `PsEditorTabState::release_gpu_resources`, which `MangaApp::on_exit` calls with the context
-    eframe hands it — the ONE shutdown hook that has one. A build failure disables the pass for the
-    session, logs the driver's message and makes the panel say the correction is unavailable; it
-    never silently draws nothing.
+    `M >= 0, B >= 0`; contrast pivoted on mid-grey needs a NEGATIVE offset.
+  - **Rendered by `egui-shader-layers`** (crates.io, glow backend): a `ShaderLayer` running
+    `presets::brightness_contrast`. This crate owns no GL objects; the binary installs the backend
+    at window creation and destroys it in `StudioBootstrapApp::on_exit`. A missing or failed
+    backend makes the panel say the correction is unavailable; it never silently draws nothing.
 - **The pixel grid is a PAGE grid, and that is an accepted limitation.** Page px == source px for
   the two base layers, which are permanently identity-transformed (`layers.rs::is_transformable`),
   so the lines coincide with their texels exactly. A user raster layer that is rotated, scaled or
@@ -680,7 +675,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   / `layers_panel_body`); the «Коррекция» body lives in `correction/ui.rs`.
 - To change the view-only colour correction — its maths, its shader, its panel, or which part of the
   canvas it covers — edit `correction/` (see that directory's `MODULE_README.md`) and
-  `draw_correction_pass` in `mod.rs`.
+  `draw_correction_pass` in `lib.rs`.
 - To change the panel's row ORDER (including the `Клин`-above-`Исходник` base tail), edit
   `build_unified_tree` in `tree.rs` — never the `LayerStack` vector order.
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /

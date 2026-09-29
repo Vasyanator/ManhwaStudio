@@ -6,7 +6,7 @@ edition = "2024"
 # The «PS-подобный редактор» tab extracted whole from `src/tabs/ps_editor/`: its own
 # pan/zoom viewport, the layer stack and its tiled GPU texture cache, the page loader, the
 # tool set (select / brush / transform / deform / patch), the text-layer bridge and the
-# view-only «Коррекция» colour pass — the project's ONLY GL shader code.
+# view-only «Коррекция» colour pass (painted through `egui-shader-layers`).
 #
 # Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::ps_editor`, so every
 # existing `crate::tabs::ps_editor::…` call site keeps its path.
@@ -16,10 +16,9 @@ edition = "2024"
 # preview label), and below `app.rs` and the `page_manager` tab. It must never name `app`
 # or `launcher`.
 #
-# GL lifetime contract: the correction pass builds its GL program, VAO/VBO and scratch
-# texture lazily INSIDE an `eframe::egui_glow` paint callback (the only place a
-# `&glow::Context` exists) and frees them from `MangaApp::on_exit`, which stays in the
-# binary. `PsEditorTabState::release_gpu_resources` is therefore `pub` and must remain so.
+# GL lifetime: this crate owns NO GL objects. The correction's shader resources belong to the
+# `egui-shader-layers` glow backend, which the binary installs on the egui context at window
+# creation and destroys in its `on_exit`; this crate only paints layers and reads `status`.
 
 [dependencies]
 # Undo/redo of raster and layer-lifecycle edits (`ActionHistory`, `RasterDiff`).
@@ -53,10 +52,13 @@ ms-widgets = { path = "../ms-widgets" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }
-# The whole tab draws. `eframe` also re-exports `glow` and `egui_glow`, which the
-# correction pass uses directly — that is why no separate `glow` dependency is declared.
+# The whole tab draws.
 egui.workspace = true
 eframe.workspace = true
+# The view-only «Коррекция» pass: its `brightness_contrast` preset painted as a
+# `ShaderLayer`, and the backend `status` the panel reports. The glow backend itself is
+# installed and destroyed by the binary, which owns the eframe `CreationContext`.
+egui-shader-layers.workspace = true
 # Layer image decode/encode.
 image.workspace = true
 # Persisted layer manifests and tool presets. The tab reads and writes them as untyped

@@ -1623,6 +1623,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-shader-layers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc424a8e1a92ceb3bf7b2cf96af1e625abbea2567c5c6a7c210850ddc1176797"
+dependencies = [
+ "codespan-reporting",
+ "egui",
+ "egui_glow",
+ "glow",
+ "log",
+ "naga",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3367,6 +3382,7 @@ dependencies = [
  "cosmic-text",
  "eframe",
  "egui",
+ "egui-shader-layers",
  "flate2",
  "genai",
  "hf-hub",
@@ -3975,6 +3991,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "egui-shader-layers",
  "image 0.25.10",
  "ms-actions",
  "ms-canvas",

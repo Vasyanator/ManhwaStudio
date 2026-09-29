@@ -348,14 +348,14 @@ main.rs → ProjectData → MangaApp
    занимает всю область вкладки фоном, а поверх него плавают шесть вкладок дока («PS редактор» — главная,
    «Инструменты», «Выбранный инструмент», «Горячие клавиши», «Слои», «Коррекция»); это первый НЕ-canvas
    хост дока, поэтому он задаёт `DockArea::rect` сам, а не через `canvas::dock_area_rect`.
-   **«Коррекция» (`ps_editor/correction/`) — ПЕРВЫЙ И ЕДИНСТВЕННЫЙ в проекте GPU-шейдерный проход:**
-   `egui_glow::CallbackFn` между `draw_composite` и сеткой пикселей, который переснимает уже
-   отрисованный холст и прогоняет его через `out = clamp(gain * c + bias, 0, 1)`. Это чисто ВИДОВАЯ
-   коррекция: пиксели слоёв, `LayerDoc`, `layers.json`, `CleanOverlaysModel` и сохранённый проект не
-   затрагиваются, состояние не персистится. Отсюда новый контракт времени жизни GL-ресурсов:
-   программа/VAO/VBO/текстура создаются ЛЕНИВО внутри paint-callback (единственное место, где есть
-   `&glow::Context`) и освобождаются в `MangaApp::on_exit` — единственном хуке eframe, которому
-   контекст передаётся; любой будущий GL-ресурс обязан следовать той же паре.
+   **«Коррекция» (`ps_editor/correction/`) is the project's only GPU shader pass**, rendered by the
+   `egui-shader-layers` crate (crates.io, glow backend): a `ShaderLayer` running
+   `presets::brightness_contrast`, painted between `draw_composite` and the pixel grid, which
+   re-reads the already-drawn canvas. It is VIEW-ONLY: layer pixels, `LayerDoc`, `layers.json`,
+   `CleanOverlaysModel` and the saved project are untouched, and the state is not persisted. GL
+   lifetime is the library's contract: the binary calls `install_glow` once in the studio (and web)
+   app creator and `destroy_glow` in `StudioBootstrapApp::on_exit`, the one hook eframe hands a
+   `glow::Context`; no project crate holds GL objects of its own.
    Undo/redo (фаза 3a, только мазки кисти) — через `ms-actions` `RasterDiff`: `edit_op::PsEditOp`
    (`ReversibleAction<Ctx = PsEditorTabState>`) хранится в per-page `ActionHistory`, очищаемой при
    смене страницы; Ctrl/Cmd+Z / Ctrl+Shift+Z(Ctrl+Y).

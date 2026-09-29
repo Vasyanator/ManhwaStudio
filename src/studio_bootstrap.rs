@@ -19,6 +19,8 @@ Key structures:
   conversion (`storage_mode_job`) is started once the project has loaded.
 - `spawn_project_load_thread`: named worker that mirrors the previous synchronous startup
   sequence (`detect_unsaved_for_project` choosing `load_resume_unsaved` vs `load`).
+- `install_shader_layers`: installs the `egui-shader-layers` glow backend (the PS editor's
+  «Коррекция» shader) from the app creator; `StudioBootstrapApp::on_exit` destroys it.
 
 Notes:
 Only WHERE the load runs changed, not the load itself: the worker performs exactly the
@@ -142,6 +144,36 @@ pub struct StudioBootstrapApp {
     /// the persisted state: a window left un-maximized must not be maximized again on Windows.
     #[cfg(target_os = "windows")]
     maximize_root_window_on_first_frame: bool,
+    /// The window's egui context, kept for `on_exit`: the `egui-shader-layers` glow backend lives
+    /// in it (installed by `install_shader_layers` at window creation) and must be destroyed with
+    /// the GL context eframe hands `on_exit`, whichever state the shell is in.
+    egui_ctx: egui::Context,
+}
+
+/// Installs the `egui-shader-layers` glow backend on the studio window's egui context.
+///
+/// Called once from the eframe app creator, the only place the `glow::Context` is available
+/// before the first frame. Failure never aborts startup: the library registers a failed backend,
+/// the PS editor's «Коррекция» panel then reports the correction as unavailable, and the cause is
+/// logged here with the GL context's version for diagnosis. The matching teardown is
+/// `StudioBootstrapApp::on_exit`.
+pub fn install_shader_layers(cc: &eframe::CreationContext<'_>) {
+    let Some(gl) = cc.gl.as_deref() else {
+        runtime_log::log_error(
+            "[studio-bootstrap] eframe created the studio window without a glow context; shader \
+             layers (the PS editor's «Коррекция») are unavailable. Possible cause: a non-glow renderer",
+        );
+        return;
+    };
+    if let Err(error) = egui_shader_layers::install_glow(&cc.egui_ctx, gl) {
+        use eframe::glow::HasContext as _;
+        let version = gl.version();
+        runtime_log::log_error(format!(
+            "[studio-bootstrap] shader layers disabled: {error}. GL context: {}.{} (embedded: {}). \
+             The PS editor's «Коррекция» panel reports the correction as unavailable",
+            version.major, version.minor, version.is_embedded
+        ));
+    }
 }
 
 impl StudioBootstrapApp {
@@ -150,6 +182,7 @@ impl StudioBootstrapApp {
         user_settings: serde_json::Value,
         ai_backend: AiBackendHandle,
         return_to_launcher_flag: Arc<AtomicBool>,
+        egui_ctx: egui::Context,
     ) -> Self {
         // Read from disk, not from `user_settings`: that snapshot is taken once per session in
         // `run_main` and reused for every window, so a monitor chosen in a previous window of
@@ -167,6 +200,7 @@ impl StudioBootstrapApp {
             geometry: WindowGeometryTracker::new(&window_settings),
             #[cfg(target_os = "windows")]
             maximize_root_window_on_first_frame,
+            egui_ctx,
         }
     }
 
@@ -366,10 +400,21 @@ impl eframe::App for StudioBootstrapApp {
     ///
     /// The window geometry is flushed here too: the writer thread coalesces samples behind a
     /// debounce, so a resize in the last moments before closing would otherwise be dropped.
+    ///
+    /// Last, the `egui-shader-layers` glow backend (the PS editor's «Коррекция» shader) is freed:
+    /// this is the one shutdown hook eframe hands a `glow::Context`, and the backend was installed
+    /// for the whole window, not for one `MangaApp`, so the shell owns its teardown.
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let BootstrapState::Running(app) = &mut self.state {
             app.on_exit(gl);
         }
         self.geometry.flush_and_join();
+        match gl {
+            Some(gl) => egui_shader_layers::destroy_glow(&self.egui_ctx, gl),
+            None => runtime_log::log_warn(
+                "[studio-bootstrap] no GL context at shutdown; the shader-layer GL objects are \
+                 released together with the context itself",
+            ),
+        }
     }
 }

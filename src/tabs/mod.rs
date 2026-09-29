@@ -44,9 +44,9 @@ pub use ms_tab_translation as translation;
 // The «PS-подобный редактор» tab now lives in the standalone `ms-tab-ps-editor` crate —
 // viewport, layer stack, tiled texture cache, the whole tool set and the view-only
 // «Коррекция» GL pass. The re-export keeps every `crate::tabs::ps_editor::…` path valid in
-// `app.rs` and the `page_manager` tab without touching a call site. Its GL resources are
-// still released from `MangaApp::on_exit` through the public
-// `PsEditorTabState::release_gpu_resources`.
+// `app.rs` and the `page_manager` tab without touching a call site. It owns no GL objects:
+// the «Коррекция» shader belongs to the `egui-shader-layers` backend, which
+// `studio_bootstrap` installs at window creation and destroys in its `on_exit`.
 pub use ms_tab_ps_editor as ps_editor;
 // The «Менеджер страниц» tab now lives in the standalone `ms-tab-page-manager` crate —
 // the page card grid and every structural dialog (crop / split / stitch / clean). The

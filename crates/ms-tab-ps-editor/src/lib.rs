@@ -115,7 +115,7 @@ use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabExtras, TabId,
 };
-use correction::{ColorFilter, CorrectionState};
+use correction::CorrectionState;
 use edit_op::{LayerFieldPatch, LifecycleDir, PsEditOp};
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
@@ -556,13 +556,8 @@ fn draw_tool_panel_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
 /// (`PsEditorDockCx`), and the correction is per-session view state exactly like `smoothing_enabled`.
 /// The canvas reads it fresh every frame, so nothing has to be invalidated from here.
 fn draw_correction_tab_body(ui: &mut egui::Ui, cx: &mut PsEditorDockCx<'_>) {
-    let failed = cx
-        .tab
-        .correction_filter
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .has_failed();
-    correction::correction_panel_body(ui, &mut cx.tab.correction, failed);
+    let unavailable = cx.tab.correction_availability.check(ui.ctx());
+    correction::correction_panel_body(ui, &mut cx.tab.correction, unavailable);
 }
 
 /// Draws the «Слои» tab body, parking its deferred actions in the frame context.
@@ -699,13 +694,9 @@ pub struct PsEditorTabState {
     /// `layers.json` or `CleanOverlaysModel`. Deliberately NOT persisted, for the same reason as
     /// `smoothing_enabled` and `pixel_grid_enabled`: it is a per-session viewing aid.
     correction: CorrectionState,
-    /// GL objects of the correction's shader pass, shared with the paint callback.
-    ///
-    /// Behind an `Arc<Mutex<..>>` because `egui_glow::CallbackFn` demands a `Send + Sync` closure;
-    /// in practice the lock is uncontended, since the panel body and the callback both run on the
-    /// GUI thread. Built lazily inside the first callback and freed by `release_gpu_resources`,
-    /// which `MangaApp::on_exit` calls with the context eframe hands it.
-    correction_filter: Arc<Mutex<ColorFilter>>,
+    /// Whether the correction's shader layer can render, with the once-per-session latch that
+    /// writes an unavailability to `runtime_log` (the library logs only through `log`).
+    correction_availability: correction::CorrectionAvailability,
     /// Camera synced in from `CanvasView`, applied once its target page is loaded so the async
     /// page load (which refits the camera) does not clobber it. See `sync_view_from_canvas`.
     pending_camera: Option<CameraSync>,
@@ -1054,7 +1045,7 @@ impl Default for PsEditorTabState {
             smoothing_enabled: true,
             pixel_grid_enabled: false,
             correction: CorrectionState::default(),
-            correction_filter: Arc::new(Mutex::new(ColorFilter::default())),
+            correction_availability: correction::CorrectionAvailability::default(),
             pending_camera: None,
             last_overlay_revision: 0,
             node_generations: HashMap::new(),
@@ -5203,67 +5194,30 @@ impl PsEditorTabState {
 
     /// Runs the view-only «Коррекция» pass over the composited page, if one is active.
     ///
-    /// Emits an `egui_glow` paint callback that copies the already-drawn canvas out of the
-    /// framebuffer and re-draws it through `out = clamp(gain * c + bias, 0, 1)`. It is the project's
-    /// only GPU shader pass; the contract and the reason egui alone cannot express it are in
-    /// `correction/MODULE_README.md`.
+    /// Paints an `egui-shader-layers` `brightness_contrast` layer that re-reads the already-drawn
+    /// canvas and redraws it through `clamp((c - 0.5) * gain + 0.5 + offset, 0, 1)`; the reason
+    /// egui alone cannot express it is in `correction/MODULE_README.md`.
     ///
     /// Clipped to `page_rect ∩ canvas_rect`, so the viewport ground outside the page keeps its own
-    /// colour. Draws nothing when the correction is neutral, when «Нет» is selected, or when the
-    /// filter has already failed — so the default path costs one comparison and no GL work at all.
+    /// colour. Paints nothing when the correction is neutral or «Нет» is selected — so the default
+    /// path costs one comparison and no GPU work at all — and the library itself paints nothing
+    /// when its backend is missing or failed (the panel reports that state).
     ///
     /// VIEW-ONLY: it changes what is on screen this frame and nothing else. No layer buffer, no
     /// document node and no on-disk file is touched.
-    fn draw_correction_pass(&self, ui: &egui::Ui, canvas_rect: Rect, page_rect: Rect) {
-        let Some(uniforms) = self.correction.active_uniforms() else {
+    fn draw_correction_pass(&mut self, ui: &egui::Ui, canvas_rect: Rect, page_rect: Rect) {
+        let Some(params) = self.correction.active_params() else {
             return;
         };
-        if self
-            .correction_filter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .has_failed()
-        {
-            return;
-        }
         let target = page_rect.intersect(canvas_rect);
         if !target.is_positive() {
             return;
         }
-        // The closure owns its own handle: `CallbackFn` requires `Send + Sync + 'static`, so nothing
-        // borrowed from `self` may cross into it.
-        let filter = Arc::clone(&self.correction_filter);
-        let callback = egui::PaintCallback {
-            rect: target,
-            callback: Arc::new(eframe::egui_glow::CallbackFn::new(
-                move |info: egui::PaintCallbackInfo, painter: &eframe::egui_glow::Painter| {
-                    filter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .paint(painter.gl(), &info, uniforms);
-                },
-            )),
-        };
-        ui.painter_at(target).add(egui::Shape::Callback(callback));
-    }
-
-    /// Frees the GL objects of the correction filter.
-    ///
-    /// Called from `MangaApp::on_exit`, the one shutdown hook eframe hands a `&glow::Context`.
-    /// A `None` context means eframe had no live context to give (an already-lost renderer), in
-    /// which case the names die with it; that is logged rather than passed over in silence.
-    pub fn release_gpu_resources(&mut self, gl: Option<&eframe::glow::Context>) {
-        let mut filter = self
-            .correction_filter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match gl {
-            Some(gl) => filter.destroy(gl),
-            None => ms_log::runtime_log::log_warn(
-                "[ps_editor] correction: no GL context at shutdown; the colour-filter objects are \
-                 released with the context itself",
-            ),
-        }
+        // A painter clipped to the target: the layer captures only what lies inside its clip.
+        correction::paint_correction_layer(&ui.painter_at(target), target, params);
+        // Also observed here, not only in the panel: a GPU failure surfacing while the panel is
+        // collapsed must still reach `runtime_log` (once; the latch dedups with the panel's check).
+        self.correction_availability.observe(ui.ctx());
     }
 
     /// Central pan/zoom canvas: input handling, layer composite, overlays.

@@ -118,7 +118,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   the background project load behind a loading screen (or an error screen with exit/return-to-
   launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it. It also owns
   the window itself from the first frame, so the `WindowGeometryTracker` (monitor/position/size
-  persistence) and the Windows first-frame maximize workaround live here.
+  persistence) and the Windows first-frame maximize workaround live here, as does the window-wide
+  `egui-shader-layers` glow backend (installed from the app creator, destroyed in `on_exit`).
 - `project` (crate `ms-project`, re-exported by `main.rs`): chapter data models, project path
   discovery, project/settings loading, legacy `scr`/`src` and `cleaned`/`clean_layers` folder
   normalization, magic-byte JPEG->PNG conversion in `src`/`cleaned`/`clean_layers`, clean-layer

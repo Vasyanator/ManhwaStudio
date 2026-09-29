@@ -3348,12 +3348,12 @@ impl eframe::App for MangaApp {
     /// across the barrier: it clones the handle, drops the lock, then barriers; finally
     /// `shutdown_saver` drains the queue + joins the worker. Relying on Arc-drop ordering alone is
     /// unsafe (a lingering Arc clone in a worker could skip the join).
-    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+    ///
+    /// The GL context is not needed here: the only GL objects the studio owns are the
+    /// `egui-shader-layers` backend's, which `StudioBootstrapApp::on_exit` frees. The parameter is
+    /// kept because this is `eframe::App::on_exit`'s signature.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_overlay_autosave();
-        // The PS editor's view-only «Коррекция» owns a GL program, a VAO/VBO and a scratch texture
-        // built inside a paint callback. This is the ONLY shutdown hook eframe hands a context, so
-        // it is the only place they can be deleted rather than leaked into the dying context.
-        self.ps_editor_tab.release_gpu_resources(gl);
         // Release decode workers parked on the look-ahead window: after this frame nothing
         // drains the loader channels, so the promotion frontier would never advance again and
         // parked workers (and the pool joiner) would leak. Workers blocked on `send` exit on

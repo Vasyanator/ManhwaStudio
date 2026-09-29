@@ -74,6 +74,17 @@ pub fn start() {
                 Box::new(|cc| {
                     cc.egui_ctx.set_theme(egui::Theme::Dark);
                     crate::launcher::theme::configure_context(&cc.egui_ctx);
+                    // GPU shader layers (the PS editor's «Коррекция») on WebGL2. WebGL1 is
+                    // refused by the library; the panel then reports the correction as
+                    // unavailable. No teardown: the browser frees the WebGL context with the page.
+                    match cc.gl.as_deref() {
+                        Some(gl) => {
+                            if let Err(error) = egui_shader_layers::install_glow(&cc.egui_ctx, gl) {
+                                console_error(&format!("shader layers disabled: {error}"));
+                            }
+                        }
+                        None => console_error("no glow context: shader layers are disabled"),
+                    }
                     Ok(Box::new(build_web_launcher()))
                 }),
             )

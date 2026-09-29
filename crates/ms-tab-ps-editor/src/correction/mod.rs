@@ -8,18 +8,19 @@ user can spot small colour differences. It belongs to the same family as the Â«Ð
 `layers.json`, `CleanOverlaysModel` and the saved project are never touched.
 
 Submodules:
-- `model`: the data model and all the maths. GUI-free and GL-free, and the only unit-tested part.
-- `gpu`: the `egui_glow` paint callback that renders the correction. The only GL in the project.
+- `model`: the data model and all the maths. GUI-free and GL-free; holds the maths tests.
+- `shader`: paints the correction as an `egui-shader-layers` preset layer and reports whether
+  the library can render it. Owns no GL objects (the binary installs / destroys the backend).
 - `ui`: the dock-tab body and the reusable per-kind parameter card.
 
 Notes:
 Contract and rationale: `MODULE_README.md` next to this file.
 */
 
-pub mod gpu;
 pub mod model;
+pub mod shader;
 pub mod ui;
 
-pub use gpu::ColorFilter;
 pub use model::CorrectionState;
+pub(crate) use shader::{CorrectionAvailability, paint_correction_layer};
 pub(crate) use ui::correction_panel_body;

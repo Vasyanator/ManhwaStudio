@@ -27,17 +27,18 @@ const KIND_COMBO_ID_SALT: &str = "ps_editor.correction.kind_combo";
 
 /// Draws the «Коррекция» panel body and reports whether the user changed anything.
 ///
-/// `state` is the tab's live correction; `filter_failed` says whether the GPU pass has given up, in
-/// which case the panel says so instead of pretending the sliders do something.
+/// `state` is the tab's live correction; `unavailable` says whether the shader-layer backend cannot
+/// render it (`shader::CorrectionAvailability::check`), in which case the panel says so instead of
+/// pretending the sliders do something.
 ///
 /// The return value exists for the caller's repaint decision; the correction itself is read fresh
 /// by the canvas every frame, so nothing has to be invalidated here.
-pub(crate) fn correction_panel_body(ui: &mut egui::Ui, state: &mut CorrectionState, filter_failed: bool) -> bool {
+pub(crate) fn correction_panel_body(ui: &mut egui::Ui, state: &mut CorrectionState, unavailable: bool) -> bool {
     let mut changed = false;
     ui.label(t!("ps_editor.correction.setup_section"));
-    if filter_failed {
-        // The pass is dead for this session; say so where the user is looking, in the panel whose
-        // controls would otherwise appear to do nothing.
+    if unavailable {
+        // The pass cannot render (backend missing or failed); say so where the user is looking, in
+        // the panel whose controls would otherwise appear to do nothing.
         ui.colored_label(
             ms_theme::status::ERROR,
             t!("ps_editor.correction.gpu_unavailable_error"),

@@ -44,6 +44,11 @@ cosmic-text = "0.14"
 # exact feature set, so no second copy of the backend is ever built.
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
 egui = "0.36.2"
+# View-only GPU shader layers (the PS editor's «Коррекция» pass). The glow backend only,
+# matching eframe's renderer above: its default `wgpu` feature would pull a second renderer
+# into the graph. It must stay on the same egui / egui_glow / glow line as eframe, because
+# `&glow::Context` crosses its public API (`install_glow` / `destroy_glow`).
+egui-shader-layers = { version = "0.2", default-features = false, features = ["glow"] }
 flate2 = "1"
 genai = "0.6"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
@@ -210,8 +215,8 @@ ms-tab-translation = { path = "crates/ms-tab-translation" }
 # The «PS-подобный редактор» tab (`src/tabs/ps_editor/`), re-exported as
 # `crate::tabs::ps_editor` from `src/tabs/mod.rs`. Sits above `ms-tab-typing` (its layers
 # panel renders typing's text preview label) and below `app.rs` and the `page_manager`
-# tab. Its GL objects are freed from `MangaApp::on_exit`, which is why
-# `PsEditorTabState::release_gpu_resources` is public.
+# tab. It owns no GL objects: its «Коррекция» shader layer runs on the `egui-shader-layers`
+# backend this binary installs and destroys (`studio_bootstrap`).
 ms-tab-ps-editor = { path = "crates/ms-tab-ps-editor" }
 # The «Менеджер страниц» tab (`src/tabs/page_manager/`), re-exported as
 # `crate::tabs::page_manager` from `src/tabs/mod.rs`. Sits above `ms-tab-ps-editor` (the
@@ -237,6 +242,9 @@ chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 eframe.workspace = true
 egui.workspace = true
+# Installs the shader-layer glow backend on the studio window's egui context and frees it on
+# exit; the layers themselves are painted by `ms-tab-ps-editor`.
+egui-shader-layers.workspace = true
 cosmic-text.workspace = true
 swash.workspace = true
 zeno.workspace = true
