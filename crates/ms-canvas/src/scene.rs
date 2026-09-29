@@ -36,6 +36,8 @@ Notes:
 - The scrollable strip is `max(viewport, content_row, widest_page * (1 + 2 *
   RIBBON_SIDE_FREE_SPACE_FACTOR))`, so the lateral free space is proportional to the widest PAGE
   while a strip that fits still creates no scroll range at all.
+- The current page (`scroll_center_idx`, via `CurrentPageTracker`) is the page under the
+  viewport center line; a gap belongs to the page above it; above the first page -> first page.
 - Automatic horizontal centering keeps re-centering while page geometry is still provisional and
   latches (`HorizontalCenteringState`) on settled geometry, a user scroll, or an explicit
   navigation intent.
@@ -106,6 +108,43 @@ struct CanvasStripWorldWidths {
     max_page: f32,
 }
 
+/// Allocation-free, single-pass selection of the canvas' current page.
+///
+/// Contract: the current page is the page whose vertical span the viewport center line is
+/// over; when the line falls in a gap between two pages, the page ABOVE the gap wins; when it
+/// is above the first page, the first page wins (and below the last page, the last page).
+/// Equivalently: the last observed page whose top is `<= center_y`, else the first observed
+/// page. Pages must be fed in strip (top-to-bottom) order; only laid-out pages are fed, so
+/// "first page" means the first page that took part in the scene pass. All coordinates must
+/// be in one space (the scene pass uses screen Y).
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct CurrentPageTracker {
+    /// First page observed in this pass (fallback when the center is above every page).
+    first: Option<usize>,
+    /// Last observed page whose top is at or above the viewport center line.
+    last_at_or_above_center: Option<usize>,
+}
+
+impl CurrentPageTracker {
+    /// Feeds the next laid-out page (strip order) with its top edge `page_top_y` and the
+    /// viewport center line `center_y`, both in the same coordinate space.
+    pub(super) fn observe(&mut self, page_idx: usize, page_top_y: f32, center_y: f32) {
+        self.first.get_or_insert(page_idx);
+        // Tops increase monotonically in strip order, so the latest page starting at or above
+        // the center line is the one the line is over — or, in a gap, the page above the gap.
+        // The bottom edge is deliberately never compared: a gap belongs to the upper page.
+        if page_top_y <= center_y {
+            self.last_at_or_above_center = Some(page_idx);
+        }
+    }
+
+    /// The selected page, or `None` when no page was observed.
+    #[must_use]
+    pub(super) fn current(&self) -> Option<usize> {
+        self.last_at_or_above_center.or(self.first)
+    }
+}
+
 pub(super) struct CanvasSceneState {
     pub(super) page_rects: Vec<Rect>,
     pub(super) page_world_rects: Vec<Rect>,
@@ -116,6 +155,8 @@ pub(super) struct CanvasSceneState {
     pub(super) max_page_world_width: f32,
     pub(super) page_aside_presence: HashMap<usize, [bool; 2]>,
     pub(super) page_aside_widths: HashMap<usize, [f32; 2]>,
+    /// Current page: the page under the viewport center line (see [`CurrentPageTracker`]),
+    /// recomputed on every scene pass. `0` when no page has been laid out.
     pub(super) scroll_center_idx: usize,
     pub(super) scroll_offset: Vec2,
     pub(super) drag_scroll_blocked: bool,
@@ -741,8 +782,7 @@ impl CanvasView {
             // The per-frame transform must be re-established from this frame's first
             // laid-out page, so clear the previous frame's "established" marker.
             self.scene.view_established_this_frame = false;
-            let mut nearest_page = 0usize;
-            let mut nearest_dist = f32::MAX;
+            let mut current_page = CurrentPageTracker::default();
             let mut has_drawn_any_page = false;
             let mut reserved_pages = Vec::new();
             let mut page_world_top = edge_margin_world;
@@ -768,8 +808,7 @@ impl CanvasView {
                     viewport_rect,
                     viewport_center_y,
                     frame.hook_claims_shift_drag,
-                    &mut nearest_page,
-                    &mut nearest_dist,
+                    &mut current_page,
                 ) else {
                     continue;
                 };
@@ -834,7 +873,8 @@ impl CanvasView {
                 );
             }
 
-            self.scene.scroll_center_idx = nearest_page;
+            // Zero laid-out pages keep the historical fallback of page index 0.
+            self.scene.scroll_center_idx = current_page.current().unwrap_or(0);
 
             // The transform was already established during page reservation and now
             // drives every page's `image_rect`. Re-validate it here against the first
@@ -965,8 +1005,7 @@ impl CanvasView {
         viewport_rect: Rect,
         viewport_center_y: f32,
         hook_claims_shift_drag: bool,
-        nearest_page: &mut usize,
-        nearest_dist: &mut f32,
+        current_page: &mut CurrentPageTracker,
     ) -> Option<(CanvasScenePageFrame, egui::Response)> {
         if page_size_px.x <= 0.0 || page_size_px.y <= 0.0 {
             return None;
@@ -1042,11 +1081,7 @@ impl CanvasView {
             self.aside_available_widths_for_page_viewport(image_rect, ui.clip_rect()),
         );
 
-        let page_dist = (image_rect.center().y - viewport_center_y).abs();
-        if page_dist < *nearest_dist {
-            *nearest_dist = page_dist;
-            *nearest_page = page_idx;
-        }
+        current_page.observe(page_idx, image_rect.top(), viewport_center_y);
 
         Some((
             CanvasScenePageFrame {
@@ -1781,6 +1816,104 @@ impl CanvasView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// World-space page tops for `heights` laid out like the scene pass does: first top at
+    /// `edge_margin`, then `height + gap` per page.
+    fn strip_tops(heights: &[f32], edge_margin: f32, gap: f32) -> Vec<f32> {
+        let mut top = edge_margin;
+        heights
+            .iter()
+            .map(|height| {
+                let this_top = top;
+                top += height + gap;
+                this_top
+            })
+            .collect()
+    }
+
+    /// Runs the tracker over `(page_idx, top)` pairs in strip order.
+    fn current_page_for(pages: &[(usize, f32)], center_y: f32) -> Option<usize> {
+        let mut tracker = CurrentPageTracker::default();
+        for &(page_idx, top) in pages {
+            tracker.observe(page_idx, top, center_y);
+        }
+        tracker.current()
+    }
+
+    fn indexed(tops: &[f32]) -> Vec<(usize, f32)> {
+        tops.iter().copied().enumerate().collect()
+    }
+
+    #[test]
+    fn current_page_short_then_tall_flips_at_next_page_top() {
+        let heights = [1545.0, 15456.0, 15563.0, 14118.0, 16879.0, 15531.0];
+        let gap = 200.0;
+        let tops = strip_tops(&heights, 200.0, gap);
+        let pages = indexed(&tops);
+        let page0_bottom = tops[0] + heights[0];
+        // Inside page 0 and anywhere in the gap after it: still page 0.
+        assert_eq!(current_page_for(&pages, tops[0] + 10.0), Some(0));
+        assert_eq!(current_page_for(&pages, page0_bottom + 1.0), Some(0));
+        assert_eq!(current_page_for(&pages, tops[1] - 0.5), Some(0));
+        // As soon as the center line reaches page 1's top, page 1 is current.
+        assert_eq!(current_page_for(&pages, tops[1]), Some(1));
+        assert_eq!(current_page_for(&pages, tops[1] + 1.0), Some(1));
+        // The old center-to-center rule still reported page 0 here (~22% into page 1).
+        assert_eq!(current_page_for(&pages, tops[1] + 3000.0), Some(1));
+        for (idx, top) in tops.iter().enumerate() {
+            assert_eq!(current_page_for(&pages, top + heights[idx] * 0.5), Some(idx));
+        }
+    }
+
+    #[test]
+    fn current_page_in_gap_is_upper_page() {
+        let tops = strip_tops(&[1000.0, 1000.0, 1000.0], 200.0, 200.0);
+        let pages = indexed(&tops);
+        // Gap between page 1 (bottom 2400) and page 2 (top 2600).
+        assert_eq!(current_page_for(&pages, 2500.0), Some(1));
+        assert_eq!(current_page_for(&pages, 2599.0), Some(1));
+    }
+
+    #[test]
+    fn current_page_above_first_is_first_and_below_last_is_last() {
+        let tops = strip_tops(&[1000.0, 2000.0, 500.0], 200.0, 200.0);
+        let pages = indexed(&tops);
+        assert_eq!(current_page_for(&pages, 0.0), Some(0));
+        assert_eq!(current_page_for(&pages, -5000.0), Some(0));
+        assert_eq!(current_page_for(&pages, 1_000_000.0), Some(2));
+    }
+
+    #[test]
+    fn current_page_single_page_and_empty_strip() {
+        assert_eq!(current_page_for(&[(0, 200.0)], 0.0), Some(0));
+        assert_eq!(current_page_for(&[(0, 200.0)], 9000.0), Some(0));
+        assert_eq!(current_page_for(&[], 100.0), None);
+    }
+
+    #[test]
+    fn current_page_skips_unlaid_pages_by_index() {
+        // Pages 0 and 2 are not laid out (unloaded / 0x0): the strip holds pages 1, 3, 4.
+        let tops = strip_tops(&[800.0, 800.0, 800.0], 200.0, 200.0);
+        let pages = vec![(1, tops[0]), (3, tops[1]), (4, tops[2])];
+        // Above the strip: the first LAID-OUT page, not page index 0.
+        assert_eq!(current_page_for(&pages, 0.0), Some(1));
+        assert_eq!(current_page_for(&pages, tops[1] + 10.0), Some(3));
+        assert_eq!(current_page_for(&pages, tops[2] - 10.0), Some(3));
+        assert_eq!(current_page_for(&pages, tops[2] + 10.0), Some(4));
+    }
+
+    #[test]
+    fn current_page_equal_heights_switches_at_each_top() {
+        let tops = strip_tops(&[1000.0; 4], 200.0, 200.0);
+        let pages = indexed(&tops);
+        for (idx, top) in tops.iter().enumerate() {
+            assert_eq!(current_page_for(&pages, *top), Some(idx));
+            assert_eq!(current_page_for(&pages, top + 999.0), Some(idx));
+            if idx > 0 {
+                assert_eq!(current_page_for(&pages, top - 1.0), Some(idx - 1));
+            }
+        }
+    }
 
     /// Builds a `CanvasView` with the scene state needed by the pure scroll/zoom
     /// helpers, without touching any live egui `Ui`/`Context`.

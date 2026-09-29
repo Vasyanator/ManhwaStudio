@@ -1075,6 +1075,10 @@ impl CanvasView {
         self.overlay_runtime.evict_cache(request)
     }
 
+    /// Current page: the laid-out page whose vertical span the viewport center line is over;
+    /// in an inter-page gap the page above it, above the first page the first page. Updated on
+    /// every scene pass; `0` before any page was laid out.
+    #[must_use]
     pub fn current_page_idx(&self) -> usize {
         self.scene.scroll_center_idx
     }
@@ -1125,8 +1129,9 @@ impl CanvasView {
     /// viewport, for handing the view off to tabs that do not share the canvas scroll model
     /// (e.g. the standalone PS editor). `None` until the scene has been laid out at least once.
     ///
-    /// The center may fall outside `[0, page_size]` when the viewport straddles a page gap; the
-    /// receiver is expected to clamp it to its own page bounds.
+    /// The center lies inside the page except when the viewport center line is in the gap below
+    /// the current page (or above the first / below the last page); the receiver is expected to
+    /// clamp it to its own page bounds.
     pub fn current_page_local_view_center(&self) -> Option<(usize, Vec2)> {
         let page_idx = self.current_page_idx();
         let visible = self.scene.visible_scene_rect?;

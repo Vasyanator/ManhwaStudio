@@ -352,6 +352,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - Do not block the GUI thread with image decoding, disk I/O, long computation, or worker waits.
 - Do not hold shared model locks while rendering, calling hooks, or doing heavy work.
 - Keep page pixels, scene coordinates, screen coordinates, and UV coordinates explicit.
+- Current page (`current_page_idx`, `scene.rs::CurrentPageTracker`) = the laid-out page under the
+  viewport center line; center in a gap -> the page above; above the first page -> first page.
 - Overlay buffers and masks must validate width, height, and buffer length before use.
 - Shared visibility changes belong in `CleanOverlaysModel`; tab-local visibility must stay
   inside the specific `CanvasView`.
