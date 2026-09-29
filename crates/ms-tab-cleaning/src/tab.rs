@@ -16,6 +16,9 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `text_mask_load_*`: асинхронная подзагрузка масок из `text_detection`, если в shared-модели ещё нет данных.
 - `quick_clean_*`: состояние быстрого клина по маске текста (UI-параметры, фоновые job-события, прогресс).
 - `overlays_model`: shared clean-overlay model; committed edits land there and use its diff-based undo/redo history.
+- `clean_folder_status`: the «Клин» tab's clean-folder status area (`clean_status.rs`): worker scan of
+  the clean folders, rescanned on the first draw, on every entry into the tab and on
+  `request_orphan_clean_rescan` (the app calls it after a successful save), plus session-only dismissals.
 - Ключевые методы:
   - `draw`: кадр вкладки (гейты input, рендер canvas, UI панелей, overlay UI инструмента);
     все входы кадра приходят одним `CleaningDrawParams`, среди них `panel_dock` — состояние
@@ -51,6 +54,7 @@ FILE HEADER (tabs/cleaning/tab.rs)
   zoom также блокируется адресно на эту комбинацию.
 */
 use super::autoclean::{autoclean_page, UnevenBackgroundTool};
+use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
 use super::tools::{
     AiEditorTool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
     FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
@@ -778,6 +782,8 @@ pub struct CleaningTabState {
     quick_clean_progress: QuickTextCleanProgress,
     quick_clean_status_text: Option<String>,
     ai_backend_health: Option<Arc<Mutex<AiBackendHealthSnapshot>>>,
+    /// Clean-folder scan and dismiss state behind the «Клин» tab's status area.
+    clean_folder_status: CleanFolderStatus,
 }
 
 impl Default for CleaningTabState {
@@ -822,6 +828,7 @@ impl Default for CleaningTabState {
             quick_clean_progress: QuickTextCleanProgress::default(),
             quick_clean_status_text: None,
             ai_backend_health: None,
+            clean_folder_status: CleanFolderStatus::default(),
         };
         state.activate_tool(0);
         state
@@ -847,6 +854,13 @@ impl CleaningTabState {
 
     pub fn set_ai_backend_health(&mut self, snapshot: Arc<Mutex<AiBackendHealthSnapshot>>) {
         self.ai_backend_health = Some(snapshot);
+    }
+
+    /// Asks the «Клин» status area to rescan the chapter's clean folders on a worker at the next
+    /// draw. For disk changes the tab cannot see itself — the app calls it once «Сохранить проект»
+    /// has merged the staging tree. Entering the tab rescans on its own. Cheap; never blocks.
+    pub fn request_orphan_clean_rescan(&mut self) {
+        self.clean_folder_status.request_rescan();
     }
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
@@ -1032,6 +1046,10 @@ impl CleaningTabState {
 
         self.poll_text_mask_load_job();
         self.poll_quick_text_clean_job();
+        // Read by the «Клин» body, so polled before `canvas.draw` like every other body input.
+        self.clean_folder_status.note_frame(ctx.cumulative_frame_nr());
+        self.clean_folder_status.poll();
+        self.clean_folder_status.start_scan_if_needed(ctx, project);
         let cursor_occluder = self.active_cursor_occluder(ctx, canvas_rect);
         let mut hooks = CleaningHooks {
             quick_text_mask_panel_open: self.quick_text_mask_panel_open,
@@ -1049,6 +1067,7 @@ impl CleaningTabState {
             quick_clean_status_text: self.quick_clean_status_text.as_deref(),
             text_mask_load_in_progress: self.text_mask_load_in_progress,
             text_mask_load_status: self.text_mask_load_status.as_deref(),
+            clean_status: self.clean_folder_status.view(&project.pages),
             dock_out: CleaningDockOut::default(),
         };
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
@@ -1205,6 +1224,13 @@ impl CleaningTabState {
             && visible != self.canvas.clean_overlays_visible()
         {
             self.canvas.set_clean_overlays_visible(visible);
+        }
+
+        if let Some(page_idx) = out.clean_status_dismiss.mismatch_page {
+            self.clean_folder_status.dismiss_mismatch_page(page_idx);
+        }
+        if out.clean_status_dismiss.orphan {
+            self.clean_folder_status.dismiss_orphan_notice();
         }
 
         if out.clear_current_layer {
@@ -1875,6 +1901,8 @@ struct CleaningDockOut {
     run_quick_clean_current_page: bool,
     /// «Заклинить все страницы» was pressed.
     run_quick_clean_all_pages: bool,
+    /// Crosses of the «Клин» status area clicked this frame.
+    clean_status_dismiss: CleanStatusDismiss,
 }
 
 /// Per-frame context the panel dock hands to one «Клининг» tab body at a time.
@@ -1919,12 +1947,15 @@ struct CleaningDockCx<'a> {
     text_mask_load_in_progress: bool,
     /// Last text-mask load status line.
     text_mask_load_status: Option<&'a str>,
+    /// Clean-folder scan result and dismiss state, read by the «Клин» status area.
+    clean_status: CleanStatusView<'a>,
     /// Everything the bodies decided this frame; drained after the canvas draw.
     out: &'a mut CleaningDockOut,
 }
 
 /// Draws the «Клин» tab body: clean-layer visibility, the clear-layer action, the
-/// quick-clean entry point and the two hint lines.
+/// quick-clean entry point, the two hint lines and, below them, the clean-folder status
+/// area (`clean_status.rs`), which takes no space at all while it has nothing to say.
 ///
 /// Mutates nothing but [`CleaningDockOut`] — see there for why.
 ///
@@ -1973,6 +2004,11 @@ fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
 
         ui.small(t!("cleaning.tab.paint_erase_hint"));
         ui.small(t!("cleaning.tab.scroll_brush_hint"));
+
+        // Derived here rather than before `canvas.draw`: the canvas' current page is read at
+        // the moment the body runs, so the message follows the page on the very frame it changes.
+        let messages = cx.clean_status.messages(cx.canvas.current_page_idx());
+        cx.out.clean_status_dismiss = draw_clean_status(ui, &messages);
     });
 }
 
@@ -2215,6 +2251,8 @@ struct CleaningHooks<'a> {
     quick_clean_status_text: Option<&'a str>,
     text_mask_load_in_progress: bool,
     text_mask_load_status: Option<&'a str>,
+    /// Clean-folder status, read by the «Клин» body.
+    clean_status: CleanStatusView<'a>,
     /// What the dock tab bodies decided this frame. Collected here for the same
     /// reason `dock_panel_rects` is: the hook runs inside `canvas.draw`, and every
     /// mutation it stands for needs `&mut CleaningTabState` after that call
@@ -2366,6 +2404,7 @@ impl CanvasHooks for CleaningHooks<'_> {
             quick_clean_status_text: self.quick_clean_status_text,
             text_mask_load_in_progress: self.text_mask_load_in_progress,
             text_mask_load_status: self.text_mask_load_status,
+            clean_status: self.clean_status,
             out: &mut self.dock_out,
         };
         let mut dock = PanelDock::begin(

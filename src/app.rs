@@ -1469,6 +1469,9 @@ impl MangaApp {
                 if let Ok(mut model) = self.clean_overlays_model.lock() {
                     model.mark_saved_to_project();
                 }
+                // The merge rewrote the committed `clean_layers/`, which the Cleaning tab's
+                // clean-folder status area reports on; it cannot see that change by itself.
+                self.cleaning_tab.request_orphan_clean_rescan();
                 self.has_unsaved_changes_cached = false;
                 self.save_to_project_status = Some((t!("app.save.saved").to_string(), now));
                 runtime_log::log_info("[save_to_project] merge complete");

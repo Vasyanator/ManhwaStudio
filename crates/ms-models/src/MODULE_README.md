@@ -47,8 +47,11 @@ candidate.
   `ms_page_ops::chapter_docs::chapter_doc_for_write`, so a NEW staging document is
   created in the chapter's format (`.json` / `.db`, docstore rule B.3), never the
   process default when the chapter already has a document.
-- `clean_assign.rs`: worker-thread filesystem API for discovering orphan clean images,
-  checking attachment fit, decoding/resizing attachments, and moving committed files to trash.
+- `clean_assign.rs`: worker-thread filesystem API for discovering orphan clean images (plus the
+  pure `*_detached` naming convention for deliberately detached cleans),
+  checking attachment fit, decoding/resizing attachments, and moving committed files to trash. Consumers: the page manager (every
+  operation) and the Cleaning tab's «Клин» status area (`scan_orphan_cleans` only), so both
+  agree on what an orphan or size-mismatched clean is.
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, dirty
   tracking, autosave snapshots, and cached decoded page images.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.

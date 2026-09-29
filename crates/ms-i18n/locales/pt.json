@@ -523,6 +523,8 @@
   "cleaning.tab.brushes_label": "Pincéis",
   "cleaning.tab.clean_all_pages_button": "Limpar todas as páginas",
   "cleaning.tab.clean_current_page_button": "Limpar a página atual",
+  "cleaning.tab.clean_size_mismatch_status": "A camada de limpeza da página atual ({clean_width}x{clean_height}) não foi carregada porque o seu tamanho não corresponde ao original: {page_width}x{page_height}. Pode corrigir isto no gestor de páginas.",
+  "cleaning.tab.clean_status_dismiss_tooltip": "Ocultar",
   "cleaning.tab.clean_tab": "Limpeza",
   "cleaning.tab.clear_current_layer_button": "Esvaziar a camada atual",
   "cleaning.tab.mask_already_loaded_status": "A máscara já está carregada.",
@@ -538,6 +540,12 @@
   "cleaning.tab.no_pages_error": "Não há páginas para processar.",
   "cleaning.tab.no_processing_title": "Não processar",
   "cleaning.tab.open_page_error": "Não foi possível abrir a página {path}: {err}",
+  "cleaning.tab.orphan_clean_more": {
+    "one": "e mais {n} arquivo",
+    "other": "e mais {n} arquivos"
+  },
+  "cleaning.tab.orphan_clean_status": "Foi encontrado na pasta de limpeza um arquivo que não pertence a nenhuma página: {file}. Pode resolver isto no gestor de páginas.",
+  "cleaning.tab.orphan_clean_status_many": "Foram encontrados na pasta de limpeza arquivos que não pertencem a nenhuma página: {file} {more}. Pode resolver isto no gestor de páginas.",
   "cleaning.tab.pages_progress_status": "Páginas: {done}/{total}",
   "cleaning.tab.paint_erase_hint": "Clique esq.: desenhar, Shift+clique esq.: apagar",
   "cleaning.tab.pixels_suffix": " px",

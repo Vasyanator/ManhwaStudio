@@ -526,6 +526,8 @@
   "cleaning.tab.brushes_label": "Brushes",
   "cleaning.tab.clean_all_pages_button": "Clean all pages",
   "cleaning.tab.clean_current_page_button": "Clean current page",
+  "cleaning.tab.clean_size_mismatch_status": "The clean layer of the current page ({clean_width}x{clean_height}) was not loaded because its size does not match the source: {page_width}x{page_height}. You can fix this in the page manager.",
+  "cleaning.tab.clean_status_dismiss_tooltip": "Dismiss",
   "cleaning.tab.clean_tab": "Cleaning",
   "cleaning.tab.clear_current_layer_button": "Clear current layer",
   "cleaning.tab.mask_already_loaded_status": "Mask already loaded.",
@@ -541,6 +543,12 @@
   "cleaning.tab.no_pages_error": "No pages to process.",
   "cleaning.tab.no_processing_title": "Do not process",
   "cleaning.tab.open_page_error": "Failed to open page {path}: {err}",
+  "cleaning.tab.orphan_clean_more": {
+    "one": "and {n} more file",
+    "other": "and {n} more files"
+  },
+  "cleaning.tab.orphan_clean_status": "A file that does not belong to any page was found in the clean folder: {file}. You can sort this out in the page manager.",
+  "cleaning.tab.orphan_clean_status_many": "Files that do not belong to any page were found in the clean folder: {file} {more}. You can sort this out in the page manager.",
   "cleaning.tab.pages_progress_status": "Pages: {done}/{total}",
   "cleaning.tab.paint_erase_hint": "LMB: draw, Shift+LMB: erase",
   "cleaning.tab.pixels_suffix": " px",

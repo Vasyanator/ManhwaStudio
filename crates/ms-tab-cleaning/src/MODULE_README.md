@@ -41,7 +41,7 @@ This tab HOSTS the shared panel dock (`crates/ms-widgets/src/panel_dock`), and e
 is a dock tab. It declares SEVEN: the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body
 `CanvasView::draw_ribbon_tab_body`, declared through `canvas::declare_ribbon_tab` — the canvas' one
 declaration of it) plus six of its own — «Клин» (`cleaning.clean`: layer visibility, clear current
-layer and the quick-clean toggle), «Инструменты клина» (`cleaning.tools`: the tool picker,
+layer, the quick-clean toggle and the clean-folder status area), «Инструменты клина» (`cleaning.tools`: the tool picker,
 rows wrapping to the panel width), «Выбранный инструмент» (`cleaning.active_tool`:
 `CleaningTool::draw_ui`), «Быстрый клин найденного текста» (`cleaning.quick_clean`: the
 quick-clean parameters, its two run buttons and its progress), «Редактор области»
@@ -83,6 +83,16 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `final_sanity_trim`. The thin `autoclean_page` wrapper is the only egui-touching part; it
   rasterizes the winning `RegionFill`s into the overlay patch. Includes synthetic pipeline and
   characterization tests. Detector boxes arrive from `tab.rs` already in page-pixel space.
+- `clean_status.rs`: the «Клин» tab's clean-folder status area — up to two dismissible warnings
+  below the hints: the CURRENT page's committed `clean_layers/<source stem>.png` was skipped by
+  the overlay loader for its size, and a clean file (committed or staging) that matches no page.
+  Its data is `ms_models::clean_assign::scan_orphan_cleans` run on an `ms_thread` worker (the
+  same owner the page manager uses), one scan at a time with an epoch that drops superseded
+  replies. Rescans: the first draw, every entry into the tab (a gap in
+  `Context::cumulative_frame_nr` between draws — so a return from the page manager counts), and
+  `CleaningTabState::request_orphan_clean_rescan`, which `app.rs` calls after a successful
+  «Сохранить проект». Message selection is the pure, unit-tested
+  `select_clean_status_messages`. Dismissals are session-only and never persisted.
 - `watermark_chapter.rs`: GUI-free chapter-level watermark decomposition engine — the exact,
   AI-free counterpart of the neural watermark path. A semi-transparent mark composites as
   `I = c + s*B` (`c = alpha*W`, `s = 1 - alpha`), constant across every occurrence of one mark, so
@@ -112,7 +122,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management panel and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
-- `mod.rs`: module wiring and public re-export of `CleaningTabState`.
+- `lib.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants
 - The cleaning tab uses shared clean-overlay visibility from `CleanOverlaysModel`; typing
@@ -204,6 +214,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   keys or persists a model must include `MarkTemplate::anchor_key`. The accept rule additionally
   requires the occurrence to sit within `ANCHOR_TOLERANCE_PX` of an anchor and to reach
   `FALSE_ACCEPT_GAIN_FLOOR`; no `DetectionParams` value can widen past either.
+- The «Клин» status area's message 1 mirrors the overlay LOADER (committed tree only, exact
+  `<stem>.png`, exact size inequality), not the scan's broader stem match; message 2 is
+  `NoMatchingPage` only (minus deliberately detached `*_detached` files, `clean_assign::is_detached_clean_file`), never `Unreadable`. Its body only draws; cross clicks leave through
+  `CleaningDockOut::clean_status_dismiss`. With nothing to say it lays out nothing at all.
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,
   or committed clean-overlay edits.
 - Canvas zoom, drag-scroll, and context menus must respect active tool capture/blocking signals.
@@ -304,6 +318,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `tools/watermark_library_window.rs`. In particular, whether a set of samples separates the
   model is answered by `estimate_model`'s own verdict; no caller may re-derive it from a copied
   threshold.
+- To change what the «Клин» status area reports, when it rescans, or how a message looks, edit
+  `clean_status.rs`; the classification of a clean file itself belongs to `ms_models::clean_assign`.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
 - To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
   `TextMaskModel` contracts in `crates/ms-models/src/`.

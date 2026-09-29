@@ -6,6 +6,7 @@ Main items:
 - `scan_orphan_cleans`: discovers unassigned, mismatched, and unreadable clean images.
 - `attach_fit` / `load_clean_for_attach`: validate and prepare an image for a page.
 - `trash_clean_file`: discards staging files or preserves committed files in chapter trash.
+- `DETACHED_CLEAN_SUFFIX` / `is_detached_clean_file`: naming convention for deliberately detached cleans.
 
 Threading:
 Every public operation that reads or writes files is synchronous and must run outside the GUI
@@ -60,6 +61,22 @@ pub struct OrphanClean {
     /// Header-only dimensions, or `[0, 0]` for [`OrphanReason::Unreadable`].
     pub size: [u32; 2],
     pub reason: OrphanReason,
+}
+
+/// File-stem suffix that marks a clean image as deliberately detached from its page
+/// (`003_detached.png`). Such a file is kept on purpose, so passive "unassigned file" warnings
+/// must skip it; the page manager's orphan list still shows it so it can be re-attached.
+pub const DETACHED_CLEAN_SUFFIX: &str = "_detached";
+
+/// Returns whether `path`'s file stem ends with [`DETACHED_CLEAN_SUFFIX`] (ASCII case-insensitive).
+/// Pure; never touches the filesystem.
+#[must_use]
+pub fn is_detached_clean_file(path: &Path) -> bool {
+    path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
+        stem.len() >= DETACHED_CLEAN_SUFFIX.len()
+            && stem.is_char_boundary(stem.len() - DETACHED_CLEAN_SUFFIX.len())
+            && stem[stem.len() - DETACHED_CLEAN_SUFFIX.len()..].eq_ignore_ascii_case(DETACHED_CLEAN_SUFFIX)
+    })
 }
 
 /// Describes whether an image can be attached without distortion.

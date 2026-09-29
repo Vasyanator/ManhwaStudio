@@ -20,6 +20,7 @@ Modules:
 - `tools`: the whole cleaning tool set (mask brush, patch, region edit v2, the AI editor
   engines, watermark removal, AOT / Flux-Fill inpainting, mask generation).
 - `autoclean`: the batch "clean the whole chapter" driver.
+- `clean_status`: the «Клин» tab's clean-folder status area (worker scan + dismissible warnings).
 - `watermark_chapter`: the GUI-free chapter-level watermark decomposition engine.
 */
 
@@ -32,6 +33,7 @@ Modules:
 extern crate ms_i18n;
 
 mod autoclean;
+mod clean_status;
 mod tab;
 mod tools;
 // GUI-free chapter-level watermark decomposition engine (`I = c + s*B`, solved from several

@@ -523,6 +523,8 @@
   "cleaning.tab.brushes_label": "Pinceaux",
   "cleaning.tab.clean_all_pages_button": "Nettoyer toutes les pages",
   "cleaning.tab.clean_current_page_button": "Nettoyer la page actuelle",
+  "cleaning.tab.clean_size_mismatch_status": "Le calque de nettoyage de la page actuelle ({clean_width}x{clean_height}) n'a pas été chargé car sa taille ne correspond pas à l'original : {page_width}x{page_height}. Vous pouvez corriger cela dans le gestionnaire de pages.",
+  "cleaning.tab.clean_status_dismiss_tooltip": "Masquer",
   "cleaning.tab.clean_tab": "Nettoyage",
   "cleaning.tab.clear_current_layer_button": "Effacer le calque actuel",
   "cleaning.tab.mask_already_loaded_status": "Masque déjà chargé.",
@@ -538,6 +540,12 @@
   "cleaning.tab.no_pages_error": "Aucune page à traiter.",
   "cleaning.tab.no_processing_title": "Ne pas traiter",
   "cleaning.tab.open_page_error": "Impossible d'ouvrir la page {path} : {err}",
+  "cleaning.tab.orphan_clean_more": {
+    "one": "et {n} autre fichier",
+    "other": "et {n} autres fichiers"
+  },
+  "cleaning.tab.orphan_clean_status": "Un fichier n'appartenant à aucune page a été trouvé dans le dossier de nettoyage : {file}. Vous pouvez régler cela dans le gestionnaire de pages.",
+  "cleaning.tab.orphan_clean_status_many": "Des fichiers n'appartenant à aucune page ont été trouvés dans le dossier de nettoyage : {file} {more}. Vous pouvez régler cela dans le gestionnaire de pages.",
   "cleaning.tab.pages_progress_status": "Pages : {done}/{total}",
   "cleaning.tab.paint_erase_hint": "Clic gauche : dessiner, Maj+clic gauche : effacer",
   "cleaning.tab.pixels_suffix": " px",
