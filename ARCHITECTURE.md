@@ -109,10 +109,8 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `crates/puffin_egui` — vendored profiler UI, compiled only with the root `profiling` feature.
 - `egui-shader-layers`, `egui-large-image`, `ag-psd` — standalone external crates (crates.io
   dependencies in `[workspace.dependencies]`); their local checkouts under `crates/` are
-  gitignored. `egui-large-image` (tiled display of very large images, used by the launcher and
-  the page-manager viewer) is resolved from its local path through a temporary
-  `[patch.crates-io]` entry in the root `Cargo.toml` until it is published, so a clone without
-  that checkout does not build.
+  gitignored. `egui-large-image` does the tiled display of very large images (launcher ribbon
+  and crop editor, page-manager viewer).
 
 ## 3. Startup and process lifetime
 

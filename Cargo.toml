@@ -51,7 +51,7 @@ egui = "0.36.2"
 egui-shader-layers = { version = "0.2", default-features = false, features = ["glow"] }
 # Tiled display of images larger than the GPU texture limit (grid, worker-side split, budgeted
 # dirty-aware uploads, culled paint). A standalone MIT crate like egui-shader-layers: no `ms-*`
-# dependencies, its local checkout is gitignored. Not yet used by any member.
+# dependencies, its local checkout is gitignored.
 egui-large-image = "0.1"
 flate2 = "1"
 genai = "0.6"
@@ -382,11 +382,3 @@ ms-tab-typing = { path = "crates/ms-tab-typing", features = ["test-support"] }
 # accessors (`ensure_page_loaded`, `node`, `is_text`, `display_image`) that the typing
 # tab's tests drive. Test builds only, for the same reason.
 ms-models = { path = "crates/ms-models", features = ["test-support"] }
-
-# TEMPORARY: egui-large-image 0.1.0 is not on crates.io yet, so the `[workspace.dependencies]`
-# entry above resolves to the gitignored local checkout under `crates/egui-large-image/` (a
-# standalone package with its own empty `[workspace]`). A fresh clone of this repository without
-# that checkout cannot resolve it. Remove this section once egui-large-image 0.1.0 is published to
-# crates.io, then run `cargo update -p egui-large-image` so Cargo.lock records the registry source.
-[patch.crates-io]
-egui-large-image = { path = "crates/egui-large-image" }

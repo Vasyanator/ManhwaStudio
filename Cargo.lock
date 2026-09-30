@@ -1625,6 +1625,8 @@ dependencies = [
 [[package]]
 name = "egui-large-image"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe2a861c2cad8a71d125d055fb318a24e20ceea89e2d5456da43bdeaf861da04"
 dependencies = [
  "egui",
  "log",
