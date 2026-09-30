@@ -463,7 +463,7 @@ fn save_overlay_snapshots_parallel(
         if !snapshot_is_current(snapshot) {
             continue;
         }
-        let dst = dir.join(format!("{}.png", snapshot.stem));
+        let dst = dir.join(snapshot.file_name());
         match snapshot.image.save(&dst) {
             Ok(()) => {
                 // Post-write reconcile: a detach racing the encode above already bumped the

@@ -8,7 +8,9 @@ Main responsibilities:
 - render a dark-themed import UI with layer mapping and preview;
 - load PSD/PSB/image/ZIP/RAR sources on background threads using the `ag-psd` crate;
 - warn when unsupported complexity is detected (for example layer groups);
-- save selected raster layers into project `src/` and `clean_layers/` without blocking the GUI.
+- save selected raster layers into project `src/` and `clean_layers/` without blocking the GUI;
+  the clean file name comes from the binding owner (`ms_page_ops::clean_binding`) applied to the
+  source page's stem, so it binds to that page whatever the source file's extension.
 
 Notes:
 Both `.psd` and `.psb` (Large Document Format) are accepted and share one code path:
@@ -49,6 +51,7 @@ use crate::new_project::project_io::{
     ProjectCatalogController, ProjectCatalogEvent, ProjectCatalogSnapshot, chapters_for_title,
 };
 use crate::state::OpenProjectSelection;
+use ms_config as config;
 use ms_log::runtime_log;
 use ms_widgets::EditableComboBox;
 use egui::{
@@ -2652,8 +2655,10 @@ fn run_import_worker(
     assignments: Vec<ImportAssignment>,
 ) -> Result<ImportResponse, WorkerError> {
     let chapter_dir = projects_root.join(title).join(chapter);
-    let src_dir = chapter_dir.join("src");
-    let clean_dir = chapter_dir.join("clean_layers");
+    // The chapter does not exist yet, so there is no loaded `ProjectPaths`; the directory names
+    // come from the same constants `ProjectPaths` is built from.
+    let src_dir = chapter_dir.join(config::SRC_DIR);
+    let clean_dir = chapter_dir.join(config::CLEAN_LAYERS_DIR);
     fs::create_dir_all(&src_dir).map_err(|err| WorkerError {
         user_message: t!("launcher.psd_import.create_src_folder_error").to_string(),
         log_message: format!("failed to create '{}': {err}", src_dir.display()),
@@ -2687,6 +2692,8 @@ fn run_import_worker(
             continue;
         };
         let filename = import_filename_for_page(page)?;
+        // The page's clean is `<source stem>.png` by the binding owner's rule.
+        let clean_filename = import_clean_filename_for_page(page)?;
         if let Some(source) = entries.source {
             let image = render_layer_rgba(&documents, source.document_index, source.source)?;
             image
@@ -2713,10 +2720,10 @@ fn run_import_worker(
                 composite_overlay(&mut image, &patch, offset);
             }
             image
-                .save(clean_dir.join(&filename))
+                .save(clean_dir.join(&clean_filename))
                 .map_err(|err| WorkerError {
                     user_message: t!("launcher.psd_import.save_clean_error").to_string(),
-                    log_message: format!("failed to save clean page {page} as '{filename}': {err}"),
+                    log_message: format!("failed to save clean page {page} as '{clean_filename}': {err}"),
                 })?;
         } else if !entries.overlays.is_empty() {
             // `validate_all_rows` rejects this before the save starts; reaching it here means
@@ -2740,14 +2747,36 @@ fn run_import_worker(
     })
 }
 
-fn import_filename_for_page(page: u32) -> Result<String, WorkerError> {
+/// Zero-padded file stem (`NNN`, zero-based) of one-based import page `page`.
+///
+/// # Errors
+/// Rejects page `0` (page numbers are one-based).
+fn import_page_stem(page: u32) -> Result<String, WorkerError> {
     let Some(file_index) = page.checked_sub(1) else {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.page_number_min_one").to_string(),
             log_message: format!("invalid one-based page number: {page}"),
         });
     };
-    Ok(format!("{file_index:03}.png"))
+    Ok(format!("{file_index:03}"))
+}
+
+/// File name of the SOURCE page written for one-based import page `page` (`<stem>.png`; the
+/// source is always saved as PNG).
+///
+/// # Errors
+/// Rejects page `0`.
+fn import_filename_for_page(page: u32) -> Result<String, WorkerError> {
+    Ok(format!("{}.png", import_page_stem(page)?))
+}
+
+/// File name of the CLEAN layer written for one-based import page `page`: the binding owner's
+/// canonical clean name of the source page's stem, so the loader binds it to that page.
+///
+/// # Errors
+/// Rejects page `0`.
+fn import_clean_filename_for_page(page: u32) -> Result<String, WorkerError> {
+    Ok(ms_page_ops::clean_binding::clean_overlay_file_name(&import_page_stem(page)?))
 }
 
 fn render_layer_rgba(
@@ -3017,7 +3046,7 @@ fn standard_dark_style() -> egui::Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayerImportType, LayerSource, PsdLayerRow, import_filename_for_page};
+    use super::{LayerImportType, LayerSource, PsdLayerRow, import_clean_filename_for_page, import_filename_for_page};
 
     #[test]
     fn import_filename_preserves_page_gaps() {
@@ -3037,6 +3066,18 @@ mod tests {
     #[test]
     fn import_filename_rejects_zero_page() {
         assert!(import_filename_for_page(0).is_err());
+        assert!(import_clean_filename_for_page(0).is_err());
+    }
+
+    #[test]
+    fn import_clean_filename_is_the_canonical_clean_of_the_source_page() {
+        let (Ok(source), Ok(clean)) = (import_filename_for_page(5), import_clean_filename_for_page(5)) else {
+            panic!("page 5 must produce file names");
+        };
+        // Same name as the PNG source page, i.e. what the clean was always written as.
+        assert_eq!(clean, "004.png");
+        let stem = std::path::Path::new(&source).file_stem().and_then(std::ffi::OsStr::to_str);
+        assert_eq!(stem.map(ms_page_ops::clean_binding::clean_overlay_file_name), Some(clean));
     }
 
     #[test]

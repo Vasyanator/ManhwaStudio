@@ -66,8 +66,9 @@ FILE HEADER (tabs/typing/tab.rs)
     загрузкой/сохранением, кистью рисования/стирания и клипом текстовых PNG.
   - Экспорт в папку: фоновое наложение `src + clean overlay + text overlays`
     с учётом перспективной трансформации и маски обрезки; clean overlay берётся из
-    shared `CleanOverlaysModel` (с CPU RGBA-кэшем несохранённых правок), а при
-    отсутствии в памяти предварительно догружается из `clean_layers` в модель.
+    shared `CleanOverlaysModel` (с CPU RGBA-кэшем несохранённых правок); when the model holds
+    no overlay for a page, the export decodes (read-only, never written back into the model) the
+    file the overlay loader would load (`clean_assign::LOADER_CLEAN_SCOPE`).
   - Clean overlay visibility in this tab is canvas-local UI state: toggling it must not
     mutate `CleanOverlaysModel` or affect the Cleaning tab.
 - Ключевые методы:
@@ -2767,7 +2768,10 @@ pub(super) struct TypingExportPageJob {
     /// re-paginating route): there the composed pages are stitched and re-cut, so no file
     /// corresponds to one source page and inventing a path here would be a lie.
     pub(super) output_path: Option<PathBuf>,
-    pub(super) clean_overlay_path: Option<PathBuf>,
+    /// Both persistence paths of this page's клин (`PageCleanPaths::for_writer`), or `None` when
+    /// the job carries no клин source (tests). Which of them — if any — is exported is decided on
+    /// the export worker by the overlay loader's rule (`export::prepare_export_clean_overlay_snapshots`).
+    pub(super) clean_paths: Option<ms_models::clean_assign::PageCleanPaths>,
     pub(super) clean_overlay_rgba: Option<Arc<image::RgbaImage>>,
     pub(super) overlays: Vec<TypingExportOverlaySnapshot>,
     /// On-screen PS raster layers snapshotted from the doc projection. When present, the composite uses

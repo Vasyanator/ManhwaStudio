@@ -26,7 +26,8 @@ notification.
   `pub(crate)` scan/install/persist helpers; blocks input with the tutorial-engine
   overlay pattern. Edit here to change the modal's detection, preselection, or layout.
 - `pages/`: fullscreen launcher pages for open/import/export/settings flows.
-- `new_project/`: detached new-project workflow.
+- `new_project/`: detached new-project workflow. Its ribbon/crop previews are drawn through
+  the `egui-large-image` crate (tiled, budgeted uploads; see `new_project/MODULE_README.md`).
 - `psd_import_window.rs`: detached PSD/PSB import workflow. Both formats take the same path:
   `ag-psd` tells them apart by the version field in the file header, and the accepted
   extensions live in one place (`is_supported_document_ext`). Plain raster files
@@ -38,7 +39,9 @@ notification.
   (`LayerImportType::OverlayOnClean`) writes no file of its own and is instead composited
   source-over onto the page's clean image at the layer's own PSD canvas offset, clipped to
   it, before that image is saved. Several overlays may share a page; they are applied in PSD
-  hierarchy order and require a clean row on the same page (`validate_all_rows`). The action
+  hierarchy order and require a clean row on the same page (`validate_all_rows`). The saved
+  clean is named by the binding owner (`ms_page_ops::clean_binding::clean_overlay_file_name` of
+  the source page's stem), never by restating `<stem>.png`. The action
   is offered only for a `LayerSource::Layer` row of a document with three or more layer rows.
   Note the layer order this depends on: `ag-psd` preserves the raw PSD record order, so
   `LoadedPsdDocument::layers` and the rows built from it are BOTTOM-FIRST (index 0 =

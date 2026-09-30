@@ -11,13 +11,15 @@ widgets and `ms-tab-ps-editor` (the crop/split/stitch previews reuse its viewpor
 and below only `app.rs`. It must never name `app` or `launcher`.
 
 "Page manager" studio tab: a card grid of the chapter's pages with selection,
-badges (clean overlay / bubble count / layer count), and structural page
+badges (bubble count / layer count), each page's clean card linked under it, a
+«Клин без страницы» section of unassigned clean files, and structural page
 operations (insert / create blank / move / delete) requested from the app
 through `PageManagerAction`.
 
 Key structures:
 - PageManagerTabState: tab state — shared-model handles, selection, badge
-  caches, the thumbnail/scan worker, and the open dialog.
+  caches, the thumbnail/scan worker, the open dialog, the page viewer and its
+  clean worker.
 - PageManagerAction: what the tab asks the app to do (run a `PageOpKind`,
   or switch to another tab focused on a page).
 
@@ -26,6 +28,13 @@ Key functions:
   dialogs), returns the requested actions.
 - notify_pages_changed(): cache invalidation hook the app calls after a
   structural operation or project reload.
+- poll_clean_events(): drains clean-worker replies; the app calls it every frame
+  on every tab so `clean_op_in_flight()` never goes stale off-tab.
+- viewer_source_page() / viewer_wants_nearest_source() (viewer.rs): the source
+  page the viewer draws from the app's lent textures, for the app's residency
+  window.
+- release_hidden_viewer_clean() (viewer.rs): every-frame app hook that frees the
+  viewer's clean tiles and textures while this tab is not drawn.
 
 Notes:
 This tab is NOT a `CanvasView`. It never executes structural operations itself:
@@ -46,14 +55,18 @@ extern crate ms_i18n;
 
 mod dialogs;
 mod clean;
+mod clean_cards;
+mod clean_link;
 mod crop;
 mod crop_layout;
 mod grid;
+mod grid_layout;
 mod split;
 mod split_layout;
 mod stitch;
 mod stitch_layout;
 mod thumbs;
+mod viewer;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -61,7 +74,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use ms_models::page_view::PageImageInfo;
+use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_models::bubbles_model::BubblesModel;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_models::layer_model::layer_doc::LayerDoc;
@@ -72,6 +85,9 @@ use ms_widgets::WheelSpinBox;
 use dialogs::PageManagerDialog;
 use clean::CleanRuntime;
 use thumbs::ThumbRuntime;
+
+/// How often an off-tab frame is scheduled while a clean job runs ([`PageManagerTabState::poll_clean_events`]).
+const CLEAN_OP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// File name of the layer manifest inside a layers directory. Persistence
 /// identifier (matches `models/layer_model/persist.rs::MANIFEST_FILE`).
@@ -113,12 +129,15 @@ pub struct PageManagerTabState {
 
     /// Thumbnail decode + manifest scan worker and the LRU thumbnail cache.
     thumbs: ThumbRuntime,
-    /// Dedicated worker for orphan scans and clean attachment/destruction I/O.
+    /// Dedicated worker for clean inventory scans and clean-file mutations.
     clean_runtime: CleanRuntime,
-    /// Most recent worker scan, also used to flag size-mismatched card overlays.
-    orphan_cleans: Vec<ms_models::clean_assign::OrphanClean>,
-    selected_orphan: Option<usize>,
-    /// Current orphan-scan epoch; results from older epochs are dropped
+    /// Page whose in-gap unlink control is armed (a later deliberate click unlinks) and when it
+    /// was armed. Dropped when the pointer leaves that gap and on `notify_pages_changed`.
+    unlink_armed: Option<clean_cards::UnlinkArm>,
+    /// The grid's content scroll anchor and the layout it was taken in; when the next frame's
+    /// layout differs, the scroll offset is re-derived from the anchor (see `grid.rs`).
+    grid_scroll: Option<grid::GridScrollMemo>,
+    /// Current clean-inventory scan epoch; results from older epochs are dropped
     /// (mirrors the `scan_epoch` pattern of the layers scan).
     clean_scan_epoch: u64,
     /// Epoch a scan job has already been submitted for.
@@ -126,6 +145,24 @@ pub struct PageManagerTabState {
     /// Epoch whose scan result has been applied.
     clean_scan_done_epoch: Option<u64>,
     clean_op_in_flight: bool,
+    /// Latest installed clean inventory (both trees); `None` until the first scan of the
+    /// current pages lands.
+    clean_inventory: Option<ms_models::clean_assign::CleanInventory>,
+    /// Bumped on every inventory install; part of the link-cache key.
+    clean_inventory_epoch: u64,
+    /// Per-page model facts (`materialized`, remembered size), refreshed with `clean_present`.
+    model_page_cleans: Vec<clean_link::ModelPageClean>,
+    /// Per-page link state, recomputed only when `clean_links_key` changes.
+    clean_links: Vec<clean_link::PageCleanLink>,
+    /// `(overlays revision, inventory epoch, page count)` the links were computed at.
+    clean_links_key: Option<(Option<u64>, u64, usize)>,
+    /// The app's overlay loader is still delivering (`set_overlays_loading`).
+    overlays_loading: bool,
+    /// `op_in_progress` of the current frame (structural op / save running).
+    op_in_progress: bool,
+    /// `ctx.cumulative_frame_nr()` of the last frame this tab was drawn; a gap means the tab
+    /// was re-activated, which triggers a clean rescan (other tabs may have changed the trees).
+    last_drawn_frame: Option<u64>,
     clean_dialog: Option<clean::CleanDialog>,
     clean_picker_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 
@@ -154,6 +191,13 @@ pub struct PageManagerTabState {
 
     /// The currently open modal dialog, if any.
     dialog: Option<PageManagerDialog>,
+    /// The full-resolution page / clean viewer (`viewer.rs`). A separate slot from `dialog`: it
+    /// is non-modal and emits no operation, so opening a dialog does not close it.
+    viewer: Option<viewer::PageViewer>,
+    /// The viewer's clean decode/split thread: one per tab, started on the first clean request
+    /// and reused by every later viewer, so at most one clean decode runs at a time. Ends when
+    /// the tab is dropped.
+    viewer_worker: Option<viewer::ViewerWorker>,
     /// Last user-facing error (e.g. the file-picker worker died).
     error_message: Option<String>,
 }
@@ -171,12 +215,20 @@ impl Default for PageManagerTabState {
             move_to_position: 1,
             thumbs: ThumbRuntime::default(),
             clean_runtime: CleanRuntime::default(),
-            orphan_cleans: Vec::new(),
-            selected_orphan: None,
+            unlink_armed: None,
+            grid_scroll: None,
             clean_scan_epoch: 0,
             clean_scan_requested_epoch: None,
             clean_scan_done_epoch: None,
             clean_op_in_flight: false,
+            clean_inventory: None,
+            clean_inventory_epoch: 0,
+            model_page_cleans: Vec::new(),
+            clean_links: Vec::new(),
+            clean_links_key: None,
+            overlays_loading: false,
+            op_in_progress: false,
+            last_drawn_frame: None,
             clean_dialog: None,
             clean_picker_rx: None,
             bubbles_revision_seen: None,
@@ -190,6 +242,8 @@ impl Default for PageManagerTabState {
             scan_epoch: 0,
             scan_requested_epoch: None,
             dialog: None,
+            viewer: None,
+            viewer_worker: None,
             error_message: None,
         }
     }
@@ -206,6 +260,24 @@ impl PageManagerTabState {
     pub fn set_overlays_model(&mut self, model: Arc<Mutex<CleanOverlaysModel>>) {
         self.overlays_model = Some(model);
         self.overlays_revision_seen = None;
+        self.clean_links_key = None;
+        // Model thumbnails are keyed by page index of the PREVIOUS model.
+        self.thumbs.clear_model_clean_thumbs();
+    }
+
+    /// Tells the tab whether the app's clean-overlay loader is still delivering pages. While it
+    /// is, clean mutations are refused ([`Self::clean_op_in_flight`]'s counterpart): the loader's
+    /// late `load_prepared_overlay` would overwrite what a bind/unlink put into the model. The app
+    /// calls this every frame before [`Self::draw`].
+    pub fn set_overlays_loading(&mut self, loading: bool) {
+        self.overlays_loading = loading;
+    }
+
+    /// Requests a fresh clean-inventory scan on the next drawn frame, superseding any in-flight
+    /// one. The app calls this after a save-to-project merge rewrote `clean_layers/` and removed
+    /// the staging tree.
+    pub fn request_clean_rescan(&mut self) {
+        self.clean_scan_epoch = self.clean_scan_epoch.wrapping_add(1);
     }
 
     /// Wires the app-owned shared unified layer document (same wiring shape as
@@ -225,13 +297,19 @@ impl PageManagerTabState {
         self.selection.clear();
         self.selection_anchor = None;
         self.dialog = None;
+        // The viewer holds a page index (or a clean resolved through one).
+        self.close_viewer();
         self.bubbles_revision_seen = None;
         self.overlays_revision_seen = None;
         self.layer_doc_version_seen = None;
         self.resident_layer_counts.clear();
         self.manifest_layer_counts.clear();
-        self.orphan_cleans.clear();
-        self.selected_orphan = None;
+        self.unlink_armed = None;
+        self.clean_inventory = None;
+        self.clean_links.clear();
+        self.clean_links_key = None;
+        // Model clean thumbnails are keyed by page index, which may have shifted.
+        self.thumbs.clear_model_clean_thumbs();
         // New epoch: any in-flight scan result is stale (page indices may have
         // shifted) and a fresh scan is requested on the next frame. A pending
         // clean confirmation or picker also refers to pre-reload indices.
@@ -245,30 +323,55 @@ impl PageManagerTabState {
     /// True while a clean attach/detach/delete/probe worker job is running. The
     /// app root gates structural page operations and project saves on this: those
     /// flows reload or merge page-indexed state that the clean worker is mutating.
+    /// Only as fresh as the last [`Self::poll_clean_events`].
     #[must_use]
     pub fn clean_op_in_flight(&self) -> bool {
         self.clean_op_in_flight
     }
 
+    /// Applies the clean worker's finished replies (clearing [`Self::clean_op_in_flight`]) whether
+    /// or not the tab is shown. The app root calls this every frame BEFORE it reads the flag, so a
+    /// job that finished while another tab was active does not keep saves and page operations
+    /// blocked; [`Self::draw`] calls it too (a second call in one frame drains nothing). While a job
+    /// runs, a follow-up frame is scheduled: the worker cannot wake the UI itself.
+    pub fn poll_clean_events(&mut self, ctx: &egui::Context, project: &ProjectData) {
+        self.absorb_clean_events(project);
+        if self.clean_op_in_flight {
+            ctx.request_repaint_after(CLEAN_OP_POLL_INTERVAL);
+        }
+    }
+
     /// Per-frame entry point. Renders the toolbar, the card grid, the status
-    /// line, and any open dialog, and returns the actions the app must execute.
-    /// `op_in_progress` disables every structural button while an operation or
-    /// save is running.
+    /// line, any open dialog and the page viewer, and returns the actions the app
+    /// must execute. `op_in_progress` disables every structural button while an
+    /// operation or save is running. `textures` is the app's resident source-page
+    /// tiles, lent for this frame: the page viewer draws a page from them (and may
+    /// re-upload an evicted tile) instead of decoding it again.
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         project: &ProjectData,
         page_infos: &HashMap<usize, PageImageInfo>,
+        textures: &mut HashMap<usize, PageTexture>,
         op_in_progress: bool,
     ) -> Vec<PageManagerAction> {
         let mut actions = Vec::new();
         let page_count = project.pages.len();
 
+        self.op_in_progress = op_in_progress;
         self.ensure_project(project);
+        let frame_nr = ctx.cumulative_frame_nr();
+        if self.last_drawn_frame.is_some_and(|last| frame_nr > last.saturating_add(1)) {
+            // The tab was not drawn for a while (another tab was active): its edits, autosaves and
+            // saves may have changed both clean trees.
+            self.request_clean_rescan();
+        }
+        self.last_drawn_frame = Some(frame_nr);
         self.absorb_worker_events(ctx);
-        self.absorb_clean_events(project);
+        self.poll_clean_events(ctx, project);
         self.refresh_badges(page_count);
+        self.refresh_clean_links(project);
         self.request_layers_scan_if_needed(project);
         self.request_clean_scan_if_needed(project);
         self.clamp_selection(page_count);
@@ -281,8 +384,6 @@ impl PageManagerTabState {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             self.draw_grid(ui, project, page_infos, op_in_progress, &mut actions);
-            ui.separator();
-            self.draw_orphan_cleans(ui, project, page_infos, op_in_progress);
         });
 
         // The create dialog seeds its default size from a neighbouring page:
@@ -318,7 +419,8 @@ impl PageManagerTabState {
             &mut actions,
         );
         self.poll_clean_picker(project, page_infos);
-        self.draw_clean_dialog(ctx, project, page_infos, op_in_progress);
+        self.draw_clean_dialog(ctx, project);
+        self.draw_viewer(ctx, project, page_infos, textures);
 
         // Keep frames coming while background work is pending so its results land.
         if self.thumbs.has_in_flight()
@@ -389,9 +491,11 @@ impl PageManagerTabState {
                 || self.clean_present.len() != page_count
             {
                 self.overlays_revision_seen = Some(revision);
-                self.clean_present = (0..page_count)
-                    .map(|idx| !guard.is_overlay_virtual_absent(idx))
+                self.model_page_cleans = (0..page_count)
+                    .map(|idx| clean_link::ModelPageClean::of(&guard, idx))
                     .collect();
+                drop(guard);
+                self.clean_present = self.model_page_cleans.iter().map(|model| model.materialized).collect();
             }
         }
         if let Some(doc) = self.layer_doc.as_ref()
@@ -600,15 +704,17 @@ impl PageManagerTabState {
         });
     }
 
-    /// Draws the status line: total pages / pages with clean / total bubbles.
+    /// Draws the status line: total pages / pages with clean / total bubbles / unassigned cleans.
     fn draw_status(&self, ui: &mut egui::Ui, page_count: usize) {
-        let cleaned = self.clean_present.iter().filter(|present| **present).count();
+        // Counted from the links the grid draws clean cards from (OK and problem alike), so the
+        // status line and the cards always agree.
+        let cleaned = self.linked_clean_count();
         ui.label(tf!(
             "page_manager.status.summary",
             pages = page_count,
             cleaned = cleaned,
             bubbles = self.bubble_total,
-            orphans = self.orphan_cleans.len()
+            orphans = self.unassigned_cleans().len()
         ));
     }
 }

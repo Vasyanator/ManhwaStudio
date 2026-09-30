@@ -65,6 +65,7 @@ use crate::memory_manager::{
 };
 use crate::models::autosave_gate::AutosaveGate;
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings, write_bubbles_snapshot_to};
+use crate::models::clean_assign::{LOADER_CLEAN_SCOPE, PageCleanPaths, PageCleanResolution, probe_page_clean};
 use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snapshots_guarded};
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::{ComicType, ProjectData, save_comic_type_to_project_file};
@@ -1472,6 +1473,8 @@ impl MangaApp {
                 // The merge rewrote the committed `clean_layers/`, which the Cleaning tab's
                 // clean-folder status area reports on; it cannot see that change by itself.
                 self.cleaning_tab.request_orphan_clean_rescan();
+                // Same for the page manager's clean cards (its staged paths no longer exist).
+                self.page_manager_tab.request_clean_rescan();
                 self.has_unsaved_changes_cached = false;
                 self.save_to_project_status = Some((t!("app.save.saved").to_string(), now));
                 runtime_log::log_info("[save_to_project] merge complete");
@@ -1778,7 +1781,7 @@ impl MangaApp {
             self.canvas.state.separate_pages = separate_pages;
         }
 
-        // GUI thread: an atomic replace WITHOUT fsync (AGENTS.md §5); the synchronous I/O
+        // GUI thread: an atomic replace WITHOUT fsync (CLAUDE.md §5); the synchronous I/O
         // itself is a recorded gap (`dev-docs/known_gaps.md`).
         if let Err(err) = save_comic_type_to_project_file(
             &self.project.paths.settings_file,
@@ -2498,10 +2501,12 @@ impl MangaApp {
             AppTab::Translation => self.canvas.active_source_page_window(neighbor_radius),
             AppTab::Cleaning => self.cleaning_tab.active_source_page_window(neighbor_radius),
             AppTab::Typing => self.typing_tab.active_source_page_window(neighbor_radius),
+            // The page manager's viewer draws ONE page from these textures (lent in `draw`); its
+            // window is exactly that page, so the per-frame trim neither drops nor thrashes it.
+            AppTab::PageManager => self.page_manager_tab.viewer_source_page().into_iter().collect(),
             // The PS-like editor owns its own page residency through `CleanOverlaysModel`'s page
             // cache, so it does not participate in the shared source-texture window.
-            AppTab::PageManager
-            | AppTab::PsEditor
+            AppTab::PsEditor
             | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
@@ -2515,8 +2520,9 @@ impl MangaApp {
             AppTab::Translation => self.canvas.source_pixel_inspection_active(),
             AppTab::Cleaning => self.cleaning_tab.source_pixel_inspection_active(),
             AppTab::Typing => self.typing_tab.source_pixel_inspection_active(),
-            AppTab::PageManager
-            | AppTab::PsEditor
+            // The viewer zoomed past its NEAREST threshold draws the page's nearest tiles.
+            AppTab::PageManager => self.page_manager_tab.viewer_wants_nearest_source(),
+            AppTab::PsEditor
             | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
@@ -3031,6 +3037,12 @@ impl eframe::App for MangaApp {
             self.poll_loader_events();
             self.upload_textures_incremental(ctx);
             self.poll_overlay_loader_events();
+            // Before any gate reads `clean_op_in_flight` (page ops, save-to-project), and whether
+            // or not the page manager is the drawn tab.
+            self.page_manager_tab.poll_clean_events(ctx, &self.project);
+            // Frees the page viewer's clean tiles and textures while the page manager is not the
+            // drawn tab (they are prepared again when it is drawn next).
+            self.page_manager_tab.release_hidden_viewer_clean(ctx);
             self.ensure_page_cache_loader_started();
             self.poll_page_cache_loader_events();
         }
@@ -3091,10 +3103,16 @@ impl eframe::App for MangaApp {
                     || self.typing_tab.export_in_progress();
                 let project = &self.project;
                 let page_infos = &self.page_infos;
+                // Lent for the frame like for the canvas tabs: the page viewer draws a page from
+                // the resident tiles instead of decoding it again.
+                let textures = &mut self.textures;
                 let tab = &mut self.page_manager_tab;
+                // Clean mutations stay refused until every overlay has been delivered: a late
+                // `load_prepared_overlay` would overwrite what a bind/unlink put into the model.
+                tab.set_overlays_loading(!self.overlay_loader_finished);
                 let mut actions = Vec::new();
                 egui::CentralPanel::default().show(ui, |ui| {
-                    actions = tab.draw(ctx, ui, project, page_infos, op_in_progress);
+                    actions = tab.draw(ctx, ui, project, page_infos, textures, op_in_progress);
                 });
                 for action in actions {
                     match action {
@@ -4115,7 +4133,7 @@ fn spawn_text_render_font_pool_prewarm() {
 
 fn spawn_loader_thread(
     pages: Vec<(usize, PathBuf)>,
-    overlay_candidates: Vec<(usize, PathBuf, PathBuf)>,
+    overlay_candidates: Vec<(usize, PageCleanPaths, PathBuf)>,
     tx: SyncSender<LoaderEvent>,
     overlay_tx: SyncSender<OverlayLoaderEvent>,
     cache_pages_immediately: bool,
@@ -4132,9 +4150,9 @@ fn spawn_loader_thread(
             .chain(
                 overlay_candidates
                     .into_iter()
-                    .filter_map(|(idx, path, page_path)| {
-                        clean_overlay_candidate_is_compatible(&path, &page_path)
-                            .then_some(LoaderJob::CleanOverlay { idx, path })
+                    .filter_map(|(idx, clean_paths, page_path)| {
+                        loadable_clean_overlay(&clean_paths, &page_path)
+                            .map(|path| LoaderJob::CleanOverlay { idx, path })
                     }),
             )
             .collect();
@@ -4251,32 +4269,31 @@ fn spawn_loader_thread(
     });
 }
 
-/// Checks an overlay candidate on the loader thread and warns about mismatched files.
+/// Resolves one page's overlay candidate on the loader thread: the canonical clean the loader
+/// should decode, or `None`. The binding rule is the owner's (`clean_assign::probe_page_clean` in
+/// `StagedOverCommitted` scope): the staged `_unsaved/clean_layers/<stem>.png` shadows the
+/// committed one, exactly as the save-merge will, so a resumed session (launcher "restore", or the
+/// reload after a structural page op, which flushes dirty клин pages into staging first) shows the
+/// clean edits a save would commit. A missing file or an exact-size mismatch of the EFFECTIVE file
+/// yields `None` (the mismatch is warned about); an unreadable clean or page still yields the file,
+/// so decode reports its own detailed failure and an unreadable page does not hide an otherwise
+/// decodable overlay. A page loaded from staging arrives through `load_prepared_overlay` and is
+/// therefore NOT dirty: it is already persisted in staging, so the autosave does not rewrite it
+/// and the save-merge still commits it.
 ///
 /// Warning dedup needs no retained state: each candidate is examined exactly once per
 /// loader spawn (the single filtering pass in `spawn_loader_thread`), so the warning is
 /// naturally scoped to one project load instead of accumulating paths for the whole
 /// process lifetime.
-fn clean_overlay_candidate_is_compatible(clean_path: &Path, page_path: &Path) -> bool {
-    if !clean_path.is_file() {
-        return false;
+fn loadable_clean_overlay(clean_paths: &PageCleanPaths, page_path: &Path) -> Option<PathBuf> {
+    let resolution = probe_page_clean(clean_paths, page_path, LOADER_CLEAN_SCOPE);
+    if let PageCleanResolution::SizeMismatch { file, clean, page } = &resolution {
+        runtime_log::log_warn(format!(
+            "[overlay-loader] skipping '{}' size {}x{}: source page '{}' size is {}x{}",
+            file.display(), clean[0], clean[1], page_path.display(), page[0], page[1]
+        ));
     }
-    let Ok(clean_size) = image::image_dimensions(clean_path) else {
-        // Decode will provide the existing detailed failure event for unreadable overlays.
-        return true;
-    };
-    let Ok(page_size) = image::image_dimensions(page_path) else {
-        // Source decode will report its own error; do not hide an otherwise decodable overlay.
-        return true;
-    };
-    if clean_size == page_size {
-        return true;
-    }
-    runtime_log::log_warn(format!(
-        "[overlay-loader] skipping '{}' size {}x{}: source page '{}' size is {}x{}",
-        clean_path.display(), clean_size.0, clean_size.1, page_path.display(), page_size.0, page_size.1
-    ));
-    false
+    resolution.loadable_file().map(Path::to_path_buf)
 }
 
 fn should_seed_page_cache_on_initial_load(
@@ -4352,21 +4369,14 @@ fn decode_page(idx: usize, path: &Path, cache_page_rgba: bool) -> Result<Decoded
     })
 }
 
-/// Candidate clean-overlay files and their source pages, in page order. Existence and header
-/// dimensions are checked by `spawn_loader_thread`, off the GUI thread.
-fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PathBuf, PathBuf)> {
+/// Candidate clean-overlay paths (the files the clean model writes, `PageCleanPaths::for_writer`)
+/// and their source pages, in page order. Pure path building; existence and header dimensions
+/// are checked by `spawn_loader_thread`, off the GUI thread.
+fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PageCleanPaths, PathBuf)> {
     project
         .pages
         .iter()
-        .map(|page| {
-            let stem = page
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("overlay");
-            let candidate = project.paths.clean_layers_dir.join(format!("{stem}.png"));
-            (page.idx, candidate, page.path.clone())
-        })
+        .map(|page| (page.idx, PageCleanPaths::for_writer(&project.paths, page), page.path.clone()))
         .collect()
 }
 
@@ -5170,5 +5180,36 @@ mod tests {
         // maximum; the comparison still resolves without overflowing.
         assert!(decode_idx_within_window(usize::MAX - 1, usize::MAX));
         assert!(!decode_idx_within_window(usize::MAX, usize::MAX));
+    }
+
+    /// The overlay loader resolves in the save-merge's scope: a staged clean shadows the committed
+    /// one, and the size check applies to that effective file.
+    #[test]
+    fn overlay_loader_reads_staged_over_committed() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::models::clean_assign::PageCleanPaths;
+        let temp = tempfile::tempdir()?;
+        let committed_dir = temp.path().join("clean_layers");
+        let staged_dir = temp.path().join("unsaved_clean_layers");
+        std::fs::create_dir_all(&committed_dir)?;
+        std::fs::create_dir_all(&staged_dir)?;
+        let save = |path: &std::path::Path, size: [u32; 2]| image::RgbaImage::new(size[0], size[1]).save(path);
+        let page_path = temp.path().join("000.png");
+        save(&page_path, [10, 10])?;
+        let clean_paths = PageCleanPaths { committed: committed_dir.join("000.png"), staged: staged_dir.join("000.png") };
+
+        // Mismatched committed file alone: skipped.
+        save(&clean_paths.committed, [12, 10])?;
+        assert_eq!(super::loadable_clean_overlay(&clean_paths, &page_path), None);
+        // A fitting staged twin shadows it and is loaded.
+        save(&clean_paths.staged, [10, 10])?;
+        assert_eq!(super::loadable_clean_overlay(&clean_paths, &page_path), Some(clean_paths.staged.clone()));
+        // A mismatched staged twin shadows a fitting committed file: skipped, not a fallback.
+        save(&clean_paths.committed, [10, 10])?;
+        save(&clean_paths.staged, [12, 10])?;
+        assert_eq!(super::loadable_clean_overlay(&clean_paths, &page_path), None);
+        // Without staging the committed file is read.
+        std::fs::remove_file(&clean_paths.staged)?;
+        assert_eq!(super::loadable_clean_overlay(&clean_paths, &page_path), Some(clean_paths.committed.clone()));
+        Ok(())
     }
 }

@@ -16,18 +16,24 @@ drives the crop/split/stitch previews), below only `app.rs`. It must never name 
 
 ## Architecture
 ```
-draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
+draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerAction>
    |-- toolbar (top Panel)      structural buttons, disabled while an op runs
-   |-- card grid (CentralPanel) virtualized rows, selection, context menu
-   |-- status line (bottom)     totals: pages / with clean / bubbles
-   |-- orphan-clean section     worker-scanned invalid clean files and attachment candidates
-   `-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch / split / crop
+   |-- card grid (CentralPanel) show_viewport over grid_layout rows, selection, context menu
+   |     |-- clean cards        clean_cards.rs: link gap + clean card under a page card
+   |     `-- «Клин без страницы» clean_cards.rs: header row + unassigned clean cards (bind / delete)
+   |-- status line (bottom)     totals: pages / with clean / bubbles / unassigned cleans
+   |-- dialogs (Windows)        insert / create-blank / delete-confirm / stitch / split / crop
+   `-- page viewer (Window)     viewer.rs: one page or clean at full resolution (double-click)
 ```
 
 - `PageManagerAction::RequestOp(PageOpKind)` asks the app to quiesce writers,
   run the operation, reload the project, and then call `notify_pages_changed()`.
 - `PageManagerAction::OpenPageIn { tab, page_idx }` asks the app to switch tabs
-  focused on a page (double-click / context menu navigation).
+  focused on a page (the card context menu's "Open in: …" entries).
+- A double-click on a page card, a bound clean card or an unassigned clean card opens the
+  page viewer (`viewer.rs`, its own `viewer` slot, independent of `dialog`). The app lends
+  its resident source-page textures to `draw` for it and asks `viewer_source_page` /
+  `viewer_wants_nearest_source` which page (and filter) to keep resident for this tab.
 - Shared models arrive through setters, mirroring the other tabs' wiring in
   `MangaApp::new`: `set_bubbles_model`, `set_overlays_model`, `set_layer_doc`.
 - Badge data is cached and refreshed only when the source revision changes:
@@ -39,8 +45,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   downscale (long side 192 px), page previews for the stitch window (long side
   ~1024 px) and for the split and crop windows (~2048 px, because one page must
   show a seam or a horizon sharply enough to place a cut or a crop edge on it),
-  and the manifest scan. Thumbnails live in an LRU cache (64 entries) keyed by
-  (path, mtime); previews live in a SEPARATE 6-entry LRU so a few megapixel-sized
+  and the manifest scan. Thumbnails (page images and FILE-sourced clean cards) live
+  in one LRU keyed by (path, mtime) that starts at 64 entries and grows, never
+  shrinks, to twice the cards the grid draws in a frame
+  (`ensure_visible_capacity`, fed by `GridLayout::card_count`), so a very large
+  viewport cannot thrash it; previews live in a SEPARATE 6-entry LRU so a few megapixel-sized
   previews cannot evict the card grid's thumbnails. Both share the
   worker, the cancel flag, the epoch counter and the 8-job in-flight cap (whose key
   carries the job kind, so one page may have both pending).
@@ -48,24 +57,61 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   revalidation. Runtime reset also bumps a worker epoch so queued replies cannot
   upload stale textures; Drop cancellation abandons queued jobs before joining the
   worker.
+- Clean thumbnails of pages whose clean lives in `CleanOverlaysModel` come from the
+  MODEL, not from disk (dirty edits exist only in memory). The caller clones the
+  page's `Arc<RgbaImage>` under a short lock only when `model_clean_thumb_wanted`
+  says so; `thumbs.rs` never locks the model and never calls `take_delta` (the
+  canvas owns that drain). The worker downscales it exactly like a file thumbnail
+  (long side 192 px, same sampler) and drops the `Arc` right after, because the
+  model copy-on-writes any page still shared. Entries live in a SEPARATE LRU (same
+  64-entry start and growth rule) keyed by page index, are valid only for the exact `revision()` they were
+  taken at, and are stale-while-revalidate (the old texture stays drawable until
+  the new one lands). At most one downscale per page is queued, counted in the
+  shared cap. Being index-keyed, they are dropped by `clear_model_clean_thumbs`,
+  which `notify_pages_changed` must call. Clean FILES (detached/problem) use the
+  path pipeline, which keeps alpha; draw both over `ms_theme::checkerboard`.
 - The native `rfd` file picker for "insert pages" is blocking and therefore
   runs on its own worker thread; the wasm build resolves it as a cancelled pick.
-- `clean.rs` owns a second, serial worker for `clean_assign` scans, image decoding/resizing,
-  and destructive clean-file operations. It receives immutable project snapshots, locks
-  `CleanOverlaysModel` only after decode, reports completion through `mpsc`, and triggers a
-  fresh orphan scan after each operation. The GUI only does candidate arithmetic from known
-  page dimensions; it never reads clean files or decodes images. Attach and detach are explicit
-  commands outside the autosave gate: attach writes the attached page to `_unsaved/clean_layers`
-  through `save_overlay_snapshots_guarded` (page left dirty so the gated клин autosave rewrites
-  current pixels) and trashes the source only after that write succeeded; detach mutates the
-  model, then trashes the files.
+- `clean.rs` owns a second, serial worker for `clean_assign` inventory scans, image
+  decoding, and every clean-file mutation. It receives immutable project snapshots
+  (`CleanJobContext`: epoch, paths, pages), locks `CleanOverlaysModel` only briefly (never across
+  encode, decode or disk I/O), and answers each mutating job with `CleanEvent::Finished {
+  result, inventory }` — the inventory scanned right after the job. The GUI never reads clean
+  files. Operations (all IMMEDIATE, committed tree, not undone by discard):
+  - Unlink: one short lock captures the page's current `overlay_rgba` and calls
+    `detach_page_overlay` (drops its undo history, bumps its detach generation); outside the lock
+    the pixels are written to a new `<stem>[_<n>]_detached.png` (a virtual page's canonical file is
+    moved there byte-exact instead, problem files included); then the page's canonical files are
+    trashed. A failed write puts the pixels back with `replace_prepared_overlay` (dirty). Last, a
+    page RE-materialized by an edit during the job is re-queued with `mark_overlay_needs_save`
+    (its strokes are the new clean; the trash step may have removed their autosaved file).
+  - Bind: an unassigned clean is renamed to the page's committed canonical name; a clean the page
+    already has is unlinked first (kept, never lost). Only an exact-size file is decoded and
+    handed to the model with `load_prepared_overlay` (not dirty); a mismatch is bound as-is and
+    the page's link shows the problem (the loader skips it too).
+  - Delete unassigned: both tree copies (staged removed, committed to `.pageop_trash`).
+  - Attach / replace-from-file (legacy): `run_attach` writes the page to `_unsaved/clean_layers`
+    through `save_overlay_snapshots_guarded` and trashes the source only after that write.
+- `clean_link.rs` turns the model snapshot (`ModelPageClean`, refreshed per model revision) and
+  the scanned `PageCleanEntry` into a per-page `PageCleanLink` (`None` / `Ok` / `Problem`), cached
+  per (model revision, inventory epoch, page count).
 
 ## Files and submodules
 - `mod.rs`: public contract (`PageManagerTabState`, `PageManagerAction`),
   setters, badge caches, toolbar, status line, per-frame orchestration.
-- `grid.rs`: the virtualized card grid (`ScrollArea::show_rows`), card
-  rendering, click/Ctrl/Shift selection (`selection_after_click`, unit-tested),
-  double-click navigation, and the card context menu.
+- `grid.rs`: the virtualized card grid (`ScrollArea::show_viewport` driven by
+  `grid_layout.rs`), card rendering, click/Ctrl/Shift selection
+  (`selection_after_click`, unit-tested), the double-click that opens the page
+  viewer, and the card context menu (with the "Open in: …" navigation). Card interactions use explicit ids (`("pm_card", idx)`), never
+  auto ids.
+- `grid_layout.rs`: GUI-free row table of the grid (unit-tested): the column
+  formula, rows of VARIABLE height (page rows, optionally with a link gap and a
+  clean-card slot; an optional bottom section of a header plus unassigned-clean
+  rows) with prefix-summed tops, the viewport row range (binary search), and every
+  card / gap / clean-card / header / link-widget rect relative to the content
+  origin, the drawn card count of a row range, and the content scroll anchor
+  (`anchor_for_offset` / `offset_for_anchor`). Contains no egui code; `grid.rs`
+  converts its `LayoutRect`s.
 - `dialogs.rs`: insert / create-blank / delete-confirm dialogs, the
   `InsertPosition -> at` resolution and the blank-page default-size rule
   (`default_blank_size`, unit-tested), the background file picker, and the
@@ -75,7 +121,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `layers.json` layer-count scan + the stitch/split/crop windows' page previews
   (`request_preview_if_needed` / `preview_state`, mirroring the thumbnail pair;
   `preview_state_cached` reads an entry WITHOUT promoting it, for a page the
-  caller may not request a decode for).
+  caller may not request a decode for) + model-sourced clean thumbnails
+  (`model_clean_thumb_wanted` / `request_model_clean_thumb` / `model_clean_thumb`,
+  cleared by `clear_model_clean_thumbs`) + `forget_path_thumb`, which forces a
+  full re-decode of one file after a rename (a rename keeps the mtime, so a
+  generation bump alone cannot notice it).
 - `stitch_layout.rs`: GUI-free layout core of the "stitch pages" feature
   (unit-tested): `EditPlacement` and its engine-shaped field tuple, bounding box
   and `normalize` to a (0,0) origin, edge/alignment snapping during a drag,
@@ -132,13 +182,55 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `tabs/ps_editor/viewport.rs`), the arrangement / fit / background strip, and
   the confirm that emits `PageOpKind::Stitch`. Only draws and routes input; all
   geometry decisions live in `stitch_layout.rs`.
-- `clean.rs`: clean worker protocol, attachment-candidate ordering and persistence-path helpers
-  (unit-tested), orphan section, and clean-operation confirmations.
+- `clean.rs`: clean worker protocol and jobs (`run_unlink` / `run_bind` / delete / attach,
+  unit-tested against temp chapters), inventory install + link-cache refresh, the entry points
+  the clean-card UI calls (`request_unlink`, `request_bind`, `request_delete_unassigned`,
+  `page_clean_link`, `unassigned_cleans`, `clean_bind_targets`, `clean_bind_fit`,
+  `clean_mutation_blocked`), and the clean-operation confirmations (`CleanDialog`: replace from
+  file, unlink from a menu, delete unassigned, bind at a mismatched/unknown size).
+- `clean_cards.rs`: drawing of everything clean in the grid — the clean card under a page card,
+  the dashed link with its status label, the two-step in-gap unlink control, and the
+  «Клин без страницы» section (header, unassigned cards, "Привязать к …" submenu, delete). Pure
+  helpers (unlink arm state machine, bind-menu grouping/labels, fit warning rule, problem
+  tooltip) are unit-tested. It decides nothing about link state or file operations.
+  Per-page paths come from `clean_assign::PageCleanPaths`, names from `clean_assign` — never a
+  hand-built `<stem>.png`.
+- `viewer.rs`: the page viewer — an `egui::Window` (a dialog window under the README_AGENT
+  exemption: transient, per image, not a persisted panel) with its own `ViewerCamera` board
+  (fit on open, wheel zoom around the cursor, drag pan, "Fit" button, zoom and size readout).
+  The camera is not `PsViewport` because its minimum zoom follows the fit zoom (a very tall
+  strip must fit a window at its minimum height; `PsViewport`'s floor is a private constant).
+  Pages are drawn from the app's lent `PageTexture` tiles by a TEMPORARY adapter
+  (`paint_source_page`; removal: canvas source pages migrated to `egui-large-image`, plan
+  step 5). Cleans are prepared into `egui_large_image::PreparedTiles` on the tab's single
+  `ViewerWorker` thread (owned by `PageManagerTabState`, started lazily, reused by every
+  viewer) and drawn as a `TiledTexture`, alone over the checkerboard or «поверх страницы»
+  (only an OK link of exactly the page's size). The rules (`resolve_target`,
+  `over_page_available`, `clean_request_due`, `reply_is_current`, `same_model_pixels`,
+  `newest_job` / `run_viewer_worker`, the camera fit / zoom, texture reuse) are unit-tested.
+- `clean_link.rs`: GUI-free, I/O-free page <-> clean link state (`page_clean_link`, table-tested)
+  and the "bind to …" menu split (`bind_targets`: pages without a clean / with one that will be
+  replaced) plus `bind_fit` for the as-is mismatch warning.
 
 ## Contracts and invariants
-- The tab is NOT a `CanvasView` and must not become one; it holds no page
-  textures beyond its own thumbnails and the bounded preview cache. A
-  full-resolution page is never decoded or uploaded here. The stitch board
+- The tab is NOT a `CanvasView` and must not become one; it OWNS no page
+  textures beyond its own thumbnails, the bounded preview cache and the page
+  viewer's single clean. A source page is never decoded here: the viewer shows it
+  at full resolution by BORROWING the app's resident `PageTexture` tiles (lent to
+  `draw` for the frame; an evicted tile is re-uploaded from its kept RGBA under
+  the viewer's per-frame upload budget, never decoded), and the app keeps exactly
+  that page in its source-page residency window while the tab is active
+  (`viewer_source_page`, plus `viewer_wants_nearest_source` for the NEAREST
+  tiles above 200 % zoom). At most ONE clean decode runs at a time per tab, on the
+  tab's single viewer worker (never the thumbnail FIFO, where a full-resolution
+  decode would stall every thumbnail): it drops every queued job but the newest
+  before starting one; a decode already running when superseded (viewer replaced
+  or closed) runs to completion — `image::open` cannot be interrupted — and its
+  reply is discarded by epoch. Model pixels are an `Arc` clone under a short lock,
+  dropped on the worker right after the split. The clean's CPU tiles and textures
+  are freed when the viewer closes or is replaced, and while the tab is not drawn
+  (`release_hidden_viewer_clean`, called by the app every frame before `draw`;
+  the clean is prepared again when the viewer is drawn next). The stitch board
   therefore paints DOWNSCALED previews and REQUESTS at most as many of them as
   the preview LRU holds (`stitch.rs::MAX_LIVE_PREVIEWS`, defined from
   `thumbs.rs::PREVIEW_CACHE_CAPACITY`); a page that misses out is drawn as a
@@ -254,8 +346,18 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - No I/O or image decode on the GUI thread; shared-model locks are short and
   snapshot-out (counting happens after unlock).
 - `notify_pages_changed` must be called by the app after every structural op or
-  project reload; it clears the selection and any open dialog because page
-  indices may have shifted. A dialog that holds page indices (delete, stitch)
+  project reload; it clears the selection, any open dialog and the page viewer
+  because page indices may have shifted. The viewer also re-resolves its target
+  every frame (links / inventory) and closes itself when the page index no
+  longer exists or the clean went away (unlinked, bound, deleted). Model cleans
+  are keyed by the model's GLOBAL revision (the model has no per-page counter);
+  a bump that left the page's `Arc` untouched (checked through a `Weak` identity
+  token, sound because the model changes pixels only via `Arc::make_mut` or
+  replacement) only re-keys the entry. New pixels (or a renamed file) are
+  re-prepared; a result of the same size is swapped into the EXISTING
+  `TiledTexture` (`mark_all_dirty`, re-sent in place under the upload budget) so
+  the old pixels keep drawing — only a size change builds new textures. Replies
+  are epoch-tagged so a superseded one is dropped. A dialog that holds page indices (delete, stitch)
   must also re-validate them on EVERY frame: `clamp_selection` silently drops
   out-of-range indices after a reload, so a selection of two can become one
   under an open window. The stitch and split windows close themselves with a
@@ -268,26 +370,73 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `crates/ms-i18n/locales/en.json` and `ru.json`; `.pageop_trash` and
   `layers.json` are persistence identifiers (i18n-exempt), surfaced only via
   placeholders.
-- A clean attach/detach/delete/probe sets a local in-flight flag until its worker reply. The
-  gate is MUTUAL: clean buttons and dialog confirmation are disabled while `op_in_progress`
-  (structural op / save), and the app root refuses `start_page_op` / `request_save_to_project`
-  while `clean_op_in_flight()` is true — a clean worker holds page indices and an Arc of the
-  current overlays model, which a reload/merge would invalidate.
-- Orphan scans are epoch-tagged (same pattern as the layers scan): `notify_pages_changed`, the
-  refresh button, and every finished clean operation bump the epoch; a scan result from a
-  superseded epoch is dropped. A completed clean operation always rescans (in every outcome,
-  including partial failure), so a retained size-mismatched committed clean is visible both as
-  an orphan and as a card warning badge.
+- A clean job or probe sets a local in-flight flag until its worker reply. The gate is MUTUAL:
+  every clean mutation is refused while `clean_mutation_blocked()` (= in flight, OR the frame's
+  `op_in_progress` structural op / save, OR `overlays_loading` — the app's overlay loader has not
+  delivered every page yet, and its late `load_prepared_overlay` would overwrite a bind/unlink);
+  the app root refuses `start_page_op` / `request_save_to_project` while `clean_op_in_flight()` —
+  a clean worker holds page indices and an Arc of the current overlays model, which a
+  reload/merge would invalidate. The app root calls `poll_clean_events` every frame before those
+  gates, on every tab, so the flag cannot stay stale while the page manager is not drawn.
+- The model snapshot treats a page index beyond the model's page count as NOT materialized
+  (`clean_link::model_page_materialized`); `is_overlay_virtual_absent` alone answers `false` there.
+- Clean jobs carry FILE NAMES and page indices, never GUI-scanned paths: the worker re-resolves
+  every file (staged over committed) at execution time.
+- Inventory scans are epoch-tagged (same pattern as the layers scan). Rescan triggers:
+  `notify_pages_changed`, the refresh button, `request_clean_rescan` (the app calls it after a
+  successful save-to-project), tab re-activation (a gap in `ctx.cumulative_frame_nr()` between
+  two draws), and every finished clean operation (its `Finished` carries the fresh inventory,
+  installed when its epoch is still current, in every outcome including partial failure). Every
+  install bumps the thumbnail generation (mtime revalidation); a mutating install also
+  `forget_path_thumb`s every clean path of the old and new inventories, because a rename keeps
+  the mtime.
+- Link-state rule: a MATERIALIZED model page is `Ok { Model }` whatever the disk holds (known
+  limitation: a mismatched committed file under it is overwritten at the next save); otherwise
+  the page's canonical file resolved in `LOADER_CLEAN_SCOPE` decides (`None` / bound `Ok` /
+  `Problem`). Detached names (`<stem>[_<n>]_detached.png`) never bind, so an unlinked clean is
+  listed as unassigned.
+- Clean-card UI: a page row reserves the link gap + clean-card slot iff ANY of its pages has a
+  link other than `None` (`grid::page_has_clean_link`); only such pages draw a line, label and
+  card. OK = green dashed line + "клин ✓"; `Problem` = yellow line + circled "!" + "Проблема"
+  whose tooltip names the problem (both sizes for a mismatch). The page card no longer shows the
+  clean state (only a weak "no clean" marker when there is none). The gap is hovered by a pure
+  pointer query (`rect_contains_pointer`, no hitbox, never steals clicks); the unlink control
+  sits INSIDE the gap so hovering it keeps the gap hovered. Unlink is two-step: the arm
+  (`unlink_armed`, one page) is dropped whenever that gap is not drawn under the pointer, on
+  `notify_pages_changed`, and a confirm needs a plain single click (neither `double_clicked` nor
+  `triple_clicked`) landing at least twice egui's `max_double_click_delay` after the arm
+  (`UnlinkArm::armed_at`, `unlink_transition`), so no multi-click burst both arms and confirms.
+  The unlink entries of the page-card and clean-card menus give their disabled reason. Binding
+  an unassigned clean needs a confirmation only when `clean_bind_fit` is not an exact match
+  (bound as-is, not loaded until sizes match); replacing a page's clean needs none (the old one
+  is kept as unassigned). Every mutating control is disabled with a reason while
+  `clean_mutation_blocked()`. Clean thumbnails are drawn over `ms_theme::checkerboard::CANVAS`
+  and requested only for cards of visible rows (plus the grid's one prefetch row). A linked
+  unreadable clean and an unreadable unassigned file both read «Проблема», the error in the
+  hover. The status line's "with clean" count uses the same links as the cards
+  (`linked_clean_count`: OK and problem).
+- Grid scroll stability: row heights depend on the clean links, so (1) until the first
+  inventory of the current pages is installed (`grid_awaits_clean_inventory`: none installed and
+  a scan in flight) the grid draws a loading placeholder and NO ScrollArea — a ScrollArea that
+  is not shown keeps its persisted offset, one laid out with guessed short rows would clamp it
+  (the app may rebuild the tab after a page op; the egui state survives); (2) the viewport top
+  is remembered as a content anchor (`grid::GridScrollMemo`: first item of the top row +
+  intra-row offset, with the layout it was taken in) and, only on a frame whose layout differs,
+  re-applied through `ScrollArea::vertical_scroll_offset`, so user scrolling is never fought.
 - "Replace clean from file" probes the picked file on the worker (header dimensions -> real
   `AttachFit`) before showing the confirmation dialog, so the dialog warns about scaling and an
   incompatible image is rejected with a localized error instead of being silently resized.
-- Worker failures distinguish partial success (`CleanOpError`): an attach whose source cleanup
-  failed and a detach whose file trashing partially failed report exactly what was applied.
+- Worker failures distinguish partial success (`CleanOpError`): attach source cleanup / persist,
+  unlink leftovers (clean kept as unassigned but an old canonical file remains),
+  bind-failed-after-unlink (names the detached file), bind source-twin cleanup, and bind model
+  load — each reports exactly what was applied.
 
 ## Editing map
 - To add a toolbar operation: `mod.rs` (`draw_toolbar`) and, if it needs
   confirmation/input, a dialog in `dialogs.rs`.
 - To change card visuals/badges or selection behavior: `grid.rs`.
+- To change where rows and cards go (row heights, spacing, the viewport range,
+  column count): `grid_layout.rs` — never positions computed in `grid.rs`.
 - To change thumbnail/preview decoding, caching, or the layer-count scan: `thumbs.rs`.
 - To change stitch placement math (snapping, arrangements, fit modes, canvas
   size): `stitch_layout.rs` — never the drawing code.
@@ -306,7 +455,13 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
 - To change what a rotated canvas IS (its bounding box, the point mappings, crop
   legality): `page_ops/crop_geometry.rs` — both the window and the engine import
   it, and neither may restate it.
-- To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
-  `models/clean_assign.rs` contract.
+- To change clean content operations (unlink / bind / delete): `clean.rs` jobs; naming and the
+  never-replace file primitives live in `ms_models::clean_assign`.
+- To change what a page's clean link state is: `clean_link.rs` — never the drawing code.
+- To change how clean cards, the link, the unlink control or the unassigned section look or
+  react: `clean_cards.rs` (sizes of the gap / header rows: `grid.rs` constants).
+- To change the page viewer (entry targets, the board, the clean worker, the «поверх
+  страницы» rule, the page-tile adapter): `viewer.rs`; its double-click entry points are in
+  `grid.rs` and `clean_cards.rs`.
 - To change what the app must execute: extend `PageManagerAction` (coordinate
   with the app-root integration and `crates/ms-page-ops/`).

@@ -47,11 +47,27 @@ candidate.
   `ms_page_ops::chapter_docs::chapter_doc_for_write`, so a NEW staging document is
   created in the chapter's format (`.json` / `.db`, docstore rule B.3), never the
   process default when the chapter already has a document.
-- `clean_assign.rs`: worker-thread filesystem API for discovering orphan clean images (plus the
-  pure `*_detached` naming convention for deliberately detached cleans),
-  checking attachment fit, decoding/resizing attachments, and moving committed files to trash. Consumers: the page manager (every
-  operation) and the Cleaning tab's «Клин» status area (`scan_orphan_cleans` only), so both
-  agree on what an orphan or size-mismatched clean is.
+- `clean_assign.rs`: the worker I/O half of the page <-> clean binding owner (the pure rule is
+  `ms_page_ops::clean_binding`, re-exported here). `PageCleanPaths` + `probe_page_clean` ->
+  `PageCleanResolution` resolve one page's clean in a `CleanTreeScope` (the app's overlay loader
+  uses `LOADER_CLEAN_SCOPE` = `StagedOverCommitted`: staged shadows committed, the same view the
+  save-merge produces; `CommittedOnly` — what a saved chapter holds alone — has no production
+  consumer yet and is exercised by the resolver tests); `scan_clean_inventory` -> `CleanInventory` (`PageCleanEntry` per page,
+  `UnassignedClean` for non-canonical names) scans both trees once, and `scan_orphan_cleans` is
+  its projection (`orphans_from_inventory`). Also: the `*_detached` naming convention
+  (`detached_clean_name` / `allocate_detached_clean_path`: `<stem>[_<n>]_detached.png`, free in
+  BOTH trees and never a page's canonical name), the page manager's immediate file operations
+  (`write_new_clean_png`, `move_clean_file`, `delete_unassigned_clean`; typed `CleanFileOpError`),
+  `attach_fit` / `load_clean_for_attach` (OPERATION policy for attaching a picked file — 1% aspect,
+  rescales — not the binding rule), and moving committed files to trash. Consumers: the app
+  loader, the page manager (every operation), the Cleaning tab's «Клин» status area
+  (`scan_clean_inventory`: `PageCleanEntry::resolve` in `LOADER_CLEAN_SCOPE` for "not loaded",
+  `orphans_from_inventory` for unassigned files) and the typing export's disk fallback
+  (`probe_page_clean` in `LOADER_CLEAN_SCOPE` + `loadable_file`), so these agree with the canvas
+  on which file binds; so do the page manager's clean cards (`PageCleanEntry::resolve` in
+  `LOADER_CLEAN_SCOPE`).
+  The scan compares found names with `clean_binding::clean_name_key` (ASCII-case-insensitive on
+  Windows, as the loader's open of `<stem>.png` is there).
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, dirty
   tracking, autosave snapshots, and cached decoded page images.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.
@@ -79,6 +95,11 @@ it from its `[dev-dependencies]`, so no production build carries them.
 ## Contracts and invariants
 - Every `clean_assign` public function that accesses images or files is synchronous and must run
   on a worker thread. Unreadable clean images remain visible to callers as diagnostic orphans.
+- The page <-> clean binding (canonical `<stem>.png` name, exact-size fit) is decided only by
+  `ms_page_ops::clean_binding` + `clean_assign`. Clean writers here name files through
+  `OverlaySaveSnapshot::file_name` / `clean_overlay_file_name` and derive stems with
+  `writer_clean_stem`; never restate the name or the fit rule. Only the exact canonical name binds:
+  a same-stem file of another extension (`001.webp`) belongs to no page (`NoMatchingPage`).
 - Do not hold model locks during long operations or disk I/O. Clone snapshots first.
 - To read a single bubble (or its `extra` map) by id, use `BubblesModel::with_bubble` /
   `extra_of` instead of `snapshot()`; they look up via `bubble_index_by_id` and avoid cloning
@@ -170,6 +191,16 @@ it from its `[dev-dependencies]`, so no production build carries them.
   (or the autosave's guarded path), which skips stale pages before writing and removes a file
   written for a page detached mid-write, so an in-flight save can never resurrect a detached
   clean layer. `restore_dirty_save_snapshots` likewise skips stale snapshots on failure restore.
+  `mark_overlay_needs_save` re-queues a page's current pixels for saving without recording an edit
+  (for a worker that removed the page's staged file while an edit may have re-materialized it).
+- `clean_assign`'s file operations never replace an existing file: a new file is written to a
+  hidden same-directory temp (`ms_docstore::temp_path_for`, `.{name}.{pid}.tmp`; crash leftovers
+  are skipped by the inventory scan via `ms_docstore::is_temp_artifact`), fsynced, and renamed only
+  after re-checking the
+  destination is free; a move is check-then-rename (a cross-device staged -> committed move falls
+  back to copy + remove). The check-then-rename is not atomic by itself — it relies on the page
+  manager's single serial clean worker plus the app refusing page ops / saves while it runs.
+  `delete_unassigned_clean` removes BOTH tree copies of a name (a surviving one would resurface).
 - `clean_assign::trash_clean_file` accepts only paths that stay strictly inside one of the two
   managed clean folders after lexical component validation (no `..`/root re-anchoring); anything
   else is rejected with a typed `TrashCleanError` before any filesystem access.

@@ -59,9 +59,10 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   with friendly titles, capability descriptions, and recommendations (curated table plus a
   name-derived heuristic fallback). No UI, no network; consumed by the simplified Reline gallery in
   `window.rs`.
-- `ribbon.rs`: `RibbonState`, `RibbonPage`, `RibbonTile`, `RibbonCrop`, `ImportedImage`, tiled
-  preview generation, adjacent page merge, non-destructive crop state, and original-page
-  restoration.
+- `ribbon.rs`: `RibbonState`, `RibbonPage`, `RibbonTiles`, `RibbonCrop`, `ImportedImage`, tiled
+  preview generation and painting (`build_ribbon_tiles`, `paint_ribbon_tiles`,
+  `ribbon_upload_budget` over the `egui-large-image` crate), adjacent page merge, non-destructive
+  crop state, and original-page restoration.
 - `batch_processing/`: standalone visual graph editor and executor for repeated import/download,
   browser, stitch, waifu2x, and save pipelines. See `batch_processing/MODULE_README.md`.
 - `tutorial.rs`: branching onboarding tour (`TutorialId::NewProject`). `window.rs` owns a
@@ -82,6 +83,15 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 - Source images are decoded from real bytes, not from filename labels.
 - Ribbon pages retain original pixels and crop metadata so crop/restore operations are
   non-destructive.
+- Ribbon and crop-editor previews are tiled ONLY through `ribbon.rs` (`paint_ribbon_tiles`, backed
+  by `egui-large-image`): 2048-px tiles (a fixed side — changing it moves seams and pixels), split
+  where the page is built (worker for imports; GUI thread for crop/merge/crop-editor, pre-existing),
+  uploads culled to the clip rect + 128 pt and budgeted to 4 tiles / 24 MiB per frame per surface
+  (one budget shared by all ribbon pages). A visible tile still waiting for its texture shows a
+  `faint_bg_color` placeholder for a frame or two while scrolling fast; no GPU eviction. A repaint
+  is requested only while the budget defers tiles (`UploadReport::wants_repaint`). Cloning
+  `RibbonTiles` (original-page snapshot / restore) shares the CPU tiles but not the textures: the
+  clone re-uploads lazily on its first paint.
 - Browser automation must go through the unified AI backend over `backend_ipc` (method
   `browser.command`); the live browser session lifecycle is owned by the backend's `BrowserService`,
   not by spawning a Python child here. The backend process itself is owned app-globally by

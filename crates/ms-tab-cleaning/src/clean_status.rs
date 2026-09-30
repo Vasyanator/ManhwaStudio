@@ -4,14 +4,14 @@ File: crates/ms-tab-cleaning/src/clean_status.rs
 Purpose:
 The status area at the bottom of the «Клин» dock tab: warnings about the chapter's clean folders
 that the user cannot otherwise see from the Cleaning tab, each dismissible with a cross.
-1. The CURRENT page's committed clean `clean_layers/<source stem>.png` exists but was not loaded
-   because its size differs from the source page.
-2. A clean file (committed or staging) whose stem matches no source page.
+1. The CURRENT page's effective clean `<source stem>.png` (the staged one when present, else the
+   committed one) exists but was not loaded because its size differs from the source page.
+2. A clean file (committed or staging) whose name is not the canonical clean name of any page.
 Both point the user at the page manager, which is where such files are fixed.
 
 Key structures:
-- `CleanFolderStatus`: tab-owned state — the last scan result, the worker receiver with its
-  epoch, the pending-rescan flag, and the session-only dismiss state.
+- `CleanFolderStatus`: tab-owned state — the last scan result (inventory + its orphan projection),
+  the worker receiver with its epoch, the pending-rescan flag, and the session-only dismiss state.
 - `CleanStatusView`: the read-only borrow a dock body receives (`CleaningDockCx::clean_status`).
 - `CleanStatusMessages` / `SizeMismatchNotice` / `OrphanNotice`: the typed messages to draw.
 - `CleanStatusDismiss`: which crosses were clicked this frame (carried out through
@@ -23,24 +23,32 @@ Key functions:
 - `draw_clean_status`: draws the messages; draws nothing at all when there are none.
 
 Notes:
-- The scan is `ms_models::clean_assign::scan_orphan_cleans`, the same owner of "what is an orphan
-  or mismatched clean" the page manager uses, so both tabs agree. It performs directory and
-  image-header I/O and therefore only ever runs on an `ms_thread` worker.
-- Message 1 mirrors the overlay LOADER, not the scan's broader stem match: the loader only reads
-  committed `clean_layers/<stem>.png` and skips it only on an exact size mismatch, so a staging
-  file or a same-stem file with another extension is never reported as "not loaded".
+- The scan is `ms_models::clean_assign::scan_clean_inventory`; message 2 reads its orphan
+  projection (`orphans_from_inventory`, the same list `scan_orphan_cleans` gives the page manager),
+  so both tabs agree. The scan performs directory and image-header I/O and therefore only ever runs
+  on an `ms_thread` worker.
+- Message 1 mirrors the overlay LOADER exactly: it resolves the current page's inventory entry in
+  the loader's scope (`LOADER_SCOPE` = `clean_assign::LOADER_CLEAN_SCOPE`, i.e. `StagedOverCommitted`) and reports only a
+  `SizeMismatch` of that effective file. A mismatched committed file shadowed by a fitting staged
+  twin is therefore not reported, a mismatched staged file is, and a same-stem file with another
+  extension is never the page's clean at all.
 - Dismiss state lives only as long as this struct (one opened chapter); nothing is persisted.
 */
 
 use ms_log::runtime_log;
-use ms_models::clean_assign::{is_detached_clean_file, scan_orphan_cleans, CleanFileLocation, OrphanClean, OrphanReason};
-use ms_project::{Page, ProjectData};
+use ms_models::clean_assign::{
+    is_detached_clean_file, orphans_from_inventory, LOADER_CLEAN_SCOPE, scan_clean_inventory, CleanInventory, CleanTreeScope, OrphanClean, OrphanReason,
+    PageCleanEntry, PageCleanResolution,
+};
+use ms_project::ProjectData;
 use ms_thread as thread;
 use eframe::egui;
 use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// The clean-tree scope the overlay loader (`src/app.rs`, `loadable_clean_overlay`) resolves a
+/// page's clean in; message 1 must use the same one, since it reports what the loader skipped.
+const LOADER_SCOPE: CleanTreeScope = LOADER_CLEAN_SCOPE;
 
 /// Glyph of the dismiss cross. A literal, not a translation: it is an icon chosen for its shape,
 /// the same `✕` every other small close button of the studio draws; its meaning is carried by the
@@ -48,7 +56,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 const DISMISS_GLYPH: &str = "✕";
 
 /// One finished scan as the worker sends it back: the epoch it was started under and its result.
-type ScanReply = (u64, Vec<OrphanClean>);
+type ScanReply = (u64, CleanInventory);
 
 /// Tab-owned state of the «Клин» status area.
 ///
@@ -57,7 +65,9 @@ type ScanReply = (u64, Vec<OrphanClean>);
 /// arrives. The previous result stays displayed until a current-epoch result replaces it.
 #[derive(Debug)]
 pub(crate) struct CleanFolderStatus {
-    /// Last current-epoch scan result, sorted by path (the scan's own order).
+    /// Last current-epoch scan result.
+    inventory: CleanInventory,
+    /// `orphans_from_inventory(&inventory)`, projected once per accepted scan (sorted by path).
     orphans: Vec<OrphanClean>,
     /// Receiver of the scan in flight, if any.
     scan_rx: Option<Receiver<ScanReply>>,
@@ -76,6 +86,7 @@ pub(crate) struct CleanFolderStatus {
 impl Default for CleanFolderStatus {
     fn default() -> Self {
         Self {
+            inventory: CleanInventory::default(),
             orphans: Vec::new(),
             scan_rx: None,
             epoch: 0,
@@ -117,13 +128,15 @@ impl CleanFolderStatus {
             return;
         };
         match rx.try_recv() {
-            Ok((epoch, orphans)) => {
+            Ok((epoch, inventory)) => {
                 self.scan_rx = None;
                 if epoch == self.epoch {
+                    let orphans = orphans_from_inventory(&inventory);
                     runtime_log::log_info(format!(
                         "[cleaning.clean_status] orphan clean scan finished: epoch={epoch}, entries={}",
                         orphans.len()
                     ));
+                    self.inventory = inventory;
                     self.orphans = orphans;
                 } else {
                     runtime_log::log_info(format!(
@@ -167,8 +180,8 @@ impl CleanFolderStatus {
             pages.len()
         ));
         thread::spawn(move || {
-            let orphans = scan_orphan_cleans(&paths, &pages);
-            if tx.send((epoch, orphans)).is_err() {
+            let inventory = scan_clean_inventory(&paths, &pages);
+            if tx.send((epoch, inventory)).is_err() {
                 // The tab (and its receiver) is gone, or a newer scan replaced it: nothing to show.
                 runtime_log::log_info(format!(
                     "[cleaning.clean_status] orphan clean scan result discarded: receiver gone, epoch={epoch}"
@@ -188,38 +201,32 @@ impl CleanFolderStatus {
         self.orphan_notice_dismissed = true;
     }
 
-    /// Read-only view of this state for a dock body, resolved against the chapter's `pages`.
-    pub(crate) fn view<'a>(&'a self, pages: &'a [Page]) -> CleanStatusView<'a> {
-        CleanStatusView { status: self, pages }
+    /// Read-only view of this state for a dock body.
+    pub(crate) fn view(&self) -> CleanStatusView<'_> {
+        CleanStatusView { status: self }
     }
 }
 
-/// What a dock body needs to derive the status messages: the tab's status state and the page list.
+/// What a dock body needs to derive the status messages: the tab's status state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CleanStatusView<'a> {
     status: &'a CleanFolderStatus,
-    pages: &'a [Page],
 }
 
 impl CleanStatusView<'_> {
     /// The messages to show while `current_page_idx` is the canvas' current page.
     pub(crate) fn messages(&self, current_page_idx: usize) -> CleanStatusMessages {
-        let current_page_path = self
-            .pages
-            .iter()
-            .find(|page| page.idx == current_page_idx)
-            .map(|page| page.path.as_path());
         select_clean_status_messages(
+            &self.status.inventory.pages,
             &self.status.orphans,
             current_page_idx,
-            current_page_path,
             &self.status.dismissed_mismatch_pages,
             self.status.orphan_notice_dismissed,
         )
     }
 }
 
-/// The current page's committed clean was skipped by the loader because of its size.
+/// The current page's effective clean was skipped by the loader because of its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SizeMismatchNotice {
     pub(crate) page_idx: usize,
@@ -256,39 +263,33 @@ pub(crate) struct CleanStatusDismiss {
 
 /// Picks the status messages from a scan result. Pure.
 ///
-/// `orphans` is the scan result in its path order. Message 1 takes the orphan that the overlay
-/// loader would have skipped for `current_page_idx`: a COMMITTED `SizeMismatch` of that page whose
-/// file name is exactly `<stem of current_page_path>.png`; `None` path or a non-UTF-8 stem yields
-/// no message 1. It is hidden when that page is in `dismissed_pages`. Message 2 names the first
-/// `NoMatchingPage` orphan (either location) and counts the rest, skipping deliberately detached
-/// files (`is_detached_clean_file`); `Unreadable` entries are never reported. It is hidden when `orphan_dismissed`.
+/// `pages` is the scan's per-page inventory and `orphans` its orphan projection in path order.
+/// Message 1 reports what the overlay loader skipped for `current_page_idx`: that page's entry
+/// resolved in [`LOADER_SCOPE`] is a `SizeMismatch` (the first entry with that index is used; no
+/// entry yields no message 1). It is hidden when that page is in `dismissed_pages`. Message 2 names
+/// the first `NoMatchingPage` orphan (either location) and counts the rest, skipping deliberately
+/// detached files (`is_detached_clean_file`); `Unreadable` entries are never reported. It is hidden
+/// when `orphan_dismissed`.
 #[must_use]
 pub(crate) fn select_clean_status_messages(
+    pages: &[PageCleanEntry],
     orphans: &[OrphanClean],
     current_page_idx: usize,
-    current_page_path: Option<&Path>,
     dismissed_pages: &HashSet<usize>,
     orphan_dismissed: bool,
 ) -> CleanStatusMessages {
-    let expected_clean_name = current_page_path
-        .and_then(Path::file_stem)
-        .and_then(OsStr::to_str)
-        .map(|stem| format!("{stem}.png"));
-    let size_mismatch = expected_clean_name
+    let size_mismatch = pages
+        .iter()
+        .find(|entry| entry.page_idx == current_page_idx)
         .filter(|_| !dismissed_pages.contains(&current_page_idx))
-        .and_then(|expected| {
-            orphans.iter().find_map(|orphan| match orphan.reason {
-                OrphanReason::SizeMismatch { page_idx, page_size }
-                    if page_idx == current_page_idx
-                        && orphan.location == CleanFileLocation::Committed
-                        && orphan.path.file_name() == Some(OsStr::new(&expected)) =>
-                {
-                    Some(SizeMismatchNotice { page_idx, clean_size: orphan.size, page_size })
-                }
-                OrphanReason::SizeMismatch { .. }
-                | OrphanReason::NoMatchingPage
-                | OrphanReason::Unreadable { .. } => None,
-            })
+        .and_then(|entry| match entry.resolve(LOADER_SCOPE) {
+            PageCleanResolution::SizeMismatch { clean, page, .. } => {
+                Some(SizeMismatchNotice { page_idx: current_page_idx, clean_size: clean, page_size: page })
+            }
+            PageCleanResolution::Absent
+            | PageCleanResolution::Bound { .. }
+            | PageCleanResolution::CleanUnreadable { .. }
+            | PageCleanResolution::PageUnreadable { .. } => None,
         });
 
     let orphan = if orphan_dismissed {
@@ -371,20 +372,39 @@ fn draw_dismissible_warning(ui: &mut egui::Ui, id_salt: &'static str, text: Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_models::clean_assign::{CleanFileLocation, CleanFileProbe, UnassignedClean};
     use std::path::PathBuf;
 
     const CURRENT: usize = 3;
+    const PAGE_SIZE: [u32; 2] = [720, 1080];
+    const WRONG_SIZE: [u32; 2] = [800, 1200];
 
-    fn source_path() -> PathBuf {
-        PathBuf::from("/chapter/src/004.jpg")
+    /// A canonical clean probe of page `page_idx` in `location` with header size `size`.
+    fn probe(page_idx: usize, location: CleanFileLocation, size: [u32; 2]) -> CleanFileProbe {
+        let dir = match location {
+            CleanFileLocation::Committed => "/chapter/clean_layers",
+            CleanFileLocation::Unsaved => "/chapter_unsaved/clean_layers",
+        };
+        CleanFileProbe { path: PathBuf::from(format!("{dir}/{:03}.png", page_idx + 1)), location, size: Ok(size) }
+    }
+
+    /// Inventory entry of page `page_idx` (source size [`PAGE_SIZE`]) with the given canonical
+    /// clean sizes per tree.
+    fn entry(page_idx: usize, committed: Option<[u32; 2]>, staged: Option<[u32; 2]>) -> PageCleanEntry {
+        PageCleanEntry {
+            page_idx,
+            page_size: Ok(PAGE_SIZE),
+            committed: committed.map(|size| probe(page_idx, CleanFileLocation::Committed, size)),
+            staged: staged.map(|size| probe(page_idx, CleanFileLocation::Unsaved, size)),
+        }
     }
 
     fn mismatch(path: &str, location: CleanFileLocation, page_idx: usize) -> OrphanClean {
         OrphanClean {
             path: PathBuf::from(path),
             location,
-            size: [800, 1200],
-            reason: OrphanReason::SizeMismatch { page_idx, page_size: [720, 1080] },
+            size: WRONG_SIZE,
+            reason: OrphanReason::SizeMismatch { page_idx, page_size: PAGE_SIZE },
         }
     }
 
@@ -401,61 +421,76 @@ mod tests {
         }
     }
 
+    fn select_mismatch(pages: &[PageCleanEntry], current: usize, dismissed: &HashSet<usize>) -> Option<SizeMismatchNotice> {
+        select_clean_status_messages(pages, &[], current, dismissed, false).size_mismatch
+    }
+
     fn select(orphans: &[OrphanClean], dismissed: &HashSet<usize>, orphan_dismissed: bool) -> CleanStatusMessages {
-        let source = source_path();
-        select_clean_status_messages(orphans, CURRENT, Some(&source), dismissed, orphan_dismissed)
+        select_clean_status_messages(&[], orphans, CURRENT, dismissed, orphan_dismissed)
     }
 
     #[test]
     fn current_page_committed_mismatch_is_shown_with_both_sizes() {
-        let orphans = [mismatch("/chapter/clean_layers/004.png", CleanFileLocation::Committed, CURRENT)];
-        let messages = select(&orphans, &HashSet::new(), false);
+        let pages = [entry(CURRENT, Some(WRONG_SIZE), None)];
         assert_eq!(
-            messages.size_mismatch,
-            Some(SizeMismatchNotice { page_idx: CURRENT, clean_size: [800, 1200], page_size: [720, 1080] })
+            select_mismatch(&pages, CURRENT, &HashSet::new()),
+            Some(SizeMismatchNotice { page_idx: CURRENT, clean_size: WRONG_SIZE, page_size: PAGE_SIZE })
         );
-        assert_eq!(messages.orphan, None);
     }
 
     #[test]
     fn other_page_mismatch_is_not_shown() {
-        let orphans = [mismatch("/chapter/clean_layers/005.png", CleanFileLocation::Committed, CURRENT + 1)];
-        assert_eq!(select(&orphans, &HashSet::new(), false), CleanStatusMessages::default());
+        let pages = [entry(CURRENT + 1, Some(WRONG_SIZE), None)];
+        assert_eq!(select_mismatch(&pages, CURRENT, &HashSet::new()), None);
     }
 
     #[test]
-    fn staging_mismatch_is_not_shown() {
-        let orphans = [mismatch("/chapter/_unsaved/clean_layers/004.png", CleanFileLocation::Unsaved, CURRENT)];
-        assert_eq!(select(&orphans, &HashSet::new(), false).size_mismatch, None);
+    fn staged_mismatch_is_shown_because_the_loader_reads_staging_first() {
+        let pages = [entry(CURRENT, None, Some(WRONG_SIZE))];
+        assert_eq!(select_mismatch(&pages, CURRENT, &HashSet::new()).map(|notice| notice.clean_size), Some(WRONG_SIZE));
+        // A mismatched staged twin shadows a fitting committed file: the loader skips the page.
+        let shadowing = [entry(CURRENT, Some(PAGE_SIZE), Some(WRONG_SIZE))];
+        assert!(select_mismatch(&shadowing, CURRENT, &HashSet::new()).is_some());
     }
 
     #[test]
-    fn same_stem_with_other_extension_is_not_shown() {
-        let orphans = [
-            mismatch("/chapter/clean_layers/004.jpg", CleanFileLocation::Committed, CURRENT),
-            mismatch("/chapter/clean_layers/004.PNG", CleanFileLocation::Committed, CURRENT),
-        ];
-        assert_eq!(select(&orphans, &HashSet::new(), false).size_mismatch, None);
+    fn fitting_staged_twin_hides_a_mismatched_committed_file() {
+        let pages = [entry(CURRENT, Some(WRONG_SIZE), Some(PAGE_SIZE))];
+        assert_eq!(select_mismatch(&pages, CURRENT, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn message_one_follows_the_inventory_not_the_orphan_list() {
+        // A `SizeMismatch` orphan without a mismatched effective file (e.g. the committed copy of a
+        // page whose staged twin fits) never produces message 1.
+        let orphans = [mismatch("/chapter/clean_layers/004.png", CleanFileLocation::Committed, CURRENT)];
+        let pages = [entry(CURRENT, Some(WRONG_SIZE), Some(PAGE_SIZE))];
+        assert_eq!(select_clean_status_messages(&pages, &orphans, CURRENT, &HashSet::new(), false), CleanStatusMessages::default());
     }
 
     #[test]
     fn dismissed_page_is_hidden_while_another_page_still_shows() {
-        let orphans = [
-            mismatch("/chapter/clean_layers/004.png", CleanFileLocation::Committed, CURRENT),
-            mismatch("/chapter/clean_layers/006.png", CleanFileLocation::Committed, 5),
-        ];
+        let pages = [entry(CURRENT, Some(WRONG_SIZE), None), entry(5, Some(WRONG_SIZE), None)];
         let dismissed = HashSet::from([CURRENT]);
-        assert_eq!(select(&orphans, &dismissed, false).size_mismatch, None);
-        let other_source = PathBuf::from("/chapter/src/006.webp");
-        let other = select_clean_status_messages(&orphans, 5, Some(&other_source), &dismissed, false);
-        assert_eq!(other.size_mismatch.map(|notice| notice.page_idx), Some(5));
+        assert_eq!(select_mismatch(&pages, CURRENT, &dismissed), None);
+        assert_eq!(select_mismatch(&pages, 5, &dismissed).map(|notice| notice.page_idx), Some(5));
     }
 
     #[test]
-    fn missing_current_page_path_yields_no_mismatch_message() {
-        let orphans = [mismatch("/chapter/clean_layers/004.png", CleanFileLocation::Committed, CURRENT)];
-        let messages = select_clean_status_messages(&orphans, CURRENT, None, &HashSet::new(), false);
-        assert_eq!(messages.size_mismatch, None);
+    fn missing_current_page_entry_yields_no_mismatch_message() {
+        assert_eq!(select_mismatch(&[], CURRENT, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn unreadable_clean_or_page_is_not_a_size_mismatch() {
+        let mut clean_broken = entry(CURRENT, Some(WRONG_SIZE), None);
+        if let Some(committed) = clean_broken.committed.as_mut() {
+            committed.size = Err("bad header".to_owned());
+        }
+        assert_eq!(select_mismatch(&[clean_broken], CURRENT, &HashSet::new()), None);
+        let mut page_broken = entry(CURRENT, Some(WRONG_SIZE), None);
+        page_broken.page_size = Err("bad page".to_owned());
+        assert_eq!(select_mismatch(&[page_broken], CURRENT, &HashSet::new()), None);
     }
 
     #[test]
@@ -501,7 +536,8 @@ mod tests {
             unmatched("/chapter/clean_layers/extra.png", CleanFileLocation::Committed),
             mismatch("/chapter/clean_layers/004.png", CleanFileLocation::Committed, CURRENT),
         ];
-        let messages = select(&orphans, &HashSet::new(), true);
+        let pages = [entry(CURRENT, Some(WRONG_SIZE), None)];
+        let messages = select_clean_status_messages(&pages, &orphans, CURRENT, &HashSet::new(), true);
         assert_eq!(messages.orphan, None);
         assert!(messages.size_mismatch.is_some());
     }
@@ -514,17 +550,29 @@ mod tests {
         status.rescan_pending = false;
         let started_epoch = status.epoch;
         status.request_rescan();
-        assert!(tx.send((started_epoch, vec![unmatched("/c/x.png", CleanFileLocation::Committed)])).is_ok());
+        let stale = CleanInventory {
+            pages: vec![entry(CURRENT, Some(WRONG_SIZE), None)],
+            unassigned: vec![UnassignedClean {
+                file_name: "x.png".into(),
+                committed: Some(CleanFileProbe {
+                    path: PathBuf::from("/c/x.png"),
+                    location: CleanFileLocation::Committed,
+                    size: Ok([1, 1]),
+                }),
+                staged: None,
+            }],
+        };
+        assert!(tx.send((started_epoch, stale)).is_ok());
         status.poll();
         assert!(status.orphans.is_empty(), "a superseded reply must not be applied");
+        assert!(status.inventory.pages.is_empty());
         assert!(status.scan_rx.is_none());
         assert!(status.rescan_pending);
     }
 
     #[test]
     fn frame_gap_requests_a_rescan_but_consecutive_frames_do_not() {
-        let mut status = CleanFolderStatus::default();
-        status.rescan_pending = false;
+        let mut status = CleanFolderStatus { rescan_pending: false, ..CleanFolderStatus::default() };
         status.note_frame(10);
         assert!(!status.rescan_pending, "the first draw is covered by the initial pending flag");
         status.note_frame(11);

@@ -92,6 +92,19 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   `RotatedPage` (canvas size, the two point mappings, crop legality). Pure and
   GUI-free, and `pub` as a module so the page-manager UI imports the same
   formulas instead of restating them.
+- `clean_binding.rs` (`pub`, pure): the ONE owner of the page <-> clean-overlay
+  binding rule — the canonical file name `clean_overlay_file_name(stem)`
+  (`<stem>.png`) and its inverse `clean_overlay_stem`, the page-stem helpers
+  (`page_clean_stem`; `writer_clean_stem` with the `overlay` fallback the clean
+  model writer and the overlay loader share), and the exact-size fit rule
+  `classify_clean_fit` -> `CleanPageFit` (an unreadable clean takes precedence
+  and the page size is then not consulted), and `clean_name_key` /
+  `CLEAN_NAMES_CASE_INSENSITIVE`: how a FOUND file name is compared with the
+  canonical one (ASCII case folded on Windows only, matching the filesystem the
+  loader opens `<stem>.png` on). `clean_overlay_stem` stays case-sensitive on
+  every platform: it defines what page ops carry, not what the loader opens. It sits here, below `ms-project`
+  and `ms-models`, so every layer reaches it; the worker I/O resolver built on
+  it is `ms_models::clean_assign`.
 - `json_remap.rs`: bubbles / layers-manifest / text_info / detection-blocks
   rewrites over `serde_json::Value` (unknown fields survive), plus the
   geometry mapping and document merging of a stitch, the routing +
@@ -427,6 +440,12 @@ Deliberately NOT touched (each with the reason):
   overlay autosave) before `execute_page_op` and reload the project after.
 - Operations are applied to BOTH trees immediately; they are not staged and are
   not undone by discarding unsaved changes.
+- Clean overlays are carried by NAME only: the scan keys them with
+  `clean_binding::clean_overlay_stem` and the plan builds every clean path with
+  `clean_binding::clean_overlay_file_name`. The engine is deliberately
+  size-blind (it moves files, it does not bind them); never restate `<stem>.png`
+  in this crate. The name match is case-sensitive on every platform
+  (`dev-docs/known_gaps.md`, KG-022).
 - `recover_pending_page_op` must run at the very start of project load
   (`ProjectData::load_internal`), before any reconcile/normalize pass reads
   chapter files. A failed recovery aborts the load; the journal is left in

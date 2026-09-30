@@ -6,28 +6,53 @@ Ribbon page model and image-to-tile conversion for the New Project launcher wind
 
 Main responsibilities:
 - hold the current imported source path and ribbon pages;
-- convert decoded source images into tiled egui-friendly ribbon pages;
+- convert decoded source images into tiled previews (`RibbonTiles`, via `egui-large-image`);
+- paint a tiled preview with culled, per-frame budgeted texture uploads (`paint_ribbon_tiles`);
 - preserve original images and crop metadata for non-destructive page trimming;
 - keep the rendering data independent from source import logic.
 
 Key structures:
 - RibbonState
 - RibbonPage
-- RibbonTile
+- RibbonTiles
 - ImportedImage
+
+Key functions:
+- build_ribbon_pages() / build_ribbon_tiles() — CPU split (worker-safe)
+- ribbon_upload_budget() / paint_ribbon_tiles() — GUI-thread upload + draw
 
 Notes:
 Source selection and background import live in `open_source.rs`. This module only owns
-the ribbon view-model and the conversion pipeline from decoded images to tiles.
+the ribbon view-model and the conversion pipeline from decoded images to tiles. Tile
+geometry, CPU split, upload budgeting and culled drawing are delegated to the
+`egui-large-image` crate; this file only fixes the ribbon's policy (tile side, budget,
+cull margin, placeholder).
 */
 
-use egui::{ColorImage, TextureHandle};
-use image::{DynamicImage, GenericImageView, RgbaImage};
+use egui_large_image::{
+    Alpha, Placement, PreparedTiles, TiledTexture, UploadBudget, UploadScope,
+};
+use image::{DynamicImage, RgbaImage};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const RIBBON_TILE_MAX_HEIGHT: u32 = 2048;
+/// Side of a ribbon tile in pixels. Kept at the historical 2048 (the old strip height, and
+/// `egui_large_image::PORTABLE_TILE_SIDE`): changing it moves the clamp-to-edge seams and so
+/// changes the rendered pixels. Splits run on worker threads, where no `egui::Context` exists
+/// to ask for the backend limit.
+const RIBBON_TILE_SIDE: usize = egui_large_image::PORTABLE_TILE_SIDE;
+
+/// Per-frame upload allowance of one ribbon surface (the ribbon scroll area, or the crop
+/// editor): at most this many tiles ...
+const RIBBON_UPLOAD_TILES_PER_FRAME: usize = 4;
+/// ... and this many bytes (a full 2048x2048 RGBA tile is 16 MiB). Same values as the studio's
+/// source-page upload budget.
+const RIBBON_UPLOAD_BYTES_PER_FRAME: usize = 24 * 1024 * 1024;
+
+/// Screen margin, in points, around the clip rect within which tiles are uploaded and drawn,
+/// so tiles about to scroll into view are usually resident already.
+const RIBBON_CULL_MARGIN: f32 = 128.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RibbonCrop {
@@ -42,12 +67,24 @@ pub struct ImportedImage {
     pub image: DynamicImage,
 }
 
-#[derive(Clone)]
-pub struct RibbonTile {
-    pub origin_px: [usize; 2],
-    pub size: [usize; 2],
-    pub color_image: ColorImage,
-    pub texture: Option<TextureHandle>,
+/// Tiled preview of one ribbon image: CPU tiles split once, GPU textures created lazily on the
+/// first paint and uploaded tile by tile under a per-frame budget.
+///
+/// `prepared` is `None` only when the split (or the texture set) failed (logged); such a preview
+/// draws nothing.
+#[derive(Debug)]
+pub struct RibbonTiles {
+    prepared: Option<PreparedTiles>,
+    texture: Option<TiledTexture>,
+}
+
+impl Clone for RibbonTiles {
+    /// Shares the CPU tiles (`Arc`s, no pixel copy) but not the GPU textures: `TiledTexture` has
+    /// a single owner, so a clone (e.g. the original-page snapshot restored later) creates its
+    /// own textures lazily on its first paint and re-uploads them under the ribbon budget.
+    fn clone(&self) -> Self {
+        Self { prepared: self.prepared.clone(), texture: None }
+    }
 }
 
 #[derive(Clone)]
@@ -57,7 +94,7 @@ pub struct RibbonPage {
     full_image: Arc<RgbaImage>,
     source_image: Arc<RgbaImage>,
     crop: Option<RibbonCrop>,
-    pub tiles: Vec<RibbonTile>,
+    pub tiles: RibbonTiles,
 }
 
 pub struct RibbonState {
@@ -256,7 +293,7 @@ impl RibbonPage {
                 usize::try_from(rendered.height()).unwrap_or(usize::MAX),
             ];
             self.full_image = Arc::new(rendered);
-            self.tiles = split_image_into_tiles(self.full_image.as_ref());
+            self.tiles = build_ribbon_tiles(self.full_image.as_ref());
             true
         } else {
             false
@@ -284,12 +321,95 @@ fn build_ribbon_page(name: String, image: DynamicImage) -> RibbonPage {
         full_image: Arc::clone(&full_image),
         source_image,
         crop: None,
-        tiles: split_image_into_tiles(full_image.as_ref()),
+        tiles: build_ribbon_tiles(full_image.as_ref()),
     }
 }
 
-pub fn build_ribbon_tiles(image: &RgbaImage) -> Vec<RibbonTile> {
-    split_image_into_tiles(image)
+/// Splits `image` into `RIBBON_TILE_SIDE` tiles for the ribbon preview (row-major grid; pages
+/// wider than the side get several columns). CPU-bound: call it off the GUI thread where the
+/// caller can. A split failure (cannot happen for a well-formed `RgbaImage`) is logged and
+/// yields a preview that draws nothing.
+pub fn build_ribbon_tiles(image: &RgbaImage) -> RibbonTiles {
+    let size = [
+        usize::try_from(image.width()).unwrap_or(usize::MAX),
+        usize::try_from(image.height()).unwrap_or(usize::MAX),
+    ];
+    let prepared = match PreparedTiles::from_rgba(image.as_raw(), size, Alpha::Unmultiplied, RIBBON_TILE_SIDE) {
+        Ok(prepared) => Some(prepared),
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!(
+                "[launcher.new_project.ribbon] failed to split a {}x{} page into preview tiles: {err}. \
+                 The page preview stays empty; the page pixels are unaffected.",
+                size[0], size[1]
+            ));
+            None
+        }
+    };
+    RibbonTiles { prepared, texture: None }
+}
+
+/// A fresh upload budget for one ribbon surface for the current frame. Create one per frame and
+/// share it across every page painted on that surface.
+#[must_use]
+pub fn ribbon_upload_budget() -> UploadBudget {
+    UploadBudget::new(RIBBON_UPLOAD_TILES_PER_FRAME, RIBBON_UPLOAD_BYTES_PER_FRAME)
+}
+
+/// Uploads (within `budget`) and draws the tiles of `tiles` that are on screen.
+///
+/// The image's pixel `(0, 0)` sits at `image_rect.min` and each pixel is `scale` points wide.
+/// Only tiles meeting the clip rect expanded by `RIBBON_CULL_MARGIN` are uploaded and drawn;
+/// visible tiles still waiting for their texture get a neutral `faint_bg_color` placeholder, and
+/// a repaint is requested until they arrive. Textures are named `"{texture_prefix}-{tile}"` and
+/// sampled `TextureOptions::LINEAR`; the prefix is fixed when the first paint creates them.
+/// GUI thread only.
+pub fn paint_ribbon_tiles(
+    ui: &egui::Ui,
+    image_rect: egui::Rect,
+    scale: f32,
+    tiles: &mut RibbonTiles,
+    texture_prefix: &str,
+    budget: &mut UploadBudget,
+) {
+    let Some(prepared) = tiles.prepared.as_mut() else {
+        return;
+    };
+    if tiles.texture.is_none() {
+        match TiledTexture::new(*prepared.grid(), texture_prefix, egui::TextureOptions::LINEAR) {
+            Ok(texture) => tiles.texture = Some(texture),
+            Err(err) => {
+                // Unreachable for grids `PreparedTiles` accepted (same tile-count cap); dropping
+                // the CPU tiles keeps a broken preview from retrying and logging every frame.
+                let [width, height] = prepared.grid().image_size();
+                ms_log::runtime_log::log_error(format!(
+                    "[launcher.new_project.ribbon] failed to create preview textures for a {width}x{height} page: {err}. \
+                     The page preview stays empty; the page pixels are unaffected."
+                ));
+                tiles.prepared = None;
+                return;
+            }
+        }
+    }
+    let Some(texture) = tiles.texture.as_mut() else {
+        return;
+    };
+    let cull = ui.clip_rect().expand(RIBBON_CULL_MARGIN);
+    let placement = Placement::scaled(image_rect.min, scale);
+    let report = texture.upload(ui.ctx(), prepared, budget, UploadScope::visible(placement, cull));
+    let painter = ui.painter();
+    // Uploads are culled and budgeted, so a tile may show up a few frames after it scrolls into
+    // view; mark where it will appear instead of leaving a hole in the ribbon.
+    for (index, screen) in texture.visible_tiles(placement, cull) {
+        if texture.texture(index).is_none() {
+            painter.rect_filled(screen, 0.0, ui.visuals().faint_bg_color);
+        }
+    }
+    texture.paint(painter, placement, cull, egui::Color32::WHITE);
+    // Only budget deferrals need another frame: `PreparedTiles` hold every tile and never answer
+    // `NotReady`, so `awaiting_source` is always 0 here, and rejected tiles are settled.
+    if report.wants_repaint() {
+        ui.ctx().request_repaint();
+    }
 }
 
 fn normalize_crop(
@@ -329,28 +449,9 @@ fn render_page_image(source_image: &RgbaImage, crop: Option<RibbonCrop>) -> Rgba
     image::imageops::crop_imm(source_image, left, top, width, height).to_image()
 }
 
-fn split_image_into_tiles(image: &RgbaImage) -> Vec<RibbonTile> {
-    let (width, height) = image.dimensions();
-    let mut tiles = Vec::new();
-    let mut y = 0u32;
-    while y < height {
-        let tile_height = (height - y).min(RIBBON_TILE_MAX_HEIGHT);
-        let tile = image.view(0, y, width, tile_height).to_image();
-        let tile_size = [tile.width() as usize, tile.height() as usize];
-        tiles.push(RibbonTile {
-            origin_px: [0, y as usize],
-            size: tile_size,
-            color_image: ColorImage::from_rgba_unmultiplied(tile_size, tile.as_raw().as_slice()),
-            texture: None,
-        });
-        y += tile_height;
-    }
-    tiles
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ImportedImage, RibbonCrop, RibbonState, build_ribbon_pages};
+    use super::{ImportedImage, RibbonCrop, RibbonState, build_ribbon_pages, build_ribbon_tiles};
     use image::{DynamicImage, Rgba, RgbaImage};
     use std::path::PathBuf;
 
@@ -362,6 +463,60 @@ mod tests {
             }
         }
         DynamicImage::ImageRgba8(image)
+    }
+
+    /// Tile geometry `(cols, rows)` and tile sizes of a ribbon preview for a `width x height` page.
+    fn preview_grid(width: u32, height: u32) -> (usize, usize, Vec<[usize; 2]>) {
+        let tiles = build_ribbon_tiles(&RgbaImage::new(width, height));
+        let prepared = tiles.prepared.expect("a well-formed image always splits");
+        let grid = *prepared.grid();
+        let sizes = grid.tiles().map(|(_, rect)| [rect.width, rect.height]).collect();
+        (grid.cols(), grid.rows(), sizes)
+    }
+
+    #[test]
+    fn cloned_preview_shares_cpu_tiles_but_not_textures() {
+        let mut tiles = build_ribbon_tiles(&RgbaImage::new(64, 64));
+        let grid = *tiles.prepared.as_ref().expect("a well-formed image always splits").grid();
+        tiles.texture = Some(
+            egui_large_image::TiledTexture::new(grid, "clone-test", egui::TextureOptions::LINEAR)
+                .expect("a 1-tile grid is within the tile cap"),
+        );
+        let clone = tiles.clone();
+        assert!(clone.texture.is_none(), "a clone creates its own textures on first paint");
+        let original_tile = tiles.prepared.as_ref().and_then(|p| p.tile(0));
+        let cloned_tile = clone.prepared.as_ref().and_then(|p| p.tile(0));
+        assert!(
+            matches!((original_tile, cloned_tile), (Some(a), Some(b)) if std::sync::Arc::ptr_eq(a, b)),
+            "CPU tiles are shared, not copied"
+        );
+    }
+
+    #[test]
+    fn narrow_page_splits_into_2048_px_strips() {
+        let (cols, rows, sizes) = preview_grid(800, 5000);
+        assert_eq!((cols, rows), (1, 3));
+        assert_eq!(sizes, vec![[800, 2048], [800, 2048], [800, 904]]);
+    }
+
+    #[test]
+    fn page_wider_than_tile_side_splits_into_columns() {
+        let (cols, rows, sizes) = preview_grid(2500, 3000);
+        assert_eq!((cols, rows), (2, 2));
+        assert_eq!(sizes, vec![[2048, 2048], [452, 2048], [2048, 952], [452, 952]]);
+    }
+
+    #[test]
+    fn crop_rebuilds_preview_tiles_for_the_cropped_size() {
+        let mut pages = build_ribbon_pages(vec![ImportedImage {
+            name: "page".to_string(),
+            image: sample_image(),
+        }]);
+        let page = pages.first_mut().expect("page should exist");
+        assert!(page.apply_crop(RibbonCrop { left: 1, top: 1, width: 5, height: 3 }));
+        let prepared = page.tiles.prepared.as_ref().expect("cropped page splits");
+        assert_eq!(prepared.grid().image_size(), [5, 3]);
+        assert!(page.tiles.texture.is_none(), "textures of the old size must not be reused");
     }
 
     #[test]

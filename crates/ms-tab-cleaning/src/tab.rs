@@ -1067,7 +1067,7 @@ impl CleaningTabState {
             quick_clean_status_text: self.quick_clean_status_text.as_deref(),
             text_mask_load_in_progress: self.text_mask_load_in_progress,
             text_mask_load_status: self.text_mask_load_status.as_deref(),
-            clean_status: self.clean_folder_status.view(&project.pages),
+            clean_status: self.clean_folder_status.view(),
             dock_out: CleaningDockOut::default(),
         };
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();

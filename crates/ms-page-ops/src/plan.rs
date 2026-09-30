@@ -1531,7 +1531,7 @@ fn resolve_crop(
 /// SILENTLY IGNORED by every planner and remap, which is a data-loss bug the
 /// compiler would never point at. Every consumer must therefore destructure
 /// this enum with its own exhaustive `match`, so that adding a variant fails to
-/// compile at every site that has to reconsider it (AGENTS.md §17).
+/// compile at every site that has to reconsider it (CLAUDE.md §17).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PageGeometry<'a> {
     /// No pixel remapping: pages keep their own coordinate spaces.
@@ -3091,7 +3091,18 @@ fn plan_src_pages(
     Ok(())
 }
 
-/// Clean overlays are keyed by the PAGE'S CURRENT STEM (`{stem}.png`), in both
+/// Tree-relative path of the clean overlay keyed by `page_stem` inside the tree rooted at
+/// `tree_rel`: `<tree_rel>/clean_layers/<canonical clean file name>`. The file name comes from
+/// the binding owner, [`crate::clean_binding::clean_overlay_file_name`].
+fn clean_overlay_rel_path(tree_rel: &str, page_stem: &str) -> String {
+    format!(
+        "{tree_rel}/{}/{}",
+        config::CLEAN_LAYERS_DIR,
+        crate::clean_binding::clean_overlay_file_name(page_stem)
+    )
+}
+
+/// Clean overlays are keyed by the PAGE'S CURRENT STEM (`clean_binding::clean_overlay_file_name`), in both
 /// the committed and unsaved `clean_layers/` dirs.
 ///
 /// Under a stitch they are page-sized rasters and therefore COMPOSED, not
@@ -3124,7 +3135,7 @@ fn plan_clean_overlays(
     for (old_idx, name) in snapshot.page_file_names.iter().enumerate() {
         let (stem, _) = split_name(name);
         let exists = tree.clean_overlay_stems.contains(stem);
-        let from = format!("{}/{}/{stem}.png", tree.tree_rel, config::CLEAN_LAYERS_DIR);
+        let from = clean_overlay_rel_path(&tree.tree_rel, stem);
         if let Some(geo) = crop
             && geo.source_old_idx() == old_idx
         {
@@ -3136,12 +3147,7 @@ fn plan_clean_overlays(
                     page_size,
                     [0, 0, 0, 0],
                     false,
-                    format!(
-                        "{}/{}/{}.png",
-                        tree.tree_rel,
-                        config::CLEAN_LAYERS_DIR,
-                        canonical_page_stem(geo.source_old_idx())
-                    ),
+                    clean_overlay_rel_path(&tree.tree_rel, &canonical_page_stem(geo.source_old_idx())),
                 );
                 b.trash(from);
             }
@@ -3152,12 +3158,7 @@ fn plan_clean_overlays(
         {
             if exists && let Some(page_size) = snapshot.page_sizes.get(old_idx).copied() {
                 plan_split_raster_parts(b, geo, &from, page_size, [0, 0, 0, 0], false, |new_idx| {
-                    format!(
-                        "{}/{}/{}.png",
-                        tree.tree_rel,
-                        config::CLEAN_LAYERS_DIR,
-                        canonical_page_stem(new_idx)
-                    )
+                    clean_overlay_rel_path(&tree.tree_rel, &canonical_page_stem(new_idx))
                 });
                 b.trash(from);
             }
@@ -3186,12 +3187,7 @@ fn plan_clean_overlays(
         }
         match map[old_idx] {
             Some(new_idx) => {
-                let target = format!(
-                    "{}/{}/{}.png",
-                    tree.tree_rel,
-                    config::CLEAN_LAYERS_DIR,
-                    canonical_page_stem(new_idx)
-                );
+                let target = clean_overlay_rel_path(&tree.tree_rel, &canonical_page_stem(new_idx));
                 b.rename(from, target);
             }
             None => b.trash(from),
@@ -3201,12 +3197,7 @@ fn plan_clean_overlays(
         && !composed.is_empty()
     {
         b.create(
-            format!(
-                "{}/{}/{}.png",
-                tree.tree_rel,
-                config::CLEAN_LAYERS_DIR,
-                canonical_page_stem(geo.primary_new)
-            ),
+            clean_overlay_rel_path(&tree.tree_rel, &canonical_page_stem(geo.primary_new)),
             NewPageContent::ComposedPng {
                 width: geo.canvas[0],
                 height: geo.canvas[1],

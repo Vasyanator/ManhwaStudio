@@ -1020,7 +1020,8 @@ saving, and export.
   overlay. If the page is not cached yet, return a clear user-facing error instead of
   inventing a fallback image.
 - Clean overlay visibility in the typing tab is a UI/runtime concern; export still
-  composites clean overlay snapshots from `CleanOverlaysModel` or `clean_layers/`.
+  composites clean overlay snapshots from `CleanOverlaysModel`, or else from the file the
+  overlay loader would load (staged over committed, see the export contract below).
 - Do not hold `Mutex` locks from shared models while performing image analysis,
   rendering, export composition, disk I/O, or callbacks. Copy or snapshot the required
   data and release the lock.
@@ -1086,9 +1087,13 @@ saving, and export.
   silently drops the clip masks of every not-yet-loaded page; `run_pending_export_if_ready` requests a
   repaint while waiting so the frame loop drains the loader instead of idle-stalling. КЛИН (cleaned base)
   is deliberately NOT gated for export: `export::load_clean_overlay_snapshot_for_export` already falls
-  back to a disk read (`clean_layers/{stem}.png`) when the in-memory `CleanOverlaysModel` is not resident,
-  so the composite is correct regardless of the App-side eager overlay loader — adding клин gating to
-  export would have no correctness effect.
+  back to a disk read when the in-memory `CleanOverlaysModel` holds no overlay for the page, so the
+  composite is correct regardless of the App-side eager overlay loader — adding клин gating to
+  export would have no correctness effect. The fallback file is the one the overlay LOADER would load
+  (`clean_assign::probe_page_clean` in `LOADER_CLEAN_SCOPE` + `loadable_file`, resolved on the export
+  worker: staged shadows committed, a size-mismatched file is not exported), and the decode is
+  READ-ONLY — it is never written back into the model (that would mark the page save-dirty and let
+  the autosave overwrite the staged клин).
   EXPORT⇄SAVE MUTUAL EXCLUSION (Finding 2): export and project-save share the SAME preloader and both
   mutate shared doc/staging state (save's text flush → staging merge; export reads doc/overlays), so they
   must never dispatch in the same window. `MangaApp` passes `save_busy` (= `save_to_project_rx.is_some() ||

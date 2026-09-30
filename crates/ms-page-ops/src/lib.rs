@@ -31,6 +31,8 @@ Key structures:
 Key functions:
 - execute_page_op(): run one operation as a crash-safe transaction.
 - recover_pending_page_op(): resolve an interrupted transaction at project load.
+- clean_binding::{clean_overlay_file_name, classify_clean_fit}: the page <-> clean-overlay
+  binding rule (canonical name and exact-size fit), owned here for every layer above.
 - chapter_docs::chapter_doc_for_write(): the `DocRef` (with the chapter-format hint) every
   writer of a chapter's `layers` / bubbles document uses; chapter_doc_durability(): its
   staging-vs-committed durability.
@@ -54,6 +56,10 @@ pub mod crop_geometry;
 // document joins the chapter's format" decision, shared by the save merge (`ms-project`)
 // and the staging savers (`ms-models`).
 pub mod chapter_docs;
+// The page <-> clean-overlay binding rule (canonical `<stem>.png` name + exact-size fit). It
+// lives here, below `ms-project` and `ms-models`, so the page-op engine, the load-time
+// reconcile passes, the clean model writers and the worker-side resolver share ONE owner.
+pub mod clean_binding;
 mod fs_exec;
 mod json_remap;
 mod plan;

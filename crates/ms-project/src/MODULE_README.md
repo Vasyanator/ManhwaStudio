@@ -94,6 +94,11 @@ joined onto a chapter or title directory.
 - Legacy formats are read FOREVER. A reconcile or migration pass may only act on an
   unambiguous match, and `persist_migrated_bubbles` backs the original up to
   `*_legacy_xy.json` before rewriting.
+- The clean-overlay reconcile / legacy / normalize passes name their targets with
+  `ms_page_ops::clean_binding::clean_overlay_file_name` and rename a source only when
+  `classify_clean_fit` says `Matches` (`clean_dimensions_match_page`); which files are
+  CANDIDATES for renaming (case-insensitive `.png`, legacy numbering, fuzzy keys) is migration
+  policy owned here, the binding rule is not.
 
 ## Editing map
 - To change the chapter file layout, edit `ProjectPaths` in

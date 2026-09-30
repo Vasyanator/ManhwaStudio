@@ -849,7 +849,7 @@ mod tests {
             page_idx: 0,
             page_path: PathBuf::from("unused.png"),
             output_path: Some(PathBuf::from("unused.psd")),
-            clean_overlay_path: None,
+            clean_paths: None,
             clean_overlay_rgba: None,
             overlays: vec![ov_a, ov_b],
             rasters: Vec::new(),
@@ -1086,7 +1086,7 @@ mod tests {
             page_idx: 0,
             page_path: PathBuf::from("unused.png"),
             output_path: Some(PathBuf::from("unused.psd")),
-            clean_overlay_path: None,
+            clean_paths: None,
             clean_overlay_rgba: None,
             overlays: vec![
                 overlay("a", "Shared-Regular%1111111111111111"),

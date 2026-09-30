@@ -37,7 +37,8 @@ thread behind a loading screen and swaps in `MangaApp` once the project snapshot
 
 `MangaApp` in `app.rs` is the editor root. It creates shared models, wires them into tabs and
 canvas instances, starts one unified background loader pool that decodes source pages and clean
-overlays from a single page-ordered queue, seeds the source-page CPU cache from the initial
+overlays from a single page-ordered queue (a page's clean is resolved "staged over committed",
+`clean_assign::CleanTreeScope::StagedOverCommitted`, the view the save-merge produces), seeds the source-page CPU cache from the initial
 page decode when both canvas caching and the memory profile allow it, throttles GPU uploads, routes
 the active tab, and dispatches global hotkeys. It should coordinate subsystems, not absorb
 feature-specific domain logic.
@@ -409,7 +410,9 @@ pool that interleaves source pages and clean overlays in page order; overlays ar
 in-order promotion. Page image decode and clean overlay preparation happen off the GUI thread; the
 GUI thread uploads texture tiles incrementally with a per-frame budget. Source-page
 dimensions are kept separately from source GPU texture handles so canvas layout can remain stable
-after GPU cache eviction.
+after GPU cache eviction. The source textures are lent per frame to the canvas tabs and to the page
+manager (its page viewer); the per-frame GPU trim keeps the pages of `active_source_page_window`,
+which for the page manager is the one page its viewer draws.
 
 Tabs own feature state. Translation owns OCR/detector/MT controllers; cleaning owns overlay editing
 tools; typing owns text/image overlay placement, text rendering, masks, and export composition.

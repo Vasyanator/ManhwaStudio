@@ -41,7 +41,7 @@ fn flatten_composites_raster_from_disk_fallback() {
         page_idx: 0,
         page_path: base,
         output_path: Some(dir.join("out.png")),
-        clean_overlay_path: None,
+        clean_paths: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(), // force the disk-read path
@@ -112,7 +112,7 @@ fn flatten_composites_raster_from_disk_fallback() {
         page_idx: 0,
         page_path: base2,
         output_path: Some(dir.join("out2.png")),
-        clean_overlay_path: None,
+        clean_paths: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(),
@@ -170,7 +170,7 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
         page_idx: 0,
         page_path: base,
         output_path: Some(dir.join("out.png")),
-        clean_overlay_path: None,
+        clean_paths: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: vec![snap],
@@ -234,7 +234,7 @@ fn flatten_clips_mask_clip_enabled_raster_in_export() {
             page_idx: 0,
             page_path: base.clone(),
             output_path: Some(dir.join("out.png")),
-            clean_overlay_path: None,
+            clean_paths: None,
             clean_overlay_rgba: None,
             overlays: Vec::new(),
             rasters: vec![snap],
@@ -6296,7 +6296,7 @@ fn plain_export_job(dir: &Path, page_idx: usize, width_px: u32, height_px: u32, 
         page_idx,
         page_path,
         output_path,
-        clean_overlay_path: None,
+        clean_paths: None,
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(),
@@ -6795,4 +6795,65 @@ fn a_text_node_created_by_the_typing_tab_is_pinned_for_the_ps_editor() {
     assert!(node.text_pinned && !node.text_pinned_by_group);
     drop(guard);
     remove_fixture_dir(&dir);
+}
+
+/// The export's клин disk fallback resolves exactly like the overlay loader (staged over
+/// committed, a size-mismatched effective file is skipped) and never writes the decode back into
+/// the clean model — a write-back would mark the page save-dirty and let the autosave overwrite
+/// the staged клин.
+#[test]
+fn export_clean_fallback_follows_loader_scope_and_leaves_model_untouched() {
+    let dir = std::env::temp_dir().join(format!("typ_export_clean_scope_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let committed_dir = dir.join("clean_layers");
+    let staged_dir = dir.join("_unsaved").join("clean_layers");
+    std::fs::create_dir_all(&committed_dir).unwrap();
+    std::fs::create_dir_all(&staged_dir).unwrap();
+    let page = dir.join("001.png");
+    let save = |path: &Path, size: u32, rgba: [u8; 4]| {
+        image::RgbaImage::from_pixel(size, size, image::Rgba(rgba)).save(path).unwrap();
+    };
+    save(&page, 4, [0, 0, 0, 255]);
+    let clean_paths = ms_models::clean_assign::PageCleanPaths {
+        committed: committed_dir.join("001.png"),
+        staged: staged_dir.join("001.png"),
+    };
+    let job = || TypingExportPageJob {
+        page_idx: 0,
+        page_path: page.clone(),
+        output_path: None,
+        clean_paths: Some(clean_paths.clone()),
+        clean_overlay_rgba: None,
+        overlays: Vec::new(),
+        rasters: Vec::new(),
+        mask: None,
+        export_format: TypingExportFormat::Png,
+        layers_primary_dir: None,
+        layers_fallback_dir: None,
+        font_post_script_names: Default::default(),
+    };
+    let model = Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(std::slice::from_ref(&page))));
+    let export_clean = || {
+        let mut jobs = [job()];
+        prepare_export_clean_overlay_snapshots(&mut jobs, Some(Arc::clone(&model))).unwrap();
+        jobs[0].clean_overlay_rgba.as_ref().map(|image| image.get_pixel(0, 0).0)
+    };
+
+    // No clean anywhere: nothing exported.
+    assert_eq!(export_clean(), None);
+    // Committed only: exported.
+    save(&clean_paths.committed, 4, [0, 0, 255, 255]);
+    assert_eq!(export_clean(), Some([0, 0, 255, 255]));
+    // A fitting staged file shadows the committed one.
+    save(&clean_paths.staged, 4, [255, 0, 0, 255]);
+    assert_eq!(export_clean(), Some([255, 0, 0, 255]));
+    // A mismatched staged file shadows too, and is skipped: the committed clean is NOT resurrected.
+    save(&clean_paths.staged, 5, [255, 0, 0, 255]);
+    assert_eq!(export_clean(), None);
+
+    let locked = model.lock().unwrap();
+    assert!(locked.overlay_rgba(0).is_none(), "the export must not write a disk decode into the model");
+    assert!(locked.is_overlay_virtual_absent(0), "the page must not become save-dirty");
+    drop(locked);
+    let _ = std::fs::remove_dir_all(&dir);
 }

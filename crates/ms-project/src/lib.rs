@@ -76,6 +76,7 @@ extern crate ms_i18n;
 // `ProjectPaths` field is an `ms_config` name joined onto a chapter/title dir).
 // The re-export keeps `crate::project::{Page, ProjectPaths}` valid in the binary.
 pub use ms_page_ops::{Page, ProjectPaths};
+use ms_page_ops::clean_binding::{classify_clean_fit, clean_overlay_file_name, CleanPageFit};
 
 // Catalogue scan of the projects ROOT (titles, chapters, openability of a chapter dir),
 // as opposed to the chapter LOAD that the rest of this crate performs. It is the same
@@ -972,7 +973,7 @@ fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<
             continue;
         }
         let desired_stem = page_stems[page_number - 1];
-        let desired_path = overlay_dir.join(format!("{desired_stem}.png"));
+        let desired_path = overlay_dir.join(clean_overlay_file_name(desired_stem));
         if storage().exists(desired_path.to_string_lossy().as_ref()) {
             runtime_log::log_warn(format!(
                 "[cleaned-reconcile] target '{}' already exists; leaving '{}'",
@@ -1028,25 +1029,27 @@ fn legacy_cleaned_page_number(stem: &str) -> Option<usize> {
 /// Header probe failures and size mismatches are logged and treated as non-matches so the file is
 /// preserved in place for orphan management instead of being silently assigned.
 fn clean_dimensions_match_page(clean_path: &Path, page: &Page, log_scope: &str) -> bool {
-    let clean_size = image::image_dimensions(clean_path);
-    let page_size = image::image_dimensions(&page.path);
-    match (clean_size, page_size) {
-        (Ok(clean_size), Ok(page_size)) if clean_size == page_size => true,
-        (Ok(clean_size), Ok(page_size)) => {
+    // Both headers are read up front (as this pass always did); the fit rule itself is the
+    // binding owner's `classify_clean_fit`.
+    let clean_size = image::image_dimensions(clean_path).map(|(width, height)| [width, height]).map_err(|err| err.to_string());
+    let page_size = image::image_dimensions(&page.path).map(|(width, height)| [width, height]).map_err(|err| err.to_string());
+    match classify_clean_fit(clean_size, || page_size) {
+        CleanPageFit::Matches { .. } => true,
+        CleanPageFit::SizeMismatch { clean: clean_size, page: page_size } => {
             runtime_log::log_info(format!(
                 "[{log_scope}] leaving '{}' in place: clean size {}x{} differs from page '{}' size {}x{}",
-                clean_path.display(), clean_size.0, clean_size.1, page.path.display(), page_size.0, page_size.1
+                clean_path.display(), clean_size[0], clean_size[1], page.path.display(), page_size[0], page_size[1]
             ));
             false
         }
-        (Err(err), _) => {
+        CleanPageFit::CleanUnreadable(err) => {
             runtime_log::log_info(format!(
                 "[{log_scope}] leaving unreadable clean '{}' in place: {err}",
                 clean_path.display()
             ));
             false
         }
-        (_, Err(err)) => {
+        CleanPageFit::PageUnreadable { error: err, .. } => {
             runtime_log::log_info(format!(
                 "[{log_scope}] cannot validate clean '{}' because page '{}' is unreadable: {err}",
                 clean_path.display(), page.path.display()
@@ -1127,7 +1130,7 @@ fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<(
             Some((
                 page.idx,
                 stem.to_string(),
-                overlay_dir.join(format!("{stem}.png")),
+                overlay_dir.join(clean_overlay_file_name(stem)),
                 match_key,
             ))
         })
@@ -1293,7 +1296,7 @@ fn normalize_page_filenames(
         let tmp_src = src_dir.join(format!("__ms_normalize_{}.{}", plan.idx, plan.src_ext));
         rename_if_exists(&cur_src, &tmp_src)?;
         for dir in overlay_dirs {
-            let cur_overlay = dir.join(format!("{}.png", plan.current_stem));
+            let cur_overlay = dir.join(clean_overlay_file_name(&plan.current_stem));
             let tmp_overlay = dir.join(format!("__ms_normalize_{}.png", plan.idx));
             rename_if_exists(&cur_overlay, &tmp_overlay)?;
         }
@@ -1306,7 +1309,7 @@ fn normalize_page_filenames(
         rename_if_exists(&tmp_src, &final_src)?;
         for dir in overlay_dirs {
             let tmp_overlay = dir.join(format!("__ms_normalize_{}.png", plan.idx));
-            let final_overlay = dir.join(format!("{}.png", plan.target_stem));
+            let final_overlay = dir.join(clean_overlay_file_name(&plan.target_stem));
             rename_if_exists(&tmp_overlay, &final_overlay)?;
         }
         if let Some(page) = pages.iter_mut().find(|p| p.idx == plan.idx) {

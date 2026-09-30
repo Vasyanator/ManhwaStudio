@@ -12,7 +12,9 @@ Main responsibilities:
 Notes:
 The folder/file import flow, quick downloader, and stitch/split workflow are implemented here.
 Long-running image processing is delegated to background controllers to keep the egui window
-responsive while the ribbon updates.
+responsive while the ribbon updates. Ribbon and crop-editor page images are painted only through
+`ribbon::paint_ribbon_tiles` (tiled, culled, budgeted uploads); this file owns their layout, not
+their tiling.
 */
 
 use egui::{
@@ -53,8 +55,8 @@ use crate::new_project::reline::{
     RelineUpscaleOptions,
 };
 use crate::new_project::ribbon::{
-    ImportedImage, RibbonCrop, RibbonMergeError, RibbonPage, RibbonState, RibbonTile,
-    build_ribbon_pages, build_ribbon_tiles,
+    ImportedImage, RibbonCrop, RibbonMergeError, RibbonPage, RibbonState, RibbonTiles,
+    build_ribbon_pages, build_ribbon_tiles, paint_ribbon_tiles, ribbon_upload_budget,
 };
 use crate::new_project::stitching::{
     ManualCutGuide, StitchController, StitchEvent, StitchInputImage, StitchOptions, StitchRequest,
@@ -446,7 +448,7 @@ struct CropEditorState {
     page_name: String,
     source_size: [usize; 2],
     crop_rect: RibbonCrop,
-    tiles: Vec<RibbonTile>,
+    tiles: RibbonTiles,
     drag_state: Option<CropDragState>,
     window_rect: Option<egui::Rect>,
 }
@@ -3913,6 +3915,9 @@ impl NewProjectWindowState {
                                 let uniform_width = self.ribbon_uniform_width;
                                 // Proportional mode measures every page against the widest one,
                                 // so this is resolved once instead of per page.
+                                // One upload allowance for the whole ribbon per frame, shared
+                                // by every page.
+                                let mut upload_budget = ribbon_upload_budget();
                                 let widest_page_px = self
                                     .ribbon
                                     .pages()
@@ -4019,42 +4024,14 @@ impl NewProjectWindowState {
                                                     ui.close();
                                                 }
                                             });
-                                            let viewport_rect = ui.clip_rect().expand(128.0);
-                                            for (tile_index, tile) in page.tiles.iter_mut().enumerate() {
-                                                if tile.texture.is_none() {
-                                                    let texture = ui.ctx().load_texture(
-                                                        format!("launcher-new-project-ribbon-{index}-{tile_index}"),
-                                                        tile.color_image.clone(),
-                                                        TextureOptions::LINEAR,
-                                                    );
-                                                    tile.texture = Some(texture);
-                                                }
-                                                if let Some(texture) = tile.texture.as_ref() {
-                                                    let tile_rect = egui::Rect::from_min_size(
-                                                        egui::pos2(
-                                                            image_rect.left()
-                                                                + tile.origin_px[0] as f32 * width_scale,
-                                                            image_rect.top()
-                                                                + tile.origin_px[1] as f32 * width_scale,
-                                                        ),
-                                                        egui::vec2(
-                                                            tile.size[0] as f32 * width_scale,
-                                                            tile.size[1] as f32 * width_scale,
-                                                        ),
-                                                    );
-                                                    if tile_rect.intersects(viewport_rect) {
-                                                        ui.painter().image(
-                                                            texture.id(),
-                                                            tile_rect,
-                                                            egui::Rect::from_min_max(
-                                                                egui::Pos2::ZERO,
-                                                                egui::pos2(1.0, 1.0),
-                                                            ),
-                                                            egui::Color32::WHITE,
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                            paint_ribbon_tiles(
+                                                ui,
+                                                image_rect,
+                                                width_scale,
+                                                &mut page.tiles,
+                                                &format!("launcher-new-project-ribbon-{index}"),
+                                                &mut upload_budget,
+                                            );
                                             if selected_page == Some(index) {
                                                 ui.painter().rect_stroke(
                                                     image_rect.expand(2.0),
@@ -7319,58 +7296,19 @@ fn clamp_window_pos_to_viewport(
 fn draw_crop_editor_canvas(ui: &mut Ui, editor: &mut CropEditorState) {
     let image_size = egui::vec2(editor.source_size[0] as f32, editor.source_size[1] as f32);
     let (image_rect, _) = ui.allocate_exact_size(image_size, egui::Sense::hover());
-    paint_tiled_image(
+    paint_ribbon_tiles(
         ui,
         image_rect,
         1.0,
-        editor.tiles.as_mut_slice(),
+        &mut editor.tiles,
         &format!("launcher-new-project-crop-{}", editor.page_index),
+        &mut ribbon_upload_budget(),
     );
 
     let crop_rect_screen = crop_rect_to_screen(editor.crop_rect, image_rect);
     paint_crop_overlay(ui, image_rect, crop_rect_screen);
     paint_crop_handles(ui, crop_rect_screen);
     handle_crop_drag(ui, image_rect, editor, crop_rect_screen);
-}
-
-fn paint_tiled_image(
-    ui: &mut Ui,
-    image_rect: egui::Rect,
-    width_scale: f32,
-    tiles: &mut [RibbonTile],
-    texture_prefix: &str,
-) {
-    let viewport_rect = ui.clip_rect().expand(128.0);
-    for (tile_index, tile) in tiles.iter_mut().enumerate() {
-        if tile.texture.is_none() {
-            let texture = ui.ctx().load_texture(
-                format!("{texture_prefix}-{tile_index}"),
-                tile.color_image.clone(),
-                TextureOptions::LINEAR,
-            );
-            tile.texture = Some(texture);
-        }
-        if let Some(texture) = tile.texture.as_ref() {
-            let tile_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    image_rect.left() + tile.origin_px[0] as f32 * width_scale,
-                    image_rect.top() + tile.origin_px[1] as f32 * width_scale,
-                ),
-                egui::vec2(
-                    tile.size[0] as f32 * width_scale,
-                    tile.size[1] as f32 * width_scale,
-                ),
-            );
-            if tile_rect.intersects(viewport_rect) {
-                ui.painter().image(
-                    texture.id(),
-                    tile_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-        }
-    }
 }
 
 fn crop_rect_to_screen(crop_rect: RibbonCrop, image_rect: egui::Rect) -> egui::Rect {

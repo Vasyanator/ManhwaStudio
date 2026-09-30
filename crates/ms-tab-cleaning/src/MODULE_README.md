@@ -214,8 +214,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   keys or persists a model must include `MarkTemplate::anchor_key`. The accept rule additionally
   requires the occurrence to sit within `ANCHOR_TOLERANCE_PX` of an anchor and to reach
   `FALSE_ACCEPT_GAIN_FLOOR`; no `DetectionParams` value can widen past either.
-- The «Клин» status area's message 1 mirrors the overlay LOADER (committed tree only, exact
-  `<stem>.png`, exact size inequality), not the scan's broader stem match; message 2 is
+- The «Клин» status area's message 1 mirrors the overlay LOADER: the current page's
+  `PageCleanEntry` resolved in the loader's scope (`clean_status::LOADER_SCOPE`,
+  `StagedOverCommitted`) is a `SizeMismatch`; it never restates the binding rule itself, and the
+  scope must change together with the loader's in `src/app.rs`; message 2 is
   `NoMatchingPage` only (minus deliberately detached `*_detached` files, `clean_assign::is_detached_clean_file`), never `Unreadable`. Its body only draws; cross clicks leave through
   `CleaningDockOut::clean_status_dismiss`. With nothing to say it lays out nothing at all.
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,

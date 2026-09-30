@@ -45,6 +45,9 @@ egui.workspace = true
 eframe.workspace = true
 # Thumbnail and preview decode.
 image.workspace = true
+# Tiled full-resolution display of a clean in the page viewer (`viewer.rs`): the worker splits
+# the decoded clean into `PreparedTiles`, the GUI uploads them under a per-frame budget.
+egui-large-image.workspace = true
 # Typed public errors of the dialog and worker paths.
 thiserror.workspace = true
 

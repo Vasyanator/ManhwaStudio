@@ -476,11 +476,7 @@ fn scan_tree(
 ) -> Result<TreeSnapshot, PageOpError> {
     let clean_overlay_stems = list_file_names(clean_layers_dir)?
         .into_iter()
-        .filter_map(|name| {
-            name.strip_suffix(".png")
-                .map(str::to_string)
-                .filter(|stem| !stem.is_empty())
-        })
+        .filter_map(|name| crate::clean_binding::clean_overlay_stem(&name).map(str::to_string))
         .collect();
     let layers_files: BTreeSet<String> = list_file_names(layers_dir)?.into_iter().collect();
     let text_images_files: BTreeSet<String> =

@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::autosave_gate::AutosaveGate;
+use ms_page_ops::clean_binding::{clean_overlay_file_name, writer_clean_stem, FALLBACK_CLEAN_STEM};
 
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -231,12 +232,22 @@ impl ReversibleAction for CleanOverlayDiffOp {
 pub struct OverlaySaveSnapshot {
     /// Page index in the model's page order.
     pub page_idx: usize,
-    /// File stem (source page basename without extension); the file is `<stem>.png`.
+    /// File stem (source page basename without extension, `writer_clean_stem`); the file is
+    /// [`OverlaySaveSnapshot::file_name`].
     pub stem: String,
     /// Straight-alpha RGBA pixels, shared with the model.
     pub image: Arc<RgbaImage>,
     /// Detach generation of the page at capture time.
     pub generation: u64,
+}
+
+impl OverlaySaveSnapshot {
+    /// The clean-overlay file name this snapshot is written as (`<stem>.png`), from the binding
+    /// owner `ms_page_ops::clean_binding`; writers join it onto the target clean directory.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        clean_overlay_file_name(&self.stem)
+    }
 }
 
 #[derive(Debug)]
@@ -377,8 +388,7 @@ impl CleanOverlaysModel {
             let stem = self
                 .basenames
                 .get(idx)
-                .and_then(|n| Path::new(n).file_stem().and_then(|s| s.to_str()))
-                .unwrap_or("overlay")
+                .map_or(FALLBACK_CLEAN_STEM, |n| writer_clean_stem(Path::new(n)))
                 .to_string();
             out.push((stem, Arc::clone(image)));
         }
@@ -1076,7 +1086,7 @@ impl CleanOverlaysModel {
         let dir_str = clean_layers_dir.to_string_lossy();
         store.create_dir_all(dir_str.as_ref())?;
         for (stem, image) in self.save_snapshots() {
-            let dst = clean_layers_dir.join(format!("{stem}.png"));
+            let dst = clean_layers_dir.join(clean_overlay_file_name(&stem));
             let dst_str = dst.to_string_lossy();
             // Encode straight-alpha RGBA to PNG in memory (default encoder params,
             // identical to `RgbaImage::save`) before handing bytes to storage.
@@ -1126,8 +1136,7 @@ impl CleanOverlaysModel {
                 let stem = self
                     .basenames
                     .get(idx)
-                    .and_then(|n| std::path::Path::new(n).file_stem().and_then(|s| s.to_str()))
-                    .unwrap_or("overlay")
+                    .map_or(FALLBACK_CLEAN_STEM, |n| writer_clean_stem(Path::new(n)))
                     .to_string();
                 Some(OverlaySaveSnapshot {
                     page_idx: idx,
@@ -1152,6 +1161,25 @@ impl CleanOverlaysModel {
             .map(|snapshot| snapshot.page_idx)
             .collect();
         self.save_dirty_indexes.extend(current);
+    }
+
+    /// Re-queues page `idx`'s CURRENT pixels for the next autosave/save pass without recording an
+    /// edit: no undo entry, no revision bump (the pixels did not change). Returns `false`, doing
+    /// nothing, when the page holds no pixels (virtual/out of range) — there is nothing to write.
+    ///
+    /// For a worker that just deleted the page's staged file while an edit may have re-materialized
+    /// the page and already had its autosave taken (see the page manager's unlink): marking it again
+    /// makes the next pass (or the exit flush) rewrite the file from the model.
+    pub fn mark_overlay_needs_save(&mut self, idx: usize) -> bool {
+        if self.overlay_rgba_cache.get(idx).is_none_or(Option::is_none) {
+            return false;
+        }
+        self.save_dirty_indexes.insert(idx);
+        self.has_project_unsaved_changes = true;
+        if let Some(gate) = &self.autosave_gate {
+            gate.note_action();
+        }
+        true
     }
 
     /// Marks page `idx` changed for the canvas AND for the next save, and reports one autosave action.
@@ -1479,7 +1507,7 @@ pub fn save_overlay_snapshots_to(
     let dir_str = dir.to_string_lossy();
     store.create_dir_all(dir_str.as_ref())?;
     for snapshot in snapshots {
-        let dst = dir.join(format!("{}.png", snapshot.stem));
+        let dst = dir.join(snapshot.file_name());
         let dst_str = dst.to_string_lossy();
         // Encode straight-alpha RGBA to PNG in memory (default encoder params,
         // identical to `RgbaImage::save`) before handing bytes to storage.
@@ -1523,7 +1551,7 @@ pub fn save_overlay_snapshots_guarded(
                 continue;
             }
         }
-        let dst = dir.join(format!("{}.png", snapshot.stem));
+        let dst = dir.join(snapshot.file_name());
         let dst_str = dst.to_string_lossy();
         let mut buf = Vec::new();
         snapshot
@@ -2137,6 +2165,26 @@ mod tests {
         assert!(model.detach_page_overlay(0));
         assert!(model.is_overlay_virtual_absent(0));
         assert!(!model.save_dirty_indexes.contains(&0));
+    }
+
+    #[test]
+    fn mark_overlay_needs_save_requeues_only_pages_with_pixels() {
+        let mut model = multi_page_model(2);
+        model.replace_from_rgba(0, opaque_image(4));
+        let revision = model.revision();
+        let can_undo = model.can_undo_overlay_history();
+        assert_eq!(model.take_dirty_save_snapshots().len(), 1);
+        assert!(!model.has_unsaved_overlay_changes());
+
+        assert!(model.mark_overlay_needs_save(0));
+        assert_eq!(model.revision(), revision, "no pixel change, no revision bump");
+        assert_eq!(model.can_undo_overlay_history(), can_undo, "no undo entry is recorded");
+        let snapshots = model.take_dirty_save_snapshots();
+        assert_eq!(snapshots.iter().map(|snapshot| snapshot.page_idx).collect::<Vec<_>>(), [0]);
+
+        assert!(!model.mark_overlay_needs_save(1), "a virtual page has nothing to write");
+        assert!(!model.mark_overlay_needs_save(2), "out of range");
+        assert!(!model.has_unsaved_overlay_changes());
     }
 
     fn opaque_image(side: u32) -> RgbaImage {

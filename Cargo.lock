@@ -1623,6 +1623,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-large-image"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "egui-shader-layers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3723,6 +3732,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "egui-large-image",
  "flate2",
  "image 0.25.10",
  "libloading 0.8.9",
@@ -3970,6 +3980,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "egui-large-image",
  "image 0.25.10",
  "ms-config",
  "ms-i18n",

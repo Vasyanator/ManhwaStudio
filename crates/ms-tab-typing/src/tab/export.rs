@@ -40,6 +40,7 @@ use std::sync::Condvar;
 
 use crate::export_repaginate::{RibbonSlicer, TypingRepaginateSettings, group_pages_into_ribbons, repaginated_page_file_name};
 use crate::pdf_export::TypingPdfBuilder;
+use ms_models::clean_assign::{LOADER_CLEAN_SCOPE, PageCleanPaths, PageCleanResolution, probe_page_clean};
 
 /// The checked pairing of an export format with its destination: the ONE place that decides
 /// which pipeline a request runs through.
@@ -943,47 +944,66 @@ fn is_windows_reserved_file_name(name: &str) -> bool {
     numbered_device && stem.len() == 4 && stem.as_bytes().get(3).is_some_and(|digit| matches!(digit, b'1'..=b'9'))
 }
 
+/// Fills every job's клин snapshot (`clean_overlay_rgba`) on the export worker; see
+/// [`load_clean_overlay_snapshot_for_export`].
+///
+/// # Errors
+/// The first клин file that the loader's rule selects but that cannot be read or decoded
+/// (localized message).
 pub(super) fn prepare_export_clean_overlay_snapshots(
     jobs: &mut [TypingExportPageJob],
     clean_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
 ) -> Result<(), String> {
     for job in jobs {
-        job.clean_overlay_rgba = load_clean_overlay_snapshot_for_export(
-            clean_overlays_model.as_ref(),
-            job.page_idx,
-            job.clean_overlay_path.as_deref(),
-        )?;
+        let clean_paths = job.clean_paths.as_ref();
+        let page_path = job.page_path.as_path();
+        job.clean_overlay_rgba = load_clean_overlay_snapshot_for_export(clean_overlays_model.as_ref(), job.page_idx, || {
+            clean_paths.and_then(|paths| export_clean_file(paths, page_path))
+        })?;
     }
     Ok(())
 }
 
+/// The клин file the export decodes for a page the clean model holds no overlay for: exactly the
+/// file the overlay loader would load (`probe_page_clean` in [`LOADER_CLEAN_SCOPE`], then
+/// `loadable_file`). A staged file therefore shadows the committed one, and a size-mismatched
+/// file is never exported as the page's клин (the page exports without one, as the canvas shows
+/// it). Synchronous stat + image-header I/O: export worker only.
+fn export_clean_file(clean_paths: &PageCleanPaths, page_path: &Path) -> Option<PathBuf> {
+    let resolution = probe_page_clean(clean_paths, page_path, LOADER_CLEAN_SCOPE);
+    if let PageCleanResolution::SizeMismatch { file, clean, page } = &resolution {
+        ms_log::runtime_log::log_warn(format!(
+            "[typing] export: skipping клин '{}' size {}x{}: source page '{}' size is {}x{}",
+            file.display(), clean[0], clean[1], page_path.display(), page[0], page[1]
+        ));
+    }
+    resolution.loadable_file().map(Path::to_path_buf)
+}
+
+/// One page's клин snapshot for the export: the clean model's in-memory overlay when it holds
+/// one (it includes unsaved edits), otherwise the decode of `clean_file()` — called only in that
+/// case, because it probes the disk — or `None` when that yields no file.
+///
+/// READ-ONLY with respect to the model: a disk decode is never written back into it. Writing it
+/// back would mark the page save-dirty, and the autosave would then overwrite the staged клин
+/// with whatever the export happened to decode.
+///
+/// # Errors
+/// The selected file cannot be read or decoded (localized message).
 pub(super) fn load_clean_overlay_snapshot_for_export(
     clean_overlays_model: Option<&Arc<Mutex<CleanOverlaysModel>>>,
     page_idx: usize,
-    clean_overlay_path: Option<&Path>,
+    clean_file: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<Option<Arc<image::RgbaImage>>, String> {
-    let Some(model) = clean_overlays_model else {
-        return load_clean_overlay_rgba_from_disk(clean_overlay_path)
-            .map(|image| image.map(Arc::new));
-    };
-    if let Ok(locked) = model.lock()
+    // A poisoned model lock is treated like "no in-memory overlay": the disk file is still the
+    // loader's truth for this page, and export must not fail on another thread's panic.
+    if let Some(model) = clean_overlays_model
+        && let Ok(locked) = model.lock()
         && let Some(image) = locked.overlay_rgba(page_idx)
     {
         return Ok(Some(image));
     }
-    let Some(decoded) = load_clean_overlay_rgba_from_disk(clean_overlay_path)? else {
-        return Ok(None);
-    };
-    if let Ok(mut locked) = model.lock() {
-        if let Some(image) = locked.overlay_rgba(page_idx) {
-            return Ok(Some(image));
-        }
-        locked.replace_from_rgba(page_idx, decoded.clone());
-        if let Some(image) = locked.overlay_rgba(page_idx) {
-            return Ok(Some(image));
-        }
-    }
-    Ok(Some(Arc::new(decoded)))
+    load_clean_overlay_rgba_from_disk(clean_file().as_deref()).map(|image| image.map(Arc::new))
 }
 
 pub(super) fn load_clean_overlay_rgba_from_disk(
@@ -1499,20 +1519,13 @@ impl TypingTextOverlayLayer {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("page");
-                let clean_overlay_path = project.paths.clean_layers_dir.join(format!("{stem}.png"));
                 TypingExportPageJob {
                     page_idx: page.idx,
                     page_path: page.path.clone(),
                     output_path: per_page_output.as_ref().map(|(dir, ext)| dir.join(format!("{stem}.{ext}"))),
-                    clean_overlay_path: {
-                        // `is_file()` via the storage seam: exists AND is not a directory.
-                        let store = ms_storage::global::storage();
-                        let is_file = {
-                            let s = clean_overlay_path.to_string_lossy();
-                            store.exists(s.as_ref()) && !store.is_dir(s.as_ref())
-                        };
-                        is_file.then_some(clean_overlay_path)
-                    },
+                    // The clean model writer's paths (same stem, including its fallback, as the
+                    // overlay loader); pure here, resolved on the export worker.
+                    clean_paths: Some(PageCleanPaths::for_writer(&project.paths, page)),
                     clean_overlay_rgba: None,
                     overlays: overlays_by_page.remove(&page.idx).unwrap_or_default(),
                     rasters: rasters_by_page.remove(&page.idx).unwrap_or_default(),
