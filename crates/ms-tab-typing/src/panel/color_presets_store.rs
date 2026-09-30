@@ -31,7 +31,7 @@ Notes:
 - A document whose `version` is HIGHER than this build's is read best-effort (the
   user still sees the colors this build understands) but is NEVER written back.
   This is the project's standing contract for a self-versioned document — see the
-  `"PanelLayout"` section of `README_AGENT.md`: a newer section is never
+  `"PanelLayout"` section (`crates/ms-widgets/src/panel_dock/MODULE_README.md`): a newer section is never
   overwritten, because rewriting it as the current version would silently drop
   every field the newer format added. An OLDER (or absent) version is read
   best-effort and rewritten normally, which is what upgrades the document.
@@ -409,7 +409,7 @@ pub(super) enum ColorPresetsDocumentState {
     /// [`COLOR_PRESETS_VERSION`], which would silently drop every field the newer
     /// format added. Recovery is to run a build that understands the document, not
     /// to overwrite it. Same contract as the `"PanelLayout"` section of
-    /// `user_config.json` (`README_AGENT.md`).
+    /// `user_config.json` (`crates/ms-widgets/src/panel_dock/MODULE_README.md`).
     NewerVersion,
     /// The document exists but could not be read or its load result never arrived,
     /// so its content is unknown. Saving is refused and the file is left exactly as

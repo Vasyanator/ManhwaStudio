@@ -195,8 +195,9 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   tooltip) are unit-tested. It decides nothing about link state or file operations.
   Per-page paths come from `clean_assign::PageCleanPaths`, names from `clean_assign` — never a
   hand-built `<stem>.png`.
-- `viewer.rs`: the page viewer — an `egui::Window` (a dialog window under the README_AGENT
-  exemption: transient, per image, not a persisted panel) with its own `ViewerCamera` board
+- `viewer.rs`: the page viewer — an `egui::Window` (a dialog window, not a panel: transient,
+  per image and never persisted, so the panel-dock rule of `egui-docs/01-app-shell.md` §3.1 does
+  not apply) with its own `ViewerCamera` board
   (fit on open, wheel zoom around the cursor, drag pan, "Fit" button, zoom and size readout).
   The camera is not `PsViewport` because its minimum zoom follows the fit zoom (a very tall
   strip must fit a window at its minimum height; `PsViewport`'s floor is a private constant).

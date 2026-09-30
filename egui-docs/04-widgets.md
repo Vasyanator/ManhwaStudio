@@ -11,11 +11,11 @@ memory of 0.27-0.31 — several APIs on this page did not exist then.
 
 **Do NOT build a floating panel out of `Area` + `Frame::popup`, and do NOT use `egui::Window` as
 one.** Every floating panel of the studio is declared as a **tab** of the panel dock — the two
-widgets `CollapsiblePanel` (`src/widgets/panel_dock/panel.rs:232`) and `PanelTab`
-(`src/widgets/panel_dock/tab.rs:43`) are **mandatory**, and you reach them through the frame driver
-`PanelDock::begin` → `.tab(id)` → `.end(&mut cx)` (`src/widgets/panel_dock/mod.rs:644`) rather than
+widgets `CollapsiblePanel` (`crates/ms-widgets/src/panel_dock/panel.rs:232`) and `PanelTab`
+(`crates/ms-widgets/src/panel_dock/tab.rs:43`) are **mandatory**, and you reach them through the frame driver
+`PanelDock::begin` → `.tab(id)` → `.end(&mut cx)` (`crates/ms-widgets/src/panel_dock/mod.rs:644`) rather than
 constructing them yourself. Full call-site recipe and rationale: `01-app-shell.md` §3.1; the rule as
-written: `README_AGENT.md` §"Панельный док" and `src/widgets/panel_dock/MODULE_README.md`.
+written: `PROJECT_RULES.md` ("egui: never write it from memory") and `crates/ms-widgets/src/panel_dock/MODULE_README.md`.
 
 Why — a hand-rolled panel silently loses everything the user expects of a panel: docking with a
 stable gap, snapping, collapse, a persisted position and size, tear-off into an OS sub-window, the
@@ -30,9 +30,8 @@ precedent**: new panels have no exemption.
 ### 0.2 No stock `Slider` / `ComboBox` / `DragValue`
 
 **Do NOT use `egui::Slider` or `egui::ComboBox` directly in product UI** — use the `Wheel*`
-replacements from `src/widgets/`. That is the rule as written in `README_AGENT.md:616`. It
-extends to `egui::DragValue`, which `WheelSpinBox` wraps for the same reason
-(`README_AGENT.md:611`).
+replacements from `crates/ms-widgets/src/`. That is the rule as written in `PROJECT_RULES.md`. It
+extends to `egui::DragValue`, which `WheelSpinBox` wraps for the same reason.
 
 Why — two reasons, both invisible in the type system:
 
@@ -40,8 +39,8 @@ Why — two reasons, both invisible in the type system:
    and a wheel event over them scrolls the *parent* `ScrollArea` instead. Every settings
    panel in this app lives inside a `ScrollArea`, so stock widgets would make the panel jump
    under the cursor. The `Wheel*` widgets give one logical step per physical notch and
-   consume the event locally (`src/widgets/wheel_slider.rs:12-21`,
-   `src/widgets/wheel_combo_box.rs:12-20`).
+   consume the event locally (`crates/ms-widgets/src/wheel_slider.rs:12-21`,
+   `crates/ms-widgets/src/wheel_combo_box.rs:12-20`).
 2. **The process-global wheel guard.** An open combo-box popup floats *over* sliders and
    spin boxes. Without a guard, scrolling that popup's list also drags the slider
    underneath it. The `Wheel*` family shares `wheel_input_guard.rs` to suppress that
@@ -50,7 +49,7 @@ Why — two reasons, both invisible in the type system:
 
 A `WheelComboBox` is not the only replacement. When the list is a CATALOG the user has to
 search — hundreds of rows, each wanting its own typeface and per-row diagnostics — the
-replacement is `SearchableComboBox` (`src/widgets/searchable_combo_box.rs:334`), which owns the
+replacement is `SearchableComboBox` (`crates/ms-widgets/src/searchable_combo_box.rs:334`), which owns the
 same wheel contract and adds a filtering search field. The typing tab's font combo is that case
 and is built on it (`src/tabs/typing/panel/create_presets.rs::draw_font_combo`); it is the only
 product call site so far, and it draws its own label, because unlike `ComboBox` the widget draws
@@ -61,30 +60,30 @@ slider, drawn twice) and `src/launcher/new_project/window.rs` (fetch parallelism
 `egui::Slider`. Treat them as debt, not a precedent — the typing layout editor's opacity
 slider, which used to head this list, is a `WheelSlider` now.
 
-## 1. The project widget set (`src/widgets/`)
+## 1. The project widget set (`crates/ms-widgets/src/`)
 
-Public surface is `src/widgets/mod.rs:43-72`; the module contract is
-`src/widgets/MODULE_README.md`.
+Public surface is `crates/ms-widgets/src/lib.rs:43-72`; the module contract is
+`crates/ms-widgets/src/MODULE_README.md`.
 
 | Widget | File | What it is / when to use |
 |---|---|---|
-| `WheelSlider` | `src/widgets/wheel_slider.rs:39` | `Slider` replacement: hover+wheel = one step (Shift = 5, `SHIFT_WHEEL_STEP_MULTIPLIER`, :37), parent scroll suppressed. Use for every bounded numeric in a panel. |
-| `WheelComboBox` | `src/widgets/wheel_combo_box.rs:35` | `ComboBox` replacement for `show_index`-style enums. Wheel cycles the index when closed; when open it publishes the wheel guard. `new` / `from_label` / `from_id_salt`. |
-| `SearchableComboBox` | `src/widgets/searchable_combo_box.rs:334` | `ComboBox` replacement for a CATALOG: two-line rows (`RowLayout::Tall`/`Wide`), the main line optionally in that row's own `FontFamily`, per-row colour + tooltip, wheel-cycling when closed. Search is a MODE — the popup opens as a plain list and reveals a filtering field when the user types into it or presses the square magnifier button the widget draws beside the combo button. `width(..)` covers both buttons (ask `search_button_overhang` for the difference) and so does the popup. Draws NO label — the caller must. Call site: the typing font combo. |
-| `WheelSpinBox` | `src/widgets/wheel_spin_box.rs:31` | `DragValue` replacement: unbounded/precise numeric entry with the same wheel contract. |
-| `SeedSpinBox` | `src/widgets/seed_spin_box.rs:21` | `u64` seed field + "random" button (`random_seed`, :63+). Self-contained; no `rand` dependency. |
-| `AutocompleteLine` | `src/widgets/autocomplete_line.rs` | Single-line input with an inline-completion popup and a configurable suggestion limit. |
-| `SpellcheckedTextEdit` | `src/widgets/spellchecked_line.rs` | Multiline `TextEdit` with async Hunspell-compatible spellcheck and misspelling underlines. Dictionary follows the **typesetting** language, never the UI language. |
-| `TextEditPlus` | `src/widgets/text_edit_plus.rs` | Multiline editor with per-range text color and ordered rounded background highlights. |
-| `EditableComboBox` | `src/widgets/editable_combo_box.rs:38` | Combo box whose value can also be typed freely. Stateful; takes an explicit id source in `new`. |
-| `AiButton` | `src/widgets/ai_button.rs:31-96` | Button for an AI tool that gates itself on runtime capabilities (§3). |
-| `ViewportColorSelector` | `src/widgets/viewport_color_selector.rs:28` | Color swatch + eyedropper that samples a viewport pixel through egui screenshot events. Stateful, owns a screenshot token. |
-| `MarkedScrollArea` | `src/widgets/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
-| `PanelTab` + `CollapsiblePanel` | `src/widgets/panel_dock/` | The **only** way to make a floating panel (§0.1). Declared per frame through `PanelDock`, never constructed directly. Owns collapse, docking, resize, persistence and tear-off into an OS window. |
+| `WheelSlider` | `crates/ms-widgets/src/wheel_slider.rs:39` | `Slider` replacement: hover+wheel = one step (Shift = 5, `SHIFT_WHEEL_STEP_MULTIPLIER`, :37), parent scroll suppressed. Use for every bounded numeric in a panel. |
+| `WheelComboBox` | `crates/ms-widgets/src/wheel_combo_box.rs:35` | `ComboBox` replacement for `show_index`-style enums. Wheel cycles the index when closed; when open it publishes the wheel guard. `new` / `from_label` / `from_id_salt`. |
+| `SearchableComboBox` | `crates/ms-widgets/src/searchable_combo_box.rs:334` | `ComboBox` replacement for a CATALOG: two-line rows (`RowLayout::Tall`/`Wide`), the main line optionally in that row's own `FontFamily`, per-row colour + tooltip, wheel-cycling when closed. Search is a MODE — the popup opens as a plain list and reveals a filtering field when the user types into it or presses the square magnifier button the widget draws beside the combo button. `width(..)` covers both buttons (ask `search_button_overhang` for the difference) and so does the popup. Draws NO label — the caller must. Call site: the typing font combo. |
+| `WheelSpinBox` | `crates/ms-widgets/src/wheel_spin_box.rs:31` | `DragValue` replacement: unbounded/precise numeric entry with the same wheel contract. |
+| `SeedSpinBox` | `crates/ms-widgets/src/seed_spin_box.rs:21` | `u64` seed field + "random" button (`random_seed`, :63+). Self-contained; no `rand` dependency. |
+| `AutocompleteLine` | `crates/ms-widgets/src/autocomplete_line.rs` | Single-line input with an inline-completion popup and a configurable suggestion limit. |
+| `SpellcheckedTextEdit` | `crates/ms-widgets/src/spellchecked_line.rs` | Multiline `TextEdit` with async Hunspell-compatible spellcheck and misspelling underlines. Dictionary follows the **typesetting** language, never the UI language. |
+| `TextEditPlus` | `crates/ms-widgets/src/text_edit_plus.rs` | Multiline editor with per-range text color and ordered rounded background highlights. |
+| `EditableComboBox` | `crates/ms-widgets/src/editable_combo_box.rs:38` | Combo box whose value can also be typed freely. Stateful; takes an explicit id source in `new`. |
+| `AiButton` | `crates/ms-widgets/src/ai_button.rs:31-96` | Button for an AI tool that gates itself on runtime capabilities (§3). |
+| `ViewportColorSelector` | `crates/ms-widgets/src/viewport_color_selector.rs:28` | Color swatch + eyedropper that samples a viewport pixel through egui screenshot events. Stateful, owns a screenshot token. |
+| `MarkedScrollArea` | `crates/ms-widgets/src/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
+| `PanelTab` + `CollapsiblePanel` | `crates/ms-widgets/src/panel_dock/` | The **only** way to make a floating panel (§0.1). Declared per frame through `PanelDock`, never constructed directly. Owns collapse, docking, resize, persistence and tear-off into an OS window. |
 
 ## 2. `wheel_input_guard.rs` — the process-global popup guard
 
-Contract (`src/widgets/wheel_input_guard.rs:21-86`):
+Contract (`crates/ms-widgets/src/wheel_input_guard.rs:21-86`):
 
 - One `Context::data` temp entry under `Id::new("wheel_input_open_combo_popup_guard")`
   (`:21`) holding `{ frame_nr, rect: Option<Rect> }` (`:24-27`).
@@ -102,14 +101,14 @@ aware widget, wire both calls; if you write a new popup widget, publish both.
 
 Related egui 0.36 fact used by these widgets: **`InputState::raw_scroll_delta` no longer
 exists**; the unsmoothed per-notch delta is recovered by summing `Event::MouseWheel` events
-(`src/widgets/wheel_slider.rs:431-445`).
+(`crates/ms-widgets/src/wheel_slider.rs:431-445`).
 
 ## 3. `ai_button.rs` — self-gating AI button
 
 Three process-global capability signals live in `src/ai_backend_capabilities.rs:55-58`
 (`AtomicU8`, tri-state unknown/yes/no): backend, torch, onnxruntime.
 
-- `AiRequirement` (`src/widgets/ai_button.rs:31`): `Backend | Torch | Onnx | TorchOrOnnx`.
+- `AiRequirement` (`crates/ms-widgets/src/ai_button.rs:31`): `Backend | Torch | Onnx | TorchOrOnnx`.
 - `AiCaps::current()` (`:96-100`) snapshots the three globals.
 - `AiRequirement::is_met(caps, unknown_ok)` (`:52`) is the pure, unit-testable gate;
   `satisfied` (`:43`) is the strict alias (`unknown_ok = false`).
@@ -118,13 +117,13 @@ Three process-global capability signals live in `src/ai_backend_capabilities.rs:
 re-derive the tooltip text at each call site. Use `AiButton`: it disables itself, explains
 why on hover, and stays correct when a capability flips at runtime.
 
-Drawing invariant (`src/widgets/ai_button.rs:16-18`): the optional marker badge is painted
+Drawing invariant (`crates/ms-widgets/src/ai_button.rs:16-18`): the optional marker badge is painted
 with the **painter only** — it must never allocate a second interactive rect, which would
 carve a hole in the button's hitbox.
 
 ## 4. `marked_scroll/` — a PORT, not a wrapper
 
-`src/widgets/marked_scroll/bar.rs:9-13`:
+`crates/ms-widgets/src/marked_scroll/bar.rs:9-13`:
 
 > PORT SOURCE: egui 0.33.3, `src/containers/scroll_area.rs`, the per-axis bar block of
 > `ScrollArea::show_viewport_dyn` (roughly lines 1200-1443). That code is private, so the
@@ -133,7 +132,7 @@ carve a hole in the button's hitbox.
 
 The host `egui::ScrollArea` is still the scroll *engine* (wheel, drag, momentum, clipping);
 its native bars are hidden and the ported bar is painted on top
-(`src/widgets/marked_scroll/MODULE_README.md`).
+(`crates/ms-widgets/src/marked_scroll/MODULE_README.md`).
 
 **Warning:** this is a copy of *private* egui internals from a **different version** (0.33.3)
 than the one the app links (0.36.2). Do not "modernize" it against 0.36's current
@@ -241,9 +240,9 @@ So `TextEdit::show(ui).response.rect` does not compile — you need
 `.response.response.rect`. The project's wrappers all do exactly that, with the reason
 comment inline:
 
-- `src/widgets/text_edit_plus.rs:210-212` — `self.show(ui).response.response` in `Widget::ui`.
-- `src/widgets/spellchecked_line.rs:399-401` — same shape.
-- `src/widgets/autocomplete_line.rs:86-88` —
+- `crates/ms-widgets/src/text_edit_plus.rs:210-212` — `self.show(ui).response.response` in `Widget::ui`.
+- `crates/ms-widgets/src/spellchecked_line.rs:399-401` — same shape.
+- `crates/ms-widgets/src/autocomplete_line.rs:86-88` —
   `let text_response = &text_output.response.response;`
 
 If you add a widget that calls `TextEdit::show`, follow the same pattern and keep the
@@ -301,13 +300,13 @@ architectural change, not a drive-by.
 
 ## Editing map
 
-- To add a reusable widget: new file in `src/widgets/`, re-export in `src/widgets/mod.rs`,
-  update `src/widgets/MODULE_README.md`.
-- To change wheel behaviour or popup suppression: `src/widgets/wheel_input_guard.rs` plus the
+- To add a reusable widget: new file in `crates/ms-widgets/src/`, re-export in `crates/ms-widgets/src/lib.rs`,
+  update `crates/ms-widgets/src/MODULE_README.md`.
+- To change wheel behaviour or popup suppression: `crates/ms-widgets/src/wheel_input_guard.rs` plus the
   specific `wheel_*.rs` wrapper.
-- To gate a new AI tool on runtime availability: `src/widgets/ai_button.rs` +
+- To gate a new AI tool on runtime availability: `crates/ms-widgets/src/ai_button.rs` +
   `src/ai_backend_capabilities.rs`; never re-derive the gate at the call site.
-- To touch the scrollbar port: `src/widgets/marked_scroll/bar.rs` (upgrade boundary — read
+- To touch the scrollbar port: `crates/ms-widgets/src/marked_scroll/bar.rs` (upgrade boundary — read
   its PORT SOURCE header first).
 - To add a settings pane shown in both launcher and studio: `src/settings_shared.rs` +
   a new `src/<name>_panel.rs`; wire both consumers.

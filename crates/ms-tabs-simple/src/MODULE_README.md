@@ -28,7 +28,9 @@ and image decode run on an `ms_thread` worker and reach the GUI through an mpsc 
 - `characters.rs`: character cards (portrait, aliases, description) over `characters.json`,
   plus the `load_character_names` / `load_characters_for_notes` readers other crates use.
 - `terms.rs`: glossary CRUD over `terms.json`, plus the `load_terms_for_notes` reader.
-- `notes.rs`: read-only aggregated notes view composed from characters and terms on a worker.
+- `notes.rs`: translation-notes tab with two sub-tabs — the prompt assembled on a worker from
+  the `notes_file` template with `{charas}` / `{terms}` filled from characters and terms, and an
+  editor for that template itself (with placeholder helpers). Inputs are re-probed every 600 ms.
 - `wiki.rs`: bundled markdown documentation browser. Reads the per-language folder
   `wiki/<lang>/` chosen from the active UI locale (falling back to `wiki/en`, then `wiki/`)
   and re-scans when the interface language changes; pages share one `wiki/images/` tree via
@@ -37,9 +39,10 @@ and image decode run on an `ms_thread` worker and reach the GUI through an mpsc 
 
 ## Contracts and invariants
 - No literal user-visible strings: every label goes through `t!` / `tf!` / `tp!`.
-- Image decode and the heavy loads above are worker-driven. Known gap (AGENTS.md §5): the
+- Image decode and the heavy loads above are worker-driven. Known gap (CLAUDE.md §5): the
   characters/terms tabs still load and save their roster on the GUI thread
-  (`dev-docs/known_gaps.md`); those saves use `Durability::None` (atomic, no fsync).
+  (`dev-docs/known_gaps.md`); those saves use `Durability::None` (atomic, no fsync). The notes
+  template editor likewise writes `notes_file` on the GUI thread (`save_template`).
 - `characters.json` / `terms.json` go through `ms_docstore` only; other file access goes
   through the storage seam, never `std::fs` directly.
 - A malformed `characters.json` / `terms.json` is reported and NEVER overwritten: not on
@@ -58,5 +61,6 @@ and image decode run on an `ms_thread` worker and reach the GUI through an mpsc 
 ## Editing map
 - To change character data or portraits, see `characters.rs`.
 - To change the glossary, see `terms.rs`.
-- To change what the notes view composes, see `notes.rs` (and the two readers it calls).
+- To change what the notes prompt composes or the template editor, see `notes.rs` (and the two
+  readers it calls).
 - To change wiki rendering, markdown parsing or the per-language folder rules, see `wiki.rs`.

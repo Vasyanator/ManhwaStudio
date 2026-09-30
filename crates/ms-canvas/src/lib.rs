@@ -588,11 +588,11 @@ pub trait CanvasHooks {
     ///
     /// Creation order inside the hook decides nothing about z-order. Within one
     /// `Order`, egui keeps a persistent layer list and re-sorts it STABLY on
-    /// every pass (`egui-0.35.0/src/memory/mod.rs:1215-1221`, `:1350`), so a tab's
+    /// every pass (`egui-0.36.2/src/memory/mod.rs:1358-1372`, stable `sort_by_key` in `Areas::end_pass`), so a tab's
     /// own full-canvas `Order::Foreground` capture surface and the dock's panels
     /// keep whatever relative order they already had. What does move a layer up is
     /// `Area::begin`'s `move_to_top` for an area that was not visible last frame
-    /// (`egui-0.35.0/src/containers/area.rs:548-552`) — so a capture surface rises
+    /// (`egui-0.36.2/src/containers/area.rs:548-553`) — so a capture surface rises
     /// above the panels each time its selection mode is ENTERED and takes clicks
     /// meant for a panel until the mode ends. That is unchanged from the pre-dock
     /// controls panel, which sat on the lower `Order::Middle` anyway, and it is a

@@ -20,7 +20,9 @@ Two layers, cleanly separated:
    NOT assume one transport read == one frame.
 
 2. Pluggable transport (`transport.rs`) — carries the codec bytes:
-   - `Inner::Unix`: AF_UNIX `UnixStream` (default on Linux/Windows).
+   - `Inner::Unix`: AF_UNIX `UnixStream` — the transport on unix. The variant also
+     compiles on Windows (`uds_windows`), but `current_backend_endpoint` never selects
+     it there: Windows always uses the token-authenticated loopback WebSocket.
    - `Inner::Ws`: loopback WebSocket. A dedicated I/O thread OWNS the
      `tungstenite::WebSocket<TcpStream>`; app code never touches the socket. It
      exchanges bytes through `WsShared`: an inbound `VecDeque<u8>` byte queue
@@ -42,7 +44,7 @@ supervisor (a different module) parses the backend's `MS_BACKEND_WS_PORT=<port>`
 and calls `set_ws_endpoint(port, token)`.
 
 ### Rejected alternatives (do not re-propose)
-Three ways out of "CPython on Windows cannot bind AF_UNIX" were weighed; the WS fallback won.
+Three ways out of "CPython on Windows cannot bind AF_UNIX" were weighed; the loopback WebSocket won.
 
 - **Bump the managed Python to the release that adds Windows AF_UNIX (3.15).** Not reachable:
   the managed runtime is pinned to 3.11 (`installer::utils::PYTHON_VERSION_REQUEST`) and the
@@ -68,7 +70,9 @@ is ephemeral and published per process.
   `seed_isolated_backend_socket_name`, and — native only — `BackendEndpoint`,
   `set_ws_endpoint`, `current_backend_endpoint`).
 - `protocol.rs`: constants mirroring `modules/ai_backend/ipc/protocol.py` (version,
-  kinds, statuses, topics, method names, header keys) + header builders. Values must
+  kinds, statuses, topics, method names, header keys) + header builders. It is the index
+  of backend methods: names are dotted `<domain>.<action>` strings (`health`,
+  `ocr.manga`, `inpaint.lama_v2`, `textdetector.ctd`, …), not HTTP paths. Values must
   match Python byte-for-byte. Edit here when the shared contract changes. Its
   `python_protocol_version_matches_rust` test reads the Python file and asserts the
   two `PROTOCOL_VERSION` constants agree.

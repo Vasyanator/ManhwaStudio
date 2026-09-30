@@ -4,8 +4,9 @@ File: crates/ms-backend-ipc/src/transport.rs
 Purpose:
 Connection primitives for the framed IPC client. The frame codec (see `frame.rs`)
 travels over a pluggable transport:
-- AF_UNIX (default on Linux and Windows): `UnixStream`, the primary path.
-- loopback WebSocket (fallback, e.g. when AF_UNIX is unavailable): a `tungstenite`
+- AF_UNIX: `UnixStream`, the transport on unix (the variant also compiles on
+  Windows via `uds_windows`, but is never selected there).
+- loopback WebSocket, token-authenticated: the transport on Windows, a `tungstenite`
   WS client over `std::net::TcpStream` bound to 127.0.0.1.
 Both are exposed uniformly through `BackendStream` (Read + Write + clone +
 shutdown), so `client.rs` stays transport-agnostic.
@@ -198,7 +199,7 @@ pub fn backend_socket_path() -> PathBuf {
 
 /// Which transport to dial for the framed AI-backend IPC.
 ///
-/// `Unix` carries the AF_UNIX socket path (the default on Linux/Windows). `Ws`
+/// `Unix` carries the AF_UNIX socket path (selected on unix). `Ws` (selected on windows)
 /// carries the loopback WebSocket `port` and the auth `token` echoed in the
 /// handshake URL query string; the backend validates the token constant-time and
 /// rejects the upgrade on mismatch.

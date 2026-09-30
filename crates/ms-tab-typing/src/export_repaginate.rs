@@ -292,7 +292,7 @@ impl RibbonSlicer {
         }
         // A non-empty `pending` can only exist after a successful `push_page`, which already
         // proved `target_bytes` (>= `row_bytes`) addressable; the fallible conversion is kept
-        // instead of an `expect` because this module must not panic (AGENTS.md §7, §11).
+        // instead of an `expect` because this module must not panic (CLAUDE.md §7, §11).
         let row_bytes = usize::try_from(self.row_bytes).ok()?;
         let rgba = std::mem::take(&mut self.pending);
         let height_px = u32::try_from(rgba.len() / row_bytes).ok()?;

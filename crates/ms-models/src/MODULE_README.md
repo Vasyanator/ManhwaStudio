@@ -75,12 +75,15 @@ candidate.
   page geometry with its load state (`PageImageInfo` / `SourcePageLoadState`) plus the tiled GPU
   residency of a decoded page (`PageTexture` / `TextureTile`). Producing and evicting the
   textures stays in `app.rs`; only the types live here.
+- `layer_model/`: the chapter layer document (`LayerDoc`, per-page `layers.json` manifest, text
+  payload, migration, background layer saver). See `layer_model/MODULE_README.md`.
 - `lib.rs`: module declarations for the shared model layer.
 
 ## Crate boundary
 `ms-models` sits ABOVE `ms-project` (these models load and save the chapter domain model) and
-BELOW `ms-canvas` and the tabs. egui appears here ONLY as a pixel format (`ColorImage` /
-`Color32`): an `egui::Ui` or `egui::Painter` in this crate is a layer violation. The crate may
+BELOW `ms-canvas` and the tabs. egui appears here only as DATA types — pixel formats
+(`ColorImage` / `Color32`) and, in `page_view.rs`, GPU residency handles (`TextureHandle`, `Vec2`);
+an `egui::Ui` or `egui::Painter` in this crate is a layer violation. The crate may
 not name `ms-canvas`, `ms-widgets` or anything in `src/`.
 
 The three-way canvas-defaults agreement test (`canvas_defaults_agree_across_the_three_mirrors`)
@@ -111,8 +114,8 @@ it from its `[dev-dependencies]`, so no production build carries them.
     merge cannot copy a staging file the saver has not written yet, and the saver cannot re-create
     staging after the merge deleted it). Holds are **reference-counted**: each guard's `Resume`
     releases exactly one level; at zero the held snapshot returns to the normal (gate) decision. The
-    barrier itself first force-writes whatever the autosave gate was holding, then acks. A boolean hold was broken
-    by a second concurrent holder releasing someone else's. Shutdown during a hold waits for every
+    barrier itself first force-writes whatever the autosave gate was holding, then acks. (A boolean
+    hold would let a second concurrent holder release someone else's.) Shutdown during a hold waits for every
     holder, then persists the held snapshot — it must never drop it silently.
     Never call it on the GUI thread; the one exception is `shutdown_saver`, which uses it internally
     on the exit path where the drain is bounded and the process is ending anyway. Its "flushes
@@ -129,7 +132,8 @@ it from its `[dev-dependencies]`, so no production build carries them.
   - `shutdown_saver` — drain + join at exit.
 - **The discard path must not flush.** `start_exit_cleanup` pauses the saver before deleting the
   staging dir. Otherwise a write landing after the delete re-creates `_unsaved/`
-  (`write_bubbles_snapshot_to` does `create_dir_all`) and the next launch offers to restore exactly
+  (`write_bubbles_snapshot_to` goes through `ms_docstore::write`, whose default
+  `create_parent_dirs` re-creates the parent dir) and the next launch offers to restore exactly
   what the user discarded. Deletions stay eager; anti-resurrection never depends on a flush point.
 - `mark_saved_to_project` probes staging EXISTENCE rather than clearing the dirty flag outright, so
   an edit accepted while the save was running is correctly still reported as unsaved afterwards.
@@ -154,7 +158,8 @@ it from its `[dev-dependencies]`, so no production build carries them.
   pixels only for `pixels_dirty` rasters + dirty/missing text renders of pending pages (which stay
   resident) + the PS active page's raster set; bubbles hold one `Arc`; clean holds nothing extra.
 - Model revisions and dirty sets are the synchronization contract with canvas/runtime
-  subscribers; update them whenever visible shared state changes.
+  subscribers; update them whenever visible shared state changes. `LayerDoc` has no model-wide
+  revision: GPU texture caches key on the per-node pixel `generation` (`LayerNode::bump_generation`).
 - Bubble ids are the stable identity for updates. Maintain the id index whenever the stored bubble
   list changes.
 - Bubble autosave writes the latest snapshot to the unsaved staging path and must preserve
@@ -180,8 +185,7 @@ it from its `[dev-dependencies]`, so no production build carries them.
   cache first, then re-derives the `ColorImage` over the changed rects with `from_rgba_unmultiplied`
   so both representations stay byte-consistent. Region/brush construction is bounded and runs inline;
   the full-page construction path (`apply_overlay_snapshot`: clear / quick-clean / large region apply)
-  still scans+compresses synchronously on the caller's thread (parity with prior behavior; off-thread
-  is a planned Phase 2c follow-up). Because `RasterDiff` works in straight-alpha space, a synced
+  still scans+compresses synchronously on the caller's thread. Because `RasterDiff` works in straight-alpha space, a synced
   `ColorImage` pixel can differ from a directly-blitted one by at most premultiplication rounding for
   partial alpha; the save/export RGBA cache is bit-exact.
 - `detach_page_overlay` (page-manager clean management) selectively removes the page's undo/redo

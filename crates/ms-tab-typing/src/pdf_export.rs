@@ -11,7 +11,7 @@ finished pixels in the container format.
 Layer:
 A GUI-free, I/O-free leaf of the typing tab. It returns the finished document as bytes and
 never touches the filesystem — writing them out through `ms_storage` belongs to the caller,
-which also owns the background thread the whole export runs on (`AGENTS.md` §5).
+which also owns the background thread the whole export runs on (`CLAUDE.md` §5).
 
 Main responsibilities:
 - accumulate pages incrementally, so peak memory is the size of the FINISHED PDF rather than
@@ -24,7 +24,7 @@ Main responsibilities:
 
 Key structures:
 - TypingPdfBuilder — the incremental document builder.
-- PdfExportError — the typed failure set (`AGENTS.md` §7: no panics on bad input).
+- PdfExportError — the typed failure set (`CLAUDE.md` §7: no panics on bad input).
 - PageBoxPt — a validated page box in PDF points.
 
 Key functions:
@@ -74,7 +74,7 @@ const IMAGE_RESOURCE_NAME: Name<'static> = Name(b"Im0");
 /// Everything that can stop a typing-tab PDF export, with the page geometry that caused it.
 ///
 /// Every variant is a rejected INPUT: the module validates instead of panicking, because the
-/// page sizes and buffers come from the export pipeline at runtime (`AGENTS.md` §7, §11).
+/// page sizes and buffers come from the export pipeline at runtime (`CLAUDE.md` §7, §11).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PdfExportError {
     /// A page was pushed with a zero width or height; a PDF page box cannot be empty.
@@ -157,7 +157,7 @@ impl TypingPdfBuilder {
 
         let too_large = || PdfExportError::PageTooLarge { width: width_px, height: height_px };
         // Checked throughout: on wasm32 `usize` is 32 bits, so a page well below `u32::MAX` per
-        // side can still overflow the byte count (`AGENTS.md` §11).
+        // side can still overflow the byte count (`CLAUDE.md` §11).
         let width = usize::try_from(width_px).map_err(|_| too_large())?;
         let height = usize::try_from(height_px).map_err(|_| too_large())?;
         let row_rgba_len = width.checked_mul(4).ok_or_else(too_large)?;
@@ -242,7 +242,7 @@ impl TypingPdfBuilder {
 /// same image is simply placed on a physically smaller page, which a viewer zooms as usual.
 ///
 /// Truncating the box, or dropping such a page, would silently lose content, which
-/// `AGENTS.md` §14 forbids.
+/// `CLAUDE.md` §14 forbids.
 #[must_use]
 fn page_box_pt(width_px: u32, height_px: u32) -> PageBoxPt {
     // `f64::from` is lossless for every u32, and the products below stay under 2^53, so the

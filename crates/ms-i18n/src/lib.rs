@@ -14,7 +14,7 @@ Main responsibilities:
   `resolve_key` — their counterpart for keys chosen at RUNTIME rather than written
   as string literals (a GUI-free crate returns a `&'static str` catalog key it
   computed from an enum variant, and the UI resolves it). See
-  `docs/i18n_exclusions.md` §F.
+  `dev-docs/i18n_exclusions.md` §F.
 
 Type split — identity vs. plural rules:
 - `LocaleTag` is an OPEN validated string: any `<tag>.json` a user drops into the
@@ -109,7 +109,7 @@ impl PluralCount for isize {
 /// hands the UI a `&'static str` catalog key it computed from an enum variant
 /// (`ScriptGroup::name_key`, `TextLanguage::name_key`, `Conservatism::label_key`, …) and
 /// the caller resolves it here. The key/label split contract lives in
-/// `docs/i18n_exclusions.md` §F. The returned `&'static str` points into the leaked
+/// `dev-docs/i18n_exclusions.md` §F. The returned `&'static str` points into the leaked
 /// active catalog, so it is safe to paint every frame.
 #[must_use]
 pub fn resolve_key(key: &'static str) -> &'static str {

@@ -1,7 +1,9 @@
 # Module: crates/ms-settings-ui/src/tutorial
 
 ## Purpose
-Gated behind the `tutorial` cargo feature (off by default): the integration
+Gated behind the `tutorial` cargo feature (off by default; the root package's
+`tutorial` feature forwards to `ms-settings-ui/tutorial` and `ms-launcher/tutorial`,
+the only root feature forwarded to workspace crates): the integration
 points (`mod tutorial`, controller fields, `mark`/autoplay/`sync`/`render` calls,
 and the "Обучение" settings panes) are `#[cfg(feature = "tutorial")]` in their
 host surfaces, so a default build compiles the whole subsystem out. This module's

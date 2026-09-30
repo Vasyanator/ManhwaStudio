@@ -57,9 +57,9 @@ A host that needs a storage BACKDROP under the ROI (both shipped hosts do, for
 retains it until the store step. The core never asks for it, because it has no consumer for it.
 
 ### The two hosts, and what each one requires
-- `tabs/cleaning/tools/patch/`: stores into the clean overlay. Its backdrop is the ORIGINAL page,
+- `crates/ms-tab-cleaning/src/tools/patch/`: stores into the clean overlay. Its backdrop is the ORIGINAL page,
   which it must DECODE, so it owns a loader thread and issues a second region load for it.
-- `tabs/ps_editor/tools/patch.rs`: stores into the PS editor's active layer through
+- `crates/ms-tab-ps-editor/src/tools/patch.rs`: stores into the PS editor's active layer through
   `PsToolAction::WriteRegion`. Its pixels are already in memory, so it composites the ROI
   synchronously and needs no thread of its own. Being a LAYERED host, it must also answer the plane
   question the core does not ask: the region it hands over is the composite up to and INCLUDING its
@@ -86,7 +86,7 @@ the target is in NEITHER, because the renderer composites it over the stored res
 it in the solve region and it is copied into the target and then painted a second time over its own
 copy. The cleaning host satisfies this trivially (the clean overlay is the top of its two-layer
 model); the PS host names the two bounds `CompositeBound::UpTo` / `CompositeBound::Below`
-(`tabs/ps_editor/mod.rs`) so the one-index difference between them cannot be written by accident,
+(`crates/ms-tab-ps-editor/src/lib.rs`) so the one-index difference between them cannot be written by accident,
 and REFUSES a target layer that the composite would drop — a hidden or fully transparent active
 layer — instead of solving in a plane that does not contain it.
 
@@ -157,7 +157,7 @@ layer — instead of solving in a plane that does not contain it.
   already handed over: what remains of such a load is the store step's backdrop, not a pending
   answer.
 - Every heavy step — decode, composite, solve — runs off the GUI thread. `PatchHost` implementors
-  must honour that for the region load too (AGENTS.md §5). What `draw_overlay_ui` itself does is
+  must honour that for the region load too (CLAUDE.md §5). What `draw_overlay_ui` itself does is
   bounded and ROI-sized.
 - `membrane::solve_patch` refuses a contract violation instead of repairing it: a buffer-length
   mismatch, an ROI below 3x3, or a mask touching the ROI border. An EMPTY mask is a no-op, not an
@@ -182,6 +182,6 @@ layer — instead of solving in a plane that does not contain it.
 - To change the polygon rasterization rule, edit `../polygon_mask.rs` — it is shared with the
   PS-editor's selection and its sampling rule is a contract, not an implementation detail.
 - To change what the core needs from a host, edit the `PatchHost` trait; every implementor has to
-  be revisited, and today that is `src/tabs/cleaning/tools/patch/` and
-  `src/tabs/ps_editor/tools/patch.rs`.
+  be revisited, and today that is `crates/ms-tab-cleaning/src/tools/patch/` and
+  `crates/ms-tab-ps-editor/src/tools/patch.rs`.
 - To change how a patch is STORED, edit the host, never this module.

@@ -19,7 +19,7 @@ Key structures:
 
 File dialogs and the GUI thread:
 A native file dialog blocks until the user answers it, and reading or writing a graph is
-filesystem work; neither may run on the GUI thread (`AGENTS.md` §5). Both therefore live in
+filesystem work; neither may run on the GUI thread (`CLAUDE.md` §5). Both therefore live in
 `spawn_graph_save` / `spawn_graph_load` / `spawn_node_path_pick`, which return a
 `Receiver<FileTaskEvent>` that `poll_file_task` drains once per frame — the same
 dialog-off-thread shape used by the cleaning tab's watermark library window. At most one such
@@ -83,7 +83,7 @@ const SPAWN_STAGGER_WRAP_PX: f32 = 300.0;
 ///
 /// Every task answers with exactly one of these and then drops its sender. `Cancelled` is a
 /// normal outcome (the user dismissed the dialog) and leaves the graph untouched; `Failed`
-/// carries both halves required by `AGENTS.md` §7 — a translated sentence for the status bar
+/// carries both halves required by `CLAUDE.md` §7 — a translated sentence for the status bar
 /// and an untranslated, context-rich line for the runtime log.
 #[derive(Debug)]
 enum FileTaskEvent {
@@ -305,7 +305,7 @@ impl BatchProcessingWindowState {
     /// showing a spinner with Save/Load disabled.
     ///
     /// Not an error path from the user's point of view — they closed the window — so it logs
-    /// and shows nothing (`AGENTS.md` §7).
+    /// and shows nothing (`CLAUDE.md` §7).
     fn on_window_closed(&mut self) {
         if self.file_task_rx.take().is_some() {
             ms_log::runtime_log::log_info(
@@ -762,10 +762,10 @@ where
 /// Ask the user for a path with the native dialog for `kind`, blocking until they answer.
 ///
 /// Called only from inside a file-task worker — it blocks, so it must never reach the GUI
-/// thread (`AGENTS.md` §5). Returns `Ok(Some(path))` for a choice and `Ok(None)` for a
+/// thread (`CLAUDE.md` §5). Returns `Ok(Some(path))` for a choice and `Ok(None)` for a
 /// dismissed dialog; `Err` carries a ready-made failure event for a build that has no dialog at
 /// all. Those two are deliberately distinct outcomes: reporting "no dialog exists here" as a
-/// cancellation would be the silent fallback `AGENTS.md` §6 forbids. `what` and
+/// cancellation would be the silent fallback `CLAUDE.md` §6 forbids. `what` and
 /// `unsupported_message` describe the capability for that case and are unused on native.
 #[cfg(not(target_arch = "wasm32"))]
 fn pick_path(

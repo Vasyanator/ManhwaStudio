@@ -140,12 +140,18 @@ moved by the user — is not an egui construct here at all. There is exactly one
 > Declare a **tab** on the panel dock. Never write `Area` + `Frame::popup` with a hand-rolled
 > collapse arrow, and never use `egui::Window` as a panel.
 
-The dock is `src/widgets/panel_dock/` (contract: `dev-docs/dockable_panels_plan.md`, details:
-`src/widgets/panel_dock/MODULE_README.md`). Its two widgets are mandatory, not preferred:
-`PanelTab` (src/widgets/panel_dock/tab.rs:43) declares one tab, `CollapsiblePanel`
-(src/widgets/panel_dock/panel.rs:232) draws one panel. **You never construct either directly** —
+A **dialog window** is not a panel: a transient, task-scoped window the user opens for one job and
+closes again (the PS editor's layer-effects editor with Apply/Cancel; the page manager's stitch,
+split, crop and page-viewer windows) stays an `egui::Window`. `Area` remains for decorations and
+temporary surfaces the user can neither dock nor persist (toasts, tooltips, scene-anchored
+overlays, the tutorial blocker).
+
+The dock is `crates/ms-widgets/src/panel_dock/` (contract: `dev-docs/dockable_panels_plan.md`, details:
+`crates/ms-widgets/src/panel_dock/MODULE_README.md`). Its two widgets are mandatory, not preferred:
+`PanelTab` (crates/ms-widgets/src/panel_dock/tab.rs:43) declares one tab, `CollapsiblePanel`
+(crates/ms-widgets/src/panel_dock/panel.rs:232) draws one panel. **You never construct either directly** —
 the frame driver does. You call `PanelDock::begin` → `.tab(id)` … → `.end(&mut cx)`
-(src/widgets/panel_dock/mod.rs:644, :663, :718).
+(crates/ms-widgets/src/panel_dock/mod.rs:644, :663, :718).
 
 You declare **tabs, not panels.** Which panel a tab lands in, where that panel sits, whether it is
 docked to another one or torn off into its own OS window — all of that belongs to the user's saved
@@ -281,7 +287,7 @@ src/launcher/new_project/window.rs:2047 (screen capture) and :6757
 (src/launcher/new_project/batch_processing/window.rs).
 
 **Do not open a viewport for a floating panel.** A panel torn off into its own OS window is still a
-dock tab; the dock owns that window (`src/widgets/panel_dock/window.rs`), draws one
+dock tab; the dock owns that window (`crates/ms-widgets/src/panel_dock/window.rs`), draws one
 `show_viewport_immediate` per sub-window every frame, persists it, and closes it when its last panel
 leaves. Rolling your own viewport for a panel would take it out of the layout, out of persistence,
 and out of the user's «Переместить в окно →» menu. See §3.1.
@@ -365,7 +371,7 @@ app must make that call — see the next section for why the work cannot stay on
 
 ## 9. The GUI thread is sacred
 
-`README_AGENT.md` / `CLAUDE.md` §5: **the main GUI thread must never block.** Inside `fn ui` (and
+`ARCHITECTURE.md` "Key invariants" / global `CLAUDE.md` §5: **the main GUI thread must never block.** Inside `fn ui` (and
 `fn logic`) there must be no file I/O, no image decode, no network, no long computation, no blocking
 wait on a worker. Kick the work to a thread / `rayon` / async, keep a channel, poll it non-blockingly
 in `ui()`, and call `ctx.request_repaint()` (or `request_repaint_after`) so the frame that consumes
@@ -384,5 +390,5 @@ the result actually happens. The font loader above is the canonical example.
 * To change the PS-editor panel layout (top/left/right/central): `src/tabs/ps_editor/mod.rs:1698-1851`.
 * To add or change a **floating** panel of a workspace tab: declare a dock tab at that tab's call
   site (`src/tabs/typing/tab.rs:1814` is the reference) — never a new `Area`. To change docking
-  behaviour itself (gaps, shrinking, drag, sub-windows): `src/widgets/panel_dock/`, its
+  behaviour itself (gaps, shrinking, drag, sub-windows): `crates/ms-widgets/src/panel_dock/`, its
   `MODULE_README.md` first.

@@ -22,7 +22,21 @@ Layer: ABOVE `ms-onnx` (sessions), `ms-onnx-runtime` (the dylib resolver/downloa
 detector routers and the AI backend panel, which call into it. Native-only: `ms-onnx`/`ort`
 load a native shared library, so the binary gates the re-export off wasm.
 
+Selection: ONE unified ONNX selection — `General.ai_onnx_build` (build slug from
+`ms_onnx_runtime::builds`), `ai_onnx_provider` (ORT token), `ai_onnx_device_id` — is shared
+with the Python backend and resolved once per process. An unavailable accelerator falls back
+to the `cpu` build with a logged notice, never a wrong result; a load-time EP failure is an
+error the callers answer by falling back to the backend.
+
+Background pipeline: this crate owns no thread. Native load and inference run on the
+callers' workers — the OCR and text-detector workers in `ms-tab-translation` (`ocr.rs`,
+`text_detector.rs`, the latter also reached from Cleaning mask generation) — while the AI
+backend panel in `ms-settings-ui` reads status and resets the load latch.
+
 ## Contracts and invariants
+- The SIGILL-guard scope key is `{build}:{provider}[:{device}]@{version}`
+  (`native_load_scope_key`), so a crashed scope never blocks a different
+  build/provider/adapter.
 - Every dylib load is bracketed by the crash guard in `ms_config::ort_load_guard`
   (`mark_ort_load_attempted` before, `mark_ort_load_succeeded` after the first successful
   inference, `reset_ort_load_guard` on a graceful failure). That guard is what makes an

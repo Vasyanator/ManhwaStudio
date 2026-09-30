@@ -274,7 +274,7 @@ impl NodeDefs {
             }
             // Variable-node sockets are rebuilt here with the referenced variable's data type.
             // Their NAMES are the same fixed identifiers used everywhere else
-            // (`"Вход"`/`"Далее"`/`"Значение"`, see `docs/i18n_exclusions.md` §A2), so they
+            // (`"Вход"`/`"Далее"`/`"Значение"`, see `dev-docs/i18n_exclusions.md` §A2), so they
             // reuse the shared `launcher.batch.socket.*` label keys — only the data type is
             // dynamic, not the label. (Genuinely user-authored socket names exist only for
             // `string_template` placeholders, which carry no key and paint verbatim.)

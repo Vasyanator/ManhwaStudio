@@ -139,7 +139,7 @@ enum MatchKind {
 /// `title`, `description`, and `recommendation` hold i18n catalog KEYS (not the text),
 /// because `t!` is not `const` and this table is a `static`. They are resolved to the
 /// active-locale label in `classify` via [`resolve_key`]. This mirrors the
-/// `(wire_code, display_key)` pattern in `tabs/translation/panels/ocr_langs.rs`.
+/// `(wire_code, display_key)` pattern in `crates/ms-tab-translation/src/panels/ocr_langs.rs`.
 struct CuratedEntry {
     kind: MatchKind,
     /// Lowercased lookup key.

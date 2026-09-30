@@ -2,9 +2,9 @@
 File: crates/ms-text-render/src/lib.rs
 
 Purpose:
-Каркас нового рендера вкладки typing (крейт `ms-text-render`, GUI-free).
-Приложение подключает его как `crate::tabs::typing::render_next`
-(`pub use ms_text_render as render_next;` в `src/tabs/typing/mod.rs`).
+Crate root of the typing tab's text renderer (crate `ms-text-render`, GUI-free).
+`ms-tab-typing` re-exports it as `render_next`
+(`pub use ms_text_render as render_next;` in `crates/ms-tab-typing/src/lib.rs`).
 
 Main responsibilities:
 - публиковать совместимый внешний контракт через `types.rs`;

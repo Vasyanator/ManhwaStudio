@@ -156,7 +156,7 @@ pub struct PatchCommit<'a> {
 ///
 /// The core knows its host through this trait ONLY. Three groups: the geometry the on-canvas
 /// gesture is projected with, the region load (which must not decode on the GUI thread — see
-/// AGENTS.md §5), and the commit. Nothing here mentions a canvas, a project, an overlay or an
+/// CLAUDE.md §5), and the commit. Nothing here mentions a canvas, a project, an overlay or an
 /// undo stack: which of those a patch lands in is exactly what the trait exists to abstract.
 pub trait PatchHost {
     /// The page's size in SOURCE pixels, or `None` while the page is not laid out this frame.
@@ -384,7 +384,7 @@ impl std::fmt::Display for PatchBuffer {
 /// None of these is recoverable by guessing. Substituting a value for a buffer whose size cannot
 /// be explained would commit that guess over the user's work — an all-transparent stand-in for
 /// the stored chunk erases every pre-existing pixel of the ROI — so every one of them is REFUSED
-/// and reported instead (AGENTS.md §14).
+/// and reported instead (CLAUDE.md §14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PatchInputError {
     /// The ROI has no pixels at all, so nothing can be solved or written.

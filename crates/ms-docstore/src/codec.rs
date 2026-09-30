@@ -344,7 +344,7 @@ pub(crate) fn remove_format(doc: &DocRef, format: DocFormat) -> Result<()> {
     Ok(())
 }
 
-/// Structured log line for a failed document write (AGENTS.md §7/§8); only I/O-class
+/// Structured log line for a failed document write (CLAUDE.md §7/§8); only I/O-class
 /// failures are logged, the rest are the caller's to report. `DirSync` is NOT
 /// logged here: the new file is in place, and only the caller knows whether an undurable
 /// directory entry matters (it logs that case once, at the severity it chooses).

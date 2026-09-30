@@ -6,13 +6,13 @@ Bundled font chain for the application's own user interface — every window the
 
 This is NOT the user's typesetting font library. Chapter text rendered onto pages uses the
 fonts of the typing tab (`fonts/` next to a project / title, loaded by
-`src/tabs/typing/fonts.rs`), and the whole `fonts/ui` subtree stays out of that scan
+`crates/ms-tab-typing/src/panel/fonts.rs`), and the whole `fonts/ui` subtree stays out of that scan
 (`fonts::should_skip_font_dir`).
 
 ONE exception, and it is a single list entry, not a folder: the typing font combo offers
 the stack as a whole under the name «Встроенный шрифт интерфейса». That entry points at
 `core/00-NotoSans-Regular.ttf` as its selected face and gets the rest of the chain from the
-renderer's `common_fallback` (`src/tabs/typing/panel/MODULE_README.md`, "Built-in interface
+renderer's `common_fallback` (`crates/ms-tab-typing/src/panel/MODULE_README.md`, "Built-in interface
 font"). The files themselves are still never listed individually.
 
 ## Architecture
@@ -24,14 +24,14 @@ There are exactly four readers, and they consume the same manifest for different
 
 - `crates/ms-fonts` — the OWNER. Resolves the directory, sorts the files by their `NN-`
   prefix, reads the family names out of each `name` table and hands out `'static` bytes.
-- `src/ui_fonts.rs` — the egui UI. Runs on a worker thread and registers each file with
+- `crates/ms-widgets/src/ui_fonts.rs` — the egui UI. Runs on a worker thread and registers each file with
   `egui::Context::add_font` (as `FontData::from_static` over the shared bytes). It is also
   the only reader that honours a title-local `fonts/ui` override.
-- `crates/ms-text-render/src/font_base.rs` — the text RENDERER (phase 4 of
+- `crates/ms-text-render/src/font_base.rs` — the text RENDERER (design:
   `dev-docs/unicode_base_font_plan.md`). Turns the same manifest into the renderer's own
   `fontdb::Database` plus the deterministic `MsFallback` chain, and never uses the
   operating system's fonts. It ignores the title override on purpose (decision 2).
-- `src/tabs/typing/panel/{fonts,font_provider}.rs` — the typing panel (phase 5). Reads only
+- `crates/ms-tab-typing/src/panel/{fonts,font_provider}.rs` — the typing panel. Reads only
   `core[0]` (its path for the list entry, its `ms_fonts::bytes` for the renderer) to offer
   the stack as the selectable "built-in interface font". It uses the process manifest, not
   the title override, for the same reason the renderer does.
@@ -85,7 +85,7 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
   a repeated `add_font` with the same name is a no-op (egui-0.36.2/src/context.rs:2133-2144) —
   i.e. a second copy of ~19 MB of font bytes. That is not worth paying: inside `Monospace` the
   core faces overlap on only a handful of geometric symbols (■ ○ ● ◊), so the difference is
-  cosmetic. The order is pinned by a unit test in `src/ui_fonts.rs`; change it deliberately or
+  cosmetic. The order is pinned by a unit test in `crates/ms-widgets/src/ui_fonts.rs`; change it deliberately or
   not at all.
 - **A `fonts/ui` candidate must actually contain USABLE core fonts to win.** A candidate that
   yields no core font (`core/`, or the legacy flat layout) is skipped and logged, so an
@@ -96,7 +96,7 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
   and a file that fails is dropped with a logged reason instead of taking the studio down.
   The probe order is split by owner: the process manifest (`ms-fonts`) probes the working
   directory and then the executable directory, while a title-local `fonts/ui` is probed
-  first and ONLY by `src/ui_fonts.rs`. That override therefore restyles the UI but never
+  first and ONLY by `crates/ms-widgets/src/ui_fonts.rs`. That override therefore restyles the UI but never
   the render — a project must not be able to change how a finished render looks
   (`dev-docs/unicode_base_font_plan.md`, decision 2). An override supplies its own tiers
   only; a tier it does not ship stays empty rather than being mixed with the bundled one.
@@ -127,7 +127,7 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
 - To change which faces the whole UI is drawn with: edit `core/` (and `bold/` for the bold
   weight), keeping the numbering consistent.
 - To change WHEN a folder is loaded into the UI, the egui family names, or the on-demand
-  rule for `ext/`: `src/ui_fonts.rs`.
+  rule for `ext/`: `crates/ms-widgets/src/ui_fonts.rs`.
 - To change how these files back a RENDER (which tier is resident, the script -> font
   chains, the forbidden list): `crates/ms-text-render/src/font_base.rs`.
 - To change which directory is the stack, the `NN-` ordering rule, or how the bytes are

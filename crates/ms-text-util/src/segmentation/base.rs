@@ -73,7 +73,7 @@ impl Conservatism {
     /// Catalog key for this category's short UI label (painted as `+ {label}`). This
     /// crate is GUI-free and must not depend on the UI-string catalog, so it returns
     /// the key; the binary resolves it via `ms_i18n::lookup(key).unwrap_or(key)` (see
-    /// `docs/i18n_exclusions.md` §F). Total: every variant maps to a non-empty, unique
+    /// `dev-docs/i18n_exclusions.md` §F). Total: every variant maps to a non-empty, unique
     /// key.
     #[must_use]
     pub fn label_key(self) -> &'static str {

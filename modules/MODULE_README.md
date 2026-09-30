@@ -20,7 +20,10 @@ Python modules may use local browser profiles, Selenium, CloakBrowser/Playwright
 - `browser_f.py`: Selenium browser/profile construction and cookie/header transfer helpers.
 - `ai_device.py`: PyTorch/ONNX device selection helpers used by backend services.
 - `lama_mpe.py` / `ffc.py`: LaMa MPE inpainting runtime used by the backend.
-- `ai_backend/`: Python AI service runtime called by the Rust application.
+- `ai_backend/`: Python AI service runtime called by the Rust application over framed IPC
+  (`ms-backend-ipc`; dotted method names such as `ocr.manga`, `inpaint.lama_v2`, indexed in
+  `crates/ms-backend-ipc/src/protocol.rs`), with the service domains `ocr`, `detection`,
+  `inpaint`, `reline`, `translate`, `watermark` and `browser`. See `ai_backend/MODULE_README.md`.
 
 ## Contracts and invariants
 

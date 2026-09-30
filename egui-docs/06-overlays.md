@@ -58,7 +58,7 @@ panel rects from it, or by leaving it alone — never by reshuffling the creatio
 **Scope, before you reach for it:** `Area` is for decoration and transient surfaces the user cannot
 dock, resize, or persist — toasts, tooltips, scene-anchored overlays, the tutorial blocker. It is
 **not** how a floating panel is made in this project: a panel with a title strip, a collapse arrow
-and a remembered position is a tab of the panel dock (`src/widgets/panel_dock/`, mandatory — see
+and a remembered position is a tab of the panel dock (`crates/ms-widgets/src/panel_dock/`, mandatory — see
 `01-app-shell.md` §3.1 and `04-widgets.md` §0.1). The dock itself uses `Area` under the hood; your
 call site does not.
 
@@ -171,7 +171,7 @@ Correct pattern — always go through the `Response` produced by `allocate_rect`
 from egui's occlusion-aware frame hit-test:
 
 ```rust
-// src/widgets/wheel_slider.rs:368-376
+// crates/ms-widgets/src/wheel_slider.rs:368-376
 fn pointer_over_response_rect(response: &Response) -> bool {
     // Respect element overlap (z-order): rely only on egui's occlusion-aware
     // hit-test. `contains_pointer()` is derived from the frame hit-test, which
@@ -251,7 +251,7 @@ Tabs paint on top of the page image through the `CanvasHooks` trait
 * To change the tutorial overlay (dim, spotlight, blocker, callout, arrow): `src/tutorial/engine.rs`
   (contract in its header, engine.rs:1-47; module notes in `src/tutorial/MODULE_README.md`).
 * To change "did the click land on bare canvas vs. floating UI": `src/input_util.rs`.
-* To change hover/wheel occlusion behavior of a custom widget: `src/widgets/wheel_slider.rs` is the
+* To change hover/wheel occlusion behavior of a custom widget: `crates/ms-widgets/src/wheel_slider.rs` is the
   worked example of the correct `Response`-based pattern.
 * To change what tabs paint over the page: the `CanvasHooks` impls in `src/tabs/*/`, dispatched from
   `src/canvas/scene.rs`; see `src/canvas/MODULE_README.md`.

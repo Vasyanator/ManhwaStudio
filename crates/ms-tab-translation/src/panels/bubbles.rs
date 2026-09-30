@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/panels/bubbles.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/panels/bubbles.rs
 Translation tab panel with searchable/editable bubble cards and debounced text/footer syncing.
 
 Main types:

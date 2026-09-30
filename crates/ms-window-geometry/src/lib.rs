@@ -48,7 +48,7 @@ UNITS. Everything persisted here is in *logical pixels*: physical pixels divided
 monitor's DPI scale factor, independent of the egui zoom factor (`General.ui_scale_percent`).
 That is exactly what `ViewportBuilder::with_position` / `with_inner_size` consume, because
 egui-winit turns them into `LogicalPosition`/`LogicalSize` multiplied by
-`Context::zoom_factor()` (`egui-winit-0.35.0/src/lib.rs:2063-2087`) and the builder is
+`Context::zoom_factor()` (`egui-winit-0.36.2/src/lib.rs:2111-2135`) and the builder is
 consumed while the context is still at zoom 1.0 — the `run_native` creator closure that
 applies the UI scale runs only after the window has been created. At runtime the same numbers
 are recovered from `ViewportInfo` (reported in points = physical / (zoom * scale)) by
@@ -56,13 +56,12 @@ multiplying by `Context::zoom_factor()`. `MonitorKey` is the one exception: it s
 winit reports, i.e. PHYSICAL pixels, plus the scale needed to convert it.
 
 WAYLAND. The compositor owns window placement there: `with_position` is ignored and
-`ViewportInfo::outer_rect` is always `None` (`egui-0.35.0/src/data/input/viewport_info.rs:52-66`).
+`ViewportInfo::outer_rect` is always `None` (`egui-0.36.2/src/data/input/viewport_info.rs:52-66`).
 This module detects that (no outer rect / `Window::outer_position()` errors), persists no
 geometry, never relocates, and says so in the settings UI instead of pretending to work.
 
 Native-only: winit windows and OS monitors do not exist in the web build. The binary
-re-exports this crate as `crate::window_geometry` from its `cfg(not(wasm32))` block, so
-every `crate::window_geometry::…` call site keeps working unchanged.
+re-exports this crate as `crate::window_geometry` from its `cfg(not(wasm32))` block.
 */
 
 #![warn(clippy::all)]

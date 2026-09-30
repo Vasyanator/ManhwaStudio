@@ -19,7 +19,7 @@ Notes:
 - A malformed `characters.json` is reported and left untouched, also by later saves
   (`load_error` blocks them; `save_entries_in` refuses a malformed existing document); the
   legacy `*.txt` migration runs only when the document is absent.
-- Roster load/save still run on the GUI thread (pre-existing AGENTS.md §5 gap); portraits
+- Roster load/save still run on the GUI thread (pre-existing CLAUDE.md §5 gap); portraits
   and clipboard work are worker-driven.
 */
 

@@ -13,7 +13,7 @@ Key structures:
   everything uses.
 
 Notes:
-`key()` and `title()` are deliberately split (see `docs/i18n_exclusions.md` B1):
+`key()` and `title()` are deliberately split (see `dev-docs/i18n_exclusions.md` B1):
 `key()` is the byte-stable English identifier used for persistence and must never
 change with the UI language, while `title()` is a localized label for display only.
 Both live next to the enum: an inherent `impl` may only be written in the crate that

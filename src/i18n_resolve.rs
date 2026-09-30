@@ -15,7 +15,7 @@ Key items:
 
 Notes:
 This mirrors the `SocketSpec::display_label` / `reline_models::resolve_key`
-pattern. The key/label split contract lives in `docs/i18n_exclusions.md` §F: a
+pattern. The key/label split contract lives in `dev-docs/i18n_exclusions.md` §F: a
 GUI-free crate never carries localized text, but any label it hands the UI is a
 catalog key resolved here.
 */

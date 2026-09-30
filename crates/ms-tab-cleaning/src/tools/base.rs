@@ -62,7 +62,7 @@ FILE HEADER (cleaning/tools/base.rs)
     `draw_cursor` is that with white. A tool tints the cursor when a drag is about to do
     something other than open the region editor.
   - `build_composited_region_image` режет базовую страницу и композитит overlay.
-- Shared `pub(super)` free functions (English, per AGENTS.md §3). The whole `tools` subtree reuses
+- Shared `pub(super)` free functions (English, per CLAUDE.md §3). The whole `tools` subtree reuses
   them and a copy of any of them in a tool is a defect:
   - coordinates: `capture_overlay_chunk`, `extract_overlay_chunk`, `overlay_rect_to_scene_rect`,
     `scene_pointer_to_image_px`, `scene_pos_to_source_xy`, and the fractional point pair

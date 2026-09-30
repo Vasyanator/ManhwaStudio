@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/wiki.rs
+FILE OVERVIEW: crates/ms-tabs-simple/src/wiki.rs
 Wiki tab for rendering local Markdown docs from `wiki/<lang>/` with file tabs and
 an async image pipeline.
 

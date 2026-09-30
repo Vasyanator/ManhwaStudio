@@ -47,7 +47,7 @@ Why no worker thread for the region load: the cleaning host needs one because it
 disk. Here the pixels are already in memory in the `LayerStack`, so the composite is a bounded
 ROI-sized buffer walk on the GUI thread. The ROI is the user's selection box plus the drag offset,
 padded — small relative to the membrane solve, which IS off-thread (the core owns that worker), so
-`AGENTS.md` §5 is honoured. A selection large enough to make this composite visible would already
+`CLAUDE.md` §5 is honoured. A selection large enough to make this composite visible would already
 have made the solve unusable.
 */
 
@@ -87,7 +87,7 @@ const MAX_PLACEMENT_PX: f32 = 1.0e9;
 /// Every variant is a REFUSAL, never a fallback: the patch works in PAGE pixels while
 /// `ToolRegionWrite` geometry is LAYER-local, so the two spaces must coincide up to a whole-pixel
 /// translation. Clamping or reprojecting instead would silently drop part of the patch or land it
-/// on the wrong pixels (`AGENTS.md` §6).
+/// on the wrong pixels (`CLAUDE.md` §6).
 ///
 /// `Eq` is deliberately absent: `Transformed` carries the raw `f32` transform values for the log,
 /// so only `PartialEq` is meaningful. The tests compare variants, which is all `PartialEq` needs.
@@ -237,7 +237,7 @@ fn axis_aligned_origin(layer: &Layer) -> Option<[i64; 2]> {
         }
         // `rounded` is an integral `f32` whose magnitude is at most `MAX_PLACEMENT_PX` (1e9), far
         // inside `i64`'s range and inside the range where `f32` represents integers exactly, so the
-        // conversion is lossless (`AGENTS.md` §17's proven-safe exception).
+        // conversion is lossless (`CLAUDE.md` §17's proven-safe exception).
         *out = rounded as i64;
     }
     Some(origin)
@@ -269,7 +269,7 @@ fn patch_target_for(stack: &LayerStack) -> Result<PatchTarget, PatchRefusal> {
     // The SAME predicate `visible_layers_bottom_to_top` filters on, so "the active layer is in the
     // solve plane" is checked rather than assumed: the patch samples the plane the target layer is
     // part of, and a target the composite drops would be solved against pixels that do not contain
-    // it and then written where the user cannot see the result (`AGENTS.md` §6).
+    // it and then written where the user cannot see the result (`CLAUDE.md` §6).
     if !stack.layer_visible(layer) || stack.layer_opacity(layer) <= 0.0 {
         return Err(PatchRefusal::InvisibleLayer);
     }
@@ -399,7 +399,7 @@ impl HostState {
     ///
     /// Reachable only through [`PsTool::reset`] — a tool, page or gesture abandonment in the ONE
     /// frame between `commit_patch` and the `interact` that would have built the write. Silence
-    /// there would lose a finished patch with no trace (`AGENTS.md` §6), so it is reported even
+    /// there would lose a finished patch with no trace (`CLAUDE.md` §6), so it is reported even
     /// though the window is a single frame.
     fn drop_parked_commit(&mut self, reason: &dyn std::fmt::Display) {
         if let Some(commit) = self.pending_commit.take() {
@@ -652,7 +652,7 @@ impl PatchTool {
     /// the active layer, not on a flattened view.
     ///
     /// Runs on the GUI thread by design — see this file's header for why that is bounded work and
-    /// why `AGENTS.md` §5 is still honoured.
+    /// why `CLAUDE.md` §5 is still honoured.
     fn service_pending_region(&mut self, stack: &LayerStack) {
         let Some(request) = self.host.pending_region.take() else {
             return;
@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     /// An ROI that leaves an "incomplete" layer is REFUSED, never clipped: a clipped commit would
-    /// drop part of the patch with nothing said (`AGENTS.md` §6).
+    /// drop part of the patch with nothing said (`CLAUDE.md` §6).
     #[test]
     fn an_roi_outside_the_layer_footprint_is_refused() {
         let mut stack = stack_with([32, 32], Color32::WHITE, Color32::TRANSPARENT);

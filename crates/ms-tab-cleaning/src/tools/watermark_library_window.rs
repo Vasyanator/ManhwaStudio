@@ -2542,7 +2542,7 @@ struct VerdictLine {
 /// `verdict_deposit_exact` both say so literally — and that has to be testable without a
 /// `Ui`.
 ///
-/// The match over `ModelConditioning` is EXHAUSTIVE by design (AGENTS.md §17): every known
+/// The match over `ModelConditioning` is EXHAUSTIVE by design (CLAUDE.md §17): every known
 /// verdict gets an arm of its own, because reporting a known one through the unknown-verdict
 /// fallback tells the user their build is out of date about an answer the build already has —
 /// the chapter mode renders the same five verdicts correctly, and the two may not disagree.

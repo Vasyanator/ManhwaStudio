@@ -67,7 +67,7 @@ otherwise hits the public `UiBuilder.id_source` **field** at `ui_builder.rs:20` 
 
 ## 2. THE RULE: localized label ⇒ mandatory `id_salt`
 
-The rule (`README_AGENT.md:532-534`): **when the label of a `ComboBox::from_label` /
+The rule (`PROJECT_RULES.md`, "Localization (i18n)"): **when the label of a `ComboBox::from_label` /
 `WheelComboBox::from_label` / `Window::new` / `CollapsingHeader::new` /
 `ui.collapsing` widget is a translated string, you MUST pin a stable `id_salt`.** egui hashes
 the label *text* into the `Id`, so the id changes with the UI language — and everything egui
@@ -104,26 +104,26 @@ parameter — its id is the text. Wrap it: `ui.push_id("stable_key", |ui| ui.col
 
 ## 3. The other mandatory i18n rule: no literal user-visible strings
 
-`README_AGENT.md:508-513` states it as an absolute: **no user-visible text may be written as a
+`PROJECT_RULES.md` ("Localization (i18n)") states it as an absolute: **no user-visible text may be written as a
 literal in `.rs`.** Every such string is added to the catalog as a KEY and read back through
 `t!` / `tf!` / `tp!`.
 
 - Macros: `t!` (`crates/ms-i18n/src/lib.rs:106`), `tf!` (formatted, `:119`), `tp!` (plural,
   `:136`).
-- Catalogs: `crates/ms-i18n/locales/{en,ru,es,fr,pt}.json`. A new key must land in **all** of
-  them at once — `en` is the reference/fallback and a missing key fails the `key_validation`
-  test (`README_AGENT.md:515-518`).
+- Catalogs: `crates/ms-i18n/locales/{en,ru,es,fr,pt}.json`. A new key must land in `en.json`
+  AND `ru.json` at once — `en` is the reference/fallback and a used key missing from it fails the
+  `key_validation` test; `es` / `fr` / `pt` are translated separately and fall back to `en`.
 - Key shape: `<area>.<screen_or_module>.<meaning>` with a role suffix (`_label`, `_hint`,
-  `_button`, `_title`, `_error`, `_tooltip`, `_status`) (`README_AGENT.md:523-525`).
+  `_button`, `_title`, `_error`, `_tooltip`, `_status`).
 - Exceptions (logs, protocol identifiers, persistence keys, on-disk names, probes) are listed
-  in `docs/i18n_exclusions.md` (`README_AGENT.md:527-530`). **An `id_salt` is one of these
+  in `dev-docs/i18n_exclusions.md`. **An `id_salt` is one of these
   exclusions**: it is a persistence key, not a caption — keep it a literal.
 
 Idiom:
 
 ```rust
 ui.label(t!("settings.general.projects_dir_label"));          // src/general_settings_panel.rs:188
-let btn = ui.button(t!("widgets.seed_spin_box.random"));      // src/widgets/seed_spin_box.rs:50
+let btn = ui.button(t!("widgets.seed_spin_box.random"));      // crates/ms-widgets/src/seed_spin_box.rs:50
 ```
 
 ## 4. Per-widget state: where it lives, and how ids collide
@@ -138,7 +138,7 @@ let btn = ui.button(t!("widgets.seed_spin_box.random"));      // src/widgets/see
 
 Worked example in this repo: the wheel guard is a deliberate **global** temp slot,
 `Id::new("wheel_input_open_combo_popup_guard")` written with `data_mut(insert_temp)` and read
-with `data(get_temp)` (`src/widgets/wheel_input_guard.rs:21-70`).
+with `data(get_temp)` (`crates/ms-widgets/src/wheel_input_guard.rs:21-70`).
 
 **The collision failure mode.** Two widgets that resolve to the same `Id` share one state
 slot: one steals the other's open/closed flag, scroll offset, or text cursor; focus ping-pongs
@@ -170,6 +170,6 @@ this app opens child viewports.
   `.id_salt("<the same key>")` in the same edit.
 - To add a widget inside a loop: `ui.push_id(index, |ui| …)`.
 - To store per-widget state: `ui.make_persistent_id(...)` + `ctx.data_mut(...)`; global,
-  frame-scoped signals follow `src/widgets/wheel_input_guard.rs`.
+  frame-scoped signals follow `crates/ms-widgets/src/wheel_input_guard.rs`.
 - To debug a state-loss-on-language-switch bug: grep the widget's construction for
   `from_label` / `Window::new` / `collapsing` without a neighbouring `id_salt` / `.id(`.

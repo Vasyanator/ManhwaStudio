@@ -212,7 +212,7 @@ pub enum PsToolAction {
     /// Raised today by `patch::PatchTool`, which solves its membrane off-thread and can therefore
     /// reach neither the undo stack nor the shared models from where the answer arrives. Add a
     /// second variant only together with the tool that raises it and the tab arm that performs it
-    /// (`AGENTS.md` §14).
+    /// (`CLAUDE.md` §14).
     WriteRegion(ToolRegionWrite),
 }
 
@@ -448,7 +448,7 @@ pub trait PsTool {
     /// Consumes finished results from the tool's OWN worker channels; called once per frame for
     /// EVERY tool, active or not, from `PsEditorTabState::poll_tools` (`../mod.rs`).
     ///
-    /// The GUI thread must never block (`AGENTS.md` §5), so a tool that computes anything
+    /// The GUI thread must never block (`CLAUDE.md` §5), so a tool that computes anything
     /// expensive owns a `Sender`/`Receiver` pair and drains it here with `try_recv` — never inside
     /// `interact`, which runs under the canvas input gate and is skipped on a pan frame.
     ///

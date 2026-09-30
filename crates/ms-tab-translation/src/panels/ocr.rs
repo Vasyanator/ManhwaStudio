@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/panels/ocr.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/panels/ocr.rs
 UI for Translation panel "Распознавание текста".
 
 Main types:

@@ -1428,7 +1428,7 @@ fn draw_custom_kerning_editor_body(
 /// frame (the caller uses that to drop a stale validation message).
 ///
 /// `id_salt` is a persistence key, never a caption, so it stays a literal
-/// (`docs/i18n_exclusions.md`). `char_limit(1)` keeps typing to one character; a paste is
+/// (`dev-docs/i18n_exclusions.md`). `char_limit(1)` keeps typing to one character; a paste is
 /// still clamped by the caller, which is the only place that sees the final buffer.
 fn draw_single_char_field(ui: &mut egui::Ui, label: &str, id_salt: &str, buf: &mut String) -> bool {
     ui.vertical(|ui| {
@@ -1453,7 +1453,7 @@ fn draw_single_char_field(ui: &mut egui::Ui, label: &str, id_salt: &str, buf: &m
 /// `CUSTOM_KERNING_CONTEXT_CHAR_LIMIT`.
 ///
 /// `id_salt` is a persistence key, never a caption, so it stays a literal
-/// (`docs/i18n_exclusions.md`). Nothing is reported back because nothing depends on the field
+/// (`dev-docs/i18n_exclusions.md`). Nothing is reported back because nothing depends on the field
 /// changing: the content is preview-only, so it neither validates nor invalidates anything.
 fn draw_context_field(ui: &mut egui::Ui, label: &str, id_salt: &str, buf: &mut String) {
     ui.vertical(|ui| {

@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/panels/machine_translation.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/panels/machine_translation.rs
 UI panel for machine translation options in Translation tab.
 
 Main items:

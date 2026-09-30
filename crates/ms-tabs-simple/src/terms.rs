@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/terms.rs
+FILE OVERVIEW: crates/ms-tabs-simple/src/terms.rs
 Terms tab state and CRUD UI for project-scoped `terms.json`.
 
 Main items:
@@ -9,7 +9,7 @@ Main items:
 
 Storage behavior:
 - Reads/writes `project.paths.terms_file` ONLY through `ms_docstore` (`read` / atomic
-  `write`); load/save still run on the GUI thread (pre-existing AGENTS.md §5 gap), so saves
+  `write`); load/save still run on the GUI thread (pre-existing CLAUDE.md §5 gap), so saves
   are not fsynced (`Durability::None`). After a failed load every save is refused
   (`load_error`), and a save never replaces a malformed existing document.
 - Supports legacy `tags` wire format as string or string array.

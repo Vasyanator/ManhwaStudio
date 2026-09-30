@@ -333,7 +333,7 @@ fn git_describe_info(manifest: &Path) -> Option<(String, u32)> {
 /// untracked). The scope is those two directory trees ENTIRELY, documentation included:
 /// `src/MODULE_README.md` and the per-module readmes live inside `src/`, so editing one
 /// marks the build dirty. Everything outside the two trees — `wiki/`, `dev-docs/`,
-/// `user_config.json`, logs, `README_AGENT.md` — does not. Any git failure reads as
+/// `user_config.json`, logs, `ARCHITECTURE.md` — does not. Any git failure reads as
 /// "clean".
 fn git_source_tree_is_dirty(manifest: &Path) -> bool {
     run_git(manifest, &["status", "--porcelain", "--", "src", "crates"])

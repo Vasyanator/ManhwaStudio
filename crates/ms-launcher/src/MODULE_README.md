@@ -4,7 +4,8 @@
 Rust launcher runtime shown before a chapter is opened.
 
 ## Architecture
-`mod.rs` owns the native launcher entry points and returns a typed outcome to `main.rs`.
+`lib.rs` (crate root) owns the native launcher entry points (`run_launcher`, `run_test_launcher`)
+and returns a typed outcome to `main.rs`.
 `app.rs` owns the root `eframe::App`, background image workers, detached child windows, and
 page navigation. Page modules render focused launcher workflows and report actions through
 `PageNavAction`.
@@ -14,7 +15,7 @@ The launcher does not perform blocking I/O on the GUI thread. Startup update che
 notification.
 
 ## Files and submodules
-- `mod.rs`: launcher window setup, app metadata, and public run functions.
+- `lib.rs`: crate root; launcher window setup, app metadata, and public run functions.
 - `app.rs`: root app state, worker polling, page routing, detached viewport handling.
 - `main_page.rs`: central menu, update notification overlay, AI install-type notices, and the
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
@@ -26,8 +27,9 @@ notification.
   `pub(crate)` scan/install/persist helpers; blocks input with the tutorial-engine
   overlay pattern. Edit here to change the modal's detection, preselection, or layout.
 - `pages/`: fullscreen launcher pages for open/import/export/settings flows.
-- `new_project/`: detached new-project workflow. Its ribbon/crop previews are drawn through
-  the `egui-large-image` crate (tiled, budgeted uploads; see `new_project/MODULE_README.md`).
+- `new_project/`: detached new-project workflow. Its ribbon and crop-editor previews are drawn
+  only through `new_project/ribbon.rs` over the `egui-large-image` crate (tiled, budgeted uploads;
+  see `new_project/MODULE_README.md`).
 - `psd_import_window.rs`: detached PSD/PSB import workflow. Both formats take the same path:
   `ag-psd` tells them apart by the version field in the file header, and the accepted
   extensions live in one place (`is_supported_document_ext`). Plain raster files
@@ -89,7 +91,7 @@ the child windows. See `crates/ms-settings-ui/src/tutorial/MODULE_README.md` for
   the cwd or the exe dir and falls back to the cwd, so the whole config tree — including
   `General.first_run_languages_confirmed` — is created inside that scratch dir and the real
   installation is untouched.
-- To change launcher startup or return values, edit `mod.rs` and `state.rs`.
+- To change launcher startup or return values, edit `lib.rs` and `state.rs`.
 - To change root polling, page routing, or window lifecycle, edit `app.rs`.
 - To change the main menu or update notice, edit `main_page.rs`.
 - To change a specific page workflow, edit `pages/`.

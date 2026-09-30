@@ -73,7 +73,7 @@ impl BrightnessContrastParams {
 /// Which correction the «Настройка» section is currently showing.
 ///
 /// A project-owned enum: every `match` on it is exhaustive, so a new correction added later cannot
-/// be forgotten at any of its sites (`AGENTS.md` §17).
+/// be forgotten at any of its sites (`CLAUDE.md` §17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CorrectionKind {
     /// No correction: the canvas is shown exactly as it is composited.

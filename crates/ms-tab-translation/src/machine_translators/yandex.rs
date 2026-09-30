@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/machine_translators/yandex.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/machine_translators/yandex.rs
 Yandex Translate backend implementation adapted from translatepy behavior.
 
 Main items:

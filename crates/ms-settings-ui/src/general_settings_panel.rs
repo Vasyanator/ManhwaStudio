@@ -14,8 +14,8 @@ caller must apply (there is no app-global channel here, unlike `ai_backend_panel
 
 Persistence is SYNCHRONOUS and goes through `ms_config::update_user_config_file`, the
 serialized user-config read-modify-write, so a write never clobbers the ONNX Runtime
-SIGILL load-guard marker or another writer's keys (see `README_AGENT`'s user_config
-write-lock invariant).
+SIGILL load-guard marker or another writer's keys (see the user_config write-lock
+invariant in `ARCHITECTURE.md`, "Config", and `crates/ms-config/src/MODULE_README.md`).
 
 The UI-language selector lists the locales found in the on-disk `locale/` folder
 (scanned ONCE at construction — never per frame; see CLAUDE.md §5), each shown by

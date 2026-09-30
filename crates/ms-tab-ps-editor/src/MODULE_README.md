@@ -72,8 +72,8 @@ now on disk, so a later flush treats the raster as clean and preserves a non-des
 the typing tab may have added in between — leaving the flag set would re-run the dirty path, rewrite
 the base, and silently drop those effects.
 
-ASYNC PERSISTENCE: layer writes are now OFF-THREAD via the doc's background saver (`models/layer_model/
-saver.rs`). The per-edit `route_to_doc` flush calls `doc.enqueue_page_save`; text edits call
+ASYNC PERSISTENCE: layer writes are OFF-THREAD via the doc's background saver
+(`crates/ms-models/src/layer_model/saver.rs`). The per-edit `route_to_doc` flush calls `doc.enqueue_page_save`; text edits call
 `doc.enqueue_page_text_save`; the effects poll (`apply_ps_raster_effects_result`) calls
 `doc.enqueue_raster_effects`. `persist_current_page` stays NON-redundant: it reads the PS `self.stack`
 (not the doc) and carries the EXPLICIT `removed_uids` from `self.deleted_raster_uids` (the doc's
@@ -87,8 +87,7 @@ enqueued (set on a deferred `edit_doc_node`, cleared on any enqueue/flush); the 
 `flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). Base layers
 are never part of the LAYER persistence (`persist_current_page` filters to `LayerKind::Raster`);
 they project `src/` and `clean_layers/`, and a `Клин` edit is persisted by the shared clean-overlay
-model's own autosave / save-to-project path instead. See `models/layer_model/` for the on-disk schema and the unified
-layer-model roadmap (groups, text layers, effects, typing-tab sync).
+model's own autosave / save-to-project path instead. See `crates/ms-models/src/layer_model/` for the on-disk schema.
 
 DISK READS AND STRUCTURAL WRITES: PS reads a page's layers from disk exactly ONCE — the page loader's
 off-thread decode, inserted into the doc; every later state (rasters, text, and the PS-owned text pin

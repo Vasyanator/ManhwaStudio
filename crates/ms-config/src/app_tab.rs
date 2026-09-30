@@ -11,7 +11,7 @@ default from `key()` without referencing the `tabs` module upwards; the binary r
 module as `crate::app_tab` and `tabs::mod` re-exports the enum, so every existing
 `crate::tabs::AppTab` path keeps working. The localized display `title()` sits here too — an
 inherent `impl` may only be written in the DEFINING crate — but stays strictly separate from
-the persistence `key()` (see `docs/i18n_exclusions.md` B1).
+the persistence `key()` (see `dev-docs/i18n_exclusions.md` B1).
 */
 
 /// The editor tabs. `key()` is the persistence identifier; `title()` is the

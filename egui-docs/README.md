@@ -30,7 +30,7 @@ This folder exists so that no agent ever has to guess.
    - `egui-0.36.2/src/…:LINE`, `epaint-0.36.2/…`, `emath-0.36.2/…` — into the crate
      sources in the local cargo registry. Pinned to an exact published version, so
      these do **not** drift. They are authoritative.
-   - `src/…:LINE`, `README_AGENT.md:LINE` — into this repo. These drift as the code
+   - `src/…:LINE`, `crates/…:LINE` — into this repo. These drift as the code
      is edited. Trust the **path and the symbol name**; treat the line number as a
      hint that was correct when the page was written, and re-locate by name if it
      no longer lands where the page says.
@@ -72,11 +72,11 @@ These are not egui facts; they are this repo's contracts. Breaking them compiles
 and still counts as a defect.
 
 - **Do not use `egui::Slider` / `egui::ComboBox` / `egui::DragValue` directly in
-  product UI.** Use the `Wheel*` widgets from `src/widgets/` (`README_AGENT.md`,
-  §"Виджеты"). See `04-widgets.md` §0.2.
+  product UI.** Use the `Wheel*` widgets from `crates/ms-widgets/src/` (`PROJECT_RULES.md`,
+  "egui: never write it from memory"). See `04-widgets.md` §0.2.
 - **Do not build a floating panel out of `Area` + `Frame::popup`, and do not use
   `egui::Window` as one.** Every floating panel of the studio is declared as a tab of
-  the panel dock (`CollapsiblePanel` + `PanelTab`, `src/widgets/panel_dock/`). See
+  the panel dock (`CollapsiblePanel` + `PanelTab`, `crates/ms-widgets/src/panel_dock/`). See
   `01-app-shell.md` §3.1 and `04-widgets.md` §0.1.
 - **No literal user-visible strings.** Everything goes through `t!` / `tf!` / `tp!`.
   See `05-ids-and-i18n.md` §3.
@@ -92,7 +92,7 @@ and still counts as a defect.
   `crates/ms-launcher/src/theme.rs`. A new repeated role gets a new token in `ms-theme`.
   See `02-painting.md` and `crates/ms-theme/MODULE_README.md`.
 - **The GUI thread never blocks.** No I/O, decode, or long compute inside `fn ui`
-  (`README_AGENT.md`, "GUI Thread").
+  (`ARCHITECTURE.md`, "Key invariants").
 
 ## Layout of this folder
 

@@ -77,4 +77,4 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
   `patch/`; to change how a patch is stored, edit the host instead.
 - To expose another low-level reusable tool primitive, add its module here and re-export only the
   narrow API needed by callers.
-- To change cleaning-specific mask editor behavior, edit `src/tabs/cleaning/tools/base.rs` instead.
+- To change cleaning-specific mask editor behavior, edit `crates/ms-tab-cleaning/src/tools/base.rs` instead.

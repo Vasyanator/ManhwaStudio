@@ -79,7 +79,7 @@ pub struct SocketSpec {
     /// and `executor.rs` looks runtime values up by it. The graph format is documented as
     /// compatible with the Python `version=1` format, so this must NEVER be localized — a
     /// translated name orphans every saved graph and breaks Python interop (see
-    /// `docs/i18n_exclusions.md` §A2).
+    /// `dev-docs/i18n_exclusions.md` §A2).
     ///
     /// It is a `Cow` so static node templates borrow a `&'static str` (allocation-free) while
     /// dynamic sockets (`node_defs::socket_specs_for_node`) own a user-authored `String`

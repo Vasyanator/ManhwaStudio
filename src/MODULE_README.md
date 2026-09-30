@@ -1,18 +1,14 @@
 # Module: src
 
 ## Purpose
-Primary Rust source tree for ManhwaStudio. What is LEFT here is the binary itself: the desktop
-entry point and startup routing, the studio window shell, the editor root (`MangaApp`), the
-`settings/` tab and the crate-shim map in `main.rs`. Everything else — the launcher, the
-installer, the settings UI, the tabs, the canvas, the models, the widgets, the config hub — now
-lives in `crates/*` and is re-exported from `main.rs` under the module name its call sites
-already used, so no `crate::…` path changed.
+The binary crate `manhwastudio_rs`: the desktop entry point and startup routing, the studio
+window shell, the editor root (`MangaApp`), the `settings/` tab and the crate-shim map in
+`main.rs`. Everything else — the launcher, the installer, the settings UI, the tabs, the canvas,
+the models, the widgets, the config hub — lives in `crates/*`; `main.rs` re-exports those crates
+under binary-local `crate::…` module names (see `ARCHITECTURE.md` for the crate layers).
 
-`src/` is still the authoritative entry point for current application behaviour, but it is no
-longer where most of it is implemented: follow the shim comments in `main.rs` to the owning crate.
-
-`src/` is the authoritative implementation for current application behavior. Legacy Python UI code
-outside this tree is not an architecture reference for new work.
+`src/` is the entry point for application behaviour; follow the shim comments in `main.rs` to the
+owning crate. Legacy Python UI code outside this tree is not an architecture reference for new work.
 
 ## Architecture
 The top-level flow is:
@@ -23,7 +19,7 @@ main.rs / args.rs
     -> ms_launcher (launcher) or studio_bootstrap.rs (background ProjectData::load behind
        a loading screen)
     -> MangaApp
-    -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel
+    -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel, LayerDoc
     -> tabs/* through shared CanvasView + CanvasHooks
     -> background workers and optional Python AI backend
 ```
@@ -100,7 +96,10 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   unacknowledged layer-saver writes (`LayerDoc::has_pending_saves`) and клин pages still held dirty.
   It creates and owns the project's single `AutosaveGate` and hands it to all three staging writers
   (layer saver, bubbles model, клин model + autosave thread); it forces the gate on save-to-project
-  success and before a page operation (see README_AGENT «Autosave write buffer»).
+  success and before a page operation (gate semantics: `crates/ms-models/src/MODULE_README.md`;
+  the app-side ordering: "Save / page-op / discard / exit choreography" below). It turns off
+  egui's keyboard zoom (`zoom_with_keyboard = false`) every frame, so the only UI zoom is the
+  interface-scale setting.
 - `app_tab` (crate `ms-config`): declaration of the `AppTab` tab selector with BOTH its persistence
   half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `main.rs` as
   `crate::app_tab` and again by `tabs/mod.rs`, so `crate::tabs::AppTab` stays the path everything
@@ -145,15 +144,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   user-config load/default/write transactions remain serialized by the config-layer lock.
   `General.enabled_tabs` object keys are the stable English `AppTab::key()` ids
   (`tabs/mod.rs`) — the persistence contract, byte-stable across releases and UI languages, so they
-  are NEVER localized (`docs/i18n_exclusions.md` A3/B1). The field has NO reader today (verified
-  repo-wide): it is structurally a key set coupled 1:1 to `AppTab::key()`. The keys were migrated
-  from legacy Russian labels to English ids in the same change that split `AppTab::key()` from the
-  localized `AppTab::title()`. No config migration is performed: `merge_missing` adds the new English
-  keys but never removes, so an upgraded user config may carry both the old Russian keys and the new
-  English keys. Because nothing reads the field, the stale Russian keys are functionally inert and
-  are left untouched on disk rather than paying for startup rename I/O for a field with no reader. If
-  a future tab-visibility feature ever reads `enabled_tabs`, that change owns the one-time cleanup
-  migration (keyed by `AppTab::key()`).
+  are NEVER localized (`dev-docs/i18n_exclusions.md` A3/B1). The field has NO reader: it is a key
+  set coupled 1:1 to `AppTab::key()`. `merge_missing` adds keys but never removes, so an old user
+  config may still carry legacy Russian tab labels as keys next to the English ids; they are inert
+  and left on disk. A feature that starts reading `enabled_tabs` owns the one-time cleanup migration
+  (keyed by `AppTab::key()`).
 - `config_saver` (crate `ms-config`, re-exported by `main.rs`): the ONE debouncing writer thread behind every `user_config.json` section that
   is written from the GUI thread by a user gesture — today the `PanelLayout` section
   (`ms-widgets`' `panel_dock/persist.rs`) and the `Window` section (crate `ms-window-geometry`). It owns the
@@ -186,8 +181,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `WindowGeometryTracker` (per-frame `ViewportInfo` sampling + a `config_saver` writer thread +
   `on_exit` flush; the tracker only compares each sample against the last one it queued, so the
   saver is the last owner of a queued sample and must not drop it on a failed write). It is the
-  project's ONLY direct `winit` dependency — egui/eframe expose no monitor list — and `winit` was
-  removed from the root manifest with it. Wayland is detected and refused explicitly (no geometry
+  project's ONLY direct `winit` dependency — egui/eframe expose no monitor list. Wayland is detected and refused explicitly (no geometry
   persisted, no relocation, a message in the settings UI) instead of failing silently.
   See `crates/ms-window-geometry/src/MODULE_README.md`.
 - `memory_manager` (crate `ms-memory`): image-cache memory profile, pressure classification, budget policy, and
@@ -230,7 +224,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `client` (`BackendClient` with background reader thread, id demultiplexing, hello handshake,
   reconnect, event subscriptions, and the process-wide `shared_client()` singleton).
   `CallHandle::{id,cancel,wait,wait_streaming}` supports explicit cancellation and SDXL streaming.
-  The framed protocol is the single, sole IPC transport; the legacy HTTP helpers have been removed.
+  The framed protocol is the only IPC transport to the backend.
 - `ai_backend_capabilities` (crate `ms-sysprobe`): process-wide mirrored capability slot for cheap Torch availability
   checks after backend health probing.
 - `ai_install_probe` (crate `ms-sysprobe`, re-exported by `main.rs`): shared Python package
@@ -320,8 +314,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   kernel, the dense overlay-pixel solve — plus `tools::patch`, the host-neutral patch-tool core
   the tabs drive through its `PatchHost` trait. `crate::tools::…` still names all of it.
 - `page_ops` (crate `ms-page-ops`, re-exported by `main.rs`): GUI-free engine for structural
-  page operations (move / insert / create-blank / delete) executed as a journaled crash-safe
-  transaction over both the committed chapter tree and the `_unsaved` mirror;
+  page operations (`PageOpKind`: move / insert files / create blank / delete / split / crop-rotate /
+  stitch) executed as a journaled crash-safe transaction over both the committed chapter tree and the `_unsaved` mirror;
   `recover_pending_page_op` is called at the start of `ProjectData::load_internal`. It also
   DECLARES `Page` and `ProjectPaths`, which `ms-project` re-exports — the direction that keeps
   the two crates acyclic. `MangaApp` quiesces all page-indexed writers before dispatching the
@@ -354,7 +348,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   feature is FORWARDED from the root `tutorial` feature (features are not inherited); the demo bin
   `src/bin/tutorial_test` still mounts `tutorial/engine.rs` through `#[path]`. See
   `crates/ms-settings-ui/src/MODULE_README.md`.
-- `i18n_resolve.rs`: no longer a re-export — every caller names `ms_i18n::resolve_key` directly.
+- `i18n_resolve.rs`: not a re-export — every caller names `ms_i18n::resolve_key` directly.
   The module exists only to HOST the cross-crate tests guarding it: they assert against
   `ms-text-util`'s key sets and hold `ms_config::locale_store::GLOBAL_LOCALE_LOCK`, and `ms-i18n`
   sits below both, so the binary is the lowest place that can see all three at once.
@@ -373,7 +367,8 @@ outcome to startup; it does not start the editor on its own.
 Startup routing order in `run_main`: CLI parse -> (Linux desktop integration and the isolated
 backend-socket seed, both decided by `--ignore-installed`) -> Windows service flags -> storage-mode
 probe (`init_storage_mode_at_startup`: the FIRST document access; seeds the docstore default format)
--> config / locale / UI-scale seeding -> `--check-venv` (terminal) -> `--continue-update` ->
+-> config seeding -> on-disk locale reconcile (`locale_store::reconcile_disk_catalog`, BEFORE
+`load_user_settings_for_startup`) -> UI-locale install / UI-scale / autosave-policy seeding -> `--check-venv` (terminal) -> `--continue-update` ->
 `--update` -> `--test-launcher` -> AI backend supervisor -> project resolution -> studio window.
 A pending storage reconciliation (user_config still in the other format than its recorded mode) is
 started on a worker right before the launcher, or — on a direct `--project` start — by
@@ -404,7 +399,7 @@ Two startup flags change that routing:
 
 When a chapter opens, `ProjectData::load` builds the typed project snapshot on a background thread
 while `StudioBootstrapApp` shows a loading screen. `MangaApp::new` then constructs `BubblesModel`,
-`CleanOverlaysModel`, and `TextMaskModel`, shares them with tabs, and starts one unified decode
+`CleanOverlaysModel`, `TextMaskModel` and the chapter `LayerDoc` (all `Arc<Mutex<_>>`), shares them with tabs, and starts one unified decode
 pool that interleaves source pages and clean overlays in page order; overlays are applied to
 `CleanOverlaysModel` as they arrive (no in-order promotion), while source pages keep strict
 in-order promotion. Page image decode and clean overlay preparation happen off the GUI thread; the
@@ -425,6 +420,31 @@ one-shot `health` pull as a startup/liveness fallback); Torch availability is mi
 `ai_backend_capabilities` (crate `ms-sysprobe`). Device state is queried via `device.get`/`device.set` IPC methods.
 Unresolved backend device choices reported by `device.get` are surfaced by the editor as startup
 prompts instead of blocking the GUI thread.
+
+## Save / page-op / discard / exit choreography
+`app.rs` sequences the three staging writers (layer saver, bubbles saver, клин autosave with its
+`OverlayAutosaveControl`) around every destructive point. The writers' own contracts live in
+`crates/ms-models/src/MODULE_README.md` and `crates/ms-canvas/src/MODULE_README.md`; typing's
+deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
+- `start_save_to_project`: PS `flush_layers`, then typing `flush_text_layers`. A flush `Err` or any
+  `failed_pages` ABORTS the save (nothing merged, staging kept, status shown) — an `Err` is never
+  degraded to an empty owned-page set. The worker then barriers the bubbles saver (holding it), the
+  layer saver (a failed TEXT write aborts), pauses the клин autosave and takes the dirty клин
+  snapshots (a failed write restores them via `restore_dirty_save_snapshots` and aborts), merges,
+  resumes, and re-barriers; success calls `AutosaveGate::force_flush`.
+- `start_page_op`: flushes canvas upserts, PS layers and typing text; `page_op_text_quiesce` refuses
+  the op when edits stay unwritten or the doc lock is poisoned (`NoLayersDir`/`NoLayerDoc` pass only
+  when nothing was pending). Then `force_flush`, клин autosave `request_stop_now`; the worker joins
+  it, takes клин snapshots, pauses the bubbles saver, barriers the layer saver, writes the snapshots
+  to staging and dispatches the engine. Page ops are not staged; the app is rebuilt from disk.
+- DISCARD (`start_exit_cleanup`): latches `discarding_unsaved_changes` first, DROPS (never flushes)
+  typing's deferred edits, `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver,
+  `request_stop_now` on the клин autosave, then deletes staging on a job that joins that thread.
+- Failed discard (`abort_discard_after_failed_cleanup`): releases the latch, marks the session
+  unsaved, and restarts ALL three writers on the same `AutosaveGate` (`enable_background_saver`,
+  `resume_saver_after_failed_discard`, a fresh `OverlayAutosaveControl` + autosave thread).
+- `on_exit`: flush-and-stop the клин autosave (stop-now when discarding) and join it, then (unless discarding) enqueue typing's deferred edits INLINE,
+  then barrier the layer saver and report its failed pages, then shut down layer and bubbles savers.
 
 ## Contracts and invariants
 - Current application behavior belongs in Rust under `src/`; do not copy architecture from legacy
@@ -537,11 +557,11 @@ prompts instead of blocking the GUI thread.
   CONSUMER, not the owner.
 - General settings editor (projects directory, global memory profile, interface scale, primary
   monitor, UI language, and a duplicate surface for the typesetting-language selector owned by
-  `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:
+  `tabs/settings/typesetting/`) shared by the studio settings tab AND the launcher settings page:
   `ms-settings-ui`'s `general_settings_panel.rs`. Per-UI
   `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to
   `user_config.json` through `config::update_user_config_file`, except the typesetting
-  language, which is written off-thread through `tabs::settings::save_text_language`.
+  language, which is written off-thread through `ms_config::save_text_language`.
 - Global interface scale (`General.ui_scale_percent`, 50-200 %): also `ms-settings-ui`'s `general_settings_panel.rs`.
   It is a `Context::set_zoom_factor` call, so it rescales a whole window (fonts, spacing, widget
   sizes) without touching the OS window size. The live value is the process-global
@@ -551,7 +571,7 @@ prompts instead of blocking the GUI thread.
   `apply_ui_scale_to_context` next to `ui_fonts::install*` (today: studio `run_main_window` +
   `launcher::run`); a window that does not call it renders at native size. The shared
   typesetting-language selector itself is the public `general_settings_panel::draw_text_language_setting(ui, id_salt)`,
-  called by both this widget and the studio "Тайп" pane (`tabs/settings/typesetting.rs`).
+  called by both this widget and the studio "Тайп" pane (`tabs/settings/typesetting/`).
 - Menu-level shared layer for the two settings surfaces (launcher settings page + studio settings
   tab): `ms-settings-ui`'s `settings_shared.rs`. Holds the section registry (`SettingsSectionId`, `SettingsSurface`,
   `SettingsSectionDescriptor`, `SECTIONS`, `sections_for`, `title_key` — the existing per-surface
@@ -580,7 +600,7 @@ prompts instead of blocking the GUI thread.
     round-tripping through `execution_provider_from_ort_token`); the device combo adapts per EP
     (DirectML/WebGPU adapter indices, CUDA/TensorRT `GPU 0`, CPU/CoreML default, OpenVINO device-TYPE
     strings `CPU`/`GPU`/`NPU` written verbatim to `ai_onnx_device_id`). The selected build persists via
-    `settings::save_onnx_build` (`General.ai_onnx_build`); the EP/device via `save_onnx_provider_device`.
+    `ms_config::save_onnx_build` (`General.ai_onnx_build`); the EP/device via `save_onnx_provider_device`.
     An AVAILABLE build's dylib auto-downloads via `resolve_or_download_ort_dylib(build)` off-thread; the
     build-action button is a PURE decision `ort_build_action(committed, active_build, selected, present)`
     → {Retry | LoadOtherBuild | RestartNote}: not-committed + present → same-build "Повторить попытку

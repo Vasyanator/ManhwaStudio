@@ -2086,7 +2086,7 @@ const REPAGINATE_RATIO_PRESETS: [(u32, u32); 5] = [(9, 16), (3, 4), (2, 3), (1, 
 
 /// File name used for a PDF export when the tab could not supply a base name.
 ///
-/// An on-disk name, not a caption (`docs/i18n_exclusions.md`), so it stays a literal.
+/// An on-disk name, not a caption (`dev-docs/i18n_exclusions.md`), so it stays a literal.
 const DEFAULT_PDF_BASE_NAME: &str = "export";
 
 /// Which save dialog the green export button opens.

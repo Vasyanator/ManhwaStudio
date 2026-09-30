@@ -8,7 +8,7 @@ FILE HEADER (cleaning/tools/stamp.rs)
   - `CurrentImageStampSource`: какой слой текущей страницы используется как источник штампа.
   - `StampScratch`: временный буфер штриха по видимой области (как у `zamazka`, без спама в модель на каждый move).
   - `SourceLoadRequest/SourceLoadResult`: очередь фоновой загрузки одной текущей alt-страницы.
-- Notes (English, per AGENTS.md §3):
+- Notes (English, per CLAUDE.md §3):
   - Source pages are validated against BOTH overlay dimensions; a zero expected dimension means the
     overlay size is not known yet (`CanvasView::overlay_size` returned `None`), never "skip".
   - The `CurrentImage` commit writes a DENSE overlay: `base::overlay_pixel_for_final_color` raises

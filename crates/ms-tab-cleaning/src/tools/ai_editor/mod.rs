@@ -274,7 +274,7 @@ pub struct AiEditorTool {
     ///
     /// Injection rather than a `#[cfg(test)]` override inside `mask_generation.rs`: an override
     /// there would have to be reconfigurable, i.e. mutable process- or thread-global state,
-    /// which this project forbids (`AGENTS.md` §5), and it would be invisible at the call site.
+    /// which this project forbids (`CLAUDE.md` §5), and it would be invisible at the call site.
     /// This field is per-instance, needs no crate feature — `ms-tab-cleaning` has none — and
     /// leaves `start_mask_detection` with ONE code path, so the test drives exactly what ships.
     spawn_detection: MaskGenerationSpawner,

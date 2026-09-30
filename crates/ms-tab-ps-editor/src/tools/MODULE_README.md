@@ -88,7 +88,7 @@ Rules:
   two undo steps to take back one edit; the unit tests pin this.
 - **Exactly ONE variant today**: `PsToolAction::WriteRegion(ToolRegionWrite)` — "write this pixel
   rect into the ACTIVE EDITABLE layer as ONE undo step, with this label". Add a variant only
-  together with the tool that raises it and the tab arm that performs it (`AGENTS.md` §14).
+  together with the tool that raises it and the tab arm that performs it (`CLAUDE.md` §14).
 - **`ToolRegionWrite` geometry is in the ACTIVE LAYER's own pixels**, the same space as `DirtyRect`
   and as the undo diff — never in page pixels. `pixels` are PREMULTIPLIED RGBA (the `Layer::image`
   convention); `coverage`, when present, is one byte per source pixel and blends
@@ -110,7 +110,7 @@ unaffected.
 
 - **`poll_workers(&mut self) -> bool`** — the tool's own channels, drained once per frame for EVERY
   tool from `PsEditorTabState::poll_tools`, next to `poll_loader`. The GUI thread never blocks
-  (`AGENTS.md` §5), so anything expensive runs on a worker and its result arrives here, never inside
+  (`CLAUDE.md` §5), so anything expensive runs on a worker and its result arrives here, never inside
   `interact` (which is skipped on a pan frame and on a frame the pointer sits over a panel).
   Returning `true` asks for the next frame — that is what makes an off-thread result appear without
   any pointer movement. It runs for INACTIVE tools on purpose: a job dispatched before a tool switch
@@ -172,7 +172,7 @@ deliberately (see «Region-tool hooks»). So:
 **The region load has no worker thread, on purpose.** The cleaning host needs one because it decodes
 a PNG from disk; here the pixels are already in memory, so `service_pending_region` composites the
 ROI synchronously with `composite_rect` (`../mod.rs`). The heavy step — the membrane solve — is the
-core's own worker, so `AGENTS.md` §5 holds. The ROI is the selection box plus the drag offset, padded:
+core's own worker, so `CLAUDE.md` §5 holds. The ROI is the selection box plus the drag offset, padded:
 bounded, and small relative to the solve it feeds.
 
 **THE SOLVE PLANE, and why it must agree with the backdrop.** A patch is solved in the plane its
@@ -202,7 +202,7 @@ the pixel, 0 where it does not: the feather is already inside `rgb` and inside t
 a second blend would attenuate it twice, and the zero bytes are what leave the surrounding work
 untouched.
 
-**Six refusals, each with its own message, none of them silent** (`AGENTS.md` §6). `ToolRegionWrite`
+**Six refusals, each with its own message, none of them silent** (`CLAUDE.md` §6). `ToolRegionWrite`
 geometry is LAYER-local while the patch works in PAGE pixels, so the two grids must coincide up to a
 whole-pixel translation. `patch_target_for` (pure, one case per variant in the tests) refuses: no
 active layer; `Исходник`; an INVISIBLE active layer (hidden, in a hidden group, or at zero effective

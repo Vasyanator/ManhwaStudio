@@ -10,13 +10,13 @@ key, and asserts it exists in the reference catalog `en.json`. It also asserts
 A second guard (`every_catalog_key_is_referenced_in_source`) closes the opposite gap:
 every catalog key must be reachable, i.e. it must appear as a bare `"key"` string
 literal somewhere under `src/` or `crates/` (a GUI-free crate may return a catalog
-key it chose from an enum variant — see `docs/i18n_exclusions.md` §F). This catches
+key it chose from an enum variant — see `dev-docs/i18n_exclusions.md` §F). This catches
 ORPHAN keys left behind after a rename/refactor, which would otherwise sit
 unreachable and untranslated forever.
 
 Notes:
-- Almost no call sites exist yet, so the extracted set is expected to be (near)
-  empty; the test must still pass on an empty result while performing a real scan.
+- Only `en.json` and `ru.json` are validated here; `es`/`fr`/`pt` may lag behind and
+  resolve missing keys through the `en` fallback.
 - The `ms-i18n` crate's own directory is skipped: its unit tests deliberately
   call the macros with unknown keys (negative cases) that must NOT be validated
   here.
@@ -368,7 +368,7 @@ fn meta_holds_only_name() {
 ///
 /// `crates/` is scanned because a GUI-free logic crate may hand the binary a catalog
 /// KEY it chose from an enum variant (the crate never depends on the UI-string
-/// catalog — see `docs/i18n_exclusions.md` §F). Those keys appear as `"…"` literals in
+/// catalog — see `dev-docs/i18n_exclusions.md` §F). Those keys appear as `"…"` literals in
 /// the crate source, not under `src/`: e.g. `ScriptGroup::name_key` /
 /// `TextLanguage::name_key` (`ms-text-util`), `Conservatism::label_key`
 /// (`ms-text-util`), `TextFormPreset::label` (`ms-text-render`). Without scanning

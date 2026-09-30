@@ -118,8 +118,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
   its only consumer `tools/ai_editor/`, which HOSTS the AI engines (FLUX.2 klein is the first) and
   splits their UI across those two tabs, local fill tools, stamp tool, the on-canvas patch tool
-  (`tools/patch/`, gradient-domain seamless cloning), AI-backed
-  inpaint tools, and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
+  (`tools/patch/`, gradient-domain seamless cloning), the AI-backed
+  inpaint tools (`tools/aot.rs`, FLUX.1 Fill in `tools/flux_fill.rs`), and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management panel and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.
@@ -172,7 +172,11 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   Its `c`/`s` are per pixel PER CHANNEL: per channel is mandatory for `c`, while alpha
   measured channel-neutral on both chapters and the graded fit deliberately ties the channels
   together. Removal is licensed only for occurrences the gain test verified: a correlation-only
-  accept is refused, because subtracting a mark that is not there injects an inverse mark.
+  accept is refused, because subtracting a mark that is not there injects an inverse mark. The
+  gain test's background estimate is a box blur of the provisional removal WEIGHTED BY `s`: an
+  unweighted blur folds the injected inverse mark back into the estimate, so a false candidate
+  would pass exactly when it must fail. Removal stays `f32` end to end and is clamped and rounded
+  exactly once, at the write to the output byte.
 - A mark's FOOTPRINT is the rectangle the mark actually deposits in plus
   `FOOTPRINT_TRIM_SAFETY_PX` of background — never the loose box a detector handed over. Outside
   the deposit the model is `c = 0`, `s = 1`: fully transparent, no information and no removable

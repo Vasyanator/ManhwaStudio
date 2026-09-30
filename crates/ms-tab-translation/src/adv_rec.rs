@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/adv_rec.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/adv_rec.rs
 Floating advanced-recognition window for Translation tab.
 
 Main responsibilities:

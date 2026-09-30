@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/machine_translators/google.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/machine_translators/google.rs
 Google Translate backend implementation for Translation tab MT worker.
 
 Main items:

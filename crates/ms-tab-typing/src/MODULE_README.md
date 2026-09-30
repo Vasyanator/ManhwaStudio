@@ -123,15 +123,17 @@ resize or collapse — becomes a dock tab.
 
 The main data flow is:
 
-1. `ProjectData` provides page paths. Text overlays (their `text_info.json` metadata and PNGs) now
-   live in the chapter's `layers/` folder (saves stage to `*_unsaved/layers/`). The legacy
-   `text_images/` folder is still read as a fallback so older chapters open and convert — their
-   metadata migrates into `layers/` on the next save, while their PNGs keep being read from
-   `text_images/`. Page masks (`mask.rs`) are a separate store and remain under `text_images/`.
+1. `ProjectData` provides page paths. Text overlays persist as inline v3 text nodes of the chapter
+   `LayerDoc` (`layers.json`) with their rendered PNGs in the chapter's `layers/` folder (saves stage
+   to `*_unsaved/layers/`). A legacy chapter's `text_info.json` (in `layers/` or the older
+   `text_images/`) is READ-ONLY input: it is loaded as a fallback and converted once by the eager
+   chapter migration (`tab/render_jobs.rs` -> `ms_models::layer_model::migrate`), which renames the
+   PNGs and retires the file to `.bak` last. Page masks (`mask.rs`) are a separate store and remain
+   under `text_images/`.
 2. INITIAL load of a legacy chapter reads `text_info.json` + referenced PNG files on worker threads,
    trying the unsaved `layers/`, committed `layers/`, then legacy `text_images/` dirs in order. Each
    overlay carries a stable `uid` (minted on creation or on first load). Legacy placement schemas are
-   normalized up front by the SHARED codec `text_payload::migrate_overlay_entries` (absolute ribbon
+   normalized up front by the SHARED codec `ms_models::layer_model::text_payload::migrate_overlay_entries` (absolute ribbon
    `x`/`y` via `project::LegacyRibbonGeometry`, top-left `u`/`v` via the PNG footprint) — IN MEMORY
    only; `text_info.json` is never rewritten. Persistence is owned by the shared `LayerDoc`: overlays
    become **text nodes** in `layers.json` with their FULL inline payload via the doc's text flush.
@@ -307,8 +309,8 @@ The main data flow is:
    together. Inline alignment tags (`<align=...>` or machine `<m a=...>`) are line-level style
    spans: the line whose start offset is inside the span uses that alignment for horizontal
    placement, while the control tag itself is stripped from rendered text.
-5. Finished text or image overlays are appended to the runtime layer, written as PNGs
-   in `text_images/`, and serialized back to `text_info.json`.
+5. Finished text or image overlays are appended to the runtime layer; their PNGs and inline
+   payload reach `layers/` through the doc's text flush (`tab/persist.rs`, deferred-save policy).
 6. Export workers compose page source, shared clean overlay snapshots, text/image
    overlays, deform meshes, and optional typing masks into final page images
    (`flatten_typing_export_page_rgba`, shared by PNG and PSD). Export is GATED on full residency
@@ -333,10 +335,10 @@ The main data flow is:
 `panel.rs` owns the floating UI state and emits typed requests; it does not directly
 mutate overlay storage. `mask.rs` owns typing-specific binary clip masks. `auto_typing.rs`
 contains the image analysis used to center selected text over a detected bubble.
-`render_next` is the production text renderer boundary for this module; it now lives in the
+`render_next` is the production text renderer boundary for this module; it lives in the
 `ms-text-render` crate (`crates/ms-text-render`) and is re-exported here as
-`crate::render_next` via `mod.rs` (`pub use ms_text_render as render_next;`).
-`segmentation` likewise comes from `ms-text-util` (re-exported in `mod.rs`).
+`crate::render_next` by `lib.rs` (`pub use ms_text_render as render_next;`).
+`segmentation` likewise comes from `ms-text-util` (re-exported in `lib.rs`).
 
 Typing mask tile textures and text/image overlay display textures are reconstructable GPU caches.
 The module exposes memory snapshots and eviction methods for those textures only. Persistent
@@ -344,8 +346,8 @@ The module exposes memory snapshots and eviction methods for those textures only
 saving, and export.
 
 ## Files and submodules
-- `mod.rs`: module wiring and public re-exports for `TypingTabState`, `TypingDrawParams`,
-  `TypingTopPanelState`, and `TypingPanelLayout`, plus the `pub(crate)`
+- `lib.rs`: crate root — module wiring and public re-exports for `TypingTabState`, `TypingDrawParams`,
+  `TypingTopPanelState`, and `TypingPanelLayout`, plus the
   `typing_default_dock_layout` the app hands to the shared dock state.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
@@ -430,6 +432,8 @@ saving, and export.
     still falls back to `ByLineLength` for a line restored from a project or preset whose JSON
     carries no mode, so existing overlays keep rendering exactly as they were saved.
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
+    The 3x3 shape-variant preview renders one worker thread per tile, a grid row at a time,
+    cancellable through one shared flag; the GUI thread only receives finished RGBA tiles.
     Also the text-preview checkerboard painter (`paint_shape_variant_checkerboard`, used by
     the shape-variant menu; `pub(super)`; palettes are `ms_theme::checkerboard::INK_PREVIEW_*`,
     only the dark/light CHOICE is typing's) and the
@@ -697,11 +701,11 @@ saving, and export.
   seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
   read by the overlay Ctrl+wheel handler in `tab/selection_rasters.rs`. The module itself lives at
   the `ms-config` crate (re-exported as `ms_config::rotation_ctrl_wheel`) because the config default
-  tree reads its default; `mod.rs`
+  tree reads its default; `lib.rs`
   re-exports it, so `ms_config::rotation_ctrl_wheel::…` stays the path callers use. Only text-overlay rotation consults the mode; raster Ctrl+wheel rotation
   (`try_rotate_selected_raster_by_ctrl_wheel`) ignores it and always uses ordinary rotation.
-- `render_next`: text rendering subsystem, now the `ms-text-render` crate re-exported as
-  `render_next` (via `mod.rs`). Its public contract is `render_next::types::*` plus
+- `render_next`: text rendering subsystem, the `ms-text-render` crate re-exported as
+  `render_next` (by `lib.rs`). Its public contract is `render_next::types::*` plus
   `render_next::render_text_to_image`; callers in this directory should treat its layout,
   wrap, raster, formula, and effects modules as renderer internals.
 - `segmentation`: re-exported from the `ms-text-util` crate (line/unit segmentation used by
@@ -826,7 +830,7 @@ saving, and export.
   worker every frame — the worst offender was `vector_transform::dispatch_vector_rerender`, reached per
   drag frame from `draw_page.rs` via `resize_selected_overlay_width`. Deferral is safe because
   durability never came from the individual writes in the first place: it comes from the barriers (see
-  `README_AGENT.md`, "Что важно не ломать").
+  `ARCHITECTURE.md`, "Key invariants" -> "Staging and autosave").
   **A flush point may retire its dirty state ONLY once a write is genuinely dispatched.** Both writers
   report that, and neither may be assumed to have written: `request_overlay_placement_save` returns
   `PlacementSaveDispatch` (`Started`/`Parked` = the pipeline owns the write; `NotWired` = nothing was
@@ -838,7 +842,7 @@ saving, and export.
   The `Err` vs `Ok`-with-empty-`owned_pages` distinction binds `app.rs` too, and in BOTH of its eager
   callers an unverified set means ABORT, never proceed: save-to-project would otherwise let the merge
   preserve stale committed text, delete the staging dir, and report success, and a page operation would
-  remap the page-keyed trees without the pending edits. See `README_AGENT.md`. One asymmetry belongs
+  remap the page-keyed trees without the pending edits (`ARCHITECTURE.md`, "Key invariants"). One asymmetry belongs
   here: `NoLayersDir`/`NoLayerDoc` mean the store was never wired, because `ensure_loader_started`
   wires it on the tab's FIRST DRAW. A session that never opened the Text tab therefore gets `Err` from
   a tab that owes nothing — which is why `app.rs`'s page-op gate treats those variants as "quiesced
@@ -1264,9 +1268,11 @@ saving, and export.
   expansion in their own struct fields.
 
 ## Storage and external boundaries
-- Persistent text assets are under `ProjectPaths::text_images_dir`.
-- `text_info.json` contains an array of overlay entries with page index, file name,
-  overlay kind, placement/deform data, render data, and mask clipping state.
+- Text overlays persist as inline v3 text nodes in the chapter `layers.json` (payload codec:
+  `ms_models::layer_model::text_payload`), rendered PNGs under `ProjectPaths::layers_dir` (staged
+  in the unsaved `layers/`). `ProjectPaths::text_images_dir` keeps page masks and, for legacy
+  chapters, the read-only `text_info.json` (an array of overlay entries with page index, file
+  name, overlay kind, placement/deform data, render data, and mask clipping state).
 - Render parameters are serialized through JSON-compatible names that are parsed in
   both `panel.rs` and `tab.rs`; keep enum string mappings synchronized when extending
   `TextRenderParams`.
@@ -1400,9 +1406,9 @@ saving, and export.
 - To change clipping mask loading, painting, fill, save, or export snapshots, edit
   `mask.rs`.
 - To change automatic centering over bubbles, edit `auto_typing.rs`.
-- To change text layout/raster/effects behavior, use the `render_next/` public contract
+- To change text layout/raster/effects behavior, use the `render_next` public contract
   first and keep call-site changes in this directory typed through `TextRenderParams`.
-  See `render_next/MODULE_README.md` and nested renderer readmes before editing
+  See `crates/ms-text-render/src/MODULE_README.md` and nested renderer readmes before editing
   renderer internals.
 - To change persisted overlay schema, update the parser/normalizer in `tab/codec.rs`, the
   writer path in `tab/persist.rs` / `tab/doc_layers.rs`, and the export path in

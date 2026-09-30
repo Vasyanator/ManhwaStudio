@@ -138,7 +138,7 @@ comments, docs, locale files and `MODULE_README.md`.**
 
 Serena keeps its own memory store in `.serena/memories`. It is empty and onboarding has never been
 run. **Keep it that way.** This project deliberately has no persistent agent memory: project
-knowledge belongs in `README_AGENT.md`, `MODULE_README.md`, file headers and `dev-docs/`, where it
+knowledge belongs in `ARCHITECTURE.md`, `PROJECT_RULES.md`, `MODULE_README.md`, file headers and `dev-docs/`, where it
 is revised together with the code. A memory store is a copy nobody revises — an audit of the 48
 memories this project used to keep found roughly a quarter of them factually wrong, naming
 functions that no longer existed and features described as unbuilt that had shipped. Serena's
@@ -200,13 +200,13 @@ Its `initial_instructions` is written for a different harness. Specifically:
 
 - **"Built-in `Read` is FORBIDDEN for discovery" and "`Edit` is FORBIDDEN".** Not in this project.
   Reading documentation, grepping for text, and verifying cfg-gated code with grep are required
-  work here — see `AGENTS.md` section 3.
+  work here — see `CLAUDE.md` section 3.
 - **"Your built-in tools will deny such edits (they will assume you haven't read the content)."**
   Tested: a symbol body was read through `find_symbol(include_body=true)`, never through the
   built-in `Read`, and a subsequent built-in `Edit` on that file succeeded on the first attempt.
   This harness only requires a prior read for files outside the working directory.
 - **"Trust the refactoring tools; do not re-run the build or tests to confirm."** Section 16 of
-  `AGENTS.md` is not negotiable: `cargo check-all` and `cargo clippy --all-targets -- -D warnings`
+  `CLAUDE.md` is not negotiable: `cargo check-all` and `cargo clippy --all-targets -- -D warnings`
   after any Rust change. Serena cannot see the two non-active build targets this project must
   compile for, which is precisely why the check exists.
 - **Its cost framing** ("much more efficient than your own tools for most coding scenarios").

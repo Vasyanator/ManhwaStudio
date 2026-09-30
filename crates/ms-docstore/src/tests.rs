@@ -3,7 +3,7 @@ File: tests.rs
 
 Purpose:
 Contract tests of the public store API (native only). Every test works inside its own
-`tempfile` directory and never touches a real document (README_AGENT.md "Test hygiene").
+`tempfile` directory and never touches a real document (PROJECT_RULES.md "Test hygiene").
 The atomic-write recipe's own step-order tests live next to it in `json.rs`.
 */
 

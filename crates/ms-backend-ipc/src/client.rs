@@ -82,7 +82,7 @@ impl std::error::Error for CallError {}
 // Host application version (diagnostic only)
 // ----------------------------------------------------------------------------
 // `env!("CARGO_PKG_VERSION")` expanded HERE yields THIS crate's version (`0.1.0`),
-// not the application's, exactly as `README_AGENT.md` warns for `ms-installer`. The
+// not the application's (the same trap `ms-installer` avoids with `HostVersion`). The
 // value must therefore originate in the binary crate, and it is carried by a
 // process-global seed rather than by a `connect` parameter for two reasons:
 //   * the only public way in is `shared_client()` — a no-argument lazy singleton with

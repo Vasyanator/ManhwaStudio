@@ -59,7 +59,7 @@ MODEL_SUFFIXES = (".safetensors", ".ckpt")
 
 # Sampler name -> (diffusers scheduler class name, from_config kwargs).
 # Keep names in sync with `SDXL_SAMPLERS` in
-# src/tabs/cleaning/tools/ai_editor/engines/sdxl/mod.rs.
+# crates/ms-tab-cleaning/src/tools/ai_editor/engines/sdxl/mod.rs.
 SAMPLER_CONFIGS: dict[str, tuple[str, dict[str, Any]]] = {
     "Euler": ("EulerDiscreteScheduler", {}),
     "Euler a": ("EulerAncestralDiscreteScheduler", {}),

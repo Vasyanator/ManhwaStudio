@@ -1,8 +1,7 @@
 # Module: crates/ms-config/src
 
 ## Purpose
-The project's global configuration and runtime-path layer, extracted verbatim from
-`src/config.rs`. It answers two questions for the whole application:
+The project's global configuration and runtime-path layer. It answers two questions for the whole application:
 
 - **Where does anything live?** — `program_dir()` / `data_dir()` and every path helper
   derived from them (bundled resources, the Python env and backend, `user_config.json`,
@@ -18,19 +17,21 @@ It is the hub every upper layer reads, so it depends on nothing above it: no egu
 ```text
 ms-log ─┐
 ms-memory ─┤
-ms-docstore ─┼─> ms-config ──(re-exported as `crate::config`)──> manhwastudio_rs
-ms-text-util ─┤
-ms-i18n ─┘
+ms-docstore ─┤
+ms-text-util ─┼─> ms-config ──(re-exported as `crate::config`)──> manhwastudio_rs
+ms-i18n ─┤
+ms-thread ─┘
 ```
 
-The binary declares three re-export shims in `src/main.rs`, so no call site in `src/`
-names this crate directly:
+The binary re-exports this crate and several of its modules under binary-local names in
+`src/main.rs` (other crates name `ms_config::` directly):
 
 | shim | reaches |
 |---|---|
 | `pub use ms_config as config;` | `crate::config::…` |
 | `pub use ms_config::app_tab;` | `crate::app_tab::…`, and `crate::tabs::AppTab` on top of it |
 | `pub use ms_config::rotation_ctrl_wheel;` | `crate::rotation_ctrl_wheel::…`, and `crate::tabs::typing::rotation_ctrl_wheel::…` |
+| `pub use ms_config::{config_saver, locale_store, version_format};` | `crate::config_saver::…` etc. (`locale_store` native-only) |
 
 Every access to a config DOCUMENT goes through `ms-docstore`: `JsonConfig` (user config
 and a title's `settings.json`), `load_user_config`, `load_raw_user_settings_for_startup`,
@@ -82,15 +83,15 @@ that defines the type.
   defaults and the pure reader `autosave_policy_from_user_settings`. `ms_models::autosave_gate`
   reads it on every call, so a settings change applies live with no channel to the writers.
 - `config_saver.rs`: the ONE debouncing, retrying writer thread every self-owned section of
-  `user_config.json` is written through (today `ms-widgets`' `PanelLayout` section and the
-  binary's `Window` section). It sits in this crate because its write step IS `lib.rs`'s
+  `user_config.json` is written through (`ms-widgets`' `PanelLayout` section and
+  `ms-window-geometry`'s `Window` section). It sits in this crate because its write step IS `lib.rs`'s
   `update_user_config_file`; the feeders stay above. Owns the durability policy — 700 ms
   coalescing, a failed write HELD and retried with a capped backoff, a final attempt on
   shutdown, a definitive loss logged with cause/path/context.
 - `settings_deep_link.rs`: `SettingsDeepLink` — the reveal targets one part of the app can ask the
   settings surface to open. It sits here because its REQUESTER (crate `ms-tab-typing`) and its
-  CONSUMER (the binary's settings tab) may not depend on each other; `src/settings_shared.rs`
-  re-exports it, so `crate::settings_shared::SettingsDeepLink` still resolves in the binary.
+  CONSUMER (the binary's settings tab) may not depend on each other; `ms-settings-ui`'s
+  `settings_shared.rs` re-exports it (`crate::settings_shared::SettingsDeepLink` in the binary).
 - `ort_load_guard.rs`: the crash-safe `General.ort_load_state` markers written around every
   onnxruntime dylib load (`mark_ort_load_attempted` / `mark_ort_load_succeeded` /
   `reset_ort_load_guard`), plus the shared `read_user_config_root` the section writers in
@@ -117,7 +118,7 @@ that defines the type.
 Two items in those files are TEST-ONLY and are gated `#[cfg(any(test, feature = "test-support"))]`
 rather than `#[cfg(test)]`: `config_saver::test_harness` and `locale_store::GLOBAL_LOCALE_LOCK`.
 A `#[cfg(test)]` item is invisible to a dependent crate, and both are used by the tests of crates
-above this one (`ms-widgets`' panel-dock, the binary's window geometry, and every test in the
+above this one (`ms-widgets`' panel-dock, `ms-window-geometry`, and every test in the
 binary that installs a UI locale). Those crates enable `test-support` from their
 `[dev-dependencies]`, so no production build carries either item.
 

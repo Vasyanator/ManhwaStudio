@@ -37,14 +37,14 @@ Key constants:
 
 Notes:
 - This module must never call `Context::set_fonts`: that REPLACES all font definitions
-  (egui-0.35.0/src/context.rs:2038 + :535-540) and would drop the families other
+  (egui-0.36.2/src/context.rs:2106 + :548-553) and would drop the families other
   subsystems register through `add_font` (`typing-panel-combo-font-*`,
   `typing-editor-font-*`), which then panics in epaint when they are used again.
 - The LOADER must never call `Context::fonts`/`Context::fonts_mut`: they panic before the
-  first frame (egui-0.35.0/src/context.rs:1037, :1047), and the loader starts from a
+  first frame (egui-0.36.2/src/context.rs:1097-1103, :1114-1121), and the loader starts from a
   `run_native` constructor closure, i.e. before the first frame. `ensure_covers` may use
   them because it is called from UI code, from the GUI thread, during a frame.
-- `add_font` is purely additive and only touches `Memory` (context.rs:2061-2085), so it
+- `add_font` is purely additive and only touches `Memory` (egui-0.36.2/src/context.rs:2129-2148), so it
   is safe both from a worker thread and before the first frame.
 */
 
@@ -105,7 +105,7 @@ pub fn install(ctx: &egui::Context, tier: Tier) {
 /// change how a finished render looks (`dev-docs/unicode_base_font_plan.md`, decision 2).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn install_with_roots(ctx: &egui::Context, tier: Tier, extra_roots: &[PathBuf]) {
-    // `egui::Context` is `Arc<RwLock<..>>` (egui-0.35.0/src/context.rs:710) and therefore
+    // `egui::Context` is `Arc<RwLock<..>>` (egui-0.36.2/src/context.rs:723) and therefore
     // Send + Sync: the worker can call `add_font` on this clone directly, with no channel
     // and no GUI-thread polling.
     let ctx = ctx.clone();
@@ -145,12 +145,12 @@ pub fn install_with_roots(_ctx: &egui::Context, tier: Tier, extra_roots: &[PathB
 /// (or when there is none to install, e.g. in a `Tier::Core` window) the call is a single
 /// atomic load. While the tier is still armed the cost is one pass over the non-ASCII
 /// characters of `text`, each a lookup in epaint's per-family `face_cache`
-/// (epaint-0.35.0/src/text/fonts.rs:635) — a pure-ASCII string does not even get that far.
+/// (epaint-0.36.2/src/text/fonts.rs:629) — a pure-ASCII string does not even get that far.
 ///
 /// # Panics
 /// Must be called from the GUI thread WHILE A FRAME IS RUNNING: it reads the installed
 /// fonts through `Context::fonts_mut`, which panics before the first frame
-/// (egui-0.35.0/src/context.rs:1047). Never call it from a background thread or from a
+/// (egui-0.36.2/src/context.rs:1114-1121). Never call it from a background thread or from a
 /// `run_native` constructor closure.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn ensure_covers(ctx: &egui::Context, text: &str) {
@@ -315,7 +315,7 @@ mod desktop {
 
         /// Whether the name-sorted file list is walked backwards when registering it.
         ///
-        /// `FontPriority::Highest` is `fam.insert(0, ..)` (egui-0.35.0/src/context.rs:554),
+        /// `FontPriority::Highest` is `fam.insert(0, ..)` (egui-0.36.2/src/context.rs:567),
         /// so a loop over ascending file names would REVERSE the chain — that was the bug
         /// where `NotoSerifHentaigana` ended up first and swallowed all latin text. Core and
         /// bold are `Highest`-driven and therefore walked backwards; `Ext` is appended with
@@ -335,7 +335,7 @@ mod desktop {
         ///
         /// Its bytes are read at most once per process and handed to epaint as
         /// `FontData::from_static`, which stores a `Cow::Borrowed`
-        /// (epaint-0.35.0/src/text/fonts.rs:131-137). `from_owned` would instead keep the
+        /// (epaint-0.36.2/src/text/fonts.rs:125-131). `from_owned` would instead keep the
         /// bytes TWICE — once in `FontDefinitions::font_data` and once as a deep clone in
         /// the `Blob` of the parsed face (fonts.rs:397-402, called from fonts.rs:988) —
         /// i.e. ~99 MB of avoidable resident memory for the current bundle.
@@ -413,7 +413,7 @@ mod desktop {
     /// A title-local `fonts/ui` override is selected by FILE EXTENSION alone, but epaint
     /// parses every registered file eagerly and turns a parse failure into a PANIC on the
     /// GUI thread — `FontFace::new(..).unwrap_or_else(|err| panic!(..))`,
-    /// epaint-0.35.0/src/text/fonts.rs:987-1000 — so a `core/junk.ttf` in someone else's
+    /// epaint-0.36.2/src/text/fonts.rs:981-994 — so a `core/junk.ttf` in someone else's
     /// archive would otherwise crash the first frame after installation. The bundled path
     /// is protected indirectly (`ms_fonts` drops a file whose `name` table it cannot read,
     /// `crates/ms-fonts/src/manifest.rs`); this is the same rule for the override path.
@@ -527,7 +527,7 @@ mod desktop {
     /// `Highest` families, the core fonts land in `Monospace` in REVERSE `NN-` order. That
     /// is deliberate and not worth a second copy of the bytes to fix: re-registering a font
     /// under a second name would duplicate it (a repeated `add_font` with the same name is a
-    /// no-op, egui-0.35.0/src/context.rs:2065-2076), and the only overlap between the core
+    /// no-op, egui-0.36.2/src/context.rs:2133-2144), and the only overlap between the core
     /// faces there is a handful of geometric symbols (■ ○ ● ◊).
     fn core_families() -> Vec<InsertFontFamily> {
         vec![
@@ -938,7 +938,7 @@ mod desktop {
     }
 
     /// Skipped by the coverage check: `has_glyph` reports the replacement character itself
-    /// as missing whichever face owns it (epaint-0.35.0/src/text/font.rs:720-723), so a
+    /// as missing whichever face owns it (epaint-0.36.2/src/text/font.rs:719-722), so a
     /// text that contains one — a mis-decoded chapter, say — would otherwise pull in the
     /// whole extended tier for nothing.
     const REPLACEMENT_CHARACTER: char = '\u{FFFD}';
@@ -1069,9 +1069,9 @@ mod desktop {
     /// is the chain canvas text is actually drawn with.
     ///
     /// Returns `true` ("nothing to do") while the family is not bound yet: `add_font` is
-    /// only folded into the definitions on the next pass (egui-0.35.0/src/context.rs:543-560),
+    /// only folded into the definitions on the next pass (egui-0.36.2/src/context.rs:556-573),
     /// so the frame right after the loader finishes can still see an unbound family, and
-    /// `FontsImpl::font` PANICS on one (epaint-0.35.0/src/text/fonts.rs:1030).
+    /// `FontsImpl::font` PANICS on one (epaint-0.36.2/src/text/fonts.rs:1025).
     fn bubble_chain_covers(ctx: &egui::Context, text: &str) -> bool {
         let family = egui::FontFamily::Name(BUBBLE_TEXT_FAMILY_NAME.into());
         ctx.fonts_mut(|fonts| {
@@ -1079,7 +1079,7 @@ mod desktop {
                 return true;
             }
             // The size is irrelevant here: `has_glyph` only looks at `font_id.family`
-            // (epaint-0.35.0/src/text/fonts.rs:858-860).
+            // (epaint-0.36.2/src/text/fonts.rs:852-854).
             let font_id = egui::FontId::new(1.0, family.clone());
             text.chars()
                 .filter(|ch| !ch.is_ascii() && *ch != REPLACEMENT_CHARACTER)
@@ -1097,7 +1097,7 @@ mod desktop {
             return;
         };
         let planned = plan.len();
-        // `egui::Context` is `Arc<RwLock<..>>` (egui-0.35.0/src/context.rs:710), so the
+        // `egui::Context` is `Arc<RwLock<..>>` (egui-0.36.2/src/context.rs:723), so the
         // worker registers the fonts on this clone directly, exactly like the initial load.
         let ctx = ctx.clone();
         if let Err(err) = std::thread::Builder::new()
@@ -1158,7 +1158,7 @@ mod desktop {
         /// Replays `add_font` plans the way egui folds them and returns the resulting chains.
         ///
         /// Mirrors `FontPriority::Highest` = `fam.insert(0, ..)` / `Lowest` = `fam.push`
-        /// (egui-0.35.0/src/context.rs:551-557). The simulated context starts empty, so the
+        /// (egui-0.36.2/src/context.rs:564-570). The simulated context starts empty, so the
         /// chains below are relative to the egui default fonts, which stay behind the
         /// `Highest` entries and in front of the `Lowest` ones.
         fn simulate_chains(plans: &[Vec<PlannedFont>]) -> BTreeMap<egui::FontFamily, Vec<String>> {
@@ -1537,7 +1537,7 @@ mod desktop {
 
         /// The crash vector itself: bytes that are not a font must be rejected with a
         /// reason instead of reaching epaint, which panics on a parse failure
-        /// (epaint-0.35.0/src/text/fonts.rs:987-1000).
+        /// (epaint-0.36.2/src/text/fonts.rs:981-994).
         #[test]
         fn junk_bytes_are_rejected_instead_of_being_installed() {
             let rejected = validate_font_bytes(JUNK_FONT_BYTES);

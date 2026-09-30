@@ -115,7 +115,7 @@ impl ScriptGroup {
     /// binary resolves it via `ms_i18n::lookup(key).unwrap_or(key)`; this crate is
     /// GUI-free and must not depend on the UI-string catalog, so it returns the key
     /// rather than the localized text. Total: every variant maps to a non-empty,
-    /// unique key (see `docs/i18n_exclusions.md` §F).
+    /// unique key (see `dev-docs/i18n_exclusions.md` §F).
     #[must_use]
     pub fn name_key(self) -> &'static str {
         match self {
@@ -200,7 +200,7 @@ impl TextLanguage {
     /// Catalog key for this language's display name, used by the typesetting-language
     /// selector and the font-coverage tooltip. The binary resolves it via
     /// `ms_i18n::lookup(key).unwrap_or(key)`; this crate is GUI-free and returns the
-    /// key rather than localized text (see `docs/i18n_exclusions.md` §F). Total:
+    /// key rather than localized text (see `dev-docs/i18n_exclusions.md` §F). Total:
     /// every variant maps to a non-empty, unique key (exhaustive match).
     #[must_use]
     pub fn name_key(self) -> &'static str {

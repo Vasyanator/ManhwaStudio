@@ -42,7 +42,7 @@ startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
 ## File dialogs
 - **Only `window.rs` opens a dialog or touches the filesystem, and never on the GUI thread.**
   A native dialog blocks until answered and a graph read/write is I/O, both forbidden on the
-  GUI thread (`AGENTS.md` §5). `spawn_graph_save` / `spawn_graph_load` / `spawn_node_path_pick`
+  GUI thread (`CLAUDE.md` §5). `spawn_graph_save` / `spawn_graph_load` / `spawn_node_path_pick`
   run on a worker and answer with one `FileTaskEvent`; `poll_file_task` drains that channel
   once per frame and is what applies the result to the model. The window holds **at most one**
   such task (`file_task_rx`): the Save/Load buttons disable while it is in flight and a node's

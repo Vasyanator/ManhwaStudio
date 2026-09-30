@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/machine_translators/mod.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/machine_translators/mod.rs
 Machine translation backends for Translation tab worker.
 
 Main items:

@@ -1,5 +1,5 @@
 /*
-FILE HEADER (tabs/typing/tab.rs)
+FILE HEADER (crates/ms-tab-typing/src/tab.rs)
 - Назначение: состояние вкладки `Текст` на основе `CanvasView` с read-only оверлеями и
   интерактивной деформацией поверх общей high-res surface + созданием новых текстовых оверлеев
   + бинарной маской обрезки страниц.
@@ -16,7 +16,9 @@ FILE HEADER (tabs/typing/tab.rs)
     forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `app.rs` seed the
     collapsed flag from `user_config` at construction, read it back on exit, and push per-frame hint
     content.
-  - `text_overlays`: слой PNG-оверлеев (`text` + `image`) с загрузкой из `text_images/text_info.json`,
+  - `text_overlays`: слой PNG-оверлеев (`text` + `image`). Text overlays persist as inline v3 text
+    nodes of the chapter `LayerDoc` (`layers.json`); a legacy `text_images/text_info.json` is
+    read-only input, migrated once into the doc (`tab/render_jobs.rs`),
     декодирование в фоне, дозированная загрузка текстур в GUI-потоке, выбор, drag,
     загрузка/редактирование сохраняемой `deform_mesh` как общей high-res surface
     and LRU snapshots/eviction for reconstructable display textures while keeping `source_rgba`;
@@ -44,7 +46,7 @@ FILE HEADER (tabs/typing/tab.rs)
     при выделении оверлея верхняя панель auto-переключается в режим редактирования,
     изменения текста/параметров рендерятся в тот же PNG в фоне по схеме latest-wins:
     новый запрос сразу вытесняет предыдущий и устаревший результат не применяется,
-    а `text_info.json` сохраняется отложенно после снятия выделения;
+    and the edit is written to the doc later, at a deferred-save flush point (`tab/persist.rs`);
     масштаб выделенного оверлея через `-` / `=` / `0` (уменьшить/увеличить/сброс), Shift-выделение
     под создание нового текстового оверлея, inline-редактор и фоновый финальный рендер+сохранение;
     новый оверлей после рендера создаётся с `scale = 1.0` (без fit-подгонки под ширину выделения);
@@ -52,8 +54,8 @@ FILE HEADER (tabs/typing/tab.rs)
     `Сдвиг`, `Закрутка`, `Восстановление`, `Разгладить`, `Растянуть`, `Складка`)
     являются только инструментами редактирования общей surface и
     не хранят собственные отдельные параметры влияния; после изменения положения/деформации
-    placement сохраняется в `text_info.json`
-    через отдельный worker-поток (без блокировки GUI);
+    placement is flushed into the doc's inline payload and written to `layers.json` by a
+    detached worker (never blocking the GUI), under the same deferred-save policy;
     у записей оверлея хранятся placement-поля + `render_data` + флаг `mask_clip_enabled`,
     в `render_data.text_params` сохраняются расширенные поля раскладки
     (`text_layout_mode`, `formula_layout`, `shape_layout`, `drawn_lines_layout`,

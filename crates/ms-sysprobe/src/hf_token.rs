@@ -10,18 +10,19 @@ reads the same value, so it lives here rather than inside an engine.
 Storage:
 The token is a CREDENTIAL and is kept in the OS secret store (`keyring`) under the
 service name `"ManhwaStudio Hugging Face"`, exactly as the AI API keys are kept under
-`"ManhwaStudio AI API OCR"` (`tabs/translation/ocr.rs`). It is NEVER written to
+`"ManhwaStudio AI API OCR"` (`crates/ms-tab-translation/src/ocr.rs`). It is NEVER written to
 `user_config.json`, to any settings JSON, or to a log. The OCR entry is deliberately
 NOT reused or generalized: that one belongs to the translation tab and is keyed by
 service, while this one is a single global value.
 
 Shape:
 A runtime global with free get/set/clear functions, in the shape of
-`tabs/typing/rotation_ctrl_wheel.rs`: a cached value behind an `RwLock`, seeded once
-at startup (`main.rs::seed_hf_token_from_secret_store`) so that every later READ is a
-lock acquisition rather than an OS round trip. Only the seed, a save and a delete
+`crates/ms-config/src/rotation_ctrl_wheel.rs`: a cached value behind an `RwLock`,
+seeded once at startup (`seed_hf_token_from_secret_store`, called by `main.rs`, reads
+on its own worker) so that every later READ is a lock acquisition rather than an OS
+round trip. Only the seed, a save and a delete
 touch the secret store, and all three are BLOCKING — the GUI thread must never call
-them directly (AGENTS.md §5).
+them directly (CLAUDE.md §5).
 
 Key items:
 - `HfTokenState`: the tri-state the UI badge renders (not known / not set / stored).

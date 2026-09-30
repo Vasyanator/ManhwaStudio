@@ -210,7 +210,7 @@ def _handle_inpaint_flux2_klein(
         "oom_recovered": bool(result.get("oom_recovered", False)),
         # ALL FIVE flags, always. The Rust side parses `applied` as one struct and
         # ignores a partial object outright (`Flux2AppliedFlags` in
-        # `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/progress.rs`), so dropping a key here does
+        # `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/progress.rs`), so dropping a key here does
         # not degrade the answer — it discards the whole thing, and with it the
         # OOM-recovery settings the next run was supposed to start from.
         "applied": {name: bool(applied.get(name, False)) for name in _APPLIED_FLAGS},

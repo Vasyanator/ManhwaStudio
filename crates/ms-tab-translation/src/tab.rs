@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/tab.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/tab.rs
 Translation tab state and orchestration for side panels, OCR, machine translation,
 text detector, and footer metadata synchronization with CanvasView/BubblesModel.
 

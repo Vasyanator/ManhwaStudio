@@ -4,8 +4,7 @@
 Owns WHERE the program's OS window opens and where it is left: the user's primary-monitor
 choice, the last known geometry of the studio window, and the plumbing that keeps both in
 the self-versioned `Window` section of `user_config.json`. Re-exported by the binary as
-`crate::window_geometry` (`src/main.rs`), so every `crate::window_geometry::…` call site
-keeps working unchanged.
+`crate::window_geometry` (`src/main.rs`).
 
 Native-only: winit windows and OS monitors do not exist in the web build, so the binary
 depends on this crate from its `cfg(not(target_arch = "wasm32"))` block.
@@ -53,6 +52,17 @@ in, or the two `Window` types stop unifying.
 - **Section version.** `WINDOW_SECTION_VERSION` is mirrored as a literal in `ms-config`'s
   default tree (this crate is native-only and cannot be referenced from there); a drift test
   in `lib.rs` keeps the two in step.
+- **Owners.** The studio owns the geometry: `StudioBootstrapApp` (`src/studio_bootstrap.rs`)
+  holds the `WindowGeometryTracker` from the first frame and flushes it in `on_exit`. The
+  launcher only follows the monitor choice (`SizePolicy::KeepDefault`) and never persists
+  geometry. A geometry sample is taken only while the window is neither maximized, minimized
+  nor fullscreen; a write touches only its own fields of the section.
+- **Windows first-frame maximize.** On Windows the restored maximized state is applied as a
+  first-frame `ViewportCommand::Maximized`, gated on the persisted `Window.maximized` flag
+  (default `true`), by `StudioBootstrapApp`.
+- **No `ViewportBuilder::with_monitor`.** In egui-winit 0.36.2 it requests BORDERLESS
+  FULLSCREEN on that monitor (`egui-winit-0.36.2/src/lib.rs:2003-2006`), so placement uses a
+  stored position inside the monitor instead.
 - Blocking work never runs on the GUI thread: `observe` only samples and hands the sample to
   the writer thread.
 

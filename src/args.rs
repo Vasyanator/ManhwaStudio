@@ -9,7 +9,7 @@ Main items:
 - `Cli.test_launcher`: starts the new Rust launcher test mode instead of the main app.
 - `Cli.test_ver_check`: forces update checks to report an available update in launcher/update UI.
 - `Cli.check_venv`: verifies the managed Python environment and exits; opens the installer in
-  environment-repair mode only when something is missing (see `src/venv_check.rs`).
+  environment-repair mode only when something is missing (see `crates/ms-installer/src/venv_check.rs`).
 - `Cli.ignore_installed`: run-from-sources mode — never touches or competes with an installed copy
   (no existing-install discovery, no Linux desktop entry, isolated backend socket, self-update off).
 - `conflicting_installed_copy_flags`: the single validation of flag combinations that contradict
@@ -24,10 +24,10 @@ Main items:
 - `Cli.continue_create_start_menu_shortcut`: скрытый служебный флаг продолжения elevated-создания ярлыка меню Пуск.
 - `Cli.uninstall_signal_file`: скрытый служебный файл-сигнал для сценария "удалить и затем переустановить".
 - `Cli.continue_update`: hidden service flag that resumes update work after executable replacement.
-- `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `src/trace.rs`).
+- `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `crates/ms-log/src/trace.rs`).
 
 Notes:
-`--version` reports the extended, git-derived `MS_APP_VERSION` (see `src/version_format.rs`
+`--version` reports the extended, git-derived `MS_APP_VERSION` (see `crates/ms-config/src/version_format.rs`
 and `build.rs`), not the plain `CARGO_PKG_VERSION`.
 */
 

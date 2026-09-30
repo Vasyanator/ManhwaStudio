@@ -31,7 +31,7 @@ re-apply it and the next positional flush would write the stale runtime value ba
 `create_hint_bubble_at_pointer_shortcut` → `create_bubble_at` → `promote_bubble_to_hint`, which seeds
 the flag from the user-level `CanvasState::hint_show_outside_default`.
 
-CONVERTING an existing bubble goes through `mod.rs::set_bubble_class_for_bid`, which owns the whole
+CONVERTING an existing bubble goes through `lib.rs::set_bubble_class_for_bid`, which owns the whole
 class-owned normalization (the bubbles side panel only calls it and mirrors the result into its own
 editor buffer). Entering `Hint` pins `bubble_type = Aside`, seeds `hint_show_outside` from the same
 user-level default, and folds the two text fields into the hint's single line: a blank `text` takes
@@ -131,7 +131,7 @@ gates the bubble history on `!ctx.egui_wants_keyboard_input()`, which in egui 0.
 `memory.focused().is_some()` (`egui-0.36.2/src/context.rs:2987`). So while the field is focused Ctrl+Z is consumed by egui's own
 `TextEdit` undoer; the bubble-history entry is what applies once focus is elsewhere.
 
-`mod.rs::draw_hangul_keyboard_panel` draws the panel after the scene pass as an `egui::Window` with
+`lib.rs::draw_hangul_keyboard_panel` draws the panel after the scene pass as an `egui::Window` with
 a literal id, owns closing through `Window::open`, and publishes its rect into
 `scene.canvas_hangul_keyboard_rect`, which is folded into the same `handle_shortcuts` `inside_canvas`
 occlusion test as `canvas_bottom_hint_rect` — without it the wheel over the panel would zoom the page
@@ -301,15 +301,29 @@ The centering reads its viewport width from `scene.scroll_inner_rect` (falling b
 ## Crate boundary
 `ms-canvas` sits ABOVE `ms-models` / `ms-project` / `ms-widgets` and BELOW the tabs. The
 `CanvasHooks` trait is DECLARED here and IMPLEMENTED by the tabs, so the dependency points down
-only: this crate must never name `tabs`, `app` or `launcher`, and re-introducing such a reference
-would recreate the cycle the crate split removed. The binary re-exports the crate as
-`crate::canvas`, so every pre-split `crate::canvas::...` call site keeps its path.
+only: this crate must never name `tabs`, `app` or `launcher` (that would be a dependency cycle).
+The binary re-exports the crate as `crate::canvas`.
 
 What the tabs consume is therefore the crate's PUBLIC surface, not a `pub(crate)` one:
 `ViewTransform`, `pixel_grid` (the PS editor paints the same grid from its own viewport),
 `pixel_inspection_recommended_for`, `parse_image_text_areas` / `ImageTextArea`,
 `save_canvas_settings_to_{user,project}_file`, `declare_ribbon_tab` / `dock_area_rect` and the
 `CANVAS_RIBBON_TAB*` constants. Keep additions to that surface deliberate.
+
+`CanvasHooks` (declared in `lib.rs`; every method has a no-op/`false`/empty default) is the ONLY
+extension point for tab behaviour:
+
+| Area | Methods |
+|---|---|
+| Page overlays | `draw_canvas_mask_overlay_on_page`, `draw_canvas_overlay_on_page`, `draw_canvas_overlay_top_left` (tab panels + panel dock) |
+| Bubble cards | `has_bubble_header`, `build_bubble_header`, `readonly_aside_header_width_hint`, `build_bubble_footer`, `on_bubble_action` |
+| Bubble visibility / status | `should_hide_on_top_bubble`, `should_hide_aside_bubble_line`, `bubble_status_style` |
+| Page context menu | `draw_canvas_page_context_menu`, `suppress_canvas_page_context_menu` |
+| Gestures / scrollbar | `wants_canvas_shift_drag_selection`, `canvas_scrollbar_marks` |
+
+Bubble status borders: the rules live in `SharedCanvasSettings` (edited only in the studio settings
+«Лента» pane), are evaluated by the GUI-free `ms_config::bubble_status` model and reach the canvas
+through the tab's `bubble_status_style`; the border is painted by `ms_widgets::bubble_status`.
 
 `canvas_defaults_agree_across_the_three_mirrors` lives at the bottom of `types.rs`, next to
 `CanvasState::default` — the only one of the three canvas-default mirrors reachable from a crate
@@ -323,6 +337,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - `overlay_runtime.rs`: clean overlay CPU/GPU runtime state, background preparation, and
   local/shared visibility state.
 - `bubble_runtime.rs`: runtime bubble state, model synchronization, undo/redo, and clipboard.
+- `bubble_action.rs`: `BubbleSnapshotOp`, the `ms-actions` `ReversibleAction` behind bubble undo/redo
+  (full before/after snapshots; see "Bubble undo/redo" below).
 - `bubble_aside_ui.rs`: aside bubble column layout and interactions. Layout runs as
   `build_aside_desired_slots` (measure) -> `pack_aside_slots` (pure vertical packing) ->
   `draw_aside_slots`. `draw_aside_side` picks single- or two-column layout per side: with
@@ -345,7 +361,12 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `draw_pixel_grid` emits one `Painter::line_segment` per line — never a polyline, which
   `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
-- `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`). The `ScrollArea` still allocates the page strip and owns scrolling, but each page's authoritative screen `image_rect` and its `page_in_view` visibility are now produced by this transform: `reserve_canvas_page_frame` establishes one per-frame transform from the first laid-out page (`scale == state.zoom`, `translation = old_image_left_top - world_min*scale`) and maps every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the transform-derived rect drifts >0.5px from the old ad-hoc rect. Future increments will remove the `ScrollArea` and make the transform the sole camera.
+- `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`).
+  The `ScrollArea` allocates the page strip and owns scrolling; each page's authoritative screen
+  `image_rect` and its `page_in_view` visibility come from this transform: `reserve_canvas_page_frame`
+  establishes one per-frame transform from the first laid-out page (`scale == state.zoom`) and maps
+  every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the
+  transform-derived rect drifts >0.5px from the allocated rect.
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
 
 ## Contracts and invariants
@@ -405,7 +426,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - `CanvasHooks` callbacks must stay lightweight and must not mutate shared models while canvas
   locks are held. Use typed canvas APIs or tab-owned worker/event channels for heavier work.
 - Vertical-scrollbar marks are tab-owned. After `draw_canvas_scene` lays out the strip,
-  `mod.rs::render_scrollbar_marks` asks the active tab via `CanvasHooks::canvas_scrollbar_marks`
+  `lib.rs::render_scrollbar_marks` asks the active tab via `CanvasHooks::canvas_scrollbar_marks`
   (default none) and paints the returned marks onto the native vertical bar with
   `widgets::paint_marks_on_bar`, then re-draws the handle on top so it stays visible. The
   `egui::ScrollArea::both` engine is untouched (both axes scroll natively). Tabs position marks in
@@ -440,7 +461,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   so one gesture yields exactly one undo entry and one model commit. Gesture-end handlers must
   re-insert the dragged id into `pending_upsert` so the final position commits. If the dragged
   widget stops being rendered mid-drag (its page scrolls fully off-screen) egui never delivers
-  `drag_stopped()`, so the per-frame `mod.rs::commit_lingering_drag_gestures_on_pointer_up`
+  `drag_stopped()`, so the per-frame `lib.rs::commit_lingering_drag_gestures_on_pointer_up`
   fallback (run in `draw` after the scene pass, only when the primary pointer is up) is the
   data-loss guard: it routes aside/on-top drags through `finish_*_drag` and mirrors the rect/area
   handle `drag_stopped` paths (`pending_upsert.insert` + clear `active_*_handle`). It is the single
@@ -461,7 +482,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   COUNTED FOR LAYOUT. Any new scan over `runtime_bubbles` that feeds drawing, hit-testing, or
   layout must call the predicate — a scan that forgets it leaks the bubble's existence even without
   painting it. There are exactly three call sites today: `page_bubbles_bucketed` (covers both aside
-  columns, both on-top columns, and `focus_candidate_at_scene_pos`), `mod.rs::refresh_page_aside_presence`
+  columns, both on-top columns, and `focus_candidate_at_scene_pos`), `lib.rs::refresh_page_aside_presence`
   (the aside-gutter reservation read by `scene.rs::canvas_row_width_for_page`; without it a page whose
   only aside bubble is a hidden hint would reserve an empty gutter), and
   `bubble_aside_ui.rs::aside_hit_test` (whose `mounted` flag stays `true` with stale card geometry
@@ -494,7 +515,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   their own builder (`translation_default_dock_layout`, `cleaning_default_dock_layout`,
   `typing_default_dock_layout`), because a default layout must name every tab its program tab
   declares. To change how the tab is DECLARED (title, size bounds, body), edit
-  `mod.rs::declare_ribbon_tab`, which all three tabs call.
+  `lib.rs::declare_ribbon_tab`, which all three tabs call.
 - To change source page GPU residency or NEAREST inspection behavior, edit `scene.rs`,
   `lib.rs`, and the source-page texture owner in `app.rs`.
 - To change how the pixel grid LOOKS or which lines it emits, edit `pixel_grid.rs` — it is shared
@@ -506,7 +527,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - To change hint-bubble behavior, edit `bubble_runtime.rs` (`create_hint_bubble_at_pointer_shortcut`,
   `promote_bubble_to_hint`, `is_runtime_bubble_hidden` and its three call sites, the write-back in
   `flush_bubble_upserts_to_model`), `helpers.rs::hint_show_outside_from_extra`, and
-  `mod.rs::set_bubble_class_for_bid` (forced aside + class-owned normalization). For the CARD, edit `bubble_aside_ui.rs` (`aside_visible_groups`,
+  `lib.rs::set_bubble_class_for_bid` (forced aside + class-owned normalization). For the CARD, edit `bubble_aside_ui.rs` (`aside_visible_groups`,
   `estimate_aside_body_height`, and the `show_hint_text` field in the card body) — the estimator and
   the card body must change together. The footer content is tab-owned
   (`tabs/translation/tab.rs::build_bubble_footer`). The default for new hints is a canvas setting
@@ -515,7 +536,7 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   capture, the text splice), edit `bubble_runtime.rs` (`open_hangul_keyboard_session`,
   `apply_hangul_keyboard_insert`, `hangul_insert_splice_range`, the `hangul_target` eviction points);
   for the window itself, its default position, the no-target warning, or its input occlusion, edit
-  `mod.rs::draw_hangul_keyboard_panel` and `scene.canvas_hangul_keyboard_rect`. The keyboard
+  `lib.rs::draw_hangul_keyboard_panel` and `scene.canvas_hangul_keyboard_rect`. The keyboard
   content is a general-purpose widget and lives in `crates/ms-widgets/src/hangul_keyboard.rs`.
 - To change canvas hook contracts, public runtime DTOs, or persisted canvas settings, start in
   `types.rs`, `lib.rs`, and `settings.rs`.

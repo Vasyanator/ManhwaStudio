@@ -86,9 +86,13 @@ repo-root `docstore.py` (it touches only `user_config`).
 ## Contracts and invariants
 - The document lock is NON-reentrant; inside `with_lock` use `LockedDoc` methods only.
 - `update` never overwrites a malformed document (`Malformed`, file untouched, mutator not
-  run); a failing mutator writes nothing. JSON `update` always rewrites; `.db` `update`
+  run); a failing mutator writes nothing. Only `quarantine` moves a malformed file aside
+  (sidecar name, `.db` journal included).
+- `WriteOptions::default()` has `create_parent_dirs: true`: a write RE-CREATES a missing
+  parent directory. A caller that must not resurrect a deleted directory (a staging dir being
+  discarded) must stop its writers first or pass `false`. JSON `update` always rewrites; `.db` `update`
   writes nothing for an unchanged document.
-- Baselines: JSON fingerprints the exact bytes (byte-compatible with step 1); `.db`
+- Baselines: JSON fingerprints the exact bytes; `.db`
   fingerprints the compact text of the joined `Value`. A baseline from one format never
   matches the other (one `Conflict` after a conversion → the caller's merge path).
 - `.db` ignores `pretty`/`trailing_newline`/`Durability` BY DESIGN (always
@@ -97,8 +101,7 @@ repo-root `docstore.py` (it touches only `user_config`).
   ~100-170 ms on an HDD) is therefore paid per transaction — callers batch writes.
 - Replacing, removing or quarantining a `.db` handles its `-journal` (removed, or moved to
   `<sidecar>-journal`): SQLite would replay a stale journal into a new file of that name.
-- Public error enum and `Signature` are unchanged from step 1 (callers match them
-  exhaustively): `SQLite` engine failures map to `Storage(StorageError::Io)` (busy →
+- Public error enum and `Signature` are matched exhaustively by callers — keep them stable: `SQLite` engine failures map to `Storage(StorageError::Io)` (busy →
   `ResourceBusy`), schema/foreign/corrupt files to `Malformed`, a newer schema to
   `Unsupported`, a failed whole-write validation to `Write(TempWrite)`. `Signature` is
   `Bytes` for both formats; `revision()` is the exact `.db` counter.

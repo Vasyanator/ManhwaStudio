@@ -107,7 +107,7 @@ DEVICE_MEMORY_RESERVE_BYTES = 512 * 1024**2
 
 #: The four memory profiles the UI offers, as (label, placement,
 #: low_cpu_mem_usage). MUST stay in sync with `MemoryPreset::values` in
-#: `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs` — the guard names the ones that fit,
+#: `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/settings.rs` — the guard names the ones that fit,
 #: so a stale entry here is advice the user cannot follow.
 _MEMORY_PRESETS = (
     # The labels are shown to the USER by `_preset_advice`, so they must be the

@@ -7,8 +7,9 @@ browser (no filesystem). This is the foundation of the web (wasm) port's
 "projects in site data" requirement.
 
 ## Architecture
-A single synchronous, object-safe `Storage` trait plus two backends that behave
-identically (guaranteed by shared contract tests in `tests/backends.rs`):
+A single synchronous, object-safe `Storage` trait plus two virtual-root backends that
+behave identically (guaranteed by shared contract tests in `tests/backends.rs`), and the
+`PassthroughStorage` desktop default (see `passthrough.rs` below):
 
 - **`NativeStorage`** — desktop backend. Resolves virtual paths under a fixed
   root `PathBuf` and delegates to `std::fs`. Never touches anything outside its
@@ -30,7 +31,9 @@ Paths are **virtual**: root-relative, '/'-separated (backslashes accepted),
   lazily defaulting to `PassthroughStorage` on native and `MemStorage` on wasm, and
   `install()` (wasm-only) for the web layer's pre-hydrated store. The binary re-exports
   this module as `crate::storage`, so every `crate::storage::storage()` call site in
-  `src/` reaches it unchanged. `ms-config` reads and writes `user_config.json` through it.
+  `src/` reaches it unchanged. `ms-docstore` (every config document, `user_config`
+  included) uses it only on wasm32; natively it calls `std::fs` itself on the same file
+  system, because the atomic write recipe needs real `Path`s and fsync.
 - `native.rs`: `NativeStorage` + `real_path()` migration helper (virtual → real
   `PathBuf`, for call sites still handing a `&Path` to e.g. `image::open`).
 - `passthrough.rs`: `PassthroughStorage` — `std::fs` with no virtual root and no
@@ -44,6 +47,8 @@ Paths are **virtual**: root-relative, '/'-separated (backslashes accepted),
   at startup.
 - Semantics mirror `std::fs`: `write`/`rename` do NOT create missing parent
   dirs; call `create_dir_all` first (the desktop code already does).
+- `write` is NOT crash-atomic (the native backends call `std::fs::write`). Documents
+  that need atomic replacement go through `ms-docstore` (temp file + rename + fsync).
 - All methods are total (no panics): lock poisoning is recovered via
   `PoisonError::into_inner`, oversized lengths saturate instead of overflowing.
 - Backends MUST stay behaviorally identical; any new method needs a matching

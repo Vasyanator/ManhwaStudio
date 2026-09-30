@@ -37,7 +37,12 @@ dependency list.
 ## Files and submodules
 - `lib.rs`: crate root and module list; the `tutorial` feature gate.
 - `settings_shared.rs`: the menu-level layer — `SettingsSectionId`, `sections_for`,
-  `title_key`, and `SharedSettingsPanels`, which owns the three shared panes.
+  `title_key`, and `SharedSettingsPanels`, which owns the three shared panes. The studio
+  Settings tab shows six sections: the shared General, AiBackend and Tutorials (the last only
+  with the `tutorial` feature) plus its own CanvasRibbon, Typesetting and Hotkeys; the launcher
+  adds its own SystemInfo, AiComputations, TorchUpgrade and PythonEnvironment. `SettingsDeepLink`
+  is declared in `ms_config::settings_deep_link` (the typing tab requests deep links and may not
+  depend on this crate) and only re-exported here.
 - `storage_mode_job.rs`: the ONE process-wide Dev/Prod conversion job (slot Idle / Pending /
   Running {done,total} / Finished {outcome}). The startup reconciliation (`main.rs` records it
   pending; the launcher loop or `studio_bootstrap` starts it) and the General pane's switch
@@ -59,10 +64,16 @@ dependency list.
   (`ui_scale_percent` / `apply_ui_scale`) every `eframe::run_native` creator applies, and
   the locale-catalog helpers the launcher's first-run language modal reuses.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
-  backend health readout, ORT crash-guard reset.
+  backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
+  native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
+  ROCm) stay selectable for backend ONNX. Selections persist off-thread through
+  `ms_config::save_onnx_provider_device` / `save_onnx_build` / `save_max_loaded_models` and work
+  with no backend running.
 - `ai_backend_supervisor.rs`: `AiBackendHandle` — the app-global handle both shells drive
   the Python backend process through, plus its health probe and (on Windows) the loopback
-  WebSocket handshake. `start_with_autostart_gate` defers the persisted autostart until a
+  WebSocket handshake. `AiBackendSupervisor` is built once in `run_main` and outlives the
+  launcher -> studio switch; the process itself (spawn, stdout/stderr reader threads, runtime
+  log) is owned by the `AiBackendProcessRuntime` worker (`spawn_ai_backend_process_worker`). `start_with_autostart_gate` defers the persisted autostart until a
   gate opens (the binary passes `!storage_mode_job::backend_autostart_blocked()`); a user
   Start/Restart/Stop cancels a deferred autostart.
 - `tutorial/`: the onboarding subsystem, behind the `tutorial` feature. See its own

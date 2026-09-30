@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/machine_translation.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/machine_translation.rs
 Background machine-translation controller for Translation tab.
 
 Main types:

@@ -24,8 +24,13 @@ Long work is delegated to focused controllers:
 
 - `ocr.rs` owns the OCR worker, backend IPC transport (framed `shared_client()`), AI API OCR
   transport, page crop/cache handling, OS credential-store API key access, and per-engine load state.
+  `OcrEngine` has six engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL and Surya (backend IPC
+  methods `ocr.*`, MangaOCR/PaddleOCR also native ONNX) and AI API (`genai`, no backend).
 - `text_detector.rs` owns the text detector worker and returns page boxes plus editable binary
-  masks.
+  masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
+  connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle`), `AiCtd`
+  (backend `textdetector.ctd`) and `Surya` (backend `textdetector.surya`). The inline
+  `detect_*_mask_for_image` helpers are the same contracts reused by Cleaning's mask generation.
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
 - `backend_health.rs` owns the shared Python backend probe snapshot used by Translation and
@@ -85,10 +90,11 @@ Text-detector mask GPU textures are a reconstructable display cache. The tab exp
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
 text-mask data remain intact for redraw, editing, and disk persistence.
 
-Python-backed OCR/detector routes call the backend service over the framed IPC protocol on the
-AF_UNIX socket from `backend_ipc::backend_socket_path()`. All backend transport goes through
-`ms_backend_ipc::shared_client()`; `backend_health.rs` owns no TCP/port state. OCR requests use
-`begin_call`/`CallHandle` for explicit cancellation (replacing legacy "latest-wins" behavior). App-managed
+Python-backed OCR/detector routes call the backend service over the framed IPC protocol (AF_UNIX
+socket on unix, token-authenticated loopback WebSocket on Windows; the transport is chosen inside
+`ms-backend-ipc`). All backend transport goes through `ms_backend_ipc::shared_client()`;
+`backend_health.rs` owns no TCP/port state. OCR requests use `begin_call`/`CallHandle` for explicit
+cancellation. App-managed
 model files must be resolved through `ms_sysprobe::ai_models` before backend initialization; EasyOCR,
 Surya, and PaddleOCR-VL library/Hugging Face caches remain backend/library-managed. PaddleOCR
 detector-only downloads only detection files, while full PaddleOCR also downloads the selected
@@ -106,8 +112,9 @@ routes to `NativeManga`, and PaddleOCR routes to `NativePaddle` (any language); 
 the native route the OCR worker decodes the crop to RGBA and calls
 `ms_native_runtime::recognize_manga` / `recognize_paddle` (desktop-only), assembling lines/text
 with the same `join_newlines`/`reflect_strings` rules as the backend (Paddle's lines are joined with
-`\n` first). The guard scope uses `native_runtime::native_load_scope_key()` (provider[:device]) so the
-pre-check matches the provider/adapter that will actually load. Native PaddleOCR text detection is selected in `text_detector.rs`
+`\n` first). The guard scope uses `native_runtime::native_load_scope_key()`
+(`{build}:{provider}[:{device}]@{version}`) so the pre-check matches the build/provider/adapter that
+will actually load. Native PaddleOCR text detection is selected in `text_detector.rs`
 by `detector_native_route` (native runtime + non-Suspect guard): `detect_page_paddle_ocr` and the
 inline `detect_paddle_mask_for_image` call `native_runtime::detect_paddle` and build the same
 `TextDetectorPageResult`/mask the backend produces (xyxy blocks sorted y1,x1 truncated to 2500;
@@ -124,14 +131,13 @@ skip `ensure_v2_backend_ready` (and the backend warmup) when the active route is
 in-process runtime/model load lazily on first use and the controller reaches `Ready` with the
 backend offline. The UI trigger gate `ocr::ocr_requires_backend(engine, model, runtime, guard)` is
 the single source of truth for "does this OCR selection need the backend?": native ONNX routes
-return `false`, backend routes and `AiApi` (over `genai`) preserve their historical behavior;
+return `false`, backend routes return `true`, and `AiApi` (over `genai`) never requires the backend;
 `tab.rs::ocr_requires_backend_runtime` calls it, reading the runtime+guard from a per-tab cache
 refreshed at most every `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks on disk I/O.
 Every OCR trigger (drag-box, advanced/quick recognize, the load button, the proactive health check)
 consults it, so a native selection dispatches with the backend offline. Only backend routes warm
 the backend and probe backend health. The native→backend fallback still applies when native
-inference fails AND the backend is up (the fallback path re-checks readiness itself); native no
-longer requires the backend to run.
+inference fails AND the backend is up (the fallback path re-checks readiness itself).
 AI API MT also bypasses the Python backend. Plain untranslated text batches are sent grouped by
 character and require flat JSON responses containing every bubble ID. When the "existing translation
 in context" option is on, a scope translation also includes already-translated replicas as ordered
@@ -222,7 +228,10 @@ is an author note addressed to the translator, not a replica.
   an empty external-image bubble under the pointer, and `Shift+Q` captures a drag rectangle as the
   page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
   files are written to the chapter unsaved staging `image_bubbles/` directory and stored as
-  chapter-relative paths so the saved chapter can resolve them after commit.
+  chapter-relative paths so the saved chapter can resolve them after commit. `Q`/`Shift+Q` are
+  NOT registered hotkeys: plain `Q` is edge-gated by `image_create_q_armed`, cleared while `Q`
+  takes part in a `Shift+Q` crop session or after a creation and re-armed only once `Q` is fully
+  released, so a lingering `Q` (e.g. `Shift` released a frame earlier) cannot spawn an extra bubble.
 - Translation also owns the hint-bubble shortcut: `H` creates a `BubbleClass::Hint` under the
   pointer. Unlike `Q`/`Shift+Q` it is a REGISTERED hotkey
   (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `app.rs`, default `Key::H` with no modifiers, scope

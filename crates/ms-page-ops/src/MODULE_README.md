@@ -2,7 +2,7 @@
 
 ## Purpose
 Crate root of `ms-page-ops`, re-exported by the binary as `crate::page_ops`
-(`src/main.rs`), so every `crate::page_ops::…` call site keeps working unchanged.
+(`src/main.rs`).
 
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: move a
 page, insert pages (from image files or a generated blank), delete pages,
@@ -72,10 +72,21 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   resolve a pending journal through `recover_pending_page_op` before any
   reconcile pass touches the chapter files, so `ms-project` depends on this
   crate and the types had to sit at or below this layer. They belong here
-  anyway — every `ProjectPaths` field is an `ms_config` name joined onto a
-  chapter or title directory, and this crate already owns that layout.
-  `ms-project` re-exports both, so `crate::project::{Page, ProjectPaths}`
-  is still a valid path in the binary.
+  anyway — every `ProjectPaths` field is a fixed name (an `ms_config` constant,
+  or the literal `image_bubbles`) joined onto a chapter or title directory, and
+  this crate already owns that layout. `ms-project` re-exports both
+  (`crate::project::{Page, ProjectPaths}` in the binary); `ProjectData::load`
+  fills the struct. The layout (paths need not exist):
+  - title dir: `translation_notes.txt`, `char_favorites.json`,
+    `color_presets.json`, `characters/`, `terms.json`, `settings.json`;
+  - chapter dir: `translation_bubbles.json`, `src/`, `clean_layers/`,
+    `cleaned/` (legacy), `alt_vers/`, `saved/`, `image_bubbles/`,
+    `text_images/`, `layers/`, `text_detection/`;
+  - staging `{title}/{chapter}_unsaved/`: bubbles, `clean_layers/`,
+    `image_bubbles/`, `text_images/`, `layers/`.
+  Owned documents (`translation_bubbles`, `settings`, the layers manifest, …)
+  may be `.json` or `.db` on disk; open them through `chapter_docs` /
+  `ms_docstore`, never by the literal file name.
 - `plan.rs`: permutation math, canonical page-keyed file-name helpers (with
   citations to the owning modules), snapshot types, plan types, `build_plan`,
   and the pixel-identity geometry: `PlacementMap` (the ONE affine from a page

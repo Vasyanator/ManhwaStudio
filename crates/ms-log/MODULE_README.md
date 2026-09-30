@@ -1,8 +1,8 @@
 # Module: crates/ms-log
 
 ## Purpose
-Standalone logging + tracing layer for ManhwaStudio, extracted from the binary so
-that other crates (and the app) can log without depending on the application crate.
+Standalone logging + tracing layer for ManhwaStudio, so that every crate (and the app)
+can log without depending on the application crate.
 
 ## Architecture
 Two independent, self-contained modules. Both are configured with an explicit log
@@ -20,7 +20,8 @@ directory supplied by the caller; the crate never reads config or resolves paths
 - `src/trace.rs`: `init_trace`, `emit`, `trace_enabled`, `TraceSpan`, `cat::*`, macros.
 
 ## Contracts and invariants
-- Pure `std`; no external crate dependencies; no dependency on the app crate.
+- Dependencies stay minimal: `web-time` (wasm-safe clock) and `ms-thread` (writer
+  threads, Web Workers on wasm); no dependency on the app crate or any other `ms-*` crate besides `ms-thread`.
 - Callers pass the log directory in. The crate must not call into `config` or
   discover paths itself.
 - The `trace_log!` / `trace_scope!` macros use `$crate::trace::...`, so they resolve

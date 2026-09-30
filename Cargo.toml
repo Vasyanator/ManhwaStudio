@@ -104,10 +104,10 @@ active-logs = []
 tutorial = ["ms-settings-ui/tutorial", "ms-launcher/tutorial"]
 # Web (wasm) build switch. Enabled by the wcheck/wbuild aliases and build-wasm.sh.
 # Selects the browser storage/network backends and compiles out native-only
-# subsystems (subprocess AI backend, sockets, dynamic libs). See docs/WEB_PORT.md.
-# Currently a marker feature consumed by cfg(feature = "web") gates; wasm-only
-# dependencies are added under [target.'cfg(target_arch = "wasm32")'.dependencies]
-# as subsystems are ported.
+# subsystems (subprocess AI backend, sockets, dynamic libs). See dev-docs/WEB_PORT.md.
+# A marker feature: no code gates on cfg(feature = "web"); the web build is selected by
+# cfg(target_arch = "wasm32"), and wasm-only dependencies live under
+# [target.'cfg(target_arch = "wasm32")'.dependencies].
 web = []
 # Frame profiler instrumentation. Off by default for zero runtime overhead.
 # Enable with `cargo run --features profiling` to record per-frame puffin scopes

@@ -60,8 +60,8 @@ Callers: `src/canvas/mod.rs:1507`, `src/tabs/typing/tab.rs:725` and `:788`,
 `src/tabs/translation/adv_rec.rs:962`.
 
 Caveat (pre-existing duplication, not a pattern to copy): the wheel widgets each carry a private clone
-of the same helper, `raw_wheel_events_delta` — `src/widgets/wheel_slider.rs:438`,
-`src/widgets/wheel_spin_box.rs:284`, `src/widgets/wheel_combo_box.rs:326`. They do **not** call
+of the same helper, `raw_wheel_events_delta` — `crates/ms-widgets/src/wheel_slider.rs:438`,
+`crates/ms-widgets/src/wheel_spin_box.rs:284`, `crates/ms-widgets/src/wheel_combo_box.rs:326`. They do **not** call
 `input_util`. New code should call `crate::input_util::raw_wheel_delta`.
 
 ## REMOVED: `Context::is_pointer_over_area` — and `is_pointer_over_egui` is a trap here
@@ -207,7 +207,7 @@ Screenshot { viewport_id: ViewportId, user_data: UserData, image: Arc<ColorImage
 `Text` is the character stream (use it for text entry); `Key` is the physical/logical press-release
 stream (use it for shortcuts). `physical_key` ignores keymaps — only for game-style WASD.
 
-`Event::Screenshot` powers the viewport eyedropper: `src/widgets/viewport_color_selector.rs` requests
+`Event::Screenshot` powers the viewport eyedropper: `crates/ms-widgets/src/viewport_color_selector.rs` requests
 a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(token)))`
 (:129-131) and picks the reply back up in `poll_screenshot_events` (:139-159), matching
 `user_data.data.downcast_ref::<u64>()` against its own token before keeping `Arc<ColorImage>`.
@@ -231,6 +231,6 @@ a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::User
   `MangaApp::execute_hotkey_command` (`src/app.rs:1571`).
 - Widget-local interaction → allocate with the right `Sense` and read the `Response`; do not read
   `ctx.input().pointer` for widget hit-testing.
-- Screenshot/eyedropper flow → `src/widgets/viewport_color_selector.rs`.
-- Wheel widgets (slider/spin box/combo box) → `src/widgets/wheel_*.rs` (each has a local wheel-delta
+- Screenshot/eyedropper flow → `crates/ms-widgets/src/viewport_color_selector.rs`.
+- Wheel widgets (slider/spin box/combo box) → `crates/ms-widgets/src/wheel_*.rs` (each has a local wheel-delta
   clone; prefer `input_util` in new code).

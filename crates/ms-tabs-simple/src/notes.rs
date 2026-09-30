@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/notes.rs
+FILE OVERVIEW: crates/ms-tabs-simple/src/notes.rs
 Translation notes tab with two sub-tabs:
 - "Собранный промпт": builds final prompt from `notes_file` template + `{charas}/{terms}`.
 - "Шаблон (notes_file)": edits the template file itself with placeholder helpers.

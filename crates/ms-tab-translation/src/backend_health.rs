@@ -1,10 +1,11 @@
 /*
-FILE OVERVIEW: src/tabs/translation/backend_health.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/backend_health.rs
 Shared health helpers for Python AI backend used by Settings and Translation tabs.
 
 Transport:
-All backend requests go through the v2 framed IPC client (`ms_backend_ipc`)
-over the AF_UNIX socket. This file no longer owns any TCP endpoint or HTTP state.
+All backend requests go through the v2 framed IPC client (`ms_backend_ipc`),
+which picks the transport (AF_UNIX on unix, loopback WebSocket on Windows). This
+file owns no endpoint, socket or HTTP state.
 
 Health transport (v2 push):
 Health is delivered by the backend as `TOPIC_HEALTH` events pushed over the v2

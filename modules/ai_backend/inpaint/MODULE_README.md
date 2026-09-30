@@ -523,7 +523,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   in the run wants back, while dropping it costs a full 16 GB re-read on the next cache miss. When
   it is off, the encoder IS resident, so it joins `_model_key` — the key must never claim less than
   what the service holds. **The default is duplicated on the Rust side** (`MemoryPreset::values` and
-  `Flux2KleinSettings` in `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs`); changing one side alone makes
+  `Flux2KleinSettings` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/settings.rs`); changing one side alone makes
   the UI and the backend disagree about what a preset means.
   - The one combination the reorder does NOT make cheaper is a resident encoder together with
     `unload_transformer_before_vae`: parking the 9B transformer for the decode copies it back into
@@ -614,7 +614,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     17.6 GiB of VRAM that the very pipeline it was about to reuse was occupying, and refused a run
     whose memory was already in place. The refusal message names the short resource, the phase, the numbers, and the
   settings that DO fit right now — computed from `_MEMORY_PRESETS`, which must stay in sync with
-  `MemoryPreset::values` in `src/tabs/cleaning/tools/ai_editor/engines/flux2_klein/settings.rs`.
+  `MemoryPreset::values` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/settings.rs`.
 - **`is_distilled` is READ FROM THE CHECKPOINT, and it decides whether guidance can happen at all.**
   `components.checkpoint_is_distilled` answers a TRI-STATE from the `model_index.json` beside the
   weights — `True` / `False` as declared, `None` when there is no manifest, it cannot be read, or it
@@ -885,7 +885,7 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   the class, not by reading the code.
 - To change SDXL param validation, sampler mapping, or the latent preview, see `sdxl.py`
   (`normalize_sdxl_params`, `SAMPLER_CONFIGS`, `_latent_preview_rgb`); keep `SAMPLER_CONFIGS` in sync
-  with `SDXL_SAMPLERS` in `src/tabs/cleaning/tools/ai_editor/engines/sdxl/mod.rs`.
+  with `SDXL_SAMPLERS` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/sdxl/mod.rs`.
 - To change the FLUX quant catalog, download layout, or device pinning, see `flux_fill.py`
   (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is

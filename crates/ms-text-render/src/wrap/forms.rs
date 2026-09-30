@@ -306,7 +306,7 @@ pub enum TextFormPreset {
 }
 
 /// How a preset's UI label is produced. This crate is GUI-free and must not depend
-/// on the UI-string catalog (see `docs/i18n_exclusions.md` §F), so a localizable
+/// on the UI-string catalog (see `dev-docs/i18n_exclusions.md` §F), so a localizable
 /// label is returned as a catalog key for the binary to resolve, while a fixed
 /// ASCII shape sketch is returned verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

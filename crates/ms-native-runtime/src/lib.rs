@@ -70,8 +70,8 @@ Key items:
 SIGILL crash-guard:
 The onnxruntime library can abort the process with an uncatchable SIGILL on CPUs
 missing required instructions. Before the first dlopen we persist an fsync'd attempt
-marker (`General.ort_load_state[<provider[:device]>@<ver>]`) via
-`settings::mark_ort_load_attempted`; only after the FIRST successful inference do we
+marker (`General.ort_load_state[<scope key>]`, see `native_load_scope_key`) via
+`settings::mark_ort_load_attempted` (`settings` = `ms_config::ort_load_guard`); only after the FIRST successful inference do we
 mark it succeeded. A crash during load OR first inference leaves `succeeded = false`,
 which the next launch reads as `Suspect` and refuses to re-trigger. A GRACEFUL error
 (the process survived, so it was not a SIGILL) clears the marker again so it is not

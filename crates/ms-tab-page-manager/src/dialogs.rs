@@ -53,7 +53,7 @@ const BLANK_SIZE_MAX_PX: u32 = 65535;
 
 /// On-disk trash directory name used by the page-ops engine inside the chapter
 /// folder. Persistence identifier shown to the user only through a placeholder
-/// (i18n-exempt literal, see `docs/i18n_exclusions.md`).
+/// (i18n-exempt literal, see `dev-docs/i18n_exclusions.md`).
 pub(super) const PAGE_OP_TRASH_DIR: &str = ".pageop_trash";
 
 /// Where an inserted/created page lands relative to the current selection.

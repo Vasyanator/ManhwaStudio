@@ -34,7 +34,7 @@ This is the ONLY file of `panel_dock/` that touches the disk; `model.rs`,
 `config::update_user_config_file`, the single locked read-modify-write border of
 `user_config.json` — never through the `save_*` helpers of the settings tab,
 which rewrite the whole root and clobber it on a read failure
-(`README_AGENT.md`, "user_config").
+(`ARCHITECTURE.md`, "Config"; `crates/ms-config/src/MODULE_README.md`).
 
 DURABILITY. The writer is the LAST owner of a snapshot: `take_dirty_layouts`
 clears the dock's `dirty` flag when it hands one over, so a snapshot the writer

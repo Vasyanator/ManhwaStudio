@@ -11,7 +11,7 @@ Key functions:
 
 Notes:
 This is the single implementation of lasso/polygon filling shared by the PS-editor selection
-(`src/tabs/ps_editor/selection.rs`) and the cleaning tools. Its numeric behavior is a contract,
+(`crates/ms-tab-ps-editor/src/selection.rs`) and the cleaning tools. Its numeric behavior is a contract,
 not an implementation detail: two callers rasterizing the same polygon into differently sized
 buffers must agree pixel for pixel, so the sampling rule (scanline centre, even-odd, inclusive
 `ceil`/`floor` span ends) must not be "improved" without updating every caller and its tests.

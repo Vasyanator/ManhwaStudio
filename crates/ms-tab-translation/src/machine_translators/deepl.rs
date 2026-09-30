@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/machine_translators/deepl.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/machine_translators/deepl.rs
 DeepL backend implementation adapted from translatepy JSON-RPC flow.
 
 Main items:

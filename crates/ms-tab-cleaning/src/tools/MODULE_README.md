@@ -44,7 +44,10 @@ exists to prevent. A tool that never diverts keeps the Shift-only gate unchanged
 A finished drag that produces NO rectangle is REFUSED WITH A REASON, never dropped: `load_error`
 holds it for `draw_ui_hint`, and `take_selection_refusal` is the one-shot drain a diverting tool
 uses to repeat it on the surface it drew the user's attention onto. The same applies to a
-selection the size limits refuse.
+selection the size limits refuse. Those limits (`min_selection_px`, `max_selection_area_px2`,
+`max_selection_aspect`, enforced by `check_selection_limits`) have NO setter: `new` leaves all
+three unset and only the in-module tests assign them, so no production tool is constrained by
+them today; a tool that needs one must add a setter rather than assume it exists.
 
 A size contract is NOT something `RegionEditToolBase` can guarantee: `snap_selection_end` clamps
 to the page edge AFTER snapping to the multiple, and `build_composited_region_image` re-derives
@@ -184,8 +187,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   inset the crop does not have. Those margins say what was clipped; they never say which rectangle
   the entry's footprint should be (see the footprint contract below). The admission floor stays the engine's own `min_ring_pixels`, a pixel COUNT; the
   partialness is recorded with the measurement (see `../MODULE_README.md`) and never treated as
-  an assertion. It used to demand the full margin on all four sides, which made a mark stamped
-  flush against the image edge permanently unsamplable — the user's marks sit there.
+  an assertion. A full-margin demand on all four sides would make a mark stamped flush against
+  the image edge permanently unsamplable, and the user's marks sit there.
   Membership has THREE states, not two (`chapter_library_selection`, `chapter_saved_entries`,
   `chapter_entry_index`): an entry can also be in the chapter because a DISCOVERED mark was
   saved to it, keeping its `mark-{n}` kind id — such an entry is neither loadable (a second

@@ -27,7 +27,7 @@ image ─► PaddleOcrEngine.recognize ─► PaddleRecognizer.recognize_crops �
   softmax-if-needed → CTC greedy decode → per-crop `(text, confidence)`.
 
 Sessions are built via `OrtRuntime::build_session`, so the committed execution
-provider (CPU/DirectML/CoreML/CUDA) is applied uniformly. Model input/output names
+provider (whichever EP was committed, CPU included) is applied uniformly. Model input/output names
 are discovered positionally (input[0]/output[0]).
 
 ## Files and submodules

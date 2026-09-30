@@ -46,7 +46,7 @@ Notes:
   stay two entries. Deduplication is a policy of the caller (the group editor decides whether a
   repeat is an overwrite, a conflict, or a second alias), not of the reader.
 - A PSD records a font by NAME only. That name is exactly what the project uses as a font's
-  IDENTITY (see README_AGENT: identity = PostScript name), so a card entry can be matched
+  IDENTITY (see ARCHITECTURE.md: identity = PostScript name), so a card entry can be matched
   against the font list directly — but a name contested by two byte-different files cannot be
   resolved here any better than it can on export. Resolution is the caller's job.
 */

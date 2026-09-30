@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/text_detector.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/text_detector.rs
 Background text-detector controller for Translation tab.
 
 Main types:

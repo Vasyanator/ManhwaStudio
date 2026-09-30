@@ -19,9 +19,9 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
 `ms-gifs`, `ms-thread` and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
-launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its three
+launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::input_util`, `crate::ui_fonts`, `crate::bubble_status` and
-`crate::input_manager_v2`, so every pre-split call site keeps its path.
+`crate::input_manager_v2`.
 
 Two helpers this crate owns are TEST-ONLY and reach dependent crates through the `test-support`
 feature of `ms-config`, not through `#[cfg(test)]`: `ms_config::config_saver::test_harness`
@@ -40,9 +40,18 @@ crate's `[dev-dependencies]`, so no production build carries them.
   the binary's `app.rs` and settings hotkeys pane AND the `ms-tab-translation` crate both register
   specs with it. Defaults stay in Rust code; only user overrides are stored on disk (read via
   `ms_docstore::read_value`, written via `ms_config::update_user_config_file`).
+  `collect_triggered` consumes a `KeyboardShortcut` press (auto-repeats included) but fires the
+  command only on the RISING edge (per-command `last_shortcut_held`): holding a key triggers it
+  once. Modifier-only bindings are not dispatched there.
 - `ui_fonts.rs`: the single owner of the bundled `fonts/ui` stack. Every egui context the
   application creates installs the same chain through it, off the GUI thread. Native-only
   internals (`mod desktop`); the wasm build compiles the two entry points to no-ops.
+  Fonts are registered only with `Context::add_font`, as `FontData::from_static` over the
+  `ms-fonts` bytes (`from_owned` would keep a second copy of ~99 MB). Never call
+  `Context::set_fonts` (it replaces the whole definition set and drops runtime-registered
+  families, which then panic in epaint), and never call `Context::fonts`/`fonts_mut` from the
+  loader: they panic before the first frame. Every product `run_native` creator closure calls
+  `install*` exactly once (the dev binaries in `src/bin/` do not).
 - `bubble_status.rs`: the egui half of the bubble-status feature — it paints a rule's border
   with a bare `Painter` and re-exports the GUI-free rule model from `ms_config::bubble_status`.
 - `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities

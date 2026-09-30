@@ -880,6 +880,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   unknown variables/functions or the failing `TextFormulaLayoutParams` field.
 - Custom raster-line layout reads a PNG path from `TextDrawnLinesLayoutParams`; failures
   should be clear errors, not silent fallback to normal text.
+- `TextRenderParams::compare_shape_with` (`TextRenderShapeCompareParams`) is a PRE-RASTER
+  shape comparison: `pipeline.rs` builds the layout text a second time with the compared
+  width/wrap/shape parameters and, when both line breakings are identical, pushes
+  `UNCHANGED_LAYOUT_TEXT_WARNING`; with `cancel_render_if_layout_text_unchanged` it returns an
+  empty 0x0 image before shaping. The typing tab's shape-variant preview grid
+  (`ms-tab-typing/src/tab/render_store.rs`) uses it to skip variants that look like the current one.
 
 ## External Dependencies
 - `cosmic-text` provides font database, shaping, layout runs, and swash cache access.

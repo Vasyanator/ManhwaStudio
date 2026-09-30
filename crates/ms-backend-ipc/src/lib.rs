@@ -22,9 +22,9 @@ Submodules:
   seed (`set_studio_version` / `studio_version`).
 
 Transport:
-The framed codec runs over a pluggable transport (AF_UNIX default; loopback
-WebSocket fallback), selected per platform by `transport::current_backend_endpoint`
-(AF_UNIX path on unix, published WS endpoint on windows). The frame bytes are
+The framed codec runs over a pluggable transport selected per platform by
+`transport::current_backend_endpoint`: AF_UNIX on unix, the token-authenticated
+loopback WebSocket endpoint published by the supervisor on windows. The frame bytes are
 identical on both transports.
 */
 

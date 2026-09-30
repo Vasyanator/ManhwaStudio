@@ -2736,7 +2736,7 @@ impl PsEditorTabState {
         self.ensure_loader();
         self.poll_loader();
         // Consume every TOOL-owned worker channel, next to the loader poll and for the same reason:
-        // a tool that computes anything expensive must never block `interact` (`AGENTS.md` §5), so
+        // a tool that computes anything expensive must never block `interact` (`CLAUDE.md` §5), so
         // its results arrive on a channel and are drained here. The pixel writes such a result asks
         // for are queued as `PsToolAction`s and applied by `apply_tool_actions` below.
         if self.poll_tools() {
@@ -3834,7 +3834,7 @@ impl PsEditorTabState {
         {
             let n = stack.groups().len() + 1;
             // Persisted group name (round-trips to `layers.json`); stable literal, not
-            // localized. See docs/i18n_exclusions.md §A (persisted layer/group names).
+            // localized. See dev-docs/i18n_exclusions.md §A (persisted layer/group names).
             let gid = stack.add_group(format!("Группа {n}"));
             ms_log::trace_log!(cat::PS_EDITOR, "panel new_empty_group gid={}", gid);
         }
@@ -4430,7 +4430,7 @@ impl PsEditorTabState {
                 let n = self.stack.as_ref().map_or(0, |s| s.groups().len()) + 1;
                 let uid = uuid::Uuid::new_v4().to_string();
                 // Persisted group name (round-trips to `layers.json`); stable literal.
-                // See docs/i18n_exclusions.md §A (persisted layer/group names).
+                // See dev-docs/i18n_exclusions.md §A (persisted layer/group names).
                 let name = format!("Группа {n}");
                 edit.new_groups.push(persist::GroupMeta {
                     uid: uid.clone(),
@@ -5134,7 +5134,7 @@ impl PsEditorTabState {
                     .stack
                     .as_mut()
                     // Persisted raster-layer name (round-trips to `layers.json`); stable
-                    // literal, not localized. See docs/i18n_exclusions.md §A.
+                    // literal, not localized. See dev-docs/i18n_exclusions.md §A.
                     .map(|s| {
                         s.add_raster_layer_image(format!("Запечён: {name}"), image, transform)
                     });
@@ -7277,7 +7277,7 @@ fn clip_into_new_layer(
 
     let name = match mode {
         // Persisted raster-layer names (round-trip to `layers.json`); stable literals,
-        // not localized. See docs/i18n_exclusions.md §A (persisted layer/group names).
+        // not localized. See dev-docs/i18n_exclusions.md §A (persisted layer/group names).
         ClipMode::Copy => "Копия".to_string(),
         ClipMode::Cut => "Вырезка".to_string(),
     };
@@ -7575,7 +7575,7 @@ fn tool_panel_visible(tools: &[Box<dyn PsTool>], active_tool_idx: usize) -> bool
 ///   result yields `None`, so a rect that hangs off the page is a no-op rather than a panic;
 /// * `coverage`, when present, must be exactly `src.size[0] * src.size[1]` bytes — a wrongly-sized
 ///   buffer is REFUSED (`None`), never padded, because a silent fallback would land a half-written
-///   patch (`AGENTS.md` §11);
+///   patch (`CLAUDE.md` §11);
 /// * the blend is `dst += (src - dst) * coverage / 255` per premultiplied channel. Linear
 ///   interpolation of PREMULTIPLIED RGBA is exactly the premultiplied form of the interpolated
 ///   image, so this is a correct cross-fade and not an approximation of one. `None` coverage means
@@ -7670,7 +7670,7 @@ fn lerp_premul(from: Color32, to: Color32, weight: u8) -> Color32 {
 /// Converts a page/world coordinate in px to a pixel index, or `None` when it addresses no pixel.
 ///
 /// Rejects negatives, NaN, infinities and anything past `u32::MAX` instead of letting an `as usize`
-/// truncate or saturate them into a valid-looking index (§17 of `AGENTS.md`): a saturating cast
+/// truncate or saturate them into a valid-looking index (§17 of `CLAUDE.md`): a saturating cast
 /// turns "the pointer is nowhere near the page" into "the pointer is on the last pixel", which
 /// silently samples or clips the wrong pixel. The upper bound is 2^24, the largest integer an `f32`
 /// still represents exactly and far above any page dimension, so everything it excludes is out of
@@ -9896,7 +9896,7 @@ mod tests {
     }
 
     /// A coverage buffer whose length does not match the source rect is REFUSED, not padded:
-    /// silently filling the difference would land a half-written patch (`AGENTS.md` §11).
+    /// silently filling the difference would land a half-written patch (`CLAUDE.md` §11).
     #[test]
     fn a_wrongly_sized_coverage_buffer_is_refused() {
         let mut dst = solid(4, 4, Color32::TRANSPARENT);

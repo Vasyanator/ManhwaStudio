@@ -34,7 +34,7 @@ Key structures:
 
 No blocking work here:
 This module runs entirely on the paint path, so it opens no file dialog and touches no
-filesystem (`AGENTS.md` §5). The "..." button of a path parameter only emits
+filesystem (`CLAUDE.md` §5). The "..." button of a path parameter only emits
 `CanvasAction::PickNodePath`; `window.rs` runs the dialog off-thread and writes the result
 back into the node's parameters on a later frame.
 
@@ -245,7 +245,7 @@ pub enum CanvasAction {
     /// The "..." button of a node's path parameter was clicked — open a file dialog for it.
     ///
     /// The canvas only REQUESTS the dialog. Opening it is blocking work and must not happen on
-    /// the paint path (`AGENTS.md` §5), so `window.rs` owns the off-thread dialog and writes the
+    /// the paint path (`CLAUDE.md` §5), so `window.rs` owns the off-thread dialog and writes the
     /// picked path back into `purpose`'s parameter once it arrives. The node may have been
     /// deleted or retyped by then, which is why the request carries the purpose rather than a
     /// borrow of the parameter.
@@ -476,7 +476,7 @@ impl CanvasState {
                 .insert(node_id, self.screen_to_world_size(node_render.rect.size()));
 
             // The dialog itself is the window's job: opening one blocks, and the paint path
-            // must not (`AGENTS.md` §5).
+            // must not (`CLAUDE.md` §5).
             if let Some(purpose) = node_render.path_pick_request {
                 actions.push(CanvasAction::PickNodePath { node_id, purpose });
             }
@@ -849,7 +849,7 @@ impl CanvasState {
                     })
                     // Clamped like the corner radii above: `Margin` stores `i8`, so the cast
                     // must be bounded at the point of use rather than by `ZOOM_MAX` happening
-                    // to be small enough today (`AGENTS.md` §17).
+                    // to be small enough today (`CLAUDE.md` §17).
                     .inner_margin(egui::Margin::same(
                         (8.0 * self.zoom).round().clamp(0.0, 127.0) as i8,
                     ));
@@ -1159,7 +1159,7 @@ fn draw_socket_rows(
 ///
 /// Returns the path parameter a file dialog was requested for, if the user clicked one of the
 /// "..." buttons this frame. The dialog is NOT opened here: it blocks, and this runs on the
-/// paint path (`AGENTS.md` §5); the request travels to `window.rs` as a
+/// paint path (`CLAUDE.md` §5); the request travels to `window.rs` as a
 /// [`CanvasAction::PickNodePath`].
 ///
 /// `zoom` is the canvas zoom. Every widget drawn here inherits the zoom-scaled `Style` applied

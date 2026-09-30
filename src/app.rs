@@ -620,7 +620,7 @@ impl MangaApp {
         // ONE autosave gate per project instance, shared by every `{chapter}_unsaved` writer: each
         // writer holds its changes in memory and writes them when the gate is due (interval since the
         // first pending change, or the action count, from the live global policy). Force points
-        // (barriers, shutdown, `force_flush`) bypass it; see README_AGENT «Autosave write buffer».
+        // (barriers, shutdown, `force_flush`) bypass it; see `ARCHITECTURE.md` "Key invariants" (staging and autosave).
         let autosave_gate = Arc::new(AutosaveGate::new());
         let bubbles_model = Arc::new(Mutex::new(BubblesModel::new(
             project.bubbles.as_ref().clone(),
@@ -1543,7 +1543,7 @@ impl MangaApp {
         // write re-dispatched afterwards takes `enqueue_page_text_save`'s SYNC fallback and re-creates
         // `_unsaved/layers/` after the delete job removed it. Keeping them also keeps
         // `has_pending_text_edits` true, which re-latches the unsaved-changes cache. Deliberately a
-        // DROP, not a flush: `README_AGENT.md` — "The DISCARD path must NOT flush".
+        // DROP, not a flush: `ARCHITECTURE.md` "Key invariants" — DISCARD never flushes.
         self.typing_tab.discard_pending_text_edits();
         // Stop the layer saver BEFORE deleting the unsaved dir. The discard path removes the staging
         // folder the saver writes into; a still-running saver could recreate files mid/post deletion,

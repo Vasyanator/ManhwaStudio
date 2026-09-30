@@ -230,7 +230,7 @@ default (`style.rs:643-654`). The area's edge-fade gradients need nothing: they 
 `ui.stack().bg_color()` (`scroll_area.rs:1564-1575`), i.e. from the enclosing `Frame`'s fill, which
 `multiply_with_opacity` has already faded.
 
-Repo example: `src/widgets/panel_dock/panel.rs` (`chrome_opacity`, `faded`, `faded_scroll_style`)
+Repo example: `crates/ms-widgets/src/panel_dock/panel.rs` (`chrome_opacity`, `faded`, `faded_scroll_style`)
 hides a dock panel's frame, grips and body scroll bars until the pointer is over it while keeping
 its geometry and every gesture bit-identical to the opaque state.
 
@@ -259,7 +259,7 @@ pub struct ColorImage {
 - `ImageData` (`image.rs:16`) is a one-variant enum `Color(Arc<ColorImage>)`; `load_texture` takes
   `impl Into<ImageData>`, so passing a `ColorImage` directly works.
 
-**Repo rule (README_AGENT.md:184, :711):** clean overlays keep a **dual CPU representation** —
+**Repo rule (`ARCHITECTURE.md` "Root runtime and shared models", `crates/ms-models/src/MODULE_README.md`):** clean overlays keep a **dual CPU representation** —
 `egui::ColorImage` for UI/canvas *and* `Arc<image::RgbaImage>` for export/save/tools. Dropping either
 side silently breaks export. Never "simplify" one away.
 
@@ -338,6 +338,6 @@ points × `pixels_per_point`.
 - Page tile texture upload (frame-budgeted, `ColorImage` → `TextureHandle`): `src/app.rs`
   (`upload_textures_incremental`, :1718).
 - Mask textures (`NEAREST`): `src/tabs/cleaning/tools/base.rs`, `src/tabs/translation/tab.rs`.
-- Anything that must also be exported: keep the `Arc<image::RgbaImage>` side alive (README_AGENT.md:711).
-- Fading a widget or a frame in/out without moving anything: `src/widgets/panel_dock/panel.rs`
+- Anything that must also be exported: keep the `Arc<image::RgbaImage>` side alive (`CleanOverlaysModel`, `ARCHITECTURE.md`).
+- Fading a widget or a frame in/out without moving anything: `crates/ms-widgets/src/panel_dock/panel.rs`
   (`faded`, `chrome_opacity`); see "Fading things out without touching layout" above.

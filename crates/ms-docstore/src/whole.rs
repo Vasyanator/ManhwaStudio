@@ -43,7 +43,7 @@ pub(crate) fn journal_path(path: &Path) -> PathBuf {
 }
 
 /// Best-effort removal of `temp` and its `SQLite` journal. The result is dropped on purpose:
-/// the failure being reported is the one worth surfacing (AGENTS.md §7).
+/// the failure being reported is the one worth surfacing (CLAUDE.md §7).
 pub(crate) fn remove_temp(temp: &Path) {
     let _ = std::fs::remove_file(temp);
     let _ = std::fs::remove_file(journal_path(temp));

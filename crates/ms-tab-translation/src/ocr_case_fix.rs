@@ -1,5 +1,5 @@
 /*
-File: src/tabs/translation/ocr_case_fix.rs
+File: crates/ms-tab-translation/src/ocr_case_fix.rs
 
 Purpose:
 Post-OCR "ALL CAPS" normalization. Comic and manhwa lettering fonts are usually

@@ -375,7 +375,7 @@ impl LayerStack {
             id,
             uid: uuid::Uuid::new_v4(),
             // Persisted layer name (round-trips to `layers.json`); must stay a stable
-            // literal, not a UI-language string. See docs/i18n_exclusions.md §A (layer names).
+            // literal, not a UI-language string. See dev-docs/i18n_exclusions.md §A (layer names).
             name: format!("Слой {raster_index}"),
             kind: LayerKind::Raster,
             visible: true,

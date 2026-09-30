@@ -4,7 +4,7 @@
 Crate root of `ms-project`: the project/chapter domain model of ManhwaStudio and the
 load-time passes that bring a chapter folder into a consistent, current shape before
 any tab or worker reads it. Re-exported by the binary as `crate::project`
-(`src/main.rs`), so every `crate::project::…` call site keeps working unchanged.
+(`src/main.rs`).
 
 GUI-free: it produces data for the editor, never widgets. All of its work is blocking
 disk I/O, so it runs on the background load thread (`src/studio_bootstrap.rs`), never
@@ -20,7 +20,8 @@ ProjectData::load / load_resume_unsaved
         |                        magic-byte JPEG -> PNG, filename normalization)
         |  4. load pages / bubbles / settings / canvas settings
         v
-   ProjectData { pages, bubbles, paths, comic_type, canvas_settings, settings_data }
+   ProjectData { project_dir, image_dir, pages, bubbles: Arc<Vec<Bubble>>, paths,
+                 comic_type: Option<ComicType>, canvas_settings, settings_data }
 ```
 
 Layer position: `ms-config` <- `ms-page-ops` <- **`ms-project`** <- the binary.
@@ -81,9 +82,10 @@ joined onto a chapter or title directory.
 - **Never on the GUI thread.** Every entry point here performs blocking I/O, and the
   JPEG conversion additionally fans out over the global rayon pool.
 - **Canvas defaults are mirrored in three places** (`CanvasSettings::default` here,
-  `SharedCanvasSettings::default` and `CanvasState::default` in the binary) plus the
-  JSON copies in `ms_config`. The test that guards their agreement lives in
-  `crates/ms-models/src/bubbles_model.rs` because two of the mirrors are binary-only types.
+  `SharedCanvasSettings::default` in `ms-models`, `CanvasState::default` in `ms-canvas`) plus the
+  JSON copies in `ms_config`. The test that guards their agreement
+  (`canvas_defaults_agree_across_the_three_mirrors`) lives in `crates/ms-canvas/src/types.rs`,
+  the only crate that sees all three.
 - **Owned documents.** `settings.json` (`DocKind::ProjectSettings`) and the bubbles document
   (`DocKind::Bubbles`) are read/written through `ms_docstore`, never the seam directly:
   `load_bubbles` reads, `persist_migrated_bubbles` writes (its `*_legacy_xy.json` backup is a
@@ -111,4 +113,4 @@ joined onto a chapter or title directory.
 - To change which global/title documents a storage-mode switch converts, or its order, see
   `storage_mode.rs` (keep user_config last: it is the sentinel `ms-config`'s startup probe reads).
 - To change canvas presets or defaults, see `CanvasSettings` / `ComicType` here AND
-  the two binary mirrors named above — the test will fail if they drift.
+  the two mirrors named above — the test will fail if they drift.

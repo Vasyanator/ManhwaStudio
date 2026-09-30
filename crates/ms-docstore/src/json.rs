@@ -56,7 +56,7 @@ pub enum Durability {
     /// Nothing is fsynced: still an atomic temp + rename (a crash never tears the file),
     /// but a crash shortly after the call may lose THIS write and leave the previous
     /// version. For callers on the GUI thread, which must never wait for a disk flush
-    /// (AGENTS.md §5); never for a write after which an old copy is deleted.
+    /// (CLAUDE.md §5); never for a write after which an old copy is deleted.
     None,
     /// Only the new CONTENTS are fsynced. Enough for a document that is rewritten by the
     /// next mutation anyway and whose loss costs at most one cached value.
@@ -240,7 +240,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8], durability: Durability)
 
     if let Err(reason) = write_temp_file(&temp, contents, durability != Durability::None) {
         // The handle is already closed (see `write_temp_file`), so this cleanup can also
-        // succeed on Windows. A failed cleanup cannot mask the real error — AGENTS.md §7.
+        // succeed on Windows. A failed cleanup cannot mask the real error — CLAUDE.md §7.
         remove_orphan_temp(&temp);
         return Err(AtomicWriteError::TempWrite { path: temp, reason });
     }
@@ -371,7 +371,7 @@ fn is_transient_sharing_error(_err: &std::io::Error) -> bool {
 
 /// Best-effort removal of a temp file left behind by a failed write. The removal result is
 /// deliberately dropped: the write failure is the error worth reporting, and a failed
-/// cleanup must not mask it (AGENTS.md §7).
+/// cleanup must not mask it (CLAUDE.md §7).
 #[cfg(not(target_arch = "wasm32"))]
 fn remove_orphan_temp(temp: &Path) {
     let _ = fs::remove_file(temp);

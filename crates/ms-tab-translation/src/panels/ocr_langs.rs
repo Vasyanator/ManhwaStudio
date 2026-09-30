@@ -8,7 +8,7 @@ Each entry is `(wire_code, display_key)`: the wire code is the stable engine
 identifier persisted in project settings and sent to the backend, and the
 display key is a stable i18n catalog key resolved to a localized label at
 render time via `lang_label`. Only the wire code is identity; the label is
-free to localize (see `docs/i18n_exclusions.md` §A5).
+free to localize (see `dev-docs/i18n_exclusions.md` §A5).
 
 Key structures:
 - EASYOCR_FULL_LANGUAGES / EASYOCR_MAIN_LANGUAGES

@@ -39,6 +39,10 @@ Callers own the threading: nothing here spawns a worker for you.
   never leaves a half file that looks present. Download is serialized by a process mutex.
   Native-only for the network half; on wasm the signatures stay and return a typed
   "unavailable on web" error. The model ROOT is a parameter: this module reads no config.
+  Every Rust path that needs an app-managed model (native runtime, OCR/detector workers,
+  cleaning inpaint engines) resolves it here BEFORE loading it natively or asking the
+  backend to use it. Library-managed caches (EasyOCR, Surya) are deliberately not in the
+  catalog.
 - `hf_token.rs`: the process-wide Hugging Face access token. Cached value plus free
   get/set/clear, backed by the OS secret store (`keyring`) under its OWN service name
   `"ManhwaStudio Hugging Face"` — never the OCR key entry, which is a different credential

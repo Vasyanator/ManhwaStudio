@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: src/tabs/translation/panels/text_detector.rs
+FILE OVERVIEW: crates/ms-tab-translation/src/panels/text_detector.rs
 Translation panel UI for text detection controls.
 
 Main types:

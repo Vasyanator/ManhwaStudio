@@ -1,11 +1,12 @@
 # Module: crates/ms-actions
 
 ## Purpose
-Pure, GUI-free generic undo/redo engine for ManhwaStudio (Phase 0 of the unified
-action system; see `docs/unified_action_system.md`). It provides only the generic
-mechanism — a self-inverting command contract and an in-memory history — and no
-domain behavior. Concrete Ops (bubble field patches, raster diffs) are implemented
-in the main crate in later phases and must NOT live here.
+Pure, GUI-free generic undo/redo engine for ManhwaStudio (design notes:
+`dev-docs/unified_action_system.md`). It provides only the generic mechanism — a
+self-inverting command contract, an in-memory history and an optional raster delta
+primitive — and no domain behavior. Concrete Ops live with their domain and must NOT
+live here: `BubbleSnapshotOp` (`ms-canvas/src/bubble_action.rs`), `CleanOverlayDiffOp`
+(`ms-models/src/clean_overlays_model.rs`) and `PsEditOp` (`ms-tab-ps-editor/src/edit_op.rs`).
 
 ## Architecture
 Two small, independent pieces:
@@ -18,19 +19,17 @@ Two small, independent pieces:
   two stacks (`undo` VecDeque with oldest at the front, `redo` Vec), a count
   `limit`, and an optional `weight_budget` (total-bytes cap). It drives
   `apply`/`inverse` and enforces redo-branch truncation and undo eviction under
-  both caps. No durable log in this phase — the append-only history log is a
-  later, optional phase.
+  both caps. There is no durable history log.
 - `RasterDiff` (`raster_diff.rs`, behind the optional `raster` feature): a pure,
-  domain-agnostic, reversible RGBA8 delta primitive (Phase 2a). It TILES a
+  domain-agnostic, reversible RGBA8 delta primitive. It TILES a
   straight-alpha RGBA8 image into `tile_side`-sized tiles and stores only changed
   tiles, each with its own tight bbox plus a zstd-compressed signed `[i16;4]`
-  delta. It generalizes the single-bbox delta already used by
-  `CleanOverlaysModel`. It is a standalone primitive: it does NOT implement
-  `ReversibleAction` and is not yet wired into any model.
+  delta. It is a standalone primitive: it does NOT implement `ReversibleAction`;
+  domain Ops wrap it (`CleanOverlayDiffOp`, `PsEditOp`).
 
 ## Files and submodules
-- `src/lib.rs`: crate root; crate-level clippy lints; re-exports `ReversibleAction`
-  and `ActionHistory`.
+- `src/lib.rs`: crate root; crate-level clippy lints; re-exports `ReversibleAction`,
+  `ActionHistory` and (feature `raster`) the `raster_diff` types.
 - `src/action.rs`: the `ReversibleAction` trait and its lifecycle contract,
   including the defaulted `weight()` (retained bytes, default 0) for memory
   budgeting.
@@ -106,5 +105,4 @@ Two small, independent pieces:
 - To change raster delta tiling, serialization, compression, or apply/clamp
   behavior, see `raster_diff.rs`. Keep it feature-gated and dependency-free apart
   from `zstd`.
-- Durable logging / replay and concrete domain Ops are future phases and belong in
-  the main crate, not here.
+- Concrete domain Ops belong in their domain crate, not here.

@@ -1076,7 +1076,7 @@ session long before this call.
   process has not read (or has no right to rewrite) would overwrite the 19 cells it never saw
   with in-memory defaults.
 - **A document of a NEWER version is read but NEVER written** — the same contract as the
-  self-versioned `"PanelLayout"` section of `user_config.json` (`README_AGENT.md`). Its known
+  self-versioned `"PanelLayout"` section of `user_config.json` (`crates/ms-widgets/src/panel_dock/MODULE_README.md`). Its known
   cells are shown so the user still sees their colors, `ColorPresetsDocumentState::NewerVersion`
   refuses every save with a WARN naming the path, and the refusal is permanent for that
   document rather than transient. An OLDER (or absent) version is read best-effort and the
