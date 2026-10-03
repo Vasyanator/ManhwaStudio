@@ -12,6 +12,20 @@ Un programme spécialisé pour traduire des bandes dessinées, y compris les man
 
 > **Pour installer, rendez-vous dans les [Releases](https://github.com/Vasyanator/ManhwaStudio/releases/latest), téléchargez et lancez l'exécutable pour votre système.** Windows, Linux et macOS sont pris en charge.
 
+## Lancer la version dev depuis les sources
+
+La version dev est le code le plus récent du dépôt, compilé sur votre machine par les scripts `run-dev`.
+
+1. Téléchargez le dépôt au format ZIP ([master.zip](https://github.com/Vasyanator/ManhwaStudio/archive/refs/heads/master.zip)) et décompressez-le dans n'importe quel dossier.
+2. Lancez depuis le dossier décompressé le script correspondant à votre système :
+   - Windows : `run-dev.Windows.bat`
+   - Linux : `bash run-dev.Linux.sh`
+   - macOS : `bash run-dev.MacOS.command`
+
+Le script met le code à jour vers la dernière version, installe Rust si nécessaire, compile le programme et le lance. Sous Windows, tout le nécessaire est téléchargé automatiquement ; sous Linux et macOS, git et un compilateur C doivent être installés — le script indique ce qui manque. La première compilation prend un certain temps.
+
+**Pour lancer le programme sans la longue mise à jour et la compilation**, exécutez le fichier `manhwastudio_rs` (`manhwastudio_rs.exe` sous Windows) dans le dossier du projet : il y apparaît dès que le script s'est exécuté avec succès au moins une fois.
+
 > **Remarque sur les captures d'écran.** Toutes les captures ci-dessous sont prises avec l'interface en russe. Les remplacer par des captures en français est une tâche qui attend une personne volontaire — les pull requests sont les bienvenues.
 
 ## Idée principale : des bulles de texte sur les côtés de la bande continue de pages. Tout le chapitre est traité d'un coup. Les bulles indiquent l'endroit où se place le texte traduit.

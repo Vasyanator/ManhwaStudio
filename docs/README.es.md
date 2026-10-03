@@ -12,6 +12,20 @@ Un programa especializado para traducir cómics, incluidos manga y webtoons. Una
 
 > **Para instalar, ve a [Releases](https://github.com/Vasyanator/ManhwaStudio/releases/latest), descarga y ejecuta el archivo ejecutable para tu sistema.** Se admiten Windows, Linux y macOS.
 
+## Ejecutar la versión dev desde el código fuente
+
+La versión dev es el código más reciente del repositorio, compilado en tu equipo por los scripts `run-dev`.
+
+1. Descarga el repositorio como ZIP ([master.zip](https://github.com/Vasyanator/ManhwaStudio/archive/refs/heads/master.zip)) y descomprímelo en cualquier carpeta.
+2. Ejecuta desde la carpeta descomprimida el script para tu sistema:
+   - Windows: `run-dev.Windows.bat`
+   - Linux: `bash run-dev.Linux.sh`
+   - macOS: `bash run-dev.MacOS.command`
+
+El script actualiza el código a la última versión, instala Rust si hace falta, compila el programa y lo inicia. En Windows todo lo necesario se descarga automáticamente; en Linux y macOS deben estar instalados git y un compilador de C — el script indica qué falta. La primera compilación tarda bastante.
+
+**Para iniciar el programa sin la larga actualización y compilación**, ejecuta el archivo `manhwastudio_rs` (`manhwastudio_rs.exe` en Windows) en la carpeta del proyecto: aparece allí después de que el script se haya ejecutado correctamente al menos una vez.
+
 > **Nota sobre las capturas.** Todas las capturas de pantalla están tomadas con la interfaz en ruso. Reemplazarlas por capturas en español es una tarea que espera a una persona voluntaria: los pull requests son bienvenidos.
 
 ## Idea principal: burbujas de texto a los lados de la tira continua de páginas. Todo el capítulo se procesa de una vez. Las burbujas indican en qué lugar va el texto traducido.
