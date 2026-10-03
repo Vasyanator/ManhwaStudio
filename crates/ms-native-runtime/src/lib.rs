@@ -5,7 +5,8 @@ Process-global lazy manager for the in-process native ONNX Runtime path.
 Purpose:
 Owns the single, lazily-loaded `ms_onnx::OrtRuntime` plus a small, LRU-bounded cache
 of native OCR engines. Exactly ONE `PaddleDetector` is kept resident and shared by
-the `textdetector.paddle` op AND every PaddleOCR-language recognition (through
+the native Paddle detection forward (`paddle_det_forward` / `detect_paddle`) AND every
+PaddleOCR-language recognition (through
 `ms_onnx::paddle_recognize`), so no per-language detector session is duplicated.
 `MangaOcrEngine`s (Base / 2025) and per-language `PaddleRecognizer`s live in a
 capacity-bounded LRU keyed by `NativeModelId`. Turns a crop/page image into
@@ -60,7 +61,12 @@ Key items:
 - recognize_manga       : native MangaOCR entry point (guard -> load -> recognize).
 - recognize_paddle      : native PaddleOCR OCR entry point (shared detector + per-lang
   recognizer).
-- detect_paddle         : native PaddleOCR text-detector entry point (shared detector).
+- detect_paddle         : native PaddleOCR text-detector entry point (shared detector,
+  single 960-px pass + postprocess; kept for callers of the whole-page result).
+- paddle_det_forward    : forward-only PaddleOCR detector pass on prepared tiles -> u8
+  probability maps (shared detector), for the tiled `ms_text_detect` pipeline.
+- paddle_det_max_batch  : tiles per paddle_det_forward call for the effective provider
+  (4 on CPU, 1 on any accelerator, to bound GPU memory).
 - execution_provider_from_ort_token : maps a shared ORT provider token -> ExecutionProvider.
 - native_load_scope_key : the effective {build}:{provider}[:{device}]@{version} SIGILL-guard key.
 - ort_dylib_committed / active_build : the hot-swap-vs-restart signal + committed build slug.
@@ -104,6 +110,7 @@ crate depends on `ms-onnx`/`ort`.
 #[macro_use]
 extern crate ms_i18n;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -112,6 +119,8 @@ use ms_onnx::{
     ExecutionProvider, MangaOcrEngine, NativeDeviceSelection, OrtError, OrtRuntime,
     PaddleDetection, PaddleDetector, PaddleRecognizer,
 };
+
+use ms_text_detect::ProbMap;
 
 use ms_config as config;
 use ms_log::runtime_log;
@@ -841,7 +850,8 @@ static SUCCEEDED_MARKED: AtomicBool = AtomicBool::new(false);
 /// marker never fires while another op could still SIGILL. See [`InFlightGuard`].
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Serializes PaddleOCR detector operations (`detect_paddle` + `recognize_paddle`),
+/// Serializes PaddleOCR detector operations (`detect_paddle`, `paddle_det_forward`,
+/// `recognize_paddle`),
 /// which all share the single resident `PaddleDetector`.
 static PADDLE_OP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1009,6 +1019,73 @@ pub fn detect_paddle(
         run_paddle_detect(image)
     })
 }
+
+/// Runs the native PaddleOCR detection model on prepared tiles and returns one
+/// quantized probability map per tile — the forward pass of the tiled text-detector
+/// pipeline (`ms_text_detect` plans the tiles, stitches the maps and runs the DB
+/// postprocess). See `ms_onnx::PaddleDetector::forward_prob_maps` for the tile
+/// contract (equal sizes, both sides a multiple of 32, no resize) and the quantization.
+///
+/// Uses the SAME sequence as [`detect_paddle`]: [`run_guarded`] (load guard, attempt
+/// marker, first-success marker), `lock_paddle_op` (serialized with every other op on
+/// the ONE shared detector), then the shared detector.
+///
+/// # Threading
+/// Worker-thread only: performs blocking download, dlopen, and inference.
+///
+/// # Errors
+/// Same guard/dylib/ORT-load surface as [`recognize_manga`], plus
+/// [`NativeRuntimeError::PaddleDetectorLoad`] and [`NativeRuntimeError::PaddleDetect`]
+/// (which also carries a tile-shape rejection or a non-finite model output).
+pub fn paddle_det_forward(
+    tiles: &[image::RgbImage],
+    progress: &mut dyn FnMut(OrtDownloadProgress),
+) -> Result<Vec<ProbMap>, NativeRuntimeError> {
+    run_guarded(progress, |ort, progress| {
+        // Serialize with `recognize_paddle` / `detect_paddle` on the shared detector.
+        let _paddle_op = lock_paddle_op();
+        ensure_paddle_detector(ort, progress)?;
+        run_paddle_forward(tiles)
+    })
+}
+
+/// Tiles per [`paddle_det_forward`] call suited to this process's effective native
+/// execution provider: 4 on the CPU provider, 1 on every accelerator provider.
+///
+/// Batching amortizes the per-run overhead, which matters on the CPU (host RAM is
+/// plentiful). On a GPU/NPU provider four 960x960 tiles multiply the activation memory
+/// by four, and an out-of-memory failure there is a runner error that makes the
+/// detector re-run the whole page on the Python backend (or fail when it is down), so
+/// the native route would silently stop being used on small-VRAM cards; one tile per
+/// run keeps the memory footprint of the former single-image pass.
+///
+/// Reads the cached selection (the first call in a process resolves it, which does disk
+/// I/O + hardware probes); call off the GUI thread.
+#[must_use]
+pub fn paddle_det_max_batch() -> NonZeroUsize {
+    paddle_det_batch_for(native_selection().provider)
+}
+
+/// The [`paddle_det_max_batch`] policy for one provider. OpenVINO counts as an
+/// accelerator even with a `CPU` device type: its device string may name a GPU/NPU, and
+/// the conservative batch only costs throughput.
+fn paddle_det_batch_for(provider: ExecutionProvider) -> NonZeroUsize {
+    match provider {
+        ExecutionProvider::Cpu => PADDLE_DET_CPU_BATCH,
+        ExecutionProvider::DirectMl
+        | ExecutionProvider::CoreMl
+        | ExecutionProvider::Cuda
+        | ExecutionProvider::WebGpu
+        | ExecutionProvider::OpenVino
+        | ExecutionProvider::TensorRt => NonZeroUsize::MIN,
+    }
+}
+
+/// Tiles per native Paddle detection run on the CPU provider (see [`paddle_det_max_batch`]).
+const PADDLE_DET_CPU_BATCH: NonZeroUsize = match NonZeroUsize::new(4) {
+    Some(batch) => batch,
+    None => NonZeroUsize::MIN,
+};
 
 /// Runs `work` under the shared SIGILL-guarded native-runtime sequence.
 ///
@@ -1484,19 +1561,35 @@ fn ensure_paddle_detector(
     Ok(())
 }
 
-/// Runs PaddleOCR text detection with the global lock RELEASED during the call. The
-/// shared detector is taken out of the cache, used, then put back.
+/// Runs PaddleOCR text detection with the global lock RELEASED during the call.
 fn run_paddle_detect(image: &image::RgbaImage) -> Result<PaddleDetection, NativeRuntimeError> {
+    with_shared_detector(|detector| detector.detect(image))
+}
+
+/// Runs the forward-only PaddleOCR detector pass on `tiles` with the global lock
+/// RELEASED during the call.
+fn run_paddle_forward(tiles: &[image::RgbImage]) -> Result<Vec<ProbMap>, NativeRuntimeError> {
+    with_shared_detector(|detector| detector.forward_prob_maps(tiles))
+}
+
+/// Takes the shared detector out of the cache, runs `op` on it WITHOUT the global
+/// STATE lock held (inference is slow), and puts it back whatever the outcome (a failed
+/// run leaves the session reusable). An `op` error maps to
+/// [`NativeRuntimeError::PaddleDetect`].
+///
+/// Callers hold `lock_paddle_op`, so the detector cannot be taken concurrently;
+/// [`NativeRuntimeError::EngineUnavailable`] is the typed form of that invariant.
+fn with_shared_detector<T>(
+    op: impl FnOnce(&mut PaddleDetector) -> Result<T, OrtError>,
+) -> Result<T, NativeRuntimeError> {
     let mut detector = {
         let mut state = lock_state();
         state.paddle_detector.take()
     }
     .ok_or(NativeRuntimeError::EngineUnavailable)?;
 
-    // `detect` takes `&mut self` and can be slow; run it without the lock held.
-    let result = detector.detect(image);
+    let result = op(&mut detector);
 
-    // Return the detector to the cache regardless of the outcome (still reusable).
     {
         let mut state = lock_state();
         state.paddle_detector.get_or_insert(detector);
@@ -1565,6 +1658,21 @@ fn emit_downloading(progress: &mut dyn FnMut(OrtDownloadProgress)) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn paddle_det_batch_is_four_on_cpu_and_one_on_accelerators() {
+        assert_eq!(paddle_det_batch_for(ExecutionProvider::Cpu).get(), 4);
+        for provider in [
+            ExecutionProvider::DirectMl,
+            ExecutionProvider::CoreMl,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::WebGpu,
+            ExecutionProvider::OpenVino,
+            ExecutionProvider::TensorRt,
+        ] {
+            assert_eq!(paddle_det_batch_for(provider), NonZeroUsize::MIN, "{provider:?}");
+        }
+    }
 
     #[test]
     fn read_max_loaded_models_defaults_and_clamps() {

@@ -1,31 +1,36 @@
 """
 FILE OVERVIEW: modules/ai_backend/detection/surya.py
-Low-level Surya text detector service.
+Forward-only Surya text detector service.
 
 Main responsibilities:
-- lazy init and health reporting for Surya detection-only predictor;
+- lazy init and health reporting for the Surya detection-only predictor;
 - explicit checkpoint presence check and auto-download for the detector model;
-- low-level heatmap-based text detection without OCR wrappers;
-- return line blocks and a binary mask derived from Surya detector heatmaps;
+- run ONE batched forward pass over equal-size RGB tiles prepared by Rust and
+  return the text heatmap (model channel 0, at a quarter of the tile size) as
+  `uint8`;
 - synchronize model device with backend `General.ai_device`;
 - cooperate with `LoadedModelManager` for bounded resident model count.
 
+Key structures:
+- SuryaTextDetectorService
+
 Notes:
-Backs the `textdetector.surya` IPC method (`ipc/handlers/textdetector.py`).
-Checkpoint presence and download are delegated to `engines/surya_checkpoints.py`,
-shared with the Surya OCR service (`ocr/surya.py`). This service needs no ROCm
-mmap staging: it loads the float16 detector checkpoint as float32, and that
-host-side cast already materializes the weights in anonymous memory (see
-`_preferred_detector_dtype`).
+Backs the `textdetector.surya.forward` IPC method (`ipc/handlers/textdetector.py`).
+Resizing, page chunking, stitching and the CRAFT-style post-process (dynamic
+thresholds, components, boxes, mask) live in Rust (`crates/ms-text-detect`);
+this service only applies the library processor's normalization (no resize)
+and the network. Checkpoint presence and download are delegated to
+`engines/surya_checkpoints.py`, shared with the Surya OCR service
+(`ocr/surya.py`). This service needs no ROCm mmap staging: it loads the float16
+detector checkpoint as float32, and that host-side cast already materializes the
+weights in anonymous memory (see `_preferred_detector_dtype`).
 """
 
 from __future__ import annotations
 
 import gc
-import io
 import logging
 import threading
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -46,11 +51,18 @@ from ..engines.surya_checkpoints import (
     checkpoint_ready,
     ensure_checkpoint_downloaded,
 )
+from .forward_maps import quantize_probability_maps, validate_tiles
 
 log = logging.getLogger(__name__)
 
 # Names this service in checkpoint download errors.
 CHECKPOINT_LABEL = "Surya detector"
+
+# Input alignment and output stride of the Surya segformer: the heatmap is
+# exactly a quarter of the input on each axis when both sides are a multiple
+# of 4 (probed: 1200x1200 -> 300x300, 1000x700 -> 250x175).
+SURYA_INPUT_ALIGN = 4
+SURYA_MAP_STRIDE = 4
 
 
 def _clear_torch_cache() -> None:
@@ -99,23 +111,28 @@ class SuryaTextDetectorService:
                 "last_error": self._last_error,
             }
 
-    def detect_page(self, page_path: str) -> dict[str, Any]:
-        log.info("Surya detect_page start path=%s", page_path)
-        raw = Path(page_path).read_bytes()
-        return self.detect_image_bytes(raw)
+    def forward_tiles(self, tiles: np.ndarray) -> np.ndarray:
+        """Run the Surya detector on RGB tiles and return `uint8` maps `[n, 1, h/4, w/4]`.
 
-    def detect_image_bytes(self, image_bytes: bytes) -> dict[str, Any]:
+        `tiles` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 4. The
+        single channel is the model's text heatmap (channel 0, sigmoid already
+        applied inside the model) at its native quarter resolution; the
+        library's bilinear upsample to the processor size is NOT applied.
+
+        Raises `ValueError` for an invalid batch and `RuntimeError` for an
+        unavailable package, a failed load, an unexpected output shape or
+        non-finite heatmap values (float16 NaN on some CUDA setups).
+        """
+        n, height, width = validate_tiles(tiles, align=SURYA_INPUT_ALIGN, engine="surya")
         selected_device = _resolve_selected_backend_device(self._device or "cpu")
         model_key = self._model_key(selected_device)
-        checkpoint = self._checkpoint_name()
-        model_dir = checkpoint_local_dir(checkpoint)
         log.info(
-            "Surya detect_image_bytes start bytes=%s device=%s model_key=%s checkpoint=%s model_dir=%s",
-            len(image_bytes),
+            "Surya forward start tiles=%s size=%sx%s device=%s model_key=%s",
+            n,
+            width,
+            height,
             selected_device,
             model_key,
-            checkpoint,
-            model_dir,
         )
         lease = self._model_manager.begin_model_use(
             model_key,
@@ -124,20 +141,14 @@ class SuryaTextDetectorService:
         try:
             with self._lock:
                 predictor = self._ensure_predictor_locked(selected_device)
-            payload = self._detect_with_predictor(image_bytes, predictor)
-            log.info(
-                "Surya detect_image_bytes done device=%s blocks=%s lines=%s mask_png_len=%s",
-                selected_device,
-                len(payload.get("blocks", [])),
-                len(payload.get("lines", [])),
-                len(payload.get("mask_png", b"")),
-            )
+                maps = _forward_with_predictor(predictor, tiles)
             if lease.needs_load:
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
             self._last_error = None
-            return payload
+            log.info("Surya forward done device=%s map_size=%sx%s", selected_device, maps.shape[3], maps.shape[2])
+            return maps
         except Exception as exc:
-            log.exception("Surya detect_image_bytes failed device=%s error=%s", selected_device, exc)
+            log.exception("Surya forward failed device=%s error=%s", selected_device, exc)
             if lease.needs_load:
                 lease.mark_load_failed()
             self._last_error = str(exc)
@@ -195,165 +206,6 @@ class SuryaTextDetectorService:
         """
         ensure_checkpoint_downloaded(self._checkpoint_name(), label=CHECKPOINT_LABEL)
 
-    def _detect_with_predictor(self, image_bytes: bytes, predictor) -> dict[str, Any]:
-        from surya.common.util import clean_boxes  # type: ignore
-        from surya.common.polygon import PolygonBox  # type: ignore
-        from surya.settings import settings  # type: ignore
-
-        cv2 = self._ensure_cv2()
-        image = self._decode_image(image_bytes)
-        image_rgb = image.convert("RGB")
-        image_w, image_h = image_rgb.size
-        image_np = np.asarray(image_rgb, dtype=np.uint8)
-        log.info("Surya predictor input image_size=%sx%s", image_w, image_h)
-        log.info(
-            "Surya predictor input pixels min=%s max=%s mean=%.3f std=%.3f",
-            int(np.min(image_np)),
-            int(np.max(image_np)),
-            float(np.mean(image_np)),
-            float(np.std(image_np)),
-        )
-
-        detection_batches = list(
-            predictor.batch_detection(
-                [image_rgb], batch_size=1, static_cache=settings.DETECTOR_STATIC_CACHE
-            )
-        )
-        if not detection_batches:
-            raise RuntimeError("Surya detector returned no predictions.")
-
-        preds, orig_sizes = detection_batches[0]
-        if not preds or not orig_sizes:
-            raise RuntimeError("Surya detector returned empty prediction payload.")
-
-        heatmap = preds[0][0]
-        if heatmap.dtype != np.float32:
-            heatmap = heatmap.astype(np.float32)
-        finite_mask = np.isfinite(heatmap)
-        finite_count = int(np.count_nonzero(finite_mask))
-        total_count = int(heatmap.size)
-        nonfinite_count = total_count - finite_count
-        log.info(
-            "Surya heatmap stats shape=%s dtype=%s min=%.6f max=%.6f mean=%.6f finite=%s/%s nonfinite=%s",
-            tuple(int(v) for v in heatmap.shape),
-            heatmap.dtype,
-            float(np.nanmin(heatmap)),
-            float(np.nanmax(heatmap)),
-            float(np.nanmean(heatmap)),
-            finite_count,
-            total_count,
-            nonfinite_count,
-        )
-        if nonfinite_count > 0:
-            raise RuntimeError(
-                "Surya detector returned non-finite heatmap values. "
-                f"device={self._device or 'unknown'} nonfinite={nonfinite_count}/{total_count}"
-            )
-
-        processor_size = list(reversed(heatmap.shape))
-        boxes, confidences, proc_mask, debug_stats = _extract_mask_and_boxes(
-            cv2=cv2,
-            linemap=heatmap,
-            text_threshold=float(settings.DETECTOR_TEXT_THRESHOLD),
-            low_text=float(settings.DETECTOR_BLANK_THRESHOLD),
-        )
-        log.info(
-            "Surya postprocess raw processor_size=%s labels=%s accepted=%s "
-            "text_threshold=%.6f low_text=%.6f max_confidence=%.6f proc_mask_nonzero=%s",
-            processor_size,
-            debug_stats["label_count"],
-            len(boxes),
-            debug_stats["text_threshold"],
-            debug_stats["low_text"],
-            debug_stats["max_confidence"],
-            debug_stats["proc_mask_nonzero"],
-        )
-
-        polygon_boxes = [
-            PolygonBox(polygon=box, confidence=confidence)
-            for box, confidence in zip(boxes, confidences)
-        ]
-        for box in polygon_boxes:
-            box.rescale(processor_size, (image_w, image_h))
-            box.fit_to_bounds([0, 0, image_w, image_h])
-
-        polygon_boxes = clean_boxes(polygon_boxes)
-        for box in polygon_boxes:
-            if box.height < 3 * box.width:
-                box.expand(
-                    x_margin=0,
-                    y_margin=float(settings.DETECTOR_BOX_Y_EXPAND_MARGIN),
-                )
-                box.fit_to_bounds([0, 0, image_w, image_h])
-
-        source_mask = cv2.resize(
-            proc_mask,
-            (image_w, image_h),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        log.info(
-            "Surya postprocess cleaned_boxes=%s source_mask_nonzero=%s source_mask_size=%sx%s",
-            len(polygon_boxes),
-            int(np.count_nonzero(source_mask)),
-            image_w,
-            image_h,
-        )
-
-        lines = []
-        blocks = []
-        for box in sorted(
-            polygon_boxes,
-            key=lambda item: (
-                float(item.bbox[1]),
-                float(item.bbox[0]),
-                float(item.bbox[3]),
-                float(item.bbox[2]),
-            ),
-        ):
-            bbox = box.bbox
-            x1 = int(bbox[0])
-            y1 = int(bbox[1])
-            x2 = int(bbox[2])
-            y2 = int(bbox[3])
-            if x2 <= x1 or y2 <= y1:
-                continue
-            blocks.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-            lines.append(
-                {
-                    "polygon": [[float(x), float(y)] for x, y in box.polygon],
-                    "bbox": [x1, y1, x2, y2],
-                    "confidence": float(box.confidence or 0.0),
-                }
-            )
-        log.info("Surya final payload blocks=%s lines=%s", len(blocks), len(lines))
-
-        return {
-            "source_size": [image_w, image_h],
-            "blocks": blocks,
-            "lines": lines,
-            "mask_png": _encode_mask_png_bytes(cv2, source_mask),
-        }
-
-    @staticmethod
-    def _decode_image(image_bytes: bytes):
-        from PIL import Image
-
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            rgb = img.convert("RGB")
-            width, height = rgb.size
-            if width >= 2 and height >= 2:
-                return rgb
-
-            resampling = getattr(getattr(Image, "Resampling", Image), "NEAREST")
-            target_size = (max(2, width), max(2, height))
-            return rgb.resize(target_size, resample=resampling)
-
-    @staticmethod
-    def _ensure_cv2():
-        import cv2  # type: ignore
-
-        return cv2
-
     def _unload_key(self, model_key: str) -> bool:
         with self._lock:
             current_device = self._device
@@ -379,116 +231,40 @@ class SuryaTextDetectorService:
         return str(settings.DETECTOR_MODEL_CHECKPOINT)
 
 
-def _extract_mask_and_boxes(
-    *,
-    cv2,
-    linemap: np.ndarray,
-    text_threshold: float,
-    low_text: float,
-) -> tuple[list[np.ndarray], list[float], np.ndarray, dict[str, float | int]]:
-    from surya.detection.heatmap import get_dynamic_thresholds  # type: ignore
+def _forward_with_predictor(predictor, tiles: np.ndarray) -> np.ndarray:
+    """One batched forward pass through a loaded `DetectionPredictor`.
 
-    img_h, img_w = linemap.shape
-    text_threshold, low_text = get_dynamic_thresholds(linemap, text_threshold, low_text)
-    text_score_comb = (linemap > low_text).astype(np.uint8)
-    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        text_score_comb, connectivity=4
-    )
+    Normalizes each tile with the predictor's own processor (rescale 1/255, then
+    the checkpoint's mean/std from `preprocessor_config.json`; the processor does
+    not resize), casts to the model dtype (float32 on CUDA, see
+    `_preferred_detector_dtype`) and returns quantized channel 0. Releases
+    Torch's CUDA cache afterwards when CUDA (or ROCm) is available, as upstream
+    `batch_detection` does.
+    """
+    import torch  # type: ignore
+    from surya.settings import settings  # type: ignore
 
-    det: list[np.ndarray] = []
-    confidences: list[float] = []
-    max_confidence = 0.0
-    binary_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-
-    for label_idx in range(1, label_count):
-        size = int(stats[label_idx, cv2.CC_STAT_AREA])
-        if size < 10:
-            continue
-
-        x, y, width, height = [
-            int(value)
-            for value in stats[
-                label_idx,
-                [
-                    cv2.CC_STAT_LEFT,
-                    cv2.CC_STAT_TOP,
-                    cv2.CC_STAT_WIDTH,
-                    cv2.CC_STAT_HEIGHT,
-                ],
-            ]
-        ]
-
-        try:
-            niter = int(np.sqrt(min(width, height)))
-        except ValueError:
-            niter = 0
-
-        buffer = 1
-        sx = max(0, x - niter - buffer)
-        sy = max(0, y - niter - buffer)
-        ex = min(img_w, x + width + niter + buffer)
-        ey = min(img_h, y + height + niter + buffer)
-
-        component_mask = labels[sy:ey, sx:ex] == label_idx
-        selected_linemap = linemap[sy:ey, sx:ex][component_mask]
-        if selected_linemap.size == 0:
-            continue
-
-        line_max = float(np.max(selected_linemap))
-        if line_max < text_threshold:
-            continue
-
-        segmap = component_mask.astype(np.uint8)
-        ksize = max(1, buffer + niter)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
-        selected_segmap = cv2.dilate(segmap, kernel)
-        binary_mask[sy:ey, sx:ex][selected_segmap > 0] = 255
-
-        y_inds, x_inds = np.nonzero(selected_segmap)
-        x_inds += sx
-        y_inds += sy
-        if x_inds.size == 0 or y_inds.size == 0:
-            continue
-        np_contours = np.column_stack((x_inds, y_inds))
-        rectangle = cv2.minAreaRect(np_contours)
-        box = cv2.boxPoints(rectangle)
-
-        edge_w = np.linalg.norm(box[0] - box[1])
-        edge_h = np.linalg.norm(box[1] - box[2])
-        box_ratio = max(edge_w, edge_h) / (min(edge_w, edge_h) + 1e-5)
-        if abs(1 - box_ratio) <= 0.1:
-            left = np_contours[:, 0].min()
-            right = np_contours[:, 0].max()
-            top = np_contours[:, 1].min()
-            bottom = np_contours[:, 1].max()
-            box = np.array(
-                [[left, top], [right, top], [right, bottom], [left, bottom]],
-                dtype=np.float32,
-            )
-
-        startidx = box.sum(axis=1).argmin()
-        box = np.roll(box, 4 - startidx, 0)
-        det.append(box)
-        confidences.append(line_max)
-        max_confidence = max(max_confidence, line_max)
-
-    if max_confidence > 0:
-        confidences = [confidence / max_confidence for confidence in confidences]
-
-    return det, confidences, binary_mask, {
-        "label_count": int(max(0, label_count - 1)),
-        "text_threshold": float(text_threshold),
-        "low_text": float(low_text),
-        "max_confidence": float(max_confidence),
-        "proc_mask_nonzero": int(np.count_nonzero(binary_mask)),
-    }
-
-
-def _encode_mask_png_bytes(cv2, mask: np.ndarray) -> bytes:
-    ok, encoded = cv2.imencode(".png", mask)
-    if not ok:
-        raise RuntimeError("Не удалось закодировать mask PNG.")
-    return encoded.tobytes()
+    n, height, width = (int(v) for v in tiles.shape[:3])
+    pixel_values = [
+        torch.from_numpy(np.asarray(predictor.processor(tile)["pixel_values"][0]))
+        for tile in tiles
+    ]
+    batch = torch.stack(pixel_values, dim=0).to(predictor.model.dtype)
+    with settings.INFERENCE_MODE():
+        pred = predictor.model(pixel_values=batch.to(predictor.model.device))
+    heat = pred.logits[:, 0:1].to(torch.float32).cpu().numpy()
+    # Upstream `DetectionPredictor.batch_detection` ends every call with
+    # `torch.cuda.empty_cache()`; this path bypasses it, so release the batch's
+    # cached activation memory here. Torch could reuse it, but the non-Torch GPU
+    # users of this process (ONNX Runtime CUDA/ROCm sessions) cannot. A bare call
+    # rather than `_clear_torch_cache`: that one also runs `gc.collect()`, too
+    # costly once per tile batch.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    expected = (n, 1, height // SURYA_MAP_STRIDE, width // SURYA_MAP_STRIDE)
+    if tuple(heat.shape) != expected:
+        raise RuntimeError(f"Surya detector output has shape {tuple(heat.shape)}, expected {expected}.")
+    return quantize_probability_maps(heat, engine="surya")
 
 
 def _read_configured_device() -> str | None:

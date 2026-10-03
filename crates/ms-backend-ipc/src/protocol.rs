@@ -45,7 +45,7 @@ use serde_json::{Map, Value, json};
 /// The contract also covers state the two processes SHARE on disk: the `user_config`
 /// document's storage semantics (`ms-docstore` / `docstore.py`, `.json` or SQLite `.db`).
 /// A backend payload that reads/writes it differently must be refused here.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -223,10 +223,14 @@ pub const METHOD_WATERMARK_STATUS: &str = "watermark.status";
 /// Releases the resident watermark model; responds with whether one was loaded.
 pub const METHOD_WATERMARK_UNLOAD: &str = "watermark.unload";
 
-// --- Text detection ---
-pub const METHOD_TEXTDETECTOR_CTD: &str = "textdetector.ctd";
-pub const METHOD_TEXTDETECTOR_PADDLE: &str = "textdetector.paddle";
-pub const METHOD_TEXTDETECTOR_SURYA: &str = "textdetector.surya";
+// --- Text detection (forward-only since protocol v4) ---
+/// CTD forward pass: equal-size RGB tiles in, `[seg, shrink]` u8 maps out. The wire
+/// contract (header fields, blob layout, validation) is `crate::textdetector`.
+pub const METHOD_TEXTDETECTOR_CTD_FORWARD: &str = "textdetector.ctd.forward";
+/// PP-OCR detection forward pass: one `prob` u8 map per tile at the tile resolution.
+pub const METHOD_TEXTDETECTOR_PADDLE_FORWARD: &str = "textdetector.paddle.forward";
+/// Surya forward pass: one `text` u8 map per tile at a quarter of the tile resolution.
+pub const METHOD_TEXTDETECTOR_SURYA_FORWARD: &str = "textdetector.surya.forward";
 
 // --- Device ---
 pub const METHOD_DEVICE_GET: &str = "device.get";

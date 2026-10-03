@@ -1,0 +1,864 @@
+{
+ "case": "color_bg",
+ "description": "Coloured gradient page with a white bubble (dark text), red text and blue text on the gradient; detect_size 256 < long side 288, so the letterbox DOWNSCALES (maps 199x256).",
+ "engine": "ctd",
+ "expected": {
+  "blocks": [
+   {
+    "x1": 70.0,
+    "x2": 155.0,
+    "y1": 57.0,
+    "y2": 82.0
+   },
+   {
+    "x1": 75.0,
+    "x2": 149.0,
+    "y1": 80.0,
+    "y2": 105.0
+   },
+   {
+    "x1": 28.0,
+    "x2": 113.0,
+    "y1": 176.0,
+    "y2": 206.0
+   },
+   {
+    "x1": 132.0,
+    "x2": 198.0,
+    "y1": 226.0,
+    "y2": 262.0
+   }
+  ]
+ },
+ "files": {
+  "expected_mask": "expected_mask.png",
+  "input": "input.png",
+  "seg": "seg.png",
+  "seg_source": "seg_source.png",
+  "shrink": "shrink.png"
+ },
+ "intermediate": {
+  "db_candidates": [
+   {
+    "box_map_px": [
+     [
+      119.81610107421875,
+      201.14479064941406
+     ],
+     [
+      176.16043090820312,
+      207.8524627685547
+     ],
+     [
+      173.18389892578125,
+      232.85523986816406
+     ],
+     [
+      116.83956909179688,
+      226.14756774902344
+     ]
+    ],
+    "kept_score_gt_0_6": true,
+    "mini_box_map_px": [
+     [
+      126.46153259277344,
+      209.30770874023438
+     ],
+     [
+      168.6769256591797,
+      214.58462524414062
+     ],
+     [
+      167.2769317626953,
+      225.78463745117188
+     ],
+     [
+      125.06153869628906,
+      220.50772094726562
+     ]
+    ],
+    "score": 0.8355951414052357,
+    "skipped_sside_lt_2": false,
+    "sside_post": 25.17934226989746,
+    "sside_pre": 11.287160873413086,
+    "unclipped_map_px": [
+     [
+      169,
+      207
+     ],
+     [
+      172,
+      209
+     ],
+     [
+      174,
+      212
+     ],
+     [
+      175,
+      215
+     ],
+     [
+      174,
+      226
+     ],
+     [
+      172,
+      229
+     ],
+     [
+      170,
+      231
+     ],
+     [
+      166,
+      232
+     ],
+     [
+      124,
+      227
+     ],
+     [
+      121,
+      225
+     ],
+     [
+      119,
+      222
+     ],
+     [
+      118,
+      219
+     ],
+     [
+      119,
+      208
+     ],
+     [
+      121,
+      205
+     ],
+     [
+      123,
+      203
+     ],
+     [
+      127,
+      202
+     ]
+    ]
+   },
+   {
+    "box_map_px": [
+     [
+      25.0,
+      156.0
+     ],
+     [
+      100.0,
+      156.0
+     ],
+     [
+      100.0,
+      183.0
+     ],
+     [
+      25.0,
+      183.0
+     ]
+    ],
+    "kept_score_gt_0_6": true,
+    "mini_box_map_px": [
+     [
+      32.0,
+      163.0
+     ],
+     [
+      92.0,
+      163.0
+     ],
+     [
+      92.0,
+      175.0
+     ],
+     [
+      32.0,
+      175.0
+     ]
+    ],
+    "score": 0.8853250320291459,
+    "skipped_sside_lt_2": false,
+    "sside_post": 27.0,
+    "sside_pre": 12.0,
+    "unclipped_map_px": [
+     [
+      98,
+      159
+     ],
+     [
+      100,
+      163
+     ],
+     [
+      100,
+      175
+     ],
+     [
+      99,
+      179
+     ],
+     [
+      96,
+      181
+     ],
+     [
+      92,
+      183
+     ],
+     [
+      32,
+      183
+     ],
+     [
+      28,
+      182
+     ],
+     [
+      26,
+      179
+     ],
+     [
+      25,
+      175
+     ],
+     [
+      25,
+      159
+     ],
+     [
+      28,
+      157
+     ],
+     [
+      32,
+      156
+     ],
+     [
+      96,
+      156
+     ]
+    ]
+   },
+   {
+    "box_map_px": [
+     [
+      142.0,
+      133.0
+     ],
+     [
+      178.0,
+      133.0
+     ],
+     [
+      178.0,
+      151.0
+     ],
+     [
+      142.0,
+      151.0
+     ]
+    ],
+    "kept_score_gt_0_6": false,
+    "mini_box_map_px": [
+     [
+      147.0,
+      138.0
+     ],
+     [
+      173.0,
+      138.0
+     ],
+     [
+      173.0,
+      146.0
+     ],
+     [
+      147.0,
+      146.0
+     ]
+    ],
+    "score": 0.4502420268298193,
+    "skipped_sside_lt_2": false,
+    "sside_post": 18.0,
+    "sside_pre": 8.0,
+    "unclipped_map_px": [
+     [
+      176,
+      134
+     ],
+     [
+      178,
+      138
+     ],
+     [
+      178,
+      146
+     ],
+     [
+      177,
+      149
+     ],
+     [
+      173,
+      151
+     ],
+     [
+      147,
+      151
+     ],
+     [
+      144,
+      150
+     ],
+     [
+      142,
+      146
+     ],
+     [
+      142,
+      138
+     ],
+     [
+      143,
+      135
+     ],
+     [
+      147,
+      133
+     ],
+     [
+      173,
+      133
+     ]
+    ]
+   },
+   {
+    "box_map_px": [
+     [
+      67.0,
+      71.0
+     ],
+     [
+      132.0,
+      71.0
+     ],
+     [
+      132.0,
+      93.0
+     ],
+     [
+      67.0,
+      93.0
+     ]
+    ],
+    "kept_score_gt_0_6": true,
+    "mini_box_map_px": [
+     [
+      73.0,
+      77.0
+     ],
+     [
+      126.0,
+      77.0
+     ],
+     [
+      126.0,
+      87.0
+     ],
+     [
+      73.0,
+      87.0
+     ]
+    ],
+    "score": 0.8744437915307504,
+    "skipped_sside_lt_2": false,
+    "sside_post": 22.0,
+    "sside_pre": 10.0,
+    "unclipped_map_px": [
+     [
+      129,
+      72
+     ],
+     [
+      132,
+      74
+     ],
+     [
+      132,
+      87
+     ],
+     [
+      131,
+      90
+     ],
+     [
+      129,
+      93
+     ],
+     [
+      73,
+      93
+     ],
+     [
+      70,
+      92
+     ],
+     [
+      67,
+      90
+     ],
+     [
+      67,
+      77
+     ],
+     [
+      68,
+      74
+     ],
+     [
+      70,
+      71
+     ],
+     [
+      126,
+      71
+     ]
+    ]
+   },
+   {
+    "box_map_px": [
+     [
+      62.0,
+      51.0
+     ],
+     [
+      138.0,
+      51.0
+     ],
+     [
+      138.0,
+      73.0
+     ],
+     [
+      62.0,
+      73.0
+     ]
+    ],
+    "kept_score_gt_0_6": true,
+    "mini_box_map_px": [
+     [
+      68.0,
+      57.0
+     ],
+     [
+      132.0,
+      57.0
+     ],
+     [
+      132.0,
+      67.0
+     ],
+     [
+      68.0,
+      67.0
+     ]
+    ],
+    "score": 0.8764459142318138,
+    "skipped_sside_lt_2": false,
+    "sside_post": 22.0,
+    "sside_pre": 10.0,
+    "unclipped_map_px": [
+     [
+      138,
+      54
+     ],
+     [
+      138,
+      70
+     ],
+     [
+      135,
+      73
+     ],
+     [
+      65,
+      73
+     ],
+     [
+      62,
+      70
+     ],
+     [
+      62,
+      54
+     ],
+     [
+      65,
+      51
+     ],
+     [
+      135,
+      51
+     ]
+    ]
+   }
+  ],
+  "refine_blocks": [
+   {
+    "block_xyxy": [
+     132,
+     226,
+     198,
+     262
+    ],
+    "candidates_in_merge_order": [
+     55585,
+     57997,
+     58204,
+     61439
+    ],
+    "otsu": {
+     "chosen_channel_bgr": 1,
+     "minxor": [
+      {
+       "inverted": false,
+       "xor_sum": 664556
+      },
+      {
+       "inverted": true,
+       "xor_sum": 57997
+      },
+      {
+       "inverted": true,
+       "xor_sum": 58132
+      }
+     ],
+     "threshold_per_channel_bgr": [
+      111.0,
+      113.0,
+      112.0
+     ]
+    },
+    "topk": {
+     "colors": [
+      74.0,
+      92.89411764705882,
+      103.76470588235294
+     ],
+     "histogram_first_last_edge": [
+      74.0,
+      140.0
+     ],
+     "histogram_sample_count": 199,
+     "inrange_bounds": [
+      [
+       44.0,
+       104.0
+      ],
+      [
+       62.89411764705882,
+       122.89411764705882
+      ],
+      [
+       73.76470588235293,
+       133.76470588235293
+      ]
+     ],
+     "minxor": [
+      {
+       "inverted": false,
+       "xor_sum": 55585
+      },
+      {
+       "inverted": false,
+       "xor_sum": 58204
+      },
+      {
+       "inverted": false,
+       "xor_sum": 61439
+      }
+     ],
+     "stable_sort_order_differs": false
+    },
+    "window_xyxy": [
+     118,
+     212,
+     212,
+     276
+    ]
+   },
+   {
+    "block_xyxy": [
+     28,
+     176,
+     113,
+     206
+    ],
+    "candidates_in_merge_order": [
+     69430,
+     70469,
+     70586
+    ],
+    "otsu": {
+     "chosen_channel_bgr": 0,
+     "minxor": [
+      {
+       "inverted": true,
+       "xor_sum": 70469
+      },
+      {
+       "inverted": true,
+       "xor_sum": 70635
+      },
+      {
+       "inverted": false,
+       "xor_sum": 475705
+      }
+     ],
+     "threshold_per_channel_bgr": [
+      93.0,
+      85.0,
+      124.0
+     ]
+    },
+    "topk": {
+     "colors": [
+      49.0,
+      68.92156862745098
+     ],
+     "histogram_first_last_edge": [
+      49.0,
+      69.0
+     ],
+     "histogram_sample_count": 575,
+     "inrange_bounds": [
+      [
+       19.0,
+       79.0
+      ],
+      [
+       38.92156862745098,
+       98.92156862745098
+      ]
+     ],
+     "minxor": [
+      {
+       "inverted": false,
+       "xor_sum": 69430
+      },
+      {
+       "inverted": false,
+       "xor_sum": 70586
+      }
+     ],
+     "stable_sort_order_differs": false
+    },
+    "window_xyxy": [
+     15,
+     163,
+     126,
+     219
+    ]
+   },
+   {
+    "block_xyxy": [
+     75,
+     80,
+     149,
+     105
+    ],
+    "candidates_in_merge_order": [
+     182155,
+     209148,
+     234408,
+     264392
+    ],
+    "otsu": {
+     "chosen_channel_bgr": 2,
+     "minxor": [
+      {
+       "inverted": true,
+       "xor_sum": 238233
+      },
+      {
+       "inverted": true,
+       "xor_sum": 235683
+      },
+      {
+       "inverted": true,
+       "xor_sum": 234408
+      }
+     ],
+     "threshold_per_channel_bgr": [
+      148.0,
+      147.0,
+      146.0
+     ]
+    },
+    "topk": {
+     "colors": [
+      26.0,
+      90.45098039215686,
+      58.56470588235294
+     ],
+     "histogram_first_last_edge": [
+      26.0,
+      199.0
+     ],
+     "histogram_sample_count": 285,
+     "inrange_bounds": [
+      [
+       -4.0,
+       56.0
+      ],
+      [
+       60.450980392156865,
+       120.45098039215686
+      ],
+      [
+       28.56470588235294,
+       88.56470588235294
+      ]
+     ],
+     "minxor": [
+      {
+       "inverted": false,
+       "xor_sum": 182155
+      },
+      {
+       "inverted": false,
+       "xor_sum": 209148
+      },
+      {
+       "inverted": false,
+       "xor_sum": 264392
+      }
+     ],
+     "stable_sort_order_differs": false
+    },
+    "window_xyxy": [
+     64,
+     69,
+     160,
+     116
+    ]
+   },
+   {
+    "block_xyxy": [
+     70,
+     57,
+     155,
+     82
+    ],
+    "candidates_in_merge_order": [
+     204778,
+     227400,
+     291312,
+     313415
+    ],
+    "otsu": {
+     "chosen_channel_bgr": 2,
+     "minxor": [
+      {
+       "inverted": true,
+       "xor_sum": 366758
+      },
+      {
+       "inverted": true,
+       "xor_sum": 366758
+      },
+      {
+       "inverted": true,
+       "xor_sum": 313415
+      }
+     ],
+     "threshold_per_channel_bgr": [
+      155.0,
+      156.0,
+      147.0
+     ]
+    },
+    "topk": {
+     "colors": [
+      26.0,
+      90.45098039215686,
+      58.56470588235294
+     ],
+     "histogram_first_last_edge": [
+      26.0,
+      199.0
+     ],
+     "histogram_sample_count": 254,
+     "inrange_bounds": [
+      [
+       -4.0,
+       56.0
+      ],
+      [
+       60.450980392156865,
+       120.45098039215686
+      ],
+      [
+       28.56470588235294,
+       88.56470588235294
+      ]
+     ],
+     "minxor": [
+      {
+       "inverted": false,
+       "xor_sum": 204778
+      },
+      {
+       "inverted": false,
+       "xor_sum": 227400
+      },
+      {
+       "inverted": false,
+       "xor_sum": 291312
+      }
+     ],
+     "stable_sort_order_differs": false
+    },
+    "window_xyxy": [
+     58,
+     45,
+     167,
+     94
+    ]
+   }
+  ]
+ },
+ "map_size": [
+  199,
+  256
+ ],
+ "params": {
+  "db_max_candidates": 1000,
+  "db_skip_sside_lt": 2,
+  "db_thresh": 0.3,
+  "db_unclip_ratio": 1.5,
+  "detect_size": 256,
+  "letterbox_pad_right_bottom": [
+   57,
+   0
+  ],
+  "letterbox_ratio": 0.8888888888888888,
+  "mask_binarize_gt": 30,
+  "mask_dilate_size": 0,
+  "score_filter_gt": 0.6
+ },
+ "source_size": [
+  224,
+  288
+ ]
+}

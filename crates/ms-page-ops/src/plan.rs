@@ -1589,8 +1589,8 @@ pub(crate) struct ComposeSource {
     /// construction: the typing mask is painted by
     /// `MaskBrush::paint_binary_mask_segment` and re-thresholded at luma 128 on
     /// load (`tabs/typing/mask.rs`), and a detection mask is normalized to
-    /// `0`/`255` by `text_detector::parse_mask_alpha_from_blob` /
-    /// `glyph_mask_into_alpha`, whose loader promotes ANY non-zero byte to fully
+    /// `0`/`255` by its one owner, `ms_text_detect::mask` (`normalize_binary_alpha` /
+    /// `binary_alpha_from_gray`), which promotes ANY non-zero byte to fully
     /// masked. A smooth filter therefore does not merely blur such a raster, it
     /// changes what it MEANS: every interpolated pixel of a detection mask reads
     /// as masked, so the mask silently GROWS outwards, and a typing mask's edge

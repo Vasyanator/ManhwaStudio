@@ -133,9 +133,7 @@ use crate::watermark_chapter::{
     remove_occurrences_on_page, scan_page, validate_calibration_sample,
 };
 use ms_tab_translation::backend_health::ai_backend_offline_error;
-use ms_tab_translation::text_detector::{
-    encode_color_image_png_rgba, parse_mask_alpha_from_blob,
-};
+use super::region_png::{decode_mask_png, encode_color_image_png_rgba};
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
@@ -4653,7 +4651,7 @@ fn decode_region_mask(bytes: &[u8], expected: [usize; 2]) -> Result<egui::ColorI
         return Err(t!("cleaning.tools.watermark.no_mask_result_error").to_string());
     }
     let method_label = t!("cleaning.mask_editor.source.watermark");
-    let (mask_size, mask_alpha) = parse_mask_alpha_from_blob(bytes)?;
+    let (mask_size, mask_alpha) = decode_mask_png(bytes)?;
     let width = usize::try_from(mask_size[0]).map_err(|_| {
         tf!(
             "cleaning.mask_editor.mask_width_too_large_error",

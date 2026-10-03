@@ -294,7 +294,8 @@ use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLan
 use ms_widgets::{SeedSpinBox, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
-use image::{ColorType, ImageEncoder};
+// The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
+use crate::tools::region_png::{encode_color_image_png_rgba, encode_mask_png_l8};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

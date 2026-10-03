@@ -62,6 +62,9 @@ unsupported-CPU SIGILL would surface.
   and `modules/ai_backend/detection/paddle.py`.
 - `tests/manga_ocr_e2e.rs`: `#[ignore]` end-to-end parity test (needs real models +
   an onnxruntime dylib).
+- `tests/paddle_ocr_e2e.rs`: `#[ignore]` PaddleOCR end-to-end tests (detect + recognize, and
+  the forward-only `forward_prob_maps` checked against `detect` and batch-vs-single); env
+  vars in its header.
 
 ## Contracts and invariants
 - **Pure inference crate.** No egui/eframe, no application config, no path

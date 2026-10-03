@@ -25,7 +25,7 @@ use ms_widgets::WheelSlider;
 use ms_config as config;
 use ms_sysprobe::ai_models;
 use eframe::egui;
-use image::{ColorType, ImageEncoder};
+use super::region_png::{encode_color_image_png_rgba, encode_mask_png_luma};
 use serde_json::{Value, json};
 use web_time::Duration;
 
@@ -230,45 +230,6 @@ impl CleaningTool for AotInpaintTool {
     fn block_canvas_zoom(&self) -> bool {
         self.inpaint_base.has_open_editor()
     }
-}
-
-fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let width = image.size[0];
-    let height = image.size[1];
-    let width_u32 =
-        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
-    let height_u32 =
-        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
-
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
-    for px in &image.pixels {
-        let [r, g, b, a] = px.to_srgba_unmultiplied();
-        raw.extend_from_slice(&[r, g, b, a]);
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
-    Ok(out)
-}
-
-fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let width = mask.size[0];
-    let height = mask.size[1];
-    let width_u32 =
-        u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
-    let height_u32 =
-        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
-
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
-    for px in &mask.pixels {
-        raw.push(if px.a() > 0 { 255 } else { 0 });
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
-    Ok(out)
 }
 
 /// Concatenates the image PNG and mask PNG into the v2 two-image request blob

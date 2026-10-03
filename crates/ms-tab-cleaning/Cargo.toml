@@ -48,9 +48,15 @@ ms-tab-translation = { path = "../ms-tab-translation" }
 # Every background worker this tab spawns goes through the project thread wrapper.
 ms-thread = { path = "../ms-thread" }
 # The reusable mask brush, polygon rasterizer, the shared red-black SOR kernel, the dense
-# overlay-pixel solve and the host-neutral patch core this tab implements `PatchHost`
-# against.
+# overlay-pixel solve, the backend-wire PNG encoders (`png_wire`) and the host-neutral patch
+# core this tab implements `PatchHost` against.
 ms-tools = { path = "../ms-tools" }
+# The one square dilation (`dilate_square`) behind the autoclean cluster/stroke growth and
+# the gradient tool's ring masks. A level-0 leaf (std + thiserror), no layering constraint.
+ms-raster = { path = "../ms-raster" }
+# The detector mask contract (`mask::binary_alpha_from_gray`: 0/255 normalization and the
+# `MAX_MASK_PIXELS` guard) applied to the L8 mask PNGs the backend returns. A level-1 leaf.
+ms-text-detect = { path = "../ms-text-detect" }
 # Every reusable widget the panels put on screen, the dockable-panel subsystem and
 # `input_util`.
 ms-widgets = { path = "../ms-widgets" }

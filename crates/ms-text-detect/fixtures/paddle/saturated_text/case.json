@@ -1,0 +1,215 @@
+{
+ "case": "saturated_text",
+ "description": "Saturated red and green text on a pale page (saturation Otsu branch); map 256x192 for a 250x200 source.",
+ "engine": "paddle",
+ "expected": {
+  "blocks": [
+   {
+    "x1": 65,
+    "x2": 185,
+    "y1": 84,
+    "y2": 136
+   },
+   {
+    "x1": 54,
+    "x2": 194,
+    "y1": 31,
+    "y2": 67
+   }
+  ],
+  "polys": [
+   {
+    "points": [
+     [
+      65.0,
+      96.0
+     ],
+     [
+      181.0,
+      84.0
+     ],
+     [
+      185.0,
+      124.0
+     ],
+     [
+      69.0,
+      136.0
+     ]
+    ],
+    "score": 0.7899779097194359
+   },
+   {
+    "points": [
+     [
+      54.0,
+      31.0
+     ],
+     [
+      194.0,
+      31.0
+     ],
+     [
+      194.0,
+      67.0
+     ],
+     [
+      54.0,
+      67.0
+     ]
+    ],
+    "score": 0.8590589765135462
+   }
+  ]
+ },
+ "files": {
+  "expected_mask": "expected_mask.png",
+  "input": "input.png",
+  "prob": "prob.png"
+ },
+ "intermediate": {
+  "db_candidates": [
+   {
+    "mini_box_map_px": [
+     [
+      104.0,
+      154.0
+     ],
+     [
+      152.0,
+      154.0
+     ],
+     [
+      152.0,
+      163.0
+     ],
+     [
+      104.0,
+      163.0
+     ]
+    ],
+    "score": 0.4111084485540585,
+    "short_side_pre": 9.0,
+    "skipped_lt_box_thresh": true,
+    "skipped_lt_min_size": false
+   },
+   {
+    "box_map_px": [
+     [
+      66.55380249023438,
+      92.17911529541016
+     ],
+     [
+      185.85153198242188,
+      80.87723541259766
+     ],
+     [
+      189.44619750976562,
+      118.8208999633789
+     ],
+     [
+      70.14846801757812,
+      130.12277221679688
+     ]
+    ],
+    "mini_box_map_px": [
+     [
+      80.17821502685547,
+      103.78218841552734
+     ],
+     [
+      175.12872314453125,
+      94.2871322631836
+     ],
+     [
+      176.4554443359375,
+      107.5544662475586
+     ],
+     [
+      81.50494384765625,
+      117.04952239990234
+     ]
+    ],
+    "score": 0.7899779097194359,
+    "short_side_post": 38.11355972290039,
+    "short_side_pre": 13.33349895477295,
+    "skipped_lt_box_thresh": false,
+    "skipped_lt_min_size": false,
+    "skipped_post_lt_min_size_plus_2": false
+   },
+   {
+    "box_map_px": [
+     [
+      55.0,
+      30.0
+     ],
+     [
+      198.99996948242188,
+      30.0
+     ],
+     [
+      198.99996948242188,
+      63.99999237060547
+     ],
+     [
+      55.0,
+      63.99999237060547
+     ]
+    ],
+    "mini_box_map_px": [
+     [
+      66.99999237060547,
+      41.999996185302734
+     ],
+     [
+      188.99996948242188,
+      41.999996185302734
+     ],
+     [
+      188.99996948242188,
+      53.999996185302734
+     ],
+     [
+      66.99999237060547,
+      53.999996185302734
+     ]
+    ],
+    "score": 0.8590589765135462,
+    "short_side_post": 33.99999237060547,
+    "short_side_pre": 11.999998092651367,
+    "skipped_lt_box_thresh": false,
+    "skipped_lt_min_size": false,
+    "skipped_post_lt_min_size_plus_2": false
+   }
+  ],
+  "glyph_branches": [
+   {
+    "branch": "saturation",
+    "mean_sat": 58.15376676986584,
+    "poly_index": 0,
+    "sat_fill": 0.16372992359270233
+   },
+   {
+    "branch": "saturation",
+    "mean_sat": 69.25263561433773,
+    "poly_index": 1,
+    "sat_fill": 0.25627755414989456
+   }
+  ]
+ },
+ "map_size": [
+  256,
+  192
+ ],
+ "params": {
+  "db_box_thresh": 0.6,
+  "db_max_candidates": 1000,
+  "db_min_size": 3,
+  "db_thresh": 0.3,
+  "db_unclip_ratio": 2.0
+ },
+ "source_size": [
+  250,
+  200
+ ]
+}

@@ -2,23 +2,32 @@
 File: modules/ai_backend/detection/ctd.py
 
 Purpose:
-Comic Text Detector service adapter for the Python AI backend.
+Forward-only Comic Text Detector service for the Python AI backend.
 
 Main responsibilities:
-- load CTD models lazily;
-- synchronize model device with backend AI device settings;
-- run detection and return masks/blocks to Rust.
+- load the CTD Torch network (`TextDetBase`) lazily, keyed by device;
+- synchronize the model device with the backend setting `General.ai_device`;
+- run ONE batched forward pass over equal-size RGB tiles prepared by Rust and
+  return the `[seg, shrink]` probability maps as `uint8`.
+
+Key structures:
+- CtdTextDetectorService
+
+Key functions:
+- CtdTextDetectorService.forward_tiles()
 
 Notes:
-The heavy ComicTextDetector implementation lives in the sibling package
-`detection/textdetector/` and is imported lazily (`from .textdetector.ctd
-import CTDModel`) so that constructing this service never pulls in Torch.
-Backs the `textdetector.ctd` IPC method (`ipc/handlers/textdetector.py`).
+Planning, resizing, tiling, stitching and every post-process step (DB boxes,
+mask refinement, dilation) live in Rust (`crates/ms-text-detect`). The network
+code is the vendored `detection/textdetector/ctd/basemodel.py`, imported lazily
+so that constructing this service never pulls in Torch.
+Backs the `textdetector.ctd.forward` IPC method (`ipc/handlers/textdetector.py`).
 """
 
 from __future__ import annotations
 
 import gc
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -37,32 +46,15 @@ except Exception:
     UserConfig = None
 
 from ..runtime.model_manager import LoadedModelManager
+from .forward_maps import quantize_probability_maps, validate_tiles
+
+log = logging.getLogger(__name__)
 
 MODEL_FILENAME = "comictextdetector.pt"
 
-# ============================================================================
-# CTD TEXT DETECTOR SERVICE
-# ----------------------------------------------------------------------------
-# Что в файле:
-# - lazy init и health для CTD-детектора.
-# - запуск детекции страницы с постобработкой bbox и mask.
-# - нормализация runtime-параметров детектора.
-# - синхронизация `device` с backend-настройкой `General.ai_device`.
-# ============================================================================
-
-
-def _to_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+# Input alignment of the CTD network: every side must be a multiple of 64
+# (a 1000 px side fails inside the UNet head with "Expected size 64 but got 63").
+CTD_INPUT_ALIGN = 64
 
 
 def _normalize_device(raw: Any, fallback: str) -> str:
@@ -111,305 +103,133 @@ def _clear_torch_cache() -> None:
 
 
 class CtdTextDetectorService:
+    """CTD forward pass behind a `LoadedModelManager` lease.
+
+    Thread-safety: `forward_tiles` serializes model load and inference on one
+    re-entrant lock; the lease is taken before the lock so the resident-model
+    budget can ask this service to unload while it waits.
+    """
+
     def __init__(self, model_manager: LoadedModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
-        self._detector = None
-        self._detector_model_key: str | None = None
-        self._cv2 = None
+        self._net = None
+        self._net_model_key: str | None = None
+        self._device = _resolve_selected_backend_device(_default_device())
         self._last_error: str | None = None
         self._model_path = Path(TEXT_DETECTOR_DIR) / MODEL_FILENAME
-        start_device = _resolve_selected_backend_device(_default_device())
-        self._active_params = {
-            "device": start_device,
-            "detect_size": 1280,
-            "det_rearrange_max_batches": 4,
-            "font size multiplier": 1.0,
-            "font size max": -1.0,
-            "font size min": -1.0,
-            "mask dilate size": 2,
-        }
 
     def health(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "ready": self._detector is not None,
+                "ready": self._net is not None,
                 "model": "ctd",
                 "model_path": str(self._model_path),
                 "model_exists": self._model_path.exists(),
-                "params": dict(self._active_params),
+                "device": self._device,
                 "last_error": self._last_error,
             }
 
-    def detect_page(
-        self, page_path: str, *, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        normalized = self._normalize_params(params)
-        model_key = self._model_key_for(normalized)
+    def forward_tiles(self, tiles: np.ndarray) -> np.ndarray:
+        """Run CTD on a batch of RGB tiles and return `uint8` maps `[n, 2, h, w]`.
+
+        `tiles` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 64.
+        Channel 0 is the segmentation map (`seg`), channel 1 the DB shrink map
+        (`lines[:, 0]`); both have the input's resolution. The YOLO block head
+        and the DB threshold map are discarded.
+
+        Raises `ValueError` for an invalid batch, `FileNotFoundError` when the
+        checkpoint is missing, and `RuntimeError` for a failed load, an
+        unexpected output shape or non-finite probabilities.
+        """
+        n, height, width = validate_tiles(tiles, align=CTD_INPUT_ALIGN, engine="ctd")
+        device = _resolve_selected_backend_device(self._device)
+        model_key = self._model_key_for(device)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
         )
         with self._lock:
             try:
-                detector = self._ensure_detector_locked(normalized)
-                # cv2.imread на Windows не поддерживает не-ASCII пути (кириллица и т.д.),
-                # поэтому читаем байты через pathlib и декодируем через imdecode.
-                raw = Path(page_path).read_bytes()
-                payload = self._detect_from_encoded_image_bytes(raw, detector, normalized)
+                net = self._ensure_net_locked(device, model_key)
+                maps = self._forward_locked(net, tiles, device)
                 if lease.needs_load:
                     lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
-                return payload
+                log.info("CTD forward done device=%s tiles=%s size=%sx%s", device, n, width, height)
+                return maps
             except Exception as exc:
                 if lease.needs_load:
                     lease.mark_load_failed()
                 self._last_error = str(exc)
+                log.exception("CTD forward failed device=%s tiles=%s size=%sx%s", device, n, width, height)
                 raise
             finally:
                 lease.release()
 
-    def detect_image_bytes(
-        self, image_bytes: bytes, *, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        normalized = self._normalize_params(params)
-        model_key = self._model_key_for(normalized)
-        lease = self._model_manager.begin_model_use(
-            model_key,
-            unload_callback=lambda: self._unload_key(model_key),
-        )
-        with self._lock:
-            try:
-                detector = self._ensure_detector_locked(normalized)
-                payload = self._detect_from_encoded_image_bytes(
-                    image_bytes, detector, normalized
-                )
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
-                self._last_error = None
-                return payload
-            except Exception as exc:
-                if lease.needs_load:
-                    lease.mark_load_failed()
-                self._last_error = str(exc)
-                raise
-            finally:
-                lease.release()
+    def _ensure_net_locked(self, device: str, model_key: str):
+        """Return the network for `device`, (re)loading it when the key changed.
 
-    def _normalize_params(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        merged = dict(self._active_params)
-        if isinstance(params, dict):
-            merged.update(params)
-        merged["device"] = _resolve_selected_backend_device(self._active_params["device"])
-        merged["detect_size"] = _to_int(merged.get("detect_size"), 1280)
-        merged["detect_size"] = max(896, min(2048, merged["detect_size"]))
-        merged["det_rearrange_max_batches"] = _to_int(
-            merged.get("det_rearrange_max_batches"), 4
-        )
-        merged["det_rearrange_max_batches"] = max(
-            1, min(64, merged["det_rearrange_max_batches"])
-        )
-        merged["font size multiplier"] = _to_float(
-            merged.get("font size multiplier"), 1.0
-        )
-        merged["font size multiplier"] = max(
-            0.1, min(8.0, merged["font size multiplier"])
-        )
-        merged["font size max"] = _to_float(merged.get("font size max"), -1.0)
-        merged["font size max"] = max(-1.0, min(500.0, merged["font size max"]))
-        merged["font size min"] = _to_float(merged.get("font size min"), -1.0)
-        merged["font size min"] = max(-1.0, min(500.0, merged["font size min"]))
-        merged["mask dilate size"] = _to_int(merged.get("mask dilate size"), 2)
-        merged["mask dilate size"] = max(0, min(30, merged["mask dilate size"]))
-        return merged
-
-    def _ensure_cv2_locked(self):
-        if self._cv2 is None:
-            import cv2  # type: ignore
-
-            self._cv2 = cv2
-        return self._cv2
-
-    def _ensure_detector_locked(self, params: dict[str, Any]):
+        Caller holds `self._lock`.
+        """
+        if self._net is not None and self._net_model_key == model_key:
+            return self._net
         if not self._model_path.exists():
             raise FileNotFoundError(f"CTD model not found: {self._model_path}")
 
-        requested_key = self._model_key_for(params)
-        previous_key = self._detector_model_key
-
-        if self._detector is None:
-            from .textdetector.ctd import CTDModel  # heavy import; keep lazy
-
-            self._detector = CTDModel(
-                str(self._model_path),
-                detect_size=int(params["detect_size"]),
-                device=str(params["device"]),
-                det_rearrange_max_batches=int(params["det_rearrange_max_batches"]),
-            )
-            self._detector_model_key = requested_key
-            self._active_params = dict(params)
-            return self._detector
-
-        if previous_key != requested_key:
-            self._detector = None
-            self._detector_model_key = None
+        previous_key = self._net_model_key
+        if self._net is not None:
+            self._net = None
+            self._net_model_key = None
             _clear_torch_cache()
             if previous_key is not None:
                 self._model_manager.mark_unloaded(previous_key)
-            from .textdetector.ctd import CTDModel  # heavy import; keep lazy
 
-            self._detector = CTDModel(
-                str(self._model_path),
-                detect_size=int(params["detect_size"]),
-                device=str(params["device"]),
-                det_rearrange_max_batches=int(params["det_rearrange_max_batches"]),
+        from .textdetector.ctd.basemodel import TextDetBase  # heavy import; keep lazy
+
+        self._net = TextDetBase(str(self._model_path), device=device, act="leaky")
+        self._net_model_key = model_key
+        self._device = device
+        log.info("CTD network loaded device=%s path=%s", device, self._model_path)
+        return self._net
+
+    @staticmethod
+    def _forward_locked(net, tiles: np.ndarray, device: str) -> np.ndarray:
+        """One batched forward pass; returns quantized `[seg, shrink]` maps."""
+        import torch  # type: ignore
+
+        n, height, width = (int(v) for v in tiles.shape[:3])
+        # NHWC RGB u8 -> NCHW float32 in [0, 1]: the normalization the network
+        # was trained with (upstream `preprocess_img`: /255, RGB order).
+        batch = np.ascontiguousarray(tiles.transpose(0, 3, 1, 2)).astype(np.float32) / np.float32(255.0)
+        with torch.no_grad():
+            _blocks, seg, lines = net(torch.from_numpy(batch).to(device))
+            seg_np = seg.float().cpu().numpy()
+            shrink_np = lines[:, 0:1].float().cpu().numpy()
+        if seg_np.shape != (n, 1, height, width):
+            raise RuntimeError(
+                f"CTD segmentation output has shape {tuple(seg_np.shape)}, expected {(n, 1, height, width)}."
             )
-            self._detector_model_key = requested_key
-            self._active_params = dict(params)
-            return self._detector
-
-        requested_device = str(params["device"])
-        current_device = str(getattr(self._detector, "device", "")).strip().lower()
-        if current_device != requested_device:
-            set_device = getattr(self._detector, "set_device", None)
-            if callable(set_device):
-                set_device(requested_device)
-            else:
-                self._detector.device = requested_device
-
-        self._detector.detect_size = int(params["detect_size"])
-        if hasattr(self._detector, "det_rearrange_max_batches"):
-            self._detector.det_rearrange_max_batches = int(
-                params["det_rearrange_max_batches"]
+        if shrink_np.shape != (n, 1, height, width):
+            raise RuntimeError(
+                f"CTD DB output has shape {tuple(shrink_np.shape)}, expected {(n, 1, height, width)}."
             )
-
-        self._active_params = dict(params)
-        return self._detector
+        return quantize_probability_maps(np.concatenate([seg_np, shrink_np], axis=1), engine="ctd")
 
     def _unload_key(self, model_key: str) -> bool:
         with self._lock:
-            if self._detector is None or self._detector_model_key != model_key:
+            if self._net is None or self._net_model_key != model_key:
                 return False
-            self._detector = None
-            self._detector_model_key = None
+            self._net = None
+            self._net_model_key = None
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True
 
     @staticmethod
-    def _model_key_for(params: dict[str, Any]) -> str:
-        device = str(params.get("device", "cpu")).strip().lower() or "cpu"
-        return f"ctd:{device}"
-
-    def _apply_font_params(self, blocks, params: dict[str, Any]) -> None:
-        if not isinstance(blocks, list):
-            return
-        mul = float(params.get("font size multiplier", 1.0))
-        fmax = float(params.get("font size max", -1.0))
-        fmin = float(params.get("font size min", -1.0))
-        for block in blocks:
-            base = getattr(block, "_detected_font_size", -1.0)
-            if base is None:
-                base = -1.0
-            try:
-                size = float(base) * mul
-            except Exception:
-                continue
-            if fmax > 0:
-                size = min(fmax, size)
-            if fmin > 0:
-                size = max(fmin, size)
-            try:
-                block.font_size = size
-            except Exception:
-                pass
-            try:
-                block._detected_font_size = size
-            except Exception:
-                pass
-
-    def _collect_blocks(self, blocks, width: int, height: int) -> list[dict[str, float]]:
-        if not isinstance(blocks, list):
-            return []
-
-        out: list[dict[str, float]] = []
-        for block in blocks:
-            xyxy = getattr(block, "xyxy", None)
-            if not isinstance(xyxy, (list, tuple)) or len(xyxy) < 4:
-                continue
-            try:
-                x1 = float(xyxy[0])
-                y1 = float(xyxy[1])
-                x2 = float(xyxy[2])
-                y2 = float(xyxy[3])
-            except Exception:
-                continue
-
-            x1 = max(0.0, min(float(width), x1))
-            y1 = max(0.0, min(float(height), y1))
-            x2 = max(0.0, min(float(width), x2))
-            y2 = max(0.0, min(float(height), y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            out.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-
-        out.sort(key=lambda item: (item["y1"], item["x1"], item["y2"], item["x2"]))
-        if len(out) > 2500:
-            out = out[:2500]
-        return out
-
-    def _detect_from_encoded_image_bytes(self, raw_bytes: bytes, detector, params: dict[str, Any]):
-        cv2 = self._ensure_cv2_locked()
-        raw = np.frombuffer(raw_bytes, dtype=np.uint8)
-        image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FileNotFoundError("Не удалось открыть изображение.")
-
-        _, mask_refined, blocks = detector(image)
-        self._apply_font_params(blocks, params)
-        mask_refined = self._apply_mask_dilate(mask_refined, params)
-
-        h, w = image.shape[:2]
-        return {
-            "source_size": [int(w), int(h)],
-            "blocks": self._collect_blocks(blocks, int(w), int(h)),
-            "mask_png": self._encode_mask_png_bytes(mask_refined),
-        }
-
-    def _apply_mask_dilate(self, mask, params: dict[str, Any]):
-        cv2 = self._ensure_cv2_locked()
-        if mask is None:
-            return None
-        try:
-            mask = cv2.convertScaleAbs(mask)
-        except Exception:
-            return None
-
-        ksize = _to_int(params.get("mask dilate size"), 2)
-        ksize = max(0, min(30, ksize))
-        if ksize <= 0:
-            return mask
-        element = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * ksize + 1, 2 * ksize + 1),
-            (ksize, ksize),
-        )
-        return cv2.dilate(mask, element)
-
-    def _encode_mask_png_bytes(self, mask) -> bytes:
-        if mask is None:
-            return b""
-        cv2 = self._ensure_cv2_locked()
-        try:
-            binary = cv2.convertScaleAbs(mask)
-            _, binary = cv2.threshold(binary, 30, 255, cv2.THRESH_BINARY)
-            ok, encoded = cv2.imencode(".png", binary)
-            if not ok:
-                return b""
-            return encoded.tobytes()
-        except Exception:
-            return b""
+    def _model_key_for(device: str) -> str:
+        normalized = str(device).strip().lower() or "cpu"
+        return f"ctd:{normalized}"
 
 
 def _resolve_selected_backend_device(fallback: str) -> str:

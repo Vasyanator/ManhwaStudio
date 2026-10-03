@@ -26,6 +26,9 @@ ms-sysprobe = { path = "../ms-sysprobe" }
 # The unified ONNX selection keys in `user_config.json` plus `ort_load_guard`, the
 # crash-safe `General.ort_load_state` markers written around every dylib load.
 ms-config = { path = "../ms-config" }
+# `ProbMap`, the validated probability map `paddle_det_forward` returns to the tiled
+# text-detector pipeline.
+ms-text-detect = { path = "../ms-text-detect" }
 # Diagnostics on every load/fallback/failure path.
 ms-log = { path = "../ms-log" }
 # Localized failure messages (`t!` / `tf!`), mounted crate-wide in `lib.rs`.

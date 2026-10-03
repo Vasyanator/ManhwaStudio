@@ -47,8 +47,8 @@ status lines. Nothing here is behind a fold except the parameters, which open by
   feeds. Informational only — the picker always offers the full catalog.
 - `settings.rs`: `LamaSettings` (the selected model and every parameter of both methods), its
   clamping, its file IO and `settings_save_due`.
-- `wire.rs`: `effective_refine`, `lama_run_header`, `run_lama`, `unload_lama`, the PNG/L8
-  encoders and the `CallError` mapping. Edit here to change what travels on the wire.
+- `wire.rs`: `effective_refine`, `lama_run_header`, `run_lama`, `unload_lama`, the
+  request-blob packing and the `CallError` mapping (the PNGs come from `tools/region_png.rs`). Edit here to change what travels on the wire.
 - `engine.rs`: `LamaEngine`, its `AiEngine` impl, its channel polling and its parameter panel.
 
 ## Contracts and invariants

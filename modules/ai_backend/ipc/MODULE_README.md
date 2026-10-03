@@ -29,7 +29,7 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
             └── handlers/ — one module per group; each self-registers at import time
                 ├── health.py      — health (pull) + TOPIC_HEALTH push via health worker
                 ├── ocr.py         — ocr.manga / ocr.easy / ocr.paddle / ocr.paddle_vl / ocr.surya / ocr.paddle_onnx
-                ├── textdetector.py— textdetector.ctd / .paddle / .surya
+                ├── textdetector.py— textdetector.{ctd,paddle,surya}.forward
                 ├── inpaint.py     — inpaint.lama_v2 / .lama_mpe / .aot (+ unloads)
                 ├── sdxl.py        — inpaint.sdxl (+ unload); streaming via ProgressEmitter
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
@@ -156,10 +156,12 @@ live in `handlers/MODULE_README.md`.
     the Rust supervisor to parse. Each transport option also has an environment fallback
     (`MS_BACKEND_TRANSPORT` / `WS_HOST` / `WS_PORT` / `WS_TOKEN`); the CLI flag wins.
   - An unknown `transport` value is a `ValueError`, never a silent fall back to `unix`.
-- The frame protocol version is 3 (`PROTOCOL_VERSION`; it also covers the shared on-disk `user_config` storage semantics of `docstore.py`). A client with a different `v` is rejected
+- The frame protocol version is 4 (`PROTOCOL_VERSION`; it also covers the shared on-disk `user_config` storage semantics of `docstore.py`). A client with a different `v` is rejected
   at handshake with a `kind:"error"` frame before any request.
 - Image bytes are never base64-encoded on the wire. Request blobs carry raw PNG input; response
-  blobs carry raw PNG output (masks, inpaint results, SDXL previews).
+  blobs carry raw PNG output (masks, inpaint results, SDXL previews). The text-detector forward
+  methods are the exception that carries NO encoding at all: raw RGB u8 tiles in, raw u8
+  probability maps out, dimensions in the header (`PROTOCOL.md` §5.3).
 - Inpaint methods that need two images (image + mask) use a concatenated blob: `blob = image_png ++
   mask_png` with `image_len`/`mask_len` header fields splitting them. `watermark.remove` applies the
   same convention to its RESPONSE (`clean_png ++ mask_png`); it is the only method that does.

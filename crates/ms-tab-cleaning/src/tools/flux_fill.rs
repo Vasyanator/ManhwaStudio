@@ -23,7 +23,7 @@ use ms_project::ProjectData;
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
-use image::{ColorType, ImageEncoder};
+use super::region_png::{encode_color_image_png_rgba, encode_mask_png_luma};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
@@ -748,40 +748,6 @@ fn save_flux_settings(settings: &FluxSettings) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(settings)
         .map_err(|err| tf!("cleaning.tools.flux.serialize_settings_error", err = err))?;
     fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.flux.write_settings_error", err = err))
-}
-
-fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let (width, height) = (image.size[0], image.size[1]);
-    let width_u32 =
-        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
-    let height_u32 =
-        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
-    for px in &image.pixels {
-        let [r, g, b, a] = px.to_srgba_unmultiplied();
-        raw.extend_from_slice(&[r, g, b, a]);
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
-    Ok(out)
-}
-
-fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let (width, height) = (mask.size[0], mask.size[1]);
-    let width_u32 = u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
-    let height_u32 =
-        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
-    for px in &mask.pixels {
-        raw.push(if px.a() > 0 { 255 } else { 0 });
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
-    Ok(out)
 }
 
 #[cfg(test)]

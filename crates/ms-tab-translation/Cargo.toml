@@ -20,7 +20,7 @@ edition = "2024"
 
 [dependencies]
 # Framed IPC with the Python AI backend: every OCR, detector and health request goes
-# through `shared_client()`.
+# through `shared_client()`; `textdetector` is the forward-only detector wire contract.
 ms-backend-ipc = { path = "../ms-backend-ipc" }
 # The canvas this tab draws pages and bubble overlays into; it implements `CanvasHooks`.
 ms-canvas = { path = "../ms-canvas" }
@@ -48,6 +48,11 @@ ms-tabs-simple = { path = "../ms-tabs-simple" }
 ms-thread = { path = "../ms-thread" }
 # The reusable mask/polygon primitives behind the detector's region selection.
 ms-tools = { path = "../ms-tools" }
+# The one square dilation and Otsu threshold (classic detector, detector mask dilation).
+ms-raster = { path = "../ms-raster" }
+# The detection domain: the per-engine scale/tiling plan, the runner seam, stitching, the
+# CTD/Paddle/Surya postprocess, block rules and mask normalization. This tab supplies runners.
+ms-text-detect = { path = "../ms-text-detect" }
 # Every reusable widget the panels put on screen, plus `input_util`, `bubble_status` and
 # the configurable-hotkey registry (`input_manager_v2`) this tab registers specs with.
 ms-widgets = { path = "../ms-widgets" }
@@ -77,7 +82,8 @@ web-time.workspace = true
 # Native-only dependencies, matching the root manifest exactly so the graph keeps one copy
 # of each: blocking HTTP (`ureq`), the LLM client stack (`genai` + `tokio`), the concrete
 # Google translator (`translators`), the OS credential store for API keys (`keyring`),
-# native file dialogs (`rfd`), the ONNX Runtime loader and the native OCR/detector manager.
+# native file dialogs (`rfd`), the ONNX Runtime loader and the native OCR/detector manager
+# (the ONNX sessions themselves stay behind `ms-native-runtime`).
 # Their call sites are `#[cfg(not(target_arch = "wasm32"))]`-gated; the wasm build compiles
 # error stubs instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -87,13 +93,11 @@ tokio.workspace = true
 translators.workspace = true
 keyring.workspace = true
 rfd.workspace = true
-# Native ONNX Runtime inference (the Paddle detection/recognition sessions this tab runs
-# in-process).
-ms-onnx = { path = "../ms-onnx" }
 # The loader that resolves/downloads the onnxruntime dylib; the detector panel renders its
 # `OrtDownloadProgress`.
 ms-onnx-runtime = { path = "../ms-onnx-runtime" }
-# The process-global OCR/detector engine manager (`recognize_manga` / `recognize_paddle`).
+# The process-global OCR/detector engine manager (`recognize_manga` / `recognize_paddle`,
+# and `paddle_det_forward`, the native forward pass of the tiled detector pipeline).
 ms-native-runtime = { path = "../ms-native-runtime" }
 
 [dev-dependencies]

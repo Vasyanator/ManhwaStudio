@@ -50,7 +50,22 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   sent to the backend, the display key is an i18n catalog key resolved to a localized
   label at render time via `lang_label`. Only the wire code is identity; labels localize.
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
-  actions, and line/mask edit mode toggles.
+  actions, and line/mask edit mode toggles. `tab.rs` lends it a per-frame
+  `TextDetectorPanelView` snapshot. It also owns `TextDetectorAlgorithm::availability`, the ONE
+  "can this detector run" decision (`--no-ai`, reported-missing PyTorch) shared by the panel's
+  detect-button gate and hint and by `tab.rs`'s run-mode refusal; never re-derive it elsewhere.
+  The hint under disabled detect buttons names the same reason a refused run reports.
+  `TextDetectorPanelOptions::run_mode` builds the run mode `tab.rs` starts (availability is
+  checked separately). The per-page plan notice (full resolution / scaled with percent / tiled
+  with tile count, grid and tile size / both, plus the effective CTD detection size) comes from
+  `TextDetectorPlanNoticeCache`, which plans the CURRENT page with
+  `run_mode().plan_inputs()` -> `ms_text_detect::plan_detection` — the same inputs the worker
+  uses — and replans only when the engine, params or page size change. The tab owns the cache
+  and lends it to `draw_text_detector_panel`, which queries it after the option widgets ran, so
+  the frame of an option change already shows the new plan. The page size reaches the
+  panel from `MangaApp::page_infos` through `draw_side_panel` (`detector_page_size`: no notice
+  while the page is loading, failed or 0x0). `plan_notice_text` / `plan_ctd_size_text` only
+  format the notice.
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
   provider/key/model/prompt/batching/context controls, multimodal ImageBubble inclusion and image
   visual-detail controls, plus start/cancel actions. On the AI API tab the start buttons also expose
@@ -132,8 +147,15 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `draw_active_panel` in `tab.rs`, and define an option/action boundary.
 - To change OCR UI fields or language lists, edit `ocr.rs` and `ocr_langs.rs`; update settings
   parsing and request construction in `tab.rs`.
-- To change detector UI controls or edit-mode buttons, edit `text_detector.rs`; update controller
-  option conversion in `tab.rs` and `text_detector.rs` if semantics change.
+- To change detector UI controls or edit-mode buttons, edit `text_detector.rs`; update
+  `TextDetectorPanelOptions::run_mode`, the settings read/write in `tab.rs` and
+  `../text_detector/` if semantics change.
+- To change the plan notice wording, edit `plan_notice_text` and its
+  `translation.text_detector_panel.plan_*` keys; to change what it reports, change the plan in
+  `ms-text-detect` (never recompute scale or tiles in the panel).
+- To change when a detector algorithm may run or the text explaining why not, edit
+  `TextDetectorAlgorithm::availability` / `DetectorUnavailable` in `text_detector.rs` (its
+  truth-table test pins the current rules).
 - To change MT provider/language UI, edit `machine_translation.rs` and coordinate with
   `translation/machine_translation.rs`.
 - To change bubble card editing or footer metadata UI, edit `bubbles.rs` and related footer sync

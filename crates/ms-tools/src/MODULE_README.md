@@ -3,12 +3,13 @@
 ## Purpose
 This directory contains shared tool code that is useful across UI tools but does not belong to a
 single tab: low-level primitives (mask brush, polygon rasterization, the SOR kernel, the overlay
-pixel solver) and, in `patch/`, a whole host-neutral TOOL that several tabs can drive.
+pixel solver, the AI-backend wire PNG encoders) and, in `patch/`, a whole host-neutral TOOL that several tabs can drive.
 
 ## Architecture
-`lib.rs` is the crate root and the public boundary. It exports `MaskBrush` from `mask_brush.rs`, `fill_polygon_spans`
-from `polygon_mask.rs`, `red_black_sor_sweeps` from `sor.rs` and `overlay_pixel_for_final_color`
-from `overlay_pixel.rs`, and re-exports `patch` as a public submodule.
+`lib.rs` is the crate root and the public boundary. It exports `MaskBrush` from `mask_brush.rs`,
+`red_black_sor_sweeps` from `sor.rs` and `overlay_pixel_for_final_color` from `overlay_pixel.rs`,
+exposes `png_wire` as a public submodule, re-exports `fill_polygon_spans` from `ms-raster` (its owner since it moved down to level 0, so
+lower crates can use it), and re-exports `patch` as a public submodule.
 
 The primitives are leaves: they take buffers and geometry and know nothing about tabs. `patch/` is
 the one exception in shape, not in principle — it is a complete tool, but it reaches its
@@ -30,14 +31,17 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 - `lib.rs`: crate root; shared-tool exports and the `ms-i18n` macro mount.
 - `mask_brush.rs`: `MaskBrush`, internal ColorImage painting helpers, binary-mask painting helpers,
   radius input handling, and cursor drawing.
-- `polygon_mask.rs`: `fill_polygon_spans`, the even-odd scanline polygon rasterizer shared by the
-  PS-editor lasso selection and the cleaning tools.
 - `sor.rs`: `red_black_sor_sweeps`, the ONE red-black SOR kernel of the project. Consumers are the
   cleaning tab's gradient fill and `patch/membrane.rs`.
 - `overlay_pixel.rs`: `overlay_pixel_for_final_color`, which solves the DENSE overlay pixel that
   reproduces a desired final colour over a known, opaque backdrop at an alpha of at least the given
   coverage. Consumers are the cleaning tab's brushes and stamp (through `base::`) and BOTH patch
   hosts — the cleaning tab's and the PS editor's.
+- `png_wire.rs`: `encode_rgba_png` (unmultiplied RGBA8 from an `egui::ColorImage`) and
+  `encode_mask_png_l8`, the ONE encoder pair of the region/mask PNGs sent to the AI backend, plus
+  `decode_png_luma8` for the mask PNGs it returns, with the typed, text-free `PngWireError` /
+  `PngDecodeError`. Consumers: the cleaning tab's AOT, Flux-Fill, AI-editor engines and watermark
+  sources (through its localized `tools/region_png.rs`).
 - `patch/`: the host-neutral core of the «Заплатка» (patch) tool, driven by a host through the
   `PatchHost` trait. Own `MODULE_README.md`.
 
@@ -61,6 +65,12 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
   in the project is a defect.
 - `overlay_pixel_for_final_color` returns the DENSE solution, not the minimum-alpha one; its
   declaration comment carries the renderer-level reason, which is not a property of any one tool.
+- `png_wire` output bytes are a cross-process contract (the Python backend decodes them) pinned
+  by characterization hashes in `png_wire.rs` tests: the encoder settings must not change
+  without re-pinning them. The RGBA path writes UNMULTIPLIED sRGB bytes. A buffer that is not
+  `width * height` pixels is `SizeMismatch`, never a panic (the `image` encoder would panic).
+  The decoder only decodes to 8-bit gray: binary normalization and the mask pixel limit are the
+  caller's (`ms_text_detect::mask`). Errors carry no user-facing text; callers localize them.
 - Keep this directory independent of tab-specific state. If behavior needs project paths, canvas
   state, or cleaning/typing-specific policy, it belongs in that tab module — or, for `patch/`,
   behind `PatchHost`.
@@ -69,12 +79,14 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 - To change shared brush radius controls, cursor rendering, or stroke stamping, edit
   `mask_brush.rs`.
 - To change lasso/polygon fill semantics (both the PS-editor selection and the cleaning tools),
-  edit `polygon_mask.rs`.
+  edit `crates/ms-raster/src/polygon.rs`; `ms_tools::fill_polygon_spans` is only a re-export.
 - To change the Laplacian/screened-Poisson solve shared by the gradient fill and the patch
   membrane, edit `sor.rs`; both consumers must be re-verified.
 - To change how a desired final colour becomes an overlay pixel, edit `overlay_pixel.rs`.
 - To change the patch tool's gesture, geometry or maths — or what it needs from a host — edit
   `patch/`; to change how a patch is stored, edit the host instead.
+- To change the wire PNG encoding of backend request payloads, edit `png_wire.rs` and re-pin
+  the characterization hashes in its tests and in the cleaning callers.
 - To expose another low-level reusable tool primitive, add its module here and re-export only the
   narrow API needed by callers.
 - To change cleaning-specific mask editor behavior, edit `crates/ms-tab-cleaning/src/tools/base.rs` instead.

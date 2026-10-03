@@ -13,12 +13,12 @@ FILE HEADER (cleaning/tools/gradient.rs)
 - Важно:
   - Обработка запускается по кнопке "Обработать" в `RegionMaskInpaintToolBase`.
   - По `Применить` результат вставляется обратно в clean-overlay выбранного региона.
-- Параллелизм (rayon, глобальный пул):
+- Shared kernels (no second copy may live here):
   - The screened-Poisson L-channel consolidation calls the SHARED red-black SOR kernel
     `ms_tools::red_black_sor_sweeps`; this file only builds its `u0`/`lam`/`denom` buffers.
     A second SOR implementation anywhere in the project is a defect.
-  - `dilate`: ping-pong буфер вместо клонирования на итерацию; каждая итерация параллелится по
-    строкам (каждая выходная строка читает 3×3 окно из предыдущего буфера).
+  - `dilate` is only a `bool` adapter over the one square dilation `ms_raster::dilate_square`
+    (iterated 3×3 growth = one square window of radius `iters`); no morphology lives here.
 */
 use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
 use ms_canvas::CanvasView;
@@ -26,7 +26,6 @@ use ms_project::ProjectData;
 use ms_tools::red_black_sor_sweeps;
 use eframe::egui;
 use egui::Color32;
-use rayon::prelude::*;
 
 const ANGLE_STEP_DEG: usize = 3;
 const DELTA_E_THRESHOLD: f32 = 2.5;
@@ -830,46 +829,26 @@ fn ring_mask(mask: &[bool], w: usize, h: usize, inner: usize, outer: usize) -> V
     ring
 }
 
-/// Binary dilation by a 3×3 full structuring element (8-connectivity), applied `iters` times.
+/// Binary dilation by a 3×3 full structuring element (8-connectivity), applied `iters` times —
+/// equal to one square dilation of radius `iters`, computed by the one square dilation
+/// `ms_raster::dilate_square` (O(w*h) whatever `iters`). This is only the `bool` adapter.
 ///
-/// Border pixels use replicate behavior (neighbor indices clamped into range), matching the
-/// original implementation. Uses a ping-pong double buffer instead of cloning per iteration and
-/// parallelizes each iteration across output rows: every output cell reads only the previous
-/// buffer's 3×3 neighborhood and writes a single row, so rows are independent. The flat-buffer
-/// row stride is `w`. The result is bit-for-bit identical to the sequential clone-per-iter form.
+/// `iters == 0` or a zero side returns the input unchanged. `mask` must hold `w * h` cells;
+/// otherwise the call is a caller bug: it is logged and the input is returned undilated (same
+/// length, so the ring arithmetic downstream stays in bounds). `run` allocates `w * h` cells,
+/// so that branch is unreachable from the tool.
 fn dilate(mask: &[bool], w: usize, h: usize, iters: usize) -> Vec<bool> {
     if iters == 0 || w == 0 || h == 0 {
         return mask.to_vec();
     }
-
-    let mut src = mask.to_vec();
-    let mut dst = vec![false; mask.len()];
-    for _ in 0..iters {
-        // Compute each output row in parallel from the immutable `src` buffer.
-        dst.par_chunks_mut(w).enumerate().for_each(|(y, dst_row)| {
-            let y0 = y.saturating_sub(1);
-            let y1 = (y + 1).min(h - 1);
-            for (x, cell) in dst_row.iter_mut().enumerate() {
-                let x0 = x.saturating_sub(1);
-                let x1 = (x + 1).min(w - 1);
-                let mut on = false;
-                'outer: for ny in y0..=y1 {
-                    let row_base = ny * w;
-                    for nx in x0..=x1 {
-                        if src[row_base + nx] {
-                            on = true;
-                            break 'outer;
-                        }
-                    }
-                }
-                *cell = on;
-            }
-        });
-        // Swap buffers: the freshly written `dst` becomes the source for the next iteration.
-        std::mem::swap(&mut src, &mut dst);
+    let bytes = mask.iter().map(|&on| u8::from(on)).collect::<Vec<u8>>();
+    match ms_raster::dilate_square(&bytes, w, h, iters, iters, 1) {
+        Ok(grown) => grown.into_iter().map(|px| px != 0).collect(),
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!("[gradient] dilation skipped: {err}"));
+            mask.to_vec()
+        }
     }
-    // After the final swap, `src` holds the latest result.
-    src
 }
 
 fn rgb_to_lab(rgb: &[[u8; 3]]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -1192,5 +1171,67 @@ mod tests {
         assert_eq!(dilate(&[], 0, 0, 3), Vec::<bool>::new());
         let mask = vec![true, false, true, false];
         assert_eq!(dilate(&mask, 2, 2, 0), mask);
+    }
+
+    // Characterization tests (detector Phase 1 refactor): the expected values were
+    // OBSERVED from the pre-refactor code, never derived by hand. The random mask is
+    // the same one (generator, seed, 37x23, ~8 %) the translation `dilate_binary`
+    // characterization test uses, so equal set counts across the copies are visible.
+
+    /// FNV-1a 64 over `bytes`: a compact, dependency-free fingerprint for pinned buffers.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Deterministic 64-bit LCG (Knuth MMIX constants); returns the high 31 bits.
+    fn lcg_next(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // `>> 33` leaves 31 significant bits, so the conversion cannot fail.
+        u32::try_from(*state >> 33).unwrap_or(0)
+    }
+
+    /// Random 37x23 mask with ~8 % set pixels using the mixed values 1/7/255.
+    fn characterization_mask() -> Vec<u8> {
+        let mut state = 0xd11a_7e01_u64;
+        (0..37 * 23)
+            .map(|_| {
+                let roll = lcg_next(&mut state);
+                if roll % 100 < 8 {
+                    [1u8, 7, 255][usize::try_from(roll % 3).unwrap_or(0)]
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
+    /// characterization: the gradient `dilate` (iterated 3x3 over `bool`) at
+    /// iters = 0, 1, 3.
+    #[test]
+    fn characterization_dilate_random() {
+        let src = characterization_mask().into_iter().map(|px| px != 0).collect::<Vec<_>>();
+        let observed = [0usize, 1, 3]
+            .into_iter()
+            .map(|iters| {
+                let out = dilate(&src, 37, 23, iters);
+                let bytes = out.iter().map(|&on| u8::from(on)).collect::<Vec<_>>();
+                (iters, out.iter().filter(|&&on| on).count(), fnv1a64(&bytes))
+            })
+            .collect::<Vec<_>>();
+        // (iters, set count, FNV of the 0/1 bytes): byte-identical to the translation
+        // `dilate_binary` (r, r) output on the same mask.
+        assert_eq!(
+            observed,
+            vec![
+                (0, 64, 9_260_574_274_878_741_243),
+                (1, 407, 12_066_787_267_297_046_334),
+                (3, 834, 13_298_246_393_450_976_053),
+            ],
+            "observed={observed:?}"
+        );
     }
 }

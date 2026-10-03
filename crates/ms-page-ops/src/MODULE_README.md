@@ -332,10 +332,9 @@ and by contract, not merely thresholded on use.
   `tools/mask_brush.rs::paint_binary_mask_segment`, written as `(v, v, v, 255)`,
   and re-thresholded at luma 128 by its loader (`tabs/typing/mask.rs`).
 - `text_detection/{idx:05}_mask.png` comes from
-  `tabs/translation/text_detector.rs`, whose `parse_mask_alpha_from_blob` and
-  `glyph_mask_into_alpha` both normalize every byte to `0`/`255` with the comment
-  "CTD mask is logically binary". Note the promotion rule is `!= 0 -> 255`, not a
-  midpoint threshold, so ANY grey a filter introduces reads as fully masked and
+  `tabs/translation/text_detector/`, normalized to `0`/`255` by its one owner,
+  `ms_text_detect::mask` (`normalize_binary_alpha` / `binary_alpha_from_gray`).
+  Note the promotion rule is `!= 0 -> 255`, not a midpoint threshold, so ANY grey a filter introduces reads as fully masked and
   the mask grows outwards.
 A smooth filter therefore does not blur such a raster, it changes what it MEANS.
 

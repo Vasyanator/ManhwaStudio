@@ -26,7 +26,12 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `health.py`: `health` (`ctx.get_health_snapshot`, not a service call).
 - `ocr.py`: `ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.paddle_onnx`
   (`paddle_onnx` routes through the same `state.paddle_ocr` service as `ocr.paddle`).
-- `textdetector.py`: `textdetector.ctd` / `.paddle` / `.surya`; owns the `mask_png` header/blob split.
+- `textdetector.py`: `textdetector.ctd.forward` / `.paddle.forward` / `.surya.forward` — forward-only
+  detection. Owns the wire contract (`FORWARD_SPECS`: align, map stride, channel names per engine;
+  `parse_forward_request` / `encode_forward_response`) and validates BOTH directions: `n`, tile
+  alignment, exact blob length, `MAX_BLOB_BYTES` for the request and the response it implies, and
+  the service's map shape/dtype. Services receive `uint8 [n, h, w, 3]` and return `uint8` maps;
+  numpy is imported inside the handler. The table is mirrored by `ms_backend_ipc::textdetector`.
 - `inpaint.py`: `inpaint.lama_v2` / `.lama_mpe` / `.aot` and their `.unload` methods.
 - `sdxl.py`: `inpaint.sdxl` (+ `.unload`) — streaming, with a latent-preview PNG blob per `progress`.
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`

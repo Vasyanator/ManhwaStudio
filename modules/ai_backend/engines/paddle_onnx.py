@@ -5,7 +5,9 @@ Shared ONNX Runtime helpers for PaddleOCR recognition and text detection.
 Main responsibilities:
 - Resolve PaddleOCR ONNX model files from `ManhwaStudio_AI_Models/ONNX/PaddleOCR`.
 - Build ONNX Runtime sessions for the selected Execution Provider and device id.
-- Run PP-OCR detection and recognition pipelines without Paddle dependencies.
+- Run the PP-OCR recognition pipeline and the forward-only detection pass
+  (`forward_det`, tiles prepared and post-processed by Rust) without Paddle
+  dependencies.
 - Reuse runtime sessions across backend requests.
 - Configure ONNX Runtime cache directories used by MiGraphX where supported.
 
@@ -505,54 +507,41 @@ class PaddleOnnxRuntime:
             return choose_rec_bucket_width(requested_width, cfg)
         return requested_width
 
-    def detect(
+    def forward_det(
         self,
-        image_bgr: np.ndarray,
+        tiles_rgb: np.ndarray,
         settings: ProviderSettings,
-    ) -> dict[str, Any]:
+    ) -> np.ndarray:
+        """Run the PP-OCR detection network on a batch of RGB tiles.
+
+        `tiles_rgb` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 32
+        (the caller validates; no resize happens here). Returns the raw float
+        probability batch `[n, 1, h, w]`. The detection session follows the
+        MIGraphX->CPU rule of `_det_provider_settings`.
+
+        Raises `RuntimeError` when the session cannot be built or the output
+        does not have the input's batch and spatial shape.
+        """
         det_model_path = resolve_det_model_path()
         det_cfg = parse_det_config(det_model_path.with_name("config.json"))
         det_settings = self._det_provider_settings(settings)
         managed_runner = self._factory.acquire_runner(det_model_path, det_settings)
         try:
             det_runner = managed_runner.runner
-            det_input, src_h, src_w = preprocess_det_image(image_bgr, det_cfg)
+            det_input = normalize_det_rgb(tiles_rgb, det_cfg)
             log.info(
-                "Paddle detect started: image=%s det_input=%s src_h=%s src_w=%s requested_provider=%s det_provider=%s",
-                _array_stats_str(image_bgr),
+                "Paddle det forward started: det_input=%s requested_provider=%s det_provider=%s",
                 _array_stats_str(det_input),
-                src_h,
-                src_w,
                 settings.provider,
                 det_runner.selected_provider,
             )
             det_pred = det_runner.run(det_input)
-            if det_pred.ndim != 4:
-                raise RuntimeError(f"Unexpected detector output shape: {det_pred.shape}")
-
-            det_post = DBPostProcess(
-                thresh=det_cfg.thresh,
-                box_thresh=det_cfg.box_thresh,
-                max_candidates=det_cfg.max_candidates,
-                unclip_ratio=det_cfg.unclip_ratio,
-            )
-            boxes, scores = det_post.process_single(det_pred[0], src_h, src_w)
-            det_map = np.asarray(det_pred[0, 0])
-            above_thresh = int(np.count_nonzero(det_map > det_cfg.thresh))
-            log.info(
-                "Paddle detect finished: boxes=%s scores=%s det_map=%s thresh=%.3f above_thresh=%s/%s",
-                len(boxes),
-                [round(float(score), 4) for score in scores[:10]],
-                _array_stats_str(det_map),
-                det_cfg.thresh,
-                above_thresh,
-                int(det_map.size),
-            )
-            return {
-                "pred_map": np.asarray(det_pred[0, 0]),
-                "boxes": boxes,
-                "scores": scores,
-            }
+            n, height, width = (int(v) for v in tiles_rgb.shape[:3])
+            if det_pred.ndim != 4 or tuple(det_pred.shape) != (n, 1, height, width):
+                raise RuntimeError(
+                    f"Unexpected detector output shape: {tuple(det_pred.shape)}, expected {(n, 1, height, width)}"
+                )
+            return det_pred
         finally:
             managed_runner.release()
 
@@ -1012,16 +1001,27 @@ def adapt_rec_config_to_model_input(cfg: RecConfig, input_shape: tuple[Any, ...]
 
 
 def preprocess_det_image(img_bgr: np.ndarray, cfg: DetConfig) -> tuple[np.ndarray, int, int]:
+    """Resize one BGR page for the OCR detection pass and normalize it to `[1, 3, h, w]`."""
     resized = resize_image_for_det(img_bgr, cfg.resize_long, cfg.max_stride)
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    img = rgb.astype(np.float32) * cfg.scale
-    mean = np.array(cfg.mean, dtype=np.float32).reshape(1, 1, 3)
-    std = np.array(cfg.std, dtype=np.float32).reshape(1, 1, 3)
-    img = (img - mean) / std
-    chw = np.transpose(img, (2, 0, 1)).astype(np.float32)
-    batch = np.ascontiguousarray(np.expand_dims(chw, axis=0))
+    batch = normalize_det_rgb(np.expand_dims(rgb, axis=0), cfg)
     src_h, src_w = img_bgr.shape[:2]
     return batch, src_h, src_w
+
+
+def normalize_det_rgb(tiles_rgb: np.ndarray, cfg: DetConfig) -> np.ndarray:
+    """Normalize an RGB batch `uint8 [n, h, w, 3]` to the detector's NCHW float32 input.
+
+    The single owner of the detection normalization: `x * cfg.scale`, then
+    `(x - cfg.mean) / cfg.std` per channel (ImageNet constants, `parse_det_config`).
+    Used by OCR's `preprocess_det_image` and by the forward-only `forward_det`.
+    """
+    img = tiles_rgb.astype(np.float32) * cfg.scale
+    mean = np.array(cfg.mean, dtype=np.float32).reshape(1, 1, 1, 3)
+    std = np.array(cfg.std, dtype=np.float32).reshape(1, 1, 1, 3)
+    img = (img - mean) / std
+    nchw = np.transpose(img, (0, 3, 1, 2)).astype(np.float32)
+    return np.ascontiguousarray(nchw)
 
 
 def resize_image_for_det(img: np.ndarray, resize_long: int, max_stride: int) -> np.ndarray:

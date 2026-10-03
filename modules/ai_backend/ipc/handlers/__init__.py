@@ -28,7 +28,7 @@ parallel agents — they never edit registry.py or each other's group files.
 # ---------------------------------------------------------------------------
 from . import health       # noqa: F401  — health
 from . import ocr          # noqa: F401  — ocr.manga (+ future ocr.* methods)
-from . import textdetector # noqa: F401  — textdetector.ctd / .paddle / .surya
+from . import textdetector # noqa: F401  — textdetector.{ctd,paddle,surya}.forward
 from . import inpaint      # noqa: F401  — inpaint.lama_v2 / .lama_mpe / .aot (+ unloads)
 from . import sdxl         # noqa: F401  — inpaint.sdxl (+ unload)
 from . import reline       # noqa: F401  — reline.models / reline.process

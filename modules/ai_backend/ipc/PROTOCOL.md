@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `3` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `4` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `src/backend_ipc/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -150,7 +150,8 @@ The server then emits exactly one terminal `response`:
 { "v": 1, "id": 42, "kind": "response", "status": "ok",
   "engine": "mangaocr", "lines": ["..."], "text": "..." }
 ```
-(blob = result PNG bytes for inpaint/textdetector-mask methods; else blob_len = 0)
+(blob = result PNG bytes for inpaint methods, raw u8 maps for the text-detector
+forward methods; else blob_len = 0)
 
 After the `response`, the `id` is retired and may not be reused.
 
@@ -196,9 +197,12 @@ request result (a failed request uses `response{status:"error"}` instead).
   / `preview_png_base64` are **removed** from headers; that binary moves to the
   frame blob.
 - A method that takes a single image puts it in the **request** blob.
-- A method that returns a single image (inpaint result, text-detector mask)
-  puts it in the **response** blob, and the corresponding `*_png_base64` result
-  field is dropped.
+- A method that returns a single image (inpaint result) puts it in the
+  **response** blob, and the corresponding `*_png_base64` result field is
+  dropped.
+- The text-detector forward methods (§5.3) are the one place where the blob is
+  NOT encoded at all: N equal-size raw RGB u8 tiles in, raw u8 probability maps
+  out, with the dimensions in the header.
 - Methods needing **two** input images (inpaint: image + mask) cannot use one
   blob for both. Convention: the **image** goes in the request blob; the **mask**
   PNG bytes go in a second frame field... — see the per-method note in §5: such
@@ -257,23 +261,51 @@ Notes:
 |--------------------|------------------|------------------------------------------------------------------------------------------------------------------------|-----------|----------------------------------------------------------------------------------------------|------------|--------|--------|
 | POST /translate/deep | `translate.deep` | `service: string="google"`, `source: string="auto"`, `target: string="ru"`, `params: object={}`, `texts: string[]` (non-empty) | none      | `service: string`, `translated: int`, `errors: int`, `results: object[]` (each `{ok: bool, ...}`) | none       | no     | no     |
 
-### 5.3 Text detection
+### 5.3 Text detection (forward-only)
 
-Each detector accepts **either** a page path on disk **or** an inline image. In
-v2 the inline image moves to the request blob; the on-disk path stays as a
-`page_path` header field (`path` is a legacy alias). Exactly one of the two must
-be supplied. All return a mask PNG, which moves to the **response blob** (the
-legacy `mask_png_base64` field is dropped).
+The backend runs only the detector **networks**. Rust (`crates/ms-text-detect`)
+decides scale and tiling, resizes and pads the page, cuts N equal-size tiles,
+and after the call stitches the maps and runs every post-process step (DB
+boxes, mask refinement, CRAFT components, dilation). The v3 page-level methods
+`textdetector.ctd` / `.paddle` / `.surya` (page path or PNG in, blocks and a mask
+PNG out) were removed in v4.
 
-| HTTP path                     | method                | request fields (inline)                                  | blob(req)                       | response fields (status=ok)                                                  | blob(resp) | stream | cancel |
-|-------------------------------|-----------------------|----------------------------------------------------------|---------------------------------|------------------------------------------------------------------------------|------------|--------|--------|
-| POST /textdetector/ctd/detect | `textdetector.ctd`    | `page_path: string\|null` (alias `path`), `params: object={}` | input image PNG (when no path) | `engine:"ctd"`, `source_size: [w,h]`, `blocks: object[]`                      | mask PNG   | no     | no     |
-| POST /textdetector/paddle/detect | `textdetector.paddle` | `page_path: string\|null` (alias `path`)               | input image PNG (when no path) | `engine:"paddle"`, `source_size: [w,h]`, `blocks: object[]`, `polys: array[]` | mask PNG   | no     | no     |
-| POST /textdetector/surya/detect | `textdetector.surya` | `page_path: string\|null` (alias `path`)               | input image PNG (when no path) | `engine:"surya"`, `source_size: [w,h]`, `blocks: object[]`, `lines: array[]`  | mask PNG   | no     | no     |
+| method                        | request fields (inline)                     | blob(req)                         | response fields (status=ok)                                                                 | blob(resp)       | stream | cancel |
+|-------------------------------|---------------------------------------------|-----------------------------------|---------------------------------------------------------------------------------------------|------------------|--------|--------|
+| `textdetector.ctd.forward`    | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"ctd"`, `n: int`, `map_width: int`, `map_height: int`, `channels: ["seg","shrink"]` | u8 maps          | no     | no     |
+| `textdetector.paddle.forward` | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"paddle"`, `n`, `map_width`, `map_height`, `channels: ["prob"]`                     | u8 maps          | no     | no     |
+| `textdetector.surya.forward`  | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"surya"`, `n`, `map_width`, `map_height`, `channels: ["text"]`                      | u8 maps          | no     | no     |
+
+Engine table (both sides hold it: `FORWARD_SPECS` in `handlers/textdetector.py`,
+`ForwardEngine` in `crates/ms-backend-ipc/src/textdetector.rs`):
+
+| engine   | align (tile sides multiple of) | map size                     | channels (blob order) | input normalization (backend)                                  |
+|----------|--------------------------------|------------------------------|-----------------------|----------------------------------------------------------------|
+| `ctd`    | 64                             | `width x height`             | `seg`, `shrink`       | `/255`, RGB, NCHW float32                                      |
+| `paddle` | 32                             | `width x height`             | `prob`                | `/255`, ImageNet mean/std, NCHW float32; MIGraphX -> CPU session |
+| `surya`  | 4                              | `width/4 x height/4`         | `text`                | the library processor (`/255`, ImageNet mean/std), no resize; float32 on CUDA |
+
+Blob layouts:
+- Request: `n * height * width * 3` bytes — RGB u8, tile-major, then row-major,
+  then interleaved channels (`RGBRGB...`). All tiles share one size.
+- Response: `n * C * map_height * map_width` bytes — tile-major, then
+  channel-major (in `channels` order), then row-major. Each value is
+  `round(clip(p, 0, 1) * 255)` of the sigmoid probability `p`.
+
+Validation (both sides; a failure is `response{status:"error"}` with a message):
+- `n >= 1`; `width` and `height` are positive multiples of the engine align;
+- the request blob length equals `n * height * width * 3` exactly (checked
+  arithmetic on the Rust side);
+- the request blob and the response it implies both fit `MAX_BLOB_BYTES`, so the
+  client sizes its batches against BOTH directions;
+- the response header matches the request (`engine`, `n`, map size, channel
+  names) and the response blob length is exact;
+- a non-finite probability anywhere is an error, never a map of zeros.
 
 Notes:
-- CTD and Surya detectors require Torch; Paddle detector uses the ONNX runtime.
-- When the request supplies `page_path`, `blob(req)` is empty.
+- CTD and Surya require Torch; Paddle uses the ONNX runtime.
+- Not cancellable: one bounded forward pass per request; the client bounds the
+  batch instead.
 
 ### 5.4 Inpaint
 

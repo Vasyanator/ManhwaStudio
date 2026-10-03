@@ -1,0 +1,27 @@
+[package]
+name = "ms-text-detect"
+version = "0.1.0"
+edition = "2024"
+
+# The text-detection DOMAIN, GUI-free and engine-neutral: DB postprocess and glyph mask, block
+# finalization (reading-order sort, block cap), detector mask normalization, and the detection
+# plan / tile stitching / runner pipeline that the CTD, PaddleOCR and Surya engines share, each
+# with its pipeline postprocess. Model forward passes are NOT
+# here: a caller supplies them through a runner (native ONNX or the Python backend over IPC).
+#
+# Layer: level 1, directly above `ms-raster`. No egui, no `ms-*` service crate, no logging (the
+# callers log), so it builds for every target including wasm32.
+[dependencies]
+# Page and probability-map buffers (`RgbImage`, `GrayImage`) and resize filters.
+image.workspace = true
+# Contours, minimum-area rectangles and polygon helpers of the DB postprocess. Defaults are off
+# in the workspace table, which keeps this crate wasm-buildable.
+imageproc.workspace = true
+# The one polygon fill, square dilation and Otsu threshold of the project.
+ms-raster = { path = "../ms-raster" }
+# Typed public errors.
+thiserror.workspace = true
+
+[dev-dependencies]
+# Golden-fixture metadata (`fixtures/*/case.json`) read by the parity tests.
+serde_json.workspace = true

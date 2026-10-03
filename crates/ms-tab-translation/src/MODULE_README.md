@@ -26,11 +26,17 @@ Long work is delegated to focused controllers:
   transport, page crop/cache handling, OS credential-store API key access, and per-engine load state.
   `OcrEngine` has six engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL and Surya (backend IPC
   methods `ocr.*`, MangaOCR/PaddleOCR also native ONNX) and AI API (`genai`, no backend).
-- `text_detector.rs` owns the text detector worker and returns page boxes plus editable binary
+- `text_detector/` owns the text detector worker and returns page boxes plus editable binary
   masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
-  connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle`), `AiCtd`
-  (backend `textdetector.ctd`) and `Surya` (backend `textdetector.surya`). The inline
-  `detect_*_mask_for_image` helpers are the same contracts reused by Cleaning's mask generation.
+  connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle.forward`),
+  `AiCtd` (backend `textdetector.ctd.forward`) and `Surya` (backend `textdetector.surya.forward`).
+  The model modes run `ms_text_detect`'s plan / tile / stitch / postprocess pipeline in Rust; the
+  runners here only run the forward pass (in-process or over IPC). The inline
+  `detect_*_mask_for_image` helpers are the same pipeline reused by Cleaning's mask generation.
+  The detector panel announces the current page's plan (resize, tile count) by planning with the
+  same `TextDetectorRunMode::plan_inputs` the worker uses; `app.rs` lends the page sizes
+  (`page_infos`) through `draw_side_panel`.
+  Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
 - `backend_health.rs` owns the shared Python backend probe snapshot used by Translation and
@@ -114,11 +120,11 @@ the native route the OCR worker decodes the crop to RGBA and calls
 with the same `join_newlines`/`reflect_strings` rules as the backend (Paddle's lines are joined with
 `\n` first). The guard scope uses `native_runtime::native_load_scope_key()`
 (`{build}:{provider}[:{device}]@{version}`) so the pre-check matches the build/provider/adapter that
-will actually load. Native PaddleOCR text detection is selected in `text_detector.rs`
-by `detector_native_route` (native runtime + non-Suspect guard): `detect_page_paddle_ocr` and the
-inline `detect_paddle_mask_for_image` call `native_runtime::detect_paddle` and build the same
-`TextDetectorPageResult`/mask the backend produces (xyxy blocks sorted y1,x1 truncated to 2500;
-glyph mask normalized to 0/255, oversized masks over `MAX_MASK_PIXELS` rejected → backend fallback).
+will actually load. Native PaddleOCR text detection is selected by
+`text_detector::pipeline::detector_native_route` (native runtime + non-Suspect guard, read by
+`text_detector/native.rs`): pages and the inline `detect_paddle_mask_for_image` then run the
+shared detection pipeline on `NativePaddleRunner` (`native_runtime::paddle_det_forward`), and a
+native runner failure re-runs the page on the backend runner.
 A native error (OCR or detection) is always logged. On the OCR recognize dispatch it falls back to
 the backend ONLY when the backend is up; when the backend is offline the native path is the only
 path, so `run_recognize_command` surfaces the real native error (`Нативный ONNX: <reason>` from
@@ -126,7 +132,7 @@ path, so `run_recognize_command` surfaces the real native error (`Нативны
 (`try_native_ocr` → `NativeOcrOutcome`, `native_failure_should_surface`). These paths are compiled
 out on the web build.
 Native OCR/detection run WITHOUT the Python backend: BOTH the controller readiness gate AND the UI
-trigger gate are route-aware. `ocr.rs::warmup_ocr_engine` and `text_detector.rs::run_detect_batch`
+trigger gate are route-aware. `ocr.rs::warmup_ocr_engine` and `text_detector/mod.rs::run_detect_batch`
 skip `ensure_v2_backend_ready` (and the backend warmup) when the active route is native — the
 in-process runtime/model load lazily on first use and the controller reaches `Ready` with the
 backend offline. The UI trigger gate `ocr::ocr_requires_backend(engine, model, runtime, guard)` is
@@ -171,16 +177,20 @@ is an author note addressed to the translator, not a replica.
   MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
   written only via `ms_docstore::update` touching the tab's four sections (`OCR`,
   `machine_translation`, `composition`, `text_detector`); a malformed file makes the save fail
-  and is left untouched. The `characters.json` watch uses `ms_docstore::signature`.
+  and is left untouched. Retired `text_detector.params` keys (`STALE_TEXT_DETECTOR_PARAM_KEYS`:
+  the old CTD font-size and rearrange-batch params) are ignored on read and stripped on write.
+  The `characters.json` watch uses `ms_docstore::signature`.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR via `genai`,
   credential-store API key commands, crop encoding, page image LRU cache, and
   model-download/load-state events.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
-- `text_detector.rs`: `TranslationTextDetectorController`, local classic detector, backend
-  PaddleOCR/CTD/Surya detector calls, mask decoding/building, detector batch progress, and helper
-  routes reused by cleaning tools for region masks.
+- `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
+  model-based entry point and fallback policy (`pipeline.rs`), the backend forward runner
+  (`backend.rs`), native Paddle routing and runner (`native.rs`, desktop only), local classic
+  detector (`classic.rs`), and the region helpers reused by cleaning tools (`region.rs`). Own
+  `MODULE_README.md`.
 - `machine_translation.rs`: `TranslationMtController`, `MtService`, AI API MT options, batch
   item/request types including optional ImageBubble image payloads, per-run worker thread
   lifecycle, cancellation, chat context pruning, JSON response parsing, and backend dispatch.
@@ -362,7 +372,8 @@ is an author note addressed to the translator, not a replica.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector
-  helpers, edit `text_detector.rs` and `panels/text_detector.rs`.
+  helpers, edit `text_detector/` (map in its `MODULE_README.md`) and `panels/text_detector.rs`.
+  Block order/cap and mask normalization rules live in `ms-text-detect`, not here.
 - To change MT run lifecycle, provider selection, cancellation, or batch dispatch, edit
   `machine_translation.rs`, `machine_translators/`, and `panels/machine_translation.rs`.
 - To change bubble list editing, footer fields, search/filter behavior, or text write-through, edit

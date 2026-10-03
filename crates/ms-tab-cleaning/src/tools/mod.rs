@@ -16,6 +16,8 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
     catalog, its availability rules, the detection worker and the watermark plumbing. Shared
     by `base.rs` (the detached mask-inpaint editors), `ai_editor` (the area editor's mask
     stack) and `watermark_removal`.
+  - `region_png` — the localized face of `ms_tools::png_wire`: the one encoder of the region
+    and mask PNGs the AOT, Flux-Fill and AI-editor engines send to the backend.
   - `watermark_library` — библиотека измеренных знаков на диске; используется
     режимом «По главе» из `watermark_removal.rs`.
   - `watermark_entry` — мост между движком разложения и библиотекой: приём
@@ -32,6 +34,8 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
 mod base;
 
 mod mask_generation;
+
+mod region_png;
 
 pub use base::StrokeModifiers;
 pub use base::{CleaningCursorOccluder, CleaningTool, StrokePoint};

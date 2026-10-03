@@ -57,8 +57,9 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   `surya_checkpoints`, `model_download`). See `engines/MODULE_README.md`.
 - `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya`) and the
   PaddleOCR-VL script constraint. See `ocr/MODULE_README.md`.
-- `detection/`: text detectors (`textdetector.ctd` / `.paddle` / `.surya`) plus the vendored
-  ComicTextDetector implementation in `detection/textdetector/`. See `detection/MODULE_README.md`.
+- `detection/`: forward-only text detectors (`textdetector.{ctd,paddle,surya}.forward`: tiles in,
+  probability maps out; Rust plans and post-processes) plus the vendored ComicTextDetector network
+  in `detection/textdetector/`. See `detection/MODULE_README.md`.
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
   `.flux_fill` / `.flux2_klein`), the standalone LaMa V2 runtime module, and the vendored
   `lama_runtime_bundle/`. See `inpaint/MODULE_README.md`.

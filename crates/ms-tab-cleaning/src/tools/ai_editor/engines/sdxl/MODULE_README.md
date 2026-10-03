@@ -49,7 +49,7 @@ subtree and it is one-directional.
   helpers, the bar fraction and `draw_sdxl_progress_ui`. Edit it to change what a run reports while
   it is in flight.
 - `wire.rs`: `lama_model_for_run` (the prefill gate), `sdxl_run_header`, `run_sdxl`, `unload_sdxl`,
-  the streaming call, the `CallError` mapping and the PNG/L8 encoders. Edit it to change what
+  the streaming call, the `CallError` mapping and the request-blob packing (the PNGs come from `tools/region_png.rs`). Edit it to change what
   travels on the wire — and read the protocol contract below first.
 - `engine.rs`: `SdxlEngine`, its `AiEngine` impl and its parameter panel. Edit it to change the
   panel layout, the run gate or the polling.

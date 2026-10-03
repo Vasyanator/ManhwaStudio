@@ -35,7 +35,7 @@ from __future__ import annotations
 # The contract also covers the on-disk user_config storage semantics shared with
 # Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
 # ============================================================================
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -175,10 +175,13 @@ METHOD_WATERMARK_REMOVE = "watermark.remove"  # cleaned image ++ mask (experimen
 METHOD_WATERMARK_STATUS = "watermark.status"  # model catalog + on-disk state
 METHOD_WATERMARK_UNLOAD = "watermark.unload"  # drop the resident network
 
-# --- Text detection ---
-METHOD_TEXTDETECTOR_CTD = "textdetector.ctd"        # POST /textdetector/ctd/detect
-METHOD_TEXTDETECTOR_PADDLE = "textdetector.paddle"  # POST /textdetector/paddle/detect
-METHOD_TEXTDETECTOR_SURYA = "textdetector.surya"    # POST /textdetector/surya/detect
+# --- Text detection (forward-only since v4) ---
+# Rust sends N equal-size RGB u8 tiles it already resized/padded and receives
+# u8 probability maps; planning and post-processing live in Rust. The v3
+# page-level methods `textdetector.ctd` / `.paddle` / `.surya` were removed.
+METHOD_TEXTDETECTOR_CTD_FORWARD = "textdetector.ctd.forward"        # maps [seg, shrink]
+METHOD_TEXTDETECTOR_PADDLE_FORWARD = "textdetector.paddle.forward"  # maps [prob]
+METHOD_TEXTDETECTOR_SURYA_FORWARD = "textdetector.surya.forward"    # maps [text] at 1/4
 
 # --- Device ---
 METHOD_DEVICE_GET = "device.get"                          # GET /device
@@ -239,9 +242,9 @@ ALL_METHODS = frozenset(
         METHOD_WATERMARK_REMOVE,
         METHOD_WATERMARK_STATUS,
         METHOD_WATERMARK_UNLOAD,
-        METHOD_TEXTDETECTOR_CTD,
-        METHOD_TEXTDETECTOR_PADDLE,
-        METHOD_TEXTDETECTOR_SURYA,
+        METHOD_TEXTDETECTOR_CTD_FORWARD,
+        METHOD_TEXTDETECTOR_PADDLE_FORWARD,
+        METHOD_TEXTDETECTOR_SURYA_FORWARD,
         METHOD_DEVICE_GET,
         METHOD_DEVICE_SET,
         METHOD_DEVICE_CUDA_DIAGNOSTICS,

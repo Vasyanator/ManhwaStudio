@@ -4,23 +4,26 @@ File: crates/ms-onnx/src/paddle_ocr/mod.rs
 Purpose:
 Native PaddleOCR (PP-OCRv5) text detection + recognition over ONNX Runtime, in
 pure Rust (no OpenCV/Clipper). Faithful port of the pipelines in
-`modules/ai_backend/engines/paddle_onnx.py` (DBPostProcess, CTC decode,
-pre/post-processing) and `modules/ai_backend/detection/paddle.py` (glyph mask).
+`modules/ai_backend/engines/paddle_onnx.py` (CTC decode, pre/post-processing).
+The DB postprocess and the glyph mask are the engine-neutral detection domain and
+live in `ms_text_detect::{db, glyph_mask}`; `detect` calls them.
+`PaddleDetector::forward_prob_maps` is the forward-only entry of the tiled
+text-detector pipeline: prepared tiles in, quantized `ms_text_detect::ProbMap`s
+out; `ms-text-detect` plans, stitches and postprocesses around it.
 
 Key structures:
 - PaddleDetection : detector output (quads, axis-aligned blocks, glyph mask).
 - PaddleLine      : one recognized line (text + mean-token confidence).
-- PaddleDetector  : owns the detection session (`textdetector.paddle`).
+- PaddleDetector  : owns the detection session; `detect` (single 960 pass, used
+                    by OCR) and `forward_prob_maps` (tiles -> u8 maps).
 - PaddleRecognizer: owns the recognition session + character table.
 - PaddleOcrEngine : composes both (`ocr.paddle`).
 
 Submodules:
 - preprocess     : detection/recognition input preprocessing.
-- db_postprocess : DB probability-map -> text quads.
 - crop           : perspective crop + reading-order sort.
 - ctc            : CTC greedy decode.
 - dict           : character-table construction.
-- glyph_mask     : glyph-shaped binary mask for the detector op.
 
 Notes:
 Sessions are built through [`crate::OrtRuntime::build_session`], so the committed
@@ -31,24 +34,26 @@ downloads or resolves models: the caller supplies model + dict paths.
 
 pub mod crop;
 pub mod ctc;
-pub mod db_postprocess;
 pub mod dict;
-pub mod glyph_mask;
 pub mod preprocess;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use image::{GrayImage, RgbaImage};
+use image::{GrayImage, RgbImage, RgbaImage};
 use ms_log::trace::cat;
 use ort::session::Session;
 use ort::value::{Shape, Tensor};
 
 use crate::{OrtError, OrtRuntime};
 use dict::CharacterTable;
+use ms_text_detect::db::{block_from_quad, boxes_from_bitmap};
+use ms_text_detect::glyph_mask::build_glyph_mask;
+use ms_text_detect::ProbMap;
 
 /// A detected text region: four corner points `[TL, TR, BR, BL]` in image pixels.
-pub type Quad = [[f32; 2]; 4];
+/// Owned by `ms-text-detect`; re-exported here so `paddle_ocr::Quad` keeps its path.
+pub use ms_text_detect::Quad;
 
 // --- Numeric conversion helpers (centralize the few unavoidable float<->int casts) ---
 
@@ -82,35 +87,6 @@ pub(crate) fn nonneg_f32_to_u32(value: f32) -> u32 {
     out
 }
 
-/// Truncates a finite `f32` to `i32`, saturating out-of-range input.
-///
-/// Matches NumPy's `astype(np.int32)` / Python `int(...)` truncation toward zero.
-#[must_use]
-pub(crate) fn f32_to_i32_trunc(value: f32) -> i32 {
-    if value.is_nan() {
-        return 0;
-    }
-    let capped = value.clamp(u32_to_f32_i32_floor(), u32_to_f32_i32_ceil());
-    // Safe: `capped` is finite and within i32 range; truncation drops the fraction.
-    #[allow(clippy::cast_possible_truncation)]
-    let out = capped as i32;
-    out
-}
-
-/// `i32::MIN` as `f32` (lower clamp bound for [`f32_to_i32_trunc`]).
-fn u32_to_f32_i32_floor() -> f32 {
-    #[allow(clippy::cast_precision_loss)]
-    let out = i32::MIN as f32;
-    out
-}
-
-/// `i32::MAX` as `f32` (upper clamp bound for [`f32_to_i32_trunc`]).
-fn u32_to_f32_i32_ceil() -> f32 {
-    #[allow(clippy::cast_precision_loss)]
-    let out = i32::MAX as f32;
-    out
-}
-
 /// Result of `PaddleDetector::detect`: quads, axis-aligned blocks, and glyph mask.
 #[derive(Debug, Clone)]
 pub struct PaddleDetection {
@@ -134,7 +110,9 @@ pub struct PaddleLine {
     pub confidence: f32,
 }
 
-/// Native PaddleOCR text detector (`textdetector.paddle` op).
+/// Native PaddleOCR text detector: the whole-page [`PaddleDetector::detect`] and the
+/// forward-only [`PaddleDetector::forward_prob_maps`] of the tiled pipeline (the in-process
+/// counterpart of the backend's `textdetector.paddle.forward` method).
 ///
 /// Owns the DB detection session. Construct with [`PaddleDetector::load`].
 #[derive(Debug)]
@@ -229,9 +207,9 @@ impl PaddleDetector {
             detail: "детектор: карта вероятностей короче ожидаемой".to_owned(),
         })?;
 
-        let quads = db_postprocess::boxes_from_bitmap(prob, map_w, map_h, input.src_w, input.src_h);
+        let quads = boxes_from_bitmap(prob, map_w, map_h, input.src_w, input.src_h);
         let blocks = quads.iter().map(|q| block_from_quad(q, input.src_w, input.src_h)).collect();
-        let glyph_mask = glyph_mask::build_glyph_mask(image, &quads);
+        let glyph_mask = build_glyph_mask(image, &quads);
 
         ms_log::trace_log!(
             cat::RENDER,
@@ -250,6 +228,141 @@ impl PaddleDetector {
             glyph_mask,
         })
     }
+
+    /// Runs the detection model on prepared tiles and returns one quantized DB
+    /// probability map per tile, in order — the forward pass ONLY.
+    ///
+    /// No resize, no postprocess: the `ms-text-detect` plan has already scaled and
+    /// padded the tiles, and it stitches the maps and runs the DB postprocess once on
+    /// the whole page. Tiles are ImageNet-normalized exactly as [`Self::detect`] does
+    /// (`preprocess::preprocess_det_tiles`) and run as ONE batch (the model's batch
+    /// axis is dynamic). Each map has the tile's size and holds
+    /// `floor(clamp(p, 0, 1) * 255 + 0.5)`, the same rule as the Python backend's
+    /// `forward_maps.quantize_probability_maps`. An empty `tiles` slice returns an
+    /// empty vector without running the model.
+    ///
+    /// Takes `&mut self` because `ort::session::Session::run` requires it.
+    ///
+    /// # Errors
+    /// [`OrtError::TensorShape`] when the tiles are not all the same positive size
+    /// with both sides a multiple of [`preprocess::DET_TILE_ALIGN`], when the output
+    /// is not `[N, 1, H, W]` matching the batch, or when it holds a non-finite value;
+    /// [`OrtError::Inference`] if the run fails.
+    pub fn forward_prob_maps(&mut self, tiles: &[RgbImage]) -> Result<Vec<ProbMap>, OrtError> {
+        if tiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = preprocess::preprocess_det_tiles(tiles)?;
+        let batch_dim = i64::try_from(batch.count).map_err(|_| OrtError::TensorShape {
+            detail: format!("детектор: размер пакета {} не помещается в i64", batch.count),
+        })?;
+        let shape = vec![batch_dim, 3_i64, i64::from(batch.height), i64::from(batch.width)];
+        let tensor = Tensor::<f32>::from_array((shape, batch.data)).map_err(|e| {
+            OrtError::TensorShape {
+                detail: format!("не удалось создать тензор входа детектора: {e}"),
+            }
+        })?;
+
+        let input_name = self.input_name.clone();
+        let output_name = self.output_name.clone();
+        let outputs = self
+            .session
+            .run(ort::inputs![input_name.as_str() => tensor])
+            .map_err(|e| OrtError::Inference {
+                stage: "paddle_det",
+                reason: e.to_string(),
+            })?;
+        let value = outputs.get(output_name.as_str()).ok_or_else(|| OrtError::TensorShape {
+            detail: format!("выход детектора «{output_name}» отсутствует"),
+        })?;
+        let (out_shape, data): (&Shape, &[f32]) =
+            value.try_extract_tensor::<f32>().map_err(|e| OrtError::TensorShape {
+                detail: format!("не удалось извлечь карту вероятностей детектора: {e}"),
+            })?;
+        let maps = quantize_prob_maps(out_shape, data, batch.count, batch.width, batch.height)?;
+
+        ms_log::trace_log!(
+            cat::RENDER,
+            "PaddleDetector forward done tiles={} tile={}x{}",
+            batch.count,
+            batch.width,
+            batch.height
+        );
+        Ok(maps)
+    }
+}
+
+/// Validates a DB detector output and quantizes it into one [`ProbMap`] per tile.
+///
+/// `dims` must be exactly `[count, 1, height, width]` and `data` exactly that long:
+/// the DB head returns one probability plane the size of its 32-aligned input.
+/// Each value becomes `floor(clamp(p, 0, 1) * 255 + 0.5)` computed in `f32` — the
+/// rule of `modules/ai_backend/detection/forward_maps.py::quantize_probability_maps`,
+/// mirrored operation for operation so the native and backend routes hand the
+/// stitcher identical bytes for identical probabilities.
+///
+/// # Errors
+/// [`OrtError::TensorShape`] on a shape or length mismatch or any NaN / infinite
+/// value (a broken forward pass must not read as an empty map).
+fn quantize_prob_maps(
+    dims: &[i64],
+    data: &[f32],
+    count: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<ProbMap>, OrtError> {
+    let expected = [
+        i64::try_from(count).ok(),
+        Some(1),
+        Some(i64::from(height)),
+        Some(i64::from(width)),
+    ];
+    if dims.len() != 4 || dims.iter().zip(expected).any(|(&dim, want)| Some(dim) != want) {
+        return Err(OrtError::TensorShape {
+            detail: format!(
+                "детектор: ожидалась форма [{count}, 1, {height}, {width}], получено {dims:?}"
+            ),
+        });
+    }
+    let plane = usize::try_from(width)
+        .ok()
+        .zip(usize::try_from(height).ok())
+        .and_then(|(w, h)| w.checked_mul(h))
+        .ok_or_else(|| OrtError::TensorShape {
+            detail: "детектор: переполнение размера карты".to_owned(),
+        })?;
+    if plane.checked_mul(count) != Some(data.len()) {
+        return Err(OrtError::TensorShape {
+            detail: format!(
+                "детектор: карта вероятностей содержит {} значений, ожидалось {count}x{plane}",
+                data.len()
+            ),
+        });
+    }
+    if let Some(bad) = data.iter().position(|p| !p.is_finite()) {
+        return Err(OrtError::TensorShape {
+            detail: format!("детектор: нечисловое значение вероятности в позиции {bad}"),
+        });
+    }
+
+    data.chunks_exact(plane)
+        .map(|chunk| {
+            let bytes = chunk.iter().map(|&p| quantize_prob(p)).collect();
+            ProbMap::new(width, height, bytes).map_err(|e| OrtError::TensorShape {
+                detail: format!("детектор: некорректная карта вероятностей: {e}"),
+            })
+        })
+        .collect()
+}
+
+/// Quantizes one FINITE probability: `floor(clamp(p, 0, 1) * 255 + 0.5)` in `f32`.
+fn quantize_prob(p: f32) -> u8 {
+    let level = (p.clamp(0.0, 1.0) * 255.0 + 0.5).floor();
+    // `level` is an integer in [0, 255] for finite `p` (the clamp bounds it and the
+    // caller rejected NaN/inf), so the cast is exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let out = level as u8;
+    out
 }
 
 /// Native PaddleOCR text recognizer (`ocr.paddle` recognition stage).
@@ -470,7 +583,7 @@ impl PaddleOcrEngine {
         })
     }
 
-    /// Mutable access to the detection stage (for the `textdetector.paddle` op).
+    /// Mutable access to the detection stage (the native Paddle detection forward).
     pub fn detector(&mut self) -> &mut PaddleDetector {
         &mut self.detector
     }
@@ -539,20 +652,6 @@ pub fn paddle_recognize(
     Ok(lines.into_iter().map(|line| line.text).filter(|t| !t.is_empty()).collect())
 }
 
-/// Axis-aligned `[x1, y1, x2, y2]` bounding box of a quad, clamped to the image.
-fn block_from_quad(quad: &Quad, img_w: u32, img_h: u32) -> [f32; 4] {
-    let xs = [quad[0][0], quad[1][0], quad[2][0], quad[3][0]];
-    let ys = [quad[0][1], quad[1][1], quad[2][1], quad[3][1]];
-    let w = u32_to_f32(img_w);
-    let h = u32_to_f32(img_h);
-    [
-        xs.iter().copied().fold(f32::INFINITY, f32::min).clamp(0.0, w),
-        ys.iter().copied().fold(f32::INFINITY, f32::min).clamp(0.0, h),
-        xs.iter().copied().fold(f32::NEG_INFINITY, f32::max).clamp(0.0, w),
-        ys.iter().copied().fold(f32::NEG_INFINITY, f32::max).clamp(0.0, h),
-    ]
-}
-
 /// Returns the name of the session's `index`-th input, or a typed shape error.
 fn nth_input_name(session: &Session, index: usize, stage: &str) -> Result<String, OrtError> {
     session
@@ -580,22 +679,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_from_quad_is_clamped_bbox() {
-        // Quad partly outside the image: bbox clamps to [0, dims].
-        let quad: Quad = [[-5.0, 10.0], [30.0, 8.0], [32.0, 40.0], [-2.0, 42.0]];
-        let block = block_from_quad(&quad, 25, 35);
-        let expected = [0.0_f32, 8.0, 25.0, 35.0];
-        for (got, want) in block.iter().zip(expected.iter()) {
-            assert!((got - want).abs() < 1e-6, "block {block:?} != {expected:?}");
-        }
-    }
-
-    #[test]
     fn conversions_saturate_and_truncate() {
         assert_eq!(nonneg_f32_to_u32(3.9), 3);
         assert_eq!(nonneg_f32_to_u32(-1.0), 0);
         assert_eq!(nonneg_f32_to_u32(f32::NAN), 0);
-        assert_eq!(f32_to_i32_trunc(-2.7), -2);
-        assert_eq!(f32_to_i32_trunc(2.7), 2);
+    }
+
+    #[test]
+    fn quantize_prob_clamps_and_rounds_half_up() {
+        assert_eq!(quantize_prob(-0.5), 0);
+        assert_eq!(quantize_prob(0.0), 0);
+        assert_eq!(quantize_prob(1.0), 255);
+        assert_eq!(quantize_prob(7.0), 255);
+        // 0.5 * 255 = 127.5 -> half up -> 128.
+        assert_eq!(quantize_prob(0.5), 128);
+        // Just under one level's midpoint stays below it.
+        assert_eq!(quantize_prob(0.3 / 255.0), 0);
+        assert_eq!(quantize_prob(0.7 / 255.0), 1);
+    }
+
+    #[test]
+    fn quantize_maps_splits_tiles_in_order() {
+        // Two 2x1 tiles (width 2, height 1).
+        let data = [0.0, 1.0, 0.5, 0.25];
+        let maps = quantize_prob_maps(&[2, 1, 1, 2], &data, 2, 2, 1).expect("valid output");
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].size(), [2, 1]);
+        assert_eq!(maps[0].data(), &[0, 255]);
+        assert_eq!(maps[1].data(), &[128, 64]);
+    }
+
+    #[test]
+    fn quantize_maps_rejects_bad_shape_length_and_non_finite() {
+        let is_shape = |r: Result<Vec<ProbMap>, OrtError>| matches!(r, Err(OrtError::TensorShape { .. }));
+        let data = [0.1_f32; 4];
+        // Wrong rank, batch, channel count and map size.
+        assert!(is_shape(quantize_prob_maps(&[2, 1, 2], &data, 2, 2, 1)));
+        assert!(is_shape(quantize_prob_maps(&[1, 1, 1, 2], &data, 2, 2, 1)));
+        assert!(is_shape(quantize_prob_maps(&[2, 2, 1, 1], &data, 2, 1, 1)));
+        assert!(is_shape(quantize_prob_maps(&[2, 1, 2, 1], &data, 2, 2, 1)));
+        // Data shorter than the declared shape.
+        assert!(is_shape(quantize_prob_maps(&[2, 1, 1, 2], &data[..3], 2, 2, 1)));
+        // NaN and infinity are errors, never zeros.
+        assert!(is_shape(quantize_prob_maps(&[1, 1, 1, 2], &[0.1, f32::NAN], 1, 2, 1)));
+        assert!(is_shape(quantize_prob_maps(&[1, 1, 1, 2], &[f32::INFINITY, 0.1], 1, 2, 1)));
     }
 }

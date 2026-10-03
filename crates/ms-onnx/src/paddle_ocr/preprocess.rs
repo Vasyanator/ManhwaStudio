@@ -10,6 +10,8 @@ PaddleOCR detection and recognition input preprocessing. Faithful port of
 Key functions:
 - resize_dims_for_det : longest-side<=960, snapped to a stride-32 multiple, no upscale.
 - preprocess_det      : image -> DetInput (NCHW f32, ImageNet-normalized) + model/src dims.
+- preprocess_det_tiles: equal-size, 32-aligned RGB tiles -> DetTileBatch (NCHW f32, same
+                        normalization, NO resize) for the forward-only path.
 - plan_rec_width      : target batch width for one crop (dynamic width, [320, 3200]).
 - preprocess_rec      : crop -> NCHW f32 (height 48, (x/255-0.5)/0.5, right zero-pad).
 
@@ -21,7 +23,7 @@ stride-snap uses round-half-away-from-zero (`f32::round`); Python's built-in
 `round` is round-half-to-even, so results differ only for the rare exact-.5 case.
 */
 
-use image::{RgbaImage, imageops};
+use image::{RgbImage, RgbaImage, imageops};
 
 use super::{nonneg_f32_to_u32, u32_to_f32};
 use crate::OrtError;
@@ -30,6 +32,9 @@ use crate::OrtError;
 const DET_RESIZE_LONG: u32 = 960;
 /// Detection: resized dimensions are snapped to a multiple of this stride.
 const DET_STRIDE: u32 = 32;
+/// Forward-only detection tiles must have both sides a multiple of this (the DB network's
+/// total downsampling; the probability map then has exactly the tile's size).
+pub const DET_TILE_ALIGN: u32 = DET_STRIDE;
 /// Detection ImageNet normalization mean, RGB order (`(rgb/255 - mean)/std`).
 const DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 /// Detection ImageNet normalization std, RGB order.
@@ -118,8 +123,7 @@ pub fn preprocess_det(image: &RgbaImage) -> Result<DetInput, OrtError> {
         let [r, g, b, _a] = pixel.0;
         let channels = [r, g, b];
         for (c, &value) in channels.iter().enumerate() {
-            let normalized = (f32::from(value) / 255.0 - DET_MEAN[c]) / DET_STD[c];
-            data[c * plane + i] = normalized;
+            data[c * plane + i] = normalize_det_channel(c, value);
         }
     }
 
@@ -129,6 +133,92 @@ pub fn preprocess_det(image: &RgbaImage) -> Result<DetInput, OrtError> {
         model_w,
         src_w,
         src_h,
+    })
+}
+
+/// ImageNet-normalizes one 8-bit channel value of channel `channel` (0 = R, 1 = G, 2 = B):
+/// `(value / 255 - DET_MEAN[channel]) / DET_STD[channel]`.
+///
+/// The one detection normalization rule, shared by [`preprocess_det`] (resized page) and
+/// [`preprocess_det_tiles`] (forward-only tiles) so both feed the model identical values.
+/// `channel` is always `< 3` at both call sites (it enumerates an `[r, g, b]` array).
+#[inline]
+fn normalize_det_channel(channel: usize, value: u8) -> f32 {
+    (f32::from(value) / 255.0 - DET_MEAN[channel]) / DET_STD[channel]
+}
+
+/// A batch of forward-only detection tiles laid out as one NCHW tensor.
+#[derive(Debug, Clone)]
+pub struct DetTileBatch {
+    /// Row-major NCHW f32 data, shape `[count, 3, height, width]`, tile-major then
+    /// channel-major, ImageNet-normalized.
+    pub data: Vec<f32>,
+    /// Number of tiles (`N`).
+    pub count: usize,
+    /// Common tile width in pixels (a positive multiple of [`DET_TILE_ALIGN`]).
+    pub width: u32,
+    /// Common tile height in pixels (a positive multiple of [`DET_TILE_ALIGN`]).
+    pub height: u32,
+}
+
+/// Lays prepared detection tiles out as one NCHW batch, WITHOUT resizing.
+///
+/// Every tile must be non-empty, share the first tile's size, and have both sides a multiple
+/// of [`DET_TILE_ALIGN`] (the DB network downsamples by 32 and returns a map the size of its
+/// input only then). Values are normalized exactly as [`preprocess_det`] does
+/// (`normalize_det_channel`). The caller (the `ms-text-detect` plan) has already scaled and
+/// padded the tiles.
+///
+/// # Errors
+/// [`OrtError::TensorShape`] when `tiles` is empty, a tile has a zero or unaligned side, the
+/// sizes differ, or the batch size overflows `usize`.
+pub fn preprocess_det_tiles(tiles: &[RgbImage]) -> Result<DetTileBatch, OrtError> {
+    let first = tiles.first().ok_or_else(|| OrtError::TensorShape {
+        detail: "детектор: пустой пакет тайлов".to_owned(),
+    })?;
+    let (width, height) = first.dimensions();
+    if width == 0 || height == 0 || width % DET_TILE_ALIGN != 0 || height % DET_TILE_ALIGN != 0 {
+        return Err(OrtError::TensorShape {
+            detail: format!(
+                "детектор: размер тайла {width}x{height} должен быть положительным и кратным {DET_TILE_ALIGN}"
+            ),
+        });
+    }
+    if let Some((index, tile)) = tiles.iter().enumerate().find(|(_, tile)| tile.dimensions() != (width, height)) {
+        let (tile_w, tile_h) = tile.dimensions();
+        return Err(OrtError::TensorShape {
+            detail: format!(
+                "детектор: тайл #{index} имеет размер {tile_w}x{tile_h}, ожидался {width}x{height}"
+            ),
+        });
+    }
+
+    let overflow = || OrtError::TensorShape {
+        detail: format!("детектор: пакет {}x{width}x{height} не помещается в usize", tiles.len()),
+    };
+    let plane = usize::try_from(width)
+        .ok()
+        .zip(usize::try_from(height).ok())
+        .and_then(|(w, h)| w.checked_mul(h))
+        .ok_or_else(overflow)?;
+    let per_tile = plane.checked_mul(3).ok_or_else(overflow)?;
+    let total = per_tile.checked_mul(tiles.len()).ok_or_else(overflow)?;
+
+    let mut data = vec![0.0_f32; total];
+    for (tile, chunk) in tiles.iter().zip(data.chunks_exact_mut(per_tile)) {
+        // Channel-major within the tile: R plane, then G, then B.
+        for (i, pixel) in tile.pixels().enumerate() {
+            for (c, &value) in pixel.0.iter().enumerate() {
+                chunk[c * plane + i] = normalize_det_channel(c, value);
+            }
+        }
+    }
+
+    Ok(DetTileBatch {
+        data,
+        count: tiles.len(),
+        width,
+        height,
     })
 }
 
@@ -228,6 +318,43 @@ mod tests {
         assert_eq!(h % DET_STRIDE, 0);
         assert_eq!(w, 960);
         assert_eq!(h, 480);
+    }
+
+    #[test]
+    fn det_tiles_reject_empty_unaligned_and_mixed_sizes() {
+        let tile = |w, h| RgbImage::new(w, h);
+        let is_shape = |r: Result<DetTileBatch, OrtError>| matches!(r, Err(OrtError::TensorShape { .. }));
+        assert!(is_shape(preprocess_det_tiles(&[])));
+        assert!(is_shape(preprocess_det_tiles(&[tile(0, 32)])));
+        assert!(is_shape(preprocess_det_tiles(&[tile(33, 32)])));
+        assert!(is_shape(preprocess_det_tiles(&[tile(32, 48)])));
+        assert!(is_shape(preprocess_det_tiles(&[tile(64, 32), tile(32, 64)])));
+        assert!(is_shape(preprocess_det_tiles(&[tile(32, 32), tile(32, 32), tile(64, 32)])));
+    }
+
+    #[test]
+    fn det_tiles_layout_matches_page_normalization() {
+        // Two 32x32 tiles: tile 0 has one red pixel at (1, 0), tile 1 is uniform grey.
+        let mut first = RgbImage::from_pixel(32, 32, image::Rgb([0, 0, 0]));
+        first.put_pixel(1, 0, image::Rgb([255, 10, 20]));
+        let second = RgbImage::from_pixel(32, 32, image::Rgb([128, 128, 128]));
+        let batch = preprocess_det_tiles(&[first, second]).expect("aligned tiles");
+        assert_eq!((batch.count, batch.width, batch.height), (2, 32, 32));
+        let plane = 32 * 32;
+        assert_eq!(batch.data.len(), 2 * 3 * plane);
+        // Tile 0, pixel index 1, per channel plane.
+        assert!((batch.data[1] - normalize_det_channel(0, 255)).abs() < 1e-7);
+        assert!((batch.data[plane + 1] - normalize_det_channel(1, 10)).abs() < 1e-7);
+        assert!((batch.data[2 * plane + 1] - normalize_det_channel(2, 20)).abs() < 1e-7);
+        // Tile 1 starts after tile 0's three planes.
+        assert!((batch.data[3 * plane] - normalize_det_channel(0, 128)).abs() < 1e-7);
+        assert!((batch.data[5 * plane + plane - 1] - normalize_det_channel(2, 128)).abs() < 1e-7);
+
+        // A 32x32 page needs no resize in `preprocess_det`, so both paths must agree exactly.
+        let mut page = RgbaImage::from_pixel(32, 32, image::Rgba([0, 0, 0, 255]));
+        page.put_pixel(1, 0, image::Rgba([255, 10, 20, 255]));
+        let page_input = preprocess_det(&page).expect("page preprocess");
+        assert_eq!(page_input.data, batch.data[..3 * plane]);
     }
 
     #[test]

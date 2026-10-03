@@ -82,7 +82,8 @@ use crate::tools::region_edit_v2::geometry::FrameConstraints;
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
 use eframe::egui;
-use image::{ColorType, ImageEncoder};
+// The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
+use crate::tools::region_png::{encode_color_image_png_rgba, encode_mask_png_l8};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

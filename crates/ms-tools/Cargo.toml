@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 # The host-neutral tooling primitives extracted from `src/tools/`: the reusable mask
-# brush, the polygon scanline rasterizer, the shared red-black SOR kernel, the dense
-# overlay-pixel solve, and the «Заплатка» (patch) tool core. Re-exported by the binary
+# brush, the polygon scanline rasterizer (re-exported from `ms-raster`), the shared
+# red-black SOR kernel, the dense overlay-pixel solve, the AI-backend wire PNG encoders,
+# and the «Заплатка» (patch) tool core. Re-exported by the binary
 # as `crate::tools`, so every existing `crate::tools::...` call site keeps its path.
 #
 # Layer: ABOVE `ms-canvas` / `ms-widgets` (it borrows `OverlayRectPx` and a slider),
@@ -28,7 +29,14 @@ ms-i18n = { path = "../ms-i18n" }
 ms-log = { path = "../ms-log" }
 # The project thread wrapper for the patch tool's background membrane solve.
 ms-thread = { path = "../ms-thread" }
+# The one polygon scanline rasterizer, re-exported as `ms_tools::fill_polygon_spans` so every
+# existing caller keeps its path. A level-0 leaf (std + thiserror), no layering constraint.
+ms-raster = { path = "../ms-raster" }
+# The PNG codec behind `png_wire`, the one encoder of the region/mask PNGs sent to the AI
+# backend. Same workspace entry the tabs already build, so it adds no new compile unit.
+image.workspace = true
 # Parallel span/solve passes in the SOR kernel and the membrane solve.
 rayon.workspace = true
-# Typed public errors for the patch core (`PatchInputError`, `PatchError`, `DragRefusal`).
+# Typed public errors for the patch core (`PatchInputError`, `PatchError`, `DragRefusal`) and
+# `png_wire::PngWireError`.
 thiserror.workspace = true

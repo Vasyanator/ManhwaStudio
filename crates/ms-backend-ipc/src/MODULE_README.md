@@ -72,10 +72,19 @@ is ephemeral and published per process.
 - `protocol.rs`: constants mirroring `modules/ai_backend/ipc/protocol.py` (version,
   kinds, statuses, topics, method names, header keys) + header builders. It is the index
   of backend methods: names are dotted `<domain>.<action>` strings (`health`,
-  `ocr.manga`, `inpaint.lama_v2`, `textdetector.ctd`, …), not HTTP paths. Values must
+  `ocr.manga`, `inpaint.lama_v2`, `textdetector.ctd.forward`, …), not HTTP paths. Values must
   match Python byte-for-byte. Edit here when the shared contract changes. Its
   `python_protocol_version_matches_rust` test reads the Python file and asserts the
   two `PROTOCOL_VERSION` constants agree.
+- `textdetector.rs`: the forward-only text-detector wire contract (`PROTOCOL.md` §5.3):
+  `ForwardEngine` (method, align, map stride, channel names per engine — mirrored by
+  `FORWARD_SPECS` in `modules/ai_backend/ipc/handlers/textdetector.py`), `build_forward_request`
+  (equal-size RGB tiles -> `{n, width, height}` + concatenated blob), `decode_forward_response`
+  (header + blob -> `ForwardMaps`, raw `u8` maps) and `max_tiles_per_request` (batch bound for
+  BOTH frame directions within a caller-chosen percent of `MAX_BLOB_BYTES`; the only owner of
+  the tiles-per-frame rule, callers pass their safety margin instead of re-deriving it). Pure and fully validated (`ForwardWireError`, checked arithmetic); it
+  knows no image or probability-map type, so callers wrap the bytes themselves. Edit here when the
+  detector wire shape changes, together with the Python handler and a `PROTOCOL_VERSION` bump.
 - `frame.rs`: the frame codec (`Frame`, `read_frame`, `write_frame`). Edit here for
   wire-format / size-guard changes.
 - `transport.rs`: connection primitives — `BackendStream` (Read/Write/clone/shutdown),
@@ -88,7 +97,7 @@ is ephemeral and published per process.
 
 ## Contracts and invariants
 - Crate boundary: this crate depends on `ms-log` (diagnostics), `ms-i18n` (user-facing
-  failure strings), `ms-thread` (worker threads), `serde_json` and `web-time`, plus
+  failure strings), `ms-thread` (worker threads), `serde_json`, `web-time` and `thiserror`, plus
   `tungstenite` (native) and `uds_windows` (Windows). It must NOT gain a dependency on
   application layers (`config`, `project`, the tabs) or on egui — the whole point of the
   extraction is that it is a GUI-free leaf that type-checks in parallel with the binary.
@@ -156,6 +165,8 @@ false`. A timeout at step (3) is therefore a real backend/protocol failure, not 
 symptom: read the backend log the test prints before blaming the environment.
 
 ## Editing map
+- To change the text-detector forward contract, see `textdetector.rs` (mirror
+  `handlers/textdetector.py`, update `PROTOCOL.md` §5.3, bump `PROTOCOL_VERSION`).
 - To change the wire format or size guards, see `frame.rs` (+ `protocol.rs` guards) and
   keep `modules/ai_backend/ipc` in sync.
 - To add/adjust a method, topic, or header key, see `protocol.rs` (mirror Python), and

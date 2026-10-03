@@ -15,7 +15,8 @@ Main responsibilities:
   `parse_flux2_status`, `parse_flux2_component_snapshot`);
 - request a component load/unload and read the catalog it answers with;
 - translate a prompt to English through the shared MT service;
-- encode the colour image and the mask into the single PNG blob the request carries.
+- pack the colour image and the mask PNGs (encoded by `tools::region_png`, the cleaning face
+  of `ms_tools::png_wire`) into the single blob the request carries.
 
 Key functions:
 - `run_flux2_klein()`, `run_flux2_klein_pass()`, `flux2_stream_call()`
@@ -24,7 +25,7 @@ Key functions:
 - `unload_flux2_klein()`, `flux2_component_action_header()`,
   `run_flux2_component_action()`
 - `translate_prompt_to_english()`, `map_flux2_call_error()`
-- `concat_image_mask()`, `encode_color_image_png_rgba()`, `encode_mask_png_l8()`
+- `concat_image_mask()`
 
 Notes:
 Every function here runs on a WORKER thread — none of it may be called from the GUI
@@ -473,40 +474,6 @@ pub(super) fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
     blob.extend_from_slice(image_png);
     blob.extend_from_slice(mask_png);
     blob
-}
-
-pub(super) fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let (width, height) = (image.size[0], image.size[1]);
-    let width_u32 = u32::try_from(width)
-        .map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
-    let height_u32 = u32::try_from(height)
-        .map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
-    for px in &image.pixels {
-        let [r, g, b, a] = px.to_srgba_unmultiplied();
-        raw.extend_from_slice(&[r, g, b, a]);
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
-    Ok(out)
-}
-
-/// Encodes the L8 edit-permission mask. `mask` must be exactly `width * height` bytes.
-pub(super) fn encode_mask_png_l8(mask: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
-    let width_u32 = u32::try_from(width)
-        .map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
-    let height_u32 = u32::try_from(height)
-        .map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
-    if mask.len() != width.saturating_mul(height) {
-        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(mask, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -1,0 +1,314 @@
+{
+ "case": "dark_on_light",
+ "description": "Dark text on white; map 224x288 for a 230x300 source (non-uniform map->source scale). A low-score blob and a 2-px sliver exercise box_thresh and min_size.",
+ "engine": "paddle",
+ "expected": {
+  "blocks": [
+   {
+    "x1": 44,
+    "x2": 155,
+    "y1": 138,
+    "y2": 201
+   },
+   {
+    "x1": 66,
+    "x2": 164,
+    "y1": 68,
+    "y2": 100
+   },
+   {
+    "x1": 51,
+    "x2": 179,
+    "y1": 44,
+    "y2": 76
+   }
+  ],
+  "polys": [
+   {
+    "points": [
+     [
+      53.0,
+      138.0
+     ],
+     [
+      155.0,
+      161.0
+     ],
+     [
+      146.0,
+      201.0
+     ],
+     [
+      44.0,
+      178.0
+     ]
+    ],
+    "score": 0.7832803234569888
+   },
+   {
+    "points": [
+     [
+      66.0,
+      68.0
+     ],
+     [
+      164.0,
+      68.0
+     ],
+     [
+      164.0,
+      100.0
+     ],
+     [
+      66.0,
+      100.0
+     ]
+    ],
+    "score": 0.883150842927751
+   },
+   {
+    "points": [
+     [
+      51.0,
+      44.0
+     ],
+     [
+      179.0,
+      44.0
+     ],
+     [
+      179.0,
+      76.0
+     ],
+     [
+      51.0,
+      76.0
+     ]
+    ],
+    "score": 0.8853781579978882
+   }
+  ]
+ },
+ "files": {
+  "expected_mask": "expected_mask.png",
+  "input": "input.png",
+  "prob": "prob.png"
+ },
+ "intermediate": {
+  "db_candidates": [
+   {
+    "mini_box_map_px": [
+     [
+      90.0,
+      235.0
+     ],
+     [
+      134.0,
+      235.0
+     ],
+     [
+      134.0,
+      245.0
+     ],
+     [
+      90.0,
+      245.0
+     ]
+    ],
+    "score": 0.4593701812956068,
+    "short_side_pre": 10.0,
+    "skipped_lt_box_thresh": true,
+    "skipped_lt_min_size": false
+   },
+   {
+    "box_map_px": [
+     [
+      51.5617561340332,
+      132.66513061523438
+     ],
+     [
+      150.63116455078125,
+      154.82540893554688
+     ],
+     [
+      142.1549835205078,
+      192.71890258789062
+     ],
+     [
+      43.085575103759766,
+      170.55862426757812
+     ]
+    ],
+    "mini_box_map_px": [
+     [
+      60.81951141357422,
+      148.17559814453125
+     ],
+     [
+      136.760986328125,
+      164.44876098632812
+     ],
+     [
+      133.84878540039062,
+      178.03900146484375
+     ],
+     [
+      57.907310485839844,
+      161.76583862304688
+     ]
+    ],
+    "score": 0.7832803234569888,
+    "short_side_post": 38.82991027832031,
+    "short_side_pre": 13.898764610290527,
+    "skipped_lt_box_thresh": false,
+    "skipped_lt_min_size": false,
+    "skipped_post_lt_min_size_plus_2": false
+   },
+   {
+    "box_map_px": [
+     [
+      64.0,
+      65.0
+     ],
+     [
+      160.0,
+      65.0
+     ],
+     [
+      160.0,
+      96.0
+     ],
+     [
+      64.0,
+      96.0
+     ]
+    ],
+    "mini_box_map_px": [
+     [
+      74.0,
+      75.0
+     ],
+     [
+      150.0,
+      75.0
+     ],
+     [
+      150.0,
+      86.0
+     ],
+     [
+      74.0,
+      86.0
+     ]
+    ],
+    "score": 0.883150842927751,
+    "short_side_post": 31.0,
+    "short_side_pre": 11.0,
+    "skipped_lt_box_thresh": false,
+    "skipped_lt_min_size": false,
+    "skipped_post_lt_min_size_plus_2": false
+   },
+   {
+    "box_map_px": [
+     [
+      50.0,
+      42.0
+     ],
+     [
+      174.0,
+      42.0
+     ],
+     [
+      174.0,
+      73.0
+     ],
+     [
+      50.0,
+      73.0
+     ]
+    ],
+    "mini_box_map_px": [
+     [
+      60.0,
+      52.0
+     ],
+     [
+      164.0,
+      52.0
+     ],
+     [
+      164.0,
+      63.0
+     ],
+     [
+      60.0,
+      63.0
+     ]
+    ],
+    "score": 0.8853781579978882,
+    "short_side_post": 31.0,
+    "short_side_pre": 11.0,
+    "skipped_lt_box_thresh": false,
+    "skipped_lt_min_size": false,
+    "skipped_post_lt_min_size_plus_2": false
+   },
+   {
+    "mini_box_map_px": [
+     [
+      195.0,
+      19.0
+     ],
+     [
+      214.0,
+      19.0
+     ],
+     [
+      214.0,
+      21.0
+     ],
+     [
+      195.0,
+      21.0
+     ]
+    ],
+    "short_side_pre": 2.0,
+    "skipped_lt_min_size": true
+   }
+  ],
+  "glyph_branches": [
+   {
+    "branch": "dark",
+    "dark_fill": 0.09347098214285714,
+    "mean_sat": 4.842212189616252,
+    "poly_index": 0
+   },
+   {
+    "branch": "dark",
+    "dark_fill": 0.18610345883073157,
+    "mean_sat": 7.680440771349862,
+    "poly_index": 1
+   },
+   {
+    "branch": "dark",
+    "dark_fill": 0.19755696499882547,
+    "mean_sat": 7.963589382194034,
+    "poly_index": 2
+   }
+  ]
+ },
+ "map_size": [
+  224,
+  288
+ ],
+ "params": {
+  "db_box_thresh": 0.6,
+  "db_max_candidates": 1000,
+  "db_min_size": 3,
+  "db_thresh": 0.3,
+  "db_unclip_ratio": 2.0
+ },
+ "source_size": [
+  230,
+  300
+ ]
+}

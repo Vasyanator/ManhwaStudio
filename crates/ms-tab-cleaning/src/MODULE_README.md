@@ -9,8 +9,8 @@ surface of its own.
 This directory is the crate root of `ms-tab-cleaning`, re-exported by the binary from
 `src/tabs/mod.rs` as `crate::tabs::cleaning`, so every existing
 `crate::tabs::cleaning::…` path stays valid. Layer: the TOP of the library stack — above
-`ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets` and `ms-tab-translation` (backend
-health, the text detector and the MT service), and below only `app.rs`, which calls
+`ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets`, the level-0 `ms-raster` (square
+dilation) and `ms-tab-translation` (backend health, the text detector and the MT service), and below only `app.rs`, which calls
 `CleaningTabState::draw`. It must never name `app` or `launcher`. There is NO dependency on
 `ms-tab-typing`: the only thing shared with it is the atomic document-write RECIPE that
 `tools/watermark_library.rs` reimplements, because that crate's `panel/doc_store.rs` is
@@ -81,8 +81,12 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `evolve_mask_to_homogeneous` on both in parallel (`rayon::join`) -> coverage/area selection
   -> universal `clip_fill_to_bubble_interior` -> conditional background-only padding ->
   `final_sanity_trim`. The thin `autoclean_page` wrapper is the only egui-touching part; it
-  rasterizes the winning `RegionFill`s into the overlay patch. Includes synthetic pipeline and
+  rasterizes the winning `RegionFill`s into the overlay patch. Its entry guard (sides fit
+  `i32`, area fits `usize`, mask is exactly `width * height` bytes) returns
+  `AutocleanInputError`, which `tab.rs` reports as a failed page; the engine relies on it. Includes synthetic pipeline and
   characterization tests. Detector boxes arrive from `tab.rs` already in page-pixel space.
+  Both of its dilations (cluster slack, 0/255; stroke growth in place, keeping existing nonzero
+  values) are thin adapters over the one square dilation `ms_raster::dilate_square`.
 - `clean_status.rs`: the «Клин» tab's clean-folder status area — up to two dismissible warnings
   below the hints: the CURRENT page's committed `clean_layers/<source stem>.png` was skipped by
   the overlay loader for its size, and a clean file (committed or staging) that matches no page.

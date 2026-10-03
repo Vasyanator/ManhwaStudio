@@ -14,6 +14,9 @@ Submodules:
   process-global per-root socket-name holder used by `--ignore-installed`).
 - `protocol`: Rust mirror of `modules/ai_backend/ipc/protocol.py` — protocol
   version, kind/topic/method/header constants.
+- `textdetector`: the forward-only text-detector wire contract (`ForwardEngine`,
+  `build_forward_request`, `decode_forward_response`, `max_tiles_per_request`); pure
+  functions over bytes and JSON, no I/O.
 - `frame`: the frame codec (`Frame`, `read_frame`, `write_frame`) implementing
   the `[u32 BE header_len][header_json][u32 BE blob_len][blob]` wire format.
 - `client`: the framed, multiplexed `BackendClient` (background reader thread,
@@ -40,6 +43,7 @@ extern crate ms_i18n;
 pub mod client;
 pub mod frame;
 pub mod protocol;
+pub mod textdetector;
 pub mod transport;
 
 // `backend_socket_path` is the single source of truth for the IPC socket path,

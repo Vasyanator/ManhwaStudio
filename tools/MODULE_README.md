@@ -4,7 +4,7 @@
 Offline developer/agent utilities that operate on the repository but are **not**
 part of the shipped runtime. Nothing here is imported by `src/` or the `crates/`.
 
-Three unrelated concerns live here:
+Several unrelated concerns live here:
 
 - **i18n migration** (`i18n_extract.py`) — routing the ~4,800 hardcoded Russian UI
   string literals through the `ms-i18n` `t!` / `tf!` macros. Run by hand during
@@ -12,9 +12,11 @@ Three unrelated concerns live here:
 - **font-bundle audit** (`check_font_bundle.py`) — checking `fonts/` against the app's
   font-IDENTITY rules before the identity code ever sees the files. Run by hand when
   the bundle changes.
-- **fixture generation** (`make_ellipsis_ligature_fixture.py`) — building the one
-  committed test font of `ms-text-render`. Run by hand only when that fixture's
-  contract changes.
+- **fixture generation** (`make_ellipsis_ligature_fixture.py`,
+  `make_text_detect_fixtures.py`) — building committed test fixtures: the one test
+  font of `ms-text-render`, and the golden text-detector postprocess fixtures of
+  `ms-text-detect` recorded from the Python backend. Run by hand only when a
+  fixture's contract changes.
 - **`run-dev/`** — the source-run entry point (update from git, provision Rust,
   `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
   and is invoked through the launchers in the project root. It has its own
@@ -22,9 +24,10 @@ Three unrelated concerns live here:
 
 ## Architecture
 The i18n tool is pure Python 3 (stdlib only — no third-party deps) and is a
-single-file pipeline. The font-bundle audit is the one tool here with a third-party
-dependency (`fontTools`, already installed in the project's `venv/`), because it has to
-read `name` tables. Migration is **two-step**: the tool finds and rewrites
+single-file pipeline. The font tools (audit and ligature fixture) depend on `fontTools`
+because they read and write font tables. The text-detector fixture generator depends on the
+backend's own stack (numpy, OpenCV, Torch, pyclipper, shapely, surya), because it runs the
+backend code. All of these are already installed in the project's `venv/`. Migration is **two-step**: the tool finds and rewrites
 deterministically; a human supplies the semantic key names. The tool never
 invents a final key.
 
@@ -111,6 +114,21 @@ detection cannot be fooled by punctuation inside strings or comments.
   pinned to `FIXED_TIMESTAMP` and `recalcTimestamp` is off, so two runs produce
   the same sha256 and a rerun shows up in `git status` only when something real
   changed. Keep it that way when editing the script.
+- `make_text_detect_fixtures.py`: records golden fixtures under
+  `crates/ms-text-detect/fixtures/{ctd,paddle,surya}/` from the CURRENT Python
+  postprocess, so the Rust ports can be parity-tested. It needs no model weights:
+  it imports the backend as `modules.ai_backend.*` (repo root on `sys.path`, as the
+  backend tests do) and calls the real service entry points with a fake network
+  whose output is a stored u8 map. It captures intermediates through in-process
+  wrappers, never by editing backend files. Run:
+  `./venv/bin/python tools/make_text_detect_fixtures.py`. Exit `0` = written,
+  `1` = a generated case broke a robustness or coverage rule, `2` = reference
+  modules or packages are absent (after the backend became forward-only, the
+  committed fixtures are final). Output is byte-deterministic, and
+  `fixtures/manifest.json` records the git revision and library versions. The
+  fixture format and the upstream quirks a port must replicate are documented in
+  `crates/ms-text-detect/fixtures/README.md`; keep that file in sync with the
+  script.
 - `test_i18n_extract.py`: stdlib `unittest` suite. Covers lexing (raw strings,
   comments, char literals, escapes), classification precedence, `concat!` refusal,
   `format!`->`tf!` placeholder conversion, suggested-key stability/collisions, the
@@ -167,6 +185,9 @@ detection cannot be fooled by punctuation inside strings or comments.
   (notably the §C `id_salt` insertions and any `REVIEW`-flagged sites).
 
 ## Editing map
+- To add or change a text-detector fixture case, edit the `*_cases()` builders in
+  `make_text_detect_fixtures.py`, rerun it, and update
+  `crates/ms-text-detect/fixtures/README.md` if the case list or format changed.
 - To change how the font bundle is audited (a validity rule, the merge key, the hash),
   see `check_font_bundle.py` — and mirror the change from
   `src/tabs/typing/panel/fonts.rs`, never the other way round.

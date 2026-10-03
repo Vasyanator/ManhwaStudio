@@ -46,9 +46,9 @@ use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_tab_translation::text_detector::{
     TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, detect_ai_ctd_mask_for_image,
-    detect_paddle_mask_for_image, detect_surya_mask_for_image, encode_color_image_png_rgba,
-    parse_mask_alpha_from_blob,
+    detect_paddle_mask_for_image, detect_surya_mask_for_image,
 };
+use super::region_png::{decode_mask_png, encode_color_image_png_rgba};
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
@@ -789,7 +789,7 @@ fn detect_watermark_mask(
     if mask_blob.is_empty() {
         return Err(t!("cleaning.tools.watermark.no_mask_result_error").to_string());
     }
-    parse_mask_alpha_from_blob(&mask_blob)
+    decode_mask_png(&mask_blob)
 }
 
 /// Issues the streaming `watermark.detect` request. Each `progress` frame carries

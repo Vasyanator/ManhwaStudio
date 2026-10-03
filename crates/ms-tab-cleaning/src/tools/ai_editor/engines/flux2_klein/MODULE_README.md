@@ -128,7 +128,7 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   `mask_for_run`, `apply_backend_flags` and `spawn_flux2_picker`.
 - `wire.rs`: `run_flux2_klein` with its OOM retry pass, `flux2_stream_call`, the
   `.status` and `.component_action` calls and their parsers, the prompt translation and
-  the image/mask PNG encoding.
+  the image/mask blob packing (the PNGs come from `tools/region_png.rs`).
 - `test_support.rs`: `cfg(test)` only. The fixtures every `mod tests` here is built from
   (`runnable_settings`, `cacheable_settings`, `status_with_present`,
   `status_with_components`, `FLUX2_ALL_COMPONENTS`, `region_rect`,

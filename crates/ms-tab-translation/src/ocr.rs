@@ -1001,7 +1001,7 @@ fn log_native_fallback_once() {
 /// provider `native_runtime` will actually load. Shared by [`try_native_ocr`] (which
 /// dispatches on it) and the load-time warmup (which uses it to skip the backend
 /// warmup when the route is native), so both agree on the routing decision.
-/// Mirrors `text_detector::current_detector_route`.
+/// Mirrors `text_detector::native::current_detector_route`.
 #[cfg(not(target_arch = "wasm32"))]
 fn current_ocr_route(engine: OcrEngine, manga_model_key: &str) -> OcrRoute {
     let (runtime, decision) = read_ocr_route_inputs();

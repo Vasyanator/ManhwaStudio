@@ -179,7 +179,7 @@ layer — instead of solving in a plane that does not contain it.
 - To change the solve — the pyramid, the sweep counts, the Dirichlet weight, the blend modes or the
   feather ramp — edit `membrane.rs`. Every constant there is named and carries its rationale.
 - To change the shared SOR kernel itself, edit `../sor.rs`; both consumers must be re-verified.
-- To change the polygon rasterization rule, edit `../polygon_mask.rs` — it is shared with the
+- To change the polygon rasterization rule, edit `crates/ms-raster/src/polygon.rs` — it is shared with the
   PS-editor's selection and its sampling rule is a contract, not an implementation detail.
 - To change what the core needs from a host, edit the `PatchHost` trait; every implementor has to
   be revisited, and today that is `crates/ms-tab-cleaning/src/tools/patch/` and

@@ -23,6 +23,7 @@ rasterizes those fills into a transparent `egui::ColorImage` patch for the job l
 Key structures:
 - `UnevenBackgroundTool`: policy for clusters that do not converge (currently NoProcessing).
 - `AutocleanPageOutcome`: egui patch + per-region counts returned to the job layer.
+- `AutocleanInputError`: entry-guard rejection (page too large, mask length mismatch).
 - `AutocleanEngineResult` / `RegionFill`: GUI-free engine output.
 - `Converged` / `EvolveStats`: result of `evolve_mask_to_homogeneous`.
 - `CandidateFill`: an evolved+clipped+padded candidate ready for selection.
@@ -120,6 +121,18 @@ pub(super) struct AutocleanPageOutcome {
     pub(super) regions_partial: usize,
 }
 
+/// Why `autoclean_page` rejected its input before running the engine. `Display` is the
+/// technical text for logs; the job layer (`tab.rs`) maps each variant to a localized message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(super) enum AutocleanInputError {
+    /// A page side does not fit `i32`, or `width * height` overflows `usize`.
+    #[error("page {width}x{height} exceeds the autoclean coordinate range")]
+    PageTooLarge { width: usize, height: usize },
+    /// The binary mask is not `width * height` bytes.
+    #[error("text mask has {len} bytes, expected {width}x{height}")]
+    MaskSizeMismatch { width: usize, height: usize, len: usize },
+}
+
 /// Одна принятая заливка кластера в глобальных координатах страницы: маска в
 /// координатах crop со смещением (`ox`, `oy`) и цвет фона.
 #[derive(Debug)]
@@ -150,6 +163,11 @@ struct AutocleanEngineResult {
 /// (по ≤ столько пикселей). `blocks` — боксы детектора текста в пиксельных координатах
 /// СТРАНИЦЫ (уже приведённые из source-space в `tab.rs`), `None` при отсутствии.
 /// `uneven_tool` — политика для не-сошедшихся кластеров (сейчас только пропуск).
+///
+/// # Errors
+/// `PageTooLarge` when a side does not fit `i32` or the area overflows `usize`;
+/// `MaskSizeMismatch` when `binary_mask` is not `width * height` bytes. Both are logged here
+/// and nothing is painted.
 pub(super) fn autoclean_page(
     base_rgba: &image::RgbaImage,
     binary_mask: &[u8],
@@ -158,7 +176,7 @@ pub(super) fn autoclean_page(
     spread_radius_px: usize,
     uneven_tool: UnevenBackgroundTool,
     blocks: Option<&[[i32; 4]]>,
-) -> AutocleanPageOutcome {
+) -> Result<AutocleanPageOutcome, AutocleanInputError> {
     // Единственная сегодня политика: не-сошедшиеся кластеры не обрабатываются
     // (они уже посчитаны в `regions_skipped` движком). Новые варианты обязаны
     // ветвиться здесь — исчерпывающий match это гарантирует.
@@ -167,22 +185,24 @@ pub(super) fn autoclean_page(
     }
 
     // Entry invariant: the whole engine does signed pixel-coordinate math in `i32` and
-    // flat `usize` indexing. Establish ONCE here that the page width, height and their
-    // product fit those types. Every crop is a sub-rect of the page, so once this holds,
-    // all downstream `dim as i32` / `idx as usize` casts in the engine are provably in
-    // range. A page that violates it is rejected (empty patch, all-skipped counters)
-    // rather than wrapping into corrupt coordinates. Real pages are far below the bound.
-    let dims_fit = i32::try_from(width).is_ok()
-        && i32::try_from(height).is_ok()
-        && width.checked_mul(height).is_some();
-    if !dims_fit {
-        return AutocleanPageOutcome {
-            patch: egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT),
-            regions_total: 0,
-            regions_filled: 0,
-            regions_skipped: 0,
-            regions_partial: 0,
-        };
+    // flat `usize` indexing over `binary_mask`. Establish ONCE here that the page width,
+    // height and their product fit those types and that the mask is exactly
+    // `width * height` bytes. Every crop is a sub-rect of the page, so once this holds,
+    // all downstream `dim as i32` / `idx as usize` casts and mask indexing in the engine are
+    // provably in range. A violation is reported as an error (the job layer counts the page
+    // as failed) rather than wrapping into corrupt coordinates or silently finding no
+    // regions. Real pages are far below the bound, and `tab.rs` builds the mask at page size.
+    let area = i32::try_from(width).ok().and(i32::try_from(height).ok()).and(width.checked_mul(height));
+    let checked = match area {
+        None => Err(AutocleanInputError::PageTooLarge { width, height }),
+        Some(area) if binary_mask.len() != area => {
+            Err(AutocleanInputError::MaskSizeMismatch { width, height, len: binary_mask.len() })
+        }
+        Some(_) => Ok(()),
+    };
+    if let Err(err) = checked {
+        ms_log::runtime_log::log_error(format!("[autoclean] page rejected before the engine: {err}"));
+        return Err(err);
     }
 
     let mut patch =
@@ -192,13 +212,13 @@ pub(super) fn autoclean_page(
     for fill in &engine.fills {
         paint_patch_from_mask(&mut patch, width, height, fill.ox, fill.oy, &fill.mask, fill.bg);
     }
-    AutocleanPageOutcome {
+    Ok(AutocleanPageOutcome {
         patch,
         regions_total: engine.regions_total,
         regions_filled: engine.regions_filled,
         regions_skipped: engine.regions_skipped,
         regions_partial: engine.regions_partial,
-    }
+    })
 }
 
 /// GUI-free ядро автоклина: кластеризация маски и покластерная обработка.
@@ -679,35 +699,38 @@ fn fill_holes(mask: &mut image::GrayImage) {
     }
 }
 
-/// 8-связная дилатация на `r` пикс. (r итераций роста на 1 пиксель).
+/// 8-connected dilation by `r` pixels in place (equal to `r` passes of 3x3 growth), through
+/// the one square dilation `ms_raster::dilate_square`.
+///
+/// Pixels the dilation newly covers become 255; pixels that were already nonzero KEEP their
+/// value (callers may rely on it). `r <= 0` is a no-op.
 fn dilate_gray_inplace(mask: &mut image::GrayImage, r: i32) {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    for _ in 0..r {
-        let src = mask.clone();
-        for y in 0..h {
-            for x in 0..w {
-                if src.get_pixel(x as u32, y as u32)[0] != 0 {
-                    continue;
-                }
-                let mut hit = false;
-                'n: for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (nx, ny) = (x + dx, y + dy);
-                        if nx >= 0
-                            && ny >= 0
-                            && nx < w
-                            && ny < h
-                            && src.get_pixel(nx as u32, ny as u32)[0] != 0
-                        {
-                            hit = true;
-                            break 'n;
-                        }
-                    }
-                }
-                if hit {
-                    mask.put_pixel(x as u32, y as u32, image::Luma([255]));
-                }
-            }
+    let Ok(radius) = usize::try_from(r) else {
+        return;
+    };
+    if radius == 0 {
+        return;
+    }
+    let (Ok(width), Ok(height)) = (usize::try_from(mask.width()), usize::try_from(mask.height())) else {
+        ms_log::runtime_log::log_error(format!(
+            "[autoclean] gray dilation skipped: {}x{} mask does not fit usize",
+            mask.width(),
+            mask.height()
+        ));
+        return;
+    };
+    // A `GrayImage` always holds exactly `width * height` bytes (an `ImageBuffer` invariant),
+    // so the length error cannot fire; it is still logged rather than ignored.
+    let grown = match ms_raster::dilate_square(mask.as_raw(), width, height, radius, radius, 255) {
+        Ok(grown) => grown,
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!("[autoclean] gray dilation skipped: {err}"));
+            return;
+        }
+    };
+    for (px, &on) in mask.iter_mut().zip(&grown) {
+        if *px == 0 && on != 0 {
+            *px = 255;
         }
     }
 }
@@ -1251,6 +1274,16 @@ fn extract_connected_components(mask: &[u8], width: usize, height: usize) -> Con
     ConnectedComponents { labels, pixels }
 }
 
+/// Square (Chebyshev) dilation of a nonzero-is-set mask by `radius` in both axes, output
+/// 0/255, through the one square dilation `ms_raster::dilate_square`.
+///
+/// `radius == 0` returns the input UNCHANGED (mixed nonzero values are not normalized). An
+/// empty `mask` or a zero side yields an empty `Vec`.
+///
+/// Precondition: `mask.len() == width * height`. The engine's only caller path enters through
+/// `autoclean_page`, whose entry guard rejects any other length with
+/// `AutocleanInputError::MaskSizeMismatch`, so the `Err` arm below is an invariant violation:
+/// it is logged and degrades to "no clusters" instead of indexing out of bounds.
 fn dilate_binary_mask(mask: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
     if mask.is_empty() || width == 0 || height == 0 {
         return Vec::new();
@@ -1258,27 +1291,13 @@ fn dilate_binary_mask(mask: &[u8], width: usize, height: usize, radius: usize) -
     if radius == 0 {
         return mask.to_vec();
     }
-    let mut out = vec![0u8; mask.len()];
-    for y in 0..height {
-        let y0 = y.saturating_sub(radius);
-        let y1 = (y + radius).min(height - 1);
-        for x in 0..width {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(width - 1);
-            let mut any = false;
-            'scan: for yy in y0..=y1 {
-                let row = yy.saturating_mul(width);
-                for xx in x0..=x1 {
-                    if mask[row + xx] != 0 {
-                        any = true;
-                        break 'scan;
-                    }
-                }
-            }
-            out[y.saturating_mul(width).saturating_add(x)] = if any { 255 } else { 0 };
+    match ms_raster::dilate_square(mask, width, height, radius, radius, 255) {
+        Ok(out) => out,
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!("[autoclean] invariant violated (mask length checked at autoclean_page entry), cluster dilation skipped: {err}"));
+            Vec::new()
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -1882,5 +1901,123 @@ mod tests {
         let engine = run_autoclean_engine(&rgba, &mask, w, h, 4, None);
         assert_eq!(engine.regions_filled, 0);
         assert!(engine.fills.is_empty());
+    }
+
+    // Characterization tests (detector Phase 1 refactor): the expected values were
+    // OBSERVED from the pre-refactor code, never derived by hand. The random mask is
+    // the same one (generator, seed, 37x23, ~8 %) the translation `dilate_binary`
+    // characterization test uses, so equal set counts across the copies are visible.
+
+    /// FNV-1a 64 over `bytes`: a compact, dependency-free fingerprint for pinned buffers.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Deterministic 64-bit LCG (Knuth MMIX constants); returns the high 31 bits.
+    fn lcg_next(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // `>> 33` leaves 31 significant bits, so the conversion cannot fail.
+        u32::try_from(*state >> 33).unwrap_or(0)
+    }
+
+    /// Random 37x23 mask with ~8 % set pixels using the mixed values 1/7/255.
+    fn characterization_mask() -> Vec<u8> {
+        let mut state = 0xd11a_7e01_u64;
+        (0..37 * 23)
+            .map(|_| {
+                let roll = lcg_next(&mut state);
+                if roll % 100 < 8 {
+                    [1u8, 7, 255][usize::try_from(roll % 3).unwrap_or(0)]
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
+    /// characterization: `dilate_binary_mask` (output 0/255; r = 0 returns the
+    /// input unchanged, mixed values included) at r = 0, 1, 3.
+    #[test]
+    fn characterization_dilate_binary_mask_random() {
+        let src = characterization_mask();
+        let observed = [0usize, 1, 3]
+            .into_iter()
+            .map(|r| {
+                let out = dilate_binary_mask(&src, 37, 23, r);
+                (r, out.iter().filter(|&&px| px != 0).count(), fnv1a64(&out))
+            })
+            .collect::<Vec<_>>();
+        // (r, set count, FNV of the output bytes); the set counts equal the
+        // translation `dilate_binary` (r, r) counts on the same mask.
+        assert_eq!(
+            observed,
+            vec![
+                (0, 64, 697_843_125_624_898_045),
+                (1, 407, 9_423_328_760_394_973_520),
+                (3, 834, 11_412_883_831_778_999_225),
+            ],
+            "observed={observed:?}"
+        );
+        assert_eq!(dilate_binary_mask(&src, 37, 23, 0), src);
+    }
+
+    /// characterization: `dilate_gray_inplace` (r passes of 3x3, writes 255, keeps
+    /// existing nonzero values) at r = 0, 1, 3 and a negative r (no-op).
+    #[test]
+    fn characterization_dilate_gray_inplace_random() {
+        let src = characterization_mask();
+        let observed = [0i32, 1, 3, -2]
+            .into_iter()
+            .map(|r| {
+                let mut mask = image::GrayImage::from_raw(37, 23, src.clone()).expect("37x23 buffer");
+                dilate_gray_inplace(&mut mask, r);
+                (r, mask.as_raw().iter().filter(|&&px| px != 0).count(), fnv1a64(mask.as_raw()))
+            })
+            .collect::<Vec<_>>();
+        // (r, set count, FNV of the mask bytes): same set counts as the square
+        // dilation copies; the bytes differ because original 1/7 values are kept.
+        assert_eq!(
+            observed,
+            vec![
+                (0, 64, 697_843_125_624_898_045),
+                (1, 407, 4_130_987_187_910_466_514),
+                (3, 834, 3_662_668_586_112_366_631),
+                (-2, 64, 697_843_125_624_898_045),
+            ],
+            "observed={observed:?}"
+        );
+    }
+
+    /// The entry guard reports a mask whose length is not `width * height` as an error
+    /// instead of letting the engine find "0 regions".
+    #[test]
+    fn autoclean_page_rejects_mask_length_mismatch() {
+        let page = image::RgbaImage::new(4, 3);
+        let outcome = autoclean_page(&page, &[255u8; 11], 4, 3, 4, UnevenBackgroundTool::NoProcessing, None);
+        assert_eq!(outcome.err(), Some(AutocleanInputError::MaskSizeMismatch { width: 4, height: 3, len: 11 }));
+    }
+
+    /// A side outside `i32` is rejected before any coordinate math (zero area: no allocation).
+    #[test]
+    fn autoclean_page_rejects_page_outside_i32() {
+        let Ok(wide) = usize::try_from(i64::from(i32::MAX) + 1) else {
+            return;
+        };
+        let page = image::RgbaImage::new(1, 1);
+        let outcome = autoclean_page(&page, &[], wide, 0, 4, UnevenBackgroundTool::NoProcessing, None);
+        assert_eq!(outcome.err(), Some(AutocleanInputError::PageTooLarge { width: wide, height: 0 }));
+    }
+
+    /// A well-formed page with an empty mask passes the guard and paints nothing.
+    #[test]
+    fn autoclean_page_accepts_matching_mask() {
+        let page = image::RgbaImage::new(4, 3);
+        let outcome = autoclean_page(&page, &[0u8; 12], 4, 3, 4, UnevenBackgroundTool::NoProcessing, None).expect("matching mask");
+        assert_eq!(outcome.regions_total, 0);
+        assert!(outcome.patch.pixels.iter().all(|px| px.a() == 0));
     }
 }

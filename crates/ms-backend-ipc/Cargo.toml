@@ -5,7 +5,7 @@ edition = "2024"
 
 # Framed IPC layer between the Rust application and the Python AI backend.
 # GUI-free: no egui, no application config, no domain types — only the wire
-# format, the transports and the client.
+# format, the transports, the client and the pure text-detector forward codec.
 [dependencies]
 # Session logging. Every connection/handshake diagnostic goes through
 # `ms_log::runtime_log`; this is the crate's only link back to the app's own layers.
@@ -21,6 +21,8 @@ ms-thread = { path = "../ms-thread" }
 serde_json.workspace = true
 # Timeouts/instants that also work under wasm, matching the rest of the workspace.
 web-time.workspace = true
+# Typed wire-contract errors (`textdetector::ForwardWireError`).
+thiserror.workspace = true
 
 # Native-only: the loopback WebSocket fallback transport used on Windows, where the
 # AF_UNIX path is not always available. The wasm build has no backend process at all

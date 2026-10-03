@@ -53,7 +53,7 @@ FILE HEADER (tabs/cleaning/tab.rs)
   Для инструментов, которым нужен `Ctrl+ЛКМ` (например, `Замазка` для прямоугольника),
   zoom также блокируется адресно на эту комбинацию.
 */
-use super::autoclean::{autoclean_page, UnevenBackgroundTool};
+use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool};
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
 use super::tools::{
     AiEditorTool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
@@ -2655,7 +2655,13 @@ fn run_quick_text_clean_on_page_impl(
         spread_radius_px,
         uneven_tool,
         blocks_page_space.as_deref(),
-    );
+    )
+    .map_err(|err| match err {
+        AutocleanInputError::PageTooLarge { width, height } => {
+            tf!("cleaning.tab.quick_clean_page_too_large_error", width = width, height = height)
+        }
+        AutocleanInputError::MaskSizeMismatch { .. } => t!("cleaning.inpaint.size_mismatch_error").to_string(),
+    })?;
     let has_patch = outcome.patch.pixels.iter().any(|px| px.a() > 0);
     Ok(QuickTextCleanPageResult {
         page_idx,

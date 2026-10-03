@@ -85,6 +85,11 @@
 # Python codec (docstore.py). Both implementations are tested against them.
 !crates/ms-docstore/fixtures/*.json
 
+# Golden text-detector postprocess fixtures of ms-text-detect (inputs and expected outputs
+# recorded from the reference Python implementation). The parity tests read them, so a clean
+# clone needs them. Regenerate with tools/make_text_detect_fixtures.py (whitelisted below).
+!crates/ms-text-detect/fixtures/**
+
 # ag-psd is a standalone project (github.com/Vasyanator/ag-psd-rs) consumed from
 # crates.io (ag-psd = "0.2.0"); its local dev checkout is not part of this repo.
 crates/ag-psd/
@@ -128,6 +133,10 @@ tools/egui_docs/*.py[cod]
 # (whitelisted above). The fixture must stay reproducible instead of being a
 # magic binary, so the one script that builds it is published with it.
 !tools/make_ellipsis_ligature_fixture.py
+
+# The generator of the committed ms-text-detect fixtures (whitelisted above), published with them
+# so the fixtures stay reproducible.
+!tools/make_text_detect_fixtures.py
 
 # The run-dev source-run scripts. Unlike the rest of tools/, these are user-facing
 # and are useless unless published: run-dev.* in the root only hands off to them.

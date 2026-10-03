@@ -1,0 +1,248 @@
+{
+ "case": "low_contrast",
+ "description": "Weak heatmap (peaks 0.42-0.55 over a 0.2 floor) 256x200 for a 180x240 source: the top-10% mean is below 0.7, so both dynamic thresholds scale down without clipping.",
+ "engine": "surya",
+ "expected": {
+  "blocks": [
+   {
+    "x1": 36,
+    "x2": 144,
+    "y1": 31,
+    "y2": 48
+   },
+   {
+    "x1": 43,
+    "x2": 137,
+    "y1": 54,
+    "y2": 70
+   },
+   {
+    "x1": 42,
+    "x2": 138,
+    "y1": 108,
+    "y2": 152
+   }
+  ],
+  "lines": [
+   {
+    "bbox": [
+     36,
+     31,
+     144,
+     48
+    ],
+    "confidence": 1.0,
+    "polygon": [
+     [
+      36.0,
+      31.0
+     ],
+     [
+      144.0,
+      31.0
+     ],
+     [
+      144.0,
+      48.0
+     ],
+     [
+      36.0,
+      48.0
+     ]
+    ]
+   },
+   {
+    "bbox": [
+     43,
+     54,
+     137,
+     70
+    ],
+    "confidence": 1.0,
+    "polygon": [
+     [
+      43.0,
+      54.0
+     ],
+     [
+      137.0,
+      54.0
+     ],
+     [
+      137.0,
+      70.0
+     ],
+     [
+      43.0,
+      70.0
+     ]
+    ]
+   },
+   {
+    "bbox": [
+     42,
+     108,
+     138,
+     152
+    ],
+    "confidence": 0.9071428129411495,
+    "polygon": [
+     [
+      42.0,
+      128.0
+     ],
+     [
+      137.0,
+      108.0
+     ],
+     [
+      138.0,
+      132.0
+     ],
+     [
+      43.0,
+      152.0
+     ]
+    ]
+   }
+  ]
+ },
+ "files": {
+  "expected_mask": "expected_mask.png",
+  "heat": "heat.png",
+  "input": "input.png",
+  "proc_mask": "proc_mask.png"
+ },
+ "intermediate": {
+  "components": [
+   {
+    "area": 1657,
+    "bbox_xywh": [
+     53,
+     28,
+     151,
+     11
+    ],
+    "label": 1,
+    "max": 0.5490196347236633,
+    "outcome": "kept"
+   },
+   {
+    "area": 1437,
+    "bbox_xywh": [
+     63,
+     47,
+     131,
+     11
+    ],
+    "label": 2,
+    "max": 0.5490196347236633,
+    "outcome": "kept"
+   },
+   {
+    "area": 1377,
+    "bbox_xywh": [
+     63,
+     96,
+     131,
+     26
+    ],
+    "label": 3,
+    "max": 0.49803921580314636,
+    "outcome": "kept"
+   },
+   {
+    "area": 810,
+    "bbox_xywh": [
+     84,
+     163,
+     90,
+     9
+    ],
+    "label": 4,
+    "max": 0.41960784792900085,
+    "outcome": "max_lt_text_threshold"
+   }
+  ],
+  "dynamic_low_text_f32": 0.286659836769104,
+  "dynamic_text_threshold_f32": 0.49141690135002136,
+  "label_count": 4,
+  "max_confidence": 0.5490196347236633,
+  "proc_boxes": [
+   [
+    [
+     52.0,
+     27.0
+    ],
+    [
+     205.0,
+     27.0
+    ],
+    [
+     205.0,
+     40.0
+    ],
+    [
+     52.0,
+     40.0
+    ]
+   ],
+   [
+    [
+     62.0,
+     46.0
+    ],
+    [
+     195.0,
+     46.0
+    ],
+    [
+     195.0,
+     59.0
+    ],
+    [
+     62.0,
+     59.0
+    ]
+   ],
+   [
+    [
+     60.092369079589844,
+     108.73844909667969
+    ],
+    [
+     194.861572265625,
+     91.89230346679688
+    ],
+    [
+     196.923095703125,
+     108.38461303710938
+    ],
+    [
+     62.153900146484375,
+     125.23075866699219
+    ]
+   ]
+  ],
+  "proc_confidences": [
+   1.0,
+   1.0,
+   0.9071428129411495
+  ]
+ },
+ "map_size": [
+  256,
+  200
+ ],
+ "params": {
+  "low_text": 0.35,
+  "min_component_area": 10,
+  "text_threshold": 0.6,
+  "typical_top10_avg": 0.7,
+  "y_expand_margin": 0.05
+ },
+ "source_size": [
+  180,
+  240
+ ]
+}

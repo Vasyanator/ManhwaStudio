@@ -49,7 +49,8 @@ TranslationTabState lifecycle:
 
 TranslationTabState public API:
 - `sync_with_project_settings`: lazy-loads OCR/MT/composition/text-detector settings.
-- `draw_side_panel`: draws floating panel window and active panel body.
+- `draw_side_panel`: draws floating panel window and active panel body (takes the app's
+  `page_infos` for the detector panel's per-page plan notice).
 - `toggle_bubbles_panel_hotkey`, `toggle_ocr_panel_hotkey`,
   `toggle_composition_panel_hotkey`, `toggle_machine_translation_panel_hotkey`,
   `toggle_text_detector_panel_hotkey`: hotkey actions to toggle translation panels.
@@ -246,13 +247,14 @@ use crate::panels::ocr::{
     CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel,
 };
 use crate::panels::text_detector::{
-    TextDetectorAlgorithm, TextDetectorPanelOptions, draw_text_detector_panel,
+    TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
+    detector_page_size, draw_text_detector_panel,
 };
 use crate::text_detector::{
-    TextDetectorAiCtdOptions, TextDetectorControllerEvent, TextDetectorPaddleOcrOptions,
-    TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode, TextDetectorSuryaOptions,
+    TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
     TranslationTextDetectorController,
 };
+use ms_models::page_view::PageImageInfo;
 use ms_tools::MaskBrush;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
@@ -686,6 +688,7 @@ pub struct TranslationTabState {
     mt_panel_options: MtPanelOptions,
     text_detector_controller: TranslationTextDetectorController,
     text_detector_options: TextDetectorPanelOptions,
+    text_detector_plan_notice: TextDetectorPlanNoticeCache,
     text_detector_results: HashMap<usize, TextDetectorPageResult>,
     text_detector_mask_textures: HashMap<usize, TextDetectorMaskTexturePage>,
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
@@ -960,6 +963,7 @@ impl TranslationTabState {
             mt_panel_options: MtPanelOptions::default(),
             text_detector_controller: TranslationTextDetectorController::default(),
             text_detector_options: TextDetectorPanelOptions::default(),
+            text_detector_plan_notice: TextDetectorPlanNoticeCache::default(),
             text_detector_results: HashMap::new(),
             text_detector_mask_textures: HashMap::new(),
             text_mask_model: None,
@@ -1262,6 +1266,7 @@ impl TranslationTabState {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        page_infos: &HashMap<usize, PageImageInfo>,
     ) {
         if self.active_panel == TranslationPanel::None {
             return;
@@ -1296,7 +1301,7 @@ impl TranslationTabState {
             .default_size(egui::vec2(360.0, 460.0))
             .resizable(true)
             .show(ctx, |ui| {
-                self.draw_active_panel(ui, ctx, canvas, project);
+                self.draw_active_panel(ui, ctx, canvas, project, page_infos);
             });
         if !panel_open {
             if self.active_panel == TranslationPanel::TextDetector {
@@ -1427,12 +1432,15 @@ impl TranslationTabState {
             .then(|| t!("translation.common.pytorch_not_installed_status").to_string())
     }
 
+    /// Draws the body of the active panel. `page_infos` (the app's decoded page sizes) feeds
+    /// the detector panel's per-page plan notice.
     fn draw_active_panel(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        page_infos: &HashMap<usize, PageImageInfo>,
     ) {
         // Keep the native-ORT capability fresh for EVERY panel (not just OCR): the
         // detector panel also gates algorithm buttons on onnx availability, so the
@@ -1625,16 +1633,10 @@ impl TranslationTabState {
             TranslationPanel::TextDetector => {
                 self.ensure_text_detection_storage_loaded(project);
                 let has_pages = !project.pages.is_empty();
-                let can_detect = match self.text_detector_options.algorithm {
-                    TextDetectorAlgorithm::Classic => true,
-                    TextDetectorAlgorithm::PaddleOcr => self.ai_enabled,
-                    TextDetectorAlgorithm::Ai => {
-                        self.ai_enabled && !matches!(self.ai_backend_torch_available(), Some(false))
-                    }
-                    TextDetectorAlgorithm::Surya => {
-                        self.ai_enabled && !matches!(self.ai_backend_torch_available(), Some(false))
-                    }
-                };
+                let availability = self
+                    .text_detector_options
+                    .algorithm
+                    .availability(self.ai_enabled, self.ai_backend_torch_available());
                 let can_ocr_current = self.ai_enabled
                     && self.ocr_controller.state() == OcrLoadState::Ready
                     && self.has_detected_blocks_on_page(canvas.current_page_idx());
@@ -1644,21 +1646,27 @@ impl TranslationTabState {
                 let can_save =
                     !self.text_detector_results.is_empty() && !self.text_detection_storage_busy;
                 let ocr_busy = self.textdetector_ocr_is_running();
-                let actions = draw_text_detector_panel(
-                    ui,
-                    &mut self.text_detector_options,
-                    &self.text_detector_status,
-                    self.text_detector_status_severity.color(),
-                    self.text_detector_progress,
-                    self.text_detector_controller.is_busy(),
+                let page_size = detector_page_size(page_infos.get(&canvas.current_page_idx()));
+                let view = TextDetectorPanelView {
+                    status_text: &self.text_detector_status,
+                    status_color: self.text_detector_status_severity.color(),
+                    progress: self.text_detector_progress,
+                    detect_busy: self.text_detector_controller.is_busy(),
                     ocr_busy,
                     has_pages,
-                    can_detect,
+                    availability,
                     can_ocr_current,
                     can_ocr_all,
                     can_save,
-                    self.text_detector_edit_lines_mode,
-                    self.text_detector_edit_mask_mode,
+                    edit_lines_mode: self.text_detector_edit_lines_mode,
+                    edit_mask_mode: self.text_detector_edit_mask_mode,
+                    page_size,
+                };
+                let actions = draw_text_detector_panel(
+                    ui,
+                    &mut self.text_detector_options,
+                    &mut self.text_detector_plan_notice,
+                    &view,
                 );
                 if actions.options_changed {
                     self.text_detector_settings_dirty = true;
@@ -3001,45 +3009,15 @@ impl TranslationTabState {
                 && self.textdetector_ocr_done < self.textdetector_ocr_total)
     }
 
+    /// Builds the run mode for the selected algorithm (`TextDetectorPanelOptions::run_mode`,
+    /// the same mode the panel's plan notice uses), or the localized refusal text when
+    /// [`TextDetectorAlgorithm::availability`] says it cannot run now.
     fn text_detector_run_mode(&self) -> Result<TextDetectorRunMode, String> {
-        match self.text_detector_options.algorithm {
-            TextDetectorAlgorithm::Classic => Ok(TextDetectorRunMode::Classic),
-            TextDetectorAlgorithm::PaddleOcr => {
-                if !self.ai_enabled {
-                    return Err(t!("translation.text_detector.paddle_disabled_status").to_string());
-                }
-                Ok(TextDetectorRunMode::PaddleOcr(
-                    TextDetectorPaddleOcrOptions::default(),
-                ))
-            }
-            TextDetectorAlgorithm::Ai => {
-                if !self.ai_enabled {
-                    return Err(t!("translation.text_detector.ai_disabled_status").to_string());
-                }
-                if matches!(self.ai_backend_torch_available(), Some(false)) {
-                    return Err(t!("translation.common.pytorch_not_installed_status").to_string());
-                }
-                Ok(TextDetectorRunMode::AiCtd(TextDetectorAiCtdOptions {
-                    detect_size: self.text_detector_options.ai_detect_size,
-                    det_rearrange_max_batches: self
-                        .text_detector_options
-                        .ai_det_rearrange_max_batches,
-                    font_size_multiplier: self.text_detector_options.ai_font_size_multiplier,
-                    font_size_max: self.text_detector_options.ai_font_size_max,
-                    font_size_min: self.text_detector_options.ai_font_size_min,
-                    mask_dilate_size: 0,
-                }))
-            }
-            TextDetectorAlgorithm::Surya => {
-                if !self.ai_enabled {
-                    return Err(t!("translation.text_detector.surya_disabled_status").to_string());
-                }
-                if matches!(self.ai_backend_torch_available(), Some(false)) {
-                    return Err(t!("translation.common.pytorch_not_installed_status").to_string());
-                }
-                Ok(TextDetectorRunMode::Surya(TextDetectorSuryaOptions))
-            }
-        }
+        let algorithm = self.text_detector_options.algorithm;
+        algorithm
+            .availability(self.ai_enabled, self.ai_backend_torch_available())
+            .map_err(|reason| reason.status_text(algorithm).to_string())?;
+        Ok(self.text_detector_options.run_mode())
     }
 
     fn text_detector_running_status(&self) -> &'static str {
@@ -6389,26 +6367,6 @@ impl TranslationTabState {
                 if let Some(value) = params_obj.get("detect_size").and_then(Value::as_i64) {
                     self.text_detector_options.ai_detect_size = (value as i32).clamp(896, 2048);
                 }
-                if let Some(value) = params_obj
-                    .get("det_rearrange_max_batches")
-                    .and_then(Value::as_i64)
-                {
-                    self.text_detector_options.ai_det_rearrange_max_batches =
-                        (value as i32).clamp(1, 64);
-                }
-                if let Some(value) = params_obj
-                    .get("font size multiplier")
-                    .and_then(Value::as_f64)
-                {
-                    self.text_detector_options.ai_font_size_multiplier =
-                        (value as f32).clamp(0.1, 8.0);
-                }
-                if let Some(value) = params_obj.get("font size max").and_then(Value::as_f64) {
-                    self.text_detector_options.ai_font_size_max = (value as f32).clamp(-1.0, 500.0);
-                }
-                if let Some(value) = params_obj.get("font size min").and_then(Value::as_f64) {
-                    self.text_detector_options.ai_font_size_min = (value as f32).clamp(-1.0, 500.0);
-                }
                 if let Some(value) = params_obj.get("mask dilate size").and_then(Value::as_i64)
                     && det_obj.get("mask_dilate_size").is_none()
                 {
@@ -6795,12 +6753,7 @@ fn detector_merge_blocks(blocks: &[TextDetectorRect], merge_gap_px: i32) -> Vec<
         merged.push(cur);
     }
 
-    merged.sort_by(|a, b| {
-        a.y1.total_cmp(&b.y1)
-            .then_with(|| a.x1.total_cmp(&b.x1))
-            .then_with(|| a.y2.total_cmp(&b.y2))
-            .then_with(|| a.x2.total_cmp(&b.x2))
-    });
+    ms_text_detect::blocks::sort_reading_order(&mut merged);
     merged
 }
 
@@ -7176,12 +7129,7 @@ fn load_text_detection_page(
             }
         }
     }
-    blocks.sort_by(|a, b| {
-        a.y1.total_cmp(&b.y1)
-            .then_with(|| a.x1.total_cmp(&b.x1))
-            .then_with(|| a.y2.total_cmp(&b.y2))
-            .then_with(|| a.x2.total_cmp(&b.x2))
-    });
+    ms_text_detect::blocks::sort_reading_order(&mut blocks);
 
     let mask_size = parse_u32_pair(obj.get("mask_size")).unwrap_or(source_size);
     let mask_file = obj
@@ -7693,6 +7641,11 @@ fn save_translation_settings_to_project_file(
     .map_err(|err| format!("failed to save translation settings '{}': {err}", settings_file.display()))
 }
 
+/// Keys of `text_detector.params` that older builds wrote and nothing reads any more; the
+/// settings writer removes them (reading ignores them).
+const STALE_TEXT_DETECTOR_PARAM_KEYS: [&str; 4] =
+    ["det_rearrange_max_batches", "font size multiplier", "font size max", "font size min"];
+
 /// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
 /// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
 fn apply_translation_settings_sections(
@@ -8102,44 +8055,14 @@ fn apply_translation_settings_sections(
         .cloned()
         .unwrap_or_default();
     text_detector_params.remove("device");
+    // Retired CTD params (the backend never used them; removed from the panel): strip them so
+    // project settings written before their removal do not keep stale entries.
+    for stale in STALE_TEXT_DETECTOR_PARAM_KEYS {
+        text_detector_params.remove(stale);
+    }
     text_detector_params.insert(
         "detect_size".to_string(),
         Value::Number((text_detector_options.ai_detect_size.clamp(896, 2048) as i64).into()),
-    );
-    text_detector_params.insert(
-        "det_rearrange_max_batches".to_string(),
-        Value::Number(
-            (text_detector_options
-                .ai_det_rearrange_max_batches
-                .clamp(1, 64) as i64)
-                .into(),
-        ),
-    );
-    text_detector_params.insert(
-        "font size multiplier".to_string(),
-        serde_json::Number::from_f64(
-            text_detector_options
-                .ai_font_size_multiplier
-                .clamp(0.1, 8.0) as f64,
-        )
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::Number(serde_json::Number::from(1))),
-    );
-    text_detector_params.insert(
-        "font size max".to_string(),
-        serde_json::Number::from_f64(
-            text_detector_options.ai_font_size_max.clamp(-1.0, 500.0) as f64
-        )
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::Number(serde_json::Number::from(-1))),
-    );
-    text_detector_params.insert(
-        "font size min".to_string(),
-        serde_json::Number::from_f64(
-            text_detector_options.ai_font_size_min.clamp(-1.0, 500.0) as f64
-        )
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::Number(serde_json::Number::from(-1))),
     );
     text_detector_params.insert(
         "mask dilate size".to_string(),
@@ -8944,6 +8867,25 @@ mod settings_persistence_tests {
         std::fs::write(&path, seed).map_err(|err| err.to_string())?;
         assert!(save_defaults(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
+        Ok(())
+    }
+
+    /// The retired CTD params of older builds are stripped on save; the kept params and
+    /// unknown keys of the same object survive.
+    #[test]
+    fn save_strips_retired_text_detector_params() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        let seed = r#"{"text_detector":{"params":{"detect_size":1024,"det_rearrange_max_batches":4,"font size multiplier":1.0,"font size max":-1.0,"font size min":-1.0,"custom":7}}}"#;
+        std::fs::write(&path, seed).map_err(|err| err.to_string())?;
+        save_defaults(&path)?;
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|err| err.to_string())?).map_err(|err| err.to_string())?;
+        let params = root["text_detector"]["params"].as_object().ok_or("params is an object")?;
+        for stale in ["det_rearrange_max_batches", "font size multiplier", "font size max", "font size min"] {
+            assert!(!params.contains_key(stale), "{stale} stripped: {params:?}");
+        }
+        assert_eq!(params["detect_size"], 1280, "the current options are written");
+        assert_eq!(params["custom"], 7, "unknown keys survive");
         Ok(())
     }
 

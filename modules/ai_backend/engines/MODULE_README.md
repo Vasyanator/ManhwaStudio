@@ -32,7 +32,9 @@ for cv2/onnxruntime at startup.
 ## Files and submodules
 - `paddle_onnx.py`: shared ONNX Runtime engine for PaddleOCR. Resolves the model files under
   `ManhwaStudio_AI_Models/ONNX/PaddleOCR`, builds ORT sessions for the selected Execution Provider
-  and device id, runs the PP-OCR detection and recognition pipelines without any Paddle dependency,
+  and device id, runs the PP-OCR recognition pipeline and the forward-only detection pass
+  (`PaddleOnnxRuntime.forward_det`; `normalize_det_rgb` is the one owner of the detection input
+  normalization) without any Paddle dependency,
   reuses sessions across backend requests through `runtime/model_manager.py`, and configures the
   compiled-kernel cache directory used by MiGraphX. Key entry points: `resolve_model_paths()`,
   `resolve_det_model_path()`, `resolve_models_root()`, `resolve_compiled_cache_root()`,

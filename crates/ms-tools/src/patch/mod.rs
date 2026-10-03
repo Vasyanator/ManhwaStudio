@@ -287,7 +287,7 @@ impl PatchSelection {
     ///
     /// The same even-odd rule `fill_polygon_spans` rasterizes with, but sampled at the exact
     /// position rather than at the scanline centre the rasterizer uses (`y + 0.5`,
-    /// `tools/polygon_mask.rs`). The two therefore answer differently for a press within half a
+    /// `ms-raster` `polygon.rs`). The two therefore answer differently for a press within half a
     /// pixel of a near-horizontal edge. That is harmless: this test only decides WHICH gesture a
     /// press starts, never which pixels a patch covers.
     fn contains(&self, x: f32, y: f32) -> bool {

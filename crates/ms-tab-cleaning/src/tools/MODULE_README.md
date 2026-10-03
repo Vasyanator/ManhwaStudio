@@ -71,8 +71,9 @@ a compact part in «Выбранный инструмент» (`draw_ui`) and a 
 (`draw_main_panel`).
 
 AI-backed tools (`aot.rs`, `flux_fill.rs`, and the engines under `ai_editor/engines/`) send region
-and mask as raw PNG
-bytes in the IPC request blob (no base64), ensure required app-managed models through `ai_models.rs`,
+and mask as raw PNG bytes in the IPC request blob (no base64). Every one of them encodes through
+`region_png.rs`, the localized face of the one wire encoder `ms_tools::png_wire` (unmultiplied
+RGBA8 region, L8 mask); no tool or engine owns a PNG encoder. They also ensure required app-managed models through `ai_models.rs`,
 verify backend health, call the Python AI backend via `backend_ipc::shared_client()`, validate the
 returned PNG size (from the response blob), and surface backend errors in the region editor status.
 All backend transport goes through `crate::backend_ipc` (framed IPC over the AF_UNIX socket), in
@@ -313,6 +314,12 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   нет» in the icon slot instead of inventing a picture; its «Выбрать» control is disabled too,
   because there is no template to correlate a chapter against.
 - `aot.rs`: AOT backend inpaint and `inpaint.aot` IPC calls.
+- `region_png.rs`: the cleaning face of `ms_tools::png_wire` — `encode_color_image_png_rgba`,
+  `encode_mask_png_luma` (`alpha > 0 -> 255`), `encode_mask_png_l8` and `decode_mask_png`
+  (response mask PNG -> 0/255 alpha), mapping the typed `PngWireError` / `PngDecodeError` /
+  `MaskError` onto the `cleaning.png.*` / `cleaning.inpaint.size_mismatch_error` texts. The
+  only PNG codec of backend payloads in this crate (the watermark sources included); the wire bytes are pinned once,
+  in the `ms_tools::png_wire` tests, and `region_png.rs` tests its error mapping and threshold.
 - `patch/`: this tab's HOST for the «Заплатка» tool — Photoshop's Patch Tool. A free-form or
   rectangular selection drawn straight onto the page canvas, dragged onto a clean source area; the
   copied pixels are colour-adapted to the destination's contour by a gradient-domain (Poisson)
@@ -352,8 +359,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - Text-detector mask generation inside the region editor must use the typed detector helpers from
   the translation module and must treat returned masks as binary alpha data in region coordinates.
   The watermark source calls `watermark.detect` itself but obeys the same contract: the response
-  blob is an L8 mask PNG at the region resolution, decoded through the shared
-  `text_detector::parse_mask_alpha_from_blob`.
+  blob is an L8 mask PNG at the region resolution, decoded through `region_png::decode_mask_png`
+  (the `ms_tools::png_wire` decoder + the `ms_text_detect::mask` 0/255 normalization and guard).
 - Watermark model ids (`slbr`/`wdnet`/`splitnet`) are wire values and the persisted selection
   identity, so they stay literals; only the display label is an i18n key resolved at render time
   (same split as `LamaModelSpec`). The catalog lives ONCE, in `base.rs`; the mask source and the
@@ -553,7 +560,10 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   weight, blend modes, feather ramp), edit `crate::tools::patch::membrane`. To change how a patch is
   STORED in the clean overlay, or how its region is loaded, edit `patch/mod.rs` here. Read
   `patch/MODULE_README.md` and `crate::tools::patch`'s `MODULE_README.md` first.
-- To change local fill/inpaint algorithms, edit `gradient.rs` or `texture_synthesis.rs`.
+- To change local fill/inpaint algorithms, edit `gradient.rs` or `texture_synthesis.rs`. Their
+  dilation is `ms_raster::dilate_square` behind a `bool` adapter; change the morphology there.
+- To change how request PNGs are encoded, edit `ms_tools::png_wire` (bytes) or `region_png.rs`
+  (error texts); never add an encoder in a tool or engine.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
   settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
   bar it reuses live in `base.rs`.

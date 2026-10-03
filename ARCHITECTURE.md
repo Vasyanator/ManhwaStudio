@@ -11,7 +11,7 @@ ManhwaStudio is a desktop editor for translating comics (manga / manhwa): a chap
 translated (bubbles, OCR, machine translation), cleaned (clean layers, inpainting), typeset
 (rendered text layers) and exported.
 
-- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 34
+- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 36
   `ms-*` library crates in `crates/`. Builds for Linux and Windows (mandatory), macOS, and
   `wasm32` (web entry, `src/web_entry.rs`).
 - **Python AI backend** — an optional separate process (`ai_backend.py` + `modules/ai_backend/`)
@@ -47,8 +47,8 @@ bin (src/: main.rs, app.rs, studio_bootstrap.rs, tabs/settings/, web_entry.rs)
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx
-  <- ms-log
-  <- ms-actions / ms-gifs / ms-i18n / ms-storage / ms-text-util / ms-theme / ms-thread
+  <- ms-log / ms-text-detect
+  <- ms-actions / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
 
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
@@ -68,7 +68,13 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   `RasterDiff`).
 - `ms-theme` — sole owner of semantic colours over egui's dark theme.
 - `ms-gifs` — embedded animated hints, streaming decoder.
+- `ms-raster` — generic raster primitives with one owner each: polygon scanline fill
+  (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold.
 - `ms-log` — session log (`runtime_log`) and opt-in trace log (`trace_log!` / `trace_scope!`).
+- `ms-text-detect` — GUI-free text-detection domain (block sort and cap, mask normalization, DB
+  postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
+  with the CTD, Paddle and Surya postprocess); the model forward pass is supplied by the caller
+  through `ProbMapRunner`. No logging, wasm-buildable.
 - `ms-docstore` — named logical documents (`DocRef`): per-document lock, atomic writes, JSON or
   SQLite. Must not depend on `ms-config`.
 - `ms-fonts` — the bundled `fonts/ui` stack, shared by egui UI fonts and the text renderer.
@@ -282,6 +288,10 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   routers in `ms-tab-translation` decide. Native routes need no backend; a native failure is
   logged and falls back to the backend when it is up. Native code runs only on worker threads
   and is compiled out on wasm.
+- **Text detection is forward-only on the backend.** Rust (`ms-text-detect`) plans scale and
+  tiling, cuts equal-size RGB tiles and post-processes the stitched maps;
+  `textdetector.{ctd,paddle,surya}.forward` only runs the network and returns u8 probability
+  maps (wire codec: `ms_backend_ipc::textdetector`).
 - **App-managed models** live under `ManhwaStudio_AI_Models/` and are fetched by Rust through
   `ms_sysprobe::ai_models` before a backend feature initializes them.
 - **Downloaded code.** `modules/ai_backend/watermark/` is the only place that executes
@@ -327,6 +337,7 @@ logged error); the GUI thread only polls and applies results.
 | Clean overlay autosave, canvas settings saver, overlay tile prepare | `ms-canvas/src/workers.rs` |
 | Config sections `Window` / `PanelLayout` | `ms-config::config_saver` |
 | OCR, text detection, MT, crop recognition, backend health | `ms-tab-translation` |
+| Text detection plan / tiles / stitch / postprocess (one plan for worker and panel notice) | `ms-text-detect`, driven by `ms-tab-translation/src/text_detector/` |
 | Native ONNX load and inference | `ms-native-runtime` (called from those workers) |
 | AI backend process supervisor | `ms-settings-ui/src/ai_backend_supervisor.rs` |
 | Storage-mode conversion job | `ms-settings-ui/src/storage_mode_job.rs` |

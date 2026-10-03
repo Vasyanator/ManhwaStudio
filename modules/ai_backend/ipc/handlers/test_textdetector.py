@@ -1,28 +1,24 @@
 """
 File: modules/ai_backend/ipc/handlers/test_textdetector.py
 
-Unit tests for the v2 IPC text-detector handlers:
-    textdetector.ctd    (METHOD_TEXTDETECTOR_CTD)
-    textdetector.paddle (METHOD_TEXTDETECTOR_PADDLE)
-    textdetector.surya  (METHOD_TEXTDETECTOR_SURYA)
+Unit tests for the forward-only text-detector handlers:
+    textdetector.ctd.forward    (METHOD_TEXTDETECTOR_CTD_FORWARD)
+    textdetector.paddle.forward (METHOD_TEXTDETECTOR_PADDLE_FORWARD)
+    textdetector.surya.forward  (METHOD_TEXTDETECTOR_SURYA_FORWARD)
 
 Strategy
 --------
-The service objects (``text_detector_ctd``, ``text_detector_paddle``,
-``text_detector_surya``) are replaced with ``unittest.mock.MagicMock``
-instances so no Torch models are loaded.  Tests drive the handlers directly
-(no socket/dispatcher), verifying:
+The services (``text_detector_ctd`` / ``_paddle`` / ``_surya``) are
+``unittest.mock.MagicMock`` stand-ins, so no model and no Torch is loaded. The
+handlers are driven directly (no socket), verifying:
 
-1.  ``page_path`` branch  -> ``detect_page`` called; no ``detect_image_bytes``.
-2.  ``path`` alias branch -> same as above.
-3.  Blob branch           -> ``detect_image_bytes`` called; no ``detect_page``.
-4.  Neither source        -> ``ValueError`` raised.
-5.  Response header fields match the HTTP shape per engine.
-6.  Mask PNG arrives as raw bytes in the response blob (byte-identical to the
-    service's ``mask_png`` result).
-7.  ``params`` is forwarded to CTD; paddle/surya take no params.
-8.  ``FileNotFoundError`` propagates (so the dispatcher turns it into
-    ``status:"error"`` with the message).
+1. the request blob reaches ``forward_tiles`` as ``uint8 [n, h, w, 3]`` with
+   the tile-major / row-major layout preserved;
+2. the response header (`engine`, `n`, `map_width`, `map_height`, `channels`)
+   and the blob layout (tile-major, then channel-major) per engine;
+3. request validation: `n`, size, alignment, exact blob length, request and
+   response size limits — each a ``ValueError`` before the service runs;
+4. service-output validation: shape, dtype, response size — ``RuntimeError``.
 """
 
 from __future__ import annotations
@@ -30,47 +26,35 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
+from modules.ai_backend.ipc.handlers import textdetector as td
 from modules.ai_backend.ipc.handlers.textdetector import (
-    _handle_textdetector_ctd,
-    _handle_textdetector_paddle,
-    _handle_textdetector_surya,
+    FORWARD_SPECS,
+    _handle_textdetector_ctd_forward,
+    _handle_textdetector_paddle_forward,
+    _handle_textdetector_surya_forward,
+    encode_forward_response,
+    parse_forward_request,
 )
 from modules.ai_backend.ipc.protocol import (
-    METHOD_TEXTDETECTOR_CTD,
-    METHOD_TEXTDETECTOR_PADDLE,
-    METHOD_TEXTDETECTOR_SURYA,
+    ALL_METHODS,
+    MAX_BLOB_BYTES,
+    METHOD_TEXTDETECTOR_CTD_FORWARD,
+    METHOD_TEXTDETECTOR_PADDLE_FORWARD,
+    METHOD_TEXTDETECTOR_SURYA_FORWARD,
 )
 from modules.ai_backend.ipc.registry import METHOD_HANDLERS, HandlerContext
 
-# ---------------------------------------------------------------------------
-# Helpers / fixtures
-# ---------------------------------------------------------------------------
-
-# A tiny 1x1 white PNG for round-trip testing.  Produced once so every test
-# uses the same stable bytes.
-_MASK_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00"
-    b"\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
-)
-_FAKE_IMAGE_BLOB = b"FAKE_PNG_BYTES"
-
-# A cancel event that is never set (handlers are synchronous here).
 _NO_CANCEL = threading.Event()
 
-
-def _make_service_result(extra: dict | None = None) -> dict:
-    """Return a dict that looks like what a *TextDetectorService returns."""
-    base = {
-        "source_size": [800, 1200],
-        "blocks": [{"x": 10, "y": 20, "w": 100, "h": 50}],
-        "mask_png": _MASK_PNG_BYTES,
-    }
-    if extra:
-        base.update(extra)
-    return base
+# (handler, AppState field, engine) for the parametrized round-trip tests.
+_ENGINES = [
+    (_handle_textdetector_ctd_forward, "text_detector_ctd", "ctd"),
+    (_handle_textdetector_paddle_forward, "text_detector_paddle", "paddle"),
+    (_handle_textdetector_surya_forward, "text_detector_surya", "surya"),
+]
 
 
 def _ctx(state: MagicMock) -> HandlerContext:
@@ -81,415 +65,148 @@ def _ctx(state: MagicMock) -> HandlerContext:
     )
 
 
-# ---------------------------------------------------------------------------
-# Registration smoke test
-# ---------------------------------------------------------------------------
-
-def test_methods_are_registered() -> None:
-    """All three text-detector methods must be present in the handler registry."""
-    assert METHOD_TEXTDETECTOR_CTD in METHOD_HANDLERS
-    assert METHOD_TEXTDETECTOR_PADDLE in METHOD_HANDLERS
-    assert METHOD_TEXTDETECTOR_SURYA in METHOD_HANDLERS
-
-
-# ===========================================================================
-# textdetector.ctd
-# ===========================================================================
-
-class TestCtd:
-    def _state(self, result: dict | None = None) -> MagicMock:
-        state = MagicMock()
-        svc = state.text_detector_ctd
-        svc.detect_page.return_value = result or _make_service_result()
-        svc.detect_image_bytes.return_value = result or _make_service_result()
-        return state
-
-    # --- page_path branch ---
-
-    def test_page_path_calls_detect_page(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        header = {"page_path": "/some/page.png"}
-        resp_h, resp_b = _handle_textdetector_ctd(ctx, header, b"", _NO_CANCEL)
-
-        state.text_detector_ctd.detect_page.assert_called_once_with(
-            "/some/page.png", params={}
-        )
-        state.text_detector_ctd.detect_image_bytes.assert_not_called()
-
-    def test_page_path_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_ctd(
-            ctx, {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert resp_h["engine"] == "ctd"
-        assert resp_h["source_size"] == [800, 1200]
-        assert isinstance(resp_h["blocks"], list)
-        # the mask bytes must NOT be in the header (only in the blob)
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-
-    def test_page_path_mask_in_blob(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _, resp_b = _handle_textdetector_ctd(
-            ctx, {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        # Blob must be raw PNG bytes, round-trip-decodable
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- path alias ---
-
-    def test_path_alias_calls_detect_page(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_ctd(ctx, {"path": "/alias.png"}, b"", _NO_CANCEL)
-        state.text_detector_ctd.detect_page.assert_called_once_with(
-            "/alias.png", params={}
-        )
-
-    # --- blob branch ---
-
-    def test_blob_calls_detect_image_bytes(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_ctd(ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL)
-
-        state.text_detector_ctd.detect_image_bytes.assert_called_once_with(
-            _FAKE_IMAGE_BLOB, params={}
-        )
-        state.text_detector_ctd.detect_page.assert_not_called()
-
-    def test_blob_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_ctd(
-            ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL
-        )
-        assert resp_h["engine"] == "ctd"
-        assert resp_h["source_size"] == [800, 1200]
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- params forwarded ---
-
-    def test_params_forwarded_for_page_path(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        params = {"threshold": 0.5, "max_width": 100}
-        _handle_textdetector_ctd(
-            ctx, {"page_path": "/p.png", "params": params}, b"", _NO_CANCEL
-        )
-        state.text_detector_ctd.detect_page.assert_called_once_with(
-            "/p.png", params=params
-        )
-
-    def test_params_forwarded_for_blob(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        params = {"min_area": 50}
-        _handle_textdetector_ctd(
-            ctx, {"params": params}, _FAKE_IMAGE_BLOB, _NO_CANCEL
-        )
-        state.text_detector_ctd.detect_image_bytes.assert_called_once_with(
-            _FAKE_IMAGE_BLOB, params=params
-        )
-
-    def test_params_none_treated_as_empty_dict(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_ctd(
-            ctx, {"page_path": "/p.png", "params": None}, b"", _NO_CANCEL
-        )
-        state.text_detector_ctd.detect_page.assert_called_once_with(
-            "/p.png", params={}
-        )
-
-    def test_params_invalid_type_raises(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        with pytest.raises(ValueError, match="params"):
-            _handle_textdetector_ctd(
-                ctx, {"page_path": "/p.png", "params": "not-a-dict"}, b"", _NO_CANCEL
-            )
-
-    # --- neither source ---
-
-    def test_neither_source_raises_value_error(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        with pytest.raises(ValueError, match="page_path"):
-            _handle_textdetector_ctd(ctx, {}, b"", _NO_CANCEL)
-
-    # --- FileNotFoundError propagates ---
-
-    def test_file_not_found_propagates(self) -> None:
-        state = MagicMock()
-        state.text_detector_ctd.detect_page.side_effect = FileNotFoundError(
-            "No such file: /missing.png"
-        )
-        ctx = _ctx(state)
-        with pytest.raises(FileNotFoundError, match="missing.png"):
-            _handle_textdetector_ctd(
-                ctx, {"page_path": "/missing.png"}, b"", _NO_CANCEL
-            )
-
-
-# ===========================================================================
-# textdetector.paddle
-# ===========================================================================
-
-class TestPaddle:
-    def _state(self, result: dict | None = None) -> MagicMock:
-        r = result or _make_service_result({"polys": [[1, 2], [3, 4]]})
-        state = MagicMock()
-        state.text_detector_paddle.detect_page.return_value = r
-        state.text_detector_paddle.detect_image_bytes.return_value = r
-        return state
-
-    # --- page_path branch ---
-
-    def test_page_path_calls_detect_page(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_paddle(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        state.text_detector_paddle.detect_page.assert_called_once_with("/page.png")
-        state.text_detector_paddle.detect_image_bytes.assert_not_called()
-
-    def test_page_path_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_paddle(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        assert resp_h["engine"] == "paddle"
-        assert resp_h["source_size"] == [800, 1200]
-        assert isinstance(resp_h["blocks"], list)
-        assert "polys" in resp_h
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-
-    def test_page_path_mask_in_blob(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _, resp_b = _handle_textdetector_paddle(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- path alias ---
-
-    def test_path_alias(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_paddle(ctx, {"path": "/alias.png"}, b"", _NO_CANCEL)
-        state.text_detector_paddle.detect_page.assert_called_once_with("/alias.png")
-
-    # --- blob branch ---
-
-    def test_blob_calls_detect_image_bytes(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_paddle(ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL)
-        state.text_detector_paddle.detect_image_bytes.assert_called_once_with(
-            _FAKE_IMAGE_BLOB
-        )
-        state.text_detector_paddle.detect_page.assert_not_called()
-
-    def test_blob_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_paddle(
-            ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL
-        )
-        assert resp_h["engine"] == "paddle"
-        assert "polys" in resp_h
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- polys present ---
-
-    def test_polys_in_response(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, _ = _handle_textdetector_paddle(
-            ctx, {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert resp_h["polys"] == [[1, 2], [3, 4]]
-
-    # --- neither source ---
-
-    def test_neither_source_raises(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        with pytest.raises(ValueError, match="page_path"):
-            _handle_textdetector_paddle(ctx, {}, b"", _NO_CANCEL)
-
-    # --- FileNotFoundError propagates ---
-
-    def test_file_not_found_propagates(self) -> None:
-        state = MagicMock()
-        state.text_detector_paddle.detect_page.side_effect = FileNotFoundError("gone")
-        ctx = _ctx(state)
-        with pytest.raises(FileNotFoundError, match="gone"):
-            _handle_textdetector_paddle(
-                ctx, {"page_path": "/gone.png"}, b"", _NO_CANCEL
-            )
-
-
-# ===========================================================================
-# textdetector.surya
-# ===========================================================================
-
-class TestSurya:
-    def _state(self, result: dict | None = None) -> MagicMock:
-        r = result or _make_service_result(
-            {"lines": [{"text": "hello"}, {"text": "world"}]}
-        )
-        state = MagicMock()
-        state.text_detector_surya.detect_page.return_value = r
-        state.text_detector_surya.detect_image_bytes.return_value = r
-        return state
-
-    # --- page_path branch ---
-
-    def test_page_path_calls_detect_page(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_surya(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        state.text_detector_surya.detect_page.assert_called_once_with("/page.png")
-        state.text_detector_surya.detect_image_bytes.assert_not_called()
-
-    def test_page_path_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_surya(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        assert resp_h["engine"] == "surya"
-        assert resp_h["source_size"] == [800, 1200]
-        assert isinstance(resp_h["blocks"], list)
-        assert "lines" in resp_h
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-
-    def test_page_path_mask_in_blob(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _, resp_b = _handle_textdetector_surya(
-            ctx, {"page_path": "/page.png"}, b"", _NO_CANCEL
-        )
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- path alias ---
-
-    def test_path_alias(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_surya(ctx, {"path": "/alias.png"}, b"", _NO_CANCEL)
-        state.text_detector_surya.detect_page.assert_called_once_with("/alias.png")
-
-    # --- blob branch ---
-
-    def test_blob_calls_detect_image_bytes(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        _handle_textdetector_surya(ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL)
-        state.text_detector_surya.detect_image_bytes.assert_called_once_with(
-            _FAKE_IMAGE_BLOB
-        )
-        state.text_detector_surya.detect_page.assert_not_called()
-
-    def test_blob_response_fields(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, resp_b = _handle_textdetector_surya(
-            ctx, {}, _FAKE_IMAGE_BLOB, _NO_CANCEL
-        )
-        assert resp_h["engine"] == "surya"
-        assert "lines" in resp_h
-        assert "mask_png" not in resp_h
-        assert "mask_png_base64" not in resp_h
-        assert resp_b == _MASK_PNG_BYTES
-
-    # --- lines present ---
-
-    def test_lines_in_response(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        resp_h, _ = _handle_textdetector_surya(
-            ctx, {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert resp_h["lines"] == [{"text": "hello"}, {"text": "world"}]
-
-    # --- neither source ---
-
-    def test_neither_source_raises(self) -> None:
-        state = self._state()
-        ctx = _ctx(state)
-        with pytest.raises(ValueError, match="page_path"):
-            _handle_textdetector_surya(ctx, {}, b"", _NO_CANCEL)
-
-    # --- FileNotFoundError propagates ---
-
-    def test_file_not_found_propagates(self) -> None:
-        state = MagicMock()
-        state.text_detector_surya.detect_page.side_effect = FileNotFoundError("gone")
-        ctx = _ctx(state)
-        with pytest.raises(FileNotFoundError, match="gone"):
-            _handle_textdetector_surya(
-                ctx, {"page_path": "/gone.png"}, b"", _NO_CANCEL
-            )
-
-
-# ===========================================================================
-# Cross-engine: mask PNG round-trip decodable
-# ===========================================================================
-
-class TestMaskRoundTrip:
-    """Verify that the response blob is the raw PNG from the service's
-    ``mask_png`` field — for all three engines."""
-
-    def _state_ctd(self) -> MagicMock:
-        state = MagicMock()
-        state.text_detector_ctd.detect_page.return_value = _make_service_result()
-        return state
-
-    def _state_paddle(self) -> MagicMock:
-        state = MagicMock()
-        state.text_detector_paddle.detect_page.return_value = _make_service_result(
-            {"polys": []}
-        )
-        return state
-
-    def _state_surya(self) -> MagicMock:
-        state = MagicMock()
-        state.text_detector_surya.detect_page.return_value = _make_service_result(
-            {"lines": []}
-        )
-        return state
-
-    def test_ctd_mask_round_trip(self) -> None:
-        _, blob = _handle_textdetector_ctd(
-            _ctx(self._state_ctd()), {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert blob == _MASK_PNG_BYTES
-
-    def test_paddle_mask_round_trip(self) -> None:
-        _, blob = _handle_textdetector_paddle(
-            _ctx(self._state_paddle()), {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert blob == _MASK_PNG_BYTES
-
-    def test_surya_mask_round_trip(self) -> None:
-        _, blob = _handle_textdetector_surya(
-            _ctx(self._state_surya()), {"page_path": "/p.png"}, b"", _NO_CANCEL
-        )
-        assert blob == _MASK_PNG_BYTES
+def _tiles(n: int, width: int, height: int) -> np.ndarray:
+    """Deterministic tiles whose every byte encodes its position."""
+    return (np.arange(n * height * width * 3, dtype=np.uint64) % 251).astype(np.uint8).reshape(n, height, width, 3)
+
+
+def _fake_maps(spec, tiles: np.ndarray) -> np.ndarray:
+    """Maps whose value encodes (tile, channel) so the layout is checkable."""
+    n, height, width = tiles.shape[:3]
+    channels = len(spec.channels)
+    maps = np.empty((n, channels, height // spec.map_stride, width // spec.map_stride), dtype=np.uint8)
+    for t in range(n):
+        for c in range(channels):
+            maps[t, c] = 10 * t + c
+    return maps
+
+
+def test_methods_are_registered_and_listed() -> None:
+    for method in (
+        METHOD_TEXTDETECTOR_CTD_FORWARD,
+        METHOD_TEXTDETECTOR_PADDLE_FORWARD,
+        METHOD_TEXTDETECTOR_SURYA_FORWARD,
+    ):
+        assert method in METHOD_HANDLERS
+        assert method in ALL_METHODS
+    for removed in ("textdetector.ctd", "textdetector.paddle", "textdetector.surya"):
+        assert removed not in METHOD_HANDLERS
+        assert removed not in ALL_METHODS
+
+
+def test_forward_specs_match_the_protocol_table() -> None:
+    """PROTOCOL.md §5.3 and `ms_backend_ipc::textdetector` carry the same table."""
+    assert FORWARD_SPECS["ctd"].align == 64
+    assert FORWARD_SPECS["ctd"].map_stride == 1
+    assert FORWARD_SPECS["ctd"].channels == ("seg", "shrink")
+    assert FORWARD_SPECS["paddle"].align == 32
+    assert FORWARD_SPECS["paddle"].map_stride == 1
+    assert FORWARD_SPECS["paddle"].channels == ("prob",)
+    assert FORWARD_SPECS["surya"].align == 4
+    assert FORWARD_SPECS["surya"].map_stride == 4
+    assert FORWARD_SPECS["surya"].channels == ("text",)
+
+
+@pytest.mark.parametrize("handler, field, engine", _ENGINES)
+def test_round_trip_layout(handler, field: str, engine: str) -> None:
+    spec = FORWARD_SPECS[engine]
+    n, width, height = 2, 2 * 64, 64
+    tiles = _tiles(n, width, height)
+    state = MagicMock()
+    service = getattr(state, field)
+    service.forward_tiles.side_effect = lambda arr: _fake_maps(spec, arr)
+
+    header, blob = handler(_ctx(state), {"n": n, "width": width, "height": height}, tiles.tobytes(), _NO_CANCEL)
+
+    service.forward_tiles.assert_called_once()
+    received = service.forward_tiles.call_args.args[0]
+    assert received.dtype == np.uint8
+    assert received.shape == (n, height, width, 3)
+    assert np.array_equal(received, tiles)
+
+    map_w, map_h = width // spec.map_stride, height // spec.map_stride
+    assert header == {
+        "engine": engine,
+        "n": n,
+        "map_width": map_w,
+        "map_height": map_h,
+        "channels": list(spec.channels),
+    }
+    channels = len(spec.channels)
+    assert len(blob) == n * channels * map_w * map_h
+    plane = map_w * map_h
+    for t in range(n):
+        for c in range(channels):
+            start = (t * channels + c) * plane
+            assert set(blob[start : start + plane]) == {10 * t + c}
+
+
+@pytest.mark.parametrize(
+    "header, blob_len, match",
+    [
+        ({"n": 0, "width": 64, "height": 64}, 0, "at least 1"),
+        ({"n": 1, "width": 96, "height": 64}, 96 * 64 * 3, "multiple of 64"),
+        ({"n": 1, "width": 64, "height": 0}, 0, "multiple of 64"),
+        ({"n": 1, "width": 64, "height": 64}, 64 * 64 * 3 - 1, "expected"),
+        ({"n": 2, "width": 64, "height": 64}, 64 * 64 * 3, "expected"),
+        ({"n": "1", "width": 64, "height": 64}, 64 * 64 * 3, "integer"),
+        ({"n": True, "width": 64, "height": 64}, 64 * 64 * 3, "integer"),
+        ({"width": 64, "height": 64}, 64 * 64 * 3, "integer"),
+        ({"n": 1, "width": 64.0, "height": 64}, 64 * 64 * 3, "integer"),
+    ],
+)
+def test_invalid_requests_never_reach_the_service(header: dict, blob_len: int, match: str) -> None:
+    state = MagicMock()
+    with pytest.raises(ValueError, match=match):
+        _handle_textdetector_ctd_forward(_ctx(state), header, bytes(blob_len), _NO_CANCEL)
+    state.text_detector_ctd.forward_tiles.assert_not_called()
+
+
+def test_paddle_and_surya_alignment() -> None:
+    state = MagicMock()
+    with pytest.raises(ValueError, match="multiple of 32"):
+        _handle_textdetector_paddle_forward(_ctx(state), {"n": 1, "width": 48, "height": 32}, bytes(48 * 32 * 3), _NO_CANCEL)
+    with pytest.raises(ValueError, match="multiple of 4"):
+        _handle_textdetector_surya_forward(_ctx(state), {"n": 1, "width": 6, "height": 4}, bytes(6 * 4 * 3), _NO_CANCEL)
+    state.text_detector_paddle.forward_tiles.assert_not_called()
+    state.text_detector_surya.forward_tiles.assert_not_called()
+
+
+def test_request_over_blob_limit_is_rejected() -> None:
+    side = 2048
+    n = MAX_BLOB_BYTES // (side * side * 3) + 1
+    with pytest.raises(ValueError, match="MAX_BLOB_BYTES"):
+        parse_forward_request(FORWARD_SPECS["ctd"], {"n": n, "width": side, "height": side}, b"")
+
+
+def test_response_over_blob_limit_is_rejected_before_the_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CTD returns 2 maps of 1 byte per 3 input bytes: shrink the limit to hit only the response."""
+    spec = FORWARD_SPECS["ctd"]
+    n, side = 1, 64
+    request_bytes = n * side * side * 3
+    monkeypatch.setattr(td, "MAX_BLOB_BYTES", request_bytes)
+    # Request fits exactly; the CTD response (2 channels) is 2/3 of it and fits too.
+    parse_forward_request(spec, {"n": n, "width": side, "height": side}, bytes(request_bytes))
+    # A 4-channel engine at the same size would need 4/3 of the request: rejected.
+    wide = td.ForwardSpec(engine="wide", align=64, map_stride=1, channels=("a", "b", "c", "d"))
+    with pytest.raises(ValueError, match="response"):
+        parse_forward_request(wide, {"n": n, "width": side, "height": side}, bytes(request_bytes))
+
+
+def test_service_output_shape_and_dtype_are_checked() -> None:
+    spec = FORWARD_SPECS["surya"]
+    with pytest.raises(RuntimeError, match="shape"):
+        encode_forward_response(spec, 1, 64, 64, np.zeros((1, 1, 64, 64), dtype=np.uint8))
+    with pytest.raises(RuntimeError, match="shape"):
+        encode_forward_response(spec, 2, 64, 64, np.zeros((1, 1, 16, 16), dtype=np.uint8))
+    with pytest.raises(RuntimeError, match="uint8"):
+        encode_forward_response(spec, 1, 64, 64, np.zeros((1, 1, 16, 16), dtype=np.float32))
+    with pytest.raises(RuntimeError, match="shape"):
+        encode_forward_response(spec, 1, 64, 64, b"\x00" * 256)
+
+
+def test_service_errors_propagate() -> None:
+    state = MagicMock()
+    state.text_detector_surya.forward_tiles.side_effect = RuntimeError("non-finite heatmap")
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _handle_textdetector_surya_forward(_ctx(state), {"n": 1, "width": 8, "height": 8}, bytes(8 * 8 * 3), _NO_CANCEL)

@@ -11,7 +11,8 @@ Main responsibilities:
   (`lama_model_for_run`) — the one place that rule lives;
 - build the request header (`sdxl_run_header`);
 - run one streaming pass (`run_sdxl`) and one unload (`unload_sdxl`);
-- encode the region PNG and the L8 mask PNG into the two-image request blob;
+- pack the region PNG and the L8 mask PNG (encoded by `tools::region_png`, the cleaning face
+  of `ms_tools::png_wire`) into the two-image request blob;
 - decode a streamed latent preview.
 
 Key functions:
@@ -256,48 +257,6 @@ fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
     blob.extend_from_slice(image_png);
     blob.extend_from_slice(mask_png);
     blob
-}
-
-/// Encodes the region as an RGBA8 PNG.
-///
-/// # Errors
-/// Returns a localized message when a side does not fit `u32` or the encoder fails.
-fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let (width, height) = (image.size[0], image.size[1]);
-    let width_u32 = u32::try_from(width)
-        .map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
-    let height_u32 = u32::try_from(height)
-        .map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
-    let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
-    for px in &image.pixels {
-        let [r, g, b, a] = px.to_srgba_unmultiplied();
-        raw.extend_from_slice(&[r, g, b, a]);
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
-    Ok(out)
-}
-
-/// Encodes the inpainting mask as an L8 PNG. `mask` must be exactly `width * height` bytes.
-///
-/// # Errors
-/// Returns a localized message when a side does not fit `u32`, when `mask` is not the
-/// expected length, or when the encoder fails.
-fn encode_mask_png_l8(mask: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
-    let width_u32 = u32::try_from(width)
-        .map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
-    let height_u32 = u32::try_from(height)
-        .map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
-    if mask.len() != width.saturating_mul(height) {
-        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
-    }
-    let mut out = Vec::<u8>::new();
-    image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(mask, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
-    Ok(out)
 }
 
 #[cfg(test)]

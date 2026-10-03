@@ -589,7 +589,8 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   crates `ms-native-runtime` and `ms-onnx-runtime`. Runtime via `General.ai_runtime`, provider/device via the
   unified `General.ai_onnx_provider`/`ai_onnx_device_id` (shared with the backend); OCR routing lives
   in `crates/ms-tab-translation/src/ocr.rs::ocr_route`, detection routing in
-  `crates/ms-tab-translation/src/text_detector.rs::detector_native_route`.
+  `crates/ms-tab-translation/src/text_detector/pipeline.rs::detector_native_route` (its disk
+  inputs are read by `text_detector/native.rs::current_detector_route`).
 - ONNX selection UI (shared Settings + launcher panel): `ms-settings-ui`'s `ai_backend_panel.rs`. The section is
   RUNTIME-BRANCHED on `General.ai_runtime`:
   - Native → the BUILD-based selection (Билд → EP → Устройство). The "Билд" combo lists the

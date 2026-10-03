@@ -29,5 +29,9 @@ image.workspace = true
 # Pure-Rust image geometry/morphology used by the native PaddleOCR path
 # (contours, minimum-area rectangle, perspective warp). Pairs with the workspace
 # `image` 0.25.x and cross-compiles to windows-gnu/macos/linux. No OpenCV/Clipper.
-imageproc = "0.27"
+# The workspace entry disables imageproc defaults; this crate opts back into `rayon` only.
+imageproc = { workspace = true, features = ["rayon"] }
 thiserror.workspace = true
+# The engine-neutral text-detection domain: the DB postprocess, the glyph mask and `Quad`
+# (re-exported as `paddle_ocr::Quad`) that the native Paddle detector runs after its forward pass.
+ms-text-detect = { path = "../ms-text-detect" }

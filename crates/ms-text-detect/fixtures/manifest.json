@@ -1,0 +1,141 @@
+{
+ "cases": [
+  {
+   "blocks": 4,
+   "case": "dark_on_light",
+   "engine": "ctd",
+   "files": {
+    "case.json": "7d6ed633906e3ca80fe1b315cdca7022329d2313bef37b7fe77783ff4d090e7c",
+    "expected_mask.png": "dbe2574ff3e59bc04ccb23cce1f964cbf6e11a03b825dfe3f1006f8b016be23e",
+    "input.png": "1cbd1d1576216cb7bdb903eaa4e2af0e1e4e88741576aacc492abf7997de93ae",
+    "seg.png": "9e7d5d7e0f0aa5d67d2a14aaa8602114fb5823b6e100824d72fb3e2c6eab65d2",
+    "seg_source.png": "9e7d5d7e0f0aa5d67d2a14aaa8602114fb5823b6e100824d72fb3e2c6eab65d2",
+    "shrink.png": "a5e2dd959a6731a25aa3deedbe76ad7e9f1725c44c22cd6b4d0cc67b97e4f4fb"
+   }
+  },
+  {
+   "blocks": 3,
+   "case": "light_on_dark",
+   "engine": "ctd",
+   "files": {
+    "case.json": "eadda84192d6ae9ce86bf7ecf05092020c41f1fc24d9e45e18e2630442106f82",
+    "expected_mask.png": "96a0a9aaa0ed05a1babb3865cd1feebcde86ae43e0ad5ca720ed8cba56a73554",
+    "input.png": "1b33fb67c40f3a960aa31c6e60619147b47f3663cb7fc1a0e1c4d4c2e58e1e89",
+    "seg.png": "05b13c20e44fa447ad4a73bb54b591f24bcdf33adb7cb806878fbd34b21d504c",
+    "seg_source.png": "159790ed3d5316012aa4dffc1eb817264d88254feaf9bea1ffd70e4237677943",
+    "shrink.png": "17828ede7fe566fcf9e81c43f1fe060ca9a0d3268243edad481b87e116d17683"
+   }
+  },
+  {
+   "blocks": 4,
+   "case": "color_bg",
+   "engine": "ctd",
+   "files": {
+    "case.json": "1be07e6fa277a7c818b41a4778cfc6f35f20291dec71ab4615ea1c92719aac21",
+    "expected_mask.png": "5ed5d93b428399611b06272358d046b81d829a4ef3382f69cb3cff36f6e2df4a",
+    "input.png": "8f1ec29fb8007b4e9501259061a94de42c13195e1da0ce81dc70604442d8a2ee",
+    "seg.png": "57759dab6d99a8d5fb350844d4438a59cde56f6acad0f2e84b181dd84b070436",
+    "seg_source.png": "dba30930c4bf202f1fbb551cfeb8c69d295306f3d79398e1231c5cd6df363366",
+    "shrink.png": "07cc075744d2ac33291a158f7c16cae0feb40f8ba470f37abbe1e3d445e0c0eb"
+   }
+  },
+  {
+   "blocks": 3,
+   "case": "dark_on_light",
+   "engine": "paddle",
+   "files": {
+    "case.json": "add10e012783e40e220be8c65e874127d5110e9bdd3288e4aefce1db5c8ac21e",
+    "expected_mask.png": "3ae826fef1be70ad06d6408aac25a662533a417ccca84e78e09e957ba79eac70",
+    "input.png": "a83d9f93a4a678cbf1d853606f3b52d66cf5bfdf4049a1bbd4c49102d8691b07",
+    "prob.png": "2f847dad66595891a24321dae319358432d995ae2d55ce91fd3f247576e6a7df"
+   }
+  },
+  {
+   "blocks": 2,
+   "case": "saturated_text",
+   "engine": "paddle",
+   "files": {
+    "case.json": "af2936e1c6e27658f37dff59736dce4df1f00f2a93eac8af9f8d977331286027",
+    "expected_mask.png": "03feb7fb4b9fa056841d48115ed6be8acdda38fea6b0c1e18dd3178522b3bde9",
+    "input.png": "4cb76ef985247644e1ea0802d7a663f5bc64ba7650946e7b5e8cd6470c476bf4",
+    "prob.png": "e91e94e0b01c989fe3127003c4651645b4e45b68a573f9c01161b4f7c48501a5"
+   }
+  },
+  {
+   "blocks": 2,
+   "case": "light_on_dark",
+   "engine": "paddle",
+   "files": {
+    "case.json": "4b761f36b63cc3a25fc2d050fa2dbff2bb5d351f52cf1bfa8176c16905626361",
+    "expected_mask.png": "67aeaa88ebb75a8dbbb6b26ed83541de7fbed45d0d464468acc586ef32744aab",
+    "input.png": "95f42c1f13b250f4174c1e92ace1a0560688c07e287f52e239cfcb8f826849da",
+    "prob.png": "67b737ebbd1dafc3dad8149a3c6570fe1f7a08e18fdc639c26f782fab83a6d0e"
+   }
+  },
+  {
+   "blocks": 4,
+   "case": "stretch_both",
+   "engine": "surya",
+   "files": {
+    "case.json": "f3cf1a414d7963aa59c796355ecaa7bf639cdea08f10eb528f56760838fe34b2",
+    "expected_mask.png": "4cc7dda22beb5092d1d6f7cdca7e23778ff9c2d2b3dde098083046195280f3aa",
+    "heat.png": "f9e1a280f600112f937f2ff1a6eda71423e42fa0827a5c77b4da321079c3c374",
+    "input.png": "6378871020a5a4b20775af28ad4b303b7b38829dcc8b5216d331ddb2c87600ce",
+    "proc_mask.png": "c7168b02be122a0fdd3c95393203dcf83c5a901ac040f90378a89d98a876a096"
+   }
+  },
+  {
+   "blocks": 5,
+   "case": "width_only",
+   "engine": "surya",
+   "files": {
+    "case.json": "e903325fdc260147d24b1c1bc9b5f03a10930a29768355e659811d7dc36a71bb",
+    "expected_mask.png": "44d4fe612a8435418a7b1abc471ec6af77907cfa45ed8321d35feb797e8cc343",
+    "heat.png": "ef782d2d714330a8458104de5a94d085a95233dc42d4ee735ff64f31e3928d35",
+    "input.png": "3cdcfea18ba2c49e0b53b1ff8c71b20148a4278369e86e83d166d588abd2d56f",
+    "proc_mask.png": "7de4043ce70de1abf57503ffe31291e3d6baa76cea9b272f3592bf8bf9a7cee5"
+   }
+  },
+  {
+   "blocks": 3,
+   "case": "low_contrast",
+   "engine": "surya",
+   "files": {
+    "case.json": "1baff25eaca614acf8bc64257081d33328825e23f56ac04ae2f61165de77c743",
+    "expected_mask.png": "9913770bf50f7f2b1f84642bb3e32f2e1d576e00e77b60092b2a4be54154e753",
+    "heat.png": "b39dc84cd2fe499a8f9bb3861750ba639fb73641a3fe48b5db42de3b2ece3e89",
+    "input.png": "88f5368db4eb894655136576aac791edf6e35b9cce4a3d0f525c9f76ea47ba40",
+    "proc_mask.png": "411641131740a6ce99e0d7eb37f6535349d0226c3081abff0eb59f7f820a6cbf"
+   }
+  }
+ ],
+ "checks": {
+  "connected_components_label_order_verified_calls": {
+   "4": 6,
+   "8": 49
+  }
+ },
+ "generator": "tools/make_text_detect_fixtures.py",
+ "git": {
+  "head": "588bd72b3d69adb5d654c0f526d274c90c00930e",
+  "uncommitted_reference_edits": []
+ },
+ "surya_settings": {
+  "DETECTOR_BLANK_THRESHOLD": 0.35,
+  "DETECTOR_BOX_Y_EXPAND_MARGIN": 0.05,
+  "DETECTOR_TEXT_THRESHOLD": 0.6
+ },
+ "versions": {
+  "cv2.__version__": "4.12.0",
+  "numpy": "2.4.4",
+  "opencv-contrib-python": "4.10.0.84",
+  "opencv-python": "4.12.0.88",
+  "opencv-python-headless": "4.11.0.86",
+  "pillow": "12.2.0",
+  "pyclipper": "1.3.0.post6",
+  "python": "3.11.13",
+  "shapely": "2.1.1",
+  "surya-ocr": "0.17.1",
+  "torch": "2.12.0+rocm7.2"
+ }
+}

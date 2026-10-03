@@ -3128,7 +3128,7 @@ impl eframe::App for MangaApp {
                 self.translation_tab
                     .sync_with_project_settings(&self.project);
                 self.translation_tab
-                    .draw_side_panel(ctx, &mut self.canvas, &self.project);
+                    .draw_side_panel(ctx, &mut self.canvas, &self.project, &self.page_infos);
                 self.canvas.set_drag_scroll_blocked(false);
                 self.canvas.set_wheel_scroll_blocked(false);
                 self.canvas

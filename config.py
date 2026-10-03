@@ -279,10 +279,6 @@ USER_CONFIG_DEFAULTS = {
             "params": {
                 "device": "cpu",
                 "detect_size": 1280,
-                "det_rearrange_max_batches": 4,
-                "font size multiplier": 1.0,
-                "font size max": -1.0,
-                "font size min": -1.0,
                 "mask dilate size": 2
             }
         },
