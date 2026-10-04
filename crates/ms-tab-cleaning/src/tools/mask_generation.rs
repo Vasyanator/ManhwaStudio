@@ -11,8 +11,8 @@ tool can offer the same generation without a copy of any of it.
 Two hosts consume it and neither may fork it:
 - `base.rs::RegionMaskInpaintToolBase`, the detached region-editor window of the classic
   mask-inpaint tools;
-- `ai_editor/`, the «ИИ-редактор области» host, which writes the answer into the selected
-  layer of its `RegionFrame`'s mask stack.
+- `region_edit_v2/host.rs`, the generic region-editing host behind «ИИ-редактор области»,
+  which writes the answer into the selected layer of its `RegionFrame`'s mask stack.
 
 Main responsibilities:
 - name the four sources and say what each of them needs (Torch, a running backend)
@@ -362,7 +362,7 @@ pub(super) enum MaskGenerationPoll {
 /// mask-generation path without starting the real detector, which performs a backend round
 /// trip and, for the Torch sources, a model download into the runtime data root. A host stores
 /// this pointer, defaults it to `spawn_mask_generation` and lets its tests install a stub — see
-/// `ai_editor::AiEditorTool::spawn_detection`.
+/// `region_edit_v2::host::RegionEditHost::spawn_detection`.
 pub(super) type MaskGenerationSpawner = fn(egui::ColorImage, MaskGenerationParams, Arc<Mutex<WatermarkProgress>>) -> Receiver<Result<GeneratedMask, String>>;
 
 /// Starts a detection on a worker thread and returns its result channel.

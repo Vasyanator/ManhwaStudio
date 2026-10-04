@@ -712,6 +712,17 @@ pub fn lama_engine_settings_path() -> PathBuf {
     data_dir().join("lama_engine_settings.json")
 }
 
+/// Dedicated settings file of the «ИИ редактирование (API)» cleaning tool (the selected
+/// cloud provider, each provider's model and endpoint, the prompt and the mask blend), kept
+/// out of `user_config.json` for the same reason as the engine files above: its background
+/// saves must not race the canvas-settings saver.
+///
+/// It never holds an API key: keys live only in the OS credential store.
+#[must_use]
+pub fn ai_api_edit_settings_path() -> PathBuf {
+    data_dir().join("ai_api_edit_settings.json")
+}
+
 /// Root of the reusable watermark LIBRARY: one self-contained directory per entry
 /// (metadata JSON, the `c`/`s` planes, the correlation template and the calibration
 /// crops that produced it).

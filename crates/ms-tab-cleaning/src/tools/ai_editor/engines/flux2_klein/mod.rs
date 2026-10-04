@@ -7,7 +7,7 @@ frame — the rectangle, the painted mask stack, the pending result and Прим
 This MODULE owns everything model-specific: the parameters and their persistence, the memory
 presets, the RAM/VRAM forecast, the prompt-cache library, the request/response wire
 contracts, the OOM recovery, the worker thread and its own progress bar. It implements
-`super::super::engine::AiEngine` and never touches `CanvasView`, `ProjectData` or the frame.
+`region_edit_v2::engine::AiEngine` and never touches `CanvasView`, `ProjectData` or the frame.
 
 This file is the MODULE ROOT and holds no logic at all: this header, the module
 declarations, and the constants shared by everything below — the selection limits, the
@@ -281,13 +281,15 @@ Contracts:
   SUPPORTED — the shipped klein checkpoints are distilled, but the paths are the user's and
   may point at one that is not.
 */
-use super::super::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
+// The save gate every engine's settings saver consults; one owner for all hosted engines.
+use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
 use ms_config::Flux2Variant;
 use crate::tools::base::RegionEditToolBase;
-use crate::tools::region_edit_v2::geometry::FrameConstraints;
+use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
 use ms_tab_translation::backend_health::ai_backend_offline_error;
 use ms_tab_translation::machine_translation::{MtService, translate_texts_via_translator};
 use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};

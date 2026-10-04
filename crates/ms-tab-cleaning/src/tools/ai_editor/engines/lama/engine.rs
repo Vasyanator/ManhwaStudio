@@ -385,8 +385,7 @@ impl AiEngine for LamaEngine {
         FrameConstraints {
             multiple: LAMA_SELECTION_MULTIPLE,
             min_side: LAMA_MIN_SELECTION_PX,
-            max_area: None,
-            max_aspect: None,
+            ..FrameConstraints::UNCONSTRAINED
         }
     }
 
@@ -614,7 +613,7 @@ mod tests {
         assert_eq!(constraints.multiple, 8);
         assert_eq!(constraints.min_side, 8);
         assert!(constraints.max_area.is_none(), "neither method caps the region's area");
-        assert!(constraints.max_aspect.is_none(), "nor its aspect ratio");
+        assert!(constraints.aspect.is_none(), "nor its aspect ratio");
     }
 
     /// A malformed request is refused by `start` instead of being encoded onto the wire,

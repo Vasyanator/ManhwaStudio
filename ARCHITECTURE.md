@@ -69,7 +69,8 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `ms-theme` — sole owner of semantic colours over egui's dark theme.
 - `ms-gifs` — embedded animated hints, streaming decoder.
 - `ms-raster` — generic raster primitives with one owner each: polygon scanline fill
-  (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold.
+  (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold,
+  integer replicate upscale / box downscale, single-channel box blur.
 - `ms-log` — session log (`runtime_log`) and opt-in trace log (`trace_log!` / `trace_scope!`).
 - `ms-text-detect` — GUI-free text-detection domain (block sort and cap, mask normalization, DB
   postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
@@ -107,6 +108,12 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   capability table (`model_caps`: supported / not supported / unknown), and the shared connection widget
   (`AiApiConnectionState`, `draw_connection`, `AiApiTaskRunner`). Consumers build their own
   requests; persistence of the selected service/model stays with the consumer.
+  `image_edit/` is the GUI-free cloud image-EDIT layer: provider/model catalog (size rule per
+  model, mask support, Russia availability), one adapter per API shape, a single native
+  executor (no retry of paid POSTs, key only to the provider's own hosts) and the exact-size
+  pipeline — integer ×k replicate up / box down only, output must be exactly k·W×k·H, composite
+  only inside the mask. The size VALIDITY decision stays with the cleaning frame
+  (`region_edit_v2::geometry`); `image_edit` carries rule data mapped 1:1 onto it.
 
 **UI engines and tabs (levels 7-11)**
 - `ms-canvas` — the shared page + bubble canvas; declares `CanvasHooks`.
@@ -235,8 +242,11 @@ the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw th
 - **Translation** — `ms-tab-translation`: bubbles, OCR, text detection, machine translation
   (AI API OCR and MT go through `ms-ai-api`).
   Talks to the backend only through `ms-backend-ipc`; owns the backend health probe.
-- **Cleaning** — `ms-tab-cleaning`: clean overlays, brush / region tools, the AI region editor
-  (engines behind `AiEngine`), the watermark engine. Writes only through `CleanOverlaysModel`.
+- **Cleaning** — `ms-tab-cleaning`: clean overlays, brush / region tools, two region-edit tools
+  on ONE generic host (`tools/region_edit_v2`: `RegionEditHost` + `HostSpec`, engines behind
+  `AiEngine`) — the local AI region editor (`tools/ai_editor`) and the cloud «ИИ редактирование
+  (API)» (`tools/ai_api_editor`, no Torch, over `ms_ai_api::image_edit`) — and the watermark
+  engine. Writes only through `CleanOverlaysModel`.
 - **Typing** — `ms-tab-typing` (+ renderer `ms-text-render`): text layers in `LayerDoc`, masks,
   export (PNG, PSD, lossless PDF).
 - **PS Editor** — `ms-tab-ps-editor`: single-page layered raster editor, NOT a `CanvasView`
@@ -322,7 +332,8 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
 - **Log** (`ms-log`) — session log `last.log` / `previous.log` and opt-in trace log, each with
   its own writer thread; callers pass the directory in.
 - **Credentials** — secrets live only in the OS keyring, never in a config file: AI API keys
-  (`ms_ai_api::keys`; per service, and per service + base URL for compatible endpoints) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
+  (`ms_ai_api::keys`; per service, per service + base URL for compatible endpoints, and frozen
+  `image_edit:{provider}[@{region}]` names for image-edit providers) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU
@@ -352,6 +363,7 @@ logged error); the GUI thread only polls and applies results.
 | Typing live render (latest-wins), save, export | `ms-tab-typing/src/tab/` |
 | PS editor page decode, raster effects | `ms-tab-ps-editor` |
 | Cleaning region loader, inpaint runs, quick text clean | `ms-tab-cleaning` |
+| Cloud image-edit run (submit, poll, download, exact-size finish) | `ms-tab-cleaning/src/tools/ai_api_editor` + `ms_ai_api::image_edit` |
 | Characters / Notes / Wiki background work | `ms-tabs-simple` |
 | Batch processing of new projects | `ms-launcher/src/new_project/batch_processing/` |
 

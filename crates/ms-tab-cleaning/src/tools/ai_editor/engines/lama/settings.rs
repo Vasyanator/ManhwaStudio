@@ -3,18 +3,18 @@ File: cleaning/tools/ai_editor/engines/lama/settings.rs
 
 Purpose:
 Everything the LaMa engine persists to `config::lama_engine_settings_path()` — the selected
-model and the parameters of BOTH backend methods — plus the file IO and the save gate.
+model and the parameters of BOTH backend methods — plus the file IO. The save gate is the
+shared `region_edit_v2::engine_settings::settings_save_due`.
 
 Main responsibilities:
 - own `LamaSettings`, its defaults and its clamping (`normalized`);
 - read and write the settings file on worker threads;
-- decide when a save is due (`settings_save_due`).
 
 Key structures:
 - `LamaSettings`
 
 Key functions:
-- `load_lama_settings()`, `save_lama_settings()`, `settings_save_due()`
+- `load_lama_settings()`, `save_lama_settings()`
 
 Notes:
 ONE file for the whole engine, unlike FLUX.2 klein's file-per-variant: the selected model is
@@ -129,17 +129,6 @@ pub(super) fn save_lama_settings(settings: &LamaSettings) -> Result<(), String> 
     fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.lama.write_settings_error", err = err))
 }
 
-/// Whether a settings save must be started right now.
-///
-/// `dirty` is raised by every parameter change. `settings_loaded` gates it because the
-/// initial load runs on its own worker: saving the in-memory DEFAULTS before that load lands
-/// would overwrite the user's file with defaults — a silent data loss rather than a visible
-/// failure. `save_in_flight` keeps at most one writer on the file at a time.
-#[must_use]
-pub(super) fn settings_save_due(dirty: bool, settings_loaded: bool, save_in_flight: bool) -> bool {
-    dirty && settings_loaded && !save_in_flight
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,18 +197,5 @@ mod tests {
             round_trip, both,
             "the unselected method's parameters must survive, or switching model and back would reset them"
         );
-    }
-
-    /// The save gate: only a real change writes, never before the initial load has landed,
-    /// and never a second writer while one is in flight.
-    #[test]
-    fn a_save_is_due_only_after_the_load_and_never_twice_at_once() {
-        assert!(settings_save_due(true, true, false));
-        assert!(!settings_save_due(false, true, false), "nothing changed: no write");
-        assert!(
-            !settings_save_due(true, false, false),
-            "saving before the load lands would overwrite the file with defaults"
-        );
-        assert!(!settings_save_due(true, true, true), "at most one writer at a time");
     }
 }

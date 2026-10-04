@@ -1,18 +1,24 @@
 /*
-File: ai_editor/engine.rs
+File: region_edit_v2/engine.rs
 
 Purpose:
-The contract between the «ИИ-редактор области» HOST and the AI engines it hosts. The host
+The contract between the region-editing HOST (`host.rs`) and the AI engines it hosts. The host
 owns the on-canvas `RegionFrame` — the rectangle, the mask stack, the pending result, the
 lock and Применить/Отменить; an engine owns everything model-specific — its parameters, its
-settings file, its wire protocol, its worker thread and its own progress bar.
+settings file, its wire protocol, its worker thread and its own progress bar. Also the ONE
+owner of the user-facing sentence for a `SizeViolation`, shared by the host's panel and the
+engines' run-path re-check.
 
 Key structures:
 - `AiEngine`: the trait every engine implements
 - `EngineSection`: which picker section («Без промпта» / «С промптом») an engine appears in
-- `MaskLayerSpec`: one mask layer an engine wants painted (re-exported from the framework)
+- `MaskLayerSpec`: one mask layer an engine wants painted (re-exported from `layers`)
 - `EngineRunRequest`: everything the host hands an engine to start one run
 - `EnginePoll`: what one `poll` says about the run in flight
+
+Key functions:
+- `violation_text()`: the localized sentence for one `SizeViolation`
+- `region_size_refusal()`: the run-path re-check of an engine's `FrameConstraints`
 
 Notes:
 An engine never sees `CanvasView`, `ProjectData`, the frame or an `egui::Context` outside
@@ -22,7 +28,7 @@ what progress even is, so each draws its own bar inside its own parameter panel 
 learns only Running / Done / Failed. A run's answer is PIXELS and only pixels (D12).
 */
 
-use super::super::region_edit_v2::geometry::FrameConstraints;
+use super::geometry::{FrameConstraints, SizeViolation, check_size};
 use ms_canvas::OverlayRectPx;
 use eframe::egui;
 
@@ -46,7 +52,7 @@ pub enum EngineSection {
 /// the type could only ever drift from the one the frame consumes. Layers are declared in
 /// painting order — a later layer wins where two overlap, in the preview and in the run
 /// request alike — and the layer count is the LENGTH of `mask_layers()` and nothing else.
-pub use super::super::region_edit_v2::layers::MaskLayerSpec;
+pub use super::layers::MaskLayerSpec;
 
 /// Everything the host hands an engine to start one run.
 ///
@@ -89,7 +95,7 @@ pub enum EnginePoll {
     Failed(String),
 }
 
-/// One AI engine the «ИИ-редактор области» tool can host.
+/// One AI engine a region-editing host can run.
 ///
 /// Ownership boundary: the engine owns its parameters, its persistence, its wire protocol,
 /// its worker threads and its progress reporting; the host owns the rectangle, the mask
@@ -196,4 +202,96 @@ pub trait AiEngine {
     /// queried the backend on each of them would issue one request per frame. Defer such
     /// work to the first call that reports `true`.
     fn set_region(&mut self, region: Option<OverlayRectPx>, geometry_settled: bool);
+}
+
+/// The localized sentence that says which rule a size broke.
+///
+/// The ONE mapping from a violation to its words: the host's main panel prints it under an
+/// invalid frame, and [`region_size_refusal`] returns it from an engine's run path, so the two
+/// read exactly alike and a new variant is worded in one place.
+#[must_use]
+pub(in crate::tools) fn violation_text(violation: SizeViolation) -> &'static str {
+    match violation {
+        SizeViolation::NotMultiple => t!("cleaning.tools.area_editor.violation_multiple"),
+        SizeViolation::TooSmall => t!("cleaning.tools.area_editor.violation_min_side"),
+        SizeViolation::TooLarge => t!("cleaning.tools.area_editor.violation_max_side"),
+        SizeViolation::AreaTooSmall => t!("cleaning.tools.area_editor.violation_min_area"),
+        SizeViolation::AreaTooLarge => t!("cleaning.tools.area_editor.violation_max_area"),
+        SizeViolation::AspectTooSteep => t!("cleaning.tools.area_editor.violation_aspect"),
+        SizeViolation::NotAllowedSize => t!("cleaning.tools.area_editor.violation_not_allowed_size"),
+    }
+}
+
+/// The localized refusal for a region that violates `constraints`, or `None` when the size
+/// satisfies every one of them. `width` and `height` are in source page pixels.
+///
+/// This is the RUN-PATH half of the size contract, and it is deliberately a second copy of a
+/// check the frame already performs: the frame snaps its rectangle to the same constraints,
+/// but the rectangle and the region an engine is handed can disagree — a host that hands
+/// over another size must be told which rule it broke instead of having the backend refuse
+/// the blob. The verdict comes from `geometry::check_size`, the single authority on what a
+/// valid size is, so this side can never accept a size the frame paints red.
+///
+/// The wording is [`violation_text`], so an engine's refusal reads exactly like the line the
+/// host draws under an invalid rectangle.
+#[must_use]
+pub(in crate::tools) fn region_size_refusal(
+    width: usize,
+    height: usize,
+    constraints: &FrameConstraints,
+) -> Option<String> {
+    let violation = check_size(width, height, constraints)?;
+    Some(violation_text(violation).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared run-path re-check answers exactly what `check_size` decides, and names the
+    /// rule that was broken.
+    #[test]
+    fn the_run_path_size_refusal_follows_the_authoritative_checker() {
+        let grid_of_8 =
+            FrameConstraints { multiple: 8, min_side: 8, ..FrameConstraints::UNCONSTRAINED };
+        assert!(region_size_refusal(64, 64, &grid_of_8).is_none());
+        // Off the grid, and below the shortest side that grid allows.
+        assert!(region_size_refusal(7, 8, &grid_of_8).is_some());
+        assert!(region_size_refusal(9, 16, &grid_of_8).is_some());
+        for (w, h) in [(1024usize, 1024usize), (250, 256), (0, 8)] {
+            assert_eq!(
+                region_size_refusal(w, h, &grid_of_8).is_some(),
+                check_size(w, h, &grid_of_8).is_some(),
+                "{w}x{h}"
+            );
+        }
+    }
+
+    /// Every violation has a sentence of its own, and the run path speaks it word for word: a
+    /// copy-pasted arm in the one mapping would tell the user to fix the wrong rule.
+    #[test]
+    fn every_size_violation_has_its_own_sentence() {
+        // `t!` answers against the PROCESS-GLOBAL catalog and degrades to the bare key without
+        // one; install the reference catalog under the shared lock, as the other UI-string
+        // tests of this crate do.
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
+        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
+        ms_i18n::set_locale(&en).expect("en catalog installs");
+        let texts = [
+            violation_text(SizeViolation::NotMultiple),
+            violation_text(SizeViolation::TooSmall),
+            violation_text(SizeViolation::TooLarge),
+            violation_text(SizeViolation::AreaTooSmall),
+            violation_text(SizeViolation::AreaTooLarge),
+            violation_text(SizeViolation::AspectTooSteep),
+            violation_text(SizeViolation::NotAllowedSize),
+        ];
+        for (idx, text) in texts.iter().enumerate() {
+            assert!(!text.is_empty());
+            assert!(texts[idx + 1..].iter().all(|other| other != text), "{text} is used twice");
+        }
+        let grid_of_8 =
+            FrameConstraints { multiple: 8, min_side: 8, ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(region_size_refusal(12, 16, &grid_of_8).as_deref(), Some(violation_text(SizeViolation::NotMultiple)));
+    }
 }

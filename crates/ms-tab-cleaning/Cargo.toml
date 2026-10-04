@@ -5,7 +5,7 @@ edition = "2024"
 
 # The «Клининг» (cleaning) tab extracted whole from `src/tabs/cleaning/`: the tab state and
 # its canvas hooks, the complete tool set (mask brush, patch, region edit v2, the AI editor
-# engines Flux.2 / LaMa / SDXL, AOT and Flux-Fill inpainting, mask generation, watermark
+# engines Flux.2 / LaMa / SDXL, the cloud API editor, AOT and Flux-Fill inpainting, mask generation, watermark
 # removal and its library), the batch autoclean driver and the GUI-free chapter-level
 # watermark decomposition engine.
 #
@@ -20,6 +20,13 @@ edition = "2024"
 # It does NOT depend on `ms-tab-typing`: those two are the workspace's largest crates, and
 # an edge between them would serialize the build's critical path for nothing. Keep it that
 # way — route anything the tab needs from the typing side through the models instead.
+
+[features]
+# Exposes `suppress_ai_api_editor_settings_persistence_for_tests` to OTHER crates' tests: it
+# arms the runtime latch that keeps the cloud-edit tool from writing the user's settings file
+# in a test binary where this crate's `cfg!(test)` is false. Enable it only from a
+# `[dev-dependencies]` entry; the latch, not the feature, gates the save.
+test-support = []
 
 [dependencies]
 # Framed IPC with the Python AI backend: every inpainting / mask / watermark request goes
@@ -45,6 +52,11 @@ ms-sysprobe = { path = "../ms-sysprobe" }
 # The «Перевод» tab: AI backend health (`backend_health`), the text detector's mask helpers
 # and the MT service the Flux.2 engine translates prompts through.
 ms-tab-translation = { path = "../ms-tab-translation" }
+# The cloud image-edit layer behind «ИИ редактирование (API)» (`tools/ai_api_editor/`): the
+# provider/model catalogue and its size rules, the picker widget with its key block, and the
+# size-exact `run_image_edit` pipeline. Already below this crate through `ms-tab-translation`,
+# so the edge adds no build cost and no layering change.
+ms-ai-api = { path = "../ms-ai-api" }
 # Every background worker this tab spawns goes through the project thread wrapper.
 ms-thread = { path = "../ms-thread" }
 # The reusable mask brush, polygon rasterizer, the shared red-black SOR kernel, the dense

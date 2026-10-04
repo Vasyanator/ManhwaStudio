@@ -6,7 +6,7 @@ The «SDXL Inpaint» ENGINE of the «ИИ-редактор области» tool
 frame — the rectangle, the painted mask stack, the pending result and Применить/Отменить.
 This MODULE owns everything model-specific: the two channel modes and their parameters, the
 persistence of both parameter sets, the streaming wire contract, the live latent preview and
-the worker thread. It implements `super::super::engine::AiEngine` and never touches
+the worker thread. It implements `region_edit_v2::engine::AiEngine` and never touches
 `CanvasView`, `ProjectData` or the frame.
 
 This file is the MODULE ROOT and holds no logic: this header, the module declarations, the
@@ -67,14 +67,16 @@ Notes:
 - A run cannot be stopped backend-side: `cancel` detaches the answer and the backend finishes
   the pass.
 */
-use super::super::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
 use super::lama::{
     LamaModelSpec, default_lama_model_filename, ensure_lama_model_for_external,
     lama_v2_model_catalog,
 };
 // The engines' shared run-path re-check of `FrameConstraints`, so this engine's refusal
 // wording is the host's own.
-use super::region_size_refusal;
+use crate::tools::region_edit_v2::engine::region_size_refusal;
+// The save gate every engine's settings saver consults; one owner for all hosted engines.
+use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::OverlayRectPx;
 use ms_config as config;

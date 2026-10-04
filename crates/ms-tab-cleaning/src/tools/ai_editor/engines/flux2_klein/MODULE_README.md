@@ -2,7 +2,7 @@
 
 ## Purpose
 The FLUX.2 klein engine of the «ИИ-редактор области» tool: one implementation of
-`ai_editor::engine::AiEngine`. It owns everything model-specific — the persisted
+`region_edit_v2::engine::AiEngine`. It owns everything model-specific — the persisted
 parameters, the memory presets, the RAM/VRAM forecast, the prompt-cache library, the
 model download, the per-component residency, the request/response wire contracts, the
 OOM recovery, the worker threads and its own progress bar — and nothing host-specific:

@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 # Generic, GUI-free raster primitives with exactly one owner each in the project: the even-odd
-# polygon scanline rasterizer, the square (Chebyshev) binary dilation and the Otsu threshold.
+# polygon scanline rasterizer, the square (Chebyshev) binary dilation, the Otsu threshold,
+# integer-factor replicate upscale / box downscale and the `u8` box blur.
 #
 # Layer: level 0 (foundation). std plus `thiserror` only, wasm-safe, no `ms-*` dependency, so any
 # crate — tools, cleaning, translation, the text-detection domain — can use it without pulling a
 # UI or domain layer. A second implementation of any of these primitives elsewhere is a defect.
 [dependencies]
-# Typed public error (`RasterError`) for the buffer-length contract.
+# Typed public error (`RasterError`) for the buffer-shape and parameter contracts.
 thiserror.workspace = true

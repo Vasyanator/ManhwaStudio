@@ -32,6 +32,13 @@ pub enum AiApiError {
     StoreKey { service: AiApiService, detail: String },
     /// Deleting the stored key failed for a reason other than "no key stored".
     DeleteKey { service: AiApiService, detail: String },
+    /// Reading the key of a named slot (`keys::NamedKeyUser`) failed for a reason other than
+    /// "no key stored"; `label` is the slot owner's display name.
+    ReadNamedKey { label: &'static str, detail: String },
+    /// Writing the key of a named slot to the credential store failed.
+    StoreNamedKey { label: &'static str, detail: String },
+    /// Deleting the key of a named slot failed for a reason other than "no key stored".
+    DeleteNamedKey { label: &'static str, detail: String },
     /// The async runtime for the model-list request could not be created.
     ModelListRuntime { detail: String },
     /// The provider's model-list request failed.
@@ -64,6 +71,9 @@ impl AiApiError {
             Self::ReadKey { service, detail } => tf!("ai_api.keys.read_error", service = service.label(), err = detail),
             Self::StoreKey { service, detail } => tf!("ai_api.keys.store_error", service = service.label(), err = detail),
             Self::DeleteKey { service, detail } => tf!("ai_api.keys.delete_error", service = service.label(), err = detail),
+            Self::ReadNamedKey { label, detail } => tf!("ai_api.keys.read_named_error", provider = label, err = detail),
+            Self::StoreNamedKey { label, detail } => tf!("ai_api.keys.store_named_error", provider = label, err = detail),
+            Self::DeleteNamedKey { label, detail } => tf!("ai_api.keys.delete_named_error", provider = label, err = detail),
             Self::ModelListRuntime { detail } => tf!("ai_api.metadata.async_runtime_error", err = detail),
             Self::FetchModels { service, detail } => tf!("ai_api.metadata.fetch_models_error", service = service.label(), err = detail),
             Self::MetadataWebUnavailable => t!("ai_api.metadata.web_unavailable_error").to_string(),
@@ -97,5 +107,7 @@ mod tests {
         let error = AiApiError::ReadKey { service: AiApiService::Groq, detail: "boom-detail".to_string() };
         assert_eq!(error.to_string(), error.user_message());
         assert_eq!(AiApiError::EmptyKey.to_string(), AiApiError::EmptyKey.user_message());
+        let named = AiApiError::StoreNamedKey { label: "Black Forest Labs", detail: "boom-detail".to_string() };
+        assert_eq!(named.to_string(), named.user_message());
     }
 }

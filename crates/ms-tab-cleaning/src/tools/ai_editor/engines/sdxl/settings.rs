@@ -3,19 +3,19 @@ File: cleaning/tools/ai_editor/engines/sdxl/settings.rs
 
 Purpose:
 The channel mode, the per-mode generation parameters, the document persisted to
-`config::sdxl_inpaint_settings_path()` and the save gate that decides when to write it.
+`config::sdxl_inpaint_settings_path()`. The save gate that decides when to write it is the
+shared `region_edit_v2::engine_settings::settings_save_due`.
 
 Main responsibilities:
 - own `SdxlMode` and its wire spelling;
 - own `SdxlSettings` — one full parameter set per mode — and the per-mode defaults;
 - own `SdxlPersisted`, the on-disk document, and read/write it on worker threads;
-- decide when a save is due (`settings_save_due`).
 
 Key structures:
 - `SdxlMode`, `SdxlSettings`, `SdxlPersisted`, `SdxlRunConfig`
 
 Key functions:
-- `load_sdxl_settings()`, `save_sdxl_settings()`, `settings_save_due()`
+- `load_sdxl_settings()`, `save_sdxl_settings()`
 
 Notes:
 The FILE and every FIELD NAME are FIXED by on-disk compatibility: an existing
@@ -207,17 +207,6 @@ pub(super) fn save_sdxl_settings(persisted: &SdxlPersisted) -> Result<(), String
     fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.sdxl.write_settings_error", err = err))
 }
 
-/// Whether a settings save must be started right now.
-///
-/// `dirty` is raised by every parameter change. `settings_loaded` gates it because the
-/// initial load runs on its own worker: saving the in-memory DEFAULTS before that load lands
-/// would overwrite the user's file with defaults — a silent data loss rather than a visible
-/// failure. `save_in_flight` keeps at most one writer on the file at a time.
-#[must_use]
-pub(super) fn settings_save_due(dirty: bool, settings_loaded: bool, save_in_flight: bool) -> bool {
-    dirty && settings_loaded && !save_in_flight
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,18 +287,5 @@ mod tests {
             "a missing key is its default, not a parse failure"
         );
         assert_eq!(doc.nine_channel, SdxlSettings::for_mode(SdxlMode::NineChannel));
-    }
-
-    /// The save gate: only a real change writes, never before the initial load has landed,
-    /// and never a second writer while one is in flight.
-    #[test]
-    fn a_save_is_due_only_after_the_load_and_never_twice_at_once() {
-        assert!(settings_save_due(true, true, false));
-        assert!(!settings_save_due(false, true, false), "nothing changed: no write");
-        assert!(
-            !settings_save_due(true, false, false),
-            "saving before the load lands would overwrite the file with defaults"
-        );
-        assert!(!settings_save_due(true, true, true), "at most one writer at a time");
     }
 }

@@ -39,7 +39,7 @@ use super::*;
 /// Draws the source-mode switch: two toggle buttons, exactly one of them selected.
 ///
 /// Two mutually exclusive positions with short captions, so this is the toggle-button
-/// idiom the engine picker already uses (`../../mod.rs::draw_engine_picker`) —
+/// idiom the engine picker already uses (`region_edit_v2/host_panels.rs::draw_engine_picker`) —
 /// `egui::Button::selected` in a `horizontal_wrapped`, with `wrap_mode = Extend` so a long
 /// caption moves its button to the next ROW instead of breaking over two lines
 /// (`egui-docs/04-widgets.md` §5). A `WheelComboBox` would hide one of two choices behind a

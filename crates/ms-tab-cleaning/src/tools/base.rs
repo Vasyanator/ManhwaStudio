@@ -17,7 +17,7 @@ FILE HEADER (cleaning/tools/base.rs)
     The «Сгенерировать маску» button, its source catalog, its worker and the whole watermark
     plumbing live in the shared `mask_generation` module, NOT here: this base owns only the
     `MaskGenerationState` it hands that module and the mask layer the answer is written into.
-    The area editor (`ai_editor/`) drives the same module, so a change to a source, to a
+    The region-editing host (`region_edit_v2/host.rs`) drives the same module, so a change to a source, to a
     requirement rule or to the detection call belongs there and reaches both hosts at once.
   - `RegionEditorSession`: состояние открытого окна region editor (target rect в overlay px,
     изображение, texture, статус, zoom-drag).

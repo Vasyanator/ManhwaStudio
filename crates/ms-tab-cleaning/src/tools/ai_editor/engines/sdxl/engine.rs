@@ -396,8 +396,7 @@ impl AiEngine for SdxlEngine {
         FrameConstraints {
             multiple: SDXL_SELECTION_MULTIPLE,
             min_side: SDXL_MIN_SELECTION_PX,
-            max_area: None,
-            max_aspect: None,
+            ..FrameConstraints::UNCONSTRAINED
         }
     }
 
@@ -653,7 +652,7 @@ mod tests {
         assert_eq!(constraints.multiple, 8);
         assert_eq!(constraints.min_side, 8);
         assert!(constraints.max_area.is_none(), "the pipeline caps no region area");
-        assert!(constraints.max_aspect.is_none(), "nor the aspect ratio");
+        assert!(constraints.aspect.is_none(), "nor the aspect ratio");
     }
 
     /// Each mode owns a COMPLETE parameter set: selecting a mode selects its set whole, and

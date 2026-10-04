@@ -18,9 +18,14 @@ Modules:
 - `metadata`  : `AiApiMetadata` and `load_metadata` (key state, model list, account status).
 - `openrouter`: OpenRouter account status fetch + its pure formatter (native only).
 - `quota`     : provider-agnostic "out of credits / rate limited" error classifier.
-- `encoding`  : the one base64 encoder for binary chat parts.
+- `encoding`  : the one base64 codec (encoder for binary chat parts and image-edit bodies,
+                strict decoder for image-edit responses).
+- `image_edit`: the cloud image-edit layer (provider / model catalogue, size-rule data, the
+                size-exact pipeline, the per-API-shape adapters and the native HTTP executor,
+                the provider / model picker and its single-flight key state).
 - `connection`: `AiApiConnectionState` (widget state), its actions, `apply_event`.
-- `connection_view`: `draw_connection`, the shared egui connection widget.
+- `connection_view`: `draw_connection`, the shared egui connection widget, and its reusable
+                `draw_key_block`.
 - `tasks`     : `AiApiRequest` / `AiApiEvent` / `AiApiTaskRunner` (one serial `ms_thread`
                 worker per runner, FIFO).
 
@@ -44,6 +49,7 @@ pub mod connection;
 pub mod connection_view;
 pub mod encoding;
 pub mod error;
+pub mod image_edit;
 pub mod keys;
 pub mod metadata;
 pub mod model_caps;
@@ -56,8 +62,8 @@ pub mod target;
 pub mod tasks;
 
 pub use connection::{AiApiConnectionActions, AiApiConnectionState, AiApiEventOutcome, AiApiNotice};
-pub use connection_view::draw_connection;
-pub use encoding::base64_encode;
+pub use connection_view::{KeyBlockActions, KeyBlockView, draw_connection, draw_key_block};
+pub use encoding::{Base64Error, base64_decode, base64_encode};
 pub use error::AiApiError;
 pub use metadata::{AiApiMetadata, load_metadata};
 pub use model_caps::{ImageInputSupport, image_input_support};

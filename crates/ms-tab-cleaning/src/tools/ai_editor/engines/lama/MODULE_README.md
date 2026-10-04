@@ -46,7 +46,8 @@ status lines. Nothing here is behind a fold except the parameters, which open by
 - `scan.rs`: the presence scan of BOTH model directories (a worker) and the one status line it
   feeds. Informational only — the picker always offers the full catalog.
 - `settings.rs`: `LamaSettings` (the selected model and every parameter of both methods), its
-  clamping, its file IO and `settings_save_due`.
+  clamping and its file IO. The save gate `settings_save_due` is shared, in
+  `../../../region_edit_v2/engine_settings.rs`.
 - `wire.rs`: `effective_refine`, `lama_run_header`, `run_lama`, `unload_lama`, the
   request-blob packing and the `CallError` mapping (the PNGs come from `tools/region_png.rs`). Edit here to change what travels on the wire.
 - `engine.rs`: `LamaEngine`, its `AiEngine` impl, its channel polling and its parameter panel.
@@ -115,5 +116,5 @@ status lines. Nothing here is behind a fold except the parameters, which open by
 - To change the mask label: `LamaEngine::mask_layers`; the tint itself is the shared
   `ms_theme::canvas::MASK_TINT`.
 - To change where the settings file lives: `config::lama_engine_settings_path`.
-- To change the picker, the panels, the frame or the apply path: the HOST (`../../mod.rs`),
-  never here.
+- To change the picker, the panels, the frame or the apply path: the HOST
+  (`../../../region_edit_v2/host.rs`, `host_panels.rs`), never here.

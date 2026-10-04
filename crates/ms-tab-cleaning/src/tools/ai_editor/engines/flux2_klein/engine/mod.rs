@@ -633,7 +633,8 @@ impl Flux2KleinEngine {
             multiple: FLUX2_SELECTION_MULTIPLE,
             min_side: FLUX2_MIN_SELECTION_PX,
             max_area: Some(u64::try_from(FLUX2_MAX_SELECTION_AREA_PX2).unwrap_or(u64::MAX)),
-            max_aspect: Some(FLUX2_MAX_SELECTION_ASPECT),
+            aspect: Some(AspectLimit::symmetric(FLUX2_MAX_SELECTION_ASPECT)),
+            ..FrameConstraints::UNCONSTRAINED
         }
     }
 

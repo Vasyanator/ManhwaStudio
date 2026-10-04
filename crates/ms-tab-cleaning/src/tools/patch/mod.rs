@@ -65,7 +65,7 @@ const OUTLINE_LAYER_ID: &str = "cleaning_patch_outline";
 /// The check exists because `CanvasView::replace_overlay_region_px` REPAIRS instead of refusing:
 /// it clips a target rectangle that no longer fits the overlay and then nearest-rescales the
 /// whole chunk into what is left, overwriting alpha wholesale. The same reason
-/// `ai_editor::check_result_fits` and `region_edit_v2/frame.rs`'s D7 exist.
+/// `region_edit_v2::host::check_result_fits` and `region_edit_v2/frame.rs`'s D7 exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum ApplyError {
     /// The solved chunk does not have exactly the ROI's size.

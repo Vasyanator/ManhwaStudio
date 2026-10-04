@@ -3,7 +3,7 @@
 ## Purpose
 The «SDXL Inpaint» ENGINE of the «ИИ-редактор области» tool: two channel modes behind one backend
 method, a prompt, a streamed progress bar with a live latent preview, and one run button. It
-implements `../../engine.rs`'s `AiEngine` and owns everything model-specific — the parameters of
+implements `../../../region_edit_v2/engine.rs`'s `AiEngine` and owns everything model-specific — the parameters of
 both modes and their persistence, the wire contract, the worker thread and the progress state.
 
 It owns NOTHING about the canvas. The rectangle, the painted mask stack, the pending result and
@@ -44,7 +44,8 @@ subtree and it is one-directional.
   sampler list, a parameter range, or the preview width.
 - `settings.rs`: `SdxlMode` and its wire spelling, `SdxlSettings` (one full parameter set per mode)
   with the per-mode defaults, `SdxlPersisted` (the document), `SdxlRunConfig` (the worker snapshot),
-  the file IO and `settings_save_due`. Edit it to add, rename or re-default a persisted field.
+  the file IO (the save gate `settings_save_due` is shared, in
+  `../../../region_edit_v2/engine_settings.rs`). Edit it to add, rename or re-default a persisted field.
 - `progress.rs`: `SdxlSharedProgress`, the poison-tolerant lock, the generation claim/retire/publish
   helpers, the bar fraction and `draw_sdxl_progress_ui`. Edit it to change what a run reports while
   it is in flight.
@@ -122,5 +123,5 @@ subtree and it is one-directional.
 - To change the panel layout, the run gate or the polling: `engine.rs`.
 - To change what a run reports while in flight: `progress.rs`.
 - To change which LaMa checkpoints the prefill picker offers: `../lama/catalog.rs`, never here.
-- To change what the host does with the engine (the picker, the panels, the frame): `../../mod.rs`
-  and `../../../region_edit_v2/`, never here.
+- To change what the host does with the engine (the picker, the panels, the frame):
+  `../../../region_edit_v2/` (`host.rs`, `host_panels.rs`), never here.

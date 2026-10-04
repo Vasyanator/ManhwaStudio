@@ -56,7 +56,7 @@ FILE HEADER (tabs/cleaning/tab.rs)
 use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool};
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
 use super::tools::{
-    AiEditorTool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
+    ai_api_editor_tool, ai_editor_tool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
     FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
     StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool,
     ZamazkaTool,
@@ -223,11 +223,11 @@ const CLEANING_PANEL_CHROME_WIDTH_PX: f32 = 16.0;
 const BRUSH_TOOL_INDICES: [usize; 3] = [0, 1, 2];
 const MASK_REMOVAL_TOOL_INDICES: [usize; 3] = [3, 4, 5];
 // Инструменты редактирования области (FLUX.1 Fill, удаление водяных знаков,
-// ИИ-редактор области) — отдельной строкой. FLUX.2 klein, Lama и SDXL Inpaint больше
+// ИИ-редактор области, ИИ редактирование (API)) — отдельной строкой. FLUX.2 klein, Lama и SDXL Inpaint больше
 // не являются самостоятельными инструментами: это движки ИИ-редактора области
 // (`tools/ai_editor/engines/`). Индекс, отсутствующий в этих массивах,
 // зарегистрирован, но не рисуется ни в одной группе панели инструментов.
-const AREA_EDIT_TOOL_INDICES: [usize; 3] = [6, 7, 8];
+const AREA_EDIT_TOOL_INDICES: [usize; 4] = [6, 7, 8, 9];
 
 /// Every tool index the «Инструменты клина» tab draws a button for, in draw order.
 ///
@@ -800,7 +800,8 @@ impl Default for CleaningTabState {
             Box::<AotInpaintTool>::default(),
             Box::<FluxFillInpaintTool>::default(),
             Box::<WatermarkRemovalTool>::default(),
-            Box::<AiEditorTool>::default(),
+            Box::new(ai_editor_tool()),
+            Box::new(ai_api_editor_tool()),
         ];
         let mut state = Self {
             canvas,

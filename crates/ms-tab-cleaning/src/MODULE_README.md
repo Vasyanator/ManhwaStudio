@@ -10,7 +10,8 @@ This directory is the crate root of `ms-tab-cleaning`, re-exported by the binary
 `src/tabs/mod.rs` as `crate::tabs::cleaning`, so every existing
 `crate::tabs::cleaning::…` path stays valid. Layer: the TOP of the library stack — above
 `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets`, the level-0 `ms-raster` (square
-dilation) and `ms-tab-translation` (backend health, the text detector and the MT service), and below only `app.rs`, which calls
+dilation), `ms-ai-api` (the cloud image-edit layer of «ИИ редактирование (API)») and
+`ms-tab-translation` (backend health, the text detector and the MT service), and below only `app.rs`, which calls
 `CleaningTabState::draw`. It must never name `app` or `launcher`. There is NO dependency on
 `ms-tab-typing`: the only thing shared with it is the atomic document-write RECIPE that
 `tools/watermark_library.rs` reimplements, because that crate's `panel/doc_store.rs` is
@@ -119,9 +120,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `canvas.draw`; and two visibility/body PAIRS — `wants_main_panel` / `draw_main_panel` for
   «Редактор области» and `wants_library_panel` / `draw_library_panel` for «Библиотека знаков»,
   both bodies bound by the same "a body may not mutate the tab" rule as
-  `draw_ui`) — brush/region-edit bases, the on-canvas region frame (`tools/region_edit_v2/`) and
-  its only consumer `tools/ai_editor/`, which HOSTS the AI engines (FLUX.2 klein is the first) and
-  splits their UI across those two tabs, local fill tools, stamp tool, the on-canvas patch tool
+  `draw_ui`) — brush/region-edit bases, the on-canvas region frame and its generic engine host
+  (`tools/region_edit_v2/`), which splits a hosted tool's UI across those two tabs, and its two
+  consumers `tools/ai_editor/` (a `HostSpec` plus the local AI engine catalog, FLUX.2 klein first)
+  and `tools/ai_api_editor/` (one cloud engine over `ms_ai_api::image_edit`), local fill tools, stamp tool, the on-canvas patch tool
   (`tools/patch/`, gradient-domain seamless cloning), the AI-backed
   inpaint tools (`tools/aot.rs`, FLUX.1 Fill in `tools/flux_fill.rs`), and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management panel and the reference-crop intake that builds an

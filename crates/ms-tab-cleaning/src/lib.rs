@@ -55,3 +55,8 @@ pub use tab::{CleaningDrawParams, CleaningTabState};
 /// `app.rs::restore_panel_dock` before the first frame. `pub`, not crate-private: the
 /// caller lives in the binary.
 pub use tab::cleaning_default_dock_layout;
+/// Test-only door: marks the process as a test process so the cloud-edit tool never writes the
+/// user's `ai_api_edit_settings` file. A dependent crate's test that builds `CleaningTabState`
+/// calls it first (with this crate's `test-support` feature enabled from `[dev-dependencies]`).
+#[cfg(any(test, feature = "test-support"))]
+pub use tools::suppress_ai_api_editor_settings_persistence_for_tests;

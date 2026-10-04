@@ -16,7 +16,8 @@ Key structures:
 Key functions:
 - `handle_points()`, `handle_hit_rects()`: handle centres and their hit rectangles
 - `moved_rect_px()`: the top-strip drag
-- `resized_rect_px()`: a handle drag, snapped through `geometry::nearest_valid_size`
+- `resized_rect_px()`: a handle drag, snapped and fitted into the page through
+  `geometry::snap_size`
 
 Notes:
 Every handle lives entirely OUTSIDE the frame — see `handle_hit_rects` for why and for the
@@ -29,7 +30,7 @@ and the frame simply stays pinned at the border while the pointer is beyond it.
 Design: `dev-docs/region_edit_v2_plan.md` (§1, §2 D3/D4, §10).
 */
 
-use super::geometry::{FrameConstraints, nearest_valid_size};
+use super::geometry::{FrameConstraints, snap_size};
 use ms_canvas::OverlayRectPx;
 use egui::{Pos2, Rect, pos2};
 
@@ -322,16 +323,15 @@ fn clamp_origin(origin: i64, size: usize, page: usize) -> usize {
 /// The frame rectangle after dragging `handle` by `delta` page pixels.
 ///
 /// The edges the handle owns move, the opposite edges stay put, the resulting size is snapped
-/// through `nearest_valid_size` and the rectangle is then re-anchored on the edges that did
+/// and fitted into the page through `geometry::snap_size` (the one owner of what a legal size
+/// is and how a page bounds it), and the rectangle is then re-anchored on the edges that did
 /// NOT move, so a resize never drags the frame sideways. The result is always inside the
 /// page.
 ///
-/// Snapping rounds to the NEAREST legal size and can therefore ask for more than the page
-/// holds; the size is then reduced to the largest grid multiple that fits, and never to more
-/// than the page itself. When the result is below `FrameConstraints::min_side` or off the
-/// grid, the size is left illegal on purpose — the frame paints red and says so (D6), which
-/// is more useful than silently editing a region the consumer would refuse, and far more
-/// useful than a legal size that leaves the page.
+/// When no legal size fits the page, the size `snap_size` settles on is left illegal on
+/// purpose — the frame paints red and says so (D6), which is more useful than silently
+/// editing a region the consumer would refuse, and far more useful than a legal size that
+/// leaves the page.
 #[must_use]
 pub(super) fn resized_rect_px(
     start: OverlayRectPx,
@@ -354,9 +354,7 @@ pub(super) fn resized_rect_px(
         to_i64(page_h),
     );
 
-    let (w, h) = nearest_valid_size(to_usize(x1 - x0), to_usize(y1 - y0), constraints);
-    let w = fit_side_into_page(w, page_w, constraints.multiple);
-    let h = fit_side_into_page(h, page_h, constraints.multiple);
+    let (w, h) = snap_size(to_usize(x1 - x0), to_usize(y1 - y0), page_w, page_h, constraints);
 
     // Re-anchor on the edge the handle did NOT move, so the fixed corner stays fixed.
     let x = anchor_origin(x0, x1, w, handle.moves_left(), page_w);
@@ -378,25 +376,6 @@ fn drag_edges(edges: (i64, i64), moves: (bool, bool), delta: i64, page: i64) -> 
         hi = hi.saturating_add(delta).clamp(lo + 1, page.max(lo + 1));
     }
     (lo, hi)
-}
-
-/// The largest grid multiple of `step` that is at most `page`, or `side` when it already fits.
-///
-/// The result NEVER exceeds `page`: a frame may not leave the page it edits (D2), and that
-/// invariant outranks the grid. A page narrower than one grid unit therefore yields the page
-/// itself — an illegal size that `check_size` reports and the frame paints red, exactly as
-/// `nearest_valid_size` already resolves a `min_side` that contradicts `max_area`.
-#[must_use]
-fn fit_side_into_page(side: usize, page: usize, step: usize) -> usize {
-    if side <= page {
-        return side;
-    }
-    let step = step.max(1);
-    let fitted = (page / step).saturating_mul(step);
-    // Zero units fit only when the page is narrower than the grid; the page itself is then
-    // the largest side that stays on the page. Floored at one so no caller sees a zero-sized
-    // frame on a degenerate (zero-pixel) page.
-    if fitted == 0 { page.max(1) } else { fitted }
 }
 
 /// Origin of one axis after a resize: anchored on the far edge when the near edge moved.
@@ -426,11 +405,11 @@ mod tests {
     use egui::vec2;
 
     fn free_constraints() -> FrameConstraints {
-        FrameConstraints { multiple: 1, min_side: 1, max_area: None, max_aspect: None }
+        FrameConstraints { multiple: 1, min_side: 1, ..FrameConstraints::UNCONSTRAINED }
     }
 
     fn grid_constraints(multiple: usize, min_side: usize) -> FrameConstraints {
-        FrameConstraints { multiple, min_side, max_area: None, max_aspect: None }
+        FrameConstraints { multiple, min_side, ..FrameConstraints::UNCONSTRAINED }
     }
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
@@ -601,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_snaps_through_nearest_valid_size_and_keeps_the_fixed_corner() {
+    fn resize_snaps_through_snap_size_and_keeps_the_fixed_corner() {
         let start = rect(100, 100, 64, 64);
         let c = grid_constraints(16, 16);
         // Dragging the left edge by -5 asks for 69 px, which snaps to 64: the RIGHT edge
@@ -633,19 +612,6 @@ mod tests {
         assert!(r.w >= 1, "got {r:?}");
         let r = resized_rect_px(start, HandleKind::Left, (10_000, 0), 1000, 1000, &c);
         assert!(r.w >= 1, "got {r:?}");
-    }
-
-    #[test]
-    fn a_page_narrower_than_the_grid_yields_the_whole_page() {
-        // Deliberately illegal: `check_size` then reports it and the frame paints red, rather
-        // than this function returning a grid unit the frame could not hold without leaving
-        // the page — the one invariant that outranks the grid (D2).
-        assert_eq!(fit_side_into_page(64, 10, 16), 10);
-        // A side that already fits is returned untouched, on or off the grid.
-        assert_eq!(fit_side_into_page(64, 100, 16), 64);
-        // One that does not falls back to the largest grid multiple the page holds.
-        assert_eq!(fit_side_into_page(112, 100, 16), 96);
-        assert_eq!(fit_side_into_page(112, 100, 1), 100);
     }
 
     #[test]

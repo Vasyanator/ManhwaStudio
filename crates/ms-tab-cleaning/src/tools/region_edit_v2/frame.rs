@@ -42,7 +42,7 @@ Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§1, §2 
 
 use super::geometry::{
     self, FrameChrome, FrameConstraints, PageChoice, PageView, SizeViolation, hitbox_rect,
-    keep_in_view_delta, nearest_valid_size,
+    keep_in_view_delta,
 };
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
 use super::layers::{MaskLayerSpec, MaskStack, ResultLayer};
@@ -478,6 +478,10 @@ pub struct RegionFrame {
     /// Hitbox of the last drawn pass, clipped to the usable viewport, or `None` when the
     /// frame was not drawn. This is what `captures_pointer` answers from.
     hitbox: Option<Rect>,
+    /// Source-pixel size of the page the frame was anchored to in the last pass that got past
+    /// the anchor step, `[w, h]`; `None` before that. Read only by `snapped_size`, a display
+    /// answer, so a page that changed size since then costs at most one stale hint.
+    page_px: Option<[usize; 2]>,
 }
 
 impl std::fmt::Debug for RegionFrame {
@@ -520,6 +524,7 @@ impl RegionFrame {
             compare_held: false,
             pending: PendingRequests::default(),
             hitbox: None,
+            page_px: None,
         }
     }
 
@@ -632,6 +637,19 @@ impl RegionFrame {
     pub fn size_violation(&self) -> Option<SizeViolation> {
         let rect = self.rect_px?;
         geometry::check_size(rect.w, rect.h, &self.constraints)
+    }
+
+    /// The size `geometry::snap_size` settles the current rectangle on, within the page the
+    /// frame was last drawn on, or `None` before the first drawn pass.
+    ///
+    /// Display only — the panel's "nearest valid size" line under an invalid frame. The frame
+    /// never applies it on its own: a rectangle the consumer refuses stays where the user put
+    /// it and turns red (D16).
+    #[must_use]
+    pub fn snapped_size(&self) -> Option<(usize, usize)> {
+        let rect = self.rect_px?;
+        let [page_w, page_h] = self.page_px?;
+        Some(geometry::snap_size(rect.w, rect.h, page_w, page_h, &self.constraints))
     }
 
     /// Which of the four actions are available right now.
@@ -825,12 +843,15 @@ impl RegionFrame {
         let Some(page) = Self::page_placement(canvas, page_idx, zoom) else {
             return false;
         };
-        let (w, h) = nearest_valid_size(
+        // The same snap a resize drag uses, so the first rectangle is already the one the
+        // consumer accepts on this page (or, when none fits, the red one a drag would reach).
+        let (w, h) = geometry::snap_size(
             DEFAULT_FRAME_SIDE_PX.min(page.w),
             DEFAULT_FRAME_SIDE_PX.min(page.h),
+            page.w,
+            page.h,
             &self.constraints,
         );
-        let (w, h) = (w.min(page.w).max(1), h.min(page.h).max(1));
 
         // Centre on the visible part of the page when there is one, so a frame spawned while
         // the page is half scrolled away still appears where the user is looking.
@@ -961,6 +982,7 @@ impl RegionFrame {
         //    viewport border"; there is no second clamp for dragging anywhere.
         let rect_px = keep_in_view_px(lock, anchor.rect_px, &anchor.page, usable);
         self.rect_px = Some(rect_px);
+        self.page_px = Some([anchor.page.w, anchor.page.h]);
         let frame_screen = anchor.page.screen_rect(rect_px);
 
         let hitbox = hitbox_rect(frame_screen, &chrome());
@@ -1425,7 +1447,7 @@ mod tests {
     use super::*;
 
     fn free_constraints() -> FrameConstraints {
-        FrameConstraints { multiple: 1, min_side: 1, max_area: None, max_aspect: None }
+        FrameConstraints { multiple: 1, min_side: 1, ..FrameConstraints::UNCONSTRAINED }
     }
 
     /// One layer spec per tint, all naming the same catalog key: the tests care about the
@@ -1997,7 +2019,7 @@ mod tests {
         frame.rect_px = Some(rect_px(0, 0, 100, 100));
         assert_eq!(frame.visual(), FrameVisual::Free);
 
-        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 64, max_area: None, max_aspect: None });
+        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 64, ..FrameConstraints::UNCONSTRAINED });
         assert_eq!(frame.size_violation(), Some(SizeViolation::NotMultiple));
         assert_eq!(frame.visual(), FrameVisual::Invalid);
         let kept = frame.rect_px().expect("the frame was given a rectangle above");
@@ -2053,7 +2075,7 @@ mod tests {
         assert!(!frame.buttons().clear_mask, "there is still nothing to erase");
 
         // An invalid size still wins over the relaxation.
-        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 4096, max_area: None, max_aspect: None });
+        frame.set_constraints(FrameConstraints { multiple: 64, min_side: 4096, ..FrameConstraints::UNCONSTRAINED });
         assert!(!frame.buttons().process);
     }
 

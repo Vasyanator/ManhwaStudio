@@ -3,12 +3,12 @@ File: ai_editor/engines/mod.rs
 
 Purpose:
 The catalog of AI engines the «ИИ-редактор области» tool hosts. One submodule per engine,
-each implementing `super::engine::AiEngine`; this file is the only place that knows which
-engines exist and in which order the picker offers them.
+each implementing `region_edit_v2::engine::AiEngine`; this file is the only place that knows
+which engines exist and in which order the picker offers them.
 
 Key functions:
-- `all_engines()`: builds one instance of every engine, in picker order
-- `region_size_refusal()`: the shared run-path re-check of an engine's `FrameConstraints`
+- `all_engines()`: builds one instance of every engine, in picker order (the
+  `HostSpec::catalog` of `super::AI_EDITOR_SPEC`)
 
 Notes:
 An engine is added by writing its module and adding ONE line to `all_engines`. The picker's
@@ -40,42 +40,11 @@ mod flux2_klein;
 mod lama;
 mod sdxl;
 
-use super::engine::AiEngine;
+use crate::tools::region_edit_v2::engine::AiEngine;
 use ms_config::Flux2Variant;
-use crate::tools::region_edit_v2::geometry::{
-    FrameConstraints, SizeViolation, check_size,
-};
 use flux2_klein::Flux2KleinEngine;
 use lama::LamaEngine;
 use sdxl::SdxlEngine;
-
-/// The localized refusal for a region that violates `constraints`, or `None` when the size
-/// satisfies every one of them. `width` and `height` are in source page pixels.
-///
-/// This is the RUN-PATH half of the size contract, and it is deliberately a second copy of a
-/// check the frame already performs: the frame snaps its rectangle to the same constraints,
-/// but the rectangle and the region an engine is handed can disagree — a host that hands
-/// over another size must be told which rule it broke instead of having the backend refuse
-/// the blob. The verdict comes from `region_edit_v2::geometry::check_size`, the single
-/// authority on what a valid size is, so this side can never accept a size the frame paints
-/// red.
-///
-/// The wording is the host's own violation vocabulary, so an engine's refusal reads exactly
-/// like the line the frame draws under an invalid rectangle.
-pub(super) fn region_size_refusal(
-    width: usize,
-    height: usize,
-    constraints: &FrameConstraints,
-) -> Option<String> {
-    let violation = check_size(width, height, constraints)?;
-    let text = match violation {
-        SizeViolation::NotMultiple => t!("cleaning.tools.area_editor.violation_multiple"),
-        SizeViolation::TooSmall => t!("cleaning.tools.area_editor.violation_min_side"),
-        SizeViolation::AreaTooLarge => t!("cleaning.tools.area_editor.violation_max_area"),
-        SizeViolation::AspectTooSteep => t!("cleaning.tools.area_editor.violation_aspect"),
-    };
-    Some(text.to_string())
-}
 
 /// Builds one instance of every hosted engine, in the order the picker offers them.
 ///
@@ -93,7 +62,7 @@ pub(super) fn region_size_refusal(
 /// ONCE and offers its two channel modes inside its own panel — the mode is a parameter of
 /// one `inpaint.sdxl` method, not a second implementation.
 #[must_use]
-pub fn all_engines() -> Vec<Box<dyn AiEngine>> {
+pub(super) fn all_engines() -> Vec<Box<dyn AiEngine>> {
     let mut engines: Vec<Box<dyn AiEngine>> = Flux2Variant::all()
         .into_iter()
         .map(|variant| Box::new(Flux2KleinEngine::new(variant)) as Box<dyn AiEngine>)
@@ -134,22 +103,15 @@ mod tests {
         assert_eq!(ids.len(), total, "two engines share an id");
     }
 
-    /// The shared run-path re-check answers exactly what `check_size` decides, and names the
-    /// rule that was broken.
+    /// Every hosted engine's frame behaves exactly as it did before `FrameConstraints` grew
+    /// the max-side, min-area, aspect-pair, table and upscale rules: validity, snapping and
+    /// page fit are swept against the frozen legacy copy. `legacy_of` also fails the test if an
+    /// engine starts declaring one of the new rules, which is a behaviour change this guard
+    /// must then be told about.
     #[test]
-    fn the_run_path_size_refusal_follows_the_authoritative_checker() {
-        let grid_of_8 =
-            FrameConstraints { multiple: 8, min_side: 8, max_area: None, max_aspect: None };
-        assert!(region_size_refusal(64, 64, &grid_of_8).is_none());
-        // Off the grid, and below the shortest side that grid allows.
-        assert!(region_size_refusal(7, 8, &grid_of_8).is_some());
-        assert!(region_size_refusal(9, 16, &grid_of_8).is_some());
-        for (w, h) in [(1024usize, 1024usize), (250, 256), (0, 8)] {
-            assert_eq!(
-                region_size_refusal(w, h, &grid_of_8).is_some(),
-                check_size(w, h, &grid_of_8).is_some(),
-                "{w}x{h}"
-            );
+    fn every_engine_frame_answers_exactly_like_the_legacy_size_rules() {
+        for engine in all_engines() {
+            crate::tools::region_edit_v2::size_oracle::assert_equivalent_to_legacy(&engine.constraints(), engine.id());
         }
     }
 }

@@ -2,10 +2,10 @@
 
 ## Purpose
 The AI engines the «ИИ-редактор области» tool hosts, one module per engine, each implementing
-`super::engine::AiEngine`. An engine owns everything model-specific — its parameters and their
+`region_edit_v2::engine::AiEngine`. An engine owns everything model-specific — its parameters and their
 persistence, its wire protocol, its worker threads, its own progress bar — and nothing about the
-canvas: the rectangle, the painted mask, the pending result and the apply path belong to the host
-(`../MODULE_README.md`) and the frame (`../../region_edit_v2/MODULE_README.md`).
+canvas: the rectangle, the painted mask, the pending result and the apply path belong to the
+generic host and the frame (`../../region_edit_v2/MODULE_README.md`).
 
 An engine is NOT a `CleaningTool`. It has no selection, no editor window, no canvas hooks and no
 entry in `tab.rs`; it reaches the user only through the host's panels.
@@ -45,8 +45,7 @@ machine always is, and no section wraps or nests another. The decisions the line
 functions with unit tests, not conditionals inside the drawing code.
 
 ## Files and submodules
-- `mod.rs`: the catalog — `all_engines()`, plus the one helper every engine's run path shares
-  (`region_size_refusal`, the `FrameConstraints` re-check described below). It also decides ONE
+- `mod.rs`: the catalog — `all_engines()`, the `HostSpec::catalog` of `../mod.rs`. It also decides ONE
   thing beyond the list: the engine at index 0 is the one selected when the tool is created, which
   is why FLUX.2 klein 9B stays at the head and `lama` then `sdxl` are appended after it. Screen
   order is unaffected — the picker draws «Без промпта» before «С промптом», so «Lama» appears first
@@ -159,7 +158,8 @@ functions with unit tests, not conditionals inside the drawing code.
 - **`poll` is also the only writer of the settings file, and losing it loses data silently.**
   Every engine's saver runs inside `poll`; a host that stops polling keeps the tool working and
   quietly discards every model path, memory preset, prompt and parameter on exit. The arming rule
-  is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)` — a plain gate with no
+  is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)`, ONE copy for every
+  engine in `../../region_edit_v2/engine_settings.rs` — a plain gate with no
   time debounce, so a save starts on the first poll it is due on: a write before the initial load
   lands would overwrite the user's file with the in-memory defaults, so `dirty` is kept pending
   instead of dropped, and at most one writer touches the path at a time.
@@ -170,9 +170,10 @@ functions with unit tests, not conditionals inside the drawing code.
 - **The run path re-checks the size against `constraints()`, it does not trust the host.** The frame
   snaps and validates a rectangle against the same constraints, but the rectangle and the region an
   engine is handed can disagree, so `AiEngine::start` refuses a violating size instead of encoding
-  it onto the wire. `lama/` and `sdxl/` do it through the shared `region_size_refusal` in `mod.rs`,
-  which reads `region_edit_v2::geometry::check_size` — the one authority on what a valid size is —
-  and answers in the host's own violation wording; `flux2_klein/` does it through its own
+  it onto the wire. `lama/` and `sdxl/` do it through the shared `region_size_refusal` in
+  `../../region_edit_v2/engine.rs`, which reads `region_edit_v2::geometry::check_size` — the one
+  authority on what a valid size is — and answers in the host's own violation wording
+  (`violation_text`); `flux2_klein/` does it through its own
   `region_block_reason`, whose message set is engine-specific and whose agreement with `check_size`
   is pinned by a unit test.
 - **The RAM/VRAM forecast is armed by a SETTLED SIZE change and by nothing else geometric.**
@@ -195,7 +196,7 @@ functions with unit tests, not conditionals inside the drawing code.
   already a mask, so a stray dot can never become permission to regenerate everything. The host's
   painted layer is never overwritten — the solid buffer is built BESIDE it — and `allows_empty_mask()`
   is therefore unconditionally `true`, which is what stops the frame demanding a non-empty mask. It
-  is the HOST that tells the user an empty mask is legal (`AiEditorTool::draw_empty_mask_hint`), not
+  is the HOST that tells the user an empty mask is legal (`RegionEditHost::draw_empty_mask_hint`), not
   this engine. `whole_region` also travels as `false` on every path that only ASKS the backend
   something (`.status`, `.estimate`, the prompt-cache calls): no mask exists there, which is why
   `to_params` takes the flag instead of reading it. Backend-side `mask_dilate_px` is ignored when
@@ -473,7 +474,7 @@ functions with unit tests, not conditionals inside the drawing code.
 
 ## Editing map
 - To add an engine: a module here plus one line in `mod.rs::all_engines`; the trait it must satisfy
-  is `../engine.rs`.
+  is `../../region_edit_v2/engine.rs`.
 - To change which paths a run uses, or to add a third source mode:
   `Flux2KleinSettings::effective_paths` and `Flux2SourceMode` — never a second computation at a
   call site.
@@ -504,5 +505,5 @@ functions with unit tests, not conditionals inside the drawing code.
   (`draw_mode_parameters`) plus the range constants in `sdxl/mod.rs`; to change what travels on the
   wire: `sdxl/wire.rs` (`sdxl_run_header`), which is also where `lama_model_for_run` lives. To
   change what is persisted, or the on-disk document: `sdxl/settings.rs`.
-- To change what the host does with an engine (the picker, the panels, the frame): `../mod.rs` and
-  `../../region_edit_v2/`, never here.
+- To change what the host does with an engine (the picker, the panels, the frame):
+  `../../region_edit_v2/` (`host.rs`, `host_panels.rs`), never here.

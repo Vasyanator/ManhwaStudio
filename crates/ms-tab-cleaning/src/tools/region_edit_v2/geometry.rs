@@ -9,13 +9,16 @@ without a window; `Rect` / `Pos2` / `Vec2` are used as plain geometry only (the
 `src/widgets/panel_dock/` precedent).
 
 Key structures:
-- `FrameConstraints`, `SizeViolation`: the consumer's size requirements and how a size fails
+- `FrameConstraints`, `AspectLimit`, `SizeViolation`: the consumer's size requirements and
+  how a size fails
 - `FrameChrome`: the strip above the frame, the two rows below it, and the handle margin
 - `PageView`, `PageChoice`: one page as the frame sees it, and the page-transition verdict
 - `OffscreenArrow`: where to point when a locked frame has scrolled out of view
 
 Key functions:
-- `check_size()`, `nearest_valid_size()`: page-pixel size validation and snapping
+- `check_size()`, `upscale_factor_for()`, `snap_size()`: page-pixel size validation, the
+  upscale factor a valid region is sent at, and snapping fitted into the page — the ONE owner
+  of what a legal frame size is
 - `hitbox_rect()`: the frame plus its handles and chrome, i.e. what must stay in the viewport
 - `usable_viewport_for()`: the viewport minus the dock panels, cut relative to the hitbox
 - `keep_in_view_delta()`: the per-frame clamp, where the page wins over the viewport
@@ -23,7 +26,7 @@ Key functions:
 - `offscreen_arrow()`: the off-screen indicator
 
 Notes:
-Two unit systems meet here and must not be mixed: `check_size` / `nearest_valid_size` work in
+Two unit systems meet here and must not be mixed: `check_size` / `snap_size` work in
 SOURCE PAGE PIXELS (the units of `ms_canvas::types::OverlayRectPx`, which is what the
 frame stores and what `CanvasView::replace_overlay_region_px` consumes), everything else in
 SCREEN POINTS. Every function is pure: no interior mutability, no globals, same output for
@@ -41,58 +44,110 @@ pub const ARROW_INSET: f32 = 12.0;
 // Size constraints
 // ---------------------------------------------------------------------------------------
 
-/// Size requirements a consumer (an AI model, or the step-1 stub) imposes on the frame.
+/// An aspect-ratio limit as two INDEPENDENT maxima, one per orientation.
 ///
-/// All fields are in SOURCE PAGE PIXELS. A consumer's declaration reaches this module as
-/// plain data, so out-of-range values are sanitized rather than rejected — a pure geometry
-/// call must never panic on them: `multiple` below 1 reads as 1, `min_side` below 1 reads as
-/// 1, a non-finite `max_aspect` is ignored, and a `max_aspect` below 1.0 reads as 1.0 (a
-/// square, the least steep rectangle there is).
+/// Two maxima rather than a `(min, max)` ratio pair on purpose: a lower bound of `1/3` is not
+/// exact in `f32`, so it would reject an exact 1:3 rectangle that `h <= w * 3` accepts. Each
+/// value is sanitized where it is read: a non-finite maximum lifts that orientation's limit,
+/// and one below 1.0 reads as 1.0 (a square is never too steep).
+#[derive(Debug, Clone, Copy)]
+pub struct AspectLimit {
+    /// Largest allowed `width / height` (a landscape limit), e.g. `3.0` for 3:1.
+    pub max_w_over_h: f32,
+    /// Largest allowed `height / width` (a portrait limit), e.g. `3.0` for 1:3.
+    pub max_h_over_w: f32,
+}
+
+impl AspectLimit {
+    /// The same limit in both orientations: the longest/shortest side ratio is at most `ratio`.
+    #[must_use]
+    pub const fn symmetric(ratio: f32) -> Self {
+        Self { max_w_over_h: ratio, max_h_over_w: ratio }
+    }
+}
+
+/// Size requirements a consumer (an AI engine) imposes on the frame.
+///
+/// All sizes are in SOURCE PAGE PIXELS. A consumer's declaration reaches this module as plain
+/// data, so out-of-range values are sanitized rather than rejected — a pure geometry call must
+/// never panic on them: `multiple` below 1 reads as 1, `min_side` below 1 reads as 1,
+/// `max_upscale` 0 reads as 1, and `aspect` is sanitized per [`AspectLimit`]. Contradictory
+/// rules (a `max_side` below `min_side`, a `min_area` above `max_area`, a size table no rule
+/// admits) are not an error either: no size satisfies them, so every frame is drawn red.
+///
+/// Build a declaration from [`FrameConstraints::UNCONSTRAINED`] with struct-update syntax, so
+/// a rule added later reads as "absent" in every existing declaration.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameConstraints {
     /// Both sides must be whole multiples of this. `1` means "no grid".
     pub multiple: usize,
     /// Smallest allowed side length.
     pub min_side: usize,
+    /// Largest allowed side length. `None` means unlimited.
+    pub max_side: Option<usize>,
+    /// Smallest allowed `w * h`, in page pixels squared. `None` means no floor.
+    pub min_area: Option<u64>,
     /// Largest allowed `w * h`, in page pixels squared. `None` means unlimited.
     pub max_area: Option<u64>,
-    /// Largest allowed longest/shortest side ratio, e.g. `8.0`. `None` means unlimited.
-    pub max_aspect: Option<f32>,
+    /// Steepest allowed shape. `None` means unlimited.
+    pub aspect: Option<AspectLimit>,
+    /// The only sizes allowed, as `(width, height)`; empty means any size the other rules
+    /// admit. A table entry must ALSO pass every other rule.
+    pub sizes: &'static [(u32, u32)],
+    /// Largest integer upscale `K` the consumer applies before the model sees the region: a
+    /// size is valid when SOME `k` in `1..=K` makes `(k·w, k·h)` pass every rule above. `1`
+    /// (and `0`) means "no upscale" — the region itself must pass.
+    pub max_upscale: u8,
+}
+
+impl FrameConstraints {
+    /// Imposes nothing: grid 1, minimum side 1, no other rule, no upscale.
+    pub const UNCONSTRAINED: Self = Self {
+        multiple: 1,
+        min_side: 1,
+        max_side: None,
+        min_area: None,
+        max_area: None,
+        aspect: None,
+        sizes: &[],
+        max_upscale: 1,
+    };
 }
 
 /// How a size fails its `FrameConstraints`.
 ///
-/// `check_size` reports the FIRST failure in the order `nearest_valid_size` resolves them,
-/// so the reported violation is always the one snapping would fix first.
+/// `check_size` reports the FIRST failure in the order the rules are checked (grid, minimum
+/// side, maximum side, minimum area, maximum area, aspect, size table), which for the original
+/// four rules is also the order `snap_size` resolves them in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeViolation {
     /// A side is not a whole multiple of `FrameConstraints::multiple`.
     NotMultiple,
     /// A side is shorter than `FrameConstraints::min_side`.
     TooSmall,
+    /// A side is longer than `FrameConstraints::max_side`.
+    TooLarge,
+    /// `w * h` is below `FrameConstraints::min_area`.
+    AreaTooSmall,
     /// `w * h` exceeds `FrameConstraints::max_area`.
     AreaTooLarge,
-    /// The longest/shortest side ratio exceeds `FrameConstraints::max_aspect`.
+    /// The shape is steeper than `FrameConstraints::aspect` allows.
     AspectTooSteep,
+    /// The size is not in the `FrameConstraints::sizes` table.
+    NotAllowedSize,
 }
 
-/// `c.multiple`, sanitized to at least 1 so the grid maths can never divide by zero.
+/// `c.max_upscale`, sanitized to at least 1: "no upscale" is a factor of one.
 #[inline]
-fn grid_step(c: &FrameConstraints) -> usize {
-    c.multiple.max(1)
+fn max_upscale(c: &FrameConstraints) -> u8 {
+    c.max_upscale.max(1)
 }
 
-/// `c.min_side`, sanitized to at least 1: a zero-sized frame is not a frame.
+/// One aspect maximum, sanitized: `None` for a non-finite limit, otherwise at least 1.0,
+/// because a limit below 1.0 would forbid every rectangle including the square.
 #[inline]
-fn min_side(c: &FrameConstraints) -> usize {
-    c.min_side.max(1)
-}
-
-/// `c.max_aspect`, sanitized: `None` for an absent or non-finite limit, otherwise at least
-/// 1.0, because a limit below 1.0 would forbid every rectangle including the square.
-#[inline]
-fn max_aspect(c: &FrameConstraints) -> Option<f32> {
-    c.max_aspect.filter(|r| r.is_finite()).map(|r| r.max(1.0))
+fn aspect_max(r: f32) -> Option<f32> {
+    r.is_finite().then(|| r.max(1.0))
 }
 
 /// Saturating widening of a pixel count for the area maths. A count that does not fit `u64`
@@ -109,8 +164,14 @@ fn as_usize(v: u64) -> usize {
     usize::try_from(v).unwrap_or(usize::MAX)
 }
 
+/// A size-table side as a page-pixel count, saturating on a (hypothetical) 16-bit target.
+#[inline]
+fn table_side(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
 /// A pixel count as `f64`, for the aspect and area-scale maths — the only places a fraction
-/// is unavoidable, because `max_aspect` is itself a float and the area scale is a square
+/// is unavoidable, because an aspect maximum is itself a float and the area scale is a square
 /// root. Page-pixel counts are many orders of magnitude below 2^53, where `f64` still
 /// represents every integer exactly, so this conversion cannot lose a bit for any input this
 /// module can be handed.
@@ -119,83 +180,258 @@ fn px_f64(v: usize) -> f64 {
     v as f64
 }
 
-/// `None` when the size satisfies every constraint, otherwise the first violation in the
-/// resolution order of `nearest_valid_size` (grid, minimum side, area, aspect).
+/// Greatest common divisor, for the grid a `k`-fold upscale leaves on the region.
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// The rules of a `FrameConstraints`, sanitized and restated for the REGION of a `k`-fold
+/// upscale: the region `(w, h)` passes these exactly when `(k·w, k·h)` passes the declared
+/// rules. Derived on the fly and never allocated — the size table is not rewritten, it is
+/// matched against `k·w × k·h` (and scanned for entries divisible by `k` when snapping).
+///
+/// The derivation, per rule: the grid `m` becomes `m / gcd(m, k)` (`k·w` is a multiple of `m`
+/// exactly when `w` is a multiple of that); a side floor `s` becomes `ceil(s / k)`, a side
+/// ceiling `floor(s / k)`; an area floor `a` becomes `ceil(a / k²)`, an area ceiling
+/// `floor(a / k²)`; the aspect is scale-invariant. Each restatement is exact in integers.
+#[derive(Debug, Clone, Copy)]
+struct ScaledRules {
+    step: usize,
+    min_side: usize,
+    max_side: Option<usize>,
+    min_area: Option<u64>,
+    max_area: Option<u64>,
+    max_w_over_h: Option<f32>,
+    max_h_over_w: Option<f32>,
+    sizes: &'static [(u32, u32)],
+    scale: usize,
+}
+
+impl ScaledRules {
+    /// The rules `c` imposes on the region of a `k`-fold upscale. `k` below 1 reads as 1.
+    fn at_scale(c: &FrameConstraints, k: usize) -> Self {
+        let k = k.max(1);
+        let multiple = c.multiple.max(1);
+        let k_sq = as_u64(k).saturating_mul(as_u64(k));
+        Self {
+            step: multiple / gcd(multiple, k),
+            min_side: c.min_side.max(1).div_ceil(k).max(1),
+            max_side: c.max_side.map(|s| s / k),
+            min_area: c.min_area.map(|a| a.div_ceil(k_sq)),
+            max_area: c.max_area.map(|a| a / k_sq),
+            max_w_over_h: c.aspect.and_then(|a| aspect_max(a.max_w_over_h)),
+            max_h_over_w: c.aspect.and_then(|a| aspect_max(a.max_h_over_w)),
+            sizes: c.sizes,
+            scale: k,
+        }
+    }
+
+    /// `None` when `w × h` passes every rule, otherwise the first violation in the order
+    /// grid, minimum side, maximum side, minimum area, maximum area, aspect, size table.
+    fn violation(&self, w: usize, h: usize) -> Option<SizeViolation> {
+        if !w.is_multiple_of(self.step) || !h.is_multiple_of(self.step) {
+            return Some(SizeViolation::NotMultiple);
+        }
+        if w < self.min_side || h < self.min_side {
+            return Some(SizeViolation::TooSmall);
+        }
+        if self.max_side.is_some_and(|max| w > max || h > max) {
+            return Some(SizeViolation::TooLarge);
+        }
+        let area = as_u64(w).saturating_mul(as_u64(h));
+        if self.min_area.is_some_and(|min| area < min) {
+            return Some(SizeViolation::AreaTooSmall);
+        }
+        if self.max_area.is_some_and(|max| area > max) {
+            return Some(SizeViolation::AreaTooLarge);
+        }
+        // The minimum-side check above guarantees both sides are at least 1, so neither
+        // product below can hide a zero side.
+        if self.max_w_over_h.is_some_and(|r| px_f64(w) > px_f64(h) * f64::from(r))
+            || self.max_h_over_w.is_some_and(|r| px_f64(h) > px_f64(w) * f64::from(r))
+        {
+            return Some(SizeViolation::AspectTooSteep);
+        }
+        if !self.sizes.is_empty() && !self.table_admits(w, h) {
+            return Some(SizeViolation::NotAllowedSize);
+        }
+        None
+    }
+
+    /// Whether `(k·w, k·h)` is an entry of the size table.
+    fn table_admits(&self, w: usize, h: usize) -> bool {
+        let (Some(sw), Some(sh)) = (w.checked_mul(self.scale), h.checked_mul(self.scale)) else {
+            return false;
+        };
+        self.sizes.iter().any(|&(tw, th)| table_side(tw) == sw && table_side(th) == sh)
+    }
+
+    /// The table entry, restated for the region (each side divided by `k`; entries not
+    /// divisible by `k` are unreachable at this scale), that fits a `page_w × page_h` page and
+    /// is nearest to `w × h` by `|dw| + |dh|`, ties to the smaller area. `None` when no entry
+    /// fits the page.
+    fn nearest_table_entry(&self, w: usize, h: usize, page_w: usize, page_h: usize) -> Option<(usize, usize)> {
+        let k = self.scale;
+        self.sizes
+            .iter()
+            .map(|&(tw, th)| (table_side(tw), table_side(th)))
+            .filter(|&(tw, th)| tw.is_multiple_of(k) && th.is_multiple_of(k))
+            .map(|(tw, th)| (tw / k, th / k))
+            .filter(|&(rw, rh)| rw <= page_w && rh <= page_h)
+            .min_by_key(|&(rw, rh)| (rw.abs_diff(w).saturating_add(rh.abs_diff(h)), as_u64(rw).saturating_mul(as_u64(rh))))
+    }
+
+    /// The nearest size passing the side, area and aspect rules (the size table is not
+    /// consulted here), with no regard for the page.
+    ///
+    /// Resolution order — grid, minimum side, maximum side, maximum area, aspect, minimum area
+    /// — and why it is that order: every step after the first works in whole GRID UNITS, so
+    /// no later step can leave the grid. The maximum side, the area budget and the aspect only
+    /// ever SHRINK a side and never below the minimum, so none of them can undo an earlier
+    /// one: rounding up to the grid may push a size past the area budget, and the area step
+    /// pulls it back; shrinking for the area may steepen the aspect, and the aspect step then
+    /// shrinks the longer side, which cannot re-break the area. The minimum area is the one
+    /// rule that has to GROW a size, so it runs last and grows both sides in proportion,
+    /// never past the maximum side.
+    ///
+    /// Two pairs of rules can genuinely contradict each other — `min_side` against
+    /// `max_side` / `max_area`, and `min_area` against `max_side` / `max_area`. **The minimum
+    /// side wins** over the ceilings, and the area floor yields to the side ceiling: the
+    /// returned size is then still rejected by `violation`, which is exactly the state the
+    /// frame renders in red rather than a size no consumer could use.
+    ///
+    /// "Nearest" means the result of this sequence, not a global minimum-distance optimum.
+    fn nearest(&self, w: usize, h: usize) -> (usize, usize) {
+        let step = self.step;
+        // Counting in grid units (one unit = `step` page pixels) is what makes the multiple
+        // constraint unbreakable: no later step can produce a fraction of a unit.
+        let min_units = self.min_side.div_ceil(step).max(1);
+        // The largest side in whole units; the minimum side wins a contradiction.
+        let max_units = self.max_side.map(|max| (max / step).max(min_units));
+
+        // 1. Grid: nearest unit, halves up. This is the step that follows the drag.
+        // 2. Minimum side, rounded UP to the grid, so a `min_side` that is not itself a
+        //    multiple (100 on a grid of 16, say) yields the first legal size above it.
+        let mut w_u = round_units(w, step).max(min_units);
+        let mut h_u = round_units(h, step).max(min_units);
+
+        // 3. Maximum side.
+        if let Some(max_units) = max_units {
+            w_u = w_u.min(max_units);
+            h_u = h_u.min(max_units);
+        }
+
+        // 4. Area budget.
+        if let Some(max_area) = self.max_area {
+            (w_u, h_u) = shrink_to_area(w_u, h_u, min_units, step, max_area);
+        }
+
+        // 5. Aspect limit, one orientation at a time; at most one of the two can bind,
+        //    because both maxima are at least 1.
+        (w_u, h_u) = shrink_to_aspect(w_u, h_u, self.max_w_over_h, self.max_h_over_w);
+
+        // 6. Area floor.
+        if let Some(min_area) = self.min_area {
+            (w_u, h_u) = grow_to_area(w_u, h_u, step, min_area, max_units);
+        }
+
+        (w_u.saturating_mul(step), h_u.saturating_mul(step))
+    }
+
+    /// The size a drag towards `w × h` settles on at this scale, fitted into the page.
+    ///
+    /// With a size table, the nearest entry that fits the page; when none fits, the table is
+    /// unsatisfiable on this page and the grid snap below is returned instead, which the
+    /// table then rejects (red, but on the page). Without one, `nearest` with each side
+    /// reduced to the largest grid multiple the page holds.
+    fn snap_into_page(&self, w: usize, h: usize, page_w: usize, page_h: usize) -> (usize, usize) {
+        if !self.sizes.is_empty()
+            && let Some(entry) = self.nearest_table_entry(w, h, page_w, page_h)
+        {
+            return entry;
+        }
+        let (sw, sh) = self.nearest(w, h);
+        (fit_side_into_page(sw, page_w, self.step), fit_side_into_page(sh, page_h, self.step))
+    }
+}
+
+/// The smallest upscale factor `k` in `1..=max_upscale` for which `(k·w, k·h)` passes every
+/// rule of `c`, or `None` when no factor does.
+///
+/// This is THE answer to "what does the consumer send for this region": `Some(1)` means the
+/// region as it is, `Some(k)` means it must be upscaled `k`-fold first. `w` and `h` are in
+/// source page pixels. Agrees with [`check_size`]: exactly one of them is `None`.
+#[must_use]
+pub fn upscale_factor_for(w: usize, h: usize, c: &FrameConstraints) -> Option<u8> {
+    (1..=max_upscale(c)).find(|&k| ScaledRules::at_scale(c, usize::from(k)).violation(w, h).is_none())
+}
+
+/// `None` when the size is valid — some upscale factor in `1..=max_upscale` makes it pass
+/// every rule (see [`upscale_factor_for`]) — otherwise the violation to report.
+///
+/// The reported violation is the region's own (`k = 1`), in the check order of
+/// [`SizeViolation`]. One exception: when the region fails only for being too SMALL
+/// (`TooSmall` or `AreaTooSmall`) and an upscale was allowed, the largest upscale is what the
+/// user's size would be sent as, so ITS violation is reported — the upscale was the remedy for
+/// "too small", and it is what failed.
 ///
 /// `w` and `h` are in source page pixels.
 #[must_use]
 pub fn check_size(w: usize, h: usize, c: &FrameConstraints) -> Option<SizeViolation> {
-    let step = grid_step(c);
-    if !w.is_multiple_of(step) || !h.is_multiple_of(step) {
-        return Some(SizeViolation::NotMultiple);
+    let direct = ScaledRules::at_scale(c, 1).violation(w, h)?;
+    if upscale_factor_for(w, h, c).is_some() {
+        return None;
     }
-    let min = min_side(c);
-    if w < min || h < min {
-        return Some(SizeViolation::TooSmall);
-    }
-    if let Some(max_area) = c.max_area
-        && as_u64(w).saturating_mul(as_u64(h)) > max_area
-    {
-        return Some(SizeViolation::AreaTooLarge);
-    }
-    if let Some(ratio) = max_aspect(c) {
-        // The minimum-side check above guarantees both sides are at least 1, so the shorter
-        // side can never be zero here and the ratio is always defined.
-        let (short, long) = if w <= h { (w, h) } else { (h, w) };
-        if px_f64(long) > px_f64(short) * f64::from(ratio) {
-            return Some(SizeViolation::AspectTooSteep);
+    let top = max_upscale(c);
+    match direct {
+        SizeViolation::TooSmall | SizeViolation::AreaTooSmall if top > 1 => {
+            ScaledRules::at_scale(c, usize::from(top)).violation(w, h).or(Some(direct))
         }
+        SizeViolation::NotMultiple
+        | SizeViolation::TooSmall
+        | SizeViolation::TooLarge
+        | SizeViolation::AreaTooSmall
+        | SizeViolation::AreaTooLarge
+        | SizeViolation::AspectTooSteep
+        | SizeViolation::NotAllowedSize => Some(direct),
     }
-    None
 }
 
-/// The nearest size that satisfies every constraint, in source page pixels. Used while a
-/// resize handle is dragged.
+/// The size a drag towards `w × h` settles on: the nearest size the consumer accepts that
+/// fits a `page_w × page_h` page, in source page pixels. Used while a resize handle is dragged
+/// and when the frame is first placed.
 ///
-/// Resolution order — grid, minimum side, area, aspect — and why it is that order: every
-/// step after the first works in whole GRID UNITS and only ever shrinks a side, never below
-/// the minimum, so no later step can undo an earlier one. Rounding up to the grid may push a
-/// size past the area budget, and the area step then pulls it back WITHOUT leaving the grid;
-/// shrinking for the area may steepen the aspect, and the aspect step then shrinks the
-/// longer side, which cannot re-break the area.
+/// For every upscale factor `k` in `1..=max_upscale` it derives the region rules of that
+/// scale, snaps to them (a size table snaps to its nearest entry that fits the page; otherwise
+/// the grid/side/area/aspect snap of [`ScaledRules::nearest`]) and fits each side into the page
+/// on that scale's grid. Of the candidates that are valid it returns the one nearest the
+/// target by `|dw| + |dh|`, ties to the smaller `k`; when none is valid — contradictory rules,
+/// or a page too small for any legal size — it returns the `k = 1` candidate, which the
+/// frame then paints red.
 ///
-/// The one pair of constraints that can genuinely contradict each other is `min_side` versus
-/// `max_area` (`min_side²` may already exceed the budget). **The minimum side wins**: the
-/// returned size is then still rejected by `check_size`, which is exactly the state the
-/// frame renders in red rather than a size no consumer could use.
-///
-/// "Nearest" means the result of this sequence, not a global minimum-distance optimum.
+/// The result NEVER exceeds the page (on a page of at least one pixel per side): a frame may
+/// not leave the page it edits (D2), and that invariant outranks every rule.
 #[must_use]
-pub fn nearest_valid_size(w: usize, h: usize, c: &FrameConstraints) -> (usize, usize) {
-    let step = grid_step(c);
-    // Counting in grid units (one unit = `step` page pixels) is what makes the multiple
-    // constraint unbreakable: no later step can produce a fraction of a unit.
-    let min_units = min_side(c).div_ceil(step).max(1);
-
-    // 1. Grid: nearest unit, halves up. This is the step that follows the drag.
-    let mut w_u = round_units(w, step);
-    let mut h_u = round_units(h, step);
-
-    // 2. Minimum side, rounded UP to the grid, so a `min_side` that is not itself a multiple
-    //    (100 on a grid of 16, say) yields the first legal size above it rather than below.
-    w_u = w_u.max(min_units);
-    h_u = h_u.max(min_units);
-
-    // 3. Area budget.
-    if let Some(max_area) = c.max_area {
-        let (nw, nh) = shrink_to_area(w_u, h_u, min_units, step, max_area);
-        w_u = nw;
-        h_u = nh;
+pub fn snap_size(w: usize, h: usize, page_w: usize, page_h: usize, c: &FrameConstraints) -> (usize, usize) {
+    let direct_rules = ScaledRules::at_scale(c, 1);
+    let direct = direct_rules.snap_into_page(w, h, page_w, page_h);
+    let mut best = direct_rules.violation(direct.0, direct.1).is_none().then_some(direct);
+    for k in 2..=usize::from(max_upscale(c)) {
+        let rules = ScaledRules::at_scale(c, k);
+        let candidate = rules.snap_into_page(w, h, page_w, page_h);
+        if rules.violation(candidate.0, candidate.1).is_some() {
+            continue;
+        }
+        let distance = |(cw, ch): (usize, usize)| cw.abs_diff(w).saturating_add(ch.abs_diff(h));
+        // Strictly nearer only, so a tie keeps the smaller factor found first.
+        if best.is_none_or(|b| distance(candidate) < distance(b)) {
+            best = Some(candidate);
+        }
     }
-
-    // 4. Aspect limit.
-    if let Some(ratio) = max_aspect(c) {
-        let (nw, nh) = shrink_to_aspect(w_u, h_u, ratio);
-        w_u = nw;
-        h_u = nh;
-    }
-
-    (w_u.saturating_mul(step), h_u.saturating_mul(step))
+    best.unwrap_or(direct)
 }
 
 /// `v` in whole grid units, rounded to the nearest unit with halves going up.
@@ -209,7 +445,7 @@ fn round_units(v: usize, step: usize) -> usize {
 ///
 /// Never grows a side beyond the one it was given and never returns a side below
 /// `min_units`; when `min_units` alone already exceeds the budget the constraints are
-/// contradictory and the minimum side wins (see `nearest_valid_size`).
+/// contradictory and the minimum side wins (see `ScaledRules::nearest`).
 fn shrink_to_area(w_u: usize, h_u: usize, min_units: usize, step: usize, max_area: u64) -> (usize, usize) {
     // Budget in whole grid cells. `w_u * h_u <= max_area / step²` is EXACT rather than
     // conservative: the left-hand side is an integer, so flooring the right-hand side
@@ -238,6 +474,35 @@ fn shrink_to_area(w_u: usize, h_u: usize, min_units: usize, step: usize, max_are
     (fitted_w, fitted_h)
 }
 
+/// The smallest grid size of at least `min_area` obtained by GROWING `w_u` x `h_u` in
+/// proportion, each side capped at `max_units`.
+///
+/// Never shrinks a side. When the cap stops the growth short of the floor the rules are
+/// contradictory and the cap wins: the result is then rejected by the area check and drawn
+/// red, like every other contradiction here.
+fn grow_to_area(w_u: usize, h_u: usize, step: usize, min_area: u64, max_units: Option<usize>) -> (usize, usize) {
+    let cell = as_u64(step).saturating_mul(as_u64(step)).max(1);
+    // Floor in whole grid cells: `w_u * h_u * cell >= min_area` exactly when
+    // `w_u * h_u >= ceil(min_area / cell)`, because the left-hand side is an integer.
+    let need = min_area.div_ceil(cell);
+    let current = as_u64(w_u).saturating_mul(as_u64(h_u));
+    if current >= need {
+        return (w_u, h_u);
+    }
+    let cap = |units: usize| max_units.map_or(units, |max| units.min(max));
+
+    // As in `shrink_to_area`, a uniform scale only seeds the width (so the shape is kept),
+    // and the height then follows exactly, in integers: `ceil(need / width)` is the smallest
+    // height that reaches the floor beside that width. The width is re-derived from that
+    // height the same way, which hands back a unit the rounded-up scale may have added.
+    // `current < need` and both sides are at least one unit, so the scale exceeds 1.
+    let scale = (px_f64(as_usize(need)) / px_f64(as_usize(current).max(1))).sqrt();
+    let seeded_w = cap(float_ceil_units(px_f64(w_u) * scale).max(w_u));
+    let grown_h = cap(as_usize(need.div_ceil(as_u64(seeded_w).max(1))).max(h_u));
+    let grown_w = cap(as_usize(need.div_ceil(as_u64(grown_h).max(1))).max(w_u));
+    (grown_w, grown_h)
+}
+
 /// Floor of a non-negative, finite scaled side length, in grid units.
 #[inline]
 fn float_floor_units(v: f64) -> usize {
@@ -250,21 +515,58 @@ fn float_floor_units(v: f64) -> usize {
     v.floor() as usize
 }
 
-/// Brings the longest/shortest side ratio within `ratio` (>= 1.0) by shrinking the LONGER
-/// side only.
+/// Ceiling of a non-negative, finite scaled side length, in grid units.
+#[inline]
+fn float_ceil_units(v: f64) -> usize {
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    // A float-to-integer cast saturates in Rust, so an absurdly large scaled side becomes
+    // `usize::MAX` (then capped by the caller) rather than a wrapped small value.
+    v.ceil() as usize
+}
+
+/// Brings the shape within the two aspect maxima (each `None` or at least 1.0) by shrinking
+/// the side that is too LONG for its orientation.
 ///
 /// Shrinking rather than growing is what keeps the area step that ran before valid, and the
-/// shrink stops at the shorter side, where the ratio is 1 and within any limit — so this
-/// step always succeeds and can never drop a side below the minimum.
-fn shrink_to_aspect(w_u: usize, h_u: usize, ratio: f32) -> (usize, usize) {
-    let (short, long) = if w_u <= h_u { (w_u, h_u) } else { (h_u, w_u) };
-    let allowed = px_f64(short) * f64::from(ratio);
-    if px_f64(long) <= allowed {
-        return (w_u, h_u);
+/// shrink stops at the other side, where the ratio is 1 and within any limit — so this step
+/// always succeeds and can never drop a side below the minimum. At most one orientation can
+/// bind: a shape too wide is not also too tall when both maxima are at least 1.
+fn shrink_to_aspect(w_u: usize, h_u: usize, max_w_over_h: Option<f32>, max_h_over_w: Option<f32>) -> (usize, usize) {
+    if let Some(ratio) = max_w_over_h {
+        let allowed = px_f64(h_u) * f64::from(ratio);
+        if px_f64(w_u) > allowed {
+            // Here `h_u <= allowed < w_u`, so the floor is a valid unit count in that range.
+            return (float_floor_units(allowed).max(h_u), h_u);
+        }
     }
-    // Here `short <= allowed < long`, so the floor is a valid unit count in that range.
-    let long_new = float_floor_units(allowed).max(short);
-    if w_u <= h_u { (w_u, long_new) } else { (long_new, h_u) }
+    if let Some(ratio) = max_h_over_w {
+        let allowed = px_f64(w_u) * f64::from(ratio);
+        if px_f64(h_u) > allowed {
+            return (w_u, float_floor_units(allowed).max(w_u));
+        }
+    }
+    (w_u, h_u)
+}
+
+/// The largest grid multiple of `step` that is at most `page`, or `side` when it already fits.
+///
+/// The result NEVER exceeds `page`: a frame may not leave the page it edits (D2), and that
+/// invariant outranks the grid. A page narrower than one grid unit therefore yields the page
+/// itself — an illegal size that `check_size` reports and the frame paints red, exactly as
+/// `ScaledRules::nearest` already resolves a `min_side` that contradicts `max_area`.
+#[must_use]
+fn fit_side_into_page(side: usize, page: usize, step: usize) -> usize {
+    if side <= page {
+        return side;
+    }
+    let step = step.max(1);
+    let fitted = (page / step).saturating_mul(step);
+    // Zero units fit only when the page is narrower than the grid; the page itself is then
+    // the largest side that stays on the page. Floored at one so no caller sees a zero-sized
+    // frame on a degenerate (zero-pixel) page.
+    if fitted == 0 { page.max(1) } else { fitted }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -705,11 +1007,11 @@ mod tests {
 
     /// The size contract FLUX.2 klein declares, reused as a realistic constraint set.
     fn klein() -> FrameConstraints {
-        FrameConstraints { multiple: 16, min_side: 128, max_area: Some(1_000_000), max_aspect: Some(8.0) }
+        FrameConstraints { multiple: 16, min_side: 128, max_area: Some(1_000_000), aspect: Some(AspectLimit::symmetric(8.0)), ..FrameConstraints::UNCONSTRAINED }
     }
 
     fn unconstrained() -> FrameConstraints {
-        FrameConstraints { multiple: 1, min_side: 1, max_area: None, max_aspect: None }
+        FrameConstraints { multiple: 1, min_side: 1, ..FrameConstraints::UNCONSTRAINED }
     }
 
     fn chrome() -> FrameChrome {
@@ -718,6 +1020,12 @@ mod tests {
 
     fn rect(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Rect {
         Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y))
+    }
+
+    /// The region snap of the declared rules (no upscale, no page), i.e. what a drag settles
+    /// on before the page bounds it.
+    fn nearest_valid_size(w: usize, h: usize, c: &FrameConstraints) -> (usize, usize) {
+        ScaledRules::at_scale(c, 1).nearest(w, h)
     }
 
     // -- check_size ---------------------------------------------------------------------
@@ -756,13 +1064,13 @@ mod tests {
 
     #[test]
     fn a_zero_side_never_passes_even_without_a_minimum() {
-        let c = FrameConstraints { multiple: 1, min_side: 0, max_area: None, max_aspect: None };
+        let c = FrameConstraints { multiple: 1, min_side: 0, ..FrameConstraints::UNCONSTRAINED };
         assert_eq!(check_size(0, 10, &c), Some(SizeViolation::TooSmall));
     }
 
     #[test]
     fn a_multiple_of_zero_is_read_as_one_and_does_not_panic() {
-        let c = FrameConstraints { multiple: 0, min_side: 1, max_area: None, max_aspect: None };
+        let c = FrameConstraints { multiple: 0, min_side: 1, ..FrameConstraints::UNCONSTRAINED };
         assert_eq!(check_size(7, 13, &c), None);
         assert_eq!(nearest_valid_size(7, 13, &c), (7, 13));
     }
@@ -790,7 +1098,7 @@ mod tests {
     #[test]
     fn a_minimum_side_off_the_grid_is_rounded_up_to_the_next_multiple() {
         // 100 is not a multiple of 16: the first legal size at or above it is 112.
-        let c = FrameConstraints { multiple: 16, min_side: 100, max_area: None, max_aspect: None };
+        let c = FrameConstraints { multiple: 16, min_side: 100, ..FrameConstraints::UNCONSTRAINED };
         let (w, h) = nearest_valid_size(10, 10, &c);
         assert_eq!((w, h), (112, 112));
         assert_eq!(w % 16, 0);
@@ -801,7 +1109,7 @@ mod tests {
     fn rounding_up_to_the_grid_never_leaves_the_area_budget_broken() {
         // 255 rounds up to 256, and 256 x 256 = 65536 exceeds the 65000 budget, so the area
         // step has to pull one axis back — without leaving the grid.
-        let c = FrameConstraints { multiple: 16, min_side: 16, max_area: Some(65_000), max_aspect: None };
+        let c = FrameConstraints { multiple: 16, min_side: 16, max_area: Some(65_000), ..FrameConstraints::UNCONSTRAINED };
         let (w, h) = nearest_valid_size(255, 255, &c);
         assert_eq!(check_size(w, h, &c), None);
         assert_eq!((w % 16, h % 16), (0, 0));
@@ -820,7 +1128,7 @@ mod tests {
     fn a_square_stays_square_when_the_area_budget_shrinks_it() {
         // The area fix-up must not hand the freed units to one axis: 10x10 under 50 cells
         // becomes 7x7, not 10x5.
-        let c = FrameConstraints { multiple: 1, min_side: 1, max_area: Some(50), max_aspect: None };
+        let c = FrameConstraints { multiple: 1, min_side: 1, max_area: Some(50), ..FrameConstraints::UNCONSTRAINED };
         assert_eq!(nearest_valid_size(10, 10, &c), (7, 7));
     }
 
@@ -833,7 +1141,7 @@ mod tests {
 
     #[test]
     fn the_aspect_fix_up_never_drops_a_side_below_the_minimum() {
-        let c = FrameConstraints { multiple: 1, min_side: 100, max_area: None, max_aspect: Some(1.0) };
+        let c = FrameConstraints { multiple: 1, min_side: 100, max_area: None, aspect: Some(AspectLimit::symmetric(1.0)), ..FrameConstraints::UNCONSTRAINED };
         let (w, h) = nearest_valid_size(100, 400, &c);
         assert_eq!((w, h), (100, 100));
         assert_eq!(check_size(w, h, &c), None);
@@ -843,7 +1151,7 @@ mod tests {
     fn the_minimum_side_wins_over_a_contradictory_area_budget() {
         // min_side² = 16384 can never fit a budget of 1000: the frame keeps a usable size
         // and stays INVALID, which is the state the UI paints red.
-        let c = FrameConstraints { multiple: 1, min_side: 128, max_area: Some(1_000), max_aspect: None };
+        let c = FrameConstraints { multiple: 1, min_side: 128, max_area: Some(1_000), ..FrameConstraints::UNCONSTRAINED };
         let (w, h) = nearest_valid_size(500, 500, &c);
         assert_eq!((w, h), (128, 128));
         assert_eq!(check_size(w, h, &c), Some(SizeViolation::AreaTooLarge));
@@ -853,7 +1161,7 @@ mod tests {
     fn degenerate_sizes_snap_to_the_first_legal_size() {
         assert_eq!(nearest_valid_size(0, 0, &unconstrained()), (1, 1));
         assert_eq!(nearest_valid_size(1, 1, &unconstrained()), (1, 1));
-        let grid = FrameConstraints { multiple: 16, min_side: 0, max_area: None, max_aspect: None };
+        let grid = FrameConstraints { multiple: 16, min_side: 0, ..FrameConstraints::UNCONSTRAINED };
         // Rounding alone would give zero units; the floor of one unit rescues it.
         assert_eq!(nearest_valid_size(0, 1, &grid), (16, 16));
     }
@@ -863,14 +1171,215 @@ mod tests {
         let sets = [
             klein(),
             unconstrained(),
-            FrameConstraints { multiple: 8, min_side: 32, max_area: Some(120_000), max_aspect: Some(3.0) },
-            FrameConstraints { multiple: 64, min_side: 64, max_area: Some(500_000), max_aspect: Some(1.5) },
+            FrameConstraints { multiple: 8, min_side: 32, max_area: Some(120_000), aspect: Some(AspectLimit::symmetric(3.0)), ..FrameConstraints::UNCONSTRAINED },
+            FrameConstraints { multiple: 64, min_side: 64, max_area: Some(500_000), aspect: Some(AspectLimit::symmetric(1.5)), ..FrameConstraints::UNCONSTRAINED },
         ];
         for c in &sets {
             for w in [0_usize, 1, 15, 63, 130, 777, 1500, 4000] {
                 for h in [0_usize, 1, 17, 64, 129, 800, 2600, 5000] {
                     let (sw, sh) = nearest_valid_size(w, h, c);
                     assert_eq!(check_size(sw, sh, c), None, "{w}x{h} -> {sw}x{sh} for {c:?}");
+                }
+            }
+        }
+    }
+
+    // -- legacy equivalence -------------------------------------------------------------
+
+    /// The original four rules answer EXACTLY as before the max-side, min-area, aspect-pair,
+    /// table and upscale rules existed — validity, snapping and page fit — for every shape the
+    /// existing engines declare (FLUX.2 klein; LaMa and SDXL share the grid of 8) and the sets
+    /// the tests above use. The real engines' own declarations are swept in
+    /// `ai_editor/engines/mod.rs`.
+    #[test]
+    fn the_original_four_rules_answer_exactly_like_the_legacy_code() {
+        let sets = [
+            ("flux2 klein", FrameConstraints { multiple: 16, min_side: 128, max_area: Some(1_048_576), aspect: Some(AspectLimit::symmetric(8.0)), ..FrameConstraints::UNCONSTRAINED }),
+            ("lama / sdxl", FrameConstraints { multiple: 8, min_side: 8, ..FrameConstraints::UNCONSTRAINED }),
+            ("no engine", FrameConstraints::UNCONSTRAINED),
+            ("klein test set", klein()),
+            ("grid 8 area aspect 3", FrameConstraints { multiple: 8, min_side: 32, max_area: Some(120_000), aspect: Some(AspectLimit::symmetric(3.0)), ..FrameConstraints::UNCONSTRAINED }),
+            ("grid 64 aspect 1.5", FrameConstraints { multiple: 64, min_side: 64, max_area: Some(500_000), aspect: Some(AspectLimit::symmetric(1.5)), ..FrameConstraints::UNCONSTRAINED }),
+            ("degenerate", FrameConstraints { multiple: 0, min_side: 0, aspect: Some(AspectLimit::symmetric(0.5)), ..FrameConstraints::UNCONSTRAINED }),
+            ("non-finite aspect", FrameConstraints { multiple: 4, min_side: 4, aspect: Some(AspectLimit::symmetric(f32::NAN)), ..FrameConstraints::UNCONSTRAINED }),
+        ];
+        for (label, c) in &sets {
+            super::super::size_oracle::assert_equivalent_to_legacy(c, label);
+        }
+    }
+
+    #[test]
+    fn a_page_narrower_than_the_grid_yields_the_whole_page() {
+        // Deliberately illegal: `check_size` then reports it and the frame paints red, rather
+        // than this function returning a grid unit the frame could not hold without leaving
+        // the page — the one invariant that outranks the grid (D2).
+        assert_eq!(fit_side_into_page(64, 10, 16), 10);
+        // A side that already fits is returned untouched, on or off the grid.
+        assert_eq!(fit_side_into_page(64, 100, 16), 64);
+        // One that does not falls back to the largest grid multiple the page holds.
+        assert_eq!(fit_side_into_page(112, 100, 16), 96);
+        assert_eq!(fit_side_into_page(112, 100, 1), 100);
+    }
+
+    // -- the extended rules ---------------------------------------------------------------
+
+    /// A Gemini-like allowed-size table, shared by the table tests.
+    static GEMINI_LIKE_SIZES: [(u32, u32); 4] = [(1024, 1024), (832, 1248), (1248, 832), (1536, 672)];
+
+    #[test]
+    fn a_side_over_the_maximum_is_reported_and_snapped_back_onto_the_grid() {
+        let c = FrameConstraints { multiple: 16, min_side: 64, max_side: Some(1000), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(1008, 512, &c), Some(SizeViolation::TooLarge));
+        assert_eq!(check_size(992, 512, &c), None);
+        // 1000 is not on the grid: the largest legal side below it is 992.
+        assert_eq!(snap_size(1100, 512, 5000, 5000, &c), (992, 512));
+    }
+
+    #[test]
+    fn the_minimum_side_wins_over_a_contradictory_maximum_side() {
+        let c = FrameConstraints { multiple: 1, min_side: 100, max_side: Some(50), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(snap_size(70, 70, 5000, 5000, &c), (100, 100));
+        assert_eq!(check_size(100, 100, &c), Some(SizeViolation::TooLarge), "contradictory rules stay red");
+    }
+
+    #[test]
+    fn an_area_below_the_floor_is_reported_and_grown_in_proportion() {
+        let c = FrameConstraints { multiple: 8, min_side: 8, min_area: Some(65_536), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(96, 200, &c), Some(SizeViolation::AreaTooSmall));
+        let (w, h) = snap_size(96, 200, 5000, 5000, &c);
+        assert_eq!(check_size(w, h, &c), None, "got {w}x{h}");
+        assert!(w * h >= 65_536 && h > w, "{w}x{h} must reach the floor and keep the portrait shape");
+        assert_eq!((w, h), (184, 360));
+    }
+
+    #[test]
+    fn the_area_floor_yields_to_the_maximum_side() {
+        let c = FrameConstraints { multiple: 1, min_side: 1, max_side: Some(100), min_area: Some(20_000), ..FrameConstraints::UNCONSTRAINED };
+        let (w, h) = snap_size(50, 50, 5000, 5000, &c);
+        assert_eq!((w, h), (100, 100), "the growth stops at the side cap");
+        assert_eq!(check_size(w, h, &c), Some(SizeViolation::AreaTooSmall), "contradictory rules stay red");
+    }
+
+    #[test]
+    fn an_exact_one_to_three_shape_passes_a_three_to_one_limit_in_both_orientations() {
+        let c = FrameConstraints { aspect: Some(AspectLimit::symmetric(3.0)), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(100, 300, &c), None);
+        assert_eq!(check_size(300, 100, &c), None);
+        assert_eq!(check_size(100, 301, &c), Some(SizeViolation::AspectTooSteep));
+        assert_eq!(check_size(301, 100, &c), Some(SizeViolation::AspectTooSteep));
+    }
+
+    #[test]
+    fn the_two_aspect_maxima_are_independent() {
+        let c = FrameConstraints { aspect: Some(AspectLimit { max_w_over_h: 2.0, max_h_over_w: 3.0 }), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(200, 100, &c), None);
+        assert_eq!(check_size(300, 100, &c), Some(SizeViolation::AspectTooSteep));
+        assert_eq!(check_size(100, 300, &c), None);
+        assert_eq!(snap_size(300, 100, 5000, 5000, &c), (200, 100), "the too-wide side shrinks to the landscape limit");
+        assert_eq!(snap_size(100, 400, 5000, 5000, &c), (100, 300), "the too-tall side shrinks to the portrait limit");
+    }
+
+    #[test]
+    fn a_size_table_admits_only_its_entries_and_snaps_to_the_nearest_that_fits_the_page() {
+        let c = FrameConstraints { sizes: &GEMINI_LIKE_SIZES, ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(1024, 1024, &c), None);
+        assert_eq!(check_size(1000, 1000, &c), Some(SizeViolation::NotAllowedSize));
+        assert_eq!(snap_size(1000, 1000, 5000, 5000, &c), (1024, 1024));
+        // On a 1000 px wide page only the portrait entry fits.
+        assert_eq!(snap_size(1000, 1000, 1000, 2000, &c), (832, 1248));
+        // Nothing fits a 500 px page: the frame stays on the page, and red.
+        let (w, h) = snap_size(1000, 1000, 500, 500, &c);
+        assert!(w <= 500 && h <= 500, "{w}x{h} left the page");
+        assert_eq!(check_size(w, h, &c), Some(SizeViolation::NotAllowedSize));
+    }
+
+    #[test]
+    fn a_table_entry_is_reachable_through_an_upscale() {
+        static ONE_SIZE: [(u32, u32); 1] = [(1024, 1024)];
+        let c = FrameConstraints { sizes: &ONE_SIZE, max_upscale: 2, ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(check_size(512, 512, &c), None);
+        assert_eq!(upscale_factor_for(512, 512, &c), Some(2));
+        assert_eq!(upscale_factor_for(1024, 1024, &c), Some(1));
+        assert_eq!(check_size(600, 600, &c), Some(SizeViolation::NotAllowedSize));
+        // 512 (via ×2) is nearer to 600 than 1024 is, and it is the only entry an 800 px page holds.
+        assert_eq!(snap_size(600, 600, 5000, 5000, &c), (512, 512));
+        assert_eq!(snap_size(900, 900, 800, 800, &c), (512, 512));
+        assert_eq!(snap_size(900, 900, 5000, 5000, &c), (1024, 1024));
+    }
+
+    #[test]
+    fn the_upscale_factor_is_the_smallest_that_works() {
+        let c = FrameConstraints { min_side: 256, max_upscale: 4, ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(upscale_factor_for(256, 256, &c), Some(1));
+        assert_eq!(upscale_factor_for(100, 100, &c), Some(3), "200 < 256 <= 300");
+        assert_eq!(upscale_factor_for(50, 50, &c), None);
+        assert_eq!(check_size(50, 50, &c), Some(SizeViolation::TooSmall));
+        // A grid of 16 at ×2 is a grid of 8 on the region.
+        let grid = FrameConstraints { multiple: 16, min_side: 16, max_upscale: 2, ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(upscale_factor_for(8, 24, &grid), Some(2));
+        assert_eq!(check_size(12, 24, &grid), Some(SizeViolation::NotMultiple));
+    }
+
+    #[test]
+    fn an_openai_like_rule_sends_a_small_tall_region_at_twice_its_size() {
+        // Area floor 655 360 px², ceiling 8 294 400 px², sides up to 3840, at most 3:1; grid 4 here.
+        let rule = |max_upscale| FrameConstraints {
+            multiple: 4,
+            max_side: Some(3840),
+            min_area: Some(655_360),
+            max_area: Some(8_294_400),
+            aspect: Some(AspectLimit::symmetric(3.0)),
+            max_upscale,
+            ..FrameConstraints::UNCONSTRAINED
+        };
+        assert_eq!(upscale_factor_for(300, 900, &rule(4)), Some(2));
+        assert_eq!(check_size(300, 900, &rule(4)), None);
+        assert_eq!(snap_size(300, 900, 5000, 5000, &rule(4)), (300, 900), "valid through the upscale, so left alone");
+    }
+
+    #[test]
+    fn without_an_upscale_allowance_a_small_region_is_grown_instead() {
+        let c = FrameConstraints { multiple: 4, min_area: Some(655_360), aspect: Some(AspectLimit::symmetric(3.0)), ..FrameConstraints::UNCONSTRAINED };
+        assert_eq!(upscale_factor_for(300, 900, &c), None);
+        assert_eq!(check_size(300, 900, &c), Some(SizeViolation::AreaTooSmall));
+        let (w, h) = snap_size(300, 900, 5000, 5000, &c);
+        assert_eq!(check_size(w, h, &c), None, "got {w}x{h}");
+        assert_eq!(upscale_factor_for(w, h, &c), Some(1));
+    }
+
+    #[test]
+    fn a_too_small_region_reports_what_its_largest_upscale_breaks() {
+        let c = FrameConstraints { min_side: 200, max_side: Some(300), max_upscale: 2, ..FrameConstraints::UNCONSTRAINED };
+        // As is, 120x160 is too small; at x2, 240x320 is too LONG — that is what failed.
+        assert_eq!(check_size(120, 160, &c), Some(SizeViolation::TooLarge));
+        // A violation the upscale cannot remedy is the region's own.
+        assert_eq!(check_size(400, 250, &c), Some(SizeViolation::TooLarge));
+    }
+
+    #[test]
+    fn contradictory_area_rules_stay_red() {
+        let c = FrameConstraints { min_area: Some(1000), max_area: Some(500), ..FrameConstraints::UNCONSTRAINED };
+        let (w, h) = snap_size(20, 20, 100, 100, &c);
+        assert!(check_size(w, h, &c).is_some(), "{w}x{h} cannot satisfy both");
+    }
+
+    #[test]
+    fn check_size_and_upscale_factor_for_agree_and_snap_size_never_leaves_the_page() {
+        static SIZES: [(u32, u32); 3] = [(512, 512), (768, 512), (1024, 1536)];
+        let sets = [
+            FrameConstraints { multiple: 16, min_side: 128, max_side: Some(1536), min_area: Some(262_144), max_area: Some(1_048_576), aspect: Some(AspectLimit { max_w_over_h: 2.5, max_h_over_w: 4.0 }), max_upscale: 3, ..FrameConstraints::UNCONSTRAINED },
+            FrameConstraints { sizes: &SIZES, max_upscale: 4, ..FrameConstraints::UNCONSTRAINED },
+            FrameConstraints { multiple: 8, min_area: Some(65_536), max_upscale: 0, ..FrameConstraints::UNCONSTRAINED },
+            klein(),
+        ];
+        for c in &sets {
+            for w in (0..=2200).step_by(37) {
+                for h in (0..=2200).step_by(41) {
+                    assert_eq!(check_size(w, h, c).is_none(), upscale_factor_for(w, h, c).is_some(), "{w}x{h} for {c:?}");
+                    for (page_w, page_h) in [(300, 2000), (1024, 1024), (5000, 5000)] {
+                        let (sw, sh) = snap_size(w, h, page_w, page_h, c);
+                        assert!(sw >= 1 && sh >= 1 && sw <= page_w && sh <= page_h, "{w}x{h} -> {sw}x{sh} on {page_w}x{page_h} for {c:?}");
+                    }
                 }
             }
         }

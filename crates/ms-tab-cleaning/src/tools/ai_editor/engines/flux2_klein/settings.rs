@@ -27,8 +27,7 @@ Key structures:
 - `Flux2SourceMode`
 
 Key functions:
-- `load_flux2_settings()`, `save_flux2_settings()`, `settings_from_json()`,
-  `settings_save_due()`
+- `load_flux2_settings()`, `save_flux2_settings()`, `settings_from_json()`
 - `normalize_source_lang()`, `source_lang_title()`
 
 Notes:
@@ -797,18 +796,6 @@ pub(super) fn settings_from_json(value: &Value) -> Flux2KleinSettings {
     settings
 }
 
-/// Whether a settings save must be started right now.
-///
-/// `dirty` is raised by every parameter change and by the OOM recovery that rewrites the
-/// economy settings itself. `settings_loaded` gates it because the initial load runs on its own
-/// worker: saving the in-memory DEFAULTS before that load lands would overwrite the user's file
-/// with defaults, which is a silent data loss rather than a visible failure.
-/// `save_in_flight` keeps at most one writer on the file at a time.
-#[must_use]
-pub(super) fn settings_save_due(dirty: bool, settings_loaded: bool, save_in_flight: bool) -> bool {
-    dirty && settings_loaded && !save_in_flight
-}
-
 /// Writes `settings` into the file of the variant the document itself names.
 ///
 /// The variant is read from `settings` rather than passed in, so the document and the
@@ -1056,25 +1043,6 @@ mod tests {
         assert!(!MemoryPreset::Custom.apply(&mut settings));
         assert_eq!(before.placement, settings.placement);
         assert_eq!(before.vae_slicing, settings.vae_slicing);
-    }
-
-    /// The settings saver must be ARMED by a settings change and by nothing else.
-    ///
-    /// This is the whole persistence guarantee of the engine: `dirty` is the only signal a
-    /// parameter change leaves behind, and `poll_and_maybe_save` — which runs inside
-    /// `AiEngine::poll`, i.e. once per frame while the tool is active — is the only writer.
-    /// The two guards beside it are equally load-bearing: saving before the initial load
-    /// landed would overwrite the user's file with the in-memory defaults, and a second writer
-    /// would race the first on the same path.
-    #[test]
-    fn the_settings_saver_is_armed_by_a_settings_change_and_only_then() {
-        assert!(settings_save_due(true, true, false), "a changed setting must be written");
-        assert!(!settings_save_due(false, true, false), "nothing changed: no write");
-        assert!(
-            !settings_save_due(true, false, false),
-            "a write before the initial load lands would clobber the file with the defaults"
-        );
-        assert!(!settings_save_due(true, true, true), "at most one writer on the file at a time");
     }
 
     /// The mode is not a setting any more, so the only thing left to pin about the wire

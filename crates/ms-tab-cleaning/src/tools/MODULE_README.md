@@ -22,7 +22,7 @@ translation module's typed helpers) and the watermark detector (`watermark.detec
 their availability rules, the detection worker, and the two shared controls. A host owns only the
 `MaskGenerationState` it hands that module and the mask it writes the answer into. Both hosts read
 it and neither may fork it: `RegionMaskInpaintToolBase` writes into its single editor mask, and
-`ai_editor/` writes into the selected layer of its `RegionFrame` mask stack. Every mask-carrying
+`region_edit_v2/host.rs` writes into the selected layer of its `RegionFrame` mask stack. Every mask-carrying
 tool therefore gains watermark removal with a user-editable mask without a tool of its own, and a
 new source or requirement rule reaches both hosts at once.
 
@@ -53,7 +53,7 @@ A size contract is NOT something `RegionEditToolBase` can guarantee: `snap_selec
 to the page edge AFTER snapping to the multiple, and `build_composited_region_image` re-derives
 the crop by ratio from the DECODED page, whose dimensions may differ from the overlay's. A tool
 or engine with a hard size contract must therefore re-validate the loaded region's own size on
-its run path, and both consumers do (`ai_editor::hand_region_to_engine`, `Flux2KleinEngine::start`).
+its run path, and both consumers do (`region_edit_v2::host::hand_region_to_engine`, `Flux2KleinEngine::start`).
 
 The region LOADER is shared, not copied. `spawn_region_loader_thread` + `RegionLoadRequest` /
 `RegionLoadResult` are `pub(super)` so any tool in this subtree can hand a page path, a source
@@ -65,10 +65,12 @@ The region-editor WINDOW is not the only shape a region tool can take. `region_e
 alternative: a selection FRAME that lives on the canvas for the whole editing session, with its
 own handles, N mask layers, a result preview and a chrome of its own, driven from
 `CleaningTool::draw_overlay_ui` instead of a floating window. It replaces the window flow for the
-tools built on it; `RegionEditToolBase` and every tool on it stay exactly as they are. Its first
-and so far only consumer is `ai_editor/`, which also carries the UI split the framework assumes:
-a compact part in «Выбранный инструмент» (`draw_ui`) and a main part in its own dock panel
-(`draw_main_panel`).
+tools built on it; `RegionEditToolBase` and every tool on it stay exactly as they are. The
+framework also carries the GENERIC host tool over it (`region_edit_v2/host.rs`,
+`RegionEditHost`), which owns the UI split the framework assumes — a compact part in «Выбранный
+инструмент» (`draw_ui`) and a main part in its own dock panel (`draw_main_panel`) — and runs an
+engine catalog behind the `AiEngine` trait. A consumer tool is a `HostSpec` plus a catalog: the
+local-model `ai_editor/` and the cloud `ai_api_editor/`.
 
 AI-backed tools (`aot.rs`, `flux_fill.rs`, and the engines under `ai_editor/engines/`) send region
 and mask as raw PNG bytes in the IPC request blob (no base64). Every one of them encodes through
@@ -96,7 +98,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   `crate::tools::overlay_pixel`, so the whole subtree keeps reaching it as
   `base::overlay_pixel_for_final_color`.
 - `mask_generation.rs`: the host-neutral core of «Сгенерировать маску», shared by `base.rs` and
-  `ai_editor/`. Owns the source catalog (`MaskSource`, `MASK_SOURCES`), the availability rule
+  `region_edit_v2/host.rs`. Owns the source catalog (`MaskSource`, `MASK_SOURCES`), the availability rule
   (`MaskSource::is_available` / `requires_torch`), the per-host parameters and progress
   (`MaskGenerationParams`, `MaskGenerationState`), the worker lifecycle
   (`spawn_mask_generation` / `poll_mask_generation`, answering with a validated 0/255
@@ -333,13 +335,20 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - `region_edit_test.rs`: development-only mask-inpaint pipeline test tool; it is not exported by
   `mod.rs`.
 - `region_edit_v2/`: the on-canvas region-editing FRAMEWORK (frame, mask layers, geometry,
-  painting, input). It has its own `MODULE_README.md`; a tool built on it drives `RegionFrame`
-  from `draw_overlay_ui` and must not duplicate the helpers `base.rs` already exposes.
-- `ai_editor/`: the «ИИ-редактор области» tool — the framework's only consumer, and the only tool
-  with a MAIN dock panel (`wants_main_panel`). It HOSTS the AI engines behind the `AiEngine` trait
-  (`ai_editor/engine.rs`, `ai_editor/engines/`), which is where FLUX.2 klein lives; a model is an
-  engine of this tool and not a `CleaningTool` of its own. Own `MODULE_README.md`, and a second one under
-  `engines/`.
+  painting, input) and the generic HOST tool over it (`host.rs` + `host_panels.rs`:
+  `RegionEditHost`, `HostSpec`; `engine.rs`: the `AiEngine` contract). It has its own
+  `MODULE_README.md`; the host drives `RegionFrame` from `draw_overlay_ui` and must not duplicate
+  the helpers `base.rs` already exposes. It is the tool with a MAIN dock panel
+  (`wants_main_panel`).
+- `ai_editor/`: the «ИИ-редактор области» tool — a `HostSpec` (`AI_EDITOR_SPEC`, built by
+  `ai_editor_tool()`) plus its engine catalog `ai_editor/engines/`, which is where FLUX.2 klein,
+  Lama and SDXL Inpaint live; a model is an engine of this tool and not a `CleaningTool` of its
+  own. Own `MODULE_README.md`, and a second one under `engines/`.
+- `ai_api_editor/`: the «ИИ редактирование (API)» tool — a `HostSpec` (`AI_API_EDITOR_SPEC`,
+  built by `ai_api_editor_tool()`) whose catalog is ONE engine, «Облачные модели», over
+  `ms_ai_api::image_edit` (hosted image-edit models: provider/model picker with its key block,
+  prompt, mask blend, size-exact run on a worker). Needs neither the backend nor Torch; the host
+  hides its engine picker because the catalog has one entry. Own `MODULE_README.md`.
 
 ## Contracts and invariants
 - Tools must mutate clean overlays through `CanvasView` APIs such as `replace_overlay_region*` and
@@ -550,9 +559,9 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - To change mask generation — a source, its parameters or availability rule, the watermark model
   catalog, the streaming progress, the detection call or the source picker — edit
   `mask_generation.rs`. It is shared, so the change reaches both the mask-inpaint editor and
-  `ai_editor/`; edit a host only for where the answer is written (`base.rs` for the single editor
-  mask, `ai_editor/mod.rs` for the selected `RegionFrame` layer) or for a block reason of that
-  host's own.
+  `region_edit_v2/host.rs`; edit a host only for where the answer is written (`base.rs` for the
+  single editor mask, `region_edit_v2/host.rs` for the selected `RegionFrame` layer) or for a
+  block reason of that host's own.
 - To change direct paint behavior, edit `zamazka.rs`; to change alt-version or current-page
   stamping, edit `stamp.rs`.
 - To change the patch tool's selection gesture or its ROI/refusal geometry, edit
@@ -603,11 +612,14 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   `scratch_crop_is_stale` in `watermark_removal.rs`; the panel's own delete-on-commit /
   delete-on-discard is `remove_scratch_crop` in `watermark_library_window.rs`.
 - To change the on-canvas region frame (its geometry, lock rules, painting or input), edit
-  `region_edit_v2/` and read its `MODULE_README.md` first. To change what the area editor DOES
+  `region_edit_v2/` and read its `MODULE_README.md` first. To change what a hosted tool DOES
   with that frame — its engine picker, its run path, its apply check or either of its panels —
-  edit `ai_editor/`; where its main panel sits by default is `cleaning_default_dock_layout` in
-  `../tab.rs`. Which ENGINES it offers, and what each of them requires of the frame, is
-  `ai_editor/engines/`.
+  edit `region_edit_v2/host.rs` / `host_panels.rs` (shared by every hosted tool); where its main
+  panel sits by default is `cleaning_default_dock_layout` in `../tab.rs`. Which ENGINES the
+  «ИИ-редактор области» offers, and what each of them requires of the frame, is
+  `ai_editor/engines/`; its id, title, id salts and log tag are `AI_EDITOR_SPEC` in
+  `ai_editor/mod.rs`. The cloud tool's engine, settings and run worker are `ai_api_editor/`; its
+  providers, models, size rules, keys and HTTP pipeline are `ms_ai_api::image_edit`.
 - To change Python backend IPC method names, request/response blob layout, model selection, unload
   behavior, or model ensure logic, edit the relevant AI tool file and keep `ai_models.rs` as the
   model boundary.

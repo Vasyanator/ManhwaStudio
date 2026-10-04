@@ -10,6 +10,9 @@ instruction. Used by the translation tab's OCR and machine-translation panels.
 
 Key functions:
 - draw_connection()  : draws the block, returns the user's `AiApiConnectionActions`.
+- draw_key_block()   : the key status / refresh / password / save-delete block alone
+                       (`KeyBlockView` in, `KeyBlockActions` out); `draw_connection` draws it in
+                       place, and other key owners (image-edit providers) reuse it.
 - compact_middle()   : private, middle-ellipsizes the selected model id for the combo button.
 - draw_image_input_status(): private, the "Images: ..." line under the model field.
 
@@ -79,43 +82,10 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
         actions.refresh = true;
     }
 
-    ui.horizontal_wrapped(|ui| {
-        let key_state = match state.key_configured {
-            Some(true) => t!("ai_api.connection.key_saved_status"),
-            Some(false) => t!("ai_api.connection.key_not_set_status"),
-            None => t!("ai_api.connection.key_unverified_status"),
-        };
-        ui.small(key_state);
-        if ui.small_button(t!("ai_api.connection.refresh_button")).clicked() {
-            actions.refresh = true;
-        }
-    });
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label(t!("ai_api.connection.api_key_label"));
-        // Only a verified state is shown: `None` (not refreshed yet) has no reliable answer.
-        match state.key_configured {
-            Some(true) => {
-                ui.colored_label(ms_theme::status::SUCCESS, t!("ai_api.connection.key_present_status"));
-            }
-            Some(false) if state.service.requires_key() => {
-                ui.colored_label(ms_theme::status::ERROR, t!("ai_api.connection.key_missing_status"));
-            }
-            Some(false) => {
-                ui.weak(t!("ai_api.connection.key_optional_status"));
-            }
-            None => {}
-        }
-    });
-    ui.add(egui::TextEdit::singleline(&mut state.key_edit).password(true).desired_width(max_width));
-    ui.horizontal_wrapped(|ui| {
-        if ui.small_button(t!("ai_api.connection.save_key_button")).clicked() {
-            actions.save_key = true;
-        }
-        if ui.small_button(t!("ai_api.connection.delete_key_button")).clicked() {
-            actions.clear_key = true;
-        }
-    });
+    let key_actions = draw_key_block(ui, max_width, KeyBlockView { key_configured: state.key_configured, key_required: state.service.requires_key() }, &mut state.key_edit);
+    actions.refresh |= key_actions.refresh;
+    actions.save_key |= key_actions.save_key;
+    actions.clear_key |= key_actions.clear_key;
     if !state.status.trim().is_empty() {
         ui.small(state.status.clone());
     }
@@ -143,6 +113,76 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
         .add(egui::TextEdit::multiline(&mut state.system_instruction).desired_width(max_width).desired_rows(4))
         .changed();
 
+    actions
+}
+
+/// What the key block shows: the verified key state and whether the slot needs a key at all.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBlockView {
+    /// Whether a key is stored for the slot; `None` until a refresh for that slot answered.
+    pub key_configured: Option<bool>,
+    /// Whether the slot needs a key (`false`: an absent key reads as "optional", not "missing").
+    pub key_required: bool,
+}
+
+/// User requests collected from one `draw_key_block` call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyBlockActions {
+    /// "Refresh" was clicked: re-verify the stored key (and whatever else the owner reloads).
+    pub refresh: bool,
+    /// "Save key" was clicked: store the trimmed `key_edit` buffer.
+    pub save_key: bool,
+    /// "Delete key" was clicked: delete the stored key.
+    pub clear_key: bool,
+}
+
+/// Draws the API-key block into `ui` and returns what the user requested: the key status line
+/// with "Refresh", the "API key" label with a coloured presence line (only once `view` holds a
+/// verified state), the password field over `key_edit` (`max_width` wide) and the save/delete
+/// buttons. It uses `ui`'s auto ids (no `push_id`), so drawn inside `draw_connection` it keeps
+/// that widget's id sequence; a caller drawing several blocks in one `Ui` wraps each in its own
+/// `push_id`. Never blocks and never touches the credential store: the owner turns the actions
+/// into requests and keeps `key_edit` out of every log and settings file.
+#[must_use]
+pub fn draw_key_block(ui: &mut egui::Ui, max_width: f32, view: KeyBlockView, key_edit: &mut String) -> KeyBlockActions {
+    let mut actions = KeyBlockActions::default();
+    ui.horizontal_wrapped(|ui| {
+        let key_state = match view.key_configured {
+            Some(true) => t!("ai_api.connection.key_saved_status"),
+            Some(false) => t!("ai_api.connection.key_not_set_status"),
+            None => t!("ai_api.connection.key_unverified_status"),
+        };
+        ui.small(key_state);
+        if ui.small_button(t!("ai_api.connection.refresh_button")).clicked() {
+            actions.refresh = true;
+        }
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t!("ai_api.connection.api_key_label"));
+        // Only a verified state is shown: `None` (not refreshed yet) has no reliable answer.
+        match view.key_configured {
+            Some(true) => {
+                ui.colored_label(ms_theme::status::SUCCESS, t!("ai_api.connection.key_present_status"));
+            }
+            Some(false) if view.key_required => {
+                ui.colored_label(ms_theme::status::ERROR, t!("ai_api.connection.key_missing_status"));
+            }
+            Some(false) => {
+                ui.weak(t!("ai_api.connection.key_optional_status"));
+            }
+            None => {}
+        }
+    });
+    ui.add(egui::TextEdit::singleline(key_edit).password(true).desired_width(max_width));
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button(t!("ai_api.connection.save_key_button")).clicked() {
+            actions.save_key = true;
+        }
+        if ui.small_button(t!("ai_api.connection.delete_key_button")).clicked() {
+            actions.clear_key = true;
+        }
+    });
     actions
 }
 
@@ -177,7 +217,133 @@ fn compact_middle(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_middle;
+    use super::{KeyBlockActions, KeyBlockView, compact_middle, draw_connection, draw_key_block};
+    use crate::connection::{AiApiConnectionActions, AiApiConnectionState};
+    use crate::service::AiApiService;
+
+    /// One drawn widget of the headless harness: its rect, type and label.
+    type WidgetRow = (egui::Rect, Option<egui::WidgetType>, Option<String>);
+
+    /// `(save_key, clear_key, refresh)` of one frame's requests.
+    type KeyFlags = (bool, bool, bool);
+
+    fn connection_flags(actions: AiApiConnectionActions) -> KeyFlags {
+        (actions.save_key, actions.clear_key, actions.refresh)
+    }
+
+    fn block_flags(actions: KeyBlockActions) -> KeyFlags {
+        (actions.save_key, actions.clear_key, actions.refresh)
+    }
+
+    /// A headless context that records `WidgetInfo` (debug builds only), so a test can find a
+    /// widget by its label.
+    fn headless() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.debug.show_interactive_widgets = true);
+        ctx
+    }
+
+    /// Runs one frame of `draw` at `time` with `events`; returns its flags and every widget of
+    /// the frame in paint order.
+    fn frame(ctx: &egui::Context, time: f64, events: Vec<egui::Event>, mut draw: impl FnMut(&mut egui::Ui) -> KeyFlags) -> (KeyFlags, Vec<WidgetRow>) {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 1400.0))), time: Some(time), events, ..Default::default() };
+        let mut result = None;
+        let output = ctx.run_ui(input, |ui| {
+            let flags = draw(ui);
+            let widgets = ui.ctx().viewport(|viewport| {
+                let rects = &viewport.this_pass.widgets;
+                rects.get_layer(egui::LayerId::background()).map(|widget| (widget.rect, rects.info(widget.id).map(|info| info.typ), rects.info(widget.id).and_then(|info| info.label.clone()))).collect::<Vec<_>>()
+            });
+            result = Some((flags, widgets));
+        });
+        output.drop_without_applying_deltas();
+        result.unwrap_or_else(|| panic!("run_ui did not call the frame closure"))
+    }
+
+    /// Clicks the centre of `rect` (press frame, release frame, then a frame carrying `extra`
+    /// events) and returns the flags of those three frames OR-ed together.
+    fn click(ctx: &egui::Context, rect: egui::Rect, extra: Vec<egui::Event>, mut draw: impl FnMut(&mut egui::Ui) -> KeyFlags) -> KeyFlags {
+        let pos = rect.center();
+        let press = vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }];
+        let release = vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }];
+        let (a, _) = frame(ctx, 1.0, press, &mut draw);
+        let (b, _) = frame(ctx, 1.05, release, &mut draw);
+        let (c, _) = frame(ctx, 1.1, extra, &mut draw);
+        (a.0 | b.0 | c.0, a.1 | b.1 | c.1, a.2 | b.2 | c.2)
+    }
+
+    /// The rect of the widget labelled `label`.
+    fn rect_of(widgets: &[WidgetRow], label: &str) -> egui::Rect {
+        widgets.iter().find(|row| row.2.as_deref() == Some(label)).map_or_else(|| panic!("no widget labelled {label:?}"), |row| row.0)
+    }
+
+    fn has_label(widgets: &[WidgetRow], label: &str) -> bool {
+        widgets.iter().any(|row| row.2.as_deref() == Some(label))
+    }
+
+    // The chat widget keeps its key-block behaviour: each button sets exactly its own flag
+    // (the warm-up frame, which carries the automatic first refresh, is excluded).
+    #[test]
+    fn connection_key_buttons_set_their_own_flag() {
+        let buttons = [(t!("ai_api.connection.refresh_button"), (false, false, true)), (t!("ai_api.connection.save_key_button"), (true, false, false)), (t!("ai_api.connection.delete_key_button"), (false, true, false))];
+        for service in [AiApiService::OpenAi, AiApiService::OpenAiCompatible] {
+            for (label, expected) in buttons {
+                let ctx = headless();
+                let mut state = AiApiConnectionState::new("sys");
+                state.service = service;
+                state.base_url = "http://127.0.0.1:8080".to_string();
+                let mut draw = |ui: &mut egui::Ui| connection_flags(draw_connection(ui, "test_ai_api", 240.0, &mut state));
+                let (warm_up, widgets) = frame(&ctx, 0.0, Vec::new(), &mut draw);
+                assert_eq!(warm_up, (false, false, true), "{service:?}: first draw requests the initial refresh");
+                assert_eq!(click(&ctx, rect_of(&widgets, label), Vec::new(), &mut draw), expected, "{service:?} {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn key_block_buttons_set_their_own_flag_and_field_edits_the_buffer() {
+        let view = KeyBlockView { key_configured: None, key_required: true };
+        let buttons = [(t!("ai_api.connection.refresh_button"), (false, false, true)), (t!("ai_api.connection.save_key_button"), (true, false, false)), (t!("ai_api.connection.delete_key_button"), (false, true, false))];
+        for (label, expected) in buttons {
+            let ctx = headless();
+            let mut key_edit = String::new();
+            let mut draw = |ui: &mut egui::Ui| block_flags(draw_key_block(ui, 240.0, view, &mut key_edit));
+            let (idle, widgets) = frame(&ctx, 0.0, Vec::new(), &mut draw);
+            assert_eq!(idle, (false, false, false));
+            assert_eq!(click(&ctx, rect_of(&widgets, label), Vec::new(), &mut draw), expected, "{label}");
+        }
+        let ctx = headless();
+        let mut key_edit = String::new();
+        let mut draw = |ui: &mut egui::Ui| block_flags(draw_key_block(ui, 240.0, view, &mut key_edit));
+        let (_, widgets) = frame(&ctx, 0.0, Vec::new(), &mut draw);
+        let field = widgets.iter().find(|row| row.1 == Some(egui::WidgetType::TextEdit)).map_or_else(|| panic!("no key field"), |row| row.0);
+        assert_eq!(click(&ctx, field, vec![egui::Event::Text("sk-test".to_string())], &mut draw), (false, false, false));
+        assert_eq!(key_edit, "sk-test");
+    }
+
+    // The presence line appears only for a verified state; a missing key is an error only when
+    // the slot requires one.
+    #[test]
+    fn key_block_presence_line_follows_the_view() {
+        let present = t!("ai_api.connection.key_present_status");
+        let missing = t!("ai_api.connection.key_missing_status");
+        let optional = t!("ai_api.connection.key_optional_status");
+        let cases = [
+            (Some(true), true, Some(present)),
+            (Some(false), true, Some(missing)),
+            (Some(false), false, Some(optional)),
+            (None, true, None),
+            (None, false, None),
+        ];
+        for (key_configured, key_required, shown) in cases {
+            let ctx = headless();
+            let mut key_edit = String::new();
+            let (_, widgets) = frame(&ctx, 0.0, Vec::new(), |ui| block_flags(draw_key_block(ui, 240.0, KeyBlockView { key_configured, key_required }, &mut key_edit)));
+            for line in [present, missing, optional] {
+                assert_eq!(has_label(&widgets, line), shown == Some(line), "{key_configured:?} {key_required}: {line}");
+            }
+        }
+    }
 
     #[test]
     fn compact_middle_never_exceeds_max() {
