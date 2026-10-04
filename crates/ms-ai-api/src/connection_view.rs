@@ -2,27 +2,33 @@
 File: crates/ms-ai-api/src/connection_view.rs
 
 Purpose:
-The shared AI API connection widget: service picker, key status + refresh, password field
-(labelled with a coloured ✓/✗ key-presence line once the key state is known) with save/delete, request status, model picker + manual model id, account status, system
+The shared AI API connection widget: service picker, base URL field (compatible services only),
+key status + refresh, password field (labelled with a ✓/✗ key-presence line once the key state is
+known; a neutral "optional" line for a keyless compatible service) with save/delete, request
+status, model picker + manual model id + the model's image-input status, account status, system
 instruction. Used by the translation tab's OCR and machine-translation panels.
 
 Key functions:
 - draw_connection()  : draws the block, returns the user's `AiApiConnectionActions`.
 - compact_middle()   : private, middle-ellipsizes the selected model id for the combo button.
+- draw_image_input_status(): private, the "Images: ..." line under the model field.
 
 Notes:
 The widget draws straight into the caller's `Ui` (no `push_id`, no `vertical`, no
 `ScrollArea`, no width clamp), so the caller decides scrolling and width and the
 `WheelComboBox` ids stay `ui.id()`-scoped `"{id_salt}_service"` / `"{id_salt}_model"` strings
-(persisted widget-state keys; `String` and `&str` salts hash identically). The first draw of a
-state, and every service change, request a metadata refresh, so a stored key is verified and
-the model list loaded without pressing "Refresh". It never spawns
+(persisted widget-state keys; `String` and `&str` salts hash identically); the base URL field is
+salted `"{id_salt}_base_url"`. The first draw of a
+state, every service change, and a committed base URL edit (focus lost or Enter, with a changed
+value) request a metadata refresh, so a stored key is verified and the model list loaded without
+pressing "Refresh"; typing in the URL field only marks the options changed. It never spawns
 work: buttons only set flags that the consumer turns into requests via `AiApiTaskRunner`.
 */
 
 use ms_widgets::WheelComboBox;
 
 use crate::connection::{AiApiConnectionActions, AiApiConnectionState};
+use crate::model_caps::{ImageInputSupport, image_input_support};
 use crate::service::AiApiService;
 
 /// Longest model id (in chars) shown on the model combo button before middle-ellipsizing; keeps
@@ -31,11 +37,12 @@ const MODEL_LABEL_MAX_CHARS: usize = 42;
 
 /// Draws the connection block for `state` into `ui` and returns what the user requested.
 ///
-/// `id_salt` prefixes the two combo ids (`"{id_salt}_service"`, `"{id_salt}_model"`); it must be
+/// `id_salt` prefixes the two combo ids (`"{id_salt}_service"`, `"{id_salt}_model"`) and the base
+/// URL field's id (`"{id_salt}_base_url"`); it must be
 /// unique among the widget instances in one parent `Ui`. `max_width` is the desired width of
-/// the three text fields. A service change resets the per-service state
-/// (`reset_for_service_change`) and sets both `options_changed` and `refresh`; the first call
-/// for a given state also sets `refresh` (`take_initial_refresh`). Never blocks.
+/// the text fields. A service change resets the per-service state (`reset_for_service_change`)
+/// and sets both `options_changed` and `refresh`; the first call for a given state also sets
+/// `refresh` (`take_initial_refresh`); a committed, changed base URL sets `refresh`. Never blocks.
 #[must_use]
 pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: &mut AiApiConnectionState) -> AiApiConnectionActions {
     let mut actions = AiApiConnectionActions::default();
@@ -53,6 +60,18 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
         state.reset_for_service_change();
         actions.options_changed = true;
         actions.refresh = true;
+    }
+    if state.service.uses_base_url() {
+        ui.label(t!("ai_api.connection.base_url_label"));
+        // A stable salt: the field appears and disappears with the service, which would otherwise
+        // shift the auto ids of the key and model fields below it.
+        let response = ui.add(egui::TextEdit::singleline(&mut state.base_url).id_salt(format!("{id_salt}_base_url")).desired_width(max_width).hint_text(t!("ai_api.connection.base_url_hint")));
+        actions.options_changed |= response.changed();
+        // A singleline `TextEdit` surrenders focus on Enter, so `lost_focus` covers both "Enter"
+        // and "clicked elsewhere"; the refresh waits for that instead of firing per keystroke.
+        if response.lost_focus() && state.commit_base_url_edit() {
+            actions.refresh = true;
+        }
     }
     // First show of this state: verify the stored key and load the models automatically (the
     // service change above already refreshes, so this only matters for the persisted service).
@@ -79,8 +98,11 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
             Some(true) => {
                 ui.colored_label(ms_theme::status::SUCCESS, t!("ai_api.connection.key_present_status"));
             }
-            Some(false) => {
+            Some(false) if state.service.requires_key() => {
                 ui.colored_label(ms_theme::status::ERROR, t!("ai_api.connection.key_missing_status"));
+            }
+            Some(false) => {
+                ui.weak(t!("ai_api.connection.key_optional_status"));
             }
             None => {}
         }
@@ -111,6 +133,7 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
     actions.options_changed |= ui
         .add(egui::TextEdit::singleline(&mut state.model).desired_width(max_width).hint_text(t!("ai_api.connection.model_id_hint")))
         .changed();
+    draw_image_input_status(ui, &state.model);
 
     ui.label(t!("ai_api.connection.balance_limits_label"));
     ui.small(state.account_status.clone());
@@ -121,6 +144,20 @@ pub fn draw_connection(ui: &mut egui::Ui, id_salt: &str, max_width: f32, state: 
         .changed();
 
     actions
+}
+
+/// Draws whether `model` accepts images (`image_input_support`), coloured by certainty; nothing
+/// for a blank model id.
+fn draw_image_input_status(ui: &mut egui::Ui, model: &str) {
+    if model.trim().is_empty() {
+        return;
+    }
+    let (color, text) = match image_input_support(model) {
+        ImageInputSupport::Supported => (ms_theme::status::SUCCESS, t!("ai_api.connection.images_supported_status")),
+        ImageInputSupport::NotSupported => (ms_theme::status::ERROR, t!("ai_api.connection.images_not_supported_status")),
+        ImageInputSupport::Unknown => (ms_theme::status::WARNING, t!("ai_api.connection.images_unknown_status")),
+    };
+    ui.colored_label(color, text);
 }
 
 /// Shortens `text` to at most `max_chars` chars as `"<head>...<tail>"` (equal halves). Text

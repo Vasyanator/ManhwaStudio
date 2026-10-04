@@ -8,11 +8,12 @@ Main items:
 - `MtStopNotice`: sticky yellow notice shown when an AI run stopped due to a probable credit/quota or
   usage-limit error, with a toggle that reveals the full provider error.
 - AI API MT options: the connection section (source/target languages, then the shared
-  `ms_ai_api::draw_connection` widget for provider/key/model/system prompt), JSON batch size,
-  reasoning, context budget, and optional ImageBubble inclusion/visual detail for multimodal models.
+  `ms_ai_api::draw_connection` widget for provider/base URL/key/model/system prompt), JSON batch
+  size, reasoning, context budget, and optional ImageBubble inclusion/visual detail.
 - Translation mode toggle (`ai_image_mode`): "Обычный" batched mode vs "Только картинки"
   (per-ImageBubble) mode; the latter adds a chapter-context source switch (`ai_image_context_source`:
-  original vs translation) and is gated on a multimodal model.
+  original vs translation). Image modes are blocked only for a model `ms_ai_api::image_input_support`
+  lists as text-only (`NotSupported`); `Supported` and `Unknown` models may use them.
 - `MtPanelActions`: UI actions requested by the user (`start` + `cancel`).
 - `draw_machine_translation_panel`: renders settings and action buttons.
 
@@ -25,7 +26,7 @@ Notes:
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtService,
 };
-use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, draw_connection, is_likely_multimodal_model};
+use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, ImageInputSupport, draw_connection, image_input_support};
 use ms_widgets::WheelComboBox;
 
 #[derive(Debug, Clone)]
@@ -641,9 +642,11 @@ fn draw_ai_translation_section(
             t!("translation.mt_panel.include_existing_translation_label"),
         )
         .changed();
-    let selected_model_is_multimodal = is_likely_multimodal_model(&options.ai_api.model);
-    // Per-ImageBubble mode requires a multimodal model; coerce back to the normal mode otherwise.
-    if !selected_model_is_multimodal && options.ai_image_mode != AiMtImageMode::Normal {
+    // Image modes are offered unless the model is KNOWN to be text-only: an unlisted model
+    // (`Unknown`, e.g. a local server's) may well accept images, and the user can tell.
+    let images_allowed = image_input_support(&options.ai_api.model) != ImageInputSupport::NotSupported;
+    // Per-ImageBubble mode needs image input; coerce back to the normal mode for a text-only model.
+    if !images_allowed && options.ai_image_mode != AiMtImageMode::Normal {
         options.ai_image_mode = AiMtImageMode::Normal;
         actions.options_changed = true;
     }
@@ -662,7 +665,7 @@ fn draw_ai_translation_section(
             actions.options_changed = true;
         }
         let images_only_toggle = ui.add_enabled(
-            selected_model_is_multimodal,
+            images_allowed,
             egui::Button::selectable(
                 options.ai_image_mode == AiMtImageMode::ImagesOnly,
                 AiMtImageMode::ImagesOnly.title(),
@@ -673,9 +676,9 @@ fn draw_ai_translation_section(
             actions.options_changed = true;
         }
     });
-    if !selected_model_is_multimodal {
+    if !images_allowed {
         ui.small(
-            t!("translation.mt_panel.images_only_multimodal_hint"),
+            t!("translation.mt_panel.images_unsupported_model_hint"),
         );
     }
 
@@ -701,13 +704,13 @@ fn draw_ai_translation_section(
                 .changed();
         });
     } else {
-        if !selected_model_is_multimodal && options.ai_include_image_bubbles {
+        if !images_allowed && options.ai_include_image_bubbles {
             options.ai_include_image_bubbles = false;
             actions.options_changed = true;
         }
         actions.options_changed |= ui
             .add_enabled(
-                selected_model_is_multimodal,
+                images_allowed,
                 egui::Checkbox::new(
                     &mut options.ai_include_image_bubbles,
                     t!("translation.mt_panel.include_image_bubbles_label"),

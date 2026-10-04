@@ -16,7 +16,8 @@ use std::fmt;
 
 use crate::service::AiApiService;
 
-/// Failure of an AI API key-store, model-list, account-status or background-task operation.
+/// Failure of an AI API key-store, target (base URL / model), model-list, account-status or
+/// background-task operation.
 #[derive(Debug, Clone)]
 pub enum AiApiError {
     /// The OS credential store could not be opened at all.
@@ -43,6 +44,12 @@ pub enum AiApiError {
     OpenRouterNonJson { detail: String },
     /// The background thread for a connection request could not be started.
     TaskSpawn { detail: String },
+    /// A compatible service has no base URL (server address) set.
+    BaseUrlMissing { service: AiApiService },
+    /// The base URL is not an `http(s)://host[/path]` address (see `target::normalize_base_url`).
+    BaseUrlInvalid { url: String },
+    /// A request was built for an empty model id.
+    EmptyModel,
 }
 
 impl AiApiError {
@@ -63,6 +70,9 @@ impl AiApiError {
             Self::OpenRouterRequest { detail } => tf!("ai_api.openrouter.key_request_error", err = detail),
             Self::OpenRouterNonJson { detail } => tf!("ai_api.openrouter.non_json_error", err = detail),
             Self::TaskSpawn { detail } => tf!("ai_api.tasks.spawn_error", err = detail),
+            Self::BaseUrlMissing { service } => tf!("ai_api.target.base_url_missing_error", service = service.label()),
+            Self::BaseUrlInvalid { url } => tf!("ai_api.target.base_url_invalid_error", url = url),
+            Self::EmptyModel => t!("ai_api.target.empty_model_error").to_string(),
         }
     }
 }

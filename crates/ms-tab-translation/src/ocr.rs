@@ -14,8 +14,9 @@
 //   2) LRU-кэш декодированных страниц для повторных crop при OCR по блокам.
 //   3) advanced-recognition может передать уже скомпозитенный PNG crop с
 //      пользовательским оверлеем, который worker использует вместо crop страницы.
-// - AI API OCR builds `genai` multimodal chat calls (through `ms_ai_api`: client,
-//   credential-store API keys, async bridge) from the worker thread.
+// - AI API OCR builds `genai` multimodal chat calls (through `ms_ai_api`: target with the
+//   base URL of a compatible service, client, credential-store API keys (optional for a
+//   compatible service), async bridge) from the worker thread.
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -37,7 +38,7 @@ use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 // AI API OCR (`genai`, reached through `ms_ai_api`) is native-only: `genai` is not
 // compiled for wasm. The worker command/event enums and the controller stay
 // target-neutral; only the bodies that build `genai` requests are gated below.
-use ms_ai_api::AiApiService;
+use ms_ai_api::{AiApiService, AiApiTarget};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::genai::chat::{ChatMessage, ChatRequest, ContentPart};
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -122,6 +123,8 @@ pub struct OcrRuntimeOptions {
     pub surya_max_sliding_window: u32,
     pub surya_max_tokens: u32,
     pub ai_api_service: AiApiService,
+    /// Server address of a compatible AI API service, as typed (validated per request).
+    pub ai_api_base_url: String,
     pub ai_api_model: String,
     pub ai_api_system_instruction: String,
 }
@@ -455,7 +458,7 @@ fn warmup_ocr_engine(
     evt_tx: &Sender<WorkerEvent>,
 ) -> Result<(), String> {
     if engine == OcrEngine::AiApi {
-        return validate_ai_api_options(options);
+        return validate_ai_api_options(options).map(|_target| ());
     }
 
     // Route-aware readiness gate. When the active route is the native ONNX Runtime,
@@ -1292,15 +1295,18 @@ fn parse_ocr_response(response: &Value) -> Result<OcrRecognizeResult, String> {
     Ok(OcrRecognizeResult { lines, text })
 }
 
-fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<(), String> {
+/// Checks that an AI API OCR request can be sent and returns its target: a usable base URL for a
+/// compatible service, a stored key for a service that requires one, and a model id.
+fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<AiApiTarget, String> {
     let service = options.ai_api_service;
-    if ms_ai_api::keys::read_api_key(service).map_err(|err| err.to_string())?.trim().is_empty() {
+    let target = AiApiTarget::new(service, &options.ai_api_base_url).map_err(|err| err.to_string())?;
+    if service.requires_key() && ms_ai_api::keys::read_api_key(&target).map_err(|err| err.to_string())?.trim().is_empty() {
         return Err(tf!("translation.ocr.api_key_missing_error", service = service.label()));
     }
     if options.ai_api_model.trim().is_empty() {
         return Err(t!("translation.ocr.no_multimodal_model_error").to_string());
     }
-    Ok(())
+    Ok(target)
 }
 
 /// Web stub: AI-API OCR runs over `genai` + `tokio`, which are not compiled for
@@ -1318,11 +1324,13 @@ fn run_ai_api_ocr_request(
     request: &OcrRecognizeRequest,
     page_cache: &mut PageImageCache,
 ) -> Result<OcrRecognizeResult, String> {
-    validate_ai_api_options(&request.options)?;
+    let target = validate_ai_api_options(&request.options)?;
     let crop_png = crop_image_as_png(request, page_cache)?;
-    let service = request.options.ai_api_service;
-    let api_key = ms_ai_api::keys::read_api_key(service).map_err(|err| err.to_string())?;
-    let model = ms_ai_api::model_id::model_iden(service, &request.options.ai_api_model);
+    let service = target.service();
+    // Blank for a compatible service without a key stored for this exact base URL: sent as an
+    // empty key.
+    let api_key = ms_ai_api::keys::read_api_key(&target).map_err(|err| err.to_string())?;
+    let model = ms_ai_api::model_id::model_iden(service, &request.options.ai_api_model).map_err(|err| err.to_string())?;
     let system_instruction = normalized_ai_api_system_instruction(&request.options);
     let prompt = if request.reflect_strings {
         "Recognize all visible text in this manga/comic image. Read vertical columns right-to-left when the layout indicates manga reading order. Return only the recognized text, preserving line breaks when they are meaningful."
@@ -1332,7 +1340,7 @@ fn run_ai_api_ocr_request(
     let image_b64 = ms_ai_api::base64_encode(&crop_png);
 
     let text = ms_ai_api::client::block_on(async move {
-        let client = ms_ai_api::client::build_client(service, api_key);
+        let client = ms_ai_api::client::build_client(&target, api_key);
         let chat_req = ChatRequest::default()
             .with_system(system_instruction)
             .append_message(ChatMessage::user(vec![
@@ -1483,6 +1491,7 @@ mod tests {
             surya_max_sliding_window: 0,
             surya_max_tokens: 128,
             ai_api_service: AiApiService::OpenAi,
+            ai_api_base_url: String::new(),
             ai_api_model: "gpt-4o-mini".to_string(),
             ai_api_system_instruction: String::new(),
         }

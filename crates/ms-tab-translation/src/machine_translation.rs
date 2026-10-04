@@ -61,6 +61,8 @@ use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
 use ms_ai_api::AiApiService;
 #[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::AiApiTarget;
+#[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::client::{block_on, build_client};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::keys::read_api_key;
@@ -375,6 +377,8 @@ impl AiMtContextSource {
 #[derive(Debug, Clone)]
 pub struct AiMtOptions {
     pub service: AiApiService,
+    /// Server address of a compatible AI API service, as typed (validated when the run starts).
+    pub base_url: String,
     pub model: String,
     pub system_instruction: String,
     pub sort_mode: AiMtSortMode,
@@ -940,8 +944,19 @@ fn run_ai_translate_request(
     errors: &mut usize,
 ) {
     let service = options.service;
-    let api_key = match read_api_key(service).map_err(|err| err.to_string()) {
-        Ok(key) if !key.trim().is_empty() => key,
+    let target = match AiApiTarget::new(service, &options.base_url) {
+        Ok(target) => target,
+        Err(error) => {
+            runtime_log::log_error(format!("[MT][run {run_id}] invalid AI API target for {}: {error}", service.label()));
+            // A failed send means the controller (and its tab) was dropped; the failure is logged above.
+            let _ = evt_tx.send(WorkerEvent::RunFailed { run_id, error: error.to_string() });
+            return;
+        }
+    };
+    // A compatible service may run without a key (sent as an empty key; only a key stored for
+    // this exact base URL is ever sent); every other service needs a stored one.
+    let api_key = match read_api_key(&target).map_err(|err| err.to_string()) {
+        Ok(key) if !key.trim().is_empty() || !service.requires_key() => key,
         Ok(_) => {
             let _ = evt_tx.send(WorkerEvent::RunFailed {
                 run_id,
@@ -1049,8 +1064,9 @@ async fn run_ai_translate_async(
         .await;
     }
 
-    let client = build_client(options.service, api_key);
-    let model = model_iden(options.service, &options.model);
+    let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
+    let client = build_client(&target, api_key);
+    let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
     let mut chat_req = ChatRequest::default().with_system(build_ai_mt_system_prompt(
         source_lang,
         target_lang,
@@ -1281,8 +1297,9 @@ async fn run_ai_imagebubble_translate_async(
     translated: &mut usize,
     errors: &mut usize,
 ) -> Result<(), String> {
-    let client = build_client(options.service, api_key);
-    let model = model_iden(options.service, &options.model);
+    let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
+    let client = build_client(&target, api_key);
+    let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
     let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, &options);
     // OpenAI-style providers route by this stable key; Anthropic gets message-level cache markers.
     let cache_key = format!(
@@ -2677,6 +2694,7 @@ mod tests {
     fn ai_options(batch_size: usize) -> AiMtOptions {
         AiMtOptions {
             service: AiApiService::OpenAi,
+            base_url: String::new(),
             model: "gpt-test".to_string(),
             system_instruction: "Translate well.".to_string(),
             sort_mode: AiMtSortMode::Height,

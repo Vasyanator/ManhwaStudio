@@ -3765,7 +3765,6 @@
   "translation.mt_panel.hide_full_error_button": "Masquer l'erreur complète",
   "translation.mt_panel.hide_notice_button": "Masquer la notification",
   "translation.mt_panel.image_detail_label": "Détail de l'image",
-  "translation.mt_panel.images_only_multimodal_hint": "Le mode « Images uniquement » et les bulles avec images ne sont disponibles que pour les modèles multimodaux.",
   "translation.mt_panel.include_existing_translation_label": "Inclure la traduction existante dans le contexte",
   "translation.mt_panel.include_image_bubbles_label": "Inclure les bulles avec images",
   "translation.mt_panel.machine_tab": "Traduction automatique",

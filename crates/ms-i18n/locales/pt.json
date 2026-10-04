@@ -3765,7 +3765,6 @@
   "translation.mt_panel.hide_full_error_button": "Ocultar o erro completo",
   "translation.mt_panel.hide_notice_button": "Ocultar aviso",
   "translation.mt_panel.image_detail_label": "Detalhamento da imagem",
-  "translation.mt_panel.images_only_multimodal_hint": "O modo «Somente imagens» e os balões com imagens estão disponíveis apenas para modelos multimodais.",
   "translation.mt_panel.include_existing_translation_label": "Incluir a tradução existente no contexto",
   "translation.mt_panel.include_image_bubbles_label": "Incluir balões com imagens",
   "translation.mt_panel.machine_tab": "Tradução automática",

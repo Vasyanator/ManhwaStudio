@@ -71,8 +71,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
   controls: a "connection" accordion section (source/target languages, then the shared
   `ms_ai_api::draw_connection` widget, id salt `translation_mt_ai_api`) and the
-  batching/context section, multimodal ImageBubble inclusion and image
-  visual-detail controls, plus start/cancel actions. On the AI API tab the start buttons also expose
+  batching/context section, ImageBubble inclusion and image visual-detail controls (blocked only
+  for a model `ms_ai_api::image_input_support` lists as text-only; `Unknown` models are allowed), plus start/cancel actions. On the AI API tab the start buttons also expose
   a right-click "Отобразить полный запрос" debug action (`MtPanelActions::preview_request_page` /
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
   sending it.
@@ -103,7 +103,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 - Option structs are the settings boundary between panel UI, project settings persistence, and
   controller request construction. Keep parser/writer mappings in `tab.rs` synchronized when
   adding fields. The AI API connection state (`ai_api: AiApiConnectionState`) persists only
-  `service`, `model` and `system_instruction` (written by `tab.rs`); its key buffer is transient
+  `service`, `base_url`, `model` and `system_instruction` (written by `tab.rs` as
+  `OCR.params.ai_api.*` / `machine_translation.ai_api.*`; a missing `base_url` loads as empty); its key buffer is transient
   UI input stored only through `AiApiConnectionActions` -> `AiApiTaskRunner` in the OS credential
   store, never serialized into project settings. The connection id salts are persisted widget
   state: keep them stable.

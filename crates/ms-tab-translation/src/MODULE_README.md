@@ -116,7 +116,9 @@ engine that needs no text detection and no language selection; it is shown on a 
 the OCR panel so the side panel stays narrow.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`) from the OCR
 worker thread; provider API keys are read/written only through `ms_ai_api::keys` (OS credential
-store) and never persisted to project or user JSON settings.
+store) and never persisted to project or user JSON settings. For an OpenAI-/Anthropic-compatible
+service the request goes to the panel's base URL (`ms_ai_api::AiApiTarget`) and a missing key is
+not an error; OCR and MT raise their "API key missing" errors only when `requires_key()`.
 The native ONNX Runtime OCR path (MangaOCR + PaddleOCR) is selected in `ocr.rs` by the pure
 `ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope SIGILL
 guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
@@ -160,7 +162,7 @@ sees the exact reading-order interleaving. `split_ai_mt_batches` keeps context a
 translatable replicas but cuts each batch right after its `batch_size`-th translatable replica, so a
 context replica beyond a reached per-batch limit is deferred until translation reaches its window;
 context replicas are never returned, counted, or reported as failures. When ImageBubble inclusion is enabled for a
-multimodal model, the MT worker attaches each image in ordered message parts using the selected
+model not listed as text-only (`ms_ai_api::image_input_support` != `NotSupported`), the MT worker attaches each image in ordered message parts using the selected
 visual detail level and requires `original_text` plus `translation` for those IDs. A multi-area
 ImageBubble is sent as one item whose `MtImageInput.areas` lists every text area (description,
 current original, image-relative bbox); the model must return

@@ -235,7 +235,7 @@ use crate::ocr::{
     OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
     TranslationOcrController,
 };
-use ms_ai_api::{AiApiService, AiApiTaskRunner, is_likely_multimodal_model, is_probable_quota_or_limit_error};
+use ms_ai_api::{AiApiService, AiApiTaskRunner, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
     BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
     bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
@@ -4024,11 +4024,12 @@ impl TranslationTabState {
         items
     }
 
-    /// True when the AI per-ImageBubble mode is selected and usable (AI tab + multimodal model).
+    /// True when the AI per-ImageBubble mode is selected and usable (AI tab + a model not known
+    /// to be text-only).
     fn ai_mt_imagebubble_mode_active(&self) -> bool {
         self.mt_panel_options.active_tab == MtPanelTab::AiApi
             && self.mt_panel_options.ai_image_mode == AiMtImageMode::ImagesOnly
-            && is_likely_multimodal_model(&self.mt_panel_options.ai_api.model)
+            && image_input_support(&self.mt_panel_options.ai_api.model) != ImageInputSupport::NotSupported
     }
 
     /// Collects items for the per-ImageBubble mode: every chapter bubble in reading order is included
@@ -4206,6 +4207,7 @@ impl TranslationTabState {
     fn current_ai_mt_options(&self, project: &ProjectData) -> AiMtOptions {
         AiMtOptions {
             service: self.mt_panel_options.ai_api.service,
+            base_url: self.mt_panel_options.ai_api.base_url.clone(),
             model: self.mt_panel_options.ai_api.model.clone(),
             system_instruction: self.mt_panel_options.ai_api.system_instruction.clone(),
             sort_mode: self.mt_panel_options.ai_sort_mode,
@@ -4411,7 +4413,7 @@ impl TranslationTabState {
     fn ai_mt_can_include_image_bubbles(&self) -> bool {
         self.mt_panel_options.active_tab == MtPanelTab::AiApi
             && self.mt_panel_options.ai_include_image_bubbles
-            && is_likely_multimodal_model(&self.mt_panel_options.ai_api.model)
+            && image_input_support(&self.mt_panel_options.ai_api.model) != ImageInputSupport::NotSupported
     }
 
     /// True when a scope translation should also send already-translated replicas as ordered
@@ -5992,7 +5994,18 @@ impl TranslationTabState {
                     .and_then(Value::as_object);
                 if let Some(ai_api) = ai_api_obj {
                     if let Some(service) = ai_api.get("service").and_then(Value::as_str) {
-                        self.ocr_panel_options.ai_api.service = AiApiService::from_key(service);
+                        let service = AiApiService::from_key(service);
+                        self.ocr_panel_options.ai_api.service = service;
+                        // A compatible service has no default model: never keep the hosted default
+                        // of `AiApiConnectionState::new` under it when no model was saved.
+                        self.ocr_panel_options.ai_api.model = service.default_model().to_string();
+                    }
+                    // Absent in settings written before compatible services existed: the field keeps
+                    // its current value (empty in a fresh state, else the previously loaded
+                    // settings' URL). A key is bound to its exact URL, so a kept URL never sends
+                    // a key saved for another server.
+                    if let Some(base_url) = ai_api.get("base_url").and_then(Value::as_str) {
+                        self.ocr_panel_options.ai_api.base_url = base_url.trim().to_string();
                     }
                     if let Some(model) = ai_api.get("model").and_then(Value::as_str) {
                         let trimmed = model.trim();
@@ -6049,7 +6062,15 @@ impl TranslationTabState {
             }
             if let Some(ai_obj) = mt_obj.get("ai_api").and_then(Value::as_object) {
                 if let Some(service) = ai_obj.get("service").and_then(Value::as_str) {
-                    self.mt_panel_options.ai_api.service = AiApiService::from_key(service);
+                    let service = AiApiService::from_key(service);
+                    self.mt_panel_options.ai_api.service = service;
+                    // As for OCR: a saved service without a saved model gets its own default.
+                    self.mt_panel_options.ai_api.model = service.default_model().to_string();
+                }
+                // Absent in settings written before compatible services existed: kept as is, as
+                // for OCR above (empty only in a fresh state).
+                if let Some(base_url) = ai_obj.get("base_url").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_api.base_url = base_url.trim().to_string();
                 }
                 if let Some(model) = ai_obj.get("model").and_then(Value::as_str)
                     && !model.trim().is_empty()
@@ -7704,6 +7725,10 @@ fn apply_translation_settings_sections(
         Value::String(ocr_options.ai_api.service.key().to_string()),
     );
     ai_api_obj.insert(
+        "base_url".to_string(),
+        Value::String(ocr_options.ai_api.base_url.trim().to_string()),
+    );
+    ai_api_obj.insert(
         "model".to_string(),
         Value::String(ocr_options.ai_api.model.clone()),
     );
@@ -7750,6 +7775,10 @@ fn apply_translation_settings_sections(
     mt_ai_obj.insert(
         "service".to_string(),
         Value::String(mt_options.ai_api.service.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "base_url".to_string(),
+        Value::String(mt_options.ai_api.base_url.trim().to_string()),
     );
     mt_ai_obj.insert(
         "model".to_string(),
@@ -8109,6 +8138,7 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
             ocr_options.surya_max_tokens
         },
         ai_api_service: ocr_options.ai_api.service,
+        ai_api_base_url: ocr_options.ai_api.base_url.clone(),
         ai_api_model: ocr_options.ai_api.model.clone(),
         ai_api_system_instruction: ocr_options.ai_api.system_instruction.clone(),
     }

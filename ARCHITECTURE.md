@@ -101,8 +101,10 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   but never takes `Ui` / `Painter`.
 - `ms-tabs-simple` — Characters, Terms, Notes, Wiki tabs.
 - `ms-installer` — install/update, Python environment, `venv_check`.
-- `ms-ai-api` — the multi-provider LLM API layer over `genai` (re-exported): services, client,
-  keyring key storage, model listing, account status, and the shared connection widget
+- `ms-ai-api` — the multi-provider LLM API layer over `genai` (re-exported): services
+  (including OpenAI- / Anthropic-compatible endpoints at a user base URL, key optional),
+  client, keyring key storage, model listing, account status, the hard-coded image-input
+  capability table (`model_caps`: supported / not supported / unknown), and the shared connection widget
   (`AiApiConnectionState`, `draw_connection`, `AiApiTaskRunner`). Consumers build their own
   requests; persistence of the selected service/model stays with the consumer.
 
@@ -319,8 +321,8 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   deletes).
 - **Log** (`ms-log`) — session log `last.log` / `previous.log` and opt-in trace log, each with
   its own writer thread; callers pass the directory in.
-- **Credentials** — secrets live only in the OS keyring, never in a config file: per-service AI
-  API keys (`ms_ai_api::keys`) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
+- **Credentials** — secrets live only in the OS keyring, never in a config file: AI API keys
+  (`ms_ai_api::keys`; per service, and per service + base URL for compatible endpoints) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU

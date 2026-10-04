@@ -6,7 +6,8 @@ edition = "2024"
 # The provider-neutral layer over the `genai` multi-provider LLM client ("AI API"): the service
 # catalogue (`AiApiService`), API keys in the OS credential store, the authenticated client and
 # the async bridge, model metadata (model list, OpenRouter account status), model-id prefix
-# rules, the multimodal heuristic, the quota/limit error classifier and one base64 encoder.
+# rules, base URLs of OpenAI-/Anthropic-compatible servers, the model capability table (image
+# input), the quota/limit error classifier and one base64 encoder.
 # Consumers (the translation tab's OCR and MT today) build their own chat requests with the
 # re-exported `ms_ai_api::genai` types, so the graph keeps exactly one `genai` copy.
 #

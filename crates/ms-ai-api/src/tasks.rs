@@ -21,7 +21,7 @@ Each runner executes its requests one at a time in submission order on its own d
 (spawned on the first `submit`, fed by a channel, exiting when the runner is dropped), so a
 refresh can never overwrite a newer one and a save followed by a delete reaches the credential
 store in that order. Runners are independent of each other and of the OCR / MT run workers.
-`AiApiConnectionState::apply_event` drops results for a service that is no longer selected. A
+`AiApiConnectionState::apply_event` drops results for a target that is no longer selected. A
 failed thread spawn is logged and reported as an immediate `Failed` event, never a panic; a dead
 worker is logged and replaced on the next `submit`. Requests and events are `Send`; the runner
 itself lives on the GUI thread.
@@ -37,15 +37,17 @@ use crate::connection::{AiApiConnectionActions, AiApiConnectionState, AiApiNotic
 use crate::error::AiApiError;
 use crate::metadata::AiApiMetadata;
 use crate::service::AiApiService;
+use crate::target::AiApiTarget;
 
 /// One blocking connection operation for a worker thread.
 pub enum AiApiRequest {
-    /// Store `key` (trimmed by `keys::store_api_key`) as the API key of `service`.
-    StoreKey { service: AiApiService, key: String },
-    /// Delete the stored API key of `service`.
-    ClearKey { service: AiApiService },
-    /// Reload key state, model list and account status of `service`.
-    RefreshMetadata { service: AiApiService },
+    /// Store `key` (trimmed by `keys::store_api_key`) as the API key of `target` (for a
+    /// compatible service: of its normalized base URL only).
+    StoreKey { target: AiApiTarget, key: String },
+    /// Delete the stored API key of `target`.
+    ClearKey { target: AiApiTarget },
+    /// Reload key state, model list and account status of the (already validated) `target`.
+    RefreshMetadata { target: AiApiTarget },
 }
 
 impl AiApiRequest {
@@ -53,7 +55,7 @@ impl AiApiRequest {
     #[must_use]
     pub fn service(&self) -> AiApiService {
         match self {
-            Self::StoreKey { service, .. } | Self::ClearKey { service } | Self::RefreshMetadata { service } => *service,
+            Self::StoreKey { target, .. } | Self::ClearKey { target } | Self::RefreshMetadata { target } => target.service(),
         }
     }
 
@@ -70,17 +72,17 @@ impl AiApiRequest {
     /// turns the outcome into the event the GUI applies. Worker threads only.
     fn execute(self) -> AiApiEvent {
         match self {
-            Self::StoreKey { service, key } => match crate::keys::store_api_key(service, &key) {
-                Ok(()) => AiApiEvent::KeyStored { service },
-                Err(error) => AiApiEvent::Failed { service, error },
+            Self::StoreKey { target, key } => match crate::keys::store_api_key(&target, &key) {
+                Ok(()) => AiApiEvent::KeyStored { target },
+                Err(error) => AiApiEvent::Failed { service: target.service(), error },
             },
-            Self::ClearKey { service } => match crate::keys::clear_api_key(service) {
-                Ok(()) => AiApiEvent::KeyCleared { service },
-                Err(error) => AiApiEvent::Failed { service, error },
+            Self::ClearKey { target } => match crate::keys::clear_api_key(&target) {
+                Ok(()) => AiApiEvent::KeyCleared { target },
+                Err(error) => AiApiEvent::Failed { service: target.service(), error },
             },
-            Self::RefreshMetadata { service } => match crate::metadata::load_metadata(service) {
+            Self::RefreshMetadata { target } => match crate::metadata::load_metadata(&target) {
                 Ok(metadata) => AiApiEvent::MetadataLoaded(metadata),
-                Err(error) => AiApiEvent::Failed { service, error },
+                Err(error) => AiApiEvent::Failed { service: target.service(), error },
             },
         }
     }
@@ -90,19 +92,20 @@ impl AiApiRequest {
 impl fmt::Debug for AiApiRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StoreKey { service, .. } => f.debug_struct("StoreKey").field("service", service).field("key", &"<redacted>").finish(),
-            Self::ClearKey { service } => f.debug_struct("ClearKey").field("service", service).finish(),
-            Self::RefreshMetadata { service } => f.debug_struct("RefreshMetadata").field("service", service).finish(),
+            Self::StoreKey { target, .. } => f.debug_struct("StoreKey").field("target", target).field("key", &"<redacted>").finish(),
+            Self::ClearKey { target } => f.debug_struct("ClearKey").field("target", target).finish(),
+            Self::RefreshMetadata { target } => f.debug_struct("RefreshMetadata").field("target", target).finish(),
         }
     }
 }
 
-/// Result of one `AiApiRequest`. Store, delete and refresh failures share `Failed`; the
-/// error's `Display` is the localized message.
+/// Result of one `AiApiRequest`. Key events carry the target they acted on (a compatible key is
+/// bound to its base URL); store, delete and refresh failures share `Failed`; the error's
+/// `Display` is the localized message.
 #[derive(Debug)]
 pub enum AiApiEvent {
-    KeyStored { service: AiApiService },
-    KeyCleared { service: AiApiService },
+    KeyStored { target: AiApiTarget },
+    KeyCleared { target: AiApiTarget },
     MetadataLoaded(AiApiMetadata),
     Failed { service: AiApiService, error: AiApiError },
 }
@@ -246,6 +249,7 @@ mod tests {
     use super::{AiApiEvent, AiApiRequest, AiApiTaskRunner};
     use crate::error::AiApiError;
     use crate::service::AiApiService;
+    use crate::target::AiApiTarget;
 
     /// Test executor: the FIRST service submitted in `fifo_order_*` is the slowest, so a
     /// thread-per-request runner would deliver it last. No I/O, no credential store.
@@ -270,10 +274,21 @@ mod tests {
         AiApiEvent::Failed { service: request.service(), error: AiApiError::EmptyKey }
     }
 
+    /// The target of a hosted `service` (no base URL needed).
+    fn hosted(service: AiApiService) -> AiApiTarget {
+        AiApiTarget::new(service, "").unwrap_or_else(|error| panic!("hosted target never fails: {error:?}"))
+    }
+
+    /// A refresh request for a hosted `service`.
+    fn refresh(service: AiApiService) -> AiApiRequest {
+        AiApiRequest::RefreshMetadata { target: hosted(service) }
+    }
+
     /// Services of `events`, in order (every test executor answers with `Failed`).
     fn event_services(events: &[AiApiEvent]) -> Vec<AiApiService> {
         events.iter().map(|event| match event {
-            AiApiEvent::Failed { service, .. } | AiApiEvent::KeyStored { service } | AiApiEvent::KeyCleared { service } => *service,
+            AiApiEvent::Failed { service, .. } => *service,
+            AiApiEvent::KeyStored { target } | AiApiEvent::KeyCleared { target } => target.service(),
             AiApiEvent::MetadataLoaded(metadata) => metadata.service,
         }).collect()
     }
@@ -294,7 +309,7 @@ mod tests {
         let runner = AiApiTaskRunner::with_executor(delayed_echo);
         let submitted = [AiApiService::Groq, AiApiService::OpenAi, AiApiService::Gemini, AiApiService::Xai];
         for service in submitted {
-            runner.submit(AiApiRequest::RefreshMetadata { service });
+            runner.submit(refresh(service));
         }
         assert_eq!(event_services(&poll_until(&runner, submitted.len())), submitted);
     }
@@ -302,13 +317,13 @@ mod tests {
     #[test]
     fn dead_worker_is_replaced_on_next_submit() {
         let runner = AiApiTaskRunner::with_executor(panics_on_clear);
-        runner.submit(AiApiRequest::ClearKey { service: AiApiService::Groq });
+        runner.submit(AiApiRequest::ClearKey { target: hosted(AiApiService::Groq) });
         // Probes sent before the worker has unwound are lost with it; the first probe after its
         // death must respawn a worker and come back.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut events = Vec::new();
         while events.is_empty() && Instant::now() < deadline {
-            runner.submit(AiApiRequest::RefreshMetadata { service: AiApiService::Gemini });
+            runner.submit(refresh(AiApiService::Gemini));
             std::thread::sleep(Duration::from_millis(20));
             events.extend(runner.poll());
         }
@@ -322,7 +337,7 @@ mod tests {
 
     #[test]
     fn store_key_debug_redacts_the_key() {
-        let request = AiApiRequest::StoreKey { service: AiApiService::Groq, key: "sk-secret-123".to_string() };
+        let request = AiApiRequest::StoreKey { target: hosted(AiApiService::Groq), key: "sk-secret-123".to_string() };
         let debug = format!("{request:?}");
         assert!(!debug.contains("sk-secret-123"), "{debug}");
         assert!(debug.contains("Groq"), "{debug}");
