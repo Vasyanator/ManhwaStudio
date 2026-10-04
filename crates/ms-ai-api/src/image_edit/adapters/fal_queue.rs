@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, mask_data_url, mask_has_both_regions, png_data_url, required_str, result_url_step};
+use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, mask_data_url, mask_has_both_regions, png_data_url, refuse_reference, required_str, result_url_step};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::MaskPolarity;
 use crate::image_edit::error::ImageEditError;
@@ -84,9 +84,12 @@ impl EditProtocol for FalQueue {
         input.insert("prompt".to_string(), json!(call.prompt));
         let image = png_data_url(&call.image_png);
         if endpoint.single_image {
+            refuse_reference(call)?;
             input.insert("image_url".to_string(), json!(image));
         } else {
-            input.insert("image_urls".to_string(), json!([image]));
+            // The edited image first, then the reference.
+            let images: Vec<String> = std::iter::once(image).chain(call.reference_png.as_deref().map(png_data_url)).collect();
+            input.insert("image_urls".to_string(), json!(images));
         }
         if let Some(polarity) = endpoint.mask {
             let send = call.mask.as_deref().is_some_and(|mask| !endpoint.mask_needs_both || mask_has_both_regions(mask));

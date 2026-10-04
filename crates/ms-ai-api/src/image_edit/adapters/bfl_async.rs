@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, required_str, result_url_step};
+use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, refuse_reference, required_str, result_url_step};
 use crate::encoding::base64_encode;
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::{MaskPolarity, encode_mask_png};
@@ -75,6 +75,10 @@ impl EditProtocol for BflAsync {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
         let family = family(&call.model_id).ok_or_else(|| ImageEditError::RequestBuild { detail: format!("unknown BFL model {}", call.model_id) })?;
         let image = base64_encode(&call.image_png);
+        // Only FLUX 3's `images` is a list; the other families name single image fields.
+        if family != Family::Flux3 {
+            refuse_reference(call)?;
+        }
         let body = match family {
             Family::Flux2 => {
                 let mut body = json!({ "prompt": call.prompt, "input_image": image, "output_format": "png" });
@@ -97,7 +101,11 @@ impl EditProtocol for BflAsync {
                 let mask = base64_encode(&encode_mask_png(mask, call.width, call.height, MaskPolarity::WhiteEdits)?);
                 json!({ "image": image, "mask": mask, "prompt": call.prompt, "output_format": "png" })
             }
-            Family::Flux3 => json!({ "prompt": call.prompt, "images": [image], "aspect_ratio": "auto" }),
+            // The edited image first: `auto` "keeps the first reference image's framing".
+            Family::Flux3 => {
+                let images: Vec<String> = std::iter::once(image).chain(call.reference_png.as_deref().map(base64_encode)).collect();
+                json!({ "prompt": call.prompt, "images": images, "aspect_ratio": "auto" })
+            }
         };
         Ok(json_post(format!("{}/v1/{}", call.base_url, call.model_id), Vec::new(), body, AUTH))
     }

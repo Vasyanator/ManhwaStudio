@@ -107,9 +107,11 @@ impl EditProtocol for DashScopeMultimodal {
             }
             Family::Wan => {}
         }
+        // The edited image first, then the reference, then the instruction.
+        let content: Vec<Value> = std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "image": png_data_url(png) })).chain(std::iter::once(json!({ "text": call.prompt }))).collect();
         let body = json!({
             "model": call.model_id,
-            "input": { "messages": [{ "role": "user", "content": [{ "image": png_data_url(&call.image_png) }, { "text": call.prompt }] }] },
+            "input": { "messages": [{ "role": "user", "content": content }] },
             "parameters": Value::Object(parameters)
         });
         Ok(json_post(format!("{}{GENERATION_PATH}", call.base_url), Vec::new(), body, AuthScheme::Bearer))

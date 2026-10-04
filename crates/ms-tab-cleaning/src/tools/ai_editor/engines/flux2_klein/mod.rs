@@ -281,7 +281,7 @@ Contracts:
   SUPPORTED — the shipped klein checkpoints are distilled, but the paths are the user's and
   may point at one that is not.
 */
-use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks};
 // The save gate every engine's settings saver consults; one owner for all hosted engines.
 use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 use ms_backend_ipc::{self as backend_ipc, CallError};

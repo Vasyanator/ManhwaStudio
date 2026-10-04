@@ -169,6 +169,18 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   changed pixels would force the edit's own mean and standard deviation back onto the original's,
   i.e. undo the edit, and computing it from an empty sample is a division by zero. `mask_feather_px`
   is deliberately NOT switched off: it is what joins the regenerated region to the page.
+- **A marks reference is a CONDITION image, never an edit target.** The optional third blob segment
+  (`reference_len`, PROTOCOL.md §5.4) is the user's marks composited over a copy of the region. The
+  service decodes it to RGB, refuses any size other than the region's (only then do diffusers'
+  identical reference/region preprocessing rules — the 1 MP cap and the floor to 16 — keep it
+  pixel-aligned with the region, and for a valid region both are no-ops), and passes it as
+  `image_reference`: ONE PIL image, because diffusers treats a list as a batch sized from its first
+  element. The pipeline already conditions on the region itself, so the reference is the second
+  condition image. It never enters `_composite_over_region` or the colour match; without one the
+  pipeline call carries no `image_reference` key at all. The memory guard counts its condition
+  tokens in the denoise (`forecast_memory(with_reference=True)`: the region's token count again);
+  `.estimate` has no reference input and forecasts a run without one, so the on-screen figure can
+  sit below the guard's for a marked run by exactly that term.
 - **The region's border is a mask contour.** `_mask_distance_inside` pads the mask with a ring of
   zeros before measuring, because the region is a WINDOW onto a larger page and the pixels past its
   edge belong to that page, which the request may not change. Without the ring neither backend sees
@@ -972,6 +984,10 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   pipeline component and every prompt encode (encoding is read-only and the pipeline's copy is never
   called), and dropped by `unload()`. Do not add a second read: it used to happen on every encode,
   which is real disk I/O on an otherwise hot pipeline.
+- To change how the marks reference reaches the pipeline, see `_split_request_blob` in
+  `../ipc/handlers/flux2_klein.py` (the wire split), `inpaint_image_bytes` (decode and size check)
+  and `_generate_locked` (`image_reference`) in `flux2_klein/service.py`, and the `with_reference`
+  term of `forecast_memory` in `flux2_klein/memory.py`.
 - To change the "no mask" mode, see `normalize_flux2_klein_params` / `_whole_region_overrides` (the
   params it settles) and `_require_solid_mask` (the check). `_generate_locked` needs no special
   case and must not grow one — the mode is expressed entirely as normalized parameters.

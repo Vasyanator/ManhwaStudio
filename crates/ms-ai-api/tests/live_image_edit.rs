@@ -61,7 +61,7 @@ fn live_provider_returns_exactly_the_source_size() {
         Err(_) => offer.rule.sizes.first().map_or((DEFAULT_SIDE, DEFAULT_SIDE), |&(w, h)| (w / u32::from(upscale), h / u32::from(upscale))),
     };
     let (image, mask) = test_scene(width, height);
-    let request = ImageEditRequest { provider, model_id: model.clone(), endpoint, prompt: "Fill the white square with a solid red circle. Keep everything else unchanged.".to_string(), image, mask: Some(mask), blend: MaskBlend::default(), upscale };
+    let request = ImageEditRequest { provider, model_id: model.clone(), endpoint, prompt: "Fill the white square with a solid red circle. Keep everything else unchanged.".to_string(), image, reference: None, mask: Some(mask), blend: MaskBlend::default(), upscale };
     println!("live_image_edit: {provider_key} / {model}: {width}x{height}, k={upscale}");
     let outcome = run_image_edit(&request, &key, &CancelFlag::new(), |stage| println!("live_image_edit: stage {stage:?}")).unwrap_or_else(|error| panic!("run failed: {error:?} ({error})"));
     assert_eq!((outcome.image.width(), outcome.image.height()), (width, height), "the finished image must be the source size");

@@ -47,9 +47,13 @@ impl EditProtocol for TencentTokenHub {
         }
         let size = format!("{}x{}", call.width, call.height);
         let (path, body) = if call.model_id == V3_MODEL {
-            ("v3-generation", json!({ "model": call.model_id, "prompt": call.prompt, "images": [base64_encode(&call.image_png)], "size": size, "revise": false }))
+            // The edited image first, then the reference.
+            let images: Vec<String> = std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| base64_encode(png)).collect();
+            ("v3-generation", json!({ "model": call.model_id, "prompt": call.prompt, "images": images, "size": size, "revise": false }))
         } else {
-            let content = json!([{ "type": "text", "text": call.prompt }, { "type": "image_url", "image_url": { "url": png_data_url(&call.image_png) } }]);
+            let content: Vec<Value> = std::iter::once(json!({ "type": "text", "text": call.prompt }))
+                .chain(std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "type": "image_url", "image_url": { "url": png_data_url(png) } })))
+                .collect();
             ("v35-generation", json!({ "model": call.model_id, "size": size, "messages": [{ "role": "user", "content": content }] }))
         };
         Ok(json_post(format!("{}/wand/hunyuan-image/{path}", call.base_url), Vec::new(), body, AuthScheme::Bearer))

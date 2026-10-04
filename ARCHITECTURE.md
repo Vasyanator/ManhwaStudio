@@ -109,7 +109,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   (`AiApiConnectionState`, `draw_connection`, `AiApiTaskRunner`). Consumers build their own
   requests; persistence of the selected service/model stays with the consumer.
   `image_edit/` is the GUI-free cloud image-EDIT layer: provider/model catalog (size rule per
-  model, mask support, Russia availability), one adapter per API shape, a single native
+  model, mask support, extra reference images, Russia availability), one adapter per API shape, a single native
   executor (no retry of paid POSTs, key only to the provider's own hosts) and the exact-size
   pipeline — integer ×k replicate up / box down only, output must be exactly k·W×k·H, composite
   only inside the mask. The size VALIDITY decision stays with the cleaning frame

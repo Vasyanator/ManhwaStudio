@@ -3,7 +3,7 @@ File: crates/ms-ai-api/src/image_edit/request.rs
 
 Purpose:
 The inputs and outputs of one image-edit run: the validated RGBA region, the request (provider,
-model, endpoint choice, prompt, mask, blend, upscale factor), the finished outcome, the
+model, endpoint choice, prompt, optional reference image, mask, blend, upscale factor), the finished outcome, the
 progress stages and the cancel flag shared with the worker.
 
 Key structures:
@@ -133,6 +133,11 @@ pub struct ImageEditRequest {
     pub prompt: String,
     /// The source region.
     pub image: RgbaRegion,
+    /// One optional reference image sent after the edited one (e.g. the user's marks), the
+    /// source region's size, straight alpha kept. Only an offer with `max_extra_references > 0`
+    /// takes it (`ReferenceNotSupported` otherwise). It never affects the composite: the result
+    /// still changes only inside `mask`.
+    pub reference: Option<RgbaRegion>,
     /// `width * height` bytes, nonzero = may change; `None` or all zero = the whole region.
     pub mask: Option<Vec<u8>>,
     /// How the result is blended back.

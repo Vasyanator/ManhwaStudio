@@ -3,7 +3,8 @@ File: ai_api_editor/worker.rs
 
 Purpose:
 One cloud edit run on its own worker thread: read the provider's API key from the credential
-store, convert the region to the pipeline's RGBA raster, call `ms_ai_api::image_edit::
+store, convert the region (and the user's marks, when they travel as a reference) to the
+pipeline's RGBA rasters, call `ms_ai_api::image_edit::
 run_image_edit` (which owns the HTTP exchange and the size contract), and turn the edited
 raster back into an `egui::ColorImage` of exactly the region's size.
 
@@ -13,6 +14,7 @@ Key structures:
 
 Key functions:
 - `spawn_run()`: starts the worker and returns its event channel
+- `marks_reference()`: the run's `RunMarks` as the pipeline's reference raster
 
 Notes:
 Every blocking step (key-store read, network, decode, composite) happens here, never on the GUI
@@ -22,6 +24,7 @@ sent back. The prompt is never logged here (the pipeline logs its length only).
 */
 
 use ms_ai_api::image_edit::{CancelFlag, EndpointChoice, ImageEditError, ImageEditProvider, ImageEditRequest, ImageEditStage, MaskBlend, RgbaRegion, read_key, run_image_edit};
+use crate::tools::region_edit_v2::engine::RunMarks;
 use eframe::egui;
 use ms_thread as thread;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -41,6 +44,9 @@ pub(super) struct RunJob {
     pub region: egui::ColorImage,
     /// The painted mask (`width * height` bytes, 0/255), `None` when nothing is painted.
     pub mask: Option<Vec<u8>>,
+    /// The user's marks as the host packaged them; a `Reference` or `Layer` is sent as the
+    /// model's reference image (the engine admits them only for a model that takes one).
+    pub marks: RunMarks,
     /// How the edit is blended back inside the mask.
     pub blend: MaskBlend,
     /// The upscale factor from `geometry::upscale_factor_for`.
@@ -74,6 +80,7 @@ fn run(job: RunJob, cancel: &CancelFlag, tx: &Sender<WorkerEvent>) -> Result<egu
     cancel.check()?;
     let [width, height] = job.region.size;
     let image = color_image_to_region(&job.region)?;
+    let reference = marks_reference(job.marks)?;
     // Blocking credential-store read: this is why the key is read here and not by the panel.
     let key = read_key(job.provider, &job.endpoint)?;
     cancel.check()?;
@@ -83,6 +90,7 @@ fn run(job: RunJob, cancel: &CancelFlag, tx: &Sender<WorkerEvent>) -> Result<egu
         endpoint: job.endpoint,
         prompt: job.prompt,
         image,
+        reference,
         mask: job.mask,
         blend: job.blend,
         upscale: job.upscale,
@@ -114,6 +122,23 @@ fn color_image_to_region(image: &egui::ColorImage) -> Result<RgbaRegion, ImageEd
     RgbaRegion::new(side(width)?, side(height)?, pixels)
 }
 
+/// The reference raster `marks` travels as: `Reference` (the region with the marks composited,
+/// opaque) un-premultiplied, `Layer` (the marks alone) with its straight alpha untouched, `None`
+/// as no reference. The pipeline encodes it (RGB when opaque, RGBA otherwise) at the sent size.
+///
+/// # Errors
+/// `ShapeMismatch` when a side does not fit `u32` or a buffer disagrees with its size.
+fn marks_reference(marks: RunMarks) -> Result<Option<RgbaRegion>, ImageEditError> {
+    match marks {
+        RunMarks::None => Ok(None),
+        RunMarks::Reference(image) => color_image_to_region(&image).map(Some),
+        RunMarks::Layer(layer) => {
+            let (width, height) = layer.dimensions();
+            RgbaRegion::new(width, height, layer.into_raw()).map(Some)
+        }
+    }
+}
+
 /// The edited raster as a `ColorImage`, refused unless it is exactly `width × height`.
 ///
 /// # Errors
@@ -143,6 +168,20 @@ mod tests {
         let back = region_to_color_image(region.clone(), 3, 2).expect("the same size converts back");
         assert_eq!(back.pixels, image.pixels);
         assert!(matches!(region_to_color_image(region, 2, 3), Err(ImageEditError::SizeContractViolated { .. })));
+    }
+
+    /// Each marks form becomes its reference raster: the composited copy opaque, the layer with
+    /// its alpha byte for byte, no marks no reference.
+    #[test]
+    fn marks_become_the_reference_raster() {
+        assert!(matches!(marks_reference(RunMarks::None), Ok(None)));
+        let composited = egui::ColorImage::new([2, 1], vec![egui::Color32::from_rgb(200, 10, 10), egui::Color32::from_rgb(1, 2, 3)]);
+        let reference = marks_reference(RunMarks::Reference(composited)).expect("converts").expect("a reference");
+        assert_eq!((reference.width(), reference.height()), (2, 1));
+        assert_eq!(reference.pixels(), &[200, 10, 10, 255, 1, 2, 3, 255]);
+        let layer = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 128, 0, 0, 0, 0]).expect("2x1 layer");
+        let reference = marks_reference(RunMarks::Layer(layer)).expect("converts").expect("a reference");
+        assert_eq!(reference.pixels(), &[255, 0, 0, 128, 0, 0, 0, 0], "straight alpha is kept");
     }
 
     /// A stage forwarded to a live engine leaves the run alone; once the receiver is gone the

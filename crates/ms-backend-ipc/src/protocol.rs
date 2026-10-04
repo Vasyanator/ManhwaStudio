@@ -45,7 +45,7 @@ use serde_json::{Map, Value, json};
 /// The contract also covers state the two processes SHARE on disk: the `user_config`
 /// document's storage semantics (`ms-docstore` / `docstore.py`, `.json` or SQLite `.db`).
 /// A backend payload that reads/writes it differently must be refused here.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -116,8 +116,10 @@ pub const METHOD_INPAINT_FLUX_FILL: &str = "inpaint.flux_fill";
 pub const METHOD_INPAINT_FLUX_FILL_UNLOAD: &str = "inpaint.flux_fill.unload";
 pub const METHOD_INPAINT_FLUX_FILL_STATUS: &str = "inpaint.flux_fill.status";
 /// FLUX.2 klein region edit (streaming). Request header carries `image_len`,
-/// `mask_len` and `params`; the blob is `region.png ++ mask.png` (mask L8, exactly
-/// the region size). The response header carries `image_len` and the blob is the
+/// `mask_len`, `params` and, only when a marks reference travels, `reference_len`; the
+/// blob is `region.png ++ mask.png [++ reference.png]` (mask L8, reference RGB(A), both
+/// exactly the region size; the lengths must sum to the blob exactly, and an absent or
+/// zero `reference_len` means no reference). The response header carries `image_len` and the blob is the
 /// edited region as an RGB PNG of exactly the region size.
 pub const METHOD_INPAINT_FLUX2_KLEIN: &str = "inpaint.flux2_klein";
 /// Reports whether the FLUX.2 klein components resolve on disk plus the host's

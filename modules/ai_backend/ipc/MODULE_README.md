@@ -165,6 +165,8 @@ live in `handlers/MODULE_README.md`.
 - Inpaint methods that need two images (image + mask) use a concatenated blob: `blob = image_png ++
   mask_png` with `image_len`/`mask_len` header fields splitting them. `watermark.remove` applies the
   same convention to its RESPONSE (`clean_png ++ mask_png`); it is the only method that does.
+  `inpaint.flux2_klein` extends it with an optional third segment (`reference_len`, absent = none);
+  every declared length still has to sum to the blob exactly.
 - A `cancel{id}` sets that id's `threading.Event`; the handler observes it and raises `Interrupted`
   to emit `response{status:"interrupted"}`.
 - **Outbound error text is sanitized; the log keeps the original.** `_run_handler` calls

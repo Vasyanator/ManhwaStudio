@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, png_data_url, provider_message, result_url_step};
+use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, png_data_url, provider_message, refuse_reference, result_url_step};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::error::ImageEditError;
 use crate::image_edit::protocol::{AuthScheme, EditCall, EditProtocol, HttpRequestSpec, HttpResponse, JobRef, NextStep, StepCtx};
@@ -44,9 +44,12 @@ impl EditProtocol for GenApiAsync {
         let image = png_data_url(&call.image_png);
         // The model pages: `qwen-image-edit` has a single `image_url`, the others `image_urls`.
         if call.model_id == "qwen-image-edit" {
+            refuse_reference(call)?;
             body.insert("image_url".to_string(), json!(image));
         } else {
-            body.insert("image_urls".to_string(), json!([image]));
+            // The edited image first, then the reference.
+            let images: Vec<String> = std::iter::once(image).chain(call.reference_png.as_deref().map(png_data_url)).collect();
+            body.insert("image_urls".to_string(), json!(images));
         }
         match call.size_param {
             SizeParamStyle::WxH => {

@@ -11,7 +11,10 @@ Main responsibilities:
 - own `Flux2KleinEngine` — the settings and their save timer, the cached `.status`
   catalog, the forecast, the progress, the session and every worker channel;
 - implement `AiEngine`: the sections the host draws, the mask layer it declares, the
-  frame constraints it validates against, the run it starts and the poll it answers with;
+  frame constraints it validates against, the marks modes it accepts (a separate reference
+  by preference, or composited onto the region — never a transparent layer), the run it
+  starts and the poll it answers with;
+- validate a run request and turn it into the run's pixels (`run_input`);
 - keep the derived state honest between frames: reload the settings once, save them when
   they settle, re-query the catalog when the paths change, re-arm the forecast when the
   region SIZE settles, and drop the undo history when the region moves;
@@ -24,7 +27,8 @@ Key structures:
 - `Flux2KleinEngine`
 
 Key functions:
-- `AiEngine::start()`, `AiEngine::poll()`, `AiEngine::draw_section()`
+- `AiEngine::start()`, `AiEngine::poll()`, `AiEngine::draw_parameters()`,
+  `AiEngine::marks_support()`, `Flux2KleinEngine::run_input()`
 - `same_region()`, `same_region_size()`
 
 Submodules:
@@ -642,6 +646,85 @@ impl Flux2KleinEngine {
     pub(super) fn region_size(&self) -> Option<[usize; 2]> {
         self.region.map(|rect| [rect.w, rect.h])
     }
+
+    /// Turns the host's request into the pixels one run sends, or refuses it.
+    ///
+    /// The size guarantees of `EngineRunRequest` are CHECKED rather than trusted: a request
+    /// whose region, mask or marks reference does not match `rect_px` would otherwise be
+    /// encoded onto the wire and rejected by the backend with a message about the protocol
+    /// instead of about the region. The user-facing refusal names the region; the numbers
+    /// go to the log.
+    ///
+    /// `RunMarks::Reference` becomes the run's extra reference image; `RunMarks::Layer`
+    /// cannot reach this engine by contract (`marks_support` does not offer it), so a host
+    /// that sends one anyway is refused and logged rather than having its marks silently
+    /// dropped. The working mode is decided here too, through [`mask_for_run`].
+    ///
+    /// # Errors
+    /// Returns a localized message when the region, the masks or the marks reference do
+    /// not match `rect_px`, when the marks arrive as a transparent layer, or when the
+    /// region size breaks a model constraint.
+    pub(super) fn run_input(request: EngineRunRequest) -> Result<Flux2RunInput, String> {
+        let EngineRunRequest {
+            page_idx,
+            rect_px,
+            region,
+            masks,
+            marks,
+        } = request;
+        let reference = match marks {
+            RunMarks::None => None,
+            RunMarks::Reference(reference) => Some(reference),
+            RunMarks::Layer(layer) => {
+                ms_log::runtime_log::log_error(format!(
+                    "[cleaning] FLUX.2 klein was handed the marks as a transparent {}x{} layer, which it does not support (marks_support offers SeparateReference and OverlayOnRegion only): page {page_idx}, rect {}x{} at ({}, {}); run refused",
+                    layer.width(),
+                    layer.height(),
+                    rect_px.w,
+                    rect_px.h,
+                    rect_px.x,
+                    rect_px.y
+                ));
+                return Err(t!("cleaning.tools.area_editor.marks_mode_unsupported_hint").to_string());
+            }
+        };
+        let size = [rect_px.w, rect_px.h];
+        let expected_bytes = rect_px.w.saturating_mul(rect_px.h);
+        let mask_ok = masks.len() == 1 && masks[0].len() == expected_bytes;
+        let reference_ok = reference.as_ref().is_none_or(|reference| reference.size == size);
+        if region.size != size || !mask_ok || !reference_ok {
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] FLUX.2 klein run request does not match the frame: page {page_idx}, rect {}x{} at ({}, {}), region {}x{}, {} mask layer(s) of {:?} bytes, expected {expected_bytes}, marks reference {:?}",
+                rect_px.w,
+                rect_px.h,
+                rect_px.x,
+                rect_px.y,
+                region.size[0],
+                region.size[1],
+                masks.len(),
+                masks.iter().map(Vec::len).collect::<Vec<_>>(),
+                reference.as_ref().map(|reference| reference.size)
+            ));
+            return Err(t!("cleaning.region.invalid_selection_size_error").to_string());
+        }
+        // Re-validated here as well as on the worker: the frame snaps to the same
+        // constraints, but a host that hands over another size must be told which rule it
+        // broke rather than have the backend refuse the blob.
+        if let Some(reason) = region_block_reason(size) {
+            return Err(reason);
+        }
+        // The mode is decided HERE, from the mask the host handed over, and nowhere else:
+        // an empty layer becomes the solid buffer the whole-region mode requires, while a
+        // painted one travels verbatim. The host's layer is never overwritten either way.
+        let (mask, whole_region) = mask_for_run(&masks[0]);
+        Ok(Flux2RunInput {
+            region,
+            reference,
+            mask,
+            whole_region,
+            mask_size: size,
+        })
+    }
 }
 
 /// Whether two frame rectangles describe the same region.
@@ -705,6 +788,15 @@ impl AiEngine for Flux2KleinEngine {
     /// costs nothing and simply keeps agreeing with this.
     fn allows_empty_mask(&self) -> bool {
         true
+    }
+
+    /// A separate reference is preferred: the region stays clean and the marks travel as
+    /// diffusers' `image_reference`, one extra condition image beside the region the
+    /// pipeline already conditions on. Compositing onto the region is offered too. A
+    /// transparent layer is NOT: the pipeline converts every condition image to RGB, so the
+    /// alpha that makes it a layer would be flattened away before the model saw it.
+    fn marks_support(&self) -> MarksSupport {
+        MarksSupport::new(MarksMode::SeparateReference).with(MarksMode::OverlayOnRegion)
     }
 
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
@@ -928,62 +1020,21 @@ impl AiEngine for Flux2KleinEngine {
 
     /// Validates the host's request and starts the run.
     ///
-    /// The size guarantees of `EngineRunRequest` are CHECKED rather than trusted: a request
-    /// whose region or mask does not match `rect_px` would otherwise be encoded onto the
-    /// wire and rejected by the backend with a message about the protocol instead of about
-    /// the region. The user-facing refusal names the region; the numbers go to the log.
+    /// Everything about the request itself is checked by [`Flux2KleinEngine::run_input`];
+    /// this adds the engine-state gate and the bookkeeping a started run owes.
     ///
     /// # Errors
-    /// Returns a localized message when a run is already in flight, when the region or the
-    /// masks do not match `rect_px`, or when the region size breaks a model constraint.
+    /// Returns a localized message when a run or another long operation is in flight, or
+    /// whatever [`Flux2KleinEngine::run_input`] refuses the request for.
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
-        let EngineRunRequest {
-            page_idx,
-            rect_px,
-            region,
-            masks,
-        } = request;
         // Checked before anything is encoded: the backend has ONE pipeline, so a run
         // started under a prompt-cache build, a component action or a model download would
         // queue behind it for as long as it lasts AND steal its progress bar.
         if self.non_run_pipeline_busy() {
             return Err(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());
         }
-        let size = [rect_px.w, rect_px.h];
-        let expected_bytes = rect_px.w.saturating_mul(rect_px.h);
-        let mask_ok = masks.len() == 1 && masks[0].len() == expected_bytes;
-        if region.size != size || !mask_ok {
-            ms_log::runtime_log::log_warn(format!(
-                "[cleaning] FLUX.2 klein run request does not match the frame: page {page_idx}, rect {}x{} at ({}, {}), region {}x{}, {} mask layer(s) of {:?} bytes, expected {expected_bytes}",
-                rect_px.w,
-                rect_px.h,
-                rect_px.x,
-                rect_px.y,
-                region.size[0],
-                region.size[1],
-                masks.len(),
-                masks.iter().map(Vec::len).collect::<Vec<_>>()
-            ));
-            return Err(t!("cleaning.region.invalid_selection_size_error").to_string());
-        }
-        // Re-validated here as well as on the worker: the frame snaps to the same
-        // constraints, but a host that hands over another size must be told which rule it
-        // broke rather than have the backend refuse the blob.
-        if let Some(reason) = region_block_reason(size) {
-            return Err(reason);
-        }
-        // The mode is decided HERE, from the mask the host handed over, and nowhere else:
-        // an empty layer becomes the solid buffer the whole-region mode requires, while a
-        // painted one travels verbatim. The host's layer is never overwritten either way.
-        let (mask, whole_region) = mask_for_run(&masks[0]);
-        self.session.start_run(
-            region,
-            mask,
-            whole_region,
-            size,
-            &self.settings,
-            &self.progress,
-        )?;
+        let input = Self::run_input(request)?;
+        self.session.start_run(input, &self.settings, &self.progress)?;
         // A run may have to load weights it did not have; the catalog and the forecast are
         // stale afterwards.
         self.status_wanted = true;
@@ -1379,6 +1430,7 @@ mod tests {
             rect_px,
             region,
             masks,
+            marks: RunMarks::None,
         };
 
         assert!(
@@ -1424,6 +1476,76 @@ mod tests {
                 ))
                 .is_err(),
             "120 is not a multiple of 16"
+        );
+    }
+
+    /// Both FLUX.2 klein engines prefer the separate reference, also accept the marks
+    /// composited onto the region, and never a transparent layer — diffusers converts every
+    /// condition image to RGB, so the layer's alpha would be gone before the model saw it.
+    #[test]
+    fn marks_travel_as_a_separate_reference_by_preference_and_never_as_a_layer() {
+        for variant in Flux2Variant::all() {
+            let support = Flux2KleinEngine::new(variant).marks_support();
+            assert_eq!(support.preferred(), MarksMode::SeparateReference, "{variant:?}");
+            assert!(support.supports(MarksMode::OverlayOnRegion), "{variant:?}");
+            assert!(!support.supports(MarksMode::TransparentLayer), "{variant:?}");
+        }
+    }
+
+    fn marks_request(marks: RunMarks) -> EngineRunRequest {
+        EngineRunRequest {
+            page_idx: 1,
+            rect_px: OverlayRectPx {
+                x: 16,
+                y: 32,
+                w: 128,
+                h: 128,
+            },
+            region: egui::ColorImage::filled([128, 128], Color32::WHITE),
+            masks: vec![vec![255u8; 128 * 128]],
+            marks,
+        }
+    }
+
+    /// `Layer` is unreachable by contract; a host that sends one anyway gets a refusal it
+    /// can show, and no run starts — the marks are never silently dropped.
+    #[test]
+    fn marks_handed_over_as_a_layer_are_refused_and_start_nothing() {
+        let mut engine = Flux2KleinEngine {
+            settings: runnable_settings(),
+            ..Flux2KleinEngine::default()
+        };
+        let layer = image::RgbaImage::new(128, 128);
+        assert_eq!(
+            engine.start(marks_request(RunMarks::Layer(layer))).err(),
+            Some(t!("cleaning.tools.area_editor.marks_mode_unsupported_hint").to_string())
+        );
+        assert!(engine.session.run_rx.is_none(), "a refused request starts no worker");
+    }
+
+    /// The reference is what the run SENDS: it reaches the wire input untouched beside a
+    /// region that stays clean, and the wire packs it as the third blob segment
+    /// (`wire::tests`). Its size is checked like the region's.
+    #[test]
+    fn a_marks_reference_reaches_the_run_input_and_must_be_the_region_size() {
+        let reference = egui::ColorImage::filled([128, 128], Color32::RED);
+        let input = Flux2KleinEngine::run_input(marks_request(RunMarks::Reference(reference.clone())))
+            .expect("a region-sized reference is a valid request");
+        assert_eq!(input.reference.as_ref().map(|image| &image.pixels), Some(&reference.pixels));
+        assert!(
+            input.region.pixels.iter().all(|pixel| *pixel == Color32::WHITE),
+            "the region the model edits stays clean"
+        );
+        assert_eq!(input.mask_size, [128, 128]);
+
+        let without = Flux2KleinEngine::run_input(marks_request(RunMarks::None))
+            .expect("no marks is a valid request");
+        assert!(without.reference.is_none());
+
+        let wrong = egui::ColorImage::filled([128, 64], Color32::RED);
+        assert_eq!(
+            Flux2KleinEngine::run_input(marks_request(RunMarks::Reference(wrong))).err(),
+            Some(t!("cleaning.region.invalid_selection_size_error").to_string())
         );
     }
 

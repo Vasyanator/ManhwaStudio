@@ -49,13 +49,12 @@ impl EditProtocol for GeminiGenerate {
                 return Err(ImageEditError::RequestBuild { detail: format!("generateContent cannot state the size as {:?}", call.size_param) });
             }
         }
+        // The prompt, the edited image, then the reference.
+        let parts: Vec<Value> = std::iter::once(json!({ "text": call.prompt }))
+            .chain(std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "inline_data": { "mime_type": "image/png", "data": base64_encode(png) } })))
+            .collect();
         let body = json!({
-            "contents": [{
-                "parts": [
-                    { "text": call.prompt },
-                    { "inline_data": { "mime_type": "image/png", "data": base64_encode(&call.image_png) } }
-                ]
-            }],
+            "contents": [{ "parts": parts }],
             "generationConfig": generation_config
         });
         Ok(HttpRequestSpec { method: HttpMethod::Post, url: format!("{}/models/{}:generateContent", call.base_url, call.model_id), headers: Vec::new(), body: HttpBody::Json(body), auth: Some(AuthScheme::Header("x-goog-api-key")) })

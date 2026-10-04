@@ -27,6 +27,9 @@ pub enum ImageEditError {
     UnknownModel { model_id: String },
     /// The prompt is empty or whitespace-only.
     EmptyPrompt,
+    /// The request carries a reference image but the model (or its endpoint) takes none
+    /// besides the edited image; it is refused, never silently dropped.
+    ReferenceNotSupported { model_id: String },
     /// A raster buffer does not match its declared shape (zero size, wrong length, overflow).
     ShapeMismatch { detail: String },
     /// The caller's upscale factor `k` is outside `1..=max` of the selected offer.
@@ -88,6 +91,7 @@ impl ImageEditError {
             Self::WebUnavailable => t!("ai_api.image_edit.error.web_unavailable_error").to_string(),
             Self::UnknownModel { model_id } => tf!("ai_api.image_edit.error.unknown_model_error", model = model_id),
             Self::EmptyPrompt => t!("ai_api.image_edit.error.empty_prompt_error").to_string(),
+            Self::ReferenceNotSupported { model_id } => tf!("ai_api.image_edit.error.reference_not_supported_error", model = model_id),
             Self::ShapeMismatch { detail } => tf!("ai_api.image_edit.error.shape_mismatch_error", err = detail),
             Self::UpscaleNotAllowed { k, max } => tf!("ai_api.image_edit.error.upscale_not_allowed_error", k = k, max = max),
             Self::SizeNotOffered { width, height } => tf!("ai_api.image_edit.error.size_not_offered_error", width = width, height = height),

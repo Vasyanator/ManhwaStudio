@@ -42,7 +42,9 @@ impl EditProtocol for PolzaMedia {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
         let mut input = Map::new();
         input.insert("prompt".to_string(), json!(call.prompt));
-        input.insert("images".to_string(), json!([{ "type": "base64", "data": png_data_url(&call.image_png) }]));
+        // The edited image first, then the reference.
+        let images: Vec<Value> = std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "type": "base64", "data": png_data_url(png) })).collect();
+        input.insert("images".to_string(), json!(images));
         match call.size_param {
             SizeParamStyle::AspectTier(_) => {
                 let entry = call.size_entry.ok_or_else(|| ImageEditError::RequestBuild { detail: "a table offer reached the adapter without its table entry".to_string() })?;

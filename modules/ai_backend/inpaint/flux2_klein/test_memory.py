@@ -13,7 +13,9 @@ Main responsibilities:
   materialize in full is forecast in full;
 - verify each of the guard's refusals fires on the right shortfall and names a
   placement preset that would fit;
-- verify `estimate` answers without loading anything.
+- verify `estimate` answers without loading anything;
+- verify a marks reference adds exactly the region's token count to the denoise
+  and reaches the guard.
 
 Notes:
 `_weight_bytes` is patched on `components` and `memory_snapshot` on `hardware`:
@@ -476,6 +478,29 @@ class EstimateTests(_TempTreeCase):
         self.assertEqual(out["breakdown"]["transformer"], 4096)
         self.assertEqual(out["breakdown"]["text_encoder"], 2048)
         self.assertEqual(out["breakdown"]["vae"], 1024)
+
+    def test_a_marks_reference_costs_the_region_tokens_again_in_the_denoise(self) -> None:
+        # The reference is required to be the region's size, so it lengthens the
+        # transformer's sequence by exactly the region's own token count — and
+        # touches nothing else: no weight, no encode, no decode.
+        normalized = svc.normalize_flux2_klein_params(self.params(placement="full_gpu"))
+        plain = svc.forecast_memory(normalized, 256, 128)
+        marked = svc.forecast_memory(normalized, 256, 128, with_reference=True)
+        tokens = (256 // svc.REGION_SIZE_MULTIPLE) * (128 // svc.REGION_SIZE_MULTIPLE)
+        extra = tokens * svc.ACTIVATION_BYTES_PER_LATENT_TOKEN
+        self.assertEqual(
+            marked["phases"]["denoise"]["vram_bytes"],
+            plain["phases"]["denoise"]["vram_bytes"] + extra,
+        )
+        self.assertEqual(
+            marked["breakdown"]["activations"], plain["breakdown"]["activations"] + extra
+        )
+        for phase in ("encode", "encode_standalone", "decode"):
+            with self.subTest(phase=phase):
+                self.assertEqual(marked["phases"][phase], plain["phases"][phase])
+        self.assertEqual(
+            marked["phases"]["denoise"]["ram_bytes"], plain["phases"]["denoise"]["ram_bytes"]
+        )
 
     def test_without_an_encoder_the_encode_phases_cost_nothing(self) -> None:
         params = self.params()

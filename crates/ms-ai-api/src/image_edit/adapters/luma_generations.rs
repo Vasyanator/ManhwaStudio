@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, required_str, result_url_step};
+use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, refuse_reference, required_str, result_url_step};
 use crate::encoding::base64_encode;
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::error::ImageEditError;
@@ -42,6 +42,8 @@ pub struct LumaGenerations;
 
 impl EditProtocol for LumaGenerations {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+        // One image field: a reference cannot be expressed.
+        refuse_reference(call)?;
         if call.size_param != SizeParamStyle::None {
             return Err(ImageEditError::RequestBuild { detail: format!("Luma image edits take the source size; they cannot state {:?}", call.size_param) });
         }

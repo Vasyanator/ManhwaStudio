@@ -4,7 +4,8 @@ File: crates/ms-ai-api/src/image_edit/catalog.rs
 Purpose:
 The image-edit model catalogue: every model each provider offers for editing, with its size
 rule, how well that rule is evidenced, its native mask support, how the adapter states the
-size, and its retirement date. Pure data plus two lookups.
+size, how many reference images it takes besides the edited one, and its retirement date. Pure
+data plus two lookups.
 
 Key structures:
 - ModelOffer, MaskSupport, SizeParamStyle
@@ -105,18 +106,34 @@ pub struct ModelOffer {
     pub size_param: SizeParamStyle,
     /// Announced shutdown date `(year, month, day)`, if any.
     pub retires_on: Option<(u16, u8, u8)>,
+    /// How many reference images the model takes BESIDES the edited image (0 = none). Nonzero
+    /// only where the provider documents multi-image input for this exact model / endpoint AND
+    /// its adapter sends the images as a list (the edited image first); the source of every
+    /// nonzero value is cited at its row and in `dev-docs/image_edit/references.md`.
+    pub max_extra_references: u8,
 }
 
 /// Shorthand constructor for the table below (no retirement date): `size` is the rule and its
 /// evidence, the pair every row states together.
 const fn offer(provider: ImageEditProvider, model_id: &'static str, label: &'static str, family: &'static str, size: (&'static ImageSizeRule, SizeEvidence), mask: MaskSupport, size_param: SizeParamStyle) -> ModelOffer {
-    ModelOffer { provider, model_id, label, family, rule: size.0, evidence: size.1, mask, size_param, retires_on: None }
+    ModelOffer { provider, model_id, label, family, rule: size.0, evidence: size.1, mask, size_param, retires_on: None, max_extra_references: 0 }
 }
 
 impl ModelOffer {
     /// The same offer with an announced shutdown date.
     const fn retiring(self, year: u16, month: u8, day: u8) -> Self {
         Self { retires_on: Some((year, month, day)), ..self }
+    }
+
+    /// The same offer taking up to `count` reference images besides the edited one.
+    const fn references(self, count: u8) -> Self {
+        Self { max_extra_references: count, ..self }
+    }
+
+    /// Whether the model takes at least one reference image besides the edited one.
+    #[must_use]
+    pub const fn accepts_references(&self) -> bool {
+        self.max_extra_references > 0
     }
 }
 
@@ -140,26 +157,29 @@ const GPT_IMAGE_1X_RETIRE: (u16, u8, u8) = (2026, 12, 1);
 /// Every offer, grouped by provider in `ImageEditProvider::ALL` order.
 static OFFERS: &[ModelOffer] = &[
     // OpenAI: arbitrary /16 sizes on the 2.x models, three sizes on the 1.x ones; the mask is
-    // prompt guidance (research_openai_gemini §A).
-    offer(P::OpenAi, "gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH),
-    offer(P::OpenAi, "gpt-image-2.5-flare", "GPT Image 2.5 Flare", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH),
-    offer(P::OpenAi, "gpt-image-2", "GPT Image 2", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH),
-    offer(P::OpenAi, "gpt-image-1.5", "GPT Image 1.5", GPT, (&OPENAI_STD3, PO), M::Soft, S::WxH).retiring(GPT_IMAGE_1X_RETIRE.0, GPT_IMAGE_1X_RETIRE.1, GPT_IMAGE_1X_RETIRE.2),
-    offer(P::OpenAi, "gpt-image-1-mini", "GPT Image 1 Mini", GPT, (&OPENAI_STD3, PO), M::Soft, S::WxH).retiring(GPT_IMAGE_1X_RETIRE.0, GPT_IMAGE_1X_RETIRE.1, GPT_IMAGE_1X_RETIRE.2),
+    // prompt guidance (research_openai_gemini §A). References: "up to 16 images for GPT image
+    // models" (images edit reference), sent as repeated `image[]`; the mask applies to the first.
+    offer(P::OpenAi, "gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH).references(15),
+    offer(P::OpenAi, "gpt-image-2.5-flare", "GPT Image 2.5 Flare", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH).references(15),
+    offer(P::OpenAi, "gpt-image-2", "GPT Image 2", GPT, (&OPENAI_ARB, PO), M::Soft, S::WxH).references(15),
+    offer(P::OpenAi, "gpt-image-1.5", "GPT Image 1.5", GPT, (&OPENAI_STD3, PO), M::Soft, S::WxH).retiring(GPT_IMAGE_1X_RETIRE.0, GPT_IMAGE_1X_RETIRE.1, GPT_IMAGE_1X_RETIRE.2).references(15),
+    offer(P::OpenAi, "gpt-image-1-mini", "GPT Image 1 Mini", GPT, (&OPENAI_STD3, PO), M::Soft, S::WxH).retiring(GPT_IMAGE_1X_RETIRE.0, GPT_IMAGE_1X_RETIRE.1, GPT_IMAGE_1X_RETIRE.2).references(15),
     // Gemini: output only from the per-ratio table; that a table-sized input yields that exact
-    // size is inferred, not documented.
-    offer(P::Gemini, "gemini-3.1-flash-image", "Nano Banana 2 (Gemini 3.1 Flash Image)", GEMINI, (&GEMINI_31_FLASH, PO), M::None, S::AspectTier(&GEMINI_31_FLASH_ENTRIES)),
-    offer(P::Gemini, "gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, PO), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)),
+    // size is inferred, not documented. References (image-generation guide, 2026-10-05): up to
+    // 14 on Flash / Pro; Lite is "not optimized for multiple reference inputs", so none.
+    offer(P::Gemini, "gemini-3.1-flash-image", "Nano Banana 2 (Gemini 3.1 Flash Image)", GEMINI, (&GEMINI_31_FLASH, PO), M::None, S::AspectTier(&GEMINI_31_FLASH_ENTRIES)).references(13),
+    offer(P::Gemini, "gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, PO), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)).references(13),
     offer(P::Gemini, "gemini-3.1-flash-lite-image", "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)", GEMINI, (&GEMINI_31_LITE, PO), M::None, S::AspectTier(&GEMINI_31_LITE_ENTRIES)),
     // Black Forest Labs (api.bfl.ai OpenAPI): FLUX.2 width / height; Kontext matches the input
-    // ~1 MP; Fill requires a mask; FLUX 3 has tier-only sizing.
+    // ~1 MP; Fill requires a mask; FLUX 3 has tier-only sizing. References: only FLUX 3's
+    // `images` is a list (1-10); FLUX.2 / Kontext name single `input_image_N` fields, unwired.
     offer(P::Bfl, "flux-2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2, PO), M::None, S::WidthHeight),
     offer(P::Bfl, "flux-2-flex", "FLUX.2 [flex]", FLUX, (&FLUX2, PO), M::None, S::WidthHeight),
     offer(P::Bfl, "flux-2-max", "FLUX.2 [max]", FLUX, (&FLUX2, PO), M::None, S::WidthHeight),
     offer(P::Bfl, "flux-kontext-pro", "FLUX.1 Kontext [pro]", FLUX, (&KONTEXT, U), M::None, S::None),
     offer(P::Bfl, "flux-kontext-max", "FLUX.1 Kontext [max]", FLUX, (&KONTEXT, U), M::None, S::None),
     offer(P::Bfl, "flux-pro-1.0-fill", "FLUX.1 Fill [pro]", FLUX, (&UNVERIFIED_DEFAULT, U), M::HardRequired, S::None),
-    offer(P::Bfl, "flux-3-image", "FLUX 3 Image", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
+    offer(P::Bfl, "flux-3-image", "FLUX 3 Image", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None).references(9),
     // xAI: edit output size undocumented.
     offer(P::Xai, "grok-imagine-image-2.0", "Grok Imagine Image 2.0", GROK, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
     offer(P::Xai, "grok-imagine-image-quality", "Grok Imagine Image Quality", GROK, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
@@ -169,8 +189,9 @@ static OFFERS: &[ModelOffer] = &[
     // only for Recraft V3; the mask is required; the output size is unstated.
     offer(P::Recraft, "recraftv3", "Recraft V3 Inpaint", "Recraft", (&UNVERIFIED_DEFAULT, U), M::HardRequired, S::None),
     // Runway: reference-based generation; `ratio` is "the resolution of the output image", one of
-    // 16 values (the adapter sends the sent size as `ratio`, so `S::None`).
-    offer(P::Runway, "gen4_image", "Gen-4 Image", "Runway", (&RUNWAY_GEN4, D), M::None, S::None),
+    // 16 values (the adapter sends the sent size as `ratio`, so `S::None`). `referenceImages`:
+    // "An array of one to three images" (OpenAPI, 2026-10-05).
+    offer(P::Runway, "gen4_image", "Gen-4 Image", "Runway", (&RUNWAY_GEN4, D), M::None, S::None).references(2),
     // Luma Agents API `image_edit` (docs.agents.lumalabs.ai, 2026-10-04): model ids `uni-1` /
     // `uni-1-max`; "edit output dimensions are derived from the source image". Photon "no
     // longer exists as a separate product" (lumalabs.ai/llm-info).
@@ -178,62 +199,73 @@ static OFFERS: &[ModelOffer] = &[
     offer(P::Luma, "uni-1-max", "Uni-1 Max", "Luma", (&UNVERIFIED_DEFAULT, U), M::None, S::None),
     // Alibaba Model Studio: "W*H" snapped to /16 (documented example) on edit plus / max / 2.x;
     // 3.0 has an explicit size with documented limits; Wan 2.7 takes "W*H" whose output "may
-    // have minor differences".
-    offer(P::DashScope, "qwen-image-edit-max", "Qwen Image Edit Max", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH),
-    offer(P::DashScope, "qwen-image-edit-plus", "Qwen Image Edit Plus", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH),
-    offer(P::DashScope, "qwen-image-2.0-pro", "Qwen Image 2.0 Pro", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH),
-    offer(P::DashScope, "qwen-image-2.0", "Qwen Image 2.0", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH),
-    offer(P::DashScope, "qwen-image-3.0-pro", "Qwen Image 3.0 Pro", QWEN, (&QWEN_3, PO), M::None, S::WStarH),
-    offer(P::DashScope, "qwen-image-3.0", "Qwen Image 3.0", QWEN, (&QWEN_3, PO), M::None, S::WStarH),
-    offer(P::DashScope, "wan2.7-image-pro", "Wan 2.7 Image Pro", "Wan", (&WAN_27, U), M::None, S::WStarH),
-    offer(P::DashScope, "wan2.7-image", "Wan 2.7 Image", "Wan", (&WAN_27, U), M::None, S::WStarH),
+    // have minor differences". References: qwen edit / 2.0 / 3.0 "one to three input images",
+    // Wan 2.7 "0 to 9 images" (API references, 2026-10-05); `size` is always sent, so the
+    // "output follows the last image" default never applies.
+    offer(P::DashScope, "qwen-image-edit-max", "Qwen Image Edit Max", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "qwen-image-edit-plus", "Qwen Image Edit Plus", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "qwen-image-2.0-pro", "Qwen Image 2.0 Pro", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "qwen-image-2.0", "Qwen Image 2.0", QWEN, (&QWEN_EDIT_PLUS, D), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "qwen-image-3.0-pro", "Qwen Image 3.0 Pro", QWEN, (&QWEN_3, PO), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "qwen-image-3.0", "Qwen Image 3.0", QWEN, (&QWEN_3, PO), M::None, S::WStarH).references(2),
+    offer(P::DashScope, "wan2.7-image-pro", "Wan 2.7 Image Pro", "Wan", (&WAN_27, U), M::None, S::WStarH).references(8),
+    offer(P::DashScope, "wan2.7-image", "Wan 2.7 Image", "Wan", (&WAN_27, U), M::None, S::WStarH).references(8),
     // Tencent TokenHub: v3.5 renders at the given size; v3's limits are documented but its
-    // output rule is not.
-    offer(P::Tencent, "hy-image-v3.5-preview", "Hy-Image 3.5 Preview", "Hunyuan Image", (&TENCENT_35, D), M::None, S::WxH),
-    offer(P::Tencent, "hy-image-v3", "Hy-Image 3.0", "Hunyuan Image", (&TENCENT_3, U), M::None, S::WxH),
-    // Kling: aspect ratio + 1K / 2K tier only; documented input limits.
-    offer(P::Kling, "kling-image-o1", "Kling Image O1", "Kling", (&KLING_O1, U), M::None, S::None),
+    // output rule is not. References: v3.5 up to 20, v3 up to 3 (services_cn_ru [15]).
+    offer(P::Tencent, "hy-image-v3.5-preview", "Hy-Image 3.5 Preview", "Hunyuan Image", (&TENCENT_35, D), M::None, S::WxH).references(19),
+    offer(P::Tencent, "hy-image-v3", "Hy-Image 3.0", "Hunyuan Image", (&TENCENT_3, U), M::None, S::WxH).references(2),
+    // Kling: aspect ratio + 1K / 2K tier only; documented input limits. `image_list`: "The sum
+    // of reference elements and reference images must not exceed 10" (O1 API doc, 2026-10-05).
+    offer(P::Kling, "kling-image-o1", "Kling Image O1", "Kling", (&KLING_O1, U), M::None, S::None).references(9),
     // BytePlus ModelArk (model list + image generation API, 2026-10-04): versioned model ids,
     // "WxH" with per-model total-pixel limits.
     offer(P::BytePlus, "dola-seedream-5-0-pro-260628", "Seedream 5.0 Pro", SEEDREAM, (&ARK_SEEDREAM_5_PRO, PO), M::None, S::WxH),
     offer(P::BytePlus, "seedream-5-0-lite-260128", "Seedream 5.0 Lite", SEEDREAM, (&ARK_SEEDREAM_5_LITE, PO), M::None, S::WxH),
     // OpenRouter (`/api/v1/images/models`, 2026-10-04): no mask anywhere; whether `size` reaches
-    // the upstream is unverified.
-    offer(P::OpenRouter, "openai/gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&OPENAI_ARB, U), M::None, S::WxH),
-    offer(P::OpenRouter, "openai/gpt-image-2.5-flare", "GPT Image 2.5 Flare", GPT, (&OPENAI_ARB, U), M::None, S::WxH),
-    offer(P::OpenRouter, "openai/gpt-image-2", "GPT Image 2", GPT, (&OPENAI_ARB, U), M::None, S::WxH),
-    offer(P::OpenRouter, "google/gemini-3.1-flash-image", "Nano Banana 2 (Gemini 3.1 Flash Image)", GEMINI, (&GEMINI_31_FLASH, U), M::None, S::AspectTier(&GEMINI_31_FLASH_ENTRIES)),
-    offer(P::OpenRouter, "google/gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)),
-    offer(P::OpenRouter, "black-forest-labs/flux.2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2, U), M::None, S::WxH),
-    offer(P::OpenRouter, "black-forest-labs/flux.2-flex", "FLUX.2 [flex]", FLUX, (&FLUX2, U), M::None, S::WxH),
-    offer(P::OpenRouter, "black-forest-labs/flux.2-max", "FLUX.2 [max]", FLUX, (&FLUX2, U), M::None, S::WxH),
-    offer(P::OpenRouter, "qwen/qwen-image-3", "Qwen Image 3", QWEN, (&QWEN_3, U), M::None, S::WxH),
-    offer(P::OpenRouter, "qwen/qwen-image-3-pro", "Qwen Image 3 Pro", QWEN, (&QWEN_3, U), M::None, S::WxH),
+    // the upstream is unverified. References: the live `input_references` max (2026-10-05):
+    // GPT 16, Gemini 14, FLUX.2 8, Qwen Image 3 4.
+    offer(P::OpenRouter, "openai/gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&OPENAI_ARB, U), M::None, S::WxH).references(15),
+    offer(P::OpenRouter, "openai/gpt-image-2.5-flare", "GPT Image 2.5 Flare", GPT, (&OPENAI_ARB, U), M::None, S::WxH).references(15),
+    offer(P::OpenRouter, "openai/gpt-image-2", "GPT Image 2", GPT, (&OPENAI_ARB, U), M::None, S::WxH).references(15),
+    offer(P::OpenRouter, "google/gemini-3.1-flash-image", "Nano Banana 2 (Gemini 3.1 Flash Image)", GEMINI, (&GEMINI_31_FLASH, U), M::None, S::AspectTier(&GEMINI_31_FLASH_ENTRIES)).references(13),
+    offer(P::OpenRouter, "google/gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)).references(13),
+    offer(P::OpenRouter, "black-forest-labs/flux.2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2, U), M::None, S::WxH).references(7),
+    offer(P::OpenRouter, "black-forest-labs/flux.2-flex", "FLUX.2 [flex]", FLUX, (&FLUX2, U), M::None, S::WxH).references(7),
+    offer(P::OpenRouter, "black-forest-labs/flux.2-max", "FLUX.2 [max]", FLUX, (&FLUX2, U), M::None, S::WxH).references(7),
+    offer(P::OpenRouter, "qwen/qwen-image-3", "Qwen Image 3", QWEN, (&QWEN_3, U), M::None, S::WxH).references(3),
+    offer(P::OpenRouter, "qwen/qwen-image-3-pro", "Qwen Image 3 Pro", QWEN, (&QWEN_3, U), M::None, S::WxH).references(3),
     // fal.ai (per-endpoint OpenAPI, 2026-10-04): `image_size {width, height}` where documented.
-    offer(P::Fal, "openai/gpt-image-2/edit", "GPT Image 2", GPT, (&OPENAI_ARB, PO), M::Soft, S::ImageSizeObject),
-    offer(P::Fal, "fal-ai/nano-banana-pro/edit", "Nano Banana Pro", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)),
-    offer(P::Fal, "fal-ai/flux-2-pro/edit", "FLUX.2 [pro]", FLUX, (&FLUX2, PO), M::None, S::ImageSizeObject),
-    offer(P::Fal, "fal-ai/flux-2-max/edit", "FLUX.2 [max]", FLUX, (&FLUX2, PO), M::None, S::ImageSizeObject),
+    // References (`image_urls`, OpenAPI 2026-10-05): GPT maxItems 16, Seedream "Up to 10"; the
+    // Nano Banana example sends two, FLUX.2 / Qwen 2511 describe a list of input images without
+    // a maximum, so one. Single-`image_url` endpoints take none.
+    offer(P::Fal, "openai/gpt-image-2/edit", "GPT Image 2", GPT, (&OPENAI_ARB, PO), M::Soft, S::ImageSizeObject).references(15),
+    offer(P::Fal, "fal-ai/nano-banana-pro/edit", "Nano Banana Pro", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)).references(1),
+    offer(P::Fal, "fal-ai/flux-2-pro/edit", "FLUX.2 [pro]", FLUX, (&FLUX2, PO), M::None, S::ImageSizeObject).references(1),
+    offer(P::Fal, "fal-ai/flux-2-max/edit", "FLUX.2 [max]", FLUX, (&FLUX2, PO), M::None, S::ImageSizeObject).references(1),
     offer(P::Fal, "fal-ai/flux-pro/v1/fill", "FLUX.1 Fill [pro]", FLUX, (&UNVERIFIED_DEFAULT, U), M::HardRequired, S::None),
-    offer(P::Fal, "fal-ai/qwen-image-edit-2511", "Qwen Image Edit 2511", QWEN, (&QWEN_EDIT_PLUS, PO), M::None, S::ImageSizeObject),
+    offer(P::Fal, "fal-ai/qwen-image-edit-2511", "Qwen Image Edit 2511", QWEN, (&QWEN_EDIT_PLUS, PO), M::None, S::ImageSizeObject).references(1),
     offer(P::Fal, "fal-ai/qwen-image-edit/inpaint", "Qwen Image Edit Inpaint", QWEN, (&QWEN_EDIT_PLUS, PO), M::HardRequired, S::ImageSizeObject),
-    offer(P::Fal, "bytedance/seedream/v5/pro/edit", "Seedream 5.0 Pro", SEEDREAM, (&SEEDREAM_5, PO), M::None, S::ImageSizeObject),
+    offer(P::Fal, "bytedance/seedream/v5/pro/edit", "Seedream 5.0 Pro", SEEDREAM, (&SEEDREAM_5, PO), M::None, S::ImageSizeObject).references(9),
     // fal's schema: `auto` "preserves source geometry" (masked edits take no size).
     offer(P::Fal, "ideogram/v4.5/edit", "Ideogram 4.5 Edit", IDEOGRAM, (&IDEOGRAM_45, D), M::Hard, S::None),
     // Replicate (model `llms.txt`, 2026-10-04): FLUX.2 custom width / height up to 2048.
-    offer(P::Replicate, "black-forest-labs/flux-2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2_MAX_2048, PO), M::None, S::WidthHeight),
-    offer(P::Replicate, "black-forest-labs/flux-2-max", "FLUX.2 [max]", FLUX, (&FLUX2_MAX_2048, PO), M::None, S::WidthHeight),
+    // References: FLUX.2 `input_images` "Maximum 8 images"; Qwen 2511 `image` is an array of
+    // "Images to use as reference" without a maximum, so one (2026-10-05).
+    offer(P::Replicate, "black-forest-labs/flux-2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2_MAX_2048, PO), M::None, S::WidthHeight).references(7),
+    offer(P::Replicate, "black-forest-labs/flux-2-max", "FLUX.2 [max]", FLUX, (&FLUX2_MAX_2048, PO), M::None, S::WidthHeight).references(7),
     offer(P::Replicate, "black-forest-labs/flux-fill-pro", "FLUX.1 Fill [pro]", FLUX, (&UNVERIFIED_DEFAULT, U), M::HardRequired, S::None),
     offer(P::Replicate, "black-forest-labs/flux-kontext-pro", "FLUX.1 Kontext [pro]", FLUX, (&KONTEXT, U), M::None, S::None),
-    offer(P::Replicate, "qwen/qwen-image-edit-2511", "Qwen Image Edit 2511", QWEN, (&QWEN_EDIT_PLUS, U), M::None, S::None),
+    offer(P::Replicate, "qwen/qwen-image-edit-2511", "Qwen Image Edit 2511", QWEN, (&QWEN_EDIT_PLUS, U), M::None, S::None).references(1),
     offer(P::Replicate, "ideogram-ai/ideogram-v3-quality", "Ideogram 3.0 Quality", IDEOGRAM, (&UNVERIFIED_DEFAULT, U), M::HardRequired, S::None),
     // Together (serverless models + images reference, 2026-10-04): `reference_images` edits,
     // `width` / `height` (FLUX.2 256..1920). Gemini's size fields are not documented there, so
-    // its table sizes go out as `width` / `height`.
-    offer(P::Together, "black-forest-labs/FLUX.2-pro", "FLUX.2 [pro]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight),
-    offer(P::Together, "black-forest-labs/FLUX.2-max", "FLUX.2 [max]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight),
-    offer(P::Together, "black-forest-labs/FLUX.2-flex", "FLUX.2 [flex]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight),
-    offer(P::Together, "google/gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::WidthHeight),
+    // its table sizes go out as `width` / `height`. References (`reference_images`, "used by
+    // ... FLUX.2, and Google models"; model cards 2026-10-05): FLUX.2 [pro] "Up to 8 reference
+    // images via API", [flex] "Up to 10"; [max] and Gemini state no count, so one.
+    offer(P::Together, "black-forest-labs/FLUX.2-pro", "FLUX.2 [pro]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight).references(7),
+    offer(P::Together, "black-forest-labs/FLUX.2-max", "FLUX.2 [max]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight).references(1),
+    offer(P::Together, "black-forest-labs/FLUX.2-flex", "FLUX.2 [flex]", FLUX, (&TOGETHER_FLUX2, U), M::None, S::WidthHeight).references(9),
+    offer(P::Together, "google/gemini-3-pro-image", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::WidthHeight).references(1),
     // DeepInfra `OpenAI` images edits (`/v1/images/edits`, schema has `mask`).
     offer(P::DeepInfra, "black-forest-labs/FLUX-2-pro", "FLUX.2 [pro]", FLUX, (&FLUX2, U), M::Soft, S::WxH),
     offer(P::DeepInfra, "black-forest-labs/FLUX-2-max", "FLUX.2 [max]", FLUX, (&FLUX2, U), M::Soft, S::WxH),
@@ -282,14 +314,15 @@ static OFFERS: &[ModelOffer] = &[
     offer(P::RouterAi, "qwen/qwen-image-3", "Qwen Image 3", QWEN, (&QWEN_3, U), M::None, S::WxH),
     offer(P::RouterAi, "qwen/qwen-image-3-pro", "Qwen Image 3 Pro", QWEN, (&QWEN_3, U), M::None, S::WxH),
     // Polza.ai (`/api/v1/models`, 2026-10-04): only `aspect_ratio` + `image_resolution`, so no
-    // explicit size outside the Gemini tables; `qwen/image-2.1` takes `mask_url`.
-    offer(P::Polza, "openai/gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
+    // explicit size outside the Gemini tables; `qwen/image-2.1` takes `mask_url`. References:
+    // the catalogue's `images` max (2026-10-05); Gemini 3.1 Flash lists no `images` parameter.
+    offer(P::Polza, "openai/gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst", GPT, (&UNVERIFIED_DEFAULT, U), M::None, S::None).references(15),
     offer(P::Polza, "google/gemini-3.1-flash-image", "Nano Banana 2 (Gemini 3.1 Flash Image)", GEMINI, (&GEMINI_31_FLASH, U), M::None, S::AspectTier(&GEMINI_31_FLASH_ENTRIES)),
-    offer(P::Polza, "google/gemini-3-pro-image-preview", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)),
-    offer(P::Polza, "black-forest-labs/flux.2-pro", "FLUX.2 [pro]", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
-    offer(P::Polza, "black-forest-labs/flux.2-flex", "FLUX.2 [flex]", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
-    offer(P::Polza, "seedream/5-pro-text-to-image", "Seedream 5.0 Pro", SEEDREAM, (&UNVERIFIED_DEFAULT, U), M::None, S::None),
-    offer(P::Polza, "qwen/image-2.1", "Qwen Image 2.1", QWEN, (&UNVERIFIED_DEFAULT, U), M::Hard, S::None),
+    offer(P::Polza, "google/gemini-3-pro-image-preview", "Nano Banana Pro (Gemini 3 Pro Image)", GEMINI, (&GEMINI_3_PRO, U), M::None, S::AspectTier(&GEMINI_3_PRO_ENTRIES)).references(7),
+    offer(P::Polza, "black-forest-labs/flux.2-pro", "FLUX.2 [pro]", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None).references(7),
+    offer(P::Polza, "black-forest-labs/flux.2-flex", "FLUX.2 [flex]", FLUX, (&UNVERIFIED_DEFAULT, U), M::None, S::None).references(7),
+    offer(P::Polza, "seedream/5-pro-text-to-image", "Seedream 5.0 Pro", SEEDREAM, (&UNVERIFIED_DEFAULT, U), M::None, S::None).references(9),
+    offer(P::Polza, "qwen/image-2.1", "Qwen Image 2.1", QWEN, (&UNVERIFIED_DEFAULT, U), M::Hard, S::None).references(9),
     // GenAPI (model pages, 2026-10-04): gpt-image `image_size` is a 9-entry preset list.
     offer(P::GenApi, "gpt-image-2", "GPT Image 2", GPT, (&GENAPI_GPT_IMAGE, PO), M::None, S::WxH),
     offer(P::GenApi, "gpt-image-2-5", "GPT Image 2.5", GPT, (&GENAPI_GPT_IMAGE, PO), M::None, S::WxH),
@@ -425,6 +458,26 @@ mod tests {
         assert_eq!(ark, ["dola-seedream-5-0-pro-260628", "seedream-5-0-lite-260128"]);
         assert_eq!(offers(ImageEditProvider::Recraft).map(|offer| (offer.model_id, offer.mask)).collect::<Vec<_>>(), [("recraftv3", MaskSupport::HardRequired)]);
         assert!(lookup(ImageEditProvider::Together, "Qwen/Qwen-Image-2.0-Pro").is_err());
+    }
+
+    // Reference counts are documented per row (sources at the rows); everything unconfirmed,
+    // the user's own server and every single-image field stays at 0.
+    #[test]
+    fn reference_rows_are_pinned() {
+        let count = |provider: ImageEditProvider, id: &str| lookup(provider, id).ok().map(|offer| offer.max_extra_references);
+        assert_eq!(count(ImageEditProvider::OpenAi, "gpt-image-2"), Some(15));
+        assert_eq!(count(ImageEditProvider::Gemini, "gemini-3-pro-image"), Some(13));
+        assert_eq!(count(ImageEditProvider::Gemini, "gemini-3.1-flash-lite-image"), Some(0));
+        assert_eq!(count(ImageEditProvider::Runway, "gen4_image"), Some(2));
+        assert_eq!(count(ImageEditProvider::DashScope, "qwen-image-edit-plus"), Some(2));
+        assert_eq!(count(ImageEditProvider::Bfl, "flux-3-image"), Some(9));
+        assert_eq!(count(ImageEditProvider::Bfl, "flux-2-pro"), Some(0));
+        assert_eq!(count(ImageEditProvider::OpenAiCompatible, "any-model"), Some(0));
+        let none = [ImageEditProvider::Xai, ImageEditProvider::Ideogram, ImageEditProvider::Recraft, ImageEditProvider::Luma, ImageEditProvider::BytePlus, ImageEditProvider::DeepInfra, ImageEditProvider::AimlApi, ImageEditProvider::AiTunnel, ImageEditProvider::ProxyApi, ImageEditProvider::RouterAi, ImageEditProvider::Runware, ImageEditProvider::GenApi];
+        for provider in none {
+            assert!(offers(provider).all(|offer| !offer.accepts_references()), "{provider:?}");
+        }
+        assert!(all_offers().iter().all(|offer| offer.accepts_references() == (offer.max_extra_references > 0)));
     }
 
     #[test]

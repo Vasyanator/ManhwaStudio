@@ -4,7 +4,8 @@ File: crates/ms-ai-api/src/image_edit/pipeline.rs
 Purpose:
 The single owner of size on the API side: the pure halves of an image-edit run around the
 HTTP exchange. `prepare` validates the request, applies the caller's integer upscale `k`,
-encodes the image and the native mask and resolves the endpoint; `finish` decodes the
+encodes the image, the optional reference (same `k`, alpha kept) and the native mask and
+resolves the endpoint; `finish` decodes the
 provider's answer, demands exactly `(k * W, k * H)`, box-downscales by `k`, composites inside
 the feathered mask and returns exactly `W x H` with alpha 255.
 
@@ -28,7 +29,7 @@ only to the opt-in trace log.
 */
 
 use super::catalog::{MaskSupport, ModelOffer, SizeParamStyle};
-use super::codec::{decode_rgba, encode_rgb_png};
+use super::codec::{decode_rgba, encode_reference_png, encode_rgb_png};
 use super::composite::composite_feathered;
 use super::error::ImageEditError;
 use super::protocol::EditCall;
@@ -61,7 +62,9 @@ pub struct PreparedCall {
 /// # Errors
 /// - `EmptyPrompt` for a blank prompt.
 /// - `UnknownModel` when `offer` is not the request's provider / model.
-/// - `ShapeMismatch` for a mask of the wrong length or an upscaled size that overflows.
+/// - `ReferenceNotSupported` when the request carries a reference and the offer takes none.
+/// - `ShapeMismatch` for a mask of the wrong length, a reference of another size than the
+///   image, or an upscaled size that overflows.
 /// - `UpscaleNotAllowed` when `request.upscale` is outside `1..=offer.rule.max_upscale`.
 /// - `SizeNotOffered` when the offer states its size by table labels and `(k * W, k * H)` is
 ///   not an entry.
@@ -87,6 +90,14 @@ pub fn prepare(request: &ImageEditRequest, offer: &ModelOffer) -> Result<Prepare
     {
         return Err(ImageEditError::ShapeMismatch { detail: format!("mask of {width}x{height} must be {count} bytes, got {}", mask.len()) });
     }
+    if let Some(reference) = &request.reference {
+        if !offer.accepts_references() {
+            return Err(ImageEditError::ReferenceNotSupported { model_id: model_id.to_string() });
+        }
+        if (reference.width(), reference.height()) != (width, height) {
+            return Err(ImageEditError::ShapeMismatch { detail: format!("reference of {}x{} must match the {width}x{height} image", reference.width(), reference.height()) });
+        }
+    }
     let k = request.upscale;
     let overflow = || ImageEditError::ShapeMismatch { detail: format!("{width}x{height} upscaled by {k} overflows") };
     let sent_width = width.checked_mul(u32::from(k)).ok_or_else(overflow)?;
@@ -102,6 +113,16 @@ pub fn prepare(request: &ImageEditRequest, offer: &ModelOffer) -> Result<Prepare
     let raster = |error: ms_raster::RasterError| ImageEditError::ShapeMismatch { detail: error.to_string() };
     let sent_rgb = ms_raster::upscale_replicate(&rgb, w, h, 3, factor).map_err(raster)?;
     let image_png = encode_rgb_png(&sent_rgb, sent_width, sent_height)?;
+    // The reference goes through the same integer replicate `xk` (all four channels, so its
+    // alpha survives) and reaches the provider at exactly the sent size.
+    let reference_png = request
+        .reference
+        .as_ref()
+        .map(|reference| {
+            let sent = ms_raster::upscale_replicate(reference.pixels(), w, h, 4, factor).map_err(raster)?;
+            encode_reference_png(&sent, sent_width, sent_height)
+        })
+        .transpose()?;
     let painted = request.mask.as_deref().filter(|mask| mask.iter().any(|&value| value != 0));
     let native_mask = match (offer.mask, painted) {
         (MaskSupport::None, _) | (MaskSupport::Soft | MaskSupport::Hard, None) => None,
@@ -120,6 +141,7 @@ pub fn prepare(request: &ImageEditRequest, offer: &ModelOffer) -> Result<Prepare
         region_id,
         prompt: request.prompt.clone(),
         image_png,
+        reference_png,
         mask: native_mask,
         width: sent_width,
         height: sent_height,
@@ -209,12 +231,13 @@ fn run_with(transport: &dyn HttpTransport, limits: &ExecutorLimits, request: &Im
     };
     let size_text = |size: Option<(u32, u32)>| size.map_or_else(|| "-".to_string(), |(width, height)| format!("{width}x{height}"));
     let line = format!(
-        "[AI API/image_edit] run provider={} model={} region={}x{} k={} sent={} returned={} prompt_chars={} elapsed_ms={} outcome={}",
+        "[AI API/image_edit] run provider={} model={} region={}x{} k={} reference={} sent={} returned={} prompt_chars={} elapsed_ms={} outcome={}",
         request.provider.key(),
         request.model_id.trim(),
         request.image.width(),
         request.image.height(),
         request.upscale,
+        request.reference.is_some(),
         size_text(sent),
         size_text(returned),
         request.prompt.chars().count(),
@@ -302,7 +325,7 @@ mod tests {
     }
 
     fn request(provider: ImageEditProvider, model_id: &str, mask: Option<Vec<u8>>, upscale: u8) -> ImageEditRequest {
-        ImageEditRequest { provider, model_id: model_id.to_string(), endpoint: EndpointChoice::Default, prompt: "remove the text".to_string(), image: pattern(W, H), mask, blend: MaskBlend { dilate_px: 2, feather_px: 1 }, upscale }
+        ImageEditRequest { provider, model_id: model_id.to_string(), endpoint: EndpointChoice::Default, prompt: "remove the text".to_string(), image: pattern(W, H), reference: None, mask, blend: MaskBlend { dilate_px: 2, feather_px: 1 }, upscale }
     }
 
     fn prepared(request: &ImageEditRequest, offer: &ModelOffer) -> PreparedCall {
@@ -422,6 +445,51 @@ mod tests {
         assert_eq!(fill.call.mask, Some(vec![255; count]));
         assert_eq!(fill.call.base_url, "https://api.bfl.ai");
         assert_eq!(fill.call.region_id, Some("global"));
+    }
+
+    /// A translucent reference: a red mark at (1, 0), half-transparent at (2, 1), clear elsewhere.
+    fn marks(width: u32, height: u32) -> RgbaRegion {
+        let mut pixels = vec![0u8; usize::try_from(width * height * 4).unwrap_or(0)];
+        for (x, y, rgba) in [(1u32, 0u32, [255u8, 0, 0, 255]), (2, 1, [0, 0, 255, 128])] {
+            let index = usize::try_from((y * width + x) * 4).unwrap_or(0);
+            pixels[index..index + 4].copy_from_slice(&rgba);
+        }
+        RgbaRegion::new(width, height, pixels).unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
+    // The reference is upscaled by the image's own `k` (replicate), keeps its alpha, travels
+    // after the image, and never changes the composite.
+    #[test]
+    fn a_reference_is_scaled_like_the_image_and_keeps_its_alpha() {
+        let offer = offer(ImageEditProvider::OpenAi, "gpt-image-2");
+        assert!(offer.accepts_references());
+        for k in [1u8, 2, 3] {
+            let mut request = request(ImageEditProvider::OpenAi, "gpt-image-2", None, k);
+            let reference = marks(W, H);
+            request.reference = Some(reference.clone());
+            let prepared = prepared(&request, offer);
+            let png = prepared.call.reference_png.clone().unwrap_or_else(|| panic!("k={k}: no reference"));
+            let (width, height, rgba) = decode_rgba(&png).unwrap_or_else(|error| panic!("{error:?}"));
+            assert_eq!((width, height), (prepared.call.width, prepared.call.height));
+            let expected = ms_raster::upscale_replicate(reference.pixels(), usize::try_from(W).unwrap_or(0), usize::try_from(H).unwrap_or(0), 4, usize::from(k)).unwrap_or_else(|error| panic!("{error:?}"));
+            assert_eq!(rgba, expected, "k={k}");
+            // The composite ignores the reference: an identity provider round-trips exactly.
+            let outcome = finish(&request, &prepared, &prepared.call.image_png).unwrap_or_else(|error| panic!("{error:?}"));
+            assert_eq!(outcome.image, request.image);
+        }
+    }
+
+    #[test]
+    fn a_reference_is_refused_where_the_offer_takes_none_or_its_size_differs() {
+        let mut request = request(ImageEditProvider::Xai, "grok-imagine-image-2.0", None, 1);
+        request.reference = Some(marks(W, H));
+        let result = prepare(&request, offer(ImageEditProvider::Xai, "grok-imagine-image-2.0"));
+        assert!(matches!(result, Err(ImageEditError::ReferenceNotSupported { model_id }) if model_id == "grok-imagine-image-2.0"));
+        let mut request = self::request(ImageEditProvider::OpenAi, "gpt-image-2", None, 1);
+        request.reference = Some(marks(W, H + 1));
+        assert!(matches!(prepare(&request, offer(ImageEditProvider::OpenAi, "gpt-image-2")), Err(ImageEditError::ShapeMismatch { .. })));
+        request.reference = None;
+        assert!(prepared(&request, offer(ImageEditProvider::OpenAi, "gpt-image-2")).call.reference_png.is_none());
     }
 
     #[test]

@@ -25,7 +25,7 @@ https://docs.x.ai/developers/debugging.md (fetched 2026-10-04).
 
 use serde_json::json;
 
-use super::{images_data_step, json_post, png_data_url};
+use super::{images_data_step, json_post, png_data_url, refuse_reference};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::error::ImageEditError;
 use crate::image_edit::protocol::{AuthScheme, EditCall, EditProtocol, HttpRequestSpec, HttpResponse, NextStep, StepCtx};
@@ -36,6 +36,8 @@ pub struct XaiImages;
 
 impl EditProtocol for XaiImages {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+        // One image field: a reference cannot be expressed.
+        refuse_reference(call)?;
         if call.size_param != SizeParamStyle::None {
             return Err(ImageEditError::RequestBuild { detail: format!("xAI image edits have no pixel size field; they cannot state {:?}", call.size_param) });
         }

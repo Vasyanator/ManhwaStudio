@@ -97,6 +97,12 @@ pub struct EditCall {
     pub prompt: String,
     /// RGB PNG of the image to send, `width x height`.
     pub image_png: Vec<u8>,
+    /// PNG of the one reference image sent AFTER the edited image (`width x height`, RGB, or
+    /// RGBA when it carries transparency); `None` for no reference. Only an offer with
+    /// `max_extra_references > 0` gets one (`pipeline::prepare` guards it). An adapter with a
+    /// list field appends it after `image_png`; an endpoint without one refuses the call with
+    /// `ImageEditError::ReferenceNotSupported`, never dropping it.
+    pub reference_png: Option<Vec<u8>>,
     /// The native mask to send, `width * height` bytes, 255 = editable, 0 = keep; `None` when
     /// the offer takes no mask or nothing was painted (unless the offer requires one). The
     /// adapter encodes it in its provider's polarity (`codec::encode_mask_png`).

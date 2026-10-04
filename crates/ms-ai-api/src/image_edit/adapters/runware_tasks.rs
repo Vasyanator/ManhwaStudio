@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use super::{classify_error, is_success, json_post, json_value, job_failure, mask_data_url, png_data_url, required_str, result_url_step};
+use super::{classify_error, is_success, json_post, json_value, job_failure, mask_data_url, png_data_url, refuse_reference, required_str, result_url_step};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::MaskPolarity;
 use crate::image_edit::error::ImageEditError;
@@ -88,10 +88,13 @@ fn seed_and_mask_model(model_id: &str) -> bool {
 fn inference_task(call: &EditCall, task_uuid: &str) -> Result<Value, ImageEditError> {
     let image = png_data_url(&call.image_png);
     let inputs = if seed_and_mask_model(&call.model_id) {
+        refuse_reference(call)?;
         let mask = mask_data_url(call, MaskPolarity::WhiteEdits)?.ok_or_else(|| ImageEditError::RequestBuild { detail: format!("Runware {} requires a mask", call.model_id) })?;
         json!({ "seedImage": image, "maskImage": mask })
     } else {
-        json!({ "referenceImages": [image] })
+        // The edited image first, then the reference.
+        let images: Vec<String> = std::iter::once(image).chain(call.reference_png.as_deref().map(png_data_url)).collect();
+        json!({ "referenceImages": images })
     };
     let mut task = Map::new();
     task.insert("taskType".to_string(), json!("imageInference"));

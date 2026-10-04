@@ -21,8 +21,12 @@ via the dispatcher's ``ProgressEmitter`` (``HandlerContext.progress_emitter``),
 with a ``phase`` header field that is ``"load"`` (component being built) or
 ``"generate"`` (denoising step). No preview blob is ever sent.
 
-Blob convention (same as the other inpaint methods):
-    request blob = region_png ++ mask_png   (split via image_len / mask_len)
+Blob convention (the other inpaint methods' two segments, plus one optional):
+    request blob = region_png ++ mask_png [++ reference_png]
+                   (split via image_len / mask_len / reference_len)
+`reference_len` is optional: absent or 0 means no reference. A reference is the
+user's marks composited over a copy of the region, handed to the pipeline as its
+`image_reference`; the service requires it to be exactly the region's size.
 The result PNG goes in the response blob (raw bytes) and its length is repeated
 as ``image_len`` in the response header, next to the OOM-recovery report.
 """
@@ -64,31 +68,42 @@ _APPLIED_FLAGS = (
 )
 
 
-def _split_image_mask(header: dict[str, Any], blob: bytes) -> tuple[bytes, bytes]:
-    """Split the request blob into region PNG + mask PNG.
+def _require_segment_len(header: dict[str, Any], field: str, *, optional: bool) -> int:
+    """Read one blob-segment length; an absent OPTIONAL field reads as 0."""
+    value = header.get(field)
+    if value is None and optional:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"Field '{field}' must be a non-negative integer.")
+    return value
 
-    Strict equality is required: `image_len + mask_len` must be exactly the blob
-    length, so a truncated or over-long frame is a request error rather than a
-    silently mis-sliced image.
+
+def _split_request_blob(
+    header: dict[str, Any], blob: bytes
+) -> tuple[bytes, bytes, bytes | None]:
+    """Split the request blob into region PNG + mask PNG + optional reference PNG.
+
+    Strict equality is required: `image_len + mask_len + reference_len` must be
+    exactly the blob length, so a truncated or over-long frame is a request error
+    rather than a silently mis-sliced image. `reference_len` absent or `0` means
+    the request carries no reference, and the third value is `None`.
     """
-    image_len = header.get("image_len")
-    mask_len = header.get("mask_len")
-    if isinstance(image_len, bool) or not isinstance(image_len, int) or image_len < 0:
-        raise ValueError("Field 'image_len' must be a non-negative integer.")
-    if isinstance(mask_len, bool) or not isinstance(mask_len, int) or mask_len < 0:
-        raise ValueError("Field 'mask_len' must be a non-negative integer.")
-    if image_len + mask_len != len(blob):
+    image_len = _require_segment_len(header, "image_len", optional=False)
+    mask_len = _require_segment_len(header, "mask_len", optional=False)
+    reference_len = _require_segment_len(header, "reference_len", optional=True)
+    if image_len + mask_len + reference_len != len(blob):
         raise ValueError(
             f"Inpaint blob length mismatch: image_len ({image_len}) + mask_len "
-            f"({mask_len}) != blob length ({len(blob)})."
+            f"({mask_len}) + reference_len ({reference_len}) != blob length ({len(blob)})."
         )
     image_png = blob[:image_len]
     mask_png = blob[image_len : image_len + mask_len]
+    reference_png = blob[image_len + mask_len :] if reference_len else None
     if not image_png:
         raise ValueError("inpaint.flux2_klein requires a non-empty region image in the blob.")
     if not mask_png:
         raise ValueError("inpaint.flux2_klein requires a non-empty mask in the blob.")
-    return image_png, mask_png
+    return image_png, mask_png, reference_png
 
 
 def _require_params(header: dict[str, Any]) -> dict[str, Any]:
@@ -181,7 +196,7 @@ def _handle_inpaint_flux2_klein(
     if cancel_event.is_set():
         raise Interrupted("inpaint.flux2_klein canceled before start.")
 
-    image_png, mask_png = _split_image_mask(header, blob)
+    image_png, mask_png, reference_png = _split_request_blob(header, blob)
     params_raw = _require_params(header)
     on_progress = _progress_forwarder(ctx)
 
@@ -189,6 +204,7 @@ def _handle_inpaint_flux2_klein(
         result = ctx.state.flux2_klein_inpaint.inpaint_image_bytes(
             image_png,
             mask_png,
+            reference_bytes=reference_png,
             params=params_raw,
             progress_callback=on_progress,
         )

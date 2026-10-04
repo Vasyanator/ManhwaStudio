@@ -35,7 +35,7 @@ from __future__ import annotations
 # The contract also covers the on-disk user_config storage semantics shared with
 # Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
 # ============================================================================
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # ============================================================================
 # FRAME SIZE GUARDS

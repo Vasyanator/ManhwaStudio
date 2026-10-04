@@ -18,7 +18,10 @@ Coverage:
 - two-phase progress (`load` / `generate`) with an always-empty blob;
 - terminal response: result PNG as the RESPONSE BLOB, header carrying
   `image_len`, `oom_recovered` and the `applied` memory settings;
-- request blob split by `image_len`/`mask_len` with strict equality;
+- request blob split by `image_len`/`mask_len`/`reference_len` with strict
+  equality; an absent or zero `reference_len` reaches the service as NO reference
+  (`None`), a present one as exactly its own segment, and a malformed length or a
+  sum that misses the blob is a request error;
 - `params` passed through, `null` params treated as an empty object;
 - no-emitter => no progress frames, still a correct terminal response;
 - `inpaint.flux2_klein.status` with and without `params`;
@@ -84,6 +87,7 @@ from modules.ai_backend.ipc.registry import HandlerContext, Interrupted, get_han
 
 REGION_PNG = b"\x89PNG-region-bytes"
 MASK_PNG = b"MASK-bytes!!"
+REFERENCE_PNG = b"\x89PNG-marks-reference"
 RESULT_PNG = b"\x89PNG-result-\x00\x01\x02"
 
 REQUEST_ID = 77
@@ -124,6 +128,8 @@ class _FakeFlux2KleinService:
         self._result = result if result is not None else _default_result()
         self._raise_exc = raise_exc
         self.calls: list[tuple[bytes, bytes, dict[str, Any]]] = []
+        #: The `reference_bytes` of every `inpaint_image_bytes` call, in order.
+        self.reference_calls: list[bytes | None] = []
         self.status_calls: list[Any] = []
         self.estimate_calls: list[dict[str, Any]] = []
         #: (method, params, extra kwargs) per prompt-cache call.
@@ -138,10 +144,12 @@ class _FakeFlux2KleinService:
         image_bytes: bytes,
         mask_bytes: bytes,
         *,
+        reference_bytes: bytes | None,
         params: dict[str, Any],
         progress_callback: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((image_bytes, mask_bytes, params))
+        self.reference_calls.append(reference_bytes)
         if progress_callback is not None:
             for frame in PROGRESS_SCRIPT:
                 progress_callback(*frame)
@@ -423,6 +431,60 @@ def test_a_bad_blob_split_is_a_request_error(header: dict[str, Any]) -> None:
         handler(
             _ctx(_FakeFlux2KleinService()), header, REGION_PNG + MASK_PNG, _no_cancel()
         )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        # One byte short of covering the reference, and one byte over.
+        {"reference_len": len(REFERENCE_PNG) - 1},
+        {"reference_len": len(REFERENCE_PNG) + 1},
+        {"reference_len": -1},
+        {"reference_len": True},
+        {"reference_len": "17"},
+        {"reference_len": 1.5},
+    ],
+)
+def test_a_bad_reference_length_is_a_request_error(header: dict[str, Any]) -> None:
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    svc = _FakeFlux2KleinService()
+    with pytest.raises(ValueError):
+        handler(_ctx(svc), _header(header), REGION_PNG + MASK_PNG + REFERENCE_PNG, _no_cancel())
+    assert svc.calls == [], "a mis-sliced request never reaches the service"
+
+
+def test_a_reference_beside_an_undeclared_length_is_a_request_error() -> None:
+    # The trailing bytes are not silently ignored: without `reference_len` the two
+    # declared lengths no longer sum to the blob.
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    with pytest.raises(ValueError):
+        handler(
+            _ctx(_FakeFlux2KleinService()),
+            _header(),
+            REGION_PNG + MASK_PNG + REFERENCE_PNG,
+            _no_cancel(),
+        )
+
+
+def test_a_declared_reference_reaches_the_service_as_its_own_segment() -> None:
+    svc = _FakeFlux2KleinService()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    handler(
+        _ctx(svc),
+        _header({"reference_len": len(REFERENCE_PNG), "params": {}}),
+        REGION_PNG + MASK_PNG + REFERENCE_PNG,
+        _no_cancel(),
+    )
+    assert svc.calls == [(REGION_PNG, MASK_PNG, {})]
+    assert svc.reference_calls == [REFERENCE_PNG]
+
+
+@pytest.mark.parametrize("extra", [{}, {"reference_len": 0}, {"reference_len": None}])
+def test_an_absent_or_zero_reference_length_means_no_reference(extra: dict[str, Any]) -> None:
+    svc = _FakeFlux2KleinService()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    handler(_ctx(svc), _header(extra), REGION_PNG + MASK_PNG, _no_cancel())
+    assert svc.reference_calls == [None]
 
 
 def test_an_empty_mask_is_refused() -> None:

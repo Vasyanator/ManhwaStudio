@@ -11,12 +11,14 @@ Key structures:
 
 Key functions:
 - encode_rgb_png()
+- encode_reference_png()
 - encode_mask_png()
 - decode_rgba()
 
 Notes:
 The sent image is RGB (alpha dropped) because `OpenAI` treats image alpha as an edit mask
-when no mask is sent. Decoding is bounded by `image::Limits` (16384 px per side, 512 MiB
+when no mask is sent. A reference image keeps its alpha (a transparent marks layer means
+"nothing here"); a fully opaque one is sent as RGB like the edited image. Decoding is bounded by `image::Limits` (16384 px per side, 512 MiB
 allocations) so a hostile or broken answer cannot exhaust memory; the real decoded size is
 returned and never trusted from a header field.
 */
@@ -27,7 +29,7 @@ use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, ImageReader, Limits};
 
 use super::error::ImageEditError;
-use super::request::pixel_count;
+use super::request::{pixel_count, rgba_len};
 
 /// Largest decoded side accepted from a provider.
 pub const MAX_DECODE_SIDE: u32 = 16_384;
@@ -55,6 +57,23 @@ pub fn encode_rgb_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Im
         return Err(ImageEditError::ShapeMismatch { detail: format!("RGB buffer of {width}x{height} must be {expected} bytes, got {}", rgb.len()) });
     }
     encode_png(rgb, width, height, ExtendedColorType::Rgb8)
+}
+
+/// Encodes a straight-alpha RGBA8 reference image (`width * height * 4` bytes) as a PNG: RGBA8
+/// when any pixel is not fully opaque (the alpha is kept), else RGB8.
+///
+/// # Errors
+/// `ImageEditError::ShapeMismatch` for a wrong buffer length, `Encode` when the encoder fails.
+pub fn encode_reference_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, ImageEditError> {
+    let expected = rgba_len(width, height)?;
+    if rgba.len() != expected {
+        return Err(ImageEditError::ShapeMismatch { detail: format!("RGBA buffer of {width}x{height} must be {expected} bytes, got {}", rgba.len()) });
+    }
+    if rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX) {
+        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+        return encode_png(&rgb, width, height, ExtendedColorType::Rgb8);
+    }
+    encode_png(rgba, width, height, ExtendedColorType::Rgba8)
 }
 
 /// Encodes the internal mask (`width * height` bytes, nonzero = editable) as a PNG in the
@@ -111,7 +130,7 @@ pub fn decode_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), ImageEditError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{MaskPolarity, decode_rgba, encode_mask_png, encode_rgb_png};
+    use super::{MaskPolarity, decode_rgba, encode_mask_png, encode_reference_png, encode_rgb_png};
     use crate::image_edit::error::ImageEditError;
 
     #[test]
@@ -121,6 +140,19 @@ mod tests {
         let decoded = decode_rgba(&png).ok();
         assert_eq!(decoded, Some((2, 2, vec![10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255])));
         assert!(matches!(encode_rgb_png(&rgb, 3, 2), Err(ImageEditError::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn reference_png_keeps_alpha_only_when_translucent() {
+        let translucent = [255, 0, 0, 128, 0, 0, 0, 0];
+        let png = encode_reference_png(&translucent, 2, 1).unwrap_or_default();
+        assert_eq!(decode_rgba(&png).ok(), Some((2, 1, translucent.to_vec())));
+        // An opaque reference is sent as RGB: the IHDR colour type byte (offset 25) is 2.
+        let opaque = [1, 2, 3, 255, 4, 5, 6, 255];
+        let png = encode_reference_png(&opaque, 2, 1).unwrap_or_default();
+        assert_eq!(png.get(25), Some(&2));
+        assert_eq!(decode_rgba(&png).ok(), Some((2, 1, opaque.to_vec())));
+        assert!(matches!(encode_reference_png(&opaque, 3, 1), Err(ImageEditError::ShapeMismatch { .. })));
     }
 
     #[test]

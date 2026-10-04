@@ -5,7 +5,8 @@ Purpose:
 Every backend call the FLUX.2 klein engine makes that is not a download or a prompt-cache
 operation: the generation run itself with its OOM retry pass, the streaming call helper
 the long operations share, the `.status` query and its parsers, the component
-load/unload actions, and the encoding of the image/mask blob that travels with a run.
+load/unload actions, and the encoding of the image/mask(/reference) blob that travels with a
+run.
 
 Main responsibilities:
 - run one generation pass and, on an OOM, the recovery pass (`run_flux2_klein`,
@@ -15,8 +16,12 @@ Main responsibilities:
   `parse_flux2_status`, `parse_flux2_component_snapshot`);
 - request a component load/unload and read the catalog it answers with;
 - translate a prompt to English through the shared MT service;
-- pack the colour image and the mask PNGs (encoded by `tools::region_png`, the cleaning face
-  of `ms_tools::png_wire`) into the single blob the request carries.
+- pack the colour image, the mask and the optional marks reference PNGs (encoded by
+  `tools::region_png`, the cleaning face of `ms_tools::png_wire`) into the request header and
+  the single blob it describes (`flux2_run_request`).
+
+Key structures:
+- `Flux2RunInput` — the pixels of one run (region, optional reference, mask, mode)
 
 Key functions:
 - `run_flux2_klein()`, `run_flux2_klein_pass()`, `flux2_stream_call()`
@@ -25,7 +30,7 @@ Key functions:
 - `unload_flux2_klein()`, `flux2_component_action_header()`,
   `run_flux2_component_action()`
 - `translate_prompt_to_english()`, `map_flux2_call_error()`
-- `concat_image_mask()`
+- `flux2_run_request()`
 
 Notes:
 Every function here runs on a WORKER thread — none of it may be called from the GUI
@@ -53,40 +58,47 @@ pub(super) const FLUX2_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 // Worker passes
 // ---------------------------------------------------------------------------------------
 
+/// The pixels of one run, moved onto the worker as one value.
+///
+/// `region` is the image the model edits and the one the result replaces; `reference` is
+/// the user's marks composited over a COPY of that region (`RunMarks::Reference`), which
+/// the backend hands the pipeline as one extra condition image. Both are exactly
+/// `mask_size` pixels — the reference must undergo exactly the region's geometric
+/// preprocessing, and the backend guarantees that only for two images of one size. `mask`
+/// is the L8 buffer that goes on the wire and `whole_region` the mode [`mask_for_run`]
+/// derived for exactly that buffer.
+pub(super) struct Flux2RunInput {
+    pub(super) region: egui::ColorImage,
+    pub(super) reference: Option<egui::ColorImage>,
+    pub(super) mask: Vec<u8>,
+    pub(super) whole_region: bool,
+    pub(super) mask_size: [usize; 2],
+}
+
 /// Runs one FLUX.2 klein edit pass and returns the regenerated region plus what the
 /// backend reports about how it got there.
 ///
-/// `settings` must already be `normalized()`. `mask` is the L8 edit-permission mask in
-/// region coordinates and must be exactly `mask_size[0] * mask_size[1]` bytes matching
-/// `image.size`; `whole_region` is the mode [`mask_for_run`] derived for exactly that
-/// buffer and travels with it, because the backend validates the two against each other.
-/// `generation` is the progress generation claimed by `start_run`: every write into
-/// `progress`, including the terminal one that always clears the bar before returning, is
-/// dropped once a newer run (or a cancel) has retired it.
+/// `settings` must already be `normalized()`. `input.mask` is the L8 edit-permission mask
+/// in region coordinates and must be exactly `mask_size[0] * mask_size[1]` bytes matching
+/// `input.region.size`, and `input.reference`, when present, must be that size too;
+/// `whole_region` is the mode [`mask_for_run`] derived for exactly that buffer and travels
+/// with it, because the backend validates the two against each other. `generation` is the
+/// progress generation claimed by `start_run`: every write into `progress`, including the
+/// terminal one that always clears the bar before returning, is dropped once a newer run
+/// (or a cancel) has retired it.
 ///
 /// # Errors
 /// Returns a user-facing message when the region violates the model's size contract,
-/// when the mask is empty or the wrong size, when the backend fails or is unreachable,
-/// when the response is missing or contradicts its declared length, or when the
-/// returned PNG is not exactly the region size.
+/// when the mask is empty or the wrong size, when the reference is not the region's size,
+/// when the backend fails or is unreachable, when the response is missing or contradicts
+/// its declared length, or when the returned PNG is not exactly the region size.
 pub(super) fn run_flux2_klein(
-    image: &egui::ColorImage,
-    mask: &[u8],
-    whole_region: bool,
-    mask_size: [usize; 2],
+    input: &Flux2RunInput,
     settings: &Flux2KleinSettings,
     progress: &Arc<Mutex<Flux2Progress>>,
     generation: u64,
 ) -> Result<Flux2RunOutcome, String> {
-    let outcome = run_flux2_klein_pass(
-        image,
-        mask,
-        whole_region,
-        mask_size,
-        settings,
-        progress,
-        generation,
-    );
+    let outcome = run_flux2_klein_pass(input, settings, progress, generation);
     // The bar is cleared on EVERY exit, including the early validation refusals above
     // the IPC call, because `start_run` raised it before the worker even started.
     update_progress(progress, generation, |state| {
@@ -100,14 +112,19 @@ pub(super) fn run_flux2_klein(
 /// in. Same contract and same errors; split out only so no early return can leave the
 /// bar raised.
 pub(super) fn run_flux2_klein_pass(
-    image: &egui::ColorImage,
-    mask: &[u8],
-    whole_region: bool,
-    mask_size: [usize; 2],
+    input: &Flux2RunInput,
     settings: &Flux2KleinSettings,
     progress: &Arc<Mutex<Flux2Progress>>,
     generation: u64,
 ) -> Result<Flux2RunOutcome, String> {
+    let Flux2RunInput {
+        region: image,
+        reference,
+        mask,
+        whole_region,
+        mask_size,
+    } = input;
+    let (whole_region, mask_size) = (*whole_region, *mask_size);
     if image.size != mask_size {
         return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
     }
@@ -128,14 +145,26 @@ pub(super) fn run_flux2_klein_pass(
         return Err(t!("cleaning.tools.flux2_klein.empty_mask_error").to_string());
     }
 
+    // The backend feeds the reference through the very preprocessing the region gets
+    // (the same downscale cap, the same grid floor), which is the SAME transform only
+    // for an image of the same size; a reference of any other size would be aligned to
+    // nothing, so it is refused rather than sent.
+    if reference.as_ref().is_some_and(|reference| reference.size != mask_size) {
+        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+    }
+
     let image_png = encode_color_image_png_rgba(image)?;
     let mask_png = encode_mask_png_l8(mask, width, height)?;
-    let header = json!({
-        "image_len": image_png.len(),
-        "mask_len": mask_png.len(),
-        "params": settings.to_params(whole_region),
-    });
-    let blob = concat_image_mask(&image_png, &mask_png);
+    let reference_png = reference
+        .as_ref()
+        .map(encode_color_image_png_rgba)
+        .transpose()?;
+    let (header, blob) = flux2_run_request(
+        &image_png,
+        &mask_png,
+        reference_png.as_deref(),
+        settings.to_params(whole_region),
+    );
 
     let stream_result = flux2_stream_call(
         backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN,
@@ -467,13 +496,33 @@ pub(super) fn map_flux2_call_error(err: CallError) -> String {
 // Encoding
 // ---------------------------------------------------------------------------------------
 
-/// Concatenates the region PNG and the mask PNG into one request blob. The receiver
-/// splits it by the `image_len` / `mask_len` header fields.
-pub(super) fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(image_png.len() + mask_png.len());
+/// Builds the `inpaint.flux2_klein` request: its header and the one blob it describes.
+///
+/// The blob is `image_png ++ mask_png [++ reference_png]` and the header names each
+/// segment's length — `image_len`, `mask_len` and, only when a reference travels,
+/// `reference_len` — so the receiver can split it with STRICT equality against the blob
+/// length. An absent `reference_len` means no reference; the backend refuses a request
+/// whose lengths do not sum to the blob exactly.
+pub(super) fn flux2_run_request(
+    image_png: &[u8],
+    mask_png: &[u8],
+    reference_png: Option<&[u8]>,
+    params: Value,
+) -> (Value, Vec<u8>) {
+    let reference_len = reference_png.map_or(0, <[u8]>::len);
+    let mut blob = Vec::with_capacity(image_png.len() + mask_png.len() + reference_len);
     blob.extend_from_slice(image_png);
     blob.extend_from_slice(mask_png);
-    blob
+    let mut header = json!({
+        "image_len": image_png.len(),
+        "mask_len": mask_png.len(),
+        "params": params,
+    });
+    if let Some(reference_png) = reference_png {
+        blob.extend_from_slice(reference_png);
+        header["reference_len"] = json!(reference_png.len());
+    }
+    (header, blob)
 }
 
 #[cfg(test)]
@@ -481,13 +530,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blob_concat_orders_image_then_mask() {
-        let image_png = b"IMAGE".to_vec();
-        let mask_png = b"MASK".to_vec();
-        let blob = concat_image_mask(&image_png, &mask_png);
-        assert_eq!(blob.len(), image_png.len() + mask_png.len());
-        assert_eq!(&blob[..image_png.len()], image_png.as_slice());
-        assert_eq!(&blob[image_png.len()..], mask_png.as_slice());
+    fn a_run_without_a_reference_carries_image_then_mask_and_no_reference_len() {
+        let (header, blob) = flux2_run_request(b"IMAGE", b"MASK", None, json!({ "steps": 4 }));
+        assert_eq!(blob, b"IMAGEMASK");
+        assert_eq!(header["image_len"], json!(5));
+        assert_eq!(header["mask_len"], json!(4));
+        assert_eq!(header["params"]["steps"], json!(4));
+        assert!(
+            header.get("reference_len").is_none(),
+            "an absent field is how the backend learns there is no reference"
+        );
+    }
+
+    #[test]
+    fn a_run_with_a_reference_appends_it_and_names_its_length() {
+        let (header, blob) = flux2_run_request(b"IMAGE", b"MASK", Some(b"REF!!!"), json!({}));
+        assert_eq!(blob, b"IMAGEMASKREF!!!");
+        assert_eq!(header["reference_len"], json!(6));
+        // The three declared lengths must cover the blob exactly: the backend splits it
+        // with strict equality and refuses anything else.
+        let declared: u64 = ["image_len", "mask_len", "reference_len"]
+            .iter()
+            .map(|key| header[*key].as_u64().expect("every length is an integer"))
+            .sum();
+        assert_eq!(usize::try_from(declared).ok(), Some(blob.len()));
+    }
+
+    /// A reference that is not the region's size could not undergo the region's
+    /// preprocessing, so the pass refuses it before anything is encoded or sent — the
+    /// refusal happens with no backend at all, which is what this test relies on.
+    #[test]
+    fn a_reference_of_another_size_is_refused_before_the_wire() {
+        let progress = Arc::new(Mutex::new(Flux2Progress::default()));
+        let generation = begin_progress_generation(&progress);
+        let input = Flux2RunInput {
+            region: egui::ColorImage::filled([128, 128], egui::Color32::WHITE),
+            reference: Some(egui::ColorImage::filled([128, 64], egui::Color32::RED)),
+            mask: vec![255u8; 128 * 128],
+            whole_region: true,
+            mask_size: [128, 128],
+        };
+        let outcome = run_flux2_klein(&input, &runnable_settings().normalized(), &progress, generation);
+        assert_eq!(
+            outcome.err(),
+            Some(t!("cleaning.inpaint.size_mismatch_error").to_string())
+        );
     }
 
     #[test]

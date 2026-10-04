@@ -176,7 +176,11 @@ def _transformer_avoids_the_host(normalized: dict[str, Any], *, low_cpu: bool) -
 #  Memory forecast and the pre-load guard
 # =====================================================================
 def forecast_memory(
-    normalized: dict[str, Any], region_width: int, region_height: int
+    normalized: dict[str, Any],
+    region_width: int,
+    region_height: int,
+    *,
+    with_reference: bool = False,
 ) -> dict[str, Any]:
     """Forecast the device and host memory one run costs, in bytes.
 
@@ -230,6 +234,11 @@ def forecast_memory(
     and it is lower in the guard and on screen at once — there is still exactly
     one calculation.
 
+    **A marks reference adds its own condition tokens to the denoise.**
+    `with_reference` says the run carries one; the service requires it to be the
+    region's size, so it costs exactly the region's latent token count again in
+    the transformer's sequence. Nothing else changes: no weight, no decode.
+
     Returns `{"vram_bytes", "ram_bytes", "phases", "resident", "breakdown"}`.
     `phases` maps each phase name to its own `{"vram_bytes", "ram_bytes"}` — that
     is what the guard checks one at a time. `resident` names the two costs a run
@@ -277,7 +286,12 @@ def forecast_memory(
     vae_per_pixel = (
         VAE_DECODE_TILED_BYTES_PER_PIXEL if tiling_engages else VAE_DECODE_BYTES_PER_PIXEL
     )
-    denoise_activations = latent_tokens * ACTIVATION_BYTES_PER_LATENT_TOKEN
+    # A region-sized reference is encoded and packed exactly like the region, so
+    # it lengthens the transformer's sequence by the region's own token count.
+    reference_tokens = latent_tokens if with_reference else 0
+    denoise_activations = (
+        latent_tokens + reference_tokens
+    ) * ACTIVATION_BYTES_PER_LATENT_TOKEN
     decode_activations = int(region_width) * int(region_height) * vae_per_pixel
 
     placement = normalized["placement"]
@@ -429,6 +443,7 @@ def _require_memory_headroom(
     phases: tuple[str, ...],
     pipeline_resident: bool = False,
     encoder_resident: bool = False,
+    with_reference: bool = False,
 ) -> None:
     """Refuse the run when a phase's forecast does not fit in the free memory.
 
@@ -454,6 +469,9 @@ def _require_memory_headroom(
     pipeline was occupying. The discounted figures are what the message reports,
     so the numbers the user sees are the ones that were compared.
 
+    `with_reference` is passed through to `forecast_memory` (and to the preset
+    advice), so a run that carries a marks reference is gated on its real cost.
+
     `device` is the resolved torch device string, so the VRAM figures come from
     the card the run would actually use. A memory figure reported as `0` (no
     psutil, no accelerator) is unknown, not zero, and never refuses a run.
@@ -464,7 +482,9 @@ def _require_memory_headroom(
     """
     if not phases:
         return
-    forecast = forecast_memory(normalized, region_width, region_height)
+    forecast = forecast_memory(
+        normalized, region_width, region_height, with_reference=with_reference
+    )
     memory = hardware.memory_snapshot(device)
     held_vram = forecast["resident"]["pipeline_device"] if pipeline_resident else 0
     held_ram = forecast["resident"]["text_encoder_host"] if encoder_resident else 0
@@ -499,14 +519,22 @@ def _require_memory_headroom(
         int(region_width),
         int(region_height),
     )
+    advice = _preset_advice(
+        normalized, region_width, region_height, memory, with_reference=with_reference
+    )
     raise RuntimeError(
         f"Недостаточно {'; '.join(short)}. Загрузка не начата, чтобы система не осталась без "
-        f"памяти. {_preset_advice(normalized, region_width, region_height, memory)}"
+        f"памяти. {advice}"
     )
 
 
 def _preset_advice(
-    normalized: dict[str, Any], region_width: int, region_height: int, memory: dict[str, int]
+    normalized: dict[str, Any],
+    region_width: int,
+    region_height: int,
+    memory: dict[str, int],
+    *,
+    with_reference: bool = False,
 ) -> str:
     """One sentence naming the settings whose forecast fits `memory` right now.
 
@@ -577,7 +605,9 @@ def _preset_advice(
             continue
         candidate = dict(normalized)
         candidate.update(overrides)
-        if _preset_fits(candidate, region_width, region_height, memory):
+        if _preset_fits(
+            candidate, region_width, region_height, memory, with_reference=with_reference
+        ):
             fitting.append(label)
     if not fitting:
         return (
@@ -588,10 +618,17 @@ def _preset_advice(
 
 
 def _preset_fits(
-    candidate: dict[str, Any], region_width: int, region_height: int, memory: dict[str, int]
+    candidate: dict[str, Any],
+    region_width: int,
+    region_height: int,
+    memory: dict[str, int],
+    *,
+    with_reference: bool = False,
 ) -> bool:
     """Whether every phase of one preset fits the free memory, reserves included."""
-    forecast = forecast_memory(candidate, region_width, region_height)
+    forecast = forecast_memory(
+        candidate, region_width, region_height, with_reference=with_reference
+    )
     for cost in forecast["phases"].values():
         if cost["ram_bytes"] and not _fits(
             cost["ram_bytes"] + HOST_MEMORY_RESERVE_BYTES, memory["ram_free"]

@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, mask_data_url, png_data_url, required_str, result_url_step};
+use super::{classify_error, get_request, is_success, json_post, json_value, job_failure, mask_data_url, png_data_url, refuse_reference, required_str, result_url_step};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::MaskPolarity;
 use crate::image_edit::error::ImageEditError;
@@ -52,17 +52,24 @@ fn required_mask(call: &EditCall, polarity: MaskPolarity) -> Result<String, Imag
 
 /// The `input` object of `call`.
 fn input(call: &EditCall) -> Result<Value, ImageEditError> {
+    // Only FLUX.2 `input_images` and Qwen `image` are lists; the other models take one image.
+    if !matches!(call.model_id.as_str(), "black-forest-labs/flux-2-pro" | "black-forest-labs/flux-2-max" | "qwen/qwen-image-edit-2511") {
+        refuse_reference(call)?;
+    }
     let image = png_data_url(&call.image_png);
+    // The list inputs (FLUX.2 `input_images`, Qwen `image`): the edited image first, then the
+    // reference.
+    let images: Vec<String> = std::iter::once(image.clone()).chain(call.reference_png.as_deref().map(png_data_url)).collect();
     let only_none = |value: Value| if call.size_param == SizeParamStyle::None { Ok(value) } else { Err(unsupported_size(call)) };
     match call.model_id.as_str() {
         "black-forest-labs/flux-2-pro" | "black-forest-labs/flux-2-max" => match call.size_param {
-            SizeParamStyle::WidthHeight => Ok(json!({ "prompt": call.prompt, "input_images": [image], "aspect_ratio": "custom", "width": call.width, "height": call.height, "output_format": "png" })),
-            SizeParamStyle::None => Ok(json!({ "prompt": call.prompt, "input_images": [image], "aspect_ratio": "match_input_image", "resolution": "match_input_image", "output_format": "png" })),
+            SizeParamStyle::WidthHeight => Ok(json!({ "prompt": call.prompt, "input_images": images, "aspect_ratio": "custom", "width": call.width, "height": call.height, "output_format": "png" })),
+            SizeParamStyle::None => Ok(json!({ "prompt": call.prompt, "input_images": images, "aspect_ratio": "match_input_image", "resolution": "match_input_image", "output_format": "png" })),
             SizeParamStyle::WxH | SizeParamStyle::WStarH | SizeParamStyle::ImageSizeObject | SizeParamStyle::AspectTier(_) => Err(unsupported_size(call)),
         },
         "black-forest-labs/flux-fill-pro" => only_none(json!({ "prompt": call.prompt, "image": image, "mask": required_mask(call, MaskPolarity::WhiteEdits)?, "output_format": "png" })),
         "black-forest-labs/flux-kontext-pro" => only_none(json!({ "prompt": call.prompt, "input_image": image, "aspect_ratio": "match_input_image", "output_format": "png" })),
-        "qwen/qwen-image-edit-2511" => only_none(json!({ "prompt": call.prompt, "image": [image], "aspect_ratio": "match_input_image", "output_format": "png" })),
+        "qwen/qwen-image-edit-2511" => only_none(json!({ "prompt": call.prompt, "image": images, "aspect_ratio": "match_input_image", "output_format": "png" })),
         "ideogram-ai/ideogram-v3-quality" => only_none(json!({ "prompt": call.prompt, "image": image, "mask": required_mask(call, MaskPolarity::BlackEdits)? })),
         other => Err(ImageEditError::RequestBuild { detail: format!("unknown Replicate model {other}") }),
     }

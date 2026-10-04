@@ -8,7 +8,9 @@ the intent it reports back. This is the file a tool talks to; `geometry.rs` hold
 `layers.rs` the pixels, `render.rs` the painting and `input.rs` the hit geometry.
 
 Key structures:
-- `RegionFrame`: page anchor, rectangle in source page pixels, masks, result, brush, drag
+- `RegionFrame`: page anchor, rectangle in source page pixels, masks and marks, result, the
+  two brushes, drag
+- `PaintTarget`: whether the brush paints the mask or the colour marks
 - `FrameLock`, `FrameVisual`: the derived protection state and the colour it selects
 - `FrameHost`, `FrameOutcome`, `FrameButtons`: the per-pass input, the reported intent and
   the enablement table the chrome and the dock panel share
@@ -23,7 +25,8 @@ Key functions:
 - `handle_brush_gestures()`, `paint_brush_cursor()`: the brush gestures and ring the frame has
   to own itself, because `tab.rs` delivers no key, wheel or cursor hook over an occluded pointer
 - `derive_lock()`, `derive_visual()`, `derive_buttons()`, `stroke_erases()`,
-  `result_hidden()`, `keep_in_view_px()`: the pure rules
+  `result_hidden()`, `keep_in_view_px()`, `initial_marks_radius()`: the pure rules
+- `blocks_ctrl_primary_zoom()`: whether Ctrl+drag over the frame belongs to the marks rectangle
 - `fold_pending()`: queued panel requests, dropped when the frame no longer allows them
 
 Notes:
@@ -37,6 +40,9 @@ The chrome row holds four buttons — «Применить», «Сравнить
 and «Сравнить» is a MOMENTARY HOLD, not a toggle: while its pointer button is down the pending
 result layer is not painted, so the original pixels show through. That is why the row is sensed
 BEFORE the frame's contents are painted.
+The marks brush paints a colour layer under the masks with a brush of its OWN radius; in marks
+mode Ctrl/Cmd+drag over the body draws an unfilled rectangle instead of reaching the canvas zoom,
+which is why the frame tells the host when it wants that gesture (`blocks_ctrl_primary_zoom`).
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§1, §2 D1-D6/D10, §10).
 */
 
@@ -45,7 +51,7 @@ use super::geometry::{
     keep_in_view_delta,
 };
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
-use super::layers::{MaskLayerSpec, MaskStack, ResultLayer};
+use super::layers::{MaskLayerSpec, MaskStack, ResultLayer, hollow_rect_boxes};
 use super::render;
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_tools::MaskBrush;
@@ -127,6 +133,46 @@ pub enum FrameVisual {
     Occupied,
 }
 
+/// What the brush paints into: the active mask layer or the colour marks layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintTarget {
+    /// The active mask layer («Рисовать маску»), with the mask brush.
+    Mask,
+    /// The colour marks layer («Рисовать метки»), with the marks brush and colour.
+    Marks,
+}
+
+/// The default marks colour: a vivid red that reads over almost any page — the red cell of
+/// the preset palette the marks picker offers.
+const DEFAULT_MARKS_COLOR: Color32 = Color32::from_rgb(230, 30, 30);
+
+/// The marks brush radius the first switch to marks mode starts from: a quarter of the mask
+/// brush the user had, and never less than one pixel. Marks are thin annotations (arrows,
+/// outlines) drawn next to a mask that covers whole areas, so a brush 4x smaller is the useful
+/// default; afterwards each brush keeps its own radius.
+#[must_use]
+fn initial_marks_radius(mask_radius: usize) -> usize {
+    (mask_radius / 4).max(1)
+}
+
+/// A fresh marks brush starting at `initial_marks_radius` of `mask_brush`.
+#[must_use]
+fn marks_brush_from(mask_brush: &MaskBrush) -> MaskBrush {
+    let mut brush = MaskBrush::default();
+    // The answer says whether the clamp changed anything; a fresh brush has nothing to compare.
+    brush.set_radius_px(initial_marks_radius(mask_brush.radius_px()));
+    brush
+}
+
+/// A Ctrl/Cmd+drag marks rectangle in flight: both corners in region pixels, and whether its
+/// release erases (decided once, at the press, by the same rule a stroke uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarksRectGesture {
+    start: (i32, i32),
+    end: (i32, i32),
+    erase: bool,
+}
+
 /// What the host tool hands the frame for one pass.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameHost<'a> {
@@ -183,17 +229,21 @@ pub struct FrameButtons {
     pub compare: bool,
     /// «Отменить»: a result is pending, or work is running and can be cancelled.
     pub cancel: bool,
-    /// «Стереть маску»: the mask stack holds something to erase.
+    /// «Стереть маску»: the mask stack holds something to erase — a mask pixel or a mark.
     pub clear_mask: bool,
 }
 
 /// The lock a frame is under, from the four facts that can hold it.
 ///
+/// `mask_empty` means the frame holds NOTHING the user drew — no mask pixel and no mark: marks
+/// are work exactly like a mask, and a resize would clear them just the same.
+///
 /// Precedence is `Processing` > `ResultPending` > `MaskPainted` > `Free`: the strongest
 /// reason present is the one reported, so the status line names the state the user must
 /// resolve first.
 ///
-/// `stroke_in_flight` — a paint or erase stroke whose button is still down — locks the frame
+/// `stroke_in_flight` — a paint or erase stroke, or a marks rectangle, whose button is still
+/// down — locks the frame
 /// as `MaskPainted` even while the mask is empty. Without it, erasing the last painted pixel
 /// mid-stroke unlocks the frame BEFORE the button is released, and the page transition, the
 /// keep-in-view clamp and the mask resize they can trigger then run under the live stroke:
@@ -246,8 +296,12 @@ fn derive_visual(lock: FrameLock, violation: Option<SizeViolation>) -> FrameVisu
 /// consumer whose run regenerates the WHOLE region has nothing for the user to paint, so
 /// demanding a stroke first would make its own mode unreachable. The size check and the lock
 /// still apply unchanged.
+///
+/// `mask_empty` is about the MASK layers only — marks alone never enable «Обработать», they
+/// annotate a run, they do not describe one — while «Стереть маску» clears the marks too, so it
+/// is offered while either holds something (`marks_empty`).
 #[must_use]
-fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool, allows_empty_mask: bool) -> FrameButtons {
+fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool, marks_empty: bool, allows_empty_mask: bool) -> FrameButtons {
     let processing = matches!(lock, FrameLock::Processing);
     let has_result = matches!(lock, FrameLock::ResultPending);
     FrameButtons {
@@ -257,7 +311,7 @@ fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty:
         apply: has_result,
         compare: has_result,
         cancel: has_result || processing,
-        clear_mask: !mask_empty,
+        clear_mask: !mask_empty || !marks_empty,
     }
 }
 
@@ -455,7 +509,15 @@ pub struct RegionFrame {
     result: Option<ResultLayer>,
     processing: bool,
     drag: Option<DragState>,
+    /// The mask brush. Its radius is independent of the marks brush's.
     brush: MaskBrush,
+    /// The marks brush, `None` until the first switch to `PaintTarget::Marks`, which creates it
+    /// at `initial_marks_radius` of the mask brush; it keeps its own radius from then on.
+    marks_brush: Option<MaskBrush>,
+    /// What a stroke paints into right now.
+    paint_target: PaintTarget,
+    /// The colour a marks stroke or rectangle paints with.
+    marks_color: Color32,
     /// Whether a PRIMARY-button stroke erases instead of painting. The secondary button
     /// erases regardless of it, so this is the panel's mode, not the whole erase policy.
     erase: bool,
@@ -463,6 +525,17 @@ pub struct RegionFrame {
     /// `Some` for exactly as long as the stroke's button is held, which is also what makes it
     /// the frame's "a stroke is in flight" flag (`derive_lock`, `drag_active`).
     last_paint_px: Option<(i32, i32)>,
+    /// The Ctrl/Cmd+drag marks rectangle in flight, committed as ONE undo step on release.
+    /// Locks the frame and counts as a gesture exactly like a stroke.
+    marks_rect: Option<MarksRectGesture>,
+    /// Set by the host while something outside the frame owns the next click — the marks
+    /// colour eyedropper — so the press that samples a colour does not also paint.
+    painting_suppressed: bool,
+    /// Whether, in the last drawn pass with NO pointer button down, the frame was in marks mode,
+    /// paintable, with its body hovered and `Z` not held — the state in which a Ctrl/Cmd press
+    /// over the body starts a marks rectangle rather than a canvas zoom drag
+    /// (`blocks_ctrl_primary_zoom`). Frozen while a button is down (`update_ctrl_rect_arm`).
+    ctrl_rect_armed: bool,
     /// Whether the chrome's «Сравнить» button is being HELD right now, which hides the pending
     /// result so the original pixels show through.
     ///
@@ -519,8 +592,14 @@ impl RegionFrame {
             processing: false,
             drag: None,
             brush: MaskBrush::default(),
+            marks_brush: None,
+            paint_target: PaintTarget::Mask,
+            marks_color: DEFAULT_MARKS_COLOR,
             erase: false,
             last_paint_px: None,
+            marks_rect: None,
+            painting_suppressed: false,
+            ctrl_rect_armed: false,
             compare_held: false,
             pending: PendingRequests::default(),
             hitbox: None,
@@ -622,7 +701,13 @@ impl RegionFrame {
     /// The lock the frame is under, derived from its contents (D4).
     #[must_use]
     pub fn lock(&self) -> FrameLock {
-        derive_lock(self.processing, self.result.is_some(), self.masks.is_empty(), self.last_paint_px.is_some())
+        derive_lock(self.processing, self.result.is_some(), self.masks.is_blank(), self.stroke_in_flight())
+    }
+
+    /// Whether a paint gesture's button is still down: a stroke or a marks rectangle.
+    #[must_use]
+    fn stroke_in_flight(&self) -> bool {
+        self.last_paint_px.is_some() || self.marks_rect.is_some()
     }
 
     /// The colour state, i.e. the lock combined with the size check (D6).
@@ -655,7 +740,7 @@ impl RegionFrame {
     /// Which of the four actions are available right now.
     #[must_use]
     pub fn buttons(&self) -> FrameButtons {
-        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty(), self.allows_empty_mask)
+        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty(), self.masks.marks_is_empty(), self.allows_empty_mask)
     }
 
     #[must_use]
@@ -687,13 +772,85 @@ impl RegionFrame {
         if on {
             // A run starts from the mask as it is; a stroke may not continue into it.
             self.last_paint_px = None;
+            self.marks_rect = None;
         }
     }
 
-    /// The brush the frame paints its mask with. The host tool routes wheel events into
-    /// `MaskBrush::handle_wheel` through this, so the radius policy lives in ONE place.
-    pub fn brush_mut(&mut self) -> &mut MaskBrush {
-        &mut self.brush
+    /// The brush of the CURRENT paint target — the mask brush or the marks brush. The host
+    /// tool routes the panel slider, wheel events and the size shortcuts through this, so the
+    /// radius policy lives in ONE place (`MaskBrush`) and always acts on the brush in use.
+    pub fn active_brush_mut(&mut self) -> &mut MaskBrush {
+        match self.paint_target {
+            PaintTarget::Mask => &mut self.brush,
+            // `set_paint_target` creates the marks brush before the target can become `Marks`;
+            // the insert is the same initialization, restated so this accessor is total.
+            PaintTarget::Marks => self.marks_brush.get_or_insert_with(|| marks_brush_from(&self.brush)),
+        }
+    }
+
+    /// The brush of the current paint target, read-only.
+    #[must_use]
+    fn active_brush(&self) -> &MaskBrush {
+        match (self.paint_target, self.marks_brush.as_ref()) {
+            (PaintTarget::Marks, Some(marks)) => marks,
+            (PaintTarget::Marks, None) | (PaintTarget::Mask, _) => &self.brush,
+        }
+    }
+
+    /// What the brush paints into right now.
+    #[must_use]
+    pub fn paint_target(&self) -> PaintTarget {
+        self.paint_target
+    }
+
+    /// Switches what the brush paints into. The first switch to `Marks` creates the marks
+    /// brush at a quarter of the mask brush's radius (`initial_marks_radius`); later switches
+    /// keep both radii as the user left them. A gesture in flight is ended without commit.
+    pub fn set_paint_target(&mut self, target: PaintTarget) {
+        if target == self.paint_target {
+            return;
+        }
+        if target == PaintTarget::Marks && self.marks_brush.is_none() {
+            self.marks_brush = Some(marks_brush_from(&self.brush));
+        }
+        self.paint_target = target;
+        self.last_paint_px = None;
+        self.marks_rect = None;
+    }
+
+    /// The colour marks are painted with.
+    #[must_use]
+    pub fn marks_color(&self) -> Color32 {
+        self.marks_color
+    }
+
+    /// Sets the colour of the next marks stroke or rectangle; marks already drawn keep theirs.
+    pub fn set_marks_color(&mut self, color: Color32) {
+        self.marks_color = color;
+    }
+
+    /// Suppresses painting (and the brush ring) while `on`: the host sets it while the marks
+    /// colour eyedropper waits for its sampling click, so that click does not paint too. A
+    /// gesture in flight ends without commit.
+    pub fn set_painting_suppressed(&mut self, on: bool) {
+        self.painting_suppressed = on;
+        if on {
+            self.last_paint_px = None;
+            self.marks_rect = None;
+        }
+    }
+
+    /// Whether a Ctrl/Cmd+primary drag over the frame belongs to the frame right now: marks mode
+    /// armed by the last button-free pass (`update_ctrl_rect_arm`), or a marks rectangle in
+    /// flight. The host answers `CleaningTool::block_canvas_zoom_on_ctrl_primary` with it.
+    ///
+    /// Conditional, never a constant: switching the canvas zoom off mid-gesture cancels a
+    /// running zoom drag, and over the rest of the canvas Ctrl+drag must keep zooming. `Z` is
+    /// excluded because `Z`+drag stays a canvas zoom in every mode. Read one pass late, because
+    /// the tab asks before the pass runs.
+    #[must_use]
+    pub fn blocks_ctrl_primary_zoom(&self) -> bool {
+        self.paint_target == PaintTarget::Marks && (self.ctrl_rect_armed || self.marks_rect.is_some())
     }
 
     /// Whether a primary-button stroke currently ERASES instead of painting.
@@ -748,6 +905,10 @@ impl RegionFrame {
     fn cancel_gestures(&mut self) {
         self.drag = None;
         self.last_paint_px = None;
+        // An uncommitted rectangle is dropped, never committed: the geometry it was measured
+        // against is gone for this pass.
+        self.marks_rect = None;
+        self.ctrl_rect_armed = false;
         // A hold is a gesture too: nothing may keep hiding a result the frame no longer draws.
         self.compare_held = false;
     }
@@ -762,7 +923,7 @@ impl RegionFrame {
     /// the same way.
     #[must_use]
     pub fn drag_active(&self) -> bool {
-        self.drag.is_some() || self.last_paint_px.is_some()
+        self.drag.is_some() || self.stroke_in_flight()
     }
 
     /// Whether `pos` (screen points) lies on the frame's hitbox — the frame plus its top
@@ -794,6 +955,11 @@ impl RegionFrame {
         }
         match lock {
             FrameLock::Free => t!("cleaning.region_frame.status.free").to_string(),
+            // Only marks hold the frame: saying "a mask is painted" would send the user looking
+            // for a mask that is not there.
+            FrameLock::MaskPainted if self.masks.is_empty() && !self.masks.marks_is_empty() => {
+                t!("cleaning.region_frame.status.marks_drawn").to_string()
+            }
             FrameLock::MaskPainted => t!("cleaning.region_frame.status.mask_painted").to_string(),
             FrameLock::ResultPending => t!("cleaning.region_frame.status.result_pending").to_string(),
             FrameLock::Processing => t!("cleaning.region_frame.status.processing").to_string(),
@@ -1052,6 +1218,7 @@ impl RegionFrame {
         }
         let body = ui.interact(cx.frame_screen, Id::new((FRAME_AREA_ID, "body")), Sense::click_and_drag());
         self.sense_mask_painting(ui, &body, cx.frame_screen);
+        self.update_ctrl_rect_arm(ui, &body);
         // The pointer of a drag already claimed through a `Response`: the occlusion test ran
         // when the drag started, so following it raw afterwards is what egui itself does.
         let pointer = ui.ctx().input(|i| i.pointer.interact_pos());
@@ -1074,7 +1241,7 @@ impl RegionFrame {
         // The rows lie strictly below the frame body and below the bottom handles, so drawing
         // them first changes neither the picture nor any widget's pointer claim.
         self.draw_rows(ui, hitbox, frame_screen.bottom(), visual, &mut outcome);
-        self.paint_contents(ui, frame_screen, lock);
+        self.paint_contents(ui, frame_screen, rect_px, lock);
         render::paint_frame_border(ui.painter(), frame_screen, visual);
         render::paint_handles(ui.painter(), frame_screen, visual, lock.is_free());
 
@@ -1085,17 +1252,42 @@ impl RegionFrame {
         outcome
     }
 
-    /// Paints the mask layers and, on top of them, the pending result (§6 of the design:
-    /// index order, the result last).
+    /// Re-decides `ctrl_rect_armed`, which the tab reads BEFORE the next pass
+    /// (`blocks_ctrl_primary_zoom`).
+    ///
+    /// Decided only in a pass where NO pointer button is down, and frozen otherwise. The canvas
+    /// zoom drag is raw input, not an egui-dragged widget, so `body.hovered()` turns true the
+    /// moment a Ctrl+drag that started on the page crosses the body; arming then would flip the
+    /// block on mid-gesture and cancel that zoom. Frozen, the arm keeps the value it had when
+    /// the button went down: off for a drag that started elsewhere, on for a press that started
+    /// over the body (which is the rectangle). Armed only where a rectangle could actually
+    /// start — a frame that refuses painting leaves Ctrl+drag to the canvas zoom.
+    fn update_ctrl_rect_arm(&mut self, ui: &egui::Ui, body: &egui::Response) {
+        let (any_down, z_down) = ui.ctx().input(|i| (i.pointer.any_down(), i.key_down(egui::Key::Z)));
+        if any_down {
+            return;
+        }
+        self.ctrl_rect_armed = self.paint_target == PaintTarget::Marks
+            && self.mask_paintable()
+            && !self.painting_suppressed
+            && body.hovered()
+            && !z_down;
+    }
+
+    /// Paints the marks, the mask layers over them and, on top, the pending result (§6 of the
+    /// design: marks, then masks in index order, the result last). A marks rectangle in
+    /// flight is previewed between the marks and the masks, where it will land.
     ///
     /// The result is SKIPPED while «Сравнить» is held (`result_hidden`), which is the whole
     /// point of that button: the user sees the original pixels under the pending result. The
-    /// mask layers keep drawing in both states — they are the user's own marking, equally
-    /// present before and after the run, and blinking them would disturb the comparison.
-    fn paint_contents(&mut self, ui: &mut egui::Ui, frame_screen: Rect, lock: FrameLock) {
+    /// mask layers and the marks keep drawing in both states — they are the user's own marking,
+    /// equally present before and after the run, and blinking them would disturb the comparison.
+    fn paint_contents(&mut self, ui: &mut egui::Ui, frame_screen: Rect, rect_px: OverlayRectPx, lock: FrameLock) {
         let ctx = ui.ctx().clone();
         self.masks.ensure_textures(&ctx);
-        self.masks.draw(ui.painter(), frame_screen);
+        self.masks.draw_marks(ui.painter(), frame_screen);
+        self.paint_marks_rect_preview(ui, frame_screen, rect_px);
+        self.masks.draw_masks(ui.painter(), frame_screen);
         let hidden = result_hidden(self.buttons(), self.compare_held);
         if let Some(result) = self.result.as_mut()
             && !hidden
@@ -1188,33 +1380,68 @@ impl RegionFrame {
         self.rect_px = Some(next);
     }
 
-    /// Paints a stroke into the active mask layer while the body is being dragged.
+    /// Paints a stroke into the active mask layer, or into the marks layer, while the body is
+    /// being dragged; in marks mode a Ctrl/Cmd+drag draws an unfilled rectangle instead.
     ///
     /// The right mouse button always erases, whatever mode a panel offers — the one gesture
     /// users expect for undoing a stray stroke (the same rule the FLUX.2 klein engine follows,
-    /// `tools/ai_editor/engines/flux2_klein/`).
+    /// `tools/ai_editor/engines/flux2_klein/`). A marks stroke and a marks rectangle follow the
+    /// same erase rule and erase to transparent.
     fn sense_mask_painting(&mut self, ui: &mut egui::Ui, body: &egui::Response, frame_screen: Rect) {
         let Some(rect_px) = self.rect_px else {
             return;
         };
-        if !self.mask_paintable() || self.drag.is_some() {
+        if !self.mask_paintable() || self.drag.is_some() || self.painting_suppressed {
             self.last_paint_px = None;
+            self.marks_rect = None;
             return;
         }
-        let (primary, secondary, mods, z_down) = ui.ctx().input(|i| {
+        let (primary, primary_pressed, secondary, mods, z_down) = ui.ctx().input(|i| {
             (
                 i.pointer.primary_down(),
+                i.pointer.primary_pressed(),
                 i.pointer.secondary_down(),
                 i.modifiers,
                 i.key_down(egui::Key::Z),
             )
         });
+        let image_size = [rect_px.w, rect_px.h];
+        // A rectangle in flight follows the pointer until the primary button is released and
+        // is committed then — whatever the modifiers do meanwhile, so letting go of Ctrl early
+        // neither drops the rectangle nor turns the rest of the drag into a stroke.
+        if let Some(mut gesture) = self.marks_rect {
+            if primary {
+                if let Some(pointer) = body.interact_pointer_pos() {
+                    gesture.end = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
+                }
+                self.marks_rect = Some(gesture);
+                ui.ctx().request_repaint();
+            } else {
+                self.marks_rect = None;
+                self.commit_marks_rect(gesture);
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
         // Ctrl / Cmd / Z are the canvas' zoom modifiers, and Ctrl+drag over the frame zooms the
         // page (`canvas/mod.rs::handle_shortcuts` tests only `canvas_rect`, not occlusion). A
-        // zoom gesture must not leave a stroke behind on the mask, so painting is suppressed
-        // exactly as the region editor suppresses it.
-        if mods.ctrl || mods.command || z_down {
+        // zoom gesture must not leave a stroke behind, so a stroke is suppressed exactly as the
+        // region editor suppresses it. In marks mode Ctrl/Cmd is the rectangle gesture instead:
+        // the host then blocks the canvas zoom for it (`blocks_ctrl_primary_zoom`).
+        let rect_modifier = mods.ctrl || mods.command;
+        if z_down || rect_modifier {
             self.last_paint_px = None;
+            if !z_down
+                && self.paint_target == PaintTarget::Marks
+                && primary
+                && primary_pressed
+                && let Some(pointer) = body.interact_pointer_pos()
+            {
+                let at = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
+                let erase = stroke_erases(true, false, mods.shift, self.erase);
+                self.marks_rect = Some(MarksRectGesture { start: at, end: at, erase });
+                ui.ctx().request_repaint();
+            }
             return;
         }
         // `interact_pointer_pos` is `Some` only while EGUI decided this widget owns the
@@ -1227,16 +1454,71 @@ impl RegionFrame {
             self.last_paint_px = None;
             return;
         }
-        let to = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, [rect_px.w, rect_px.h]);
+        let to = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
         let from = self.last_paint_px.unwrap_or(to);
-        if self.last_paint_px.is_none() {
-            // One snapshot per stroke, taken before the first segment reaches the buffer.
-            self.masks.push_undo();
-        }
+        let starting = self.last_paint_px.is_none();
         let erase = stroke_erases(primary, secondary, mods.shift, self.erase);
-        self.masks.paint_segment(from, to, self.brush.radius_px(), erase);
+        let radius = self.active_brush().radius_px();
+        // One snapshot per stroke, taken before the first segment reaches the buffer, into the
+        // one history both layers share.
+        match self.paint_target {
+            PaintTarget::Mask => {
+                if starting {
+                    self.masks.push_undo();
+                }
+                self.masks.paint_segment(from, to, radius, erase);
+            }
+            PaintTarget::Marks => {
+                if starting {
+                    self.masks.push_marks_undo();
+                }
+                self.masks.paint_marks_segment(from, to, radius, self.marks_color, erase);
+            }
+        }
         self.last_paint_px = Some(to);
         ui.ctx().request_repaint();
+    }
+
+    /// Wall thickness of a marks rectangle, in region pixels: the marks brush's DIAMETER, so a
+    /// rectangle reads as a stroke of the same brush.
+    #[must_use]
+    fn marks_rect_thickness(&self) -> usize {
+        self.active_brush().radius_px().saturating_mul(2).max(1)
+    }
+
+    /// Commits a released marks rectangle into the marks layer as ONE undo step.
+    ///
+    /// A press released where it started is a Ctrl+click, not a rectangle: it leaves nothing
+    /// behind and takes no undo step, so a stray click never drops a dot on the marks.
+    fn commit_marks_rect(&mut self, gesture: MarksRectGesture) {
+        if gesture.start == gesture.end {
+            return;
+        }
+        let (w, h) = self.masks.size();
+        let boxes = hollow_rect_boxes(w, h, gesture.start, gesture.end, self.marks_rect_thickness());
+        if boxes.is_empty() {
+            return;
+        }
+        self.masks.push_marks_undo();
+        self.masks.paint_marks_boxes(&boxes, self.marks_color, gesture.erase);
+    }
+
+    /// Paints the marks rectangle in flight exactly where its release will land: the pixel
+    /// boxes `hollow_rect_boxes` yields, mapped onto the frame's screen rect.
+    fn paint_marks_rect_preview(&self, ui: &egui::Ui, frame_screen: Rect, rect_px: OverlayRectPx) {
+        let Some(gesture) = self.marks_rect else {
+            return;
+        };
+        if rect_px.w == 0 || rect_px.h == 0 {
+            return;
+        }
+        let scale = vec2(frame_screen.width() / px_f32(rect_px.w), frame_screen.height() / px_f32(rect_px.h));
+        let to_screen = |x: usize, y: usize| frame_screen.min + vec2(px_f32(x) * scale.x, px_f32(y) * scale.y);
+        let boxes: Vec<Rect> = hollow_rect_boxes(rect_px.w, rect_px.h, gesture.start, gesture.end, self.marks_rect_thickness())
+            .into_iter()
+            .map(|(x0, y0, x1, y1)| Rect::from_min_max(to_screen(x0, y0), to_screen(x1, y1)))
+            .collect();
+        render::paint_marks_rect_preview(ui.painter(), &boxes, (!gesture.erase).then_some(self.marks_color));
     }
 
     /// Applies the two brush-size gestures of the region editor while the pointer is over the
@@ -1264,7 +1546,9 @@ impl RegionFrame {
         if mods.ctrl || mods.command || z_down {
             return;
         }
-        let mut changed = self.brush.handle_size_shortcuts(ui.ctx());
+        // The brush of the current target: the mask and the marks brush keep separate radii.
+        let brush = self.active_brush_mut();
+        let mut changed = brush.handle_size_shortcuts(ui.ctx());
         // With Shift some backends remap the wheel into horizontal scrolling, so fall back to
         // the X component. The delta is tested before the call because `handle_wheel` answers
         // "handled" for every Shift-held frame, and repainting on that alone would spin the
@@ -1273,7 +1557,7 @@ impl RegionFrame {
         if wheel.abs() <= f32::EPSILON {
             wheel = scroll.x;
         }
-        if wheel.abs() > f32::EPSILON && self.brush.handle_wheel(wheel, mods) {
+        if wheel.abs() > f32::EPSILON && brush.handle_wheel(wheel, mods) {
             changed = true;
         }
         if changed {
@@ -1288,9 +1572,10 @@ impl RegionFrame {
     /// pointer is occluded, and the frame occludes it over its own hitbox — a ring requested
     /// from that hook could therefore never appear over the one rectangle it belongs to.
     /// Nothing is drawn while a stroke could not reach the mask, so the ring never advertises
-    /// an edit the frame would refuse.
+    /// an edit the frame would refuse. The ring is the CURRENT brush's; in marks mode a thin
+    /// cross of the marks colour marks its centre.
     fn paint_brush_cursor(&self, ui: &mut egui::Ui, body: &egui::Response, frame_screen: Rect, rect_px: OverlayRectPx) {
-        if !self.mask_paintable() || !body.contains_pointer() {
+        if !self.mask_paintable() || self.painting_suppressed || !body.contains_pointer() {
             return;
         }
         // The hover DECISION came from the `Response` above; this reads only the position to
@@ -1301,7 +1586,10 @@ impl RegionFrame {
         else {
             return;
         };
-        self.brush.draw_circle_cursor_on_image(ui, frame_screen, [rect_px.w, rect_px.h], pointer);
+        self.active_brush().draw_circle_cursor_on_image(ui, frame_screen, [rect_px.w, rect_px.h], pointer);
+        if self.paint_target == PaintTarget::Marks && frame_screen.contains(pointer) {
+            render::paint_crosshair(ui.painter(), pointer, self.marks_color);
+        }
     }
 
     /// Rect of the drag grip: the strip minus the mask-layer chips on its right.
@@ -1533,19 +1821,19 @@ mod tests {
 
     #[test]
     fn buttons_of_a_free_frame_with_an_empty_mask() {
-        let b = derive_buttons(FrameLock::Free, None, true, false);
+        let b = derive_buttons(FrameLock::Free, None, true, true, false);
         assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: false, clear_mask: false });
     }
 
     #[test]
     fn buttons_of_a_painted_frame() {
-        let b = derive_buttons(FrameLock::MaskPainted, None, false, false);
+        let b = derive_buttons(FrameLock::MaskPainted, None, false, true, false);
         assert_eq!(b, FrameButtons { process: true, apply: false, compare: false, cancel: false, clear_mask: true });
     }
 
     #[test]
     fn buttons_of_a_painted_frame_with_an_invalid_size() {
-        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, false);
+        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, true, false);
         assert!(!b.process, "an invalid size must block processing");
         assert!(!b.compare, "there is no result to compare against yet");
         assert!(b.clear_mask, "erasing the mask is how the user gets back to a free frame");
@@ -1555,13 +1843,13 @@ mod tests {
     /// recovered, so «Обработать» stays disabled until the user applies or cancels.
     #[test]
     fn buttons_of_a_pending_result() {
-        let b = derive_buttons(FrameLock::ResultPending, None, false, false);
+        let b = derive_buttons(FrameLock::ResultPending, None, false, true, false);
         assert_eq!(b, FrameButtons { process: false, apply: true, compare: true, cancel: true, clear_mask: true });
     }
 
     #[test]
     fn buttons_while_processing() {
-        let b = derive_buttons(FrameLock::Processing, None, false, false);
+        let b = derive_buttons(FrameLock::Processing, None, false, true, false);
         // No result exists yet, so there is nothing for «Сравнить» to hide.
         assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: true, clear_mask: true });
     }
@@ -1880,7 +2168,7 @@ mod tests {
     fn compare_is_offered_exactly_when_apply_is() {
         for lock in [FrameLock::Free, FrameLock::MaskPainted, FrameLock::ResultPending, FrameLock::Processing] {
             for mask_empty in [false, true] {
-                let b = derive_buttons(lock, None, mask_empty, false);
+                let b = derive_buttons(lock, None, mask_empty, true, false);
                 assert_eq!(b.compare, b.apply, "lock {lock:?}, mask_empty {mask_empty}");
             }
         }
@@ -2003,7 +2291,7 @@ mod tests {
 
         // A pending result: apply and cancel are allowed, a second run is not (F4).
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false, false), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false, true, false), &mut outcome);
         assert_eq!(
             outcome,
             FrameOutcome { process_requested: false, apply_requested: true, cancel_requested: true, clear_mask_requested: false }
@@ -2011,7 +2299,7 @@ mod tests {
 
         // A free frame with an empty mask allows none of the three.
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::Free, None, true, false), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::Free, None, true, true, false), &mut outcome);
         assert_eq!(outcome, FrameOutcome::default());
     }
 
@@ -2254,6 +2542,238 @@ mod tests {
         assert!(stroke_erases(true, false, false, true), "the panel's erase mode erases");
         assert!(!stroke_erases(true, true, false, false), "with both buttons down the left one wins");
         assert!(stroke_erases(false, false, true, false), "Shift alone would erase once a button goes down");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The marks brush
+    // -----------------------------------------------------------------------------------
+
+    /// "By default, on switching, the marks brush is 4x smaller than the mask brush was" —
+    /// and never smaller than one pixel.
+    #[test]
+    fn the_marks_radius_starts_at_a_quarter_of_the_mask_radius() {
+        assert_eq!(initial_marks_radius(24), 6);
+        assert_eq!(initial_marks_radius(200), 50);
+        assert_eq!(initial_marks_radius(7), 1);
+        assert_eq!(initial_marks_radius(3), 1);
+        assert_eq!(initial_marks_radius(0), 1);
+    }
+
+    /// The first switch creates the marks brush from the mask brush; afterwards each brush
+    /// keeps its own radius, and the shared accessor always edits the brush in use.
+    #[test]
+    fn the_two_brushes_keep_separate_radii() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.active_brush_mut().set_radius_px(40);
+        frame.set_paint_target(PaintTarget::Marks);
+        assert_eq!(frame.active_brush_mut().radius_px(), 10, "a quarter of the mask brush");
+
+        frame.active_brush_mut().set_radius_px(3);
+        frame.set_paint_target(PaintTarget::Mask);
+        assert_eq!(frame.active_brush_mut().radius_px(), 40, "the mask brush is untouched");
+        frame.active_brush_mut().set_radius_px(80);
+        frame.set_paint_target(PaintTarget::Marks);
+        assert_eq!(frame.active_brush_mut().radius_px(), 3, "the marks brush is not re-derived on later switches");
+    }
+
+    /// Marks alone hold the frame (a resize would clear them) and say so in the status line,
+    /// but they never enable «Обработать»: they annotate a run, they do not describe one.
+    #[test]
+    fn marks_alone_lock_the_frame_without_enabling_the_run() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 32, 32));
+        frame.masks.paint_marks_segment((10, 10), (20, 10), 2, Color32::RED, false);
+        assert_eq!(frame.lock(), FrameLock::MaskPainted);
+        assert_eq!(frame.status_text(), t!("cleaning.region_frame.status.marks_drawn"));
+        let buttons = frame.buttons();
+        assert!(!buttons.process, "marks are not a mask");
+        assert!(buttons.clear_mask, "«Стереть маску» clears the marks too");
+
+        frame.masks.paint_segment((5, 5), (5, 5), 2, false);
+        assert_eq!(frame.status_text(), t!("cleaning.region_frame.status.mask_painted"), "a mask is named when there is one");
+        assert!(frame.buttons().process);
+    }
+
+    #[test]
+    fn marks_count_in_the_button_table_for_clearing_only() {
+        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, false);
+        assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: false, clear_mask: true });
+        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, true);
+        assert!(b.process, "an engine that runs without a mask still may");
+    }
+
+    /// The Ctrl+drag hook answers for the marks mode only, and only while the frame wants the
+    /// gesture: armed by hovering the body, or holding a rectangle in flight.
+    #[test]
+    fn the_ctrl_drag_zoom_block_belongs_to_the_marks_mode() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.ctrl_rect_armed = true;
+        assert!(!frame.blocks_ctrl_primary_zoom(), "mask mode never takes Ctrl+drag from the canvas");
+        frame.set_paint_target(PaintTarget::Marks);
+        assert!(frame.blocks_ctrl_primary_zoom());
+        frame.ctrl_rect_armed = false;
+        assert!(!frame.blocks_ctrl_primary_zoom(), "off the body the canvas keeps its zoom");
+        frame.marks_rect = Some(MarksRectGesture { start: (0, 0), end: (4, 4), erase: false });
+        assert!(frame.blocks_ctrl_primary_zoom(), "a rectangle in flight keeps the block wherever the pointer is");
+        assert!(frame.drag_active(), "and is a gesture");
+        assert_eq!(frame.lock(), FrameLock::MaskPainted, "that locks the frame");
+    }
+
+    /// Drives `sense_mask_painting` through a real `egui::Context`, one pass per entry, the
+    /// way the real pass runs it: the hover sensor, then the body, then the painting.
+    fn drive_body(frame: &mut RegionFrame, body: Rect, passes: Vec<(egui::Modifiers, Vec<egui::Event>)>) {
+        let ctx = egui::Context::default();
+        let hitbox = hitbox_rect(body, &chrome());
+        let screen_rect = hitbox.expand(200.0);
+        for (modifiers, pass_events) in passes {
+            let mut events = Vec::with_capacity(pass_events.len() + 1);
+            events.push(egui::Event::ModifiersChanged(modifiers));
+            events.extend(pass_events);
+            let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
+            // Headless: no renderer applies the texture deltas (see `drag_started_at`).
+            ctx.run_ui(input, |ui| {
+                // Allocated first to occlude, exactly as the real pass does; the `Response` is
+                // not needed here.
+                let _ = ui.allocate_rect(hitbox, Sense::hover());
+                let response = ui.interact(body, Id::new((FRAME_AREA_ID, "body")), Sense::click_and_drag());
+                frame.sense_mask_painting(ui, &response, body);
+                frame.update_ctrl_rect_arm(ui, &response);
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+
+    fn press(pos: Pos2, modifiers: egui::Modifiers, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers }
+    }
+
+    /// A Ctrl+drag in marks mode, over a 100x100 frame drawn 1:1 at (200, 300).
+    fn ctrl_drag(frame: &mut RegionFrame, from: Pos2, to: Pos2) {
+        let body = screen(200.0, 300.0, 300.0, 400.0);
+        let ctrl = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        drive_body(
+            frame,
+            body,
+            vec![
+                (ctrl, vec![egui::Event::PointerMoved(from)]),
+                (ctrl, vec![press(from, ctrl, true)]),
+                (ctrl, vec![egui::Event::PointerMoved(to)]),
+                (ctrl, vec![egui::Event::PointerMoved(to)]),
+                (ctrl, vec![press(to, ctrl, false)]),
+            ],
+        );
+    }
+
+    /// Ctrl+drag in marks mode draws an UNFILLED rectangle of wall thickness = brush diameter,
+    /// committed on release as one undo step.
+    #[test]
+    fn ctrl_drag_in_marks_mode_commits_a_hollow_rectangle() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        frame.set_paint_target(PaintTarget::Marks);
+        frame.active_brush_mut().set_radius_px(2);
+        frame.set_marks_color(Color32::BLUE);
+        ctrl_drag(&mut frame, pos2(210.0, 310.0), pos2(260.0, 370.0));
+
+        assert!(frame.marks_rect.is_none(), "the release ends the gesture");
+        assert!(frame.masks().is_empty(), "the rectangle never reaches a mask layer");
+        let px = |x: usize, y: usize| {
+            let at = (y * 100 + x) * 4;
+            frame.masks().marks_rgba()[at..at + 4].to_vec()
+        };
+        assert_eq!(px(10, 10), vec![0, 0, 255, 255], "the start corner");
+        assert_eq!(px(60, 70), vec![0, 0, 255, 255], "the end corner");
+        assert_eq!(px(13, 40), vec![0, 0, 255, 255], "inside a 4 px wall");
+        assert_eq!(px(14, 40), vec![0, 0, 0, 0], "just past the wall");
+        assert_eq!(px(35, 40), vec![0, 0, 0, 0], "the interior stays empty");
+        assert_eq!(px(61, 40), vec![0, 0, 0, 0], "outside the rectangle");
+
+        assert!(frame.masks_mut().undo(), "the rectangle is one undo step");
+        assert!(frame.masks().is_blank());
+    }
+
+    /// In mask mode Ctrl still belongs to the canvas zoom: nothing is painted, nothing starts.
+    #[test]
+    fn ctrl_drag_in_mask_mode_paints_nothing() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        ctrl_drag(&mut frame, pos2(210.0, 310.0), pos2(260.0, 370.0));
+        assert!(frame.masks().is_blank());
+        assert!(!frame.drag_active());
+    }
+
+    /// A plain drag in marks mode is a colour stroke into the marks layer only.
+    #[test]
+    fn a_plain_drag_in_marks_mode_paints_the_marks() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        frame.set_paint_target(PaintTarget::Marks);
+        let body = screen(200.0, 300.0, 300.0, 400.0);
+        let none = egui::Modifiers::NONE;
+        let (from, to) = (pos2(220.0, 320.0), pos2(250.0, 320.0));
+        drive_body(
+            &mut frame,
+            body,
+            vec![
+                (none, vec![egui::Event::PointerMoved(from)]),
+                (none, vec![press(from, none, true)]),
+                (none, vec![egui::Event::PointerMoved(to)]),
+                (none, vec![press(to, none, false)]),
+            ],
+        );
+        assert!(!frame.masks().marks_is_empty());
+        assert!(frame.masks().is_empty());
+        let at = (20 * 100 + 35) * 4;
+        assert_eq!(&frame.masks().marks_rgba()[at..at + 4], &[230, 30, 30, 255], "the default red, along the stroke");
+    }
+
+    /// The regression: a canvas Ctrl+drag zoom is raw input, so egui reports the body as
+    /// hovered as soon as such a drag crosses it. Arming then would block the zoom mid-gesture
+    /// and cancel it; the arm must stay as it was when the button went down.
+    #[test]
+    fn a_canvas_zoom_drag_crossing_the_body_does_not_arm_the_rectangle() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        frame.set_paint_target(PaintTarget::Marks);
+        let body = screen(200.0, 300.0, 300.0, 400.0);
+        let ctrl = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let outside = pos2(100.0, 150.0);
+        drive_body(
+            &mut frame,
+            body,
+            vec![
+                (ctrl, vec![egui::Event::PointerMoved(outside)]),
+                (ctrl, vec![press(outside, ctrl, true)]),
+                (ctrl, vec![egui::Event::PointerMoved(body.center())]),
+                (ctrl, vec![egui::Event::PointerMoved(body.center() + vec2(5.0, 5.0))]),
+            ],
+        );
+        assert!(!frame.blocks_ctrl_primary_zoom(), "a zoom drag that started on the page must keep zooming over the frame");
+        assert!(frame.masks().is_blank(), "and leaves nothing behind");
+
+        // The positive control: resting over the body with no button down arms it.
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        frame.set_paint_target(PaintTarget::Marks);
+        drive_body(
+            &mut frame,
+            body,
+            vec![(ctrl, vec![egui::Event::PointerMoved(body.center())]), (ctrl, vec![egui::Event::PointerMoved(body.center())])],
+        );
+        assert!(frame.blocks_ctrl_primary_zoom(), "hovering the body in marks mode claims Ctrl+drag");
+    }
+
+    /// While the host's eyedropper waits for its click, that click must not paint.
+    #[test]
+    fn suppressed_painting_leaves_the_layers_alone() {
+        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
+        frame.place_for_test(0, rect_px(0, 0, 100, 100));
+        frame.set_painting_suppressed(true);
+        let body = screen(200.0, 300.0, 300.0, 400.0);
+        let none = egui::Modifiers::NONE;
+        let at = pos2(220.0, 320.0);
+        drive_body(&mut frame, body, vec![(none, vec![egui::Event::PointerMoved(at)]), (none, vec![press(at, none, true)]), (none, vec![press(at, none, false)])]);
+        assert!(frame.masks().is_blank());
     }
 
     #[test]

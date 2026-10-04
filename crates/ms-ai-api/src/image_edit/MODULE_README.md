@@ -10,7 +10,8 @@ size-exact pipeline and the HTTP request descriptions the adapters produce.
 ## Architecture
 ```text
 caller: k = cleaning geometry upscale_factor_for(W, H, frame_constraints(offer.rule))
-  -> pipeline::prepare(request, offer)      validate, upscale_replicate xk, RGB PNG, native mask,
+  -> pipeline::prepare(request, offer)      validate, upscale_replicate xk, RGB PNG, optional
+                                            reference PNG (same xk, alpha kept), native mask,
                                             size labels, endpoint -> PreparedCall { EditCall }
   -> adapter (EditProtocol, per ApiShape)   EditCall -> HttpRequestSpec; response -> NextStep
   -> native executor                        HTTP, polling, cancel, download, key injection
@@ -33,10 +34,13 @@ only behind `keys.rs` / `key_state.rs`.
 - `size_rule.rs`: `ImageSizeRule` data (1:1 with the cleaning frame's `FrameConstraints`),
   `SizeEvidence`, `AspectTierEntry` tables (Gemini), the named rules.
 - `catalog.rs`: `ModelOffer` table (`offers`, `all_offers`, `lookup`), `MaskSupport`,
-  `SizeParamStyle`, retirement dates, the deliberate-exclusion list (file header).
+  `SizeParamStyle`, `max_extra_references` (sources at the rows and in
+  `dev-docs/image_edit/references.md`), retirement dates, the deliberate-exclusion list (file
+  header).
 - `request.rs`: `RgbaRegion` (validated), `ImageEditRequest`, `EndpointChoice`, `MaskBlend`,
   `ImageEditOutcome`, `ImageEditStage`, `CancelFlag`.
-- `codec.rs`: RGB PNG encode, native-mask PNG per `MaskPolarity`, bounded decode.
+- `codec.rs`: RGB PNG encode, reference PNG encode (RGBA only when translucent), native-mask
+  PNG per `MaskPolarity`, bounded decode.
 - `composite.rs`: `composite_feathered`.
 - `pipeline.rs`: `prepare` / `finish`, endpoint resolution, `run_image_edit` (native run over
   the executor; `run_with` takes the transport so tests script it).
@@ -72,6 +76,13 @@ only behind `keys.rs` / `key_state.rs`.
   `ms_raster::downscale_box`; `box(replicate(x)) == x`. A decoded size other than exactly
   `(kW, kH)` is `SizeMismatch`, never resized. `finish` returns exactly `W x H`, alpha 255
   (`SizeContractViolated` guards it).
+- **Reference image** (`ImageEditRequest::reference`, e.g. the user's marks): the source
+  region's size, straight alpha. Only an offer with `max_extra_references > 0` takes it
+  (`prepare` returns `ReferenceNotSupported` otherwise, never drops it); it is upscaled by the
+  image's own `k` (replicate, all four channels) and sent AFTER the edited image in the
+  adapter's list field; a single-image endpoint refuses it (`adapters::refuse_reference`). A
+  nonzero count needs documented multi-image input for that exact model / endpoint AND a list
+  field in its adapter (a test submits every such offer). It never touches the composite.
 - **Composite.** alpha = `box_blur_u8(dilate_square(mask, dilate), feather)`; pixels farther
   than `dilate + feather` from paint are bit-identical to the source; an empty mask (`None` or
   all zero) means the whole region. Applied for every provider, mask-capable ones included.

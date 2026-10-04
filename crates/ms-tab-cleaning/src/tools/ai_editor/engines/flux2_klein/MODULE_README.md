@@ -72,8 +72,9 @@ engine/        owns the state   -- builds the panel context, runs the workers
 Data flow of one edit:
 
 ```
-host frame + painted mask
+host frame + painted mask (+ marks reference)
         -> AiEngine::start           (engine/mod.rs)
+        -> run_input                 (engine/mod.rs) validates sizes, accepts the marks
         -> mask_for_run              (session.rs)   derives the working mode
         -> settings.normalized()     (settings.rs)  the ONLY value put on the wire
         -> run_flux2_klein           (wire.rs)      worker thread, streaming call
@@ -126,9 +127,10 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   `Flux2RateEstimator`, the streamed frame parsers and the byte/rate/duration formatters.
 - `session.rs`: `Flux2SessionState` (run channel + per-RUN undo stack), `Flux2RunPoll`,
   `mask_for_run`, `apply_backend_flags` and `spawn_flux2_picker`.
-- `wire.rs`: `run_flux2_klein` with its OOM retry pass, `flux2_stream_call`, the
-  `.status` and `.component_action` calls and their parsers, the prompt translation and
-  the image/mask blob packing (the PNGs come from `tools/region_png.rs`).
+- `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` with its OOM
+  retry pass, `flux2_stream_call`, the `.status` and `.component_action` calls and their
+  parsers, the prompt translation and the run request packing `flux2_run_request`
+  (header + `image ++ mask [++ reference]` blob; the PNGs come from `tools/region_png.rs`).
 - `test_support.rs`: `cfg(test)` only. The fixtures every `mod tests` here is built from
   (`runnable_settings`, `cacheable_settings`, `status_with_present`,
   `status_with_components`, `FLUX2_ALL_COMPONENTS`, `region_rect`,
@@ -146,6 +148,17 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 - **`mask_for_run` is the only place the working mode is decided** (`session.rs`): a
   painted mask travels verbatim with `whole_region = false`; an empty one becomes a
   SOLID mask, because the backend refuses `whole_region = true` otherwise.
+- **Marks travel as a SEPARATE REFERENCE by preference** (`marks_support` in
+  `engine/mod.rs`): the host composites the user's marks over a copy of the region and
+  hands it over as `RunMarks::Reference`; `run_input` checks it is the region's size and
+  the wire appends it as the optional third blob segment (`reference_len`), which the
+  backend passes to diffusers as `image_reference`. The region itself stays clean.
+  Compositing onto the region (`OverlayOnRegion`) is offered too and needs nothing here.
+  `TransparentLayer` is NOT supported — the pipeline flattens every condition image to
+  RGB — so a `RunMarks::Layer` that arrives anyway is refused and logged, never dropped.
+  The `.estimate` forecast takes no reference (the engine learns of the marks only at
+  `start`), so for a marked run the backend's pre-load guard counts a little more than
+  the forecast on screen — the reference's condition tokens.
 - **One progress bar, claimed by generation** (`progress.rs`): four operations — a run,
   `.prompt_cache.build`, `.component_action`, `.download.start` — share it, and a write
   from a retired generation is dropped. Gates that mean "wait for the current operation"
@@ -187,7 +200,12 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   `decisions.rs`; to change what a `.status` answer MEANS, see `status.rs`; to change how
   either LOOKS, see `ui/`.
 - To change a request or response shape, see `wire.rs`, `download.rs` or
-  `prompt_cache.rs` — the file that owns that method family.
+  `prompt_cache.rs` — the file that owns that method family. A change to the run blob
+  (`flux2_run_request`) is a protocol change: the Python split is `_split_request_blob` in
+  `modules/ai_backend/ipc/handlers/flux2_klein.py`, and `PROTOCOL_VERSION` is bumped on
+  both sides.
+- To change which marks modes the engine accepts or how a marks reference is validated,
+  see `marks_support` and `run_input` in `engine/mod.rs`.
 - To change the progress bar's arithmetic, see `progress.rs`; to change how it looks, see
   `ui/progress.rs`.
 - To change the run's undo history or the derived mask, see `session.rs`.

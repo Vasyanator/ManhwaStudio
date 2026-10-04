@@ -21,6 +21,9 @@ Main responsibilities:
   the answer into the frame's pending result or into a user-facing failure (D14)
 - run mask generation into the selected mask layer through the same region load
 - refuse a result whose size is not exactly the frame rect (D7), with a message and a log
+- own the marks mode (how the marks layer reaches the engine), keep it inside the selected
+  engine's `marks_support()` and package the marks into each run (`prepare_run_marks`)
+- own the marks colour selector, and keep its eyedropper click from also painting
 
 Key structures:
 - `HostSpec`: what a consumer tool declares to get a host of its own
@@ -36,6 +39,7 @@ Key functions:
 - `select_engine()`: applies an engine's constraints and mask layers to the frame
 - `capture_clean_overlay()`: the clean chunk that is composited over the page crop
 - `check_result_fits()`: the D7 size check, pure and unit-tested
+- `reconcile_marks_mode()`, `prepare_run_marks()`: the marks-mode rules, pure and unit-tested
 
 Notes:
 The panel bodies (`draw_ui` / `draw_main_panel` halves) live in the sibling `host_panels.rs`,
@@ -44,12 +48,13 @@ touches them. NOTHING here decodes an image on the GUI thread: the source region
 the shared region loader worker of `base.rs` (`spawn_region_loader_thread`, reused rather than
 copied, D10/D14), and the engine runs its own workers. `block_canvas_zoom()` stays `false` (D5):
 that flag also disables the clean-overlay undo shortcuts for the whole session. Blocking is
-precise instead — `captures_canvas_pointer` over the hitbox and
-`block_canvas_drag_scroll_on_primary` only during a live gesture.
+precise instead — `captures_canvas_pointer` over the hitbox,
+`block_canvas_drag_scroll_on_primary` only during a live gesture, and
+`block_canvas_zoom_on_ctrl_primary` only while the frame wants Ctrl+drag for a marks rectangle.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
-use super::engine::{AiEngine, EnginePoll, EngineRunRequest};
+use super::engine::{AiEngine, EnginePoll, EngineRunRequest, MarksMode, MarksSupport, RunMarks, composite_marks_over};
 use super::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::geometry::FrameConstraints;
 use super::layers::ResultLayer;
@@ -60,6 +65,7 @@ use crate::tools::base::{
 use crate::tools::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationSpawner, MaskGenerationState, MaskSource};
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_project::ProjectData;
+use ms_widgets::{ColorPresets, PresetDefaults, ViewportColorSelector};
 use eframe::egui;
 use egui::Pos2;
 use std::sync::Arc;
@@ -197,6 +203,112 @@ enum CaptureError {
     },
 }
 
+/// The marks mode to use under `support`: `current` while the engine supports it, otherwise
+/// the engine's preferred mode.
+///
+/// The per-frame half of the auto-switch rule (`select_engine` sets the preferred mode
+/// outright): the user's choice stands as long as it stays legal, and an engine that stops
+/// accepting it — a different API model picked in its own panel — moves it to its preference
+/// rather than leaving a mode the run cannot honour.
+#[must_use]
+fn reconcile_marks_mode(current: MarksMode, support: MarksSupport) -> MarksMode {
+    if support.supports(current) { current } else { support.preferred() }
+}
+
+/// Why the marks could not be packaged for a run. Each is a broken internal invariant (the
+/// marks layer always has the frame's size), reported rather than papered over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum MarksError {
+    /// The marks layer does not hold `4 * w * h` bytes for the region.
+    #[error("the marks layer holds {len} bytes, a {w}x{h} region needs {expected}")]
+    Shape { len: usize, w: usize, h: usize, expected: usize },
+}
+
+/// Packages the marks for one run: the region the engine edits and what travels beside it.
+///
+/// - nothing drawn (`marks_empty`): the region unchanged and `RunMarks::None`, whatever `mode`;
+/// - `OverlayOnRegion`: the marks composited onto the region ("over", straight alpha), and
+///   `RunMarks::None`;
+/// - `SeparateReference`: the region unchanged, and a composited copy as `RunMarks::Reference`;
+/// - `TransparentLayer`: the region unchanged, and the marks alone as `RunMarks::Layer`.
+///
+/// `mode` must already be one the engine supports (`reconcile_marks_mode`). `marks_rgba` is the
+/// frame's straight-alpha marks layer, 4 bytes per region pixel.
+///
+/// # Errors
+/// [`MarksError::Shape`] when `marks_rgba` is not exactly the region's size, so a layer of
+/// another shape is never stretched over the picture.
+fn prepare_run_marks(mode: MarksMode, region: egui::ColorImage, marks_rgba: &[u8], marks_empty: bool) -> Result<(egui::ColorImage, RunMarks), MarksError> {
+    if marks_empty {
+        return Ok((region, RunMarks::None));
+    }
+    let [w, h] = region.size;
+    let shape = MarksError::Shape { len: marks_rgba.len(), w, h, expected: w.saturating_mul(h).saturating_mul(4) };
+    match mode {
+        MarksMode::OverlayOnRegion => {
+            let composited = composite_marks_over(&region, marks_rgba).ok_or(shape)?;
+            Ok((composited, RunMarks::None))
+        }
+        MarksMode::SeparateReference => {
+            let reference = composite_marks_over(&region, marks_rgba).ok_or(shape)?;
+            Ok((region, RunMarks::Reference(reference)))
+        }
+        MarksMode::TransparentLayer => {
+            let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
+                return Err(shape);
+            };
+            let layer = image::RgbaImage::from_raw(w32, h32, marks_rgba.to_vec())
+                .filter(|layer| layer.as_raw().len() == marks_rgba.len())
+                .ok_or(shape)?;
+            Ok((region, RunMarks::Layer(layer)))
+        }
+    }
+}
+
+/// What a run that composited the marks INTO its region keeps, so the marks can be taken back
+/// out of the engine's answer (`restore_untouched_marked_pixels`).
+#[derive(Debug)]
+struct MarksRestore {
+    /// The region as loaded, without the marks.
+    original: egui::ColorImage,
+    /// The region exactly as the engine received it, marks composited.
+    sent: egui::ColorImage,
+}
+
+/// Takes the user's marks back out of an engine's answer: every pixel the marks changed in the
+/// SENT region (`sent != original`) that the engine returned UNTOUCHED (`result == sent`) is
+/// restored to the original, unmarked pixel. Returns how many pixels were restored.
+///
+/// Marks are instructions, never content. An inpainting engine composites its output only
+/// inside the mask and hands every other pixel back as it got it, so without this a mark drawn
+/// outside the mask would be merged into the clean overlay by «Применить». A pixel the engine
+/// CHANGED is kept: that is the engine's answer, whatever it replaced. A mark whose colour
+/// equals the pixel under it changed nothing, so testing `sent != original` is the same as
+/// testing the mark's alpha, without keeping a copy of the marks layer.
+///
+/// Changes nothing and returns `0` when the three images are not the same size — the caller
+/// has already refused a result of the wrong size, so this is a guard, not a path.
+fn restore_untouched_marked_pixels(result: &mut egui::ColorImage, original: &egui::ColorImage, sent: &egui::ColorImage) -> usize {
+    if result.size != original.size || result.size != sent.size {
+        return 0;
+    }
+    let mut restored = 0usize;
+    for ((out, before), sent) in result.pixels.iter_mut().zip(&original.pixels).zip(&sent.pixels) {
+        if sent != before && out == sent {
+            *out = *before;
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// The fixed colour set the marks colour picker offers. Not persisted in this version: the
+/// shipped palette is already a set of clearly distinct colours, which is what marks need.
+#[must_use]
+fn marks_color_presets() -> ColorPresets {
+    ColorPresets::from_defaults(PresetDefaults::Palette)
+}
+
 /// A line the tool shows under its main panel's status line.
 #[derive(Debug, Clone)]
 pub(super) struct ToolMessage {
@@ -287,6 +399,21 @@ pub struct RegionEditHost {
     /// `draw_overlay_ui`. A panel body may mutate only the tool, and starting the job needs
     /// the canvas and the project — the same reason «Обработать» goes through the frame.
     pub(super) generate_mask_requested: bool,
+    /// How the marks layer reaches the selected engine. Always one the engine supports: set to
+    /// its preferred mode on `select_engine`, kept legal every frame by `push_engine_rules`.
+    pub(super) marks_mode: MarksMode,
+    /// The marks colour widget of the compact panel; it owns the eyedropper state.
+    pub(super) marks_color_selector: ViewportColorSelector,
+    /// The colour cells the marks picker offers (`marks_color_presets`). Edits live for the
+    /// session only.
+    pub(super) marks_presets: ColorPresets,
+    /// Whether the compact panel drew the marks colour selector in THIS frame. Painting is
+    /// suppressed for the eyedropper only then: a selector that is not drawn cannot sample or
+    /// end its sampling, and must not keep the brush disabled from behind a closed panel.
+    pub(super) marks_selector_drawn: bool,
+    /// `Some` while a run that composited the marks into its region is in flight: what
+    /// `accept_result` needs to take them back out of the answer. Dropped with the run.
+    marks_restore: Option<MarksRestore>,
 }
 
 impl std::fmt::Debug for RegionEditHost {
@@ -312,14 +439,14 @@ impl RegionEditHost {
     #[must_use]
     pub(in crate::tools) fn new(spec: &'static HostSpec) -> Self {
         let engines = (spec.catalog)();
-        let (constraints, layers) = match engines.first() {
-            Some(engine) => (engine.constraints(), engine.mask_layers()),
+        let (constraints, layers, marks_mode) = match engines.first() {
+            Some(engine) => (engine.constraints(), engine.mask_layers(), engine.marks_support().preferred()),
             None => {
                 ms_log::runtime_log::log_error(format!(
                     "{} the engine catalog is empty: the tool can paint a mask but can run nothing",
                     spec.log_tag
                 ));
-                (NO_ENGINE_CONSTRAINTS, Vec::new())
+                (NO_ENGINE_CONSTRAINTS, Vec::new(), MarksSupport::OVERLAY_ONLY.preferred())
             }
         };
         let (load_tx, load_rx, load_thread) = spawn_region_loader_thread();
@@ -341,6 +468,11 @@ impl RegionEditHost {
             spawn_detection: mask_generation::spawn_mask_generation,
             mask_generation_rx: None,
             generate_mask_requested: false,
+            marks_mode,
+            marks_color_selector: ViewportColorSelector::default(),
+            marks_presets: marks_color_presets(),
+            marks_selector_drawn: false,
+            marks_restore: None,
         }
     }
 }
@@ -441,13 +573,23 @@ impl RegionEditHost {
         let constraints = engine.constraints();
         let layers = engine.mask_layers();
         let allows_empty = engine.allows_empty_mask();
+        // A switch always starts from the new engine's own preference; the user's choice
+        // under the previous engine says nothing about what this one handles best.
+        self.marks_mode = engine.marks_support().preferred();
         self.frame.set_constraints(constraints);
         self.frame.set_mask_layers(&layers);
         self.frame.set_allows_empty_mask(allows_empty);
     }
 
-    /// Re-reads the two answers of the selected engine that may change with its own parameters
-    /// — `allows_empty_mask()` and `constraints()` — into the frame. Pass step 1, every frame.
+    /// The marks modes the selected engine accepts; the default set with no engine.
+    #[must_use]
+    pub(super) fn marks_support(&self) -> MarksSupport {
+        self.engine().map_or(MarksSupport::OVERLAY_ONLY, AiEngine::marks_support)
+    }
+
+    /// Re-reads the answers of the selected engine that may change with its own parameters —
+    /// `allows_empty_mask()` and `constraints()` into the frame, `marks_support()` into the
+    /// marks mode — and pushes the eyedropper's claim on the next click. Pass step 1, every frame.
     ///
     /// `set_constraints` re-validates and never resizes, so pushing an unchanged declaration
     /// every frame is free and a changed one turns a refused rectangle red. Mask layers are
@@ -458,6 +600,33 @@ impl RegionEditHost {
         self.frame.set_allows_empty_mask(allows_empty);
         let constraints = self.engine().map_or(NO_ENGINE_CONSTRAINTS, AiEngine::constraints);
         self.frame.set_constraints(constraints);
+        let support = self.marks_support();
+        let mode = reconcile_marks_mode(self.marks_mode, support);
+        if mode != self.marks_mode {
+            ms_log::runtime_log::log_info(format!(
+                "{} the engine no longer accepts marks as {:?}; switched to its preferred {:?}",
+                self.spec.log_tag, self.marks_mode, mode
+            ));
+            self.marks_mode = mode;
+        }
+        // The panel body ran earlier this frame; only a selector it actually drew can hold the
+        // click, and the flag is consumed so a closed panel releases the brush next frame.
+        let drawn = std::mem::take(&mut self.marks_selector_drawn);
+        if !drawn {
+            // A selector that was not drawn (mask mode, a hidden panel) cannot finish a sampling;
+            // left pending it would eat the first click after it reappears.
+            self.cancel_marks_eyedropper();
+        }
+        let selector = &self.marks_color_selector;
+        self.frame.set_painting_suppressed(drawn && (selector.eyedropper_active() || selector.primary_click_consumed_this_frame()));
+    }
+
+    /// Ends a pending marks-colour sampling, as Escape would, and puts back the colour the
+    /// sampling previews overwrote. A no-op when nothing is pending.
+    pub(super) fn cancel_marks_eyedropper(&mut self) {
+        if let Some(color) = self.marks_color_selector.cancel_eyedropper() {
+            self.frame.set_marks_color(color);
+        }
     }
 
     /// The clean-overlay pixels under `rect` of page `page_idx`, or `None` when the page has
@@ -716,18 +885,48 @@ impl RegionEditHost {
             return;
         }
 
+        // The mode is legal by `push_engine_rules`; re-checked here because a run must never
+        // hand an engine a form it refuses, and the fallback is logged rather than silent.
+        let support = self.marks_support();
+        let mode = reconcile_marks_mode(self.marks_mode, support);
+        if mode != self.marks_mode {
+            ms_log::runtime_log::log_warn(format!(
+                "{} run requested with marks as {:?}, which the engine does not accept; sending {:?}",
+                self.spec.log_tag, self.marks_mode, mode
+            ));
+        }
+        let frame_masks = self.frame.masks();
+        let marks_empty = frame_masks.marks_is_empty();
+        // Overlay mode puts the marks INTO the picture the engine edits; the unmarked region is
+        // kept so `accept_result` can take every untouched mark back out of the answer.
+        let original = (mode == MarksMode::OverlayOnRegion && !marks_empty).then(|| region.clone());
+        let (region, marks) = match prepare_run_marks(mode, region, frame_masks.marks_rgba(), marks_empty) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.frame.set_processing(false);
+                // An internal invariant broke (the marks layer always has the frame's size): say
+                // so, rather than blame the loaded region.
+                self.report_error(t!("cleaning.tools.area_editor.error_marks_shape").to_string(), &error);
+                return;
+            }
+        };
+        let restore = original.map(|original| MarksRestore { original, sent: region.clone() });
         let request = EngineRunRequest {
             page_idx: pending.page_idx,
             rect_px: rect,
             region,
             masks,
+            marks,
         };
         let outcome = match self.engine_mut() {
             Some(engine) => engine.start(request),
             None => Err(t!("cleaning.tools.area_editor.error_no_engine").to_string()),
         };
         match outcome {
-            Ok(()) => self.report_info(t!("cleaning.tools.area_editor.run_started_status").to_string()),
+            Ok(()) => {
+                self.marks_restore = restore;
+                self.report_info(t!("cleaning.tools.area_editor.run_started_status").to_string());
+            }
             Err(reason) => {
                 self.frame.set_processing(false);
                 self.report_error(reason, &"the engine refused the run request");
@@ -840,6 +1039,7 @@ impl RegionEditHost {
             EnginePoll::Idle | EnginePoll::Running => {}
             EnginePoll::Done(image) => self.accept_result(image),
             EnginePoll::Failed(reason) => {
+                self.marks_restore = None;
                 self.frame.set_processing(false);
                 self.report_error(reason, &"the engine reported a failed run");
             }
@@ -851,8 +1051,12 @@ impl RegionEditHost {
     /// The check is against the frame's CURRENT rectangle, which is the one the run started
     /// with — the frame is locked for the whole run — so a mismatch means the engine answered
     /// about something else and the result must not be applied anywhere.
-    fn accept_result(&mut self, image: egui::ColorImage) {
+    ///
+    /// A run that composited the marks into its region gets them taken back out first
+    /// (`restore_untouched_marked_pixels`): marks are instructions, never content.
+    fn accept_result(&mut self, mut image: egui::ColorImage) {
         self.frame.set_processing(false);
+        let restore = self.marks_restore.take();
         let Some(rect) = self.frame.rect_px() else {
             self.report_error(
                 t!("cleaning.tools.area_editor.error_no_frame").to_string(),
@@ -870,6 +1074,13 @@ impl RegionEditHost {
             );
             return;
         }
+        if let Some(restore) = restore {
+            let restored = restore_untouched_marked_pixels(&mut image, &restore.original, &restore.sent);
+            ms_log::runtime_log::log_info(format!(
+                "{} took the marks back out of the result: {restored} untouched marked pixel(s) restored",
+                self.spec.log_tag
+            ));
+        }
         self.frame.set_result(Some(ResultLayer::new(image)));
         self.report_info(t!("cleaning.tools.area_editor.result_ready_status").to_string());
     }
@@ -882,6 +1093,7 @@ impl RegionEditHost {
     /// meanwhile taken back.
     fn cancel_run(&mut self) {
         self.pending_load = None;
+        self.marks_restore = None;
         self.mask_generation_rx = None;
         self.generate_mask_requested = false;
         if let Some(engine) = self.engine_mut() {
@@ -951,6 +1163,8 @@ impl CleaningTool for RegionEditHost {
         self.cancel_run();
         self.frame.reset();
         self.message = None;
+        // The compact panel is not drawn for an inactive tool, so a pending sampling ends here.
+        self.cancel_marks_eyedropper();
     }
 
     /// The compact part of the tool's interface, in «Выбранный инструмент» (§13.1).
@@ -962,6 +1176,7 @@ impl CleaningTool for RegionEditHost {
         self.draw_layer_picker(ui);
         self.draw_mask_generation(ui);
         self.draw_mask_actions(ui);
+        self.draw_marks_mode(ui);
         self.draw_mask_summary(ui);
         ui.separator();
         ui.small(t!("cleaning.tools.area_editor.main_panel_hint"));
@@ -1084,13 +1299,20 @@ impl CleaningTool for RegionEditHost {
         false
     }
 
-    /// Shift+wheel resizes the brush, through the frame's own `MaskBrush`.
+    /// Ctrl/Cmd+drag over the frame body draws a marks rectangle in marks mode, so the canvas
+    /// zoom drag is blocked exactly then — never as a constant (see
+    /// `RegionFrame::blocks_ctrl_primary_zoom`); mask mode keeps the canvas zoom.
+    fn block_canvas_zoom_on_ctrl_primary(&self) -> bool {
+        self.frame.blocks_ctrl_primary_zoom()
+    }
+
+    /// Shift+wheel resizes the CURRENT brush (mask or marks), through the frame's `MaskBrush`.
     ///
     /// This hook covers the pointer OUTSIDE the frame only: `tab.rs::handle_active_tool_wheel`
     /// drops the event while the canvas pointer is occluded, and the frame occludes its own
     /// hitbox. Over the frame the identical gesture is handled inside the frame's pass.
     fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.frame.brush_mut().handle_wheel(delta_y, modifiers)
+        self.frame.active_brush_mut().handle_wheel(delta_y, modifiers)
     }
 
     /// The region editor's brush-size shortcuts `-` / `=` / `+`, for the pointer OUTSIDE the
@@ -1100,7 +1322,7 @@ impl CleaningTool for RegionEditHost {
     /// The tab repaints on a `true`, which is what makes the new radius show up in the brush
     /// ring immediately.
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.frame.brush_mut().handle_size_shortcuts(ctx)
+        self.frame.active_brush_mut().handle_size_shortcuts(ctx)
     }
 }
 
@@ -1108,6 +1330,7 @@ impl CleaningTool for RegionEditHost {
 mod tests {
     use super::*;
     use super::super::engine::{EngineSection, MaskLayerSpec};
+    use super::super::frame::PaintTarget;
     use super::super::geometry::SizeViolation;
     use crate::tools::mask_generation::{MaskGenerationParams, WatermarkProgress};
     use egui::Color32;
@@ -1264,6 +1487,7 @@ mod tests {
             answer: EnginePoll::Idle,
             switch_block: None,
             grid: Rc::clone(&grid),
+            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
         })];
         tool.selected = 0;
         tool.frame.place_for_test(0, rect(0, 0, 12, 20));
@@ -1526,6 +1750,9 @@ mod tests {
         /// What the last `set_region` push reported about the frame's gesture state.
         geometry_settled: Option<bool>,
         started: Option<(usize, usize, usize)>,
+        /// The region and the marks of the last started run.
+        run_region: Option<egui::ColorImage>,
+        run_marks: Option<RunMarks>,
     }
 
     /// A minimal `AiEngine` that records what the host does to it and answers whatever the
@@ -1540,6 +1767,9 @@ mod tests {
         /// The grid its `constraints()` declare, shared so a test can change the declaration
         /// the way a real engine's own parameter would. `1` everywhere else.
         grid: Rc<Cell<usize>>,
+        /// What its `marks_support()` answers, shared for the same reason as `grid`. The
+        /// trait default (overlay only) everywhere else.
+        marks: Rc<Cell<MarksSupport>>,
     }
 
     impl RecordingEngine {
@@ -1550,7 +1780,21 @@ mod tests {
                 answer: EnginePoll::Idle,
                 switch_block: None,
                 grid: Rc::new(Cell::new(1)),
+                marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
             }
+        }
+
+        /// An idle engine whose marks support the test controls through the returned cell.
+        fn with_marks(support: MarksSupport, calls: &Rc<RefCell<EngineCalls>>) -> (Self, Rc<Cell<MarksSupport>>) {
+            let marks = Rc::new(Cell::new(support));
+            let engine = Self {
+                calls: Rc::clone(calls),
+                answer: EnginePoll::Idle,
+                switch_block: None,
+                grid: Rc::new(Cell::new(1)),
+                marks: Rc::clone(&marks),
+            };
+            (engine, marks)
         }
     }
 
@@ -1583,8 +1827,14 @@ mod tests {
         fn switch_block_reason(&self) -> Option<String> {
             self.switch_block.clone()
         }
+        fn marks_support(&self) -> MarksSupport {
+            self.marks.get()
+        }
         fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
-            self.calls.borrow_mut().started = Some((request.page_idx, request.region.size[0], request.masks.len()));
+            let mut calls = self.calls.borrow_mut();
+            calls.started = Some((request.page_idx, request.region.size[0], request.masks.len()));
+            calls.run_region = Some(request.region);
+            calls.run_marks = Some(request.marks);
             Ok(())
         }
         fn poll(&mut self, _ctx: &egui::Context) -> EnginePoll {
@@ -1617,6 +1867,7 @@ mod tests {
             answer,
             switch_block: None,
             grid: Rc::new(Cell::new(1)),
+            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
         })];
         tool.selected = 0;
         (tool, calls)
@@ -1633,6 +1884,7 @@ mod tests {
             answer: EnginePoll::Idle,
             switch_block: reason.map(str::to_string),
             grid: Rc::new(Cell::new(1)),
+            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
         };
         let mut tool = test_host();
         tool.engines = vec![Box::new(busy(Some("downloading"))), Box::new(busy(None))];
@@ -1697,5 +1949,229 @@ mod tests {
         tool.accept_result(egui::ColorImage::filled([8, 8], Color32::WHITE));
         assert!(tool.frame.result().is_none(), "an unplaced frame has no rectangle to match");
         assert!(tool.message.as_ref().is_some_and(|message| message.error));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The marks mode
+    // -----------------------------------------------------------------------------------
+
+    /// Every mode with the reference and the layer, preferring `preferred`.
+    fn all_modes(preferred: MarksMode) -> MarksSupport {
+        MarksSupport::new(preferred)
+            .with(MarksMode::OverlayOnRegion)
+            .with(MarksMode::SeparateReference)
+            .with(MarksMode::TransparentLayer)
+    }
+
+    /// The user's choice stands while it is supported; an unsupported one becomes the
+    /// engine's preferred mode.
+    #[test]
+    fn the_marks_mode_stays_inside_the_engines_support() {
+        let layer_first = all_modes(MarksMode::TransparentLayer);
+        assert_eq!(reconcile_marks_mode(MarksMode::SeparateReference, layer_first), MarksMode::SeparateReference);
+        let reference_only = MarksSupport::new(MarksMode::SeparateReference);
+        assert_eq!(reconcile_marks_mode(MarksMode::TransparentLayer, reference_only), MarksMode::SeparateReference);
+        assert_eq!(reconcile_marks_mode(MarksMode::TransparentLayer, MarksSupport::OVERLAY_ONLY), MarksMode::OverlayOnRegion);
+    }
+
+    /// A 2x1 region (white, grey) and a marks layer with an opaque red mark on pixel 0.
+    fn region_and_marks() -> (egui::ColorImage, Vec<u8>) {
+        let region = egui::ColorImage::new([2, 1], vec![Color32::WHITE, Color32::from_rgb(100, 100, 100)]);
+        let marks = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        (region, marks)
+    }
+
+    /// Each mode packages the marks the way the contract says, and an empty layer sends the
+    /// region untouched whatever the mode.
+    #[test]
+    fn the_marks_are_packaged_per_mode() {
+        for mode in MarksMode::ALL {
+            let (region, marks) = region_and_marks();
+            let (sent, extra) = prepare_run_marks(mode, region.clone(), &marks, true).expect("an empty layer always packages");
+            assert_eq!(sent, region, "{mode:?}: nothing drawn, nothing changed");
+            assert!(matches!(extra, RunMarks::None), "{mode:?}");
+        }
+
+        let (region, marks) = region_and_marks();
+        let (sent, extra) = prepare_run_marks(MarksMode::OverlayOnRegion, region.clone(), &marks, false).expect("overlay");
+        assert_eq!(sent.pixels, vec![Color32::RED, region.pixels[1]], "composited onto the region");
+        assert!(matches!(extra, RunMarks::None));
+
+        let (sent, extra) = prepare_run_marks(MarksMode::SeparateReference, region.clone(), &marks, false).expect("reference");
+        assert_eq!(sent, region, "the edited region stays clean");
+        let RunMarks::Reference(reference) = extra else { panic!("a reference was expected") };
+        assert_eq!(reference.pixels, vec![Color32::RED, region.pixels[1]]);
+
+        let (sent, extra) = prepare_run_marks(MarksMode::TransparentLayer, region.clone(), &marks, false).expect("layer");
+        assert_eq!(sent, region, "the edited region stays clean");
+        let RunMarks::Layer(layer) = extra else { panic!("a layer was expected") };
+        assert_eq!((layer.width(), layer.height()), (2, 1));
+        assert_eq!(layer.as_raw(), &marks, "the straight-alpha bytes travel as they are");
+
+        for mode in MarksMode::ALL {
+            let (region, marks) = region_and_marks();
+            assert!(prepare_run_marks(mode, region, &marks[..4], false).is_err(), "{mode:?}: a layer of the wrong size is refused");
+        }
+    }
+
+    /// A switch starts from the new engine's preference; afterwards the user's choice stands
+    /// until the engine stops supporting it, and is then moved to the preferred mode.
+    #[test]
+    fn the_marks_mode_follows_engine_switches_and_support_changes() {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let (overlay_engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
+        let (flexible, support) = RecordingEngine::with_marks(all_modes(MarksMode::TransparentLayer), &calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(overlay_engine), Box::new(flexible)];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::OverlayOnRegion;
+
+        tool.select_engine(1);
+        assert_eq!(tool.marks_mode, MarksMode::TransparentLayer, "the new engine's preference");
+        tool.marks_mode = MarksMode::SeparateReference;
+        tool.push_engine_rules();
+        assert_eq!(tool.marks_mode, MarksMode::SeparateReference, "a supported choice stands");
+
+        support.set(MarksSupport::new(MarksMode::TransparentLayer).with(MarksMode::OverlayOnRegion));
+        tool.push_engine_rules();
+        assert_eq!(tool.marks_mode, MarksMode::TransparentLayer, "an unsupported choice falls back to the preference");
+
+        tool.select_engine(0);
+        assert_eq!(tool.marks_mode, MarksMode::OverlayOnRegion);
+    }
+
+    /// The run hands the engine the marks in the selected mode, and the frame's own layers are
+    /// not consumed by it.
+    #[test]
+    fn a_run_carries_the_marks_in_the_selected_mode() {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let (engine, _) = RecordingEngine::with_marks(all_modes(MarksMode::TransparentLayer), &calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(engine)];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::TransparentLayer;
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        tool.frame.masks_mut().paint_marks_segment((1, 1), (1, 1), 1, Color32::RED, false);
+        tool.frame.set_processing(true);
+
+        let region = egui::ColorImage::filled([4, 4], Color32::WHITE);
+        tool.hand_region_to_engine(PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run }, region.clone());
+
+        let calls = calls.borrow();
+        assert_eq!(calls.run_region.as_ref(), Some(&region), "a layer-mode run keeps the region clean");
+        let Some(RunMarks::Layer(layer)) = calls.run_marks.as_ref() else { panic!("the marks travel as a layer: {:?}", calls.run_marks) };
+        assert_eq!(layer.get_pixel(1, 1).0, [255, 0, 0, 255], "the mark the frame holds");
+        assert!(!tool.frame.masks().marks_is_empty(), "the frame keeps its marks");
+    }
+
+    /// The default (overlay-only) engine gets the marks composited into its region.
+    #[test]
+    fn a_default_engine_gets_the_marks_inside_the_region() {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let (engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(engine)];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::OverlayOnRegion;
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        tool.frame.masks_mut().paint_marks_segment((0, 0), (0, 0), 1, Color32::RED, false);
+        tool.frame.set_processing(true);
+
+        tool.hand_region_to_engine(
+            PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run },
+            egui::ColorImage::filled([4, 4], Color32::WHITE),
+        );
+        let calls = calls.borrow();
+        let sent = calls.run_region.as_ref().expect("the run started");
+        assert_eq!(sent.pixels[0], Color32::RED, "the mark is part of the picture");
+        assert_eq!(sent.pixels[3 * 4 + 3], Color32::WHITE, "an unmarked pixel is untouched");
+        assert!(matches!(calls.run_marks, Some(RunMarks::None)));
+    }
+
+    /// Marks are instructions, never content: a marked pixel the engine handed back untouched
+    /// gets the original pixel back, a pixel the engine changed is kept, and an unmarked pixel
+    /// is never touched.
+    #[test]
+    fn untouched_marked_pixels_are_restored_from_the_original() {
+        let gray = Color32::from_rgb(100, 100, 100);
+        let green = Color32::from_rgb(0, 200, 0);
+        // Pixel 0: marked, untouched. 1: marked, repainted by the engine. 2: unmarked,
+        // repainted. 3: unmarked, untouched. 4: marked with the colour already under it.
+        let original = egui::ColorImage::new([5, 1], vec![Color32::WHITE, Color32::WHITE, gray, gray, Color32::RED]);
+        let sent = egui::ColorImage::new([5, 1], vec![Color32::RED, Color32::RED, gray, gray, Color32::RED]);
+        let mut result = egui::ColorImage::new([5, 1], vec![Color32::RED, green, green, gray, Color32::RED]);
+        let restored = restore_untouched_marked_pixels(&mut result, &original, &sent);
+        assert_eq!(result.pixels, vec![Color32::WHITE, green, green, gray, Color32::RED]);
+        assert_eq!(restored, 1);
+
+        let mut wrong = egui::ColorImage::new([4, 1], vec![Color32::RED; 4]);
+        assert_eq!(restore_untouched_marked_pixels(&mut wrong, &original, &sent), 0, "a size mismatch changes nothing");
+        assert_eq!(wrong.pixels, vec![Color32::RED; 4]);
+    }
+
+    /// End to end through the host: an overlay-mode run sends the marks inside the region, and
+    /// the accepted result carries none of the marks the engine did not paint over.
+    #[test]
+    fn an_overlay_run_never_merges_untouched_marks_into_the_result() {
+        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let (engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(engine)];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::OverlayOnRegion;
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        tool.frame.masks_mut().paint_marks_boxes(&[(0, 0, 2, 1)], Color32::RED, false);
+        tool.frame.set_processing(true);
+        tool.hand_region_to_engine(
+            PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run },
+            egui::ColorImage::filled([4, 4], Color32::WHITE),
+        );
+        let mut answer = calls.borrow().run_region.clone().expect("the run started");
+        assert_eq!(answer.pixels[0], Color32::RED, "the engine saw the marks");
+        // The engine repaints pixel 1 and leaves pixel 0 as it got it.
+        answer.pixels[1] = Color32::BLUE;
+        tool.accept_result(answer);
+
+        let result = tool.frame.result().expect("the result is pending").image();
+        assert_eq!(result.pixels[0], Color32::WHITE, "an untouched mark is taken back out");
+        assert_eq!(result.pixels[1], Color32::BLUE, "what the engine painted stays");
+        assert!(tool.marks_restore.is_none(), "the restore data goes with the run");
+    }
+
+    /// A sampling the selector can no longer finish is cancelled, and the colour it started
+    /// from comes back.
+    #[test]
+    fn an_undrawn_selector_cancels_its_eyedropper() {
+        let mut tool = test_host();
+        tool.frame.set_paint_target(PaintTarget::Marks);
+        let start = tool.frame.marks_color();
+        // Nothing drew the selector this frame, so nothing is pending and nothing changes.
+        tool.push_engine_rules();
+        assert_eq!(tool.frame.marks_color(), start);
+        assert!(!tool.marks_color_selector.eyedropper_active());
+    }
+
+    /// The mode switch only ever happens in marks mode; the idle host keeps the canvas zoom,
+    /// and so does a marks-mode frame whose body was never hovered.
+    #[test]
+    fn the_marks_mode_does_not_block_the_canvas_zoom_by_itself() {
+        let mut tool = test_host();
+        tool.frame.set_paint_target(PaintTarget::Marks);
+        assert!(!tool.block_canvas_zoom_on_ctrl_primary(), "not hovered, nothing in flight");
+        assert!(!tool.block_canvas_zoom(), "D5 still holds in marks mode");
+    }
+
+    /// The wheel and the size shortcuts outside the frame resize the brush IN USE.
+    #[test]
+    fn the_wheel_resizes_the_active_brush() {
+        let mut tool = test_host();
+        let shift = egui::Modifiers { shift: true, ..egui::Modifiers::NONE };
+        tool.frame.set_paint_target(PaintTarget::Marks);
+        let marks_before = tool.frame.active_brush_mut().radius_px();
+        assert!(tool.on_wheel_event(400.0, shift));
+        let marks_after = tool.frame.active_brush_mut().radius_px();
+        assert!(marks_after > marks_before, "{marks_before} -> {marks_after}");
+        tool.frame.set_paint_target(PaintTarget::Mask);
+        assert_eq!(tool.frame.active_brush_mut().radius_px(), ms_tools::MaskBrush::default().radius_px(), "the mask brush is untouched");
     }
 }

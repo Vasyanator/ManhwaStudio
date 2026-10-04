@@ -244,6 +244,57 @@ class InpaintRequestTests(_TempTreeCase):
         self.assertTrue(result["oom_recovered"])
         self.assertTrue(result["applied"]["unload_transformer_before_vae"])
 
+    def test_a_marks_reference_reaches_the_pipeline_as_one_region_sized_image(self) -> None:
+        import io
+
+        reference = np.full((128, 128, 3), 30, dtype=np.uint8)
+        reference[10:20, 10:20] = (255, 0, 0)
+        guard_calls: list[dict[str, object]] = []
+        guard_patch = patch.object(
+            self.service,
+            "_require_headroom_locked",
+            lambda *_args, **kwargs: guard_calls.append(kwargs),
+        )
+        guard_patch.start()
+        self.addCleanup(guard_patch.stop)
+
+        result = self.service.inpaint_image_bytes(
+            _png_bytes(self.region, "RGB"),
+            _png_bytes(self.mask, "L"),
+            reference_bytes=_png_bytes(reference, "RGB"),
+            params=self.params(placement="full_gpu", color_match=False, mask_feather_px=0),
+        )
+        sent = self.pipe_calls[0]["image_reference"]
+        # ONE PIL image, not a list: diffusers batches a list from its first element.
+        self.assertIsInstance(sent, Image.Image)
+        self.assertEqual(sent.size, (128, 128))
+        self.assertTrue(np.array_equal(np.asarray(sent, dtype=np.uint8), reference))
+        # The region the model edits stays the clean one ...
+        self.assertTrue(
+            np.array_equal(np.asarray(self.pipe_calls[0]["image"], dtype=np.uint8), self.region)
+        )
+        # ... and the reference never leaks into the composite outside the mask.
+        with Image.open(io.BytesIO(result["image_png"])) as image:
+            out = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        outside = self.mask == 0
+        self.assertTrue(np.array_equal(out[outside], self.region[outside]))
+        self.assertEqual(guard_calls, [{"with_reference": True}])
+
+    def test_without_a_reference_the_pipeline_gets_no_image_reference(self) -> None:
+        self._run(placement="full_gpu")
+        self.assertNotIn("image_reference", self.pipe_calls[0])
+
+    def test_a_reference_of_another_size_is_refused_before_anything_loads(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.inpaint_image_bytes(
+                _png_bytes(self.region, "RGB"),
+                _png_bytes(self.mask, "L"),
+                reference_bytes=_png_bytes(np.zeros((64, 128, 3), dtype=np.uint8), "RGB"),
+                params=self.params(),
+            )
+        self.assertEqual(self.builds, 0)
+        self.assertEqual(self.pipe_calls, [])
+
     def test_a_mask_of_the_wrong_size_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             self.service.inpaint_image_bytes(

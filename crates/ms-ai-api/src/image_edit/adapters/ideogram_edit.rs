@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{classify_error, get_request, is_success, json_value, job_failure, mask_has_both_regions, required_str, result_url_step};
+use super::{classify_error, get_request, is_success, json_value, job_failure, mask_has_both_regions, refuse_reference, required_str, result_url_step};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::{MaskPolarity, encode_mask_png};
 use crate::image_edit::error::ImageEditError;
@@ -43,6 +43,8 @@ pub struct IdeogramEdit;
 
 impl EditProtocol for IdeogramEdit {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+        // One image field: a reference cannot be expressed.
+        refuse_reference(call)?;
         if call.size_param != SizeParamStyle::None {
             return Err(ImageEditError::RequestBuild { detail: format!("Ideogram precise edit keeps the input size; it cannot state {:?}", call.size_param) });
         }

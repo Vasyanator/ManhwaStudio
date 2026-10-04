@@ -59,13 +59,16 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   `.download.*` requests. `new(variant)` stamps it into the in-memory settings before the
   load worker starts, so everything derived from them describes the right checkpoint from
   the first frame; `Default` is `new(Klein9B)` and exists for the tests' sake.
-- The frame rectangle, the painted mask and the pending result belong to the HOST and
-  reach this type only through `AiEngine`. This module never touches `CanvasView` or
+- The frame rectangle, the painted mask, the marks and the pending result belong to the
+  HOST and reach this type only through `AiEngine`. The marks arrive already packaged per
+  `marks_support()`: a region-sized reference (sent as the run's extra reference image),
+  or nothing; a transparent layer is unsupported and refused by `run_input`. This module never touches `CanvasView` or
   `CleanOverlaysModel`.
 
 ## Editing map
-- To change what the host sees — the sections, the mask layer, the size constraints, what
-  a run answers with — see `impl AiEngine` in `mod.rs`.
+- To change what the host sees — the sections, the mask layer, the size constraints, the
+  accepted marks modes, what a run answers with — see `impl AiEngine` in `mod.rs`; to change
+  what a run request is validated and turned into, see `Flux2KleinEngine::run_input`.
 - To change when the catalog, the forecast or the library listing is re-queried, see
   `poll_and_maybe_query_*` and `note_settings_changed` in `mod.rs`.
 - To add a button that starts something long, add its `start_*` / `poll_*` pair in

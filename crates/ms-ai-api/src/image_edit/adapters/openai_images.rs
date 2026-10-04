@@ -25,7 +25,7 @@ https://raw.githubusercontent.com/leejet/stable-diffusion.cpp/master/examples/se
 (fetched 2026-10-04).
 */
 
-use super::images_data_step;
+use super::{images_data_step, refuse_reference};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::{MaskPolarity, encode_mask_png};
 use crate::image_edit::error::ImageEditError;
@@ -37,10 +37,13 @@ use crate::image_edit::provider::ImageEditProvider;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiImages;
 
+/// The repeatable multipart image field; only it can carry a reference after the edited image.
+const MULTI_IMAGE_FIELD: &str = "image[]";
+
 /// The multipart field name of the edited image at `provider`.
 fn image_field(provider: ImageEditProvider) -> &'static str {
     match provider {
-        ImageEditProvider::OpenAi | ImageEditProvider::OpenAiCompatible => "image[]",
+        ImageEditProvider::OpenAi | ImageEditProvider::OpenAiCompatible => MULTI_IMAGE_FIELD,
         // The resellers' samples; providers of other shapes never reach this adapter and get
         // the shape's common single-file field.
         ImageEditProvider::DeepInfra
@@ -78,7 +81,16 @@ impl EditProtocol for OpenAiImages {
                 return Err(ImageEditError::RequestBuild { detail: format!("the images edits shape cannot state the size as {:?}", call.size_param) });
             }
         };
-        let mut form = MultipartForm::new().text("model", &call.model_id).text("prompt", &call.prompt).file(image_field(call.provider), "image.png", "image/png", call.image_png.clone());
+        let field = image_field(call.provider);
+        let mut form = MultipartForm::new().text("model", &call.model_id).text("prompt", &call.prompt).file(field, "image.png", "image/png", call.image_png.clone());
+        if let Some(reference) = &call.reference_png {
+            // A second `image[]` part after the edited image ("the mask will be applied to the
+            // first image"); the resellers' single `image` field cannot carry it.
+            if field != MULTI_IMAGE_FIELD {
+                refuse_reference(call)?;
+            }
+            form = form.file(field, "reference.png", "image/png", reference.clone());
+        }
         if let Some(mask) = &call.mask {
             form = form.file("mask", "mask.png", "image/png", encode_mask_png(mask, call.width, call.height, MaskPolarity::TransparentEdits)?);
         }

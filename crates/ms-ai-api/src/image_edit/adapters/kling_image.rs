@@ -68,7 +68,8 @@ impl EditProtocol for KlingImage {
         let body = json!({
             "model_name": call.model_id,
             "prompt": call.prompt,
-            "image_list": [{ "image": base64_encode(&call.image_png) }],
+            // The edited image first (`<<<image_1>>>`), then the reference.
+            "image_list": std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "image": base64_encode(png) })).collect::<Vec<Value>>(),
             "n": 1
         });
         Ok(json_post(format!("{}{TASK_PATH}", call.base_url), Vec::new(), body, AuthScheme::Bearer))

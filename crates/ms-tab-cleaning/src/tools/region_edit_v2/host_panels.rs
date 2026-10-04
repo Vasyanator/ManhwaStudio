@@ -3,14 +3,16 @@ File: region_edit_v2/host_panels.rs
 
 Purpose:
 The two panel bodies of `RegionEditHost` (`host.rs`): the compact part in «Выбранный
-инструмент» (engine picker, brush, mask layer, mask generation, mask actions, per-layer pixel
-counts) and the host's own half of the main «Редактор области» panel (the run / apply / cancel
+инструмент» (engine picker, mask/marks switch, brush and marks colour, mask layer, mask
+generation, mask actions, marks mode, per-layer pixel counts) and the host's own half of the main «Редактор области» panel (the run / apply / cancel
 row, the «no mask needed» hint, the frame's status line, the size violation and the last
 message). Split from `host.rs` only to keep that file readable; the two are one type.
 
 Key functions:
 - `draw_engine_picker()`, `draw_brush_controls()`, `draw_layer_picker()`,
-  `draw_mask_generation()`, `draw_mask_actions()`, `draw_mask_summary()`: the compact panel
+  `draw_mask_generation()`, `draw_mask_actions()`, `draw_marks_mode()`, `draw_mask_summary()`:
+  the compact panel
+- `marks_mode_label()`: the caption of one marks mode
 - `draw_host_actions()`: the host's part of the main panel
 - `constraint_lines()`: the active engine's size rules as panel sentences (pure, tested)
 - `engine_picker_shown()`: the one-engine rule of the picker (pure, tested)
@@ -22,7 +24,8 @@ Localized controls take their `id_salt` from the tool's `HostSpec`, so two hoste
 share stored widget state.
 */
 
-use super::engine::{AiEngine, EngineSection, violation_text};
+use super::engine::{AiEngine, EngineSection, MarksMode, violation_text};
+use super::frame::PaintTarget;
 use super::geometry::{FrameConstraints, check_size};
 use super::host::RegionEditHost;
 use crate::tools::mask_generation;
@@ -119,9 +122,25 @@ impl RegionEditHost {
         true
     }
 
-    /// Draws the brush row of the compact panel: radius and paint/erase mode.
+    /// Draws the brush block of the compact panel: the mask/marks switch on top, the radius of
+    /// the CURRENT brush, the marks colour (marks mode only) and the paint/erase mode.
+    ///
+    /// The two brushes keep separate radii, so the slider always shows and edits the one in
+    /// use. The colour selector runs inside its own id scope, salted with the tool id, so two
+    /// hosted tools never share its popup state.
     pub(super) fn draw_brush_controls(&mut self, ui: &mut egui::Ui) {
-        let mut radius = self.frame.brush_mut().radius_px();
+        let mut target = self.frame.paint_target();
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut target, PaintTarget::Mask, t!("cleaning.tools.area_editor.paint_mask_button"));
+            ui.selectable_value(&mut target, PaintTarget::Marks, t!("cleaning.tools.area_editor.paint_marks_button"));
+        });
+        if target == PaintTarget::Mask {
+            // The colour row is about to disappear; a sampling it was waiting on ends with it.
+            self.cancel_marks_eyedropper();
+        }
+        self.frame.set_paint_target(target);
+
+        let mut radius = self.frame.active_brush_mut().radius_px();
         if ui
             .add(
                 WheelSlider::new(&mut radius, BRUSH_RADIUS_MIN_PX..=BRUSH_RADIUS_MAX_PX)
@@ -131,7 +150,24 @@ impl RegionEditHost {
         {
             // The setter answers whether it changed anything after clamping; the slider is
             // rebuilt from the brush next frame either way, so the answer has no reader here.
-            self.frame.brush_mut().set_radius_px(radius);
+            self.frame.active_brush_mut().set_radius_px(radius);
+        }
+
+        if target == PaintTarget::Marks {
+            let mut color = self.frame.marks_color();
+            let selector = &mut self.marks_color_selector;
+            let presets = &mut self.marks_presets;
+            ui.horizontal(|ui| {
+                ui.label(t!("cleaning.tools.area_editor.marks_color_label"));
+                ui.push_id((self.spec.tool_id, "marks_color"), |ui| {
+                    // `presets_changed` has no reader: the marks presets live for the session
+                    // only, and the edited cell is already in `marks_presets`.
+                    let response = selector.draw_with_presets(ui, &mut color, Some(presets));
+                    response.changed
+                })
+            });
+            self.frame.set_marks_color(color);
+            self.marks_selector_drawn = true;
         }
 
         let mut erase = self.frame.erase();
@@ -165,10 +201,12 @@ impl RegionEditHost {
         self.frame.masks_mut().set_active(active);
     }
 
-    /// Draws the two mask actions of the compact panel: undo one stroke, erase everything.
+    /// Draws the two mask actions of the compact panel: undo the latest stroke — a mask stroke,
+    /// a marks stroke or a marks rectangle, from the one shared history — and erase everything,
+    /// marks included.
     pub(super) fn draw_mask_actions(&mut self, ui: &mut egui::Ui) {
         let editable = self.mask_editable();
-        let has_mask = !self.frame.masks().is_empty();
+        let has_mask = !self.frame.masks().is_blank();
         let mut nothing_to_undo = false;
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -193,6 +231,37 @@ impl RegionEditHost {
         });
         if nothing_to_undo {
             self.report_info(t!("cleaning.tools.area_editor.nothing_to_undo").to_string());
+        }
+    }
+
+    /// Draws the marks-mode selector of the compact panel: how the marks layer reaches the
+    /// selected engine.
+    ///
+    /// Every mode is listed; one the engine does not accept is disabled with a tooltip that
+    /// says so, rather than hidden, so the user learns the other forms exist. A click only
+    /// changes the host's choice — `push_engine_rules` keeps it legal every frame.
+    pub(super) fn draw_marks_mode(&mut self, ui: &mut egui::Ui) {
+        let support = self.marks_support();
+        let current = self.marks_mode;
+        let mut requested: Option<MarksMode> = None;
+        ui.label(t!("cleaning.tools.area_editor.marks_mode_label"));
+        ui.horizontal_wrapped(|ui| {
+            // The same reason as the engine picker: move a long caption to the next row
+            // instead of breaking it over two lines.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            for mode in MarksMode::ALL {
+                let response = ui
+                    .add_enabled(support.supports(mode), egui::Button::new(marks_mode_label(mode)).selected(mode == current))
+                    .on_disabled_hover_text(t!("cleaning.tools.area_editor.marks_mode_unsupported_hint"));
+                if response.clicked() {
+                    requested = Some(mode);
+                }
+            }
+        });
+        if let Some(mode) = requested
+            && support.supports(mode)
+        {
+            self.marks_mode = mode;
         }
     }
 
@@ -259,17 +328,21 @@ impl RegionEditHost {
     /// anywhere inside it, and a stray dot is invisible at a low zoom. The counts name the
     /// layer that still holds something, so the user can undo that stroke instead of erasing
     /// the whole mask to get the frame back.
+    ///
+    /// Marks lock the frame exactly like a mask, so they get a line of their own.
     pub(super) fn draw_mask_summary(&self, ui: &mut egui::Ui) {
         let masks = self.frame.masks();
-        if masks.is_empty() {
-            return;
+        if !masks.is_empty() {
+            for idx in 0..masks.layer_count() {
+                ui.small(tf!(
+                    "cleaning.tools.area_editor.layer_row",
+                    name = self.frame.layer_label(idx),
+                    count = masks.layer_set_px(idx)
+                ));
+            }
         }
-        for idx in 0..masks.layer_count() {
-            ui.small(tf!(
-                "cleaning.tools.area_editor.layer_row",
-                name = self.frame.layer_label(idx),
-                count = masks.layer_set_px(idx)
-            ));
+        if !masks.marks_is_empty() {
+            ui.small(tf!("cleaning.tools.area_editor.marks_row", count = masks.marks_set_px()));
         }
     }
 
@@ -390,6 +463,16 @@ impl RegionEditHost {
         {
             ui.small(tf!("cleaning.tools.area_editor.constraint_nearest", width = w, height = h));
         }
+    }
+}
+
+/// The localized caption of one marks mode, resolved at draw time.
+#[must_use]
+pub(super) fn marks_mode_label(mode: MarksMode) -> &'static str {
+    match mode {
+        MarksMode::OverlayOnRegion => t!("cleaning.tools.area_editor.marks_mode_overlay_button"),
+        MarksMode::SeparateReference => t!("cleaning.tools.area_editor.marks_mode_reference_button"),
+        MarksMode::TransparentLayer => t!("cleaning.tools.area_editor.marks_mode_layer_button"),
     }
 }
 

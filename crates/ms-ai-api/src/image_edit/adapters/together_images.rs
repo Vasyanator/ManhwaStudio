@@ -49,7 +49,9 @@ impl EditProtocol for TogetherImages {
         body.insert("prompt".to_string(), json!(call.prompt));
         body.insert("width".to_string(), json!(call.width));
         body.insert("height".to_string(), json!(call.height));
-        body.insert("reference_images".to_string(), json!([png_data_url(&call.image_png)]));
+        // The edited image first, then the reference.
+        let images: Vec<String> = std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| png_data_url(png)).collect();
+        body.insert("reference_images".to_string(), json!(images));
         body.insert("response_format".to_string(), json!("base64"));
         body.insert("output_format".to_string(), json!("png"));
         if call.model_id == PROMPT_UPSAMPLING_MODEL {

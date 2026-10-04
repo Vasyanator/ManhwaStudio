@@ -13,6 +13,7 @@ Key functions:
 - images_data_step()    : `{ "data": [{ "b64_json" | "url" }] }` -> `NextStep` (a `data:` url is
                           decoded via `result_url_step`).
 - result_url_step()     : a result URL -> inline `data:` decode or an unauthenticated download.
+- refuse_reference()    : `ReferenceNotSupported` for a reference at a single-image endpoint.
 - json_value(), required_str(), get_request(), json_post(), png_data_url(), mask_data_url(),
   mask_has_both_regions(): small shared builders / readers.
 
@@ -29,7 +30,9 @@ Submodules (submit, then poll):
 
 Notes:
 Adapters are pure and target-neutral: they never see a key (they name an `AuthScheme`) and
-never perform I/O, so they are tested against documented request / response examples. Provider
+never perform I/O. A reference image (`EditCall::reference_png`) goes into a list field AFTER
+the edited image; an endpoint with a single image field refuses it (`refuse_reference`). They
+are tested against documented request / response examples. Provider
 error messages are passed through truncated; no adapter error carries the prompt.
 */
 
@@ -213,6 +216,18 @@ pub fn mask_data_url(call: &EditCall, polarity: MaskPolarity) -> Result<Option<S
     call.mask.as_deref().map(|mask| encode_mask_png(mask, call.width, call.height, polarity).map(|png| png_data_url(&png))).transpose()
 }
 
+/// Refuses a call carrying a reference image at an endpoint that takes only the edited image
+/// (a single image field): a reference is never silently dropped.
+///
+/// # Errors
+/// `ImageEditError::ReferenceNotSupported` when `call.reference_png` is `Some`.
+pub fn refuse_reference(call: &EditCall) -> Result<(), ImageEditError> {
+    if call.reference_png.is_some() {
+        return Err(ImageEditError::ReferenceNotSupported { model_id: call.model_id.clone() });
+    }
+    Ok(())
+}
+
 /// Whether a native mask (255 = editable) has both editable and kept pixels. Providers that
 /// require both regions (Ideogram) get no mask when this is false: an all-editable mask is the
 /// same request as no mask, and an all-kept one never reaches an adapter.
@@ -293,6 +308,7 @@ pub(crate) mod test_support {
             region_id: None,
             prompt: "Remove the speech bubble text".to_string(),
             image_png: b"PNGDATA".to_vec(),
+            reference_png: None,
             mask,
             width: size.0,
             height: size.1,
@@ -339,9 +355,11 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{call, json_response};
     use super::{classify_error, images_data_step, job_failure, mask_has_both_regions, protocol_for, provider_message, result_url_step};
-    use crate::image_edit::catalog::{MaskSupport, SizeParamStyle, all_offers};
+    use crate::encoding::base64_encode;
+    use crate::image_edit::catalog::{MaskSupport, ModelOffer, SizeParamStyle, all_offers, lookup};
     use crate::image_edit::error::ImageEditError;
-    use crate::image_edit::protocol::{HttpMethod, NextStep};
+    use crate::image_edit::protocol::{EditCall, HttpBody, HttpMethod, NextStep};
+    use crate::image_edit::provider::ImageEditProvider;
 
     // Every catalogue offer's provider builds a request through its shape's adapter (a smoke
     // test of the dispatch: each adapter accepts the size style its offers name).
@@ -361,6 +379,97 @@ mod tests {
             let call = call(offer.provider, model_id, "https://api.example.com/v1", mask, (width, height), offer.size_param, size_entry);
             let spec = protocol_for(offer.provider.info().shape).submit(&call);
             assert!(spec.is_ok(), "{offer:?}: {spec:?}");
+        }
+    }
+
+    /// The serialized body of `spec` (JSON text or multipart bytes).
+    fn body_bytes(spec: &crate::image_edit::protocol::HttpRequestSpec) -> Vec<u8> {
+        match &spec.body {
+            HttpBody::Json(value) => value.to_string().into_bytes(),
+            HttpBody::Multipart(body) => body.bytes.clone(),
+            HttpBody::Empty => Vec::new(),
+        }
+    }
+
+    /// Where `needle` first occurs in `haystack`.
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|window| window == needle)
+    }
+
+    /// The canned call of `offer` (a valid size for its style), carrying `reference`.
+    fn offer_call(offer: &ModelOffer, model_id: &str, reference: Option<Vec<u8>>) -> EditCall {
+        let size_entry = match offer.size_param {
+            SizeParamStyle::AspectTier(entries) => entries.first().copied(),
+            SizeParamStyle::WxH | SizeParamStyle::WStarH | SizeParamStyle::WidthHeight | SizeParamStyle::ImageSizeObject | SizeParamStyle::None => None,
+        };
+        let (width, height) = size_entry.map_or((1024, 1024), |entry| (entry.width, entry.height));
+        let mask = match offer.mask {
+            MaskSupport::HardRequired => Some(vec![255; 1024 * 1024]),
+            MaskSupport::None | MaskSupport::Soft | MaskSupport::Hard => None,
+        };
+        EditCall { reference_png: reference, ..call(offer.provider, model_id, "https://api.example.com/v1", mask, (width, height), offer.size_param, size_entry) }
+    }
+
+    /// Asserts the submit body of `call` carries the reference, and after the edited image
+    /// (raw bytes in multipart bodies, base64 in JSON ones).
+    fn assert_reference_after_image(call: &EditCall) {
+        let spec = protocol_for(call.provider.info().shape).submit(call).unwrap_or_else(|error| panic!("{} {}: {error:?}", call.provider.key(), call.model_id));
+        let body = body_bytes(&spec);
+        let image = find(&body, b"PNGDATA").or_else(|| find(&body, base64_encode(b"PNGDATA").as_bytes()));
+        let reference = find(&body, b"REFDATA").or_else(|| find(&body, base64_encode(b"REFDATA").as_bytes()));
+        match (image, reference) {
+            (Some(image), Some(reference)) => assert!(image < reference, "{} {}: the reference precedes the image", call.provider.key(), call.model_id),
+            other => panic!("{} {}: image / reference positions {other:?}", call.provider.key(), call.model_id),
+        }
+    }
+
+    // A reference is declared only where the adapter sends it in a list, after the edited image.
+    #[test]
+    fn offers_with_references_send_the_reference_after_the_image() {
+        let mut with_references = 0;
+        for offer in all_offers().iter().filter(|offer| offer.accepts_references()) {
+            with_references += 1;
+            assert!(!offer.model_id.is_empty(), "the generic offer cannot promise references: {offer:?}");
+            assert_reference_after_image(&offer_call(offer, offer.model_id, Some(b"REFDATA".to_vec())));
+        }
+        assert!(with_references > 0);
+        // List-shaped endpoints whose offers declare no reference still place one correctly.
+        for (provider, model_id) in [(ImageEditProvider::GenApi, "gpt-image-2"), (ImageEditProvider::RouterAi, "openai/gpt-image-2"), (ImageEditProvider::Runware, "runware:108@22"), (ImageEditProvider::OpenAiCompatible, "custom-model")] {
+            let offer = lookup(provider, model_id).unwrap_or_else(|error| panic!("{error:?}"));
+            assert_reference_after_image(&offer_call(offer, model_id, Some(b"REFDATA".to_vec())));
+        }
+    }
+
+    // Single-image endpoints refuse a reference with the typed error instead of dropping it.
+    #[test]
+    fn single_image_endpoints_refuse_a_reference() {
+        let single = [
+            (ImageEditProvider::BytePlus, "seedream-5-0-lite-260128"),
+            (ImageEditProvider::Xai, "grok-imagine-image-2.0"),
+            (ImageEditProvider::Recraft, "recraftv3"),
+            (ImageEditProvider::Luma, "uni-1"),
+            (ImageEditProvider::Ideogram, "ideogram-4-5"),
+            (ImageEditProvider::Bfl, "flux-2-pro"),
+            (ImageEditProvider::Bfl, "flux-kontext-pro"),
+            (ImageEditProvider::Bfl, "flux-pro-1.0-fill"),
+            (ImageEditProvider::Fal, "fal-ai/flux-pro/v1/fill"),
+            (ImageEditProvider::Fal, "ideogram/v4.5/edit"),
+            (ImageEditProvider::Replicate, "black-forest-labs/flux-fill-pro"),
+            (ImageEditProvider::Replicate, "black-forest-labs/flux-kontext-pro"),
+            (ImageEditProvider::Replicate, "ideogram-ai/ideogram-v3-quality"),
+            (ImageEditProvider::Runware, "bfl:1@2"),
+            (ImageEditProvider::DeepInfra, "black-forest-labs/FLUX-2-pro"),
+            (ImageEditProvider::AiTunnel, "gpt-image-2"),
+            (ImageEditProvider::GenApi, "qwen-image-edit"),
+        ];
+        for (provider, model_id) in single {
+            let offer = lookup(provider, model_id).unwrap_or_else(|error| panic!("{error:?}"));
+            assert!(!offer.accepts_references(), "{offer:?}");
+            let call = offer_call(offer, model_id, Some(b"REFDATA".to_vec()));
+            let result = protocol_for(provider.info().shape).submit(&call);
+            assert!(matches!(&result, Err(ImageEditError::ReferenceNotSupported { model_id: id }) if id == model_id), "{model_id}: {result:?}");
+            // The same call without a reference is accepted.
+            assert!(protocol_for(provider.info().shape).submit(&offer_call(offer, model_id, None)).is_ok(), "{model_id}");
         }
     }
 

@@ -40,7 +40,10 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   `.component_action`, the six `.prompt_cache.*` methods and the two `.download.*` methods) — FLUX.2
   klein region editing. Generation streams `load`/`generate` phases (never `download`: by then the
   weights are user-supplied paths) and returns `image_len` + the
-  OOM-recovery report (`oom_recovered`, `applied`) in the response header. `.estimate` is the only
+  OOM-recovery report (`oom_recovered`, `applied`) in the response header. Its request blob is
+  `region ++ mask [++ reference]`, split by `_split_request_blob` with strict equality against
+  `image_len + mask_len + reference_len`; an absent or zero `reference_len` reaches the service as
+  `reference_bytes=None`. `.estimate` is the only
   inpaint method taking a region size instead of image bytes.
   **`applied` must always carry all five names of `_APPLIED_FLAGS`**: the Rust client parses it as
   one struct and ignores an incomplete object outright, so omitting a key does not degrade the

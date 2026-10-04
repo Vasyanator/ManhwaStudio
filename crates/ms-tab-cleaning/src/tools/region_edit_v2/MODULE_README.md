@@ -4,7 +4,7 @@
 The reusable on-canvas region-editing framework of the cleaning tab, and the GENERIC host tool
 built on it. The framework replaces the detached region-editor window flow (not
 `RegionEditToolBase` itself, which stays untouched) with a selection FRAME drawn over the page
-strip: eight resize handles, a drag strip above it, N mask layers and a processed-result layer
+strip: eight resize handles, a drag strip above it, a colour marks layer, N mask layers over it and a processed-result layer
 inside it, and a button row plus a status line below it (the frame size in pixels, e.g. `512x512`, right-aligned in the same row; the status text is elided before it). The host (`RegionEditHost`) turns that
 frame plus a catalog of AI engines (`AiEngine`) into a whole `CleaningTool`: it loads the source
 region, runs the selected engine, fills a mask layer from a backend detector and merges a result
@@ -18,7 +18,7 @@ window, and the host on top of them:
 
 ```
 geometry.rs        pure maths      size constraints, hitbox, viewport clamp, page transition, arrow
-layers.rs          pixels          MaskStack (N L8 layers + tinted previews) and ResultLayer
+layers.rs          pixels          MaskStack (N L8 layers + the RGBA marks layer, one undo history) and ResultLayer
 input.rs           hit geometry    handle rects, and the move/resize maths a drag performs
 render.rs          paint only      strokes, handles, chrome plates, status text, off-screen arrow
 frame.rs           the pass        RegionFrame: state, the per-frame pass, the reported intent
@@ -61,17 +61,21 @@ that owns the context, the canvas and the project at once:
   `geometry.rs`.
 - `layers.rs`: `MaskLayerSpec` (what a consumer declares about one layer: its tint and the
   catalog key of its name), `MaskStack` (per-layer L8 buffer, O(1) set-pixel counter, tinted
-  preview, partial texture upload, per-stroke undo) and `ResultLayer`. No brush radius policy
-  lives here.
+  preview, partial texture upload; the straight-alpha RGBA marks layer; ONE per-stroke undo
+  history over both), `hollow_rect_boxes` (the pixel boxes of a marks rectangle) and
+  `ResultLayer`. The disc and the segment walk are one rasterizer shared by masks and marks. No
+  brush radius policy lives here.
 - `input.rs`: `HandleKind`, the handle hit rects and arcs, and `moved_rect_px` /
   `resized_rect_px`. Every drag is measured from an anchor captured on `drag_started`, never
   accumulated per frame.
 - `render.rs`: the local chrome colour constants and every paint call; the state colours
   (backing ring, refused red, occupied green) are `ms_theme::canvas` tokens. Registers no hitbox, ever.
 - `frame.rs`: `RegionFrame` and the per-frame pass; `FrameLock`, `FrameVisual`, `FrameHost`,
-  `FrameOutcome`, `FrameButtons`.
+  `FrameOutcome`, `FrameButtons`, `PaintTarget` (mask or marks), the two brushes, the marks
+  colour and the Ctrl+drag marks rectangle.
 - `engine.rs`: the `AiEngine` trait (`EngineSection`, `EngineRunRequest`, `EnginePoll`,
-  `MaskLayerSpec` re-exported from `layers`), plus `violation_text` — the ONE mapping from a
+  `MaskLayerSpec` re-exported from `layers`, `MarksMode` / `MarksSupport` / `RunMarks` and the
+  pure `composite_marks_over`), plus `violation_text` — the ONE mapping from a
   `SizeViolation` to its sentence — and `region_size_refusal`, the engines' run-path size
   re-check built on it. Mask generation is deliberately ABSENT from the trait: it is the host's.
 - `engine_settings.rs`: pure, engine-agnostic helpers for an engine's own settings file —
@@ -202,7 +206,37 @@ that owns the context, the canvas and the project at once:
   The host's «Сгенерировать маску» is the only caller today.
 - **Painting is refused while a result is pending or work is running**: the mask then describes
   work already handed over. It is also refused while a canvas zoom modifier (Ctrl/Cmd/`Z`) is
-  held, because Ctrl+drag over the frame zooms the page and must not leave a stroke behind.
+  held, because Ctrl+drag over the frame zooms the page and must not leave a stroke behind —
+  with ONE exception, the marks rectangle below. `Z` refuses in every mode. Painting is also
+  refused while the host's marks-colour eyedropper waits for its sampling click
+  (`set_painting_suppressed`), so that click never paints too.
+- **The marks layer is the user's colour annotation, owned by `MaskStack` but not a mask
+  layer.** It has no spec and no index, never reaches `bytes(idx)` and is drawn UNDER the mask
+  layers; `resize` and `clear_all` cover it, and mask strokes, marks strokes and marks
+  rectangles share ONE ordered undo history (an enum step, bounded by count and by a byte budget
+  that is SHARED with the mask snapshots, so a very large frame keeps fewer mask steps too), so
+  «Отменить мазок» always takes back the latest gesture. The layer is allocated LAZILY: until
+  the first mark it holds no buffer and no texture, a snapshot of an empty layer is a marker
+  rather than a copy, and `resize` / `clear_all` release it. A mark REPLACES the pixel (straight
+  alpha, never blended) and erases to transparent. Marks LOCK the frame exactly like a mask
+  (`is_blank` is the lock signal, `is_empty` stays masks-only) but never enable «Обработать»;
+  «Стереть маску» clears both. «Сравнить» still hides only the result.
+- **Two brushes, one policy.** The mask brush and the marks brush are both `MaskBrush`es with
+  separate radii; the first switch to marks creates the marks brush at `max(1, mask / 4)`. The
+  slider, the wheel and the `-`/`=`/`+` shortcuts act on the ACTIVE brush through
+  `active_brush_mut`, inside the frame and through the host hooks alike.
+- **Ctrl/Cmd+drag over the body in marks mode is the frame's, not the canvas'.** It draws an
+  unfilled rectangle (walls of the brush diameter, inside the dragged rect, clamped to the frame;
+  a drag along one axis is a line of that thickness; live preview drawn where the result lands,
+  between the marks and the masks; one undo step on release; a release where it started commits
+  nothing). The canvas zoom drag is blocked for it through
+  `CleaningTool::block_canvas_zoom_on_ctrl_primary`, answered by
+  `RegionFrame::blocks_ctrl_primary_zoom`: true only in marks mode while the frame is ARMED, or
+  while a rectangle is in flight — never a constant, because switching it on mid-gesture cancels
+  a running canvas zoom drag. The arm is decided only in a pass with NO pointer button down (the
+  body `hovered`, `Z` up, the frame paintable) and frozen while a button is held: the canvas zoom
+  drag is raw input, not an egui-dragged widget, so `hovered` turns true as soon as such a drag
+  crosses the body, and re-arming then would cut that zoom. In mask mode Ctrl still zooms.
 - **The brush is the region editor's brush, and the frame answers its gestures itself.**
   Radius, wheel and the `-`/`=`/`+` shortcuts all live in `crate::tools::MaskBrush`; erasing
   follows the same rule the region editor uses (`stroke_erases`: the right button erases unless
@@ -228,7 +262,13 @@ that owns the context, the canvas and the project at once:
   are retuned studio-wide in `crates/ms-theme/src/canvas.rs`.
 - To change the lock rules, the button enablement, the status line or the pass order:
   `frame.rs`.
-- To change how a mask layer stores, previews or uploads its pixels: `layers.rs`.
+- To change how a mask layer or the marks layer stores, previews or uploads its pixels, or how
+  the shared undo history is bounded: `layers.rs`.
+- To change the marks gestures (stroke, Ctrl rectangle, crosshair, brush switch): `frame.rs`
+  (`sense_mask_painting`, `commit_marks_rect`, `paint_brush_cursor`, `set_paint_target`); the
+  rectangle geometry is `hollow_rect_boxes` in `layers.rs`.
+- To change how marks reach an engine: `prepare_run_marks` / `reconcile_marks_mode` in `host.rs`,
+  the types in `engine.rs`; the compact-panel controls are in `host_panels.rs`.
 - To change how a mask arrives from somewhere other than the brush: `set_active_from_alpha` in
   `layers.rs`. `place_for_test` in `frame.rs` is how a CONSUMER's own tests reach a placed
   frame — the rectangle stays unsettable from production code, which is what keeps every
@@ -261,20 +301,22 @@ protocol, its worker threads and its OWN progress bar (no shared progress vocabu
 that stack, the pending result and the apply path, and learns only Running / Done / Failed.
 
 ```
-CleaningTool::draw_ui           compact panel: engine picker, brush, mask layer, mask generation,
-                                mask actions
+CleaningTool::draw_ui           compact panel: engine picker, mask/marks switch, brush and marks
+                                colour, mask layer, mask generation, mask actions, marks mode
 CleaningTool::draw_main_panel   «Редактор области»: engine.draw_parameters + host actions
 CleaningTool::draw_overlay_ui   the per-frame pass (order below), the run, the generation, the apply
-CleaningTool::on_key_event      `-` / `=` / `+`, for the pointer OUTSIDE the frame
-CleaningTool::on_wheel_event    Shift+wheel, for the pointer OUTSIDE the frame
+CleaningTool::on_key_event      `-` / `=` / `+` on the active brush, for the pointer OUTSIDE the frame
+CleaningTool::on_wheel_event    Shift+wheel on the active brush, for the pointer OUTSIDE the frame
+CleaningTool::block_canvas_zoom_on_ctrl_primary   the marks rectangle's claim on Ctrl+drag
 ```
 
 `draw_overlay_ui` is the whole per-frame pass and its ORDER is load-bearing:
 
 1. `push_engine_rules`: read `allows_empty_mask()` and `constraints()` back from the engine into
-   the frame — the engine may derive either from a parameter the user changed in this same
-   frame's panel body, which ran earlier inside `CanvasView::draw`; a stale copy silently blocks
-   or allows a run (§13.5) or validates against the previous model's size rules;
+   the frame and `marks_support()` into the marks mode — the engine may derive any of them from
+   a parameter the user changed in this same frame's panel body, which ran earlier inside
+   `CanvasView::draw`; a stale copy silently blocks or allows a run (§13.5) or validates against
+   the previous model's size rules. It also pushes the marks eyedropper's claim on the click;
 2. `RegionFrame::update` — the frame settles its rectangle and reports a `FrameOutcome`;
 3. push `set_backend_available` / `set_torch_available` / `set_region` — after the pass, so the
    rectangle is THIS frame's (an engine may treat a moved rectangle as "a different image" and
@@ -308,6 +350,20 @@ Host contracts:
   and the rectangle are pushed every frame (step 3). Re-pushing mask layers per frame would be
   wrong: `set_mask_layers` refuses and logs on a locked frame. A per-frame constraint push is
   free because `set_constraints` only re-validates.
+- **The host owns the marks mode and packages the marks.** `select_engine` sets the new engine's
+  preferred mode; the per-frame re-read moves a mode the engine stopped supporting to its
+  preferred one (logged); otherwise the user's choice stands. `hand_region_to_engine` hands the
+  engine the marks through `prepare_run_marks`: nothing drawn -> region unchanged and
+  `RunMarks::None` in every mode; Overlay -> composited "over" the region; Reference -> region
+  unchanged plus a composited copy; Layer -> region unchanged plus the straight-alpha layer. An
+  engine never composites. The marks colour presets are the shipped palette and are not
+  persisted; a sampling of the marks eyedropper is cancelled whenever the selector is not drawn
+  (mask mode, a hidden panel, tool deactivation), so it can never eat a later click.
+- **Marks are instructions, never content.** An Overlay run keeps the unmarked region and the
+  region it sent; `accept_result` restores every pixel the marks changed that the engine handed
+  back UNTOUCHED (`restore_untouched_marked_pixels`), so a mark outside an inpainting mask can
+  never reach the clean overlay through «Применить». A pixel the engine changed is the engine's
+  answer and is kept. The other two modes never put marks into the region at all.
 - **Apply validates the size and refuses (D7).** `check_result_fits` rejects a wrong size or an
   out-of-overlay rectangle before `replace_overlay_region_px` could rescale or clip; the same
   check runs on the engine's answer (`accept_result`) and on the loaded region
@@ -341,9 +397,15 @@ Host contracts:
 - **User message and technical detail are separate.** `report_error` shows a localized sentence
   and logs `"{log_tag} {text} | {detail}"`; a technical reason never enters a translated string.
 - **`block_canvas_zoom()` stays `false` (D5)** and `wants_primary_stroke` is `false`; a test pins
-  the former (`the_area_editor_never_blocks_canvas_zoom_...`).
-- **Nothing blocks the GUI thread**: the only per-frame work is capturing an in-memory overlay
-  chunk when a job starts.
+  the former (`the_area_editor_never_blocks_canvas_zoom_...`). `block_canvas_zoom_on_ctrl_primary`
+  is `false` on an idle host and in mask mode, and answers the frame's marks-rectangle claim
+  otherwise.
+- **Nothing blocks the GUI thread**: the only GUI-thread work of a job is capturing an
+  in-memory overlay chunk when it starts and, when marks are drawn, ONE per-pixel pass over the
+  region at hand-off (`prepare_run_marks`: a composite or a copy of the marks layer) plus the
+  same order of work once on accept (`restore_untouched_marked_pixels`). Both are linear in the
+  frame size and happen once per run, never per frame; moving them into the shared loader
+  worker would widen `base.rs`'s `RegionLoadRequest` for every tool, so they stay here.
 - Every `t!` key of the host lives under `cleaning.tools.area_editor.*` (generation-block keys are
   the mask editor's own `cleaning.mask_editor.*`); the dock tab caption is
   `cleaning.tab.area_editor_tab`.

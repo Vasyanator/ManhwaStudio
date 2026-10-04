@@ -98,6 +98,12 @@ between steps (the executor hands back the `JobRef` they returned). Target-neutr
   `SizeParamStyle` names and refuses (`RequestBuild`) a style its shape cannot express; it never
   changes the size.
 - **Masks** are encoded here in the provider's polarity (`codec::MaskPolarity`), at the sent size.
+- **Reference image** (`EditCall::reference_png`): appended to the shape's list field right
+  after the edited image (fal / GenAPI `image_urls`, `OpenRouter` `input_references`, Together
+  `reference_images`, Replicate `input_images` / `image`, Polza `images`, Kling `image_list`,
+  Runway `referenceImages`, Tencent `images` / content, BFL FLUX 3 `images`, Gemini `parts`,
+  `DashScope` content, Runware `referenceImages`, `OpenAI` / own server a second `image[]`).
+  An endpoint with a single image field returns `ReferenceNotSupported` (`refuse_reference`).
 
 ## Editing map
 - Add a shape: a new file implementing `EditProtocol`, its arm in `protocol_for`, documented

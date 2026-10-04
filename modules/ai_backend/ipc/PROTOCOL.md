@@ -9,9 +9,9 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `4` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `5` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
-  `protocol.py` mirrored by `src/backend_ipc/protocol.rs`. It MUST be bumped in BOTH
+  `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
   a new header or payload field, a new topic, a changed meaning of an existing field, a
   changed blob format. A Rust parity test asserts the two constants agree, but nothing
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 3. Optional/ignored on others.   |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 5. Optional/ignored on others.   |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -375,7 +375,7 @@ streams `phase:"download"`.
 
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
-| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `params: object` (see below)                            | region PNG ++ mask PNG | `image_len: int`, `oom_recovered: bool`, `applied: object`                 | result PNG | **yes** | yes    |
+| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: object`                 | result PNG | **yes** | yes    |
 | `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
 | `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
@@ -538,6 +538,21 @@ size — mode `L` is checked and any other mode (`RGB`, `RGBA`, `P`, …) is a
 request error, never converted: guessing which channel carries the permission to
 edit would turn a client bug into an edit of the wrong pixels. A violation is a
 `status:"error"` naming the offending numbers or the mode that arrived.
+
+**`reference_len` — the user's marks as a separate reference.** Optional; absent
+or `0` means the request carries no reference. When present, the blob carries a
+THIRD segment after the mask: the user's marks composited over a copy of the
+region, an RGB(A) PNG (alpha is dropped) of EXACTLY the region's size —
+any other size is a request error. The three lengths must sum to the blob length
+exactly, like the two without it. The backend hands it to diffusers'
+`Flux2KleinInpaintPipeline` as `image_reference` (one PIL image), a condition
+image beside the region the pipeline already conditions on; the region itself
+stays the clean image the model edits, and the reference never enters the
+composite. The pipeline preprocesses a reference with the region's own rules (the
+1 MP cap and the floor to a multiple of 16), so a reference of the region's size
+stays pixel-aligned with it — and for a valid region both rules are no-ops. The
+pre-load memory guard counts the reference's condition tokens in the denoise
+phase; `.estimate` takes no reference and forecasts a run without one.
 
 **`whole_region` — editing without a painted mask.** The request format does not
 fork: the blob still carries a mask, and under `whole_region: true` it must be

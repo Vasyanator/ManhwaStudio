@@ -28,7 +28,7 @@ render client-side; their markdown is embedded in the served HTML).
 
 use serde_json::{Value, json};
 
-use super::{classify_error, images_data_step, is_success, json_post, png_data_url};
+use super::{classify_error, images_data_step, is_success, json_post, png_data_url, refuse_reference};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::error::ImageEditError;
 use crate::image_edit::protocol::{AuthScheme, EditCall, EditProtocol, HttpRequestSpec, HttpResponse, NextStep, StepCtx};
@@ -55,6 +55,8 @@ fn ark_error(status: u16, body: &[u8]) -> ImageEditError {
 
 impl EditProtocol for ArkImages {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+        // One image field: a reference cannot be expressed.
+        refuse_reference(call)?;
         if call.size_param != SizeParamStyle::WxH {
             return Err(ImageEditError::RequestBuild { detail: format!("ModelArk states a pixel size only as \"WxH\"; it cannot state {:?}", call.size_param) });
         }

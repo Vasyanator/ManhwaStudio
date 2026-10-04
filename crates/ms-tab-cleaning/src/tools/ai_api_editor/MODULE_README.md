@@ -17,10 +17,11 @@ CloudEditEngine (engine.rs)
   draw_parameters  draw_image_edit_picker (provider + Russia badge, endpoint, key block, model,
                    offer notes) -> prompt -> blend -> size line -> billing/privacy -> run state
   constraints()    selection.offer() -> constraints::frame_constraints(rule)  (host re-reads per frame)
+  marks_support()  offer.accepts_references() ? reference (preferred) + layer + overlay : overlay only
   run_block_reason decisions::run_block_reason(RunGate snapshot)
   start            geometry::upscale_factor_for -> k; worker::spawn_run(RunJob, CancelFlag)
   poll             settings load -> key slot + ImageEditKeyRunner::pump -> settings save -> run events
-worker.rs          read_key -> RgbaRegion -> run_image_edit(&req, key, cancel, on_stage) -> ColorImage
+worker.rs          read_key -> RgbaRegion (+ marks_reference) -> run_image_edit(&req, key, cancel, on_stage) -> ColorImage
 ```
 
 ## Files and submodules
@@ -34,7 +35,8 @@ worker.rs          read_key -> RgbaRegion -> run_image_edit(&req, key, cancel, o
 - `settings.rs`: `ApiEditSettings` in `ms_config::ai_api_edit_settings_path()` — selected provider,
   per-provider `{model_id, endpoint}`, prompt, dilate, feather; load/save on workers; the test
   persistence latch.
-- `worker.rs`: `RunJob`, `WorkerEvent`, `spawn_run` — one run per `ms_thread` worker.
+- `worker.rs`: `RunJob`, `WorkerEvent`, `spawn_run`, `marks_reference` — one run per
+  `ms_thread` worker.
 
 ## Contracts and invariants
 - **The size rule has one owner: `region_edit_v2::geometry`.** The selected offer's rule is DATA
@@ -43,6 +45,12 @@ worker.rs          read_key -> RgbaRegion -> run_image_edit(&req, key, cancel, o
   check of the result stays in force.
 - **A model switch re-validates, never resizes.** `constraints()` follows the selection and the
   host pushes it every frame: an incompatible rectangle turns red and blocks «Обработать».
+- **Marks follow the model.** `marks_support()` is derived from the selected offer every frame:
+  a model with `max_extra_references > 0` takes the marks as the reference image (the region
+  with the marks composited, opaque; or the marks layer alone, straight alpha), else only drawn
+  onto the region (the panel says so). Separate marks for a model without references are
+  refused in `start` (localized, logged), never sent without them; the conversion to the
+  reference raster runs on the worker, the PNG encoding in the pipeline.
 - **The mask means "may change here"** (stated in the panel); `allows_empty_mask` is always true
   and an empty mask means the whole region. One mask layer, constant.
 - **No blocking work on the GUI thread.** Settings IO, every credential-store operation (key check,

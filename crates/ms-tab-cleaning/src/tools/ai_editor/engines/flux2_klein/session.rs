@@ -72,20 +72,18 @@ impl Flux2SessionState {
 
     /// Starts a run on a worker thread. A second run is refused while one is in flight.
     ///
-    /// `mask` is the L8 buffer that actually goes on the wire — the host's painted layer,
-    /// or the solid one built for the whole-region mode — and `mask_size` is the region size
-    /// both it and `region` describe. `whole_region` is the flag [`mask_for_run`] derived
-    /// alongside that buffer and must not be re-derived here: the two have to agree, or the
-    /// backend refuses the pair. The sizes are validated by the caller before it gets here.
+    /// `input.mask` is the L8 buffer that actually goes on the wire — the host's painted
+    /// layer, or the solid one built for the whole-region mode — and `input.mask_size` is
+    /// the region size it, `input.region` and the optional `input.reference` all describe.
+    /// `input.whole_region` is the flag [`mask_for_run`] derived alongside that buffer and
+    /// must not be re-derived here: the two have to agree, or the backend refuses the pair.
+    /// The sizes are validated by the caller before it gets here, and again on the worker.
     ///
     /// # Errors
     /// Returns the localized "already running" message when a run is still in flight.
     pub(super) fn start_run(
         &mut self,
-        region: egui::ColorImage,
-        mask: Vec<u8>,
-        whole_region: bool,
-        mask_size: [usize; 2],
+        input: Flux2RunInput,
         settings: &Flux2KleinSettings,
         progress: &Arc<Mutex<Flux2Progress>>,
     ) -> Result<(), String> {
@@ -99,17 +97,9 @@ impl Flux2SessionState {
         let progress = Arc::clone(progress);
         let (tx, rx) = mpsc::channel::<Flux2JobResult>();
         thread::spawn(move || {
-            let result = run_flux2_klein(
-                &region,
-                &mask,
-                whole_region,
-                mask_size,
-                &settings,
-                &progress,
-                generation,
-            );
+            let result = run_flux2_klein(&input, &settings, &progress, generation);
             let _ = tx.send(Flux2JobResult {
-                source: region,
+                source: input.region,
                 result,
             });
         });

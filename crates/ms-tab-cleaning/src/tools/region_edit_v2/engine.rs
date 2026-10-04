@@ -14,9 +14,12 @@ Key structures:
 - `EngineSection`: which picker section («Без промпта» / «С промптом») an engine appears in
 - `MaskLayerSpec`: one mask layer an engine wants painted (re-exported from `layers`)
 - `EngineRunRequest`: everything the host hands an engine to start one run
+- `MarksMode`, `MarksSupport`, `RunMarks`: how the user's marks layer may reach an engine, what
+  an engine accepts, and what one run carries
 - `EnginePoll`: what one `poll` says about the run in flight
 
 Key functions:
+- `composite_marks_over()`: the straight-alpha "over" of the marks layer onto a region (pure)
 - `violation_text()`: the localized sentence for one `SizeViolation`
 - `region_size_refusal()`: the run-path re-check of an engine's `FrameConstraints`
 
@@ -26,6 +29,10 @@ An engine never sees `CanvasView`, `ProjectData`, the frame or an `egui::Context
 progress vocabulary (`dev-docs/region_edit_v2_plan.md` §13.2 D13): engines disagree about
 what progress even is, so each draws its own bar inside its own parameter panel and the host
 learns only Running / Done / Failed. A run's answer is PIXELS and only pixels (D12).
+The marks layer is the user's colour annotation over the region (arrows, outlines); the HOST
+decides how it travels — composited into the region, as a separate reference image or as a
+transparent layer — from the engine's `marks_support()`, so an engine only ever reads
+`EngineRunRequest::marks` and never sees the frame's buffers.
 */
 
 use super::geometry::{FrameConstraints, SizeViolation, check_size};
@@ -75,6 +82,140 @@ pub struct EngineRunRequest {
     /// One L8 buffer per declared mask layer, in `mask_layers()` order, each
     /// `rect_px.w * rect_px.h` bytes and holding only `0` or `255`.
     pub masks: Vec<Vec<u8>>,
+    /// The user's marks, in the form the host chose from `marks_support()`. `RunMarks::None`
+    /// when nothing is drawn, AND when the marks were composited into `region` already
+    /// (`MarksMode::OverlayOnRegion`) — an engine never has to composite anything itself.
+    pub marks: RunMarks,
+}
+
+/// How the user's marks layer reaches an engine.
+///
+/// Picked by the user in the compact panel among the modes the selected engine supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarksMode {
+    /// The marks are composited onto the region the engine edits: the model sees them as part
+    /// of the picture («На редактируемую картинку»).
+    OverlayOnRegion,
+    /// The region stays clean and a COPY of it with the marks composited on top travels as a
+    /// separate reference image («Отдельный референс»).
+    SeparateReference,
+    /// The region stays clean and the marks travel alone, as a transparent RGBA layer
+    /// («Прозрачный слой»).
+    TransparentLayer,
+}
+
+impl MarksMode {
+    /// Every mode, in the order the panel lists them.
+    pub const ALL: [Self; 3] = [Self::OverlayOnRegion, Self::SeparateReference, Self::TransparentLayer];
+}
+
+/// What an engine accepts as marks: a NON-EMPTY set of modes and the preferred one, which is
+/// always in the set.
+///
+/// Both invariants hold by construction: [`MarksSupport::new`] starts from the preferred mode
+/// and [`MarksSupport::with`] can only add modes, so an empty set or a preferred mode outside
+/// the set cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarksSupport {
+    overlay: bool,
+    reference: bool,
+    layer: bool,
+    preferred: MarksMode,
+}
+
+impl MarksSupport {
+    /// The default of every engine: the marks are composited onto the region and nothing else.
+    pub const OVERLAY_ONLY: Self = Self::new(MarksMode::OverlayOnRegion);
+
+    /// A set holding exactly `preferred`, which is also the preferred mode.
+    #[must_use]
+    pub const fn new(preferred: MarksMode) -> Self {
+        Self { overlay: false, reference: false, layer: false, preferred }.with(preferred)
+    }
+
+    /// The same set plus `mode`; the preferred mode is unchanged.
+    #[must_use]
+    pub const fn with(self, mode: MarksMode) -> Self {
+        match mode {
+            MarksMode::OverlayOnRegion => Self { overlay: true, ..self },
+            MarksMode::SeparateReference => Self { reference: true, ..self },
+            MarksMode::TransparentLayer => Self { layer: true, ..self },
+        }
+    }
+
+    /// Whether `mode` is in the set.
+    #[must_use]
+    pub const fn supports(&self, mode: MarksMode) -> bool {
+        match mode {
+            MarksMode::OverlayOnRegion => self.overlay,
+            MarksMode::SeparateReference => self.reference,
+            MarksMode::TransparentLayer => self.layer,
+        }
+    }
+
+    /// The mode the host switches to when this engine is selected, or when the user's choice
+    /// stops being supported.
+    #[must_use]
+    pub const fn preferred(&self) -> MarksMode {
+        self.preferred
+    }
+}
+
+/// The marks of one run, in the form the host chose.
+#[derive(Debug, Clone)]
+pub enum RunMarks {
+    /// No marks travel separately: none were drawn, or they were composited into the region.
+    None,
+    /// A copy of the region with the marks composited over it, exactly `rect_px` in size and as
+    /// opaque as the region is. Premultiplied like every `egui::ColorImage`.
+    Reference(egui::ColorImage),
+    /// The marks layer alone, `rect_px` in size, STRAIGHT (non-premultiplied) alpha; a pixel
+    /// nobody marked is `[0, 0, 0, 0]`.
+    Layer(image::RgbaImage),
+}
+
+/// `region` with the straight-alpha marks layer `marks` composited OVER it ("over" operator).
+///
+/// `marks` holds 4 straight-alpha bytes per pixel in the region's row-major order. The
+/// operation is done in premultiplied space — `out = mark + region * (1 - mark.a)` — which is
+/// exact for any region alpha, so an unmarked pixel comes back bit-identical and a fully
+/// opaque mark replaces the pixel outright.
+///
+/// Returns `None`, having produced nothing, when `marks` does not hold exactly
+/// `4 * width * height` bytes: a layer of another shape must never be stretched over a region.
+#[must_use]
+pub(super) fn composite_marks_over(region: &egui::ColorImage, marks: &[u8]) -> Option<egui::ColorImage> {
+    if marks.len() != region.pixels.len().checked_mul(4)? {
+        return None;
+    }
+    let pixels = region
+        .pixels
+        .iter()
+        .zip(marks.chunks_exact(4))
+        .map(|(dst, mark)| {
+            let alpha = mark[3];
+            if alpha == 0 {
+                return *dst;
+            }
+            let src = egui::Color32::from_rgba_unmultiplied(mark[0], mark[1], mark[2], alpha).to_array();
+            let dst = dst.to_array();
+            let keep = u16::from(255 - alpha);
+            // `src + dst * (255 - a) / 255` per premultiplied channel. Both terms are bounded by
+            // the result alpha, which never exceeds 255, so the sum fits a byte; `min` keeps
+            // the narrowing total against rounding.
+            let blend = |s: u8, d: u8| -> u8 {
+                let scaled = (u16::from(d) * keep + 127) / 255;
+                u8::try_from((u16::from(s) + scaled).min(255)).unwrap_or(u8::MAX)
+            };
+            egui::Color32::from_rgba_premultiplied(
+                blend(src[0], dst[0]),
+                blend(src[1], dst[1]),
+                blend(src[2], dst[2]),
+                blend(src[3], dst[3]),
+            )
+        })
+        .collect();
+    Some(egui::ColorImage::new(region.size, pixels))
 }
 
 /// What one `poll` says about the run in flight.
@@ -166,6 +307,16 @@ pub trait AiEngine {
         None
     }
 
+    /// How the user's marks layer may reach this engine. Default: composited onto the region
+    /// only ([`MarksSupport::OVERLAY_ONLY`]).
+    ///
+    /// Re-read by the host EVERY frame, like `constraints()`, because an engine may derive it
+    /// from one of its own parameters (the selected API model, say). When the user's chosen
+    /// mode stops being supported the host falls back to `preferred()`. Must stay cheap.
+    fn marks_support(&self) -> MarksSupport {
+        MarksSupport::OVERLAY_ONLY
+    }
+
     /// Starts one run. The engine takes over `request` and reports through `poll`.
     ///
     /// # Errors
@@ -247,6 +398,56 @@ pub(in crate::tools) fn region_size_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constructor cannot build an empty set nor a preferred mode outside it, and `with`
+    /// only ever adds.
+    #[test]
+    fn marks_support_always_holds_its_preferred_mode() {
+        for preferred in MarksMode::ALL {
+            let support = MarksSupport::new(preferred);
+            assert_eq!(support.preferred(), preferred);
+            assert!(support.supports(preferred), "{preferred:?} must be in its own set");
+            for other in MarksMode::ALL {
+                assert_eq!(support.supports(other), other == preferred, "{preferred:?} / {other:?}");
+            }
+            let wider = support.with(MarksMode::TransparentLayer);
+            assert_eq!(wider.preferred(), preferred, "adding a mode never changes the preference");
+            assert!(wider.supports(preferred) && wider.supports(MarksMode::TransparentLayer));
+        }
+        assert_eq!(MarksSupport::OVERLAY_ONLY.preferred(), MarksMode::OverlayOnRegion);
+        assert!(!MarksSupport::OVERLAY_ONLY.supports(MarksMode::SeparateReference));
+        assert!(!MarksSupport::OVERLAY_ONLY.supports(MarksMode::TransparentLayer));
+    }
+
+    /// Unmarked pixels come back bit-identical, an opaque mark replaces the pixel, a
+    /// translucent mark blends, and a layer of the wrong length is refused.
+    #[test]
+    fn marks_are_composited_with_the_over_operator() {
+        let region = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::from_rgb(10, 20, 30),
+                egui::Color32::from_rgb(200, 100, 50),
+                egui::Color32::from_rgba_premultiplied(40, 40, 40, 128),
+                egui::Color32::from_rgb(0, 0, 0),
+            ],
+        );
+        let mut marks = vec![0u8; 16];
+        // Pixel 1: opaque red. Pixel 3: half-transparent white over black.
+        marks[4..8].copy_from_slice(&[255, 0, 0, 255]);
+        marks[12..16].copy_from_slice(&[255, 255, 255, 128]);
+        let out = composite_marks_over(&region, &marks).expect("the layer has the region's shape");
+        assert_eq!(out.size, [2, 2]);
+        assert_eq!(out.pixels[0], region.pixels[0], "an unmarked pixel is untouched");
+        assert_eq!(out.pixels[2], region.pixels[2], "an unmarked translucent pixel is untouched");
+        assert_eq!(out.pixels[1], egui::Color32::from_rgb(255, 0, 0), "an opaque mark replaces the pixel");
+        let [r, g, b, a] = out.pixels[3].to_array();
+        assert_eq!(a, 255, "a mark over an opaque pixel stays opaque");
+        assert!(r == g && g == b && (127..=129).contains(&r), "half white over black is mid grey: {r}");
+
+        assert!(composite_marks_over(&region, &marks[..12]).is_none(), "a short layer is refused");
+        assert!(composite_marks_over(&region, &[0u8; 20]).is_none(), "a long layer is refused");
+    }
 
     /// The shared run-path re-check answers exactly what `check_size` decides, and names the
     /// rule that was broken.

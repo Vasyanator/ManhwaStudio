@@ -25,7 +25,7 @@ inpainting), https://www.recraft.ai/docs/api-reference/image-inputs-and-results.
 
 use serde_json::json;
 
-use super::{images_data_step, json_post, mask_data_url, png_data_url};
+use super::{images_data_step, json_post, mask_data_url, png_data_url, refuse_reference};
 use crate::image_edit::catalog::SizeParamStyle;
 use crate::image_edit::codec::MaskPolarity;
 use crate::image_edit::error::ImageEditError;
@@ -37,6 +37,8 @@ pub struct RecraftEdit;
 
 impl EditProtocol for RecraftEdit {
     fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+        // One image field: a reference cannot be expressed.
+        refuse_reference(call)?;
         if call.size_param != SizeParamStyle::None {
             return Err(ImageEditError::RequestBuild { detail: format!("Recraft inpainting keeps the input size; it cannot state {:?}", call.size_param) });
         }

@@ -58,7 +58,8 @@ impl EditProtocol for RunwayTasks {
             "model": call.model_id,
             "promptText": call.prompt,
             "ratio": format!("{}:{}", call.width, call.height),
-            "referenceImages": [{ "uri": png_data_url(&call.image_png) }]
+            // The edited image first, then the reference.
+            "referenceImages": std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "uri": png_data_url(png) })).collect::<Vec<Value>>()
         });
         Ok(json_post(format!("{}/text_to_image", call.base_url), version_headers(), body, AuthScheme::Bearer))
     }

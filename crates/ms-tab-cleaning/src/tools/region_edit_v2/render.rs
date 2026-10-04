@@ -18,6 +18,8 @@ Key functions:
 - `paint_row_background()`, `paint_status_text()`, `paint_size_text()`: the two rows below it
   (the status line on the left, the frame size in pixels right-aligned in the same row)
 - `paint_offscreen_arrow()`: the "the frame is over there" indicator of a locked frame
+- `paint_crosshair()`: the marks brush's centre cross, drawn inside its ring
+- `paint_marks_rect_preview()`: the live preview of a Ctrl+drag marks rectangle
 
 Notes:
 The state colours (outer backing ring, refused red, occupied green) come from
@@ -43,6 +45,14 @@ const CHROME_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(20, 20, 22, 
 const CHROME_FOREGROUND: Color32 = Color32::from_rgb(200, 200, 205);
 /// Fill of the mask-layer chip that is currently selected for painting.
 const LAYER_CHIP_ACTIVE_FILL: Color32 = Color32::from_rgb(60, 90, 140);
+
+/// Fill of a Ctrl+drag marks rectangle that will ERASE on release: a neutral translucent white,
+/// because the eventual colour is "nothing" and the user must still see where it lands.
+const MARKS_ERASE_PREVIEW_FILL: Color32 = Color32::from_rgba_premultiplied(110, 110, 110, 110);
+/// Half the length of one arm of the marks brush crosshair, in screen points.
+const CROSSHAIR_HALF_LEN: f32 = 5.0;
+/// Width of the marks brush crosshair's lines, in screen points.
+const CROSSHAIR_STROKE_W: f32 = 1.0;
 
 /// Width of the outer stroke, in screen points.
 const OUTER_STROKE_W: f32 = 3.0;
@@ -245,4 +255,23 @@ pub(super) fn layer_chip_rect(strip: Rect, index: usize, count: usize) -> Rect {
     let steps = f32::from(u16::try_from(from_right).unwrap_or(u16::MAX));
     let right = strip.right() - 2.0 - steps * (side + gap);
     Rect::from_min_size(pos2(right - side, strip.top() + 2.0), vec2(side, side))
+}
+
+/// Paints a thin cross of `color` centred on `center` — the marks brush's centre mark, drawn
+/// INSIDE the ring `MaskBrush` paints, so a mark lands exactly where the user aims even with a
+/// large brush.
+pub(super) fn paint_crosshair(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(CROSSHAIR_STROKE_W, color);
+    painter.line_segment([center - vec2(CROSSHAIR_HALF_LEN, 0.0), center + vec2(CROSSHAIR_HALF_LEN, 0.0)], stroke);
+    painter.line_segment([center - vec2(0.0, CROSSHAIR_HALF_LEN), center + vec2(0.0, CROSSHAIR_HALF_LEN)], stroke);
+}
+
+/// Paints the live preview of a Ctrl+drag marks rectangle: `boxes` are the screen rects of the
+/// exact pixel boxes the release will fill, so the preview IS the result. `color` is the marks
+/// colour, or `None` for a rectangle that will erase.
+pub(super) fn paint_marks_rect_preview(painter: &Painter, boxes: &[Rect], color: Option<Color32>) {
+    let fill = color.unwrap_or(MARKS_ERASE_PREVIEW_FILL);
+    for rect in boxes {
+        painter.rect_filled(*rect, CornerRadius::ZERO, fill);
+    }
 }

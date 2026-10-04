@@ -13,7 +13,9 @@ Main responsibilities:
   VAE are loaded, placed and warmed up FIRST, then the text encoder is read into
   the host memory the transformer has just vacated - as a `Qwen3Model` truncated
   to `ENCODER_KEEP_LAYERS` layers and always in bfloat16
-  (`text_encoder_dtype_name`), because it runs on the host CPU;
+  (`text_encoder_dtype_name`), because it runs on the host CPU; an optional
+  marks reference of the region's exact size goes to the pipeline as its
+  `image_reference`;
 - `component_action` - one per-component residency action under the same memory
   guard and lease protocol a generation uses;
 - the `prompt_cache_*` methods - the library surface, keyed identically to the
@@ -424,13 +426,21 @@ class Flux2KleinInpaintService:
         image_bytes: bytes,
         mask_bytes: bytes,
         *,
+        reference_bytes: bytes | None = None,
         params: dict[str, Any] | None = None,
         progress_callback: ProgressCb | None = None,
     ) -> dict[str, Any]:
         """Regenerate the masked part of `image_bytes` and composite it back.
 
         `image_bytes` is the region PNG and `mask_bytes` an L8 mask of exactly the
-        same size, where non-zero means "may change". The returned `image_png` has
+        same size, where non-zero means "may change". `reference_bytes`, when
+        given, is the user's marks composited over a copy of the region: it must
+        decode to EXACTLY the region's size, because only then does the pipeline's
+        reference preprocessing (the same 1 MP cap and grid floor as the region's)
+        leave it aligned pixel for pixel with the region — and for a valid region
+        both are no-ops. It is handed to the pipeline as `image_reference`, one
+        extra condition image beside the region; it never enters the composite,
+        which is built from the region alone. The returned `image_png` has
         the region's size and is byte-identical to the input outside the mask.
         Under `whole_region` the mask must be solid (every pixel 255) and the
         whole region is regenerated; a non-solid mask there is a request error,
@@ -451,8 +461,8 @@ class Flux2KleinInpaintService:
         stopped being true while no weight moved.
 
         # Raises
-        `ValueError` for bad params, a bad region size, a mask size mismatch, a
-        non-solid mask under `whole_region`, or a text encoder whose width does
+        `ValueError` for bad params, a bad region size, a mask or reference size
+        mismatch, a non-solid mask under `whole_region`, or a text encoder whose width does
         not match the transformer (`require_encoder_transformer_compatible`);
         `FileNotFoundError` when a component is missing; `RuntimeError` when a
         phase does not fit in the free memory; whatever the pipeline raises
@@ -465,6 +475,14 @@ class Flux2KleinInpaintService:
         mask_u8 = _decode_mask(mask_bytes, expected_hw=(height, width))
         if normalized["whole_region"]:
             _require_solid_mask(mask_u8)
+        reference_rgb = None
+        if reference_bytes is not None:
+            reference_rgb = _decode_image_rgb(reference_bytes)
+            if reference_rgb.shape[:2] != (height, width):
+                raise ValueError(
+                    f"Референс меток {reference_rgb.shape[1]}x{reference_rgb.shape[0]} не совпадает "
+                    f"по размеру с областью {width}x{height}"
+                )
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
 
         model_key = _model_key(normalized)
@@ -499,7 +517,13 @@ class Flux2KleinInpaintService:
                     # memory guard, and dies as a bare matmul shape error inside
                     # the denoise — after ~34 GB has been read from disk.
                     require_encoder_transformer_compatible(normalized)
-                    self._require_headroom_locked(normalized, width, height, model_key)
+                    self._require_headroom_locked(
+                        normalized,
+                        width,
+                        height,
+                        model_key,
+                        with_reference=reference_rgb is not None,
+                    )
                     pipe = self._ensure_pipeline_locked(
                         normalized,
                         model_key,
@@ -523,7 +547,13 @@ class Flux2KleinInpaintService:
                 self._warmup_pipeline_if_needed_locked(pipe, normalized, report)
                 embeds = self._prompt_embeds_locked(normalized, report)
                 out_rgb, applied, oom_recovered = self._generate_locked(
-                    pipe, region_rgb, mask_u8, normalized, embeds, progress_callback
+                    pipe,
+                    region_rgb,
+                    mask_u8,
+                    normalized,
+                    embeds,
+                    progress_callback,
+                    reference_rgb=reference_rgb,
                 )
                 self._last_error = None
             except Exception as exc:
@@ -1488,7 +1518,13 @@ class Flux2KleinInpaintService:
         ]
 
     def _require_headroom_locked(
-        self, normalized: dict[str, Any], region_width: int, region_height: int, model_key: str
+        self,
+        normalized: dict[str, Any],
+        region_width: int,
+        region_height: int,
+        model_key: str,
+        *,
+        with_reference: bool = False,
     ) -> None:
         """Gate the request on the free memory, before a single byte is read.
 
@@ -1506,6 +1542,9 @@ class Flux2KleinInpaintService:
         for them twice refused a run whose memory was, literally, already in
         place; that was measured on this project's reference host the first time
         a second prompt was sent to a resident pipeline.
+
+        `with_reference` says the run carries a region-sized marks reference, whose
+        condition tokens the denoise forecast then includes.
         """
         phases: list[str] = []
         pipeline_resident = self._pipe is not None and self._active_key == model_key
@@ -1525,6 +1564,7 @@ class Flux2KleinInpaintService:
             phases=tuple(phases),
             pipeline_resident=pipeline_resident,
             encoder_resident=encoder_resident,
+            with_reference=with_reference,
         )
 
     def _prompt_embeds_locked(
@@ -2104,8 +2144,15 @@ class Flux2KleinInpaintService:
         normalized: dict[str, Any],
         embeds: dict[str, Any],
         progress_callback: ProgressCb | None,
+        *,
+        reference_rgb: np.ndarray | None = None,
     ) -> tuple[np.ndarray, dict[str, bool], bool]:
         """Run the pipeline once and composite the result over the region.
+
+        `reference_rgb`, when given, is a region-sized marks reference passed as
+        the pipeline's `image_reference` (ONE PIL image: diffusers treats a list as
+        a batch sized from its first element). The argument is left out entirely
+        without one, so a run with no marks calls the pipeline exactly as before.
 
         `embeds` is the prompt phase's output: `{"prompt", "negative"}`, host-resident.
         The pipeline is ALWAYS called with `prompt=None` and those embeddings —
@@ -2181,6 +2228,8 @@ class Flux2KleinInpaintService:
             "callback_on_step_end": _on_step,
             "callback_on_step_end_tensor_inputs": ["latents"],
         }
+        if reference_rgb is not None:
+            call_kwargs["image_reference"] = Image.fromarray(reference_rgb, "RGB")
 
         # `self._device` is the placement target `_ensure_pipeline_locked` chose,
         # which is what the run must happen on; the probe is checked against it

@@ -9,7 +9,8 @@ owns the frame, the mask, the pending result and the apply path.
 
 Main responsibilities:
 - implement `AiEngine` — id, caption, section, the selected offer's size rule as the frame's
-  constraints, the single "may change" mask layer, the run gate, the run and the per-frame poll;
+  constraints, the single "may change" mask layer, the marks forms the selected model takes,
+  the run gate, the run and the per-frame poll;
 - draw the «Редактор области» panel body: the mask meaning, the service picker
   (`draw_image_edit_picker`), the prompt, the blend, the size line, the billing and privacy
   notes, and the run's progress and outcome;
@@ -23,7 +24,12 @@ Notes:
 Nothing here blocks the GUI thread: the settings IO, every credential-store operation and the
 run live on workers; `poll` only drains channels. `constraints()` follows the selected model and
 the host re-reads it every frame, so switching model re-validates the frame (red, never
-resized). The mask means "the model MAY change this"; an empty mask means the whole region.
+resized). `marks_support()` follows the selected model the same way: a model that takes a
+reference image besides the edited one (`ModelOffer::accepts_references`) gets the marks as a
+separate reference (preferred), a transparent layer, or drawn onto the region; any other model
+only the last. A run carrying separate marks for a model that takes none (the host's mode
+switch lags one frame behind a model switch) is refused with a localized message, never sent
+without them. The mask means "the model MAY change this"; an empty mask means the whole region.
 A cancelled run is detached and its HTTP call may still complete and be billed (the panel says
 so); dropping the engine cancels its run the same way (`Drop`). A failure is logged with the
 run's own provider and model snapshot (`RunInFlight`), not the picker's current selection. Errors reach the user as the localized `ImageEditError` text and the log as one line with
@@ -34,7 +40,7 @@ use super::constraints::frame_constraints;
 use super::decisions::{RunGate, run_block_reason};
 use super::settings::{ApiEditSettings, BLEND_RADIUS_MAX_PX, load_api_edit_settings, save_api_edit_settings};
 use super::worker::{RunJob, WorkerEvent, spawn_run};
-use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec, region_size_refusal};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks, region_size_refusal};
 use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 use crate::tools::region_edit_v2::geometry::{FrameConstraints, upscale_factor_for};
 use ms_ai_api::image_edit::{CancelFlag, ImageEditKeyRunner, ImageEditKeySlot, ImageEditKeyState, ImageEditProvider, ImageEditSelection, ImageEditStage, MaskBlend, draw_image_edit_picker, key_slot};
@@ -238,6 +244,11 @@ impl CloudEditEngine {
         }
     }
 
+    /// Whether the selected model takes a reference image besides the edited one.
+    fn accepts_references(&self) -> bool {
+        self.selection.offer().is_ok_and(|offer| offer.accepts_references())
+    }
+
     /// The run gate's snapshot of this engine.
     fn gate(&self) -> RunGate<'_> {
         RunGate {
@@ -378,6 +389,15 @@ impl Drop for CloudEditEngine {
     }
 }
 
+/// The log name of a run's marks form (technical, not localized).
+fn marks_form(marks: &RunMarks) -> &'static str {
+    match marks {
+        RunMarks::None => "none",
+        RunMarks::Reference(_) => "reference",
+        RunMarks::Layer(_) => "layer",
+    }
+}
+
 /// The localized text of a pipeline stage.
 fn stage_text(stage: ImageEditStage) -> String {
     match stage {
@@ -424,6 +444,17 @@ impl AiEngine for CloudEditEngine {
         true
     }
 
+    /// A model that takes a reference image besides the edited one gets the marks as that
+    /// reference (preferred), as a transparent layer in the same slot, or drawn onto the region;
+    /// any other model (or no model) only drawn onto the region. Re-read by the host every frame.
+    fn marks_support(&self) -> MarksSupport {
+        if self.accepts_references() {
+            MarksSupport::new(MarksMode::SeparateReference).with(MarksMode::OverlayOnRegion).with(MarksMode::TransparentLayer)
+        } else {
+            MarksSupport::OVERLAY_ONLY
+        }
+    }
+
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         ui.small(t!("cleaning.tools.ai_api_editor.mask_meaning_hint"));
         ui.separator();
@@ -437,6 +468,9 @@ impl AiEngine for CloudEditEngine {
         self.key_actions.clear_key |= actions.key.clear_key;
         if let Some(notice) = self.key_notice.as_ref() {
             ui.colored_label(notice.severity.color(), &notice.text);
+        }
+        if self.selection.offer().is_ok() && !self.accepts_references() {
+            ui.small(t!("cleaning.tools.ai_api_editor.marks_overlay_only_hint"));
         }
         ui.separator();
 
@@ -459,8 +493,9 @@ impl AiEngine for CloudEditEngine {
     /// Starts one run on a worker thread.
     ///
     /// # Errors
-    /// A localized message when a run is in flight, the request's sizes disagree, the gate is
-    /// closed, or the region fits the selected model at no allowed upscale.
+    /// A localized message when a run is in flight, the request's sizes disagree (the marks'
+    /// included), the gate is closed, the region fits the selected model at no allowed upscale,
+    /// or separate marks arrive for a model that takes no reference (logged).
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
         if let Some(reason) = run_block_reason(&RunGate { region: None, ..self.gate() }) {
             return Err(reason);
@@ -472,6 +507,21 @@ impl AiEngine for CloudEditEngine {
         };
         if pixel_count.is_none() || request.region.size != [width, height] || Some(mask.len()) != pixel_count {
             return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+        }
+        let marks_fit = match &request.marks {
+            RunMarks::None => true,
+            RunMarks::Reference(image) => image.size == [width, height],
+            RunMarks::Layer(layer) => usize::try_from(layer.width()).is_ok_and(|w| w == width) && usize::try_from(layer.height()).is_ok_and(|h| h == height),
+        };
+        if !marks_fit {
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+        }
+        let marks_form = marks_form(&request.marks);
+        if !matches!(request.marks, RunMarks::None) && !self.accepts_references() {
+            // The host switches the mode one frame after a model switch; a run started in
+            // between must not silently lose the marks.
+            ms_log::runtime_log::log_warn(format!("{LOG_TAG} cloud edit refused: marks as {marks_form} but provider={} model={} takes no reference image", self.selection.provider.key(), self.selection.model_id().trim()));
+            return Err(tf!("cleaning.tools.ai_api_editor.marks_reference_unsupported_error", button = t!("cleaning.tools.area_editor.marks_mode_overlay_button")));
         }
         let constraints = self.constraints();
         let Some(upscale) = upscale_factor_for(width, height, &constraints) else {
@@ -487,11 +537,12 @@ impl AiEngine for CloudEditEngine {
             prompt: self.prompt.clone(),
             region: request.region,
             mask,
+            marks: request.marks,
             blend: self.blend,
             upscale,
         };
         ms_log::runtime_log::log_info(format!(
-            "{LOG_TAG} cloud edit started: page={} region={}x{} provider={} model={} k={upscale}",
+            "{LOG_TAG} cloud edit started: page={} region={}x{} provider={} model={} k={upscale} marks={marks_form}",
             request.page_idx,
             width,
             height,
@@ -542,6 +593,7 @@ impl AiEngine for CloudEditEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::region_edit_v2::engine::RunMarks;
 
     /// A fresh engine: the default provider's first model is selected, so its rule is the
     /// frame's, and a run is refused until the settings have loaded.
@@ -582,10 +634,52 @@ mod tests {
         engine.settings_loaded = true;
         engine.prompt = "remove the text".to_string();
         let rect = OverlayRectPx { x: 0, y: 0, w: 1024, h: 1024 };
-        let short_mask = EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([1024, 1024], egui::Color32::WHITE), masks: vec![vec![0u8; 8]] };
+        let short_mask = EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([1024, 1024], egui::Color32::WHITE), masks: vec![vec![0u8; 8]], marks: RunMarks::None };
         assert!(engine.start(short_mask).is_err());
-        let two_layers = EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([1024, 1024], egui::Color32::WHITE), masks: vec![Vec::new(), Vec::new()] };
+        let two_layers = EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([1024, 1024], egui::Color32::WHITE), masks: vec![Vec::new(), Vec::new()], marks: RunMarks::None };
         assert!(engine.start(two_layers).is_err());
+        assert!(engine.run.is_none(), "a refused start leaves no run behind");
+    }
+
+    /// The engine for `provider`'s `model_id`, loaded and with a prompt, so only the request
+    /// decides whether `start` refuses.
+    fn engine_for(provider: ImageEditProvider, model_id: &str) -> CloudEditEngine {
+        let mut engine = CloudEditEngine::new();
+        engine.settings_loaded = true;
+        engine.prompt = "remove the text".to_string();
+        engine.selection = ImageEditSelection::new(provider);
+        if let Some(choice) = engine.selection.choices.get_mut(&provider) {
+            choice.model_id = model_id.to_string();
+        }
+        engine
+    }
+
+    /// The marks forms follow the selected model: references -> reference preferred plus the
+    /// other two; no references (or no model) -> drawn onto the region only.
+    #[test]
+    fn marks_support_follows_the_selected_model() {
+        let with_references = engine_for(ImageEditProvider::OpenAi, "gpt-image-2").marks_support();
+        assert_eq!(with_references.preferred(), MarksMode::SeparateReference);
+        assert!(MarksMode::ALL.iter().all(|mode| with_references.supports(*mode)));
+        let single_image = engine_for(ImageEditProvider::Xai, "grok-imagine-image-2.0").marks_support();
+        assert_eq!(single_image, MarksSupport::OVERLAY_ONLY);
+        let no_model = engine_for(ImageEditProvider::OpenAi, "").marks_support();
+        assert_eq!(no_model, MarksSupport::OVERLAY_ONLY);
+    }
+
+    /// Separate marks for a model without references (the host's mode switch lags a model
+    /// switch by a frame) and marks of another size are refused before any worker starts.
+    #[test]
+    fn start_refuses_marks_the_model_cannot_take() {
+        let rect = OverlayRectPx { x: 0, y: 0, w: 64, h: 32 };
+        let request = |marks: RunMarks| EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([64, 32], egui::Color32::WHITE), masks: vec![vec![0u8; 64 * 32]], marks };
+        let mut engine = engine_for(ImageEditProvider::Xai, "grok-imagine-image-2.0");
+        let refusal = tf!("cleaning.tools.ai_api_editor.marks_reference_unsupported_error", button = t!("cleaning.tools.area_editor.marks_mode_overlay_button"));
+        assert_eq!(engine.start(request(RunMarks::Reference(egui::ColorImage::filled([64, 32], egui::Color32::RED)))), Err(refusal.clone()));
+        assert_eq!(engine.start(request(RunMarks::Layer(image::RgbaImage::new(64, 32)))), Err(refusal));
+        let mut engine = engine_for(ImageEditProvider::OpenAi, "gpt-image-2");
+        assert!(engine.start(request(RunMarks::Layer(image::RgbaImage::new(32, 32)))).is_err(), "marks of another size");
+        assert!(engine.start(request(RunMarks::Reference(egui::ColorImage::filled([64, 31], egui::Color32::RED)))).is_err(), "marks of another size");
         assert!(engine.run.is_none(), "a refused start leaves no run behind");
     }
 

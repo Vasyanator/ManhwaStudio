@@ -204,6 +204,12 @@ functions with unit tests, not conditionals inside the drawing code.
   stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
   instead. `mask_feather_px` keeps working either way and softens the join between the region and the
   page.
+- **Marks modes differ per engine.** FLUX.2 klein (both variants) declares
+  `MarksSupport::new(SeparateReference).with(OverlayOnRegion)`: the marks preferably travel as a
+  region-sized reference beside a clean region (diffusers' `image_reference`), and never as a
+  transparent layer, which the pipeline would flatten to RGB. Lama and SDXL keep the trait default
+  `OVERLAY_ONLY` — neither pipeline has a reference input — so their run requests never carry
+  separate marks. See `flux2_klein/MODULE_README.md`.
 - **Lama's mask is MANDATORY and means the OPPOSITE of FLUX.2 klein's.** `allows_empty_mask()` is
   unconditionally `false`: the mask says WHAT TO REMOVE, so an empty one describes no work at all,
   and the host disables «Обработать» rather than sending a request whose only possible answer is the

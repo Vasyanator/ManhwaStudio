@@ -585,6 +585,7 @@ impl AiEngine for LamaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::region_edit_v2::engine::RunMarks;
 
     /// A fresh engine names itself, sits in the no-prompt section, and REQUIRES a mask —
     /// the rule that makes the host disable «Обработать» on an empty one.
@@ -627,6 +628,7 @@ mod tests {
             rect_px: rect,
             region: egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]),
             masks: vec![vec![0u8; 8]],
+            marks: RunMarks::None,
         };
         assert!(engine.start(short_mask).is_err());
         assert!(engine.run_rx.is_none(), "a refused start must leave no run behind");
@@ -636,6 +638,7 @@ mod tests {
             rect_px: rect,
             region: egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]),
             masks: vec![vec![0u8; 64], vec![0u8; 64]],
+            marks: RunMarks::None,
         };
         assert!(engine.start(wrong_layer_count).is_err());
 
@@ -644,6 +647,7 @@ mod tests {
             rect_px: rect,
             region: egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]),
             masks: vec![vec![0u8; 64]],
+            marks: RunMarks::None,
         };
         assert!(engine.start(wrong_region).is_err());
 
@@ -652,6 +656,7 @@ mod tests {
             rect_px: OverlayRectPx { x: 0, y: 0, w: 0, h: 0 },
             region: egui::ColorImage::new([0, 0], Vec::new()),
             masks: vec![Vec::new()],
+            marks: RunMarks::None,
         };
         assert!(engine.start(empty_rect).is_err());
     }
@@ -681,6 +686,7 @@ mod tests {
                 rect_px: OverlayRectPx { x: 0, y: 0, w, h },
                 region: egui::ColorImage::new([w, h], vec![egui::Color32::BLACK; pixels]),
                 masks: vec![vec![255u8; pixels]],
+                marks: RunMarks::None,
             };
             assert!(
                 engine.start(request).is_err(),

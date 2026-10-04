@@ -12,6 +12,8 @@ FILE HEADER (widgets/viewport_color_selector.rs)
     `ColorPresets` set. `draw` is the `None` case of it and keeps the stock egui
     color button. The eyedropper outranks both: while it is active the swatch is
     frozen and no preset UI is drawn.
+  - `ViewportColorSelector::cancel_eyedropper`: ends a pending sampling (as Escape) for a caller
+    that stops drawing the selector, and hands back the color to restore.
   - `ViewportColorSelector::poll_screenshot_events`: чтение `Event::Screenshot` по токену этого виджета.
   - `sample_color_at_pointer`: выбор цвета по пикселю viewport под курсором.
 - Замечание: пипетка меняет цвет в кадрах, где `ColorPresetPicker::draw` не вызывается,
@@ -76,6 +78,27 @@ impl ViewportColorSelector {
     #[must_use]
     pub fn primary_click_consumed_this_frame(&self) -> bool {
         self.primary_click_consumed_this_frame
+    }
+
+    /// Ends a waiting eyedropper without sampling, exactly as Escape would, and returns the
+    /// color it started from — the caller writes it back, because the sampling previews
+    /// overwrote the caller's color while it waited. `None` when no sampling was active (or it
+    /// had no start color), in which case nothing changes.
+    ///
+    /// For callers that stop drawing the selector while a sampling may be pending (a hidden
+    /// panel, a mode switch): a sampling that is never drawn can neither sample nor end, and
+    /// would otherwise swallow the first click after the selector reappears.
+    pub fn cancel_eyedropper(&mut self) -> Option<Color32> {
+        if !self.eyedropper_active {
+            return None;
+        }
+        self.eyedropper_active = false;
+        self.skip_primary_click_until_release = false;
+        self.primary_click_consumed_this_frame = false;
+        let start_color = self.start_color_before_eyedropper.take()?;
+        // Same bookkeeping as the Escape rollback: the restored color is the user's own pick.
+        self.preset_picker.note_color_picked_by_user(start_color);
+        Some(start_color)
     }
 
     /// Draws the selector with the stock egui color button.
@@ -263,4 +286,25 @@ fn sample_color_at_pointer(
     let x = px_x.min(width.saturating_sub(1));
     let y = px_y.min(height.saturating_sub(1));
     screenshot.pixels.get(y * width + x).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cancelling a pending sampling ends it and hands back the color it started from;
+    /// cancelling when nothing is pending changes nothing.
+    #[test]
+    fn cancelling_the_eyedropper_restores_the_start_color() {
+        let mut selector = ViewportColorSelector::default();
+        assert_eq!(selector.cancel_eyedropper(), None);
+
+        selector.eyedropper_active = true;
+        selector.skip_primary_click_until_release = true;
+        selector.start_color_before_eyedropper = Some(Color32::RED);
+        assert_eq!(selector.cancel_eyedropper(), Some(Color32::RED));
+        assert!(!selector.eyedropper_active());
+        assert!(!selector.skip_primary_click_until_release);
+        assert_eq!(selector.cancel_eyedropper(), None, "a second cancel has nothing to end");
+    }
 }

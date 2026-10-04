@@ -37,7 +37,9 @@ impl EditProtocol for OpenRouterImages {
         body.insert("model".to_string(), json!(call.model_id));
         body.insert("prompt".to_string(), json!(call.prompt));
         body.insert("n".to_string(), json!(1));
-        body.insert("input_references".to_string(), json!([{ "type": "image_url", "image_url": { "url": png_data_url(&call.image_png) } }]));
+        // The edited image first, then the reference.
+        let references: Vec<serde_json::Value> = std::iter::once(&call.image_png).chain(call.reference_png.as_ref()).map(|png| json!({ "type": "image_url", "image_url": { "url": png_data_url(png) } })).collect();
+        body.insert("input_references".to_string(), json!(references));
         match call.size_param {
             SizeParamStyle::WxH => {
                 body.insert("size".to_string(), json!(format!("{}x{}", call.width, call.height)));
