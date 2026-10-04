@@ -34,7 +34,7 @@ Notes:
   upload budget exactly like the canvas does. That adapter is temporary (see
   `paint_source_page`).
 - CLEANS are decoded (file) or taken from `CleanOverlaysModel` (an `Arc` clone under a short
-  lock, never `take_delta`) and split into `egui_large_image::PreparedTiles` on the tab's viewer
+  lock, never `delta_since`) and split into `egui_large_image::PreparedTiles` on the tab's viewer
   worker; the `Arc` is dropped there right after the split, because the model copy-on-writes any
   page still shared. The worker runs one job at a time and skips every queued job but the
   newest; a decode already running when it is superseded runs to completion (`image::open`

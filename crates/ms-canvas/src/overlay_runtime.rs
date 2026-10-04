@@ -21,7 +21,13 @@ Key functions:
 - OverlayRuntimeState::draw_overlay_on_page()
 - OverlayRuntimeState::replace_overlay_region()
 - OverlayRuntimeState::replace_overlay_region_px()
+- OverlayRuntimeState::sync_from_model() + plan_overlay_sync(): non-destructive per-canvas delta apply
+- write_own_change() / synced_revision_after_own_write(): own model writes never skip foreign changes
 Notes:
+- The synced revision is a per-canvas cursor into the shared, non-destructive
+  `CleanOverlaysModel::delta_since`; own writes advance it only when the canvas was fully synced,
+  and the read-only lazy load (`ensure_overlay_for_page_size`) never advances it. Own writes record
+  the page stamp they produced (`own_write_stamps`), so a re-listed own page is not re-fetched.
 - Публичный API для остальных вкладок по-прежнему проходит через `CanvasView`;
   этот модуль обслуживает только внутренний runtime bucket overlay-подсистемы.
 */
@@ -55,6 +61,10 @@ pub(super) struct OverlayRuntimeState {
     pub(super) overlay_dirty_tiles: HashMap<usize, HashSet<usize>>,
     pub(super) overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
     pub(super) synced_overlays_revision: u64,
+    /// Per page, the model change stamp produced by this canvas's OWN last write to it. A cached
+    /// page whose model stamp still equals it holds exactly that write, so sync keeps the cached
+    /// image (which may carry newer local-only preview pixels) instead of re-fetching it.
+    pub(super) own_write_stamps: HashMap<usize, u64>,
     pub(super) overlay_upload_min_interval_s: f64,
     pub(super) overlay_last_upload_s: HashMap<usize, f64>,
     pub(super) overlay_prepare_tx: Sender<Option<OverlayPrepareRequest>>,
@@ -79,6 +89,7 @@ impl Default for OverlayRuntimeState {
             overlay_dirty_tiles: HashMap::new(),
             overlays_model: None,
             synced_overlays_revision: 0,
+            own_write_stamps: HashMap::new(),
             overlay_upload_min_interval_s: 0.0,
             overlay_last_upload_s: HashMap::new(),
             overlay_prepare_tx,
@@ -103,6 +114,81 @@ fn clip_overlay_rect_to_size(rect: OverlayRectPx, size: [usize; 2]) -> OverlayRe
         w: x1.saturating_sub(x0),
         h: y1.saturating_sub(y0),
     }
+}
+
+/// The canvas's synced revision after its own model write moved the model from revision
+/// `before` to `after`.
+///
+/// Advances to `after` only when the canvas was fully synced before the write (`synced == before`):
+/// then the only change between `synced` and `after` is the canvas's own, which it already shows.
+/// Otherwise a foreign change landed after the last sync; jumping past it would hide it forever,
+/// so `synced` is kept and the next `delta_since` delivers the foreign pages. It also lists the
+/// canvas's own page again; sync skips re-fetching that page while its model stamp still equals
+/// the one recorded in `own_write_stamps`, so local-only preview pixels drawn after the write
+/// survive (see [`plan_overlay_sync`]).
+fn synced_revision_after_own_write(synced: u64, before: u64, after: u64) -> u64 {
+    if synced == before { after } else { synced }
+}
+
+/// Runs the canvas's own `write` against the locked model and updates the canvas's `synced`
+/// revision by [`synced_revision_after_own_write`]. When the write targets `page` and changed it
+/// (its model stamp moved), the new stamp is recorded in `own_write_stamps`; page-less writes
+/// (`set_visible`) pass `None`. The caller holds the lock only for this call.
+fn write_own_change<R>(
+    locked: &mut CleanOverlaysModel,
+    synced: &mut u64,
+    own_write_stamps: &mut HashMap<usize, u64>,
+    page: Option<usize>,
+    write: impl FnOnce(&mut CleanOverlaysModel) -> R,
+) -> R {
+    let before = locked.revision();
+    let stamp_before = page.and_then(|idx| locked.page_change_revision(idx));
+    let result = write(locked);
+    *synced = synced_revision_after_own_write(*synced, before, locked.revision());
+    if let Some(idx) = page
+        && let Some(stamp) = locked.page_change_revision(idx)
+        && Some(stamp) != stamp_before
+    {
+        own_write_stamps.insert(idx, stamp);
+    }
+    result
+}
+
+/// What a canvas sync does with one page listed in a model delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OverlaySyncAction {
+    /// Cached page changed by someone else: re-read its current image from the model.
+    Refetch,
+    /// Cached page whose model content is still this canvas's own last write: keep the cached
+    /// image untouched (it may carry newer local-only preview pixels).
+    KeepOwnWrite,
+    /// Page not cached by this canvas: copy nothing, only drop stale GPU/prepare state; it loads
+    /// lazily through `ensure_overlay_for_page_size`.
+    DropUncached,
+}
+
+/// Decides, for every page in a delta's `changed` list, what the sync does with it (see
+/// [`OverlaySyncAction`]). `model_stamp` is `CleanOverlaysModel::page_change_revision`, read under
+/// the same lock as the delta.
+pub(super) fn plan_overlay_sync(
+    changed: &[usize],
+    is_cached: impl Fn(usize) -> bool,
+    own_write_stamps: &HashMap<usize, u64>,
+    model_stamp: impl Fn(usize) -> Option<u64>,
+) -> Vec<(usize, OverlaySyncAction)> {
+    changed
+        .iter()
+        .map(|&idx| {
+            let action = if !is_cached(idx) {
+                OverlaySyncAction::DropUncached
+            } else if own_write_stamps.get(&idx).is_some_and(|own| model_stamp(idx) == Some(*own)) {
+                OverlaySyncAction::KeepOwnWrite
+            } else {
+                OverlaySyncAction::Refetch
+            };
+            (idx, action)
+        })
+        .collect()
 }
 
 impl OverlayRuntimeState {
@@ -134,6 +220,7 @@ impl OverlayRuntimeState {
         self.overlays_visible = self.local_visibility_override.unwrap_or(model_visible);
         self.overlays_model = Some(model);
         self.synced_overlays_revision = 0;
+        self.own_write_stamps.clear();
         self.overlay_prepare_inflight.clear();
         self.overlay_prepared_pages.clear();
     }
@@ -159,8 +246,7 @@ impl OverlayRuntimeState {
         self.local_visibility_override = None;
         self.overlays_visible = visible;
         if let Ok(mut locked) = model.lock() {
-            locked.set_visible(visible);
-            self.synced_overlays_revision = locked.revision();
+            write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, None, |model| model.set_visible(visible));
         }
     }
 
@@ -201,25 +287,24 @@ impl OverlayRuntimeState {
             return false;
         }
 
+        // A read-only lazy load: the synced revision is deliberately NOT advanced, so changes to
+        // OTHER pages made since the last sync are still delivered by the next sync.
         let model_snapshot = if let Some(model) = self.overlays_model.clone() {
             match model.lock() {
-                Ok(locked) => locked
-                    .get(page_idx)
-                    .cloned()
-                    .map(|image| (image, locked.revision())),
+                Ok(locked) => locked.get(page_idx).cloned(),
                 Err(_) => None,
             }
         } else {
             None
         };
-        if let Some((image, revision)) = model_snapshot {
+        if let Some(image) = model_snapshot {
             self.reset_prepare_state(page_idx);
             self.overlay_last_upload_s.remove(&page_idx);
             self.overlay_textures.remove(&page_idx);
             self.overlay_texture_last_used_frame.remove(&page_idx);
             self.overlay_images.insert(page_idx, Arc::new(image));
+            self.own_write_stamps.remove(&page_idx);
             self.mark_dirty_full(page_idx);
-            self.synced_overlays_revision = revision;
             return true;
         }
         false
@@ -250,10 +335,68 @@ impl OverlayRuntimeState {
         if let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
         {
-            locked.ensure_overlay(page_idx, [w, h]);
-            self.synced_overlays_revision = locked.revision();
+            write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| model.ensure_overlay(page_idx, [w, h]));
         }
         true
+    }
+
+    /// Pulls clean-overlay changes newer than `synced_overlays_revision` from the shared model.
+    ///
+    /// `CleanOverlaysModel::delta_since` is non-destructive, so every canvas sharing the model
+    /// (Cleaning and Typing) receives each change. Under one brief lock this plans every changed
+    /// page ([`plan_overlay_sync`]) and clones only the pages to re-fetch; uncached pages copy
+    /// nothing and pages still holding this canvas's own write are left untouched.
+    pub(super) fn sync_from_model(&mut self) {
+        let Some((delta, plan, mut fetched)) = ({
+            let Some(model) = self.overlays_model.as_ref() else {
+                return;
+            };
+            let Ok(locked) = model.lock() else {
+                return;
+            };
+            locked.delta_since(self.synced_overlays_revision).map(|delta| {
+                let plan = plan_overlay_sync(
+                    &delta.changed,
+                    |idx| self.overlay_images.contains_key(&idx),
+                    &self.own_write_stamps,
+                    |idx| locked.page_change_revision(idx),
+                );
+                let fetched: HashMap<usize, egui::ColorImage> = plan
+                    .iter()
+                    .filter(|(_, action)| *action == OverlaySyncAction::Refetch)
+                    .filter_map(|&(idx, _)| locked.get(idx).map(|image| (idx, image.clone())))
+                    .collect();
+                (delta, plan, fetched)
+            })
+        }) else {
+            return;
+        };
+        if let Some(visible) = delta.visibility {
+            self.apply_model_visibility(visible);
+        }
+        for (idx, action) in plan {
+            match action {
+                OverlaySyncAction::KeepOwnWrite => continue,
+                OverlaySyncAction::Refetch | OverlaySyncAction::DropUncached => {}
+            }
+            self.reset_prepare_state(idx);
+            self.own_write_stamps.remove(&idx);
+            // An absent or zero-sized model overlay means "no clean": the cached page is dropped.
+            match fetched.remove(&idx).filter(|img| img.size[0] > 0 && img.size[1] > 0) {
+                Some(img) => {
+                    // The texture is kept so the old pixels stay on screen until the re-upload.
+                    self.overlay_images.insert(idx, Arc::new(img));
+                    self.mark_dirty_full(idx);
+                }
+                None => {
+                    self.overlay_images.remove(&idx);
+                    self.overlay_textures.remove(&idx);
+                    self.overlay_dirty_tiles.remove(&idx);
+                    self.overlay_last_upload_s.remove(&idx);
+                }
+            }
+        }
+        self.synced_overlays_revision = delta.revision;
     }
 
     pub(super) fn reset_prepare_state(&mut self, page_idx: usize) {
@@ -462,8 +605,7 @@ impl OverlayRuntimeState {
                 && let Some(overlay) = self.overlay_images.get(&page_idx)
                 && let Ok(mut locked) = model.lock()
             {
-                locked.replace(page_idx, overlay);
-                self.synced_overlays_revision = locked.revision();
+                write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| model.replace(page_idx, overlay));
             }
         }
     }
@@ -550,10 +692,9 @@ impl OverlayRuntimeState {
             && let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
         {
-            locked.replace_region(
-                page_idx, size_px, target.x, target.y, target.w, target.h, chunk,
-            );
-            self.synced_overlays_revision = locked.revision();
+            write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| {
+                model.replace_region(page_idx, size_px, target.x, target.y, target.w, target.h, chunk)
+            });
         }
         self.mark_dirty_rect(page_idx, target.x, target.y, target.w, target.h);
         true
@@ -585,10 +726,9 @@ impl OverlayRuntimeState {
             && let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
         {
-            locked.replace_region(
-                page_idx, size_px, clipped.x, clipped.y, clipped.w, clipped.h, chunk,
-            );
-            self.synced_overlays_revision = locked.revision();
+            write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| {
+                model.replace_region(page_idx, size_px, clipped.x, clipped.y, clipped.w, clipped.h, chunk)
+            });
         }
         self.mark_dirty_rect(page_idx, clipped.x, clipped.y, clipped.w, clipped.h);
         true
@@ -602,8 +742,7 @@ impl OverlayRuntimeState {
             return false;
         };
         if let Ok(mut locked) = model.lock() {
-            locked.replace(page_idx, dst);
-            self.synced_overlays_revision = locked.revision();
+            write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| model.replace(page_idx, dst));
             return true;
         }
         false
@@ -914,6 +1053,189 @@ mod tests {
         set_model_visible(&model, false);
         runtime.apply_model_visibility(false);
         assert!(!runtime.clean_overlays_visible());
+        runtime.shutdown();
+    }
+
+    fn two_page_model() -> Arc<Mutex<CleanOverlaysModel>> {
+        Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(&[
+            PathBuf::from("001.png"),
+            PathBuf::from("002.png"),
+        ])))
+    }
+
+    fn opaque_pixel() -> egui::ColorImage {
+        egui::ColorImage::filled([1, 1], Color32::from_rgba_unmultiplied(10, 20, 30, 255))
+    }
+
+    /// A write to the shared model made by someone other than the canvas under test.
+    fn foreign_write(model: &Arc<Mutex<CleanOverlaysModel>>, page_idx: usize) {
+        match model.lock() {
+            Ok(mut locked) => assert!(locked.replace_region(page_idx, [1, 1], 0, 0, 1, 1, &opaque_pixel())),
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+    }
+
+    fn changed_since(model: &Arc<Mutex<CleanOverlaysModel>>, known: u64) -> Option<Vec<usize>> {
+        match model.lock() {
+            Ok(locked) => locked.delta_since(known).map(|delta| delta.changed),
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+    }
+
+    fn model_revision(model: &Arc<Mutex<CleanOverlaysModel>>) -> u64 {
+        match model.lock() {
+            Ok(locked) => locked.revision(),
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+    }
+
+    #[test]
+    fn synced_revision_advances_only_when_fully_synced_before_own_write() {
+        assert_eq!(synced_revision_after_own_write(5, 5, 6), 6);
+        assert_eq!(synced_revision_after_own_write(4, 5, 6), 4, "a foreign change at 5 must not be skipped");
+        assert_eq!(synced_revision_after_own_write(5, 5, 5), 5, "a no-op write keeps the revision");
+    }
+
+    #[test]
+    fn own_write_when_synced_skips_only_the_own_change() {
+        let model = two_page_model();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        runtime.synced_overlays_revision = model_revision(&model);
+
+        let target = OverlayRectPx { x: 0, y: 0, w: 1, h: 1 };
+        assert!(runtime.replace_overlay_region_px(0, [1, 1], target, &opaque_pixel(), true));
+
+        assert_eq!(runtime.synced_overlays_revision, model_revision(&model));
+        assert_eq!(changed_since(&model, runtime.synced_overlays_revision), None);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn own_write_does_not_leap_over_a_foreign_change() {
+        let model = two_page_model();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        runtime.synced_overlays_revision = model_revision(&model);
+
+        foreign_write(&model, 1);
+        let target = OverlayRectPx { x: 0, y: 0, w: 1, h: 1 };
+        assert!(runtime.replace_overlay_region_px(0, [1, 1], target, &opaque_pixel(), true));
+
+        assert_eq!(changed_since(&model, runtime.synced_overlays_revision), Some(vec![0, 1]), "the foreign page 1 must still be delivered");
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn lazy_overlay_load_does_not_advance_the_synced_revision() {
+        let model = two_page_model();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        foreign_write(&model, 0);
+        runtime.synced_overlays_revision = model_revision(&model);
+
+        foreign_write(&model, 1);
+        assert!(runtime.ensure_overlay_for_page_size(0, [1, 1]));
+
+        assert_eq!(changed_since(&model, runtime.synced_overlays_revision), Some(vec![1]));
+        runtime.shutdown();
+    }
+
+    fn red_pixel() -> egui::ColorImage {
+        egui::ColorImage::filled([1, 1], Color32::from_rgba_unmultiplied(200, 0, 0, 255))
+    }
+
+    fn cached_pixel(runtime: &OverlayRuntimeState, page_idx: usize) -> Option<Color32> {
+        runtime.overlay_image(page_idx).map(|image| image.pixels[0])
+    }
+
+    #[test]
+    fn plan_overlay_sync_classifies_uncached_own_and_foreign_pages() {
+        let own = HashMap::from([(1, 7), (2, 7)]);
+        let stamps = HashMap::from([(0, 9), (1, 7), (2, 9), (3, 9)]);
+        let plan = plan_overlay_sync(&[0, 1, 2, 3], |idx| idx != 3, &own, |idx| stamps.get(&idx).copied());
+        assert_eq!(
+            plan,
+            vec![
+                (0, OverlaySyncAction::Refetch),
+                (1, OverlaySyncAction::KeepOwnWrite),
+                (2, OverlaySyncAction::Refetch),
+                (3, OverlaySyncAction::DropUncached),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_canvases_both_receive_a_change_and_never_copy_uncached_pages() {
+        let model = two_page_model();
+        foreign_write(&model, 0);
+        let mut cleaning = OverlayRuntimeState::default();
+        let mut typing = OverlayRuntimeState::default();
+        for runtime in [&mut cleaning, &mut typing] {
+            runtime.set_model(Arc::clone(&model));
+            assert!(runtime.ensure_overlay_for_page_size(0, [1, 1]));
+            runtime.sync_from_model();
+        }
+
+        match model.lock() {
+            Ok(mut locked) => {
+                assert!(locked.replace_region(0, [1, 1], 0, 0, 1, 1, &red_pixel()));
+                assert!(locked.replace_region(1, [1, 1], 0, 0, 1, 1, &red_pixel()));
+            }
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+        cleaning.sync_from_model();
+        typing.sync_from_model();
+
+        for runtime in [&cleaning, &typing] {
+            assert_eq!(cached_pixel(runtime, 0), Some(red_pixel().pixels[0]));
+            assert!(runtime.overlay_image(1).is_none(), "an uncached page must not be copied");
+            assert_eq!(runtime.synced_overlays_revision, model_revision(&model));
+        }
+        cleaning.shutdown();
+        typing.shutdown();
+    }
+
+    #[test]
+    fn sync_drops_a_cached_page_whose_overlay_is_gone() {
+        let model = two_page_model();
+        foreign_write(&model, 0);
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        assert!(runtime.ensure_overlay_for_page_size(0, [1, 1]));
+        runtime.sync_from_model();
+
+        match model.lock() {
+            Ok(mut locked) => assert!(locked.detach_page_overlay(0)),
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+        runtime.sync_from_model();
+
+        assert!(runtime.overlay_image(0).is_none());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn sync_keeps_local_preview_on_own_page_but_refetches_after_a_foreign_edit() {
+        let model = two_page_model();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        runtime.sync_from_model();
+
+        // Foreign write lands between the sync and the canvas's own write, so the synced
+        // revision stays behind and the next delta re-lists the canvas's own page 0.
+        foreign_write(&model, 1);
+        assert!(runtime.ensure_editable_overlay_for_page(0, [1, 1]));
+        let target = OverlayRectPx { x: 0, y: 0, w: 1, h: 1 };
+        assert!(runtime.replace_overlay_region_px(0, [1, 1], target, &red_pixel(), false));
+        assert_eq!(changed_since(&model, runtime.synced_overlays_revision), Some(vec![0, 1]));
+
+        runtime.sync_from_model();
+        assert_eq!(cached_pixel(&runtime, 0), Some(red_pixel().pixels[0]), "local-only preview must survive the sync");
+
+        foreign_write(&model, 0);
+        runtime.sync_from_model();
+        assert_eq!(cached_pixel(&runtime, 0), Some(opaque_pixel().pixels[0]), "a foreign edit of the page is re-fetched");
         runtime.shutdown();
     }
 }

@@ -68,8 +68,8 @@ candidate.
   `LOADER_CLEAN_SCOPE`).
   The scan compares found names with `clean_binding::clean_name_key` (ASCII-case-insensitive on
   Windows, as the loader's open of `<stem>.png` is there).
-- `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, dirty
-  tracking, autosave snapshots, and cached decoded page images.
+- `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, per-consumer change
+  revisions (`delta_since`), save-dirty tracking, autosave snapshots, and cached decoded page images.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.
 - `page_view.rs`: source-page view model shared by the app shell, the canvas and the tabs —
   page geometry with its load state (`PageImageInfo` / `SourcePageLoadState`) plus the tiled GPU
@@ -176,6 +176,14 @@ it from its `[dev-dependencies]`, so no production build carries them.
   mask). `blocks == None` means "no detector boxes known"; the model never stores `Some(vec![])`.
   A manual mask edit (`edit_page_mask` closure reporting a change) invalidates `blocks` to `None`,
   because a hand-edited mask no longer matches the detector boxes.
+- Clean-overlay change delivery is NON-DESTRUCTIVE and per consumer: every page change stamps the
+  page with the revision that carries it, `set_visible` stamps a visibility revision, and
+  `CleanOverlaysModel::delta_since(known)` (`&self`) returns the changed page INDEXES and visibility
+  newer than `known`. Several consumers (the Cleaning and Typing canvases) share one model, each
+  with its own known revision; nothing may ever drain or reset change state on read, or one
+  consumer steals the other's changes. The delta carries no pixels: a consumer re-reads only the
+  pages it caches. `page_change_revision(idx)` exposes a page's stamp so a consumer can recognise
+  that a page still holds its own last write. The save-dirty set (`save_dirty_indexes`) is separate and owned by autosave.
 - PNG/export-facing clean overlay buffers must be straight-alpha RGBA. Convert from
   `Color32` with `to_srgba_unmultiplied()` before writing to `RgbaImage`.
 - Undo/redo for clean overlays uses `ms_actions::ActionHistory<CleanOverlayDiffOp>`: each committed

@@ -95,8 +95,8 @@ RuntimeBubble helper:
 CanvasView method map:
 - Overlay lifecycle/preparation:
   `ensure_overlay_for_page_size`, `page_source_size_from_scene`,
-  `reset_overlay_prepare_state`, `poll_overlay_prepare_results`,
-  `has_pending_overlay_work`, `mark_overlay_dirty_full`, `draw_overlay_on_page`,
+  `poll_overlay_prepare_results`, `sync_overlays_from_model`,
+  `has_pending_overlay_work`, `draw_overlay_on_page`,
   `commit_overlay_page_to_model`.
 - External wiring/state toggles:
   `set_bubbles_model`, `set_overlays_model`, `set_drag_scroll_blocked`,
@@ -789,10 +789,6 @@ impl CanvasView {
         Some([w, h])
     }
 
-    fn reset_overlay_prepare_state(&mut self, page_idx: usize) {
-        self.overlay_runtime.reset_prepare_state(page_idx);
-    }
-
     fn poll_overlay_prepare_results(&mut self) {
         self.overlay_runtime.poll_prepare_results();
     }
@@ -1337,10 +1333,6 @@ impl CanvasView {
 
     pub fn commit_overlay_page_to_model(&mut self, page_idx: usize) -> bool {
         self.overlay_runtime.commit_overlay_page_to_model(page_idx)
-    }
-
-    fn mark_overlay_dirty_full(&mut self, page_idx: usize) {
-        self.overlay_runtime.mark_dirty_full(page_idx);
     }
 
     /// Rebuilds `scene.page_aside_presence`: per page, whether its left/right side holds at least
@@ -2497,43 +2489,9 @@ impl CanvasView {
         }
     }
 
+    /// Pulls clean-overlay changes from the shared model; see `OverlayRuntimeState::sync_from_model`.
     fn sync_overlays_from_model(&mut self) {
-        let Some(delta) = ({
-            let Some(model) = self.overlay_runtime.overlays_model.as_ref() else {
-                return;
-            };
-            let Ok(mut locked) = model.lock() else {
-                return;
-            };
-            locked.take_delta(self.overlay_runtime.synced_overlays_revision)
-        }) else {
-            return;
-        };
-        if let Some(visible) = delta.visibility {
-            self.overlay_runtime.apply_model_visibility(visible);
-        }
-        for (idx, maybe_img) in delta.changed {
-            self.reset_overlay_prepare_state(idx);
-            if let Some(img) = maybe_img {
-                if img.size[0] > 0 && img.size[1] > 0 {
-                    self.overlay_runtime
-                        .overlay_images
-                        .insert(idx, Arc::new(img));
-                    self.mark_overlay_dirty_full(idx);
-                } else {
-                    self.overlay_runtime.overlay_images.remove(&idx);
-                    self.overlay_runtime.overlay_textures.remove(&idx);
-                    self.overlay_runtime.overlay_dirty_tiles.remove(&idx);
-                    self.overlay_runtime.overlay_last_upload_s.remove(&idx);
-                }
-            } else {
-                self.overlay_runtime.overlay_images.remove(&idx);
-                self.overlay_runtime.overlay_textures.remove(&idx);
-                self.overlay_runtime.overlay_dirty_tiles.remove(&idx);
-                self.overlay_runtime.overlay_last_upload_s.remove(&idx);
-            }
-        }
-        self.overlay_runtime.synced_overlays_revision = delta.revision;
+        self.overlay_runtime.sync_from_model();
     }
 
     fn calc_bubble_width(&self, span: f32) -> f32 {

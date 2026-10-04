@@ -3,7 +3,8 @@ FILE OVERVIEW: crates/ms-models/src/clean_overlays_model.rs
 Shared runtime model for clean overlays and action-side page cache.
 
 Main items:
-- `OverlayDelta`: incremental overlay/visibility changes for canvas subscribers.
+- `OverlayDelta`: changed page indexes / visibility since a consumer's known revision; read
+  non-destructively (`delta_since`), so any number of canvas subscribers each get every change.
 - `CleanOverlayDiffOp`: one committed overlay edit as a reversible tiled+zstd `RasterDiff`
   (a `ms_actions::ReversibleAction` over `CleanOverlaysModel`).
 - `CleanOverlaysModel`: shared storage for per-page clean overlays and cached source pages.
@@ -33,6 +34,11 @@ Core behavior:
 - `set_autosave_gate` installs the project's `AutosaveGate`; every save-dirtying edit (`mark_dirty`:
   one committed region / clear / snapshot apply / undo step) reports ONE action. The dirty set is
   the held state — the overlay autosave thread writes it only when the gate is due.
+- Change delivery is per consumer: every page change stamps the page with the revision that
+  carries it (`page_change_revisions`), `set_visible` stamps `visibility_revision`, and
+  `delta_since(known)` reports what is newer than `known` without mutating anything. Nothing is
+  drained, so the Cleaning and Typing canvases (and any later subscriber) cannot steal each
+  other's changes.
 - Supports "cache pages immediately" mode via `cache_pages_enabled`; when disabled, page cache can
   still be populated lazily for specific pages when needed by tools.
 
@@ -128,11 +134,19 @@ impl PageCachePolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+/// What changed in a [`CleanOverlaysModel`] after a consumer's known revision
+/// (see [`CleanOverlaysModel::delta_since`]).
+///
+/// Carries page INDEXES only, never pixels: a consumer re-reads the current image of each
+/// page it actually caches, so a late-activating consumer does not clone every overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayDelta {
+    /// The model revision this delta brings the consumer up to; store it as the new known revision.
     pub revision: u64,
+    /// `Some(current visibility)` iff visibility changed after the known revision.
     pub visibility: Option<bool>,
-    pub changed: Vec<(usize, Option<ColorImage>)>,
+    /// Ascending page indexes whose overlay changed after the known revision.
+    pub changed: Vec<usize>,
 }
 
 /// Error raised while applying a `CleanOverlayDiffOp` to a `CleanOverlaysModel`.
@@ -266,14 +280,17 @@ pub struct CleanOverlaysModel {
     visible: bool,
     updates_lock: usize,
     revision: u64,
-    dirty_indexes: HashSet<usize>,
+    /// Per-page revision of the last overlay change (0 = never changed). Read by `delta_since`;
+    /// never cleared, so every consumer sees each change regardless of read order.
+    page_change_revisions: Vec<u64>,
     save_dirty_indexes: HashSet<usize>,
     /// Per-page detach generation. `detach_page_overlay` bumps it; save writers
     /// compare it against the generation captured in an [`OverlaySaveSnapshot`]
     /// to discard snapshots (and files written from them) that predate a detach.
     detach_generations: Vec<u64>,
     has_project_unsaved_changes: bool,
-    visibility_dirty: bool,
+    /// Revision of the last visibility change (see `page_change_revisions` for the stamping rule).
+    visibility_revision: u64,
     /// Unified undo/redo engine. Each entry is a reversible tiled+zstd overlay
     /// delta; bounded by `OVERLAY_HISTORY_LIMIT` steps and a per-profile
     /// compressed byte budget (see `set_memory_profile`).
@@ -319,11 +336,13 @@ impl CleanOverlaysModel {
             visible: true,
             updates_lock: 0,
             revision: 1,
-            dirty_indexes: HashSet::new(),
+            page_change_revisions: vec![0; sorted_pages.len()],
             save_dirty_indexes: HashSet::new(),
             detach_generations: vec![0; sorted_pages.len()],
             has_project_unsaved_changes: false,
-            visibility_dirty: true,
+            // Equal to the initial revision, so a fresh consumer (known revision 0) always learns
+            // the visibility on its first sync.
+            visibility_revision: 1,
             // Start with the count cap and a default (Medium-profile) byte budget;
             // `set_memory_profile` re-tunes the budget once the profile is known.
             history: ActionHistory::with_weight_budget(
@@ -1030,7 +1049,7 @@ impl CleanOverlaysModel {
             return;
         }
         self.visible = visible;
-        self.visibility_dirty = true;
+        self.visibility_revision = self.next_change_stamp();
         self.bump_revision_unless_locked();
     }
 
@@ -1052,26 +1071,35 @@ impl CleanOverlaysModel {
         self.updates_lock > 0
     }
 
-    pub fn take_delta(&mut self, known_revision: u64) -> Option<OverlayDelta> {
+    /// Revision stamp of page `idx`'s last overlay change (0 = never changed), `None` when out of
+    /// range. A consumer that records the stamp its own write produced can tell later whether the
+    /// page still holds exactly that write. Changes made while updates are locked share one stamp.
+    #[must_use]
+    pub fn page_change_revision(&self, idx: usize) -> Option<u64> {
+        self.page_change_revisions.get(idx).copied()
+    }
+
+    /// Reports what changed after `known_revision`, without mutating the model.
+    ///
+    /// Returns `None` when `known_revision` is the current revision. Otherwise returns the current
+    /// revision, `Some(visible)` iff visibility changed after `known_revision`, and every page whose
+    /// overlay changed after it. Each consumer keeps its own known revision (start at 0, store
+    /// `delta.revision` after applying), so several consumers of one model all receive every
+    /// change regardless of who reads first. A change made while updates are locked is reported
+    /// once a later change bumps the revision.
+    #[must_use]
+    pub fn delta_since(&self, known_revision: u64) -> Option<OverlayDelta> {
         if known_revision == self.revision {
             return None;
         }
-
-        let mut changed: Vec<(usize, Option<ColorImage>)> = Vec::new();
-        let mut indexes: Vec<usize> = self.dirty_indexes.drain().collect();
-        indexes.sort_unstable();
-        for idx in indexes {
-            let item = self.overlays.get(idx).cloned().unwrap_or(None);
-            changed.push((idx, item));
-        }
-
-        let visibility = if self.visibility_dirty {
-            self.visibility_dirty = false;
-            Some(self.visible)
-        } else {
-            None
-        };
-
+        let changed = self
+            .page_change_revisions
+            .iter()
+            .enumerate()
+            .filter(|(_, stamp)| **stamp > known_revision)
+            .map(|(idx, _)| idx)
+            .collect();
+        let visibility = (self.visibility_revision > known_revision).then_some(self.visible);
         Some(OverlayDelta {
             revision: self.revision,
             visibility,
@@ -1186,7 +1214,7 @@ impl CleanOverlaysModel {
     /// Called once per committed edit (a stroke's scratch commit, a clear, a snapshot apply, an undo
     /// step) — each also records one undo entry — never per rendered frame of an uncommitted stroke.
     fn mark_dirty(&mut self, idx: usize) {
-        self.dirty_indexes.insert(idx);
+        self.stamp_page_change(idx);
         self.save_dirty_indexes.insert(idx);
         self.has_project_unsaved_changes = true;
         self.bump_revision_unless_locked();
@@ -1195,9 +1223,25 @@ impl CleanOverlaysModel {
         }
     }
 
+    /// Marks page `idx` changed for canvas consumers only (no save, no autosave action).
     fn mark_runtime_changed(&mut self, idx: usize) {
-        self.dirty_indexes.insert(idx);
+        self.stamp_page_change(idx);
         self.bump_revision_unless_locked();
+    }
+
+    /// The revision that will carry a change recorded now: the one `bump_revision_unless_locked`
+    /// is about to produce. Under `lock_updates` no bump happens, so the stamp stays ahead of the
+    /// current revision and `delta_since` reports the change once a later change bumps it.
+    fn next_change_stamp(&self) -> u64 {
+        self.revision.saturating_add(1)
+    }
+
+    /// Records that page `idx` changed; must be followed by `bump_revision_unless_locked`.
+    fn stamp_page_change(&mut self, idx: usize) {
+        let stamp = self.next_change_stamp();
+        if let Some(slot) = self.page_change_revisions.get_mut(idx) {
+            *slot = stamp;
+        }
     }
 
     fn bump_revision_unless_locked(&mut self) {
@@ -2345,5 +2389,121 @@ Pages wired down:                        333333.\n";
             parse_vm_stat_available_bytes("Pages free: 10.\nPages inactive: 5.\nPages speculative: 2.\n"),
             None
         );
+    }
+
+    fn opaque_pixel() -> ColorImage {
+        ColorImage::filled([1, 1], egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255))
+    }
+
+    /// Applies a delta the way a consumer does and returns its pages; panics when nothing changed.
+    fn consume(model: &CleanOverlaysModel, known: &mut u64) -> Vec<usize> {
+        let Some(delta) = model.delta_since(*known) else {
+            panic!("expected a delta after known revision {known}");
+        };
+        *known = delta.revision;
+        delta.changed
+    }
+
+    #[test]
+    fn delta_since_delivers_same_pages_to_every_consumer_regardless_of_read_order() {
+        let mut model = multi_page_model(4);
+        let mut cleaning = model.revision();
+        let mut typing = model.revision();
+
+        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(3, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+
+        assert_eq!(consume(&model, &mut cleaning), vec![1, 3]);
+        assert_eq!(consume(&model, &mut typing), vec![1, 3], "first reader must not drain the second");
+        assert_eq!(cleaning, typing);
+    }
+
+    #[test]
+    fn delta_since_delivers_undo_to_a_consumer_that_has_not_seen_the_edits() {
+        let mut model = multi_page_model(3);
+        let mut cleaning = model.revision();
+        let mut typing = model.revision();
+
+        assert!(model.replace_region(2, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert_eq!(consume(&model, &mut cleaning), vec![2]);
+        assert!(model.undo_overlay_history());
+        assert_eq!(consume(&model, &mut cleaning), vec![2]);
+
+        assert_eq!(consume(&model, &mut typing), vec![2]);
+        assert!(model.delta_since(typing).is_none());
+        assert!(model.delta_since(cleaning).is_none());
+    }
+
+    #[test]
+    fn delta_since_reports_only_pages_changed_after_the_known_revision() {
+        let mut model = multi_page_model(3);
+        let mut early = model.revision();
+        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        let mut late = model.revision();
+        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+
+        assert_eq!(consume(&model, &mut late), vec![1]);
+        assert_eq!(consume(&model, &mut early), vec![0, 1]);
+    }
+
+    #[test]
+    fn delta_since_reports_visibility_change_to_every_consumer() {
+        let mut model = multi_page_model(2);
+        let fresh = model.delta_since(0);
+        assert_eq!(fresh.map(|delta| delta.visibility), Some(Some(true)), "a fresh consumer learns the visibility");
+
+        let known = model.revision();
+        model.set_visible(false);
+        for _consumer in 0..2 {
+            let Some(delta) = model.delta_since(known) else {
+                panic!("visibility change must produce a delta");
+            };
+            assert_eq!(delta.visibility, Some(false));
+            assert!(delta.changed.is_empty());
+        }
+
+        let after_visibility = model.revision();
+        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        let Some(delta) = model.delta_since(after_visibility) else {
+            panic!("page change must produce a delta");
+        };
+        assert_eq!(delta.visibility, None, "visibility did not change after the known revision");
+    }
+
+    #[test]
+    fn delta_since_is_none_without_changes_and_does_not_mutate() {
+        let mut model = multi_page_model(2);
+        let known = model.revision();
+        assert!(model.delta_since(known).is_none());
+        model.set_visible(true);
+        assert!(model.delta_since(known).is_none(), "setting the same visibility is not a change");
+
+        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        let first = model.delta_since(known);
+        assert_eq!(model.delta_since(known), first, "reading a delta must not consume it");
+    }
+
+    #[test]
+    fn delta_since_reports_runtime_only_changes() {
+        let mut model = multi_page_model(2);
+        let known = model.revision();
+        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        let mut after_edit = model.revision();
+        assert!(model.detach_page_overlay(1));
+        assert_eq!(consume(&model, &mut after_edit), vec![1]);
+        assert!(model.get(1).is_none());
+        assert_eq!(model.delta_since(known).map(|delta| delta.changed), Some(vec![1]));
+    }
+
+    #[test]
+    fn locked_change_is_reported_with_the_next_revision_bump() {
+        let mut model = multi_page_model(3);
+        let mut known = model.revision();
+        model.lock_updates();
+        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.delta_since(known).is_none(), "no revision bump while locked");
+        model.unlock_updates();
+        assert!(model.replace_region(2, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert_eq!(consume(&model, &mut known), vec![0, 2]);
     }
 }

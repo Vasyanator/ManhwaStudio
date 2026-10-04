@@ -40,7 +40,7 @@ grow (never shrink) to twice the cards the grid draws in one frame
 (`ensure_visible_capacity`), so a very large viewport cannot thrash them.
 Model clean thumbnails receive only an `Arc<RgbaImage>` the caller cloned under a
 short model lock; this module never locks the model and never calls
-`CleanOverlaysModel::take_delta` (that drain belongs to the canvas). The worker
+`CleanOverlaysModel::delta_since` (change delivery belongs to the canvas). The worker
 drops the `Arc` as soon as the downscale is done, because the model
 copy-on-writes (`Arc::make_mut`) any page someone else still holds.
 */
@@ -702,7 +702,7 @@ impl ThumbRuntime {
     /// in-memory `CleanOverlaysModel`, taken at model `revision`.
     ///
     /// `rgba` is the model's own `Arc`, cloned by the caller under a short lock;
-    /// this module never locks the model and never calls `take_delta`. No-op
+    /// this module never locks the model and never calls `delta_since`. No-op
     /// (and `rgba` is dropped immediately) when an entry for exactly `revision`
     /// is cached, a downscale of this page is already queued, or the shared
     /// in-flight cap is reached. The worker drops `rgba` right after the

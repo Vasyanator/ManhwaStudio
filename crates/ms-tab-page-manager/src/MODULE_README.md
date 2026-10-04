@@ -60,8 +60,8 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
 - Clean thumbnails of pages whose clean lives in `CleanOverlaysModel` come from the
   MODEL, not from disk (dirty edits exist only in memory). The caller clones the
   page's `Arc<RgbaImage>` under a short lock only when `model_clean_thumb_wanted`
-  says so; `thumbs.rs` never locks the model and never calls `take_delta` (the
-  canvas owns that drain). The worker downscales it exactly like a file thumbnail
+  says so; `thumbs.rs` never locks the model and never calls `delta_since` (change
+  delivery belongs to the canvas). The worker downscales it exactly like a file thumbnail
   (long side 192 px, same sampler) and drops the `Arc` right after, because the
   model copy-on-writes any page still shared. Entries live in a SEPARATE LRU (same
   64-entry start and growth rule) keyed by page index, are valid only for the exact `revision()` they were

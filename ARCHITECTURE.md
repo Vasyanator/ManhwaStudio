@@ -193,8 +193,9 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   (cross-tab canvas settings persisted to the project settings and to `user_config`).
 - `CleanOverlaysModel` — per-page clean overlay kept twice and updated together: premultiplied
   `egui::ColorImage` for display and straight-alpha `RgbaImage` for tools, export and PNG.
-  Subscribers drain `OverlayDelta`. Written by Cleaning and by the PS editor (which adopts the
-  model revision only when no foreign bump happened).
+  Several canvases (Cleaning, Typing) read it: deltas are NON-destructive, each consumer asks
+  for pages changed since its own revision, so no reader can steal another's changes. Writers
+  (canvases, PS editor) adopt the model revision only when no foreign bump happened.
 - `TextMaskModel` — detector masks and boxes per page; the detector writes, Cleaning reads.
 - **Page <-> clean binding has one owner:** `ms_page_ops::clean_binding` (pure rule: canonical
   `<stem>.png`, exact-size fit) + `ms_models::clean_assign` (worker I/O, staged-over-committed).

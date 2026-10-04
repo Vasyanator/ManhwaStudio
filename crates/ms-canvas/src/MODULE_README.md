@@ -219,6 +219,17 @@ model's shared visibility flag. A canvas may also set a local clean-overlay visi
 override for UI-only cases such as the typing tab; local overrides must not mutate the
 shared model or change cleaning-tab visibility.
 
+Overlay pixels reach a canvas through `OverlayRuntimeState::sync_from_model` (top of every `draw`):
+it asks `CleanOverlaysModel::delta_since(synced_overlays_revision)` — non-destructive, so the
+Cleaning and Typing canvases both receive every change — and `plan_overlay_sync` decides per changed
+page under the same brief lock: re-fetch a cached page, keep a cached page whose model stamp
+(`page_change_revision`) still equals the canvas's own last write (`own_write_stamps`; keeps
+local-only stamp-preview pixels), or copy nothing for an uncached page (it loads lazily via
+`ensure_overlay_for_page_size`). The canvas's own model writes go through
+`overlay_runtime::write_own_change`, which records that stamp and advances
+`synced_overlays_revision` past the write only when the canvas was fully synced before it; the
+lazy load never advances it.
+
 Viewport sync across translation, cleaning, and typing is explicit. `MangaApp` owns the
 shared `CanvasViewportSnapshot`, publishes it only from the active canvas after that
 canvas is drawn, and applies it only to the canvas being entered. Inactive canvases must
@@ -378,6 +389,9 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - Overlay buffers and masks must validate width, height, and buffer length before use.
 - Shared visibility changes belong in `CleanOverlaysModel`; tab-local visibility must stay
   inside the specific `CanvasView`.
+- `synced_overlays_revision` must never jump past a change the canvas has not applied: set it to
+  `delta.revision` after applying a delta, or through `write_own_change` after an own write. A
+  direct `= locked.revision()` hides foreign edits (PS editor, undo, the other canvas) forever.
 - Canvas scroll areas need per-instance egui ids. Cross-tab viewport sync must go through
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
 - `CANVAS_RIBBON_TAB` (`lib.rs`) is the ONE definition of the controls tab's identity, and the
