@@ -7,8 +7,9 @@ Main items:
 - `MtPanelProgress`: transient run progress shown while a translation is active.
 - `MtStopNotice`: sticky yellow notice shown when an AI run stopped due to a probable credit/quota or
   usage-limit error, with a toggle that reveals the full provider error.
-- AI API MT options: provider/model/key prompt, JSON batch size, reasoning, context budget, and
-  optional ImageBubble inclusion/visual detail for multimodal models.
+- AI API MT options: the connection section (source/target languages, then the shared
+  `ms_ai_api::draw_connection` widget for provider/key/model/system prompt), JSON batch size,
+  reasoning, context budget, and optional ImageBubble inclusion/visual detail for multimodal models.
 - Translation mode toggle (`ai_image_mode`): "Обычный" batched mode vs "Только картинки"
   (per-ImageBubble) mode; the latter adds a chapter-context source switch (`ai_image_context_source`:
   original vs translation) and is gated on a multimodal model.
@@ -24,7 +25,7 @@ Notes:
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtService,
 };
-use crate::ocr::{AiApiService, is_likely_multimodal_model};
+use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, draw_connection, is_likely_multimodal_model};
 use ms_widgets::WheelComboBox;
 
 #[derive(Debug, Clone)]
@@ -33,14 +34,8 @@ pub struct MtPanelOptions {
     pub service: MtService,
     pub source_lang: String,
     pub target_lang: String,
-    pub ai_api_service: AiApiService,
-    pub ai_api_model: String,
-    pub ai_api_key_edit: String,
-    pub ai_api_key_configured: Option<bool>,
-    pub ai_api_models: Vec<String>,
-    pub ai_api_account_status: String,
-    pub ai_api_status: String,
-    pub ai_api_system_instruction: String,
+    /// AI API connection (service, model, system instruction are persisted by the tab).
+    pub ai_api: AiApiConnectionState,
     pub ai_sort_mode: AiMtSortMode,
     pub ai_use_character_names: bool,
     pub ai_use_notes_prompt: bool,
@@ -83,14 +78,7 @@ impl Default for MtPanelOptions {
             service: MtService::Google,
             source_lang: "auto".to_string(),
             target_lang: "ru".to_string(),
-            ai_api_service: AiApiService::OpenAi,
-            ai_api_model: AiApiService::OpenAi.default_model().to_string(),
-            ai_api_key_edit: String::new(),
-            ai_api_key_configured: None,
-            ai_api_models: Vec::new(),
-            ai_api_account_status: t!("translation.common.press_refresh_status").to_string(),
-            ai_api_status: String::new(),
-            ai_api_system_instruction: "You are a manga/comic translation engine. Translate faithfully into Russian. Since the text was recognized using OCR, there may be errors, and the English text is often in uppercase. Do not preserve line breaks; write the translation in normal text, not in all caps. Preserve tone, names, honorifics, jokes, and speaker intent. Return only valid JSON with id and translation.".to_string(),
+            ai_api: AiApiConnectionState::new("You are a manga/comic translation engine. Translate faithfully into Russian. Since the text was recognized using OCR, there may be errors, and the English text is often in uppercase. Do not preserve line breaks; write the translation in normal text, not in all caps. Preserve tone, names, honorifics, jokes, and speaker intent. Return only valid JSON with id and translation."),
             ai_sort_mode: AiMtSortMode::Height,
             ai_use_character_names: true,
             ai_use_notes_prompt: true,
@@ -129,9 +117,9 @@ pub struct MtPanelActions {
     pub start_page: bool,
     pub cancel: bool,
     pub options_changed: bool,
-    pub save_ai_api_key: bool,
-    pub clear_ai_api_key: bool,
-    pub refresh_ai_api_metadata: bool,
+    /// Key save / delete / metadata refresh requested in the AI API connection widget (its
+    /// `options_changed` is also folded into `options_changed` above).
+    pub ai_api: AiApiConnectionActions,
     /// Debug-only: right-click on "Перевести всё" -> build and show the first AI request that would
     /// be sent for the whole-project scope, without translating. AI API tab only.
     pub preview_request_all: bool,
@@ -587,6 +575,8 @@ fn draw_ai_section_header(
     }
 }
 
+/// The "connection" accordion section: source/target language combos, then the shared AI API
+/// connection widget (its `options_changed` folded into `actions.options_changed`).
 fn draw_ai_connection_section(
     ui: &mut egui::Ui,
     max_width: f32,
@@ -606,92 +596,9 @@ fn draw_ai_connection_section(
         MT_TARGET_LANGUAGES,
     );
 
-    let old_service = options.ai_api_service;
-    ui.label(t!("translation.common.service_label"));
-    WheelComboBox::from_id_salt("translation_mt_ai_api_service")
-        .selected_text(options.ai_api_service.label())
-        .show_ui(ui, |ui| {
-            for service in AiApiService::ALL {
-                actions.options_changed |= ui
-                    .selectable_value(&mut options.ai_api_service, service, service.label())
-                    .changed();
-            }
-        });
-    if old_service != options.ai_api_service {
-        options.ai_api_model = options.ai_api_service.default_model().to_string();
-        options.ai_api_key_edit.clear();
-        options.ai_api_key_configured = None;
-        options.ai_api_models.clear();
-        options.ai_api_account_status = t!("translation.common.press_refresh_status").to_string();
-        options.ai_api_status.clear();
-        actions.options_changed = true;
-        actions.refresh_ai_api_metadata = true;
-    }
-
-    ui.horizontal_wrapped(|ui| {
-        let key_state = match options.ai_api_key_configured {
-            Some(true) => t!("translation.common.key_saved_status"),
-            Some(false) => t!("translation.common.key_not_set_status"),
-            None => t!("translation.common.key_unverified_status"),
-        };
-        ui.small(key_state);
-        if ui.small_button(t!("translation.common.refresh_button")).clicked() {
-            actions.refresh_ai_api_metadata = true;
-        }
-    });
-
-    ui.label("API key");
-    ui.add(
-        egui::TextEdit::singleline(&mut options.ai_api_key_edit)
-            .password(true)
-            .desired_width(max_width),
-    );
-    ui.horizontal_wrapped(|ui| {
-        if ui.small_button(t!("translation.common.save_button")).clicked() {
-            actions.save_ai_api_key = true;
-        }
-        if ui.small_button(t!("translation.common.delete_button")).clicked() {
-            actions.clear_ai_api_key = true;
-        }
-    });
-    if !options.ai_api_status.trim().is_empty() {
-        ui.small(options.ai_api_status.clone());
-    }
-
-    ui.label(t!("translation.common.model_label"));
-    WheelComboBox::from_id_salt("translation_mt_ai_api_model")
-        .selected_text(compact_middle(&options.ai_api_model, 42))
-        .show_ui(ui, |ui| {
-            let models = if options.ai_api_models.is_empty() {
-                vec![options.ai_api_service.default_model().to_string()]
-            } else {
-                options.ai_api_models.clone()
-            };
-            for model in models {
-                actions.options_changed |= ui
-                    .selectable_value(&mut options.ai_api_model, model.clone(), model)
-                    .changed();
-            }
-        });
-    actions.options_changed |= ui
-        .add(
-            egui::TextEdit::singleline(&mut options.ai_api_model)
-                .desired_width(max_width)
-                .hint_text("model id"),
-        )
-        .changed();
-
-    ui.label(t!("translation.common.balance_limits_label"));
-    ui.small(options.ai_api_account_status.clone());
-
-    ui.label(t!("translation.common.system_instruction_label"));
-    actions.options_changed |= ui
-        .add(
-            egui::TextEdit::multiline(&mut options.ai_api_system_instruction)
-                .desired_width(max_width)
-                .desired_rows(4),
-        )
-        .changed();
+    let connection = draw_connection(ui, "translation_mt_ai_api", max_width, &mut options.ai_api);
+    actions.options_changed |= connection.options_changed;
+    actions.ai_api = connection;
 }
 
 fn draw_ai_translation_section(
@@ -734,7 +641,7 @@ fn draw_ai_translation_section(
             t!("translation.mt_panel.include_existing_translation_label"),
         )
         .changed();
-    let selected_model_is_multimodal = is_likely_multimodal_model(&options.ai_api_model);
+    let selected_model_is_multimodal = is_likely_multimodal_model(&options.ai_api.model);
     // Per-ImageBubble mode requires a multimodal model; coerce back to the normal mode otherwise.
     if !selected_model_is_multimodal && options.ai_image_mode != AiMtImageMode::Normal {
         options.ai_image_mode = AiMtImageMode::Normal;
@@ -915,16 +822,3 @@ fn language_title<'a>(code: &str, langs: &'a [MtLanguage]) -> Option<&'a str> {
         .map(|lang| lang.title())
 }
 
-fn compact_middle(text: &str, max_chars: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars || max_chars < 8 {
-        return text.to_string();
-    }
-    let keep = (max_chars - 3) / 2;
-    let start = chars.iter().take(keep).collect::<String>();
-    let end = chars
-        .iter()
-        .skip(chars.len().saturating_sub(keep))
-        .collect::<String>();
-    format!("{start}...{end}")
-}

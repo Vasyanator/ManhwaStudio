@@ -1,0 +1,43 @@
+[package]
+name = "ms-ai-api"
+version = "0.1.0"
+edition = "2024"
+
+# The provider-neutral layer over the `genai` multi-provider LLM client ("AI API"): the service
+# catalogue (`AiApiService`), API keys in the OS credential store, the authenticated client and
+# the async bridge, model metadata (model list, OpenRouter account status), model-id prefix
+# rules, the multimodal heuristic, the quota/limit error classifier and one base64 encoder.
+# Consumers (the translation tab's OCR and MT today) build their own chat requests with the
+# re-exported `ms_ai_api::genai` types, so the graph keeps exactly one `genai` copy.
+#
+# It also owns the shared connection widget (`draw_connection`), its GUI-free state and the
+# background task runner that executes key and metadata requests.
+#
+# Layer: one level above `ms-widgets` (uses `ms-i18n`, `ms-log`, `ms-thread`, `ms-theme`,
+# `ms-widgets`, `egui`). It must never depend on a tab, `ms-models`, `ms-canvas` or `ms-config`.
+#
+# Web build: `genai`, `tokio`, `keyring`, `ureq` and `serde_json` are native-only; the wasm
+# build compiles the target-neutral types plus error stubs for key storage and metadata.
+[dependencies]
+# Localized error and status texts (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics for key-store, model-list and account-status failures (never the key itself).
+ms-log = { path = "../ms-log" }
+# Worker threads for key and metadata requests (Web Workers on wasm).
+ms-thread = { path = "../ms-thread" }
+# `Severity` of the notices the connection state hands to its consumer's toasts.
+ms-theme = { path = "../ms-theme" }
+# `WheelComboBox` for the service and model pickers of the connection widget.
+ms-widgets = { path = "../ms-widgets" }
+# The connection widget draws into an `egui::Ui`.
+egui.workspace = true
+
+# Native-only dependencies, matching the root manifest so the graph keeps one copy of each:
+# the LLM client (`genai`) with the runtime its futures need (`tokio`), the OS credential
+# store (`keyring`), and the blocking HTTP + JSON used for the OpenRouter account status.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+genai.workspace = true
+tokio.workspace = true
+keyring.workspace = true
+ureq.workspace = true
+serde_json.workspace = true

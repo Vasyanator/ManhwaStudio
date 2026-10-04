@@ -18,16 +18,15 @@ UI specifics:
   process-global `AiCaps::current`, not passed in.
 - EasyOCR selected languages are shown as removable rows with full names.
 - EasyOCR/PaddleOCR model dropdown options are alphabetically sorted by title.
-- AI API controls keep API key text transient and emit controller actions for
-  credential-store writes; model/status text is constrained to avoid widening
-  the side panel.
+- The AI API engine options are the shared `ms_ai_api::draw_connection` widget
+  (state in `OcrPanelOptions::ai_api`, requests in `OcrPanelActions::ai_api`),
+  wrapped here in the OCR panel's own height-capped `ScrollArea` and 300 px width.
 - Legacy local PaddleOCR engine keys are normalized back to `PaddleOCR`
   by the Translation tab loader.
 */
 
-use crate::ocr::{
-    AiApiService, CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult,
-};
+use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult};
+use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, draw_connection};
 use crate::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
     PADDLEOCR_MAIN_LANGUAGES, lang_label,
@@ -57,14 +56,8 @@ pub struct OcrPanelOptions {
     pub surya_drop_repeated_text: bool,
     pub surya_max_sliding_window: u32,
     pub surya_max_tokens: u32,
-    pub ai_api_service: AiApiService,
-    pub ai_api_model: String,
-    pub ai_api_key_edit: String,
-    pub ai_api_key_configured: Option<bool>,
-    pub ai_api_models: Vec<String>,
-    pub ai_api_account_status: String,
-    pub ai_api_status: String,
-    pub ai_api_system_instruction: String,
+    /// AI API engine connection (service, model, system instruction are persisted by the tab).
+    pub ai_api: AiApiConnectionState,
     pub join_newlines: bool,
     pub reflect_strings: bool,
     /// Lower an entirely uppercase Latin/Cyrillic OCR result to sentence case.
@@ -126,14 +119,7 @@ impl Default for OcrPanelOptions {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
-            ai_api_service: AiApiService::OpenAi,
-            ai_api_model: AiApiService::OpenAi.default_model().to_string(),
-            ai_api_key_edit: String::new(),
-            ai_api_key_configured: None,
-            ai_api_models: Vec::new(),
-            ai_api_account_status: t!("translation.common.press_refresh_status").to_string(),
-            ai_api_status: String::new(),
-            ai_api_system_instruction: "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /".to_string(),
+            ai_api: AiApiConnectionState::new("You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /"),
             join_newlines: true,
             reflect_strings: false,
             fix_caps_lock: true,
@@ -210,9 +196,9 @@ fn strip_matching_quotes(text: &str) -> &str {
 pub struct OcrPanelActions {
     pub request_load: bool,
     pub options_changed: bool,
-    pub save_ai_api_key: bool,
-    pub clear_ai_api_key: bool,
-    pub refresh_ai_api_metadata: bool,
+    /// Key save / delete / metadata refresh requested in the AI API connection widget (its
+    /// `options_changed` is also folded into `options_changed` above).
+    pub ai_api: AiApiConnectionActions,
 }
 
 /// AiRequirement gating the engine-SELECTION button (permissive: MangaOCR is
@@ -716,6 +702,8 @@ fn draw_char_replacements(
     });
 }
 
+/// The AI API engine options: the shared connection widget inside the OCR panel's own
+/// height-capped scroll area, at most 300 px wide.
 fn draw_ai_api_options(
     ui: &mut egui::Ui,
     options: &mut OcrPanelOptions,
@@ -723,123 +711,21 @@ fn draw_ai_api_options(
 ) {
     let max_width = ui.available_width().min(300.0);
     let max_height = ai_api_options_max_height(ui);
-    let old_service = options.ai_api_service;
     egui::ScrollArea::vertical()
         .max_height(max_height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.set_max_width(max_width);
-                ui.label(t!("translation.common.service_label"));
-                WheelComboBox::from_id_salt("translation_ocr_ai_api_service")
-                    .selected_text(options.ai_api_service.label())
-                    .show_ui(ui, |ui| {
-                        for service in AiApiService::ALL {
-                            actions.options_changed |= ui
-                                .selectable_value(
-                                    &mut options.ai_api_service,
-                                    service,
-                                    service.label(),
-                                )
-                                .changed();
-                        }
-                    });
-                if old_service != options.ai_api_service {
-                    options.ai_api_model = options.ai_api_service.default_model().to_string();
-                    options.ai_api_key_edit.clear();
-                    options.ai_api_key_configured = None;
-                    options.ai_api_models.clear();
-                    options.ai_api_account_status = t!("translation.common.press_refresh_status").to_string();
-                    options.ai_api_status.clear();
-                    actions.options_changed = true;
-                    actions.refresh_ai_api_metadata = true;
-                }
-
-                ui.horizontal_wrapped(|ui| {
-                    let key_state = match options.ai_api_key_configured {
-                        Some(true) => t!("translation.common.key_saved_status"),
-                        Some(false) => t!("translation.common.key_not_set_status"),
-                        None => t!("translation.common.key_unverified_status"),
-                    };
-                    ui.small(key_state);
-                    if ui.small_button(t!("translation.common.refresh_button")).clicked() {
-                        actions.refresh_ai_api_metadata = true;
-                    }
-                });
-
-                ui.label("API key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut options.ai_api_key_edit)
-                        .password(true)
-                        .desired_width(max_width),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    if ui.small_button(t!("translation.common.save_button")).clicked() {
-                        actions.save_ai_api_key = true;
-                    }
-                    if ui.small_button(t!("translation.common.delete_button")).clicked() {
-                        actions.clear_ai_api_key = true;
-                    }
-                });
-                if !options.ai_api_status.trim().is_empty() {
-                    ui.small(options.ai_api_status.clone());
-                }
-
-                ui.label(t!("translation.common.model_label"));
-                let selected_model = compact_middle(&options.ai_api_model, 42);
-                WheelComboBox::from_id_salt("translation_ocr_ai_api_model")
-                    .selected_text(selected_model)
-                    .show_ui(ui, |ui| {
-                        let models = if options.ai_api_models.is_empty() {
-                            vec![options.ai_api_service.default_model().to_string()]
-                        } else {
-                            options.ai_api_models.clone()
-                        };
-                        for model in models {
-                            actions.options_changed |= ui
-                                .selectable_value(&mut options.ai_api_model, model.clone(), model)
-                                .changed();
-                        }
-                    });
-                actions.options_changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut options.ai_api_model)
-                            .desired_width(max_width)
-                            .hint_text("model id"),
-                    )
-                    .changed();
-
-                ui.label(t!("translation.common.balance_limits_label"));
-                ui.small(options.ai_api_account_status.clone());
-
-                ui.label(t!("translation.common.system_instruction_label"));
-                actions.options_changed |= ui
-                    .add(
-                        egui::TextEdit::multiline(&mut options.ai_api_system_instruction)
-                            .desired_width(max_width)
-                            .desired_rows(4),
-                    )
-                    .changed();
+                let connection = draw_connection(ui, "translation_ocr_ai_api", max_width, &mut options.ai_api);
+                actions.options_changed |= connection.options_changed;
+                actions.ai_api = connection;
             });
         });
 }
 
 fn ai_api_options_max_height(ui: &egui::Ui) -> f32 {
     (ui.ctx().content_rect().height() * 0.7 - OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE).max(140.0)
-}
-
-fn compact_middle(text: &str, max_chars: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars || max_chars < 8 {
-        return text.to_string();
-    }
-    let keep = (max_chars - 1) / 2;
-    let start = chars.iter().take(keep).collect::<String>();
-    let end = chars
-        .iter()
-        .skip(chars.len().saturating_sub(keep))
-        .collect::<String>();
-    format!("{start}...{end}")
 }
 
 /// Renders the `base_torch` MangaOCR model button, disabled when PyTorch is not

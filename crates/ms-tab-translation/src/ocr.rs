@@ -14,8 +14,8 @@
 //   2) LRU-кэш декодированных страниц для повторных crop при OCR по блокам.
 //   3) advanced-recognition может передать уже скомпозитенный PNG crop с
 //      пользовательским оверлеем, который worker использует вместо crop страницы.
-// - AI API OCR uses `genai` multimodal chat calls from the worker thread and
-//   stores provider API keys only through the OS credential store.
+// - AI API OCR builds `genai` multimodal chat calls (through `ms_ai_api`: client,
+//   credential-store API keys, async bridge) from the worker thread.
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -34,24 +34,17 @@ use ms_sysprobe::ai_models;
 use ms_native_runtime as native_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
-// AI API OCR (`genai`) is native-only: the crate is not compiled for wasm. The
-// worker command/event enums and the controller stay target-neutral; only the
-// bodies that call `genai`/`tokio`/`ureq`/`keyring` are gated below.
+// AI API OCR (`genai`, reached through `ms_ai_api`) is native-only: `genai` is not
+// compiled for wasm. The worker command/event enums and the controller stay
+// target-neutral; only the bodies that build `genai` requests are gated below.
+use ms_ai_api::AiApiService;
 #[cfg(not(target_arch = "wasm32"))]
-use genai::adapter::AdapterKind;
-#[cfg(not(target_arch = "wasm32"))]
-use genai::chat::{ChatMessage, ChatRequest, ContentPart};
-#[cfg(not(target_arch = "wasm32"))]
-use genai::resolver::{AuthData, AuthResolver, ProviderConfig};
-#[cfg(not(target_arch = "wasm32"))]
-use genai::{Client, ModelIden};
+use ms_ai_api::genai::chat::{ChatMessage, ChatRequest, ContentPart};
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
@@ -131,100 +124,6 @@ pub struct OcrRuntimeOptions {
     pub ai_api_service: AiApiService,
     pub ai_api_model: String,
     pub ai_api_system_instruction: String,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum AiApiService {
-    OpenAi,
-    Anthropic,
-    Gemini,
-    OpenRouter,
-    Groq,
-    DeepSeek,
-    Xai,
-}
-
-impl AiApiService {
-    pub const ALL: [Self; 7] = [
-        Self::OpenAi,
-        Self::Anthropic,
-        Self::Gemini,
-        Self::OpenRouter,
-        Self::Groq,
-        Self::DeepSeek,
-        Self::Xai,
-    ];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::OpenAi => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Gemini => "gemini",
-            Self::OpenRouter => "open_router",
-            Self::Groq => "groq",
-            Self::DeepSeek => "deepseek",
-            Self::Xai => "xai",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::OpenAi => "OpenAI",
-            Self::Anthropic => "Anthropic",
-            Self::Gemini => "Gemini",
-            Self::OpenRouter => "OpenRouter",
-            Self::Groq => "Groq",
-            Self::DeepSeek => "DeepSeek",
-            Self::Xai => "xAI",
-        }
-    }
-
-    /// Maps this service to its `genai` adapter. Native-only: `genai` (and the
-    /// `AdapterKind` type) is not compiled for the web build.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn adapter_kind(self) -> AdapterKind {
-        match self {
-            Self::OpenAi => AdapterKind::OpenAI,
-            Self::Anthropic => AdapterKind::Anthropic,
-            Self::Gemini => AdapterKind::Gemini,
-            Self::OpenRouter => AdapterKind::OpenRouter,
-            Self::Groq => AdapterKind::Groq,
-            Self::DeepSeek => AdapterKind::DeepSeek,
-            Self::Xai => AdapterKind::Xai,
-        }
-    }
-
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Self::OpenAi => "gpt-4o-mini",
-            Self::Anthropic => "claude-3-5-haiku-latest",
-            Self::Gemini => "gemini-2.5-flash",
-            Self::OpenRouter => "open_router::google/gemini-2.0-flash-001",
-            Self::Groq => "groq::meta-llama/llama-4-scout-17b-16e-instruct",
-            Self::DeepSeek => "deepseek-chat",
-            Self::Xai => "grok-2-vision-1212",
-        }
-    }
-
-    pub fn from_key(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "anthropic" | "claude" => Self::Anthropic,
-            "gemini" | "google" => Self::Gemini,
-            "openrouter" | "open_router" => Self::OpenRouter,
-            "groq" => Self::Groq,
-            "deepseek" | "deep_seek" => Self::DeepSeek,
-            "xai" | "x_ai" | "grok" => Self::Xai,
-            _ => Self::OpenAi,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AiApiMetadata {
-    pub service: AiApiService,
-    pub key_configured: bool,
-    pub models: Vec<String>,
-    pub account_status: String,
 }
 
 /// A single post-OCR character-substitution rule applied to recognized text.
@@ -331,17 +230,6 @@ pub enum OcrControllerEvent {
         request_id: u64,
         error: String,
     },
-    AiApiKeyStored {
-        service: AiApiService,
-    },
-    AiApiKeyCleared {
-        service: AiApiService,
-    },
-    AiApiMetadataLoaded(AiApiMetadata),
-    AiApiMetadataFailed {
-        service: AiApiService,
-        error: String,
-    },
 }
 
 #[derive(Debug)]
@@ -425,36 +313,6 @@ impl TranslationOcrController {
         }
     }
 
-    pub fn store_ai_api_key(&mut self, service: AiApiService, api_key: String) {
-        if self
-            .cmd_tx
-            .send(WorkerCommand::StoreAiApiKey { service, api_key })
-            .is_err()
-        {
-            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-        }
-    }
-
-    pub fn clear_ai_api_key(&mut self, service: AiApiService) {
-        if self
-            .cmd_tx
-            .send(WorkerCommand::ClearAiApiKey { service })
-            .is_err()
-        {
-            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-        }
-    }
-
-    pub fn refresh_ai_api_metadata(&mut self, service: AiApiService) {
-        if self
-            .cmd_tx
-            .send(WorkerCommand::RefreshAiApiMetadata { service })
-            .is_err()
-        {
-            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-        }
-    }
-
     pub fn poll_events(&mut self) -> Vec<OcrControllerEvent> {
         let mut out = Vec::new();
         for _ in 0..OCR_EVENT_POLL_BUDGET {
@@ -514,18 +372,6 @@ impl TranslationOcrController {
                     out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
                     out.push(OcrControllerEvent::RecognizeFailed { request_id, error });
                 }
-                Ok(WorkerEvent::AiApiKeyStored { service }) => {
-                    out.push(OcrControllerEvent::AiApiKeyStored { service });
-                }
-                Ok(WorkerEvent::AiApiKeyCleared { service }) => {
-                    out.push(OcrControllerEvent::AiApiKeyCleared { service });
-                }
-                Ok(WorkerEvent::AiApiMetadataLoaded(metadata)) => {
-                    out.push(OcrControllerEvent::AiApiMetadataLoaded(metadata));
-                }
-                Ok(WorkerEvent::AiApiMetadataErr { service, error }) => {
-                    out.push(OcrControllerEvent::AiApiMetadataFailed { service, error });
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.last_error = Some(t!("translation.ocr.worker_disconnected_error").to_string());
@@ -559,16 +405,6 @@ enum WorkerCommand {
         options: OcrRuntimeOptions,
     },
     Recognize(OcrRecognizeRequest),
-    StoreAiApiKey {
-        service: AiApiService,
-        api_key: String,
-    },
-    ClearAiApiKey {
-        service: AiApiService,
-    },
-    RefreshAiApiMetadata {
-        service: AiApiService,
-    },
     Stop,
 }
 
@@ -584,17 +420,6 @@ enum WorkerEvent {
     },
     RecognizeErr {
         request_id: u64,
-        error: String,
-    },
-    AiApiKeyStored {
-        service: AiApiService,
-    },
-    AiApiKeyCleared {
-        service: AiApiService,
-    },
-    AiApiMetadataLoaded(AiApiMetadata),
-    AiApiMetadataErr {
-        service: AiApiService,
         error: String,
     },
 }
@@ -618,34 +443,6 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
             WorkerCommand::Recognize(request) => {
                 if run_recognize_command(request, &mut page_cache, &cmd_rx, &evt_tx).is_break() {
                     break;
-                }
-            }
-            WorkerCommand::StoreAiApiKey { service, api_key } => {
-                match store_ai_api_key(service, &api_key) {
-                    Ok(()) => {
-                        let _ = evt_tx.send(WorkerEvent::AiApiKeyStored { service });
-                    }
-                    Err(error) => {
-                        let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-                    }
-                }
-            }
-            WorkerCommand::ClearAiApiKey { service } => match clear_ai_api_key(service) {
-                Ok(()) => {
-                    let _ = evt_tx.send(WorkerEvent::AiApiKeyCleared { service });
-                }
-                Err(error) => {
-                    let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-                }
-            },
-            WorkerCommand::RefreshAiApiMetadata { service } => {
-                match load_ai_api_metadata(service) {
-                    Ok(metadata) => {
-                        let _ = evt_tx.send(WorkerEvent::AiApiMetadataLoaded(metadata));
-                    }
-                    Err(error) => {
-                        let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-                    }
                 }
             }
         }
@@ -1497,7 +1294,7 @@ fn parse_ocr_response(response: &Value) -> Result<OcrRecognizeResult, String> {
 
 fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<(), String> {
     let service = options.ai_api_service;
-    if read_ai_api_key(service)?.trim().is_empty() {
+    if ms_ai_api::keys::read_api_key(service).map_err(|err| err.to_string())?.trim().is_empty() {
         return Err(tf!("translation.ocr.api_key_missing_error", service = service.label()));
     }
     if options.ai_api_model.trim().is_empty() {
@@ -1524,23 +1321,18 @@ fn run_ai_api_ocr_request(
     validate_ai_api_options(&request.options)?;
     let crop_png = crop_image_as_png(request, page_cache)?;
     let service = request.options.ai_api_service;
-    let api_key = read_ai_api_key(service)?;
-    let model = model_iden_for_ai_api_service(service, &request.options.ai_api_model);
+    let api_key = ms_ai_api::keys::read_api_key(service).map_err(|err| err.to_string())?;
+    let model = ms_ai_api::model_id::model_iden(service, &request.options.ai_api_model);
     let system_instruction = normalized_ai_api_system_instruction(&request.options);
     let prompt = if request.reflect_strings {
         "Recognize all visible text in this manga/comic image. Read vertical columns right-to-left when the layout indicates manga reading order. Return only the recognized text, preserving line breaks when they are meaningful."
     } else {
         "Recognize all visible text in this manga/comic image. Return only the recognized text, preserving line breaks when they are meaningful."
     };
-    let image_b64 = base64_encode(&crop_png);
+    let image_b64 = ms_ai_api::base64_encode(&crop_png);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))?;
-
-    let text = runtime.block_on(async move {
-        let client = build_ai_api_client(service, api_key);
+    let text = ms_ai_api::client::block_on(async move {
+        let client = ms_ai_api::client::build_client(service, api_key);
         let chat_req = ChatRequest::default()
             .with_system(system_instruction)
             .append_message(ChatMessage::user(vec![
@@ -1556,7 +1348,8 @@ fn run_ai_api_ocr_request(
             .await
             .map_err(|err| tf!("translation.ocr.ai_api_request_failed_error", err = err))?;
         Ok::<String, String>(chat_res.first_text().unwrap_or("").trim().to_string())
-    })?;
+    })
+    .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))??;
 
     let lines = text
         .lines()
@@ -1575,238 +1368,6 @@ fn normalized_ai_api_system_instruction(options: &OcrRuntimeOptions) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn build_ai_api_client(service: AiApiService, api_key: String) -> Client {
-    let api_key = Arc::new(api_key);
-    let expected_adapter = service.adapter_kind();
-    let auth_resolver = AuthResolver::from_resolver_fn(
-        move |model_iden: ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
-            if model_iden.adapter_kind == expected_adapter {
-                Ok(Some(AuthData::from_single((*api_key).clone())))
-            } else {
-                Ok(None)
-            }
-        },
-    );
-    Client::builder().with_auth_resolver(auth_resolver).build()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn model_iden_for_ai_api_service(service: AiApiService, model: &str) -> ModelIden {
-    let model_name = model
-        .trim()
-        .split_once("::")
-        .map_or_else(|| model.trim(), |(_, name)| name.trim());
-    ModelIden::new(service.adapter_kind(), model_name)
-}
-
-/// Web stub: model listing / account status need `genai`/`tokio`/`ureq`, absent
-/// on the browser build. Surfaces a clear error rather than empty metadata.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn load_ai_api_metadata(_service: AiApiService) -> Result<AiApiMetadata, String> {
-    Err(t!("translation.ocr.ai_api_data_web_unavailable_error").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn load_ai_api_metadata(service: AiApiService) -> Result<AiApiMetadata, String> {
-    let key = read_ai_api_key(service).unwrap_or_default();
-    let key_configured = !key.trim().is_empty();
-    let mut account_status = if key_configured {
-        t!("translation.ocr.balance_unavailable_status").to_string()
-    } else {
-        t!("translation.common.api_key_not_set_status").to_string()
-    };
-    let mut models = Vec::new();
-
-    if key_configured {
-        models = fetch_ai_api_model_names(service, &key)?;
-        if service == AiApiService::OpenRouter {
-            account_status = fetch_openrouter_account_status(&key)
-                .unwrap_or_else(|err| tf!("translation.ocr.openrouter_balance_error", err = err));
-        }
-    }
-
-    Ok(AiApiMetadata {
-        service,
-        key_configured,
-        models,
-        account_status,
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fetch_ai_api_model_names(service: AiApiService, api_key: &str) -> Result<Vec<String>, String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| tf!("translation.ocr.models_async_runtime_error", err = err))?;
-    let adapter = service.adapter_kind();
-    let key = api_key.to_string();
-    let models = runtime.block_on(async move {
-        let client = Client::default();
-        client
-            .all_model_names(
-                adapter,
-                ProviderConfig::from_auth(AuthData::from_single(key)),
-            )
-            .await
-            .map_err(|err| {
-                tf!("translation.ocr.fetch_models_error", service = service.label(), err = err)
-            })
-    })?;
-    let mut filtered = models
-        .into_iter()
-        .filter(|model| is_likely_multimodal_model(model))
-        .map(|model| model_name_for_ai_api_ui(service, &model))
-        .collect::<Vec<_>>();
-    filtered.sort();
-    filtered.dedup();
-    if filtered.is_empty() {
-        filtered.push(service.default_model().to_string());
-    }
-    Ok(filtered)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn model_name_for_ai_api_ui(service: AiApiService, model: &str) -> String {
-    if service == AiApiService::OpenRouter && !model.contains("::") {
-        format!("open_router::{model}")
-    } else if service == AiApiService::Groq && !model.contains("::") {
-        format!("groq::{model}")
-    } else {
-        model.to_string()
-    }
-}
-
-pub(crate) fn is_likely_multimodal_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("vision")
-        || model.contains("vl")
-        || model.contains("omni")
-        || model.contains("multimodal")
-        || model.contains("gpt-4o")
-        || model.contains("gpt-4.1")
-        || model.contains("gpt-5")
-        || model.contains("claude-3")
-        || model.contains("claude-4")
-        || model.contains("gemini")
-        || model.contains("grok-2")
-        || model.contains("grok-3")
-        || model.contains("llama-4")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
-    let response = ureq::get("https://openrouter.ai/api/v1/key")
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .call()
-        .map_err(|err| tf!("translation.ocr.openrouter_key_request_error", err = err))?;
-    let value: Value = response
-        .into_json()
-        .map_err(|err| tf!("translation.ocr.openrouter_non_json_error", err = err))?;
-    let data = value.get("data").unwrap_or(&value);
-    let usage = data.get("usage").and_then(Value::as_f64);
-    let limit = data.get("limit").and_then(Value::as_f64);
-    let remaining = data.get("limit_remaining").and_then(Value::as_f64);
-    let rate = data.get("rate_limit").and_then(Value::as_object);
-
-    let mut parts = Vec::new();
-    if let Some(usage) = usage {
-        parts.push(tf!(
-            "translation.ocr.openrouter_usage",
-            usage = format!("{usage:.2}")
-        ));
-    }
-    match (limit, remaining) {
-        (Some(limit), Some(remaining)) => {
-            parts.push(tf!(
-                "translation.ocr.openrouter_limit_remaining",
-                limit = format!("{limit:.2}"),
-                remaining = format!("{remaining:.2}")
-            ));
-        }
-        (None, Some(remaining)) => {
-            parts.push(tf!(
-                "translation.ocr.openrouter_remaining",
-                remaining = format!("{remaining:.2}")
-            ));
-        }
-        (None, None) => {
-            parts.push(t!("translation.ocr.limit_not_set_status").to_string());
-        }
-        (Some(limit), None) => {
-            parts.push(tf!(
-                "translation.ocr.openrouter_limit",
-                limit = format!("{limit:.2}")
-            ));
-        }
-    }
-    if let Some(rate) = rate {
-        let requests = rate.get("requests").and_then(Value::as_u64);
-        let interval = rate.get("interval").and_then(Value::as_str);
-        if let (Some(requests), Some(interval)) = (requests, interval) {
-            parts.push(format!("{requests} req/{interval}"));
-        }
-    }
-    Ok(format!("OpenRouter: {}", parts.join(", ")))
-}
-
-/// Web stub: the OS credential store (`keyring`) does not exist in the browser,
-/// so storing an API key is rejected with a clear error.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn store_ai_api_key(_service: AiApiService, _api_key: &str) -> Result<(), String> {
-    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn store_ai_api_key(service: AiApiService, api_key: &str) -> Result<(), String> {
-    let trimmed = api_key.trim();
-    if trimmed.is_empty() {
-        return Err(t!("translation.ocr.api_key_empty_error").to_string());
-    }
-    ai_api_keyring_entry(service)?
-        .set_password(trimmed)
-        .map_err(|err| tf!("translation.ocr.store_api_key_error", service = service.label(), err = err))
-}
-
-/// Web stub: no OS credential store on the browser build, so clearing a key is
-/// rejected with a clear error.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn clear_ai_api_key(_service: AiApiService) -> Result<(), String> {
-    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn clear_ai_api_key(service: AiApiService) -> Result<(), String> {
-    match ai_api_keyring_entry(service)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(tf!("translation.ocr.delete_api_key_error", service = service.label(), err = err)),
-    }
-}
-
-/// Web stub: no OS credential store on the browser build. Returns a clear error
-/// so callers (OCR warmup, MT run, metadata) surface "unavailable on web" rather
-/// than treating a missing key as an empty one.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn read_ai_api_key(_service: AiApiService) -> Result<String, String> {
-    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn read_ai_api_key(service: AiApiService) -> Result<String, String> {
-    match ai_api_keyring_entry(service)?.get_password() {
-        Ok(key) => Ok(key),
-        Err(keyring::Error::NoEntry) => Ok(String::new()),
-        Err(err) => Err(tf!("translation.ocr.read_api_key_error", service = service.label(), err = err)),
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn ai_api_keyring_entry(service: AiApiService) -> Result<keyring::Entry, String> {
-    keyring::Entry::new("ManhwaStudio AI API OCR", service.key())
-        .map_err(|err| tf!("translation.ocr.keyring_unavailable_error", err = err))
 }
 
 struct CachedPageImage {
@@ -1895,55 +1456,18 @@ fn approx_image_size_bytes(image: &DynamicImage) -> usize {
     (w as usize).saturating_mul(h as usize).saturating_mul(4)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if data.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-
-    let rem = data.len() - i;
-    if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
         OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
         apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
-        is_likely_multimodal_model,
-        model_iden_for_ai_api_service, native_failure_should_surface, ocr_header_fields,
+        native_failure_should_surface, ocr_header_fields,
         ocr_requires_backend, ocr_route, ocr_route_needs_backend_warmup, parse_ocr_response,
     };
     use ms_sysprobe::ai_models::MangaOcrOnnxModel;
     use ms_backend_ipc::protocol;
     use ms_config::{AiRuntime, OrtLoadDecision};
-    use genai::adapter::AdapterKind;
     use serde_json::{Value, json};
 
     fn sample_options() -> OcrRuntimeOptions {
@@ -2203,34 +1727,6 @@ mod tests {
         apply_char_replacements(&mut result, &[]);
         assert_eq!(result.lines, vec!["a·b".to_string()]);
         assert_eq!(result.text, "a·b");
-    }
-
-    #[test]
-    fn parses_ai_api_service_keys() {
-        assert_eq!(
-            AiApiService::from_key("open_router"),
-            AiApiService::OpenRouter
-        );
-        assert_eq!(AiApiService::from_key("grok"), AiApiService::Xai);
-        assert_eq!(AiApiService::from_key("unknown"), AiApiService::OpenAi);
-    }
-
-    #[test]
-    fn strips_ui_namespace_for_explicit_model_identity() {
-        let model = model_iden_for_ai_api_service(
-            AiApiService::OpenRouter,
-            "open_router::google/gemini-2.0-flash-001",
-        );
-        assert_eq!(model.adapter_kind, AdapterKind::OpenRouter);
-        assert_eq!(model.model_name.to_string(), "google/gemini-2.0-flash-001");
-    }
-
-    #[test]
-    fn detects_common_multimodal_model_names() {
-        assert!(is_likely_multimodal_model("gpt-4o-mini"));
-        assert!(is_likely_multimodal_model("claude-3-5-haiku-latest"));
-        assert!(is_likely_multimodal_model("google/gemini-2.0-flash-001"));
-        assert!(!is_likely_multimodal_model("text-embedding-3-small"));
     }
 
     #[test]

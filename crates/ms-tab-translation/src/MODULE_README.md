@@ -23,7 +23,9 @@ state, and debounced settings persistence.
 Long work is delegated to focused controllers:
 
 - `ocr.rs` owns the OCR worker, backend IPC transport (framed `shared_client()`), AI API OCR
-  transport, page crop/cache handling, OS credential-store API key access, and per-engine load state.
+  transport, page crop/cache handling, and per-engine load state. The AI API layer itself
+  (services, credential-store keys, client, async bridge, model metadata, the connection widget
+  and its request runner) lives in `ms-ai-api`.
   `OcrEngine` has six engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL and Surya (backend IPC
   methods `ocr.*`, MangaOCR/PaddleOCR also native ONNX) and AI API (`genai`, no backend).
 - `text_detector/` owns the text detector worker and returns page boxes plus editable binary
@@ -39,6 +41,11 @@ Long work is delegated to focused controllers:
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
+- The AI API connection blocks of the OCR and MT panels (key save/delete, metadata refresh) do
+  not go through either controller: `tab.rs` owns one `ms_ai_api::AiApiTaskRunner` per panel
+  (`ocr_ai_api_tasks`, `mt_ai_api_tasks`), submits the panel's `AiApiConnectionActions` to it and
+  applies its events in `poll_ai_api_events` (a model replaced by a refresh marks that panel's
+  settings dirty; notices become toasts).
 - `backend_health.rs` owns the shared Python backend probe snapshot used by Translation and
   Settings.
 
@@ -107,9 +114,9 @@ detector-only downloads only detection files, while full PaddleOCR also download
 recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
 engine that needs no text detection and no language selection; it is shown on a second engine row in
 the OCR panel so the side panel stays narrow.
-AI API OCR bypasses the Python backend and uses Rust `genai` from the OCR worker thread; provider
-API keys must be read/written through the OS credential store and never persisted to project or
-user JSON settings.
+AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`) from the OCR
+worker thread; provider API keys are read/written only through `ms_ai_api::keys` (OS credential
+store) and never persisted to project or user JSON settings.
 The native ONNX Runtime OCR path (MangaOCR + PaddleOCR) is selected in `ocr.rs` by the pure
 `ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope SIGILL
 guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
@@ -181,8 +188,8 @@ is an author note addressed to the translator, not a replica.
   the old CTD font-size and rearrange-batch params) are ignored on read and stripped on write.
   The `characters.json` watch uses `ms_docstore::signature`.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
-  `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR via `genai`,
-  credential-store API key commands, crop encoding, page image LRU cache, and
+  `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
+  `ms_ai_api`, crop encoding, page image LRU cache, and
   model-download/load-state events.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.

@@ -61,6 +61,9 @@ ms-widgets = { path = "../ms-widgets" }
 ms-theme = { path = "../ms-theme" }
 # Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
+# The AI API layer (`genai` re-export, service catalogue, OS credential-store API keys, client,
+# async bridge, model metadata, quota classifier) behind the AI API OCR engine and AI API MT.
+ms-ai-api = { path = "../ms-ai-api" }
 # The whole tab draws.
 egui.workspace = true
 eframe.workspace = true
@@ -80,18 +83,15 @@ unicode-script.workspace = true
 web-time.workspace = true
 
 # Native-only dependencies, matching the root manifest exactly so the graph keeps one copy
-# of each: blocking HTTP (`ureq`), the LLM client stack (`genai` + `tokio`), the concrete
-# Google translator (`translators`), the OS credential store for API keys (`keyring`),
-# native file dialogs (`rfd`), the ONNX Runtime loader and the native OCR/detector manager
-# (the ONNX sessions themselves stay behind `ms-native-runtime`).
+# of each: blocking HTTP (`ureq`, the DeepL/Yandex backends), the concrete Google translator
+# (`translators`), native file dialogs (`rfd`), the ONNX Runtime loader and the native
+# OCR/detector manager (the ONNX sessions themselves stay behind `ms-native-runtime`). The LLM
+# client stack (`genai`, `tokio`) and the OS credential store (`keyring`) live in `ms-ai-api`.
 # Their call sites are `#[cfg(not(target_arch = "wasm32"))]`-gated; the wasm build compiles
 # error stubs instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq.workspace = true
-genai.workspace = true
-tokio.workspace = true
 translators.workspace = true
-keyring.workspace = true
 rfd.workspace = true
 # The loader that resolves/downloads the onnxruntime dylib; the detector panel renders its
 # `OrtDownloadProgress`.

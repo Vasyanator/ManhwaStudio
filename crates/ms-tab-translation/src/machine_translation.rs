@@ -40,10 +40,10 @@ Context replicas:
   counted, or reported as failures.
 */
 
-// AI API machine translation runs over `genai` + `tokio`, native-only crates not
-// compiled for wasm. The controller, worker threads, and command/event enums stay
-// target-neutral; only the bodies that touch `genai`/`tokio` (and the `keyring`
-// API-key helpers in `ocr`) are gated behind `not(target_arch = "wasm32")` below.
+// AI API machine translation runs over `genai` (reached through `ms_ai_api`, which also
+// owns the credential-store API keys and the async bridge), native-only and not compiled
+// for wasm. The controller, worker threads, and command/event enums stay target-neutral;
+// only the bodies that touch `genai` are gated behind `not(target_arch = "wasm32")` below.
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 use std::fs;
@@ -59,9 +59,13 @@ use super::machine_translators::MachineTranslatorBackend;
 use super::machine_translators::deepl::DeeplMtBackend;
 use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
-use super::ocr::AiApiService;
+use ms_ai_api::AiApiService;
 #[cfg(not(target_arch = "wasm32"))]
-use super::ocr::{build_ai_api_client, model_iden_for_ai_api_service, read_ai_api_key};
+use ms_ai_api::client::{block_on, build_client};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::keys::read_api_key;
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::model_id::model_iden;
 use ms_project::{Bubble, ProjectData};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_log::runtime_log;
@@ -69,7 +73,7 @@ use ms_tabs_simple::characters::load_characters_for_notes;
 use ms_tabs_simple::terms::load_terms_for_notes;
 use crate::panels::bubbles::{bubble_extra_i32, bubble_extra_string};
 #[cfg(not(target_arch = "wasm32"))]
-use genai::chat::{
+use ms_ai_api::genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ContentPart, ReasoningEffort,
 };
 use serde_json::Value;
@@ -427,17 +431,6 @@ pub enum MtControllerEvent {
         context_budget_chars: usize,
         pruned_replicas: usize,
     },
-    AiApiKeyStored {
-        service: AiApiService,
-    },
-    AiApiKeyCleared {
-        service: AiApiService,
-    },
-    AiApiMetadataLoaded(super::ocr::AiApiMetadata),
-    AiApiMetadataFailed {
-        service: AiApiService,
-        error: String,
-    },
 }
 
 #[derive(Debug)]
@@ -514,44 +507,6 @@ impl TranslationMtController {
         });
         self.busy = true;
         Ok(())
-    }
-
-    pub fn store_ai_api_key(&self, service: AiApiService, api_key: String) {
-        let evt_tx = self.evt_tx.clone();
-        thread::spawn(
-            move || match super::ocr::store_ai_api_key(service, &api_key) {
-                Ok(()) => {
-                    let _ = evt_tx.send(WorkerEvent::AiApiKeyStored { service });
-                }
-                Err(error) => {
-                    let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-                }
-            },
-        );
-    }
-
-    pub fn clear_ai_api_key(&self, service: AiApiService) {
-        let evt_tx = self.evt_tx.clone();
-        thread::spawn(move || match super::ocr::clear_ai_api_key(service) {
-            Ok(()) => {
-                let _ = evt_tx.send(WorkerEvent::AiApiKeyCleared { service });
-            }
-            Err(error) => {
-                let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-            }
-        });
-    }
-
-    pub fn refresh_ai_api_metadata(&self, service: AiApiService) {
-        let evt_tx = self.evt_tx.clone();
-        thread::spawn(move || match super::ocr::load_ai_api_metadata(service) {
-            Ok(metadata) => {
-                let _ = evt_tx.send(WorkerEvent::AiApiMetadataLoaded(metadata));
-            }
-            Err(error) => {
-                let _ = evt_tx.send(WorkerEvent::AiApiMetadataErr { service, error });
-            }
-        });
     }
 
     pub fn request_cancel(&mut self) -> bool {
@@ -656,18 +611,6 @@ impl TranslationMtController {
                         });
                     }
                 }
-                Ok(WorkerEvent::AiApiKeyStored { service }) => {
-                    out.push(MtControllerEvent::AiApiKeyStored { service });
-                }
-                Ok(WorkerEvent::AiApiKeyCleared { service }) => {
-                    out.push(MtControllerEvent::AiApiKeyCleared { service });
-                }
-                Ok(WorkerEvent::AiApiMetadataLoaded(metadata)) => {
-                    out.push(MtControllerEvent::AiApiMetadataLoaded(metadata));
-                }
-                Ok(WorkerEvent::AiApiMetadataErr { service, error }) => {
-                    out.push(MtControllerEvent::AiApiMetadataFailed { service, error });
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.finish_active_run();
@@ -770,17 +713,6 @@ enum WorkerEvent {
         context_used_chars: usize,
         context_budget_chars: usize,
         pruned_replicas: usize,
-    },
-    AiApiKeyStored {
-        service: AiApiService,
-    },
-    AiApiKeyCleared {
-        service: AiApiService,
-    },
-    AiApiMetadataLoaded(super::ocr::AiApiMetadata),
-    AiApiMetadataErr {
-        service: AiApiService,
-        error: String,
     },
 }
 
@@ -971,60 +903,6 @@ pub fn translate_texts_via_translator(
     }
 }
 
-/// Keyword fragments (lowercase) that strongly suggest an AI provider stopped the request because
-/// the account is out of credits/quota or hit a usage/rate limit. Kept provider-agnostic so it
-/// covers OpenAI, Anthropic, Gemini, OpenRouter and similar wordings, plus the HTTP 402/429 codes
-/// these providers return for billing/rate problems.
-const AI_QUOTA_LIMIT_ERROR_KEYWORDS: &[&str] = &[
-    "insufficient_quota",
-    "insufficient quota",
-    "insufficient credit",
-    "insufficient funds",
-    "not enough credit",
-    "out of credit",
-    "no credits",
-    "quota exceeded",
-    "exceeded your current quota",
-    "exceeded your quota",
-    "usage limit",
-    "monthly limit",
-    "spending limit",
-    "limit reached",
-    "limit exceeded",
-    "rate limit",
-    "rate_limit",
-    "ratelimit",
-    "too many requests",
-    "resource_exhausted",
-    "resource exhausted",
-    "credit balance is too low",
-    "payment required",
-    "billing",
-    "status code: 402",
-    "status code: 429",
-    "status: 402",
-    "status: 429",
-    "error 402",
-    "error 429",
-    "http 402",
-    "http 429",
-];
-
-/// Best-effort classification of an AI provider error string as a credit/quota/limit exhaustion
-/// rather than a transient network glitch or a configuration mistake.
-///
-/// Matching is a case-insensitive substring scan over [`AI_QUOTA_LIMIT_ERROR_KEYWORDS`], so it stays
-/// provider-agnostic. It is intentionally a heuristic: a false positive only changes a red error
-/// toast into the softer "probably out of credits/limit" notice, and the full original error is
-/// always still available to the user.
-#[must_use]
-pub fn is_probable_quota_or_limit_error(error: &str) -> bool {
-    let haystack = error.to_ascii_lowercase();
-    AI_QUOTA_LIMIT_ERROR_KEYWORDS
-        .iter()
-        .any(|keyword| haystack.contains(keyword))
-}
-
 /// Web stub: AI API translation runs over `genai` + `tokio`, which are not
 /// compiled for the browser build. Fails the run with a clear message rather than
 /// producing a fake translation. Signature matches the native twin so the neutral
@@ -1062,7 +940,7 @@ fn run_ai_translate_request(
     errors: &mut usize,
 ) {
     let service = options.service;
-    let api_key = match read_ai_api_key(service) {
+    let api_key = match read_api_key(service).map_err(|err| err.to_string()) {
         Ok(key) if !key.trim().is_empty() => key,
         Ok(_) => {
             let _ = evt_tx.send(WorkerEvent::RunFailed {
@@ -1083,24 +961,7 @@ fn run_ai_translate_request(
 
     sort_ai_mt_items(&mut items, options.sort_mode());
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            runtime_log::log_error(format!(
-                "[MT][run {run_id}] failed to create async runtime: {err}"
-            ));
-            let _ = evt_tx.send(WorkerEvent::RunFailed {
-                run_id,
-                error: tf!("translation.mt.async_runtime_error", err = err),
-            });
-            return;
-        }
-    };
-
-    let result = runtime.block_on(async {
+    let result = block_on(async {
         run_ai_translate_async(
             run_id,
             source_lang,
@@ -1115,6 +976,22 @@ fn run_ai_translate_request(
         )
         .await
     });
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            runtime_log::log_error(format!(
+                "[MT][run {run_id}] failed to create async runtime: {err}"
+            ));
+            // The receiver lives in `TranslationMtController`; a failed send means the
+            // controller (and its tab) was dropped, so nobody is left to show the failure,
+            // which is already in the log above.
+            let _ = evt_tx.send(WorkerEvent::RunFailed {
+                run_id,
+                error: tf!("translation.mt.async_runtime_error", err = err),
+            });
+            return;
+        }
+    };
 
     if let Err(error) = result {
         runtime_log::log_error(format!(
@@ -1172,8 +1049,8 @@ async fn run_ai_translate_async(
         .await;
     }
 
-    let client = build_ai_api_client(options.service, api_key);
-    let model = model_iden_for_ai_api_service(options.service, &options.model);
+    let client = build_client(options.service, api_key);
+    let model = model_iden(options.service, &options.model);
     let mut chat_req = ChatRequest::default().with_system(build_ai_mt_system_prompt(
         source_lang,
         target_lang,
@@ -1404,8 +1281,8 @@ async fn run_ai_imagebubble_translate_async(
     translated: &mut usize,
     errors: &mut usize,
 ) -> Result<(), String> {
-    let client = build_ai_api_client(options.service, api_key);
-    let model = model_iden_for_ai_api_service(options.service, &options.model);
+    let client = build_client(options.service, api_key);
+    let model = model_iden(options.service, &options.model);
     let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, &options);
     // OpenAI-style providers route by this stable key; Anthropic gets message-level cache markers.
     let cache_key = format!(
@@ -1652,7 +1529,7 @@ fn build_imagebubble_chat_request(
         ContentPart::from_text(descriptor),
         ContentPart::from_binary_base64(
             encoded.mime_type,
-            base64_encode(&encoded.bytes),
+            ms_ai_api::base64_encode(&encoded.bytes),
             Some(format!(
                 "image-bubble-{}.{}",
                 target.bubble_id, encoded.extension
@@ -2108,7 +1985,7 @@ fn build_ai_mt_user_message(
                     image_stats.image_bytes.saturating_add(encoded.bytes.len());
                 parts.push(ContentPart::from_binary_base64(
                     encoded.mime_type,
-                    base64_encode(&encoded.bytes),
+                    ms_ai_api::base64_encode(&encoded.bytes),
                     Some(format!("image-bubble-{bubble_id}.{}", encoded.extension)),
                 ));
             }
@@ -2514,42 +2391,6 @@ fn normalize_uv_rect(rect: [f32; 4]) -> [f32; 4] {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if data.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-
-    let rem = data.len() - i;
-    if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-
-    out
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn prune_ai_mt_chat_context(
     chat_req: &mut ChatRequest,
     history_batch_sizes: &mut VecDeque<usize>,
@@ -2785,7 +2626,7 @@ mod tests {
         ai_mt_ordered_item_descriptor, build_ai_mt_batch_prompt, build_ai_mt_history_prompt,
         build_ai_mt_imagebubble_request_preview, build_ai_mt_request_preview,
         imagebubble_context_line_for_item, imagebubble_context_line_for_target,
-        is_probable_quota_or_limit_error, parse_ai_mt_response, prepare_mt_image_for_detail,
+        parse_ai_mt_response, prepare_mt_image_for_detail,
         sort_ai_mt_items, split_ai_mt_batches,
     };
     use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
@@ -2983,38 +2824,6 @@ mod tests {
             err.starts_with(prefix),
             "expected the image-load error, got {err:?}"
         );
-    }
-
-    #[test]
-    fn quota_limit_classifier_matches_common_provider_wordings() {
-        let positives = [
-            "AI перевод не выполнен: 429 Too Many Requests",
-            "error: insufficient_quota - You exceeded your current quota",
-            "Your credit balance is too low to access the Claude API",
-            "RESOURCE_EXHAUSTED: Quota exceeded for gemini",
-            "OpenRouter: Insufficient credits (status code: 402)",
-        ];
-        for error in positives {
-            assert!(
-                is_probable_quota_or_limit_error(error),
-                "expected quota/limit match for: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn quota_limit_classifier_ignores_unrelated_errors() {
-        let negatives = [
-            "AI вернул невалидный JSON: expected value at line 1",
-            "Не удалось создать async runtime для AI перевода",
-            "connection reset by peer",
-        ];
-        for error in negatives {
-            assert!(
-                !is_probable_quota_or_limit_error(error),
-                "did not expect quota/limit match for: {error}"
-            );
-        }
     }
 
     /// Builds a plain text replica with the given translate flag for batching/context tests.

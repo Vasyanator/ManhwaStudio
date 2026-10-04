@@ -24,7 +24,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 
 ## Files and submodules
 - `mod.rs`: panel module declarations.
-- `ocr.rs`: OCR engine/language/model controls, AI API provider/key/model controls, behavior
+- `ocr.rs`: OCR engine/language/model controls, the AI API engine options (the shared
+  `ms_ai_api::draw_connection` widget, id salt `translation_ocr_ai_api`, inside this panel's own
+  height-capped `ScrollArea` and 300 px width), behavior
   toggles, load action, selection-mode hints, and last result/error preview. The "Заменять
   символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
   quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
@@ -67,7 +69,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   while the page is loading, failed or 0x0). `plan_notice_text` / `plan_ctd_size_text` only
   format the notice.
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
-  provider/key/model/prompt/batching/context controls, multimodal ImageBubble inclusion and image
+  controls: a "connection" accordion section (source/target languages, then the shared
+  `ms_ai_api::draw_connection` widget, id salt `translation_mt_ai_api`) and the
+  batching/context section, multimodal ImageBubble inclusion and image
   visual-detail controls, plus start/cancel actions. On the AI API tab the start buttons also expose
   a right-click "Отобразить полный запрос" debug action (`MtPanelActions::preview_request_page` /
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
@@ -98,8 +102,11 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   state machines.
 - Option structs are the settings boundary between panel UI, project settings persistence, and
   controller request construction. Keep parser/writer mappings in `tab.rs` synchronized when
-  adding fields. API keys edited in the OCR panel are transient UI input and must be saved only via
-  controller actions to the OS credential store, not serialized into project settings.
+  adding fields. The AI API connection state (`ai_api: AiApiConnectionState`) persists only
+  `service`, `model` and `system_instruction` (written by `tab.rs`); its key buffer is transient
+  UI input stored only through `AiApiConnectionActions` -> `AiApiTaskRunner` in the OS credential
+  store, never serialized into project settings. The connection id salts are persisted widget
+  state: keep them stable.
 - `bubbles.rs` must write bubble text through `CanvasView` APIs and footer fields through the
   parent tab patch queue; it must not mutate `ProjectData` directly.
 - A class switch in `bubbles.rs` seeds the target class's own `extra` keys through the footer patch

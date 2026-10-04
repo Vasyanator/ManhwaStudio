@@ -11,7 +11,7 @@ ManhwaStudio is a desktop editor for translating comics (manga / manhwa): a chap
 translated (bubbles, OCR, machine translation), cleaned (clean layers, inpainting), typeset
 (rendered text layers) and exported.
 
-- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 36
+- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 37
   `ms-*` library crates in `crates/`. Builds for Linux and Windows (mandatory), macOS, and
   `wasm32` (web entry, `src/web_entry.rs`).
 - **Python AI backend** — an optional separate process (`ai_backend.py` + `modules/ai_backend/`)
@@ -42,7 +42,7 @@ bin (src/: main.rs, app.rs, studio_bootstrap.rs, tabs/settings/, web_entry.rs)
   <- ms-tab-translation / ms-tab-typing
   <- ms-tools
   <- ms-canvas
-  <- ms-models / ms-tabs-simple / ms-installer
+  <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
   <- ms-project / ms-widgets / ms-native-runtime
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry
   <- ms-config / ms-text-render
@@ -101,6 +101,10 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   but never takes `Ui` / `Painter`.
 - `ms-tabs-simple` — Characters, Terms, Notes, Wiki tabs.
 - `ms-installer` — install/update, Python environment, `venv_check`.
+- `ms-ai-api` — the multi-provider LLM API layer over `genai` (re-exported): services, client,
+  keyring key storage, model listing, account status, and the shared connection widget
+  (`AiApiConnectionState`, `draw_connection`, `AiApiTaskRunner`). Consumers build their own
+  requests; persistence of the selected service/model stays with the consumer.
 
 **UI engines and tabs (levels 7-11)**
 - `ms-canvas` — the shared page + bubble canvas; declares `CanvasHooks`.
@@ -226,7 +230,8 @@ the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw th
   artifact in both the committed and `_unsaved` trees. The app quiesces every chapter writer,
   runs the op on a worker, then rebuilds the app from disk via `StudioBootstrapApp`. Save,
   export and page ops gate each other.
-- **Translation** — `ms-tab-translation`: bubbles, OCR, text detection, machine translation.
+- **Translation** — `ms-tab-translation`: bubbles, OCR, text detection, machine translation
+  (AI API OCR and MT go through `ms-ai-api`).
   Talks to the backend only through `ms-backend-ipc`; owns the backend health probe.
 - **Cleaning** — `ms-tab-cleaning`: clean overlays, brush / region tools, the AI region editor
   (engines behind `AiEngine`), the watermark engine. Writes only through `CleanOverlaysModel`.
@@ -315,11 +320,11 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
 - **Log** (`ms-log`) — session log `last.log` / `previous.log` and opt-in trace log, each with
   its own writer thread; callers pass the directory in.
 - **Credentials** — secrets live only in the OS keyring, never in a config file: per-service AI
-  API keys (`ms-tab-translation`) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
+  API keys (`ms_ai_api::keys`) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU
-  work; `tokio` only in the binary and `ms-tab-translation`.
+  work; `tokio` only in the binary and `ms-ai-api`.
 - **Versions** — `MS_APP_VERSION` (git-derived in `build.rs`) is display-only;
   `CARGO_PKG_VERSION` is what is compared and parsed; cross-process comparisons reduce both via
   `version_format::version_core`. Libraries receive the version as `ms_installer::HostVersion`.

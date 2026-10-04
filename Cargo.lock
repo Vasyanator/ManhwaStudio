@@ -3581,6 +3581,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-ai-api"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "genai",
+ "keyring",
+ "ms-i18n",
+ "ms-log",
+ "ms-theme",
+ "ms-thread",
+ "ms-widgets",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "ms-backend-ipc"
 version = "0.1.0"
 dependencies = [
@@ -4024,10 +4041,9 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
- "genai",
  "image 0.25.10",
- "keyring",
  "minijinja",
+ "ms-ai-api",
  "ms-backend-ipc",
  "ms-canvas",
  "ms-config",
@@ -4052,7 +4068,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
  "translators",
  "unicode-script",
  "ureq",

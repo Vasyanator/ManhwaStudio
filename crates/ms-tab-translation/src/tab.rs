@@ -139,6 +139,12 @@ Machine translation flow:
 - `start_mt_with_items`: validates options and starts MT controller run.
 - `on_bubble_action` (CanvasHooks): queues translate action for bubble button.
 
+AI API connection (OCR and MT panels):
+- `ocr_ai_api_tasks`, `mt_ai_api_tasks`: one `ms_ai_api::AiApiTaskRunner` per panel (key save /
+  delete, metadata refresh), fed from the panels' `AiApiConnectionActions`.
+- `poll_ai_api_events`: applies their events; a replaced model marks that panel's settings dirty,
+  notices become toasts.
+
 Composition/settings handling:
 - `rebuild_composition_text`: rebuilds composed text using composition options.
 - `ensure_ocr_settings_loaded`, `ensure_mt_settings_loaded`,
@@ -224,12 +230,12 @@ use crate::machine_translation::{
     MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,
     MtRequestPreviewPart, MtService, MtTranslateItem, MtTranslateRequest, TranslationMtController,
     bubble_order_for_sort, build_ai_mt_request_preview, character_for_bubble,
-    is_probable_quota_or_limit_error,
 };
 use crate::ocr::{
-    AiApiService, OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest,
-    OcrRuntimeOptions, TranslationOcrController, is_likely_multimodal_model,
+    OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
+    TranslationOcrController,
 };
+use ms_ai_api::{AiApiService, AiApiTaskRunner, is_likely_multimodal_model, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
     BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
     bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
@@ -671,6 +677,9 @@ pub struct TranslationTabState {
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
     ocr_controller: TranslationOcrController,
     ocr_panel_options: OcrPanelOptions,
+    /// Key / metadata requests of the OCR panel's AI API connection widget
+    /// (`ocr_panel_options.ai_api`), polled by `poll_ai_api_events`.
+    ocr_ai_api_tasks: AiApiTaskRunner,
     ocr_engine_states: [OcrLoadState; 6],
     ocr_loading_engine: Option<OcrEngine>,
     ocr_last_panel_engine: Option<OcrEngine>,
@@ -686,6 +695,9 @@ pub struct TranslationTabState {
     ocr_route_inputs_checked_at: Option<web_time::Instant>,
     mt_controller: TranslationMtController,
     mt_panel_options: MtPanelOptions,
+    /// Key / metadata requests of the MT panel's AI API connection widget
+    /// (`mt_panel_options.ai_api`), polled by `poll_ai_api_events`.
+    mt_ai_api_tasks: AiApiTaskRunner,
     text_detector_controller: TranslationTextDetectorController,
     text_detector_options: TextDetectorPanelOptions,
     text_detector_plan_notice: TextDetectorPlanNoticeCache,
@@ -945,6 +957,7 @@ impl TranslationTabState {
             ai_backend_probe_tx,
             ocr_controller: TranslationOcrController::default(),
             ocr_panel_options: OcrPanelOptions::default(),
+            ocr_ai_api_tasks: AiApiTaskRunner::default(),
             ocr_engine_states: [OcrLoadState::NotLoaded; 6],
             ocr_loading_engine: None,
             ocr_last_panel_engine: None,
@@ -961,6 +974,7 @@ impl TranslationTabState {
             ocr_route_inputs_checked_at: None,
             mt_controller: TranslationMtController::default(),
             mt_panel_options: MtPanelOptions::default(),
+            mt_ai_api_tasks: AiApiTaskRunner::default(),
             text_detector_controller: TranslationTextDetectorController::default(),
             text_detector_options: TextDetectorPanelOptions::default(),
             text_detector_plan_notice: TextDetectorPlanNoticeCache::default(),
@@ -1509,24 +1523,7 @@ impl TranslationTabState {
                             self.sync_ocr_states_from_backend_health_snapshot();
                         }
                     }
-                    if actions.save_ai_api_key {
-                        self.ocr_panel_options.ai_api_status = t!("translation.common.saving_api_key_status").to_string();
-                        self.ocr_controller.store_ai_api_key(
-                            self.ocr_panel_options.ai_api_service,
-                            self.ocr_panel_options.ai_api_key_edit.clone(),
-                        );
-                    }
-                    if actions.clear_ai_api_key {
-                        self.ocr_panel_options.ai_api_status = t!("translation.common.deleting_api_key_status").to_string();
-                        self.ocr_controller
-                            .clear_ai_api_key(self.ocr_panel_options.ai_api_service);
-                    }
-                    if actions.refresh_ai_api_metadata {
-                        self.ocr_panel_options.ai_api_status =
-                            t!("translation.common.refreshing_ai_api_status").to_string();
-                        self.ocr_controller
-                            .refresh_ai_api_metadata(self.ocr_panel_options.ai_api_service);
-                    }
+                    self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
                     if actions.request_load && !backend_unavailable {
                         if let Some(error) = self.current_ocr_torch_requirement_error() {
                             self.push_toast(ctx, error, Severity::Error, 2.8);
@@ -1567,24 +1564,7 @@ impl TranslationTabState {
                     if actions.options_changed {
                         self.mt_settings_dirty = true;
                     }
-                    if actions.save_ai_api_key {
-                        self.mt_panel_options.ai_api_status = t!("translation.common.saving_api_key_status").to_string();
-                        self.mt_controller.store_ai_api_key(
-                            self.mt_panel_options.ai_api_service,
-                            self.mt_panel_options.ai_api_key_edit.clone(),
-                        );
-                    }
-                    if actions.clear_ai_api_key {
-                        self.mt_panel_options.ai_api_status = t!("translation.common.deleting_api_key_status").to_string();
-                        self.mt_controller
-                            .clear_ai_api_key(self.mt_panel_options.ai_api_service);
-                    }
-                    if actions.refresh_ai_api_metadata {
-                        self.mt_panel_options.ai_api_status =
-                            t!("translation.common.refreshing_ai_api_status").to_string();
-                        self.mt_controller
-                            .refresh_ai_api_metadata(self.mt_panel_options.ai_api_service);
-                    }
+                    self.mt_ai_api_tasks.submit_actions(&mut self.mt_panel_options.ai_api, actions.ai_api);
                     if actions.start_all {
                         self.pending_mt_start_all = true;
                     }
@@ -2351,58 +2331,6 @@ impl TranslationTabState {
                             3.0,
                         );
                     }
-                }
-                OcrControllerEvent::AiApiKeyStored { service } => {
-                    if self.ocr_panel_options.ai_api_service == service {
-                        self.ocr_panel_options.ai_api_key_edit.clear();
-                        self.ocr_panel_options.ai_api_key_configured = Some(true);
-                        self.ocr_panel_options.ai_api_status =
-                            tf!("translation.common.api_key_saved_status", service = service.label());
-                        self.ocr_controller.refresh_ai_api_metadata(service);
-                    }
-                    self.push_toast(
-                        ctx,
-                        tf!("translation.common.api_key_saved_status", service = service.label()),
-                        Severity::Success,
-                        2.2,
-                    );
-                }
-                OcrControllerEvent::AiApiKeyCleared { service } => {
-                    if self.ocr_panel_options.ai_api_service == service {
-                        self.ocr_panel_options.ai_api_key_edit.clear();
-                        self.ocr_panel_options.ai_api_key_configured = Some(false);
-                        self.ocr_panel_options.ai_api_models.clear();
-                        self.ocr_panel_options.ai_api_account_status =
-                            t!("translation.common.api_key_not_set_status").to_string();
-                        self.ocr_panel_options.ai_api_status =
-                            tf!("translation.common.api_key_deleted_status", service = service.label());
-                    }
-                }
-                OcrControllerEvent::AiApiMetadataLoaded(metadata) => {
-                    if self.ocr_panel_options.ai_api_service == metadata.service {
-                        self.ocr_panel_options.ai_api_key_configured =
-                            Some(metadata.key_configured);
-                        self.ocr_panel_options.ai_api_models = metadata.models;
-                        self.ocr_panel_options.ai_api_account_status = metadata.account_status;
-                        if !self
-                            .ocr_panel_options
-                            .ai_api_models
-                            .iter()
-                            .any(|model| model == &self.ocr_panel_options.ai_api_model)
-                            && let Some(model) = self.ocr_panel_options.ai_api_models.first()
-                        {
-                            self.ocr_panel_options.ai_api_model = model.clone();
-                            self.ocr_settings_dirty = true;
-                        }
-                        self.ocr_panel_options.ai_api_status =
-                            t!("translation.common.ai_api_updated_status").to_string();
-                    }
-                }
-                OcrControllerEvent::AiApiMetadataFailed { service, error } => {
-                    if self.ocr_panel_options.ai_api_service == service {
-                        self.ocr_panel_options.ai_api_status = error.clone();
-                    }
-                    self.push_toast(ctx, format!("AI API: {error}"), Severity::Error, 3.0);
                 }
             }
         }
@@ -3939,58 +3867,20 @@ impl TranslationTabState {
                         2.4,
                     );
                 }
-                MtControllerEvent::AiApiKeyStored { service } => {
-                    if self.mt_panel_options.ai_api_service == service {
-                        self.mt_panel_options.ai_api_key_edit.clear();
-                        self.mt_panel_options.ai_api_key_configured = Some(true);
-                        self.mt_panel_options.ai_api_status =
-                            tf!("translation.common.api_key_saved_status", service = service.label());
-                        self.mt_controller.refresh_ai_api_metadata(service);
-                    }
-                    self.push_toast(
-                        ctx,
-                        tf!("translation.common.api_key_saved_status", service = service.label()),
-                        Severity::Success,
-                        2.2,
-                    );
-                }
-                MtControllerEvent::AiApiKeyCleared { service } => {
-                    if self.mt_panel_options.ai_api_service == service {
-                        self.mt_panel_options.ai_api_key_edit.clear();
-                        self.mt_panel_options.ai_api_key_configured = Some(false);
-                        self.mt_panel_options.ai_api_models.clear();
-                        self.mt_panel_options.ai_api_account_status =
-                            t!("translation.common.api_key_not_set_status").to_string();
-                        self.mt_panel_options.ai_api_status =
-                            tf!("translation.common.api_key_deleted_status", service = service.label());
-                    }
-                }
-                MtControllerEvent::AiApiMetadataLoaded(metadata) => {
-                    if self.mt_panel_options.ai_api_service == metadata.service {
-                        self.mt_panel_options.ai_api_key_configured = Some(metadata.key_configured);
-                        self.mt_panel_options.ai_api_models = metadata.models;
-                        self.mt_panel_options.ai_api_account_status = metadata.account_status;
-                        if !self
-                            .mt_panel_options
-                            .ai_api_models
-                            .iter()
-                            .any(|model| model == &self.mt_panel_options.ai_api_model)
-                            && let Some(model) = self.mt_panel_options.ai_api_models.first()
-                        {
-                            self.mt_panel_options.ai_api_model = model.clone();
-                            self.mt_settings_dirty = true;
-                        }
-                        self.mt_panel_options.ai_api_status =
-                            t!("translation.common.ai_api_updated_status").to_string();
-                    }
-                }
-                MtControllerEvent::AiApiMetadataFailed { service, error } => {
-                    if self.mt_panel_options.ai_api_service == service {
-                        self.mt_panel_options.ai_api_status = error.clone();
-                    }
-                    self.push_toast(ctx, format!("AI API: {error}"), Severity::Error, 3.0);
-                }
             }
+        }
+    }
+
+    /// Applies finished AI API connection requests (key save / delete, metadata refresh) of the
+    /// OCR and MT panels: a replaced model marks that panel's settings dirty, every notice
+    /// becomes a toast. Non-blocking.
+    fn poll_ai_api_events(&mut self, ctx: &egui::Context) {
+        let ocr = self.ocr_ai_api_tasks.poll_and_apply(&mut self.ocr_panel_options.ai_api);
+        self.ocr_settings_dirty |= ocr.model_changed;
+        let mt = self.mt_ai_api_tasks.poll_and_apply(&mut self.mt_panel_options.ai_api);
+        self.mt_settings_dirty |= mt.model_changed;
+        for notice in ocr.notices.into_iter().chain(mt.notices) {
+            self.push_toast(ctx, notice.text, notice.severity, notice.duration_s);
         }
     }
 
@@ -4138,7 +4028,7 @@ impl TranslationTabState {
     fn ai_mt_imagebubble_mode_active(&self) -> bool {
         self.mt_panel_options.active_tab == MtPanelTab::AiApi
             && self.mt_panel_options.ai_image_mode == AiMtImageMode::ImagesOnly
-            && is_likely_multimodal_model(&self.mt_panel_options.ai_api_model)
+            && is_likely_multimodal_model(&self.mt_panel_options.ai_api.model)
     }
 
     /// Collects items for the per-ImageBubble mode: every chapter bubble in reading order is included
@@ -4315,9 +4205,9 @@ impl TranslationTabState {
     /// AI API tab is active.
     fn current_ai_mt_options(&self, project: &ProjectData) -> AiMtOptions {
         AiMtOptions {
-            service: self.mt_panel_options.ai_api_service,
-            model: self.mt_panel_options.ai_api_model.clone(),
-            system_instruction: self.mt_panel_options.ai_api_system_instruction.clone(),
+            service: self.mt_panel_options.ai_api.service,
+            model: self.mt_panel_options.ai_api.model.clone(),
+            system_instruction: self.mt_panel_options.ai_api.system_instruction.clone(),
             sort_mode: self.mt_panel_options.ai_sort_mode,
             use_character_names: self.mt_panel_options.ai_use_character_names,
             use_notes_prompt: self.mt_panel_options.ai_use_notes_prompt,
@@ -4521,7 +4411,7 @@ impl TranslationTabState {
     fn ai_mt_can_include_image_bubbles(&self) -> bool {
         self.mt_panel_options.active_tab == MtPanelTab::AiApi
             && self.mt_panel_options.ai_include_image_bubbles
-            && is_likely_multimodal_model(&self.mt_panel_options.ai_api_model)
+            && is_likely_multimodal_model(&self.mt_panel_options.ai_api.model)
     }
 
     /// True when a scope translation should also send already-translated replicas as ordered
@@ -5657,6 +5547,7 @@ impl CanvasHooks for TranslationTabState {
         self.poll_text_detection_storage_events(project);
         self.poll_ocr_events(ctx, canvas, project);
         self.poll_mt_events(ctx, canvas);
+        self.poll_ai_api_events(ctx);
         self.handle_image_bubble_hotkeys(ctx, canvas, project);
         self.handle_image_crop_selection(ctx, canvas_rect, canvas, project);
         self.handle_ocr_selection(ctx, canvas_rect, canvas, project);
@@ -6101,18 +5992,18 @@ impl TranslationTabState {
                     .and_then(Value::as_object);
                 if let Some(ai_api) = ai_api_obj {
                     if let Some(service) = ai_api.get("service").and_then(Value::as_str) {
-                        self.ocr_panel_options.ai_api_service = AiApiService::from_key(service);
+                        self.ocr_panel_options.ai_api.service = AiApiService::from_key(service);
                     }
                     if let Some(model) = ai_api.get("model").and_then(Value::as_str) {
                         let trimmed = model.trim();
                         if !trimmed.is_empty() {
-                            self.ocr_panel_options.ai_api_model = trimmed.to_string();
+                            self.ocr_panel_options.ai_api.model = trimmed.to_string();
                         }
                     }
                     if let Some(system_instruction) =
                         ai_api.get("system_instruction").and_then(Value::as_str)
                     {
-                        self.ocr_panel_options.ai_api_system_instruction =
+                        self.ocr_panel_options.ai_api.system_instruction =
                             system_instruction.to_string();
                     }
                 }
@@ -6158,17 +6049,17 @@ impl TranslationTabState {
             }
             if let Some(ai_obj) = mt_obj.get("ai_api").and_then(Value::as_object) {
                 if let Some(service) = ai_obj.get("service").and_then(Value::as_str) {
-                    self.mt_panel_options.ai_api_service = AiApiService::from_key(service);
+                    self.mt_panel_options.ai_api.service = AiApiService::from_key(service);
                 }
                 if let Some(model) = ai_obj.get("model").and_then(Value::as_str)
                     && !model.trim().is_empty()
                 {
-                    self.mt_panel_options.ai_api_model = model.trim().to_string();
+                    self.mt_panel_options.ai_api.model = model.trim().to_string();
                 }
                 if let Some(system_instruction) =
                     ai_obj.get("system_instruction").and_then(Value::as_str)
                 {
-                    self.mt_panel_options.ai_api_system_instruction =
+                    self.mt_panel_options.ai_api.system_instruction =
                         system_instruction.to_string();
                 }
                 if let Some(sort_mode) = ai_obj.get("sort_mode").and_then(Value::as_str) {
@@ -7810,15 +7701,15 @@ fn apply_translation_settings_sections(
         .unwrap_or_default();
     ai_api_obj.insert(
         "service".to_string(),
-        Value::String(ocr_options.ai_api_service.key().to_string()),
+        Value::String(ocr_options.ai_api.service.key().to_string()),
     );
     ai_api_obj.insert(
         "model".to_string(),
-        Value::String(ocr_options.ai_api_model.clone()),
+        Value::String(ocr_options.ai_api.model.clone()),
     );
     ai_api_obj.insert(
         "system_instruction".to_string(),
-        Value::String(ocr_options.ai_api_system_instruction.clone()),
+        Value::String(ocr_options.ai_api.system_instruction.clone()),
     );
     params_obj.insert("ai_api".to_string(), Value::Object(ai_api_obj));
     ocr_obj.insert("params".to_string(), Value::Object(params_obj));
@@ -7858,15 +7749,15 @@ fn apply_translation_settings_sections(
         .unwrap_or_default();
     mt_ai_obj.insert(
         "service".to_string(),
-        Value::String(mt_options.ai_api_service.key().to_string()),
+        Value::String(mt_options.ai_api.service.key().to_string()),
     );
     mt_ai_obj.insert(
         "model".to_string(),
-        Value::String(mt_options.ai_api_model.clone()),
+        Value::String(mt_options.ai_api.model.clone()),
     );
     mt_ai_obj.insert(
         "system_instruction".to_string(),
-        Value::String(mt_options.ai_api_system_instruction.clone()),
+        Value::String(mt_options.ai_api.system_instruction.clone()),
     );
     mt_ai_obj.insert(
         "sort_mode".to_string(),
@@ -8217,9 +8108,9 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
         } else {
             ocr_options.surya_max_tokens
         },
-        ai_api_service: ocr_options.ai_api_service,
-        ai_api_model: ocr_options.ai_api_model.clone(),
-        ai_api_system_instruction: ocr_options.ai_api_system_instruction.clone(),
+        ai_api_service: ocr_options.ai_api.service,
+        ai_api_model: ocr_options.ai_api.model.clone(),
+        ai_api_system_instruction: ocr_options.ai_api.system_instruction.clone(),
     }
 }
 
