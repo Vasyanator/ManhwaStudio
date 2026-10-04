@@ -1358,7 +1358,17 @@ impl RegionFrame {
 
         render::paint_row_background(ui.painter(), buttons);
         render::paint_row_background(ui.painter(), status);
-        render::paint_status_text(ui.painter(), status, &self.status_text(), visual);
+        // The frame size sits at the right end of the status row; the status line is elided to
+        // end before it (minus a gap), so the two never overlap however narrow the frame is.
+        let status_text_rect = match self.rect_px {
+            Some(rect_px) => {
+                let size_label = tf!("cleaning.region_frame.size_label", width = rect_px.w, height = rect_px.h);
+                let size_left = render::paint_size_text(ui.painter(), status, &size_label, visual);
+                Rect::from_min_max(status.min, pos2((size_left - CHROME_GAP).max(status.left()), status.bottom()))
+            }
+            None => status,
+        };
+        render::paint_status_text(ui.painter(), status_text_rect, &self.status_text(), visual);
 
         let enabled = self.buttons();
         // «Сравнить» sits next to «Применить»: both act on the pending result, and the two are

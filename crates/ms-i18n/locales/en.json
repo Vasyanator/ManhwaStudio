@@ -633,6 +633,7 @@
   "cleaning.region_frame.button.compare": "Compare",
   "cleaning.region_frame.button.compare_tooltip": "Hold to hide the result and see the original underneath",
   "cleaning.region_frame.layer_tooltip": "Mask layer to paint into: {name}",
+  "cleaning.region_frame.size_label": "{width}x{height}",
   "cleaning.region_frame.status.free": "Free",
   "cleaning.region_frame.status.invalid_size": "Invalid size",
   "cleaning.region_frame.status.invalid_size_locked": "Invalid size: release the frame to resize it",

@@ -15,7 +15,8 @@ Key functions:
 - `paint_frame_border()`, `paint_handles()`: the frame itself; `sector_points()`, the partial
   disc a handle is drawn as
 - `paint_strip_background()`, `paint_grip()`, `paint_layer_chip()`: the strip above the frame
-- `paint_row_background()`, `paint_status_text()`: the two rows below it
+- `paint_row_background()`, `paint_status_text()`, `paint_size_text()`: the two rows below it
+  (the status line on the left, the frame size in pixels right-aligned in the same row)
 - `paint_offscreen_arrow()`: the "the frame is over there" indicator of a locked frame
 
 Notes:
@@ -190,6 +191,23 @@ pub(super) fn paint_status_text(painter: &Painter, rect: Rect, text: &str, visua
     // Vertically centred by hand: `Painter::galley` positions a galley by its TOP-LEFT.
     let top = rect.center().y - galley.size().y * 0.5;
     painter.galley(pos2(rect.left() + STATUS_TEXT_INSET, top), galley, color);
+}
+
+/// Paints `text` (the frame size, e.g. `512x512`) right-aligned inside `rect`, coloured by the
+/// frame's state, and returns the x where it starts, so the caller can end the status line
+/// before it. Never elided: the size is short and is the part the user reads while resizing.
+/// Returns `rect.right()` (nothing painted) for an empty rect.
+pub(super) fn paint_size_text(painter: &Painter, rect: Rect, text: &str, visual: FrameVisual) -> f32 {
+    if !rect.is_positive() {
+        return rect.right();
+    }
+    let color = visual_color(visual);
+    let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(CHROME_FONT_SIZE), color);
+    let left = rect.right() - STATUS_TEXT_INSET - galley.size().x;
+    // Vertically centred by hand: `Painter::galley` positions a galley by its TOP-LEFT.
+    let top = rect.center().y - galley.size().y * 0.5;
+    painter.galley(pos2(left, top), galley, color);
+    left
 }
 
 /// Paints the "the frame is over there" arrow at the viewport border.

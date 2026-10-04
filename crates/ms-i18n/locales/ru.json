@@ -633,6 +633,7 @@
   "cleaning.region_frame.button.compare": "Сравнить",
   "cleaning.region_frame.button.compare_tooltip": "Удерживайте, чтобы скрыть результат и увидеть оригинал под ним",
   "cleaning.region_frame.layer_tooltip": "Слой маски для рисования: {name}",
+  "cleaning.region_frame.size_label": "{width}x{height}",
   "cleaning.region_frame.status.free": "Свободно",
   "cleaning.region_frame.status.invalid_size": "Некорректный размер",
   "cleaning.region_frame.status.invalid_size_locked": "Некорректный размер: освободите рамку, чтобы изменить её",

@@ -5,7 +5,7 @@ The reusable on-canvas region-editing framework of the cleaning tab, and the GEN
 built on it. The framework replaces the detached region-editor window flow (not
 `RegionEditToolBase` itself, which stays untouched) with a selection FRAME drawn over the page
 strip: eight resize handles, a drag strip above it, N mask layers and a processed-result layer
-inside it, and a button row plus a status line below it. The host (`RegionEditHost`) turns that
+inside it, and a button row plus a status line below it (the frame size in pixels, e.g. `512x512`, right-aligned in the same row; the status text is elided before it). The host (`RegionEditHost`) turns that
 frame plus a catalog of AI engines (`AiEngine`) into a whole `CleaningTool`: it loads the source
 region, runs the selected engine, fills a mask layer from a backend detector and merges a result
 into the clean overlay. A consumer tool is only a `HostSpec` — id, title, egui id salts, log tag
