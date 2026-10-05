@@ -22,7 +22,8 @@ workspace crate.
 ## Files and submodules
 - `src/lib.rs`: crate root, `apply`, re-export of `Severity`.
 - `src/status.rs`: `Severity` (`Info`/`Success`/`Warning`/`Error`) and its `color()`; the
-  panel-text constants `ERROR`, `WARNING`, `SUCCESS`, `INFO`, plus `DESTRUCTIVE_ARMED_FILL`.
+  panel-text constants `ERROR`, `WARNING`, `SUCCESS`, `INFO`, plus `DESTRUCTIVE_ARMED_FILL` and
+  `ON_STATUS_FILL` (a glyph painted on an `ERROR`/`WARNING` fill, e.g. a "!" badge).
 - `src/canvas.rs`: chrome drawn over content — selection accent, neutral border, outline
   backing, crop frame/shade, split line/handle/grip, refused/occupied tool state, mask tint,
   modal scrim. Brighter than `status` by design (must read over any page).

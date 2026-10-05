@@ -8,7 +8,9 @@ Main responsibilities:
 - own launcher shell state;
 - drive background image plan generation and lazy batch decoding;
 - render the animated multi-column background with a separate post-image blur layer plus the central menu card;
-- poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImage`.
+- poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImage`;
+- start the settings-warnings checks on the first frame of each launcher entry, poll them every
+  frame, and route launcher-side setting changes (first-run language confirm) to their recheck.
 
 Notes:
 - every launcher viewport must reuse the same native app metadata so taskbar icons stay consistent
@@ -28,6 +30,7 @@ use crate::pages::export_page::ExportPageState;
 use crate::pages::import_page::ImportPageState;
 use crate::pages::open_page::OpenPageState;
 use crate::pages::settings_page::SettingsPageState;
+use ms_settings_ui::settings_warnings::{SettingChange, WarningLevel};
 use crate::psd_import_window::PsdImportWindowState;
 use crate::state::{LauncherOutcome, LauncherPage, LauncherState, UpdateNotification};
 use crate::theme::VEIL_TINT;
@@ -91,6 +94,9 @@ pub struct LauncherApp {
     /// main-menu tutorial autoplay is suppressed; on confirm the tutorial is handed
     /// off exactly once. See `first_run_language.rs`.
     first_run_language: Option<FirstRunLanguageState>,
+    /// `state.project_creator_open()` of the previous frame: its falling edge rechecks the
+    /// projects-folder warning (a create or import may have created the folder).
+    project_creator_was_open: bool,
     pub(crate) ai_install_type: config::AiInstallType,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     pending_plan: Option<Receiver<BackgroundImagePlan>>,
@@ -185,6 +191,7 @@ impl LauncherApp {
             output_outcome,
             update_notification: None,
             first_run_language,
+            project_creator_was_open: false,
             ai_install_type,
             update_check_rx,
             pending_plan: None,
@@ -213,11 +220,30 @@ impl LauncherApp {
 
     fn poll_workers(&mut self, ctx: &egui::Context, target_width: u32, viewport_height: f32) {
         self.poll_update_check(ctx);
+        // Settings warnings: the first frame of this entry starts the full check run
+        // (`new` has no egui context); every frame then forwards landed AI-pane writes
+        // and applies results, whichever page is shown.
+        self.settings_page.ensure_warning_checks_started(ctx);
+        // Creating or importing a project may create the projects folder, which no config
+        // write reports: recheck it once the creating surface (import page, new-project or
+        // PSD-import window) closes. One edge covers every create path.
+        let creator_open = self.state.project_creator_open();
+        if self.project_creator_was_open && !creator_open {
+            self.settings_page.recheck_warnings(&[SettingChange::ProjectsRoot]);
+        }
+        self.project_creator_was_open = creator_open;
+        self.settings_page.poll_warnings(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_open_image_pick(ctx);
         self.poll_plan(ctx, target_width, viewport_height);
         self.poll_images(ctx);
         self.kick_background_load(target_width, viewport_height);
+    }
+
+    /// The worst settings warning level (badge of the main-menu Settings button); `None`
+    /// when no setting is flagged or the checks have not reported yet.
+    pub(crate) fn settings_warning_level(&self) -> Option<WarningLevel> {
+        self.settings_page.overall_warning_level()
     }
 
     fn poll_update_check(&mut self, ctx: &egui::Context) {
@@ -993,6 +1019,8 @@ impl eframe::App for LauncherApp {
             .is_some_and(|modal| modal.show(ctx));
         if first_run_confirmed {
             self.first_run_language = None;
+            // The modal persisted the interface language: recheck its catalog warning.
+            self.settings_page.recheck_warnings(&[SettingChange::UiLanguage]);
             // Hand off to the tutorial through the normal entering-main edge instead of
             // a direct autoplay: clearing the tracked page makes the edge gate at the
             // top of `ui` re-fire next frame, and only when the current page is really

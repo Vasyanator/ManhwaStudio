@@ -65,7 +65,7 @@ mod manifest;
 // unused-import warning only until the build-selection UI consumes `build_version`
 // directly.
 #[allow(unused_imports)]
-pub use manifest::{ORT_VERSION, build_version, provider_version};
+pub use manifest::{ORT_VERSION, build_shipped_here, build_version, provider_version};
 
 /// Read buffer size for streaming the archive download to disk.
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;

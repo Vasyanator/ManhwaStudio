@@ -31,6 +31,7 @@ Key functions:
 - reconcile_locale_map    : the PURE reconcile over two JSON maps (no filesystem)
 - reconcile_disk_catalog  : best-effort disk unpack/reconcile at startup
 - install_ui_locale       : load the active locale from disk and install it
+- probe_disk_catalog[_in] : whether that disk load would succeed, without installing
 - ui_locale_tag_from_user_settings : read `General.ui_language` -> `LocaleTag`
 
 Identity vs. plural rules (see `ms-i18n`):
@@ -496,6 +497,27 @@ fn load_single_catalog(dir: &Path, tag: &LocaleTag) -> Result<Catalog, LocaleSto
     })
 }
 
+/// Whether the on-disk catalog for `tag` (plus the on-disk English fallback for a
+/// non-English tag) under `config::data_dir()/locale` loads, by the same rule
+/// [`install_ui_locale`] applies. Reads up to two files: worker threads only.
+///
+/// # Errors
+/// The [`LocaleStoreError`] that would make [`install_ui_locale`] fall back to the
+/// embedded catalog (see [`probe_disk_catalog_in`]).
+pub fn probe_disk_catalog(tag: &LocaleTag) -> Result<(), LocaleStoreError> {
+    probe_disk_catalog_in(&config::data_dir().join(LOCALE_DIR_NAME), tag)
+}
+
+/// [`probe_disk_catalog`] over an explicit locale directory `dir`. Installs nothing and
+/// logs nothing; the loaded catalog is dropped.
+///
+/// # Errors
+/// [`LocaleStoreError::File`] when `<tag>.json` (or `en.json` for a non-English tag)
+/// cannot be read, [`LocaleStoreError::Catalog`] when `ms-i18n` rejects its contents.
+pub fn probe_disk_catalog_in(dir: &Path, tag: &LocaleTag) -> Result<(), LocaleStoreError> {
+    load_catalog_from_disk(dir, tag).map(drop)
+}
+
 /// Installs the EMBEDDED catalog for the user's UI language, without touching the
 /// on-disk `locale/` folder. Best-effort; never fails the caller.
 ///
@@ -786,6 +808,54 @@ mod tests {
         let ru = LocaleTag::parse("ru").expect("ru tag");
         let catalog = load_catalog_from_disk(&dir, &ru).expect("load ru");
         assert_eq!(catalog.tag().as_str(), "ru");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn probe_disk_catalog_reports_a_missing_directory() {
+        let dir = tempdir();
+        let ru = LocaleTag::parse("ru").expect("ru tag");
+        assert!(matches!(
+            probe_disk_catalog_in(&dir, &ru),
+            Err(LocaleStoreError::File { .. })
+        ));
+    }
+
+    #[test]
+    fn probe_disk_catalog_accepts_valid_catalogs() {
+        let dir = tempdir();
+        reconcile_dir_at(&dir).expect("reconcile");
+        let ru = LocaleTag::parse("ru").expect("ru tag");
+        assert!(probe_disk_catalog_in(&dir, &ru).is_ok());
+        assert!(probe_disk_catalog_in(&dir, &LocaleTag::english()).is_ok());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn probe_disk_catalog_rejects_an_unparsable_catalog() {
+        let dir = tempdir();
+        reconcile_dir_at(&dir).expect("reconcile");
+        fs::write(dir.join("ru.json"), "{ not json").expect("write ru.json");
+        let ru = LocaleTag::parse("ru").expect("ru tag");
+        assert!(matches!(
+            probe_disk_catalog_in(&dir, &ru),
+            Err(LocaleStoreError::Catalog { .. })
+        ));
+        // English alone still loads: the probe follows the per-tag rule.
+        assert!(probe_disk_catalog_in(&dir, &LocaleTag::english()).is_ok());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn probe_disk_catalog_requires_the_english_fallback_for_other_tags() {
+        let dir = tempdir();
+        reconcile_dir_at(&dir).expect("reconcile");
+        fs::remove_file(dir.join("en.json")).expect("remove en.json");
+        let ru = LocaleTag::parse("ru").expect("ru tag");
+        assert!(matches!(
+            probe_disk_catalog_in(&dir, &ru),
+            Err(LocaleStoreError::File { .. })
+        ));
         cleanup(&dir);
     }
 

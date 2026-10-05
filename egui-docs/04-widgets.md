@@ -256,34 +256,40 @@ hook for completion popups that need Tab/Escape themselves.
 
 A settings pane is written **once** as a free function taking `&mut egui::Ui` plus its own
 state, and is rendered from **both** surfaces: the studio Settings tab and the launcher
-settings page. `src/settings_shared.rs:8` names them "double-interface" panels.
+settings page. `crates/ms-settings-ui/src/settings_shared.rs:8` names them "double-interface" panels.
 
 Shared panes today:
 
 | Pane | Renderer |
 |---|---|
-| General | `draw_general_settings_panel(ui, &mut GeneralSettingsPanelState) -> GeneralSettingsOutcome` — `src/general_settings_panel.rs:181` |
-| AI backend | `draw_ai_backend_panel(ui, &AiBackendHandle, &mut AiBackendPanelState)` — `src/ai_backend_panel.rs:182` |
-| Tutorials | `draw_tutorials_pane(ui, &TutorialProgressHandle)` — `src/tutorial/settings_pane.rs:31` (behind the `tutorial` feature) |
+| General | `draw_general_settings_panel(ui, &mut GeneralSettingsPanelState, Option<&WarningSet>) -> GeneralSettingsOutcome` — `crates/ms-settings-ui/src/general_settings_panel.rs:257` |
+| AI backend | `draw_ai_backend_panel(ui, &AiBackendHandle, &mut AiBackendPanelState, Option<&WarningSet>) -> AiBackendPanelOutcome` — `crates/ms-settings-ui/src/ai_backend_panel.rs:272` |
+| Tutorials | `draw_tutorials_pane(ui, &TutorialProgressHandle)` — `crates/ms-settings-ui/src/tutorial/settings_pane.rs:31` (behind the `tutorial` feature) |
 
-Glue (`src/settings_shared.rs`): `SettingsSurface { Launcher, Studio }`,
+Glue (`crates/ms-settings-ui/src/settings_shared.rs`): `SettingsSurface { Launcher, Studio }`,
 `SettingsSectionId` (the union of sections), the `SECTIONS` registry + `sections_for(surface)`
 + `title_key(id, surface)`, and `SharedSettingsPanels` which **owns the three pane states** so
 each surface embeds exactly one instance. Dispatch is `SharedSettingsPanels::draw(id, ui,
-surface, &AiBackendHandle) -> SharedSectionOutcome` (`src/settings_shared.rs:286`).
+surface, &AiBackendHandle, Option<&WarningSet>) -> SharedSectionOutcome`
+(`crates/ms-settings-ui/src/settings_shared.rs:355`). The `WarningSet` draws the inline
+settings-warning badges: the launcher passes its set, the studio passes `None` (exact
+pre-badge widget tree). Each outcome carries `changed_settings` (writes that landed);
+`SharedSettingsPanels::take_landed_changes` (`:335`) drains the AI pane's landed writes
+without a draw.
 
 Consumers:
-- Studio: `src/tabs/settings/mod.rs:218` (tab bar from `sections_for(Studio)`), `:243`/`:255`
-  (`self.shared.draw(...)`).
-- Launcher: `src/launcher/pages/settings_page.rs:433` (tab bar from `sections_for(Launcher)`),
-  `:363`/`:378` (`self.shared.draw(...)`).
+- Studio: `src/tabs/settings/mod.rs:353` (tab bar from `sections_for(Studio)`), `:378`/`:391`
+  and `src/tabs/settings/general.rs:64` (`self.shared.draw(...)`, `warnings: None`).
+- Launcher: `crates/ms-launcher/src/pages/settings_page.rs:498` (tab bar from
+  `sections_for(Launcher)`), `:428`/`:443` (`self.shared.draw(...)` with its warning set).
 
 **To add a new shared pane:** (1) write `draw_<name>_pane(ui, &mut State, ...)` in its own
 `src/<name>_panel.rs` — no `MangaApp`/launcher types in the signature; (2) add a
 `SettingsSectionId` variant and a `SECTIONS` descriptor listing the surfaces and order;
 (3) add the state field to `SharedSettingsPanels` and an arm in its `draw`; (4) add the
 localized title keys via `title_key`. Do not route a surface-local section through
-`SharedSettingsPanels::draw` — it is debug-asserted against (`src/settings_shared.rs:29-32`).
+`SharedSettingsPanels::draw` — it is debug-asserted against
+(`crates/ms-settings-ui/src/settings_shared.rs:395`).
 
 ## 8. `egui_extras` is NOT available in app code
 

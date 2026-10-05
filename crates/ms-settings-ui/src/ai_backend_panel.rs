@@ -11,22 +11,48 @@ well as the studio. This module renders that one panel against an
 [`AiBackendPanelState`] holding only local selection scratch fields, so the two
 call sites stay in sync without duplicating the UI.
 
+Build availability:
+The native build picker does not decide which builds can run here: it asks the native
+runtime's rule (`ms_native_runtime::native_build_fallback_reason` over the probed
+`NativeHardwareFacts`), so the picker shows what the runtime's selection will do. The probed
+capabilities and the EP device-id rule live in `crate::onnx_caps`; this file adds only the
+labels and pickers.
+
+Change reporting and warning badges:
+`draw_ai_backend_panel` returns an `AiBackendPanelOutcome` whose `changed_settings` lists
+the checked settings whose write LANDED: the off-thread savers (runtime, build, EP/device,
+ORT guard reset) send their `SettingChange` over the state's completion channel after the
+write returned, and the pane drains it every frame. Autostart is persisted by the
+supervisor worker, so its change carries the new value and is reported on the click. With
+a `WarningSet` (launcher) the runtime combo, autostart checkbox, build / EP / device rows
+and the build-action row carry inline badges; `None` (studio) draws the pre-badge layout.
+
 Key items:
-- `AiBackendPanelState`: per-UI selection scratch (device/provider/onnx/max-models).
+- `AiBackendPanelState`: per-UI selection scratch (device/provider/onnx/max-models) and
+  the completion channel of the off-thread writes (`PendingChanges`).
+- `AiBackendPanelOutcome`: the landed setting changes of one frame.
 - `draw_ai_backend_panel`: renders health, process controls, device selection and
   CUDA/ROCm diagnostics.
 */
 
 use crate::ai_backend_supervisor::{AiBackendHandle, AiBackendProcessCommand};
+use crate::settings_shared::with_item_badge;
+use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::settings_warnings::item_warning_badge;
 use ms_backend_ipc as backend_ipc;
 use ms_tab_translation::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
 use ms_widgets::WheelComboBox;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_tab_translation::backend_health::AiBackendDeviceOption;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{Receiver, Sender};
 
 /// Per-UI scratch state for the shared panel. Each call site owns one instance so
 /// the studio and launcher panels can hold independent in-progress selections.
@@ -84,31 +110,86 @@ pub struct AiBackendPanelState {
     /// auto-download gate. The blocking directory scan never runs on the GUI thread.
     #[cfg(not(target_arch = "wasm32"))]
     pub ort_build_present: std::sync::Arc<std::sync::Mutex<HashMap<String, Option<bool>>>>,
+    /// Completion channel of the off-thread config writes: each saver sends its
+    /// `SettingChange` after the write returned; drained into the outcome every frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_changes: PendingChanges,
+    /// The device id of the last unified ONNX selection write that SUCCEEDED from this
+    /// pane (set by the saver thread); `None` until one did. It supersedes the one-shot
+    /// `onnx_config` seed as "the persisted id" when an explicit re-pick decides whether
+    /// to save, so only a genuinely different (or a first fixing) pick writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    onnx_device_saved: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Locally-probed ONNX capabilities driving the OFFLINE provider/device list.
+impl AiBackendPanelState {
+    /// Appends every off-thread write that landed since the last drain to `changes`, in
+    /// completion order, and returns the vector. Lets `SharedSettingsPanels::draw` report
+    /// AI-pane writes while another shared section is drawn.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn append_landed_changes(&self, mut changes: Vec<SettingChange>) -> Vec<SettingChange> {
+        self.pending_changes.drain_into(&mut changes);
+        changes
+    }
+
+    /// Web build: no off-thread writer exists, so nothing ever lands; returns `changes`.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn append_landed_changes(&self, changes: Vec<SettingChange>) -> Vec<SettingChange> {
+        changes
+    }
+}
+
+/// The runtime effects of one [`draw_ai_backend_panel`] frame. The launcher forwards
+/// `changed_settings` to its warning rechecks; the studio ignores the outcome.
+#[must_use]
+#[derive(Debug, Default)]
+pub struct AiBackendPanelOutcome {
+    /// Checked settings whose write landed (or whose autostart toggle was sent) this
+    /// frame, in completion order. A write is reported whether it succeeded or failed:
+    /// the recheck re-reads the disk, so a failure only re-confirms the old state.
+    pub changed_settings: Vec<SettingChange>,
+}
+
+/// The completion channel of the pane's off-thread writes. A channel has no `Default`,
+/// hence this wrapper with a manual one; the pane owns both ends, so the receiver never
+/// sees a disconnect while the state lives.
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Default)]
-pub struct OnnxCaps {
-    /// Whether the system CUDA 12.x/cuDNN 9.x runtime is present (gates CUDA).
-    pub cuda_available: bool,
-    /// Whether a WebGPU-capable GPU (Dawn D3D12/Vulkan/Metal) is present (gates WebGPU).
-    pub webgpu_available: bool,
-    /// DirectML accelerator NAMES (Windows); the Vec position is the adapter index.
-    pub directml_accelerators: Vec<String>,
-    /// WebGPU adapter NAMES, enumerated per-OS with Dawn's backend; the Vec position is
-    /// the WebGPU `device_id`. Empty when enumeration is unavailable (macOS / single GPU
-    /// / tool missing), in which case the panel offers a single default adapter.
-    pub webgpu_adapters: Vec<String>,
-    /// Whether the `cuda13` build's CUDA 13.x + cuDNN 9.x runtime is present (gates the
-    /// `cuda13` build in the "Билд" selector).
-    pub cuda13_available: bool,
-    /// Whether the `cuda12` build's CUDA 12.x + cuDNN 9.x runtime is present (gates the
-    /// `cuda12` build in the "Билд" selector).
-    pub cuda12_available: bool,
-    /// Whether the native OpenVINO runtime can plausibly load (Intel device + runtime;
-    /// gates the `openvino` build in the "Билд" selector).
-    pub openvino_available: bool,
+#[derive(Debug)]
+struct PendingChanges {
+    tx: Sender<SettingChange>,
+    rx: Receiver<SettingChange>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for PendingChanges {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self { tx, rx }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PendingChanges {
+    /// A sender for one writer thread, which reports through [`report_landed`].
+    fn sender(&self) -> Sender<SettingChange> {
+        self.tx.clone()
+    }
+
+    /// Moves every queued change into `out`, in send order, without blocking.
+    fn drain_into(&self, out: &mut Vec<SettingChange>) {
+        out.extend(self.rx.try_iter());
+    }
+}
+
+/// Reports a landed write from a writer thread. A failed send means the pane state (and
+/// its receiver) was dropped meanwhile: nobody is left to recheck, so it is only logged.
+#[cfg(not(target_arch = "wasm32"))]
+fn report_landed(tx: &Sender<SettingChange>, change: SettingChange) {
+    if tx.send(change).is_err() {
+        ms_log::runtime_log::log_info(format!(
+            "[ai-backend-panel] settings pane closed before {change:?} landed; warning recheck skipped"
+        ));
+    }
 }
 
 /// The unified ONNX selection + model limit read once from config to seed the UI.
@@ -156,9 +237,12 @@ struct OnnxProviderOption {
     /// path can load (CPU/DirectML/CoreML/CUDA). CPU counts as native-capable;
     /// backend-only providers (e.g. MIGraphX, ROCm) do NOT.
     native_capable: bool,
-    /// Whether the native provider can actually run locally right now (CPU always;
-    /// DirectML iff a DirectML adapter exists; CUDA iff the system CUDA runtime is
-    /// present; CoreML on macOS). Only meaningful when `native_capable`.
+    /// Local-capability heuristic of the Backend-runtime provider list (CPU always;
+    /// DirectML iff a DirectML adapter was detected; CUDA iff the system CUDA 12 runtime
+    /// is present; CoreML on macOS). NOT the native runtime's availability rule
+    /// (`ms_native_runtime::native_fallback_reason`): its live use is the Backend
+    /// default-provider seed (`default_onnx_provider`). Only meaningful when
+    /// `native_capable`.
     native_available: bool,
     /// Whether the connected Python backend reported this provider in
     /// `available_onnx_providers` (always `false` when the backend is offline).
@@ -179,11 +263,19 @@ struct OnnxDeviceOptionUi {
     label: String,
 }
 
+/// Renders the AI backend pane against the app-global `handle` and this surface's
+/// `state`, and returns the setting changes that landed this frame.
+///
+/// `warnings` is the launcher's warning set (inline item badges); the studio passes
+/// `None`, which draws no badge and the pre-badge layout. Config writes never run on the
+/// GUI thread: they run on named workers and are reported here once they returned.
 pub fn draw_ai_backend_panel(
     ui: &mut egui::Ui,
     handle: &AiBackendHandle,
     state: &mut AiBackendPanelState,
-) {
+    warnings: Option<&WarningSet>,
+) -> AiBackendPanelOutcome {
+    let mut outcome = AiBackendPanelOutcome::default();
     let snapshot = handle.health_snapshot();
     let process = handle.process_snapshot();
     let ai_enabled = handle.ai_enabled;
@@ -191,7 +283,7 @@ pub fn draw_ai_backend_panel(
     // Native ONNX runtime selector (desktop-only; the native path depends on
     // `ms-onnx`/`ort`, compiled out on the web build).
     #[cfg(not(target_arch = "wasm32"))]
-    draw_ai_runtime_section(ui, state);
+    draw_ai_runtime_section(ui, state, warnings);
 
     ui.label(tf!("ai_backend.service_address_label", backend_ipc = backend_ipc::backend_socket_path().display()));
 
@@ -256,14 +348,17 @@ pub fn draw_ai_backend_panel(
     });
 
     let mut auto_start = process.auto_start();
-    if ui
-        .add_enabled(
+    let autostart_response = with_item_badge(ui, warnings, SettingKey::BackendAutostart, |ui| {
+        ui.add_enabled(
             ai_enabled,
             egui::Checkbox::new(&mut auto_start, t!("ai_backend.autostart_checkbox")),
         )
-        .changed()
-    {
+    });
+    if autostart_response.changed() {
         handle.send_process(AiBackendProcessCommand::SetAutoStart(auto_start));
+        // The supervisor persists the flag on its own worker; the change carries the new
+        // value so a recheck does not depend on that write having landed yet.
+        outcome.changed_settings.push(SettingChange::BackendAutostart(auto_start));
     }
 
     if process.running() {
@@ -304,7 +399,7 @@ pub fn draw_ai_backend_panel(
     // OS/GPU capabilities and stays usable even without a running backend; the same
     // selection drives the native path (config on load) and the backend (device.set
     // when connected).
-    draw_onnx_and_models_section(ui, handle, state, &snapshot, ai_enabled);
+    draw_onnx_and_models_section(ui, handle, state, &snapshot, ai_enabled, warnings);
 
     ui.separator();
     ui.heading(t!("ai_backend.cuda_rocm_diagnostics_heading"));
@@ -337,6 +432,10 @@ pub fn draw_ai_backend_panel(
     } else {
         ui.small(t!("ai_backend.check_disabled_no_ai"));
     }
+
+    // Drained last so a write that landed while this frame was drawn is reported now.
+    outcome.changed_settings = state.append_landed_changes(outcome.changed_settings);
+    outcome
 }
 
 /// Renders the PyTorch device selector (backend-gated).
@@ -466,6 +565,7 @@ fn draw_onnx_and_models_section(
     state: &mut AiBackendPanelState,
     snapshot: &AiBackendHealthSnapshot,
     _ai_enabled: bool,
+    warnings: Option<&WarningSet>,
 ) {
     start_onnx_caps_probe(state);
     start_onnx_config_read(state);
@@ -496,7 +596,7 @@ fn draw_onnx_and_models_section(
 
     match runtime {
         Some(ms_config::AiRuntime::Native) => {
-            draw_native_build_selection(ui, handle, state, snapshot, &caps, &config_read);
+            draw_native_build_selection(ui, handle, state, snapshot, &caps, &config_read, warnings);
         }
         Some(ms_config::AiRuntime::Backend) | None => {
             draw_backend_provider_selection(
@@ -623,6 +723,8 @@ fn draw_backend_provider_selection(
         spawn_save_onnx_provider_device(
             state.selected_onnx_provider.clone(),
             state.selected_onnx_device_id.clone(),
+            state.pending_changes.sender(),
+            state.onnx_device_saved.clone(),
         );
         // Apply live to the running backend, if any.
         if snapshot.connected {
@@ -655,6 +757,13 @@ fn draw_backend_provider_selection(
 /// selection is persisted to the unified config keys off-thread. An AVAILABLE build's
 /// dylib is auto-downloaded; the build-action button drives a force-download / retry /
 /// restart per the committed-dylib state (see [`ort_build_action`]).
+///
+/// `warnings` (launcher only) badges the build, EP, device and build-action rows. An
+/// explicit device pick saves even when it re-picks the displayed device, as long as that
+/// id differs from the persisted one the pane was seeded from: a persisted id that is no
+/// longer offered is DISPLAYED as the first device but never saved by the seeding, and the
+/// device warning asks the user to pick one. A flagged device combo also stays enabled with
+/// a single device, so that pick is always possible.
 #[cfg(not(target_arch = "wasm32"))]
 fn draw_native_build_selection(
     ui: &mut egui::Ui,
@@ -663,6 +772,7 @@ fn draw_native_build_selection(
     snapshot: &AiBackendHealthSnapshot,
     caps: &OnnxCaps,
     config_read: &OnnxConfigRead,
+    warnings: Option<&WarningSet>,
 ) {
     use ms_onnx_runtime::builds;
 
@@ -719,6 +829,8 @@ fn draw_native_build_selection(
                 // download, EXCEPT the informational QNN entry (no binary, no EP).
                 render_build_group(ui, state, t!("ai_backend.build_group_unavailable"), &groups.unavailable, &availability);
             });
+        // The hover response only carries the tooltip; nothing reacts to it.
+        let _badge = item_warning_badge(ui, warnings, SettingKey::OnnxBuild);
     });
     ui.small(
         t!("ai_backend.build_hint"),
@@ -765,6 +877,7 @@ fn draw_native_build_selection(
                     }
                 });
         });
+        let _badge = item_warning_badge(ui, warnings, SettingKey::OnnxProvider);
     });
 
     // An EP change resets the device to that EP's first option.
@@ -782,35 +895,60 @@ fn draw_native_build_selection(
     let selected_ep =
         ms_native_runtime::execution_provider_from_ort_token(&state.selected_onnx_provider);
     let devices = ep_device_options(selected_ep, caps);
+    let device_flagged = warnings.and_then(|set| set.item_level(SettingKey::OnnxDevice)).is_some();
+    let mut device_picked = false;
     ui.horizontal_wrapped(|ui| {
         let selected_label = devices
             .iter()
             .find(|device| device.id == state.selected_onnx_device_id)
             .map(|device| device.label.clone())
             .unwrap_or_else(|| state.selected_onnx_device_id.clone());
-        ui.add_enabled_ui(devices.len() > 1, |ui| {
-            WheelComboBox::from_label(t!("ai_backend.build_device_combo_label")).id_salt("ai_backend.build_device_combo_label")
+        // A flagged device stays pickable even when only one device is offered: the
+        // warning asks for a pick, which is the only way to persist the displayed device.
+        ui.add_enabled_ui(devices.len() > 1 || (device_flagged && !devices.is_empty()), |ui| {
+            let combo = WheelComboBox::from_label(t!("ai_backend.build_device_combo_label")).id_salt("ai_backend.build_device_combo_label")
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
+                    // `selectable_value` leaves a click on the already-selected item
+                    // unchanged and unmarked, so the click itself is collected here.
+                    let mut clicked = false;
                     for device in &devices {
-                        ui.selectable_value(
-                            &mut state.selected_onnx_device_id,
-                            device.id.clone(),
-                            device.label.as_str(),
-                        );
+                        clicked |= ui
+                            .selectable_value(
+                                &mut state.selected_onnx_device_id,
+                                device.id.clone(),
+                                device.label.as_str(),
+                            )
+                            .clicked();
                     }
+                    clicked
                 });
+            device_picked = combo.inner == Some(true);
         });
+        let _badge = item_warning_badge(ui, warnings, SettingKey::OnnxDevice);
     });
 
     // Persist the EP/device selection to the unified config keys, and the build slug to
-    // its own key, when either changed.
+    // its own key, when either changed — or when the user explicitly picked a device that
+    // the persisted config does not hold yet (see the function docs).
+    let last_saved_device = match state.onnx_device_saved.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
     let selection_changed = state.selected_onnx_provider != prev_provider
-        || state.selected_onnx_device_id != prev_device;
+        || state.selected_onnx_device_id != prev_device
+        || device_pick_needs_save(
+            device_picked,
+            config_read.device_id.as_deref(),
+            last_saved_device.as_deref(),
+            &state.selected_onnx_device_id,
+        );
     if selection_changed {
         spawn_save_onnx_provider_device(
             state.selected_onnx_provider.clone(),
             state.selected_onnx_device_id.clone(),
+            state.pending_changes.sender(),
+            state.onnx_device_saved.clone(),
         );
         if snapshot.connected {
             handle.send_probe(AiBackendProbeCommand::SetOnnxDevice {
@@ -820,7 +958,7 @@ fn draw_native_build_selection(
         }
     }
     if state.selected_onnx_build != prev_build {
-        spawn_save_onnx_build(state.selected_onnx_build.clone());
+        spawn_save_onnx_build(state.selected_onnx_build.clone(), state.pending_changes.sender());
     }
 
     // Refresh the presence probe for the selected build so the button state + the
@@ -842,7 +980,18 @@ fn draw_native_build_selection(
 
     // onnxruntime auto-download progress for the selected build (worker-reported).
     draw_ort_download_progress(ui, state);
-    draw_build_action_button(ui, state, dylib_present);
+    with_item_badge(ui, warnings, SettingKey::OrtCrashGuard, |ui| draw_build_action_button(ui, state, dylib_present));
+}
+
+/// Whether an explicit device pick must be saved although the selection did not change:
+/// the user clicked an item (`picked`) and the picked id `selected` is not the persisted
+/// one. The persisted id is `last_saved` (the last successful save from this pane) when
+/// there is one, else `seed` (the one-shot config read; `None` when the key is absent).
+/// This covers the "persisted id no longer offered, first device displayed but unsaved"
+/// case once, without re-saving on every later click of the same item.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_pick_needs_save(picked: bool, seed: Option<&str>, last_saved: Option<&str>, selected: &str) -> bool {
+    picked && last_saved.or(seed) != Some(selected)
 }
 
 /// Shared model-manager slider (model limit) rendered under both runtime branches. The
@@ -883,6 +1032,7 @@ fn draw_onnx_and_models_section(
     state: &mut AiBackendPanelState,
     snapshot: &AiBackendHealthSnapshot,
     ai_enabled: bool,
+    _warnings: Option<&WarningSet>,
 ) {
     if !ai_enabled {
         return;
@@ -1397,19 +1547,21 @@ fn reconcile_onnx_selection(
     }
 }
 
-/// Per-build accelerator availability on this machine, derived once from [`OnnxCaps`]
-/// plus the compile-time OS. Feeds the pure build partition/label helpers so grouping is
-/// testable without probing.
+/// Per-build availability on this machine: each flag is the native runtime's own
+/// verdict ([`ms_native_runtime::native_build_fallback_reason`] is `None`) for that
+/// build with its headline EP — the EP a build pick resets to — so the picker shows
+/// what the runtime's selection will do. Computed once per frame from [`OnnxCaps`];
+/// the partition/label helpers stay pure over it and testable without probing.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuildAvailability {
-    /// CPU build: runnable everywhere.
+    /// CPU build.
     cpu: bool,
-    /// DirectML build: Windows with at least one DX12 adapter.
+    /// DirectML build (Windows; no adapter fact is consulted, DXGI always has one).
     directml: bool,
-    /// WebGPU build: a WebGPU-capable GPU is present.
+    /// WebGPU build (headline EP WebGPU: a WebGPU-capable GPU is present).
     webgpu: bool,
-    /// CoreML build: macOS.
+    /// CoreML build (macOS).
     coreml: bool,
     /// CUDA 13 build: CUDA 13.x + cuDNN 9.x runtime present.
     cuda13: bool,
@@ -1419,17 +1571,21 @@ struct BuildAvailability {
     openvino: bool,
 }
 
-/// Computes per-build availability from the probed [`OnnxCaps`] and the build-target OS.
+/// Computes per-build availability by asking the native runtime's availability rule
+/// about every catalog build over the probed [`OnnxCaps`] facts. Pure (no probe).
 #[cfg(not(target_arch = "wasm32"))]
 fn build_availability(caps: &OnnxCaps) -> BuildAvailability {
+    let facts = caps.native_facts();
+    let runnable =
+        |slug: &str| ms_native_runtime::native_build_fallback_reason(slug, &facts).is_none();
     BuildAvailability {
-        cpu: true,
-        directml: cfg!(target_os = "windows") && !caps.directml_accelerators.is_empty(),
-        webgpu: caps.webgpu_available,
-        coreml: cfg!(target_os = "macos"),
-        cuda13: caps.cuda13_available,
-        cuda12: caps.cuda12_available,
-        openvino: caps.openvino_available,
+        cpu: runnable("cpu"),
+        directml: runnable("directml"),
+        webgpu: runnable("webgpu"),
+        coreml: runnable("coreml"),
+        cuda13: runnable("cuda13"),
+        cuda12: runnable("cuda12"),
+        openvino: runnable("openvino"),
     }
 }
 
@@ -1575,57 +1731,39 @@ fn ep_display_label(ep: ms_onnx::ExecutionProvider) -> &'static str {
     }
 }
 
-/// The device options for an EP under the native build runtime.
+/// The device options for an EP under the native build runtime: the ids of
+/// [`ep_device_ids`] (the device-id rule, shared with inspection callers) with their
+/// labels.
 ///
-/// - DirectML → one entry per detected DX12 adapter (id = adapter index), else `GPU 0`.
-/// - WebGPU → one entry per enumerated adapter (id = Dawn `device_id` index), else a
-///   single default.
-/// - CUDA / TensorRT → a single `GPU 0` (index 0).
-/// - CPU / CoreML → a single «По умолчанию» (index 0).
-/// - OpenVINO → device-TYPE options `CPU` / `GPU` / `NPU`; the id is the type STRING
-///   (OpenVINO selects a device by type, not a numeric index).
+/// - DirectML → `"{index}: {name}"` per detected DX12 adapter, else `GPU 0`.
+/// - WebGPU → `"{index}: {name}"` per enumerated adapter, else «По умолчанию».
+/// - CUDA / TensorRT → `GPU 0`.
+/// - CPU / CoreML → «По умолчанию».
+/// - OpenVINO → the device-TYPE string itself (`CPU` / `GPU` / `NPU`).
 #[cfg(not(target_arch = "wasm32"))]
 fn ep_device_options(ep: ms_onnx::ExecutionProvider, caps: &OnnxCaps) -> Vec<OnnxDeviceOptionUi> {
     use ms_onnx::ExecutionProvider;
-    // One device per enumerated adapter (id = index), or a single placeholder id "0".
-    let indexed = |names: &[String], fallback: &str| -> Vec<OnnxDeviceOptionUi> {
+    let ids = ep_device_ids(ep, caps);
+    // One label per enumerated adapter, or the single placeholder label; this mirrors the
+    // id rule's "adapter list or one placeholder" shape, so ids and labels pair 1:1.
+    let indexed = |names: &[String], fallback: &str| -> Vec<String> {
         if names.is_empty() {
-            vec![OnnxDeviceOptionUi {
-                id: "0".to_string(),
-                label: fallback.to_string(),
-            }]
+            vec![fallback.to_string()]
         } else {
-            names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| OnnxDeviceOptionUi {
-                    id: index.to_string(),
-                    label: format!("{index}: {name}"),
-                })
-                .collect()
+            names.iter().enumerate().map(|(index, name)| format!("{index}: {name}")).collect()
         }
     };
-    match ep {
+    let labels = match ep {
         ExecutionProvider::DirectMl => indexed(&caps.directml_accelerators, "GPU 0"),
         ExecutionProvider::WebGpu => indexed(&caps.webgpu_adapters, t!("ai_backend.device_default")),
-        ExecutionProvider::Cuda | ExecutionProvider::TensorRt => vec![OnnxDeviceOptionUi {
-            id: "0".to_string(),
-            label: "GPU 0".to_string(),
-        }],
-        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => vec![OnnxDeviceOptionUi {
-            id: "0".to_string(),
-            label: t!("ai_backend.device_default").to_string(),
-        }],
+        ExecutionProvider::Cuda | ExecutionProvider::TensorRt => vec!["GPU 0".to_string()],
+        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => vec![t!("ai_backend.device_default").to_string()],
         // OpenVINO selects a device by TYPE string, persisted verbatim to
-        // `ai_onnx_device_id` (the native path routes it via `with_device_type`).
-        ExecutionProvider::OpenVino => ["CPU", "GPU", "NPU"]
-            .iter()
-            .map(|kind| OnnxDeviceOptionUi {
-                id: (*kind).to_string(),
-                label: (*kind).to_string(),
-            })
-            .collect(),
-    }
+        // `ai_onnx_device_id` (the native path routes it via `with_device_type`); the
+        // type string is also its label.
+        ExecutionProvider::OpenVino => ids.clone(),
+    };
+    ids.into_iter().zip(labels).map(|(id, label)| OnnxDeviceOptionUi { id, label }).collect()
 }
 
 /// Coerces the selected EP into `build`'s EP set (seeding it from the persisted token on
@@ -1660,14 +1798,15 @@ fn reconcile_native_ep(
     let ep =
         ms_native_runtime::execution_provider_from_ort_token(&state.selected_onnx_provider);
     let devices = ep_device_options(ep, caps);
-    let device_valid = devices
-        .iter()
-        .any(|device| device.id == state.selected_onnx_device_id);
+    // Validity is the runtime-consistent rule (`device_id_offered`), not combo membership:
+    // a hand-written id the native load accepts for an offered device (OpenVINO "GPU.0")
+    // is kept and shown verbatim instead of being silently replaced by the first item.
+    let device_valid = device_id_offered(ep, &state.selected_onnx_device_id, caps);
     if !device_valid {
         let chosen = config_read
             .device_id
             .as_ref()
-            .filter(|id| devices.iter().any(|device| &device.id == *id))
+            .filter(|id| device_id_offered(ep, id, caps))
             .cloned()
             .or_else(|| devices.first().map(|device| device.id.clone()));
         if let Some(id) = chosen {
@@ -1826,7 +1965,7 @@ fn draw_build_action_button(
                 )
                 .clicked()
             {
-                spawn_reset_ort_guard();
+                spawn_reset_ort_guard(state.pending_changes.sender());
             }
         }
         OrtBuildAction::LoadOtherBuild => {
@@ -1852,9 +1991,10 @@ fn draw_build_action_button(
     }
 }
 
-/// Persists the selected ONNX build slug off the GUI thread.
+/// Persists the selected ONNX build slug off the GUI thread, then reports
+/// `SettingChange::OnnxBuild` on `landed` (whatever the write's result).
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_save_onnx_build(build_slug: String) {
+fn spawn_save_onnx_build(build_slug: String, landed: Sender<SettingChange>) {
     let path = ms_config::user_config_path();
     if let Err(err) = std::thread::Builder::new()
         .name("onnx-build-save".to_string())
@@ -1864,6 +2004,7 @@ fn spawn_save_onnx_build(build_slug: String) {
                     "[ai-backend-panel] failed to persist ONNX build '{build_slug}': {err}"
                 ));
             }
+            report_landed(&landed, SettingChange::OnnxBuild);
         })
     {
         ms_log::runtime_log::log_error(format!(
@@ -1884,33 +2025,9 @@ fn start_onnx_caps_probe(state: &mut AiBackendPanelState) {
     if let Err(err) = std::thread::Builder::new()
         .name("onnx-caps-probe".to_string())
         .spawn(move || {
-            let cuda_available = ms_sysprobe::gpu_utils::native_cuda_runtime_available();
-            let webgpu_available = ms_sysprobe::gpu_utils::native_webgpu_runtime_available();
-            let directml_accelerators = ms_sysprobe::gpu_utils::detect_directml_accelerators_windows()
-                .into_iter()
-                .map(|adapter| adapter.name)
-                .collect::<Vec<_>>();
-            // WebGPU adapters are enumerated with Dawn's per-OS backend so the Vec index
-            // is the `device_id` passed to `ort::ep::WebGPU::with_device_id`.
-            let webgpu_adapters = ms_sysprobe::gpu_utils::detect_webgpu_adapters()
-                .into_iter()
-                .map(|adapter| adapter.name)
-                .collect::<Vec<_>>();
-            // Per-build accelerator availability for the "Билд" selector (each probe is
-            // CUDA-major / OpenVINO specific and short-lived; worker-thread only).
-            let cuda13_available = ms_sysprobe::gpu_utils::native_cuda_build_available("cuda13");
-            let cuda12_available = ms_sysprobe::gpu_utils::native_cuda_build_available("cuda12");
-            let openvino_available = ms_sysprobe::gpu_utils::native_openvino_runtime_available();
+            let caps = probe_onnx_caps();
             if let Ok(mut guard) = slot.lock() {
-                *guard = Some(OnnxCaps {
-                    cuda_available,
-                    webgpu_available,
-                    directml_accelerators,
-                    webgpu_adapters,
-                    cuda13_available,
-                    cuda12_available,
-                    openvino_available,
-                });
+                *guard = Some(caps);
             }
         })
     {
@@ -2110,20 +2227,30 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
     }
 }
 
-/// Persists the unified ONNX selection off the GUI thread.
+/// Persists the unified ONNX selection off the GUI thread, records `device_id` in `saved`
+/// when the write succeeded, then reports `SettingChange::OnnxProviderDevice` on `landed`
+/// (whatever the write's result).
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_save_onnx_provider_device(provider_token: String, device_id: String) {
+fn spawn_save_onnx_provider_device(
+    provider_token: String,
+    device_id: String,
+    landed: Sender<SettingChange>,
+    saved: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
     let path = ms_config::user_config_path();
     if let Err(err) = std::thread::Builder::new()
         .name("onnx-selection-save".to_string())
         .spawn(move || {
-            if let Err(err) =
-                ms_config::save_onnx_provider_device(&path, &provider_token, &device_id)
-            {
-                ms_log::runtime_log::log_error(format!(
+            match ms_config::save_onnx_provider_device(&path, &provider_token, &device_id) {
+                Ok(()) => match saved.lock() {
+                    Ok(mut guard) => *guard = Some(device_id),
+                    Err(poisoned) => *poisoned.into_inner() = Some(device_id),
+                },
+                Err(err) => ms_log::runtime_log::log_error(format!(
                     "[ai-backend-panel] failed to persist ONNX selection '{provider_token}'/'{device_id}': {err}"
-                ));
+                )),
             }
+            report_landed(&landed, SettingChange::OnnxProviderDevice);
         })
     {
         ms_log::runtime_log::log_error(format!(
@@ -2159,7 +2286,7 @@ fn spawn_save_max_loaded_models(value: u32) {
 /// The current runtime is read once off the GUI thread into `state`; changes are
 /// persisted off-thread. Desktop-only (the native runtime is compiled out on wasm).
 #[cfg(not(target_arch = "wasm32"))]
-fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState) {
+fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState, warnings: Option<&WarningSet>) {
     use ms_config::AiRuntime;
 
     ui.heading(t!("ai_backend.onnx_inference_heading"));
@@ -2206,25 +2333,27 @@ fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState) {
         }
         Some(runtime) => {
             let mut selected = runtime;
-            WheelComboBox::from_label(t!("ai_backend.onnx_inference_combo_label")).id_salt("ai_backend.onnx_inference_combo_label")
-                .selected_text(ai_runtime_label(selected))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut selected,
-                        AiRuntime::Backend,
-                        ai_runtime_label(AiRuntime::Backend),
-                    );
-                    ui.selectable_value(
-                        &mut selected,
-                        AiRuntime::Native,
-                        ai_runtime_label(AiRuntime::Native),
-                    );
-                });
+            with_item_badge(ui, warnings, SettingKey::AiRuntime, |ui| {
+                WheelComboBox::from_label(t!("ai_backend.onnx_inference_combo_label")).id_salt("ai_backend.onnx_inference_combo_label")
+                    .selected_text(ai_runtime_label(selected))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut selected,
+                            AiRuntime::Backend,
+                            ai_runtime_label(AiRuntime::Backend),
+                        );
+                        ui.selectable_value(
+                            &mut selected,
+                            AiRuntime::Native,
+                            ai_runtime_label(AiRuntime::Native),
+                        );
+                    })
+            });
             if selected != runtime {
                 if let Ok(mut guard) = state.ai_runtime_selection.lock() {
                     *guard = Some(selected);
                 }
-                spawn_save_ai_runtime(selected);
+                spawn_save_ai_runtime(selected, state.pending_changes.sender());
             }
         }
     }
@@ -2244,9 +2373,10 @@ fn ai_runtime_label(runtime: ms_config::AiRuntime) -> &'static str {
     }
 }
 
-/// Persists the selected AI runtime off the GUI thread.
+/// Persists the selected AI runtime off the GUI thread, then reports
+/// `SettingChange::AiRuntime` on `landed` (whatever the write's result).
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_save_ai_runtime(runtime: ms_config::AiRuntime) {
+fn spawn_save_ai_runtime(runtime: ms_config::AiRuntime, landed: Sender<SettingChange>) {
     let path = ms_config::user_config_path();
     if let Err(err) = std::thread::Builder::new()
         .name("ai-runtime-save".to_string())
@@ -2257,6 +2387,7 @@ fn spawn_save_ai_runtime(runtime: ms_config::AiRuntime) {
                     runtime.as_key()
                 ));
             }
+            report_landed(&landed, SettingChange::AiRuntime);
         })
     {
         ms_log::runtime_log::log_error(format!(
@@ -2269,11 +2400,15 @@ fn spawn_save_ai_runtime(runtime: ms_config::AiRuntime) {
 /// (provider + adapter) — on disk and the in-process latch — so a retry can
 /// re-attempt the native runtime without an app restart.
 ///
-/// The guard scope is computed inside the worker thread via
-/// `native_runtime::native_load_scope_key` (it does disk I/O + a CUDA probe on first
-/// call), never on the GUI thread.
+/// The guard scope is `ms_native_runtime::next_load_scope_key` over a fresh config read
+/// (the committed scope, else the configured effective one: the same rule as the settings
+/// guard warning), computed inside the worker thread (disk I/O + hardware probes), never
+/// on the GUI thread. It does NOT resolve the process selection, so a build changed after
+/// a Retry still takes effect on the next load. An unreadable config skips the reset
+/// (logged). Reports `SettingChange::OrtGuardReset` on `landed` once the worker finished
+/// (whatever its result).
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_reset_ort_guard() {
+fn spawn_reset_ort_guard(landed: Sender<SettingChange>) {
     // Reset the in-process latch first so a retry re-attempts loading.
     ms_native_runtime::reset_load_latch();
 
@@ -2281,12 +2416,21 @@ fn spawn_reset_ort_guard() {
     if let Err(err) = std::thread::Builder::new()
         .name("ort-guard-reset".to_string())
         .spawn(move || {
-            let scope = ms_native_runtime::native_load_scope_key();
-            if let Err(err) = ms_config::ort_load_guard::reset_ort_load_guard(&path, &scope) {
-                ms_log::runtime_log::log_error(format!(
-                    "[ai-backend-panel] failed to reset ORT load guard for '{scope}': {err}"
-                ));
+            match ms_config::load_raw_user_settings_for_startup() {
+                Ok(cfg) => {
+                    let report = ms_native_runtime::evaluate_native_selection(&cfg);
+                    let scope = ms_native_runtime::next_load_scope_key(&report);
+                    if let Err(err) = ms_config::ort_load_guard::reset_ort_load_guard(&path, &scope) {
+                        ms_log::runtime_log::log_error(format!(
+                            "[ai-backend-panel] failed to reset ORT load guard for '{scope}': {err}"
+                        ));
+                    }
+                }
+                Err(err) => ms_log::runtime_log::log_error(format!(
+                    "[ai-backend-panel] could not read user config to find the ORT load guard scope; guard not reset; error: {err:#}"
+                )),
             }
+            report_landed(&landed, SettingChange::OrtGuardReset);
         })
     {
         ms_log::runtime_log::log_error(format!(
@@ -2298,9 +2442,10 @@ fn spawn_reset_ort_guard() {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
-        BackendOnnxProviders, BuildAvailability, OnnxCaps, OnnxProviderOption, OrtBuildAction,
-        build_onnx_provider_options, default_onnx_provider, ep_device_options, ep_display_label,
-        ep_ort_token, ort_build_action, partition_builds, provider_runtime_state,
+        AiBackendPanelState, BackendOnnxProviders, BuildAvailability, OnnxCaps, OnnxProviderOption, OrtBuildAction,
+        PendingChanges, SettingChange, build_availability, build_onnx_provider_options, build_slug_available,
+        default_onnx_provider, device_pick_needs_save, ep_device_options, ep_display_label, ep_ort_token,
+        ort_build_action, partition_builds, provider_runtime_state, report_landed,
     };
     use ms_config::AiRuntime;
     use ms_tab_translation::backend_health::AiBackendDeviceOption;
@@ -2315,6 +2460,69 @@ mod tests {
             devices_by_provider: EMPTY_DEVICES_BY_PROVIDER.get_or_init(HashMap::new),
             generic_devices: &[],
         }
+    }
+
+    #[test]
+    fn pending_changes_drain_moves_every_landed_change_in_order() {
+        let pending = PendingChanges::default();
+        let writer = pending.sender();
+        // Changes landing on writer threads arrive in send order.
+        let worker = std::thread::spawn(move || {
+            report_landed(&writer, SettingChange::AiRuntime);
+            report_landed(&writer, SettingChange::OnnxBuild);
+            report_landed(&writer, SettingChange::OrtGuardReset);
+        });
+        worker.join().unwrap_or_else(|_| panic!("writer thread panicked"));
+        let mut out = vec![SettingChange::BackendAutostart(true)];
+        pending.drain_into(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                SettingChange::BackendAutostart(true),
+                SettingChange::AiRuntime,
+                SettingChange::OnnxBuild,
+                SettingChange::OrtGuardReset,
+            ]
+        );
+        let mut again = Vec::new();
+        pending.drain_into(&mut again);
+        assert!(again.is_empty(), "a drained change is reported exactly once");
+    }
+
+    #[test]
+    fn landed_changes_append_after_the_frame_changes() {
+        let state = AiBackendPanelState::default();
+        report_landed(&state.pending_changes.sender(), SettingChange::OnnxProviderDevice);
+        let changes = state.append_landed_changes(vec![SettingChange::BackendAutostart(false)]);
+        assert_eq!(changes, vec![SettingChange::BackendAutostart(false), SettingChange::OnnxProviderDevice]);
+        assert!(state.append_landed_changes(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_change_landing_after_the_pane_closed_is_dropped_without_panic() {
+        let state = AiBackendPanelState::default();
+        let writer = state.pending_changes.sender();
+        drop(state);
+        report_landed(&writer, SettingChange::AiRuntime);
+    }
+
+    #[test]
+    fn device_pick_saves_only_when_the_persisted_id_differs() {
+        // Q4: the persisted id "3" is not offered, the pane displays "0" unsaved; picking
+        // the displayed "0" must save.
+        assert!(device_pick_needs_save(true, Some("3"), None, "0"));
+        // No key persisted yet: an explicit pick saves.
+        assert!(device_pick_needs_save(true, None, None, "0"));
+        // Re-picking the persisted device is not a change.
+        assert!(!device_pick_needs_save(true, Some("0"), None, "0"));
+        // No click: the seeding never saves on its own.
+        assert!(!device_pick_needs_save(false, Some("3"), None, "0"));
+        // After the fixing save of "0" landed, re-picking "0" no longer saves ...
+        assert!(!device_pick_needs_save(true, Some("3"), Some("0"), "0"));
+        // ... while a genuinely different pick still does.
+        assert!(device_pick_needs_save(true, Some("3"), Some("0"), "1"));
+        // A later save supersedes the seed even when the seed equals the pick.
+        assert!(device_pick_needs_save(true, Some("0"), Some("1"), "0"));
     }
 
     /// Shared empty device map so `offline_backend` can hand out a `'static` borrow.
@@ -2698,6 +2906,49 @@ mod tests {
         assert_eq!(webgpu.devices[0].label, t!("ai_backend.device_default"));
     }
 
+    /// Characterization of the per-build availability the panel derives from the probed
+    /// caps, for an empty probe (no adapters, no runtimes) and a full one (two DirectML
+    /// adapters, every runtime present). Platform-gated builds follow the target OS.
+    #[test]
+    fn build_availability_per_caps_shape() {
+        // Every expectation is tied to the embedded manifest (does the build ship for this
+        // OS/arch?), so the test holds on every target, including ones with no archive.
+        let ships = ms_onnx_runtime::build_shipped_here;
+        let empty = build_availability(&OnnxCaps::default());
+        assert_eq!(empty.cpu, ships("cpu"));
+        // Formerly divergent (D1): the panel required a probed DirectML adapter, the
+        // runtime never did; the panel now follows the runtime's rule, so DirectML is
+        // available on Windows even with zero probed adapters.
+        // Formerly divergent (D3b): a build without an archive for this OS/arch is
+        // unavailable. The manifest ships DirectML only for Windows and CoreML only for
+        // macOS, where their headline EPs run.
+        assert_eq!(empty.directml, ships("directml"), "DirectML with zero adapters");
+        assert!(!empty.webgpu);
+        assert_eq!(empty.coreml, ships("coreml"));
+        assert!(!empty.cuda13 && !empty.cuda12 && !empty.openvino);
+
+        let full = build_availability(&OnnxCaps {
+            cuda_available: true,
+            webgpu_available: true,
+            directml_accelerators: vec!["A".to_string(), "B".to_string()],
+            webgpu_adapters: Vec::new(),
+            cuda13_available: true,
+            cuda12_available: true,
+            openvino_available: true,
+        });
+        assert_eq!(full.cpu, ships("cpu"));
+        assert_eq!(full.directml, ships("directml"));
+        assert_eq!(full.webgpu, ships("webgpu"));
+        assert_eq!(full.coreml, ships("coreml"));
+        assert_eq!(full.cuda13, ships("cuda13"));
+        assert_eq!(full.cuda12, ships("cuda12"));
+        assert_eq!(full.openvino, ships("openvino"));
+
+        // The informational QNN entry and an unknown slug are never available.
+        assert!(!build_slug_available("qnn", &full));
+        assert!(!build_slug_available("no-such-build", &full));
+    }
+
     /// Availability flags partition builds into Базовые / Специфичные / Недоступные:
     /// available Basic → basic, available Specific → specific, everything else + QNN →
     /// unavailable, with no slug in two groups.
@@ -2727,8 +2978,9 @@ mod tests {
         }
     }
 
-    /// An unavailable Basic build (e.g. DirectML with no adapter) drops from Базовые to
-    /// Недоступные instead of vanishing; CPU is the only always-available Basic build.
+    /// An unavailable Basic build (e.g. DirectML off Windows) drops from Базовые to
+    /// Недоступные instead of vanishing; CPU is the only Basic build available on every
+    /// shipped platform.
     #[test]
     fn partition_unavailable_basic_falls_to_bottom() {
         let availability = BuildAvailability {
@@ -2813,6 +3065,45 @@ mod tests {
             assert_eq!(devices.len(), 1, "{ep:?} should have one device");
             assert_eq!(devices[0].id, "0");
         }
+    }
+
+    /// Characterization of the device-id rule of `ep_device_options` for every EP over two
+    /// caps shapes (DirectML adapters without WebGPU adapters, and the reverse), with the
+    /// non-localized labels of the enumerated adapters.
+    #[test]
+    fn ep_device_options_ids_per_caps_shape() {
+        use ms_onnx::ExecutionProvider;
+        let ids_of = |ep: ExecutionProvider, caps: &OnnxCaps| -> Vec<String> {
+            ep_device_options(ep, caps).into_iter().map(|device| device.id).collect()
+        };
+        let directml_only = OnnxCaps {
+            directml_accelerators: vec!["A".to_string(), "B".to_string()],
+            ..OnnxCaps::default()
+        };
+        let webgpu_only = OnnxCaps {
+            webgpu_adapters: vec!["X".to_string(), "Y".to_string()],
+            ..OnnxCaps::default()
+        };
+        let cases: [(ExecutionProvider, &[&str], &[&str]); 7] = [
+            (ExecutionProvider::Cpu, &["0"], &["0"]),
+            (ExecutionProvider::DirectMl, &["0", "1"], &["0"]),
+            (ExecutionProvider::CoreMl, &["0"], &["0"]),
+            (ExecutionProvider::Cuda, &["0"], &["0"]),
+            (ExecutionProvider::WebGpu, &["0"], &["0", "1"]),
+            (ExecutionProvider::OpenVino, &["CPU", "GPU", "NPU"], &["CPU", "GPU", "NPU"]),
+            (ExecutionProvider::TensorRt, &["0"], &["0"]),
+        ];
+        for (ep, with_directml, with_webgpu) in cases {
+            assert_eq!(ids_of(ep, &directml_only), with_directml, "{ep:?} with DirectML adapters");
+            assert_eq!(ids_of(ep, &webgpu_only), with_webgpu, "{ep:?} with WebGPU adapters");
+        }
+        let labels = |ep: ExecutionProvider, caps: &OnnxCaps| -> Vec<String> {
+            ep_device_options(ep, caps).into_iter().map(|device| device.label).collect()
+        };
+        assert_eq!(labels(ExecutionProvider::DirectMl, &directml_only), vec!["0: A", "1: B"]);
+        assert_eq!(labels(ExecutionProvider::DirectMl, &webgpu_only), vec!["GPU 0"]);
+        assert_eq!(labels(ExecutionProvider::WebGpu, &webgpu_only), vec!["0: X", "1: Y"]);
+        assert_eq!(labels(ExecutionProvider::Cuda, &webgpu_only), vec!["GPU 0"]);
     }
 
     /// The build-action decision matrix: `(committed, active, selected, present)` →

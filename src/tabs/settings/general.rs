@@ -59,12 +59,14 @@ impl SettingsTabState {
         ui.add_space(8.0);
 
         // Shared section: projects directory + memory profile + languages (identical to
-        // the launcher), rendered through the shared-panel container.
+        // the launcher), rendered through the shared-panel container. The studio shows no
+        // warning badges (`None`) and ignores `outcome.changed_settings` (launcher rechecks).
         let outcome = self.shared.draw(
             SettingsSectionId::General,
             ui,
             SettingsSurface::Studio,
             &self.ai_backend_handle,
+            None,
         );
         // Studio runtime effect: apply a changed memory profile to the shared
         // `MemoryManager` and cache owners. The saved projects dir needs no studio

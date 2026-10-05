@@ -378,6 +378,7 @@ logged error); the GUI thread only polls and applies results.
 | Cloud image-edit run (submit, poll, download, exact-size finish) | `ms-tab-cleaning/src/tools/ai_api_editor` + `ms_ai_api::image_edit` |
 | Characters / Notes / Wiki background work | `ms-tabs-simple` |
 | Batch processing of new projects | `ms-launcher/src/new_project/batch_processing/` |
+| Settings warnings checks (full run per launcher entry, per-unit rechecks) | `ms-settings-ui/src/settings_warnings/`, driven by `ms-launcher/src/pages/settings_page.rs` |
 
 ## 12. Key invariants
 

@@ -20,7 +20,11 @@ Key items:
   differ per surface, so this is a function of `(id, surface)`, not a table column).
 - `SharedSettingsPanels`: owns the three shared panel states so each surface embeds ONE
   instance (independent scratch preserved).
-- `SharedSectionOutcome`: the per-surface runtime effects a shared section produced.
+- `SharedSectionOutcome`: the per-surface runtime effects a shared section produced,
+  including the `SettingChange`s whose writes landed (the launcher rechecks warnings on
+  them; the studio ignores them). `SharedSettingsPanels::take_landed_changes` drains the
+  AI pane's landed writes without a draw (the launcher calls it every frame).
+- `with_item_badge`: the one layout rule for an item's inline warning badge.
 
 Contract notes:
 - The `AiBackendHandle` is passed into `draw` BY REFERENCE, not owned here, so the
@@ -28,6 +32,9 @@ Contract notes:
   is unchanged.
 - `draw` renders ONLY the shared sections (`General`/`AiBackend`/`Tutorials`); a caller
   must not route its own local sections here (debug-asserted).
+- `draw` takes `warnings: Option<&WarningSet>`: the launcher passes its set and gets
+  inline item badges; the studio passes `None`, which draws the exact pre-badge widget
+  tree (no extra row, no reserved space, unchanged ids).
 - Dynamic per-surface cases (the launcher hiding/relabelling `TorchUpgrade`) are NOT
   handled here; the registry lists the section and the surface post-filters/relabels it.
 */
@@ -35,6 +42,7 @@ Contract notes:
 use crate::ai_backend_panel::{AiBackendPanelState, draw_ai_backend_panel};
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::general_settings_panel::{GeneralSettingsPanelState, draw_general_settings_panel};
+use crate::settings_warnings::{SettingChange, SettingKey, WarningSet, item_warning_badge};
 use ms_memory::MemoryProfile;
 use std::path::PathBuf;
 #[cfg(feature = "tutorial")]
@@ -217,10 +225,10 @@ pub fn title_key(id: SettingsSectionId, surface: SettingsSurface) -> &'static st
 
 /// Per-surface runtime effects produced by rendering a shared section.
 ///
-/// Each field is `Some` only when that change happened this frame. The launcher reacts
-/// to `projects_dir_saved` (emitting `ProjectsRootChanged`); the studio reacts to
-/// `memory_profile_changed` (applying it to the `MemoryManager`). Each surface ignores
-/// the field it does not use, exactly as before this refactor.
+/// Each `Option` field is `Some` only when that change happened this frame. The launcher
+/// reacts to `projects_dir_saved` (emitting `ProjectsRootChanged`) and to
+/// `changed_settings` (warning rechecks); the studio reacts to `memory_profile_changed`
+/// (applying it to the `MemoryManager`). Each surface ignores the fields it does not use.
 #[derive(Debug, Default)]
 pub struct SharedSectionOutcome {
     /// Set to the normalized saved root when the user saved a new projects directory.
@@ -231,6 +239,37 @@ pub struct SharedSectionOutcome {
     /// finished converting. The launcher re-validates its open page; the studio needs
     /// nothing (the driver already switched the process-global docstore default).
     pub storage_mode_changed: Option<ms_config::StorageMode>,
+    /// Checked settings whose write ran this frame (a synchronous save, or an off-thread
+    /// save that completed since the last frame), in completion order. Reported whether
+    /// the write succeeded or failed: a warning recheck re-reads the disk, so a failed
+    /// write only re-confirms the old state. Empty when nothing was written.
+    pub changed_settings: Vec<SettingChange>,
+}
+
+/// Lays out one settings item with its inline warning badge after it.
+///
+/// `warnings == None` (the studio) runs `add_contents` directly in `ui`: the widget tree,
+/// ids and layout are exactly those of an item without badges. `Some` (the launcher) runs
+/// it inside a `ui.horizontal` row and appends [`item_warning_badge`], which allocates
+/// only when `key` is flagged. The launcher wraps even a clean item, so the item's widget
+/// ids do not change when a badge appears or disappears (an open combo popup would lose
+/// its state otherwise).
+pub(crate) fn with_item_badge<R>(
+    ui: &mut egui::Ui,
+    warnings: Option<&WarningSet>,
+    key: SettingKey,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if warnings.is_none() {
+        return add_contents(ui);
+    }
+    ui.horizontal(|ui| {
+        let inner = add_contents(ui);
+        // The returned hover response only carries the tooltip; nothing reacts to it.
+        let _badge = item_warning_badge(ui, warnings, key);
+        inner
+    })
+    .inner
 }
 
 /// Owns the three shared "double-interface" panel states so each surface embeds ONE
@@ -287,12 +326,31 @@ impl SharedSettingsPanels {
         self.general.memory_profile
     }
 
+    /// Takes every AI-pane off-thread write that landed since the last drain, in
+    /// completion order, without drawing anything. A surface that rechecks warnings calls
+    /// it every frame, so a write that lands while a surface-local section (or another
+    /// page) is shown is still reported; `draw` drains the same channel, so each change is
+    /// returned exactly once by whichever runs first. Always empty on wasm.
+    #[must_use]
+    pub fn take_landed_changes(&self) -> Vec<SettingChange> {
+        self.ai_backend.append_landed_changes(Vec::new())
+    }
+
     /// Renders one SHARED section and returns its runtime effects.
     ///
     /// Handles only `General` / `AiBackend` / `Tutorials`; `ai_backend` is the caller's
-    /// app-global handle, borrowed for this frame. A non-shared `id` returns an empty
-    /// outcome and debug-asserts, since a caller must render its own local sections
-    /// itself rather than route them here.
+    /// app-global handle, borrowed for this frame. `warnings` is the launcher's current
+    /// warning set (inline item badges); the studio passes `None` and gets no badge and
+    /// no layout change. A non-shared `id` returns an empty outcome and debug-asserts,
+    /// since a caller must render its own local sections itself rather than route them
+    /// here.
+    ///
+    /// The AI pane's completed off-thread writes are drained on every shared section's
+    /// draw, so a write that lands after the user switched to General or Tutorials is
+    /// still reported; a surface that must see the change while a surface-local section
+    /// is active drains it with [`take_landed_changes`] every frame.
+    ///
+    /// [`take_landed_changes`]: SharedSettingsPanels::take_landed_changes
     #[must_use]
     pub fn draw(
         &mut self,
@@ -300,27 +358,32 @@ impl SharedSettingsPanels {
         ui: &mut egui::Ui,
         surface: SettingsSurface,
         ai_backend: &AiBackendHandle,
+        warnings: Option<&WarningSet>,
     ) -> SharedSectionOutcome {
         // `surface` is accepted for a stable, surface-aware signature; the shared
         // widgets currently render identically on both surfaces.
         let _ = surface;
         match id {
             SettingsSectionId::General => {
-                let outcome = draw_general_settings_panel(ui, &mut self.general);
+                let outcome = draw_general_settings_panel(ui, &mut self.general, warnings);
                 SharedSectionOutcome {
                     projects_dir_saved: outcome.projects_dir_saved,
                     memory_profile_changed: outcome.memory_profile_changed,
                     storage_mode_changed: outcome.storage_mode_changed,
+                    changed_settings: self.ai_backend.append_landed_changes(outcome.changed_settings),
                 }
             }
             SettingsSectionId::AiBackend => {
-                draw_ai_backend_panel(ui, ai_backend, &mut self.ai_backend);
-                SharedSectionOutcome::default()
+                let outcome = draw_ai_backend_panel(ui, ai_backend, &mut self.ai_backend, warnings);
+                SharedSectionOutcome { changed_settings: outcome.changed_settings, ..SharedSectionOutcome::default() }
             }
             #[cfg(feature = "tutorial")]
             SettingsSectionId::Tutorials => {
                 draw_tutorials_pane(ui, &self.tutorial_progress);
-                SharedSectionOutcome::default()
+                SharedSectionOutcome {
+                    changed_settings: self.ai_backend.append_landed_changes(Vec::new()),
+                    ..SharedSectionOutcome::default()
+                }
             }
             SettingsSectionId::SystemInfo
             | SettingsSectionId::AiComputations
@@ -357,7 +420,58 @@ impl Default for SharedSettingsPanels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings_warnings::{SettingWarning, WarningReason};
     use std::collections::HashSet;
+
+    /// Runs one headless frame of `draw` in a fresh context and returns the cursor and the
+    /// used rect the root `Ui` is left with.
+    fn layout_after(draw: impl Fn(&mut egui::Ui)) -> (egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        let mut layout = None;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw(ui);
+            layout = Some((ui.cursor(), ui.min_rect()));
+        });
+        output.drop_without_applying_deltas();
+        layout.unwrap_or_else(|| panic!("run_ui did not call the frame closure"))
+    }
+
+    #[test]
+    fn studio_item_without_warnings_keeps_the_plain_layout() {
+        // The studio passes `None`: the item must lay out exactly as the bare widget, with
+        // no wrapping row and no reserved badge square.
+        let plain = layout_after(|ui| {
+            ui.label("item");
+        });
+        let studio = layout_after(|ui| {
+            with_item_badge(ui, None, SettingKey::ProjectsRoot, |ui| ui.label("item"));
+        });
+        assert_eq!(studio, plain);
+    }
+
+    #[test]
+    fn launcher_item_reserves_a_badge_only_when_flagged() {
+        let clean = WarningSet::default();
+        let mut flagged = WarningSet::default();
+        flagged.replace_key(
+            SettingKey::ProjectsRoot,
+            vec![SettingWarning {
+                key: SettingKey::ProjectsRoot,
+                reason: WarningReason::ProjectsRootMissing { path: "/home/u/projects".to_string() },
+            }],
+        );
+        let (_, clean_rect) = layout_after(|ui| {
+            with_item_badge(ui, Some(&clean), SettingKey::ProjectsRoot, |ui| ui.label("item"));
+        });
+        let (_, flagged_rect) = layout_after(|ui| {
+            with_item_badge(ui, Some(&flagged), SettingKey::ProjectsRoot, |ui| ui.label("item"));
+        });
+        let (_, other_key_rect) = layout_after(|ui| {
+            with_item_badge(ui, Some(&flagged), SettingKey::UiLanguage, |ui| ui.label("item"));
+        });
+        assert!(flagged_rect.width() > clean_rect.width(), "a flagged item gets a badge square");
+        assert_eq!(other_key_rect, clean_rect, "another key's warning reserves nothing here");
+    }
 
     #[test]
     fn launcher_sections_are_filtered_and_ordered() {

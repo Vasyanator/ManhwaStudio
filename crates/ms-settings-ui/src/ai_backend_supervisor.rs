@@ -21,6 +21,8 @@ Main types:
   (`start_with_autostart_gate` there, so autostart waits for storage-mode conversions).
 - `AutostartGate` / `AutostartDeferral`: the one-shot, gate-deferred autostart polled on the
   worker tick; a user Start/Restart/Stop or autostart-off cancels it.
+- `check_backend_spawnable` / `BackendSpawnBlocker` (native-only): the spawn preconditions,
+  silent, shared by the spawn and by inspection callers (settings checks).
 
 Notes:
 - The backend speaks the framed multiplexed IPC protocol over a per-platform
@@ -35,8 +37,9 @@ Notes:
       line and publishes the endpoint via `backend_ipc::set_ws_endpoint(port,
       token)`, which `current_backend_endpoint()` then hands to the client. The
       token is never written to any log.
-- `start_ai_backend_process` is the single spawn point; it refuses a payload without
-  `docstore.py` (`backend_payload_is_current`, KG-017).
+- `start_ai_backend_process` is the single spawn point; its preconditions (script present,
+  payload with `docstore.py` per KG-017, a resolvable interpreter) are owned by
+  `check_backend_spawnable` / `BackendSpawnBlocker`, which inspection callers also use.
 - Process manager/status/output lines are mirrored into runtime file logs via
   `ms_log::runtime_log`.
 */
@@ -610,8 +613,42 @@ fn backend_payload_is_current(app_dir: &Path) -> bool {
     app_dir.join(BACKEND_PAYLOAD_MARKER).is_file()
 }
 
+/// Why the Python backend cannot be spawned from a program directory. Produced by
+/// [`check_backend_spawnable`], the one owner of the spawn preconditions.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendSpawnBlocker {
+    /// `ai_backend.py` is not a file in the program directory.
+    ScriptMissing,
+    /// The Python payload predates the document store (no `docstore.py`, KG-017).
+    PayloadOutdated,
+    /// No supported Python environment / interpreter was found; carries the localized
+    /// message of `python_manager::resolve_python_executable`.
+    PythonMissing(String),
+}
+
+/// The spawn preconditions of the backend, in the order the spawn checks them:
+/// `ai_backend.py` exists, the payload carries [`BACKEND_PAYLOAD_MARKER`]
+/// ([`backend_payload_is_current`], KG-017), and `python_manager` resolves an interpreter
+/// under `app_dir`. Silent (the caller decides what to log). Stats the disk: worker
+/// threads only.
+///
+/// # Errors
+/// The first failing precondition as a [`BackendSpawnBlocker`]. `Ok` carries the
+/// interpreter the spawn would use.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn check_backend_spawnable(app_dir: &Path) -> Result<PathBuf, BackendSpawnBlocker> {
+    if !app_dir.join("ai_backend.py").is_file() {
+        return Err(BackendSpawnBlocker::ScriptMissing);
+    }
+    if !backend_payload_is_current(app_dir) {
+        return Err(BackendSpawnBlocker::PayloadOutdated);
+    }
+    python_manager::resolve_python_executable(app_dir).map_err(BackendSpawnBlocker::PythonMissing)
+}
+
 /// Spawns the backend. The single spawn point: autostart, Start and Restart all route here,
-/// so the payload-version guard ([`backend_payload_is_current`]) covers every launch.
+/// so the spawn preconditions ([`check_backend_spawnable`]) cover every launch.
 #[cfg(not(target_arch = "wasm32"))]
 fn start_ai_backend_process(
     child: &mut Option<ManagedPythonChild>,
@@ -643,22 +680,24 @@ fn start_ai_backend_process(
     }
 
     let app_dir = config::program_dir();
-    let backend_script = app_dir.join("ai_backend.py");
-    if !backend_script.is_file() {
-        return Err(tf!("ai_backend.supervisor.script_not_found", app_dir = app_dir.display()));
-    }
-    // KG-017: a payload older than the storage-mode feature (an exe-only replacement keeps
-    // the old Python files) recreates `user_config.json` on import next to `user_config.db`,
-    // before the IPC version check could refuse it. Refuse to spawn it at all.
-    if !backend_payload_is_current(&app_dir) {
-        runtime_log::log_error(format!(
-            "[ai-backend] refusing to start the backend: the Python payload predates the document store; app_dir={}; missing={BACKEND_PAYLOAD_MARKER}; possible cause: only the executable was replaced during an update",
-            app_dir.display()
-        ));
-        return Err(tf!("ai_backend.supervisor.payload_outdated", app_dir = app_dir.display()));
-    }
-
-    let python = python_manager::resolve_python_executable(&app_dir)?;
+    let python = match check_backend_spawnable(&app_dir) {
+        Ok(python) => python,
+        Err(BackendSpawnBlocker::ScriptMissing) => {
+            return Err(tf!("ai_backend.supervisor.script_not_found", app_dir = app_dir.display()));
+        }
+        // KG-017: a payload older than the storage-mode feature (an exe-only replacement
+        // keeps the old Python files) recreates `user_config.json` on import next to
+        // `user_config.db`, before the IPC version check could refuse it. Refuse to spawn it
+        // at all.
+        Err(BackendSpawnBlocker::PayloadOutdated) => {
+            runtime_log::log_error(format!(
+                "[ai-backend] refusing to start the backend: the Python payload predates the document store; app_dir={}; missing={BACKEND_PAYLOAD_MARKER}; possible cause: only the executable was replaced during an update",
+                app_dir.display()
+            ));
+            return Err(tf!("ai_backend.supervisor.payload_outdated", app_dir = app_dir.display()));
+        }
+        Err(BackendSpawnBlocker::PythonMissing(message)) => return Err(message),
+    };
     let mut command = python_manager::build_python_command(&app_dir)?;
     command
         .current_dir(&app_dir)
@@ -1063,8 +1102,8 @@ pub fn save_ai_backend_autostart(user_settings_file: &Path, enabled: bool) -> Re
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
-        AiBackendProcessCommand, AutostartDeferral, AutostartPoll, WsPortLine, backend_payload_is_current, command_cancels_autostart,
-        load_ai_backend_autostart, parse_ws_port_line, save_ai_backend_autostart,
+        AiBackendProcessCommand, AutostartDeferral, AutostartPoll, BackendSpawnBlocker, WsPortLine, backend_payload_is_current,
+        check_backend_spawnable, command_cancels_autostart, load_ai_backend_autostart, parse_ws_port_line, save_ai_backend_autostart,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1120,6 +1159,20 @@ mod tests {
         std::fs::remove_dir(dir.path().join("docstore.py"))?;
         std::fs::write(dir.path().join("docstore.py"), b"")?;
         assert!(backend_payload_is_current(dir.path()));
+        Ok(())
+    }
+
+    /// The spawn preconditions fail in the spawn's order: script, payload, interpreter.
+    #[test]
+    fn spawn_preconditions_report_the_first_blocker() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(check_backend_spawnable(dir.path()), Err(BackendSpawnBlocker::ScriptMissing));
+        std::fs::write(dir.path().join("ai_backend.py"), b"")?;
+        assert_eq!(check_backend_spawnable(dir.path()), Err(BackendSpawnBlocker::PayloadOutdated));
+        std::fs::write(dir.path().join("docstore.py"), b"")?;
+        // The interpreter lookup is confined to `app_dir` (venv / installer_files), so an
+        // empty temp dir has none whatever Python the machine has.
+        assert!(matches!(check_backend_spawnable(dir.path()), Err(BackendSpawnBlocker::PythonMissing(_))));
         Ok(())
     }
 

@@ -3,13 +3,14 @@ File: crates/ms-theme/src/status.rs
 
 Purpose:
 Status (severity) colours of studio TEXT and labels on dark panels: error, warning, success and
-in-progress messages, toasts and status lines; plus the fill of an armed destructive button.
+in-progress messages, toasts and status lines; plus the fill of an armed destructive button and
+the colour of a glyph painted on an error/warning fill (badges).
 
 Key structures:
 - Severity
 
 Key constants:
-- ERROR, WARNING, SUCCESS, INFO, DESTRUCTIVE_ARMED_FILL
+- ERROR, WARNING, SUCCESS, INFO, DESTRUCTIVE_ARMED_FILL, ON_STATUS_FILL
 
 Notes:
 These are panel-text shades, deliberately softer than the canvas chrome in `canvas.rs`, which must
@@ -36,6 +37,10 @@ pub const INFO: Color32 = Color32::from_rgb(255, 215, 0);
 
 /// Fill of a destructive button once it is ARMED (second click confirms the deletion).
 pub const DESTRUCTIVE_ARMED_FILL: Color32 = Color32::from_rgb(150, 40, 40);
+
+/// A glyph (e.g. the "!" of a warning badge) painted ON a shape filled with [`ERROR`] or
+/// [`WARNING`]: white reads on both fills.
+pub const ON_STATUS_FILL: Color32 = Color32::WHITE;
 
 /// Severity of a status message; picks its text colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

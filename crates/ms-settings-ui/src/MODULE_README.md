@@ -37,7 +37,8 @@ dependency list.
 ## Files and submodules
 - `lib.rs`: crate root and module list; the `tutorial` feature gate.
 - `settings_shared.rs`: the menu-level layer — `SettingsSectionId`, `sections_for`,
-  `title_key`, and `SharedSettingsPanels`, which owns the three shared panes. The studio
+  `title_key`, `SharedSettingsPanels`, which owns the three shared panes, and
+  `with_item_badge`, the one layout rule for an item's inline warning badge. The studio
   Settings tab shows six sections: the shared General, AiBackend and Tutorials (the last only
   with the `tutorial` feature) plus its own CanvasRibbon, Typesetting and Hotkeys; the launcher
   adds its own SystemInfo, AiComputations, TorchUpgrade and PythonEnvironment. `SettingsDeepLink`
@@ -66,9 +67,22 @@ dependency list.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
   backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
-  ROCm) stay selectable for backend ONNX. Selections persist off-thread through
+  ROCm) stay selectable for backend ONNX. Native build availability (picker groups,
+  "(unavailable)" label, auto-download gate) is NOT decided here: it is
+  `ms_native_runtime::native_build_fallback_reason` over the caps probe's
+  `NativeHardwareFacts`, so the panel shows what the runtime will do. The Backend-branch
+  provider list's `native_available` flag is a separate local-capability heuristic (DirectML
+  adapter detected, CUDA 12 probe) that only seeds the Backend default provider. Selections persist off-thread through
   `ms_config::save_onnx_provider_device` / `save_onnx_build` / `save_max_loaded_models` and work
   with no backend running.
+- `onnx_caps.rs` (native-only): `OnnxCaps` (the probed CUDA / WebGPU / DirectML / OpenVINO
+  capabilities and adapter names), `probe_onnx_caps()` (blocking, workers only) and
+  `ep_device_ids(ep, &caps)`, the one rule for which `General.ai_onnx_device_id` values an EP
+  offers (the AI pane's device combo zips its labels onto those ids), and
+  `device_id_offered(ep, id, &caps)`, the one rule for whether a persisted id names an offered
+  device — judged on the runtime's own parse (`ms_native_runtime::device_selection_for`), so
+  an id the native load accepts (OpenVINO `"GPU.0"`) is never treated as missing. The pane's
+  device reconcile and the settings device check both ask it. No UI here.
 - `ai_backend_supervisor.rs`: `AiBackendHandle` — the app-global handle both shells drive
   the Python backend process through, plus its health probe and (on Windows) the loopback
   WebSocket handshake. `AiBackendSupervisor` is built once in `run_main` and outlives the
@@ -76,6 +90,13 @@ dependency list.
   log) is owned by the `AiBackendProcessRuntime` worker (`spawn_ai_backend_process_worker`). `start_with_autostart_gate` defers the persisted autostart until a
   gate opens (the binary passes `!storage_mode_job::backend_autostart_blocked()`); a user
   Start/Restart/Stop cancels a deferred autostart.
+- `settings_warnings/`: per-setting warnings ("!" badges) of the shared panes — the
+  GUI-free model (`SettingKey`, `WarningReason` owning the level, `WarningSet`
+  aggregation), the native-only checks, the `SettingsWarnings` worker runtime
+  (generation-based latest-wins rechecks driven by `SettingChange`) and the badge
+  painter. It consumes the detectors above (`check_backend_spawnable`, `onnx_caps`,
+  `ms_native_runtime::evaluate_native_selection`) and never owns their rules. See its own
+  `MODULE_README.md`.
 - `tutorial/`: the onboarding subsystem, behind the `tutorial` feature. See its own
   `MODULE_README.md`.
 
@@ -97,9 +118,27 @@ dependency list.
 - `tutorial/engine.rs` is ALSO mounted by the `tutorial_test` demo bin through `#[path]`,
   so it must stay dependency-light: egui + std only, no config, no logging, no `t!`.
 - **Backend spawn guard.** `start_ai_backend_process` is the single spawn point (autostart,
-  Start, Restart). It refuses a Python payload without `docstore.py` next to `ai_backend.py`
-  (a pre-docstore `config.py` would recreate `user_config.json` beside the `.db`, KG-017).
+  Start, Restart). Its preconditions have one owner, `check_backend_spawnable(app_dir)`
+  (`BackendSpawnBlocker`: `ai_backend.py` missing; a Python payload without `docstore.py`,
+  since a pre-docstore `config.py` would recreate `user_config.json` beside the `.db`, KG-017;
+  no resolvable interpreter). It is silent and stats the disk; the spawn adds the error texts
+  and the log line, and an inspection caller asks the same function on a worker.
   The autostart gate is polled on the supervisor worker, never on the GUI thread.
+- **Outcomes carry changed settings.** `SharedSectionOutcome::changed_settings` (fed by
+  `GeneralSettingsOutcome` and `AiBackendPanelOutcome`) lists the checked settings whose
+  write ran this frame: the General pane's synchronous saves (projects root, UI language)
+  on the click; the AI pane's off-thread saves (runtime, build, EP/device, ORT guard reset)
+  only after the write returned, over the state's completion channel (`PendingChanges`),
+  drained on every shared-section draw and by `SharedSettingsPanels::take_landed_changes`
+  (no draw; the launcher calls it every frame, so a write landing while a launcher-only tab
+  or another page is shown is still reported); autostart (persisted by the supervisor worker) on
+  the click, carrying the new value. A write is reported whether it succeeded or failed (the
+  recheck re-reads the disk). The launcher forwards them to its warning rechecks; the studio
+  ignores them.
+- **Item badges are launcher-only.** `SharedSettingsPanels::draw` takes
+  `warnings: Option<&WarningSet>`. The studio passes `None`, which must draw the exact
+  pre-badge widget tree; every badged item goes through `settings_shared::with_item_badge`
+  (or appends `item_warning_badge` inside an existing row), never a bespoke layout.
 - No literal user-visible strings: `t!` / `tf!` / `tp!` only, and a stable `id_salt` on any
   localized label.
 - Native-only pieces (ORT runtime, monitor list, backend subprocess) keep their
@@ -107,13 +146,17 @@ dependency list.
   declared in the target table of `Cargo.toml`.
 
 ## Editing map
+- To add or change a settings warning (check, severity, badge), see `settings_warnings/`;
+  to badge a new item or report a new `SettingChange` from a pane, see the pane file and
+  `settings_shared.rs` (`with_item_badge`, `SharedSectionOutcome`).
 - To change the storage-mode switch UI, see `storage_mode_setting.rs`; its job lifecycle,
   `storage_mode_job.rs`; which documents convert and in what order, `ms-project`'s
   `storage_mode.rs`.
 - To add a settings section, see `settings_shared.rs` (`SettingsSectionId`, `sections_for`,
   `title_key`) and add both halves of the double interface in the new pane.
-- To change what the AI pane offers or reports, see `ai_backend_panel.rs`; to change how the
-  backend process is started, watched or stopped, see `ai_backend_supervisor.rs`.
+- To change what the AI pane offers or reports, see `ai_backend_panel.rs`; which device ids
+  an EP offers or what the capability probe gathers, `onnx_caps.rs`; how the backend process
+  is started, watched or stopped (and what blocks a spawn), `ai_backend_supervisor.rs`.
 - To change a persisted settings key, add the writer in `ms-config` first, then call it here.
 - To change the tours, see `tutorial/` (`id.rs` for the stable keys, the per-surface step
   scripts live with their surfaces in the launcher).

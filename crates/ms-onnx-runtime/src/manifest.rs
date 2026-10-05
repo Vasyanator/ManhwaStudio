@@ -17,6 +17,7 @@ Key functions:
 - lookup            : find the entry for (os, arch, provider_id, build)
 - lookup_build      : find the entry for (os, arch, build) — the build-keyed primary
 - build_version     : the manifest version for a build on the current platform
+- build_shipped_here : whether a build has an archive for the current platform (no allocation)
 - provider_version  : back-compat shim — the version of a provider's DEFAULT build
 - current_platform  : the (os, arch) pair this binary was built for, via cfg
 - sha256_hex        : lowercase hex SHA256 of a byte slice (pure)
@@ -214,6 +215,18 @@ pub fn lookup_build(os: &str, arch: &str, build: &str) -> Option<&'static Manife
 pub fn build_version(build: &str) -> Option<String> {
     let (os, arch) = current_platform();
     lookup_build(os, arch, build).map(|entry| entry.version.clone())
+}
+
+/// Whether build `build` has a pinned archive for the CURRENT platform's `(os, arch)`.
+///
+/// Answers the same question as `build_version(build).is_some()` without cloning the
+/// version, so per-frame callers (the AI panel's build picker, through the native
+/// availability rule) stay allocation-free. [`current_platform`] remains the one owner
+/// of the os/arch mapping.
+#[must_use]
+pub fn build_shipped_here(build: &str) -> bool {
+    let (os, arch) = current_platform();
+    lookup_build(os, arch, build).is_some()
 }
 
 /// Back-compat shim: the version of `provider`'s DEFAULT build on the CURRENT platform.
@@ -639,6 +652,21 @@ mod tests {
     fn current_platform_is_linux_x86_64_on_test_host() {
         // The test host and the primary check target are linux x86_64.
         assert_eq!(current_platform(), ("linux", "x86_64"));
+    }
+
+    /// `build_shipped_here` agrees with `build_version` for every catalog build plus an
+    /// unknown slug, on whatever platform the test runs.
+    #[test]
+    fn build_shipped_here_matches_build_version() {
+        for build in crate::builds::all_builds() {
+            assert_eq!(
+                build_shipped_here(build.slug),
+                build_version(build.slug).is_some(),
+                "{}",
+                build.slug
+            );
+        }
+        assert!(!build_shipped_here("no-such-build"));
     }
 
     #[test]

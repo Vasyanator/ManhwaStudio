@@ -74,6 +74,7 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 - `manifest.rs`: typed manifest model (`ArchiveKind`, `ManifestSource`,
   `ManifestEntry` with its `build` field), embedded JSON parsing, `lookup`
   (four-key), `lookup_build` (the resolution primary), `build_version`,
+  `build_shipped_here` (allocation-free "has an archive here", used by the native availability rule),
   `provider_version` (compat shim), `current_platform`, and SHA256 helpers. Edit here
   to change the manifest schema or integrity checks.
 - `ort_manifest.json`: the pinned per-`(os, arch, provider, build)` download recipes,

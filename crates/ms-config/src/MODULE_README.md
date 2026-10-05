@@ -120,7 +120,9 @@ that defines the type.
 - `locale_store.rs`: native-only (`#[cfg(not(target_arch = "wasm32"))]`) on-disk layer for the
   UI localization catalog. Unpacks the catalogs `ms-i18n` embeds into an editable
   `data_dir()/locale` folder, reconciles each file on every launch (never overwriting or
-  deleting user values), and installs the active locale named by `General.ui_language`. It
+  deleting user values), and installs the active locale named by `General.ui_language`
+  (`probe_disk_catalog[_in]` answers, without installing, whether that disk load would
+  succeed or fall back to the embedded catalog — the same rule, for settings checks). It
   belongs to this layer because that tag comes out of `user_config.json`; on wasm there is no
   folder next to an executable and `web_entry.rs` installs the embedded catalog directly.
 

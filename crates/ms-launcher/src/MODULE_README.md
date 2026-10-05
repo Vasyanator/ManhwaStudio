@@ -16,8 +16,10 @@ notification.
 
 ## Files and submodules
 - `lib.rs`: crate root; launcher window setup, app metadata, and public run functions.
-- `app.rs`: root app state, worker polling, page routing, detached viewport handling.
-- `main_page.rs`: central menu, update notification overlay, AI install-type notices, and the
+- `app.rs`: root app state, worker polling, page routing, detached viewport handling; starts
+  and polls the settings-warnings checks (see "Settings warnings").
+- `main_page.rs`: central menu (the Settings button carries the overall settings-warning
+  corner badge), update notification overlay, AI install-type notices, and the
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
   dismissable failure notice). Also the native-only small "Open image" button (drawn in a
   `Ui::new_child` over the title -> grid gap, so it takes no layout space) and its picking status.
@@ -74,6 +76,30 @@ edge-triggered `maybe_autoplay(LauncherMain)` on entering the main page → `syn
 before the panel → `main_page.rs` records button rects via `app.tutorial.mark(...)` → `render` after
 the child windows. See `crates/ms-settings-ui/src/tutorial/MODULE_README.md` for the engine contract.
 
+## Settings warnings
+Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODULE_README).
+- **Owner:** `SettingsPageState::warnings` (one `SettingsWarnings` per launcher entry). The main
+  page reads it only through `LauncherApp::settings_warning_level`; nothing copies the set.
+- **Lifecycle:** a full check run on EVERY launcher entry (program start and return from the
+  studio, since `LauncherApp` is rebuilt per entry). `LauncherApp::new` has no egui context and
+  also serves `web_entry.rs`, so `poll_workers` starts the run on the first frame
+  (`ensure_warning_checks_started`, idempotent) and polls it every frame (`poll_warnings`,
+  repaint on change). `--no-ai` reaches the checks as `CheckContext::ai_enabled == false`
+  (from the backend handle). On wasm the runtime is inert: no badges.
+- **Recheck routing:** only the evaluation units a `SettingChange` affects are re-run.
+  Sources: the shared panes' `changed_settings` (forwarded by the settings page after each
+  shared draw); the AI pane's landed off-thread writes, drained EVERY frame through
+  `SharedSettingsPanels::take_landed_changes` whatever page or tab is shown; the first-run
+  language modal confirm (`UiLanguage`, in `app.rs`); a reconciled install type
+  (`AiInstallType`, inside `SettingsPageState::set_ai_install_type`, reached via
+  `PageNavAction::AiInstallTypeChanged`); the projects folder (`ProjectsRoot`) on the falling
+  edge of `LauncherState::project_creator_open` (Import page, new-project and PSD-import
+  windows), since a create or import can create the folder without any config write — the
+  one place for every create path, in `LauncherApp::poll_workers`. A new launcher-side writer
+  of a checked setting (or a new surface that creates the projects folder) must be added here.
+- **Badges** are paint-only (`paint_corner_badge`): the menu button and the tab buttons keep
+  their click and tutorial-target rects.
+
 ## Contracts and invariants
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
@@ -105,3 +131,7 @@ the child windows. See `crates/ms-settings-ui/src/tutorial/MODULE_README.md` for
 - To change the "Open image" picker, its filter or validation, edit `open_image.rs`; the accepted
   types themselves live in `ms_config::single_image::INPUT_FILE_TYPES`.
 - To change a specific page workflow, edit `pages/`.
+- To change when settings warnings run or which launcher events recheck them, edit
+  `app.rs` (`poll_workers`, first-run confirm) and `pages/settings_page.rs` (`*_warning*`); badge
+  placement: `main_page.rs` / `show_tab_button_impl`; the checks themselves live in
+  `ms_settings_ui::settings_warnings`.

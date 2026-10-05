@@ -59,6 +59,9 @@ use crate::theme;
 use ms_settings_ui::settings_shared::{
     SettingsSectionId, SettingsSurface, SharedSettingsPanels, sections_for, title_key,
 };
+use ms_settings_ui::settings_warnings::{
+    CheckContext, SettingChange, SettingsWarnings, WarningLevel, paint_corner_badge,
+};
 #[cfg(feature = "tutorial")]
 use ms_settings_ui::tutorial::TutorialProgressHandle;
 // Used only by the native Python-environment console (shell spawning); gated to
@@ -107,8 +110,8 @@ const STATUS_ERROR: Color32 = Color32::from_rgb(214, 104, 104);
 const TAB_ACTIVE_FILL: Color32 = Color32::from_rgba_premultiplied(72, 72, 78, 176);
 const TAB_IDLE_FILL: Color32 = theme::BUTTON_FILL;
 const TAB_STROKE: Color32 = theme::BUTTON_STROKE;
-const TAB_WARNING_FILL: Color32 = Color32::from_rgba_premultiplied(120, 88, 18, 188);
-const TAB_WARNING_STROKE: Color32 = Color32::from_rgba_premultiplied(236, 197, 76, 170);
+const TAB_HIGHLIGHT_FILL: Color32 = Color32::from_rgba_premultiplied(120, 88, 18, 188);
+const TAB_HIGHLIGHT_STROKE: Color32 = Color32::from_rgba_premultiplied(236, 197, 76, 170);
 const SETTINGS_CARD_EDGE_GAP: f32 = 18.0;
 // Layout constants for the native Python-console tab only.
 #[cfg(not(target_arch = "wasm32"))]
@@ -168,6 +171,12 @@ pub struct SettingsPageState {
     /// `AiBackend` panel each frame so the launcher exposes the same backend
     /// controls as the studio settings tab.
     ai_backend: AiBackendHandle,
+    /// Per-setting warnings ("!" badges) of this launcher entry: item badges in the
+    /// shared panes, worst level per tab here, overall level on the main-menu Settings
+    /// button. Inert until `ensure_warning_checks_started` runs on the entry's first frame.
+    warnings: SettingsWarnings,
+    /// Whether `warnings` was started for this entry (the full run happens once per entry).
+    warning_checks_started: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,7 +311,52 @@ impl SettingsPageState {
             log_popup_open: false,
             queued_actions: VecDeque::new(),
             ai_backend,
+            // `new` has no egui context (and also runs for the web entry): the worker is
+            // started on the first frame by `ensure_warning_checks_started`.
+            warnings: SettingsWarnings::disabled(),
+            warning_checks_started: false,
         }
+    }
+
+    /// Starts the settings-warnings worker with a full run of every checked setting, on
+    /// the first call of this launcher entry only (later calls do nothing). Called by
+    /// `LauncherApp::poll_workers` every frame; `LauncherApp` is rebuilt per entry, so the
+    /// first frame IS the entry. On wasm the started instance is inert.
+    pub fn ensure_warning_checks_started(&mut self, egui_ctx: &egui::Context) {
+        if self.warning_checks_started {
+            return;
+        }
+        self.warning_checks_started = true;
+        self.warnings = SettingsWarnings::start(egui_ctx, CheckContext::from_handle(&self.ai_backend));
+    }
+
+    /// Per-frame warnings upkeep, whatever page or tab is shown: rechecks the AI pane's
+    /// off-thread writes that landed since the last frame (so a save landing while a
+    /// launcher-only tab or another page is open is not lost), then applies arrived results
+    /// and requests a repaint when the set changed. Non-blocking.
+    pub fn poll_warnings(&mut self, egui_ctx: &egui::Context) {
+        let landed = self.shared.take_landed_changes();
+        self.recheck_warnings(&landed);
+        if self.warnings.poll() {
+            egui_ctx.request_repaint();
+        }
+    }
+
+    /// Queues a recheck of the evaluation units `changes` affect (no-op when empty or
+    /// before the worker started). The context is captured here on the GUI thread (one
+    /// short mutex read of the backend snapshot).
+    pub fn recheck_warnings(&mut self, changes: &[SettingChange]) {
+        if changes.is_empty() {
+            return;
+        }
+        self.warnings.recheck(changes, CheckContext::from_handle(&self.ai_backend));
+    }
+
+    /// The worst warning level over every setting (the main-menu Settings button badge);
+    /// `None` when nothing is flagged.
+    #[must_use]
+    pub fn overall_warning_level(&self) -> Option<WarningLevel> {
+        self.warnings.set().overall_level()
     }
 
     pub fn set_projects_root(&mut self, projects_root: PathBuf) {
@@ -329,8 +383,12 @@ impl SettingsPageState {
     #[cfg(target_arch = "wasm32")]
     pub fn close_python_console(&mut self) {}
 
+    /// Applies a reconciled (already persisted) AI install type: hides the Torch-upgrade
+    /// tab when it becomes `None` and rechecks the backend warnings, whose Python-missing
+    /// exemption depends on the install type.
     pub fn set_ai_install_type(&mut self, ai_install_type: config::AiInstallType) {
         self.ai_install_type = ai_install_type;
+        self.recheck_warnings(&[SettingChange::AiInstallType]);
         if ai_install_type == config::AiInstallType::None
             && self.active_tab == SettingsSectionId::TorchUpgrade
         {
@@ -358,9 +416,11 @@ impl SettingsPageState {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.active_tab {
-                            // Shared sections render through the shared panel container.
-                            // `Tutorials` produces no launcher outcome; `General` may
-                            // report a saved projects root.
+                            // Shared sections render through the shared panel container,
+                            // with the current warnings as inline item badges. `General`
+                            // may report a saved projects root; every shared section
+                            // reports the checked settings whose write landed, which are
+                            // rechecked here.
                             #[cfg(feature = "tutorial")]
                             id @ (SettingsSectionId::General
                             | SettingsSectionId::AiBackend
@@ -370,8 +430,10 @@ impl SettingsPageState {
                                     ui,
                                     SettingsSurface::Launcher,
                                     &self.ai_backend,
+                                    Some(self.warnings.set()),
                                 );
                                 queue_shared_outcome(&mut self.queued_actions, outcome.projects_dir_saved, outcome.storage_mode_changed);
+                                self.recheck_warnings(&outcome.changed_settings);
                                 // The launcher has no MemoryManager; the memory profile is
                                 // already persisted by the shared widget, so
                                 // `outcome.memory_profile_changed` is intentionally ignored.
@@ -383,8 +445,10 @@ impl SettingsPageState {
                                     ui,
                                     SettingsSurface::Launcher,
                                     &self.ai_backend,
+                                    Some(self.warnings.set()),
                                 );
                                 queue_shared_outcome(&mut self.queued_actions, outcome.projects_dir_saved, outcome.storage_mode_changed);
+                                self.recheck_warnings(&outcome.changed_settings);
                                 // The launcher has no MemoryManager; the memory profile is
                                 // already persisted by the shared widget, so
                                 // `outcome.memory_profile_changed` is intentionally ignored.
@@ -488,18 +552,22 @@ impl SettingsPageState {
         self.show_tab_button_impl(ui, tab, label, true);
     }
 
+    /// Draws one custom-painted tab button. `highlighted` gives it the amber
+    /// call-to-action look (the "upgrade to full" tab). The section's worst settings
+    /// warning, if any, is painted as a corner "!" badge after the label: paint only, the
+    /// click rect is unchanged.
     fn show_tab_button_impl(
         &mut self,
         ui: &mut Ui,
         tab: SettingsSectionId,
         label: &str,
-        warning: bool,
+        highlighted: bool,
     ) {
         let selected = self.active_tab == tab;
         let fill = if selected {
             TAB_ACTIVE_FILL
-        } else if warning {
-            TAB_WARNING_FILL
+        } else if highlighted {
+            TAB_HIGHLIGHT_FILL
         } else {
             TAB_IDLE_FILL
         };
@@ -527,8 +595,8 @@ impl SettingsPageState {
             fill,
             Stroke::new(
                 1.0,
-                if warning {
-                    TAB_WARNING_STROKE
+                if highlighted {
+                    TAB_HIGHLIGHT_STROKE
                 } else {
                     TAB_STROKE
                 },
@@ -542,6 +610,9 @@ impl SettingsPageState {
             FontId::proportional(14.0),
             text_color,
         );
+        if let Some(level) = self.warnings.set().section_level(tab) {
+            paint_corner_badge(ui.painter(), draw_rect, level);
+        }
         if response.clicked() {
             self.active_tab = tab;
         }

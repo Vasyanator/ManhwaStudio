@@ -23,11 +23,14 @@ slug, e.g. `cuda13`/`openvino`/`cpu`) picks the onnxruntime dylib/version; it de
 to `default_build_for_current_os()` when unset/unknown. The EP is validated to belong to
 that build's EP set (else the build's headline EP). The device is per-EP: a numeric
 adapter index for DirectML/CUDA/TensorRT/WebGPU, an OpenVINO device-TYPE string for
-OpenVINO, `Default` otherwise. Availability fallback (`decide_selection`, reusing the
-`gpu_utils` probes off the GUI thread): a CUDA build with no matching CUDA-major runtime
+OpenVINO, `Default` otherwise. Availability fallback (`native_fallback_reason`, the ONE
+owner of "is this build/EP runnable here", pure over `NativeHardwareFacts`; the AI
+settings panel asks the same function, so its build picker shows what this selection
+will do; the `gpu_utils` probes run off the GUI thread): a CUDA build with no matching CUDA-major runtime
 (`native_cuda_build_available`), an OpenVINO build with no Intel device/runtime
 (`native_openvino_runtime_available`), a WebGPU EP with no capable GPU
-(`native_webgpu_runtime_available`), an EP unsupported on this OS, or an informational
+(`native_webgpu_runtime_available`), an EP unsupported on this OS, a build with no
+manifest archive for this OS/arch (`onnx_runtime::build_shipped_here`), or an informational
 build with no runnable EP all fall back to the `cpu` build + CPU EP with a logged notice
 — never a wrong result. A genuine accelerator registration failure at load time still
 surfaces as an OrtLoad error and callers fall back to the Python backend with a log. The
@@ -68,7 +71,19 @@ Key items:
 - paddle_det_max_batch  : tiles per paddle_det_forward call for the effective provider
   (4 on CPU, 1 on any accelerator, to bound GPU memory).
 - execution_provider_from_ort_token : maps a shared ORT provider token -> ExecutionProvider.
-- native_load_scope_key : the effective {build}:{provider}[:{device}]@{version} SIGILL-guard key.
+- NativeHardwareFacts   : the probe answers the availability rule consults (`probe_all`).
+- native_fallback_reason / native_build_fallback_reason : the pure availability rule
+  (`NativeFallbackReason` = why a (build, EP) falls back to CPU); shared with the panel.
+- evaluate_native_selection / NativeSelectionReport : the UNCACHED, silent evaluation of a
+  `user_config` tree (requested + effective triple, fallback reason, guard scope key); the
+  cached selection (`compute_native_selection`) is built on it and adds the log lines.
+- native_load_scope_key : the effective {build}:{provider}[:{device}]@{version} SIGILL-guard key
+  (resolves and caches the selection on first call).
+- committed_load_scope_key : the cached selection's key, or None; never resolves the cache.
+- next_load_scope_key   : the guard scope the next load of this process uses (committed, else
+  the report's effective one); never resolves the cache. Shared by the settings guard warning
+  and the panel's guard-reset worker.
+- device_selection_for  : the one parse of `ai_onnx_device_id` into a NativeDeviceSelection.
 - ort_dylib_committed / active_build : the hot-swap-vs-restart signal + committed build slug.
 - reset_load_latch      : clears the in-process ORT load latch + cached runtime/engines
   (leaves ORT_DYLIB_COMMITTED set — a same-build hot-swap only).
@@ -349,26 +364,14 @@ pub fn execution_provider_from_ort_token(token: &str) -> ExecutionProvider {
     }
 }
 
-/// Computes the effective (build, provider, device) selection from the unified ONNX
-/// config keys (`General.ai_onnx_build` + `General.ai_onnx_provider` token +
-/// `General.ai_onnx_device_id`) plus the per-build hardware probes. See
-/// [`ProviderSelection`].
+/// Computes the effective (build, provider, device) selection for the process cache:
+/// reads `user_config`, evaluates it with [`evaluate_native_selection`] (the one decision
+/// owner) and logs the outcome. See [`ProviderSelection`].
 ///
-/// Resolution order:
-/// 1. `build` = the configured build slug validated against the catalog, else the
-///    per-OS default ([`default_build_for_current_os`]).
-/// 2. `provider` = the configured EP token, validated to belong to that build's EP set;
-///    otherwise the build's headline (first) EP ([`resolve_ep_for_build`]).
-/// 3. Availability fallback: a CUDA build with no matching CUDA-major runtime, an
-///    OpenVINO build with no Intel device/runtime, a WebGPU EP with no capable GPU, an
-///    EP unsupported on this OS, or an informational build with no runnable EP falls
-///    back to the `"cpu"` build + CPU EP with a logged notice — never a wrong result.
-/// 4. `device` = the per-EP accelerator selection built from `ai_onnx_device_id`
-///    ([`device_selection_for`]).
-///
-/// [`default_build_for_current_os`]: onnx_runtime::builds::default_build_for_current_os
-/// Changing the selection takes effect only after an app restart (the ort dylib is
-/// committed once; see [`ORT_DYLIB_COMMITTED`]).
+/// Log lines, in order: an unknown configured build slug (warn), the availability
+/// fallback (warn; a distinct line when the `cpu` build itself is not runnable), and the
+/// final selection (info). Changing the selection takes effect only after an app restart
+/// (the ort dylib is committed once; see [`ORT_DYLIB_COMMITTED`]).
 fn compute_native_selection() -> ProviderSelection {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or_else(|err| {
         runtime_log::log_warn(format!(
@@ -377,77 +380,146 @@ fn compute_native_selection() -> ProviderSelection {
         serde_json::Value::Null
     });
 
-    let build = resolve_build_slug(&cfg);
-    let requested_ep = config::ai_onnx_provider_token_from_user_settings(&cfg)
-        .as_deref()
-        .map(execution_provider_from_ort_token);
-    let ep = resolve_ep_for_build(build, requested_ep);
-
-    // Probe only what the current (build, EP) actually needs, so a CPU/DirectML config
-    // never runs nvidia-smi/lspci. Each probe runs off the GUI thread (worker only).
-    let cuda_available =
-        matches!(build, "cuda12" | "cuda13") && gpu_utils::native_cuda_build_available(build);
-    let openvino_available =
-        build == "openvino" && gpu_utils::native_openvino_runtime_available();
-    let webgpu_available =
-        ep == ExecutionProvider::WebGpu && gpu_utils::native_webgpu_runtime_available();
-
-    let outcome = decide_selection(
-        build,
-        ep,
-        onnx_runtime::builds::build_execution_providers(build).is_empty(),
-        cuda_available,
-        openvino_available,
-        webgpu_available,
-        provider_supported_on_platform(ep),
-    );
-    let (build, ep) = match outcome {
-        SelectionOutcome::Keep => (build, ep),
-        SelectionOutcome::CpuFallback(reason) => {
+    let report = evaluate_native_selection(&cfg);
+    if let Some(slug) = &report.unknown_configured_build {
+        runtime_log::log_warn(format!(
+            "[native-runtime] configured ONNX build '{slug}' is not in the catalog; \
+             using the per-OS default."
+        ));
+    }
+    match report.fallback {
+        None => {}
+        // The requested build already IS the fallback target, so "falling back to the
+        // CPU build" would be a no-op; the only reason the cpu build (CPU EP, runs on
+        // every OS) can get is that this OS/arch has no cpu archive. The selection is
+        // kept: the native load then fails with `NoManifestEntry` and callers route to
+        // the Python backend, exactly as before the ship check existed.
+        Some(reason) if report.requested_build == "cpu" => {
             runtime_log::log_warn(format!(
-                "[native-runtime] build '{build}' / provider '{}' unavailable ({}); \
-                 falling back to the CPU build. A restart is needed to retry the \
-                 selected build once its hardware/runtime is present.",
-                ep.id(),
+                "[native-runtime] build 'cpu' is not runnable here ({}); the native \
+                 runtime is unavailable on this OS/architecture and AI requests go to \
+                 the Python backend.",
                 reason.as_str()
             ));
-            ("cpu", ExecutionProvider::Cpu)
         }
-    };
-
-    let device_id_raw = config::ai_onnx_device_id_from_user_settings(&cfg);
-    let device = device_selection_for(ep, device_id_raw.as_deref());
+        Some(reason) => {
+            runtime_log::log_warn(format!(
+                "[native-runtime] build '{}' / provider '{}' unavailable ({}); \
+                 falling back to the CPU build. A restart is needed to retry the \
+                 selected build once its hardware/runtime is present.",
+                report.requested_build,
+                report.requested_provider.id(),
+                reason.as_str()
+            ));
+        }
+    }
 
     runtime_log::log_info(format!(
-        "[native-runtime] native selection: build='{build}' provider='{}' device={device:?}.",
-        ep.id()
+        "[native-runtime] native selection: build='{}' provider='{}' device={:?}.",
+        report.build,
+        report.provider.id(),
+        report.device
     ));
     ProviderSelection {
-        build,
-        provider: ep,
-        device,
+        build: report.build,
+        provider: report.provider,
+        device: report.device,
     }
 }
 
-/// Resolves the ONNX Runtime build slug for this process.
+/// The uncached evaluation of a native ONNX selection: what the first native load of a
+/// process would resolve for a given `user_config`. Produced by
+/// [`evaluate_native_selection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSelectionReport {
+    /// The configured build slug validated against the catalog; the per-OS default when
+    /// unset or unknown.
+    pub requested_build: &'static str,
+    /// The configured EP validated to belong to `requested_build`'s EP set; the build's
+    /// headline EP otherwise (CPU for a build with no EP).
+    pub requested_provider: ExecutionProvider,
+    /// The effective build after the availability fallback (`"cpu"` on a fallback,
+    /// except that a non-runnable `cpu` build is kept as is).
+    pub build: &'static str,
+    /// The effective EP after the availability fallback.
+    pub provider: ExecutionProvider,
+    /// The effective per-EP device selection, from `General.ai_onnx_device_id`.
+    pub device: NativeDeviceSelection,
+    /// Why the requested (build, EP) is not runnable here; `None` when it is.
+    pub fallback: Option<NativeFallbackReason>,
+    /// The configured `General.ai_onnx_build` slug when it is not in the catalog (the
+    /// per-OS default was used instead); `None` when unset or known.
+    pub unknown_configured_build: Option<String>,
+    /// The SIGILL guard scope key (`{build}:{provider}[:{device}]@{version}`) of the
+    /// EFFECTIVE selection.
+    pub scope_key: String,
+}
+
+/// Evaluates the native ONNX selection that `cfg` (a raw `user_config` tree) resolves to,
+/// exactly as the process's first native load would, WITHOUT reading or filling the
+/// process cache and without logging.
+///
+/// Resolution order:
+/// 1. `requested_build` = `General.ai_onnx_build` validated against the catalog, else the
+///    per-OS default (`default_build_for_current_os`).
+/// 2. `requested_provider` = the `General.ai_onnx_provider` token, validated to belong to
+///    that build's EP set; otherwise the build's headline EP ([`resolve_ep_for_build`]).
+/// 3. Availability fallback ([`native_fallback_reason`] over the facts of only the probes
+///    that (build, EP) needs): a non-runnable selection becomes the `cpu` build + CPU EP,
+///    except a non-runnable `cpu` build, which is kept (its load then fails and callers
+///    route to the Python backend).
+/// 4. `device` = the per-EP selection from `General.ai_onnx_device_id`
+///    ([`device_selection_for`]).
+///
+/// Runs the hardware probes the requested build/EP needs (CUDA/OpenVINO system commands,
+/// WebGPU loader scan): worker threads only, never the GUI thread.
+#[must_use]
+pub fn evaluate_native_selection(cfg: &serde_json::Value) -> NativeSelectionReport {
+    let (requested_build, unknown_configured_build) = resolve_build_slug(cfg);
+    let requested_token = config::ai_onnx_provider_token_from_user_settings(cfg)
+        .as_deref()
+        .map(execution_provider_from_ort_token);
+    let requested_provider = resolve_ep_for_build(requested_build, requested_token);
+
+    // Probe only what the requested (build, EP) actually needs, so a CPU/DirectML config
+    // never runs nvidia-smi/lspci.
+    let facts = NativeHardwareFacts::probe_for(requested_build, requested_provider);
+    let fallback = native_fallback_reason(requested_build, requested_provider, &facts);
+    let (build, provider) = if fallback.is_some() && requested_build != "cpu" {
+        ("cpu", ExecutionProvider::Cpu)
+    } else {
+        (requested_build, requested_provider)
+    };
+
+    let device_id_raw = config::ai_onnx_device_id_from_user_settings(cfg);
+    let device = device_selection_for(provider, device_id_raw.as_deref());
+    let scope_key = native_scope_key(build, provider, &device, &build_scope_version(build));
+    NativeSelectionReport {
+        requested_build,
+        requested_provider,
+        build,
+        provider,
+        device,
+        fallback,
+        unknown_configured_build,
+        scope_key,
+    }
+}
+
+/// Resolves the ONNX Runtime build slug for `cfg`.
 ///
 /// Returns the configured `General.ai_onnx_build` slug when it names a real catalog
 /// build; otherwise (unset, sentinel, or an unknown slug) the per-OS default
-/// `onnx_runtime::builds::default_build_for_current_os()`. The returned slug is always a
-/// `&'static str` from the catalog.
-fn resolve_build_slug(cfg: &serde_json::Value) -> &'static str {
+/// `onnx_runtime::builds::default_build_for_current_os()`. The slug is always a
+/// `&'static str` from the catalog; the second value carries an unknown configured slug
+/// so the caller can log it (this function stays silent).
+fn resolve_build_slug(cfg: &serde_json::Value) -> (&'static str, Option<String>) {
     match config::ai_onnx_build_from_user_settings(cfg) {
         Some(slug) => match onnx_runtime::builds::build_by_slug(&slug) {
-            Some(build) => build.slug,
-            None => {
-                runtime_log::log_warn(format!(
-                    "[native-runtime] configured ONNX build '{slug}' is not in the catalog; \
-                     using the per-OS default."
-                ));
-                onnx_runtime::builds::default_build_for_current_os()
-            }
+            Some(build) => (build.slug, None),
+            None => (onnx_runtime::builds::default_build_for_current_os(), Some(slug)),
         },
-        None => onnx_runtime::builds::default_build_for_current_os(),
+        None => (onnx_runtime::builds::default_build_for_current_os(), None),
     }
 }
 
@@ -474,7 +546,12 @@ fn resolve_ep_for_build(build: &str, requested: Option<ExecutionProvider>) -> Ex
 /// - Index-based EPs (`Cuda`/`TensorRt`/`DirectMl`/`WebGpu`): the id parses to an `i32`
 ///   adapter index → [`NativeDeviceSelection::Index`]; absent/unparseable → `Default`.
 /// - `Cpu`/`CoreMl`: the id is ignored → `Default`.
-fn device_selection_for(ep: ExecutionProvider, device_id: Option<&str>) -> NativeDeviceSelection {
+///
+/// The one parse owner of `ai_onnx_device_id`: callers that judge a persisted id (the
+/// settings checks, the AI panel's device reconcile) parse it here, so they accept exactly
+/// what the native load accepts. Pure.
+#[must_use]
+pub fn device_selection_for(ep: ExecutionProvider, device_id: Option<&str>) -> NativeDeviceSelection {
     match ep {
         ExecutionProvider::OpenVino => {
             match device_id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -497,9 +574,10 @@ fn device_selection_for(ep: ExecutionProvider, device_id: Option<&str>) -> Nativ
     }
 }
 
-/// Why a resolved (build, EP) selection was downgraded to the CPU build.
+/// Why a resolved (build, EP) selection is not runnable here and is downgraded to the
+/// CPU build. Produced by [`native_fallback_reason`], the one owner of that rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FallbackReason {
+pub enum NativeFallbackReason {
     /// The build has no runnable EP set (an informational catalog entry, e.g. `qnn`).
     NoRunnableProvider,
     /// A CUDA build was selected but no matching CUDA-major runtime is present.
@@ -510,9 +588,13 @@ enum FallbackReason {
     WebGpuUnavailable,
     /// The EP cannot run on the OS this binary targets.
     UnsupportedOnPlatform,
+    /// The build has no pinned archive for this OS/arch in the onnxruntime manifest
+    /// (e.g. DirectML off Windows, CoreML off Apple Silicon macOS), so it cannot load
+    /// whatever EP runs inside it.
+    BuildNotShippedForPlatform,
 }
 
-impl FallbackReason {
+impl NativeFallbackReason {
     /// A short English reason for the log line.
     fn as_str(self) -> &'static str {
         match self {
@@ -521,6 +603,7 @@ impl FallbackReason {
             Self::OpenVinoRuntimeMissing => "Intel device / OpenVINO runtime not detected",
             Self::WebGpuUnavailable => "no WebGPU-capable GPU detected",
             Self::UnsupportedOnPlatform => "provider unsupported on this OS",
+            Self::BuildNotShippedForPlatform => "build not shipped for this OS/architecture",
         }
     }
 }
@@ -531,11 +614,11 @@ enum SelectionOutcome {
     /// Keep the resolved (build, EP).
     Keep,
     /// Downgrade to the `"cpu"` build + CPU EP for the carried reason.
-    CpuFallback(FallbackReason),
+    CpuFallback(NativeFallbackReason),
 }
 
-/// Pure decision for whether a (build, EP) selection is runnable or must fall back to
-/// the CPU build.
+/// Pure decision core of [`native_fallback_reason`]: whether a (build, EP) selection is
+/// runnable or must fall back to the CPU build.
 ///
 /// The environment facts are passed in so the decision is unit-testable without touching
 /// the real system:
@@ -557,24 +640,137 @@ fn decide_selection(
     ep_platform_supported: bool,
 ) -> SelectionOutcome {
     if build_ep_set_empty {
-        return SelectionOutcome::CpuFallback(FallbackReason::NoRunnableProvider);
+        return SelectionOutcome::CpuFallback(NativeFallbackReason::NoRunnableProvider);
     }
     match build {
         "cuda12" | "cuda13" if !cuda_build_available => {
-            return SelectionOutcome::CpuFallback(FallbackReason::CudaRuntimeMissing);
+            return SelectionOutcome::CpuFallback(NativeFallbackReason::CudaRuntimeMissing);
         }
         "openvino" if !openvino_available => {
-            return SelectionOutcome::CpuFallback(FallbackReason::OpenVinoRuntimeMissing);
+            return SelectionOutcome::CpuFallback(NativeFallbackReason::OpenVinoRuntimeMissing);
         }
         _ => {}
     }
     if ep == ExecutionProvider::WebGpu && !webgpu_available {
-        return SelectionOutcome::CpuFallback(FallbackReason::WebGpuUnavailable);
+        return SelectionOutcome::CpuFallback(NativeFallbackReason::WebGpuUnavailable);
     }
     if !ep_platform_supported {
-        return SelectionOutcome::CpuFallback(FallbackReason::UnsupportedOnPlatform);
+        return SelectionOutcome::CpuFallback(NativeFallbackReason::UnsupportedOnPlatform);
     }
     SelectionOutcome::Keep
+}
+
+/// Final step of the decision core: a selection [`decide_selection`] keeps still falls
+/// back when its build has no manifest archive for this platform (`build_shipped`).
+/// Applied last, so every reason `decide_selection` reports keeps precedence.
+fn apply_ship_check(outcome: SelectionOutcome, build_shipped: bool) -> SelectionOutcome {
+    match outcome {
+        SelectionOutcome::Keep if !build_shipped => {
+            SelectionOutcome::CpuFallback(NativeFallbackReason::BuildNotShippedForPlatform)
+        }
+        other => other,
+    }
+}
+
+/// The hardware facts the native availability rule ([`native_fallback_reason`])
+/// consults. Each field is the answer of exactly one `ms_sysprobe::gpu_utils` probe, so
+/// the runtime's selection and the AI settings panel read the same probe for the same
+/// question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeHardwareFacts {
+    /// The `cuda12` build's CUDA 12.x + cuDNN 9.x runtime is present
+    /// (`gpu_utils::native_cuda_build_available("cuda12")`).
+    pub cuda12_available: bool,
+    /// The `cuda13` build's CUDA 13.x + cuDNN 9.x runtime is present
+    /// (`gpu_utils::native_cuda_build_available("cuda13")`).
+    pub cuda13_available: bool,
+    /// An Intel device + OpenVINO runtime is present
+    /// (`gpu_utils::native_openvino_runtime_available`).
+    pub openvino_available: bool,
+    /// A WebGPU-capable GPU / loader is present
+    /// (`gpu_utils::native_webgpu_runtime_available`).
+    pub webgpu_available: bool,
+}
+
+impl NativeHardwareFacts {
+    /// Runs every probe the rule can consult. Blocking (spawns short-lived system
+    /// commands and scans library directories): worker threads only.
+    #[must_use]
+    pub fn probe_all() -> Self {
+        Self {
+            cuda12_available: gpu_utils::native_cuda_build_available("cuda12"),
+            cuda13_available: gpu_utils::native_cuda_build_available("cuda13"),
+            openvino_available: gpu_utils::native_openvino_runtime_available(),
+            webgpu_available: gpu_utils::native_webgpu_runtime_available(),
+        }
+    }
+
+    /// Runs only the probes [`native_fallback_reason`] consults for `(build, ep)`, so a
+    /// CPU/DirectML selection never runs nvidia-smi/lspci; every unconsulted fact stays
+    /// `false`. Blocking: worker threads only.
+    fn probe_for(build: &str, ep: ExecutionProvider) -> Self {
+        Self {
+            cuda12_available: build == "cuda12" && gpu_utils::native_cuda_build_available(build),
+            cuda13_available: build == "cuda13" && gpu_utils::native_cuda_build_available(build),
+            openvino_available: build == "openvino"
+                && gpu_utils::native_openvino_runtime_available(),
+            webgpu_available: ep == ExecutionProvider::WebGpu
+                && gpu_utils::native_webgpu_runtime_available(),
+        }
+    }
+}
+
+/// THE native availability rule: whether `build` running `ep` is runnable on this
+/// machine, or why it must fall back to the CPU build. Pure over `facts` (no probe, no
+/// config read, no cache), so the AI settings panel can ask it per build on its own
+/// probe worker's facts and show exactly what the runtime's selection will do.
+///
+/// `build` is a catalog slug (an unknown slug has no EP and reports
+/// [`NativeFallbackReason::NoRunnableProvider`]); `ep` should belong to the build's EP
+/// set (see `resolve_ep_for_build`). Checks, first failure wins: no runnable EP; a CUDA
+/// build without its CUDA-major runtime or an OpenVINO build without its runtime
+/// (build-level, whatever EP runs inside); a WebGPU EP without a WebGPU GPU; an EP the
+/// target OS cannot run; a build with no archive for this OS/arch in the embedded
+/// onnxruntime manifest (`onnx_runtime::build_shipped_here`, the manifest owner). Returns
+/// `None` when runnable.
+#[must_use]
+pub fn native_fallback_reason(
+    build: &str,
+    ep: ExecutionProvider,
+    facts: &NativeHardwareFacts,
+) -> Option<NativeFallbackReason> {
+    let cuda_build_available = match build {
+        "cuda12" => facts.cuda12_available,
+        "cuda13" => facts.cuda13_available,
+        _ => false,
+    };
+    let outcome = decide_selection(
+        build,
+        ep,
+        onnx_runtime::builds::build_execution_providers(build).is_empty(),
+        cuda_build_available,
+        facts.openvino_available,
+        facts.webgpu_available,
+        provider_supported_on_platform(ep),
+    );
+    // The embedded manifest is the owner of "which builds ship for this OS/arch"; the
+    // allocation-free lookup keeps the panel's per-frame call cheap.
+    let build_shipped = onnx_runtime::build_shipped_here(build);
+    match apply_ship_check(outcome, build_shipped) {
+        SelectionOutcome::Keep => None,
+        SelectionOutcome::CpuFallback(reason) => Some(reason),
+    }
+}
+
+/// [`native_fallback_reason`] for `build` running its headline (first) EP: what the
+/// runtime does when `build` is configured with no EP of its own, which is also the EP
+/// the AI settings panel resets to when the user picks a build. `None` = runnable.
+#[must_use]
+pub fn native_build_fallback_reason(
+    build: &str,
+    facts: &NativeHardwareFacts,
+) -> Option<NativeFallbackReason> {
+    native_fallback_reason(build, resolve_ep_for_build(build, None), facts)
 }
 
 /// The SIGILL load-guard scope key for the effective native (build, provider, device)
@@ -589,7 +785,37 @@ fn decide_selection(
 /// probes); call off the GUI thread.
 #[must_use]
 pub fn native_load_scope_key() -> String {
-    let selection = native_selection();
+    selection_scope_key(&native_selection())
+}
+
+/// The SIGILL guard scope key this process has already committed to: the cached
+/// selection's key, or `None` when no native selection was resolved yet. Never resolves
+/// the selection itself (a plain `OnceLock::get`), so a caller that only inspects state
+/// (the launcher's settings checks) cannot pin the process to the config of that moment.
+/// No I/O beyond the embedded manifest lookup; safe on any thread.
+#[must_use]
+pub fn committed_load_scope_key() -> Option<String> {
+    SELECTED_PROVIDER.get().map(selection_scope_key)
+}
+
+/// The SIGILL guard scope the NEXT native load of this process uses, WITHOUT resolving
+/// the process selection: the committed scope when the process already resolved its
+/// selection (it cannot change without a restart), else `report`'s effective scope — what
+/// the first load would resolve from the same config. The one rule shared by the settings
+/// guard warning and the AI panel's guard-reset ("Retry") worker, so a Suspect badge is
+/// always cleared by its own button and a build changed before any load is reflected.
+#[must_use]
+pub fn next_load_scope_key(report: &NativeSelectionReport) -> String {
+    scope_for_next_load(committed_load_scope_key(), &report.scope_key)
+}
+
+/// Pure decision of [`next_load_scope_key`]: a committed scope wins over the configured one.
+fn scope_for_next_load(committed: Option<String>, configured: &str) -> String {
+    committed.unwrap_or_else(|| configured.to_string())
+}
+
+/// Formats the guard scope key of a resolved selection (see [`native_scope_key`]).
+fn selection_scope_key(selection: &ProviderSelection) -> String {
     native_scope_key(
         selection.build,
         selection.provider,
@@ -1860,17 +2086,17 @@ mod tests {
         // A CUDA build without the matching CUDA runtime -> CPU fallback.
         assert_eq!(
             decide_selection("cuda13", ExecutionProvider::Cuda, false, false, false, false, true),
-            SelectionOutcome::CpuFallback(FallbackReason::CudaRuntimeMissing)
+            SelectionOutcome::CpuFallback(NativeFallbackReason::CudaRuntimeMissing)
         );
         // An OpenVINO build without an Intel device/runtime -> CPU fallback.
         assert_eq!(
             decide_selection("openvino", ExecutionProvider::OpenVino, false, false, false, false, true),
-            SelectionOutcome::CpuFallback(FallbackReason::OpenVinoRuntimeMissing)
+            SelectionOutcome::CpuFallback(NativeFallbackReason::OpenVinoRuntimeMissing)
         );
         // A WebGPU EP with no capable GPU -> CPU fallback.
         assert_eq!(
             decide_selection("webgpu", ExecutionProvider::WebGpu, false, false, false, false, true),
-            SelectionOutcome::CpuFallback(FallbackReason::WebGpuUnavailable)
+            SelectionOutcome::CpuFallback(NativeFallbackReason::WebGpuUnavailable)
         );
         // A WebGPU EP WITH a capable GPU is kept.
         assert_eq!(
@@ -1880,17 +2106,181 @@ mod tests {
         // An informational build with no EP -> CPU fallback (checked first).
         assert_eq!(
             decide_selection("qnn", ExecutionProvider::Cpu, true, false, false, false, true),
-            SelectionOutcome::CpuFallback(FallbackReason::NoRunnableProvider)
+            SelectionOutcome::CpuFallback(NativeFallbackReason::NoRunnableProvider)
         );
         // An EP unsupported on this OS -> CPU fallback.
         assert_eq!(
             decide_selection("directml", ExecutionProvider::DirectMl, false, false, false, false, false),
-            SelectionOutcome::CpuFallback(FallbackReason::UnsupportedOnPlatform)
+            SelectionOutcome::CpuFallback(NativeFallbackReason::UnsupportedOnPlatform)
         );
         // A plain CPU build is always kept.
         assert_eq!(
             decide_selection("cpu", ExecutionProvider::Cpu, false, false, false, false, true),
             SelectionOutcome::Keep
+        );
+    }
+
+    /// Characterization of the cases where the settings panel's former per-build rule
+    /// disagreed with this rule (WP0 divergence list): the decision consults NO DirectML
+    /// adapter fact, checks WebGPU at the EP level, and checks CUDA / OpenVINO at the
+    /// build level whatever EP is chosen inside the build.
+    #[test]
+    fn decide_selection_pins_formerly_divergent_cases() {
+        // D1: DirectML EP with no adapter fact at all is kept (DXGI always offers an
+        // adapter; the adapter probe is a name heuristic with false negatives).
+        assert_eq!(
+            decide_selection("directml", ExecutionProvider::DirectMl, false, false, false, false, true),
+            SelectionOutcome::Keep
+        );
+        // D2: the CPU EP inside the WebGPU build needs no WebGPU GPU.
+        assert_eq!(
+            decide_selection("webgpu", ExecutionProvider::Cpu, false, false, false, false, true),
+            SelectionOutcome::Keep
+        );
+        // D3: the decision core keeps the CPU EP inside the DirectML / CoreML builds on
+        // any OS ...
+        let directml_cpu =
+            decide_selection("directml", ExecutionProvider::Cpu, false, false, false, false, true);
+        let coreml_cpu =
+            decide_selection("coreml", ExecutionProvider::Cpu, false, false, false, false, true);
+        assert_eq!(directml_cpu, SelectionOutcome::Keep);
+        assert_eq!(coreml_cpu, SelectionOutcome::Keep);
+        // ... and, formerly divergent (D3b, the runtime used to load a build with no
+        // archive here and fail), the ship check now sends a foreign-platform build to CPU.
+        assert_eq!(
+            apply_ship_check(directml_cpu, false),
+            SelectionOutcome::CpuFallback(NativeFallbackReason::BuildNotShippedForPlatform)
+        );
+        assert_eq!(
+            apply_ship_check(coreml_cpu, false),
+            SelectionOutcome::CpuFallback(NativeFallbackReason::BuildNotShippedForPlatform)
+        );
+        // CUDA / OpenVINO are build-level: the CPU EP inside them still needs the runtime.
+        assert_eq!(
+            decide_selection("cuda12", ExecutionProvider::Cpu, false, false, false, false, true),
+            SelectionOutcome::CpuFallback(NativeFallbackReason::CudaRuntimeMissing)
+        );
+        assert_eq!(
+            decide_selection("openvino", ExecutionProvider::Cpu, false, false, false, false, true),
+            SelectionOutcome::CpuFallback(NativeFallbackReason::OpenVinoRuntimeMissing)
+        );
+    }
+
+    /// The public rule maps each fact to the build that consults it: a CUDA build reads
+    /// only its own CUDA-major fact, OpenVINO only its runtime fact, WebGPU only at the
+    /// EP level, and an unknown slug has no runnable EP.
+    // Every build this test keeps ships for x86_64 Windows/Linux only (CUDA/OpenVINO
+    // have no archive elsewhere), so the Keep expectations hold on those targets.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn native_fallback_reason_reads_the_matching_fact() {
+        let none = NativeHardwareFacts::default();
+        let all = NativeHardwareFacts {
+            cuda12_available: true,
+            cuda13_available: true,
+            openvino_available: true,
+            webgpu_available: true,
+        };
+        assert_eq!(native_fallback_reason("cpu", ExecutionProvider::Cpu, &none), None);
+        assert_eq!(
+            native_fallback_reason("cuda12", ExecutionProvider::Cuda, &none),
+            Some(NativeFallbackReason::CudaRuntimeMissing)
+        );
+        // cuda12 does not read the cuda13 fact, and vice versa.
+        let only_cuda13 = NativeHardwareFacts { cuda13_available: true, ..none };
+        assert_eq!(
+            native_fallback_reason("cuda12", ExecutionProvider::Cuda, &only_cuda13),
+            Some(NativeFallbackReason::CudaRuntimeMissing)
+        );
+        assert_eq!(native_fallback_reason("cuda13", ExecutionProvider::Cuda, &only_cuda13), None);
+        assert_eq!(native_fallback_reason("cuda12", ExecutionProvider::Cuda, &all), None);
+        assert_eq!(
+            native_fallback_reason("openvino", ExecutionProvider::OpenVino, &none),
+            Some(NativeFallbackReason::OpenVinoRuntimeMissing)
+        );
+        assert_eq!(
+            native_fallback_reason("webgpu", ExecutionProvider::WebGpu, &none),
+            Some(NativeFallbackReason::WebGpuUnavailable)
+        );
+        assert_eq!(native_fallback_reason("webgpu", ExecutionProvider::WebGpu, &all), None);
+        assert_eq!(
+            native_fallback_reason("qnn", ExecutionProvider::Cpu, &all),
+            Some(NativeFallbackReason::NoRunnableProvider)
+        );
+        assert_eq!(
+            native_fallback_reason("no-such-build", ExecutionProvider::Cpu, &all),
+            Some(NativeFallbackReason::NoRunnableProvider)
+        );
+    }
+
+    /// The ship check only turns a Keep into a fallback; an earlier reason wins, and a
+    /// shipped build is untouched.
+    #[test]
+    fn ship_check_applies_last() {
+        assert_eq!(apply_ship_check(SelectionOutcome::Keep, true), SelectionOutcome::Keep);
+        assert_eq!(
+            apply_ship_check(SelectionOutcome::Keep, false),
+            SelectionOutcome::CpuFallback(NativeFallbackReason::BuildNotShippedForPlatform)
+        );
+        let earlier = SelectionOutcome::CpuFallback(NativeFallbackReason::UnsupportedOnPlatform);
+        assert_eq!(apply_ship_check(earlier, false), earlier);
+    }
+
+    /// Through the public rule, the CPU EP inside a foreign-platform build falls back
+    /// because the embedded manifest has no archive for it (D3b), while the same EP
+    /// inside a build that ships here is kept. No probe runs.
+    #[test]
+    fn native_fallback_reason_rejects_builds_not_shipped_here() {
+        let none = NativeHardwareFacts::default();
+        let directml_cpu = native_fallback_reason("directml", ExecutionProvider::Cpu, &none);
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert_eq!(directml_cpu, None);
+        } else {
+            assert_eq!(directml_cpu, Some(NativeFallbackReason::BuildNotShippedForPlatform));
+        }
+        let coreml_cpu = native_fallback_reason("coreml", ExecutionProvider::Cpu, &none);
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(coreml_cpu, None);
+        } else {
+            assert_eq!(coreml_cpu, Some(NativeFallbackReason::BuildNotShippedForPlatform));
+        }
+        // The rule follows the manifest owner, not a platform table of its own.
+        for build in ["cpu", "directml", "webgpu", "coreml"] {
+            let shipped = onnx_runtime::build_shipped_here(build);
+            assert_eq!(
+                native_fallback_reason(build, ExecutionProvider::Cpu, &none).is_none(),
+                shipped,
+                "{build} with the CPU EP"
+            );
+        }
+    }
+
+    /// The per-build question the settings panel asks evaluates the build's headline EP,
+    /// so platform-gated builds follow the target OS and DirectML needs no adapter fact.
+    #[test]
+    fn native_build_fallback_reason_uses_the_headline_ep() {
+        let none = NativeHardwareFacts::default();
+        assert_eq!(
+            native_build_fallback_reason("cpu", &none).is_none(),
+            onnx_runtime::build_shipped_here("cpu")
+        );
+        assert_eq!(
+            native_build_fallback_reason("directml", &none).is_none(),
+            cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        );
+        assert_eq!(
+            native_build_fallback_reason("coreml", &none).is_none(),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
+        // The webgpu build's headline EP is WebGPU, so the build needs the WebGPU fact
+        // even though its CPU EP alone would run (see the divergence pins above).
+        assert_eq!(
+            native_build_fallback_reason("webgpu", &none),
+            Some(NativeFallbackReason::WebGpuUnavailable)
+        );
+        assert_eq!(
+            native_build_fallback_reason("qnn", &none),
+            Some(NativeFallbackReason::NoRunnableProvider)
         );
     }
 
@@ -1937,6 +2327,76 @@ mod tests {
         );
         assert_ne!(webgpu, cpu);
         assert!(webgpu.starts_with("webgpu:"));
+    }
+
+    #[test]
+    fn evaluate_native_selection_keeps_a_runnable_cpu_build() {
+        let report = evaluate_native_selection(&json!({"General": {"ai_onnx_build": "cpu"}}));
+        assert_eq!(report.requested_build, "cpu");
+        assert_eq!(report.requested_provider, ExecutionProvider::Cpu);
+        assert_eq!(report.unknown_configured_build, None);
+        assert_eq!(report.device, NativeDeviceSelection::Default);
+        assert_eq!(
+            report.scope_key,
+            native_scope_key(
+                "cpu",
+                ExecutionProvider::Cpu,
+                &NativeDeviceSelection::Default,
+                &build_scope_version("cpu")
+            )
+        );
+        // The cpu build is kept whether or not this target ships a cpu archive.
+        assert_eq!(report.build, "cpu");
+        assert_eq!(report.provider, ExecutionProvider::Cpu);
+        if onnx_runtime::build_shipped_here("cpu") {
+            assert_eq!(report.fallback, None);
+        } else {
+            assert_eq!(report.fallback, Some(NativeFallbackReason::BuildNotShippedForPlatform));
+        }
+    }
+
+    #[test]
+    fn evaluate_native_selection_falls_back_from_an_informational_build() {
+        // `qnn` has no EP, so no hardware probe runs (probes are gated on cuda, openvino
+        // and the WebGPU EP).
+        let report = evaluate_native_selection(&json!({"General": {"ai_onnx_build": "qnn"}}));
+        assert_eq!(report.requested_build, "qnn");
+        assert_eq!(report.requested_provider, ExecutionProvider::Cpu);
+        assert_eq!(report.fallback, Some(NativeFallbackReason::NoRunnableProvider));
+        assert_eq!(report.build, "cpu");
+        assert_eq!(report.provider, ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn evaluate_native_selection_reports_an_unknown_build_slug() {
+        // The CPU token keeps the per-OS default build (webgpu on Linux) off its WebGPU
+        // probe, so the test never depends on this machine's GPU.
+        let report = evaluate_native_selection(&json!({"General": {
+            "ai_onnx_build": "no-such-build",
+            "ai_onnx_provider": "CPUExecutionProvider"
+        }}));
+        assert_eq!(report.unknown_configured_build.as_deref(), Some("no-such-build"));
+        assert_eq!(
+            report.requested_build,
+            onnx_runtime::builds::default_build_for_current_os()
+        );
+    }
+
+    #[test]
+    fn next_load_scope_prefers_the_committed_scope() {
+        let configured = "cuda13:CUDAExecutionProvider:0@1.24.1";
+        let committed = "cpu:CPUExecutionProvider@1.27.0";
+        assert_eq!(scope_for_next_load(Some(committed.to_string()), configured), committed);
+        assert_eq!(scope_for_next_load(None, configured), configured);
+    }
+
+    #[test]
+    fn committed_load_scope_key_never_resolves_the_selection() {
+        // No test in this crate resolves the cached selection (`native_selection()` is
+        // reached only through load paths and `active_build()` while committed), so the
+        // cache is empty here and the read must leave it empty.
+        assert_eq!(committed_load_scope_key(), None);
+        assert!(SELECTED_PROVIDER.get().is_none());
     }
 
     #[test]

@@ -25,8 +25,38 @@ load a native shared library, so the binary gates the re-export off wasm.
 Selection: ONE unified ONNX selection — `General.ai_onnx_build` (build slug from
 `ms_onnx_runtime::builds`), `ai_onnx_provider` (ORT token), `ai_onnx_device_id` — is shared
 with the Python backend and resolved once per process. An unavailable accelerator falls back
-to the `cpu` build with a logged notice, never a wrong result; a load-time EP failure is an
+to the `cpu` build with a logged notice, never a wrong result (where a `cpu` archive ships, see
+below); a load-time EP failure is an
 error the callers answer by falling back to the backend.
+`evaluate_native_selection(cfg)` is the one owner of that resolution: uncached, silent, and
+returning a `NativeSelectionReport` (requested and effective triple, fallback reason, guard
+scope key of the effective triple). The process cache (`compute_native_selection`, behind
+`native_selection()`) calls it once and adds the log lines; an inspection-only caller (the
+launcher's settings checks) calls it directly and reads the cache only through
+`committed_load_scope_key()`, which never resolves it, so inspecting the config never pins the
+process to it.
+
+Availability rule owner: `native_fallback_reason(build, ep, &NativeHardwareFacts)` (pure, uncached;
+`NativeFallbackReason` says why) answers "can this build/EP run here" for the runtime's
+selection and for the AI backend panel's native build picker. It also rejects a build with no
+archive for this OS/arch, asking the manifest owner (`ms_onnx_runtime::build_shipped_here`),
+never a platform table of its own. The cached selection calls it over the facts of only the
+probes that (build, EP) needs; the panel's build picker calls `native_build_fallback_reason`
+(headline EP) over `NativeHardwareFacts::probe_all()` taken on its own probe worker. A new
+build-availability decision for the native runtime belongs here, not in a caller.
+Known residual outside this rule: the panel's Backend-runtime provider list
+(`ms-settings-ui` `build_onnx_provider_options`) keeps a per-provider `native_available` flag
+from its own caps (DirectML = an adapter was detected, CUDA = the CUDA 12 runtime probe,
+WebGPU = the same WebGPU fact). Its only live consumer is `default_onnx_provider`, the Backend
+mode's default-provider seed; the `Native` arm of `provider_runtime_state` that also reads it
+is reachable only from tests, because the Native runtime draws the build picker instead.
+Routing it through this rule would change the Backend default on Windows without a detected
+adapter and cannot serve its tests, which simulate foreign OSes through flags.
+
+No CPU archive: on a target whose manifest ships no `cpu` build (macOS x86_64, aarch64
+Linux/Windows), the CPU fallback cannot load either. The selection then logs one warning and
+keeps `cpu` (no "falling back" line for a cpu -> cpu no-op); the load fails with
+`NoManifestEntry` and callers route to the Python backend, by design.
 
 Background pipeline: this crate owns no thread. Native load and inference run on the
 callers' workers — the OCR and text-detector workers in `ms-tab-translation` (`ocr.rs`,
@@ -49,6 +79,14 @@ send every page to the backend).
 - The SIGILL-guard scope key is `{build}:{provider}[:{device}]@{version}`
   (`native_load_scope_key`), so a crashed scope never blocks a different
   build/provider/adapter.
+- `native_load_scope_key` resolves and caches the selection; code that must not pin it
+  (settings inspection, workers that only report, the panel's guard reset) uses
+  `evaluate_native_selection` and `committed_load_scope_key` / `next_load_scope_key` instead.
+  `next_load_scope_key` (committed scope, else the configured effective one) is the one rule
+  for "which guard does the next load read": the settings guard warning and the reset button
+  both use it, so they always address the same scope.
+- `device_selection_for` is the one parse of `ai_onnx_device_id`; a caller judging a
+  persisted id (settings checks, the panel's device reconcile) parses through it.
 - Every dylib load is bracketed by the crash guard in `ms_config::ort_load_guard`
   (`mark_ort_load_attempted` before, `mark_ort_load_succeeded` after the first successful
   inference, `reset_ort_load_guard` on a graceful failure). That guard is what makes an
@@ -60,8 +98,10 @@ send every page to the backend).
 - This crate must never name `tabs`, `app` or `launcher`.
 
 ## Editing map
-- To change provider/device resolution or the fallback ladder, see `decide_selection` and
-  its neighbours in `lib.rs`.
+- To change provider/device resolution or the fallback ladder, see `native_fallback_reason`
+  (and its pure core `decide_selection`) in `lib.rs`; a new hardware fact goes into
+  `NativeHardwareFacts` (both `probe_all` and the lazy `probe_for`). The settings panel picks
+  the change up without edits.
 - To change the engine cache policy, see the LRU section of `lib.rs`
   (`General.ai_max_loaded_models`).
 - To change WHERE the crash-guard markers are written, see

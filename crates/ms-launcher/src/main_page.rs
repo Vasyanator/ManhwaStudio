@@ -9,6 +9,7 @@ Main responsibilities:
 - keep the button grid and footer layout isolated from runtime logic;
 - show installer-mode notices from `General.ai_install_type` under the main menu;
 - show the storage-mode conversion status line (progress, then a dismissable failure notice);
+- paint the overall settings-warnings level as a corner "!" on the Settings menu button;
 - offer the native-only small "Open image" button (single-image mode), placed over the
   title -> grid gap without taking layout space, and its picking status;
 - render the central UI card on top of the blur layer with the same button/status composition as launcher.py.
@@ -21,6 +22,7 @@ use crate::state::LauncherPage;
 use crate::theme;
 #[cfg(feature = "tutorial")]
 use crate::tutorial;
+use ms_settings_ui::settings_warnings::paint_corner_badge;
 use egui::{Align, Area, Color32, Frame, Grid, Layout, Order, RichText, Stroke, Ui, Vec2};
 
 const LEFT_COLUMN_BUTTON_WIDTH: f32 = 210.0;
@@ -154,6 +156,11 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                 ui.add_space(12.0);
                 let settings_response =
                     menu_button_response(ui, t!("launcher.main.settings_button"), RIGHT_COLUMN_BUTTON_WIDTH);
+                // The worst settings warning as a corner "!": paint only, so neither the
+                // click rect nor the tutorial target rect below changes.
+                if let Some(level) = app.settings_warning_level() {
+                    paint_corner_badge(ui.painter(), settings_response.rect, level);
+                }
                 #[cfg(feature = "tutorial")]
                 app.tutorial.mark(tutorial::TARGET_SETTINGS, settings_response.rect);
                 if settings_response.clicked() {

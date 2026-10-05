@@ -18,7 +18,12 @@ Main modules:
 - `ai_backend_panel`: the AI-backend pane (runtime selection, ONNX provider/device/build,
   model limit, health readout, ORT crash-guard reset).
 - `ai_backend_supervisor`: the app-global handle both shells drive the Python AI backend
-  through (`AiBackendHandle`), including its health probe.
+  through (`AiBackendHandle`), including its health probe, and the backend spawn
+  preconditions (`check_backend_spawnable`).
+- `onnx_caps` (native-only): the probed ONNX capabilities (`OnnxCaps`, `probe_onnx_caps`) and
+  the EP device-id rule (`ep_device_ids`) the AI pane and inspection callers share.
+- `settings_warnings`: the per-setting warnings of the shared panes — keys, reasons and
+  aggregation (`WarningSet`), the checks worker (`SettingsWarnings`) and the "!" badge.
 - `tutorial` (feature-gated): the onboarding overlay engine, the per-surface controller,
   the persisted progress and the shared "Обучение" pane.
 
@@ -37,7 +42,13 @@ extern crate ms_i18n;
 pub mod ai_backend_panel;
 pub mod ai_backend_supervisor;
 pub mod general_settings_panel;
+// Probed ONNX capabilities and the device-id rule over them (native-only probes).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod onnx_caps;
 pub mod settings_shared;
+// Per-setting warnings ("!" badges): GUI-free model, native-only checks, the worker
+// runtime and the badge painter.
+pub mod settings_warnings;
 // The process-wide Dev/Prod storage conversion job (startup reconciliation and the
 // General pane's switch share it) and the pane row that drives it.
 pub mod storage_mode_job;

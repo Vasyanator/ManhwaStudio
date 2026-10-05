@@ -11,6 +11,8 @@ Main responsibilities:
 - track detached launcher windows that live outside the page stack.
 - carry launcher exit intent back to the startup flow;
 - remember which storage-conversion failure notice the main page already dismissed.
+- say whether a surface that can create the projects folder is open
+  (`project_creator_open`, the edge the settings-warnings recheck of that folder uses).
 */
 
 use crate::pages::base::PageTransition;
@@ -81,6 +83,15 @@ impl LauncherState {
         }
     }
 
+    /// Whether a surface that can create the projects folder is open: the Import page (an
+    /// archive import creates `{root}/{title}`), the new-project window or the PSD-import
+    /// window (both save a title under the root). `LauncherApp` rechecks the projects-folder
+    /// warning when this turns false.
+    #[must_use]
+    pub fn project_creator_open(&self) -> bool {
+        self.current_page == LauncherPage::ImportChapter || self.new_project_window_open || self.psd_import_window_open
+    }
+
     pub fn begin_transition(&mut self, target: LauncherPage) {
         if self.current_page == target || self.page_transition.is_some() {
             return;
@@ -97,5 +108,25 @@ impl LauncherState {
         if should_finish && let Some(transition) = self.page_transition.take() {
             self.current_page = transition.target();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LauncherPage, LauncherState};
+
+    #[test]
+    fn project_creator_open_covers_import_page_and_creating_windows() {
+        let mut state = LauncherState::new();
+        assert!(!state.project_creator_open());
+        state.current_page = LauncherPage::ImportChapter;
+        assert!(state.project_creator_open());
+        state.current_page = LauncherPage::Settings;
+        assert!(!state.project_creator_open());
+        state.new_project_window_open = true;
+        assert!(state.project_creator_open());
+        state.new_project_window_open = false;
+        state.psd_import_window_open = true;
+        assert!(state.project_creator_open());
     }
 }

@@ -36,12 +36,16 @@ startup through `apply_ui_scale_from_user_settings`.
 
 Key items:
 - `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values.
-- `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing.
+- `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing,
+  including the `SettingChange`s of the checked settings saved this frame (projects
+  root, UI language) that drive the launcher's warning rechecks.
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
   (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy + UI-language
-  selector + typesetting-language selector.
+  selector + typesetting-language selector. With a `WarningSet` (launcher) the
+  projects-dir and UI-language labels carry their inline warning badges; `None` (studio)
+  draws no badge and keeps the layout unchanged.
 - `draw_autosave_settings`: the global autosave policy (interval minutes + action
   threshold); applied live to `ms_config::autosave_policy` first, then persisted.
 - `apply_ui_scale` / `apply_ui_scale_from_user_settings`: apply `General.ui_scale_percent`
@@ -65,6 +69,8 @@ use ms_log::runtime_log;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
 use ms_thread as thread;
+use crate::settings_shared::with_item_badge;
+use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 use crate::storage_mode_setting::{StorageModeSettingState, draw_storage_mode_setting};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -152,6 +158,11 @@ pub struct GeneralSettingsOutcome {
     /// Set to the target mode on the frame a storage-mode switch started by this pane
     /// finished converting (successfully or with per-document failures).
     pub storage_mode_changed: Option<ms_config::StorageMode>,
+    /// Checked settings whose synchronous save RAN this frame
+    /// (`SettingChange::ProjectsRoot`, `SettingChange::UiLanguage`), reported whether the
+    /// write succeeded or failed: the warning recheck re-reads the disk, so a failed write
+    /// only re-confirms the old state.
+    pub changed_settings: Vec<SettingChange>,
 }
 
 impl Default for GeneralSettingsPanelState {
@@ -238,15 +249,20 @@ impl GeneralSettingsPanelState {
 /// Persists a changed projects dir / memory profile synchronously (one serialized
 /// `ms_docstore` update of `user_config.json`, under its document lock); persistence failures set an error status and
 /// are logged. The native folder picker button is desktop-only.
+///
+/// `warnings` is the launcher's warning set: the projects-dir and UI-language labels get
+/// their inline badges (`with_item_badge`). The studio passes `None`: no badge, the
+/// pre-badge layout.
 #[must_use]
 pub fn draw_general_settings_panel(
     ui: &mut egui::Ui,
     state: &mut GeneralSettingsPanelState,
+    warnings: Option<&WarningSet>,
 ) -> GeneralSettingsOutcome {
     let mut outcome = GeneralSettingsOutcome::default();
 
     // Projects-directory editor (rich variant: text field + folder picker + save).
-    ui.label(t!("settings.general.projects_dir_label"));
+    with_item_badge(ui, warnings, SettingKey::ProjectsRoot, |ui| ui.label(t!("settings.general.projects_dir_label")));
     let mut should_save = false;
     ui.horizontal_wrapped(|ui| {
         let response = ui.add(
@@ -304,6 +320,8 @@ pub fn draw_general_settings_panel(
                 state.status = GeneralSettingsStatus::Error(tf!("settings.general.projects_dir_save_error", err = err));
             }
         }
+        // Reported after either arm: the write ran, and the recheck reads what is on disk.
+        outcome.changed_settings.push(SettingChange::ProjectsRoot);
     }
 
     ui.separator();
@@ -358,7 +376,7 @@ pub fn draw_general_settings_panel(
 
     // Interface-language selector. Populated once from the on-disk `locale/` folder
     // (see `scan_locale_options`); changing it persists and live-installs the locale.
-    ui.label(t!("settings.general.ui_language_label"));
+    with_item_badge(ui, warnings, SettingKey::UiLanguage, |ui| ui.label(t!("settings.general.ui_language_label")));
     ui.small(t!("settings.general.ui_language_hint"));
     let previous_tag = state.ui_language_tag.clone();
     let selected_display = state
@@ -384,6 +402,8 @@ pub fn draw_general_settings_panel(
     });
     if state.ui_language_tag != previous_tag {
         apply_ui_language_change(ui, state);
+        // The save ran (successfully or not); the recheck reads what is on disk.
+        outcome.changed_settings.push(SettingChange::UiLanguage);
     }
 
     ui.separator();

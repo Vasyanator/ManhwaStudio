@@ -45,7 +45,11 @@ state arrives.
   tab bar. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
   keep their local renderers here. The `ProjectsRootChanged` invariant is unchanged — a saved
   projects root is still emitted as `PageNavAction::ProjectsRootChanged` (mapped from the shared
-  General section's outcome).
+  General section's outcome). The page also OWNS the launcher's `SettingsWarnings` (started on
+  the entry's first frame by `LauncherApp::poll_workers`): it passes the set to the shared
+  panes (item badges), paints each tab's worst level as a corner badge in
+  `show_tab_button_impl` (`highlighted` there is the unrelated amber upgrade-tab look), and
+  rechecks the units named by every `SettingChange` the panes report.
 
 ## Contracts and invariants
 - Page UI must stay responsive. Do not perform project scans, archive traversal, compression,
@@ -65,6 +69,10 @@ state arrives.
   unreadable document replaces the Convert offer with a warning. The chapter worker holds a
   `storage_mode_job::ChapterConversionLease` (taken before the target is read, released before
   the result is sent), so the global switch is refused and its radio disabled meanwhile.
+- Settings warnings: every write of a checked setting must reach
+  `SettingsPageState::recheck_warnings` (the shared panes report theirs through
+  `changed_settings` / `take_landed_changes`; a launcher-side writer calls it directly). The
+  checks themselves run only on the `settings-warnings` worker, never in `show`.
 - The settings page delivers every action a frame produced (e.g. a saved projects root AND a
   finished storage switch): extras are queued and returned one per frame, in order.
 - Notice banners (one text + at most one action) use `theme::notice_banner` with a stable

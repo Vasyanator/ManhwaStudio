@@ -15,7 +15,9 @@ labels from `settings_shared::title_key(id, Studio)`.
 Flow:
 - `draw`: renders the section switcher (from the shared registry) and dispatches. The
   shared sections (General / AiBackend / Tutorials) are rendered through
-  `self.shared.draw(...)`; studio-only sections use this module's local renderers.
+  `self.shared.draw(...)` with `warnings: None` (the studio shows no settings-warning
+  badges and ignores the outcome's `changed_settings`); studio-only sections use this
+  module's local renderers.
 - The shared panels forward to the shared `crate::general_settings_panel` /
   `crate::ai_backend_panel` / `crate::tutorial` widgets over the app-global supervisor
   handle; the backend process/probe lifecycle itself lives in
@@ -378,6 +380,7 @@ impl SettingsTabState {
                             ui,
                             SettingsSurface::Studio,
                             &self.ai_backend_handle,
+                            None,
                         );
                     });
             }
@@ -390,6 +393,7 @@ impl SettingsTabState {
                     ui,
                     SettingsSurface::Studio,
                     &self.ai_backend_handle,
+                    None,
                 );
             }
             // Launcher-only sections can never be the studio's active pane: the tab bar
